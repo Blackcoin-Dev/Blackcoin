@@ -322,6 +322,8 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("- 'v30.1.1'", workflow)
         self.assertNotIn("- 'v30.1.1-alpha", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
+        self.assertIn('metadata["LSArchitecturePriority"] = [os.environ["EXPECTED_ARCH"]]', workflow)
+        self.assertIn('verify_plist_architecture "$verified_plist"', workflow)
 
     def test_reproducibility_requires_identical_bytes(self):
         verifier = load_module("verify_reproducible")

@@ -213,7 +213,7 @@ jobs:
           set -euo pipefail
           linux_64='{"name":"linux-64-bit","host":"x86_64-pc-linux-gnu","os":"ubuntu-22.04","packages":"python3","dep-opts":"","config-opts":"--enable-sse2 --enable-glibc-back-compat LDFLAGS=-static-libstdc++","goal":"install"}'
           linux_arm_64='{"name":"linux-arm-64-bit","host":"aarch64-linux-gnu","os":"ubuntu-22.04","packages":"g++-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user","dep-opts":"","config-opts":"--enable-glibc-back-compat LDFLAGS=-static-libstdc++","goal":"install"}'
-          windows_64='{"name":"windows-64-bit","host":"x86_64-w64-mingw32","os":"ubuntu-22.04","packages":"nsis g++-mingw-w64-x86-64 build-essential libtool autotools-dev automake pkg-config bsdmainutils curl git zip wine64","postinstall":"sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix\nsudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix","dep-opts":"","config-opts":"--enable-sse2 LDFLAGS=-static-libgcc","goal":"deploy install"}'
+          windows_64='{"name":"windows-64-bit","host":"x86_64-w64-mingw32","os":"ubuntu-22.04","packages":"nsis g++-mingw-w64-x86-64 build-essential libtool autotools-dev automake pkg-config bsdmainutils curl git zip wine wine64","postinstall":"sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix\nsudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix","dep-opts":"","config-opts":"--enable-sse2 LDFLAGS=-static-libgcc","goal":"deploy install"}'
           macos_64='{"name":"macos-64-bit","host":"x86_64-apple-darwin","os":"ubuntu-22.04","packages":"curl bsdmainutils cmake libz-dev python3-setuptools libtinfo5 xorriso zip","dep-opts":"","config-opts":"--enable-sse2","goal":"deploy","sdk":"12.2-12B45b","sdk-sha256":"df75d30ecafc429e905134333aeae56ac65fac67cb4182622398fd717df77619"}'
           macos_arm_64='{"name":"macos-arm-64-bit","host":"aarch64-apple-darwin","os":"ubuntu-22.04","packages":"curl bsdmainutils cmake libz-dev python3-setuptools libtinfo5 xorriso zip","dep-opts":"","config-opts":"","goal":"deploy","sdk":"12.2-12B45b","sdk-sha256":"df75d30ecafc429e905134333aeae56ac65fac67cb4182622398fd717df77619"}'
           case "$TARGET" in
@@ -294,6 +294,26 @@ jobs:
       - name: Verify exact checkout
         run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
 
+      - name: Prefetch exact miniupnpc source
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=miniupnpc-2.3.3.tar.gz
+          expected=d52a0afa614ad6c088cc9ddff1ae7d29c8c595ac5fdd321170a05f41e634bd1a
+          destination="depends/sources/$archive"
+          mkdir -p depends/sources
+          if [[ ! -f "$destination" ]]; then
+            temporary="$destination.download"
+            rm -f "$temporary"
+            curl --location --fail --show-error \
+              --connect-timeout 30 --retry 8 --retry-all-errors \
+              "https://github.com/miniupnp/miniupnp/releases/download/miniupnpc_2_3_3/$archive" \
+              --output "$temporary"
+            echo "$expected  $temporary" | sha256sum --check --strict
+            mv "$temporary" "$destination"
+          fi
+          echo "$expected  $destination" | sha256sum --check --strict
+
       - name: SDK cache
         if: ${{ matrix.sdk }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -369,8 +389,14 @@ jobs:
                 "$test_binary" --run_test=crypto_hardening_tests --log_level=test_suite
               ;;
             windows-64-bit)
-              wine_runner=$(command -v wine64 || command -v wine)
-              test -n "$wine_runner"
+              wine_runner=$(command -v wine64 || command -v wine || true)
+              if [[ -z "$wine_runner" && -x /usr/lib/wine/wine64 ]]; then
+                wine_runner=/usr/lib/wine/wine64
+              fi
+              if [[ -z "$wine_runner" ]]; then
+                echo "::error::Wine loader is unavailable for the Windows target test"
+                exit 1
+              fi
               WINEDEBUG=-all "$wine_runner" "$test_binary" \
                 --run_test=crypto_hardening_tests --log_level=test_suite
               ;;

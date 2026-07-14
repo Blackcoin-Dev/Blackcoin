@@ -643,6 +643,8 @@ jobs:
           codesign --display --verbose=4 "$app" 2> work/codesign.txt
           grep -Fx 'Signature=adhoc' work/codesign.txt
           grep -Fx 'TeamIdentifier=not set' work/codesign.txt
+          grep -E '^Info[.]plist entries=[1-9][0-9]*$' work/codesign.txt
+          grep -E '^Sealed Resources version=2 rules=[1-9][0-9]* files=[1-9][0-9]*$' work/codesign.txt
           if grep -q '^Authority=' work/codesign.txt; then
             echo 'Unexpected signing authority in ad-hoc canary app' >&2
             exit 1

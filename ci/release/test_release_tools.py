@@ -1945,6 +1945,11 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("Fast UNTESTED release-integrity gate", workflow)
         self.assertIn("Authorize exactly one candidate validation profile", workflow)
         self.assertIn("- candidate-gate", workflow)
+        self.assertIn(
+            "always() && needs.resolve-target.result == 'success' && "
+            "needs.candidate-gate.result == 'success'",
+            workflow,
+        )
         self.assertIn('test "$SAFETY_RESULT" = skipped', workflow)
         self.assertIn('test "$FAST_RESULT" = success', workflow)
         self.assertIn("UNTESTED BETA BUILD", workflow)

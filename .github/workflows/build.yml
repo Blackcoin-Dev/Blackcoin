@@ -324,6 +324,7 @@ jobs:
     needs:
       - resolve-target
       - candidate-gate
+    if: ${{ always() && needs.resolve-target.result == 'success' && needs.candidate-gate.result == 'success' }}
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}

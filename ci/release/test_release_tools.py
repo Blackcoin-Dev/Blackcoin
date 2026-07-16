@@ -1815,6 +1815,10 @@ class ReleaseToolTests(unittest.TestCase):
             'test "$REQUESTED_PACKAGE_LABEL" = "$BASE_VERSION-$PRERELEASE_CHANNEL$RC"',
             workflow,
         )
+        self.assertIn(
+            'test "$PRERELEASE_CHANNEL" = "beta"',
+            workflow,
+        )
         self.assertIn("prerelease_channel == 'beta'", workflow)
         self.assertIn('test "$IS_RELEASE" = "false"', workflow)
         self.assertIn('test "$RC" = "0"', workflow)

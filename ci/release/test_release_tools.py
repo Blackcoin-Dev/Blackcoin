@@ -1950,6 +1950,13 @@ class ReleaseToolTests(unittest.TestCase):
             "needs.candidate-gate.result == 'success'",
             workflow,
         )
+        self.assertIn(
+            "always() && needs.resolve-target.result == 'success' && "
+            "needs.select-targets.result == 'success'",
+            workflow,
+        )
+        self.assertIn("needs.build.result == 'success'", workflow)
+        self.assertIn("needs.macos-adhoc-gate.result == 'success'", workflow)
         self.assertIn('test "$SAFETY_RESULT" = skipped', workflow)
         self.assertIn('test "$FAST_RESULT" = success', workflow)
         self.assertIn("UNTESTED BETA BUILD", workflow)

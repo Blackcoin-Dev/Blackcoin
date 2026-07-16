@@ -394,6 +394,7 @@ jobs:
     needs:
       - resolve-target
       - select-targets
+    if: ${{ always() && needs.resolve-target.result == 'success' && needs.select-targets.result == 'success' }}
     runs-on: ${{ matrix.os }}
     env:
       MAKEJOBS: 4
@@ -632,7 +633,10 @@ jobs:
       - resolve-target
       - select-targets
       - build
-    if: ${{ needs.select-targets.outputs.macos_selected == 'true' }}
+    if: >-
+      ${{ always() && needs.resolve-target.result == 'success' &&
+          needs.select-targets.result == 'success' && needs.build.result == 'success' &&
+          needs.select-targets.outputs.macos_selected == 'true' }}
     runs-on: ${{ matrix.runner }}
     env:
       SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
@@ -934,6 +938,10 @@ jobs:
       - select-targets
       - build
       - macos-adhoc-gate
+    if: >-
+      ${{ always() && needs.resolve-target.result == 'success' &&
+          needs.select-targets.result == 'success' && needs.build.result == 'success' &&
+          needs.macos-adhoc-gate.result == 'success' }}
     runs-on: ubuntu-22.04
     env:
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}

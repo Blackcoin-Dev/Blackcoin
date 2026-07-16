@@ -39,6 +39,7 @@ def generate_manifest(
     release_candidate,
     workflow_run_id,
     output,
+    validation_profile,
     macos_adhoc_signed=False,
 ):
     label_match = PRERELEASE_LABEL_RE.fullmatch(package_label)
@@ -62,12 +63,18 @@ def generate_manifest(
         raise RuntimeError("workflow-run-id must be numeric")
     if not isinstance(macos_adhoc_signed, bool):
         raise RuntimeError("macos-adhoc-signed must be a boolean")
+    if validation_profile not in {"full", "fast-untested"}:
+        raise RuntimeError("validation-profile must be full or fast-untested")
+    if validation_profile == "fast-untested" and label_match.group("channel") != "beta":
+        raise RuntimeError("fast-untested validation is restricted to beta artifacts")
     if not artifacts.is_dir():
         raise RuntimeError("artifact directory does not exist")
     if output.parent.resolve() != artifacts.resolve():
         raise RuntimeError("manifest output must be inside the artifact directory")
 
     expected_prefix = f"Blackcoin-{package_label}-{source_sha}-"
+    if validation_profile == "fast-untested":
+        expected_prefix += "UNTESTED-"
     expected_output = f"{expected_prefix}MANIFEST-UNSIGNED.json"
     if output.name != expected_output:
         raise RuntimeError(f"manifest filename must be {expected_output}")
@@ -126,10 +133,36 @@ def generate_manifest(
     for required in required_marker_text:
         if required not in marker_text:
             raise RuntimeError(f"unsigned canary marker is missing required text: {required}")
+    validation_completed = validation_profile == "full"
+    full_safety_gate_passed = validation_profile == "full"
+    long_safety_tests_skipped = validation_profile == "fast-untested"
+    release_qualification = (
+        "untested-beta-binaries-only"
+        if validation_profile == "fast-untested"
+        else "full-prerelease-gate"
+    )
+    required_validation_marker_text = (
+        f"validation_profile={validation_profile}",
+        f"validation_completed={str(validation_completed).lower()}",
+        f"full_safety_gate_passed={str(full_safety_gate_passed).lower()}",
+        f"long_safety_tests_skipped={str(long_safety_tests_skipped).lower()}",
+        f"untested={str(not validation_completed).lower()}",
+        f"release_qualification={release_qualification}",
+        "final_release_qualified=false",
+        "published_by_build_workflow=false",
+    )
+    for required in required_validation_marker_text:
+        if required not in marker_text:
+            raise RuntimeError(
+                f"canary marker is missing required validation text: {required}"
+            )
+    if validation_profile == "fast-untested" and "UNTESTED BETA BUILD" not in marker_text:
+        raise RuntimeError("untested canary marker is missing required text: UNTESTED BETA BUILD")
     required_reproducibility_text = (
         f"package_label={package_label}",
         f"prerelease_channel={label_match.group('channel')}",
         f"configured_version={configured_version}",
+        f"validation_profile={validation_profile}",
         f"source_commit={source_sha}",
     )
     for required in required_reproducibility_text:
@@ -138,14 +171,28 @@ def generate_manifest(
     if not subjects:
         raise RuntimeError("no canary artifacts were found")
 
+    classification = (
+        "UNSIGNED_UNTESTED_CANARY_NOT_FOR_PRODUCTION"
+        if validation_profile == "fast-untested"
+        else "UNSIGNED_CANARY_NOT_FOR_PRODUCTION"
+    )
     manifest = {
         "schema": 1,
-        "classification": "UNSIGNED_CANARY_NOT_FOR_PRODUCTION",
+        "classification": classification,
         "package_label": package_label,
         "prerelease_channel": label_match.group("channel"),
         "source_version": source_version,
         "configured_version": configured_version,
         "release_candidate": int(release_candidate),
+        "validation": {
+            "profile": validation_profile,
+            "completed": validation_completed,
+            "full_safety_gate_passed": full_safety_gate_passed,
+            "long_safety_tests_skipped": long_safety_tests_skipped,
+            "untested": not validation_completed,
+            "release_qualification": release_qualification,
+            "final_release_qualified": False,
+        },
         "source": {
             "repository": EXPECTED_REPOSITORY,
             "commit": source_sha,
@@ -181,6 +228,11 @@ def main():
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--release-candidate", required=True)
     parser.add_argument("--workflow-run-id", required=True)
+    parser.add_argument(
+        "--validation-profile",
+        choices=("full", "fast-untested"),
+        required=True,
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
         "--macos-adhoc-signed",
@@ -198,6 +250,7 @@ def main():
         release_candidate=args.release_candidate,
         workflow_run_id=args.workflow_run_id,
         output=args.output,
+        validation_profile=args.validation_profile,
         macos_adhoc_signed=args.macos_adhoc_signed,
     )
     print(f"Wrote unsigned canary manifest for {len(manifest['artifacts'])} artifact(s) to {args.output}")

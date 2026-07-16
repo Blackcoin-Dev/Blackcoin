@@ -1,9 +1,10 @@
 # Blackcoin Core 30.1.1 Beta 2 replacement candidate
 
 Blackcoin Core 30.1.1 Beta 2 is the proposed replacement for the withdrawn
-Beta 1 canary. It is an unsigned, unnotarized test candidate, not a production
-release or a fleet-rollout recommendation. Its source must remain configured
-as `30.1.1rc2` with `CLIENT_VERSION_IS_RELEASE=false`.
+Beta 1 canary. It is an **UNTESTED**, unsigned, unnotarized binary build for
+isolated community testing, not a production release or a fleet-rollout
+recommendation. Its source must remain configured as `30.1.1rc2` with
+`CLIENT_VERSION_IS_RELEASE=false`.
 
 ## Beta 1 is withdrawn
 
@@ -28,8 +29,13 @@ through an explicit historical rule while retaining the independent v2
 mempool-time repair. A one-transaction exception is not an acceptable release
 correction.
 
-Public prerelease promotion of the exact Beta 2 artifact is blocked until all
-of these conditions are met:
+Beta 2 uses the explicit `fast-untested` build profile. That profile compiles,
+packages, source-binds, and independently reproduces the platform binaries,
+but deliberately does not run the long safety, replay, sanitizer, fuzz,
+interoperability, or extended functional gates. Those gates remain mandatory
+before v30.1.1 final.
+
+Beta 2 therefore makes none of these claims:
 
 - deterministic coverage accepts the historical depth-182 coinstake spend and
   covers coinbase and coinstake behavior on both sides of the existing
@@ -46,9 +52,14 @@ of these conditions are met:
   `present`, `marker_valid`, and `valid_for_tip` all true.
 
 No Beta 2 source commit or artifact hash is asserted in this source-tracked
-note. The immutable `v30.1.1-beta2` prerelease page, full-SHA filenames,
+note. The immutable `v30.1.1-beta2` prerelease page, full-SHA `UNTESTED` filenames,
 unsigned canary manifest, source markers, reproducibility report, and unsigned
-checksums must all identify the same frozen commit before public testing.
+checksums must all identify the same frozen commit before public testing. The
+release title, body, marker, and manifest must all state that validation was
+not completed. The unchanged build marker records
+`published_by_build_workflow=false`; the public release page must explain that
+this is build-time provenance and that a separate manual promotion published
+the same verified bytes.
 
 ## Operator action
 

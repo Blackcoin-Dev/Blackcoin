@@ -1460,6 +1460,7 @@ class ReleaseToolTests(unittest.TestCase):
                 f"package_label={package_label}\n"
                 "prerelease_channel=alpha\n"
                 "configured_version=30.1.1rc1\n"
+                "validation_profile=full\n"
                 f"source_commit={SOURCE_SHA}\n",
                 encoding="utf-8",
             )
@@ -1473,7 +1474,15 @@ class ReleaseToolTests(unittest.TestCase):
                 "signed=false\n"
                 "developer_id_signed=false\n"
                 "macos_adhoc_signed=false\n"
-                "notarized=false\npublished=false\n",
+                "notarized=false\npublished=false\n"
+                "validation_profile=full\n"
+                "validation_completed=true\n"
+                "full_safety_gate_passed=true\n"
+                "long_safety_tests_skipped=false\n"
+                "untested=false\n"
+                "release_qualification=full-prerelease-gate\n"
+                "final_release_qualified=false\n"
+                "published_by_build_workflow=false\n",
                 encoding="utf-8",
             )
             output = artifacts / f"{prefix}MANIFEST-UNSIGNED.json"
@@ -1487,6 +1496,7 @@ class ReleaseToolTests(unittest.TestCase):
                 release_candidate="1",
                 workflow_run_id="12345",
                 output=output,
+                validation_profile="full",
             )
 
             self.assertEqual(manifest["classification"], "UNSIGNED_CANARY_NOT_FOR_PRODUCTION")
@@ -1514,6 +1524,7 @@ class ReleaseToolTests(unittest.TestCase):
                 f"package_label={package_label}\n"
                 "prerelease_channel=alpha\n"
                 "configured_version=30.1.1rc1\n"
+                "validation_profile=full\n"
                 f"source_commit={SOURCE_SHA}\n",
                 encoding="utf-8",
             )
@@ -1527,7 +1538,15 @@ class ReleaseToolTests(unittest.TestCase):
                 "signed=false\n"
                 "developer_id_signed=false\n"
                 "macos_adhoc_signed=false\n"
-                "notarized=false\npublished=false\n",
+                "notarized=false\npublished=false\n"
+                "validation_profile=full\n"
+                "validation_completed=true\n"
+                "full_safety_gate_passed=true\n"
+                "long_safety_tests_skipped=false\n"
+                "untested=false\n"
+                "release_qualification=full-prerelease-gate\n"
+                "final_release_qualified=false\n"
+                "published_by_build_workflow=false\n",
                 encoding="utf-8",
             )
             output = artifacts / f"{prefix}MANIFEST-UNSIGNED.json"
@@ -1541,6 +1560,7 @@ class ReleaseToolTests(unittest.TestCase):
                     release_candidate="1",
                     workflow_run_id="12345",
                     output=output,
+                    validation_profile="full",
                 )
 
     def test_unsigned_beta_manifest_is_bound_to_channel_and_exact_source(self):
@@ -1557,6 +1577,7 @@ class ReleaseToolTests(unittest.TestCase):
                 f"package_label={package_label}\n"
                 "prerelease_channel=beta\n"
                 "configured_version=30.1.1rc1\n"
+                "validation_profile=full\n"
                 f"source_commit={SOURCE_SHA}\n",
                 encoding="utf-8",
             )
@@ -1570,7 +1591,15 @@ class ReleaseToolTests(unittest.TestCase):
                 "signed=false\n"
                 "developer_id_signed=false\n"
                 "macos_adhoc_signed=true\n"
-                "notarized=false\npublished=false\n",
+                "notarized=false\npublished=false\n"
+                "validation_profile=full\n"
+                "validation_completed=true\n"
+                "full_safety_gate_passed=true\n"
+                "long_safety_tests_skipped=false\n"
+                "untested=false\n"
+                "release_qualification=full-prerelease-gate\n"
+                "final_release_qualified=false\n"
+                "published_by_build_workflow=false\n",
                 encoding="utf-8",
             )
             output = artifacts / f"{prefix}MANIFEST-UNSIGNED.json"
@@ -1584,6 +1613,7 @@ class ReleaseToolTests(unittest.TestCase):
                 release_candidate="1",
                 workflow_run_id="12345",
                 output=output,
+                validation_profile="full",
                 macos_adhoc_signed=True,
             )
 
@@ -1597,7 +1627,7 @@ class ReleaseToolTests(unittest.TestCase):
     def test_unsigned_beta2_manifest_is_bound_to_rc2_and_exact_source(self):
         generator = load_module("generate_canary_manifest")
         package_label = "30.1.1-beta2"
-        prefix = f"Blackcoin-{package_label}-{SOURCE_SHA}-"
+        prefix = f"Blackcoin-{package_label}-{SOURCE_SHA}-UNTESTED-"
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = Path(temporary)
             (artifacts / f"{prefix}Linux-x86_64.tar.gz").write_bytes(b"beta2")
@@ -1608,6 +1638,7 @@ class ReleaseToolTests(unittest.TestCase):
                 f"package_label={package_label}\n"
                 "prerelease_channel=beta\n"
                 "configured_version=30.1.1rc2\n"
+                "validation_profile=fast-untested\n"
                 f"source_commit={SOURCE_SHA}\n",
                 encoding="utf-8",
             )
@@ -1621,7 +1652,16 @@ class ReleaseToolTests(unittest.TestCase):
                 "signed=false\n"
                 "developer_id_signed=false\n"
                 "macos_adhoc_signed=true\n"
-                "notarized=false\npublished=false\n",
+                "notarized=false\npublished=false\n"
+                "validation_profile=fast-untested\n"
+                "validation_completed=false\n"
+                "full_safety_gate_passed=false\n"
+                "long_safety_tests_skipped=true\n"
+                "untested=true\n"
+                "release_qualification=untested-beta-binaries-only\n"
+                "final_release_qualified=false\n"
+                "published_by_build_workflow=false\n"
+                "UNTESTED BETA BUILD\n",
                 encoding="utf-8",
             )
             output = artifacts / f"{prefix}MANIFEST-UNSIGNED.json"
@@ -1636,13 +1676,79 @@ class ReleaseToolTests(unittest.TestCase):
                 workflow_run_id="12345",
                 output=output,
                 macos_adhoc_signed=True,
+                validation_profile="fast-untested",
             )
 
+            self.assertEqual(
+                manifest["classification"],
+                "UNSIGNED_UNTESTED_CANARY_NOT_FOR_PRODUCTION",
+            )
             self.assertEqual(manifest["package_label"], package_label)
             self.assertEqual(manifest["configured_version"], "30.1.1rc2")
             self.assertEqual(manifest["release_candidate"], 2)
             self.assertEqual(manifest["prerelease_channel"], "beta")
             self.assertEqual(manifest["source"]["commit"], SOURCE_SHA)
+            self.assertEqual(manifest["validation"]["profile"], "fast-untested")
+            self.assertFalse(manifest["validation"]["completed"])
+            self.assertFalse(manifest["validation"]["full_safety_gate_passed"])
+            self.assertTrue(manifest["validation"]["long_safety_tests_skipped"])
+            self.assertTrue(manifest["validation"]["untested"])
+            self.assertEqual(
+                manifest["validation"]["release_qualification"],
+                "untested-beta-binaries-only",
+            )
+            self.assertFalse(manifest["validation"]["final_release_qualified"])
+
+    def test_fast_untested_manifest_rejects_non_beta_and_missing_untested_prefix(self):
+        generator = load_module("generate_canary_manifest")
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "restricted to beta"):
+                generator.generate_manifest(
+                    artifacts=artifacts,
+                    package_label="30.1.1-alpha2",
+                    source_version="30.1.1",
+                    configured_version="30.1.1rc2",
+                    source_sha=SOURCE_SHA,
+                    release_candidate="2",
+                    workflow_run_id="12345",
+                    output=artifacts / f"Blackcoin-30.1.1-alpha2-{SOURCE_SHA}-UNTESTED-MANIFEST-UNSIGNED.json",
+                    validation_profile="fast-untested",
+                )
+
+        package_label = "30.1.1-beta2"
+        wrong_prefix = f"Blackcoin-{package_label}-{SOURCE_SHA}-"
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            output = artifacts / f"{wrong_prefix}MANIFEST-UNSIGNED.json"
+            with self.assertRaisesRegex(RuntimeError, "manifest filename must be.*UNTESTED"):
+                generator.generate_manifest(
+                    artifacts=artifacts,
+                    package_label=package_label,
+                    source_version="30.1.1",
+                    configured_version="30.1.1rc2",
+                    source_sha=SOURCE_SHA,
+                    release_candidate="2",
+                    workflow_run_id="12345",
+                    output=output,
+                    validation_profile="fast-untested",
+                )
+
+    def test_canary_manifest_requires_an_explicit_validation_profile(self):
+        generator = load_module("generate_canary_manifest")
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            with self.assertRaisesRegex(TypeError, "validation_profile"):
+                generator.generate_manifest(
+                    artifacts=artifacts,
+                    package_label="30.1.1-beta2",
+                    source_version="30.1.1",
+                    configured_version="30.1.1rc2",
+                    source_sha=SOURCE_SHA,
+                    release_candidate="2",
+                    workflow_run_id="12345",
+                    output=artifacts / "unused.json",
+                )
 
     def test_documentation_lint_preserves_final_and_beta2_identity_modes(self):
         lint = load_path(
@@ -1827,6 +1933,26 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertNotIn("- 'v30.1.1-alpha", workflow)
         self.assertNotIn("- 'v30.1.1-beta", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
+        self.assertIn("default: full", workflow)
+        self.assertIn("fast_untested_ack:", workflow)
+        self.assertIn(
+            "I_ACKNOWLEDGE_BETA2_IS_UNTESTED_AND_SKIPS_LONG_SAFETY_GATES",
+            workflow,
+        )
+        self.assertIn('test "$TARGET" = all', workflow)
+        self.assertIn('test "$PACKAGE_LABEL" = 30.1.1-beta2', workflow)
+        self.assertIn('ASSET_PREFIX="${ASSET_PREFIX}-UNTESTED"', workflow)
+        self.assertIn("Fast UNTESTED release-integrity gate", workflow)
+        self.assertIn("Authorize exactly one candidate validation profile", workflow)
+        self.assertIn("- candidate-gate", workflow)
+        self.assertIn('test "$SAFETY_RESULT" = skipped', workflow)
+        self.assertIn('test "$FAST_RESULT" = success', workflow)
+        self.assertIn("UNTESTED BETA BUILD", workflow)
+        self.assertIn("validation_completed=false", workflow)
+        self.assertIn("full_safety_gate_passed=false", workflow)
+        self.assertIn("long_safety_tests_skipped=true", workflow)
+        self.assertIn("release_qualification=untested-beta-binaries-only", workflow)
+        self.assertIn("Execute non-macOS binary identity smoke", workflow)
         self.assertIn("raw-release-${{ needs.resolve-target.outputs.package_label }}", workflow)
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("codesign --force --deep --sign - --timestamp=none", workflow)
@@ -1839,7 +1965,7 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertNotIn("Developer-ID sign and notarize macOS artifacts", workflow)
         self.assertNotIn("Authenticode-sign Windows artifacts", workflow)
 
-    def test_beta_and_production_run_the_extended_functional_gate(self):
+    def test_full_beta_and_production_retain_the_extended_functional_gate(self):
         workflow = (TOOLS.parent.parent / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
@@ -1852,6 +1978,10 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertNotIn(
             "run_extended_functional: "
             "${{ needs.resolve-target.outputs.publish == 'true' }}",
+            workflow,
+        )
+        self.assertIn(
+            "needs.resolve-target.outputs.validation_profile == 'full'",
             workflow,
         )
 

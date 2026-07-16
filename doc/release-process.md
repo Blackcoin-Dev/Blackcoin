@@ -76,6 +76,16 @@ prerelease control above, remain `prerelease=true` and `latest=false`, and
 state that its full P0/P1 and operator validation is still in progress. A beta
 tag or asset is never moved, replaced, or reused for the final release.
 
+An explicitly authorized `fast-untested` beta may skip the long safety gate so
+testers can obtain platform binaries. It must still use exact-SHA source
+identity, two-builder byte reproducibility, unsigned checksums, and conspicuous
+`UNTESTED` metadata in every public filename and at the top of the release
+title and body. The manual build requires the exact acknowledgement
+`I_ACKNOWLEDGE_BETA2_IS_UNTESTED_AND_SKIPS_LONG_SAFETY_GATES` and the complete
+all-platform target. It is not an isolated-canary success, production evidence,
+or authorization for fleet deployment. All skipped gates remain mandatory for
+the final release.
+
 #### Withdrawn Beta 1 and replacement Beta 2
 
 `v30.1.1-beta1`, source commit
@@ -229,10 +239,12 @@ signature.
 
 1. Select the exact candidate SHA, matching `30.1.1-betaN` label, and required
    platform. Confirm the source release-candidate number is `N`.
-2. Require the workflow's complete exact-SHA gate, including exhaustive
-   functional/soak, native vectors, sanitizers, fuzz, mixed-version, critical,
-   unit, and lint jobs. A skipped, canceled, neutral, stale, or failed job is
-   not a pass.
+2. For a `full` beta, require the workflow's complete exact-SHA gate, including
+   exhaustive functional/soak, native vectors, sanitizers, fuzz, mixed-version,
+   critical, unit, and lint jobs. A skipped, canceled, neutral, stale, or failed
+   job is not a pass. For an explicitly authorized `fast-untested` beta,
+   require that the safety gate is visibly skipped by profile and that the
+   marker and manifest report `validation_completed=false`.
 3. Download the `unsigned-canary-*` bundle only after both isolated builders
    reproduce every selected artifact byte for byte. Verify the unsigned
    checksum manifest and its `prerelease_channel=beta` binding.
@@ -241,22 +253,30 @@ signature.
    promotion gates. A beta must not claim that either final-production gate
    passed. If exact-SHA evidence already exists, preserve it without treating
    it as a substitute for the beta canary and replay requirements.
-5. Install one isolated canary with verified wallet and datadir backups. Run
-   the two-start upgrade, replay/reindex, restart, staking, wallet, GUI, and
-   rollback checks required by the beta plan before any broader testing.
+5. For a `full` beta, install one isolated canary with verified wallet and
+   datadir backups before broader testing. For a `fast-untested` beta, public
+   prerelease distribution exists specifically to perform those isolated
+   tests; it carries no canary-success claim.
 6. If public beta testing is authorized, create the immutable
    `v30.1.1-betaN` prerelease at that exact SHA, upload only the unchanged
    verified bundle, keep `latest=false`, then redownload and compare every
-   public byte. Corrections require a new release-candidate number and tag.
+   public byte. A fast-untested release title and body begin `UNTESTED — NOT
+   VALIDATED FOR PRODUCTION OR FLEET ROLLOUT`. Its unchanged marker may record
+   `published_by_build_workflow=false`; the page explains that this is
+   build-time state and that manual promotion published the verified bytes.
+   Corrections require a new release-candidate number and tag.
 
-For Beta 2, step 5 includes two independent offline historical-mainnet
-schema-11-to-schema-12 rebuilds from preserved copies. Both must exit zero,
+For v30.1.1 final, the acceptance gate includes two independent offline
+historical-mainnet schema-11-to-schema-12 rebuilds from preserved copies. Both
+must exit zero,
 durably commit the replacement, and agree on height, best block, UTXO MuHash,
 Gold Rush totals, replay-state commitment, and index state. A separate normal
 restart without a reindex flag must report schema 12 with replay state
 `present`, `marker_valid`, and `valid_for_tip` all true. The rebuilt results
 must match the preserved reference at the same tip. A focused unit fixture or
 a replay that stops before height 4,272,172 cannot satisfy this requirement.
+Beta 2 is published to obtain binaries for that testing and does not claim this
+gate has passed.
 
 ## Production publication procedure
 

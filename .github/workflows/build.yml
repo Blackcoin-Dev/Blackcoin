@@ -25,6 +25,19 @@ on:
           - macos-all
           - macos-64-bit
           - macos-arm-64-bit
+      validation_profile:
+        description: Full certification gate or explicitly untested binary-only build
+        required: true
+        type: choice
+        default: full
+        options:
+          - full
+          - fast-untested
+      fast_untested_ack:
+        description: Exact acknowledgement required only for a fast-untested Beta 2 all-platform build
+        required: false
+        default: ''
+        type: string
   push:
     tags:
       - 'v30.1.1'
@@ -52,6 +65,7 @@ jobs:
       target: ${{ steps.resolve.outputs.target }}
       publish: ${{ steps.resolve.outputs.publish }}
       tag: ${{ steps.resolve.outputs.tag }}
+      validation_profile: ${{ steps.resolve.outputs.validation_profile }}
     steps:
       - name: Checkout requested target
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
@@ -66,6 +80,8 @@ jobs:
           REQUESTED_SHA: ${{ inputs.target_sha }}
           REQUESTED_PACKAGE_LABEL: ${{ inputs.package_label }}
           REQUESTED_TARGET: ${{ inputs.target }}
+          REQUESTED_VALIDATION_PROFILE: ${{ inputs.validation_profile }}
+          REQUESTED_FAST_UNTESTED_ACK: ${{ inputs.fast_untested_ack }}
           CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
           EVENT_SHA: ${{ github.sha }}
         run: |
@@ -128,6 +144,34 @@ jobs:
             PACKAGE_LABEL="$REQUESTED_PACKAGE_LABEL"
             ASSET_PREFIX="Blackcoin-$PACKAGE_LABEL-$TARGET_SHA"
             TARGET="$REQUESTED_TARGET"
+            VALIDATION_PROFILE="$REQUESTED_VALIDATION_PROFILE"
+            case "$VALIDATION_PROFILE" in
+              fast-untested|full) ;;
+              *) echo "::error::Unknown validation profile: $VALIDATION_PROFILE"; exit 1 ;;
+            esac
+            if [[ "$VALIDATION_PROFILE" == fast-untested ]]; then
+              expected_ack='I_ACKNOWLEDGE_BETA2_IS_UNTESTED_AND_SKIPS_LONG_SAFETY_GATES'
+              test "$PRERELEASE_CHANNEL" = beta || {
+                echo "::error::The fast-untested profile is restricted to beta builds"
+                exit 1
+              }
+              test "$PACKAGE_LABEL" = 30.1.1-beta2 || {
+                echo "::error::The fast-untested profile is locked to the Beta 2 replacement"
+                exit 1
+              }
+              test "$TARGET" = all || {
+                echo "::error::A public fast-untested candidate must build every supported platform"
+                exit 1
+              }
+              test "$REQUESTED_FAST_UNTESTED_ACK" = "$expected_ack" || {
+                echo "::error::The exact fast-untested acknowledgement is required"
+                exit 1
+              }
+              ASSET_PREFIX="${ASSET_PREFIX}-UNTESTED"
+            elif [[ -n "$REQUESTED_FAST_UNTESTED_ACK" ]]; then
+              echo "::error::fast_untested_ack must be empty for a full validation build"
+              exit 1
+            fi
             TAG=""
             PUBLISH=false
             python3 ci/release/verify_source_identity.py \
@@ -142,6 +186,7 @@ jobs:
             PRERELEASE_CHANNEL=production
             ASSET_PREFIX="Blackcoin-$VERSION"
             TARGET=all
+            VALIDATION_PROFILE=full
             PUBLISH=true
             python3 ci/release/verify_source_identity.py \
               --head "$TARGET_SHA" \
@@ -182,11 +227,13 @@ jobs:
             echo "target=$TARGET"
             echo "publish=$PUBLISH"
             echo "tag=$TAG"
+            echo "validation_profile=$VALIDATION_PROFILE"
           } >> "$GITHUB_OUTPUT"
 
   safety-gate:
     name: Exact-SHA prerelease or production safety gate
     needs: resolve-target
+    if: ${{ needs.resolve-target.outputs.validation_profile == 'full' }}
     permissions:
       contents: read
     uses: ./.github/workflows/pr-gate.yml
@@ -198,11 +245,85 @@ jobs:
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
       run_extended_functional: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
 
+  fast-untested-gate:
+    name: Fast UNTESTED release-integrity gate
+    needs: resolve-target
+    if: ${{ needs.resolve-target.outputs.validation_profile == 'fast-untested' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ needs.resolve-target.outputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Verify source, workflow, release metadata, and documentation integrity
+        shell: bash
+        env:
+          TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test -z "$(git status --short)"
+          git diff --check "$TARGET_SHA^" "$TARGET_SHA"
+          python3 ci/release/test_release_tools.py
+          python3 test/lint/lint-quantum-doc-invariants.py
+
+      - name: Parse and semantically validate workflow YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -e 'require "yaml"; Dir[".github/workflows/*.yml"].each { |path| YAML.parse_file(path) }'
+          archive="$RUNNER_TEMP/actionlint_1.7.9_linux_amd64.tar.gz"
+          curl --location --fail --silent --show-error \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.9/actionlint_1.7.9_linux_amd64.tar.gz \
+            --output "$archive"
+          echo '233b280d05e100837f4af1433c7b40a5dcb306e3aa68fb4f17f8a7f45a7df7b4  '"$archive" |
+            sha256sum --check --strict
+          tar -C "$RUNNER_TEMP" -xzf "$archive" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+
+  candidate-gate:
+    name: Authorize exactly one candidate validation profile
+    needs:
+      - resolve-target
+      - safety-gate
+      - fast-untested-gate
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Fail closed unless the selected profile alone succeeded
+        shell: bash
+        env:
+          RESOLVE_RESULT: ${{ needs.resolve-target.result }}
+          VALIDATION_PROFILE: ${{ needs.resolve-target.outputs.validation_profile }}
+          SAFETY_RESULT: ${{ needs.safety-gate.result }}
+          FAST_RESULT: ${{ needs.fast-untested-gate.result }}
+        run: |
+          set -euo pipefail
+          test "$RESOLVE_RESULT" = success
+          case "$VALIDATION_PROFILE" in
+            full)
+              test "$SAFETY_RESULT" = success
+              test "$FAST_RESULT" = skipped
+              ;;
+            fast-untested)
+              test "$SAFETY_RESULT" = skipped
+              test "$FAST_RESULT" = success
+              ;;
+            *)
+              echo "::error::Candidate validation profile was not resolved"
+              exit 1
+              ;;
+          esac
+
   select-targets:
     name: Select build target
     needs:
       - resolve-target
-      - safety-gate
+      - candidate-gate
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -271,7 +392,6 @@ jobs:
     name: ${{ matrix.name }} (${{ matrix.builder }})
     needs:
       - resolve-target
-      - safety-gate
       - select-targets
     runs-on: ${{ matrix.os }}
     env:
@@ -283,6 +403,7 @@ jobs:
       PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
       CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
       ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
+      VALIDATION_PROFILE: ${{ needs.resolve-target.outputs.validation_profile }}
     strategy:
       fail-fast: false
       matrix:
@@ -365,7 +486,7 @@ jobs:
           done
 
       - name: Build and execute target crypto vectors
-        if: ${{ !startsWith(matrix.name, 'macos-') }}
+        if: ${{ needs.resolve-target.outputs.validation_profile == 'full' && !startsWith(matrix.name, 'macos-') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -391,6 +512,32 @@ jobs:
                 --run_test=crypto_hardening_tests --log_level=test_suite
               ;;
           esac
+
+      - name: Execute non-macOS binary identity smoke
+        if: ${{ !startsWith(matrix.name, 'macos-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_line="Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          binary="depends/${{ matrix.host }}/bin/blackcoind"
+          version_home="$RUNNER_TEMP/blackcoin-version-home-${{ matrix.name }}-${{ matrix.builder }}"
+          mkdir -p "$version_home"
+          case "${{ matrix.name }}" in
+            linux-64-bit)
+              version_output=$(HOME="$version_home" "$binary" -version 2>&1)
+              ;;
+            linux-arm-64-bit)
+              version_output=$(HOME="$version_home" qemu-aarch64 -L /usr/aarch64-linux-gnu "$binary" -version 2>&1)
+              ;;
+            windows-64-bit)
+              wine_runner=$(command -v wine64 || command -v wine)
+              test -n "$wine_runner"
+              version_output=$(WINEDEBUG=-all WINEPREFIX="$version_home/wine" "$wine_runner" "${binary}.exe" -version 2>&1)
+              ;;
+          esac
+          normalized_output=$(printf '%s\n' "$version_output" | tr -d '\r')
+          test "$(printf '%s\n' "$normalized_output" | grep -Fxc "$expected_line")" = 1
+          printf '%s\n' "$normalized_output"
 
       - name: Package release assets
         shell: bash
@@ -796,6 +943,7 @@ jobs:
       PRERELEASE_CHANNEL: ${{ needs.resolve-target.outputs.prerelease_channel }}
       ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
       MACOS_SELECTED: ${{ needs.select-targets.outputs.macos_selected }}
+      VALIDATION_PROFILE: ${{ needs.resolve-target.outputs.validation_profile }}
     steps:
       - name: Checkout immutable verification code
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
@@ -824,6 +972,7 @@ jobs:
             printf 'package_label=%s\n' "$PACKAGE_LABEL"
             printf 'prerelease_channel=%s\n' "$PRERELEASE_CHANNEL"
             printf 'configured_version=%s\n' "$CONFIGURED_VERSION"
+            printf 'validation_profile=%s\n' "$VALIDATION_PROFILE"
           } > "$report"
           for primary in "${primaries[@]}"; do
             artifact_name=$(basename "$primary")
@@ -889,11 +1038,29 @@ jobs:
             echo "configured_version=$CONFIGURED_VERSION"
             echo "source_commit=$TARGET_SHA"
             echo "workflow_run_id=$GITHUB_RUN_ID"
+            echo "validation_profile=$VALIDATION_PROFILE"
             echo 'signed=false'
             echo 'developer_id_signed=false'
             echo "macos_adhoc_signed=$MACOS_SELECTED"
             echo 'notarized=false'
             echo 'published=false'
+            echo
+            if [[ "$VALIDATION_PROFILE" == fast-untested ]]; then
+              echo 'UNTESTED BETA BUILD - LONG-RUNNING SAFETY, REPLAY, SANITIZER, FUZZ, AND INTEROPERABILITY GATES WERE NOT RUN.'
+              echo 'validation_completed=false'
+              echo 'full_safety_gate_passed=false'
+              echo 'long_safety_tests_skipped=true'
+              echo 'untested=true'
+              echo 'release_qualification=untested-beta-binaries-only'
+            else
+              echo 'validation_completed=true'
+              echo 'full_safety_gate_passed=true'
+              echo 'long_safety_tests_skipped=false'
+              echo 'untested=false'
+              echo 'release_qualification=full-prerelease-gate'
+            fi
+            echo 'final_release_qualified=false'
+            echo 'published_by_build_workflow=false'
             echo
             echo "These exact-SHA $PRERELEASE_CHANNEL artifacts are for controlled canary testing only."
             echo 'They are not release-signed, Developer-ID signed, notarized, tagged, or published as a production release.'
@@ -912,6 +1079,7 @@ jobs:
             --source-sha "$TARGET_SHA"
             --release-candidate "$RELEASE_CANDIDATE"
             --workflow-run-id "$GITHUB_RUN_ID"
+            --validation-profile "$VALIDATION_PROFILE"
             --output "$manifest"
           )
           if [[ "$MACOS_SELECTED" == true ]]; then

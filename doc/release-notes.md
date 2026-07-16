@@ -85,15 +85,20 @@ commit or artifact hash is asserted in these source-tracked notes; those
 values are recorded only after the candidate is frozen and the exact-source
 workflow emits them.
 
-Beta 2 is not eligible for public testing merely because it compiles or fixes
-the deterministic unit fixture. Its exact binary must complete two independent
-offline historical-mainnet schema-11-to-schema-12 rebuilds, make a durable
-authenticated commit, pass a normal restart without a reindex flag, and match
-height, best block, UTXO MuHash, Gold Rush totals, replay-state commitment, and
-index state between both rebuilds. The exact-source unit, functional,
-mixed-version, sanitizer, fuzz, native-platform, and extended functional/soak
-jobs must also pass. Until that evidence exists, these notes make no claim
-that the replacement replay gate has passed.
+Beta 2 is an explicitly **UNTESTED** binary-distribution candidate. Its
+`fast-untested` build compiles and packages every supported platform, verifies
+the exact source identity embedded in the binaries, and requires independent
+byte-for-byte reproduction. It deliberately skips the long unit, functional,
+historical replay, mixed-version, sanitizer, fuzz, and extended functional/soak
+gates so isolated community testing can begin quickly. Its public filenames,
+marker, manifest, and release page must state that those gates were not run.
+
+Those skipped gates remain mandatory for v30.1.1 final. Final acceptance
+requires two independent offline historical-mainnet schema-11-to-schema-12
+rebuilds, a durable authenticated commit, a normal restart without a reindex
+flag, and matching height, best block, UTXO MuHash, Gold Rush totals,
+replay-state commitment, and index state. Until that evidence exists, Beta 2
+makes no claim that the replacement replay gate or final safety gate passed.
 
 Unsafe raw quantum-key RPC disclosure
 =====================================

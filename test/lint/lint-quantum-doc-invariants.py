@@ -782,8 +782,12 @@ def check_beta2_release_identity(root, failures):
     beta2_notes = read_text(root, beta2_notes_relative)
     for fragment in (
         "# Blackcoin Core 30.1.1 Beta 2 replacement candidate",
-        "It is an unsigned, unnotarized test candidate, not a production",
-        "as `30.1.1rc2` with `CLIENT_VERSION_IS_RELEASE=false`.",
+        "It is an **UNTESTED**, unsigned, unnotarized binary build for",
+        "recommendation. Its source must remain configured as `30.1.1rc2` with\n"
+        "`CLIENT_VERSION_IS_RELEASE=false`.",
+        "Beta 2 uses the explicit `fast-untested` build profile.",
+        "release title, body, marker, and manifest must all state that validation was\n"
+        "not completed.",
         "Do not install, deploy, or reuse v30.1.1 Beta 1.",
         "`b328d2263038cdddef46b9f427827aac9e83b513`",
         "No Beta 2 source commit or artifact hash is asserted",

@@ -626,13 +626,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test_target=test/test_blackcoin
           test_binary=src/test/test_blackcoin
           if [[ "${{ matrix.name }}" == "windows-64-bit" ]]; then
-            test_target+=.exe
             test_binary+=.exe
           fi
-          make -C src -j "$MAKEJOBS" "$test_target"
+          # The preceding install goal already built this exact target. Do not
+          # re-enter make after packaging has created untracked installer
+          # output, because genbuild would then change the embedded dirty-state
+          # identity before the platform vector is executed.
+          test -f "$test_binary"
+          test ! -L "$test_binary"
           case "${{ matrix.name }}" in
             linux-64-bit)
               "$test_binary" --run_test=crypto_hardening_tests --log_level=test_suite

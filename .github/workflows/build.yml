@@ -597,19 +597,22 @@ jobs:
       - name: Build depends
         run: make -j "$MAKEJOBS" -C depends HOST=${{ matrix.host }} ${{ matrix.dep-opts }}
 
-      - name: Authorize only the deterministic macOS staging bundle
+      - name: Authorize only deterministic macOS build outputs
         if: ${{ startsWith(matrix.name, 'macos-') }}
         shell: bash
         run: |
           set -euo pipefail
-          # The Linux cross-build creates this bundle before genbuild records
-          # source provenance. Ignore only that generated path; every other
-          # untracked or modified source path must continue to mark the binary
-          # dirty.
+          # The Linux cross-build creates this bundle and compiler atomic
+          # object temporaries while parallel genbuild invocations record
+          # source provenance. Ignore only those deterministic build outputs;
+          # every other untracked or modified source path must continue to
+          # mark the binary dirty.
           test ! -e blackcoin-qt.app
+          test -z "$(find . -type f -name '*.o.tmp' -print -quit)"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
-          printf '%s\n' '/blackcoin-qt.app/' >> "$(git rev-parse --git-path info/exclude)"
+          printf '%s\n' '/blackcoin-qt.app/' '*.o.tmp' >> "$(git rev-parse --git-path info/exclude)"
           git check-ignore -q --no-index blackcoin-qt.app/Contents/PkgInfo
+          git check-ignore -q --no-index src/provenance-probe.o.tmp
 
       - name: Build Blackcoin
         shell: bash
@@ -634,6 +637,16 @@ jobs:
               make "${make_args[@]}" "$goal" V=1
             fi
           done
+
+      - name: Verify macOS build provenance remained clean
+        if: ${{ startsWith(matrix.name, 'macos-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(find . -type f -name '*.o.tmp' -print -quit)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          grep -Fqx '#define BUILD_SOURCE_COMMIT "${{ needs.resolve-target.outputs.target_sha }}"' src/obj/build.h
+          grep -Fqx '#define BUILD_SOURCE_DIRTY 0' src/obj/build.h
 
       - name: Build and execute target crypto vectors
         if: ${{ !startsWith(matrix.name, 'macos-') }}

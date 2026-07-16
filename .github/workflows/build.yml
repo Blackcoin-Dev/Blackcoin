@@ -645,8 +645,14 @@ jobs:
                 "$test_binary" --run_test=crypto_hardening_tests --log_level=test_suite
               ;;
             windows-64-bit)
-              wine_runner=$(command -v wine64 || command -v wine)
-              test -n "$wine_runner"
+              wine_runner=$(command -v wine64 || command -v wine || true)
+              if [[ -z "$wine_runner" && -x /usr/lib/wine/wine64 ]]; then
+                wine_runner=/usr/lib/wine/wine64
+              fi
+              if [[ -z "$wine_runner" ]]; then
+                echo "::error::Wine loader is unavailable for the Windows target test"
+                exit 1
+              fi
               WINEDEBUG=-all "$wine_runner" "$test_binary" \
                 --run_test=crypto_hardening_tests --log_level=test_suite
               ;;

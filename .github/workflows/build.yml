@@ -10,7 +10,7 @@ on:
       package_label:
         description: Explicit unpublished prerelease label (must match source RC)
         required: true
-        default: 30.1.1-alpha1
+        default: 30.1.1-beta2
         type: string
       target:
         description: Build target to run (manual runs never publish)

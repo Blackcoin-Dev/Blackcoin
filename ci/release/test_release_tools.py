@@ -2286,7 +2286,7 @@ class ReleaseToolTests(unittest.TestCase):
 
             pe32 = root / "pe32.exe"
             self.write_windows_identity_pe(pe32, optional_magic=0x010B)
-            with self.assertRaisesRegex(RuntimeError, "expected PE32\+"):
+            with self.assertRaisesRegex(RuntimeError, r"expected PE32\+"):
                 verifier.verify_source_identity(pe32, "30.1.1rc2", SOURCE_SHA)
 
             out_of_bounds = bytearray(valid.read_bytes())
@@ -2318,6 +2318,12 @@ class ReleaseToolTests(unittest.TestCase):
     def test_macos_app_build_output_is_ignored_with_exact_case(self):
         root = TOOLS.parent.parent
         makefile = (root / "Makefile.am").read_text(encoding="utf-8")
+        workflow = (root / ".github/workflows/build.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "source_status=$(git status --porcelain=v1 --untracked-files=all)",
+            workflow,
+        )
+        self.assertIn("Release source checkout became dirty before compilation", workflow)
         match = re.search(r"^OSX_APP=([^\s]+)$", makefile, re.MULTILINE)
         self.assertIsNotNone(match)
         app = match.group(1)
@@ -2338,6 +2344,13 @@ class ReleaseToolTests(unittest.TestCase):
             wrong_case = f"{app.upper()}/Contents/PkgInfo"
             subprocess.run(
                 ["git", "-C", repository, "check-ignore", "--no-index", "-q", exact],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", repository, "check-ignore", "--no-index", "-q",
+                    "build-aux/ar-lib",
+                ],
                 check=True,
             )
             result = subprocess.run(

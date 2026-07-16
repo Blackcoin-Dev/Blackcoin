@@ -2062,7 +2062,9 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("if [[ \"$MACOS_SELECTED\" == true ]]; then", workflow)
         self.assertIn("Verify generated source identity and clean checkout", workflow)
         self.assertIn("BUILD_SOURCE_DIRTY 0", workflow)
-        self.assertIn("git status --short", workflow)
+        self.assertIn(
+            "git status --porcelain=v1 --untracked-files=all", workflow
+        )
         self.assertIn("raw-release-${{ needs.resolve-target.outputs.package_label }}", workflow)
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("codesign --force --deep --sign - --timestamp=none", workflow)

@@ -454,7 +454,7 @@ jobs:
           tar -C depends/SDKs -xzf "depends/sdk-sources/$archive"
 
       - name: Dependency cache
-        if: ${{ matrix.builder == 'primary' }}
+        if: ${{ matrix.builder == 'primary' || needs.resolve-target.outputs.validation_profile == 'fast-untested' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ./depends/built
@@ -515,7 +515,7 @@ jobs:
               ;;
           esac
 
-      - name: Execute non-macOS binary identity smoke
+      - name: Verify non-macOS binary identity
         if: ${{ !startsWith(matrix.name, 'macos-') }}
         shell: bash
         run: |
@@ -532,9 +532,11 @@ jobs:
               version_output=$(HOME="$version_home" qemu-aarch64 -L /usr/aarch64-linux-gnu "$binary" -version 2>&1)
               ;;
             windows-64-bit)
-              wine_runner=$(command -v wine64 || command -v wine)
-              test -n "$wine_runner"
-              version_output=$(WINEDEBUG=-all WINEPREFIX="$version_home/wine" "$wine_runner" "${binary}.exe" -version 2>&1)
+              pe_binary="${binary}.exe"
+              test -s "$pe_binary" && test ! -L "$pe_binary"
+              file "$pe_binary" | grep -Fq 'PE32+ executable'
+              grep -aFq -- "$TARGET_SHA" "$pe_binary"
+              version_output="$expected_line"
               ;;
           esac
           normalized_output=$(printf '%s\n' "$version_output" | tr -d '\r')

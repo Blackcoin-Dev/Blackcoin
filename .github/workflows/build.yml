@@ -597,6 +597,20 @@ jobs:
       - name: Build depends
         run: make -j "$MAKEJOBS" -C depends HOST=${{ matrix.host }} ${{ matrix.dep-opts }}
 
+      - name: Authorize only the deterministic macOS staging bundle
+        if: ${{ startsWith(matrix.name, 'macos-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The Linux cross-build creates this bundle before genbuild records
+          # source provenance. Ignore only that generated path; every other
+          # untracked or modified source path must continue to mark the binary
+          # dirty.
+          test ! -e blackcoin-qt.app
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          printf '%s\n' '/blackcoin-qt.app/' >> "$(git rev-parse --git-path info/exclude)"
+          git check-ignore -q --no-index blackcoin-qt.app/Contents/PkgInfo
+
       - name: Build Blackcoin
         shell: bash
         run: |

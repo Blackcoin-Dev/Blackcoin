@@ -278,19 +278,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          actual_head=$(git rev-parse HEAD)
+          actual_parent=$(git rev-parse "$TARGET_SHA^")
+          actual_tree=$(git rev-parse "$TARGET_SHA^{tree}")
+          actual_blob=$(git rev-parse "$TARGET_SHA:test/functional/feature_goldrush_pos_signal_recovery.py")
+          printf 'head=%s\nparent=%s\ntree=%s\nblob=%s\n' \
+            "$actual_head" "$actual_parent" "$actual_tree" "$actual_blob"
+          test "$actual_head" = "$TARGET_SHA"
           test "$TARGET_SHA" = b328d2263038cdddef46b9f427827aac9e83b513
-          test "$(git rev-parse "$TARGET_SHA^")" = "$BASE_SHA"
-          test "$(git rev-parse "$TARGET_SHA^{tree}")" = ccd2cde357c6991ad39ca66530008194844a0895
-          test "$(git rev-parse "$TARGET_SHA:test/functional/feature_goldrush_pos_signal_recovery.py")" = e71b8752916ca055f9ef85e94f9629f44aed5986
+          test "$actual_parent" = "$BASE_SHA"
+          test "$actual_tree" = ccd2cde357c6991ad39ca66530008194844a0895
+          test "$actual_blob" = e71b8752916ca055f9ef85e94f9629f44aed5986
           mapfile -t changes < <(git diff --name-status "$BASE_SHA..$TARGET_SHA")
+          printf 'change=%q\n' "${changes[@]}"
           test "${#changes[@]}" = 1
           test "${changes[0]}" = $'M\ttest/functional/feature_goldrush_pos_signal_recovery.py'
-          test "$(git diff --binary "$BASE_SHA..$TARGET_SHA" -- \
-            test/functional/feature_goldrush_pos_signal_recovery.py | sha256sum | awk '{print $1}')" = \
-            99fae1cf43d74b41d5b58058ccafa2418ee210b20c7d3b2fd7d959881a6229f8
-          echo '7951cdf284fcae9179b0cbea1f962cb1bc2bcf3c64ab9aefe7c5c5d934b209a9  test/functional/feature_goldrush_pos_signal_recovery.py' | \
-            sha256sum --check --strict
+          file_hash=$(sha256sum test/functional/feature_goldrush_pos_signal_recovery.py | awk '{print $1}')
+          echo "file_sha256=$file_hash"
+          test "$file_hash" = 7951cdf284fcae9179b0cbea1f962cb1bc2bcf3c64ab9aefe7c5c5d934b209a9
           git diff --check "$BASE_SHA..$TARGET_SHA"
           python3 -m py_compile test/functional/feature_goldrush_pos_signal_recovery.py
 

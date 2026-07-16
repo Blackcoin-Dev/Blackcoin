@@ -25,6 +25,11 @@ on:
           - macos-all
           - macos-64-bit
           - macos-arm-64-bit
+      reuse_safety_run_id:
+        description: Pinned prior safety run to reuse for the Beta 1 test-only repair
+        required: false
+        default: ''
+        type: string
   push:
     tags:
       - 'v30.1.1'
@@ -52,6 +57,7 @@ jobs:
       target: ${{ steps.resolve.outputs.target }}
       publish: ${{ steps.resolve.outputs.publish }}
       tag: ${{ steps.resolve.outputs.tag }}
+      reuse_safety: ${{ steps.resolve.outputs.reuse_safety }}
     steps:
       - name: Checkout requested target
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
@@ -83,6 +89,7 @@ jobs:
           REQUESTED_SHA: ${{ inputs.target_sha }}
           REQUESTED_PACKAGE_LABEL: ${{ inputs.package_label }}
           REQUESTED_TARGET: ${{ inputs.target }}
+          REQUESTED_REUSE_SAFETY_RUN_ID: ${{ inputs.reuse_safety_run_id }}
           CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
           EVENT_SHA: ${{ github.sha }}
           RELEASE_GPG_FINGERPRINT: ${{ vars.RELEASE_GPG_FINGERPRINT }}
@@ -114,14 +121,39 @@ jobs:
             test "$TARGET_SHA" = "$REQUESTED_SHA"
             [[ "$CALLER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
             [[ "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]
-            test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA" || {
-              echo "::error::Run this workflow from a branch or tag whose head is target_sha; the local safety gate otherwise comes from a different revision"
-              exit 1
-            }
-            test "$EVENT_SHA" = "$TARGET_SHA" || {
-              echo "::error::The selected workflow_dispatch ref does not resolve to target_sha"
-              exit 1
-            }
+            REUSE_SAFETY=false
+            if [[ -n "$REQUESTED_REUSE_SAFETY_RUN_ID" ]]; then
+              test "$REQUESTED_REUSE_SAFETY_RUN_ID" = "29461608948" || {
+                echo "::error::Only the immutable Beta 1 repair evidence from run 29461608948 may be reused"
+                exit 1
+              }
+              test "$TARGET_SHA" = "b328d2263038cdddef46b9f427827aac9e83b513" || {
+                echo "::error::The repair route is locked to the reviewed Beta 1 test-only target"
+                exit 1
+              }
+              test "$CALLER_WORKFLOW_SHA" = "$EVENT_SHA"
+              test "$CALLER_WORKFLOW_SHA" != "$TARGET_SHA"
+              git fetch --no-tags origin "$CALLER_WORKFLOW_SHA"
+              git merge-base --is-ancestor "$TARGET_SHA" "$CALLER_WORKFLOW_SHA"
+              mapfile -t wrapper_changes < <(
+                git diff --name-only "$TARGET_SHA..$CALLER_WORKFLOW_SHA"
+              )
+              test "${#wrapper_changes[@]}" = 1
+              test "${wrapper_changes[0]}" = ".github/workflows/build.yml" || {
+                echo "::error::The repair wrapper may change only this release workflow"
+                exit 1
+              }
+              REUSE_SAFETY=true
+            else
+              test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA" || {
+                echo "::error::Run this workflow from a branch or tag whose head is target_sha; the local safety gate otherwise comes from a different revision"
+                exit 1
+              }
+              test "$EVENT_SHA" = "$TARGET_SHA" || {
+                echo "::error::The selected workflow_dispatch ref does not resolve to target_sha"
+                exit 1
+              }
+            fi
             [[ "$REQUESTED_PACKAGE_LABEL" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)([1-9][0-9]*)$ ]] || {
               echo "::error::Manual builds require an explicit major.minor.patch-alphaN or major.minor.patch-betaN package label"
               exit 1
@@ -144,6 +176,11 @@ jobs:
             TARGET="$REQUESTED_TARGET"
             TAG=""
             PUBLISH=false
+            if [[ "$REUSE_SAFETY" == true ]]; then
+              test "$GITHUB_ACTOR" = "Blackcoin-Dev"
+              test "$REQUESTED_PACKAGE_LABEL" = "30.1.1-beta1"
+              test "$TARGET" = all
+            fi
             python3 ci/release/verify_source_identity.py \
               --head "$TARGET_SHA" \
               --repository "$GITHUB_REPOSITORY" \
@@ -157,6 +194,7 @@ jobs:
             ASSET_PREFIX="Blackcoin-$VERSION"
             TARGET=all
             PUBLISH=true
+            REUSE_SAFETY=false
             python3 ci/release/verify_source_identity.py \
               --head "$TARGET_SHA" \
               --repository "$GITHUB_REPOSITORY" \
@@ -197,11 +235,13 @@ jobs:
             echo "target=$TARGET"
             echo "publish=$PUBLISH"
             echo "tag=$TAG"
+            echo "reuse_safety=$REUSE_SAFETY"
           } >> "$GITHUB_OUTPUT"
 
   safety-gate:
     name: Exact-SHA prerelease or production safety gate
     needs: resolve-target
+    if: ${{ needs.resolve-target.outputs.reuse_safety != 'true' }}
     permissions:
       contents: read
     uses: ./.github/workflows/pr-gate.yml
@@ -213,11 +253,206 @@ jobs:
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
       run_extended_functional: ${{ needs.resolve-target.outputs.publish == 'true' }}
 
+  reuse-safety-gate:
+    name: 'Verify #48 evidence and rerun only the corrected recovery test'
+    needs: resolve-target
+    if: ${{ needs.resolve-target.outputs.reuse_safety == 'true' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: read
+    env:
+      TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
+      BASE_SHA: cbb6330a957bedb835810f8c861715a3b6bb67d7
+      REUSED_RUN_ID: '29461608948'
+      REUSED_ARTIFACT_ID: '8361841076'
+      REUSED_ASAN_JOB_ID: '87506160370'
+    steps:
+      - name: Checkout the exact repaired target
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ needs.resolve-target.outputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Verify the immutable one-file repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$TARGET_SHA" = b328d2263038cdddef46b9f427827aac9e83b513
+          test "$(git rev-parse "$TARGET_SHA^")" = "$BASE_SHA"
+          test "$(git rev-parse "$TARGET_SHA^{tree}")" = ccd2cde357c6991ad39ca66530008194844a0895
+          test "$(git rev-parse "$TARGET_SHA:test/functional/feature_goldrush_pos_signal_recovery.py")" = e71b8752916ca055f9ef85e94f9629f44aed5986
+          mapfile -t changes < <(git diff --name-status "$BASE_SHA..$TARGET_SHA")
+          test "${#changes[@]}" = 1
+          test "${changes[0]}" = $'M\ttest/functional/feature_goldrush_pos_signal_recovery.py'
+          test "$(git diff --binary "$BASE_SHA..$TARGET_SHA" -- \
+            test/functional/feature_goldrush_pos_signal_recovery.py | sha256sum | awk '{print $1}')" = \
+            99fae1cf43d74b41d5b58058ccafa2418ee210b20c7d3b2fd7d959881a6229f8
+          echo '7951cdf284fcae9179b0cbea1f962cb1bc2bcf3c64ab9aefe7c5c5d934b209a9  test/functional/feature_goldrush_pos_signal_recovery.py' | \
+            sha256sum --check --strict
+          git diff --check "$BASE_SHA..$TARGET_SHA"
+          python3 -m py_compile test/functional/feature_goldrush_pos_signal_recovery.py
+
+      - name: Verify the immutable prior run and its exact safety results
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REUSED_RUN_ID" > reused-run.json
+          jq -e '
+            .id == 29461608948 and
+            .run_attempt == 1 and
+            .workflow_id == 307671160 and
+            .repository.id == 1290339568 and
+            .path == ".github/workflows/build.yml" and
+            .event == "workflow_dispatch" and
+            .head_sha == "cbb6330a957bedb835810f8c861715a3b6bb67d7" and
+            .actor.login == "Blackcoin-Dev" and
+            .triggering_actor.login == "Blackcoin-Dev" and
+            .status == "completed" and
+            .conclusion == "failure"
+          ' reused-run.json >/dev/null
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$REUSED_RUN_ID/jobs?per_page=100" \
+            > reused-jobs.json
+          python3 - <<'PY'
+          import json
+
+          prefix = "Exact-SHA prerelease or production safety gate / "
+          expected_success = {
+              "Resolve and authorize immutable release target",
+              prefix + "source identity, workflow syntax, and lint",
+              prefix + "Linux ARM64 native cryptographic vectors and resources",
+              prefix + "pinned native build and unit tests",
+              prefix + "source-pinned sanitizer regression smoke",
+              prefix + "Build pinned Windows x86_64 vector binaries",
+              prefix + "thread-sanitizer consensus and liveness gate",
+              prefix + "macOS Intel native cryptographic vectors",
+              prefix + "macOS Apple Silicon native cryptographic vectors",
+              prefix + "pinned independent quantum crypto provenance",
+              prefix + "Windows x86_64 native cryptographic vectors and resources",
+              prefix + "Linux ARM64 native UBSan block-harness gate",
+              prefix + "real v26.2, v28.4, v30.1, and candidate interoperability",
+              prefix + "measured worst-case quantum crypto resources (Linux x86_64)",
+              prefix + "critical Gold Rush, lifecycle, wallet, and recovery tests",
+          }
+          expected_asan = prefix + "address-undefined-sanitizer consensus and liveness gate"
+          expected_extended = prefix + "complete extended functional suite"
+          jobs = json.load(open("reused-jobs.json", encoding="utf-8"))["jobs"]
+          by_name = {job["name"]: job for job in jobs}
+          if len(by_name) != len(jobs):
+              raise SystemExit("duplicate job names in reused run")
+          for name in expected_success:
+              if by_name.get(name, {}).get("conclusion") != "success":
+                  raise SystemExit(f"required prior success missing: {name}")
+          if by_name.get(expected_asan, {}).get("conclusion") != "failure":
+              raise SystemExit("the expected ASan test-expectation failure is missing")
+          if by_name.get(expected_extended, {}).get("conclusion") != "skipped":
+              raise SystemExit("the Beta-only extended-suite skip changed")
+          safety_failures = {
+              job["name"] for job in jobs
+              if job["name"].startswith(prefix) and job["conclusion"] == "failure"
+          }
+          if safety_failures != {expected_asan}:
+              raise SystemExit(f"unexpected prior safety failures: {sorted(safety_failures)}")
+          if sum(job["conclusion"] == "success" for job in jobs) != 15:
+              raise SystemExit("the immutable run no longer reports exactly 15 successful jobs")
+          PY
+
+      - name: Verify the prior sanitizer failure was only the repaired expectation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run view "$REUSED_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --job "$REUSED_ASAN_JOB_ID" --log > reused-asan.log
+          grep -F 'feature_goldrush_pos_signal_recovery.py      | ✖ Failed' reused-asan.log
+          grep -F 'Expected messages "['"'"'after 2 failed resubmissions and released its inputs'"'"']"' reused-asan.log
+          grep -F 'after 3 failed resubmissions and released its inputs: wallet broadcasting is disabled' reused-asan.log
+          for finding in \
+            'ERROR: AddressSanitizer' \
+            'SUMMARY: AddressSanitizer' \
+            'UndefinedBehaviorSanitizer' \
+            'runtime error:' \
+            'LeakSanitizer'; do
+            if grep -F "$finding" reused-asan.log; then
+              echo "::error::Prior sanitizer log contains an unexpected sanitizer finding: $finding"
+              exit 1
+            fi
+          done
+
+      - name: Verify the exact reusable native artifact metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$REUSED_ARTIFACT_ID" > reused-artifact.json
+          jq -e '
+            .id == 8361841076 and
+            .name == "safety-gate-native-cbb6330a957bedb835810f8c861715a3b6bb67d7" and
+            .size_in_bytes == 413178656 and
+            .digest == "sha256:4464cc7207c24e3e189535956b685e0a9e8abd8052d928df3b4d9c28d9b88062" and
+            .expired == false and
+            .workflow_run.id == 29461608948 and
+            .workflow_run.head_sha == "cbb6330a957bedb835810f8c861715a3b6bb67d7"
+          ' reused-artifact.json >/dev/null
+
+      - name: 'Download the exact #48 native binaries'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: 8361841076
+          github-token: ${{ github.token }}
+          repository: Blackcoin-Dev/Blackcoin
+          run-id: 29461608948
+          path: .
+
+      - name: Verify binaries and rerun only the corrected regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'e221e5a8f877ba4df30294f1e639d072596ba980b86706540c0569677bc2f6b9  src/blackcoind' | sha256sum --check --strict
+          echo '7295c8d128bcece7e0fff846b00cd155e480c72d086b5ca9bcecdce863771e93  src/blackcoin-cli' | sha256sum --check --strict
+          chmod +x src/blackcoind src/blackcoin-cli src/blackcoin-tx src/blackcoin-util src/blackcoin-wallet
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=2000 \
+            feature_goldrush_pos_signal_recovery.py
+
+  safety-result:
+    name: Require one complete safety route
+    needs:
+      - resolve-target
+      - safety-gate
+      - reuse-safety-gate
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Fail closed unless exactly one authorized route passed
+        shell: bash
+        env:
+          RESOLVE_RESULT: ${{ needs.resolve-target.result }}
+          REUSE_SAFETY: ${{ needs.resolve-target.outputs.reuse_safety }}
+          FULL_GATE_RESULT: ${{ needs.safety-gate.result }}
+          REUSE_GATE_RESULT: ${{ needs.reuse-safety-gate.result }}
+        run: |
+          set -euo pipefail
+          test "$RESOLVE_RESULT" = success
+          if [[ "$REUSE_SAFETY" == true ]]; then
+            test "$FULL_GATE_RESULT" = skipped
+            test "$REUSE_GATE_RESULT" = success
+          else
+            test "$FULL_GATE_RESULT" = success
+            test "$REUSE_GATE_RESULT" = skipped
+          fi
+
   select-targets:
     name: Select build target
     needs:
       - resolve-target
-      - safety-gate
+      - safety-result
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -286,7 +521,7 @@ jobs:
     name: ${{ matrix.name }} (${{ matrix.builder }})
     needs:
       - resolve-target
-      - safety-gate
+      - safety-result
       - select-targets
     runs-on: ${{ matrix.os }}
     env:

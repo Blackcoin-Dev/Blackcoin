@@ -175,6 +175,7 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_malformed_is_noncritical)
         const std::shared_ptr<CWallet> wallet(
             new CWallet(m_node.chain.get(), "malformed-recovery-policy", std::move(database)));
         BOOST_CHECK_EQUAL(wallet->LoadWallet(), DBErrors::NONCRITICAL_ERROR);
+        BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == DefaultShadowPowClaimRecoveryPolicy());
 
         ShadowPowClaimRecoveryPolicy output;
         output.choice_recorded = true;
@@ -197,6 +198,82 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_malformed_is_noncritical)
     unknown_version.choice_recorded = true;
     unknown_version.automatic_enabled = true;
     check_malformed(unknown_version);
+}
+
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_runtime_is_atomic)
+{
+    ShadowPowClaimRecoveryPolicy initial = DefaultShadowPowClaimRecoveryPolicy();
+    initial.choice_recorded = true;
+    initial.automatic_enabled = true;
+    initial.max_fee_per_resolution = 20000;
+    initial.aggregate_batch_fee_cap = 200000;
+    initial.rolling_fee_budget = 2000000;
+    initial.rolling_fee_window_seconds = 3600;
+    initial.max_actions_per_window = 20;
+    initial.minimum_stale_blocks = 10;
+
+    std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+    {
+        WalletBatch batch(*database, /*flush_on_close=*/false);
+        BOOST_REQUIRE(batch.WriteShadowPowClaimRecoveryPolicy(initial));
+    }
+
+    const std::shared_ptr<CWallet> wallet(
+        new CWallet(m_node.chain.get(), "recovery-policy-runtime", std::move(database)));
+    BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == initial);
+
+    ShadowPowClaimRecoveryPolicy updated = initial;
+    updated.max_fee_per_resolution = 30000;
+    updated.aggregate_batch_fee_cap = 300000;
+    updated.rolling_fee_budget = 3000000;
+    updated.rolling_fee_window_seconds = 7200;
+    updated.max_actions_per_window = 30;
+    updated.minimum_stale_blocks = 20;
+    bilingual_str error;
+    BOOST_REQUIRE(wallet->SetShadowPowClaimRecoveryPolicy(updated, error));
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == updated);
+
+    MockableDatabase& mock = GetMockableDatabase(*wallet);
+    BOOST_CHECK(mock.m_last_txn_durable);
+    ShadowPowClaimRecoveryPolicy persisted;
+    {
+        WalletBatch batch(wallet->GetDatabase(), /*flush_on_close=*/false);
+        BOOST_REQUIRE_EQUAL(batch.ReadShadowPowClaimRecoveryPolicy(persisted), DBErrors::LOAD_OK);
+    }
+    BOOST_CHECK(persisted == updated);
+
+    // Validation failure changes neither the live policy nor the DB record.
+    ShadowPowClaimRecoveryPolicy invalid = updated;
+    invalid.choice_recorded = false;
+    BOOST_CHECK(!wallet->SetShadowPowClaimRecoveryPolicy(invalid, error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == updated);
+
+    // A failed write aborts the durable transaction before publishing the
+    // requested authority in memory.
+    ShadowPowClaimRecoveryPolicy write_failure = updated;
+    write_failure.max_actions_per_window += 1;
+    // MockableBatch resets its per-transaction write index in TxnBegin().
+    mock.m_fail_write_at = 0;
+    BOOST_CHECK(!wallet->SetShadowPowClaimRecoveryPolicy(write_failure, error));
+    BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == updated);
+    mock.m_fail_write_at.reset();
+
+    // A failed durable commit has the same all-or-nothing behavior.
+    ShadowPowClaimRecoveryPolicy commit_failure = updated;
+    commit_failure.max_actions_per_window += 2;
+    mock.m_fail_commit = true;
+    BOOST_CHECK(!wallet->SetShadowPowClaimRecoveryPolicy(commit_failure, error));
+    BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == updated);
+    mock.m_fail_commit = false;
+
+    {
+        WalletBatch batch(wallet->GetDatabase(), /*flush_on_close=*/false);
+        BOOST_REQUIRE_EQUAL(batch.ReadShadowPowClaimRecoveryPolicy(persisted), DBErrors::LOAD_OK);
+    }
+    BOOST_CHECK(persisted == updated);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

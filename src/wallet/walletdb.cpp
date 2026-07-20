@@ -1754,6 +1754,13 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
             pwallet->WalletLogPrintf("Error reading wallet database: %s\n", recovery_policy_error);
         }
         result = std::max(result, recovery_policy_result);
+        if (!pwallet->LoadShadowPowClaimRecoveryPolicy(recovery_policy)) {
+            // ReadShadowPowClaimRecoveryPolicy already validates or replaces
+            // records with the disabled default. Keep this defensive path
+            // fail-closed if those invariants ever diverge.
+            pwallet->WalletLogPrintf("Error reading wallet database: automated PoW claim recovery policy failed runtime validation; automation remains disabled\n");
+            result = std::max(result, DBErrors::NONCRITICAL_ERROR);
+        }
 
 #ifndef ENABLE_EXTERNAL_SIGNER
         if (pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {

@@ -35,6 +35,7 @@
 #include <wallet/crypter.h>
 #include <wallet/db.h>
 #include <wallet/scriptpubkeyman.h>
+#include <wallet/shadow_pow_claim_recovery.h>
 #include <wallet/transaction.h>
 #include <wallet/types.h>
 #include <wallet/walletutil.h>
@@ -791,6 +792,16 @@ private:
     std::unique_ptr<WalletDatabase> m_database;
 
     /**
+     * Wallet-scoped standing consent and hard limits for automated Gold Rush
+     * PoW claim recovery. The default grants no automatic authority.
+     */
+    ShadowPowClaimRecoveryPolicy m_shadow_pow_claim_recovery_policy GUARDED_BY(cs_wallet) =
+        DefaultShadowPowClaimRecoveryPolicy();
+    friend class WalletBatch;
+    /** Install an already validated database record without writing it again. */
+    bool LoadShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    /**
      * The following is used to keep track of how far behind the wallet is
      * from the chain sync, and to allow clients to block on us being caught up.
      *
@@ -838,6 +849,16 @@ public:
         assert(static_cast<bool>(m_database));
         return *m_database;
     }
+
+    /** Return a consistent snapshot of this wallet's recovery policy. */
+    ShadowPowClaimRecoveryPolicy GetShadowPowClaimRecoveryPolicy() const;
+
+    /**
+     * Validate and persist a complete recovery policy before publishing it to
+     * the running wallet. A failed write leaves the prior in-memory policy in
+     * force.
+     */
+    bool SetShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy, bilingual_str& error);
 
     /** Get a name for this wallet for logging/debugging purposes.
      */
@@ -1174,6 +1195,11 @@ public:
     std::atomic<uint64_t> m_pow_next_nonce{0};
     std::atomic<uint64_t> m_pow_total_tries{0};
     std::atomic<int64_t> m_pow_hashrate_start_ms{0};
+    // Worker 0 refreshes the component-aware quarantine gate and publishes it
+    // here for the remaining hashing workers. This avoids N identical
+    // chain+wallet graph walks per second while final submission still performs
+    // an authoritative tip-pinned recheck.
+    std::atomic<size_t> m_pow_blocking_quarantined_claims{0};
     // Serializes the fee-paying claim path across the built-in miner and
     // sendshadowpowclaim RPC. Grinding workers may still search in parallel,
     // but only one caller per wallet may select an input, sign, and commit a

@@ -2688,6 +2688,54 @@ bool CWallet::LoadWalletFlags(uint64_t flags)
     return true;
 }
 
+ShadowPowClaimRecoveryPolicy CWallet::GetShadowPowClaimRecoveryPolicy() const
+{
+    LOCK(cs_wallet);
+    return m_shadow_pow_claim_recovery_policy;
+}
+
+bool CWallet::LoadShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy)
+{
+    AssertLockHeld(cs_wallet);
+    if (!ValidateShadowPowClaimRecoveryPolicy(policy)) {
+        m_shadow_pow_claim_recovery_policy = DefaultShadowPowClaimRecoveryPolicy();
+        return false;
+    }
+    m_shadow_pow_claim_recovery_policy = policy;
+    return true;
+}
+
+bool CWallet::SetShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy, bilingual_str& error)
+{
+    std::string validation_error;
+    if (!ValidateShadowPowClaimRecoveryPolicy(policy, &validation_error)) {
+        error = Untranslated("Invalid automated PoW claim recovery policy: " + validation_error);
+        return false;
+    }
+
+    LOCK(cs_wallet);
+    WalletBatch batch(GetDatabase());
+    if (!batch.TxnBegin(/*durable=*/true)) {
+        error = Untranslated("Failed to begin durable automated PoW claim recovery policy update");
+        return false;
+    }
+    if (!batch.WriteShadowPowClaimRecoveryPolicy(policy)) {
+        batch.TxnAbort();
+        error = Untranslated("Failed to write automated PoW claim recovery policy");
+        return false;
+    }
+    if (!batch.TxnCommit()) {
+        error = Untranslated("Failed to durably commit automated PoW claim recovery policy");
+        return false;
+    }
+
+    // Publish the new authority only after the complete record was durably
+    // committed. Readers therefore observe either the old or the new policy.
+    m_shadow_pow_claim_recovery_policy = policy;
+    error.clear();
+    return true;
+}
+
 void CWallet::InitWalletFlags(uint64_t flags)
 {
     LOCK(cs_wallet);
@@ -8616,6 +8664,7 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
     m_pow_hashrate_start_ms = GetTime<std::chrono::milliseconds>().count();
     m_pow_next_nonce = 0;
     m_pow_claims_submitted = 0;
+    m_pow_blocking_quarantined_claims = CountQuarantinedShadowPowClaims();
     m_pow_state = WalletPowMiningState::STARTING;
     m_stop_pow_mining_thread = false;
     {
@@ -9345,7 +9394,12 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         // Live claims occupy normal relay/template capacity. A non-mempool
         // quarantined claim is different: a peer may still confirm it, so do
         // not consume another fee UTXO while its original input is reserved.
-        const size_t quarantined_claims = CountQuarantinedShadowPowClaims();
+        const size_t quarantined_claims = worker_id == 0
+            ? CountQuarantinedShadowPowClaims()
+            : m_pow_blocking_quarantined_claims.load();
+        if (worker_id == 0) {
+            m_pow_blocking_quarantined_claims = quarantined_claims;
+        }
         if (quarantined_claims != 0) {
             m_pow_hashrate = 0.0;
             const WalletPowMiningState prior_state =

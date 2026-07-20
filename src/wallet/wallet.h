@@ -80,6 +80,19 @@ enum class WalletCommitStatus {
     REJECTED_ABANDONED,
 };
 
+/** Optional exact precondition checked while the wallet transaction is
+ * reserved for broadcast. The successful check is the recovery relay's
+ * linearization point: later wallet changes do not retroactively revoke bytes
+ * already handed to the node under durable consent. */
+struct ShadowPowClaimRecoveryBroadcastGuard
+{
+    uint64_t expected_wallet_generation{0};
+    uint256 expected_wallet_tip;
+    bool require_normal_unlock{false};
+    std::optional<ShadowPowClaimRecoveryPolicy> expected_automatic_policy;
+    bool require_pow_mining_enabled{false};
+};
+
 /** Exact wallet input selected to authenticate one fee-paying Gold Rush PoW claim. */
 struct ShadowPowClaimInput {
     COutPoint outpoint;
@@ -797,6 +810,10 @@ private:
      */
     ShadowPowClaimRecoveryPolicy m_shadow_pow_claim_recovery_policy GUARDED_BY(cs_wallet) =
         DefaultShadowPowClaimRecoveryPolicy();
+    // A failed durable commit has an unknowable on-disk outcome. Until this
+    // wallet is reloaded, no recovery path may create or promote another
+    // transaction for the same anchor generation.
+    bool m_shadow_pow_claim_recovery_db_ambiguous GUARDED_BY(cs_wallet){false};
     friend class WalletBatch;
     /** Install an already validated database record without writing it again. */
     bool LoadShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -859,6 +876,12 @@ public:
      * force.
      */
     bool SetShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy, bilingual_str& error);
+    bool IsShadowPowClaimRecoveryDatabaseAmbiguous() const;
+    void MarkShadowPowClaimRecoveryDatabaseAmbiguous()
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        m_shadow_pow_claim_recovery_db_ambiguous = true;
+    }
 
     /** Get a name for this wallet for logging/debugging purposes.
      */
@@ -1031,6 +1054,9 @@ public:
                            std::optional<WalletBlockTime> block_time = std::nullopt);
     bool LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx, bool reconcile_chainstate = true) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void transactionAddedToMempool(const CTransactionRef& tx) override;
+    /** Record relay consent for an exact managed recovery draft only after a
+     * successful local sendrawtransaction RPC. */
+    void transactionSubmittedByRpc(const CTransactionRef& tx);
     void blockConnected(ChainstateRole role, const interfaces::BlockInfo& block) override;
     void blockDisconnected(const interfaces::BlockInfo& block) override;
     void updatedBlockTip() override;
@@ -1115,7 +1141,9 @@ public:
     bool CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, const RGBTxCommitData& rgb_data, std::string& error);
 
     /** Pass this transaction to node for mempool insertion and relay to peers if flag set to true */
-    bool SubmitTxMemoryPoolAndRelay(const uint256& txid, std::string& err_string, bool relay);
+    bool SubmitTxMemoryPoolAndRelay(
+        const uint256& txid, std::string& err_string, bool relay,
+        const ShadowPowClaimRecoveryBroadcastGuard* recovery_guard = nullptr);
 
     bool ImportScripts(const std::set<CScript> scripts, int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool ImportPrivKeys(const std::map<CKeyID, CKey>& privkey_map, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1678,6 +1706,31 @@ public:
     ShadowPowClaimRecoveryInventory GetShadowPowClaimRecoveryInventory() const;
     ShadowPowClaimRecoveryInventory GetShadowPowClaimRecoveryInventoryLocked() const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    /** Create one deterministic, tip-pinned action per confirmed anchor. */
+    ShadowPowClaimRecoveryPlan PlanShadowPowClaimRecovery(
+        const ShadowPowClaimRecoveryRequest& request) const;
+    /** Execute the shared preview/sign/persist/broadcast engine. */
+    ShadowPowClaimRecoveryResult ResolveShadowPowClaims(
+        const ShadowPowClaimRecoveryRequest& request);
+    /** Reconstruct policy usage from persisted resolution transactions. */
+    ShadowPowClaimRecoveryUsage GetShadowPowClaimRecoveryUsage(
+        uint32_t rolling_window_seconds) const;
+    /** Explicitly authenticate one reviewed historical component. */
+    bool AdoptShadowPowClaimRecoveryComponent(
+        const uint256& selector, const uint256& expected_tip,
+        const uint256& expected_component_fingerprint,
+        bilingual_str& error);
+    /** Internal durable insert used only by the shared resolver. */
+    bool PersistNewManagedShadowPowResolution(
+        const ShadowPowClaimRecoveryAction& action,
+        ShadowPowClaimRecoveryOrigin origin, bool relay_authorized,
+        int active_height, int64_t created_time, std::string& error)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    bool SetManagedShadowPowResolutionRelayAuthority(
+        const uint256& txid, bool authorized, std::string& error)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Periodic wallet-scoped automatic execution; never enables the miner. */
+    void MaybeAutoResolveShadowPowClaims();
     /** Count quarantined claim objects that currently gate claim creation.
      * This is actionable plus indeterminate objects, not raw wallet history. */
     size_t CountQuarantinedShadowPowClaims() const;

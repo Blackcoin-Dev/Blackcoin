@@ -745,10 +745,10 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_inventory_is_tip_pinned_and_reorg_safe,
     BOOST_REQUIRE(TransactionHasShadowProof(*stale_claim));
     BOOST_REQUIRE(wallet->AddToWallet(stale_claim, TxStateInactive{}));
 
-    // An unconfirmed, non-mempool wallet claim whose authenticated confirmed
-    // anchor remains in CoinsTip is actionable and must keep claim creation
-    // blocked.
-    check_inventory(/*raw=*/1, /*actionable=*/1, /*resolved=*/0, /*indeterminate=*/0);
+    // This deliberately synthetic legacy record has no durable authored or
+    // quarantine provenance. The shared classifier must fail closed as
+    // indeterminate while still keeping claim creation blocked.
+    check_inventory(/*raw=*/1, /*actionable=*/0, /*resolved=*/0, /*indeterminate=*/1);
 
     const int funding_height = WITH_LOCK(
         ::cs_main,
@@ -764,7 +764,7 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_inventory_is_tip_pinned_and_reorg_safe,
 
     // A mempool-only conflict is not an active-chain resolution. Direct
     // CoinsTip classification must continue to fail closed and block mining.
-    check_inventory(/*raw=*/1, /*actionable=*/1, /*resolved=*/0, /*indeterminate=*/0);
+    check_inventory(/*raw=*/1, /*actionable=*/0, /*resolved=*/0, /*indeterminate=*/1);
 
     const CBlock resolution_block = CreateAndProcessBlock(
         {competing_spend}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
@@ -792,8 +792,9 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_inventory_is_tip_pinned_and_reorg_safe,
     sync_wallet_tip();
 
     // Disconnecting the active-chain spend restores the anchor. Classification
-    // is reversible, so the same retained record immediately blocks again.
-    check_inventory(/*raw=*/1, /*actionable=*/1, /*resolved=*/0, /*indeterminate=*/0);
+    // is reversible, so the same retained record immediately blocks again in
+    // its provenance-incomplete, indeterminate state.
+    check_inventory(/*raw=*/1, /*actionable=*/0, /*resolved=*/0, /*indeterminate=*/1);
 
     const CTransactionRef competing_ref = MakeTransactionRef(competing_spend);
     BOOST_REQUIRE(wallet->AddToWallet(competing_ref, TxStateInMempool{}));
@@ -807,7 +808,7 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_inventory_is_tip_pinned_and_reorg_safe,
     // A claim rooted in an unconfirmed ordinary transaction has no
     // authenticated confirmed anchor. It must be indeterminate, never inferred
     // resolved merely because an outpoint is absent from CoinsTip.
-    check_inventory(/*raw=*/2, /*actionable=*/1, /*resolved=*/0, /*indeterminate=*/1);
+    check_inventory(/*raw=*/2, /*actionable=*/0, /*resolved=*/0, /*indeterminate=*/2);
 
     {
         LOCK2(::cs_main, wallet->cs_wallet);

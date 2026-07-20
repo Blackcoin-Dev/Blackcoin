@@ -27,12 +27,49 @@
 namespace wallet {
 namespace {
 
+class RecoveryShadowScheduleGuard
+{
+public:
+    RecoveryShadowScheduleGuard(int whitelist_height, int reward_start_height,
+                                int gold_rush_blocks)
+        : m_whitelist_height{SHADOW_WHITELIST_HEIGHT},
+          m_reward_start_height{SHADOW_REWARD_START_HEIGHT},
+          m_gold_rush_blocks{SHADOW_GOLD_RUSH_BLOCKS}
+    {
+        SetShadowTestSchedule(whitelist_height, reward_start_height,
+                              gold_rush_blocks);
+    }
+
+    ~RecoveryShadowScheduleGuard()
+    {
+        SetShadowTestSchedule(m_whitelist_height, m_reward_start_height,
+                              m_gold_rush_blocks);
+    }
+
+private:
+    int m_whitelist_height;
+    int m_reward_start_height;
+    int m_gold_rush_blocks;
+};
+
 CTransactionRef MakeRecoveryTestClaim(const COutPoint& input, CAmount value,
                                       const CScript& wallet_script)
 {
     std::vector<unsigned char> proof = GetShadowPrefix();
-    proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0, 0, 0, 0, 0, 0, 0, 0,
-                               0});
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0});
+    // Canonical QQP2 framing with zero nonce. It parses completely but is not
+    // valid work, yielding typed INVALID_PROOF instead of MALFORMED. Resolver
+    // tests therefore exercise a terminal, expected-shape claim component.
+    proof.insert(proof.end(), 8, 0);
+    proof.push_back(static_cast<unsigned char>(wallet_script.size() & 0xff));
+    proof.push_back(static_cast<unsigned char>((wallet_script.size() >> 8) & 0xff));
+    proof.insert(proof.end(), wallet_script.begin(), wallet_script.end());
+    const CScript quantum_payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x51)});
+    proof.push_back(static_cast<unsigned char>(quantum_payout.size() & 0xff));
+    proof.push_back(static_cast<unsigned char>((quantum_payout.size() >> 8) & 0xff));
+    proof.insert(proof.end(), quantum_payout.begin(), quantum_payout.end());
     CMutableTransaction claim;
     claim.vin.emplace_back(input);
     claim.vout.emplace_back(value, wallet_script);
@@ -676,6 +713,728 @@ BOOST_AUTO_TEST_CASE(active_chain_spend_resolution_is_reversible_after_reorg)
         wallet->GetShadowPowClaimRecoveryInventory();
     BOOST_CHECK(FindRecoveryComponent(restored_repeat, anchor).fingerprint ==
                 restored_component.fingerprint);
+}
+
+BOOST_AUTO_TEST_CASE(confirmed_claim_is_a_hard_frontier_without_duplicate_descendants)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CScript script = anchor_tx->vout.at(0).scriptPubKey;
+    const CTransactionRef winner = MakeRecoveryTestClaim(
+        anchor, anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        script);
+    const CTransactionRef stale_sibling = MakeRecoveryTestClaim(
+        anchor,
+        anchor_tx->vout.at(0).nValue - 2 * DEFAULT_TRANSACTION_MAXFEE,
+        script);
+    const COutPoint frontier{winner->GetHash(), 0};
+    const CTransactionRef descendant = MakeRecoveryTestClaim(
+        frontier, winner->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        script);
+    for (const CTransactionRef& claim :
+         {winner, stale_sibling, descendant}) {
+        AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                             tip->GetBlockHash(), tip->nHeight,
+                             tip->GetBlockHash());
+    }
+
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        CCoinsViewCache& coins = chainman.ActiveChainstate().CoinsTip();
+        BOOST_REQUIRE(coins.SpendCoin(anchor));
+        coins.AddCoin(
+            frontier,
+            Coin{winner->vout.at(0), tip->nHeight, /*coinbase=*/false,
+                 /*coinstake=*/false, winner->nTime},
+            /*possible_overwrite=*/false);
+        wallet->mapWallet.at(winner->GetHash()).m_state =
+            TxStateConfirmed{tip->GetBlockHash(), tip->nHeight, 1};
+        wallet->mapWallet.at(winner->GetHash()).MarkDirty();
+    }
+
+    const ShadowPowClaimRecoveryInventory inventory =
+        wallet->GetShadowPowClaimRecoveryInventory();
+    const auto& old_generation = FindRecoveryComponent(inventory, anchor);
+    const auto& new_frontier = FindRecoveryComponent(inventory, frontier);
+    BOOST_CHECK(old_generation.state ==
+                ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN);
+    BOOST_CHECK(std::find(old_generation.claim_txids.begin(),
+                          old_generation.claim_txids.end(),
+                          descendant->GetHash()) ==
+                old_generation.claim_txids.end());
+    BOOST_REQUIRE_EQUAL(new_frontier.claim_txids.size(), 1U);
+    BOOST_CHECK(new_frontier.claim_txids.front() == descendant->GetHash());
+
+    const size_t descendant_occurrences = std::count_if(
+        inventory.components.begin(), inventory.components.end(),
+        [&](const ShadowPowClaimRecoveryComponent& component) {
+            return std::find(component.claim_txids.begin(),
+                             component.claim_txids.end(),
+                             descendant->GetHash()) !=
+                   component.claim_txids.end();
+        });
+    BOOST_CHECK_EQUAL(descendant_occurrences, 1U);
+
+    ShadowPowClaimRecoveryRequest request;
+    request.selectors = {descendant->GetHash()};
+    const ShadowPowClaimRecoveryPlan plan =
+        wallet->PlanShadowPowClaimRecovery(request);
+    BOOST_REQUIRE_EQUAL(plan.actions.size(), 1U);
+    BOOST_CHECK(plan.actions.front().anchor == frontier);
+}
+
+BOOST_AUTO_TEST_CASE(automatic_usage_survives_original_claim_confirmation_and_reorg)
+{
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CScript script = anchor_tx->vout.at(0).scriptPubKey;
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        anchor, anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        script);
+    AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                         tip->GetBlockHash(), tip->nHeight,
+                         tip->GetBlockHash());
+
+    const auto initial = wallet->GetShadowPowClaimRecoveryInventory();
+    const uint256 generation =
+        FindRecoveryComponent(initial, anchor).generation_fingerprint;
+    const CAmount fee = 1000;
+    CMutableTransaction resolution;
+    resolution.vin.emplace_back(
+        anchor, CScript(), std::numeric_limits<uint32_t>::max());
+    resolution.vout.emplace_back(
+        anchor_tx->vout.at(0).nValue - fee, script);
+    const CTransactionRef resolution_ref =
+        MakeTransactionRef(std::move(resolution));
+    const int64_t created_time = GetTime();
+    BOOST_REQUIRE(created_time > 0);
+    BOOST_REQUIRE(wallet->AddToWallet(
+        resolution_ref, TxStateInactive{},
+        [&](CWalletTx& wtx, bool) {
+            wtx.mapValue[SHADOW_POW_RESOLUTION_SCHEMA_KEY] =
+                SHADOW_POW_RESOLUTION_SCHEMA_VERSION;
+            wtx.mapValue[SHADOW_POW_RESOLUTION_ANCHOR_TXID_KEY] =
+                anchor.hash.GetHex();
+            wtx.mapValue[SHADOW_POW_RESOLUTION_ANCHOR_VOUT_KEY] =
+                ToString(anchor.n);
+            wtx.mapValue[SHADOW_POW_RESOLUTION_FINGERPRINT_KEY] =
+                generation.GetHex();
+            wtx.mapValue[SHADOW_POW_RESOLUTION_ORIGIN_KEY] =
+                SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC;
+            wtx.mapValue[SHADOW_POW_RESOLUTION_CREATED_HEIGHT_KEY] =
+                ToString(tip->nHeight);
+            wtx.mapValue[SHADOW_POW_RESOLUTION_CREATED_TIME_KEY] =
+                ToString(created_time);
+            wtx.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] = "1";
+            wtx.fFromMe = true;
+            return true;
+        }));
+
+    Coin original_anchor;
+    const COutPoint frontier{claim->GetHash(), 0};
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        CCoinsViewCache& coins = chainman.ActiveChainstate().CoinsTip();
+        BOOST_REQUIRE(coins.SpendCoin(anchor, &original_anchor));
+        coins.AddCoin(
+            frontier,
+            Coin{claim->vout.at(0), tip->nHeight, /*coinbase=*/false,
+                 /*coinstake=*/false, claim->nTime},
+            /*possible_overwrite=*/false);
+        wallet->mapWallet.at(claim->GetHash()).m_state =
+            TxStateConfirmed{tip->GetBlockHash(), tip->nHeight, 1};
+        wallet->mapWallet.at(claim->GetHash()).MarkDirty();
+    }
+
+    const auto claim_won_inventory =
+        wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_CHECK(claim_won_inventory.components.empty());
+    const ShadowPowClaimRecoveryUsage claim_won =
+        wallet->GetShadowPowClaimRecoveryUsage(/*rolling_window_seconds=*/86400);
+    BOOST_CHECK_EQUAL(claim_won.pending_automatic, 1U);
+    BOOST_CHECK_EQUAL(claim_won.automatic_actions_in_window, 1U);
+    BOOST_CHECK_EQUAL(claim_won.automatic_fee_exposure_in_window, fee);
+
+    // Simulate disconnecting the original winner. The durable automatic
+    // action remains the same fact; only the component/anchor state changes.
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        CCoinsViewCache& coins = chainman.ActiveChainstate().CoinsTip();
+        BOOST_REQUIRE(coins.SpendCoin(frontier));
+        coins.AddCoin(anchor, std::move(original_anchor),
+                      /*possible_overwrite=*/true);
+        wallet->mapWallet.at(claim->GetHash()).m_state = TxStateInactive{};
+        wallet->mapWallet.at(claim->GetHash()).MarkDirty();
+    }
+    const auto restored_inventory =
+        wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_REQUIRE(!restored_inventory.components.empty());
+    const ShadowPowClaimRecoveryUsage restored =
+        wallet->GetShadowPowClaimRecoveryUsage(/*rolling_window_seconds=*/86400);
+    BOOST_CHECK_EQUAL(restored.pending_automatic,
+                      claim_won.pending_automatic);
+    BOOST_CHECK_EQUAL(restored.automatic_actions_in_window,
+                      claim_won.automatic_actions_in_window);
+    BOOST_CHECK_EQUAL(restored.automatic_fee_exposure_in_window,
+                      claim_won.automatic_fee_exposure_in_window);
+}
+
+BOOST_AUTO_TEST_CASE(automatic_actions_use_rollback_resistant_logical_time)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    BOOST_REQUIRE(tip->pprev);
+    const CBlockIndex* stale_observation = tip->pprev;
+
+    const CTransactionRef anchor_tx_a = m_coinbase_txns.at(0);
+    const CTransactionRef anchor_tx_b = m_coinbase_txns.at(1);
+    const COutPoint anchor_a{anchor_tx_a->GetHash(), 0};
+    const COutPoint anchor_b{anchor_tx_b->GetHash(), 0};
+    const CScript script = anchor_tx_a->vout.at(0).scriptPubKey;
+    const CTransactionRef claim_a = MakeRecoveryTestClaim(
+        anchor_a,
+        anchor_tx_a->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        script);
+    const CTransactionRef claim_b = MakeRecoveryTestClaim(
+        anchor_b,
+        anchor_tx_b->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        script);
+    for (const CTransactionRef& claim : {claim_a, claim_b}) {
+        AddRecoveryTestClaim(*wallet, claim,
+                             stale_observation->nHeight,
+                             stale_observation->GetBlockHash(),
+                             stale_observation->nHeight,
+                             stale_observation->GetBlockHash());
+    }
+
+    const auto initial = wallet->GetShadowPowClaimRecoveryInventory();
+    const uint256 generation_a =
+        FindRecoveryComponent(initial, anchor_a).generation_fingerprint;
+    const int64_t future_action_time = GetTime() + 3600;
+    CMutableTransaction old_resolution;
+    old_resolution.vin.emplace_back(
+        anchor_a, CScript(), std::numeric_limits<uint32_t>::max());
+    old_resolution.vout.emplace_back(
+        anchor_tx_a->vout.at(0).nValue - 1000, script);
+    const CTransactionRef old_resolution_ref =
+        MakeTransactionRef(std::move(old_resolution));
+    BOOST_REQUIRE(wallet->AddToWallet(
+        old_resolution_ref, TxStateInactive{},
+        [&](CWalletTx& wtx, bool) {
+            wtx.mapValue[SHADOW_POW_RESOLUTION_SCHEMA_KEY] =
+                SHADOW_POW_RESOLUTION_SCHEMA_VERSION;
+            wtx.mapValue[SHADOW_POW_RESOLUTION_ANCHOR_TXID_KEY] =
+                anchor_a.hash.GetHex();
+            wtx.mapValue[SHADOW_POW_RESOLUTION_ANCHOR_VOUT_KEY] =
+                ToString(anchor_a.n);
+            wtx.mapValue[SHADOW_POW_RESOLUTION_FINGERPRINT_KEY] =
+                generation_a.GetHex();
+            wtx.mapValue[SHADOW_POW_RESOLUTION_ORIGIN_KEY] =
+                SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC;
+            wtx.mapValue[SHADOW_POW_RESOLUTION_CREATED_HEIGHT_KEY] =
+                ToString(tip->nHeight);
+            wtx.mapValue[SHADOW_POW_RESOLUTION_CREATED_TIME_KEY] =
+                ToString(future_action_time);
+            wtx.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] = "1";
+            wtx.fFromMe = true;
+            return true;
+        }));
+
+    ShadowPowClaimRecoveryRequest wrong_origin_retry;
+    wrong_origin_retry.mode =
+        ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+    wrong_origin_retry.origin = ShadowPowClaimRecoveryOrigin::MANUAL;
+    wrong_origin_retry.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::PERSISTED_COMMIT;
+    wrong_origin_retry.selectors = {old_resolution_ref->GetHash()};
+    const ShadowPowClaimRecoveryResult refused_origin_confusion =
+        wallet->ResolveShadowPowClaims(wrong_origin_retry);
+    BOOST_CHECK(!refused_origin_confusion.success);
+
+    ShadowPowClaimRecoveryPolicy policy =
+        DefaultShadowPowClaimRecoveryPolicy();
+    policy.choice_recorded = 1;
+    policy.automatic_enabled = 1;
+    policy.minimum_stale_blocks = 1;
+    policy.max_actions_per_window = 10;
+    bilingual_str policy_error;
+    BOOST_REQUIRE(wallet->SetShadowPowClaimRecoveryPolicy(policy,
+                                                           policy_error));
+    wallet->SetBroadcastTransactions(/*broadcast=*/true);
+    wallet->m_pow_mining_enabled.store(true);
+
+    ShadowPowClaimRecoveryRequest request;
+    request.mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
+    request.origin = ShadowPowClaimRecoveryOrigin::AUTOMATIC;
+    request.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::AUTOMATIC_POLICY;
+    request.selectors = {claim_b->GetHash()};
+    const ShadowPowClaimRecoveryResult result =
+        wallet->ResolveShadowPowClaims(request);
+    BOOST_REQUIRE_MESSAGE(result.success, result.error);
+    BOOST_REQUIRE_EQUAL(result.signed_and_persisted, 1U);
+    BOOST_REQUIRE_EQUAL(result.plan.actions.size(), 1U);
+
+    int64_t persisted_time{0};
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& persisted = wallet->mapWallet.at(
+            result.plan.actions.front().transaction->GetHash());
+        const auto created = persisted.mapValue.find(
+            SHADOW_POW_RESOLUTION_CREATED_TIME_KEY);
+        BOOST_REQUIRE(created != persisted.mapValue.end());
+        BOOST_REQUIRE(ParseInt64(created->second, &persisted_time));
+    }
+    BOOST_CHECK_GE(persisted_time, future_action_time);
+    const ShadowPowClaimRecoveryUsage usage =
+        wallet->GetShadowPowClaimRecoveryUsage(/*rolling_window_seconds=*/86400);
+    BOOST_CHECK_EQUAL(usage.automatic_actions_in_window, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(shared_preview_is_deterministic_side_effect_free_and_matches_legacy_adapter)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        anchor, anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.at(0).scriptPubKey);
+    AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                         tip->GetBlockHash(), tip->nHeight,
+                         tip->GetBlockHash());
+
+    const size_t wallet_records_before = WITH_LOCK(
+        wallet->cs_wallet, return wallet->mapWallet.size());
+    ShadowPowClaimRecoveryRequest request;
+    request.selectors = {claim->GetHash()};
+    const ShadowPowClaimRecoveryPlan first =
+        wallet->PlanShadowPowClaimRecovery(request);
+    const ShadowPowClaimRecoveryPlan repeat =
+        wallet->PlanShadowPowClaimRecovery(request);
+    if (!first.refused.empty()) {
+        BOOST_TEST_MESSAGE("preview refusal: " <<
+                           first.refused.front().reason_code << " " <<
+                           first.refused.front().detail);
+        const auto debug_inventory =
+            wallet->GetShadowPowClaimRecoveryInventory();
+        const auto& debug_component =
+            FindRecoveryComponent(debug_inventory, anchor);
+        for (const auto& node : debug_component.nodes) {
+            BOOST_TEST_MESSAGE("node wallet=" << node.wallet_authored <<
+                               " shape=" << node.expected_shape <<
+                               " disposition=" <<
+                               static_cast<int>(node.disposition));
+        }
+    }
+    BOOST_REQUIRE(first.complete);
+    BOOST_REQUIRE_EQUAL(first.actions.size(), 1U);
+    BOOST_CHECK(first.refused.empty());
+    BOOST_CHECK(first.plan_id == repeat.plan_id);
+    BOOST_CHECK(first.actions.front().anchor == anchor);
+    BOOST_CHECK(first.actions.front().transaction->vin.size() == 1U);
+    BOOST_CHECK(first.actions.front().transaction->vin.front().prevout ==
+                anchor);
+    BOOST_CHECK_EQUAL(first.actions.front().transaction->vin.front().nSequence,
+                      std::numeric_limits<uint32_t>::max());
+    BOOST_CHECK(first.actions.front().transaction->vout.size() == 1U);
+    BOOST_CHECK(first.actions.front().transaction->vout.front().scriptPubKey ==
+                anchor_tx->vout.at(0).scriptPubKey);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,
+                                return wallet->mapWallet.size()),
+                      wallet_records_before);
+
+    ShadowPowClaimRecoveryRequest explicit_rate = request;
+    explicit_rate.fee_rate = CFeeRate{2000};
+    const ShadowPowClaimRecoveryPlan rate_plan =
+        wallet->PlanShadowPowClaimRecovery(explicit_rate);
+    BOOST_CHECK(rate_plan.plan_id != first.plan_id);
+
+    const ShadowPowClaimRecoveryInventory full =
+        wallet->GetShadowPowClaimRecoveryInventory();
+    const ShadowPowClaimInventory compatibility =
+        wallet->GetShadowPowClaimInventory();
+    size_t expected_raw{0};
+    size_t expected_actionable{0};
+    size_t expected_resolved{0};
+    size_t expected_indeterminate{0};
+    for (const ShadowPowClaimRecoveryComponent& component : full.components) {
+        const size_t relevant = std::count_if(
+            component.nodes.begin(), component.nodes.end(),
+            [](const ShadowPowClaimRecoveryNode& node) {
+                return node.kind == ShadowPowClaimRecoveryNodeKind::CLAIM &&
+                       !node.active_chain_confirmed && !node.in_mempool &&
+                       node.wallet_authored;
+            });
+        expected_raw += relevant;
+        if (component.state ==
+            ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN) {
+            expected_resolved += relevant;
+        } else if (component.state ==
+                   ShadowPowClaimRecoveryState::INDETERMINATE) {
+            expected_indeterminate += relevant;
+        } else {
+            expected_actionable += relevant;
+        }
+    }
+    BOOST_CHECK_EQUAL(compatibility.raw_quarantined_claims, expected_raw);
+    BOOST_CHECK_EQUAL(compatibility.actionable_claims, expected_actionable);
+    BOOST_CHECK_EQUAL(compatibility.resolved_on_active_chain_claims,
+                      expected_resolved);
+    BOOST_CHECK_EQUAL(compatibility.indeterminate_claims,
+                      expected_indeterminate);
+    BOOST_CHECK_EQUAL(wallet->CountQuarantinedShadowPowClaims(),
+                      compatibility.BlockingClaims());
+}
+
+BOOST_AUTO_TEST_CASE(sign_only_persists_exact_uncommitted_bytes_and_reuses_them)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        anchor, anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.at(0).scriptPubKey);
+    AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                         tip->GetBlockHash(), tip->nHeight,
+                         tip->GetBlockHash());
+    const size_t wallet_records_before = WITH_LOCK(
+        wallet->cs_wallet, return wallet->mapWallet.size());
+
+    ShadowPowClaimRecoveryRequest preview_request;
+    preview_request.selectors = {claim->GetHash()};
+    const ShadowPowClaimRecoveryPlan preview =
+        wallet->PlanShadowPowClaimRecovery(preview_request);
+    if (!preview.refused.empty()) {
+        BOOST_TEST_MESSAGE("sign preview refusal: " <<
+                           preview.refused.front().reason_code << " " <<
+                           preview.refused.front().detail);
+    }
+    BOOST_REQUIRE_EQUAL(preview.actions.size(), 1U);
+
+    ShadowPowClaimRecoveryRequest missing_consent = preview_request;
+    missing_consent.mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
+    missing_consent.expected_plan_id = preview.plan_id;
+    const ShadowPowClaimRecoveryResult refused_consent =
+        wallet->ResolveShadowPowClaims(missing_consent);
+    BOOST_CHECK(!refused_consent.success);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,
+                                return wallet->mapWallet.size()),
+                      wallet_records_before);
+
+    missing_consent.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+    missing_consent.acknowledge_fee_and_conflict_risk = true;
+    missing_consent.expected_plan_id.reset();
+    const ShadowPowClaimRecoveryResult refused_unpinned =
+        wallet->ResolveShadowPowClaims(missing_consent);
+    BOOST_CHECK(!refused_unpinned.success);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,
+                                return wallet->mapWallet.size()),
+                      wallet_records_before);
+
+    ShadowPowClaimRecoveryRequest sign_request = preview_request;
+    sign_request.mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
+    sign_request.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+    sign_request.acknowledge_fee_and_conflict_risk = true;
+    sign_request.expected_plan_id = preview.plan_id;
+    const ShadowPowClaimRecoveryResult signed_result =
+        wallet->ResolveShadowPowClaims(sign_request);
+    BOOST_REQUIRE_MESSAGE(signed_result.success, signed_result.error);
+    BOOST_CHECK_EQUAL(signed_result.signed_and_persisted, 1U);
+    BOOST_REQUIRE_EQUAL(signed_result.plan.actions.size(), 1U);
+    const CTransactionRef exact = signed_result.plan.actions.front().transaction;
+    BOOST_REQUIRE(exact);
+    {
+        LOCK(wallet->cs_wallet);
+        const auto persisted = wallet->mapWallet.find(exact->GetHash());
+        BOOST_REQUIRE(persisted != wallet->mapWallet.end());
+        BOOST_CHECK(persisted->second.tx->GetWitnessHash() ==
+                    exact->GetWitnessHash());
+        BOOST_CHECK_EQUAL(
+            persisted->second.mapValue.at(
+                SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY),
+            "0");
+        BOOST_CHECK_EQUAL(
+            persisted->second.mapValue.at(
+                SHADOW_POW_RESOLUTION_FINGERPRINT_KEY),
+            preview.actions.front().generation_fingerprint.GetHex());
+    }
+
+    ShadowPowClaimRecoveryRequest repeat_request = preview_request;
+    repeat_request.mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
+    repeat_request.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+    repeat_request.acknowledge_fee_and_conflict_risk = true;
+    repeat_request.expected_plan_id =
+        wallet->PlanShadowPowClaimRecovery(preview_request).plan_id;
+    const ShadowPowClaimRecoveryResult repeat =
+        wallet->ResolveShadowPowClaims(repeat_request);
+    BOOST_REQUIRE_MESSAGE(repeat.success, repeat.error);
+    BOOST_CHECK_EQUAL(repeat.signed_and_persisted, 0U);
+    BOOST_REQUIRE_EQUAL(repeat.plan.actions.size(), 1U);
+    BOOST_CHECK(repeat.plan.actions.front().status ==
+                ShadowPowClaimRecoveryActionStatus::REUSE_MANAGED);
+    BOOST_CHECK(repeat.plan.actions.front().transaction->GetWitnessHash() ==
+                exact->GetWitnessHash());
+    BOOST_CHECK(!repeat.plan.actions.front().in_mempool);
+
+    // An inbound/source-agnostic mempool callback cannot promote a draft.
+    wallet->transactionAddedToMempool(exact);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(
+            wallet->mapWallet.at(exact->GetHash()).mapValue.at(
+                SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY),
+            "0");
+    }
+    wallet->transactionRemovedFromMempool(
+        exact, MemPoolRemovalReason::EXPIRY);
+
+    // A successful local sendrawtransaction RPC is an authenticated operator
+    // action. Its dedicated callback grants durable retry authority for only
+    // these exact bytes.
+    wallet->transactionSubmittedByRpc(exact);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(
+            wallet->mapWallet.at(exact->GetHash()).mapValue.at(
+                SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY),
+            "1");
+    }
+    wallet->SetBroadcastTransactions(/*broadcast=*/true);
+
+    ShadowPowClaimRecoveryBroadcastGuard stale_guard;
+    stale_guard.expected_wallet_generation =
+        wallet->GetDatabase().nUpdateCounter.load() + 1;
+    stale_guard.expected_wallet_tip = tip->GetBlockHash();
+    std::string guarded_error;
+    BOOST_CHECK(!wallet->SubmitTxMemoryPoolAndRelay(
+        exact->GetHash(), guarded_error, /*relay=*/true, &stale_guard));
+    BOOST_CHECK_EQUAL(guarded_error,
+                      "recovery-wallet-generation-changed");
+
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->m_wallet_unlock_staking_only = true;
+    }
+    ShadowPowClaimRecoveryRequest durable_retry;
+    durable_retry.mode =
+        ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+    durable_retry.origin = ShadowPowClaimRecoveryOrigin::MANUAL;
+    durable_retry.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::PERSISTED_COMMIT;
+    durable_retry.selectors = {exact->GetHash()};
+    const ShadowPowClaimRecoveryResult retried =
+        wallet->ResolveShadowPowClaims(durable_retry);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->m_wallet_unlock_staking_only = false;
+    }
+    BOOST_REQUIRE_MESSAGE(retried.success, retried.error);
+    BOOST_CHECK_EQUAL(retried.signed_and_persisted, 0U);
+    BOOST_CHECK_EQUAL(retried.broadcast + retried.already_in_mempool, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(manual_scheduler_retries_exact_authorized_fee_above_preview_default)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CScript script = anchor_tx->vout.at(0).scriptPubKey;
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        anchor, anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        script);
+    AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                         tip->GetBlockHash(), tip->nHeight,
+                         tip->GetBlockHash());
+    const uint256 generation = FindRecoveryComponent(
+        wallet->GetShadowPowClaimRecoveryInventory(), anchor)
+                                   .generation_fingerprint;
+
+    const CAmount reviewed_fee = 2 * CENT;
+    BOOST_REQUIRE(reviewed_fee > CENT);
+    BOOST_REQUIRE(reviewed_fee < wallet->m_default_max_tx_fee);
+    CMutableTransaction resolution;
+    resolution.nVersion = CTransaction::CURRENT_VERSION;
+    resolution.nTime = GetAdjustedTimeSeconds();
+    resolution.vin.emplace_back(
+        anchor, CScript(), std::numeric_limits<uint32_t>::max());
+    resolution.vout.emplace_back(
+        anchor_tx->vout.at(0).nValue - reviewed_fee, script);
+    {
+        LOCK(wallet->cs_wallet);
+        std::map<int, bilingual_str> input_errors;
+        BOOST_REQUIRE(wallet->SignTransaction(resolution, input_errors));
+    }
+    const CTransactionRef exact =
+        MakeTransactionRef(std::move(resolution));
+    BOOST_REQUIRE(wallet->AddToWallet(
+        exact, TxStateInactive{},
+        [&](CWalletTx& wtx, bool) {
+            wtx.mapValue[SHADOW_POW_RESOLUTION_SCHEMA_KEY] =
+                SHADOW_POW_RESOLUTION_SCHEMA_VERSION;
+            wtx.mapValue[SHADOW_POW_RESOLUTION_ANCHOR_TXID_KEY] =
+                anchor.hash.GetHex();
+            wtx.mapValue[SHADOW_POW_RESOLUTION_ANCHOR_VOUT_KEY] =
+                ToString(anchor.n);
+            wtx.mapValue[SHADOW_POW_RESOLUTION_FINGERPRINT_KEY] =
+                generation.GetHex();
+            wtx.mapValue[SHADOW_POW_RESOLUTION_ORIGIN_KEY] =
+                SHADOW_POW_RESOLUTION_ORIGIN_MANUAL;
+            wtx.mapValue[SHADOW_POW_RESOLUTION_CREATED_HEIGHT_KEY] =
+                ToString(tip->nHeight);
+            wtx.mapValue[SHADOW_POW_RESOLUTION_CREATED_TIME_KEY] =
+                ToString(std::max<int64_t>(1, GetTime()));
+            wtx.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] = "1";
+            wtx.fFromMe = true;
+            return true;
+        }));
+
+    ShadowPowClaimRecoveryRequest preview_defaults;
+    preview_defaults.selectors = {exact->GetHash()};
+    const ShadowPowClaimRecoveryPlan artificially_capped =
+        wallet->PlanShadowPowClaimRecovery(preview_defaults);
+    BOOST_CHECK(artificially_capped.actions.empty());
+    BOOST_REQUIRE_EQUAL(artificially_capped.refused.size(), 1U);
+    BOOST_CHECK_EQUAL(artificially_capped.refused.front().reason_code,
+                      "fee-limit-exceeded");
+
+    wallet->SetBroadcastTransactions(/*broadcast=*/true);
+    wallet->MaybeAutoResolveShadowPowClaims();
+    SyncWithValidationInterfaceQueue();
+    BOOST_CHECK(m_node.chain->isInMempool(exact->GetHash()));
+}
+
+BOOST_AUTO_TEST_CASE(stale_plan_and_unsafe_graph_fail_before_signing)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        anchor, anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.at(0).scriptPubKey);
+    AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                         tip->GetBlockHash(), tip->nHeight,
+                         tip->GetBlockHash());
+
+    ShadowPowClaimRecoveryRequest request;
+    request.selectors = {claim->GetHash()};
+    const ShadowPowClaimRecoveryPlan preview =
+        wallet->PlanShadowPowClaimRecovery(request);
+    if (!preview.refused.empty()) {
+        BOOST_TEST_MESSAGE("stale preview refusal: " <<
+                           preview.refused.front().reason_code << " " <<
+                           preview.refused.front().detail);
+    }
+    BOOST_REQUIRE_EQUAL(preview.actions.size(), 1U);
+    BOOST_REQUIRE(wallet->AddToWallet(
+        claim, TxStateInactive{}, [](CWalletTx& wtx, bool) {
+            wtx.mapValue["test_recovery_generation_change"] = "1";
+            return true;
+        }));
+    // Mock databases do not uniformly advance their backend update counter
+    // for an overwrite. Model the externally observable wallet-generation
+    // advance that production BDB/SQLite backends perform.
+    wallet->GetDatabase().nUpdateCounter.fetch_add(1);
+    request.mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
+    request.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+    request.acknowledge_fee_and_conflict_risk = true;
+    request.expected_plan_id = preview.plan_id;
+    const ShadowPowClaimRecoveryResult stale =
+        wallet->ResolveShadowPowClaims(request);
+    BOOST_CHECK(!stale.success);
+    BOOST_CHECK(stale.stale_plan);
+
+    CMutableTransaction ordinary;
+    ordinary.vin.emplace_back(COutPoint{claim->GetHash(), 0});
+    ordinary.vout.emplace_back(
+        claim->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.at(0).scriptPubKey);
+    BOOST_REQUIRE(wallet->AddToWallet(
+        MakeTransactionRef(std::move(ordinary)), TxStateInactive{}));
+    ShadowPowClaimRecoveryRequest unsafe_request;
+    unsafe_request.selectors = {claim->GetHash()};
+    const ShadowPowClaimRecoveryPlan unsafe =
+        wallet->PlanShadowPowClaimRecovery(unsafe_request);
+    BOOST_CHECK(unsafe.actions.empty());
+    BOOST_REQUIRE_EQUAL(unsafe.refused.size(), 1U);
+    BOOST_CHECK_EQUAL(unsafe.refused.front().reason_code,
+                      "component-not-safe");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

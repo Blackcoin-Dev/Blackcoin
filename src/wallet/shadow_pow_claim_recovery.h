@@ -6,12 +6,14 @@
 #define BITCOIN_WALLET_SHADOW_POW_CLAIM_RECOVERY_H
 
 #include <consensus/amount.h>
+#include <policy/feerate.h>
 #include <primitives/transaction.h>
 #include <serialize.h>
 #include <shadow.h>
 #include <uint256.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -46,6 +48,11 @@ inline constexpr char SHADOW_POW_RESOLUTION_ORIGIN_MANUAL[]{"manual"};
 inline constexpr char SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC[]{"automatic"};
 inline constexpr char SHADOW_POW_RESOLUTION_CREATED_HEIGHT_KEY[]{"qq_shadow_pow_resolution_created_height"};
 inline constexpr char SHADOW_POW_RESOLUTION_CREATED_TIME_KEY[]{"qq_shadow_pow_resolution_created_time"};
+// A signed draft is deliberately not restart/generic-rebroadcast authority.
+// Only COMMIT_AND_BROADCAST durably changes this canonical byte flag to "1"
+// before attempting relay. A mempool-observed exact draft may be promoted by
+// the resolver after it proves that those same bytes were explicitly relayed.
+inline constexpr char SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY[]{"qq_shadow_pow_resolution_relay_authorized"};
 // Older releases use a selected claim txid as this marker's value. New code
 // retains it for downgrade-safe non-rebroadcast behavior while the anchor
 // metadata above is authoritative for idempotency.
@@ -102,6 +109,7 @@ struct ShadowPowClaimRecoveryNode
     std::string resolution_origin;
     int resolution_created_height{-1};
     int64_t resolution_created_time{0};
+    bool resolution_relay_authorized{false};
 };
 
 struct ShadowPowClaimRecoveryComponent
@@ -156,6 +164,136 @@ struct ShadowPowClaimRecoveryInventory
     std::vector<ShadowPowClaimRecoveryComponent> components;
     std::vector<uint256> unanchored_claim_txids;
 };
+
+/**
+ * Recovery has three deliberately distinct side-effect levels. PREVIEW is
+ * read-only. SIGN_ONLY signs and durably records the exact transaction bytes,
+ * but never relays them. COMMIT_AND_BROADCAST first performs the SIGN_ONLY
+ * durability step for every action in the batch and only then relays those
+ * exact wallet records.
+ */
+enum class ShadowPowClaimRecoveryMode : uint8_t {
+    PREVIEW,
+    SIGN_ONLY,
+    COMMIT_AND_BROADCAST,
+};
+
+enum class ShadowPowClaimRecoveryOrigin : uint8_t {
+    MANUAL,
+    AUTOMATIC,
+};
+
+/** Typed execution authority prevents a GUI/RPC wrapper from accidentally
+ * turning a preview-capable request into an authorized wallet mutation. */
+enum class ShadowPowClaimRecoveryExecutionAuthority : uint8_t {
+    NONE,
+    EXPLICIT_MANUAL,
+    AUTOMATIC_POLICY,
+    PERSISTED_COMMIT,
+};
+
+enum class ShadowPowClaimRecoveryActionStatus : uint8_t {
+    READY,
+    REUSE_MANAGED,
+    REUSE_LEGACY,
+    SIGNED_AND_PERSISTED,
+    BROADCAST,
+    ALREADY_IN_MEMPOOL,
+    REFUSED,
+    FAILED,
+};
+
+/** One current-anchor action or a fail-closed refusal in a pinned plan. */
+struct ShadowPowClaimRecoveryAction
+{
+    COutPoint anchor;
+    uint256 generation_fingerprint;
+    uint256 component_fingerprint;
+    std::vector<uint256> claim_txids;
+    size_t descendant_claims{0};
+    ShadowPowClaimRecoveryState component_state{
+        ShadowPowClaimRecoveryState::INDETERMINATE};
+    ShadowPowClaimRecoveryActionStatus status{
+        ShadowPowClaimRecoveryActionStatus::REFUSED};
+    CAmount fee{0};
+    CTransactionRef transaction;
+    bool persisted{false};
+    bool in_mempool{false};
+    bool frontier_may_advance{true};
+    std::string reason_code;
+    std::string detail;
+};
+
+/**
+ * Request shared by RPC, GUI, headless automation, and tests. An empty selector
+ * list means all current components. A selector may name any claim or known
+ * resolution in a component and is canonicalized to its confirmed anchor.
+ */
+struct ShadowPowClaimRecoveryRequest
+{
+    ShadowPowClaimRecoveryMode mode{ShadowPowClaimRecoveryMode::PREVIEW};
+    ShadowPowClaimRecoveryOrigin origin{ShadowPowClaimRecoveryOrigin::MANUAL};
+    ShadowPowClaimRecoveryExecutionAuthority execution_authority{
+        ShadowPowClaimRecoveryExecutionAuthority::NONE};
+    bool acknowledge_fee_and_conflict_risk{false};
+    std::vector<uint256> selectors;
+    CAmount max_fee_per_resolution{CENT};
+    CAmount aggregate_batch_fee_cap{10 * CENT};
+    /** Explicit atoms per 1000 virtual bytes; absent uses wallet policy. */
+    std::optional<CFeeRate> fee_rate;
+    std::optional<uint256> expected_plan_id;
+};
+
+struct ShadowPowClaimRecoveryPlan
+{
+    uint256 active_tip;
+    int active_height{-1};
+    uint64_t wallet_generation{0};
+    uint256 plan_id;
+    ShadowPowClaimRecoveryOrigin origin{
+        ShadowPowClaimRecoveryOrigin::MANUAL};
+    CAmount max_fee_per_resolution{0};
+    CAmount aggregate_batch_fee_cap{0};
+    std::optional<CAmount> fee_rate_atoms_per_k;
+    CAmount total_fee{0};
+    std::vector<ShadowPowClaimRecoveryAction> actions;
+    std::vector<ShadowPowClaimRecoveryAction> refused;
+    bool wallet_tip_matches{false};
+    bool complete{false};
+};
+
+struct ShadowPowClaimRecoveryResult
+{
+    ShadowPowClaimRecoveryPlan plan;
+    bool success{false};
+    bool stale_plan{false};
+    size_t signed_and_persisted{0};
+    size_t broadcast{0};
+    size_t already_in_mempool{0};
+    /** Commit-authorized exact transactions left for a fresh scheduler pass
+     * after this invocation relayed one transaction. */
+    size_t relay_deferred{0};
+    std::string error;
+};
+
+/** Reorg-correct counters reconstructed from durable CWalletTx facts. */
+struct ShadowPowClaimRecoveryUsage
+{
+    size_t pending_manual{0};
+    size_t pending_automatic{0};
+    size_t confirmed_manual{0};
+    size_t confirmed_automatic{0};
+    CAmount confirmed_resolution_fees{0};
+    size_t automatic_actions_in_window{0};
+    CAmount automatic_fee_exposure_in_window{0};
+    size_t reconciled_descendant_claims{0};
+    size_t recycled_outputs{0};
+};
+
+/** Deterministic snapshot token; transaction signatures are intentionally excluded. */
+uint256 ComputeShadowPowClaimRecoveryPlanId(
+    const ShadowPowClaimRecoveryPlan& plan,
+    const std::vector<uint256>& selectors);
 
 /**
  * Wallet-scoped standing consent for automated Gold Rush PoW claim recovery.

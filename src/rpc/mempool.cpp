@@ -11,7 +11,9 @@
 
 #include <chainparams.h>
 #include <core_io.h>
+#include <interfaces/chain.h>
 #include <kernel/mempool_entry.h>
+#include <node/context.h>
 #include <node/mempool_persist_args.h>
 #include <policy/settings.h>
 #include <primitives/transaction.h>
@@ -94,6 +96,9 @@ static RPCHelpMan sendrawtransaction()
             const TransactionError err = BroadcastTransaction(node, tx, err_string, max_raw_tx_fee, /*relay=*/true, /*wait_callback=*/true);
             if (TransactionError::OK != err) {
                 throw JSONRPCTransactionError(err, err_string);
+            }
+            for (const auto& chain_client : node.chain_clients) {
+                chain_client->transactionSubmittedByRpc(tx);
             }
 
             return tx->GetHash().GetHex();

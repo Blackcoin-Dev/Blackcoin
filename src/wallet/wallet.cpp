@@ -2311,6 +2311,39 @@ void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
     }
 }
 
+void CWallet::transactionSubmittedByRpc(const CTransactionRef& tx)
+{
+    LOCK(cs_wallet);
+    const auto it = mapWallet.find(tx->GetHash());
+    if (it == mapWallet.end() || !it->second.tx ||
+        it->second.tx->GetWitnessHash() != tx->GetWitnessHash()) {
+        return;
+    }
+    const auto schema = it->second.mapValue.find(
+        SHADOW_POW_RESOLUTION_SCHEMA_KEY);
+    if (schema == it->second.mapValue.end() ||
+        schema->second != SHADOW_POW_RESOLUTION_SCHEMA_VERSION) {
+        return;
+    }
+    const auto relay_authority = it->second.mapValue.find(
+        SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY);
+    if (relay_authority != it->second.mapValue.end() &&
+        relay_authority->second == "1") {
+        return;
+    }
+
+    // A generic inbound-mempool notification cannot prove who submitted the
+    // bytes. This method is reached only after the local sendrawtransaction
+    // RPC has accepted the exact transaction, preserving that legacy explicit
+    // operator workflow without granting a peer a consent primitive.
+    std::string promote_error;
+    if (!SetManagedShadowPowResolutionRelayAuthority(
+            tx->GetHash(), true, promote_error)) {
+        WalletLogPrintf("Failed to durably authorize locally submitted Gold Rush recovery %s for exact-byte retry: %s\n",
+                        tx->GetHash().ToString(), promote_error);
+    }
+}
+
 void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason) {
     LOCK(cs_wallet);
     auto it = mapWallet.find(tx->GetHash());
@@ -2809,6 +2842,12 @@ ShadowPowClaimRecoveryPolicy CWallet::GetShadowPowClaimRecoveryPolicy() const
     return m_shadow_pow_claim_recovery_policy;
 }
 
+bool CWallet::IsShadowPowClaimRecoveryDatabaseAmbiguous() const
+{
+    LOCK(cs_wallet);
+    return m_shadow_pow_claim_recovery_db_ambiguous;
+}
+
 bool CWallet::LoadShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy)
 {
     AssertLockHeld(cs_wallet);
@@ -2829,17 +2868,26 @@ bool CWallet::SetShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy
     }
 
     LOCK(cs_wallet);
+    if (m_shadow_pow_claim_recovery_db_ambiguous) {
+        error = Untranslated("A prior claim-recovery database commit had an ambiguous outcome; reload the wallet before changing recovery policy");
+        return false;
+    }
     WalletBatch batch(GetDatabase());
     if (!batch.TxnBegin(/*durable=*/true)) {
         error = Untranslated("Failed to begin durable automated PoW claim recovery policy update");
         return false;
     }
     if (!batch.WriteShadowPowClaimRecoveryPolicy(policy)) {
-        batch.TxnAbort();
-        error = Untranslated("Failed to write automated PoW claim recovery policy");
+        if (!batch.TxnAbort()) {
+            m_shadow_pow_claim_recovery_db_ambiguous = true;
+            error = Untranslated("Automated PoW claim recovery policy write and rollback outcomes are ambiguous; reload the wallet");
+        } else {
+            error = Untranslated("Failed to write automated PoW claim recovery policy");
+        }
         return false;
     }
     if (!batch.TxnCommit()) {
+        m_shadow_pow_claim_recovery_db_ambiguous = true;
         error = Untranslated("Failed to durably commit automated PoW claim recovery policy");
         return false;
     }
@@ -3191,7 +3239,9 @@ void CWallet::AbandonOrphanedCoinstakes()
     }
 }
 
-bool CWallet::SubmitTxMemoryPoolAndRelay(const uint256& txid, std::string& err_string, bool relay)
+bool CWallet::SubmitTxMemoryPoolAndRelay(
+    const uint256& txid, std::string& err_string, bool relay,
+    const ShadowPowClaimRecoveryBroadcastGuard* recovery_guard)
 {
     CTransactionRef tx;
     {
@@ -3199,6 +3249,41 @@ bool CWallet::SubmitTxMemoryPoolAndRelay(const uint256& txid, std::string& err_s
         const auto it = mapWallet.find(txid);
         if (it == mapWallet.end()) return false;
         CWalletTx& wtx = it->second;
+
+        if (recovery_guard) {
+            if (GetDatabase().nUpdateCounter.load() !=
+                    recovery_guard->expected_wallet_generation ||
+                m_last_block_processed != recovery_guard->expected_wallet_tip) {
+                err_string = "recovery-wallet-generation-changed";
+                return false;
+            }
+            if (m_shadow_pow_claim_recovery_db_ambiguous) {
+                err_string = "recovery-database-outcome-ambiguous";
+                return false;
+            }
+            if (recovery_guard->require_normal_unlock &&
+                (IsLocked() || m_wallet_unlock_staking_only ||
+                 !HasPrivateKeys() ||
+                 IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) ||
+                 IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER))) {
+                err_string = "recovery-normal-wallet-unlock-ended";
+                return false;
+            }
+            if (recovery_guard->expected_automatic_policy &&
+                (!(m_shadow_pow_claim_recovery_policy ==
+                   *recovery_guard->expected_automatic_policy) ||
+                 !m_shadow_pow_claim_recovery_policy.HasAutomaticAuthority() ||
+                 !ValidateShadowPowClaimRecoveryPolicy(
+                     m_shadow_pow_claim_recovery_policy))) {
+                err_string = "recovery-automatic-authority-changed";
+                return false;
+            }
+            if (recovery_guard->require_pow_mining_enabled &&
+                !m_pow_mining_enabled.load()) {
+                err_string = "recovery-pow-miner-disabled";
+                return false;
+            }
+        }
 
         // Snapshot the immutable transaction while holding the wallet lock,
         // then release it before validation takes cs_main. Staking uses the
@@ -3314,6 +3399,7 @@ void CWallet::RepairStaleShadowTransactions(bool force)
         for (auto& [txid, wtx] : mapWallet) {
             const auto cleanup_for = wtx.mapValue.find(SHADOW_POW_CLEANUP_FOR_KEY);
             if (!wtx.isUnconfirmed() || cleanup_for == wtx.mapValue.end() ||
+                wtx.mapValue.count(SHADOW_POW_RESOLUTION_SCHEMA_KEY) != 0 ||
                 wtx.mapValue[LEGACY_SHADOW_POW_CLEANUP_QUARANTINE_KEY] == "1") {
                 continue;
             }
@@ -3599,7 +3685,12 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force)
             // Legacy versions could create a fee-paying self-spend to race a
             // stale QQSPROOF. Keep that transaction and its input conflict
             // reserved, but never relay it again automatically after upgrade.
-            if (wtx.mapValue.count(SHADOW_POW_CLEANUP_FOR_KEY) != 0) continue;
+            // Managed recovery records are relayed only by the recovery
+            // scheduler after checking their durable relay-authority bit and
+            // current wallet policy. Signed drafts must never leak through
+            // generic startup or periodic rebroadcast.
+            if (wtx.mapValue.count(SHADOW_POW_RESOLUTION_SCHEMA_KEY) != 0 ||
+                wtx.mapValue.count(SHADOW_POW_CLEANUP_FOR_KEY) != 0) continue;
 
             // Attempt to rebroadcast all txes more than 5 minutes older than
             // the last block, or all txs if forcing.
@@ -3675,6 +3766,7 @@ void MaybeResendWalletTxs(WalletContext& context)
         MaybeAutoShadowSignal(*pwallet);
         MaybeAutoRedelegateQuantumColdStake(*pwallet);
         pwallet->RepairStaleShadowTransactions(/*force=*/false);
+        pwallet->MaybeAutoResolveShadowPowClaims();
         if (!pwallet->ShouldResend()) continue;
         pwallet->ResubmitWalletTransactions(/*relay=*/true, /*force=*/false);
         pwallet->SetNextResend();
@@ -9175,153 +9267,83 @@ size_t CWallet::CountLiveShadowPowClaims() const
 
 ShadowPowClaimInventory CWallet::GetShadowPowClaimInventory() const
 {
-    ShadowPowClaimInventory inventory;
-    const bool chain_ready = HaveChain() && chain().isReadyToBroadcast();
+    const ShadowPowClaimRecoveryInventory full =
+        GetShadowPowClaimRecoveryInventory();
+    ShadowPowClaimInventory compatibility;
+    compatibility.active_tip = full.active_tip;
+    compatibility.wallet_tip_matches = full.wallet_tip_matches;
 
-    // A wallet without one coherent active-chain snapshot cannot prove that a
-    // historical component has already been resolved. Preserve the legacy
-    // fail-closed gate in that case.
-    if (!chain_ready) {
-        LOCK(cs_wallet);
-        for (const auto& [txid, wtx] : mapWallet) {
-            if (!wtx.isUnconfirmed() || wtx.InMempool() ||
-                !TransactionHasShadowProof(*wtx.tx) ||
-                GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) {
+    for (const ShadowPowClaimRecoveryComponent& source : full.components) {
+        ShadowPowClaimComponent component;
+        component.anchor = source.anchor;
+        for (const ShadowPowClaimRecoveryNode& node : source.nodes) {
+            if (node.kind != ShadowPowClaimRecoveryNodeKind::CLAIM ||
+                node.active_chain_confirmed || node.in_mempool ||
+                !node.wallet_authored) {
                 continue;
             }
-            ShadowPowClaimComponent component;
-            component.claim_txids.push_back(txid);
-            inventory.components.push_back(std::move(component));
-            ++inventory.raw_quarantined_claims;
-            ++inventory.indeterminate_claims;
+            component.claim_txids.push_back(node.txid);
         }
-        return inventory;
+        if (component.claim_txids.empty()) continue;
+        compatibility.raw_quarantined_claims += component.claim_txids.size();
+        if (source.state ==
+            ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN) {
+            component.state =
+                ShadowPowClaimComponentState::RESOLVED_ON_ACTIVE_CHAIN;
+            compatibility.resolved_on_active_chain_claims +=
+                component.claim_txids.size();
+        } else if (source.state ==
+                   ShadowPowClaimRecoveryState::INDETERMINATE) {
+            component.state = ShadowPowClaimComponentState::INDETERMINATE;
+            compatibility.indeterminate_claims += component.claim_txids.size();
+        } else {
+            component.state = ShadowPowClaimComponentState::ACTIONABLE;
+            compatibility.actionable_claims += component.claim_txids.size();
+        }
+        compatibility.components.push_back(std::move(component));
     }
-
-    LOCK2(::cs_main, cs_wallet);
-    return GetShadowPowClaimInventoryLocked();
+    return compatibility;
 }
 
 ShadowPowClaimInventory CWallet::GetShadowPowClaimInventoryLocked() const
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(cs_wallet);
-    ShadowPowClaimInventory inventory;
-
-    // Keep chainstate and wallet provenance on one tip-pinned snapshot. The
-    // active-chain CoinsTip is used directly: mempool state must never turn a
-    // merely conflicting spend into an on-chain resolution.
-    const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
-    if (tip) inventory.active_tip = tip->GetBlockHash();
-    inventory.wallet_tip_matches = tip && m_last_block_processed == inventory.active_tip;
-
-    std::vector<uint256> candidates;
-    for (const auto& [txid, wtx] : mapWallet) {
-        if (!wtx.isUnconfirmed() || wtx.InMempool() ||
-            !TransactionHasShadowProof(*wtx.tx) ||
-            GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) {
-            continue;
-        }
-        candidates.push_back(txid);
-    }
-    inventory.raw_quarantined_claims = candidates.size();
-    if (candidates.empty()) return inventory;
-
-    if (!inventory.wallet_tip_matches) {
-        for (const uint256& txid : candidates) {
-            ShadowPowClaimComponent component;
-            component.claim_txids.push_back(txid);
-            inventory.components.push_back(std::move(component));
-        }
-        inventory.indeterminate_claims = candidates.size();
-        return inventory;
-    }
-
-    struct ClaimPath {
-        COutPoint anchor;
-        bool authenticated{false};
-    };
-    std::map<uint256, ClaimPath> paths;
-
-    // Resolve each candidate to the nearest active-chain-confirmed wallet
-    // output. Historical claim parents may be inactive, conflicted, or
-    // abandoned; walking through them is read-only and preserves all records.
-    for (const uint256& candidate_txid : candidates) {
-        const CWalletTx* current = &mapWallet.at(candidate_txid);
-        std::set<uint256> seen;
-        ClaimPath path;
-        while (current) {
-            const uint256 current_txid = current->GetHash();
-            if (!seen.insert(current_txid).second ||
-                current->tx->vin.size() != 1 ||
-                current->tx->vin.front().prevout.IsNull()) {
-                break;
+    const ShadowPowClaimRecoveryInventory full =
+        GetShadowPowClaimRecoveryInventoryLocked();
+    ShadowPowClaimInventory compatibility;
+    compatibility.active_tip = full.active_tip;
+    compatibility.wallet_tip_matches = full.wallet_tip_matches;
+    for (const ShadowPowClaimRecoveryComponent& source : full.components) {
+        ShadowPowClaimComponent component;
+        component.anchor = source.anchor;
+        for (const ShadowPowClaimRecoveryNode& node : source.nodes) {
+            if (node.kind != ShadowPowClaimRecoveryNodeKind::CLAIM ||
+                node.active_chain_confirmed || node.in_mempool ||
+                !node.wallet_authored) {
+                continue;
             }
-
-            const COutPoint prevout = current->tx->vin.front().prevout;
-            const auto parent_it = mapWallet.find(prevout.hash);
-            if (parent_it == mapWallet.end() ||
-                prevout.n >= parent_it->second.tx->vout.size()) {
-                // Missing ancestry cannot prove an active-chain spend. It
-                // remains indeterminate even if the outpoint is absent.
-                path.anchor = prevout;
-                break;
-            }
-
-            const CWalletTx& parent = parent_it->second;
-            if (GetTxDepthInMainChain(parent) > 0) {
-                if ((IsMine(parent.tx->vout[prevout.n]) & ISMINE_SPENDABLE) != ISMINE_NO) {
-                    path.anchor = prevout;
-                    path.authenticated = true;
-                }
-                break;
-            }
-
-            if (!TransactionHasShadowProof(*parent.tx) ||
-                GetDebit(*parent.tx, ISMINE_SPENDABLE) <= 0) {
-                path.anchor = prevout;
-                break;
-            }
-            current = &parent;
+            component.claim_txids.push_back(node.txid);
         }
-        paths.emplace(candidate_txid, std::move(path));
-    }
-
-    std::map<COutPoint, size_t> component_by_anchor;
-    const CCoinsViewCache& coins_tip = chain().chainman().ActiveChainstate().CoinsTip();
-    for (const uint256& txid : candidates) {
-        const ClaimPath& path = paths.at(txid);
-        if (!path.authenticated || path.anchor.IsNull()) {
-            ShadowPowClaimComponent component;
-            component.anchor = path.anchor;
-            component.claim_txids.push_back(txid);
-            inventory.components.push_back(std::move(component));
-            ++inventory.indeterminate_claims;
-            continue;
-        }
-
-        size_t component_index;
-        const auto [component_it, inserted] = component_by_anchor.emplace(
-            path.anchor, inventory.components.size());
-        if (inserted) {
-            ShadowPowClaimComponent component;
-            component.anchor = path.anchor;
-            Coin coin;
-            component.state = coins_tip.GetCoin(path.anchor, coin) && !coin.IsSpent()
-                ? ShadowPowClaimComponentState::ACTIONABLE
-                : ShadowPowClaimComponentState::RESOLVED_ON_ACTIVE_CHAIN;
-            inventory.components.push_back(std::move(component));
-        }
-        component_index = component_it->second;
-        ShadowPowClaimComponent& component = inventory.components.at(component_index);
-        component.claim_txids.push_back(txid);
-        if (component.state == ShadowPowClaimComponentState::ACTIONABLE) {
-            ++inventory.actionable_claims;
+        if (component.claim_txids.empty()) continue;
+        compatibility.raw_quarantined_claims += component.claim_txids.size();
+        if (source.state ==
+            ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN) {
+            component.state =
+                ShadowPowClaimComponentState::RESOLVED_ON_ACTIVE_CHAIN;
+            compatibility.resolved_on_active_chain_claims +=
+                component.claim_txids.size();
+        } else if (source.state ==
+                   ShadowPowClaimRecoveryState::INDETERMINATE) {
+            component.state = ShadowPowClaimComponentState::INDETERMINATE;
+            compatibility.indeterminate_claims += component.claim_txids.size();
         } else {
-            ++inventory.resolved_on_active_chain_claims;
+            component.state = ShadowPowClaimComponentState::ACTIONABLE;
+            compatibility.actionable_claims += component.claim_txids.size();
         }
+        compatibility.components.push_back(std::move(component));
     }
-    return inventory;
+    return compatibility;
 }
 
 size_t CWallet::CountQuarantinedShadowPowClaims() const

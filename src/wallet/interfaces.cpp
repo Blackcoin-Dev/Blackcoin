@@ -3125,6 +3125,12 @@ public:
     void flush() override { return FlushWallets(m_context); }
     void stop() override { return StopWallets(m_context); }
     void setMockTime(int64_t time) override { return SetMockTime(time); }
+    void transactionSubmittedByRpc(const CTransactionRef& tx) override
+    {
+        for (const auto& wallet : GetWallets(m_context)) {
+            wallet->transactionSubmittedByRpc(tx);
+        }
+    }
 
     //! WalletLoader methods
     util::Result<std::unique_ptr<Wallet>> createWallet(const std::string& name, const SecureString& passphrase, uint64_t wallet_creation_flags, std::vector<bilingual_str>& warnings) override

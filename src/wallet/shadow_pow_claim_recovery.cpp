@@ -7,15 +7,25 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <coins.h>
+#include <common/system.h>
 #include <hash.h>
+#include <key_io.h>
+#include <policy/policy.h>
 #include <shadow.h>
 #include <util/strencodings.h>
+#include <util/time.h>
+#include <util/translation.h>
 #include <validation.h>
+#include <wallet/coincontrol.h>
+#include <wallet/fees.h>
+#include <wallet/spend.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -28,6 +38,25 @@ bool MetadataFlag(const mapValue_t& values, const char* key)
 {
     const auto it = values.find(key);
     return it != values.end() && it->second == "1";
+}
+
+bool ParseCanonicalMetadataBool(const mapValue_t& values, const char* key,
+                                bool& value)
+{
+    const auto it = values.find(key);
+    if (it == values.end()) {
+        value = false;
+        return true;
+    }
+    if (it->second == "0") {
+        value = false;
+        return true;
+    }
+    if (it->second == "1") {
+        value = true;
+        return true;
+    }
+    return false;
 }
 
 bool ParseMetadataHeight(const mapValue_t& values, const char* key, int& value)
@@ -175,6 +204,7 @@ uint256 FingerprintComponent(const uint256& active_tip,
         hasher << node.resolution_origin;
         hasher << node.resolution_created_height;
         hasher << node.resolution_created_time;
+        hasher << node.resolution_relay_authorized;
     }
     return hasher.GetHash();
 }
@@ -192,6 +222,92 @@ uint256 FingerprintClaimGeneration(
     hasher << component.anchor_amount;
     hasher << component.anchor_script;
     return hasher.GetHash();
+}
+
+struct ManagedResolutionFacts
+{
+    COutPoint anchor;
+    uint256 generation_fingerprint;
+    std::string origin;
+    int created_height{-1};
+    int64_t created_time{0};
+    bool relay_authorized{false};
+    CAmount fee{0};
+};
+
+/** Parse and authenticate a managed resolution from durable wallet facts.
+ * This deliberately does not depend on a surviving unconfirmed claim being
+ * present in the current component inventory: an original claim may confirm
+ * first while the conflicting resolution record and its rolling budget usage
+ * must remain visible across restart and reorg. */
+bool ParseManagedResolutionFacts(const CWallet& wallet, const CWalletTx& wtx,
+                                 ManagedResolutionFacts& facts)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (!wtx.tx ||
+        wtx.mapValue.find(SHADOW_POW_RESOLUTION_SCHEMA_KEY) ==
+            wtx.mapValue.end() ||
+        wtx.mapValue.at(SHADOW_POW_RESOLUTION_SCHEMA_KEY) !=
+            SHADOW_POW_RESOLUTION_SCHEMA_VERSION) {
+        return false;
+    }
+
+    uint256 anchor_hash;
+    uint32_t anchor_vout{0};
+    const auto origin = wtx.mapValue.find(
+        SHADOW_POW_RESOLUTION_ORIGIN_KEY);
+    if (origin == wtx.mapValue.end() ||
+        (origin->second != SHADOW_POW_RESOLUTION_ORIGIN_MANUAL &&
+         origin->second != SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC) ||
+        !ParseMetadataHash(wtx.mapValue,
+                           SHADOW_POW_RESOLUTION_ANCHOR_TXID_KEY,
+                           anchor_hash) ||
+        !ParseMetadataVout(wtx.mapValue,
+                           SHADOW_POW_RESOLUTION_ANCHOR_VOUT_KEY,
+                           anchor_vout) ||
+        !ParseMetadataHash(wtx.mapValue,
+                           SHADOW_POW_RESOLUTION_FINGERPRINT_KEY,
+                           facts.generation_fingerprint) ||
+        !ParseMetadataHeight(wtx.mapValue,
+                             SHADOW_POW_RESOLUTION_CREATED_HEIGHT_KEY,
+                             facts.created_height) ||
+        !ParsePositiveMetadataTime(wtx.mapValue,
+                                   SHADOW_POW_RESOLUTION_CREATED_TIME_KEY,
+                                   facts.created_time) ||
+        !ParseCanonicalMetadataBool(
+            wtx.mapValue, SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY,
+            facts.relay_authorized)) {
+        return false;
+    }
+    facts.anchor = COutPoint{anchor_hash, anchor_vout};
+    facts.origin = origin->second;
+
+    const auto parent = wallet.mapWallet.find(anchor_hash);
+    if (parent == wallet.mapWallet.end() || !parent->second.tx ||
+        anchor_vout >= parent->second.tx->vout.size()) {
+        return false;
+    }
+    const CTxOut& anchor_output = parent->second.tx->vout[anchor_vout];
+    ShadowPowClaimRecoveryComponent generation;
+    generation.anchor = facts.anchor;
+    generation.anchor_amount = anchor_output.nValue;
+    generation.anchor_script = anchor_output.scriptPubKey;
+    generation.anchor_authenticated = true;
+    if (facts.generation_fingerprint !=
+        FingerprintClaimGeneration(generation)) {
+        return false;
+    }
+
+    const CTransaction& tx = *wtx.tx;
+    if (tx.vin.size() != 1 || tx.vin.front().prevout != facts.anchor ||
+        tx.vin.front().nSequence != CTxIn::SEQUENCE_FINAL ||
+        tx.vout.size() != 1 || tx.vout.front().nValue <= 0 ||
+        tx.vout.front().nValue > anchor_output.nValue ||
+        tx.vout.front().scriptPubKey != anchor_output.scriptPubKey) {
+        return false;
+    }
+    facts.fee = anchor_output.nValue - tx.vout.front().nValue;
+    return facts.fee > 0 && MoneyRange(facts.fee);
 }
 
 } // namespace
@@ -419,6 +535,11 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
             const uint256 txid = queue[cursor];
             const auto wtx_it = mapWallet.find(txid);
             if (wtx_it == mapWallet.end() || !wtx_it->second.tx) continue;
+            // A confirmed winning spender is the outcome boundary for this
+            // anchor generation. Keep it in the old component as evidence,
+            // but its unconfirmed descendants canonicalize only to its newly
+            // confirmed outputs and must not be duplicated here.
+            if (GetTxDepthInMainChain(wtx_it->second) > 0) continue;
             for (uint32_t output = 0; output < wtx_it->second.tx->vout.size(); ++output) {
                 const auto spenders = mapTxSpends.equal_range(
                     COutPoint{txid, output});
@@ -554,49 +675,23 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                     all_stale_depth_known = false;
                 }
             } else {
-                bool managed_resolution{false};
-                uint256 metadata_anchor_hash;
-                uint32_t metadata_anchor_vout{0};
-                uint256 metadata_fingerprint;
-                int metadata_created_height{-1};
-                int64_t metadata_created_time{0};
+                ManagedResolutionFacts managed_facts;
                 const auto schema = wtx.mapValue.find(
                     SHADOW_POW_RESOLUTION_SCHEMA_KEY);
-                const auto origin = wtx.mapValue.find(
-                    SHADOW_POW_RESOLUTION_ORIGIN_KEY);
-                if (schema != wtx.mapValue.end() &&
-                    schema->second == SHADOW_POW_RESOLUTION_SCHEMA_VERSION &&
-                    origin != wtx.mapValue.end() &&
-                    (origin->second == SHADOW_POW_RESOLUTION_ORIGIN_MANUAL ||
-                     origin->second == SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC) &&
-                    ParseMetadataHash(
-                        wtx.mapValue,
-                        SHADOW_POW_RESOLUTION_ANCHOR_TXID_KEY,
-                        metadata_anchor_hash) &&
-                    ParseMetadataVout(
-                        wtx.mapValue,
-                        SHADOW_POW_RESOLUTION_ANCHOR_VOUT_KEY,
-                        metadata_anchor_vout) &&
-                    ParseMetadataHash(
-                        wtx.mapValue,
-                        SHADOW_POW_RESOLUTION_FINGERPRINT_KEY,
-                        metadata_fingerprint) &&
-                    ParseMetadataHeight(
-                        wtx.mapValue,
-                        SHADOW_POW_RESOLUTION_CREATED_HEIGHT_KEY,
-                        metadata_created_height) &&
-                    ParsePositiveMetadataTime(
-                        wtx.mapValue,
-                        SHADOW_POW_RESOLUTION_CREATED_TIME_KEY,
-                        metadata_created_time) &&
-                    COutPoint{metadata_anchor_hash, metadata_anchor_vout} == anchor &&
-                    metadata_fingerprint == component.generation_fingerprint) {
-                    managed_resolution = true;
-                }
+                const bool managed_resolution =
+                    ParseManagedResolutionFacts(*this, wtx, managed_facts) &&
+                    managed_facts.anchor == anchor &&
+                    managed_facts.generation_fingerprint ==
+                        component.generation_fingerprint;
                 uint256 legacy_claim_txid;
-                const bool legacy_marker = ParseMetadataHash(
-                    wtx.mapValue, SHADOW_POW_LEGACY_CLEANUP_FOR_KEY,
-                    legacy_claim_txid) &&
+                // Presence of the managed schema is authoritative. A
+                // malformed managed record must fail closed and may not fall
+                // back to its downgrade cleanup marker as a trusted legacy
+                // resolution.
+                const bool legacy_marker = schema == wtx.mapValue.end() &&
+                    ParseMetadataHash(
+                        wtx.mapValue, SHADOW_POW_LEGACY_CLEANUP_FOR_KEY,
+                        legacy_claim_txid) &&
                     graph_claim_txids.count(legacy_claim_txid) != 0;
                 const bool exact_resolution_shape =
                     tx.vin.size() == 1 && tx.vin.front().prevout == anchor &&
@@ -614,10 +709,14 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                     node.kind = ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION;
                     node.expected_shape = true;
                     node.resolution_metadata_valid = true;
-                    node.resolution_generation_fingerprint = metadata_fingerprint;
-                    node.resolution_origin = origin->second;
-                    node.resolution_created_height = metadata_created_height;
-                    node.resolution_created_time = metadata_created_time;
+                    node.resolution_generation_fingerprint =
+                        managed_facts.generation_fingerprint;
+                    node.resolution_origin = managed_facts.origin;
+                    node.resolution_created_height =
+                        managed_facts.created_height;
+                    node.resolution_created_time = managed_facts.created_time;
+                    node.resolution_relay_authorized =
+                        managed_facts.relay_authorized;
                     component.has_managed_resolution = true;
                     component.resolution_txids.push_back(txid);
                 } else if (legacy_marker && legacy_nonreplaceable_sequence) {
@@ -837,6 +936,1322 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
               });
     SortUnique(inventory.unanchored_claim_txids);
     return inventory;
+}
+
+uint256 ComputeShadowPowClaimRecoveryPlanId(
+    const ShadowPowClaimRecoveryPlan& plan,
+    const std::vector<uint256>& selectors)
+{
+    std::vector<uint256> ordered_selectors = selectors;
+    SortUnique(ordered_selectors);
+
+    HashWriter hasher{};
+    hasher << uint8_t{1};
+    hasher << plan.active_tip;
+    hasher << plan.active_height;
+    hasher << plan.wallet_generation;
+    hasher << static_cast<uint8_t>(plan.origin);
+    hasher << plan.max_fee_per_resolution;
+    hasher << plan.aggregate_batch_fee_cap;
+    hasher << plan.fee_rate_atoms_per_k.has_value();
+    if (plan.fee_rate_atoms_per_k) {
+        hasher << *plan.fee_rate_atoms_per_k;
+    }
+    hasher << ordered_selectors;
+    hasher << static_cast<uint64_t>(plan.actions.size());
+    for (const ShadowPowClaimRecoveryAction& action : plan.actions) {
+        hasher << action.anchor;
+        hasher << action.generation_fingerprint;
+        hasher << action.component_fingerprint;
+        hasher << action.fee;
+        hasher << static_cast<bool>(action.transaction);
+        if (action.transaction) {
+            // Bind explicit consent to the exact unsigned preview bytes or
+            // exact persisted signed bytes, not merely to fee/anchor fields.
+            hasher << action.transaction->GetWitnessHash();
+        }
+        hasher << static_cast<uint8_t>(action.status);
+        hasher << action.persisted;
+        hasher << action.in_mempool;
+    }
+    hasher << static_cast<uint64_t>(plan.refused.size());
+    for (const ShadowPowClaimRecoveryAction& refused : plan.refused) {
+        hasher << refused.anchor;
+        hasher << refused.generation_fingerprint;
+        hasher << refused.component_fingerprint;
+        hasher << static_cast<uint8_t>(refused.component_state);
+        hasher << refused.reason_code;
+    }
+    return hasher.GetHash();
+}
+
+namespace {
+
+const char* RecoveryOriginString(ShadowPowClaimRecoveryOrigin origin)
+{
+    return origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC
+               ? SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC
+               : SHADOW_POW_RESOLUTION_ORIGIN_MANUAL;
+}
+
+bool IsResolutionNode(ShadowPowClaimRecoveryNodeKind kind)
+{
+    return kind == ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION ||
+           kind == ShadowPowClaimRecoveryNodeKind::LEGACY_RESOLUTION;
+}
+
+const ShadowPowClaimRecoveryNode* FindNode(
+    const ShadowPowClaimRecoveryComponent& component, const uint256& txid)
+{
+    const auto found = std::find_if(
+        component.nodes.begin(), component.nodes.end(),
+        [&](const ShadowPowClaimRecoveryNode& node) {
+            return node.txid == txid;
+        });
+    return found == component.nodes.end() ? nullptr : &*found;
+}
+
+bool ComponentSelected(const ShadowPowClaimRecoveryComponent& component,
+                       const std::set<uint256>& selectors)
+{
+    if (selectors.empty()) return true;
+    return std::any_of(component.nodes.begin(), component.nodes.end(),
+                       [&](const ShadowPowClaimRecoveryNode& node) {
+                           return selectors.count(node.txid) != 0;
+                       });
+}
+
+bool SafeClaimGraphForRecovery(
+    const ShadowPowClaimRecoveryComponent& component,
+    ShadowPowClaimRecoveryOrigin origin, std::string& reason)
+{
+    auto refuse = [&](const char* message) {
+        reason = message;
+        return false;
+    };
+    if (!component.anchor_authenticated || component.anchor.IsNull() ||
+        component.generation_fingerprint.IsNull()) {
+        return refuse("component has no authenticated confirmed wallet anchor");
+    }
+    if (!component.anchor_unspent) {
+        return refuse("confirmed anchor is already spent on the active chain");
+    }
+    if (component.claim_txids.empty()) {
+        return refuse("component contains no claim transactions");
+    }
+    if (!component.ordinary_or_mixed_txids.empty()) {
+        return refuse("component contains an ordinary, mixed, or malformed wallet transaction");
+    }
+    if (component.resolution_txids.size() > 1) {
+        return refuse("more than one wallet-known resolution spends this anchor generation");
+    }
+
+    size_t claims_seen{0};
+    for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
+        if (node.kind == ShadowPowClaimRecoveryNodeKind::CLAIM) {
+            ++claims_seen;
+            if (node.active_chain_confirmed) {
+                return refuse("a component claim is confirmed on the active chain");
+            }
+            if (node.in_mempool) {
+                return refuse("a component claim is still live in the local mempool");
+            }
+            if (!node.quarantined) {
+                return refuse("a component claim lacks persistent quarantine provenance");
+            }
+            if (!node.wallet_authored || !node.expected_shape) {
+                return refuse("a component claim is foreign, malformed, multi-input, or not wallet-authored");
+            }
+            if (!IsShadowPowClaimCurrentBranchTerminal(node.disposition)) {
+                return refuse("a component claim remains live, transient, or indeterminate on the pinned tip");
+            }
+            if (origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC &&
+                node.provenance !=
+                    ShadowPowClaimRecoveryProvenance::EXPLICIT_AUTHORED &&
+                node.provenance !=
+                    ShadowPowClaimRecoveryProvenance::EXPLICIT_ADOPTED) {
+                return refuse("automatic recovery requires explicit wallet-authored or adopted provenance");
+            }
+        } else if (node.kind == ShadowPowClaimRecoveryNodeKind::ORDINARY) {
+            return refuse("component contains an unsafe ordinary wallet node");
+        }
+    }
+    if (claims_seen != component.claim_txids.size()) {
+        return refuse("component claim graph is incomplete");
+    }
+    reason.clear();
+    return true;
+}
+
+bool SafeGraphForAdoption(const ShadowPowClaimRecoveryComponent& component,
+                          std::string& reason)
+{
+    if (!SafeClaimGraphForRecovery(
+            component, ShadowPowClaimRecoveryOrigin::MANUAL, reason)) {
+        return false;
+    }
+    if (!component.resolution_txids.empty()) {
+        reason = "a component with a resolution transaction cannot be adopted";
+        return false;
+    }
+    return true;
+}
+
+ShadowPowClaimRecoveryUsage BuildRecoveryUsageLocked(
+    const CWallet& wallet, const ShadowPowClaimRecoveryInventory& inventory,
+    uint32_t rolling_window_seconds)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    ShadowPowClaimRecoveryUsage usage;
+    int64_t now = GetTime();
+    std::map<uint256, ManagedResolutionFacts> managed_records;
+    for (const auto& [txid, wtx] : wallet.mapWallet) {
+        ManagedResolutionFacts facts;
+        if (!ParseManagedResolutionFacts(wallet, wtx, facts)) continue;
+        managed_records.emplace(txid, facts);
+        if (facts.origin == SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC) {
+            // A backward wall-clock jump must not reset persisted rate or fee
+            // authority. Hold logical time at least at the newest durable
+            // automatic action timestamp.
+            now = std::max(now, facts.created_time);
+        }
+    }
+    const int64_t window_start =
+        now - static_cast<int64_t>(rolling_window_seconds);
+    std::set<uint256> confirmed_managed;
+
+    for (const ShadowPowClaimRecoveryComponent& component : inventory.components) {
+        if (component.state ==
+            ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN) {
+            usage.reconciled_descendant_claims += component.descendant_claims;
+        }
+    }
+
+    // Managed facts outlive the current unconfirmed-claim inventory. This is
+    // essential when the original claim confirms first: the losing exact
+    // resolution still consumed one authorized action and fee exposure, even
+    // if no sibling claim remains to seed an inventory component.
+    for (const auto& [txid, facts] : managed_records) {
+        const CWalletTx& wtx = wallet.mapWallet.at(txid);
+        const bool automatic =
+            facts.origin == SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC;
+        if (wallet.GetTxDepthInMainChain(wtx) > 0) {
+            if (automatic) {
+                ++usage.confirmed_automatic;
+            } else {
+                ++usage.confirmed_manual;
+            }
+            usage.confirmed_resolution_fees += facts.fee;
+            confirmed_managed.insert(txid);
+        } else if (wtx.isUnconfirmed()) {
+            if (automatic) {
+                ++usage.pending_automatic;
+            } else {
+                ++usage.pending_manual;
+            }
+        }
+        if (automatic && facts.created_time >= window_start &&
+            facts.created_time <= now) {
+            ++usage.automatic_actions_in_window;
+            usage.automatic_fee_exposure_in_window += facts.fee;
+        }
+    }
+
+    std::set<uint256> recycled_claims;
+    for (const auto& [txid, wtx] : wallet.mapWallet) {
+        if (!wtx.tx || !TransactionHasShadowProof(*wtx.tx)) continue;
+        if (std::any_of(wtx.tx->vin.begin(), wtx.tx->vin.end(),
+                        [&](const CTxIn& input) {
+                            return confirmed_managed.count(
+                                       input.prevout.hash) != 0;
+                        })) {
+            recycled_claims.insert(txid);
+        }
+    }
+    usage.recycled_outputs = recycled_claims.size();
+    return usage;
+}
+
+ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
+    const CWallet& wallet, const ShadowPowClaimRecoveryRequest& request,
+    const ShadowPowClaimRecoveryPolicy* automatic_policy)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+
+    ShadowPowClaimRecoveryPlan plan;
+    plan.origin = request.origin;
+    plan.max_fee_per_resolution = request.max_fee_per_resolution;
+    plan.aggregate_batch_fee_cap = request.aggregate_batch_fee_cap;
+    if (request.fee_rate) {
+        plan.fee_rate_atoms_per_k = request.fee_rate->GetFeePerK();
+    }
+
+    const ShadowPowClaimRecoveryInventory inventory =
+        wallet.GetShadowPowClaimRecoveryInventoryLocked();
+    plan.active_tip = inventory.active_tip;
+    plan.active_height = inventory.active_height;
+    plan.wallet_generation = inventory.wallet_generation;
+    plan.wallet_tip_matches = inventory.wallet_tip_matches;
+    if (!inventory.wallet_tip_matches || inventory.active_tip.IsNull()) {
+        plan.complete = false;
+        plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+            plan, request.selectors);
+        return plan;
+    }
+
+    if (request.max_fee_per_resolution <= 0 ||
+        request.max_fee_per_resolution > wallet.m_default_max_tx_fee ||
+        request.aggregate_batch_fee_cap < request.max_fee_per_resolution ||
+        request.aggregate_batch_fee_cap <= 0) {
+        ShadowPowClaimRecoveryAction refused;
+        refused.reason_code = "invalid-fee-limits";
+        refused.detail = "invalid recovery fee limits";
+        plan.refused.push_back(std::move(refused));
+        plan.complete = true;
+        plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+            plan, request.selectors);
+        return plan;
+    }
+
+    ShadowPowClaimRecoveryUsage automatic_usage;
+    if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
+        if (!automatic_policy || !automatic_policy->HasAutomaticAuthority() ||
+            !ValidateShadowPowClaimRecoveryPolicy(*automatic_policy)) {
+            ShadowPowClaimRecoveryAction refused;
+            refused.reason_code = "automatic-authority-missing";
+            refused.detail = "automatic recovery has no valid persisted operator authority";
+            plan.refused.push_back(std::move(refused));
+            plan.complete = true;
+            plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+                plan, request.selectors);
+            return plan;
+        }
+        if (!wallet.m_pow_mining_enabled.load()) {
+            ShadowPowClaimRecoveryAction refused;
+            refused.reason_code = "miner-not-enabled";
+            refused.detail = "automatic recovery requires an already-enabled Gold Rush miner";
+            plan.refused.push_back(std::move(refused));
+            plan.complete = true;
+            plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+                plan, request.selectors);
+            return plan;
+        }
+        if (!wallet.GetBroadcastTransactions() ||
+            !wallet.chain().isReadyToBroadcast()) {
+            ShadowPowClaimRecoveryAction refused;
+            refused.reason_code = "chain-or-broadcast-unavailable";
+            refused.detail = "automatic recovery requires synchronized chain and wallet broadcast";
+            plan.refused.push_back(std::move(refused));
+            plan.complete = true;
+            plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+                plan, request.selectors);
+            return plan;
+        }
+        automatic_usage = BuildRecoveryUsageLocked(
+            wallet, inventory,
+            automatic_policy->rolling_fee_window_seconds);
+    }
+
+    std::set<uint256> selector_set{
+        request.selectors.begin(), request.selectors.end()};
+    std::set<uint256> matched_selectors;
+    CAmount new_automatic_fees{0};
+    size_t new_automatic_actions{0};
+    const CBlockIndex* pinned_tip =
+        wallet.chain().chainman().ActiveChain().Tip();
+    if (!pinned_tip || pinned_tip->GetBlockHash() != inventory.active_tip) {
+        plan.complete = false;
+        plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+            plan, request.selectors);
+        return plan;
+    }
+    // The preview and later execution must construct byte-identical unsigned
+    // transactions for one pinned tip. Wall-clock nTime would let the bytes
+    // change without changing chain or wallet state, defeating an exact plan
+    // acknowledgement. MTP+1 is deterministic for the tip and valid for a
+    // next-block ordinary transaction.
+    const uint32_t transaction_time = static_cast<uint32_t>(
+        std::min<int64_t>(std::numeric_limits<uint32_t>::max(),
+                          std::max<int64_t>(1,
+                              pinned_tip->GetMedianTimePast() + 1)));
+
+    for (const ShadowPowClaimRecoveryComponent& component :
+         inventory.components) {
+        if (!ComponentSelected(component, selector_set)) continue;
+        for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
+            if (selector_set.count(node.txid)) matched_selectors.insert(node.txid);
+        }
+
+        ShadowPowClaimRecoveryAction action;
+        action.anchor = component.anchor;
+        action.generation_fingerprint = component.generation_fingerprint;
+        action.component_fingerprint = component.fingerprint;
+        action.claim_txids = component.claim_txids;
+        action.descendant_claims = component.descendant_claims;
+        action.component_state = component.state;
+
+        std::string refusal;
+        if (!SafeClaimGraphForRecovery(component, request.origin, refusal)) {
+            action.reason_code = "component-not-safe";
+            action.detail = std::move(refusal);
+            plan.refused.push_back(std::move(action));
+            continue;
+        }
+
+        const ShadowPowClaimRecoveryNode* existing_node{nullptr};
+        if (!component.resolution_txids.empty()) {
+            existing_node = FindNode(component,
+                                     component.resolution_txids.front());
+            if (!existing_node || !IsResolutionNode(existing_node->kind)) {
+                action.detail = "wallet-known resolution metadata is incomplete";
+                action.reason_code = "resolution-metadata-invalid";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC &&
+                existing_node->kind ==
+                    ShadowPowClaimRecoveryNodeKind::LEGACY_RESOLUTION) {
+                action.detail = "legacy cleanup transactions require explicit manual relay";
+                action.reason_code = "legacy-manual-only";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC &&
+                (existing_node->resolution_origin !=
+                     SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC ||
+                 !existing_node->resolution_relay_authorized)) {
+                action.detail = "automatic recovery may retry only its own commit-authorized managed resolution";
+                action.reason_code = "automatic-cannot-promote-draft";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            const auto tx_it = wallet.mapWallet.find(existing_node->txid);
+            if (tx_it == wallet.mapWallet.end() || !tx_it->second.tx ||
+                tx_it->second.tx->vout.size() != 1) {
+                action.detail = "persisted resolution transaction is unavailable";
+                action.reason_code = "resolution-unavailable";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            action.transaction = tx_it->second.tx;
+            if (request.fee_rate) {
+                action.detail = "an explicit fee rate cannot modify an already-signed resolution";
+                action.reason_code = "fee-rate-cannot-modify-signed";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            action.fee = component.anchor_amount -
+                         action.transaction->vout.front().nValue;
+            action.persisted = true;
+            action.in_mempool = existing_node->in_mempool;
+            action.status =
+                existing_node->kind ==
+                        ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION
+                    ? ShadowPowClaimRecoveryActionStatus::REUSE_MANAGED
+                    : ShadowPowClaimRecoveryActionStatus::REUSE_LEGACY;
+        } else {
+            // A locked wallet may safely retry only an exact transaction that
+            // already has durable relay authority. It must never construct a
+            // new automatic spend.
+            if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC &&
+                (!wallet.HasPrivateKeys() ||
+                 wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) ||
+                 wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER) ||
+                 wallet.IsLocked() || wallet.m_wallet_unlock_staking_only)) {
+                action.detail = "automatic recovery requires normal local private-key wallet unlock to create a resolution";
+                action.reason_code = "wallet-signing-unavailable";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            CMutableTransaction candidate;
+            candidate.nVersion = CTransaction::CURRENT_VERSION;
+            candidate.nTime = transaction_time;
+            candidate.vin.emplace_back(component.anchor, CScript(),
+                                       std::numeric_limits<uint32_t>::max());
+            candidate.vout.emplace_back(component.anchor_amount,
+                                        component.anchor_script);
+
+            CCoinControl coin_control;
+            coin_control.m_allow_other_inputs = false;
+            coin_control.m_avoid_address_reuse = false;
+            coin_control.m_min_depth = 1;
+            if (request.fee_rate) {
+                coin_control.m_feerate = *request.fee_rate;
+                coin_control.fOverrideFeeRate = true;
+            }
+            const TxSize tx_size = CalculateMaximumSignedTxSize(
+                CTransaction(candidate), &wallet, &coin_control);
+            if (tx_size.vsize <= 0) {
+                action.detail = "wallet cannot estimate the signed resolution size";
+                action.reason_code = "fee-estimation-failed";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            const CFeeRate fee_rate = GetMinimumFeeRate(
+                wallet, coin_control, transaction_time);
+            if (request.fee_rate && fee_rate > *request.fee_rate) {
+                action.detail = "explicit fee rate is below the wallet minimum";
+                action.reason_code = "fee-rate-below-minimum";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            action.fee = std::max<CAmount>(
+                1, std::max(
+                       GetMinFee(static_cast<size_t>(tx_size.vsize),
+                                 transaction_time),
+                       fee_rate.GetFee(static_cast<uint32_t>(
+                           tx_size.vsize))));
+            if (action.fee >= component.anchor_amount ||
+                !MoneyRange(component.anchor_amount - action.fee)) {
+                action.detail = "resolution fee consumes the confirmed anchor";
+                action.reason_code = "fee-consumes-anchor";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            candidate.vout.front().nValue =
+                component.anchor_amount - action.fee;
+            if (IsDust(candidate.vout.front(),
+                       wallet.chain().relayDustFee())) {
+                action.detail = "resolution output would be dust";
+                action.reason_code = "resolution-output-dust";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            action.transaction = MakeTransactionRef(std::move(candidate));
+            action.status = ShadowPowClaimRecoveryActionStatus::READY;
+        }
+
+        if (action.fee <= 0 || action.fee > request.max_fee_per_resolution ||
+            action.fee > wallet.m_default_max_tx_fee) {
+            action.detail = "resolution fee exceeds the configured or wallet maximum";
+            action.reason_code = "fee-limit-exceeded";
+            plan.refused.push_back(std::move(action));
+            continue;
+        }
+        if (plan.total_fee > request.aggregate_batch_fee_cap - action.fee) {
+            action.detail = "aggregate batch fee cap would be exceeded";
+            action.reason_code = "batch-fee-cap-exceeded";
+            plan.refused.push_back(std::move(action));
+            continue;
+        }
+
+        if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC &&
+            !action.persisted) {
+            if (!component.stale_depth_known ||
+                component.minimum_stale_depth <
+                    static_cast<int>(automatic_policy->minimum_stale_blocks)) {
+                action.detail = "component has not satisfied the persisted stale-depth policy";
+                action.reason_code = "stale-depth-not-met";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            if (automatic_usage.automatic_actions_in_window +
+                    new_automatic_actions >=
+                automatic_policy->max_actions_per_window) {
+                action.detail = "automatic recovery action-rate budget is exhausted";
+                action.reason_code = "action-rate-exhausted";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            if (automatic_usage.automatic_fee_exposure_in_window +
+                    new_automatic_fees >
+                automatic_policy->rolling_fee_budget - action.fee) {
+                action.detail = "automatic recovery rolling fee budget is exhausted";
+                action.reason_code = "rolling-fee-budget-exhausted";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            ++new_automatic_actions;
+            new_automatic_fees += action.fee;
+        }
+
+        plan.total_fee += action.fee;
+        plan.actions.push_back(std::move(action));
+    }
+
+    for (const uint256& selector : selector_set) {
+        if (matched_selectors.count(selector) != 0) continue;
+        ShadowPowClaimRecoveryAction refused;
+        refused.reason_code = "selector-not-found";
+        refused.detail = "selector is not a claim or resolution in the current wallet graph";
+        refused.claim_txids.push_back(selector);
+        plan.refused.push_back(std::move(refused));
+    }
+
+    plan.complete = true;
+    plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(plan,
+                                                       request.selectors);
+    return plan;
+}
+
+} // namespace
+
+bool CWallet::PersistNewManagedShadowPowResolution(
+    const ShadowPowClaimRecoveryAction& action,
+    ShadowPowClaimRecoveryOrigin origin, bool relay_authorized,
+    int active_height, int64_t created_time, std::string& error)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_wallet);
+    if (m_shadow_pow_claim_recovery_db_ambiguous) {
+        error = "recovery database outcome is ambiguous; reload wallet before persistence";
+        return false;
+    }
+    if (!action.transaction || action.claim_txids.empty()) {
+        error = "resolution action has no transaction or claim provenance";
+        return false;
+    }
+    const uint256 txid = action.transaction->GetHash();
+    const auto existing = mapWallet.find(txid);
+    if (existing != mapWallet.end()) {
+        error = existing->second.tx->GetWitnessHash() ==
+                        action.transaction->GetWitnessHash()
+                    ? "resolution appeared before persistence; replan and validate its durable metadata"
+                    : "wallet contains different bytes for the resolution txid";
+        return false;
+    }
+
+    mapValue_t metadata;
+    metadata[SHADOW_POW_RESOLUTION_SCHEMA_KEY] =
+        SHADOW_POW_RESOLUTION_SCHEMA_VERSION;
+    metadata[SHADOW_POW_RESOLUTION_ANCHOR_TXID_KEY] =
+        action.anchor.hash.GetHex();
+    metadata[SHADOW_POW_RESOLUTION_ANCHOR_VOUT_KEY] =
+        ToString(action.anchor.n);
+    metadata[SHADOW_POW_RESOLUTION_FINGERPRINT_KEY] =
+        action.generation_fingerprint.GetHex();
+    metadata[SHADOW_POW_RESOLUTION_ORIGIN_KEY] =
+        RecoveryOriginString(origin);
+    metadata[SHADOW_POW_RESOLUTION_CREATED_HEIGHT_KEY] =
+        ToString(active_height);
+    metadata[SHADOW_POW_RESOLUTION_CREATED_TIME_KEY] =
+        ToString(created_time);
+    metadata[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] =
+        relay_authorized ? "1" : "0";
+    metadata[SHADOW_POW_LEGACY_CLEANUP_FOR_KEY] =
+        (*std::min_element(action.claim_txids.begin(),
+                           action.claim_txids.end())).GetHex();
+
+    WalletBatch batch(GetDatabase());
+    if (!batch.TxnBegin(/*durable=*/true)) {
+        error = "failed to begin durable resolution transaction update";
+        return false;
+    }
+    const int64_t old_order_pos_next = nOrderPosNext;
+    CWalletTx record(action.transaction, TxStateInactive{});
+    record.mapValue = std::move(metadata);
+    record.fTimeReceivedIsTxTime = true;
+    record.fFromMe = true;
+    record.nTimeReceived = GetTime();
+    record.nOrderPos = nOrderPosNext++;
+    record.nTimeSmart = ComputeTimeSmart(
+        record, /*rescanning_old_block=*/false);
+
+    if (!batch.WriteOrderPosNext(nOrderPosNext) ||
+        !batch.WriteTx(record)) {
+        nOrderPosNext = old_order_pos_next;
+        if (!batch.TxnAbort()) {
+            MarkShadowPowClaimRecoveryDatabaseAmbiguous();
+            error = "signed resolution write and rollback outcomes are ambiguous; reload the wallet";
+        } else {
+            error = "failed to durably write signed resolution transaction";
+        }
+        return false;
+    }
+    if (!batch.TxnCommit()) {
+        nOrderPosNext = old_order_pos_next;
+        batch.TxnAbort();
+        MarkShadowPowClaimRecoveryDatabaseAmbiguous();
+        error = "resolution database commit outcome is ambiguous; reload the wallet before retrying";
+        return false;
+    }
+
+    const auto [wallet_it, inserted] = mapWallet.emplace(
+        std::piecewise_construct, std::forward_as_tuple(txid),
+        std::forward_as_tuple(action.transaction, TxStateInactive{}));
+    if (!inserted) {
+        error = "resolution appeared in the wallet during durable persistence";
+        return false;
+    }
+    CWalletTx& committed = wallet_it->second;
+    committed.CopyFrom(record);
+    committed.m_it_wtxOrdered = wtxOrdered.insert(
+        std::make_pair(committed.nOrderPos, &committed));
+    AddToSpends(committed);
+    RefreshLiveUnspentStakeOutpoints(committed);
+    MaybeUpdateBirthTime(committed.GetTxTime());
+    committed.MarkDirty();
+    NotifyTransactionChanged(txid, CT_NEW);
+    const auto parent = mapWallet.find(action.anchor.hash);
+    if (parent != mapWallet.end()) {
+        parent->second.MarkDirty();
+        NotifyTransactionChanged(parent->first, CT_UPDATED);
+    }
+    return true;
+}
+
+bool CWallet::SetManagedShadowPowResolutionRelayAuthority(
+    const uint256& txid, bool authorized,
+    std::string& error)
+{
+    AssertLockHeld(cs_wallet);
+    if (m_shadow_pow_claim_recovery_db_ambiguous) {
+        error = "recovery database outcome is ambiguous; reload wallet before relay promotion";
+        return false;
+    }
+    const auto it = mapWallet.find(txid);
+    if (it == mapWallet.end() || !it->second.tx) {
+        error = "persisted managed resolution disappeared";
+        return false;
+    }
+    const auto schema = it->second.mapValue.find(
+        SHADOW_POW_RESOLUTION_SCHEMA_KEY);
+    if (schema == it->second.mapValue.end() ||
+        schema->second != SHADOW_POW_RESOLUTION_SCHEMA_VERSION) {
+        error = "legacy resolution has no managed relay-authority record";
+        return false;
+    }
+    const std::string desired = authorized ? "1" : "0";
+    const auto current = it->second.mapValue.find(
+        SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY);
+    if (current != it->second.mapValue.end() && current->second == desired) {
+        return true;
+    }
+
+    CWalletTx persisted(it->second.tx, it->second.m_state);
+    persisted.CopyFrom(it->second);
+    persisted.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] = desired;
+    WalletBatch batch(GetDatabase());
+    if (!batch.TxnBegin(/*durable=*/true)) {
+        error = "failed to begin durable managed-resolution relay-authority update";
+        return false;
+    }
+    if (!batch.WriteTx(persisted)) {
+        if (!batch.TxnAbort()) {
+            MarkShadowPowClaimRecoveryDatabaseAmbiguous();
+            error = "relay-authority write and rollback outcomes are ambiguous; reload the wallet";
+        } else {
+            error = "failed to write managed resolution relay authority";
+        }
+        return false;
+    }
+    if (!batch.TxnCommit()) {
+        batch.TxnAbort();
+        MarkShadowPowClaimRecoveryDatabaseAmbiguous();
+        error = "relay-authority commit outcome is ambiguous; reload the wallet before retrying";
+        return false;
+    }
+    it->second.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] = desired;
+    it->second.MarkDirty();
+    NotifyTransactionChanged(txid, CT_UPDATED);
+    return true;
+}
+
+ShadowPowClaimRecoveryPlan CWallet::PlanShadowPowClaimRecovery(
+    const ShadowPowClaimRecoveryRequest& request) const
+{
+    ShadowPowClaimRecoveryRequest effective = request;
+    std::optional<ShadowPowClaimRecoveryPolicy> automatic_policy;
+    if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
+        automatic_policy = GetShadowPowClaimRecoveryPolicy();
+        effective.max_fee_per_resolution =
+            automatic_policy->max_fee_per_resolution;
+        effective.aggregate_batch_fee_cap =
+            automatic_policy->aggregate_batch_fee_cap;
+    }
+    if (!HaveChain() || !chain().isReadyToBroadcast()) {
+        ShadowPowClaimRecoveryPlan plan;
+        plan.origin = effective.origin;
+        plan.max_fee_per_resolution = effective.max_fee_per_resolution;
+        plan.aggregate_batch_fee_cap = effective.aggregate_batch_fee_cap;
+        if (effective.fee_rate) {
+            plan.fee_rate_atoms_per_k = effective.fee_rate->GetFeePerK();
+        }
+        plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+            plan, effective.selectors);
+        return plan;
+    }
+    LOCK2(::cs_main, cs_wallet);
+    return BuildRecoveryPlanLocked(*this, effective,
+                                   automatic_policy
+                                       ? &*automatic_policy
+                                       : nullptr);
+}
+
+ShadowPowClaimRecoveryUsage CWallet::GetShadowPowClaimRecoveryUsage(
+    uint32_t rolling_window_seconds) const
+{
+    if (!HaveChain()) return {};
+    LOCK2(::cs_main, cs_wallet);
+    return BuildRecoveryUsageLocked(
+        *this, GetShadowPowClaimRecoveryInventoryLocked(),
+        rolling_window_seconds);
+}
+
+ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
+    const ShadowPowClaimRecoveryRequest& request)
+{
+    ShadowPowClaimRecoveryResult result;
+    if (!HaveChain()) {
+        result.error = "wallet has no chain interface";
+        return result;
+    }
+    if (!chain().isReadyToBroadcast()) {
+        result.error = "active chain is not synchronized and ready for recovery";
+        return result;
+    }
+    if (request.mode != ShadowPowClaimRecoveryMode::PREVIEW) {
+        if (request.origin == ShadowPowClaimRecoveryOrigin::MANUAL) {
+            const bool explicit_manual =
+                request.execution_authority ==
+                    ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL &&
+                request.acknowledge_fee_and_conflict_risk &&
+                request.expected_plan_id.has_value();
+            const bool persisted_retry =
+                request.execution_authority ==
+                    ShadowPowClaimRecoveryExecutionAuthority::PERSISTED_COMMIT &&
+                request.mode ==
+                    ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+            if (!explicit_manual && !persisted_retry) {
+                result.error = "manual recovery mutation requires an exact preview plan and explicit fee/conflict acknowledgement";
+                return result;
+            }
+        } else if (request.execution_authority !=
+                   ShadowPowClaimRecoveryExecutionAuthority::AUTOMATIC_POLICY) {
+            result.error = "automatic recovery mutation requires durable bounded policy authority";
+            return result;
+        }
+    }
+    ShadowPowClaimSubmissionGuard submission_guard(*this);
+    if (!submission_guard) {
+        result.error = "another Gold Rush claim or recovery action is already in progress";
+        return result;
+    }
+
+    ShadowPowClaimRecoveryRequest effective = request;
+    std::optional<ShadowPowClaimRecoveryPolicy> automatic_policy;
+    if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
+        automatic_policy = GetShadowPowClaimRecoveryPolicy();
+        effective.max_fee_per_resolution =
+            automatic_policy->max_fee_per_resolution;
+        effective.aggregate_batch_fee_cap =
+            automatic_policy->aggregate_batch_fee_cap;
+    }
+
+    std::vector<uint256> relay_txids;
+    std::set<uint256> relay_requires_unlock;
+    uint64_t post_persist_generation{0};
+    {
+        LOCK2(::cs_main, cs_wallet);
+        // The policy is re-read under the same wallet lock as planning so a
+        // concurrent revocation can never authorize another automatic sign or
+        // relay action.
+        if (effective.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
+            automatic_policy = m_shadow_pow_claim_recovery_policy;
+            effective.max_fee_per_resolution =
+                automatic_policy->max_fee_per_resolution;
+            effective.aggregate_batch_fee_cap =
+                automatic_policy->aggregate_batch_fee_cap;
+        }
+        if (m_shadow_pow_claim_recovery_db_ambiguous) {
+            result.error = "a prior recovery database commit had an ambiguous outcome; reload the wallet before any further recovery action";
+            return result;
+        }
+        result.plan = BuildRecoveryPlanLocked(
+            *this, effective,
+            automatic_policy ? &*automatic_policy : nullptr);
+        if (request.expected_plan_id &&
+            *request.expected_plan_id != result.plan.plan_id) {
+            result.stale_plan = true;
+            result.error = "recovery plan is stale; preview the current tip and wallet state again";
+            return result;
+        }
+        if (request.mode == ShadowPowClaimRecoveryMode::PREVIEW) {
+            result.success = result.plan.complete;
+            return result;
+        }
+        if (!result.plan.complete) {
+            result.error = "wallet and active-chain tips are not synchronized";
+            return result;
+        }
+        if (result.plan.actions.empty()) {
+            result.success = result.plan.refused.empty();
+            if (!result.success) {
+                result.error = "no selected claim component is currently safe to recover";
+            }
+            return result;
+        }
+        const bool needs_signing = std::any_of(
+            result.plan.actions.begin(), result.plan.actions.end(),
+            [](const ShadowPowClaimRecoveryAction& action) {
+                return action.status ==
+                       ShadowPowClaimRecoveryActionStatus::READY;
+            });
+        if (needs_signing &&
+            (IsLocked() || m_wallet_unlock_staking_only ||
+             !HasPrivateKeys() ||
+             IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) ||
+             IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER))) {
+            result.error = "normal local private-key wallet unlock is required to sign recovery transactions";
+            return result;
+        }
+
+        const uint256 pinned_tip = result.plan.active_tip;
+        const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
+        if (!tip || tip->GetBlockHash() != pinned_tip ||
+            m_last_block_processed != pinned_tip ||
+            GetDatabase().nUpdateCounter.load() !=
+                result.plan.wallet_generation) {
+            result.stale_plan = true;
+            result.error = "tip or wallet generation changed before recovery signing";
+            return result;
+        }
+
+        struct Prepared {
+            size_t action_index{0};
+            CTransactionRef transaction;
+            bool newly_signed{false};
+            bool managed{false};
+            bool relay_authorized{false};
+        };
+        std::vector<Prepared> prepared;
+        prepared.reserve(result.plan.actions.size());
+
+        const CCoinsViewCache& coins_tip =
+            chain().chainman().ActiveChainstate().CoinsTip();
+        const ShadowPowClaimRecoveryInventory execution_inventory =
+            GetShadowPowClaimRecoveryInventoryLocked();
+        for (size_t i = 0; i < result.plan.actions.size(); ++i) {
+            ShadowPowClaimRecoveryAction& action = result.plan.actions[i];
+            Coin anchor_coin;
+            if (!coins_tip.GetCoin(action.anchor, anchor_coin) ||
+                anchor_coin.IsSpent() ||
+                anchor_coin.out.nValue + 0 !=
+                    action.transaction->vout.front().nValue + action.fee ||
+                anchor_coin.out.scriptPubKey !=
+                    action.transaction->vout.front().scriptPubKey ||
+                (IsMine(anchor_coin.out) & ISMINE_SPENDABLE) == ISMINE_NO) {
+                result.stale_plan = true;
+                result.error = "confirmed recovery anchor changed before signing";
+                return result;
+            }
+
+            CTransactionRef exact = action.transaction;
+            bool newly_signed = action.status ==
+                                ShadowPowClaimRecoveryActionStatus::READY;
+            if (newly_signed) {
+                CMutableTransaction mutable_tx{*action.transaction};
+                std::map<int, bilingual_str> input_errors;
+                if (!SignTransaction(mutable_tx, input_errors)) {
+                    result.error = input_errors.empty()
+                                       ? "failed to sign recovery transaction"
+                                       : "failed to sign recovery transaction: " +
+                                             input_errors.begin()->second.original;
+                    return result;
+                }
+                exact = MakeTransactionRef(std::move(mutable_tx));
+                action.transaction = exact;
+            }
+
+            const ShadowPowClaimRecoveryNode* existing_node = nullptr;
+            if (action.persisted) {
+                const auto component_it = std::find_if(
+                    execution_inventory.components.begin(),
+                    execution_inventory.components.end(),
+                    [&](const ShadowPowClaimRecoveryComponent& component) {
+                        return component.anchor == action.anchor;
+                    });
+                if (component_it != execution_inventory.components.end()) {
+                    existing_node = FindNode(*component_it,
+                                             exact->GetHash());
+                }
+            }
+            const bool managed = newly_signed ||
+                (existing_node && existing_node->kind ==
+                    ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION);
+            bool relay_authorized = managed && existing_node &&
+                                     existing_node->resolution_relay_authorized;
+
+            if (request.execution_authority ==
+                    ShadowPowClaimRecoveryExecutionAuthority::PERSISTED_COMMIT &&
+                (newly_signed || !managed || !relay_authorized ||
+                 !existing_node ||
+                 existing_node->resolution_origin !=
+                     SHADOW_POW_RESOLUTION_ORIGIN_MANUAL)) {
+                result.error = "persisted-commit retry authority applies only to exact manual-origin managed bytes with durable relay consent";
+                return result;
+            }
+
+            if (!action.in_mempool) {
+                const MempoolAcceptResult accept =
+                    chain().chainman().ProcessTransaction(
+                        exact, /*test_accept=*/true);
+                if (accept.m_result_type !=
+                    MempoolAcceptResult::ResultType::VALID) {
+                    result.error = "resolution transaction is not acceptable on the pinned tip: " +
+                                   accept.m_state.ToString();
+                    return result;
+                }
+            }
+            prepared.push_back(
+                {i, exact, newly_signed, managed, relay_authorized});
+        }
+
+        const bool commit_authority =
+            request.mode ==
+            ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+        int64_t created_time = std::max<int64_t>(1, GetTime());
+        if (effective.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
+            // Automatic rate/fee accounting uses a rollback-resistant logical
+            // wallet clock. Persist new actions at least at the newest prior
+            // automatic action time so a backward host-clock jump cannot make
+            // fresh authority disappear from the rolling window.
+            for (const auto& [txid, wtx] : mapWallet) {
+                ManagedResolutionFacts facts;
+                if (ParseManagedResolutionFacts(*this, wtx, facts) &&
+                    facts.origin ==
+                        SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC) {
+                    created_time = std::max(created_time,
+                                            facts.created_time);
+                }
+            }
+        }
+        for (Prepared& item : prepared) {
+            ShadowPowClaimRecoveryAction& action =
+                result.plan.actions[item.action_index];
+            if (item.newly_signed) {
+                if (!PersistNewManagedShadowPowResolution(
+                        action, effective.origin, commit_authority,
+                        result.plan.active_height, created_time,
+                        result.error)) {
+                    // A failed or ambiguous durable commit never authorizes
+                    // relay. Reload/retry will discover and reuse exact bytes
+                    // if the database committed despite the error.
+                    return result;
+                }
+                action.persisted = true;
+                action.status = ShadowPowClaimRecoveryActionStatus::SIGNED_AND_PERSISTED;
+                ++result.signed_and_persisted;
+                item.relay_authorized = commit_authority;
+            } else if (commit_authority && item.managed &&
+                       !item.relay_authorized) {
+                // Promoting a SIGN_ONLY draft is a new spending consent and
+                // therefore still requires normal wallet unlock. A later
+                // retry of the already-authorized exact bytes does not.
+                if (IsLocked() || m_wallet_unlock_staking_only ||
+                    !HasPrivateKeys() ||
+                    IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) ||
+                    IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+                    result.error = "normal local private-key wallet unlock is required to authorize a signed recovery draft for relay";
+                    return result;
+                }
+                if (!SetManagedShadowPowResolutionRelayAuthority(
+                        item.transaction->GetHash(), true,
+                        result.error)) {
+                    return result;
+                }
+                relay_requires_unlock.insert(
+                    item.transaction->GetHash());
+                item.relay_authorized = true;
+            }
+
+            if (commit_authority) {
+                // A legacy transaction has no standing/scheduler authority,
+                // but this explicit manual call may relay its exact bytes.
+                if (!item.managed && effective.origin !=
+                                         ShadowPowClaimRecoveryOrigin::MANUAL) {
+                    result.error = "legacy resolution relay requires manual authority";
+                    return result;
+                }
+                relay_txids.push_back(item.transaction->GetHash());
+                if (item.newly_signed || !item.managed ||
+                    !item.relay_authorized) {
+                    relay_requires_unlock.insert(
+                        item.transaction->GetHash());
+                }
+            }
+        }
+        post_persist_generation = GetDatabase().nUpdateCounter.load();
+    }
+
+    // No outer cs_wallet is held while validation or networking runs. Each
+    // relay takes cs_main, briefly checks the exact durable record and policy,
+    // releases cs_wallet, then broadcasts while the active tip remains pinned.
+    for (size_t relay_index = 0; relay_index < relay_txids.size();
+         ++relay_index) {
+        const uint256& txid = relay_txids[relay_index];
+        LOCK(::cs_main);
+        const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
+        if (!tip || tip->GetBlockHash() != result.plan.active_tip) {
+            result.stale_plan = true;
+            result.error = "active tip changed after persistence; signed bytes remain safely stored";
+            return result;
+        }
+        bool already_in_mempool{false};
+        {
+            LOCK(cs_wallet);
+            if (m_last_block_processed != result.plan.active_tip ||
+                GetDatabase().nUpdateCounter.load() !=
+                    post_persist_generation) {
+                result.stale_plan = true;
+                result.error = "wallet generation changed after persistence; signed bytes remain safely stored";
+                return result;
+            }
+            if (m_shadow_pow_claim_recovery_db_ambiguous) {
+                result.error = "recovery database outcome became ambiguous before relay; reload the wallet";
+                return result;
+            }
+            const auto it = mapWallet.find(txid);
+            if (it == mapWallet.end() || !it->second.tx) {
+                result.error = "durably persisted resolution is missing from memory";
+                return result;
+            }
+            const bool managed = it->second.mapValue.count(
+                                     SHADOW_POW_RESOLUTION_SCHEMA_KEY) != 0;
+            const bool relay_authorized =
+                it->second.mapValue.find(
+                    SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY) !=
+                    it->second.mapValue.end() &&
+                it->second.mapValue.at(
+                    SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY) == "1";
+            if (managed && !relay_authorized) {
+                result.error = "signed recovery draft has no durable relay authority";
+                return result;
+            }
+            if (effective.origin ==
+                ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
+                if (!automatic_policy ||
+                    !(m_shadow_pow_claim_recovery_policy == *automatic_policy) ||
+                    !m_shadow_pow_claim_recovery_policy.HasAutomaticAuthority() ||
+                    !ValidateShadowPowClaimRecoveryPolicy(
+                        m_shadow_pow_claim_recovery_policy) ||
+                    !m_pow_mining_enabled.load()) {
+                    result.error = "automatic recovery authority was revoked before relay";
+                    return result;
+                }
+            }
+            if (relay_requires_unlock.count(txid) != 0 &&
+                (IsLocked() || m_wallet_unlock_staking_only ||
+                 !HasPrivateKeys() ||
+                 IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) ||
+                 IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER))) {
+                result.error = "normal local private-key wallet unlock ended before relay; exact authorized bytes remain persisted";
+                return result;
+            }
+            already_in_mempool = it->second.InMempool();
+        }
+        if (already_in_mempool) {
+            ++result.already_in_mempool;
+            continue;
+        }
+        std::string relay_error;
+        ShadowPowClaimRecoveryBroadcastGuard broadcast_guard;
+        broadcast_guard.expected_wallet_generation =
+            post_persist_generation;
+        broadcast_guard.expected_wallet_tip = result.plan.active_tip;
+        broadcast_guard.require_normal_unlock =
+            relay_requires_unlock.count(txid) != 0;
+        if (effective.origin ==
+            ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
+            broadcast_guard.expected_automatic_policy = automatic_policy;
+            broadcast_guard.require_pow_mining_enabled = true;
+        }
+        if (!SubmitTxMemoryPoolAndRelay(
+                txid, relay_error, /*relay=*/true, &broadcast_guard)) {
+            result.error = "signed resolution was retained but relay failed: " +
+                           relay_error;
+            return result;
+        }
+        ++result.broadcast;
+        // A successful relay can synchronously mutate wallet/mempool state.
+        // Do not infer that every resulting DB-generation change was ours.
+        // Leave the rest durably commit-authorized for a fresh, fully pinned
+        // scheduler pass instead of silently rebasing the generation gate.
+        result.relay_deferred = relay_txids.size() - relay_index - 1;
+        break;
+    }
+
+    result.success = true;
+    return result;
+}
+
+bool CWallet::AdoptShadowPowClaimRecoveryComponent(
+    const uint256& selector, const uint256& expected_tip,
+    const uint256& expected_component_fingerprint, bilingual_str& error)
+{
+    if (!HaveChain()) {
+        error = _("Wallet has no active chain interface.");
+        return false;
+    }
+    LOCK2(::cs_main, cs_wallet);
+    if (m_shadow_pow_claim_recovery_db_ambiguous) {
+        error = _("A prior recovery database commit had an ambiguous outcome; reload the wallet before adoption.");
+        return false;
+    }
+    if (IsLocked() || m_wallet_unlock_staking_only || !HasPrivateKeys() ||
+        IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) ||
+        IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+        error = _("Normal local private-key wallet unlock is required before adopting historical claims.");
+        return false;
+    }
+    const ShadowPowClaimRecoveryInventory inventory =
+        GetShadowPowClaimRecoveryInventoryLocked();
+    if (!inventory.wallet_tip_matches || inventory.active_tip != expected_tip) {
+        error = _("Active or wallet-processed tip changed; review the component again.");
+        return false;
+    }
+    const auto component_it = std::find_if(
+        inventory.components.begin(), inventory.components.end(),
+        [&](const ShadowPowClaimRecoveryComponent& component) {
+            return std::any_of(
+                component.nodes.begin(), component.nodes.end(),
+                [&](const ShadowPowClaimRecoveryNode& node) {
+                    return node.txid == selector;
+                });
+        });
+    if (component_it == inventory.components.end() ||
+        component_it->fingerprint != expected_component_fingerprint) {
+        error = _("Recovery component changed or selector is no longer present; review it again.");
+        return false;
+    }
+    std::string refusal;
+    if (!SafeGraphForAdoption(*component_it, refusal)) {
+        error = Untranslated("Component cannot be adopted: " + refusal);
+        return false;
+    }
+
+    struct AdoptionUpdate {
+        uint256 txid;
+        mapValue_t metadata;
+    };
+    std::vector<AdoptionUpdate> updates;
+    updates.reserve(component_it->claim_txids.size());
+    WalletBatch batch(GetDatabase());
+    if (!batch.TxnBegin(/*durable=*/true)) {
+        error = _("Failed to begin durable claim-component adoption.");
+        return false;
+    }
+    for (const uint256& txid : component_it->claim_txids) {
+        const auto it = mapWallet.find(txid);
+        if (it == mapWallet.end() || !it->second.tx) {
+            if (!batch.TxnAbort()) {
+                MarkShadowPowClaimRecoveryDatabaseAmbiguous();
+                error = _("Claim adoption rollback outcome is ambiguous; reload the wallet.");
+            } else {
+                error = _("A claim disappeared while its component was being adopted.");
+            }
+            return false;
+        }
+        CWalletTx persisted(it->second.tx, it->second.m_state);
+        persisted.CopyFrom(it->second);
+        persisted.mapValue[SHADOW_POW_CLAIM_ADOPTED_KEY] = "1";
+        persisted.mapValue[SHADOW_POW_CLAIM_ADOPTION_TIP_KEY] =
+            expected_tip.GetHex();
+        persisted.mapValue[SHADOW_POW_CLAIM_ADOPTION_FINGERPRINT_KEY] =
+            component_it->generation_fingerprint.GetHex();
+        if (!batch.WriteTx(persisted)) {
+            if (!batch.TxnAbort()) {
+                MarkShadowPowClaimRecoveryDatabaseAmbiguous();
+                error = _("Claim adoption write and rollback outcomes are ambiguous; reload the wallet.");
+            } else {
+                error = _("Failed to persist complete claim-component adoption.");
+            }
+            return false;
+        }
+        updates.push_back({txid, std::move(persisted.mapValue)});
+    }
+    if (!batch.TxnCommit()) {
+        batch.TxnAbort();
+        MarkShadowPowClaimRecoveryDatabaseAmbiguous();
+        error = _("Claim-component adoption commit outcome is ambiguous; reload the wallet before retrying.");
+        return false;
+    }
+    // Publish all metadata to memory only after the one durable batch commits.
+    for (AdoptionUpdate& update : updates) {
+        CWalletTx& wtx = mapWallet.at(update.txid);
+        wtx.mapValue = std::move(update.metadata);
+        wtx.MarkDirty();
+        NotifyTransactionChanged(update.txid, CT_UPDATED);
+    }
+    error.clear();
+    return true;
+}
+
+void CWallet::MaybeAutoResolveShadowPowClaims()
+{
+    // A prior explicit COMMIT is durable standing authority to retry those
+    // exact bytes even while the wallet is locked and independently of the
+    // optional automatic-creation policy. It never authorizes a new spend or
+    // promotes a SIGN_ONLY draft.
+    ShadowPowClaimRecoveryRequest manual_retry;
+    manual_retry.mode =
+        ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+    manual_retry.origin = ShadowPowClaimRecoveryOrigin::MANUAL;
+    manual_retry.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::PERSISTED_COMMIT;
+    // The exact bytes already carry durable per-transaction consent. Do not
+    // strand a previously authorized manual resolution merely because the
+    // scheduler request object's preview defaults are lower than the fee the
+    // operator reviewed. Creation still could never exceed the wallet max.
+    manual_retry.max_fee_per_resolution = m_default_max_tx_fee;
+    manual_retry.aggregate_batch_fee_cap = MAX_MONEY;
+    if (HaveChain() && chain().isReadyToBroadcast()) {
+        const ShadowPowClaimRecoveryInventory inventory =
+            GetShadowPowClaimRecoveryInventory();
+        for (const ShadowPowClaimRecoveryComponent& component :
+             inventory.components) {
+            for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
+                if (node.kind ==
+                        ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION &&
+                    node.resolution_metadata_valid &&
+                    node.resolution_origin ==
+                        SHADOW_POW_RESOLUTION_ORIGIN_MANUAL &&
+                    node.resolution_relay_authorized &&
+                    !node.active_chain_confirmed && !node.in_mempool) {
+                    manual_retry.selectors.push_back(node.txid);
+                }
+            }
+        }
+    }
+    if (!manual_retry.selectors.empty()) {
+        const ShadowPowClaimRecoveryResult retry =
+            ResolveShadowPowClaims(manual_retry);
+        if (!retry.success) {
+            WalletLogPrintf("Commit-authorized manual Gold Rush recovery retry paused: %s\n",
+                            retry.error);
+        }
+    }
+
+    const ShadowPowClaimRecoveryPolicy policy =
+        GetShadowPowClaimRecoveryPolicy();
+    if (!policy.HasAutomaticAuthority() ||
+        !ValidateShadowPowClaimRecoveryPolicy(policy) ||
+        !m_pow_mining_enabled.load()) {
+        return;
+    }
+    ShadowPowClaimRecoveryRequest request;
+    request.mode = ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+    request.origin = ShadowPowClaimRecoveryOrigin::AUTOMATIC;
+    request.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::AUTOMATIC_POLICY;
+    request.max_fee_per_resolution = policy.max_fee_per_resolution;
+    request.aggregate_batch_fee_cap = policy.aggregate_batch_fee_cap;
+    const ShadowPowClaimRecoveryResult result = ResolveShadowPowClaims(request);
+    if (!result.success || !result.plan.refused.empty()) {
+        const std::string reason = !result.error.empty()
+            ? result.error
+            : (!result.plan.refused.empty()
+                   ? result.plan.refused.front().reason_code + ": " +
+                         result.plan.refused.front().detail
+                   : "no actionable component");
+        WalletLogPrintf("Automatic Gold Rush PoW claim recovery paused: %s\n",
+                        reason);
+    } else if (result.broadcast != 0 || result.already_in_mempool != 0) {
+        WalletLogPrintf("Automatic Gold Rush PoW claim recovery relayed %u exact persisted transaction(s); %u already in mempool; miner enablement unchanged\n",
+                        result.broadcast, result.already_in_mempool);
+    }
 }
 
 } // namespace wallet

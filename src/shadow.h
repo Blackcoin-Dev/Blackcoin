@@ -505,6 +505,48 @@ enum class ShadowProofValidationResult {
     LOCAL_INTERNAL_ERROR,
 };
 
+/** Typed mempool-policy disposition for one fee-paying Gold Rush PoW claim.
+ *
+ * This is intentionally more specific than ShadowProofValidationResult. The
+ * latter remains the validation/control-flow result, while this enum lets
+ * wallet recovery distinguish deterministic claim failures from conditions
+ * that can clear at another tip or after local state repair without parsing a
+ * user-facing reject string.
+ */
+enum class ShadowPowClaimMempoolDisposition : uint8_t {
+    ELIGIBLE,
+    INACTIVE,
+    HEIGHT_BEFORE_WINDOW,
+    HEIGHT_AFTER_WINDOW,
+    INVALID_LOCATION,
+    MALFORMED,
+    DUPLICATE,
+    WRONG_MODE,
+    UNKNOWN_MODE,
+    UNSUPPORTED_VERSION,
+    INVALID_PROOF,
+    ORIGIN_MISMATCH,
+    ORIGIN_EXPIRED,
+    INPUT_MISMATCH,
+    ALREADY_ACCOUNTED,
+    CAPACITY_LIMIT,
+    EVALUATION_LIMIT,
+    LOCAL_STATE_ERROR,
+};
+
+/** Return true when the claim cannot become eligible on a descendant of the
+ * currently validated branch. ORIGIN_MISMATCH and ALREADY_ACCOUNTED are
+ * branch-relative: callers must revalidate after every reorg before acting.
+ */
+bool IsShadowPowClaimCurrentBranchTerminal(
+    ShadowPowClaimMempoolDisposition disposition);
+
+/** Return true for a disposition that can clear at a later tip or after local
+ * state repair and therefore must never authorize a conflicting recovery
+ * spend by itself. */
+bool IsShadowPowClaimMempoolRetryable(
+    ShadowPowClaimMempoolDisposition disposition);
+
 /** Typed result for a bounded PoW nonce search. */
 enum class ShadowPowGrindResult {
     FOUND,
@@ -618,7 +660,11 @@ std::vector<ShadowProofObservation> GetShadowProofObservations(
     ShadowProofObservationSummary& summary);
 bool TransactionHasShadowProof(const CTransaction& tx);
 bool TransactionHasShadowSignal(const CTransaction& tx);
-ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);
+ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
+    const CTransaction& tx, const CBlockIndex* pindexPrev,
+    const CCoinsViewCache& view, bool gold_rush_active,
+    std::string& reject_reason,
+    ShadowPowClaimMempoolDisposition* disposition_out = nullptr);
 bool CheckShadowPowClaimForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);
 bool CheckShadowSignalForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev,
                                  const CCoinsViewCache& view, bool gold_rush_active,

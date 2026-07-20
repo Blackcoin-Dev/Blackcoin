@@ -6750,35 +6750,131 @@ bool CheckShadowSignalForMempool(const CTransaction& tx, const CBlockIndex* pind
     return true;
 }
 
-ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason)
+bool IsShadowPowClaimCurrentBranchTerminal(
+    ShadowPowClaimMempoolDisposition disposition)
 {
-    if (!TransactionHasShadowProof(tx)) return ShadowProofValidationResult::VALID;
-    if (!gold_rush_active || !pindexPrev) {
-        reject_reason = "shadow-proof-inactive";
-        return ShadowProofValidationResult::INVALID;
+    switch (disposition) {
+    case ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW:
+    case ShadowPowClaimMempoolDisposition::INVALID_LOCATION:
+    case ShadowPowClaimMempoolDisposition::MALFORMED:
+    case ShadowPowClaimMempoolDisposition::DUPLICATE:
+    case ShadowPowClaimMempoolDisposition::WRONG_MODE:
+    case ShadowPowClaimMempoolDisposition::UNKNOWN_MODE:
+    case ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION:
+    case ShadowPowClaimMempoolDisposition::INVALID_PROOF:
+    case ShadowPowClaimMempoolDisposition::ORIGIN_MISMATCH:
+    case ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED:
+    case ShadowPowClaimMempoolDisposition::INPUT_MISMATCH:
+    case ShadowPowClaimMempoolDisposition::ALREADY_ACCOUNTED:
+        return true;
+    case ShadowPowClaimMempoolDisposition::ELIGIBLE:
+    case ShadowPowClaimMempoolDisposition::INACTIVE:
+    case ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW:
+    case ShadowPowClaimMempoolDisposition::CAPACITY_LIMIT:
+    case ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT:
+    case ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR:
+        return false;
+    }
+    return false;
+}
+
+bool IsShadowPowClaimMempoolRetryable(
+    ShadowPowClaimMempoolDisposition disposition)
+{
+    switch (disposition) {
+    case ShadowPowClaimMempoolDisposition::INACTIVE:
+    case ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW:
+    case ShadowPowClaimMempoolDisposition::CAPACITY_LIMIT:
+    case ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT:
+    case ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR:
+        return true;
+    case ShadowPowClaimMempoolDisposition::ELIGIBLE:
+    case ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW:
+    case ShadowPowClaimMempoolDisposition::INVALID_LOCATION:
+    case ShadowPowClaimMempoolDisposition::MALFORMED:
+    case ShadowPowClaimMempoolDisposition::DUPLICATE:
+    case ShadowPowClaimMempoolDisposition::WRONG_MODE:
+    case ShadowPowClaimMempoolDisposition::UNKNOWN_MODE:
+    case ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION:
+    case ShadowPowClaimMempoolDisposition::INVALID_PROOF:
+    case ShadowPowClaimMempoolDisposition::ORIGIN_MISMATCH:
+    case ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED:
+    case ShadowPowClaimMempoolDisposition::INPUT_MISMATCH:
+    case ShadowPowClaimMempoolDisposition::ALREADY_ACCOUNTED:
+        return false;
+    }
+    return false;
+}
+
+ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
+    const CTransaction& tx, const CBlockIndex* pindexPrev,
+    const CCoinsViewCache& view, bool gold_rush_active,
+    std::string& reject_reason,
+    ShadowPowClaimMempoolDisposition* disposition_out)
+{
+    const auto finish = [&](ShadowProofValidationResult result,
+                            ShadowPowClaimMempoolDisposition disposition,
+                            const char* reason = nullptr) {
+        if (disposition_out) *disposition_out = disposition;
+        if (reason) reject_reason = reason;
+        return result;
+    };
+
+    if (!TransactionHasShadowProof(tx)) {
+        return finish(ShadowProofValidationResult::VALID,
+                      ShadowPowClaimMempoolDisposition::ELIGIBLE);
+    }
+    if (!pindexPrev) {
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR,
+                      "shadow-proof-inactive");
+    }
+    const int height = pindexPrev->nHeight + 1;
+    if (!gold_rush_active) {
+        // Keep the historical reject string and control-flow result, but do
+        // not collapse a permanently closed reward-height window into a
+        // retryable phase condition. Recovery decisions consume the typed
+        // disposition and remain pinned to this exact branch tip.
+        const ShadowPowClaimMempoolDisposition inactive_disposition =
+            height < SHADOW_REWARD_START_HEIGHT
+                ? ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW
+                : height > SHADOW_REWARD_END_HEIGHT
+                    ? ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW
+                    : ShadowPowClaimMempoolDisposition::INACTIVE;
+        return finish(ShadowProofValidationResult::INVALID,
+                      inactive_disposition,
+                      "shadow-proof-inactive");
     }
     if (tx.IsCoinBase() || tx.IsCoinStake()) {
-        reject_reason = "shadow-proof-invalid-location";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::INVALID_LOCATION,
+                      "shadow-proof-invalid-location");
     }
 
-    const int height = pindexPrev->nHeight + 1;
-    if (height < SHADOW_REWARD_START_HEIGHT || height > SHADOW_REWARD_END_HEIGHT) {
-        reject_reason = "shadow-proof-height";
-        return ShadowProofValidationResult::INVALID;
+    if (height < SHADOW_REWARD_START_HEIGHT) {
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW,
+                      "shadow-proof-height");
+    }
+    if (height > SHADOW_REWARD_END_HEIGHT) {
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW,
+                      "shadow-proof-height");
     }
 
     bool pool_state_valid{true};
     ShadowPoolState pool = ReadPool(view, &pool_state_valid);
     if (!pool_state_valid) {
-        reject_reason = "shadow-proof-pool-state";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR,
+                      "shadow-proof-pool-state");
     }
     const CAmount reward = ShadowBaseReward(height);
     const auto next_pow_amount = CheckedAddMoney(pool.pow_amount, reward / 2);
     if (!next_pow_amount) {
-        reject_reason = "shadow-proof-pool-overflow";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::CAPACITY_LIMIT,
+                      "shadow-proof-pool-overflow");
     }
     pool.pow_amount = *next_pow_amount;
 
@@ -6787,9 +6883,15 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
         const auto proof = ExtractProofPayload(out.scriptPubKey);
         if (proof) proofs.push_back(*proof);
     }
-    if (proofs.size() != 1) {
-        reject_reason = "shadow-proof-duplicate";
-        return ShadowProofValidationResult::INVALID;
+    if (proofs.empty()) {
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::MALFORMED,
+                      "shadow-proof-duplicate");
+    }
+    if (proofs.size() > 1) {
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::DUPLICATE,
+                      "shadow-proof-duplicate");
     }
 
     const Consensus::Params& consensus = Params().GetConsensus();
@@ -6799,26 +6901,34 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
     const ShadowProofPayloadMode payload_mode =
         ClassifyProofPayloadMode(proofs.front(), require_qqp4);
     if (payload_mode == ShadowProofPayloadMode::POS) {
-        reject_reason = "shadow-proof-wrong-mode-pos";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::WRONG_MODE,
+                      "shadow-proof-wrong-mode-pos");
     }
     if (payload_mode == ShadowProofPayloadMode::UNKNOWN) {
-        reject_reason = "shadow-proof-unknown-mode";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::UNKNOWN_MODE,
+                      "shadow-proof-unknown-mode");
     }
-
     // v30.1.0 did not recognize QQP4 magic at all. Preserve its policy
     // surface before the fork rather than turning a future-format carrier
     // into a distinct "version" rejection.
     if (!require_qqp4 && IsQQP4ProofPayload(proofs.front())) {
-        reject_reason = "shadow-proof-invalid";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION,
+                      "shadow-proof-invalid");
+    }
+    if (payload_mode == ShadowProofPayloadMode::MALFORMED) {
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::MALFORMED,
+                      "shadow-proof-invalid");
     }
 
     ShadowProof decoded_shape;
     if (!DecodeProof(proofs.front(), decoded_shape)) {
-        reject_reason = "shadow-proof-invalid";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::MALFORMED,
+                      "shadow-proof-invalid");
     }
 
     if ((require_qqp4 &&
@@ -6826,8 +6936,9 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
           !decoded_shape.input_bound || decoded_shape.claim_outpoint.IsNull())) ||
         (!require_qqp4 &&
          (decoded_shape.version == 4 || decoded_shape.input_bound))) {
-        reject_reason = "shadow-proof-version";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION,
+                      "shadow-proof-version");
     }
 
     int proof_height = height;
@@ -6842,22 +6953,25 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
                   static_cast<int>(decoded_shape.origin_height));
         if (!origin_format_active ||
             decoded_shape.origin_height > static_cast<uint32_t>(height)) {
-            reject_reason = "shadow-proof-origin-mismatch";
-            return ShadowProofValidationResult::INVALID;
+            return finish(ShadowProofValidationResult::INVALID,
+                          ShadowPowClaimMempoolDisposition::ORIGIN_MISMATCH,
+                          "shadow-proof-origin-mismatch");
         }
         const uint32_t age = static_cast<uint32_t>(height) -
                              decoded_shape.origin_height;
         if (age > SHADOW_POW_LATE_ORIGIN_WINDOW) {
-            reject_reason = "shadow-proof-origin-expired";
-            return ShadowProofValidationResult::INVALID;
+            return finish(ShadowProofValidationResult::INVALID,
+                          ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED,
+                          "shadow-proof-origin-expired");
         }
         const CBlockIndex* origin_parent = SafeGetAncestor(
             pindexPrev, static_cast<int>(decoded_shape.origin_height) - 1);
         if (!origin_parent ||
             origin_parent->GetBlockHash() !=
                 decoded_shape.origin_previous_block_hash) {
-            reject_reason = "shadow-proof-origin-mismatch";
-            return ShadowProofValidationResult::INVALID;
+            return finish(ShadowProofValidationResult::INVALID,
+                          ShadowPowClaimMempoolDisposition::ORIGIN_MISMATCH,
+                          "shadow-proof-origin-mismatch");
         }
         proof_height = static_cast<int>(decoded_shape.origin_height);
         proof_previous_block_hash = decoded_shape.origin_previous_block_hash;
@@ -6867,15 +6981,19 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
             const std::optional<ShadowPoolUndoState> origin_undo =
                 ReadAuthenticatedPoolUndo(view, origin_block, consensus);
             if (!origin_undo) {
-                reject_reason = "local-shadow-proof-origin-state";
-                return ShadowProofValidationResult::LOCAL_INTERNAL_ERROR;
+                return finish(
+                    ShadowProofValidationResult::LOCAL_INTERNAL_ERROR,
+                    ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR,
+                    "local-shadow-proof-origin-state");
             }
             ShadowPoolState origin_pool = origin_undo->previous;
             const auto origin_pow_amount = CheckedAddMoney(
                 origin_pool.pow_amount, ShadowBaseReward(proof_height) / 2);
             if (!origin_pow_amount) {
-                reject_reason = "local-shadow-proof-origin-state";
-                return ShadowProofValidationResult::LOCAL_INTERNAL_ERROR;
+                return finish(
+                    ShadowProofValidationResult::LOCAL_INTERNAL_ERROR,
+                    ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR,
+                    "local-shadow-proof-origin-state");
             }
             origin_pool.pow_amount = *origin_pow_amount;
             proof_target_bits = RetargetedBits(
@@ -6891,14 +7009,19 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
         consensus.IsShadowQQP4Active(proof_height),
         decoded, proof_evals, proof_limit_exceeded);
     if (proof_limit_exceeded) {
-        reject_reason = "shadow-proof-limit";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT,
+                      "shadow-proof-limit");
     }
     if (status != ShadowProofValidationResult::VALID) {
-        reject_reason = status == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR
-            ? "local-shadow-proof-error"
-            : "shadow-proof-invalid";
-        return status;
+        return finish(
+            status,
+            status == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR
+                ? ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR
+                : ShadowPowClaimMempoolDisposition::INVALID_PROOF,
+            status == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR
+                ? "local-shadow-proof-error"
+                : "shadow-proof-invalid");
     }
 
     const CScript canonical_target = CanonicalLegacyStakeScript(decoded.target);
@@ -6924,25 +7047,30 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
         }
     }
     if (!spends_target) {
-        reject_reason = "shadow-proof-input-mismatch";
-        return ShadowProofValidationResult::INVALID;
+        return finish(ShadowProofValidationResult::INVALID,
+                      ShadowPowClaimMempoolDisposition::INPUT_MISMATCH,
+                      "shadow-proof-input-mismatch");
     }
 
     if (consensus.IsShadowCompetingClaimsActive(height)) {
         std::set<uint256> recent_logical_proofs;
         if (!ReadRecentLogicalProofs(view, pindexPrev, consensus,
                                      recent_logical_proofs)) {
-            reject_reason = "local-shadow-proof-accounting-state";
-            return ShadowProofValidationResult::LOCAL_INTERNAL_ERROR;
+            return finish(
+                ShadowProofValidationResult::LOCAL_INTERNAL_ERROR,
+                ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR,
+                "local-shadow-proof-accounting-state");
         }
         const uint256 logical_proof_id = LogicalPowProofId(proofs.front());
         if (recent_logical_proofs.count(logical_proof_id) != 0) {
-            reject_reason = "shadow-proof-already-accounted";
-            return ShadowProofValidationResult::INVALID;
+            return finish(ShadowProofValidationResult::INVALID,
+                          ShadowPowClaimMempoolDisposition::ALREADY_ACCOUNTED,
+                          "shadow-proof-already-accounted");
         }
     }
 
-    return ShadowProofValidationResult::VALID;
+    return finish(ShadowProofValidationResult::VALID,
+                  ShadowPowClaimMempoolDisposition::ELIGIBLE);
 }
 
 bool CheckShadowPowClaimForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason)

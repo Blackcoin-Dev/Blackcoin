@@ -182,6 +182,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "createshadowpowclaimresolution", 1, "dry_run" },
     { "createshadowpowclaimresolution", 2, "acknowledge_fee_and_conflict_risk" },
     { "createshadowpowclaimresolution", 3, "fee_rate" },
+    { "setpowclaimrecovery", 1, "options" },
     { "getnewquantumstakeaddress", 1, "unbonding_blocks" },
     { "getnewquantumcoldstakingaddress", 2, "options" },
     { "submitquantumpoolclaim", 1, "delegations" },

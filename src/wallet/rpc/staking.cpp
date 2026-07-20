@@ -25,6 +25,7 @@
 #include <wallet/quantum_stake_ops.h>
 #include <wallet/rpc/util.h>
 #include <wallet/rpc/staking.h>
+#include <wallet/shadow_pow_claim_recovery.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
 #include <wallet/redelegation.h>
@@ -41,6 +42,7 @@
 #include <univalue.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <limits>
 #include <map>
@@ -2372,6 +2374,185 @@ static RPCHelpMan checkkernel()
     };
 }
 
+static UniValue ShadowPowClaimRecoveryPolicyToJSON(
+    const ShadowPowClaimRecoveryPolicy& policy)
+{
+    UniValue result(UniValue::VOBJ);
+    const std::string mode = !policy.choice_recorded
+        ? "unset"
+        : policy.automatic_enabled ? "automatic" : "pause_and_ask";
+    result.pushKV("version", policy.version);
+    result.pushKV("mode", mode);
+    result.pushKV("choice_recorded", policy.choice_recorded == 1);
+    result.pushKV("automatic_enabled", policy.automatic_enabled == 1);
+    result.pushKV("automatic_authorized", policy.HasAutomaticAuthority());
+    result.pushKV("max_fee_per_resolution", ValueFromAmount(policy.max_fee_per_resolution));
+    result.pushKV("aggregate_batch_fee_cap", ValueFromAmount(policy.aggregate_batch_fee_cap));
+    result.pushKV("rolling_fee_budget", ValueFromAmount(policy.rolling_fee_budget));
+    result.pushKV("rolling_fee_window_seconds", policy.rolling_fee_window_seconds);
+    result.pushKV("max_actions_per_window", policy.max_actions_per_window);
+    result.pushKV("minimum_stale_blocks", policy.minimum_stale_blocks);
+    return result;
+}
+
+static std::vector<RPCResult> ShadowPowClaimRecoveryPolicyResults()
+{
+    return {
+        {RPCResult::Type::NUM, "version", "Persisted policy schema version."},
+        {RPCResult::Type::STR, "mode", "unset, pause_and_ask, or automatic."},
+        {RPCResult::Type::BOOL, "choice_recorded", "Whether this wallet records an explicit operator choice."},
+        {RPCResult::Type::BOOL, "automatic_enabled", "Whether this wallet's recorded choice requests automatic recovery."},
+        {RPCResult::Type::BOOL, "automatic_authorized", "True only when both the explicit choice and automatic-recovery flag are valid."},
+        {RPCResult::Type::STR_AMOUNT, "max_fee_per_resolution", "Maximum fee authorized for one automatic resolution."},
+        {RPCResult::Type::STR_AMOUNT, "aggregate_batch_fee_cap", "Maximum aggregate fee authorized for one recovery pass."},
+        {RPCResult::Type::STR_AMOUNT, "rolling_fee_budget", "Maximum aggregate recovery fee in the rolling window."},
+        {RPCResult::Type::NUM_TIME, "rolling_fee_window_seconds", "Length of the rolling fee and action window."},
+        {RPCResult::Type::NUM, "max_actions_per_window", "Maximum automatic resolutions in the rolling window."},
+        {RPCResult::Type::NUM, "minimum_stale_blocks", "Minimum current-tip staleness before a terminal claim may be recovered automatically."},
+    };
+}
+
+static RPCHelpMan getpowclaimrecoveryinfo()
+{
+    return RPCHelpMan{
+        "getpowclaimrecoveryinfo",
+        "\nReturn this wallet's persisted Gold Rush PoW claim-recovery consent and current component gate.\n"
+        "This RPC never creates, signs, or broadcasts a transaction. Recovery is disabled unless mode is explicitly set to automatic with bounded spending limits.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::OBJ, "policy", "Wallet-scoped standing consent and limits.", ShadowPowClaimRecoveryPolicyResults()},
+            {RPCResult::Type::STR_HEX, "active_tip", "Active-chain tip to which the inventory is pinned, or all-zero when unavailable."},
+            {RPCResult::Type::BOOL, "wallet_tip_matches", "Whether the wallet-processed tip matches the classified active tip."},
+            {RPCResult::Type::NUM, "raw_quarantined_claims", "Wallet-known quarantined claim objects retained for audit and reorg safety."},
+            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Actionable plus indeterminate claim objects that currently pause new claim creation."},
+            {RPCResult::Type::NUM, "actionable_quarantined_claims", "Claim objects whose confirmed anchor is currently unspent."},
+            {RPCResult::Type::NUM, "resolved_on_active_chain_claims", "Historical objects whose confirmed anchor is spent on the active chain."},
+            {RPCResult::Type::NUM, "indeterminate_quarantined_claims", "Objects that fail closed because classification is incomplete."},
+            {RPCResult::Type::NUM, "components", "Current wallet-known claim components."},
+        }},
+        RPCExamples{
+            HelpExampleCli("getpowclaimrecoveryinfo", "") +
+            HelpExampleRpc("getpowclaimrecoveryinfo", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+
+    const ShadowPowClaimRecoveryPolicy policy =
+        pwallet->GetShadowPowClaimRecoveryPolicy();
+    const ShadowPowClaimInventory inventory =
+        pwallet->GetShadowPowClaimInventory();
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("policy", ShadowPowClaimRecoveryPolicyToJSON(policy));
+    result.pushKV("active_tip", inventory.active_tip.GetHex());
+    result.pushKV("wallet_tip_matches", inventory.wallet_tip_matches);
+    result.pushKV("raw_quarantined_claims", static_cast<uint64_t>(inventory.raw_quarantined_claims));
+    result.pushKV("blocking_quarantined_claims", static_cast<uint64_t>(inventory.BlockingClaims()));
+    result.pushKV("actionable_quarantined_claims", static_cast<uint64_t>(inventory.actionable_claims));
+    result.pushKV("resolved_on_active_chain_claims", static_cast<uint64_t>(inventory.resolved_on_active_chain_claims));
+    result.pushKV("indeterminate_quarantined_claims", static_cast<uint64_t>(inventory.indeterminate_claims));
+    result.pushKV("components", static_cast<uint64_t>(inventory.components.size()));
+    return result;
+},
+    };
+}
+
+static RPCHelpMan setpowclaimrecovery()
+{
+    return RPCHelpMan{
+        "setpowclaimrecovery",
+        "\nPersist this wallet's Gold Rush PoW claim-recovery choice.\n"
+        "automatic is explicit standing consent to create fee-paying on-chain conflicts only after the component engine proves every relevant claim terminal on one pinned active-chain tip. All six positive limits are required when enabling it. pause_and_ask keeps recovery manual. unset removes standing consent. This call never starts mining and never creates, signs, or broadcasts a transaction.\n",
+        {
+            {"mode", RPCArg::Type::STR, RPCArg::Optional::NO, "automatic, pause_and_ask, or unset."},
+            {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Wallet-scoped spending and staleness limits.", {
+                {"max_fee_per_resolution", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Positive maximum fee for one resolution."},
+                {"aggregate_batch_fee_cap", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Positive maximum aggregate fee for one recovery pass."},
+                {"rolling_fee_budget", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Positive maximum aggregate fee in the rolling window."},
+                {"rolling_fee_window_seconds", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Rolling fee/action window in seconds."},
+                {"max_actions_per_window", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Maximum automatic resolutions in the rolling window."},
+                {"minimum_stale_blocks", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Minimum terminal-claim age in blocks before automation may act."},
+            }},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Persisted wallet policy.", ShadowPowClaimRecoveryPolicyResults()},
+        RPCExamples{
+            HelpExampleCli("setpowclaimrecovery", "\"pause_and_ask\"") +
+            HelpExampleCli("setpowclaimrecovery", "\"automatic\" '{\"max_fee_per_resolution\":0.001,\"aggregate_batch_fee_cap\":0.01,\"rolling_fee_budget\":0.1,\"rolling_fee_window_seconds\":86400,\"max_actions_per_window\":25,\"minimum_stale_blocks\":6}'") +
+            HelpExampleRpc("setpowclaimrecovery", "\"unset\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+
+    ShadowPowClaimRecoveryPolicy policy =
+        pwallet->GetShadowPowClaimRecoveryPolicy();
+    const std::string mode = ToLower(request.params[0].get_str());
+    const UniValue options = request.params[1].isNull()
+        ? UniValue(UniValue::VOBJ)
+        : request.params[1].get_obj();
+
+    if (mode != "automatic" && mode != "pause_and_ask" && mode != "unset") {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "mode must be automatic, pause_and_ask, or unset");
+    }
+
+    static const std::array<const char*, 6> REQUIRED_AUTOMATIC_LIMITS{
+        "max_fee_per_resolution",
+        "aggregate_batch_fee_cap",
+        "rolling_fee_budget",
+        "rolling_fee_window_seconds",
+        "max_actions_per_window",
+        "minimum_stale_blocks",
+    };
+    if (mode == "automatic") {
+        for (const char* key : REQUIRED_AUTOMATIC_LIMITS) {
+            if (!options.exists(key)) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    strprintf("automatic recovery requires explicit %s", key));
+            }
+        }
+    }
+
+    if (options.exists("max_fee_per_resolution")) {
+        policy.max_fee_per_resolution = AmountFromValue(options["max_fee_per_resolution"]);
+    }
+    if (options.exists("aggregate_batch_fee_cap")) {
+        policy.aggregate_batch_fee_cap = AmountFromValue(options["aggregate_batch_fee_cap"]);
+    }
+    if (options.exists("rolling_fee_budget")) {
+        policy.rolling_fee_budget = AmountFromValue(options["rolling_fee_budget"]);
+    }
+    const auto read_uint32 = [&](const char* key, uint32_t& output) {
+        if (!options.exists(key)) return;
+        const int64_t value = options[key].getInt<int64_t>();
+        if (value < 0 || value > std::numeric_limits<uint32_t>::max()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               strprintf("%s is outside the uint32 range", key));
+        }
+        output = static_cast<uint32_t>(value);
+    };
+    read_uint32("rolling_fee_window_seconds", policy.rolling_fee_window_seconds);
+    read_uint32("max_actions_per_window", policy.max_actions_per_window);
+    read_uint32("minimum_stale_blocks", policy.minimum_stale_blocks);
+
+    policy.version = ShadowPowClaimRecoveryPolicy::VERSION;
+    policy.choice_recorded = mode == "unset" ? 0 : 1;
+    policy.automatic_enabled = mode == "automatic" ? 1 : 0;
+
+    bilingual_str error;
+    if (!pwallet->SetShadowPowClaimRecoveryPolicy(policy, error)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, error.original);
+    }
+    return ShadowPowClaimRecoveryPolicyToJSON(
+        pwallet->GetShadowPowClaimRecoveryPolicy());
+},
+    };
+}
+
 static RPCHelpMan setpowmining()
 {
     return RPCHelpMan{"setpowmining",
@@ -3405,6 +3586,8 @@ static const CRPCCommand commands[] =
     { "staking",            &sendshadowsignal,               },
     { "staking",            &sendshadowpowclaim,             },
     { "staking",            &createshadowpowclaimresolution, },
+    { "staking",            &getpowclaimrecoveryinfo,        },
+    { "staking",            &setpowclaimrecovery,            },
     { "staking",            &setpowmining,                   },
     { "staking",            &getpowmininginfo,               },
     { "staking",            &getquantumstakeaddressinfo,     },

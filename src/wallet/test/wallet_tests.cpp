@@ -390,6 +390,13 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_submission_guard_is_single_flight_and_exce
 BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
 {
     CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    constexpr int first_quarantine_height{321};
+    const uint256 first_quarantine_tip{42};
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetLastBlockProcessed(
+            first_quarantine_height, first_quarantine_tip);
+    }
 
     CKey wallet_key;
     wallet_key.MakeNewKey(/*fCompressed=*/true);
@@ -416,7 +423,14 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
     claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
     const CTransactionRef claim_ref = MakeTransactionRef(std::move(claim));
     BOOST_REQUIRE(TransactionHasShadowProof(*claim_ref));
-    BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateInactive{}));
+    BOOST_REQUIRE(wallet.AddToWallet(
+        claim_ref, TxStateInactive{},
+        [](CWalletTx& wtx, bool) {
+            // A legacy display comment is not durable authorization for
+            // automatic claim recovery.
+            wtx.mapValue["comment"] = "PoW Claim";
+            return true;
+        }));
 
     // A proof need not carry the persistent marker to be unsafe to replace:
     // it can be absent from this mempool while another peer still has it.
@@ -430,7 +444,49 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
         LOCK(wallet.cs_wallet);
         const CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
         BOOST_CHECK(stored.isUnconfirmed());
-        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_quarantine"), "1");
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(SHADOW_POW_QUARANTINE_MARKER_KEY), "1");
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_quarantine_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_quarantine_tip.GetHex());
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_AUTHORED_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_CREATED_HEIGHT_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_CREATED_TIP_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY) == 0);
+    }
+
+    // Clearing the transient quarantine marker and observing the claim again
+    // must not rewrite its immutable first-observation provenance.
+    {
+        LOCK(wallet.cs_wallet);
+        CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
+        stored.mapValue.erase(SHADOW_POW_QUARANTINE_MARKER_KEY);
+        wallet.SetLastBlockProcessed(
+            first_quarantine_height + 1, uint256{43});
+    }
+    BOOST_REQUIRE(wallet.QuarantineShadowPowClaim(claim_ref->GetHash()));
+    {
+        LOCK(wallet.cs_wallet);
+        const CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_quarantine_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_quarantine_tip.GetHex());
     }
 
     // A removed claim can still be held by a peer. Generic abandonment must
@@ -443,7 +499,8 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
         LOCK(wallet.cs_wallet);
         const CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
         BOOST_CHECK(!stored.isAbandoned());
-        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_quarantine"), "1");
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(SHADOW_POW_QUARANTINE_MARKER_KEY), "1");
     }
 }
 
@@ -1035,6 +1092,232 @@ class MockTimeScope
 public:
     ~MockTimeScope() { SetMockTime(0); }
 };
+
+BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_branch_quarantine_resets_after_reorg, TestChain100Setup)
+{
+    ShadowScheduleScope schedule_scope;
+    const int initial_height = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->ActiveChain().Height());
+    const int original_whitelist_height = SHADOW_WHITELIST_HEIGHT;
+    const int original_reward_start_height = SHADOW_REWARD_START_HEIGHT;
+    const int original_gold_rush_blocks = SHADOW_GOLD_RUSH_BLOCKS;
+    const auto enable_gold_rush_classification = [&] {
+        SetShadowTestSchedule(
+            /*whitelist_height=*/initial_height,
+            /*reward_start_height=*/initial_height + 1,
+            /*gold_rush_blocks=*/32);
+    };
+    const auto restore_production_schedule = [&] {
+        SetShadowTestSchedule(
+            original_whitelist_height,
+            original_reward_start_height,
+            original_gold_rush_blocks);
+    };
+
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script =
+        GetScriptForRawPubKey(wallet_key.GetPubKey());
+    const CMutableTransaction funding = TestSimpleSpend(
+        *m_coinbase_txns[0], /*index=*/0, coinbaseKey, wallet_script);
+    CreateAndProcessBlock(
+        {funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return Assert(m_node.chainman)->ActiveChain()),
+        wallet_key);
+    wallet->SetBroadcastTransactions(/*broadcast=*/false);
+    SyncWithValidationInterfaceQueue();
+
+    auto sync_wallet_tip = [&] {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const CBlockIndex* tip =
+            Assert(m_node.chainman)->ActiveChain().Tip();
+        BOOST_REQUIRE(tip);
+        wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash());
+    };
+
+    const CBlock first_observation_block = CreateAndProcessBlock(
+        {}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+    const int first_observation_height = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->ActiveChain().Height());
+    const uint256 first_observation_tip =
+        first_observation_block.GetHash();
+
+    // A malformed QQP2 carrier is terminal on the pinned Gold Rush tip. It is
+    // sufficient here because repair must consume the typed disposition, not
+    // the public reject string.
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(),
+                 {'Q', 'Q', 'P', '2', 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const CTransactionRef funding_ref = MakeTransactionRef(funding);
+    CMutableTransaction claim;
+    claim.vin.emplace_back(COutPoint{funding_ref->GetHash(), 0});
+    claim.vout.emplace_back(
+        funding.vout[0].nValue - DEFAULT_TRANSACTION_MAXFEE,
+        wallet_script);
+    claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const CTransactionRef claim_ref = MakeTransactionRef(std::move(claim));
+    BOOST_REQUIRE(TransactionHasShadowProof(*claim_ref));
+    BOOST_REQUIRE(wallet->AddToWallet(
+        claim_ref, TxStateInactive{},
+        [&](CWalletTx& wtx, bool) {
+            wtx.mapValue[SHADOW_POW_CLAIM_AUTHORED_KEY] = "1";
+            wtx.mapValue[SHADOW_POW_CLAIM_CREATED_HEIGHT_KEY] =
+                ToString(first_observation_height + 1);
+            wtx.mapValue[SHADOW_POW_CLAIM_CREATED_TIP_KEY] =
+                first_observation_tip.GetHex();
+            return true;
+        }));
+
+    // Change the schedule only around the side-effect-free claim
+    // classification. Blocks themselves must be built under the fixture's
+    // production schedule because this synthetic chain has no retroactive
+    // shadow-state history for an activation at height 101.
+    enable_gold_rush_classification();
+    wallet->RepairStaleShadowTransactions(/*force=*/true);
+    restore_production_schedule();
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored =
+            wallet->mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+    }
+
+    // The branch-relative pair is durable across a wallet reload.
+    CWallet reloaded(
+        m_node.chain.get(), "", DuplicateMockDatabase(wallet->GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(reloaded.cs_wallet);
+        const CWalletTx& stored =
+            reloaded.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+    }
+
+    // A descendant tip must mature, rather than overwrite, the observation.
+    CreateAndProcessBlock(
+        {}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+    enable_gold_rush_classification();
+    wallet->RepairStaleShadowTransactions(/*force=*/true);
+    restore_production_schedule();
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored =
+            wallet->mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+    }
+
+    CBlockIndex* first_observation_index = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->m_blockman.LookupBlockIndex(
+            first_observation_tip));
+    BOOST_REQUIRE(first_observation_index);
+    BlockValidationState state;
+    BOOST_REQUIRE(Assert(m_node.chainman)->ActiveChainstate().InvalidateBlock(
+        state, first_observation_index));
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+
+    // Replace the invalidated observation block with a byte-distinct block.
+    const CBlock replacement_block = CreateAndProcessBlock(
+        {}, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(replacement_block.GetHash() != first_observation_tip);
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+    enable_gold_rush_classification();
+    wallet->RepairStaleShadowTransactions(/*force=*/true);
+    restore_production_schedule();
+
+    const int replacement_height = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->ActiveChain().Height());
+    const uint256 replacement_tip = replacement_block.GetHash();
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored =
+            wallet->mapWallet.at(claim_ref->GetHash());
+        // Immutable audit provenance remains the original observation.
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+        // Stale-depth provenance restarts on the current branch.
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY),
+            ToString(replacement_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY),
+            replacement_tip.GetHex());
+    }
+
+    // If a quarantined claim becomes live again, any later failure must start
+    // a fresh continuous-terminal-age interval. Keep immutable provenance,
+    // but clear the current-branch age before automatic recovery can act.
+    wallet->transactionAddedToMempool(claim_ref);
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored =
+            wallet->mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_QUARANTINE_MARKER_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY) == 0);
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+    }
+}
 
 BOOST_AUTO_TEST_CASE(shadow_solve_index_is_bounded_ordered_and_disconnect_safe)
 {

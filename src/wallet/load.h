@@ -14,13 +14,24 @@
 
 class ArgsManager;
 class CScheduler;
+struct bilingual_str;
 
 namespace interfaces {
 class Chain;
 } // namespace interfaces
 
 namespace wallet {
+class CWallet;
 struct WalletContext;
+
+/**
+ * Apply an explicitly configured process startup policy to a wallet only when
+ * that wallet has never persisted claim-recovery policy metadata. Existing
+ * records, including malformed records, always win so startup arguments can
+ * never overwrite a prior wallet-scoped decision or repair corruption by
+ * silently granting authority.
+ */
+bool ApplyShadowPowClaimRecoveryStartupPolicy(CWallet& wallet, const ArgsManager& args, bilingual_str& error);
 
 //! Responsible for reading and validating the -wallet arguments and verifying the wallet database.
 bool VerifyWallets(WalletContext& context);

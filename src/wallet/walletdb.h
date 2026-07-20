@@ -317,6 +317,7 @@ public:
      * is reported as NONCRITICAL_ERROR and never prevents wallet loading.
      */
     bool WriteShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy);
+    bool HasShadowPowClaimRecoveryPolicy() { return m_batch->Exists(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY); }
     DBErrors ReadShadowPowClaimRecoveryPolicy(ShadowPowClaimRecoveryPolicy& policy, std::string* error = nullptr);
     bool EraseShadowPowClaimRecoveryPolicy();
 

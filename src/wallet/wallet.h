@@ -1672,6 +1672,12 @@ public:
     ShadowPowClaimInventory GetShadowPowClaimInventory() const;
     /** Locked implementation for final claim preflight. */
     ShadowPowClaimInventory GetShadowPowClaimInventoryLocked() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    /** Build the complete wallet-known claim/conflict/descendant graph on one
+     * active-chain tip. This is read-only and retains malformed or incomplete
+     * components as indeterminate instead of inferring resolution. */
+    ShadowPowClaimRecoveryInventory GetShadowPowClaimRecoveryInventory() const;
+    ShadowPowClaimRecoveryInventory GetShadowPowClaimRecoveryInventoryLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     /** Count quarantined claim objects that currently gate claim creation.
      * This is actionable plus indeterminate objects, not raw wallet history. */
     size_t CountQuarantinedShadowPowClaims() const;

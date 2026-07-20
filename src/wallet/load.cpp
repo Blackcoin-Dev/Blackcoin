@@ -16,6 +16,7 @@
 #include <util/string.h>
 #include <util/translation.h>
 #include <wallet/context.h>
+#include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
@@ -25,6 +26,55 @@
 #include <system_error>
 
 namespace wallet {
+
+bool ApplyShadowPowClaimRecoveryStartupPolicy(CWallet& wallet, const ArgsManager& args, bilingual_str& error)
+{
+    error.clear();
+    std::optional<ShadowPowClaimRecoveryPolicy> seed;
+    std::string parse_error;
+    if (!ParseShadowPowClaimRecoveryStartupPolicy(args, seed, parse_error)) {
+        error = Untranslated(parse_error);
+        return false;
+    }
+    if (!seed) return true;
+
+    const bool has_persisted_policy =
+        WalletBatch(wallet.GetDatabase(), /*flush_on_close=*/false).HasShadowPowClaimRecoveryPolicy();
+    if (!has_persisted_policy) {
+        const ShadowPowClaimRecoveryPolicy current = wallet.GetShadowPowClaimRecoveryPolicy();
+        if (current.choice_recorded != 0) {
+            wallet.WalletLogPrintf(
+                "Ignoring PoW claim recovery startup seed because this wallet already has an in-memory operator choice\n");
+            return true;
+        }
+
+        if (!wallet.SetShadowPowClaimRecoveryPolicy(*seed, error)) return false;
+        wallet.WalletLogPrintf(
+            "Seeded wallet-scoped PoW claim recovery policy from explicit startup configuration (automatic=%d); this did not enable mining or unlock the wallet\n",
+            seed->HasAutomaticAuthority());
+        return true;
+    }
+
+    // Re-read present metadata to distinguish a valid standing decision from
+    // corruption. Both cases win over startup arguments. Malformed metadata
+    // remains fail-closed and must never be replaced with spending authority.
+    ShadowPowClaimRecoveryPolicy stored;
+    std::string read_error;
+    WalletBatch batch(wallet.GetDatabase(), /*flush_on_close=*/false);
+    const DBErrors read_result = batch.ReadShadowPowClaimRecoveryPolicy(stored, &read_error);
+    if (read_result != DBErrors::LOAD_OK) {
+        wallet.WalletLogPrintf(
+            "Ignoring PoW claim recovery startup seed because persisted policy metadata could not be validated: %s\n",
+            read_error);
+        return true;
+    }
+
+    wallet.WalletLogPrintf(
+        "Ignoring PoW claim recovery startup seed because this wallet already has persisted policy metadata (choice_recorded=%d)\n",
+        stored.choice_recorded);
+    return true;
+}
+
 bool VerifyWallets(WalletContext& context)
 {
     interfaces::Chain& chain = *context.chain;
@@ -131,6 +181,13 @@ bool LoadWallets(WalletContext& context)
             if (!warnings.empty()) chain.initWarning(Join(warnings, Untranslated("\n")));
             if (!pwallet) {
                 chain.initError(error);
+                return false;
+            }
+
+            if (!ApplyShadowPowClaimRecoveryStartupPolicy(*pwallet, *context.args, error)) {
+                chain.initError(Untranslated(strprintf(
+                    "Failed to seed PoW claim recovery policy for wallet %s: %s",
+                    name, error.original)));
                 return false;
             }
 

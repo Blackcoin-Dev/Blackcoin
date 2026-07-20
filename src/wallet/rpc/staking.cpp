@@ -1712,6 +1712,11 @@ static RPCHelpMan sendshadowpowclaim()
         // may re-enter it without reopening the stale-tip race.
         mapValue_t map_value;
         map_value["comment"] = "PoW Claim";
+        map_value[SHADOW_POW_CLAIM_AUTHORED_KEY] = "1";
+        map_value[SHADOW_POW_CLAIM_CREATED_HEIGHT_KEY] =
+            strprintf("%d", pow_work.height);
+        map_value[SHADOW_POW_CLAIM_CREATED_TIP_KEY] =
+            pow_work.prev_hash.GetHex();
         CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "PoW Claim");
     }
 

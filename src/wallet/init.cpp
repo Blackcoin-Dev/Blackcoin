@@ -26,6 +26,7 @@
 #include <wallet/bdb.h>
 #endif
 #include <wallet/coincontrol.h>
+#include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/wallet.h>
 #include <walletinitinterface.h>
 
@@ -106,6 +107,13 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-powmining=<true/false>", "Auto-start one built-in Gold Rush Proof-of-Work miner for every eligible private-key wallet loaded by this process (default: false). Each wallet uses the configured thread and per-core CPU limits, must be normally unlocked, needs a spendable legacy fee UTXO, and must already own a payout key unless -qqallowautokeycreation=1 was separately authorized.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingthreads=<n>", "Worker threads (CPU cores) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingcpu=<n>", "Per-core CPU utilization target (1-100) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-autoresolvefailedclaims=<mode>", "Seed wallets whose recovery policy is still unset with an explicit Gold Rush PoW claim-recovery choice: automatic (or 1) or pause-and-ask (or 0). Default: no seed and no spending authority. A persisted wallet choice always wins. Automatic mode requires every -autoresolve* limit below.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-autoresolvemaxfee=<amt>", strprintf("Maximum fee for one automatic claim resolution in %s; required with -autoresolvefailedclaims=automatic", CURRENCY_UNIT), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-autoresolvebatchfeecap=<amt>", strprintf("Maximum aggregate fees for one automatic recovery batch in %s; required with -autoresolvefailedclaims=automatic", CURRENCY_UNIT), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-autoresolverollingfeebudget=<amt>", strprintf("Maximum automatic recovery fees in one rolling window in %s; required with -autoresolvefailedclaims=automatic", CURRENCY_UNIT), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-autoresolverollingwindow=<n>", "Automatic claim-recovery rolling budget and rate-limit window in seconds; required with -autoresolvefailedclaims=automatic", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-autoresolvemaxactions=<n>", "Maximum automatic claim resolutions per rolling window; required with -autoresolvefailedclaims=automatic", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-autoresolvestaleblocks=<n>", "Minimum active-branch terminal staleness in blocks before automatic claim recovery; required with -autoresolvefailedclaims=automatic", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqallowautokeycreation=<true/false>", strprintf("Allow background automation in every loaded wallet to generate new non-HD ML-DSA keys (default: %u). This is process-wide consent and requires a new backup of each affected wallet after every generated key. Prefer existing -qqpowpayoutaddress and -qqpospayoutaddress bindings. Demurrage attestations reuse an existing wallet-owned fee-input address for change and never require hidden key creation. This option does not disable user-requested address creation.", wallet::DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqpowpayoutaddress=<address>", "Bind automatic Gold Rush PoW rewards to one existing, durably stored ordinary direct (non-tiered, non-cold-stake) quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqpospayoutaddress=<address>", "Bind automatic Gold Rush PoS signal rewards to one existing, durably stored ordinary direct (non-tiered, non-cold-stake) quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
@@ -170,6 +178,12 @@ bool WalletInit::ParameterInteraction() const
         if (pow_cpu < 1 || pow_cpu > 100) {
             return InitError(Untranslated("-powminingcpu must be between 1 and 100."));
         }
+    }
+
+    std::optional<ShadowPowClaimRecoveryPolicy> recovery_policy_seed;
+    std::string recovery_policy_error;
+    if (!ParseShadowPowClaimRecoveryStartupPolicy(gArgs, recovery_policy_seed, recovery_policy_error)) {
+        return InitError(Untranslated(recovery_policy_error));
     }
 
     for (const std::string& option : {

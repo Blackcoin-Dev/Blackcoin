@@ -9,8 +9,10 @@
 #include <clientversion.h>
 #include <streams.h>
 #include <uint256.h>
+#include <wallet/shadow_pow_claim_recovery.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -56,6 +58,145 @@ BOOST_AUTO_TEST_CASE(walletdb_read_write_deadlock)
         // Now delete all records, which performs a read write operation.
         BOOST_CHECK(wallet->GetLegacyScriptPubKeyMan()->DeleteRecords());
     }
+}
+
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_validation)
+{
+    const ShadowPowClaimRecoveryPolicy defaults = DefaultShadowPowClaimRecoveryPolicy();
+    BOOST_CHECK(ValidateShadowPowClaimRecoveryPolicy(defaults));
+    BOOST_CHECK(!defaults.choice_recorded);
+    BOOST_CHECK(!defaults.automatic_enabled);
+    BOOST_CHECK(!defaults.HasAutomaticAuthority());
+
+    auto expect_invalid = [](ShadowPowClaimRecoveryPolicy policy) {
+        std::string error;
+        BOOST_CHECK(!ValidateShadowPowClaimRecoveryPolicy(policy, &error));
+        BOOST_CHECK(!error.empty());
+    };
+
+    ShadowPowClaimRecoveryPolicy policy = defaults;
+    policy.automatic_enabled = true;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.version = ShadowPowClaimRecoveryPolicy::VERSION + 1;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.choice_recorded = 2;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.max_fee_per_resolution = 0;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.max_fee_per_resolution = SHADOW_POW_RECOVERY_MAX_FEE_PER_RESOLUTION + 1;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.aggregate_batch_fee_cap = policy.max_fee_per_resolution - 1;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.rolling_fee_budget = policy.aggregate_batch_fee_cap - 1;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.rolling_fee_window_seconds = SHADOW_POW_RECOVERY_MIN_WINDOW_SECONDS - 1;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.max_actions_per_window = 0;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.minimum_stale_blocks = 0;
+    expect_invalid(policy);
+
+    policy = defaults;
+    policy.choice_recorded = true;
+    policy.automatic_enabled = true;
+    BOOST_CHECK(ValidateShadowPowClaimRecoveryPolicy(policy));
+    BOOST_CHECK(policy.HasAutomaticAuthority());
+}
+
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_walletdb_roundtrip)
+{
+    std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+    WalletBatch batch(*database, /*flush_on_close=*/false);
+
+    ShadowPowClaimRecoveryPolicy output;
+    output.choice_recorded = true;
+    output.automatic_enabled = true;
+    std::string error{"not cleared"};
+    BOOST_CHECK_EQUAL(batch.ReadShadowPowClaimRecoveryPolicy(output, &error), DBErrors::LOAD_OK);
+    BOOST_CHECK(output == DefaultShadowPowClaimRecoveryPolicy());
+    BOOST_CHECK(error.empty());
+
+    ShadowPowClaimRecoveryPolicy input = DefaultShadowPowClaimRecoveryPolicy();
+    input.choice_recorded = true;
+    input.automatic_enabled = true;
+    input.max_fee_per_resolution = 25000;
+    input.aggregate_batch_fee_cap = 250000;
+    input.rolling_fee_budget = 1000000;
+    input.rolling_fee_window_seconds = 3600;
+    input.max_actions_per_window = 25;
+    input.minimum_stale_blocks = 12;
+    BOOST_REQUIRE(batch.WriteShadowPowClaimRecoveryPolicy(input));
+
+    BOOST_CHECK_EQUAL(batch.ReadShadowPowClaimRecoveryPolicy(output, &error), DBErrors::LOAD_OK);
+    BOOST_CHECK(output == input);
+    BOOST_CHECK(error.empty());
+
+    // Invalid writes never replace a previously valid standing-consent record.
+    ShadowPowClaimRecoveryPolicy invalid = input;
+    invalid.automatic_enabled = true;
+    invalid.choice_recorded = false;
+    BOOST_CHECK(!batch.WriteShadowPowClaimRecoveryPolicy(invalid));
+    BOOST_CHECK_EQUAL(batch.ReadShadowPowClaimRecoveryPolicy(output, &error), DBErrors::LOAD_OK);
+    BOOST_CHECK(output == input);
+
+    BOOST_REQUIRE(batch.EraseShadowPowClaimRecoveryPolicy());
+    output = input;
+    BOOST_CHECK_EQUAL(batch.ReadShadowPowClaimRecoveryPolicy(output, &error), DBErrors::LOAD_OK);
+    BOOST_CHECK(output == DefaultShadowPowClaimRecoveryPolicy());
+}
+
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_malformed_is_noncritical)
+{
+    auto check_malformed = [this](const auto& malformed_value) {
+        std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+        {
+            std::unique_ptr<DatabaseBatch> raw_batch = database->MakeBatch(/*flush_on_close=*/false);
+            BOOST_REQUIRE(raw_batch->Write(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY, malformed_value));
+        }
+
+        const std::shared_ptr<CWallet> wallet(
+            new CWallet(m_node.chain.get(), "malformed-recovery-policy", std::move(database)));
+        BOOST_CHECK_EQUAL(wallet->LoadWallet(), DBErrors::NONCRITICAL_ERROR);
+
+        ShadowPowClaimRecoveryPolicy output;
+        output.choice_recorded = true;
+        output.automatic_enabled = true;
+        std::string error;
+        WalletBatch batch(wallet->GetDatabase(), /*flush_on_close=*/false);
+        BOOST_CHECK_EQUAL(batch.ReadShadowPowClaimRecoveryPolicy(output, &error), DBErrors::NONCRITICAL_ERROR);
+        BOOST_CHECK(output == DefaultShadowPowClaimRecoveryPolicy());
+        BOOST_CHECK(!output.HasAutomaticAuthority());
+        BOOST_CHECK(!error.empty());
+    };
+
+    // A different serialized type cannot be decoded as the policy.
+    check_malformed(std::string{"truncated"});
+
+    // A structurally decodable record with an unknown version also fails
+    // closed without making the wallet unloadable.
+    ShadowPowClaimRecoveryPolicy unknown_version = DefaultShadowPowClaimRecoveryPolicy();
+    unknown_version.version = ShadowPowClaimRecoveryPolicy::VERSION + 1;
+    unknown_version.choice_recorded = true;
+    unknown_version.automatic_enabled = true;
+    check_malformed(unknown_version);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

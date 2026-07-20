@@ -11,6 +11,7 @@
 #include <script/sign.h>
 #include <wallet/crypter.h>
 #include <wallet/db.h>
+#include <wallet/shadow_pow_claim_recovery.h>
 #include <wallet/walletutil.h>
 #include <key.h>
 
@@ -105,6 +106,7 @@ extern const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT;
 extern const std::string QUANTUM_REDELEGATION_LAST_SUCCESS;
 extern const std::string QUANTUM_REDELEGATION_LAST_WIN;
 extern const std::string SETTINGS;
+extern const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY;
 extern const std::string TX;
 extern const std::string VERSION;
 extern const std::string WALLETDESCRIPTOR;
@@ -307,6 +309,16 @@ public:
 
     bool WriteLockedUTXO(const COutPoint& output);
     bool EraseLockedUTXO(const COutPoint& output);
+
+    /**
+     * Persist/read wallet-scoped standing consent for automated Gold Rush PoW
+     * claim recovery. Reads always fail closed: absent or malformed metadata
+     * leaves policy at its disabled, no-authority default. Malformed metadata
+     * is reported as NONCRITICAL_ERROR and never prevents wallet loading.
+     */
+    bool WriteShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy);
+    DBErrors ReadShadowPowClaimRecoveryPolicy(ShadowPowClaimRecoveryPolicy& policy, std::string* error = nullptr);
+    bool EraseShadowPowClaimRecoveryPolicy();
 
     bool WriteAddressPreviouslySpent(const CTxDestination& dest, bool previously_spent);
     bool WriteAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& receive_request);

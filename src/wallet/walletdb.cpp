@@ -69,6 +69,7 @@ const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT{"quantumredelegationlastatte
 const std::string QUANTUM_REDELEGATION_LAST_SUCCESS{"quantumredelegationlastsuccess"};
 const std::string QUANTUM_REDELEGATION_LAST_WIN{"quantumredelegationlastwin"};
 const std::string SETTINGS{"settings"};
+const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY{"shadowpowclaimrecoverypolicy"};
 const std::string TX{"tx"};
 const std::string VERSION{"version"};
 const std::string WALLETDESCRIPTOR{"walletdescriptor"};
@@ -421,6 +422,47 @@ bool WalletBatch::WriteLockedUTXO(const COutPoint& output)
 bool WalletBatch::EraseLockedUTXO(const COutPoint& output)
 {
     return EraseIC(std::make_pair(DBKeys::LOCKED_UTXO, std::make_pair(output.hash, output.n)));
+}
+
+bool WalletBatch::WriteShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy)
+{
+    if (!ValidateShadowPowClaimRecoveryPolicy(policy)) return false;
+    return WriteIC(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY, policy);
+}
+
+DBErrors WalletBatch::ReadShadowPowClaimRecoveryPolicy(ShadowPowClaimRecoveryPolicy& policy, std::string* error)
+{
+    policy = DefaultShadowPowClaimRecoveryPolicy();
+    if (error) error->clear();
+
+    // Exists() distinguishes an absent optional record from a present record
+    // that could not be decoded. Both cases fail closed; only the latter is a
+    // noncritical wallet warning.
+    if (!m_batch->Exists(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY)) {
+        return DBErrors::LOAD_OK;
+    }
+
+    ShadowPowClaimRecoveryPolicy stored;
+    if (!m_batch->Read(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY, stored)) {
+        if (error) *error = "malformed automated PoW claim recovery policy; automation remains disabled";
+        return DBErrors::NONCRITICAL_ERROR;
+    }
+
+    std::string validation_error;
+    if (!ValidateShadowPowClaimRecoveryPolicy(stored, &validation_error)) {
+        if (error) {
+            *error = "invalid automated PoW claim recovery policy (" + validation_error + "); automation remains disabled";
+        }
+        return DBErrors::NONCRITICAL_ERROR;
+    }
+
+    policy = stored;
+    return DBErrors::LOAD_OK;
+}
+
+bool WalletBatch::EraseShadowPowClaimRecoveryPolicy()
+{
+    return EraseIC(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY);
 }
 
 bool LoadKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr)
@@ -1700,6 +1742,18 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         // Load wallet flags, so they are known when processing other records.
         // The FLAGS key is absent during wallet creation.
         if ((result = LoadWalletFlags(pwallet, *m_batch)) != DBErrors::LOAD_OK) return result;
+
+        // Recovery consent is optional metadata. Validate it while loading so
+        // malformed records are surfaced as noncritical warnings, but never
+        // grant authority or prevent the wallet (and its keys) from loading.
+        ShadowPowClaimRecoveryPolicy recovery_policy;
+        std::string recovery_policy_error;
+        const DBErrors recovery_policy_result =
+            ReadShadowPowClaimRecoveryPolicy(recovery_policy, &recovery_policy_error);
+        if (recovery_policy_result != DBErrors::LOAD_OK) {
+            pwallet->WalletLogPrintf("Error reading wallet database: %s\n", recovery_policy_error);
+        }
+        result = std::max(result, recovery_policy_result);
 
 #ifndef ENABLE_EXTERNAL_SIGNER
         if (pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {

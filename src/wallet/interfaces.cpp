@@ -65,6 +65,8 @@ using interfaces::WalletBalances;
 using interfaces::WalletLoader;
 using interfaces::WalletMigrationResult;
 using interfaces::WalletMigrationStatus;
+using interfaces::WalletPowClaimRecoveryMode;
+using interfaces::WalletPowClaimRecoveryPolicy;
 using interfaces::WalletPowMiningInfo;
 using interfaces::WalletDemurrageInfo;
 using interfaces::WalletDemurrageOutputInfo;
@@ -90,6 +92,18 @@ using interfaces::WalletTxStatus;
 using interfaces::WalletValueMap;
 
 namespace wallet {
+static_assert(WalletPowClaimRecoveryPolicy::VERSION == ShadowPowClaimRecoveryPolicy::VERSION);
+static_assert(WalletPowClaimRecoveryPolicy::MIN_FEE_PER_RESOLUTION == SHADOW_POW_RECOVERY_MIN_FEE_PER_RESOLUTION);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_FEE_PER_RESOLUTION == SHADOW_POW_RECOVERY_MAX_FEE_PER_RESOLUTION);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_BATCH_FEE_CAP == SHADOW_POW_RECOVERY_MAX_BATCH_FEE_CAP);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_ROLLING_FEE_BUDGET == SHADOW_POW_RECOVERY_MAX_ROLLING_FEE_BUDGET);
+static_assert(WalletPowClaimRecoveryPolicy::MIN_WINDOW_SECONDS == SHADOW_POW_RECOVERY_MIN_WINDOW_SECONDS);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_WINDOW_SECONDS == SHADOW_POW_RECOVERY_MAX_WINDOW_SECONDS);
+static_assert(WalletPowClaimRecoveryPolicy::MIN_ACTIONS_PER_WINDOW == SHADOW_POW_RECOVERY_MIN_ACTIONS_PER_WINDOW);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_ACTIONS_PER_WINDOW == SHADOW_POW_RECOVERY_MAX_ACTIONS_PER_WINDOW);
+static_assert(WalletPowClaimRecoveryPolicy::MIN_STALE_BLOCKS == SHADOW_POW_RECOVERY_MIN_STALE_BLOCKS);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_STALE_BLOCKS == SHADOW_POW_RECOVERY_MAX_STALE_BLOCKS);
+
 // All members of the classes in this namespace are intentionally public, as the
 // classes themselves are private.
 namespace {
@@ -2565,6 +2579,58 @@ public:
             }
         }
         return info;
+    }
+    WalletPowClaimRecoveryPolicy getPowClaimRecoveryPolicy() override
+    {
+        const ShadowPowClaimRecoveryPolicy core = m_wallet->GetShadowPowClaimRecoveryPolicy();
+        WalletPowClaimRecoveryPolicy policy;
+        policy.version = core.version;
+        policy.mode = core.choice_recorded == 0
+            ? WalletPowClaimRecoveryMode::UNSET
+            : core.automatic_enabled == 1
+                ? WalletPowClaimRecoveryMode::AUTOMATIC
+                : WalletPowClaimRecoveryMode::PAUSE_AND_ASK;
+        policy.max_fee_per_resolution = core.max_fee_per_resolution;
+        policy.aggregate_batch_fee_cap = core.aggregate_batch_fee_cap;
+        policy.rolling_fee_budget = core.rolling_fee_budget;
+        policy.rolling_fee_window_seconds = core.rolling_fee_window_seconds;
+        policy.max_actions_per_window = core.max_actions_per_window;
+        policy.minimum_stale_blocks = core.minimum_stale_blocks;
+        return policy;
+    }
+    bool setPowClaimRecoveryPolicy(const WalletPowClaimRecoveryPolicy& policy,
+                                   std::string& error) override
+    {
+        ShadowPowClaimRecoveryPolicy core;
+        core.version = policy.version;
+        switch (policy.mode) {
+        case WalletPowClaimRecoveryMode::UNSET:
+            core.choice_recorded = 0;
+            core.automatic_enabled = 0;
+            break;
+        case WalletPowClaimRecoveryMode::PAUSE_AND_ASK:
+            core.choice_recorded = 1;
+            core.automatic_enabled = 0;
+            break;
+        case WalletPowClaimRecoveryMode::AUTOMATIC:
+            core.choice_recorded = 1;
+            core.automatic_enabled = 1;
+            break;
+        default:
+            error = "Unknown PoW claim recovery policy mode";
+            return false;
+        }
+        core.max_fee_per_resolution = policy.max_fee_per_resolution;
+        core.aggregate_batch_fee_cap = policy.aggregate_batch_fee_cap;
+        core.rolling_fee_budget = policy.rolling_fee_budget;
+        core.rolling_fee_window_seconds = policy.rolling_fee_window_seconds;
+        core.max_actions_per_window = policy.max_actions_per_window;
+        core.minimum_stale_blocks = policy.minimum_stale_blocks;
+
+        bilingual_str write_error;
+        const bool ok = m_wallet->SetShadowPowClaimRecoveryPolicy(core, write_error);
+        error = write_error.original;
+        return ok;
     }
     util::Result<WalletQuantumAddressInfo> createQuantumAddress(const std::string& label) override
     {

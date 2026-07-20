@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -133,6 +134,32 @@ public:
         std::string selected_coldstake_query_address;
     };
 
+    /** One wallet-scoped recovery-policy read or durable update. */
+    struct PowClaimRecoveryPolicyRequest
+    {
+        enum class Operation : uint8_t {
+            INFO,
+            SET_POLICY,
+        };
+
+        uint64_t request_id{0};
+        uint64_t generation{0};
+        std::string wallet_name;
+        Operation operation{Operation::INFO};
+        interfaces::WalletPowClaimRecoveryPolicy policy;
+    };
+
+    /** Immutable WalletWorker result; views reject old wallet generations. */
+    struct PowClaimRecoveryPolicyResult
+    {
+        PowClaimRecoveryPolicyRequest request;
+        bool cancelled{false};
+        bool success{false};
+        bool policy_available{false};
+        std::string error;
+        interfaces::WalletPowClaimRecoveryPolicy policy;
+    };
+
     OptionsModel* getOptionsModel() const;
     AddressTableModel* getAddressTableModel() const;
     TransactionTableModel* getTransactionTableModel() const;
@@ -231,6 +258,18 @@ public:
     /** Take the completed immutable result after stakingMiningSnapshotReady. */
     std::shared_ptr<const StakingMiningSnapshot> takeStakingMiningSnapshot(uint64_t request_id);
 
+    /**
+     * Queue a policy request and return its WalletModel-issued correlation id.
+     *
+     * IDs are unique for this WalletModel. Requests from independent views do
+     * not cancel or overwrite one another.
+     */
+    uint64_t requestPowClaimRecoveryPolicy(PowClaimRecoveryPolicyRequest request);
+    /** Cooperatively cancel an obsolete policy request before Core entry. */
+    void cancelPowClaimRecoveryPolicy(uint64_t request_id);
+    /** Take one completed immutable policy result. */
+    std::shared_ptr<const PowClaimRecoveryPolicyResult> takePowClaimRecoveryPolicyResult(uint64_t request_id);
+
     // If coin control has selected outputs, searches the total amount inside the wallet.
     // Otherwise, uses the wallet's cached available balance.
     CAmount getAvailableBalance(const wallet::CCoinControl* control);
@@ -280,6 +319,9 @@ private:
     std::shared_ptr<std::atomic<bool>> m_staking_snapshot_cancel;
     uint64_t m_staking_snapshot_request_id{0};
     std::shared_ptr<const StakingMiningSnapshot> m_completed_staking_snapshot;
+    uint64_t m_pow_claim_recovery_policy_request_sequence{0};
+    std::map<uint64_t, std::shared_ptr<std::atomic<bool>>> m_pow_claim_recovery_policy_cancels;
+    std::map<uint64_t, std::shared_ptr<const PowClaimRecoveryPolicyResult>> m_completed_pow_claim_recovery_policy_results;
 
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
@@ -322,6 +364,8 @@ Q_SIGNALS:
 
     /** Emitted on the GUI thread after a worker request completes or cancels. */
     void stakingMiningSnapshotReady(quint64 request_id, quint64 generation);
+    /** Emitted on the GUI thread after a wallet recovery-policy request. */
+    void powClaimRecoveryPolicyReady(quint64 request_id, quint64 generation);
 
 public Q_SLOTS:
     /* Starts a timer to periodically update the balance */

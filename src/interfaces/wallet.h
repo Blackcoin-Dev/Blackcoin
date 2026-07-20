@@ -56,6 +56,7 @@ struct WalletTxOut;
 struct WalletTxStatus;
 struct WalletMigrationResult;
 struct WalletPowMiningInfo;
+struct WalletPowClaimRecoveryPolicy;
 struct WalletQuantumAddressInfo;
 struct WalletQuantumColdStakeBalanceInfo;
 struct WalletQuantumColdStakeInfo;
@@ -331,6 +332,17 @@ public:
 
     //! Read the built-in Gold Rush PoW miner status (config, hashrate, epoch, payout).
     virtual WalletPowMiningInfo getPowMiningInfo() = 0;
+
+    //! Return this wallet's persisted Gold Rush PoW claim-recovery choice and
+    //! standing limits. This is wallet-scoped and never grants process-wide
+    //! authority.
+    virtual WalletPowClaimRecoveryPolicy getPowClaimRecoveryPolicy() = 0;
+
+    //! Validate and durably persist this wallet's complete recovery policy.
+    //! This call never starts mining and never creates, signs, or broadcasts a
+    //! transaction.
+    virtual bool setPowClaimRecoveryPolicy(const WalletPowClaimRecoveryPolicy& policy,
+                                           std::string& error) = 0;
 
     //! Create a wallet-backed Blackcoin ML-DSA migration address.
     virtual util::Result<WalletQuantumAddressInfo> createQuantumAddress(const std::string& label) = 0;
@@ -633,6 +645,65 @@ struct WalletPowMiningInfo
     bool wallet_active_signal{false}; //!< wallet has an active QQSIGNAL entry
     int wallet_blocks_until_solver_expiry{0}; //!< max recent-solver expiry across wallet-owned whitelisted scripts
     bool payout_address_available{true}; //!< false when the wallet lock is busy and the cached address was not read
+};
+
+//! Explicit wallet-scoped choice for automated Gold Rush PoW claim recovery.
+enum class WalletPowClaimRecoveryMode : uint8_t {
+    UNSET,
+    PAUSE_AND_ASK,
+    AUTOMATIC,
+};
+
+/**
+ * Interface-safe copy of the persisted wallet recovery policy.
+ *
+ * The interface intentionally does not expose wallet-internal serialization
+ * types. Limits mirror the Core policy and are checked again by Core before a
+ * durable write. AUTOMATIC is the only mode that grants standing authority;
+ * storing this policy does not start the miner or authorize a wallet unlock.
+ */
+struct WalletPowClaimRecoveryPolicy
+{
+    static constexpr uint32_t VERSION{1};
+
+    // Public bounds used by GUI controls. wallet/interfaces.cpp has compile-
+    // time assertions that these remain identical to Core's policy bounds.
+    static constexpr CAmount MIN_FEE_PER_RESOLUTION{1};
+    static constexpr CAmount MAX_FEE_PER_RESOLUTION{CENT};
+    static constexpr CAmount MAX_BATCH_FEE_CAP{COIN};
+    static constexpr CAmount MAX_ROLLING_FEE_BUDGET{10 * COIN};
+    static constexpr uint32_t MIN_WINDOW_SECONDS{60};
+    static constexpr uint32_t MAX_WINDOW_SECONDS{7 * 24 * 60 * 60};
+    static constexpr uint32_t MIN_ACTIONS_PER_WINDOW{1};
+    static constexpr uint32_t MAX_ACTIONS_PER_WINDOW{1000};
+    static constexpr uint32_t MIN_STALE_BLOCKS{1};
+    static constexpr uint32_t MAX_STALE_BLOCKS{10080};
+
+    uint32_t version{VERSION};
+    WalletPowClaimRecoveryMode mode{WalletPowClaimRecoveryMode::UNSET};
+    CAmount max_fee_per_resolution{CENT};
+    CAmount aggregate_batch_fee_cap{10 * CENT};
+    CAmount rolling_fee_budget{COIN};
+    uint32_t rolling_fee_window_seconds{24 * 60 * 60};
+    uint32_t max_actions_per_window{100};
+    uint32_t minimum_stale_blocks{6};
+
+    bool automaticAuthorized() const
+    {
+        return mode == WalletPowClaimRecoveryMode::AUTOMATIC;
+    }
+
+    bool operator==(const WalletPowClaimRecoveryPolicy& other) const
+    {
+        return version == other.version &&
+               mode == other.mode &&
+               max_fee_per_resolution == other.max_fee_per_resolution &&
+               aggregate_batch_fee_cap == other.aggregate_batch_fee_cap &&
+               rolling_fee_budget == other.rolling_fee_budget &&
+               rolling_fee_window_seconds == other.rolling_fee_window_seconds &&
+               max_actions_per_window == other.max_actions_per_window &&
+               minimum_stale_blocks == other.minimum_stale_blocks;
+    }
 };
 
 //! Wallet-backed Blackcoin ML-DSA migration address metadata.

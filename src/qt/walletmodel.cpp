@@ -350,6 +350,109 @@ std::shared_ptr<const WalletModel::StakingMiningSnapshot> WalletModel::takeStaki
     return std::exchange(m_completed_staking_snapshot, {});
 }
 
+uint64_t WalletModel::requestPowClaimRecoveryPolicy(PowClaimRecoveryPolicyRequest request)
+{
+    // Policy reads and durable updates share WalletWorker with other wallet
+    // walks. The Qt event thread only owns request/result bookkeeping. Issue
+    // correlation lives here (rather than in a view) so recreated or parallel
+    // pages can never collide or cancel one another's request.
+    if (++m_pow_claim_recovery_policy_request_sequence == 0) {
+        ++m_pow_claim_recovery_policy_request_sequence;
+    }
+    request.request_id = m_pow_claim_recovery_policy_request_sequence;
+    request.wallet_name = m_wallet->getWalletName();
+    const auto cancel = std::make_shared<std::atomic<bool>>(false);
+    m_pow_claim_recovery_policy_cancels.emplace(request.request_id, cancel);
+
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel] {
+        assert(QThread::currentThread() == worker->thread());
+        auto result = std::make_shared<PowClaimRecoveryPolicyResult>();
+        result->request = request;
+
+        const auto publish = [this, result] {
+            QMetaObject::invokeMethod(this, [this, result] {
+                const uint64_t request_id = result->request.request_id;
+                m_completed_pow_claim_recovery_policy_results[request_id] = result;
+                m_pow_claim_recovery_policy_cancels.erase(request_id);
+                Q_EMIT powClaimRecoveryPolicyReady(
+                    request_id, result->request.generation);
+                // Connected GUI-thread slots consume their result
+                // synchronously. Drop an unclaimed result after notification
+                // (for example, when its originating view was destroyed).
+                m_completed_pow_claim_recovery_policy_results.erase(request_id);
+            }, Qt::QueuedConnection);
+        };
+        const auto checkpoint = [this, cancel, result] {
+            if (cancel->load(std::memory_order_acquire) || m_node.shutdownRequested()) {
+                result->cancelled = true;
+                return true;
+            }
+            return false;
+        };
+
+        if (checkpoint()) {
+            publish();
+            return;
+        }
+
+        try {
+            if (request.wallet_name != m_wallet->getWalletName()) {
+                result->error = "Wallet identity changed before the PoW claim recovery policy request";
+                publish();
+                return;
+            }
+            if (request.operation == PowClaimRecoveryPolicyRequest::Operation::SET_POLICY) {
+                // Cancellation is meaningful only before entering the durable
+                // Core write. Once entered, the result may be discarded but
+                // the committed operator choice is never represented as
+                // cancelled or rolled back by the GUI.
+                if (checkpoint()) {
+                    publish();
+                    return;
+                }
+                result->success =
+                    m_wallet->setPowClaimRecoveryPolicy(request.policy, result->error);
+                result->policy = m_wallet->getPowClaimRecoveryPolicy();
+                result->policy_available = true;
+            } else {
+                result->policy = m_wallet->getPowClaimRecoveryPolicy();
+                result->policy_available = true;
+                result->success = true;
+            }
+        } catch (const std::exception& e) {
+            result->success = false;
+            result->error = e.what();
+        } catch (...) {
+            result->success = false;
+            result->error = "Unknown error while reading or updating the PoW claim recovery policy";
+        }
+
+        publish();
+    }, Qt::QueuedConnection);
+    assert(invoked);
+    return request.request_id;
+}
+
+void WalletModel::cancelPowClaimRecoveryPolicy(uint64_t request_id)
+{
+    const auto it = m_pow_claim_recovery_policy_cancels.find(request_id);
+    if (it != m_pow_claim_recovery_policy_cancels.end()) {
+        it->second->store(true, std::memory_order_release);
+    }
+}
+
+std::shared_ptr<const WalletModel::PowClaimRecoveryPolicyResult>
+WalletModel::takePowClaimRecoveryPolicyResult(uint64_t request_id)
+{
+    const auto it = m_completed_pow_claim_recovery_policy_results.find(request_id);
+    if (it == m_completed_pow_claim_recovery_policy_results.end()) {
+        return {};
+    }
+    const auto result = it->second;
+    m_completed_pow_claim_recovery_policy_results.erase(it);
+    return result;
+}
+
 void WalletModel::updateTransaction()
 {
     // Balance and number of transactions might have changed
@@ -807,6 +910,9 @@ void WalletModel::join()
         timer->stop();
 
     cancelStakingMiningSnapshot();
+    for (const auto& entry : m_pow_claim_recovery_policy_cancels) {
+        entry.second->store(true, std::memory_order_release);
+    }
 
     // Quit thread
     if (t.isRunning()) {

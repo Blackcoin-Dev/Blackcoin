@@ -8,6 +8,7 @@
 #include <qt/walletmodel.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <QPointer>
 #include <QSize>
@@ -93,8 +94,10 @@ private Q_SLOTS:
     void onWithdrawColdStakeAddress();
     void onRedelegateColdStake();
     void onOptimizeUTXOSet();
+    void onAutoClaimRecoveryToggled(bool enabled);
     void updateStatus();
     void onStakingMiningSnapshotReady(quint64 request_id, quint64 generation);
+    void onPowClaimRecoveryPolicyReady(quint64 request_id, quint64 generation);
 
 private:
     const PlatformStyle* m_platform_style{nullptr};
@@ -162,6 +165,7 @@ private:
     QCheckBox* m_auto_demurrage_attest{nullptr};
     QCheckBox* m_auto_redelegate{nullptr};
     QCheckBox* m_allow_auto_key_creation{nullptr};
+    QCheckBox* m_auto_claim_recovery{nullptr};
     QLabel* m_automation_status{nullptr};
 
     // Proof-of-Work section
@@ -174,6 +178,25 @@ private:
     QPushButton* m_pow_apply{nullptr};
     QLabel* m_pow_status{nullptr};
     QLabel* m_pow_warning{nullptr};
+    QPushButton* m_pow_recovery_review{nullptr};
+
+    // Wallet-scoped recovery-policy state is loaded and written only on
+    // WalletWorker. Timer-driven GUI refreshes read this immutable cache.
+    std::optional<interfaces::WalletPowClaimRecoveryPolicy> m_claim_recovery_policy;
+    bool m_claim_recovery_policy_pending{false};
+    uint64_t m_claim_recovery_policy_request_in_flight{0};
+    QString m_claim_recovery_policy_error;
+    std::optional<bool> m_claim_recovery_toggle_after_refresh;
+
+    enum class PowClaimRecoveryPolicyRequestPurpose : uint8_t {
+        BACKGROUND_REFRESH,
+        USER_TOGGLE_REFRESH,
+        USER_TOGGLE_WRITE,
+        POW_START_REFRESH,
+        POW_START_WRITE,
+    };
+    PowClaimRecoveryPolicyRequestPurpose m_claim_recovery_policy_request_purpose{
+        PowClaimRecoveryPolicyRequestPurpose::BACKGROUND_REFRESH};
 
     // Quantum migration section
     QLabel* m_migration_phase{nullptr};
@@ -253,6 +276,20 @@ private:
     void refreshDonationControls();
     void onAutomationToggled(QCheckBox* control, const std::string& setting, bool enabled);
     void refreshAutomationControls();
+    void requestPowClaimRecoveryPolicy(
+        WalletModel::PowClaimRecoveryPolicyRequest::Operation operation,
+        const interfaces::WalletPowClaimRecoveryPolicy& policy = {},
+        PowClaimRecoveryPolicyRequestPurpose purpose =
+            PowClaimRecoveryPolicyRequestPurpose::BACKGROUND_REFRESH);
+    void applyAutoClaimRecoveryToggle(bool enabled);
+    bool confirmAutomaticClaimRecoveryPolicy(
+        const interfaces::WalletPowClaimRecoveryPolicy& current,
+        interfaces::WalletPowClaimRecoveryPolicy& selected);
+    bool chooseInitialPowClaimRecoveryPolicy(
+        const interfaces::WalletPowClaimRecoveryPolicy& current,
+        interfaces::WalletPowClaimRecoveryPolicy& selected);
+    void applyPowWithCurrentRecoveryPolicy();
+    void abortPendingPowStart(const QString& message);
     bool requestStakingOnlyUnlock();
     bool requestNormalUnlock();
     void showHelpDialog(const QString& title, const QString& html);

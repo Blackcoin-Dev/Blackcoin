@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 #include <thread>
@@ -66,6 +67,7 @@
 #include <QTextEdit>
 #include <QListView>
 #include <QDialogButtonBox>
+#include <QDialog>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QSignalSpy>
@@ -98,17 +100,166 @@ void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_ty
     });
 }
 
+void WaitForModal(const QString& description, std::function<bool()> action)
+{
+    auto* timer = new QTimer(qApp);
+    timer->setInterval(10);
+    timer->setSingleShot(false);
+    QObject::connect(timer, &QTimer::timeout, timer,
+                     [timer, description, action = std::move(action), attempts = 0]() mutable {
+        if (action()) {
+            timer->stop();
+            timer->deleteLater();
+            return;
+        }
+        if (++attempts < 1500) return;
+
+        QTest::qFail(
+            QStringLiteral("Timed out waiting for %1").arg(description).toUtf8().constData(),
+            __FILE__, __LINE__);
+        if (auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget())) {
+            dialog->reject();
+        }
+        timer->stop();
+        timer->deleteLater();
+    });
+    timer->start();
+}
+
 //! Press a standard button in a modal message box.
 void ConfirmMessageBox(QMessageBox::StandardButton confirm_type)
 {
-    QTimer::singleShot(0, [confirm_type]() {
+    WaitForModal(QStringLiteral("message box"), [confirm_type]() {
         for (QWidget* widget : QApplication::topLevelWidgets()) {
             if (auto* dialog = qobject_cast<QMessageBox*>(widget)) {
                 if (QAbstractButton* button = dialog->button(confirm_type)) {
                     button->click();
+                    return true;
                 }
             }
         }
+        return false;
+    });
+}
+
+void AnswerPowClaimRecoveryConsent(bool enable, bool use_escape = false,
+                                   const QString& expected_wallet = {})
+{
+    WaitForModal(QStringLiteral("PoW claim recovery consent dialog"), [enable, use_escape, expected_wallet] {
+        for (QWidget* widget : QApplication::allWidgets()) {
+            auto* dialog = qobject_cast<QDialog*>(widget);
+            if (!dialog || dialog->objectName() !=
+                    QLatin1String("powClaimRecoveryConsentDialog") ||
+                !dialog->isVisible()) continue;
+            auto* cancel = dialog->findChild<QPushButton*>(
+                QStringLiteral("powClaimRecoveryConsentCancel"));
+            auto* authorize = dialog->findChild<QPushButton*>(
+                QStringLiteral("powClaimRecoveryConsentEnable"));
+            auto* wallet_identity = dialog->findChild<QLabel*>(
+                QStringLiteral("powClaimRecoveryConsentWallet"));
+            if (!cancel || !authorize || !cancel->isDefault()) {
+                QTest::qFail("PoW recovery consent dialog is missing its safe default controls",
+                             __FILE__, __LINE__);
+                dialog->reject();
+                return true;
+            }
+            if (!wallet_identity ||
+                (!expected_wallet.isEmpty() &&
+                 !wallet_identity->text().contains(expected_wallet))) {
+                QTest::qFail("PoW recovery consent is not bound to the expected wallet name",
+                             __FILE__, __LINE__);
+                dialog->reject();
+                return true;
+            }
+            if (use_escape) {
+                QTest::keyClick(dialog, Qt::Key_Escape);
+            } else {
+                QTest::mouseClick(enable ? authorize : cancel, Qt::LeftButton);
+                if (enable && dialog->result() != QDialog::Accepted) {
+                    const auto* validation = dialog->findChild<QLabel*>(
+                        QStringLiteral("powClaimRecoveryConsentValidation"));
+                    QTest::qFail(
+                        QStringLiteral("PoW recovery consent was not accepted: %1")
+                            .arg(validation ? validation->text() : QStringLiteral("unknown reason"))
+                            .toUtf8().constData(),
+                        __FILE__, __LINE__);
+                    dialog->reject();
+                }
+            }
+            return true;
+        }
+        return false;
+    });
+}
+
+void UnloadWalletDuringPowClaimRecoveryConsent(
+    StakingMiningPage& page, const QString& expected_wallet)
+{
+    WaitForModal(QStringLiteral("wallet-bound PoW claim recovery consent dialog"),
+                 [&page, expected_wallet] {
+        for (QWidget* widget : QApplication::allWidgets()) {
+            auto* dialog = qobject_cast<QDialog*>(widget);
+            if (!dialog || dialog->objectName() !=
+                    QLatin1String("powClaimRecoveryConsentDialog") ||
+                !dialog->isVisible()) continue;
+            auto* wallet_identity = dialog->findChild<QLabel*>(
+                QStringLiteral("powClaimRecoveryConsentWallet"));
+            if (!wallet_identity ||
+                !wallet_identity->text().contains(expected_wallet)) {
+                QTest::qFail("PoW recovery consent displayed the wrong wallet identity",
+                             __FILE__, __LINE__);
+                dialog->reject();
+                return true;
+            }
+            // The page must close this modal and discard its selected policy
+            // before changing wallet identity.
+            page.setWalletModel(nullptr);
+            return true;
+        }
+        return false;
+    });
+}
+
+enum class InitialPowClaimRecoveryChoice : uint8_t {
+    AUTOMATIC,
+    PAUSE_AND_ASK,
+    CANCEL,
+};
+
+void AnswerInitialPowClaimRecoveryChoice(InitialPowClaimRecoveryChoice choice)
+{
+    WaitForModal(QStringLiteral("initial PoW claim recovery choice"), [choice] {
+        for (QWidget* widget : QApplication::allWidgets()) {
+            auto* dialog = qobject_cast<QDialog*>(widget);
+            if (!dialog || dialog->objectName() !=
+                    QLatin1String("powClaimRecoveryInitialChoiceDialog") ||
+                !dialog->isVisible()) continue;
+            auto* automatic = dialog->findChild<QPushButton*>(
+                QStringLiteral("powClaimRecoveryInitialAutomatic"));
+            auto* pause = dialog->findChild<QPushButton*>(
+                QStringLiteral("powClaimRecoveryInitialPause"));
+            auto* cancel = dialog->findChild<QPushButton*>(
+                QStringLiteral("powClaimRecoveryInitialCancel"));
+            if (!automatic || !pause || !cancel || !cancel->isDefault()) {
+                QTest::qFail("Initial PoW recovery choice is missing an option or safe default",
+                             __FILE__, __LINE__);
+                dialog->reject();
+                return true;
+            }
+            switch (choice) {
+            case InitialPowClaimRecoveryChoice::AUTOMATIC:
+                QTest::mouseClick(automatic, Qt::LeftButton);
+                break;
+            case InitialPowClaimRecoveryChoice::PAUSE_AND_ASK:
+                QTest::mouseClick(pause, Qt::LeftButton);
+                break;
+            case InitialPowClaimRecoveryChoice::CANCEL:
+                QTest::mouseClick(cancel, Qt::LeftButton);
+                break;
+            }
+            return true;
+        }
+        return false;
     });
 }
 
@@ -314,6 +465,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     std::string error;
     QVERIFY(walletModel.wallet().setPowMining(false, 1, 10, error));
+    interfaces::WalletPowClaimRecoveryPolicy unset_recovery_policy;
+    QVERIFY(walletModel.wallet().setPowClaimRecoveryPolicy(unset_recovery_policy, error));
     core_wallet->StopStake();
     const auto staking_thread_count = [&] {
         LOCK(core_wallet->m_staking_thread_mutex);
@@ -672,14 +825,36 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     QCOMPARE(pow_enable->isChecked(), false);
     QVERIFY(!walletModel.wallet().getPowMiningInfo().enabled);
+    QCOMPARE(walletModel.wallet().getPowClaimRecoveryPolicy().mode,
+             interfaces::WalletPowClaimRecoveryMode::UNSET);
 
     const int requested_threads = std::min(2, pow_cores->maximum());
     pow_cores->setValue(requested_threads);
     pow_percent->setValue(25);
+
+    // The first start cannot bypass a recorded failed-claim choice. Cancel is
+    // safe: it leaves both the miner and the durable policy untouched.
+    AnswerInitialPowClaimRecoveryChoice(InitialPowClaimRecoveryChoice::CANCEL);
+    pow_enable->click();
+    QTRY_VERIFY_WITH_TIMEOUT(pow_enable->isEnabled(), 5000);
+    QVERIFY(!pow_enable->isChecked());
+    QVERIFY(!walletModel.wallet().getPowMiningInfo().enabled);
+    QCOMPARE(walletModel.wallet().getPowClaimRecoveryPolicy().mode,
+             interfaces::WalletPowClaimRecoveryMode::UNSET);
+
+    const WalletModel::EncryptionStatus encryption_before_policy =
+        walletModel.getEncryptionStatus();
+    const bool staking_only_before_policy = walletModel.getWalletUnlockStakingOnly();
+    AnswerInitialPowClaimRecoveryChoice(
+        InitialPowClaimRecoveryChoice::PAUSE_AND_ASK);
     ConfirmMessageBox(QMessageBox::Yes);
     pow_enable->click();
-    qApp->processEvents();
-    QVERIFY(pow_status->text().contains(QString("enabled")));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        walletModel.wallet().getPowClaimRecoveryPolicy().mode,
+        interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(pow_status->text().contains(QString("enabled")), 5000);
+    QCOMPARE(walletModel.getEncryptionStatus(), encryption_before_policy);
+    QCOMPARE(walletModel.getWalletUnlockStakingOnly(), staking_only_before_policy);
 
     interfaces::WalletPowMiningInfo info;
     for (int i = 0; i < 50; ++i) {
@@ -700,7 +875,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     // Full-detail wallet walks run on WalletWorker. The Qt event thread only
     // queues the refresh and applies one immutable result.
     refresh_details->click();
-    QTRY_COMPARE_WITH_TIMEOUT(pow_payout->text(), expected_payout, 10000);
+    QTRY_COMPARE_WITH_TIMEOUT(pow_payout->text(), expected_payout, 20000);
     QVERIFY(pow_copy->isEnabled());
 
     pow_copy->click();
@@ -738,6 +913,190 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     pow_enable->click();
     qApp->processEvents();
     QCOMPARE(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED);
+}
+
+void TestPowClaimRecoveryPolicyControls(
+    interfaces::Node& node,
+    MiniGUI& mini_gui,
+    const std::shared_ptr<CWallet>& core_wallet,
+    const PlatformStyle* platform_style)
+{
+    WalletModel& wallet_model = *mini_gui.walletModel;
+    interfaces::Wallet& wallet_interface = wallet_model.wallet();
+
+    std::string error;
+    QVERIFY(wallet_interface.setPowMining(false, 1, 1, error));
+    interfaces::WalletPowClaimRecoveryPolicy reset_policy;
+    QVERIFY(wallet_interface.setPowClaimRecoveryPolicy(reset_policy, error));
+    QCOMPARE(wallet_interface.getPowClaimRecoveryPolicy().mode,
+             interfaces::WalletPowClaimRecoveryMode::UNSET);
+
+    StakingMiningPage page(platform_style);
+    page.setClientModel(mini_gui.clientModel.get());
+    page.setWalletModel(&wallet_model);
+    page.show();
+    qApp->processEvents();
+
+    auto* recovery = page.findChild<QCheckBox*>(
+        QStringLiteral("automationClaimRecovery"));
+    auto* status = page.findChild<QLabel*>(QStringLiteral("automationStatus"));
+    auto* refresh = page.findChild<QPushButton*>(QStringLiteral("stakingMiningRefresh"));
+    QVERIFY(recovery);
+    QVERIFY(status);
+    QVERIFY(refresh);
+    QCOMPARE(recovery->text(), QStringLiteral(
+        "Automatically recover quarantined Gold Rush PoW claims so an enabled miner can resume"));
+    QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
+    QVERIFY(!recovery->isChecked());
+    QVERIFY(status->text().contains(QStringLiteral("6 process-wide")));
+    QVERIFY(status->text().contains(QStringLiteral("wallet-scoped")));
+    QVERIFY(status->text().contains(QStringLiteral("no choice recorded")));
+
+    // Escape is the safe cancellation path and must not persist consent.
+    AnswerPowClaimRecoveryConsent(/*enable=*/false, /*use_escape=*/true);
+    QTest::mouseClick(recovery, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 3000);
+    QVERIFY(!recovery->isChecked());
+    QCOMPARE(wallet_interface.getPowClaimRecoveryPolicy().mode,
+             interfaces::WalletPowClaimRecoveryMode::UNSET);
+
+    // The consent surface names the exact wallet. A wallet unload during its
+    // nested event loop closes the modal and cannot persist authority to the
+    // old or newly selected wallet.
+    UnloadWalletDuringPowClaimRecoveryConsent(
+        page, wallet_model.getDisplayName());
+    QTest::mouseClick(recovery, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(!recovery->isEnabled(), 3000);
+    QCOMPARE(wallet_interface.getPowClaimRecoveryPolicy().mode,
+             interfaces::WalletPowClaimRecoveryMode::UNSET);
+    page.setWalletModel(&wallet_model);
+    QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
+    QVERIFY(!recovery->isChecked());
+
+    // WalletModel owns globally unique correlation within this wallet. An
+    // exact cancellation by one caller cannot cancel another caller's work.
+    std::shared_ptr<const WalletModel::PowClaimRecoveryPolicyResult> first_result;
+    std::shared_ptr<const WalletModel::PowClaimRecoveryPolicyResult> second_result;
+    uint64_t first_id{0};
+    uint64_t second_id{0};
+    const QMetaObject::Connection request_connection = QObject::connect(
+        &wallet_model, &WalletModel::powClaimRecoveryPolicyReady, &page,
+        [&](quint64 request_id, quint64) {
+            if (request_id == first_id) {
+                first_result = wallet_model.takePowClaimRecoveryPolicyResult(request_id);
+            } else if (request_id == second_id) {
+                second_result = wallet_model.takePowClaimRecoveryPolicyResult(request_id);
+            }
+        });
+    WalletModel::PowClaimRecoveryPolicyRequest first_request;
+    first_request.generation = 1001;
+    WalletModel::PowClaimRecoveryPolicyRequest second_request;
+    second_request.generation = 1002;
+    first_id = wallet_model.requestPowClaimRecoveryPolicy(first_request);
+    second_id = wallet_model.requestPowClaimRecoveryPolicy(second_request);
+    QVERIFY(first_id != 0);
+    QVERIFY(second_id != 0);
+    QVERIFY(first_id != second_id);
+    wallet_model.cancelPowClaimRecoveryPolicy(first_id);
+    QTRY_VERIFY_WITH_TIMEOUT(first_result != nullptr, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(second_result != nullptr, 5000);
+    QVERIFY(second_result->success);
+    QVERIFY(!second_result->cancelled);
+    if (first_result) QCOMPARE(first_result->request.request_id, first_id);
+    QObject::disconnect(request_connection);
+
+    // Accept the bounded defaults. The write is asynchronous and wallet-
+    // scoped; it must not infer consent to start the miner.
+    const WalletModel::EncryptionStatus encryption_before =
+        wallet_model.getEncryptionStatus();
+    const bool staking_only_before = wallet_model.getWalletUnlockStakingOnly();
+    AnswerPowClaimRecoveryConsent(
+        /*enable=*/true, /*use_escape=*/false, wallet_model.getDisplayName());
+    QTest::mouseClick(recovery, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(
+        wallet_interface.getPowClaimRecoveryPolicy().mode,
+        interfaces::WalletPowClaimRecoveryMode::AUTOMATIC, 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(recovery->isChecked(), 10000);
+    QVERIFY(!wallet_interface.getPowMiningInfo().enabled);
+    QCOMPARE(wallet_model.getEncryptionStatus(), encryption_before);
+    QCOMPARE(wallet_model.getWalletUnlockStakingOnly(), staking_only_before);
+
+    const interfaces::WalletPowClaimRecoveryPolicy stored =
+        wallet_interface.getPowClaimRecoveryPolicy();
+    QVERIFY(stored.max_fee_per_resolution > 0);
+    QVERIFY(stored.aggregate_batch_fee_cap >= stored.max_fee_per_resolution);
+    QVERIFY(stored.rolling_fee_budget >= stored.aggregate_batch_fee_cap);
+    const wallet::ShadowPowClaimRecoveryPolicy core_stored =
+        core_wallet->GetShadowPowClaimRecoveryPolicy();
+    QVERIFY(core_stored.HasAutomaticAuthority());
+    QCOMPARE(core_stored.max_fee_per_resolution, stored.max_fee_per_resolution);
+    QCOMPARE(core_stored.aggregate_batch_fee_cap, stored.aggregate_batch_fee_cap);
+    QCOMPARE(core_stored.rolling_fee_budget, stored.rolling_fee_budget);
+
+    // A second interface instance sees the same durable wallet record, while
+    // a different wallet remains UNSET.
+    WalletContext& context = *node.walletLoader().context();
+    auto same_wallet_interface = interfaces::MakeWallet(context, core_wallet);
+    QVERIFY(same_wallet_interface->getPowClaimRecoveryPolicy() == stored);
+
+    auto other_wallet = std::make_shared<CWallet>(
+        node.context()->chain.get(), "qt-claim-recovery-isolation",
+        CreateMockableWalletDatabase());
+    QCOMPARE(other_wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    auto other_wallet_interface = interfaces::MakeWallet(context, other_wallet);
+    QCOMPARE(other_wallet_interface->getPowClaimRecoveryPolicy().mode,
+             interfaces::WalletPowClaimRecoveryMode::UNSET);
+
+    // A failed revocation must restore the actual authorized state and show a
+    // prominent failure instead of quietly implying that spending authority
+    // was removed.
+    wallet::MockableDatabase& database = wallet::GetMockableDatabase(*core_wallet);
+    database.m_fail_begin = true;
+    ConfirmMessageBox(QMessageBox::Ok);
+    QTest::mouseClick(recovery, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
+    database.m_fail_begin = false;
+    QVERIFY(recovery->isChecked());
+    QCOMPARE(wallet_interface.getPowClaimRecoveryPolicy().mode,
+             interfaces::WalletPowClaimRecoveryMode::AUTOMATIC);
+    QVERIFY(status->text().contains(QStringLiteral("Failed to begin durable")));
+    // Unchecking records PAUSE_AND_ASK instead of silently erasing the
+    // operator's choice or changing any fee bounds.
+    QTest::mouseClick(recovery, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(
+        wallet_interface.getPowClaimRecoveryPolicy().mode,
+        interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!recovery->isChecked(), 5000);
+    QCOMPARE(wallet_interface.getPowClaimRecoveryPolicy().max_fee_per_resolution,
+             stored.max_fee_per_resolution);
+    QVERIFY(!wallet_interface.getPowMiningInfo().enabled);
+
+    // An external CLI/RPC-equivalent write is reflected by the explicit
+    // refresh; the GUI must not keep displaying stale standing authority.
+    interfaces::WalletPowClaimRecoveryPolicy external = stored;
+    external.mode = interfaces::WalletPowClaimRecoveryMode::AUTOMATIC;
+    QVERIFY(wallet_interface.setPowClaimRecoveryPolicy(external, error));
+    refresh->click();
+    QTRY_VERIFY_WITH_TIMEOUT(recovery->isChecked(), 5000);
+
+    external.mode = interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK;
+    QVERIFY(wallet_interface.setPowClaimRecoveryPolicy(external, error));
+    refresh->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!recovery->isChecked(), 5000);
+
+    // Switching wallets while a click's preflight read is queued must cancel
+    // the obsolete view request without persisting its intended change.
+    QTest::mouseClick(recovery, Qt::LeftButton);
+    page.setWalletModel(nullptr);
+    qApp->processEvents();
+    page.setWalletModel(&wallet_model);
+    QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
+    QVERIFY(!recovery->isChecked());
+    QCOMPARE(wallet_interface.getPowClaimRecoveryPolicy().mode,
+             interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK);
+
+    // Leave the shared GUI wallet at the safe release default for later tests.
+    QVERIFY(wallet_interface.setPowClaimRecoveryPolicy(reset_policy, error));
 }
 
 void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet, const PlatformStyle* platformStyle)
@@ -1036,6 +1395,7 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     SendCoinsDialog& sendCoinsDialog = mini_gui.sendCoinsDialog;
 
     TestStakingMiningPageControls(mini_gui, wallet, platformStyle.get());
+    TestPowClaimRecoveryPolicyControls(node, mini_gui, wallet, platformStyle.get());
     TestWalletPagesScale(mini_gui, platformStyle.get());
     TestStakingMiningPageSurvivesWalletModelDeletion(node, wallet, platformStyle.get());
     TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(node, platformStyle.get());

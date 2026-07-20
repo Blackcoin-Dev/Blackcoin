@@ -130,6 +130,20 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(self._is_abandoned(wallet, txid), False)
 
+    @staticmethod
+    def _assert_claim_inventory(wallet, raw, actionable, resolved, indeterminate, components=None):
+        info = wallet.getpowmininginfo()
+        assert_equal(info["quarantined_claims"], raw)
+        assert_equal(info["blocking_quarantined_claims"], actionable + indeterminate)
+        assert_equal(info["actionable_quarantined_claims"], actionable)
+        assert_equal(info["resolved_on_active_chain_claims"], resolved)
+        assert_equal(info["indeterminate_quarantined_claims"], indeterminate)
+        if components is not None:
+            assert_equal(info["claim_components"], components)
+        assert_equal(info["claim_inventory_wallet_tip_matches"], True)
+        assert_equal(len(info["claim_inventory_tip"]), 64)
+        return info
+
     def run_test(self):
         node = self.nodes[0]
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
@@ -366,7 +380,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert preview["output_amount"] > 0
         assert "hex" not in preview
         assert first_txid not in node.getrawmempool()
-        assert_equal(manual.getpowmininginfo()["quarantined_claims"], 1)
+        self._assert_claim_inventory(
+            manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
+        )
 
         assert_raises_rpc_error(
             -8,
@@ -386,14 +402,18 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(resolution["fee"], preview["fee"])
         assert_equal(resolution["output_amount"], preview["output_amount"])
         assert resolution["txid"] not in node.getrawmempool()
-        assert_equal(manual.getpowmininginfo()["quarantined_claims"], 1)
+        self._assert_claim_inventory(
+            manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
+        )
 
         resolution_txid = node.sendrawtransaction(resolution["hex"])
         assert_equal(resolution_txid, resolution["txid"])
         self.wait_until(lambda: resolution_txid in node.getrawmempool(), timeout=20)
         # Publishing the conflict does not release the input. Only an active
         # chain confirmation of one side may resolve the reservation.
-        assert_equal(manual.getpowmininginfo()["quarantined_claims"], 1)
+        self._assert_claim_inventory(
+            manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
+        )
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 0)
 
         self.log.info("An unconfirmed resolution survives restart without releasing the shared input")
@@ -403,7 +423,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         manual = self._load_wallet(MANUAL_WALLET)
         assert_equal(manual.gettransaction(first_txid)["confirmations"], 0)
         assert_equal(manual.gettransaction(resolution_txid)["confirmations"], 0)
-        assert_equal(manual.getpowmininginfo()["quarantined_claims"], 1)
+        self._assert_claim_inventory(
+            manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
+        )
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 0)
         # An ordinary wallet resubmission may relay the operator-broadcast
         # resolution after restart. If startup scheduling has not done so yet,
@@ -426,7 +448,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert manual.gettransaction(resolution_txid)["confirmations"] < 0
         original_info = manual.getpowmininginfo()
         assert_equal(original_info["unresolved_claims"], 0)
-        assert_equal(original_info["quarantined_claims"], 0)
+        self._assert_claim_inventory(
+            manual, raw=0, actionable=0, resolved=0, indeterminate=0, components=0
+        )
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 1)
 
         self.log.info("The confirmed claim output becomes eligible for legacy PoS and a fresh PoW claim")
@@ -503,19 +527,25 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert manual.gettransaction(second_resolution_txid)["confirmations"] > 0
         resolution_info = manual.getpowmininginfo()
         assert_equal(resolution_info["unresolved_claims"], 0)
-        assert_equal(resolution_info["quarantined_claims"], 0)
+        self._assert_claim_inventory(
+            manual, raw=0, actionable=0, resolved=0, indeterminate=0, components=0
+        )
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 1)
 
         self.log.info("Reorging the resolution never exposes the shared input twice")
         node.invalidateblock(resolution_block)
         self.wait_until(lambda: second_resolution_txid in node.getrawmempool(), timeout=20)
         node.syncwithvalidationinterfacequeue()
-        assert_equal(manual.getpowmininginfo()["quarantined_claims"], 1)
+        self._assert_claim_inventory(
+            manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
+        )
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 0)
         node.reconsiderblock(resolution_block)
         self.wait_until(lambda: node.getbestblockhash() == resolution_block, timeout=20)
         node.syncwithvalidationinterfacequeue()
-        assert_equal(manual.getpowmininginfo()["quarantined_claims"], 0)
+        self._assert_claim_inventory(
+            manual, raw=0, actionable=0, resolved=0, indeterminate=0, components=0
+        )
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 1)
 
         self.log.info("An injected RPC broadcast exception quarantines the persisted claim")
@@ -647,6 +677,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             )
             info = boundary.getpowmininginfo()
             assert_equal(info["claims_submitted"], 0)
+            self._assert_claim_inventory(
+                boundary, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
+            )
             assert_equal(self._claim_txids(boundary), before_second_claim)
             assert_equal(len(boundary.listunspent(1, 9999999, [boundary_address])), 1)
         finally:

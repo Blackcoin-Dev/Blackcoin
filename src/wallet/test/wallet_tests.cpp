@@ -635,6 +635,139 @@ BOOST_FIXTURE_TEST_CASE(legacy_shadow_pow_cleanup_is_quarantined_without_rebroad
     }
 }
 
+BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_inventory_is_tip_pinned_and_reorg_safe, TestChain100Setup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script = GetScriptForRawPubKey(wallet_key.GetPubKey());
+    const CMutableTransaction funding = TestSimpleSpend(
+        *m_coinbase_txns[0],
+        /*index=*/0,
+        coinbaseKey,
+        wallet_script);
+    CreateAndProcessBlock({funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()),
+        wallet_key);
+    BOOST_REQUIRE(m_node.chain->isReadyToBroadcast());
+
+    auto make_shadow_claim = [](const COutPoint& input, CAmount value, const CScript& output_script) {
+        std::vector<unsigned char> proof = GetShadowPrefix();
+        proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        CMutableTransaction claim;
+        claim.vin.emplace_back(input);
+        claim.vout.emplace_back(value, output_script);
+        claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+        return MakeTransactionRef(std::move(claim));
+    };
+    auto sync_wallet_tip = [&] {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const CBlockIndex* tip = Assert(m_node.chainman)->ActiveChain().Tip();
+        BOOST_REQUIRE(tip);
+        wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash());
+    };
+    auto check_inventory = [&](size_t raw, size_t actionable, size_t resolved, size_t indeterminate) {
+        const ShadowPowClaimInventory inventory = wallet->GetShadowPowClaimInventory();
+        BOOST_CHECK(inventory.wallet_tip_matches);
+        BOOST_CHECK_EQUAL(inventory.raw_quarantined_claims, raw);
+        BOOST_CHECK_EQUAL(inventory.actionable_claims, actionable);
+        BOOST_CHECK_EQUAL(inventory.resolved_on_active_chain_claims, resolved);
+        BOOST_CHECK_EQUAL(inventory.indeterminate_claims, indeterminate);
+        BOOST_CHECK_EQUAL(inventory.BlockingClaims(), actionable + indeterminate);
+        BOOST_CHECK_EQUAL(wallet->CountQuarantinedShadowPowClaims(), actionable + indeterminate);
+    };
+
+    const CTransactionRef funding_ref = MakeTransactionRef(funding);
+    const COutPoint funding_outpoint{funding_ref->GetHash(), 0};
+    const CTransactionRef stale_claim = make_shadow_claim(
+        funding_outpoint,
+        funding.vout[0].nValue - DEFAULT_TRANSACTION_MAXFEE,
+        wallet_script);
+    BOOST_REQUIRE(TransactionHasShadowProof(*stale_claim));
+    BOOST_REQUIRE(wallet->AddToWallet(stale_claim, TxStateInactive{}));
+
+    // An unconfirmed, non-mempool wallet claim whose authenticated confirmed
+    // anchor remains in CoinsTip is actionable and must keep claim creation
+    // blocked.
+    check_inventory(/*raw=*/1, /*actionable=*/1, /*resolved=*/0, /*indeterminate=*/0);
+
+    const int funding_height = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->ActiveChain().Height());
+    const CMutableTransaction competing_spend = CreateValidMempoolTransaction(
+        funding_ref,
+        /*input_vout=*/0,
+        funding_height,
+        wallet_key,
+        wallet_script,
+        funding.vout[0].nValue - DEFAULT_TRANSACTION_MAXFEE,
+        /*submit=*/true);
+
+    // A mempool-only conflict is not an active-chain resolution. Direct
+    // CoinsTip classification must continue to fail closed and block mining.
+    check_inventory(/*raw=*/1, /*actionable=*/1, /*resolved=*/0, /*indeterminate=*/0);
+
+    const CBlock resolution_block = CreateAndProcessBlock(
+        {competing_spend}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    sync_wallet_tip();
+
+    // Model a legacy wallet record that did not learn the conflict edge. The
+    // raw QQSPROOF history remains intact, while the active-chain spend of its
+    // authenticated anchor proves that this component is nonblocking.
+    check_inventory(/*raw=*/1, /*actionable=*/0, /*resolved=*/1, /*indeterminate=*/0);
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored = wallet->mapWallet.at(stale_claim->GetHash());
+        BOOST_CHECK(stored.isUnconfirmed());
+        BOOST_CHECK(!stored.InMempool());
+        BOOST_CHECK(!stored.isAbandoned());
+    }
+
+    CBlockIndex* resolution_index = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->m_blockman.LookupBlockIndex(resolution_block.GetHash()));
+    BOOST_REQUIRE(resolution_index);
+    BlockValidationState state;
+    BOOST_REQUIRE(Assert(m_node.chainman)->ActiveChainstate().InvalidateBlock(state, resolution_index));
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+
+    // Disconnecting the active-chain spend restores the anchor. Classification
+    // is reversible, so the same retained record immediately blocks again.
+    check_inventory(/*raw=*/1, /*actionable=*/1, /*resolved=*/0, /*indeterminate=*/0);
+
+    const CTransactionRef competing_ref = MakeTransactionRef(competing_spend);
+    BOOST_REQUIRE(wallet->AddToWallet(competing_ref, TxStateInMempool{}));
+    const CTransactionRef malformed_ancestry_claim = make_shadow_claim(
+        COutPoint{competing_ref->GetHash(), 0},
+        competing_spend.vout[0].nValue - DEFAULT_TRANSACTION_MAXFEE,
+        wallet_script);
+    BOOST_REQUIRE(TransactionHasShadowProof(*malformed_ancestry_claim));
+    BOOST_REQUIRE(wallet->AddToWallet(malformed_ancestry_claim, TxStateInactive{}));
+
+    // A claim rooted in an unconfirmed ordinary transaction has no
+    // authenticated confirmed anchor. It must be indeterminate, never inferred
+    // resolved merely because an outpoint is absent from CoinsTip.
+    check_inventory(/*raw=*/2, /*actionable=*/1, /*resolved=*/0, /*indeterminate=*/1);
+
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const CBlockIndex* tip = Assert(m_node.chainman)->ActiveChain().Tip();
+        BOOST_REQUIRE(tip && tip->pprev);
+        wallet->SetLastBlockProcessed(tip->pprev->nHeight, tip->pprev->GetBlockHash());
+    }
+    const ShadowPowClaimInventory stale_snapshot = wallet->GetShadowPowClaimInventory();
+    BOOST_CHECK(!stale_snapshot.wallet_tip_matches);
+    BOOST_CHECK_EQUAL(stale_snapshot.raw_quarantined_claims, 2U);
+    BOOST_CHECK_EQUAL(stale_snapshot.actionable_claims, 0U);
+    BOOST_CHECK_EQUAL(stale_snapshot.resolved_on_active_chain_claims, 0U);
+    BOOST_CHECK_EQUAL(stale_snapshot.indeterminate_claims, 2U);
+    BOOST_CHECK_EQUAL(stale_snapshot.BlockingClaims(), 2U);
+    sync_wallet_tip();
+}
+
 static void CheckLiveUnspentStakeIndex(CWallet& wallet)
 {
     std::set<COutPoint> expected;

@@ -99,6 +99,39 @@ enum class ShadowPowClaimSubmitResult {
     FAILED,
 };
 
+/** Active-chain-relative state of one wallet-known quarantined QQSPROOF component. */
+enum class ShadowPowClaimComponentState {
+    /** The current confirmed anchor is unspent, so a retained claim may confirm. */
+    ACTIONABLE,
+    /** The current active chain already spends the confirmed anchor. */
+    RESOLVED_ON_ACTIVE_CHAIN,
+    /** The component cannot be classified completely and must fail closed. */
+    INDETERMINATE,
+};
+
+/** One transitive wallet-known QQSPROOF component keyed by its current anchor. */
+struct ShadowPowClaimComponent {
+    COutPoint anchor;
+    std::vector<uint256> claim_txids;
+    ShadowPowClaimComponentState state{ShadowPowClaimComponentState::INDETERMINATE};
+};
+
+/** One tip-pinned snapshot used by miner gating, RPC telemetry, and recovery. */
+struct ShadowPowClaimInventory {
+    uint256 active_tip;
+    bool wallet_tip_matches{false};
+    size_t raw_quarantined_claims{0};
+    size_t actionable_claims{0};
+    size_t resolved_on_active_chain_claims{0};
+    size_t indeterminate_claims{0};
+    std::vector<ShadowPowClaimComponent> components;
+
+    size_t BlockingClaims() const
+    {
+        return actionable_claims + indeterminate_claims;
+    }
+};
+
 /** Block timing captured before taking cs_wallet. */
 struct WalletBlockTime {
     int64_t block_time{0};
@@ -1606,9 +1639,15 @@ public:
      * occupy relay/template capacity. Non-mempool proofs are handled by the
      * quarantine gate and never authorize a new fee-input claim. */
     size_t CountLiveShadowPowClaims() const;
-    /** Count every wallet-authored unconfirmed QQSPROOF absent from the local
-     * mempool. Even without a persisted marker, a peer may still confirm it,
-     * so a new fee-input claim must not be created until this count is zero. */
+    /** Return a complete, active-tip-pinned quarantine/component snapshot.
+     * Unknown components fail closed. Components whose confirmed anchor is
+     * already spent on the active chain remain in wallet history but do not
+     * gate mining; a reorg makes them blocking again automatically. */
+    ShadowPowClaimInventory GetShadowPowClaimInventory() const;
+    /** Locked implementation for final claim preflight. */
+    ShadowPowClaimInventory GetShadowPowClaimInventoryLocked() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    /** Count quarantined claim objects that currently gate claim creation.
+     * This is actionable plus indeterminate objects, not raw wallet history. */
     size_t CountQuarantinedShadowPowClaims() const;
     /** Return true only for a persisted, locally recognized quarantine. This
      * is intentionally narrower than CountQuarantinedShadowPowClaims(), which

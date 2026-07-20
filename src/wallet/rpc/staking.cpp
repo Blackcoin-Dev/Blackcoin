@@ -1528,6 +1528,7 @@ static RPCHelpMan sendshadowpowclaim()
     coin_control.destChange = dest;
     coin_control.m_allow_other_inputs = false;
     coin_control.m_avoid_address_reuse = false;
+    coin_control.m_min_depth = 1;
     if (!request.params[3].isNull()) {
         coin_control.m_feerate = FeeRateFromSatVbValue(request.params[3]);
         coin_control.fOverrideFeeRate = true;
@@ -1536,6 +1537,11 @@ static RPCHelpMan sendshadowpowclaim()
     ShadowPowClaimInput selected_input;
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
+        const ShadowPowClaimInventory claim_inventory = pwallet->GetShadowPowClaimInventoryLocked();
+        if (claim_inventory.BlockingClaims() != 0) {
+            throw JSONRPCError(RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is paused because an actionable or indeterminate quarantined claim component remains unresolved");
+        }
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, GetAdjustedTimeSeconds());
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
@@ -1625,6 +1631,7 @@ static RPCHelpMan sendshadowpowclaim()
         }
         for (const COutput& output : AvailableCoins(*pwallet, &coin_control).All()) {
             if (output.outpoint != selected_input.outpoint) continue;
+            if (output.depth <= 0) continue;
             if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != selected_input.target) continue;
 
             CMutableTransaction candidate;
@@ -1681,6 +1688,18 @@ static RPCHelpMan sendshadowpowclaim()
         if (!tip || tip->GetBlockHash() != pow_work.prev_hash ||
             tip->nHeight + 1 != pow_work.height) {
             throw JSONRPCError(RPC_VERIFY_REJECTED, "Active chain tip changed before the PoW claim could be committed; retry on the new tip");
+        }
+        {
+            LOCK(pwallet->cs_wallet);
+            const ShadowPowClaimInventory claim_inventory = pwallet->GetShadowPowClaimInventoryLocked();
+            Coin selected_coin;
+            if (claim_inventory.BlockingClaims() != 0 ||
+                !claim_inventory.wallet_tip_matches ||
+                !chainman.ActiveChainstate().CoinsTip().GetCoin(selected_input.outpoint, selected_coin) ||
+                selected_coin.IsSpent()) {
+                throw JSONRPCError(RPC_VERIFY_REJECTED,
+                    "Wallet claim-component state or selected confirmed input changed before commit; retry the PoW claim");
+            }
         }
         const MempoolAcceptResult accept = chainman.ProcessTransaction(tx, /*test_accept=*/true);
         if (accept.m_result_type != MempoolAcceptResult::ResultType::VALID) {
@@ -2441,7 +2460,14 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "claims_submitted", "Claims submitted by this miner since it started."},
             {RPCResult::Type::NUM, "unresolved_claims", "Unconfirmed wallet QQSPROOF transactions, whether live or quarantined."},
             {RPCResult::Type::NUM, "live_claims", "Unconfirmed wallet QQSPROOF transactions currently in the local mempool."},
-            {RPCResult::Type::NUM, "quarantined_claims", "Unconfirmed wallet QQSPROOF transactions absent from the local mempool whose inputs remain reserved."},
+            {RPCResult::Type::NUM, "quarantined_claims", "All wallet-authored unconfirmed QQSPROOF objects absent from the local mempool, including history already resolved on the active chain (compatibility field)."},
+            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Quarantined claim objects that currently gate claim creation (actionable plus indeterminate)."},
+            {RPCResult::Type::NUM, "actionable_quarantined_claims", "Quarantined objects whose confirmed anchor remains unspent on the active chain."},
+            {RPCResult::Type::NUM, "resolved_on_active_chain_claims", "Historical quarantined objects whose confirmed anchor is already spent on the active chain; retained for reorg safety but not miner-gating."},
+            {RPCResult::Type::NUM, "indeterminate_quarantined_claims", "Quarantined objects with incomplete ancestry or an incoherent wallet/chain snapshot; these fail closed and gate mining."},
+            {RPCResult::Type::NUM, "claim_components", "Wallet-known quarantined claim components in the current snapshot."},
+            {RPCResult::Type::STR_HEX, "claim_inventory_tip", "Active tip to which component classification is bound, or all-zero when unavailable."},
+            {RPCResult::Type::BOOL, "claim_inventory_wallet_tip_matches", "Whether the wallet-processed tip exactly matched the classified active tip."},
         }},
         RPCExamples{
             HelpExampleCli("getpowmininginfo", "")
@@ -2463,7 +2489,15 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
     obj.pushKV("unresolved_claims", static_cast<uint64_t>(pwallet->CountUnresolvedShadowPowClaims()));
     obj.pushKV("live_claims", static_cast<uint64_t>(pwallet->CountLiveShadowPowClaims()));
-    obj.pushKV("quarantined_claims", static_cast<uint64_t>(pwallet->CountQuarantinedShadowPowClaims()));
+    const ShadowPowClaimInventory claim_inventory = pwallet->GetShadowPowClaimInventory();
+    obj.pushKV("quarantined_claims", static_cast<uint64_t>(claim_inventory.raw_quarantined_claims));
+    obj.pushKV("blocking_quarantined_claims", static_cast<uint64_t>(claim_inventory.BlockingClaims()));
+    obj.pushKV("actionable_quarantined_claims", static_cast<uint64_t>(claim_inventory.actionable_claims));
+    obj.pushKV("resolved_on_active_chain_claims", static_cast<uint64_t>(claim_inventory.resolved_on_active_chain_claims));
+    obj.pushKV("indeterminate_quarantined_claims", static_cast<uint64_t>(claim_inventory.indeterminate_claims));
+    obj.pushKV("claim_components", static_cast<uint64_t>(claim_inventory.components.size()));
+    obj.pushKV("claim_inventory_tip", claim_inventory.active_tip.GetHex());
+    obj.pushKV("claim_inventory_wallet_tip_matches", claim_inventory.wallet_tip_matches);
     {
         LOCK(pwallet->cs_wallet);
         obj.pushKV("payout_address", pwallet->m_pow_payout_quantum);

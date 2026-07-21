@@ -262,6 +262,90 @@ BOOST_AUTO_TEST_CASE(full_graph_groups_conflicts_branches_and_independent_anchor
                 component_b.fingerprint);
 }
 
+BOOST_AUTO_TEST_CASE(historical_three_anchor_forest_collapses_to_three_current_actions)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+
+    // Sanitized reproduction of the reported alpha-era topology: three
+    // independent confirmed anchors, three claim branches per anchor, and six
+    // claims per branch. This produces 54 claims and nine leaves without
+    // retaining any production wallet identifiers or transaction bytes.
+    std::vector<COutPoint> anchors;
+    for (size_t anchor_index = 0; anchor_index < 3; ++anchor_index) {
+        const CTransactionRef& anchor_tx = m_coinbase_txns.at(anchor_index);
+        const COutPoint anchor{anchor_tx->GetHash(), 0};
+        const CScript& wallet_script =
+            anchor_tx->vout.at(0).scriptPubKey;
+        anchors.push_back(anchor);
+
+        for (size_t branch = 0; branch < 3; ++branch) {
+            COutPoint input = anchor;
+            CAmount value = anchor_tx->vout.at(0).nValue -
+                            static_cast<CAmount>(branch + 1) *
+                                DEFAULT_TRANSACTION_MAXFEE;
+            for (size_t depth = 0; depth < 6; ++depth) {
+                const CTransactionRef claim = MakeRecoveryTestClaim(
+                    input, value, wallet_script);
+                AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                                     tip->GetBlockHash(), tip->nHeight,
+                                     tip->GetBlockHash());
+                input = COutPoint{claim->GetHash(), 0};
+                value -= DEFAULT_TRANSACTION_MAXFEE;
+            }
+        }
+    }
+
+    const ShadowPowClaimRecoveryInventory inventory =
+        wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_REQUIRE(inventory.wallet_tip_matches);
+    BOOST_CHECK_EQUAL(inventory.raw_claim_objects, 54U);
+    BOOST_CHECK_EQUAL(inventory.components.size(), 3U);
+    BOOST_CHECK(inventory.unanchored_claim_txids.empty());
+    for (const COutPoint& anchor : anchors) {
+        const auto& component = FindRecoveryComponent(inventory, anchor);
+        BOOST_CHECK_EQUAL(component.claim_txids.size(), 18U);
+        BOOST_CHECK_EQUAL(component.root_claim_txids.size(), 3U);
+        BOOST_CHECK_EQUAL(component.descendant_claims, 15U);
+        BOOST_CHECK(component.anchor_authenticated);
+        BOOST_CHECK(component.anchor_unspent);
+        BOOST_CHECK(component.all_claims_quarantined);
+        BOOST_CHECK(component.all_claims_explicitly_provenanced);
+    }
+
+    ShadowPowClaimRecoveryRequest request;
+    const ShadowPowClaimRecoveryPlan plan =
+        wallet->PlanShadowPowClaimRecovery(request);
+    BOOST_REQUIRE(plan.complete);
+    BOOST_CHECK(plan.refused.empty());
+    BOOST_REQUIRE_EQUAL(plan.actions.size(), 3U);
+    size_t affected_claims{0};
+    size_t collapsed_descendants{0};
+    for (const ShadowPowClaimRecoveryAction& action : plan.actions) {
+        BOOST_CHECK(std::find(anchors.begin(), anchors.end(),
+                              action.anchor) != anchors.end());
+        BOOST_CHECK_EQUAL(action.claim_txids.size(), 18U);
+        BOOST_CHECK_EQUAL(action.descendant_claims, 15U);
+        BOOST_REQUIRE(action.transaction);
+        BOOST_REQUIRE_EQUAL(action.transaction->vin.size(), 1U);
+        BOOST_CHECK(action.transaction->vin.front().prevout ==
+                    action.anchor);
+        affected_claims += action.claim_txids.size();
+        collapsed_descendants += action.descendant_claims;
+    }
+    BOOST_CHECK_EQUAL(affected_claims, 54U);
+    BOOST_CHECK_EQUAL(collapsed_descendants, 45U);
+}
+
 BOOST_AUTO_TEST_CASE(explicit_provenance_requires_complete_authenticated_metadata)
 {
     auto wallet = CreateSyncedWallet(

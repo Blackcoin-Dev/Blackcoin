@@ -11,7 +11,7 @@
 #include <script/sign.h>
 #include <wallet/crypter.h>
 #include <wallet/db.h>
-#include <wallet/shadow_pow_claim_recovery.h>
+#include <wallet/shadow_pow_claim_recovery_types.h>
 #include <wallet/walletutil.h>
 #include <key.h>
 

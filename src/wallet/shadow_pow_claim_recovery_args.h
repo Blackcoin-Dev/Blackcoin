@@ -8,7 +8,7 @@
 #include <common/args.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
-#include <wallet/shadow_pow_claim_recovery.h>
+#include <wallet/shadow_pow_claim_recovery_types.h>
 
 #include <array>
 #include <limits>

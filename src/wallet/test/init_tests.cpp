@@ -205,7 +205,7 @@ BOOST_AUTO_TEST_CASE(pow_claim_recovery_startup_seeds_only_absent_policy)
     BOOST_CHECK(!WalletBatch(wallet.GetDatabase(), /*flush_on_close=*/false).HasShadowPowClaimRecoveryPolicy());
 
     bilingual_str error;
-    BOOST_REQUIRE(ApplyShadowPowClaimRecoveryStartupPolicy(wallet, args, error));
+    BOOST_REQUIRE(wallet.ApplyShadowPowClaimRecoveryStartupPolicy(args, error));
     BOOST_CHECK(error.empty());
     BOOST_CHECK(wallet.GetShadowPowClaimRecoveryPolicy() == ExpectedAutomaticClaimRecoveryPolicy());
 
@@ -231,7 +231,7 @@ BOOST_AUTO_TEST_CASE(pow_claim_recovery_startup_preserves_every_existing_record)
         CWallet wallet(/*chain=*/nullptr, name, std::move(database));
         BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
         bilingual_str error;
-        BOOST_REQUIRE(ApplyShadowPowClaimRecoveryStartupPolicy(wallet, args, error));
+        BOOST_REQUIRE(wallet.ApplyShadowPowClaimRecoveryStartupPolicy(args, error));
         BOOST_CHECK(error.empty());
         BOOST_CHECK(wallet.GetShadowPowClaimRecoveryPolicy() == persisted);
 
@@ -266,7 +266,7 @@ BOOST_AUTO_TEST_CASE(pow_claim_recovery_startup_preserves_malformed_record_fail_
     ArgsManager args;
     SetAutomaticClaimRecoveryArgs(args);
     bilingual_str error;
-    BOOST_REQUIRE(ApplyShadowPowClaimRecoveryStartupPolicy(wallet, args, error));
+    BOOST_REQUIRE(wallet.ApplyShadowPowClaimRecoveryStartupPolicy(args, error));
     BOOST_CHECK(error.empty());
     BOOST_CHECK(!wallet.GetShadowPowClaimRecoveryPolicy().HasAutomaticAuthority());
 
@@ -278,11 +278,7 @@ BOOST_AUTO_TEST_CASE(pow_claim_recovery_startup_preserves_malformed_record_fail_
     BOOST_CHECK(!read_error.empty());
 }
 
-BOOST_AUTO_TEST_SUITE_END()
-
-BOOST_FIXTURE_TEST_SUITE(pow_claim_recovery_runtime_seed_tests, TestingSetup)
-
-BOOST_AUTO_TEST_CASE(createwallet_and_loadwallet_apply_seed_without_unlock_or_mining)
+BOOST_FIXTURE_TEST_CASE(createwallet_and_loadwallet_apply_seed_without_unlock_or_mining, TestingSetup)
 {
     m_args.ForceSetArg("-unsafesqlitesync", "1");
     fs::create_directories(m_args.GetDataDirNet() / "wallets");

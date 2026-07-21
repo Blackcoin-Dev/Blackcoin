@@ -35,7 +35,7 @@
 #include <wallet/crypter.h>
 #include <wallet/db.h>
 #include <wallet/scriptpubkeyman.h>
-#include <wallet/shadow_pow_claim_recovery.h>
+#include <wallet/shadow_pow_claim_recovery_types.h>
 #include <wallet/transaction.h>
 #include <wallet/types.h>
 #include <wallet/walletutil.h>
@@ -62,6 +62,7 @@ class CKey;
 class CKeyID;
 class CPubKey;
 class Coin;
+class ArgsManager;
 class SigningProvider;
 struct ShadowPowWork;
 enum class MemPoolRemovalReason;
@@ -814,6 +815,25 @@ private:
     // wallet is reloaded, no recovery path may create or promote another
     // transaction for the same anchor generation.
     bool m_shadow_pow_claim_recovery_db_ambiguous GUARDED_BY(cs_wallet){false};
+    using ShadowPowClaimRecoveryRecordMutation =
+        std::function<bool(CWalletTx&)>;
+    /**
+     * Copy, mutate, and durably commit safety-relevant claim records before
+     * publishing their metadata/state to mapWallet. Any database-stage
+     * failure latches claim recovery closed until the wallet is reloaded.
+     */
+    bool UpdateShadowPowClaimRecoveryRecordsDurably(
+        const std::vector<uint256>& txids,
+        const ShadowPowClaimRecoveryRecordMutation& mutation,
+        std::string_view operation,
+        std::vector<uint256>* changed_txids = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool UpdateShadowPowClaimRecoveryRecordDurably(
+        const uint256& txid,
+        const ShadowPowClaimRecoveryRecordMutation& mutation,
+        std::string_view operation,
+        bool* changed = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     friend class WalletBatch;
     /** Install an already validated database record without writing it again. */
     bool LoadShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -869,6 +889,10 @@ public:
 
     /** Return a consistent snapshot of this wallet's recovery policy. */
     ShadowPowClaimRecoveryPolicy GetShadowPowClaimRecoveryPolicy() const;
+    /** Atomically report whether the in-memory policy is proven to match a
+     * durable record. This fails closed after an indeterminate DB outcome. */
+    ShadowPowClaimRecoveryPolicyMutationResult
+    GetShadowPowClaimRecoveryPolicyState() const;
 
     /**
      * Validate and persist a complete recovery policy before publishing it to
@@ -876,6 +900,13 @@ public:
      * force.
      */
     bool SetShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy, bilingual_str& error);
+    ShadowPowClaimRecoveryPolicyMutationResult
+    SetShadowPowClaimRecoveryPolicyDetailed(
+        const ShadowPowClaimRecoveryPolicy& policy);
+    /** Apply an explicitly configured process startup policy only when this
+     * wallet has no persisted recovery-policy record. */
+    bool ApplyShadowPowClaimRecoveryStartupPolicy(
+        const ArgsManager& args, bilingual_str& error);
     bool IsShadowPowClaimRecoveryDatabaseAmbiguous() const;
     void MarkShadowPowClaimRecoveryDatabaseAmbiguous()
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
@@ -1233,6 +1264,9 @@ public:
     // but only one caller per wallet may select an input, sign, and commit a
     // QQSPROOF transaction at a time.
     std::atomic<bool> m_shadow_pow_claim_submission_inflight{false};
+    /** Serializes the complete operator miner lifecycle with recovery
+     * mutations so disabling PoW cannot race an automatic durable commit. */
+    Mutex m_pow_recovery_authority_mutex;
     std::string m_pow_payout_quantum GUARDED_BY(cs_wallet); // configured, reused, or explicitly consented ML-DSA payout
     // Runtime cache used to emit the configured QQSIGNAL binding once per
     // wallet process instead of once per retry attempt.
@@ -1656,6 +1690,8 @@ public:
     bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
                       bool* created_payout = nullptr, bool allow_new_payout_key = false);
     void StopPowMining();
+    void StopPowMiningLocked()
+        EXCLUSIVE_LOCKS_REQUIRED(m_pow_recovery_authority_mutex);
     bool IsPowMiningClosing() const;
     void ThreadShadowPoWMiner(int worker_id);
     QuantumAddressBindingResult ResolveConfiguredQuantumAddress(
@@ -1716,10 +1752,9 @@ public:
     ShadowPowClaimRecoveryUsage GetShadowPowClaimRecoveryUsage(
         uint32_t rolling_window_seconds) const;
     /** Explicitly authenticate one reviewed historical component. */
-    bool AdoptShadowPowClaimRecoveryComponent(
+    ShadowPowClaimRecoveryAdoptionResult AdoptShadowPowClaimRecoveryComponent(
         const uint256& selector, const uint256& expected_tip,
-        const uint256& expected_component_fingerprint,
-        bilingual_str& error);
+        const uint256& expected_component_fingerprint);
     /** Internal durable insert used only by the shared resolver. */
     bool PersistNewManagedShadowPowResolution(
         const ShadowPowClaimRecoveryAction& action,

@@ -230,10 +230,23 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_runtime_is_atomic)
     updated.rolling_fee_window_seconds = 7200;
     updated.max_actions_per_window = 30;
     updated.minimum_stale_blocks = 20;
-    bilingual_str error;
-    BOOST_REQUIRE(wallet->SetShadowPowClaimRecoveryPolicy(updated, error));
-    BOOST_CHECK(error.empty());
+    const ShadowPowClaimRecoveryPolicyMutationResult update_result =
+        wallet->SetShadowPowClaimRecoveryPolicyDetailed(updated);
+    BOOST_REQUIRE(update_result.success);
+    BOOST_CHECK(update_result.status ==
+                ShadowPowClaimRecoveryPolicyMutationStatus::SUCCESS);
+    BOOST_CHECK(update_result.durable_state_changed);
+    BOOST_CHECK(!update_result.durable_state_ambiguous);
+    BOOST_CHECK(update_result.authoritative_state_available);
+    BOOST_CHECK(update_result.authoritative_policy == updated);
     BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == updated);
+    const ShadowPowClaimRecoveryPolicyMutationResult readable_state =
+        wallet->GetShadowPowClaimRecoveryPolicyState();
+    BOOST_CHECK(readable_state.success);
+    BOOST_CHECK(!readable_state.durable_state_changed);
+    BOOST_CHECK(!readable_state.durable_state_ambiguous);
+    BOOST_CHECK(readable_state.authoritative_state_available);
+    BOOST_CHECK(readable_state.authoritative_policy == updated);
 
     MockableDatabase& mock = GetMockableDatabase(*wallet);
     BOOST_CHECK(mock.m_last_txn_durable);
@@ -247,8 +260,16 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_runtime_is_atomic)
     // Validation failure changes neither the live policy nor the DB record.
     ShadowPowClaimRecoveryPolicy invalid = updated;
     invalid.choice_recorded = false;
-    BOOST_CHECK(!wallet->SetShadowPowClaimRecoveryPolicy(invalid, error));
-    BOOST_CHECK(!error.empty());
+    const ShadowPowClaimRecoveryPolicyMutationResult invalid_result =
+        wallet->SetShadowPowClaimRecoveryPolicyDetailed(invalid);
+    BOOST_CHECK(!invalid_result.success);
+    BOOST_CHECK(invalid_result.status ==
+                ShadowPowClaimRecoveryPolicyMutationStatus::INVALID_POLICY);
+    BOOST_CHECK(!invalid_result.durable_state_changed);
+    BOOST_CHECK(!invalid_result.durable_state_ambiguous);
+    BOOST_CHECK(invalid_result.authoritative_state_available);
+    BOOST_CHECK(invalid_result.authoritative_policy == updated);
+    BOOST_CHECK(!invalid_result.detail.empty());
     BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == updated);
 
     // A failed write aborts the durable transaction before publishing the
@@ -257,17 +278,50 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_runtime_is_atomic)
     write_failure.max_actions_per_window += 1;
     // MockableBatch resets its per-transaction write index in TxnBegin().
     mock.m_fail_write_at = 0;
-    BOOST_CHECK(!wallet->SetShadowPowClaimRecoveryPolicy(write_failure, error));
+    const ShadowPowClaimRecoveryPolicyMutationResult write_result =
+        wallet->SetShadowPowClaimRecoveryPolicyDetailed(write_failure);
+    BOOST_CHECK(!write_result.success);
+    BOOST_CHECK(write_result.status ==
+                ShadowPowClaimRecoveryPolicyMutationStatus::DATABASE_FAILURE);
+    BOOST_CHECK(!write_result.durable_state_changed);
+    BOOST_CHECK(!write_result.durable_state_ambiguous);
+    BOOST_CHECK(write_result.authoritative_state_available);
+    BOOST_CHECK(write_result.authoritative_policy == updated);
     BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == updated);
     mock.m_fail_write_at.reset();
 
-    // A failed durable commit has the same all-or-nothing behavior.
+    // A failed durable commit must not claim either the old or requested
+    // policy is authoritative. The wallet fails closed until reload even
+    // though this deterministic mock's abort leaves its backing store old.
     ShadowPowClaimRecoveryPolicy commit_failure = updated;
     commit_failure.max_actions_per_window += 2;
     mock.m_fail_commit = true;
-    BOOST_CHECK(!wallet->SetShadowPowClaimRecoveryPolicy(commit_failure, error));
+    const ShadowPowClaimRecoveryPolicyMutationResult commit_result =
+        wallet->SetShadowPowClaimRecoveryPolicyDetailed(commit_failure);
+    BOOST_CHECK(!commit_result.success);
+    BOOST_CHECK(commit_result.status ==
+                ShadowPowClaimRecoveryPolicyMutationStatus::DATABASE_OUTCOME_AMBIGUOUS);
+    BOOST_CHECK(!commit_result.durable_state_changed);
+    BOOST_CHECK(commit_result.durable_state_ambiguous);
+    BOOST_CHECK(!commit_result.authoritative_state_available);
+    BOOST_CHECK(wallet->IsShadowPowClaimRecoveryDatabaseAmbiguous());
     BOOST_CHECK(wallet->GetShadowPowClaimRecoveryPolicy() == updated);
     mock.m_fail_commit = false;
+
+    const ShadowPowClaimRecoveryPolicyMutationResult ambiguous_state =
+        wallet->GetShadowPowClaimRecoveryPolicyState();
+    BOOST_CHECK(!ambiguous_state.success);
+    BOOST_CHECK(ambiguous_state.status ==
+                ShadowPowClaimRecoveryPolicyMutationStatus::DATABASE_OUTCOME_AMBIGUOUS);
+    BOOST_CHECK(ambiguous_state.durable_state_ambiguous);
+    BOOST_CHECK(!ambiguous_state.authoritative_state_available);
+
+    const ShadowPowClaimRecoveryPolicyMutationResult blocked_result =
+        wallet->SetShadowPowClaimRecoveryPolicyDetailed(updated);
+    BOOST_CHECK(blocked_result.status ==
+                ShadowPowClaimRecoveryPolicyMutationStatus::DATABASE_OUTCOME_AMBIGUOUS);
+    BOOST_CHECK(blocked_result.durable_state_ambiguous);
+    BOOST_CHECK(!blocked_result.authoritative_state_available);
 
     {
         WalletBatch batch(wallet->GetDatabase(), /*flush_on_close=*/false);

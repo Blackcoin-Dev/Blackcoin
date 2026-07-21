@@ -2,13 +2,15 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Exercise wallet QQSPROOF single-flight and exceptional broadcast quarantine.
+"""Exercise QQSPROOF single-flight, quarantine, and bounded recovery.
 
 Two concurrent sendshadowpowclaim callers must produce one wallet transaction.
 If a claim leaves the mempool or broadcast throws after wallet persistence,
 the wallet must quarantine it and keep its input reserved because a peer copy
-can still confirm. Generic manual abandonment is deliberately refused, and the
-wallet must not create an automatic fee-paying conflicting self-spend.
+can still confirm. Generic manual abandonment remains deliberately refused.
+An exact fee-paying conflict may be created only through the explicit manual
+recovery flow or a wallet-scoped, bounded automatic-recovery policy, and its
+durable relay authority must survive restart without changing the signed bytes.
 """
 
 from decimal import Decimal
@@ -23,6 +25,7 @@ from test_framework.util import assert_equal, assert_raises_rpc_error, get_rpc_p
 
 GOLD_RUSH_END_TIME = 2_000_000_000
 MANUAL_WALLET = "pow_claim_manual"
+DESCENDANT_BLOCKER_WALLET = "pow_claim_descendant_blocker"
 BUILTIN_WALLET = "pow_claim_builtin"
 POLICY_WALLET = "pow_claim_policy"
 POLICY_LOCK_WALLET = "pow_claim_policy_lock"
@@ -144,6 +147,80 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(len(info["claim_inventory_tip"]), 64)
         return info
 
+    @staticmethod
+    def _recovery_semantic_snapshot(wallet):
+        """Return restart/rescan-stable policy, graph, and accounting state."""
+        info = wallet.getpowclaimrecoveryinfo(True)
+        component_fields = (
+            "anchor",
+            "generation_fingerprint",
+            "component_fingerprint",
+            "classification",
+            "claim_txids",
+            "root_claim_txids",
+            "resolution_txids",
+            "ordinary_or_mixed_txids",
+            "descendant_claims",
+            "anchor_authenticated",
+            "anchor_unspent",
+            "all_claims_quarantined",
+            "all_claims_explicitly_provenanced",
+            "has_revalidating_unbound_proof",
+        )
+        node_fields = (
+            "txid",
+            "kind",
+            "provenance",
+            "disposition",
+            "proof_may_revalidate_on_descendant",
+            "active_chain_confirmed",
+            "in_mempool",
+            "quarantined",
+            "expected_shape",
+            "wallet_authored",
+            "abandoned",
+            "resolution_metadata_valid",
+            "resolution_relay_authorized",
+        )
+        components = []
+        for component in info["component_details"]:
+            snapshot = {field: component[field] for field in component_fields}
+            snapshot["nodes"] = sorted(
+                (
+                    {field: node[field] for field in node_fields}
+                    for node in component["nodes"]
+                ),
+                key=lambda node: (node["txid"], node["kind"]),
+            )
+            components.append(snapshot)
+        components.sort(
+            key=lambda component: (
+                component["anchor"]["txid"],
+                component["anchor"]["vout"],
+                component["component_fingerprint"],
+            )
+        )
+        metric_fields = (
+            "pending_manual_resolutions",
+            "pending_automatic_resolutions",
+            "confirmed_manual_resolutions",
+            "confirmed_automatic_resolutions",
+            "confirmed_resolution_fees",
+            "automatic_actions_in_window",
+            "automatic_fee_exposure_in_window",
+            "reconciled_descendant_claims",
+            "claims_recycled",
+        )
+        return {
+            "policy": info.get("policy"),
+            "policy_authoritative": info["policy_authoritative"],
+            "policy_state_status": info["policy_state_status"],
+            "database_outcome_ambiguous": info["database_outcome_ambiguous"],
+            "active_tip": info["active_tip"],
+            "metrics": {field: info[field] for field in metric_fields},
+            "components": components,
+        }
+
     def run_test(self):
         node = self.nodes[0]
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
@@ -151,6 +228,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         default_wallet.staking(False)
 
         node.createwallet(wallet_name=MANUAL_WALLET)
+        node.createwallet(wallet_name=DESCENDANT_BLOCKER_WALLET)
         node.createwallet(wallet_name=BUILTIN_WALLET)
         node.createwallet(wallet_name=POLICY_WALLET)
         node.createwallet(wallet_name=POLICY_LOCK_WALLET)
@@ -166,9 +244,21 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         tie_wallet = node.get_wallet_rpc(TIE_WALLET)
         fault = node.get_wallet_rpc(FAULT_WALLET)
         boundary = node.get_wallet_rpc(BOUNDARY_WALLET)
-        for wallet in (manual, builtin, policy, policy_lock, builtin_race, tie_wallet, fault, boundary):
+        descendant_blocker = node.get_wallet_rpc(DESCENDANT_BLOCKER_WALLET)
+        for wallet in (
+            manual,
+            descendant_blocker,
+            builtin,
+            policy,
+            policy_lock,
+            builtin_race,
+            tie_wallet,
+            fault,
+            boundary,
+        ):
             wallet.staking(False)
         manual_address = manual.getnewaddress("claim-input", "legacy")
+        descendant_blocker_address = descendant_blocker.getnewaddress("claim-input", "legacy")
         builtin_address = builtin.getnewaddress("claim-input", "legacy")
         policy_address = policy.getnewaddress("claim-input", "legacy")
         policy_lock_address = policy_lock.getnewaddress("claim-input", "legacy")
@@ -180,12 +270,17 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
         self.log.info("Funding independent manual and built-in claim wallets")
         self.generatetoaddress(node, 1, manual_address, sync_fun=self.no_op)
+        self.generatetoaddress(node, 1, descendant_blocker_address, sync_fun=self.no_op)
         self.generatetoaddress(node, 1, builtin_address, sync_fun=self.no_op)
         self.generatetoaddress(node, 1, fault_address, sync_fun=self.no_op)
         self.generatetoaddress(node, 1, boundary_address, sync_fun=self.no_op)
         self.generatetoaddress(node, COINBASE_MATURITY + 5, funding_address, sync_fun=self.no_op)
         assert_equal(node.getquantumquasarinfo()["phase"], "gold_rush")
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 1)
+        assert_equal(
+            len(descendant_blocker.listunspent(1, 9999999, [descendant_blocker_address])),
+            1,
+        )
         assert_equal(len(builtin.listunspent(1, 9999999, [builtin_address])), 1)
 
         self.log.info("Funding a second confirmed boundary-wallet fee input for quarantine-gate coverage")
@@ -262,6 +357,126 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self._assert_generic_abandon_rejected(policy_lock, locked_small_claim["txid"])
         assert_equal(policy_lock.lockunspent(True, [policy_lock_inputs[LIVE_FEE_VALUES[0]]]), True)
 
+        self.log.info("Automatic claim recovery is wallet-scoped, default-off, bounded, and zero-touch")
+        policy_initial_info = policy.getpowclaimrecoveryinfo()
+        assert_equal(policy_initial_info["policy"]["mode"], "unset")
+        assert_equal(policy_initial_info["policy_authoritative"], True)
+        assert_equal(policy_initial_info["policy_state_status"], "success")
+        assert_equal(policy_lock.getpowclaimrecoveryinfo()["policy"]["mode"], "unset")
+        automatic_limits = {
+            "max_fee_per_resolution": Decimal("0.01"),
+            "aggregate_batch_fee_cap": Decimal("0.05"),
+            "rolling_fee_budget": Decimal("0.10"),
+            "rolling_fee_window_seconds": 86400,
+            "max_actions_per_window": 5,
+            "minimum_stale_blocks": 1,
+        }
+        automatic_policy = policy.setpowclaimrecovery("automatic", automatic_limits)
+        assert_equal(automatic_policy["status"], "success")
+        assert_equal(automatic_policy["success"], True)
+        assert_equal(automatic_policy["durable_state_changed"], True)
+        assert_equal(automatic_policy["durable_state_ambiguous"], False)
+        assert_equal(automatic_policy["authoritative_state_available"], True)
+        assert_equal(automatic_policy["policy"]["mode"], "automatic")
+        assert_equal(automatic_policy["policy"]["automatic_authorized"], True)
+        assert_equal(policy_lock.getpowclaimrecoveryinfo()["policy"]["mode"], "unset")
+
+        automatic_claim_txids_before = self._claim_txids(policy)
+        automatic_resolution_txid = None
+        automatic_running_state = None
+        started = policy.setpowmining(True, 1, 1, True)
+        assert_equal(started["enabled"], True)
+        try:
+            # The first scheduler pass performs a typed, pinned-tip conflict
+            # classification and durably records the branch-relative
+            # quarantine observation. It must not spend on that same
+            # observation.
+            node.mockscheduler(61)
+            self.wait_until(
+                lambda: policy.getpowclaimrecoveryinfo(True)["component_details"][0]["stale_depth_known"],
+                timeout=20,
+            )
+            assert_equal(
+                policy.getpowclaimrecoveryinfo(True)["component_details"][0]["minimum_stale_depth"],
+                0,
+            )
+
+            # Mature the persisted observation by the configured number of
+            # active-branch blocks, then let the next scheduler pass create,
+            # persist, authorize, and relay the exact resolution bytes.
+            self.generateblock(node, output=funding_address, transactions=[])
+            self.wait_until(
+                lambda: policy.getpowclaimrecoveryinfo(True)["component_details"][0]["minimum_stale_depth"]
+                >= automatic_limits["minimum_stale_blocks"],
+                timeout=20,
+            )
+            node.mockscheduler(61)
+            self.wait_until(
+                lambda: policy.getpowclaimrecoveryinfo()["pending_automatic_resolutions"] == 1,
+                timeout=30,
+            )
+
+            # Keep the miner enabled while its automatic resolution confirms.
+            # The confirmed same-script output must release the quarantine gate
+            # and return the miner to an active state without operator action.
+            pending_automatic_info = policy.getpowclaimrecoveryinfo(True)
+            pending_resolution_nodes = [
+                graph_node
+                for component in pending_automatic_info["component_details"]
+                for graph_node in component["nodes"]
+                if graph_node["kind"] == "managed_resolution"
+            ]
+            assert_equal(len(pending_resolution_nodes), 1)
+            automatic_resolution_txid = pending_resolution_nodes[0]["txid"]
+            assert_equal(pending_resolution_nodes[0]["resolution_relay_authorized"], True)
+            assert automatic_resolution_txid in node.getrawmempool()
+            automatic_resolution_block = self.generateblock(
+                node,
+                output=funding_address,
+                transactions=[automatic_resolution_txid],
+            )["hash"]
+            assert automatic_resolution_txid in node.getblock(automatic_resolution_block)["tx"]
+            node.syncwithvalidationinterfacequeue()
+            self.wait_until(
+                lambda: policy.gettransaction(automatic_resolution_txid)["confirmations"] > 0,
+                timeout=20,
+            )
+            self.wait_until(
+                lambda: policy.getpowmininginfo()["state"]
+                in {"ready", "hashing", "claim_in_flight"},
+                timeout=20,
+            )
+            automatic_running_state = policy.getpowmininginfo()["state"]
+        finally:
+            policy.setpowmining(False)
+        assert automatic_resolution_txid is not None
+        assert automatic_running_state in {"ready", "hashing", "claim_in_flight"}
+        # Stop immediately after proving the recovery loop reopened mining so
+        # this wallet cannot consume the global QQP2 claim slot used below.
+        assert_equal(self._claim_txids(policy), automatic_claim_txids_before)
+        automatic_info = policy.getpowclaimrecoveryinfo(True)
+        assert_equal(automatic_info["automatic_actions_in_window"], 1)
+        assert automatic_info["automatic_fee_exposure_in_window"] > 0
+        assert_equal(automatic_info["pending_automatic_resolutions"], 0)
+        assert_equal(automatic_info["confirmed_automatic_resolutions"], 1)
+        automatic_component = automatic_info["component_details"][0]
+        assert_equal(automatic_component["has_revalidating_unbound_proof"], True)
+        assert any(
+            graph_node["proof_may_revalidate_on_descendant"]
+            for graph_node in automatic_component["nodes"]
+            if graph_node["kind"] == "claim"
+        )
+        automatic_resolution_nodes = [
+            graph_node
+            for component in automatic_info["component_details"]
+            for graph_node in component["nodes"]
+            if graph_node["kind"] == "managed_resolution"
+        ]
+        assert_equal(len(automatic_resolution_nodes), 1)
+        assert_equal(automatic_resolution_nodes[0]["txid"], automatic_resolution_txid)
+        assert_equal(automatic_resolution_nodes[0]["resolution_relay_authorized"], True)
+        assert policy.gettransaction(automatic_resolution_txid)["confirmations"] > 0
+
         self.log.info("Equal-value candidates use stable COutPoint ordering")
         tie_value = Decimal("1.25000000")
         default_wallet.sendtoaddress(tie_address, tie_value)
@@ -308,7 +523,47 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self.wait_until(lambda: builtin_race_claim not in node.getrawmempool(), timeout=20)
         self._assert_generic_abandon_rejected(builtin_race, builtin_race_claim)
 
-        self.log.info("Two concurrent RPC callers create at most one claim")
+        self.log.info("An ordinary descendant remains a blocker after local abandonment")
+        descendant_blocker_payout = descendant_blocker.getnewquantumaddress(
+            "descendant-blocker-payout"
+        )["address"]
+        blocker_claim = descendant_blocker.sendshadowpowclaim(
+            descendant_blocker_address,
+            descendant_blocker_payout,
+            500000,
+        )
+        blocker_claim_txid = blocker_claim["txid"]
+        blocker_change = node.getrawtransaction(blocker_claim_txid, True)["vout"][0]["value"]
+        blocker_descendant = descendant_blocker.signrawtransactionwithwallet(
+            node.createrawtransaction(
+                [{"txid": blocker_claim_txid, "vout": 0}],
+                {descendant_blocker_address: blocker_change - Decimal("0.01")},
+            )
+        )
+        assert blocker_descendant["complete"]
+        blocker_descendant_txid = node.sendrawtransaction(blocker_descendant["hex"])
+        assert blocker_descendant_txid in node.getrawmempool()
+        self.generateblock(node, output=funding_address, transactions=[])
+        self.wait_until(lambda: blocker_claim_txid not in node.getrawmempool(), timeout=20)
+        self.wait_until(lambda: blocker_descendant_txid not in node.getrawmempool(), timeout=20)
+        assert_raises_rpc_error(
+            -4,
+            "has an unresolved wallet descendant",
+            descendant_blocker.createshadowpowclaimresolution,
+            blocker_claim_txid,
+        )
+        descendant_blocker.abandontransaction(blocker_descendant_txid)
+        assert_equal(self._is_abandoned(descendant_blocker, blocker_descendant_txid), True)
+        # Local abandonment cannot prove that a peer discarded an ordinary
+        # conflicting descendant, so the claim-only resolver remains closed.
+        assert_raises_rpc_error(
+            -4,
+            "has an unresolved wallet descendant",
+            descendant_blocker.createshadowpowclaimresolution,
+            blocker_claim_txid,
+        )
+
+        self.log.info("Two concurrent RPC callers create at most one clean claim")
         manual_payout = manual.getnewquantumaddress("single-flight-payout")["address"]
         first_results = []
         first_errors = []
@@ -338,39 +593,21 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(len(first_results), 1)
         first_txid = first_results[0]["txid"]
         first_raw = node.getrawtransaction(first_txid)
+        claim_change = node.getrawtransaction(first_txid, True)["vout"][0]["value"]
         assert first_txid in node.getrawmempool()
         assert_equal(self._claim_txids(manual), {first_txid})
 
-        self.log.info("A claim descendant blocks guided conflict construction")
-        claim_change = node.getrawtransaction(first_txid, True)["vout"][0]["value"]
-        descendant = manual.signrawtransactionwithwallet(node.createrawtransaction(
-            [{"txid": first_txid, "vout": 0}],
-            {manual_address: claim_change - Decimal("0.01")},
-        ))
-        assert descendant["complete"]
-        descendant_txid = node.sendrawtransaction(descendant["hex"])
-        assert descendant_txid in node.getrawmempool()
-
-        self.log.info("Advancing the parent quarantines the historical QQP2 claim")
+        self.log.info("Advancing the clean claim quarantines its historical QQP2 proof")
         quarantine_block = self.generateblock(
             node,
             output=funding_address,
             transactions=[],
         )["hash"]
         self.wait_until(lambda: first_txid not in node.getrawmempool(), timeout=20)
-        self.wait_until(lambda: descendant_txid not in node.getrawmempool(), timeout=20)
         assert_equal(self._is_abandoned(manual, first_txid), False)
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 0)
         self._assert_generic_abandon_rejected(manual, first_txid)
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 0)
-        assert_raises_rpc_error(
-            -4,
-            "has an unresolved wallet descendant",
-            manual.createshadowpowclaimresolution,
-            first_txid,
-        )
-        manual.abandontransaction(descendant_txid)
-
         self.log.info("A quarantined claim has a consent-only on-chain resolution path")
         preview = manual.createshadowpowclaimresolution(first_txid)
         assert_equal(preview["dry_run"], True)
@@ -378,8 +615,31 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(preview["claim_txid"], first_txid)
         assert preview["fee"] > 0
         assert preview["output_amount"] > 0
+        assert_equal(preview["conflicts_with_revalidating_unbound_proof"], True)
         assert "hex" not in preview
         assert first_txid not in node.getrawmempool()
+        reviewed = manual.getpowclaimrecoveryinfo(True)
+        reviewed_component = next(
+            component
+            for component in reviewed["component_details"]
+            if first_txid in component["claim_txids"]
+        )
+        assert_equal(reviewed_component["has_revalidating_unbound_proof"], True)
+        already_explicit = manual.adoptshadowpowclaimcomponent(
+            first_txid,
+            reviewed["active_tip"],
+            reviewed_component["component_fingerprint"],
+            True,
+        )
+        assert_equal(already_explicit["status"], "already_explicit")
+        assert_equal(already_explicit["success"], True)
+        assert_equal(already_explicit["adopted"], False)
+        assert_equal(already_explicit["durable_state_changed"], False)
+        assert_equal(already_explicit["durable_state_ambiguous"], False)
+        assert_equal(already_explicit["claim_txids"], [first_txid])
+        assert_equal(
+            already_explicit["component_has_revalidating_unbound_proof"], True
+        )
         self._assert_claim_inventory(
             manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
         )
@@ -401,6 +661,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(resolution["broadcast"], False)
         assert_equal(resolution["fee"], preview["fee"])
         assert_equal(resolution["output_amount"], preview["output_amount"])
+        assert_equal(
+            resolution["conflicts_with_revalidating_unbound_proof"], True
+        )
         assert resolution["txid"] not in node.getrawmempool()
         self._assert_claim_inventory(
             manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
@@ -421,6 +684,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node = self.nodes[0]
         node.setmocktime(self.mock_time)
         manual = self._load_wallet(MANUAL_WALLET)
+        policy = self._load_wallet(POLICY_WALLET)
+        restarted_automatic_info = policy.getpowclaimrecoveryinfo(True)
+        assert_equal(restarted_automatic_info["policy"]["mode"], "automatic")
+        assert_equal(restarted_automatic_info["automatic_actions_in_window"], 1)
+        assert_equal(restarted_automatic_info["pending_automatic_resolutions"], 0)
+        assert_equal(restarted_automatic_info["confirmed_automatic_resolutions"], 1)
+        assert policy.gettransaction(automatic_resolution_txid)["confirmations"] > 0
         assert_equal(manual.gettransaction(first_txid)["confirmations"], 0)
         assert_equal(manual.gettransaction(resolution_txid)["confirmations"], 0)
         self._assert_claim_inventory(
@@ -490,11 +760,27 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             manual.staking(False)
         assert_equal(node.getblockcount(), stake_height)
 
+        self.log.info("The clean confirmed claim can fund an ordinary descendant and a new claim")
+        descendant = manual.signrawtransactionwithwallet(node.createrawtransaction(
+            [{"txid": first_txid, "vout": 0}],
+            {manual_address: claim_change - Decimal("0.01")},
+        ))
+        assert descendant["complete"]
+        descendant_txid = node.sendrawtransaction(descendant["hex"])
+        descendant_block = self.generateblock(
+            node,
+            output=funding_address,
+            transactions=[descendant_txid],
+        )["hash"]
+        assert descendant_txid in node.getblock(descendant_block)["tx"]
+        node.syncwithvalidationinterfacequeue()
+        assert manual.gettransaction(descendant_txid)["confirmations"] > 0
+
         second_claim = manual.sendshadowpowclaim(manual_address, manual_payout, 500000)
         second_claim_txid = second_claim["txid"]
         assert_equal(
             self._claim_input(second_claim_txid),
-            {"txid": first_txid, "vout": 0},
+            {"txid": descendant_txid, "vout": 0},
         )
         self.generateblock(
             node,
@@ -507,15 +793,40 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             timeout=20,
         )
 
-        second_preview = manual.createshadowpowclaimresolution(second_claim_txid)
-        second_resolution = manual.createshadowpowclaimresolution(
-            second_claim_txid,
-            False,
+        second_preview = manual.resolveallshadowpowclaims()
+        assert_equal(second_preview["action"], "preview")
+        assert_equal(second_preview["plan_reusable"], True)
+        assert_equal(second_preview["actionable_components"], 1)
+        assert_equal(second_preview["contains_revalidating_unbound_proof"], True)
+        assert_equal(second_preview["actions"][0]["claim_txids"], [second_claim_txid])
+        assert_equal(
+            second_preview["actions"][0]["conflicts_with_revalidating_unbound_proof"],
             True,
         )
-        assert_equal(second_resolution["fee"], second_preview["fee"])
-        second_resolution_txid = node.sendrawtransaction(second_resolution["hex"])
-        assert_equal(second_resolution_txid, second_resolution["txid"])
+        second_signed = manual.resolveallshadowpowclaims({
+            "action": "sign_only",
+            "expected_plan_id": second_preview["plan_id"],
+            "acknowledge_fee_and_conflict_risk": True,
+        })
+        assert_equal(second_signed["success"], True)
+        assert_equal(second_signed["signed_and_persisted"], 1)
+        assert_equal(second_signed["durable_state_changed"], True)
+        assert_equal(second_signed["plan_consumed"], True)
+        assert_equal(second_signed["plan_reusable"], False)
+        assert_equal(second_signed["contains_revalidating_unbound_proof"], True)
+        assert_equal(second_signed["current_plan"]["plan_reusable"], True)
+        second_resolution_txid = second_signed["actions"][0]["resolution_txid"]
+        assert second_resolution_txid not in node.getrawmempool()
+        second_committed = manual.resolveallshadowpowclaims({
+            "action": "commit_and_broadcast",
+            "expected_plan_id": second_signed["current_plan"]["plan_id"],
+            "acknowledge_fee_and_conflict_risk": True,
+        })
+        assert_equal(second_committed["success"], True)
+        assert_equal(second_committed["durable_state_changed"], True)
+        assert_equal(second_committed["relay_authority_granted"], 1)
+        assert_equal(second_committed["broadcast"] + second_committed["already_in_mempool"], 1)
+        assert second_resolution_txid in node.getrawmempool()
         resolution_block = self.generateblock(
             node,
             output=funding_address,
@@ -528,7 +839,14 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         resolution_info = manual.getpowmininginfo()
         assert_equal(resolution_info["unresolved_claims"], 0)
         self._assert_claim_inventory(
-            manual, raw=0, actionable=0, resolved=0, indeterminate=0, components=0
+            manual, raw=1, actionable=0, resolved=1, indeterminate=0, components=1
+        )
+        confirmed_recovery_metrics = manual.getpowclaimrecoveryinfo()
+        assert_equal(confirmed_recovery_metrics["pending_manual_resolutions"], 0)
+        assert_equal(confirmed_recovery_metrics["confirmed_manual_resolutions"], 1)
+        assert_equal(
+            confirmed_recovery_metrics["confirmed_resolution_fees"],
+            second_signed["actions"][0]["fee"],
         )
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 1)
 
@@ -539,13 +857,32 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self._assert_claim_inventory(
             manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
         )
+        disconnected_recovery_metrics = manual.getpowclaimrecoveryinfo()
+        assert_equal(disconnected_recovery_metrics["pending_manual_resolutions"], 1)
+        assert_equal(disconnected_recovery_metrics["confirmed_manual_resolutions"], 0)
+        assert_equal(
+            disconnected_recovery_metrics["confirmed_resolution_fees"],
+            Decimal("0"),
+        )
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 0)
         node.reconsiderblock(resolution_block)
         self.wait_until(lambda: node.getbestblockhash() == resolution_block, timeout=20)
         node.syncwithvalidationinterfacequeue()
         self._assert_claim_inventory(
-            manual, raw=0, actionable=0, resolved=0, indeterminate=0, components=0
+            manual, raw=1, actionable=0, resolved=1, indeterminate=0, components=1
         )
+        restored_recovery_metrics = manual.getpowclaimrecoveryinfo()
+        for field in (
+            "pending_manual_resolutions",
+            "confirmed_manual_resolutions",
+            "confirmed_resolution_fees",
+            "reconciled_descendant_claims",
+            "claims_recycled",
+        ):
+            assert_equal(
+                restored_recovery_metrics[field],
+                confirmed_recovery_metrics[field],
+            )
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 1)
 
         self.log.info("An injected RPC broadcast exception quarantines the persisted claim")
@@ -560,7 +897,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert manual.gettransaction(resolution_txid)["confirmations"] < 0
         assert manual.gettransaction(second_claim_txid)["confirmations"] < 0
         assert manual.gettransaction(second_resolution_txid)["confirmations"] > 0
-        assert_equal(manual.getpowmininginfo()["quarantined_claims"], 0)
+        self._assert_claim_inventory(
+            manual, raw=1, actionable=0, resolved=1, indeterminate=0, components=1
+        )
 
         fault_payout = fault.getnewquantumaddress("fault-payout")["address"]
         before_fault = self._quarantined_claim_txids(fault)
@@ -594,12 +933,84 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(len(builtin.listunspent(1, 9999999, [builtin_address])), 0)
 
         self.log.info("Quarantine survives restart and does not reactivate a peer-visible exact-input claim")
-        self.restart_node(0, extra_args=[*self.base_args, f"-mocktime={self.mock_time}"])
+        self.restart_node(0, extra_args=[
+            *self.base_args,
+            "-walletbroadcast=0",
+            f"-mocktime={self.mock_time}",
+        ])
         node = self.nodes[0]
         node.setmocktime(self.mock_time)
         fault = self._load_wallet(FAULT_WALLET)
         self._assert_generic_abandon_rejected(fault, first_fault_txid)
         assert_equal(len(fault.listunspent(1, 9999999, [fault_address])), 0)
+
+        self.log.info("A disabled wallet broadcaster retains exact commit-authorized resolution bytes")
+        # Advance beyond the failed QQP2 claim's intended height so its
+        # pinned-tip classification is eligible for the explicit conflict
+        # resolver. -walletbroadcast=0 is a real, deterministic relay-failure
+        # path: persistence and consent succeed, while wallet relay refuses.
+        self.generateblock(node, output=funding_address, transactions=[])
+        node.syncwithvalidationinterfacequeue()
+        failed_relay_preview = fault.resolveallshadowpowclaims()
+        assert_equal(failed_relay_preview["actionable_components"], 1)
+        assert_equal(failed_relay_preview["refused_components"], 0)
+        assert_equal(
+            failed_relay_preview["actions"][0]["claim_txids"],
+            [first_fault_txid],
+        )
+        failed_relay = fault.resolveallshadowpowclaims({
+            "action": "commit_and_broadcast",
+            "expected_plan_id": failed_relay_preview["plan_id"],
+            "acknowledge_fee_and_conflict_risk": True,
+        })
+        assert_equal(failed_relay["success"], False)
+        assert_equal(failed_relay["durable_state_changed"], True)
+        assert_equal(failed_relay["durable_state_ambiguous"], False)
+        assert_equal(failed_relay["signed_and_persisted"], 1)
+        assert_equal(failed_relay["relay_authority_granted"], 1)
+        assert_equal(failed_relay["broadcast"], 0)
+        assert_equal(failed_relay["already_in_mempool"], 0)
+        assert "signed resolution was retained but relay failed" in failed_relay["error"]
+        failed_relay_action = failed_relay["actions"][0]
+        assert_equal(failed_relay_action["status"], "signed_and_persisted")
+        failed_resolution_txid = failed_relay_action["resolution_txid"]
+        failed_resolution_hex = failed_relay_action["hex"]
+        assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
+        assert failed_resolution_txid not in node.getrawmempool()
+        retained = fault.getpowclaimrecoveryinfo(True)
+        retained_resolution = next(
+            graph_node
+            for component in retained["component_details"]
+            for graph_node in component["nodes"]
+            if graph_node["txid"] == failed_resolution_txid
+        )
+        assert_equal(retained_resolution["kind"], "managed_resolution")
+        assert_equal(retained_resolution["resolution_relay_authorized"], True)
+        assert_equal(retained["pending_manual_resolutions"], 1)
+
+        self.log.info("Restart retries the identical commit-authorized resolution bytes")
+        self.restart_node(0, extra_args=[*self.base_args, f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        fault = self._load_wallet(FAULT_WALLET)
+        assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
+        restarted_recovery = fault.getpowclaimrecoveryinfo(True)
+        restarted_resolution = next(
+            graph_node
+            for component in restarted_recovery["component_details"]
+            for graph_node in component["nodes"]
+            if graph_node["txid"] == failed_resolution_txid
+        )
+        assert_equal(restarted_resolution["kind"], "managed_resolution")
+        assert_equal(restarted_resolution["resolution_relay_authorized"], True)
+        if failed_resolution_txid not in node.getrawmempool():
+            node.mockscheduler(61)
+        self.wait_until(
+            lambda: failed_resolution_txid in node.getrawmempool(), timeout=30
+        )
+        assert_equal(node.getrawtransaction(failed_resolution_txid), failed_resolution_hex)
+        assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
+        assert_equal(fault.getpowclaimrecoveryinfo()["pending_manual_resolutions"], 1)
 
         self.log.info("A pre-boundary QQP2 claim crosses into QQP4 policy without releasing its input")
         activation_height = 501
@@ -688,6 +1099,70 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             entry.get("qq_shadow_pow_cleanup_for") == boundary_claim_txid
             for entry in boundary.listtransactions("*", 1000, 0, True)
         )
+
+        self.log.info("Recovery policy, exact bytes, graph, and metrics survive rescan and reindex")
+        manual = self._load_wallet(MANUAL_WALLET)
+        policy = self._load_wallet(POLICY_WALLET)
+        fault = self._load_wallet(FAULT_WALLET)
+        if failed_resolution_txid not in node.getrawmempool():
+            node.mockscheduler(61)
+            self.wait_until(
+                lambda: failed_resolution_txid in node.getrawmempool(),
+                timeout=30,
+            )
+            node.syncwithvalidationinterfacequeue()
+        assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
+        expected_recovery = {
+            MANUAL_WALLET: self._recovery_semantic_snapshot(manual),
+            POLICY_WALLET: self._recovery_semantic_snapshot(policy),
+            FAULT_WALLET: self._recovery_semantic_snapshot(fault),
+        }
+
+        for wallet in (manual, policy, fault):
+            wallet.rescanblockchain(0)
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(self._recovery_semantic_snapshot(manual), expected_recovery[MANUAL_WALLET])
+        assert_equal(self._recovery_semantic_snapshot(policy), expected_recovery[POLICY_WALLET])
+        assert_equal(self._recovery_semantic_snapshot(fault), expected_recovery[FAULT_WALLET])
+        assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
+
+        expected_tip = node.getbestblockhash()
+        expected_height = node.getblockcount()
+        self.stop_node(0)
+        self.run_chainstate_rebuild_first_pass(node, [
+            *self.base_args,
+            "-reindex-chainstate",
+            f"-mocktime={self.mock_time}",
+        ])
+        self.restart_after_chainstate_rebuild(0, extra_args=[
+            *self.base_args,
+            f"-mocktime={self.mock_time}",
+        ])
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        self.wait_until(
+            lambda: (
+                node.getblockcount() == expected_height
+                and node.getbestblockhash() == expected_tip
+                and not node.getblockchaininfo()["initialblockdownload"]
+            ),
+            timeout=120,
+        )
+        manual = self._load_wallet(MANUAL_WALLET)
+        policy = self._load_wallet(POLICY_WALLET)
+        fault = self._load_wallet(FAULT_WALLET)
+        node.syncwithvalidationinterfacequeue()
+        if failed_resolution_txid not in node.getrawmempool():
+            node.mockscheduler(61)
+            self.wait_until(
+                lambda: failed_resolution_txid in node.getrawmempool(),
+                timeout=30,
+            )
+            node.syncwithvalidationinterfacequeue()
+        assert_equal(self._recovery_semantic_snapshot(manual), expected_recovery[MANUAL_WALLET])
+        assert_equal(self._recovery_semantic_snapshot(policy), expected_recovery[POLICY_WALLET])
+        assert_equal(self._recovery_semantic_snapshot(fault), expected_recovery[FAULT_WALLET])
+        assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
 
 
 if __name__ == "__main__":

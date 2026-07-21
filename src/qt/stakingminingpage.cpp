@@ -74,6 +74,8 @@ constexpr uint16_t OPERATOR_COMMITMENT_BLOCKS = 40500;
 constexpr int OPERATOR_REGISTRY_PUBKEY_ROLE = Qt::UserRole;
 constexpr int OPERATOR_REGISTRY_PUBKEY_HASH_ROLE = Qt::UserRole + 1;
 constexpr int OPERATOR_REGISTRY_SELECTABLE_ROLE = Qt::UserRole + 2;
+constexpr int RECOVERY_SELECTOR_ROLE = Qt::UserRole;
+constexpr int RECOVERY_FINGERPRINT_ROLE = Qt::UserRole + 1;
 const QString DONATION_PERCENT_SETTING = QStringLiteral("StakingMiningDonationPercent");
 const QString DONATION_USER_CONFIGURED_SETTING = QStringLiteral("StakingMiningDonationUserConfigured");
 const QString DONATION_POST_MIGRATION_DEFAULT_SETTING = QStringLiteral("StakingMiningDonationPostMigrationDefaultApplied");
@@ -112,6 +114,62 @@ QString formatBLK(CAmount amount)
     // Light-touch formatter (8 decimals); the page is informational, not a money entry surface.
     const double v = static_cast<double>(amount) / 100000000.0;
     return QString::number(v, 'f', 8) + QStringLiteral(" BLK");
+}
+
+QString recoveryStateText(interfaces::WalletPowClaimRecoveryState state)
+{
+    using State = interfaces::WalletPowClaimRecoveryState;
+    switch (state) {
+    case State::LIVE: return QObject::tr("Live");
+    case State::TRANSIENT: return QObject::tr("Transient / retry later");
+    case State::INDETERMINATE: return QObject::tr("Indeterminate — no action");
+    case State::CURRENT_BRANCH_INELIGIBLE: return QObject::tr("Ineligible on current branch");
+    case State::TERMINAL_ON_PINNED_TIP: return QObject::tr("Terminal on reviewed tip");
+    case State::RESOLUTION_PENDING: return QObject::tr("Resolution pending");
+    case State::RESOLVED_ON_ACTIVE_CHAIN: return QObject::tr("Resolved on active chain");
+    }
+    return QObject::tr("Indeterminate — no action");
+}
+
+QString recoveryStatusText(interfaces::WalletPowClaimRecoveryActionStatus status)
+{
+    using Status = interfaces::WalletPowClaimRecoveryActionStatus;
+    switch (status) {
+    case Status::READY: return QObject::tr("Ready to resolve");
+    case Status::REUSE_MANAGED: return QObject::tr("Reuse managed resolution");
+    case Status::REUSE_LEGACY: return QObject::tr("Reuse legacy resolution");
+    case Status::SIGNED_AND_PERSISTED: return QObject::tr("Signed and persisted");
+    case Status::BROADCAST: return QObject::tr("Broadcast");
+    case Status::ALREADY_IN_MEMPOOL: return QObject::tr("Already in mempool");
+    case Status::RELAY_DEFERRED: return QObject::tr("Relay deferred to scheduler");
+    case Status::REFUSED: return QObject::tr("Refused");
+    case Status::FAILED: return QObject::tr("Failed");
+    }
+    return QObject::tr("Failed");
+}
+
+QString recoveryProvenanceText(interfaces::WalletPowClaimRecoveryProvenance provenance)
+{
+    using Provenance = interfaces::WalletPowClaimRecoveryProvenance;
+    switch (provenance) {
+    case Provenance::EXPLICIT_AUTHORED: return QObject::tr("authored");
+    case Provenance::EXPLICIT_ADOPTED: return QObject::tr("adopted");
+    case Provenance::LEGACY_WALLET_AUTHORED: return QObject::tr("legacy-authored");
+    case Provenance::UNKNOWN: return QObject::tr("unknown");
+    }
+    return QObject::tr("unknown");
+}
+
+QString recoveryNodeKindText(interfaces::WalletPowClaimRecoveryNodeKind kind)
+{
+    using Kind = interfaces::WalletPowClaimRecoveryNodeKind;
+    switch (kind) {
+    case Kind::CLAIM: return QObject::tr("claim");
+    case Kind::MANAGED_RESOLUTION: return QObject::tr("managed resolution");
+    case Kind::LEGACY_RESOLUTION: return QObject::tr("legacy resolution");
+    case Kind::ORDINARY: return QObject::tr("ordinary/mixed");
+    }
+    return QObject::tr("ordinary/mixed");
 }
 
 QString shortenHex(const std::string& value)
@@ -336,6 +394,8 @@ StakingMiningPage::StakingMiningPage(const PlatformStyle* platformStyle, QWidget
     });
     connect(m_auto_claim_recovery, &QCheckBox::clicked,
             this, &StakingMiningPage::onAutoClaimRecoveryToggled);
+    connect(m_pow_recovery_review, &QPushButton::clicked,
+            this, &StakingMiningPage::onPowClaimRecoveryReview);
     connect(m_refresh_button, &QPushButton::clicked, this, [this]() {
         if (m_wallet_model && !m_claim_recovery_policy_pending) {
             requestPowClaimRecoveryPolicy(
@@ -354,11 +414,18 @@ StakingMiningPage::StakingMiningPage(const PlatformStyle* platformStyle, QWidget
 
 StakingMiningPage::~StakingMiningPage()
 {
+    if (m_pow_recovery_view_current) {
+        m_pow_recovery_view_current->store(false, std::memory_order_release);
+    }
     if (m_wallet_model && m_detail_refresh_in_flight) {
         m_wallet_model->cancelStakingMiningSnapshot(m_detail_request_in_flight);
     }
     if (m_wallet_model && m_claim_recovery_policy_request_in_flight != 0) {
         m_wallet_model->cancelPowClaimRecoveryPolicy(m_claim_recovery_policy_request_in_flight);
+    }
+    if (m_wallet_model && m_pow_recovery_operation_in_flight != 0) {
+        m_wallet_model->cancelPowClaimRecoveryOperation(
+            m_pow_recovery_operation_in_flight);
     }
 }
 
@@ -706,8 +773,8 @@ void StakingMiningPage::setupUi()
     m_pow_recovery_review->setEnabled(false);
     m_pow_recovery_review->setVisible(false);
     m_pow_recovery_review->setToolTip(tr(
-        "A full component-aware recovery planner is not available in this policy-only UI slice. "
-        "No action is taken by this disabled control."));
+        "Review the wallet's complete claim/conflict graph and a tip-pinned Core recovery preview. "
+        "Opening this screen never signs, spends, broadcasts, unlocks the wallet, or starts mining."));
 
     m_pow_status = new QLabel(QStringLiteral("-"), powBox);
     m_pow_status->setObjectName(QStringLiteral("powStatus"));
@@ -1365,13 +1432,16 @@ bool StakingMiningPage::confirmAutomaticClaimRecoveryPolicy(
     root->addWidget(wallet_identity);
     auto* explanation = new QLabel(tr(
         "Automatic recovery may create, persist, and broadcast fee-paying on-chain conflicts "
-        "for this wallet only after Core classifies the claim component as terminal or otherwise "
-        "resolvable on the pinned active-chain tip. Broadcast "
+        "for this wallet only after Core classifies the claim component as recoverable on a "
+        "pinned active-chain tip and every configured staleness, rate, and fee limit passes. "
+        "A legacy QQP2 unbound proof may become eligible again at a later height; for that "
+        "component, either the original claim or the conflicting recovery may confirm. The "
+        "limits below are standing consent to take that conflict risk. Broadcast "
         "does not guarantee confirmation. The wallet must be normally unlocked when an action "
         "is attempted. Recovery can only let a miner that is already enabled resume after the "
         "resolution confirms. This choice never unlocks the wallet and never enables or starts "
         "a miner that is off.\n\n"
-        "Set every positive limit below. These limits are standing spending consent for this wallet."),
+        "Set every positive limit below. They bound this wallet's standing spending authority."),
         &dialog);
     explanation->setObjectName(QStringLiteral("powClaimRecoveryConsentExplanation"));
     explanation->setWordWrap(true);
@@ -1525,6 +1595,8 @@ bool StakingMiningPage::chooseInitialPowClaimRecoveryPolicy(
     auto* explanation = new QLabel(tr(
         "A Gold Rush PoW claim can leave the local mempool while another peer may still retain it. "
         "The wallet then pauses new claims and keeps the input reserved until the conflict is safely resolved.\n\n"
+        "A legacy QQP2 unbound proof may become eligible again at a later height. If recovery is "
+        "authorized for that claim, either the original claim or the conflicting recovery may confirm.\n\n"
         "Choose the wallet-scoped behavior now. Automatic recovery requires separate fee, rate, and "
         "staleness limits. Pause and ask never signs a recovery until you approve it manually. "
         "Recovery can only let a miner that is already enabled resume after a resolution "
@@ -1598,6 +1670,745 @@ void StakingMiningPage::onAutoClaimRecoveryToggled(bool enabled)
     requestPowClaimRecoveryPolicy(
         WalletModel::PowClaimRecoveryPolicyRequest::Operation::INFO, {},
         PowClaimRecoveryPolicyRequestPurpose::USER_TOGGLE_REFRESH);
+}
+
+void StakingMiningPage::onPowClaimRecoveryReview()
+{
+    if (!m_wallet_model) return;
+    if (m_pow_recovery_dialog) {
+        m_pow_recovery_dialog->raise();
+        m_pow_recovery_dialog->activateWindow();
+        return;
+    }
+
+    auto* dialog = new QDialog(this);
+    m_pow_recovery_dialog = dialog;
+    dialog->setObjectName(QStringLiteral("powClaimRecoveryDialog"));
+    dialog->setWindowTitle(tr("Gold Rush PoW claim recovery"));
+    dialog->setModal(true);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->resize(1050, 560);
+
+    auto* layout = new QVBoxLayout(dialog);
+    auto* explanation = new QLabel(
+        tr("This screen asks Core for a read-only, active-tip-pinned view of every wallet-known claim component. "
+           "Wait is the safe default. A recovery spends each confirmed anchor back to the same wallet script, pays the displayed transaction fee, and conflicts with the claims in that anchor generation. "
+           "A legacy QQP2 unbound proof may become eligible again at a later height; if the displayed plan includes one, either the original claim or the conflicting recovery may confirm. "
+           "Opening or refreshing this screen never unlocks the wallet, signs, broadcasts, changes mining, or grants automatic authority."),
+        dialog);
+    explanation->setObjectName(QStringLiteral("powClaimRecoveryExplanation"));
+    explanation->setWordWrap(true);
+    layout->addWidget(explanation);
+
+    m_pow_recovery_summary = new QLabel(dialog);
+    m_pow_recovery_summary->setObjectName(QStringLiteral("powClaimRecoverySummary"));
+    m_pow_recovery_summary->setWordWrap(true);
+    layout->addWidget(m_pow_recovery_summary);
+
+    m_pow_recovery_components = new QTableWidget(dialog);
+    m_pow_recovery_components->setObjectName(QStringLiteral("powClaimRecoveryComponents"));
+    m_pow_recovery_components->setColumnCount(7);
+    m_pow_recovery_components->setHorizontalHeaderLabels({
+        tr("Confirmed anchor"), tr("Core classification"),
+        tr("Claims / graph"), tr("Provenance"), tr("Stale depth"),
+        tr("Fee"), tr("Core outcome")});
+    m_pow_recovery_components->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_pow_recovery_components->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_pow_recovery_components->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_pow_recovery_components->horizontalHeader()->setStretchLastSection(true);
+    m_pow_recovery_components->verticalHeader()->setVisible(false);
+    layout->addWidget(m_pow_recovery_components, 1);
+
+    m_pow_recovery_fee_authorization = new QLabel(
+        tr("No recovery fee is authorized until Core returns an exact actionable plan and you acknowledge that plan below."),
+        dialog);
+    m_pow_recovery_fee_authorization->setObjectName(
+        QStringLiteral("powClaimRecoveryFeeAuthorization"));
+    m_pow_recovery_fee_authorization->setWordWrap(true);
+    layout->addWidget(m_pow_recovery_fee_authorization);
+
+    m_pow_recovery_acknowledge = new QCheckBox(
+        tr("I authorize the exact displayed plan and accept its displayed fees and on-chain conflicts, including the stated legacy QQP2 risk."),
+        dialog);
+    m_pow_recovery_acknowledge->setObjectName(
+        QStringLiteral("powClaimRecoveryAcknowledge"));
+    m_pow_recovery_acknowledge->setChecked(false);
+    m_pow_recovery_acknowledge->setEnabled(false);
+    layout->addWidget(m_pow_recovery_acknowledge);
+
+    m_pow_recovery_result = new QLabel(dialog);
+    m_pow_recovery_result->setObjectName(QStringLiteral("powClaimRecoveryResult"));
+    m_pow_recovery_result->setWordWrap(true);
+    layout->addWidget(m_pow_recovery_result);
+
+    auto* buttons = new QDialogButtonBox(dialog);
+    m_pow_recovery_wait = buttons->addButton(
+        tr("Wait / take no action"), QDialogButtonBox::RejectRole);
+    m_pow_recovery_wait->setObjectName(QStringLiteral("powClaimRecoveryWait"));
+    m_pow_recovery_wait->setDefault(true);
+    m_pow_recovery_wait->setAutoDefault(true);
+    m_pow_recovery_resolve = buttons->addButton(
+        tr("Resolve current anchors"), QDialogButtonBox::ActionRole);
+    m_pow_recovery_resolve->setObjectName(QStringLiteral("powClaimRecoveryResolve"));
+    m_pow_recovery_resolve->setDefault(false);
+    m_pow_recovery_adopt = buttons->addButton(
+        tr("Adopt selected history..."), QDialogButtonBox::ActionRole);
+    m_pow_recovery_adopt->setObjectName(QStringLiteral("powClaimRecoveryAdopt"));
+    m_pow_recovery_enable_auto = buttons->addButton(
+        tr("Enable automatic recovery..."), QDialogButtonBox::ActionRole);
+    m_pow_recovery_enable_auto->setObjectName(
+        QStringLiteral("powClaimRecoveryEnableAutomatic"));
+    m_pow_recovery_refresh = buttons->addButton(
+        tr("Refresh preview"), QDialogButtonBox::ActionRole);
+    m_pow_recovery_refresh->setObjectName(QStringLiteral("powClaimRecoveryRefresh"));
+    layout->addWidget(buttons);
+
+    connect(m_pow_recovery_wait, &QPushButton::clicked,
+            dialog, &QDialog::reject);
+    connect(m_pow_recovery_resolve, &QPushButton::clicked,
+            this, &StakingMiningPage::onPowClaimRecoveryResolve);
+    connect(m_pow_recovery_adopt, &QPushButton::clicked,
+            this, &StakingMiningPage::onPowClaimRecoveryAdopt);
+    connect(m_pow_recovery_refresh, &QPushButton::clicked,
+            this, &StakingMiningPage::requestPowClaimRecoveryReview);
+    connect(m_pow_recovery_enable_auto, &QPushButton::clicked, this, [this] {
+        closePowClaimRecoveryDialog();
+        // Reuse the existing wallet-scoped bounded-consent flow. This does
+        // not execute the displayed plan and never starts a disabled miner.
+        QTimer::singleShot(0, this, [this] {
+            onAutoClaimRecoveryToggled(true);
+        });
+    });
+    connect(m_pow_recovery_acknowledge, &QCheckBox::toggled,
+            this, [this](bool) { renderPowClaimRecoveryReview(); });
+    connect(m_pow_recovery_components, &QTableWidget::itemSelectionChanged,
+            this, [this] {
+                if (m_pow_recovery_adopt) {
+                    m_pow_recovery_adopt->setEnabled(
+                        m_pow_recovery_operation_in_flight == 0 &&
+                        selectedPowClaimRecoveryComponentNeedsAdoption());
+                }
+            });
+    connect(dialog, &QDialog::finished, this, [this, dialog] {
+        if (m_wallet_model && m_pow_recovery_operation_in_flight != 0) {
+            m_wallet_model->cancelPowClaimRecoveryOperation(
+                m_pow_recovery_operation_in_flight);
+        }
+        if (m_pow_recovery_dialog == dialog) m_pow_recovery_dialog = nullptr;
+        m_pow_recovery_summary = nullptr;
+        m_pow_recovery_fee_authorization = nullptr;
+        m_pow_recovery_result = nullptr;
+        m_pow_recovery_components = nullptr;
+        m_pow_recovery_acknowledge = nullptr;
+        m_pow_recovery_wait = nullptr;
+        m_pow_recovery_resolve = nullptr;
+        m_pow_recovery_adopt = nullptr;
+        m_pow_recovery_enable_auto = nullptr;
+        m_pow_recovery_refresh = nullptr;
+        m_pow_recovery_snapshot.reset();
+    });
+
+    dialog->open();
+    requestPowClaimRecoveryReview();
+}
+
+void StakingMiningPage::requestPowClaimRecoveryReview()
+{
+    if (!m_wallet_model || !m_pow_recovery_dialog ||
+        m_pow_recovery_operation_in_flight != 0) {
+        return;
+    }
+    WalletModel::PowClaimRecoveryOperationRequest request;
+    request.generation = m_wallet_generation;
+    request.operation =
+        WalletModel::PowClaimRecoveryOperationRequest::Operation::REVIEW;
+    const auto view_current = std::make_shared<std::atomic<bool>>(true);
+    request.view_current = view_current;
+    request.recovery.mode =
+        interfaces::WalletPowClaimRecoveryRequestMode::PREVIEW;
+    if (m_claim_recovery_policy) {
+        request.recovery.max_fee_per_resolution =
+            m_claim_recovery_policy->max_fee_per_resolution;
+        request.recovery.aggregate_batch_fee_cap =
+            m_claim_recovery_policy->aggregate_batch_fee_cap;
+    }
+    m_pow_recovery_snapshot.reset();
+    m_pow_recovery_operation_purpose =
+        PowClaimRecoveryOperationPurpose::REVIEW;
+    if (m_pow_recovery_summary) {
+        m_pow_recovery_summary->setText(
+            tr("Building an immutable Core preview on the wallet worker..."));
+    }
+    if (m_pow_recovery_result) m_pow_recovery_result->clear();
+    if (m_pow_recovery_components) m_pow_recovery_components->setRowCount(0);
+    if (m_pow_recovery_fee_authorization) {
+        m_pow_recovery_fee_authorization->setText(
+            tr("No recovery fee is authorized while Core is building the exact plan."));
+    }
+    if (m_pow_recovery_acknowledge) {
+        m_pow_recovery_acknowledge->setChecked(false);
+        m_pow_recovery_acknowledge->setEnabled(false);
+    }
+    if (m_pow_recovery_resolve) m_pow_recovery_resolve->setEnabled(false);
+    if (m_pow_recovery_adopt) m_pow_recovery_adopt->setEnabled(false);
+    if (m_pow_recovery_refresh) m_pow_recovery_refresh->setEnabled(false);
+    const QPointer<WalletModel> source = m_wallet_model;
+    m_pow_recovery_view_current = view_current;
+    const uint64_t request_id =
+        source->requestPowClaimRecoveryOperation(std::move(request));
+    if (!view_current->load(std::memory_order_acquire) ||
+        source != m_wallet_model) {
+        if (source) source->cancelPowClaimRecoveryOperation(request_id);
+        return;
+    }
+    m_pow_recovery_operation_in_flight = request_id;
+    m_pow_recovery_review->setEnabled(false);
+}
+
+void StakingMiningPage::renderPowClaimRecoveryReview()
+{
+    if (!m_pow_recovery_dialog || !m_pow_recovery_components ||
+        !m_pow_recovery_summary) {
+        return;
+    }
+    if (!m_pow_recovery_snapshot) {
+        m_pow_recovery_resolve->setEnabled(false);
+        if (m_pow_recovery_acknowledge) {
+            m_pow_recovery_acknowledge->setEnabled(false);
+        }
+        return;
+    }
+    const auto& review = *m_pow_recovery_snapshot;
+    const auto contains_unbound_legacy_proof = [](const auto& component) {
+        return component.has_revalidating_unbound_proof;
+    };
+    const bool has_unbound_legacy_proof = std::any_of(
+        review.components.begin(), review.components.end(),
+        contains_unbound_legacy_proof);
+    m_pow_recovery_summary->setText(
+        tr("Wallet: %1 | active height: %2 | tip: %3 | plan: %4\n"
+           "%5 claim object(s), %6 live, %7 quarantined; %8 blocking component(s), %9 resolved. "
+           "Persisted recovery facts: %10 manual pending, %11 automatic pending, %12 recycled output(s), %13 total confirmed fees.")
+            .arg(QString::fromStdString(m_wallet_model
+                                            ? m_wallet_model->wallet().getWalletName()
+                                            : std::string{}))
+            .arg(review.active_height)
+            .arg(shortenHex(review.active_tip))
+            .arg(shortenHex(review.plan.plan_id))
+            .arg(review.raw_claim_objects)
+            .arg(review.live_claim_objects)
+            .arg(review.quarantined_claim_objects)
+            .arg(review.blocking_components)
+            .arg(review.resolved_components)
+            .arg(review.usage.pending_manual)
+            .arg(review.usage.pending_automatic)
+            .arg(review.usage.recycled_outputs)
+            .arg(formatBLK(review.usage.confirmed_resolution_fees)));
+    if (has_unbound_legacy_proof) {
+        m_pow_recovery_summary->setText(
+            m_pow_recovery_summary->text() + QStringLiteral("\n") +
+            tr("Legacy QQP2 warning: an unbound proof in this review may become eligible again at a later height. If a conflict is authorized, either the original claim or the recovery may confirm."));
+    }
+
+    const bool fee_plan_actionable = review.consistent &&
+        review.plan.complete && !review.plan.actions.empty();
+    const QString exact_fee_authorization = tr(
+        "<b>Exact authorization for plan %1:</b> aggregate transaction fee <b>%2</b> across %3 recovery transaction(s); maximum fee per resolution <b>%4</b>; aggregate batch cap <b>%5</b>.")
+        .arg(QString::fromStdString(review.plan.plan_id))
+        .arg(formatBLK(review.plan.total_fee))
+        .arg(review.plan.actions.size())
+        .arg(formatBLK(review.plan.max_fee_per_resolution))
+        .arg(formatBLK(review.plan.aggregate_batch_fee_cap));
+    if (m_pow_recovery_fee_authorization) {
+        m_pow_recovery_fee_authorization->setText(
+            fee_plan_actionable
+                ? exact_fee_authorization +
+                      (has_unbound_legacy_proof
+                           ? tr("<br><b>Legacy QQP2 risk:</b> an unbound proof in this plan may become eligible again at a later height; either the original claim or its conflicting recovery may confirm.")
+                           : QString())
+                : tr("No recovery fee is authorized because Core did not return a complete actionable plan."));
+    }
+
+    const bool database_outcome_ambiguous = std::any_of(
+        review.plan.refused.begin(), review.plan.refused.end(),
+        [](const auto& refused) {
+            return refused.reason_code == "database-outcome-ambiguous";
+        });
+    if (!review.plan.complete) {
+        const QString warning = database_outcome_ambiguous
+            ? tr("Core cannot establish the exact durable recovery database outcome. Exact transaction bytes or relay authority may already exist. Resolve and Adopt are disabled. Reload the wallet and inspect its exact recovery records before retrying.")
+            : tr("Core returned an incomplete recovery preview. Resolve and Adopt are disabled. Refresh after the reported condition is corrected.");
+        m_pow_recovery_summary->setText(
+            m_pow_recovery_summary->text() + QStringLiteral("\n") + warning);
+        if (m_pow_recovery_result) m_pow_recovery_result->setText(warning);
+    }
+
+    m_pow_recovery_components->setRowCount(
+        static_cast<int>(review.components.size()));
+    for (int row = 0; row < static_cast<int>(review.components.size()); ++row) {
+        const auto& component = review.components.at(row);
+        bool unbound_legacy_proof =
+            contains_unbound_legacy_proof(component);
+        const interfaces::WalletPowClaimRecoveryAction* action = nullptr;
+        for (const auto& candidate : review.plan.actions) {
+            if (candidate.generation_fingerprint ==
+                component.generation_fingerprint) {
+                action = &candidate;
+                break;
+            }
+        }
+        if (!action) {
+            for (const auto& candidate : review.plan.refused) {
+                if (candidate.component_fingerprint ==
+                    component.component_fingerprint) {
+                    action = &candidate;
+                    break;
+                }
+            }
+        }
+        if (action &&
+            action->conflicts_with_revalidating_unbound_proof) {
+            unbound_legacy_proof = true;
+        }
+
+        const QString anchor = shortenHex(component.anchor_txid) +
+            QStringLiteral(":%1").arg(component.anchor_vout);
+        auto* anchor_item = new QTableWidgetItem(anchor);
+        if (!component.claim_txids.empty()) {
+            anchor_item->setData(
+                RECOVERY_SELECTOR_ROLE,
+                QString::fromStdString(component.claim_txids.front()));
+        }
+        anchor_item->setData(
+            RECOVERY_FINGERPRINT_ROLE,
+            QString::fromStdString(component.component_fingerprint));
+        anchor_item->setToolTip(
+            QString::fromStdString(component.anchor_txid) +
+            QStringLiteral(":%1").arg(component.anchor_vout));
+        m_pow_recovery_components->setItem(row, 0, anchor_item);
+        m_pow_recovery_components->setItem(
+            row, 1,
+            new QTableWidgetItem(
+                unbound_legacy_proof
+                    ? tr("May become eligible again — legacy QQP2")
+                    : recoveryStateText(component.state)));
+        m_pow_recovery_components->setItem(
+            row, 2, new QTableWidgetItem(
+                tr("%1 root / %2 total / %3 descendant")
+                    .arg(component.root_claim_txids.size())
+                    .arg(component.claim_txids.size())
+                    .arg(component.descendant_claims)));
+
+        QStringList provenance;
+        QStringList node_details;
+        for (const auto& node : component.nodes) {
+            provenance.push_back(recoveryProvenanceText(node.provenance));
+            node_details.push_back(
+                tr("%1 — %2, %3, disposition=%4%5%6%7%8")
+                    .arg(shortenHex(node.txid))
+                    .arg(recoveryNodeKindText(node.kind))
+                    .arg(recoveryProvenanceText(node.provenance))
+                    .arg(QString::fromStdString(node.disposition))
+                    .arg(node.in_mempool ? tr(", mempool") : QString())
+                    .arg(node.active_chain_confirmed ? tr(", confirmed") : QString())
+                    .arg(node.abandoned ? tr(", abandoned") : QString())
+                    .arg(node.proof_may_revalidate_on_descendant
+                             ? tr(", may become eligible on a descendant")
+                             : QString()));
+        }
+        provenance.removeDuplicates();
+        auto* provenance_item = new QTableWidgetItem(provenance.join(QStringLiteral(", ")));
+        provenance_item->setToolTip(node_details.join(QStringLiteral("\n")));
+        m_pow_recovery_components->setItem(row, 3, provenance_item);
+        m_pow_recovery_components->setItem(
+            row, 4, new QTableWidgetItem(
+                component.stale_depth_known
+                    ? QString::number(component.minimum_stale_depth) + tr(" block(s)")
+                    : tr("Unknown")));
+        m_pow_recovery_components->setItem(
+            row, 5, new QTableWidgetItem(
+                action
+                    ? action->vsize >= 0
+                        ? tr("%1 (%2 vB)")
+                              .arg(formatBLK(action->fee))
+                              .arg(action->vsize)
+                        : formatBLK(action->fee)
+                    : QStringLiteral("-")));
+        QString outcome = action
+            ? recoveryStatusText(action->status)
+            : tr("No action returned");
+        if (action && !action->reason_code.empty()) {
+            outcome += QStringLiteral(" — ") +
+                QString::fromStdString(action->reason_code);
+        }
+        if (action && action->relay_authorized && !action->in_mempool) {
+            outcome += tr(" — relay authorized");
+        }
+        if (unbound_legacy_proof) {
+            outcome += tr(" — original claim may revalidate");
+        }
+        auto* outcome_item = new QTableWidgetItem(outcome);
+        QString outcome_detail;
+        if (unbound_legacy_proof) {
+            outcome_detail = tr(
+                "This legacy QQP2 unbound proof may become eligible again at a later height. If recovery is authorized, either the original claim or the conflicting recovery may confirm.");
+        }
+        if (action && !action->detail.empty()) {
+            if (!outcome_detail.isEmpty()) outcome_detail += QStringLiteral("\n");
+            outcome_detail += QString::fromStdString(action->detail);
+        }
+        if (!outcome_detail.isEmpty()) outcome_item->setToolTip(outcome_detail);
+        m_pow_recovery_components->setItem(row, 6, outcome_item);
+    }
+    m_pow_recovery_components->resizeColumnsToContents();
+
+    const bool exact_actionable_plan = review.consistent &&
+        review.plan.complete && !review.plan.actions.empty() &&
+        m_pow_recovery_operation_in_flight == 0;
+    if (m_pow_recovery_acknowledge) {
+        m_pow_recovery_acknowledge->setEnabled(exact_actionable_plan);
+        m_pow_recovery_acknowledge->setText(
+            exact_actionable_plan
+                ? tr("I authorize exact plan %1 with aggregate fee %2, maximum fee per resolution %3, and aggregate batch cap %4. I accept the on-chain conflict%5.")
+                      .arg(QString::fromStdString(review.plan.plan_id))
+                      .arg(formatBLK(review.plan.total_fee))
+                      .arg(formatBLK(review.plan.max_fee_per_resolution))
+                      .arg(formatBLK(review.plan.aggregate_batch_fee_cap))
+                      .arg(has_unbound_legacy_proof
+                               ? tr(" and the legacy QQP2 risk stated above")
+                               : QString())
+                : tr("No actionable recovery plan is available to authorize."));
+    }
+    m_pow_recovery_resolve->setEnabled(
+        exact_actionable_plan && m_pow_recovery_acknowledge &&
+        m_pow_recovery_acknowledge->isChecked());
+    m_pow_recovery_adopt->setEnabled(
+        m_pow_recovery_operation_in_flight == 0 &&
+        selectedPowClaimRecoveryComponentNeedsAdoption());
+    m_pow_recovery_enable_auto->setEnabled(
+        m_pow_recovery_operation_in_flight == 0 &&
+        !database_outcome_ambiguous);
+    m_pow_recovery_refresh->setEnabled(
+        m_pow_recovery_operation_in_flight == 0);
+}
+
+bool StakingMiningPage::selectedPowClaimRecoveryComponentNeedsAdoption() const
+{
+    if (!m_pow_recovery_snapshot || !m_pow_recovery_components) return false;
+    if (!m_pow_recovery_snapshot->consistent ||
+        !m_pow_recovery_snapshot->plan.complete) {
+        return false;
+    }
+    const int row = m_pow_recovery_components->currentRow();
+    if (row < 0 || row >= static_cast<int>(m_pow_recovery_snapshot->components.size())) {
+        return false;
+    }
+    const auto& component = m_pow_recovery_snapshot->components.at(row);
+    if (component.state ==
+        interfaces::WalletPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN) {
+        return false;
+    }
+    return std::any_of(
+        component.nodes.begin(), component.nodes.end(), [](const auto& node) {
+            if (node.kind != interfaces::WalletPowClaimRecoveryNodeKind::CLAIM) {
+                return false;
+            }
+            return node.provenance ==
+                       interfaces::WalletPowClaimRecoveryProvenance::LEGACY_WALLET_AUTHORED ||
+                   node.provenance ==
+                       interfaces::WalletPowClaimRecoveryProvenance::UNKNOWN;
+        });
+}
+
+void StakingMiningPage::onPowClaimRecoveryResolve()
+{
+    if (!m_wallet_model || !m_pow_recovery_snapshot ||
+        !m_pow_recovery_acknowledge ||
+        !m_pow_recovery_acknowledge->isChecked() ||
+        m_pow_recovery_operation_in_flight != 0) {
+        return;
+    }
+    const auto& plan = m_pow_recovery_snapshot->plan;
+    if (!m_pow_recovery_snapshot->consistent || !plan.complete ||
+        plan.actions.empty() || plan.plan_id.empty()) {
+        if (m_pow_recovery_result) {
+            m_pow_recovery_result->setText(
+                tr("The preview is not an exact actionable plan. Refresh and review again."));
+        }
+        return;
+    }
+
+    WalletModel::PowClaimRecoveryOperationRequest request;
+    request.generation = m_wallet_generation;
+    request.operation =
+        WalletModel::PowClaimRecoveryOperationRequest::Operation::EXECUTE;
+    const auto view_current = std::make_shared<std::atomic<bool>>(true);
+    request.view_current = view_current;
+    request.recovery.mode =
+        interfaces::WalletPowClaimRecoveryRequestMode::COMMIT_AND_BROADCAST;
+    request.recovery.acknowledge_fee_and_conflict_risk = true;
+    request.recovery.max_fee_per_resolution = plan.max_fee_per_resolution;
+    request.recovery.aggregate_batch_fee_cap = plan.aggregate_batch_fee_cap;
+    request.recovery.fee_rate_atoms_per_k = plan.fee_rate_atoms_per_k;
+    request.recovery.expected_plan_id = plan.plan_id;
+    m_pow_recovery_operation_purpose =
+        PowClaimRecoveryOperationPurpose::EXECUTE;
+    if (m_pow_recovery_result) {
+        m_pow_recovery_result->setText(
+            tr("Requesting a temporary normal unlock, then rechecking the exact plan in Core..."));
+    }
+    m_pow_recovery_resolve->setEnabled(false);
+    m_pow_recovery_adopt->setEnabled(false);
+    m_pow_recovery_enable_auto->setEnabled(false);
+    m_pow_recovery_refresh->setEnabled(false);
+    const QPointer<WalletModel> source = m_wallet_model;
+    m_pow_recovery_view_current = view_current;
+    const uint64_t request_id =
+        source->requestPowClaimRecoveryOperation(std::move(request));
+    if (!view_current->load(std::memory_order_acquire) ||
+        source != m_wallet_model) {
+        if (source) source->cancelPowClaimRecoveryOperation(request_id);
+        return;
+    }
+    m_pow_recovery_operation_in_flight = request_id;
+    m_pow_recovery_review->setEnabled(false);
+}
+
+void StakingMiningPage::onPowClaimRecoveryAdopt()
+{
+    if (!m_wallet_model || !m_pow_recovery_snapshot ||
+        !m_pow_recovery_components ||
+        m_pow_recovery_operation_in_flight != 0 ||
+        !selectedPowClaimRecoveryComponentNeedsAdoption()) {
+        return;
+    }
+    const int row = m_pow_recovery_components->currentRow();
+    if (row < 0 || row >= static_cast<int>(m_pow_recovery_snapshot->components.size())) return;
+    const auto& component =
+        m_pow_recovery_snapshot->components.at(row);
+    QTableWidgetItem* const item = m_pow_recovery_components->item(row, 0);
+    if (!item) return;
+    const QString selector = item->data(RECOVERY_SELECTOR_ROLE).toString();
+    const QString fingerprint = item->data(RECOVERY_FINGERPRINT_ROLE).toString();
+    if (selector.isEmpty() || fingerprint.isEmpty()) {
+        m_pow_recovery_result->setText(
+            tr("The selected component has no claim selector that can be adopted."));
+        return;
+    }
+    QString adoption_warning = tr(
+        "Adoption records that every claim in this exact component belongs to this wallet for future recovery decisions. Core will still refuse adoption unless the complete graph, keys, active tip, and component fingerprint are safe and unchanged.");
+    if (component.has_revalidating_unbound_proof) {
+        adoption_warning += tr(
+            "\n\nThis component contains a legacy QQP2 unbound proof that may become eligible again at a later height. Adoption does not resolve it. Any later recovery remains a real conflict in which either the original claim or the recovery may confirm.");
+    }
+    adoption_warning += tr("\n\nAdopt the selected component?");
+    if (QMessageBox::warning(
+            this, tr("Adopt historical claim component"),
+            adoption_warning,
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+
+    WalletModel::PowClaimRecoveryOperationRequest request;
+    request.generation = m_wallet_generation;
+    request.operation =
+        WalletModel::PowClaimRecoveryOperationRequest::Operation::ADOPT;
+    const auto view_current = std::make_shared<std::atomic<bool>>(true);
+    request.view_current = view_current;
+    request.adoption_selector = selector.toStdString();
+    request.adoption_tip = m_pow_recovery_snapshot->active_tip;
+    request.adoption_component_fingerprint = fingerprint.toStdString();
+    m_pow_recovery_operation_purpose =
+        PowClaimRecoveryOperationPurpose::ADOPT;
+    m_pow_recovery_result->setText(
+        tr("Requesting a temporary normal unlock, then rechecking the exact component in Core..."));
+    m_pow_recovery_resolve->setEnabled(false);
+    m_pow_recovery_adopt->setEnabled(false);
+    m_pow_recovery_enable_auto->setEnabled(false);
+    m_pow_recovery_refresh->setEnabled(false);
+    const QPointer<WalletModel> source = m_wallet_model;
+    m_pow_recovery_view_current = view_current;
+    const uint64_t request_id =
+        source->requestPowClaimRecoveryOperation(std::move(request));
+    if (!view_current->load(std::memory_order_acquire) ||
+        source != m_wallet_model) {
+        if (source) source->cancelPowClaimRecoveryOperation(request_id);
+        return;
+    }
+    m_pow_recovery_operation_in_flight = request_id;
+    m_pow_recovery_review->setEnabled(false);
+}
+
+void StakingMiningPage::onPowClaimRecoveryOperationReady(
+    quint64 request_id, quint64 generation)
+{
+    WalletModel* const source = qobject_cast<WalletModel*>(sender());
+    if (!source || source != m_wallet_model ||
+        request_id != m_pow_recovery_operation_in_flight ||
+        generation != m_wallet_generation) {
+        return;
+    }
+    const auto result =
+        source->takePowClaimRecoveryOperationResult(request_id);
+    const PowClaimRecoveryOperationPurpose purpose =
+        m_pow_recovery_operation_purpose;
+    m_pow_recovery_operation_in_flight = 0;
+    m_pow_recovery_operation_purpose =
+        PowClaimRecoveryOperationPurpose::REVIEW;
+    if (m_pow_recovery_view_current) {
+        m_pow_recovery_view_current->store(false, std::memory_order_release);
+        m_pow_recovery_view_current.reset();
+    }
+    if (m_pow_recovery_review) m_pow_recovery_review->setEnabled(true);
+
+    if (!result) return;
+    if (!m_pow_recovery_dialog) {
+        // If Core had already started, WalletModel separately emits an
+        // authoritative application notification. A pre-Core cancellation
+        // needs no user-facing result after the view was closed/switched.
+        return;
+    }
+    if (result->cancelled) {
+        m_pow_recovery_result->setText(
+            tr("The request was cancelled before it entered Core. No action was taken."));
+        renderPowClaimRecoveryReview();
+        return;
+    }
+
+    if (purpose == PowClaimRecoveryOperationPurpose::REVIEW) {
+        const bool database_outcome_ambiguous = std::any_of(
+            result->review.plan.refused.begin(),
+            result->review.plan.refused.end(), [](const auto& refused) {
+                return refused.reason_code == "database-outcome-ambiguous";
+            });
+        if (result->success) {
+            m_pow_recovery_snapshot = result->review;
+            m_pow_recovery_result->setText(
+                tr("Read-only preview complete. Wait remains the default action."));
+        } else if (database_outcome_ambiguous) {
+            // Policy authority is intentionally unavailable after an
+            // ambiguous database commit, so the aggregate review cannot be
+            // labelled consistent. Retain this read-only fail-closed
+            // snapshot solely to render Core's typed ambiguity warning and
+            // keep every mutating control disabled.
+            m_pow_recovery_snapshot = result->review;
+        } else {
+            m_pow_recovery_snapshot.reset();
+            m_pow_recovery_summary->setText(
+                tr("Core could not produce a stable recovery preview."));
+            m_pow_recovery_result->setText(
+                QString::fromStdString(result->error));
+        }
+        renderPowClaimRecoveryReview();
+        if (!result->success) {
+            if (m_pow_recovery_refresh) m_pow_recovery_refresh->setEnabled(true);
+            if (m_pow_recovery_enable_auto) {
+                m_pow_recovery_enable_auto->setEnabled(
+                    !m_claim_recovery_policy_outcome_ambiguous);
+            }
+        }
+        return;
+    }
+
+    if (purpose == PowClaimRecoveryOperationPurpose::EXECUTE) {
+        if (result->success) {
+            m_pow_recovery_result->setText(
+                tr("Core completed the exact recovery plan: %1 signed and persisted, %2 newly granted relay authority, %3 broadcast, %4 already in mempool, %5 relay(s) deferred for the scheduler. Mining state was not changed.")
+                    .arg(result->execution.signed_and_persisted)
+                    .arg(result->execution.relay_authority_granted)
+                    .arg(result->execution.broadcast)
+                    .arg(result->execution.already_in_mempool)
+                    .arg(result->execution.relay_deferred));
+        } else {
+            QString failure =
+                tr("Core refused or could not complete the recovery plan%1: %2")
+                    .arg(result->execution.stale_plan
+                             ? tr(" because it became stale")
+                             : QString())
+                    .arg(QString::fromStdString(result->error));
+            if (result->execution.durable_state_changed ||
+                result->execution.relay_authority_granted != 0) {
+                failure += tr(" WARNING: Core reports that durable wallet state changed during this attempt (%1 signed and persisted; %2 newly granted relay authority). Do not reuse the prior preview. Refresh to inspect the authoritative state.")
+                    .arg(result->execution.signed_and_persisted)
+                    .arg(result->execution.relay_authority_granted);
+            }
+            if (result->execution.durable_state_ambiguous) {
+                failure += tr(" WARNING: The durable database outcome is indeterminate; exact transaction bytes or relay authority may already exist. Do not assume that no action occurred. Reload the wallet, then refresh this review before taking any further recovery action.");
+            }
+            m_pow_recovery_result->setText(failure);
+        }
+        // The exact preview was consumed even if execution failed or became
+        // stale. Never leave its old plan id actionable; preserve only the
+        // human outcome above and require a fresh explicit review.
+        m_pow_recovery_snapshot.reset();
+        m_pow_recovery_components->setRowCount(0);
+        m_pow_recovery_summary->setText(
+            tr("The prior preview has been invalidated. Refresh before authorizing another recovery."));
+        if (m_pow_recovery_acknowledge) {
+            m_pow_recovery_acknowledge->setChecked(false);
+        }
+        m_pow_recovery_resolve->setEnabled(false);
+        m_pow_recovery_adopt->setEnabled(false);
+        m_pow_recovery_refresh->setEnabled(true);
+        m_pow_recovery_enable_auto->setEnabled(true);
+        return;
+    }
+
+    if (result->adoption.durable_state_ambiguous) {
+        m_pow_recovery_result->setText(
+            tr("WARNING: Core cannot determine the durable adoption outcome. The reviewed provenance may or may not have been stored. Do not assume adoption succeeded or failed. Reload the wallet and inspect its exact recovery records before any further recovery action. [%1] %2")
+                .arg(QString::fromStdString(result->adoption.reason_code),
+                     QString::fromStdString(result->adoption.detail)));
+    } else if (result->success && result->adoption.adopted) {
+        m_pow_recovery_result->setText(
+            result->adoption.durable_state_changed
+                ? tr("Core durably adopted the exact reviewed component. Refresh the preview before authorizing any recovery.")
+                : tr("Core reports the exact reviewed component as adopted. No durable-state change was reported. Refresh the preview before authorizing any recovery."));
+    } else if (result->success &&
+               result->adoption.status ==
+                   interfaces::WalletPowClaimRecoveryAdoptionStatus::ALREADY_EXPLICIT) {
+        m_pow_recovery_result->setText(
+            tr("Core reports that the exact reviewed component was already explicitly authenticated. No new durable-state change was required. Refresh before authorizing any recovery."));
+    } else {
+        QString failure =
+            tr("Core refused or could not adopt the component: %1")
+                .arg(QString::fromStdString(result->error));
+        if (!result->adoption.reason_code.empty()) {
+            failure += tr(" [%1]").arg(
+                QString::fromStdString(result->adoption.reason_code));
+        }
+        if (result->adoption.durable_state_changed) {
+            failure += tr(" WARNING: Core reports that durable wallet state changed during this attempt. Reload and inspect the exact recovery records before continuing.");
+        }
+        m_pow_recovery_result->setText(failure);
+    }
+    if (result->adoption.component_has_revalidating_unbound_proof) {
+        m_pow_recovery_result->setText(
+            m_pow_recovery_result->text() + tr(
+                " WARNING: This component contains a legacy QQP2 unbound proof that may become eligible again at a later height. Adoption did not resolve it; in any later authorized conflict, either the original claim or the recovery may confirm."));
+    }
+    m_pow_recovery_snapshot.reset();
+    m_pow_recovery_components->setRowCount(0);
+    m_pow_recovery_summary->setText(
+        result->adoption.durable_state_ambiguous
+            ? tr("Adoption outcome is ambiguous. Mutating recovery controls are disabled; reload the wallet and inspect exact records before continuing.")
+            : tr("The prior preview has been invalidated. Refresh before another recovery or adoption action."));
+    m_pow_recovery_resolve->setEnabled(false);
+    m_pow_recovery_adopt->setEnabled(false);
+    if (m_pow_recovery_refresh) m_pow_recovery_refresh->setEnabled(true);
+    if (m_pow_recovery_enable_auto) {
+        m_pow_recovery_enable_auto->setEnabled(
+            !result->adoption.durable_state_ambiguous);
+    }
+}
+
+void StakingMiningPage::closePowClaimRecoveryDialog()
+{
+    if (m_pow_recovery_view_current) {
+        m_pow_recovery_view_current->store(false, std::memory_order_release);
+    }
+    if (m_pow_recovery_dialog) m_pow_recovery_dialog->reject();
 }
 
 void StakingMiningPage::applyAutoClaimRecoveryToggle(bool enabled)
@@ -1677,12 +2488,40 @@ void StakingMiningPage::onPowClaimRecoveryPolicyReady(
         PowClaimRecoveryPolicyRequestPurpose::BACKGROUND_REFRESH;
 
     if (!result) {
+        m_claim_recovery_policy.reset();
         m_claim_recovery_policy_error = tr("Wallet recovery policy did not return a result.");
     } else if (result->cancelled) {
+        m_claim_recovery_policy.reset();
         m_claim_recovery_policy_error = tr("Wallet recovery policy request was cancelled.");
     } else {
-        if (result->policy_available) m_claim_recovery_policy = result->policy;
+        if (result->authoritative_state_checked &&
+            (result->mutation.durable_state_ambiguous ||
+             !result->mutation.authoritative_state_available)) {
+            // Keep this WalletModel/page generation fail-closed. Later INFO
+            // reads recheck Core's authority state, but only a wallet reload
+            // may resolve an already-reported ambiguous database outcome.
+            m_claim_recovery_policy_outcome_ambiguous = true;
+            m_claim_recovery_policy_ambiguous_wallet = source;
+        }
+        if (result->policy_available &&
+            !m_claim_recovery_policy_outcome_ambiguous) {
+            m_claim_recovery_policy = result->policy;
+        } else {
+            // A failed/ambiguous durable write cannot fall back to the prior
+            // in-memory value and call it persisted truth. Keep policy-bound
+            // actions disabled until Core can return authoritative state.
+            m_claim_recovery_policy.reset();
+        }
         m_claim_recovery_policy_error = QString::fromStdString(result->error);
+        if (m_claim_recovery_policy_outcome_ambiguous) {
+            const QString core_detail = m_claim_recovery_policy_error;
+            m_claim_recovery_policy_error = tr(
+                "Recovery-policy database outcome is ambiguous. Reload the wallet and inspect exact recovery records; in-memory policy is not authoritative.");
+            if (!core_detail.isEmpty()) {
+                m_claim_recovery_policy_error +=
+                    QStringLiteral(" ") + core_detail;
+            }
+        }
         if (!result->success && m_claim_recovery_policy_error.isEmpty()) {
             m_claim_recovery_policy_error = tr("Wallet recovery policy operation failed.");
         }
@@ -1691,7 +2530,8 @@ void StakingMiningPage::onPowClaimRecoveryPolicyReady(
     refreshControlsEnabled();
 
     const bool success = result && !result->cancelled && result->success &&
-        result->policy_available;
+        result->policy_available &&
+        !m_claim_recovery_policy_outcome_ambiguous;
     if (!success) {
         m_claim_recovery_toggle_after_refresh.reset();
         if (purpose == PowClaimRecoveryPolicyRequestPurpose::POW_START_REFRESH ||
@@ -1709,13 +2549,40 @@ void StakingMiningPage::onPowClaimRecoveryPolicyReady(
                    purpose == PowClaimRecoveryPolicyRequestPurpose::POW_START_WRITE) {
             const bool revocation = result &&
                 result->request.policy.mode != interfaces::WalletPowClaimRecoveryMode::AUTOMATIC;
+            const bool authoritative_unavailable = result &&
+                result->mutation_attempted &&
+                result->authoritative_state_checked &&
+                !result->mutation.authoritative_state_available;
+            const bool ambiguous = result &&
+                result->mutation_attempted &&
+                result->authoritative_state_checked &&
+                result->mutation.durable_state_ambiguous;
+            const bool no_authoritative_result = !result ||
+                !result->policy_available;
+            QString explanation;
+            if (authoritative_unavailable || ambiguous) {
+                explanation = revocation
+                    ? tr("The database outcome is ambiguous. Your request to pause automatic recovery may or may not have been stored, so automatic spending authority may still exist. No authoritative policy state is available and the controls remain disabled. Reload the wallet and inspect its exact recovery records before mining or taking another recovery action.")
+                    : tr("The database outcome is ambiguous. Your requested automatic-recovery policy may or may not have been stored. No authoritative policy state is available and the controls remain disabled. Reload the wallet and inspect its exact recovery records before mining or taking another recovery action.");
+            } else if (no_authoritative_result) {
+                explanation = tr("Core did not return an authoritative recovery-policy state, so the requested change cannot be confirmed and no claim is made about which policy is stored. The controls remain disabled. Refresh the policy state, or reload and inspect the wallet before continuing.");
+            } else {
+                explanation = revocation
+                    ? tr("The wallet did not save your request to pause automatic recovery, so automatic spending authority may remain. The control now shows the authoritative persisted policy returned by Core.")
+                    : tr("The wallet did not save the requested recovery policy. The control now shows the authoritative persisted policy returned by Core.");
+                if (result && result->mutation.durable_state_changed) {
+                    explanation += tr(" Core reports that durable wallet state changed during the attempt; inspect the displayed policy before continuing.");
+                }
+            }
             QMessageBox::critical(
-                this, tr("PoW claim recovery policy not saved"),
-                revocation
-                    ? tr("Automatic recovery may still be authorized because the wallet could not durably save your request to pause it. The control has been restored to the actual persisted state.\n\n%1")
-                          .arg(m_claim_recovery_policy_error)
-                    : tr("The wallet could not durably save the requested recovery policy. No new spending authority was granted, and the control has been restored to the actual persisted state.\n\n%1")
-                          .arg(m_claim_recovery_policy_error));
+                this,
+                authoritative_unavailable || ambiguous
+                    ? tr("PoW claim recovery policy outcome requires reload")
+                    : no_authoritative_result
+                        ? tr("PoW claim recovery policy outcome unavailable")
+                        : tr("PoW claim recovery policy not saved"),
+                tr("%1\n\n%2")
+                    .arg(explanation, m_claim_recovery_policy_error));
         }
         return;
     }
@@ -1831,8 +2698,8 @@ void StakingMiningPage::refreshAutomationControls()
         }
     }
     status += tr("<br><b>Seventh control — wallet-scoped PoW claim recovery for %1:</b> %2. "
-                 "Recovery can only unblock an already-enabled miner; it never unlocks the "
-                 "wallet and never enables or starts a miner that is off.")
+                 "Automatic recovery can only unblock an already-enabled miner; it never unlocks the "
+                 "wallet and never enables or starts a miner that is off. Manual recovery separately requires explicit exact-plan consent and a normal signing unlock.")
         .arg(m_wallet_model
                  ? GUIUtil::HtmlEscape(m_wallet_model->getDisplayName())
                  : tr("no wallet"))
@@ -1853,6 +2720,12 @@ void StakingMiningPage::refreshAutomationControls()
 
 void StakingMiningPage::setWalletModel(WalletModel* walletModel)
 {
+    const bool ambiguous_for_selected_wallet = walletModel &&
+        m_claim_recovery_policy_ambiguous_wallet == walletModel;
+    if (m_pow_recovery_view_current) {
+        m_pow_recovery_view_current->store(false, std::memory_order_release);
+        m_pow_recovery_view_current.reset();
+    }
     // A nested modal event loop can receive a wallet switch or unload. Close
     // any wallet-scoped consent surface before changing identity so its
     // acceptance can never be applied to the newly selected wallet.
@@ -1863,6 +2736,7 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
             dialog->reject();
         }
     }
+    closePowClaimRecoveryDialog();
 
     if (m_timer) m_timer->stop();
     if (m_wallet_model) {
@@ -1871,6 +2745,10 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
         }
         if (m_claim_recovery_policy_request_in_flight != 0) {
             m_wallet_model->cancelPowClaimRecoveryPolicy(m_claim_recovery_policy_request_in_flight);
+        }
+        if (m_pow_recovery_operation_in_flight != 0) {
+            m_wallet_model->cancelPowClaimRecoveryOperation(
+                m_pow_recovery_operation_in_flight);
         }
         disconnect(m_wallet_model, nullptr, this, nullptr);
     }
@@ -1892,13 +2770,24 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
     m_claim_recovery_policy_request_purpose =
         PowClaimRecoveryPolicyRequestPurpose::BACKGROUND_REFRESH;
     m_claim_recovery_policy_error.clear();
+    m_claim_recovery_policy_outcome_ambiguous =
+        ambiguous_for_selected_wallet;
+    if (walletModel && !ambiguous_for_selected_wallet) {
+        m_claim_recovery_policy_ambiguous_wallet.clear();
+    }
     m_claim_recovery_toggle_after_refresh.reset();
+    m_pow_recovery_snapshot.reset();
+    m_pow_recovery_operation_in_flight = 0;
+    m_pow_recovery_operation_purpose =
+        PowClaimRecoveryOperationPurpose::REVIEW;
 
     if (m_wallet_model) {
         connect(m_wallet_model, &WalletModel::stakingMiningSnapshotReady,
                 this, &StakingMiningPage::onStakingMiningSnapshotReady);
         connect(m_wallet_model, &WalletModel::powClaimRecoveryPolicyReady,
                 this, &StakingMiningPage::onPowClaimRecoveryPolicyReady);
+        connect(m_wallet_model, &WalletModel::powClaimRecoveryOperationReady,
+                this, &StakingMiningPage::onPowClaimRecoveryOperationReady);
         connect(m_wallet_model, &QObject::destroyed, this, [this] {
             ++m_wallet_generation;
             m_wallet_model = nullptr;
@@ -1917,9 +2806,23 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
             m_claim_recovery_policy_request_purpose =
                 PowClaimRecoveryPolicyRequestPurpose::BACKGROUND_REFRESH;
             m_claim_recovery_policy_error.clear();
+            m_claim_recovery_policy_outcome_ambiguous = false;
+            m_claim_recovery_policy_ambiguous_wallet.clear();
             m_claim_recovery_toggle_after_refresh.reset();
+            closePowClaimRecoveryDialog();
+            m_pow_recovery_snapshot.reset();
+            m_pow_recovery_operation_in_flight = 0;
+            m_pow_recovery_operation_purpose =
+                PowClaimRecoveryOperationPurpose::REVIEW;
+            if (m_pow_recovery_view_current) {
+                m_pow_recovery_view_current->store(
+                    false, std::memory_order_release);
+                m_pow_recovery_view_current.reset();
+            }
             resetStatusForNoWallet();
         });
+        m_pow_recovery_review->setVisible(true);
+        m_pow_recovery_review->setEnabled(true);
         requestPowClaimRecoveryPolicy(
             WalletModel::PowClaimRecoveryPolicyRequest::Operation::INFO);
         updateStatus();
@@ -3297,17 +4200,11 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     // UI mutations happen only here, after the worker-owned immutable result
     // has returned to this object's Qt event thread.
     const interfaces::WalletPowMiningInfo& info = snapshot.pow;
-    const bool quarantined_claim =
-        info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED;
-    m_pow_recovery_review->setVisible(quarantined_claim);
-    m_pow_recovery_review->setEnabled(false);
-    if (quarantined_claim) {
-        m_pow_recovery_review->setText(tr("Review claim recovery... (planner pending)"));
-        m_pow_recovery_review->setToolTip(tr(
-            "The wallet-scoped consent policy is available, but the component-aware "
-            "manual recovery planner is not yet connected in this build. This disabled "
-            "button performs no action; use the existing preview-only RPC path if needed."));
-    }
+    // Recovery review is a user-requested read-only Core plan and is useful
+    // even when the miner is not currently reporting a quarantine state.
+    m_pow_recovery_review->setVisible(true);
+    m_pow_recovery_review->setEnabled(m_pow_recovery_operation_in_flight == 0);
+    m_pow_recovery_review->setText(tr("Review claim recovery..."));
     if (info.shadow_whitelist_height > 0) {
         QString eligibility;
         if (!info.wallet_goldrush_status_available) {
@@ -3492,7 +4389,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
         recommended_action = tr("Send this wallet a confirmed, spendable legacy BLK UTXO so it can authenticate and pay the fee for a Gold Rush PoW claim.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
-        recommended_action = tr("A prior Gold Rush PoW claim is quarantined outside the local mempool. Its fee input remains reserved so the wallet does not create an unsafe competing claim. Waiting for on-chain resolution is safest. For advanced, explicit recovery, copy the claim txid from Transactions and use createshadowpowclaimresolution in the debug console; it previews first, never broadcasts, and requires separate fee-risk consent and sendrawtransaction.");
+        recommended_action = tr("A prior Gold Rush PoW claim is quarantined outside the local mempool. Its fee input remains reserved so the wallet does not create an unsafe competing claim. Waiting for on-chain resolution is safest. To inspect or resolve it, select <b>Review claim recovery...</b>, review Core's exact plan and fee limits, then explicitly acknowledge that plan before Resolve is enabled.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
         recommended_action = tr("Unlock this wallet normally. Gold Rush PoW claims cannot be signed while the wallet is locked or unlocked for staking only.");
     } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
@@ -3529,7 +4426,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::EPOCH_INACTIVE) {
         m_pow_status->setText(tr("PoW mining is enabled and waiting until the Gold Rush epoch is active."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
-        m_pow_status->setText(tr("PoW mining is enabled but paused because a prior claim is quarantined outside the local mempool. Its fee input remains reserved; the wallet will not create a second fee-input claim. Waiting is safest. Advanced recovery is available through the preview-only createshadowpowclaimresolution debug-console RPC and a separate explicit broadcast."));
+        m_pow_status->setText(tr("PoW mining is enabled but paused because a prior claim is quarantined outside the local mempool. Its fee input remains reserved; the wallet will not create a second fee-input claim. Waiting is safest. Use Review claim recovery... for Core's exact preview and the built-in explicit resolve flow."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT) {
         m_pow_status->setText(tr("PoW mining is enabled and waiting for the submitted claim to confirm, conflict, or expire at the next tip."));
     } else if (info.enabled && info.epoch_active) {

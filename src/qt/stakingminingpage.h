@@ -7,7 +7,9 @@
 
 #include <qt/walletmodel.h>
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <QPointer>
@@ -22,6 +24,7 @@ class BitcoinAmountField;
 QT_BEGIN_NAMESPACE
 class QCheckBox;
 class QComboBox;
+class QDialog;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -95,9 +98,13 @@ private Q_SLOTS:
     void onRedelegateColdStake();
     void onOptimizeUTXOSet();
     void onAutoClaimRecoveryToggled(bool enabled);
+    void onPowClaimRecoveryReview();
+    void onPowClaimRecoveryResolve();
+    void onPowClaimRecoveryAdopt();
     void updateStatus();
     void onStakingMiningSnapshotReady(quint64 request_id, quint64 generation);
     void onPowClaimRecoveryPolicyReady(quint64 request_id, quint64 generation);
+    void onPowClaimRecoveryOperationReady(quint64 request_id, quint64 generation);
 
 private:
     const PlatformStyle* m_platform_style{nullptr};
@@ -180,12 +187,39 @@ private:
     QLabel* m_pow_warning{nullptr};
     QPushButton* m_pow_recovery_review{nullptr};
 
+    // User-initiated claim-component review. Planning and execution run only
+    // on WalletWorker; this view owns immutable results and presentation.
+    QPointer<QDialog> m_pow_recovery_dialog;
+    QLabel* m_pow_recovery_summary{nullptr};
+    QLabel* m_pow_recovery_fee_authorization{nullptr};
+    QLabel* m_pow_recovery_result{nullptr};
+    QTableWidget* m_pow_recovery_components{nullptr};
+    QCheckBox* m_pow_recovery_acknowledge{nullptr};
+    QPushButton* m_pow_recovery_wait{nullptr};
+    QPushButton* m_pow_recovery_resolve{nullptr};
+    QPushButton* m_pow_recovery_adopt{nullptr};
+    QPushButton* m_pow_recovery_enable_auto{nullptr};
+    QPushButton* m_pow_recovery_refresh{nullptr};
+    std::optional<interfaces::WalletPowClaimRecoveryReview> m_pow_recovery_snapshot;
+    uint64_t m_pow_recovery_operation_in_flight{0};
+    std::shared_ptr<std::atomic<bool>> m_pow_recovery_view_current;
+
+    enum class PowClaimRecoveryOperationPurpose : uint8_t {
+        REVIEW,
+        EXECUTE,
+        ADOPT,
+    };
+    PowClaimRecoveryOperationPurpose m_pow_recovery_operation_purpose{
+        PowClaimRecoveryOperationPurpose::REVIEW};
+
     // Wallet-scoped recovery-policy state is loaded and written only on
     // WalletWorker. Timer-driven GUI refreshes read this immutable cache.
     std::optional<interfaces::WalletPowClaimRecoveryPolicy> m_claim_recovery_policy;
     bool m_claim_recovery_policy_pending{false};
     uint64_t m_claim_recovery_policy_request_in_flight{0};
     QString m_claim_recovery_policy_error;
+    bool m_claim_recovery_policy_outcome_ambiguous{false};
+    QPointer<WalletModel> m_claim_recovery_policy_ambiguous_wallet;
     std::optional<bool> m_claim_recovery_toggle_after_refresh;
 
     enum class PowClaimRecoveryPolicyRequestPurpose : uint8_t {
@@ -282,6 +316,10 @@ private:
         PowClaimRecoveryPolicyRequestPurpose purpose =
             PowClaimRecoveryPolicyRequestPurpose::BACKGROUND_REFRESH);
     void applyAutoClaimRecoveryToggle(bool enabled);
+    void requestPowClaimRecoveryReview();
+    void renderPowClaimRecoveryReview();
+    bool selectedPowClaimRecoveryComponentNeedsAdoption() const;
+    void closePowClaimRecoveryDialog();
     bool confirmAutomaticClaimRecoveryPolicy(
         const interfaces::WalletPowClaimRecoveryPolicy& current,
         interfaces::WalletPowClaimRecoveryPolicy& selected);

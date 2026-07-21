@@ -99,6 +99,9 @@ persistence, and explicit commit-and-broadcast authority. Automatic recovery
 is wallet-scoped, bounded, and off by default; it never unlocks a wallet or
 enables mining. Every action is tip- and wallet-generation-pinned, reuses exact
 bytes, and creates at most one resolution for a current anchor generation.
+Rate and fee windows use active-chain median time, and recovery-authorizing
+metadata is published only after durable wallet-database commit. An
+indeterminate database outcome fails closed until wallet reload.
 
 Either the original claim or the resolution may confirm. Only the confirming
 transaction pays a fee; a confirmed resolution's ordinary base-chain fee is

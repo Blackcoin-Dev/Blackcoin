@@ -165,6 +165,13 @@ headless controls use the same engine. Optional wallet-scoped automation is off
 by default and requires positive fee, batch, rolling-budget, rate, and stale-
 depth limits. It never enables mining or unlocks the wallet.
 
+The rolling budget is measured with active-chain median time rather than host
+wall time. Safety-relevant recovery metadata becomes authoritative only after
+durable wallet-database commit; an indeterminate commit outcome disables the
+recovery path until wallet reload. Miner lifecycle changes and recovery
+mutation are serialized per wallet, and recovery never turns a disabled miner
+back on.
+
 Neither manual nor automatic broadcast guarantees confirmation. Either the
 original claim or the resolution may confirm, the input remains reserved until
 an active-chain confirmation resolves the conflict, and a reorg causes a fresh
@@ -173,6 +180,16 @@ shadow reimbursement. See
 [Gold Rush PoW claim lifecycle and recovery](gold-rush-pow-claim-recovery.md)
 for the full later-release behavior, including QQP3 origin-plus-64 eligibility
 and frontier advancement.
+
+Legacy QQP2 proof validity is descendant-dependent because QQP2 does not bind
+an origin. An unbound proof that is invalid on the pinned tip may validate on a
+normal descendant, so its typed recovery disposition is never described as
+permanently dead or terminal. Recovery is an intentional conflict authorized
+only by an exact manually acknowledged plan, or by explicit bounded automatic
+standing consent after its configured stale-depth, rate, and fee gates pass.
+Either the original claim or the resolution may confirm. Generic transient and
+local-state failures, future-origin proofs, and future-version proofs remain
+fail-closed and do not inherit this narrow QQP2 treatment.
 
 The wallet exposes helper RPCs for both paths, including `getgoldrushstate`,
 `getgoldrushinfo`, `sendshadowsignal`, `getshadowpowwork`,

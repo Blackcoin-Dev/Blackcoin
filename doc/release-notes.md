@@ -15,11 +15,26 @@ Wallet-scoped automatic recovery is a seventh optional automation, is off by
 default, requires explicit positive fee/rate/staleness bounds, and never unlocks
 the wallet or enables mining.
 
+Automatic action and fee windows are anchored to active-chain median time, so
+host-clock changes cannot erase budget usage. Claim-recovery metadata is
+published to the running wallet only after durable commit; an indeterminate
+database outcome disables recovery until wallet reload. Miner disable/start and
+recovery mutation are serialized per wallet so recovery cannot silently
+re-enable a miner or acquire authority after an earlier disable.
+
 Either the original claim or the resolution may confirm. Only the confirming
 transaction pays a fee; a confirmed resolution fee is not shadow-reimbursed.
 Broadcast is not a confirmation promise, and reorg or original-claim
 confirmation can require a fresh frontier plan. See
 `doc/gold-rush-pow-claim-recovery.md` for the complete Issue #37 behavior.
+
+The later classifier gives legacy unbound QQP2 proofs a distinct typed result:
+a proof invalid on the pinned tip may validate on a normal descendant and is
+never represented as permanently dead or terminal. A real conflict therefore
+requires exact-plan manual fee/conflict consent, or explicit bounded automatic
+standing consent after the configured stale-depth, rate, and fee gates pass.
+Either transaction may confirm. Generic transient or local-state failures,
+future-origin proofs, and future-version proofs remain fail-closed.
 
 30.1.3 Signed Corrective Release Notes
 ======================================

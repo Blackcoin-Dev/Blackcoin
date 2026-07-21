@@ -46,6 +46,22 @@ is live for recovery classification even if it is not currently in the local
 mempool. The recovery classifier must not infer terminal status from a reject
 string or elapsed wall-clock time.
 
+QQP2 does not commit an origin height or input into its proof hash. A QQP2 proof
+that fails against the pinned tip can therefore become valid against a later
+descendant context without changing its transaction bytes. Its typed
+`unbound_proof_may_revalidate` disposition is therefore never described as
+permanently dead or terminal. The classifier reports it separately from both
+terminal and generic retryable failures.
+
+Resolving such a QQP2 component is a deliberate on-chain conflict, not an
+abandonment of a dead transaction. It is available only through an exact manual
+plan with explicit fee-and-conflict acknowledgement, or through the wallet's
+explicit bounded automatic standing policy after the configured stale-depth,
+rate, and fee gates pass. Either the unchanged QQP2 claim or the conflicting
+resolution may confirm. Generic transient or indeterminate conditions, local
+state errors, future-origin proofs, and future-version proofs remain fail-closed
+and cannot authorize recovery.
+
 ## One shared recovery engine
 
 The Issue #37 release uses one component classifier and one resolver for GUI,
@@ -77,6 +93,13 @@ or wallet state fails closed and requires a fresh plan. Independent anchors are
 persisted before relay; subsequent relays can be deferred to a fresh pinned
 pass if wallet or mempool state changes.
 
+Claim provenance, quarantine observations, branch-age observations, signed
+drafts, and relay authority become authoritative only after their complete
+wallet-database transaction commits. A write failure leaves the prior live
+record in force. An indeterminate commit outcome latches recovery closed until
+the wallet is reloaded; neither the GUI nor an automatic scheduler may infer
+spending authority from metadata whose durable state is unknown.
+
 Manual recovery is available through the Issue #37 GUI and headless surfaces
 that wrap this engine. Compatibility commands from older releases may remain,
 but their help is authoritative for whether they expose only preview/signing or
@@ -107,7 +130,10 @@ wallet broadcasting, normal local-key unlock for a new signature, authenticated
 wallet-authored or explicitly adopted provenance, and a component that the
 shared classifier finds safe. It will not unlock the wallet, enable the miner,
 adopt unknown history, abandon a claim, or override any fee, rate, or staleness
-limit.
+limit. The narrow typed QQP2 descendant-revalidation disposition is eligible
+only with the risk disclosure and standing consent above; it does not make
+generic transient, local-error, future-origin, future-version, or indeterminate
+states recoverable.
 
 The corresponding startup seed is
 `-autoresolvefailedclaims=automatic` or
@@ -117,10 +143,20 @@ values for `-autoresolvemaxfee`, `-autoresolvebatchfeecap`,
 `-autoresolvemaxactions`, and `-autoresolvestaleblocks`. Omitting the seed
 records no choice and grants no spending authority.
 
+The rolling action and fee windows use active-chain median time, not the host's
+wall clock. Moving the system clock forward or backward cannot expire prior
+automatic actions. Records created by an older wall-clock-based build are
+treated as age zero when their stored time is ahead of the current chain clock,
+without moving the window past other recent actions. Their transaction
+timestamp provides a floor when old metadata is behind it.
+
 Once the wallet has explicitly committed exact resolution bytes, safe retries
 may continue across restart without creating a new spend. Disabling automatic
 recovery prevents new automatic actions; it cannot recall a transaction that
-was already propagated.
+was already propagated. Disabling the built-in PoW miner and committing a
+recovery action are serialized per wallet: whichever operation starts first
+reaches a definitive result before the other can change that authority. A
+disabled miner is never restarted by recovery.
 
 ## Confirmation outcomes and reorgs
 

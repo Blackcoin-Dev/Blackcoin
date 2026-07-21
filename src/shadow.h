@@ -524,7 +524,17 @@ enum class ShadowPowClaimMempoolDisposition : uint8_t {
     WRONG_MODE,
     UNKNOWN_MODE,
     UNSUPPORTED_VERSION,
+    /** A recognized proof format is scheduled but not active at the current
+     * candidate height. A descendant may activate it. */
+    VERSION_NOT_YET_ACTIVE,
     INVALID_PROOF,
+    /** A legacy quantum-linked proof without a committed origin failed at the
+     * current tip. Its hash context changes on descendants, so the same bytes
+     * can validate later and are not proof of permanent death. */
+    UNBOUND_PROOF_MAY_REVALIDATE,
+    /** The proof names an origin height after the current candidate height.
+     * It is not dead: a descendant tip may reach that origin. */
+    ORIGIN_NOT_YET_REACHED,
     ORIGIN_MISMATCH,
     ORIGIN_EXPIRED,
     INPUT_MISMATCH,
@@ -537,6 +547,10 @@ enum class ShadowPowClaimMempoolDisposition : uint8_t {
 /** Return true when the claim cannot become eligible on a descendant of the
  * currently validated branch. ORIGIN_MISMATCH and ALREADY_ACCOUNTED are
  * branch-relative: callers must revalidate after every reorg before acting.
+ * ORIGIN_NOT_YET_REACHED, VERSION_NOT_YET_ACTIVE, and
+ * UNBOUND_PROOF_MAY_REVALIDATE are deliberately retryable because a
+ * descendant may reach the proof's declared origin or format-activation
+ * height, or may give an unbound proof a different hash context.
  */
 bool IsShadowPowClaimCurrentBranchTerminal(
     ShadowPowClaimMempoolDisposition disposition);

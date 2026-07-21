@@ -6770,6 +6770,9 @@ bool IsShadowPowClaimCurrentBranchTerminal(
     case ShadowPowClaimMempoolDisposition::ELIGIBLE:
     case ShadowPowClaimMempoolDisposition::INACTIVE:
     case ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW:
+    case ShadowPowClaimMempoolDisposition::VERSION_NOT_YET_ACTIVE:
+    case ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE:
+    case ShadowPowClaimMempoolDisposition::ORIGIN_NOT_YET_REACHED:
     case ShadowPowClaimMempoolDisposition::CAPACITY_LIMIT:
     case ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT:
     case ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR:
@@ -6784,6 +6787,9 @@ bool IsShadowPowClaimMempoolRetryable(
     switch (disposition) {
     case ShadowPowClaimMempoolDisposition::INACTIVE:
     case ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW:
+    case ShadowPowClaimMempoolDisposition::VERSION_NOT_YET_ACTIVE:
+    case ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE:
+    case ShadowPowClaimMempoolDisposition::ORIGIN_NOT_YET_REACHED:
     case ShadowPowClaimMempoolDisposition::CAPACITY_LIMIT:
     case ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT:
     case ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR:
@@ -6914,6 +6920,32 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
     // surface before the fork rather than turning a future-format carrier
     // into a distinct "version" rejection.
     if (!require_qqp4 && IsQQP4ProofPayload(proofs.front())) {
+        ShadowProof future_version;
+        const bool structurally_future_valid =
+            DecodeProof(proofs.front(), future_version) &&
+            future_version.mode == ShadowProofMode::POW &&
+            future_version.version == 4 &&
+            future_version.origin_bound && future_version.input_bound &&
+            !future_version.claim_outpoint.IsNull() &&
+            future_version.origin_height > static_cast<uint32_t>(height) &&
+            future_version.origin_height <=
+                static_cast<uint32_t>(std::numeric_limits<int>::max()) &&
+            consensus.nShadowQQP4ActivationHeight !=
+                std::numeric_limits<int>::max() &&
+            consensus.IsShadowQQP4Active(
+                static_cast<int>(future_version.origin_height)) &&
+            IsLegacyShadowTargetScript(future_version.target) &&
+            tx.vin.size() == 1 &&
+            tx.vin.front().prevout == future_version.claim_outpoint;
+        if (structurally_future_valid) {
+            // Keep v30.1.0's public reject text. The typed recovery state is
+            // more precise: these bytes may become valid after the scheduled
+            // QQP4 boundary, so they must not authorize a conflict yet.
+            return finish(
+                ShadowProofValidationResult::INVALID,
+                ShadowPowClaimMempoolDisposition::VERSION_NOT_YET_ACTIVE,
+                "shadow-proof-invalid");
+        }
         return finish(ShadowProofValidationResult::INVALID,
                       ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION,
                       "shadow-proof-invalid");
@@ -6951,11 +6983,22 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
                   static_cast<int>(decoded_shape.origin_height))
             : consensus.IsShadowCompetingClaimsActive(
                   static_cast<int>(decoded_shape.origin_height));
-        if (!origin_format_active ||
-            decoded_shape.origin_height > static_cast<uint32_t>(height)) {
+        if (!origin_format_active) {
             return finish(ShadowProofValidationResult::INVALID,
                           ShadowPowClaimMempoolDisposition::ORIGIN_MISMATCH,
                           "shadow-proof-origin-mismatch");
+        }
+        if (decoded_shape.origin_height > static_cast<uint32_t>(height)) {
+            // The payload is structurally valid for a scheduled proof format,
+            // but its declared origin has not happened on this branch yet.
+            // Preserve the historical reject string while exposing a typed
+            // retryable state to wallet recovery. Treating this as permanent
+            // ORIGIN_MISMATCH could authorize a conflicting recovery spend
+            // before a descendant reaches the declared height.
+            return finish(
+                ShadowProofValidationResult::INVALID,
+                ShadowPowClaimMempoolDisposition::ORIGIN_NOT_YET_REACHED,
+                "shadow-proof-origin-mismatch");
         }
         const uint32_t age = static_cast<uint32_t>(height) -
                              decoded_shape.origin_height;
@@ -7014,11 +7057,18 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
                       "shadow-proof-limit");
     }
     if (status != ShadowProofValidationResult::VALID) {
+        const bool unbound_proof_may_revalidate =
+            status != ShadowProofValidationResult::LOCAL_INTERNAL_ERROR &&
+            decoded_shape.version == 2 && decoded_shape.quantum_linked &&
+            !decoded_shape.origin_bound && !decoded_shape.input_bound &&
+            IsLegacyShadowTargetScript(decoded_shape.target);
         return finish(
             status,
             status == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR
                 ? ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR
-                : ShadowPowClaimMempoolDisposition::INVALID_PROOF,
+                : unbound_proof_may_revalidate
+                    ? ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE
+                    : ShadowPowClaimMempoolDisposition::INVALID_PROOF,
             status == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR
                 ? "local-shadow-proof-error"
                 : "shadow-proof-invalid");

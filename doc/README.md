@@ -30,6 +30,8 @@ Drag Blackcoin to your applications folder, and then run Blackcoin.
 
 * See the project documentation in this repository for build, wallet, RPC, and
   network operation notes.
+* See [Gold Rush PoW claim lifecycle and recovery](gold-rush-pow-claim-recovery.md)
+  for Issue #37 manual and optional automatic claim-component recovery.
 * Check the Blackcoin community channels used by this fork before relying on
   inherited upstream support material.
 

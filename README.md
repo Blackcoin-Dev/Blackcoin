@@ -85,26 +85,29 @@ transition and replay path before it is scheduled.
 
 ### Gold Rush PoW claim safety
 
-The wallet permits only one unresolved fee-paying `QQSPROOF` claim at a time.
-If a claim leaves the local mempool, it remains quarantined and its input stays
-reserved because another peer can retain and later confirm the transaction.
-The miner pauses rather than creating an unsafe competing claim, and generic
-`abandontransaction` refuses to release that input.
+The wallet may have up to 64 independent live `QQSPROOF` claims in its local
+mempool. A claim that leaves the mempool is different: it remains quarantined
+and its fee input stays reserved because another peer can retain and later
+confirm it. Generic `abandontransaction` does not release that reservation.
+The built-in miner pauses on actionable or indeterminate quarantined
+components, not merely on the raw number of historical claim objects.
 
-`getpowmininginfo` reports the unresolved, live, and quarantined wallet-authored
-claim counts. An operator who chooses to resolve a quarantined claim can first
-preview an exact-input, same-script conflict with
-`createshadowpowclaimresolution <claim_txid>`. Signing requires a normally
-unlocked wallet, `dry_run=false`, and explicit
-`acknowledge_fee_and_conflict_risk=true`; the RPC still never broadcasts.
-Review its fee and warning, then call `sendrawtransaction` separately only if
-you accept the conflict risk. The resolution fee receives no shadow
-reimbursement, peers retaining the original may reject the conflict, and
-confirmation is not guaranteed. The input remains reserved until either the
-original claim or the resolution actually confirms. After an operator
-explicitly broadcasts the signed resolution and the wallet learns it, ordinary
-wallet rebroadcast may continue across restart; that is downstream of the
-separate broadcast decision and does not add new consent.
+The Issue #37 recovery release groups wallet-known sibling conflicts and
+descendants by their current confirmed anchor. Its shared GUI, CLI/RPC, daemon,
+and optional-automation engine separates read-only preview, exact signed-draft
+persistence, and explicit commit-and-broadcast authority. Automatic recovery
+is wallet-scoped, bounded, and off by default; it never unlocks a wallet or
+enables mining. Every action is tip- and wallet-generation-pinned, reuses exact
+bytes, and creates at most one resolution for a current anchor generation.
+
+Either the original claim or the resolution may confirm. Only the confirming
+transaction pays a fee; a confirmed resolution's ordinary base-chain fee is
+not shadow-reimbursed. Broadcast does not guarantee confirmation, and an
+original-claim confirmation can advance the component to a later frontier that
+requires a fresh plan. See the
+[Gold Rush PoW claim lifecycle and recovery guide](doc/gold-rush-pow-claim-recovery.md)
+for the manual and optional automatic flows, QQP3 origin-plus-64 eligibility,
+confirmation outcomes, restart behavior, and reorg rules.
 
 ## Required v30.1.0 chainstate rebuild
 

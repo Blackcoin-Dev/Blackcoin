@@ -145,24 +145,34 @@ boundary, the prospective rule does not rewrite historical shadow allocation.
 At and after the boundary, an operator that needs authoritative QQP3 shadow
 accounting must run v30.1.1 or a later compatible release.
 
-The wallet allows only one unresolved wallet-authored `QQSPROOF` at a time. A
-claim absent from the local mempool remains quarantined with its exact fee input
-reserved because another peer may still confirm it. `getpowmininginfo` reports
-the unresolved, live, and quarantined counts, and generic
-`abandontransaction` refuses the claim.
+In v30.1.1 through v30.1.3, a non-mempool wallet-authored `QQSPROOF` remains
+quarantined with its exact fee input reserved, the miner pauses, and generic
+`abandontransaction` refuses the claim. Those releases provide the
+`createshadowpowclaimresolution` preview/signing compatibility path described
+in their release notes; it does not itself broadcast.
 
-Advanced operators can preview an exact-input, same-script conflict with
-`createshadowpowclaimresolution <claim_txid>`. The default dry run does not
-sign. Signing requires a normally unlocked wallet, `dry_run=false`, and
-`acknowledge_fee_and_conflict_risk=true`; the result is still not broadcast.
-Review the fee and warning, then use `sendrawtransaction` separately only if
-you accept that peers may reject the conflict, confirmation is not guaranteed,
-and a confirmed resolution fee receives no shadow reimbursement. The shared
-input remains reserved until one side confirms. The Qt dashboard and embedded
-guide present the same warning without a one-click broadcast action.
-After the operator explicitly broadcasts and the wallet learns the resolution,
-ordinary wallet rebroadcast may continue across restart; that behavior is
-downstream of the explicit broadcast decision.
+The later Issue #37 recovery release corrects the older documentation's
+one-unresolved-claim description. A wallet may have up to 64 independent live
+claims in its local mempool. Quarantined sibling and descendant objects are
+classified as components rooted at current confirmed anchors, so raw historical
+object counts are not confused with the miner gate or with the number of
+recovery transactions.
+
+The Issue #37 engine uses three distinct steps: a read-only, tip-pinned preview;
+an explicitly acknowledged, exact-plan sign-and-persist step; and a separate
+commit-and-broadcast authorization for those exact bytes. Manual GUI and
+headless controls use the same engine. Optional wallet-scoped automation is off
+by default and requires positive fee, batch, rolling-budget, rate, and stale-
+depth limits. It never enables mining or unlocks the wallet.
+
+Neither manual nor automatic broadcast guarantees confirmation. Either the
+original claim or the resolution may confirm, the input remains reserved until
+an active-chain confirmation resolves the conflict, and a reorg causes a fresh
+classification. A confirmed resolution pays an ordinary base-chain fee with no
+shadow reimbursement. See
+[Gold Rush PoW claim lifecycle and recovery](gold-rush-pow-claim-recovery.md)
+for the full later-release behavior, including QQP3 origin-plus-64 eligibility
+and frontier advancement.
 
 The wallet exposes helper RPCs for both paths, including `getgoldrushstate`,
 `getgoldrushinfo`, `sendshadowsignal`, `getshadowpowwork`,
@@ -218,6 +228,9 @@ the same authorization through the named RPC or an explicit persistent option.
 | Submit QQSIGNAL | Separate confirmed QQSIGNAL automation control | `sendshadowsignal`; persistent `qqautoshadowsignal=1` |
 | Start or stop this wallet's PoW worker | Confirmed PoW control with CPU and payout disclosure | `setpowmining`; persistent `powmining=1` |
 | Permit a missing PoW payout key | One-time start confirmation | Fourth `setpowmining` argument, or process-wide `qqallowautokeycreation=1` |
+| Inspect quarantined claim components and recovery consent | Gold Rush recovery status | `getpowclaimrecoveryinfo`; `getpowmininginfo` retains mining-oriented counts |
+| Review or execute a current claim-component plan | Issue #37 **Review claim recovery...** flow with separate preview, sign, and commit decisions | Use the Issue #37 recovery commands listed by the installed build's RPC help; mutation requires the exact preview plan and explicit fee/conflict acknowledgement |
+| Persist optional automatic claim recovery | Seventh wallet-scoped Optional automation control with explicit fee, rate, and stale-depth limits | `setpowclaimrecovery`; startup `-autoresolvefailedclaims` settings seed only an unset wallet choice |
 | Create quantum change while sending | Default-No authorization before fee preparation; a key is created only if positive change is required, its address is reported, and it remains after any later failure | Use `send` with an existing wallet-owned quantum `change_address`, or final signed mode with `allow_new_quantum_key=true`; exact no-change and unsigned/PSBT flows create no key |
 | Send with legacy `sendtoaddress`, `sendmany`, or `burn` when quantum change is required | Send dialog supplies the same default-No quantum-change choice | Supply an existing wallet-owned direct quantum `change_address`; these legacy RPCs never create a non-HD quantum key |
 | Fund or withdraw stake/operator/cold-stake value | Default-No action confirmation with fee, unbonding, key, and backup consequences | The corresponding RPC requires `options.allow_new_quantum_key=true` before creating a change or withdrawal key |
@@ -227,8 +240,9 @@ the same authorization through the named RPC or an explicit persistent option.
 | Rebuild chainstate | Default-manual rebuild assistant | One-shot `-reindex-chainstate`; full-history fallback `-reindex` |
 | Select a legacy wallet source | Default-exit source dialog | One-shot `-migratewallet=blackcoin`, `blackmore`, or `none` |
 
-Persistent automation is process-wide. Runtime `staking` and `setpowmining`
-calls remain scoped to the selected wallet RPC endpoint.
+The Issue #37 PoW claim-recovery policy is wallet-scoped. The other persistent
+automations in this table remain process-wide. Runtime `staking` and
+`setpowmining` calls remain scoped to the selected wallet RPC endpoint.
 An expressly authorized non-HD key is written before final transaction
 construction. If a later action fails, the key remains in the wallet; the
 error identifies its address and instructs the operator to back up immediately.

@@ -1,3 +1,26 @@
+Issue #37 Later-Release Development Note
+========================================
+
+Issue #37 adds wallet-side Gold Rush PoW claim-component recovery after
+v30.1.3. This work does not change QQP2/QQP3 consensus or rewrite the behavior
+of historical v30.1.1 through v30.1.3 binaries. Sections below that describe a
+single unresolved claim, a one-claim compatibility RPC, or a debug-console-only
+manual path are retained as release history for those binaries.
+
+The later recovery model permits up to 64 independent live wallet claims,
+classifies non-mempool siblings and descendants as current-anchor components,
+and separates exact preview, signed-draft persistence, and explicit
+commit-and-broadcast authority. Manual GUI and headless paths share that engine.
+Wallet-scoped automatic recovery is a seventh optional automation, is off by
+default, requires explicit positive fee/rate/staleness bounds, and never unlocks
+the wallet or enables mining.
+
+Either the original claim or the resolution may confirm. Only the confirming
+transaction pays a fee; a confirmed resolution fee is not shadow-reimbursed.
+Broadcast is not a confirmation promise, and reorg or original-claim
+confirmation can require a fresh frontier plan. See
+`doc/gold-rush-pow-claim-recovery.md` for the complete Issue #37 behavior.
+
 30.1.3 Signed Corrective Release Notes
 ======================================
 
@@ -417,7 +440,8 @@ sanitizer or changing CRC32C results.
   path.
 - Successful wallet broadcasts refresh mempool state before returning, which
   prevents rapid consecutive sends from observing stale spendability state.
-- PoW claim creation pauses during reindex, import, or initial sync and
+- In v30.1.1 through v30.1.3, PoW claim creation pauses during reindex,
+  import, or initial sync and
   rechecks the exact tip through commit. A claim that leaves the local mempool
   remains persisted and keeps its input reserved because a peer may still
   confirm it. Any unresolved quarantined claim pauses that wallet's
@@ -425,7 +449,8 @@ sanitizer or changing CRC32C results.
   `abandontransaction` intentionally refuses a quarantined Gold Rush PoW claim,
   and its exact fee input remains reserved until an on-chain claim or conflict
   resolves the reservation.
-- `getpowmininginfo` exposes unresolved, live, and quarantined wallet-authored
+- In those releases, `getpowmininginfo` exposes unresolved, live, and
+  quarantined wallet-authored
   claim counts. `createshadowpowclaimresolution` accepts only an exact persisted,
   wallet-authored, single-input quarantined `QQSPROOF`. It refuses a live claim,
   unresolved descendant or conflict, spent or foreign input, incomplete sync,
@@ -440,7 +465,8 @@ sanitizer or changing CRC32C results.
   After the operator explicitly broadcasts and the wallet learns the
   resolution, ordinary wallet rebroadcast may continue across restart; this is
   downstream of the explicit broadcast decision.
-- The Qt Staking & Mining page and embedded guide show the same quarantine and
+- In those releases, the Qt Staking & Mining page and embedded guide show the
+  same quarantine and
   fee/conflict warnings and direct advanced users to the preview RPC in the
   debug console. There is no one-click conflict broadcast.
 - Wallet backups reject destinations that resolve to the wallet root itself,

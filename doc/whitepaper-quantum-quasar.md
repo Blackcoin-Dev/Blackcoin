@@ -329,21 +329,27 @@ The wallet can automate both when the corresponding staking/mining mode and sign
 prerequisites are satisfied. See §9 for the exact RPCs (`sendshadowsignal`,
 `sendshadowpowclaim`, `setpowmining`, `getgoldrushinfo`).
 
-A wallet-authored `QQSPROOF` that leaves the local mempool remains unresolved: another
-peer can retain and later confirm the base-valid transaction. The wallet therefore
-quarantines the claim, reserves its exact fee input, refuses generic abandonment, and
-pauses its built-in miner instead of creating a second claim. `getpowmininginfo` reports
-the live, quarantined, and total unresolved claim counts.
+A wallet may have up to 64 independent live `QQSPROOF` claims in its local mempool. A
+wallet-authored claim that leaves the mempool is different: another peer may retain and
+later confirm it, so the wallet quarantines the claim, reserves its fee input, and refuses
+generic abandonment. The built-in miner pauses on actionable or indeterminate
+quarantined components rather than treating every historical descendant as a separate
+recovery action.
 
-The consent-only `createshadowpowclaimresolution` RPC can preview an exact-input,
-same-script conflict. Its default dry run does not sign. A signing request requires a
-normally unlocked wallet and explicit acknowledgement of the fee and conflict risk, but
-the RPC still never broadcasts; the operator must review the result and separately call
-`sendrawtransaction`. A confirmed resolution pays its base-chain fee without shadow
-reimbursement. Peers retaining the original may reject the conflict, confirmation is not
-guaranteed, and the input remains reserved until one transaction confirms.
-After an explicit broadcast and wallet recognition, ordinary wallet rebroadcast may
-continue across restart; this is downstream of the prior broadcast decision.
+The Issue #37 wallet release groups wallet-known sibling conflicts and descendants at
+their nearest current confirmed anchor. One shared engine serves manual GUI, headless,
+and optional automatic recovery. It separates read-only preview, explicitly acknowledged
+exact-plan signing and durable draft persistence, and separate commit-and-broadcast
+authority. Automatic recovery is wallet-scoped, bounded, and off by default; it neither
+unlocks the wallet nor enables mining.
+
+Either the claim or the resolution may confirm. Only the confirming transaction pays its
+base-chain fee, and a resolution fee receives no shadow reimbursement. Peers retaining the
+original may reject the conflict, broadcast does not guarantee confirmation, and the
+input remains reserved until an active-chain confirmation resolves it. A reorg triggers
+reclassification, and original-claim confirmation can expose a later confirmed frontier
+that requires a fresh plan. The full operator model is specified in
+[Gold Rush PoW claim lifecycle and recovery](gold-rush-pow-claim-recovery.md).
 
 ---
 
@@ -672,8 +678,16 @@ RPC set.
 | `sendshadowsignal` | Broadcast a QQSIGNAL for a recent PoS solve (Gold Rush PoS credit) |
 | `sendshadowpowclaim` | Grind and submit a QQSPROOF Argon2id PoW claim |
 | `setpowmining` / `getpowmininginfo` | Control / inspect the in-process Argon2id miner |
-| `createshadowpowclaimresolution` | Preview or, after explicit acknowledgement, sign but never broadcast an exact-input conflict for one quarantined wallet claim |
+| `createshadowpowclaimresolution` | Compatibility preview/sign surface; after explicit acknowledgement it returns signed resolution bytes but does not itself broadcast them |
+| `getpowclaimrecoveryinfo` | Inspect the wallet-scoped recovery choice and current component gate without creating, signing, or broadcasting |
+| `setpowclaimrecovery` | Record unset, pause-and-ask, or explicitly bounded automatic recovery policy; never starts mining or creates a transaction |
 | `optimizeutxoset` | Rebuild the UTXO set into equal outputs to maximize PoS yield |
+
+The Issue #37 release's additional manual and bulk wrappers, when present in a
+build, use the same component engine and preserve separate preview,
+sign-and-persist, and commit-and-broadcast authority. Use that build's RPC help
+for its exact public command names and arguments; do not infer commit authority
+from a signed draft.
 
 ### 9.3 Quantum addresses and migration
 
@@ -756,11 +770,17 @@ Staking** (full unlock, required for any quantum, Gold Rush, migration, or cold-
 transaction). Automatic demurrage-attestation attempts additionally require staking to be
 enabled and a safe spendable fee input.
 
-The Staking & Mining dashboard reports a quarantined claim prominently and identifies the
-preview command available in the Qt debug console. It does not provide a one-click
-claim-resolution broadcast button. The same warning applies to CLI and headless daemon
-operators: signing the guided conflict is a separate explicit action, broadcasting it is
-another, and neither step guarantees peer acceptance or confirmation.
+In v30.1.1 through v30.1.3, the Staking & Mining dashboard reports a quarantined claim and
+directs advanced operators to the compatibility preview/sign RPC in the Qt debug console;
+those releases do not provide a one-click conflict broadcast.
+
+The later Issue #37 release adds **Review claim recovery...** and a seventh wallet-scoped
+optional-automation control. The manual dialog and headless wrappers consume the same
+pinned component plan. They preserve separate preview, sign-and-persist, and
+commit-and-broadcast decisions and show fees, sibling conflicts, descendants, stale depth,
+and both confirmation outcomes. The automatic control is off until the operator records
+positive fee, batch, rolling-budget, rate, and staleness limits. Neither path guarantees
+peer acceptance or confirmation, unlocks the wallet, or turns mining on.
 
 ---
 

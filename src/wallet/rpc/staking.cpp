@@ -1737,34 +1737,532 @@ static RPCHelpMan sendshadowpowclaim()
     };
 }
 
+static const char* ShadowPowRecoveryStateName(ShadowPowClaimRecoveryState state)
+{
+    switch (state) {
+    case ShadowPowClaimRecoveryState::LIVE: return "live";
+    case ShadowPowClaimRecoveryState::TRANSIENT: return "transient";
+    case ShadowPowClaimRecoveryState::INDETERMINATE: return "indeterminate";
+    case ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE: return "current_branch_ineligible";
+    case ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP: return "terminal_on_pinned_tip";
+    case ShadowPowClaimRecoveryState::RESOLUTION_PENDING: return "resolution_pending";
+    case ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN: return "resolved_on_active_chain";
+    }
+    return "unknown";
+}
+
+static const char* ShadowPowRecoveryProvenanceName(ShadowPowClaimRecoveryProvenance provenance)
+{
+    switch (provenance) {
+    case ShadowPowClaimRecoveryProvenance::EXPLICIT_AUTHORED: return "explicit_authored";
+    case ShadowPowClaimRecoveryProvenance::EXPLICIT_ADOPTED: return "explicit_adopted";
+    case ShadowPowClaimRecoveryProvenance::LEGACY_WALLET_AUTHORED: return "legacy_wallet_authored";
+    case ShadowPowClaimRecoveryProvenance::UNKNOWN: return "unknown";
+    }
+    return "unknown";
+}
+
+static const char* ShadowPowRecoveryNodeKindName(ShadowPowClaimRecoveryNodeKind kind)
+{
+    switch (kind) {
+    case ShadowPowClaimRecoveryNodeKind::CLAIM: return "claim";
+    case ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION: return "managed_resolution";
+    case ShadowPowClaimRecoveryNodeKind::LEGACY_RESOLUTION: return "legacy_resolution";
+    case ShadowPowClaimRecoveryNodeKind::ORDINARY: return "ordinary";
+    }
+    return "unknown";
+}
+
+static const char* ShadowPowRecoveryActionStatusName(ShadowPowClaimRecoveryActionStatus status)
+{
+    switch (status) {
+    case ShadowPowClaimRecoveryActionStatus::READY: return "ready";
+    case ShadowPowClaimRecoveryActionStatus::REUSE_MANAGED: return "reuse_managed";
+    case ShadowPowClaimRecoveryActionStatus::REUSE_LEGACY: return "reuse_legacy";
+    case ShadowPowClaimRecoveryActionStatus::SIGNED_AND_PERSISTED: return "signed_and_persisted";
+    case ShadowPowClaimRecoveryActionStatus::BROADCAST: return "broadcast";
+    case ShadowPowClaimRecoveryActionStatus::ALREADY_IN_MEMPOOL: return "already_in_mempool";
+    case ShadowPowClaimRecoveryActionStatus::RELAY_DEFERRED: return "relay_deferred";
+    case ShadowPowClaimRecoveryActionStatus::REFUSED: return "refused";
+    case ShadowPowClaimRecoveryActionStatus::FAILED: return "failed";
+    }
+    return "unknown";
+}
+
+static const char* ShadowPowMempoolDispositionName(ShadowPowClaimMempoolDisposition disposition)
+{
+    switch (disposition) {
+    case ShadowPowClaimMempoolDisposition::ELIGIBLE: return "eligible";
+    case ShadowPowClaimMempoolDisposition::INACTIVE: return "inactive";
+    case ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW: return "height_before_window";
+    case ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW: return "height_after_window";
+    case ShadowPowClaimMempoolDisposition::INVALID_LOCATION: return "invalid_location";
+    case ShadowPowClaimMempoolDisposition::MALFORMED: return "malformed";
+    case ShadowPowClaimMempoolDisposition::DUPLICATE: return "duplicate";
+    case ShadowPowClaimMempoolDisposition::WRONG_MODE: return "wrong_mode";
+    case ShadowPowClaimMempoolDisposition::UNKNOWN_MODE: return "unknown_mode";
+    case ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION: return "unsupported_version";
+    case ShadowPowClaimMempoolDisposition::VERSION_NOT_YET_ACTIVE: return "version_not_yet_active";
+    case ShadowPowClaimMempoolDisposition::INVALID_PROOF: return "invalid_proof";
+    case ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE: return "unbound_proof_may_revalidate";
+    case ShadowPowClaimMempoolDisposition::ORIGIN_MISMATCH: return "origin_mismatch";
+    case ShadowPowClaimMempoolDisposition::ORIGIN_NOT_YET_REACHED: return "origin_not_yet_reached";
+    case ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED: return "origin_expired";
+    case ShadowPowClaimMempoolDisposition::INPUT_MISMATCH: return "input_mismatch";
+    case ShadowPowClaimMempoolDisposition::ALREADY_ACCOUNTED: return "already_accounted";
+    case ShadowPowClaimMempoolDisposition::CAPACITY_LIMIT: return "capacity_limit";
+    case ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT: return "evaluation_limit";
+    case ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR: return "local_state_error";
+    }
+    return "unknown";
+}
+
+static UniValue ShadowPowTxidsToJSON(const std::vector<uint256>& txids)
+{
+    UniValue result(UniValue::VARR);
+    for (const uint256& txid : txids) result.push_back(txid.GetHex());
+    return result;
+}
+
+static UniValue ShadowPowRecoveryActionToJSON(const ShadowPowClaimRecoveryAction& action,
+                                               bool include_hex,
+                                               bool suppress_transaction = false)
+{
+    UniValue result(UniValue::VOBJ);
+    UniValue anchor(UniValue::VOBJ);
+    anchor.pushKV("txid", action.anchor.hash.GetHex());
+    anchor.pushKV("vout", action.anchor.n);
+    result.pushKV("anchor", std::move(anchor));
+    result.pushKV("generation_fingerprint", action.generation_fingerprint.GetHex());
+    result.pushKV("component_fingerprint", action.component_fingerprint.GetHex());
+    result.pushKV("classification", ShadowPowRecoveryStateName(action.component_state));
+    result.pushKV("status", ShadowPowRecoveryActionStatusName(action.status));
+    result.pushKV("claim_txids", ShadowPowTxidsToJSON(action.claim_txids));
+    result.pushKV("descendant_claims", static_cast<uint64_t>(action.descendant_claims));
+    result.pushKV("fee", ValueFromAmount(action.fee));
+    result.pushKV("persisted", action.persisted);
+    result.pushKV("relay_authorized", action.relay_authorized);
+    result.pushKV("in_mempool", action.in_mempool);
+    result.pushKV("frontier_may_advance", action.frontier_may_advance);
+    result.pushKV("conflicts_with_revalidating_unbound_proof",
+                  action.conflicts_with_revalidating_unbound_proof);
+    result.pushKV("reason_code", action.reason_code);
+    result.pushKV("reason", action.detail);
+    if (action.transaction && !suppress_transaction) {
+        if (action.status == ShadowPowClaimRecoveryActionStatus::READY) {
+            result.pushKV("unsigned_template_hash", action.transaction->GetHash().GetHex());
+        } else {
+            result.pushKV("resolution_txid", action.transaction->GetHash().GetHex());
+        }
+        result.pushKV("vsize", action.vsize);
+        if (action.transaction->vout.size() == 1) {
+            result.pushKV("input_amount", ValueFromAmount(action.transaction->vout.front().nValue + action.fee));
+            result.pushKV("output_amount", ValueFromAmount(action.transaction->vout.front().nValue));
+        }
+        if (include_hex &&
+            action.status != ShadowPowClaimRecoveryActionStatus::READY) {
+            result.pushKV("hex", EncodeHexTx(*action.transaction));
+        }
+    }
+    return result;
+}
+
+static bool ShadowPowRecoveryPlanHasRevalidatingUnboundProof(
+    const ShadowPowClaimRecoveryPlan& plan)
+{
+    const auto has_risk = [](const ShadowPowClaimRecoveryAction& action) {
+        return action.conflicts_with_revalidating_unbound_proof;
+    };
+    return std::any_of(plan.actions.begin(), plan.actions.end(), has_risk) ||
+           std::any_of(plan.refused.begin(), plan.refused.end(), has_risk);
+}
+
+static UniValue ShadowPowRecoveryPlanToJSON(const ShadowPowClaimRecoveryPlan& plan,
+                                             ShadowPowClaimRecoveryMode mode)
+{
+    UniValue result(UniValue::VOBJ);
+    const char* action = mode == ShadowPowClaimRecoveryMode::PREVIEW
+        ? "preview"
+        : mode == ShadowPowClaimRecoveryMode::SIGN_ONLY
+            ? "sign_only"
+            : "commit_and_broadcast";
+    result.pushKV("action", action);
+    const bool plan_reusable =
+        mode == ShadowPowClaimRecoveryMode::PREVIEW &&
+        plan.complete && plan.wallet_tip_matches && !plan.plan_id.IsNull();
+    if (plan_reusable) result.pushKV("plan_id", plan.plan_id.GetHex());
+    result.pushKV("plan_reusable", plan_reusable);
+    result.pushKV("active_tip", plan.active_tip.GetHex());
+    result.pushKV("active_height", plan.active_height);
+    result.pushKV("wallet_generation", plan.wallet_generation);
+    result.pushKV("wallet_tip_matches", plan.wallet_tip_matches);
+    result.pushKV("complete", plan.complete);
+    result.pushKV("one_call_finality", false);
+    result.pushKV("frontier_may_advance", true);
+    result.pushKV("contains_revalidating_unbound_proof",
+                  ShadowPowRecoveryPlanHasRevalidatingUnboundProof(plan));
+    result.pushKV("max_fee_per_resolution", ValueFromAmount(plan.max_fee_per_resolution));
+    result.pushKV("aggregate_batch_fee_cap", ValueFromAmount(plan.aggregate_batch_fee_cap));
+    if (plan.fee_rate_atoms_per_k) {
+        result.pushKV("fee_rate_atoms_per_k", *plan.fee_rate_atoms_per_k);
+    }
+    result.pushKV("total_fee", ValueFromAmount(plan.total_fee));
+    result.pushKV("actionable_components", static_cast<uint64_t>(plan.actions.size()));
+    result.pushKV("refused_components", static_cast<uint64_t>(plan.refused.size()));
+    UniValue actions(UniValue::VARR);
+    for (const auto& item : plan.actions) {
+        actions.push_back(ShadowPowRecoveryActionToJSON(
+            item, mode != ShadowPowClaimRecoveryMode::PREVIEW));
+    }
+    result.pushKV("actions", std::move(actions));
+    UniValue refused(UniValue::VARR);
+    for (const auto& item : plan.refused) {
+        refused.push_back(ShadowPowRecoveryActionToJSON(item, false));
+    }
+    result.pushKV("refused", std::move(refused));
+    return result;
+}
+
+static UniValue ShadowPowRecoveryResultToJSON(
+    const ShadowPowClaimRecoveryResult& execution,
+    ShadowPowClaimRecoveryMode mode,
+    const ShadowPowClaimRecoveryPlan* current_plan = nullptr)
+{
+    UniValue result(UniValue::VOBJ);
+    if (mode == ShadowPowClaimRecoveryMode::PREVIEW &&
+        !execution.durable_state_ambiguous) {
+        result = ShadowPowRecoveryPlanToJSON(execution.plan, mode);
+    } else if (mode == ShadowPowClaimRecoveryMode::PREVIEW) {
+        result.pushKV("action", "preview");
+        result.pushKV("plan_reusable", false);
+        result.pushKV("actions", UniValue(UniValue::VARR));
+        result.pushKV("refused", UniValue(UniValue::VARR));
+    } else {
+        result.pushKV("action", mode == ShadowPowClaimRecoveryMode::SIGN_ONLY
+            ? "sign_only" : "commit_and_broadcast");
+        const bool plan_consumed = !execution.plan.plan_id.IsNull();
+        if (plan_consumed) {
+            result.pushKV("acknowledged_plan_id", execution.plan.plan_id.GetHex());
+            result.pushKV("acknowledged_active_tip", execution.plan.active_tip.GetHex());
+            result.pushKV("acknowledged_active_height", execution.plan.active_height);
+            result.pushKV("acknowledged_wallet_generation", execution.plan.wallet_generation);
+            result.pushKV("acknowledged_total_fee", ValueFromAmount(execution.plan.total_fee));
+        }
+        result.pushKV("plan_consumed", plan_consumed);
+        result.pushKV("plan_reusable", false);
+        result.pushKV("contains_revalidating_unbound_proof",
+                      ShadowPowRecoveryPlanHasRevalidatingUnboundProof(
+                          execution.plan));
+
+        UniValue actions(UniValue::VARR);
+        for (const auto& item : execution.plan.actions) {
+            actions.push_back(ShadowPowRecoveryActionToJSON(
+                item, /*include_hex=*/true,
+                /*suppress_transaction=*/execution.durable_state_ambiguous));
+        }
+        result.pushKV("actions", std::move(actions));
+        UniValue refused(UniValue::VARR);
+        for (const auto& item : execution.plan.refused) {
+            refused.push_back(ShadowPowRecoveryActionToJSON(item, false));
+        }
+        result.pushKV("refused", std::move(refused));
+        if (current_plan) {
+            result.pushKV("current_plan", ShadowPowRecoveryPlanToJSON(
+                *current_plan, ShadowPowClaimRecoveryMode::PREVIEW));
+        }
+    }
+    result.pushKV("success", execution.success);
+    result.pushKV("stale_plan", execution.stale_plan);
+    result.pushKV("signed_and_persisted", static_cast<uint64_t>(execution.signed_and_persisted));
+    result.pushKV("durable_state_changed", execution.durable_state_changed);
+    result.pushKV("durable_state_ambiguous", execution.durable_state_ambiguous);
+    result.pushKV("relay_authority_granted", static_cast<uint64_t>(execution.relay_authority_granted));
+    result.pushKV("broadcast", static_cast<uint64_t>(execution.broadcast));
+    result.pushKV("already_in_mempool", static_cast<uint64_t>(execution.already_in_mempool));
+    result.pushKV("relay_deferred", static_cast<uint64_t>(execution.relay_deferred));
+    result.pushKV("error", execution.error);
+    if (mode == ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST) {
+        result.pushKV("relay_complete", execution.success && execution.relay_deferred == 0);
+    }
+    if (!execution.success && execution.durable_state_ambiguous) {
+        result.pushKV("next_step", "The durable database outcome is ambiguous. Stop recovery activity and reload the wallet. Reload may reveal exact persisted or relay-authorized bytes; inspect the refreshed current plan and wallet records before retrying because authorized bytes may relay later.");
+    } else if (mode != ShadowPowClaimRecoveryMode::PREVIEW &&
+               !execution.success && execution.durable_state_changed) {
+        result.pushKV("next_step", "Durable wallet state changed before this operation stopped. Inspect every action, relay_authority_granted, error, and current_plan. Exact authorized bytes may be retried by the scheduler; do not assume an RPC failure rolled them back.");
+    } else if (mode == ShadowPowClaimRecoveryMode::PREVIEW) {
+        result.pushKV("next_step", !execution.plan.complete ||
+                                      !execution.plan.wallet_tip_matches
+            ? "No reusable plan is available because the wallet and active-chain snapshot is incomplete or mismatched. Synchronize or reload, then preview again."
+            : execution.plan.actions.empty()
+            ? "No current safe action is available. Review refused components and retry only after their stated gate changes."
+            : "Review every action and fee, then repeat with this exact expected_plan_id and explicit acknowledgement. Any mutation or tip change consumes the plan.");
+    } else if (mode == ShadowPowClaimRecoveryMode::SIGN_ONLY) {
+        result.pushKV("next_step", "Exact signed bytes are persisted without new relay authority. Run preview again to obtain a fresh plan before commit_and_broadcast.");
+    } else if (execution.relay_deferred != 0) {
+        result.pushKV("next_step", "Commit authority is durable, but some exact transactions were deliberately deferred after the first new relay. The scheduler will retry them; re-preview before any further manual execution.");
+    } else {
+        result.pushKV("next_step", "Monitor mempool and confirmation state. A later original-claim confirmation can advance the component frontier and require a new preview.");
+    }
+    const bool revalidation_risk =
+        ShadowPowRecoveryPlanHasRevalidatingUnboundProof(execution.plan);
+    result.pushKV("warning", revalidation_risk
+        ? "This plan deliberately conflicts with an unbound claim proof that is invalid on the pinned tip but may become valid on a descendant. Exact-plan fee/conflict acknowledgement or bounded automatic standing consent is required. A recovery is an on-chain conflict, not abandonment; confirmation is not guaranteed, and only a confirmed resolution pays its displayed base-chain fee. Re-preview after any tip or wallet change. Recovery never enables mining."
+        : "A recovery is an on-chain conflict, not abandonment. Confirmation is not guaranteed, and only a confirmed resolution pays its displayed base-chain fee. A later original-claim confirmation may advance the component frontier and require a new plan. A commit pass relays at most one newly submitted transaction before deferring the rest for a fresh pinned scheduler pass. Recovery never enables mining.");
+    return result;
+}
+
+static std::vector<RPCResult> ShadowPowRecoveryExecutionResults()
+{
+    return {
+        {RPCResult::Type::STR, "action", "preview, sign_only, or commit_and_broadcast."},
+        {RPCResult::Type::STR_HEX, "plan_id", /*optional=*/true, "Reusable exact plan identifier returned only by preview."},
+        {RPCResult::Type::STR_HEX, "active_tip", /*optional=*/true, "Preview tip to which plan_id is bound."},
+        {RPCResult::Type::NUM, "active_height", /*optional=*/true, "Preview height to which plan_id is bound."},
+        {RPCResult::Type::NUM, "wallet_generation", /*optional=*/true, "Preview wallet generation protected by plan_id."},
+        {RPCResult::Type::BOOL, "wallet_tip_matches", /*optional=*/true, "Whether wallet processing matched the preview tip."},
+        {RPCResult::Type::BOOL, "complete", /*optional=*/true, "Whether the preview snapshot was coherent."},
+        {RPCResult::Type::BOOL, "one_call_finality", /*optional=*/true, "Always false; a later original-claim confirmation can advance the component frontier."},
+        {RPCResult::Type::BOOL, "frontier_may_advance", /*optional=*/true, "Whether a later component generation may require another plan."},
+        {RPCResult::Type::BOOL, "contains_revalidating_unbound_proof", /*optional=*/true, "Whether a selected action conflicts with an unbound proof that is invalid now but may become valid on a descendant."},
+        {RPCResult::Type::STR_AMOUNT, "max_fee_per_resolution", /*optional=*/true, "Per-resolution fee cap used by the preview."},
+        {RPCResult::Type::STR_AMOUNT, "aggregate_batch_fee_cap", /*optional=*/true, "Aggregate fee cap used by the preview."},
+        {RPCResult::Type::NUM, "fee_rate_atoms_per_k", /*optional=*/true, "Explicit fee rate in atoms per 1000 virtual bytes, when supplied."},
+        {RPCResult::Type::STR_AMOUNT, "total_fee", /*optional=*/true, "Aggregate preview fee if every planned resolution confirms."},
+        {RPCResult::Type::NUM, "actionable_components", /*optional=*/true, "Preview components with a current canonical action."},
+        {RPCResult::Type::NUM, "refused_components", /*optional=*/true, "Preview components refused closed by a safety gate."},
+        {RPCResult::Type::STR_HEX, "acknowledged_plan_id", /*optional=*/true, "Exact pre-execution plan accepted and consumed by a mutating call."},
+        {RPCResult::Type::STR_HEX, "acknowledged_active_tip", /*optional=*/true, "Tip bound to the consumed plan."},
+        {RPCResult::Type::NUM, "acknowledged_active_height", /*optional=*/true, "Height bound to the consumed plan."},
+        {RPCResult::Type::NUM, "acknowledged_wallet_generation", /*optional=*/true, "Wallet generation bound to the consumed plan."},
+        {RPCResult::Type::STR_AMOUNT, "acknowledged_total_fee", /*optional=*/true, "Aggregate fee accepted by the consumed plan."},
+        {RPCResult::Type::BOOL, "plan_consumed", /*optional=*/true, "True for a mutating call; acknowledged_plan_id must not be reused."},
+        {RPCResult::Type::ARR, "actions", "Preview actions or per-action mutation outcomes.", {{RPCResult::Type::ELISION, "", ""}}},
+        {RPCResult::Type::ARR, "refused", "Fail-closed actions with machine reason_code fields.", {{RPCResult::Type::ELISION, "", ""}}},
+        {RPCResult::Type::OBJ, "current_plan", /*optional=*/true, "Fresh read-only preview after a mutating call. Its nested plan_id is present and usable only when nested plan_reusable=true.", {{RPCResult::Type::ELISION, "", ""}}},
+        {RPCResult::Type::BOOL, "success", "Whether required persistence and authorization completed. This does not mean every authorized transaction was relayed; inspect relay_deferred and relay_complete."},
+        {RPCResult::Type::BOOL, "stale_plan", "Whether exact-plan stale-state protection rejected the request."},
+        {RPCResult::Type::NUM, "signed_and_persisted", "New exact transactions signed and durably persisted."},
+        {RPCResult::Type::BOOL, "durable_state_changed", "Whether this invocation definitely persisted new exact bytes or granted durable relay authority, including when a later step failed."},
+        {RPCResult::Type::BOOL, "durable_state_ambiguous", "Whether database commit or rollback had an indeterminate outcome. Reload may reveal exact persisted or relay-authorized bytes."},
+        {RPCResult::Type::NUM, "relay_authority_granted", "Existing or newly persisted exact transactions granted durable scheduler/relay authority by this invocation."},
+        {RPCResult::Type::NUM, "broadcast", "Exact transactions broadcast during this pass."},
+        {RPCResult::Type::NUM, "already_in_mempool", "Exact transactions already present in the mempool."},
+        {RPCResult::Type::NUM, "relay_deferred", "Commit-authorized exact transactions deferred to a later scheduler pass."},
+        {RPCResult::Type::STR, "error", "Structured execution-level error detail, empty on success."},
+        {RPCResult::Type::BOOL, "plan_reusable", "True only for a read-only preview; mutating calls require a fresh preview before another manual execution."},
+        {RPCResult::Type::BOOL, "relay_complete", /*optional=*/true, "For commit_and_broadcast, whether no commit-authorized relay was deferred."},
+        {RPCResult::Type::STR, "next_step", "Required review, re-preview, retry, or monitoring action."},
+        {RPCResult::Type::STR, "warning", "Conflict, fee, confirmation, and frontier warning."},
+    };
+}
+
+static UniValue ShadowPowRecoveryNodeToJSON(const ShadowPowClaimRecoveryNode& node)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("txid", node.txid.GetHex());
+    result.pushKV("kind", ShadowPowRecoveryNodeKindName(node.kind));
+    result.pushKV("provenance", ShadowPowRecoveryProvenanceName(node.provenance));
+    result.pushKV("disposition", ShadowPowMempoolDispositionName(node.disposition));
+    result.pushKV("proof_may_revalidate_on_descendant",
+                  node.proof_may_revalidate_on_descendant);
+    result.pushKV("active_chain_confirmed", node.active_chain_confirmed);
+    result.pushKV("in_mempool", node.in_mempool);
+    result.pushKV("quarantined", node.quarantined);
+    result.pushKV("expected_shape", node.expected_shape);
+    result.pushKV("wallet_authored", node.wallet_authored);
+    result.pushKV("abandoned", node.abandoned);
+    result.pushKV("stale_depth", node.stale_depth);
+    result.pushKV("stale_depth_known", node.stale_depth_known);
+    result.pushKV("resolution_metadata_valid", node.resolution_metadata_valid);
+    result.pushKV("resolution_relay_authorized", node.resolution_relay_authorized);
+    return result;
+}
+
+static UniValue ShadowPowRecoveryComponentToJSON(const ShadowPowClaimRecoveryComponent& component)
+{
+    UniValue result(UniValue::VOBJ);
+    UniValue anchor(UniValue::VOBJ);
+    anchor.pushKV("txid", component.anchor.hash.GetHex());
+    anchor.pushKV("vout", component.anchor.n);
+    anchor.pushKV("amount", ValueFromAmount(component.anchor_amount));
+    anchor.pushKV("scriptPubKey", HexStr(component.anchor_script));
+    result.pushKV("anchor", std::move(anchor));
+    result.pushKV("generation_fingerprint", component.generation_fingerprint.GetHex());
+    result.pushKV("component_fingerprint", component.fingerprint.GetHex());
+    result.pushKV("classification", ShadowPowRecoveryStateName(component.state));
+    result.pushKV("claim_txids", ShadowPowTxidsToJSON(component.claim_txids));
+    result.pushKV("root_claim_txids", ShadowPowTxidsToJSON(component.root_claim_txids));
+    result.pushKV("resolution_txids", ShadowPowTxidsToJSON(component.resolution_txids));
+    result.pushKV("ordinary_or_mixed_txids", ShadowPowTxidsToJSON(component.ordinary_or_mixed_txids));
+    result.pushKV("descendant_claims", static_cast<uint64_t>(component.descendant_claims));
+    result.pushKV("minimum_stale_depth", component.minimum_stale_depth);
+    result.pushKV("stale_depth_known", component.stale_depth_known);
+    result.pushKV("anchor_authenticated", component.anchor_authenticated);
+    result.pushKV("anchor_unspent", component.anchor_unspent);
+    result.pushKV("all_claims_quarantined", component.all_claims_quarantined);
+    result.pushKV("all_claims_explicitly_provenanced", component.all_claims_explicitly_provenanced);
+    result.pushKV("has_revalidating_unbound_proof",
+                  component.has_revalidating_unbound_proof);
+    UniValue nodes(UniValue::VARR);
+    for (const auto& node : component.nodes) nodes.push_back(ShadowPowRecoveryNodeToJSON(node));
+    result.pushKV("nodes", std::move(nodes));
+    return result;
+}
+
+static void EnsureShadowPowRecoveryChainReady(CWallet& wallet)
+{
+    wallet.BlockUntilSyncedToCurrentChain();
+    if (!wallet.chain().isReadyToBroadcast()) {
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                           "Gold Rush PoW claim recovery is unavailable while the node is reindexing, importing blocks, or in initial block download");
+    }
+}
+
+static int ShadowPowRecoveryRefusalCode(const ShadowPowClaimRecoveryAction& refusal)
+{
+    if (refusal.reason_code == "selector-not-found") return RPC_INVALID_ADDRESS_OR_KEY;
+    if (refusal.reason_code == "fee-consumes-anchor" ||
+        refusal.reason_code == "resolution-output-dust") {
+        return RPC_WALLET_INSUFFICIENT_FUNDS;
+    }
+    if (refusal.reason_code == "invalid-fee-limits" ||
+        refusal.reason_code == "fee-rate-below-minimum" ||
+        refusal.reason_code == "batch-fee-cap-exceeded" ||
+        refusal.reason_code == "fee-rate-cannot-modify-signed" ||
+        refusal.reason_code == "anchor-not-authenticated" ||
+        refusal.reason_code == "anchor-spent" ||
+        refusal.reason_code == "component-no-claims" ||
+        refusal.reason_code == "claim-confirmed" ||
+        refusal.reason_code == "claim-live" ||
+        refusal.reason_code == "claim-not-quarantined" ||
+        refusal.reason_code == "claim-malformed" ||
+        refusal.reason_code == "claim-not-terminal") {
+        return RPC_INVALID_PARAMETER;
+    }
+    return RPC_WALLET_ERROR;
+}
+
+[[noreturn]] static void ThrowShadowPowRecoveryFailure(const ShadowPowClaimRecoveryResult& result)
+{
+    if (result.stale_plan || !result.plan.complete || !result.plan.wallet_tip_matches) {
+        throw JSONRPCError(RPC_VERIFY_REJECTED,
+                           result.error.empty() ? "Gold Rush PoW recovery plan is stale" : result.error);
+    }
+    if (!result.plan.refused.empty()) {
+        const auto& refusal = result.plan.refused.front();
+        throw JSONRPCError(ShadowPowRecoveryRefusalCode(refusal),
+                           refusal.reason_code + ": " + refusal.detail);
+    }
+    throw JSONRPCError(RPC_WALLET_ERROR,
+                       result.error.empty() ? "Gold Rush PoW recovery failed" : result.error);
+}
+
+[[noreturn]] static void ThrowCreateShadowPowClaimResolutionFailure(
+    const ShadowPowClaimRecoveryResult& result)
+{
+    // Preserve the established one-claim RPC diagnostic while deriving the
+    // decision exclusively from the shared typed component classifier.
+    if (!result.plan.refused.empty() &&
+        result.plan.refused.front().reason_code == "ordinary-conflict") {
+        throw JSONRPCError(
+            RPC_WALLET_ERROR,
+            "Gold Rush PoW claim has an unresolved wallet descendant; resolve or abandon the descendant before preparing a conflict that would invalidate it");
+    }
+    ThrowShadowPowRecoveryFailure(result);
+}
+
+static ShadowPowClaimRecoveryRequest ManualShadowPowRecoveryRequest(CWallet& wallet,
+                                                                    const std::vector<uint256>& selectors)
+{
+    ShadowPowClaimRecoveryRequest request;
+    request.origin = ShadowPowClaimRecoveryOrigin::MANUAL;
+    request.selectors = selectors;
+    request.max_fee_per_resolution = wallet.m_default_max_tx_fee;
+    request.aggregate_batch_fee_cap = wallet.m_default_max_tx_fee;
+    return request;
+}
+
+static ShadowPowClaimRecoveryPlan CurrentShadowPowRecoveryPlan(
+    CWallet& wallet, ShadowPowClaimRecoveryRequest request)
+{
+    request.mode = ShadowPowClaimRecoveryMode::PREVIEW;
+    request.execution_authority = ShadowPowClaimRecoveryExecutionAuthority::NONE;
+    request.acknowledge_fee_and_conflict_risk = false;
+    request.expected_plan_id.reset();
+    // A persisted exact transaction cannot be repriced. The refreshed plan
+    // reports its actual signed fee instead of carrying a consumed request's
+    // fee-rate override into a guaranteed refusal.
+    request.fee_rate.reset();
+    return wallet.PlanShadowPowClaimRecovery(request);
+}
+
+static void ValidateCreateShadowPowClaimResolutionSelector(
+    CWallet& wallet, const uint256& claim_txid)
+{
+    LOCK2(::cs_main, wallet.cs_wallet);
+    const CWalletTx* claim = wallet.GetWalletTx(claim_txid);
+    if (!claim) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                           "Gold Rush PoW claim not found in this wallet");
+    }
+    if (!claim->tx || !TransactionHasShadowProof(*claim->tx)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "claim_txid is not a Gold Rush PoW QQSPROOF transaction");
+    }
+    if (wallet.GetTxDepthInMainChain(*claim) != 0 ||
+        !claim->isUnconfirmed()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "Gold Rush PoW claim is already resolved on chain");
+    }
+}
+
 static RPCHelpMan createshadowpowclaimresolution()
 {
     return RPCHelpMan{
         "createshadowpowclaimresolution",
-        "\nPrepare, but do not broadcast, a signed on-chain conflict that can resolve one quarantined Gold Rush PoW claim.\n"
-        "A peer can retain a base-valid QQSPROOF after this node removes it from the mempool, so the wallet cannot safely abandon the claim or release its input based on elapsed time. This RPC instead spends the claim's exact input back to the same wallet script. Whichever transaction confirms first resolves the conflict on chain; the other cannot confirm on that active chain.\n"
-        "The default dry_run=true returns the exact fee and output without signing. dry_run=false requires an unlocked wallet and explicit acknowledge_fee_and_conflict_risk=true, but still does not broadcast. Review the result and use sendrawtransaction separately if you choose to publish it. If the resolution confirms, its base-chain fee is not reimbursed by the shadow ledger. Some peers retaining the original claim may reject the conflict, and confirmation is not guaranteed. After an explicit broadcast, ordinary wallet resubmission may relay the still-unconfirmed resolution again across restart until one side confirms.\n",
+        "\nPreview or sign, but never broadcast, one canonical Gold Rush PoW claim-component resolution. Any claim txid in the component maps to the same current confirmed anchor. Newly signed bytes are durably retained as a non-relayable draft until commitshadowpowclaimresolution, an explicit sendrawtransaction, or a bulk commit authorizes those exact bytes. A reused managed resolution may already have durable relay authority, which is reported explicitly.\n",
         {
-            {"claim_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Quarantined wallet QQSPROOF transaction id."},
-            {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{true}, "Return a fee/output preview without signing when true."},
-            {"acknowledge_fee_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Default{false}, "Must be true when dry_run=false. A signed transaction is returned but not broadcast."},
+            {"claim_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Wallet-known QQSPROOF transaction id."},
+            {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{true}, "Return a side-effect-free exact plan when true."},
+            {"acknowledge_fee_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Default{false}, "Required when dry_run=false; signing never broadcasts."},
             {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Optional fee rate in " + CURRENCY_ATOM + "/vB."},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "", {
-            {RPCResult::Type::BOOL, "dry_run", "Whether this is an unsigned preview."},
-            {RPCResult::Type::BOOL, "broadcast", "Always false; this RPC never broadcasts."},
-            {RPCResult::Type::BOOL, "reused_legacy_resolution", "Whether an already-signed compatibility transaction was reused instead of creating a new conflict."},
-            {RPCResult::Type::STR_HEX, "claim_txid", "The quarantined QQSPROOF transaction."},
-            {RPCResult::Type::STR_HEX, "claim_input_txid", "Transaction id of the exact input shared by the claim and resolution."},
-            {RPCResult::Type::NUM, "claim_input_vout", "Output number of the exact shared input."},
-            {RPCResult::Type::STR_AMOUNT, "input_amount", "Confirmed input value."},
-            {RPCResult::Type::STR_AMOUNT, "fee", "Base-chain fee paid only if the resolution confirms."},
-            {RPCResult::Type::STR_AMOUNT, "output_amount", "Value returned to the original wallet script."},
-            {RPCResult::Type::NUM, "vsize", "Maximum signed virtual size used for fee calculation."},
-            {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "Signed raw resolution transaction; present only when dry_run=false."},
-            {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "Resolution transaction id; present only when dry_run=false."},
-            {RPCResult::Type::STR, "next_step", "Explicit action required after reviewing this result."},
-            {RPCResult::Type::STR, "warning", "Safety and fee warning."},
+        RPCResult{RPCResult::Type::OBJ, "", "Compatibility fields plus the exact component plan.", {
+            {RPCResult::Type::BOOL, "dry_run", "Whether this was a preview."},
+            {RPCResult::Type::BOOL, "broadcast", "Always false."},
+            {RPCResult::Type::BOOL, "reused_legacy_resolution", "Whether a legacy signed cleanup was reused."},
+            {RPCResult::Type::BOOL, "reused_managed_resolution", "Whether exact managed bytes were reused."},
+            {RPCResult::Type::STR_HEX, "claim_txid", "Caller-provided selector."},
+            {RPCResult::Type::STR_HEX, "claim_input_txid", "Canonical confirmed anchor transaction."},
+            {RPCResult::Type::NUM, "claim_input_vout", "Canonical confirmed anchor output."},
+            {RPCResult::Type::STR_AMOUNT, "input_amount", "Anchor value."},
+            {RPCResult::Type::STR_AMOUNT, "fee", "Fee paid only if this resolution confirms."},
+            {RPCResult::Type::STR_AMOUNT, "output_amount", "Value returned to the exact anchor script."},
+            {RPCResult::Type::NUM, "vsize", "Current transaction virtual size."},
+            {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "Exact signed bytes when dry_run=false."},
+            {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "Exact signed transaction id when dry_run=false."},
+            {RPCResult::Type::STR_HEX, "plan_id", /*optional=*/true, "Reusable exact plan identifier returned only when dry_run=true."},
+            {RPCResult::Type::STR_HEX, "acknowledged_plan_id", /*optional=*/true, "Exact preview plan accepted and consumed by dry_run=false."},
+            {RPCResult::Type::BOOL, "plan_consumed", "Whether the returned acknowledged plan was consumed by signing."},
+            {RPCResult::Type::BOOL, "plan_reusable", "True only for a side-effect-free preview."},
+            {RPCResult::Type::STR_HEX, "active_tip", "Active tip to which this plan is bound."},
+            {RPCResult::Type::NUM, "wallet_generation", "Wallet database generation protected by the plan."},
+            {RPCResult::Type::STR_HEX, "generation_fingerprint", "Stable confirmed-anchor generation identifier."},
+            {RPCResult::Type::STR_HEX, "component_fingerprint", "Tip-pinned complete component fingerprint."},
+            {RPCResult::Type::STR, "classification", "Shared typed component classification."},
+            {RPCResult::Type::ARR, "claim_txids", "All claim transactions in the selected component.", {{RPCResult::Type::STR_HEX, "", "Claim transaction id."}}},
+            {RPCResult::Type::NUM, "descendant_claims", "Claim descendants reconciled as one component."},
+            {RPCResult::Type::BOOL, "persisted", "Whether exact signed bytes already have a durable wallet record."},
+            {RPCResult::Type::BOOL, "success", "Whether signing and durable persistence completed."},
+            {RPCResult::Type::STR, "error", "Execution-level error detail, empty on success."},
+            {RPCResult::Type::BOOL, "durable_state_changed", "Whether this invocation durably persisted new exact bytes."},
+            {RPCResult::Type::BOOL, "durable_state_ambiguous", "Whether database commit or rollback had an indeterminate outcome. Reload may reveal the exact bytes."},
+            {RPCResult::Type::NUM, "relay_authority_granted", "Always zero here; this RPC never grants relay authority."},
+            {RPCResult::Type::BOOL, "relay_authorized", "Whether these exact managed bytes already have durable relay authority. This RPC never grants it."},
+            {RPCResult::Type::BOOL, "conflicts_with_revalidating_unbound_proof", "Whether this resolution deliberately conflicts with an unbound proof that is invalid on the pinned tip but may become valid on a descendant."},
+            {RPCResult::Type::OBJ, "current_plan", /*optional=*/true, "Fresh read-only preview after signing. Its nested plan_id is present and usable only when nested plan_reusable=true.", {{RPCResult::Type::ELISION, "", ""}}},
+            {RPCResult::Type::STR, "next_step", "Next explicit action."},
+            {RPCResult::Type::STR, "warning", "Conflict, fee, and confirmation warning."},
         }},
         RPCExamples{
             HelpExampleCli("createshadowpowclaimresolution", "\"claim_txid\"") +
@@ -1775,201 +2273,344 @@ static RPCHelpMan createshadowpowclaimresolution()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
-
-    pwallet->BlockUntilSyncedToCurrentChain();
-    if (!pwallet->chain().isReadyToBroadcast()) {
-        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
-                           "Gold Rush PoW claim resolution is unavailable while the node is reindexing, importing blocks, or in initial block download");
+    EnsureShadowPowRecoveryChainReady(*pwallet);
+    if (pwallet->IsShadowPowClaimRecoveryDatabaseAmbiguous()) {
+        throw JSONRPCError(
+            RPC_WALLET_ERROR,
+            "Recovery database outcome is ambiguous. Reload the wallet and inspect its recovery records before previewing or signing another resolution");
     }
 
     const uint256 claim_txid = ParseHashV(request.params[0], "claim_txid");
+    ValidateCreateShadowPowClaimResolutionSelector(*pwallet, claim_txid);
     const bool dry_run = request.params[1].isNull() || request.params[1].get_bool();
     const bool acknowledged = !request.params[2].isNull() && request.params[2].get_bool();
     if (!dry_run && !acknowledged) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            "acknowledge_fee_and_conflict_risk=true is required to sign a claim-resolution transaction; preview first with dry_run=true");
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "acknowledge_fee_and_conflict_risk=true is required to sign a claim-resolution transaction; preview first with dry_run=true");
     }
+
+    ShadowPowClaimRecoveryRequest preview = ManualShadowPowRecoveryRequest(*pwallet, {claim_txid});
+    preview.mode = ShadowPowClaimRecoveryMode::PREVIEW;
+    if (!request.params[3].isNull()) preview.fee_rate = FeeRateFromSatVbValue(request.params[3]);
+    ShadowPowClaimRecoveryResult execution = pwallet->ResolveShadowPowClaims(preview);
+    if (!execution.success || execution.plan.actions.size() != 1) {
+        ThrowCreateShadowPowClaimResolutionFailure(execution);
+    }
+
+    std::optional<ShadowPowClaimRecoveryPlan> current_plan;
     if (!dry_run) {
         EnsureWalletIsUnlocked(*pwallet);
-        if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+        ShadowPowClaimRecoveryRequest sign = preview;
+        sign.mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
+        sign.execution_authority = ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+        sign.acknowledge_fee_and_conflict_risk = true;
+        sign.expected_plan_id = execution.plan.plan_id;
+        execution = pwallet->ResolveShadowPowClaims(sign);
+        if ((!execution.success && !execution.durable_state_changed &&
+             !execution.durable_state_ambiguous) ||
+            execution.plan.actions.size() != 1) {
+            ThrowCreateShadowPowClaimResolutionFailure(execution);
         }
-        if (pwallet->m_wallet_unlock_staking_only) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to sign a claim-resolution transaction");
-        }
-    }
-
-    CCoinControl coin_control;
-    coin_control.m_allow_other_inputs = false;
-    coin_control.m_avoid_address_reuse = false;
-    if (!request.params[3].isNull()) {
-        coin_control.m_feerate = FeeRateFromSatVbValue(request.params[3]);
-        coin_control.fOverrideFeeRate = true;
-    }
-
-    CMutableTransaction resolution_tx;
-    COutPoint claim_input;
-    CAmount input_amount{0};
-    CAmount fee{0};
-    CAmount output_amount{0};
-    int64_t vsize{-1};
-    bool reused_legacy_resolution{false};
-    {
-        LOCK2(::cs_main, pwallet->cs_wallet);
-        const CWalletTx* claim = pwallet->GetWalletTx(claim_txid);
-        if (!claim) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Gold Rush PoW claim not found in this wallet");
-        }
-        if (!TransactionHasShadowProof(*claim->tx)) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "claim_txid is not a Gold Rush PoW QQSPROOF transaction");
-        }
-        if (pwallet->GetTxDepthInMainChain(*claim) != 0 || !claim->isUnconfirmed()) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim is already resolved on chain");
-        }
-        if (claim->InMempool()) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim is still in the local mempool; wait for confirmation or quarantine before preparing a conflict");
-        }
-        if (!pwallet->IsQuarantinedShadowPowClaim(claim_txid)) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim is absent from the mempool but has no persisted quarantine marker; restart or rescan the wallet before using the guided resolution path");
-        }
-        if (claim->tx->vin.size() != 1) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Only a single-input wallet Gold Rush PoW claim can use the guided resolution path");
-        }
-        if (pwallet->HasWalletSpend(claim->tx)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Gold Rush PoW claim has an unresolved wallet descendant; resolve or abandon the descendant before preparing a conflict that would invalidate it");
-        }
-        claim_input = claim->tx->vin.front().prevout;
-
-        for (const uint256& conflict_txid : pwallet->GetConflicts(claim_txid)) {
-            if (conflict_txid == claim_txid) continue;
-            const CWalletTx* other = pwallet->GetWalletTx(conflict_txid);
-            if (!other || other->isAbandoned() || other->isConflicted()) continue;
-            if (pwallet->GetTxDepthInMainChain(*other) > 0) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER,
-                                   strprintf("Gold Rush PoW claim was already resolved by confirmed conflict %s", conflict_txid.ToString()));
-            }
-            if (pwallet->IsLegacyShadowPowCleanupFor(*other, claim_txid)) {
-                if (reused_legacy_resolution) {
-                    throw JSONRPCError(RPC_WALLET_ERROR, "Multiple unresolved legacy cleanup transactions spend the claim input; manual wallet review is required");
-                }
-                if (other->tx->vin.size() != 1 ||
-                    other->tx->vin.front().prevout != claim_input ||
-                    other->tx->vout.size() != 1 ||
-                    TransactionHasShadowProof(*other->tx)) {
-                    throw JSONRPCError(RPC_WALLET_ERROR,
-                                       strprintf("Legacy cleanup %s does not match the safe single-input self-spend shape", conflict_txid.ToString()));
-                }
-                resolution_tx = CMutableTransaction{*other->tx};
-                reused_legacy_resolution = true;
-                continue;
-            }
-            throw JSONRPCError(RPC_WALLET_ERROR,
-                               strprintf("An unresolved wallet conflict %s already spends the claim input; do not create another resolution", conflict_txid.ToString()));
-        }
-
-        Coin input_coin;
-        const CCoinsViewCache& coins_tip = pwallet->chain().chainman().ActiveChainstate().CoinsTip();
-        if (!coins_tip.GetCoin(claim_input, input_coin) || input_coin.IsSpent()) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim input is already spent on the active chain; wait for wallet conflict reconciliation");
-        }
-        if ((pwallet->IsMine(input_coin.out) & ISMINE_SPENDABLE) == ISMINE_NO) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Wallet cannot spend the quarantined claim input");
-        }
-
-        input_amount = input_coin.out.nValue;
-        if (reused_legacy_resolution) {
-            if (coin_control.m_feerate) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "fee_rate cannot modify an already-signed legacy claim-resolution transaction");
-            }
-            if (resolution_tx.vout.front().scriptPubKey != input_coin.out.scriptPubKey) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Legacy claim-resolution transaction does not return value to the exact claim-input script");
-            }
-            output_amount = resolution_tx.vout.front().nValue;
-            fee = input_amount - output_amount;
-            vsize = GetVirtualTransactionSize(CTransaction{resolution_tx}, 0, 0);
-            if (!MoneyRange(output_amount) || output_amount <= 0 || fee <= 0 ||
-                !MoneyRange(fee) || IsDust(resolution_tx.vout.front(), pwallet->chain().relayDustFee())) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Legacy claim-resolution transaction has an invalid output or fee");
-            }
-        } else {
-            const int64_t current_time = GetAdjustedTimeSeconds();
-            const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
-            if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
-            }
-
-            resolution_tx.nVersion = CTransaction::CURRENT_VERSION;
-            resolution_tx.nTime = current_time;
-            resolution_tx.vin.emplace_back(claim_input);
-            resolution_tx.vout.emplace_back(input_coin.out.nValue, input_coin.out.scriptPubKey);
-            const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(resolution_tx), pwallet.get(), &coin_control);
-            if (tx_size.vsize <= 0) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Unable to estimate the signed claim-resolution transaction size");
-            }
-            fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
-            output_amount = input_coin.out.nValue - fee;
-            CTxOut resolution_output{output_amount, input_coin.out.scriptPubKey};
-            if (!MoneyRange(output_amount) || output_amount <= 0 || IsDust(resolution_output, pwallet->chain().relayDustFee())) {
-                throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Quarantined claim input is too small to pay the resolution fee and return a non-dust output");
-            }
-            resolution_tx.vout[0].nValue = output_amount;
-            vsize = tx_size.vsize;
-        }
-        if (fee > pwallet->m_default_max_tx_fee) {
-            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
-        }
-
-        if (!dry_run && !reused_legacy_resolution) {
-            // The unlock mode can change after the initial RPC argument and
-            // wallet checks. Recheck it while holding cs_wallet so a
-            // concurrent staking-only unlock cannot authorize this spend.
-            if (pwallet->IsLocked()) {
-                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
-            }
-            if (pwallet->m_wallet_unlock_staking_only) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to sign a claim-resolution transaction");
-            }
-            std::map<int, bilingual_str> input_errors;
-            if (!pwallet->SignTransaction(resolution_tx, input_errors)) {
-                const std::string detail = input_errors.empty()
-                    ? "unknown signing failure" : input_errors.begin()->second.original;
-                throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Signing claim-resolution transaction failed: %s", detail));
-            }
+        if (!execution.durable_state_ambiguous) {
+            current_plan = CurrentShadowPowRecoveryPlan(*pwallet, sign);
         }
     }
 
-    if (!dry_run) {
-        const CTransactionRef signed_tx = MakeTransactionRef(resolution_tx);
-        LOCK(cs_main);
-        const MempoolAcceptResult accept = pwallet->chain().chainman().ProcessTransaction(signed_tx, /*test_accept=*/true);
-        if (accept.m_result_type != MempoolAcceptResult::ResultType::VALID) {
-            throw JSONRPCError(RPC_VERIFY_REJECTED,
-                               strprintf("Claim-resolution transaction is not currently relayable: %s", accept.m_state.ToString()));
-        }
+    const ShadowPowClaimRecoveryAction& action = execution.plan.actions.front();
+    if (!action.transaction || action.transaction->vout.size() != 1) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Recovery resolver returned no complete single-output transaction");
     }
+    const bool reused_legacy = action.status == ShadowPowClaimRecoveryActionStatus::REUSE_LEGACY;
+    const bool reused_managed = action.status == ShadowPowClaimRecoveryActionStatus::REUSE_MANAGED;
+    const CAmount output_amount = action.transaction->vout.front().nValue;
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("dry_run", dry_run);
     result.pushKV("broadcast", false);
-    result.pushKV("reused_legacy_resolution", reused_legacy_resolution);
+    result.pushKV("reused_legacy_resolution", reused_legacy);
+    result.pushKV("reused_managed_resolution", reused_managed);
     result.pushKV("claim_txid", claim_txid.GetHex());
-    result.pushKV("claim_input_txid", claim_input.hash.GetHex());
-    result.pushKV("claim_input_vout", claim_input.n);
-    result.pushKV("input_amount", ValueFromAmount(input_amount));
-    result.pushKV("fee", ValueFromAmount(fee));
+    result.pushKV("claim_input_txid", action.anchor.hash.GetHex());
+    result.pushKV("claim_input_vout", action.anchor.n);
+    result.pushKV("input_amount", ValueFromAmount(output_amount + action.fee));
+    result.pushKV("fee", ValueFromAmount(action.fee));
     result.pushKV("output_amount", ValueFromAmount(output_amount));
-    result.pushKV("vsize", vsize);
-    if (!dry_run) {
-        const CTransactionRef signed_tx = MakeTransactionRef(resolution_tx);
-        result.pushKV("hex", EncodeHexTx(*signed_tx));
-        result.pushKV("txid", signed_tx->GetHash().GetHex());
-        result.pushKV("next_step", "Review the fee and warning, then call sendrawtransaction with hex only if you choose to broadcast this conflict.");
+    result.pushKV("vsize", action.vsize);
+    if (dry_run) {
+        result.pushKV("plan_id", execution.plan.plan_id.GetHex());
     } else {
-        result.pushKV("next_step", "Repeat with dry_run=false and acknowledge_fee_and_conflict_risk=true to obtain a signed, non-broadcast transaction.");
+        result.pushKV("acknowledged_plan_id", execution.plan.plan_id.GetHex());
     }
-    result.pushKV("warning", "This is an explicit on-chain conflict, not abandonment. If this resolution confirms, it pays the displayed base-chain fee without a shadow reimbursement. Peers retaining the original claim may reject the conflict; confirmation is not guaranteed. The wallet keeps the input reserved until either transaction actually confirms. After you explicitly broadcast, ordinary wallet resubmission may relay the unresolved resolution again across restart.");
+    result.pushKV("plan_consumed", !dry_run);
+    result.pushKV("plan_reusable", dry_run);
+    result.pushKV("active_tip", execution.plan.active_tip.GetHex());
+    result.pushKV("wallet_generation", execution.plan.wallet_generation);
+    result.pushKV("generation_fingerprint", action.generation_fingerprint.GetHex());
+    result.pushKV("component_fingerprint", action.component_fingerprint.GetHex());
+    result.pushKV("classification", ShadowPowRecoveryStateName(action.component_state));
+    result.pushKV("claim_txids", ShadowPowTxidsToJSON(action.claim_txids));
+    result.pushKV("descendant_claims", static_cast<uint64_t>(action.descendant_claims));
+    result.pushKV("persisted", action.persisted);
+    result.pushKV("success", execution.success);
+    result.pushKV("error", execution.error);
+    result.pushKV("durable_state_changed", execution.durable_state_changed);
+    result.pushKV("durable_state_ambiguous", execution.durable_state_ambiguous);
+    result.pushKV("relay_authority_granted", static_cast<uint64_t>(execution.relay_authority_granted));
+    result.pushKV("relay_authorized", action.relay_authorized);
+    result.pushKV("conflicts_with_revalidating_unbound_proof",
+                  action.conflicts_with_revalidating_unbound_proof);
+    if (current_plan) {
+        result.pushKV("current_plan", ShadowPowRecoveryPlanToJSON(
+            *current_plan, ShadowPowClaimRecoveryMode::PREVIEW));
+    }
+    if (!dry_run && !execution.durable_state_ambiguous) {
+        result.pushKV("hex", EncodeHexTx(*action.transaction));
+        result.pushKV("txid", action.transaction->GetHash().GetHex());
+    }
+    if (!dry_run) {
+        result.pushKV("next_step", execution.durable_state_ambiguous
+            ? "The durable database outcome is ambiguous. Stop recovery activity and reload the wallet. Reload may reveal these exact bytes; inspect wallet records before retrying and do not assume the operation rolled back."
+            : action.relay_authorized
+            ? "These exact bytes already have durable relay authority; monitor mempool and confirmation state while the scheduler safely retries them."
+            : "Review the exact fee and warning, then call commitshadowpowclaimresolution with this txid and explicit acknowledgement. sendrawtransaction remains compatible.");
+    } else {
+        result.pushKV("next_step", "Repeat with dry_run=false and acknowledge_fee_and_conflict_risk=true to sign and durably store exact non-broadcast bytes.");
+    }
+    result.pushKV(
+        "warning",
+        action.conflicts_with_revalidating_unbound_proof
+            ? "This resolution deliberately conflicts with an unbound proof that is invalid on the pinned tip but may become valid on a descendant. Exact-plan fee/conflict acknowledgement is required. This is an on-chain conflict, not abandonment; confirmation is not guaranteed, and recovery never enables mining."
+            : "This is an on-chain conflict, not abandonment. Confirmation is not guaranteed. The input remains reserved until the original claim or resolution confirms, and recovery never enables mining.");
     return result;
+},
+    };
+}
+
+static RPCHelpMan commitshadowpowclaimresolution()
+{
+    return RPCHelpMan{
+        "commitshadowpowclaimresolution",
+        "\nAuthorize and broadcast one exact, previously signed claim-component resolution. The component and transaction are revalidated on the current tip. A managed resolution receives durable exact-byte retry authority across restart. A legacy resolution may be relayed by this explicit call but does not gain managed scheduler authority. This RPC never authorizes another transaction or enables mining.\n",
+        {
+            {"resolution_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Persisted managed or legacy resolution transaction id."},
+            {"acknowledge_fee_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Optional::NO, "Must be true to authorize relay and its fee/conflict risk."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Execution result.", ShadowPowRecoveryExecutionResults()},
+        RPCExamples{HelpExampleCli("commitshadowpowclaimresolution", "\"resolution_txid\" true")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+    EnsureShadowPowRecoveryChainReady(*pwallet);
+    if (pwallet->IsShadowPowClaimRecoveryDatabaseAmbiguous()) {
+        ShadowPowClaimRecoveryResult ambiguous;
+        ambiguous.durable_state_ambiguous = true;
+        ambiguous.error = "Recovery database outcome is ambiguous. Reload the wallet; exact persisted or relay-authorized bytes may appear after reload";
+        return ShadowPowRecoveryResultToJSON(
+            ambiguous,
+            ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST);
+    }
+    const uint256 resolution_txid = ParseHashV(request.params[0], "resolution_txid");
+    if (!request.params[1].get_bool()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "acknowledge_fee_and_conflict_risk=true is required to commit and broadcast a resolution");
+    }
+    bool selector_known{false};
+    bool selector_is_resolution{false};
+    const ShadowPowClaimRecoveryInventory inventory =
+        pwallet->GetShadowPowClaimRecoveryInventory();
+    for (const auto& component : inventory.components) {
+        for (const auto& node : component.nodes) {
+            if (node.txid != resolution_txid) continue;
+            selector_known = true;
+            selector_is_resolution =
+                node.kind == ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION ||
+                node.kind == ShadowPowClaimRecoveryNodeKind::LEGACY_RESOLUTION;
+        }
+    }
+    if (!selector_known) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                           "Claim-resolution transaction not found in this wallet's current recovery inventory");
+    }
+    if (!selector_is_resolution) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "resolution_txid must identify exact, previously signed claim-resolution bytes; use createshadowpowclaimresolution first");
+    }
+    EnsureWalletIsUnlocked(*pwallet);
+
+    ShadowPowClaimRecoveryRequest preview = ManualShadowPowRecoveryRequest(*pwallet, {resolution_txid});
+    preview.mode = ShadowPowClaimRecoveryMode::PREVIEW;
+    ShadowPowClaimRecoveryResult execution = pwallet->ResolveShadowPowClaims(preview);
+    if (execution.durable_state_ambiguous) {
+        return ShadowPowRecoveryResultToJSON(
+            execution,
+            ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST);
+    }
+    if (!execution.success || execution.plan.actions.size() != 1) {
+        ThrowShadowPowRecoveryFailure(execution);
+    }
+    ShadowPowClaimRecoveryRequest commit = preview;
+    commit.mode = ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+    commit.execution_authority = ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+    commit.acknowledge_fee_and_conflict_risk = true;
+    commit.expected_plan_id = execution.plan.plan_id;
+    execution = pwallet->ResolveShadowPowClaims(commit);
+    if (!execution.success && !execution.durable_state_changed &&
+        !execution.durable_state_ambiguous) {
+        ThrowShadowPowRecoveryFailure(execution);
+    }
+    const std::optional<ShadowPowClaimRecoveryPlan> current_plan =
+        execution.durable_state_ambiguous
+            ? std::nullopt
+            : std::optional<ShadowPowClaimRecoveryPlan>{
+                  CurrentShadowPowRecoveryPlan(*pwallet, commit)};
+    return ShadowPowRecoveryResultToJSON(
+        execution, commit.mode,
+        current_plan ? &*current_plan : nullptr);
+},
+    };
+}
+
+static RPCHelpMan resolveallshadowpowclaims()
+{
+    return RPCHelpMan{
+        "resolveallshadowpowclaims",
+        "\nPreview or execute one current resolution per independent confirmed claim anchor. A later original-claim confirmation can advance a frontier, so one call never promises finality. Non-preview actions require the exact plan_id returned by preview plus explicit fee/conflict acknowledgement.\n",
+        {
+            {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "Manual batch recovery controls.", {
+                {"action", RPCArg::Type::STR, RPCArg::Default{"preview"}, "preview, sign_only, or commit_and_broadcast."},
+                {"expected_plan_id", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Required exact preview plan for mutations."},
+                {"acknowledge_fee_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Default{false}, "Required for mutations."},
+                {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Optional fee rate in " + CURRENCY_ATOM + "/vB."},
+                {"max_fee_per_resolution", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Optional absolute per-resolution cap."},
+                {"max_total_fee", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Optional aggregate batch cap."},
+            }},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Pinned plan and execution result.", ShadowPowRecoveryExecutionResults()},
+        RPCExamples{
+            HelpExampleCli("resolveallshadowpowclaims", "") +
+            HelpExampleCli("resolveallshadowpowclaims", "'{\"action\":\"commit_and_broadcast\",\"expected_plan_id\":\"plan_id\",\"acknowledge_fee_and_conflict_risk\":true}'")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+    EnsureShadowPowRecoveryChainReady(*pwallet);
+    const UniValue options = request.params[0].isNull()
+        ? UniValue(UniValue::VOBJ) : request.params[0].get_obj();
+    const std::string action = options.exists("action")
+        ? ToLower(options["action"].get_str()) : "preview";
+
+    ShadowPowClaimRecoveryMode mode;
+    if (action == "preview") mode = ShadowPowClaimRecoveryMode::PREVIEW;
+    else if (action == "sign_only") mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
+    else if (action == "commit_and_broadcast") mode = ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+    else throw JSONRPCError(RPC_INVALID_PARAMETER,
+                            "action must be preview, sign_only, or commit_and_broadcast");
+
+    ShadowPowClaimRecoveryRequest recovery = ManualShadowPowRecoveryRequest(*pwallet, {});
+    recovery.mode = mode;
+    if (options.exists("fee_rate")) recovery.fee_rate = FeeRateFromSatVbValue(options["fee_rate"]);
+    if (options.exists("max_fee_per_resolution")) {
+        recovery.max_fee_per_resolution = AmountFromValue(options["max_fee_per_resolution"]);
+    }
+    if (options.exists("max_total_fee")) {
+        recovery.aggregate_batch_fee_cap = AmountFromValue(options["max_total_fee"]);
+    }
+    if (recovery.max_fee_per_resolution <= 0 ||
+        recovery.aggregate_batch_fee_cap < recovery.max_fee_per_resolution) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "max_fee_per_resolution must be positive and max_total_fee must cover at least one resolution");
+    }
+
+    if (mode != ShadowPowClaimRecoveryMode::PREVIEW) {
+        const bool acknowledged = options.exists("acknowledge_fee_and_conflict_risk") &&
+                                  options["acknowledge_fee_and_conflict_risk"].get_bool();
+        if (!acknowledged || !options.exists("expected_plan_id")) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "non-preview recovery requires expected_plan_id and acknowledge_fee_and_conflict_risk=true");
+        }
+        recovery.acknowledge_fee_and_conflict_risk = true;
+        recovery.execution_authority = ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+        recovery.expected_plan_id = ParseHashV(options["expected_plan_id"], "expected_plan_id");
+        EnsureWalletIsUnlocked(*pwallet);
+    }
+    ShadowPowClaimRecoveryResult execution = pwallet->ResolveShadowPowClaims(recovery);
+    if (execution.stale_plan && !execution.durable_state_changed &&
+        !execution.durable_state_ambiguous) {
+        ThrowShadowPowRecoveryFailure(execution);
+    }
+    if (mode != ShadowPowClaimRecoveryMode::PREVIEW &&
+        !execution.success && !execution.durable_state_changed &&
+        !execution.durable_state_ambiguous &&
+        execution.plan.refused.empty()) {
+        ThrowShadowPowRecoveryFailure(execution);
+    }
+    if (mode == ShadowPowClaimRecoveryMode::PREVIEW) {
+        return ShadowPowRecoveryResultToJSON(execution, mode);
+    }
+    const std::optional<ShadowPowClaimRecoveryPlan> current_plan =
+        execution.durable_state_ambiguous
+            ? std::nullopt
+            : std::optional<ShadowPowClaimRecoveryPlan>{
+                  CurrentShadowPowRecoveryPlan(*pwallet, recovery)};
+    return ShadowPowRecoveryResultToJSON(
+        execution, mode,
+        current_plan ? &*current_plan : nullptr);
+},
+    };
+}
+
+static UniValue ShadowPowClaimRecoveryAdoptionToJSON(
+    const ShadowPowClaimRecoveryAdoptionResult& adoption);
+
+static RPCHelpMan adoptshadowpowclaimcomponent()
+{
+    return RPCHelpMan{
+        "adoptshadowpowclaimcomponent",
+        "\nExplicitly authenticate a reviewed historical claim-only component for future recovery. Adoption is wallet-scoped, exact-tip/fingerprint bound, atomic, and does not sign, broadcast, or enable mining.\n",
+        {
+            {"claim_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Any claim transaction in the reviewed component."},
+            {"expected_tip", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Exact active tip shown during review."},
+            {"expected_component_fingerprint", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Exact dynamic component fingerprint shown during review."},
+            {"acknowledge_provenance_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Optional::NO, "Must be true."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Adoption result.", {
+            {RPCResult::Type::STR, "status", "Stable typed adoption status."},
+            {RPCResult::Type::STR, "reason_code", "Stable machine-readable status alias."},
+            {RPCResult::Type::BOOL, "success", "Whether adoption succeeded or the component was already explicit."},
+            {RPCResult::Type::BOOL, "adopted", "Whether the complete component was durably adopted."},
+            {RPCResult::Type::BOOL, "durable_state_changed", "Whether complete adoption definitely committed."},
+            {RPCResult::Type::BOOL, "durable_state_ambiguous", "Whether commit or rollback had an indeterminate outcome."},
+            {RPCResult::Type::STR_HEX, "active_tip", /*optional=*/true, "Current active tip."},
+            {RPCResult::Type::STR_HEX, "generation_fingerprint", /*optional=*/true, "Stable anchor generation."},
+            {RPCResult::Type::STR_HEX, "reviewed_component_fingerprint", /*optional=*/true, "Caller-reviewed pre-adoption component fingerprint."},
+            {RPCResult::Type::STR_HEX, "component_fingerprint", /*optional=*/true, "Compatibility alias for the post-adoption component fingerprint."},
+            {RPCResult::Type::STR_HEX, "post_adoption_component_fingerprint", /*optional=*/true, "Atomic post-adoption component fingerprint."},
+            {RPCResult::Type::ARR, "claim_txids", "Claims adopted.", {{RPCResult::Type::STR_HEX, "", "Claim transaction id."}}},
+            {RPCResult::Type::NUM, "adopted_claims", "Number of claims adopted."},
+            {RPCResult::Type::BOOL, "automatic_eligible_after_adoption", "Whether all claim provenance is now explicit; all other safety gates still apply."},
+            {RPCResult::Type::BOOL, "component_has_revalidating_unbound_proof", "Whether this component contains an unbound proof that is invalid on the reviewed tip but may become valid on a descendant."},
+            {RPCResult::Type::STR, "component_refusal_code", /*optional=*/true, "Shared graph refusal code when status is unsafe_graph."},
+            {RPCResult::Type::STR, "detail", "Human-readable typed outcome detail."},
+            {RPCResult::Type::STR, "next_step", "Required follow-up action."},
+        }},
+        RPCExamples{HelpExampleCli("adoptshadowpowclaimcomponent", "\"claim_txid\" \"tip\" \"component_fingerprint\" true")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+    EnsureShadowPowRecoveryChainReady(*pwallet);
+    if (!request.params[3].get_bool()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "acknowledge_provenance_and_conflict_risk=true is required to adopt historical claims");
+    }
+    const uint256 selector = ParseHashV(request.params[0], "claim_txid");
+    const uint256 expected_tip = ParseHashV(request.params[1], "expected_tip");
+    const uint256 expected_fingerprint = ParseHashV(request.params[2], "expected_component_fingerprint");
+    return ShadowPowClaimRecoveryAdoptionToJSON(
+        pwallet->AdoptShadowPowClaimRecoveryComponent(
+            selector, expected_tip, expected_fingerprint));
 },
     };
 }
@@ -2400,6 +3041,111 @@ static UniValue ShadowPowClaimRecoveryPolicyToJSON(
     return result;
 }
 
+static UniValue ShadowPowClaimRecoveryPolicyMutationToJSON(
+    const ShadowPowClaimRecoveryPolicyMutationResult& mutation)
+{
+    UniValue result(UniValue::VOBJ);
+    const std::string reason_code =
+        ShadowPowClaimRecoveryPolicyMutationStatusName(mutation.status);
+    result.pushKV("status", reason_code);
+    result.pushKV("reason_code", reason_code);
+    result.pushKV("success", mutation.success);
+    result.pushKV("durable_state_changed", mutation.durable_state_changed);
+    result.pushKV("durable_state_ambiguous", mutation.durable_state_ambiguous);
+    result.pushKV("authoritative_state_available",
+                  mutation.authoritative_state_available);
+    if (mutation.authoritative_state_available) {
+        result.pushKV("policy", ShadowPowClaimRecoveryPolicyToJSON(
+                                    mutation.authoritative_policy));
+    }
+    result.pushKV("detail", mutation.detail);
+    if (mutation.durable_state_ambiguous) {
+        result.pushKV(
+            "next_step",
+            "Stop policy and recovery changes and reload the wallet. Neither the old nor requested policy is authoritative until reload completes.");
+    } else if (!mutation.success) {
+        result.pushKV(
+            "next_step",
+            "Correct the reported policy or database error, then retry. The returned policy is authoritative only when authoritative_state_available=true.");
+    } else {
+        result.pushKV(
+            "next_step",
+            mutation.authoritative_policy.HasAutomaticAuthority()
+                ? "Automatic recovery is authorized within the displayed wallet-scoped limits; mining remains a separate operator choice."
+                : "No automatic recovery spend is authorized. Use manual preview and explicit execution when a component becomes eligible.");
+    }
+    return result;
+}
+
+static UniValue ShadowPowClaimRecoveryAdoptionToJSON(
+    const ShadowPowClaimRecoveryAdoptionResult& adoption)
+{
+    UniValue result(UniValue::VOBJ);
+    const std::string reason_code =
+        ShadowPowClaimRecoveryAdoptionStatusName(adoption.status);
+    result.pushKV("status", reason_code);
+    result.pushKV("reason_code", reason_code);
+    result.pushKV("success", adoption.IsSuccess());
+    result.pushKV("adopted", adoption.adopted);
+    result.pushKV("durable_state_changed", adoption.durable_state_changed);
+    result.pushKV("durable_state_ambiguous", adoption.durable_state_ambiguous);
+    if (!adoption.active_tip.IsNull()) {
+        result.pushKV("active_tip", adoption.active_tip.GetHex());
+    }
+    if (!adoption.generation_fingerprint.IsNull()) {
+        result.pushKV("generation_fingerprint",
+                      adoption.generation_fingerprint.GetHex());
+    }
+    if (!adoption.reviewed_component_fingerprint.IsNull()) {
+        result.pushKV("reviewed_component_fingerprint",
+                      adoption.reviewed_component_fingerprint.GetHex());
+    }
+    if (!adoption.post_adoption_component_fingerprint.IsNull()) {
+        // Keep component_fingerprint as a compatibility alias for the exact
+        // post-adoption snapshot, while naming its timing explicitly.
+        result.pushKV("component_fingerprint",
+                      adoption.post_adoption_component_fingerprint.GetHex());
+        result.pushKV("post_adoption_component_fingerprint",
+                      adoption.post_adoption_component_fingerprint.GetHex());
+    }
+    result.pushKV("claim_txids", ShadowPowTxidsToJSON(adoption.claim_txids));
+    result.pushKV("adopted_claims",
+                  static_cast<uint64_t>(adoption.adopted
+                      ? adoption.claim_txids.size() : 0));
+    result.pushKV("automatic_eligible_after_adoption",
+                  adoption.automatic_eligible_after_adoption);
+    result.pushKV("component_has_revalidating_unbound_proof",
+                  adoption.component_has_revalidating_unbound_proof);
+    if (!adoption.component_refusal_code.empty()) {
+        result.pushKV("component_refusal_code",
+                      adoption.component_refusal_code);
+    }
+    result.pushKV("detail", adoption.detail);
+    if (adoption.durable_state_ambiguous) {
+        result.pushKV(
+            "next_step",
+            "Stop recovery activity and reload the wallet. Adoption may or may not have committed; review the refreshed provenance and component fingerprint before retrying.");
+    } else if (adoption.status ==
+               ShadowPowClaimRecoveryAdoptionStatus::ALREADY_EXPLICIT) {
+        result.pushKV(
+            "next_step",
+            adoption.component_has_revalidating_unbound_proof
+                ? "No mutation was needed. The component contains an unbound proof that may become valid on a descendant; re-preview and explicitly acknowledge that conflict risk before any manual recovery, or configure bounded automatic standing consent."
+                : "No mutation was needed. Re-preview the component before any fee-paying recovery action.");
+    } else if (adoption.adopted) {
+        result.pushKV(
+            "next_step",
+            adoption.component_has_revalidating_unbound_proof
+                ? "The complete reviewed component now has durable explicit provenance, but it contains an unbound proof that may become valid on a descendant. Re-preview and explicitly acknowledge that conflict risk before any manual recovery, or configure bounded automatic standing consent. Adoption itself never enables mining or spends funds."
+                : "The complete reviewed component now has durable explicit provenance. Re-preview before any fee-paying recovery action; adoption itself never enables mining or spends funds.");
+    } else {
+        result.pushKV(
+            "next_step",
+            "No adoption was committed. Correct the typed refusal, refresh the exact tip and component fingerprint, and review the complete graph before retrying.");
+    }
+    return result;
+}
+
 static std::vector<RPCResult> ShadowPowClaimRecoveryPolicyResults()
 {
     return {
@@ -2413,7 +3159,7 @@ static std::vector<RPCResult> ShadowPowClaimRecoveryPolicyResults()
         {RPCResult::Type::STR_AMOUNT, "rolling_fee_budget", "Maximum aggregate recovery fee in the rolling window."},
         {RPCResult::Type::NUM_TIME, "rolling_fee_window_seconds", "Length of the rolling fee and action window."},
         {RPCResult::Type::NUM, "max_actions_per_window", "Maximum automatic resolutions in the rolling window."},
-        {RPCResult::Type::NUM, "minimum_stale_blocks", "Minimum current-tip staleness before a terminal claim may be recovered automatically."},
+        {RPCResult::Type::NUM, "minimum_stale_blocks", "Minimum current-branch staleness before a conflict-resolvable claim component may be recovered automatically, including a disclosed unbound-proof descendant-revalidation risk."},
     };
 }
 
@@ -2422,11 +3168,22 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     return RPCHelpMan{
         "getpowclaimrecoveryinfo",
         "\nReturn this wallet's persisted Gold Rush PoW claim-recovery consent and current component gate.\n"
-        "This RPC never creates, signs, or broadcasts a transaction. Recovery is disabled unless mode is explicitly set to automatic with bounded spending limits.\n",
-        {},
+        "This RPC never creates, signs, or broadcasts a transaction. Recovery is disabled unless mode is explicitly set to automatic with bounded spending limits. Set verbose=true to inspect the complete typed component graph and provenance.\n",
+        {
+            {"verbose", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include complete component, node, provenance, and refusal-classification details."},
+        },
         RPCResult{RPCResult::Type::OBJ, "", "", {
-            {RPCResult::Type::OBJ, "policy", "Wallet-scoped standing consent and limits.", ShadowPowClaimRecoveryPolicyResults()},
+            {RPCResult::Type::OBJ, "policy", /*optional=*/true, "Authoritative wallet-scoped policy. Omitted when the durable database outcome is ambiguous.", ShadowPowClaimRecoveryPolicyResults()},
+            {RPCResult::Type::BOOL, "policy_authoritative", "Whether the displayed policy is proven to match a durable wallet record."},
+            {RPCResult::Type::STR, "policy_state_status", "Stable typed policy-state status."},
+            {RPCResult::Type::STR, "policy_state_detail", "Human-readable policy authority detail."},
+            {RPCResult::Type::BOOL, "chain_ready", "Whether the active chain can currently accept recovery broadcasts."},
+            {RPCResult::Type::BOOL, "database_outcome_ambiguous", "Whether a prior recovery database commit or rollback had an indeterminate outcome. Reload and inspect before any further recovery action."},
             {RPCResult::Type::STR_HEX, "active_tip", "Active-chain tip to which the inventory is pinned, or all-zero when unavailable."},
+            {RPCResult::Type::NUM, "active_height", "Active-chain height used by the classifier, or -1 when unavailable."},
+            {RPCResult::Type::STR_HEX, "wallet_processed_tip", "Last active-chain tip processed by this wallet."},
+            {RPCResult::Type::NUM, "wallet_processed_height", "Last active-chain height processed by this wallet."},
+            {RPCResult::Type::NUM, "wallet_generation", "Wallet database generation used by exact-plan stale-state protection."},
             {RPCResult::Type::BOOL, "wallet_tip_matches", "Whether the wallet-processed tip matches the classified active tip."},
             {RPCResult::Type::NUM, "raw_quarantined_claims", "Wallet-known quarantined claim objects retained for audit and reorg safety."},
             {RPCResult::Type::NUM, "blocking_quarantined_claims", "Actionable plus indeterminate claim objects that currently pause new claim creation."},
@@ -2434,31 +3191,103 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             {RPCResult::Type::NUM, "resolved_on_active_chain_claims", "Historical objects whose confirmed anchor is spent on the active chain."},
             {RPCResult::Type::NUM, "indeterminate_quarantined_claims", "Objects that fail closed because classification is incomplete."},
             {RPCResult::Type::NUM, "components", "Current wallet-known claim components."},
+            {RPCResult::Type::NUM, "raw_claim_objects", "All wallet-known unconfirmed claim objects in the typed inventory."},
+            {RPCResult::Type::NUM, "live_claim_objects", "Claim objects currently in the local mempool."},
+            {RPCResult::Type::NUM, "quarantined_claim_objects", "Claim objects marked quarantined for audit and reorg safety."},
+            {RPCResult::Type::NUM, "blocking_components", "Typed components that currently gate new mining claims."},
+            {RPCResult::Type::NUM, "resolved_components", "Typed components resolved on the active chain."},
+            {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual resolutions."},
+            {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic resolutions."},
+            {RPCResult::Type::NUM, "confirmed_manual_resolutions", "Confirmed manual resolutions reconstructed from wallet records."},
+            {RPCResult::Type::NUM, "confirmed_automatic_resolutions", "Confirmed automatic resolutions reconstructed from wallet records."},
+            {RPCResult::Type::STR_AMOUNT, "confirmed_resolution_fees", "Fees paid by confirmed managed resolutions."},
+            {RPCResult::Type::NUM, "automatic_actions_in_window", "Automatic actions counted in the current rolling policy window."},
+            {RPCResult::Type::STR_AMOUNT, "automatic_fee_exposure_in_window", "Confirmed and pending automatic fee exposure in the rolling policy window."},
+            {RPCResult::Type::NUM, "reconciled_descendant_claims", "Descendant claim objects reconciled by confirmed resolutions."},
+            {RPCResult::Type::NUM, "claims_recycled", "Later claim transactions that spent a confirmed resolution output."},
+            {RPCResult::Type::ARR, "component_details", /*optional=*/true, "Complete typed component graph when verbose=true.", {{RPCResult::Type::ELISION, "", ""}}},
+            {RPCResult::Type::ARR, "unanchored_claim_txids", /*optional=*/true, "Claim objects that could not be bound to an authenticated confirmed anchor when verbose=true.", {{RPCResult::Type::STR_HEX, "", "Claim transaction id."}}},
         }},
         RPCExamples{
             HelpExampleCli("getpowclaimrecoveryinfo", "") +
-            HelpExampleRpc("getpowclaimrecoveryinfo", "")
+            HelpExampleCli("getpowclaimrecoveryinfo", "true") +
+            HelpExampleRpc("getpowclaimrecoveryinfo", "true")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
 
-    const ShadowPowClaimRecoveryPolicy policy =
-        pwallet->GetShadowPowClaimRecoveryPolicy();
-    const ShadowPowClaimInventory inventory =
-        pwallet->GetShadowPowClaimInventory();
+    ShadowPowClaimRecoveryPolicy policy =
+        DefaultShadowPowClaimRecoveryPolicy();
+    ShadowPowClaimInventory compatibility_inventory;
+    ShadowPowClaimRecoveryInventory inventory;
+    ShadowPowClaimRecoveryUsage usage;
+    ShadowPowClaimRecoveryPolicyMutationResult policy_state;
+    bool database_ambiguous{false};
+    {
+        // One recursive lock snapshot keeps legacy compatibility fields,
+        // typed graph details, and durable usage counters on the same tip and
+        // wallet generation.
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        policy_state = pwallet->GetShadowPowClaimRecoveryPolicyState();
+        database_ambiguous = policy_state.durable_state_ambiguous;
+        if (policy_state.authoritative_state_available) {
+            policy = policy_state.authoritative_policy;
+        }
+        compatibility_inventory = pwallet->GetShadowPowClaimInventoryLocked();
+        inventory = pwallet->GetShadowPowClaimRecoveryInventoryLocked();
+        usage = pwallet->GetShadowPowClaimRecoveryUsage(
+            policy.rolling_fee_window_seconds);
+    }
+    const bool verbose = !request.params[0].isNull() && request.params[0].get_bool();
 
     UniValue result(UniValue::VOBJ);
-    result.pushKV("policy", ShadowPowClaimRecoveryPolicyToJSON(policy));
-    result.pushKV("active_tip", inventory.active_tip.GetHex());
-    result.pushKV("wallet_tip_matches", inventory.wallet_tip_matches);
-    result.pushKV("raw_quarantined_claims", static_cast<uint64_t>(inventory.raw_quarantined_claims));
-    result.pushKV("blocking_quarantined_claims", static_cast<uint64_t>(inventory.BlockingClaims()));
-    result.pushKV("actionable_quarantined_claims", static_cast<uint64_t>(inventory.actionable_claims));
-    result.pushKV("resolved_on_active_chain_claims", static_cast<uint64_t>(inventory.resolved_on_active_chain_claims));
-    result.pushKV("indeterminate_quarantined_claims", static_cast<uint64_t>(inventory.indeterminate_claims));
-    result.pushKV("components", static_cast<uint64_t>(inventory.components.size()));
+    if (policy_state.authoritative_state_available) {
+        result.pushKV("policy", ShadowPowClaimRecoveryPolicyToJSON(policy));
+    }
+    result.pushKV("policy_authoritative",
+                  policy_state.authoritative_state_available);
+    result.pushKV("policy_state_status",
+                  ShadowPowClaimRecoveryPolicyMutationStatusName(
+                      policy_state.status));
+    result.pushKV("policy_state_detail", policy_state.detail);
+    result.pushKV("chain_ready", pwallet->chain().isReadyToBroadcast());
+    result.pushKV("database_outcome_ambiguous", database_ambiguous);
+    result.pushKV("active_tip", compatibility_inventory.active_tip.GetHex());
+    result.pushKV("active_height", inventory.active_height);
+    result.pushKV("wallet_processed_tip", inventory.wallet_processed_tip.GetHex());
+    result.pushKV("wallet_processed_height", inventory.wallet_processed_height);
+    result.pushKV("wallet_generation", inventory.wallet_generation);
+    result.pushKV("wallet_tip_matches", compatibility_inventory.wallet_tip_matches);
+    result.pushKV("raw_quarantined_claims", static_cast<uint64_t>(compatibility_inventory.raw_quarantined_claims));
+    result.pushKV("blocking_quarantined_claims", static_cast<uint64_t>(compatibility_inventory.BlockingClaims()));
+    result.pushKV("actionable_quarantined_claims", static_cast<uint64_t>(compatibility_inventory.actionable_claims));
+    result.pushKV("resolved_on_active_chain_claims", static_cast<uint64_t>(compatibility_inventory.resolved_on_active_chain_claims));
+    result.pushKV("indeterminate_quarantined_claims", static_cast<uint64_t>(compatibility_inventory.indeterminate_claims));
+    result.pushKV("components", static_cast<uint64_t>(compatibility_inventory.components.size()));
+    result.pushKV("raw_claim_objects", static_cast<uint64_t>(inventory.raw_claim_objects));
+    result.pushKV("live_claim_objects", static_cast<uint64_t>(inventory.live_claim_objects));
+    result.pushKV("quarantined_claim_objects", static_cast<uint64_t>(inventory.quarantined_claim_objects));
+    result.pushKV("blocking_components", static_cast<uint64_t>(inventory.blocking_components));
+    result.pushKV("resolved_components", static_cast<uint64_t>(inventory.resolved_components));
+    result.pushKV("pending_manual_resolutions", static_cast<uint64_t>(usage.pending_manual));
+    result.pushKV("pending_automatic_resolutions", static_cast<uint64_t>(usage.pending_automatic));
+    result.pushKV("confirmed_manual_resolutions", static_cast<uint64_t>(usage.confirmed_manual));
+    result.pushKV("confirmed_automatic_resolutions", static_cast<uint64_t>(usage.confirmed_automatic));
+    result.pushKV("confirmed_resolution_fees", ValueFromAmount(usage.confirmed_resolution_fees));
+    result.pushKV("automatic_actions_in_window", static_cast<uint64_t>(usage.automatic_actions_in_window));
+    result.pushKV("automatic_fee_exposure_in_window", ValueFromAmount(usage.automatic_fee_exposure_in_window));
+    result.pushKV("reconciled_descendant_claims", static_cast<uint64_t>(usage.reconciled_descendant_claims));
+    result.pushKV("claims_recycled", static_cast<uint64_t>(usage.recycled_outputs));
+    if (verbose) {
+        UniValue components(UniValue::VARR);
+        for (const auto& component : inventory.components) {
+            components.push_back(ShadowPowRecoveryComponentToJSON(component));
+        }
+        result.pushKV("component_details", std::move(components));
+        result.pushKV("unanchored_claim_txids", ShadowPowTxidsToJSON(inventory.unanchored_claim_txids));
+    }
     return result;
 },
     };
@@ -2469,7 +3298,7 @@ static RPCHelpMan setpowclaimrecovery()
     return RPCHelpMan{
         "setpowclaimrecovery",
         "\nPersist this wallet's Gold Rush PoW claim-recovery choice.\n"
-        "automatic is explicit standing consent to create fee-paying on-chain conflicts only after the component engine proves every relevant claim terminal on one pinned active-chain tip. All six positive limits are required when enabling it. pause_and_ask keeps recovery manual. unset removes standing consent. This call never starts mining and never creates, signs, or broadcasts a transaction.\n",
+        "automatic is explicit standing consent to create fee-paying on-chain conflicts only after the component engine classifies the complete graph as conflict-resolvable on one pinned active-chain tip. This may include a disclosed unbound QQP2 proof that is invalid now but may become valid on a descendant. Generic retryable and indeterminate states remain refused. All six positive limits are required when enabling it. pause_and_ask keeps recovery manual. unset removes standing consent. This call never starts mining and never creates, signs, or broadcasts a transaction.\n",
         {
             {"mode", RPCArg::Type::STR, RPCArg::Optional::NO, "automatic, pause_and_ask, or unset."},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Wallet-scoped spending and staleness limits.", {
@@ -2478,10 +3307,20 @@ static RPCHelpMan setpowclaimrecovery()
                 {"rolling_fee_budget", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Positive maximum aggregate fee in the rolling window."},
                 {"rolling_fee_window_seconds", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Rolling fee/action window in seconds."},
                 {"max_actions_per_window", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Maximum automatic resolutions in the rolling window."},
-                {"minimum_stale_blocks", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Minimum terminal-claim age in blocks before automation may act."},
+                {"minimum_stale_blocks", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Minimum current-branch age in blocks before automation may act on a conflict-resolvable component."},
             }},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Persisted wallet policy.", ShadowPowClaimRecoveryPolicyResults()},
+        RPCResult{RPCResult::Type::OBJ, "", "Typed durable policy-mutation result.", {
+            {RPCResult::Type::STR, "status", "Stable mutation status."},
+            {RPCResult::Type::STR, "reason_code", "Stable machine-readable status alias."},
+            {RPCResult::Type::BOOL, "success", "Whether the requested policy was durably committed."},
+            {RPCResult::Type::BOOL, "durable_state_changed", "Whether this call definitely committed the requested policy."},
+            {RPCResult::Type::BOOL, "durable_state_ambiguous", "Whether commit or rollback had an indeterminate outcome."},
+            {RPCResult::Type::BOOL, "authoritative_state_available", "Whether the nested policy is proven authoritative after this call."},
+            {RPCResult::Type::OBJ, "policy", /*optional=*/true, "Authoritative policy, omitted after an ambiguous database outcome.", ShadowPowClaimRecoveryPolicyResults()},
+            {RPCResult::Type::STR, "detail", "Human-readable outcome detail."},
+            {RPCResult::Type::STR, "next_step", "Required follow-up action."},
+        }},
         RPCExamples{
             HelpExampleCli("setpowclaimrecovery", "\"pause_and_ask\"") +
             HelpExampleCli("setpowclaimrecovery", "\"automatic\" '{\"max_fee_per_resolution\":0.001,\"aggregate_batch_fee_cap\":0.01,\"rolling_fee_budget\":0.1,\"rolling_fee_window_seconds\":86400,\"max_actions_per_window\":25,\"minimum_stale_blocks\":6}'") +
@@ -2492,8 +3331,13 @@ static RPCHelpMan setpowclaimrecovery()
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
 
+    const ShadowPowClaimRecoveryPolicyMutationResult policy_state =
+        pwallet->GetShadowPowClaimRecoveryPolicyState();
+    if (!policy_state.authoritative_state_available) {
+        return ShadowPowClaimRecoveryPolicyMutationToJSON(policy_state);
+    }
     ShadowPowClaimRecoveryPolicy policy =
-        pwallet->GetShadowPowClaimRecoveryPolicy();
+        policy_state.authoritative_policy;
     const std::string mode = ToLower(request.params[0].get_str());
     const UniValue options = request.params[1].isNull()
         ? UniValue(UniValue::VOBJ)
@@ -2548,12 +3392,8 @@ static RPCHelpMan setpowclaimrecovery()
     policy.choice_recorded = mode == "unset" ? 0 : 1;
     policy.automatic_enabled = mode == "automatic" ? 1 : 0;
 
-    bilingual_str error;
-    if (!pwallet->SetShadowPowClaimRecoveryPolicy(policy, error)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, error.original);
-    }
-    return ShadowPowClaimRecoveryPolicyToJSON(
-        pwallet->GetShadowPowClaimRecoveryPolicy());
+    return ShadowPowClaimRecoveryPolicyMutationToJSON(
+        pwallet->SetShadowPowClaimRecoveryPolicyDetailed(policy));
 },
     };
 }
@@ -2654,6 +3494,12 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "claim_components", "Wallet-known quarantined claim components in the current snapshot."},
             {RPCResult::Type::STR_HEX, "claim_inventory_tip", "Active tip to which component classification is bound, or all-zero when unavailable."},
             {RPCResult::Type::BOOL, "claim_inventory_wallet_tip_matches", "Whether the wallet-processed tip exactly matched the classified active tip."},
+            {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual claim resolutions."},
+            {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic claim resolutions."},
+            {RPCResult::Type::NUM, "claims_auto_resolved", "Confirmed automatic claim resolutions."},
+            {RPCResult::Type::NUM, "claims_recycled", "Later claim transactions that spent a confirmed resolution output."},
+            {RPCResult::Type::STR_AMOUNT, "cumulative_resolution_fees", "Fees paid by all confirmed managed claim resolutions."},
+            {RPCResult::Type::BOOL, "claim_recovery_database_outcome_ambiguous", "Whether recovery database state requires wallet reload and inspection before any further recovery action."},
         }},
         RPCExamples{
             HelpExampleCli("getpowmininginfo", "")
@@ -2675,7 +3521,26 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
     obj.pushKV("unresolved_claims", static_cast<uint64_t>(pwallet->CountUnresolvedShadowPowClaims()));
     obj.pushKV("live_claims", static_cast<uint64_t>(pwallet->CountLiveShadowPowClaims()));
-    const ShadowPowClaimInventory claim_inventory = pwallet->GetShadowPowClaimInventory();
+    ShadowPowClaimInventory claim_inventory;
+    ShadowPowClaimRecoveryPolicy recovery_policy =
+        DefaultShadowPowClaimRecoveryPolicy();
+    ShadowPowClaimRecoveryUsage recovery_usage;
+    ShadowPowClaimRecoveryPolicyMutationResult recovery_policy_state;
+    bool recovery_database_ambiguous{false};
+    {
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        claim_inventory = pwallet->GetShadowPowClaimInventoryLocked();
+        recovery_policy_state =
+            pwallet->GetShadowPowClaimRecoveryPolicyState();
+        recovery_database_ambiguous =
+            recovery_policy_state.durable_state_ambiguous;
+        if (recovery_policy_state.authoritative_state_available) {
+            recovery_policy =
+                recovery_policy_state.authoritative_policy;
+        }
+        recovery_usage = pwallet->GetShadowPowClaimRecoveryUsage(
+            recovery_policy.rolling_fee_window_seconds);
+    }
     obj.pushKV("quarantined_claims", static_cast<uint64_t>(claim_inventory.raw_quarantined_claims));
     obj.pushKV("blocking_quarantined_claims", static_cast<uint64_t>(claim_inventory.BlockingClaims()));
     obj.pushKV("actionable_quarantined_claims", static_cast<uint64_t>(claim_inventory.actionable_claims));
@@ -2684,6 +3549,12 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("claim_components", static_cast<uint64_t>(claim_inventory.components.size()));
     obj.pushKV("claim_inventory_tip", claim_inventory.active_tip.GetHex());
     obj.pushKV("claim_inventory_wallet_tip_matches", claim_inventory.wallet_tip_matches);
+    obj.pushKV("pending_manual_resolutions", static_cast<uint64_t>(recovery_usage.pending_manual));
+    obj.pushKV("pending_automatic_resolutions", static_cast<uint64_t>(recovery_usage.pending_automatic));
+    obj.pushKV("claims_auto_resolved", static_cast<uint64_t>(recovery_usage.confirmed_automatic));
+    obj.pushKV("claims_recycled", static_cast<uint64_t>(recovery_usage.recycled_outputs));
+    obj.pushKV("cumulative_resolution_fees", ValueFromAmount(recovery_usage.confirmed_resolution_fees));
+    obj.pushKV("claim_recovery_database_outcome_ambiguous", recovery_database_ambiguous);
     {
         LOCK(pwallet->cs_wallet);
         obj.pushKV("payout_address", pwallet->m_pow_payout_quantum);
@@ -3591,6 +4462,9 @@ static const CRPCCommand commands[] =
     { "staking",            &sendshadowsignal,               },
     { "staking",            &sendshadowpowclaim,             },
     { "staking",            &createshadowpowclaimresolution, },
+    { "staking",            &commitshadowpowclaimresolution, },
+    { "staking",            &resolveallshadowpowclaims,       },
+    { "staking",            &adoptshadowpowclaimcomponent,    },
     { "staking",            &getpowclaimrecoveryinfo,        },
     { "staking",            &setpowclaimrecovery,            },
     { "staking",            &setpowmining,                   },

@@ -56,6 +56,41 @@ class GoldRushInfoTest(BitcoinTestFramework):
                 claims.append(txid)
         return claims
 
+    def _assert_qqp3_recovery_age(self, wallet, claim_txid, origin_age):
+        """Pin the recovery engine to every still-live QQP3 origin age."""
+        node = self.nodes[0]
+        assert claim_txid in node.getrawmempool()
+        info = wallet.getpowclaimrecoveryinfo(True)
+        component = next(
+            component
+            for component in info["component_details"]
+            if claim_txid in component["claim_txids"]
+        )
+        claim_node = next(
+            graph_node
+            for graph_node in component["nodes"]
+            if graph_node["txid"] == claim_txid
+        )
+        assert_equal(claim_node["kind"], "claim")
+        assert_equal(claim_node["in_mempool"], True)
+        assert_equal(claim_node["disposition"], "eligible")
+        assert_equal(claim_node["proof_may_revalidate_on_descendant"], False)
+        assert_equal(info["live_claim_objects"], 1)
+
+        # Recovery planning must revalidate the complete component, not infer
+        # terminality merely from age. The inclusive QQP3 late-origin window
+        # therefore refuses a conflict at every origin age 0 through 64.
+        preview = wallet.resolveallshadowpowclaims()
+        assert_equal(preview["actionable_components"], 0)
+        assert_equal(preview["refused_components"], 1)
+        assert_equal(preview["refused"][0]["reason_code"], "claim-live")
+        assert_equal(preview["refused"][0]["claim_txids"], [claim_txid])
+        self.log.debug(
+            "QQP3 claim %s remains live and non-resolvable at origin age %d",
+            claim_txid,
+            origin_age,
+        )
+
     def _assert_builtin_pow_miner_lifecycle(self):
         node = self.nodes[0]
         wallet_name = "goldrush_pow_builtin"
@@ -291,26 +326,80 @@ class GoldRushInfoTest(BitcoinTestFramework):
         )
         assert_equal(self._mempool_pow_claims(node), [stale_claim["txid"]])
 
-        self.log.info("Retaining QQP3 claims through the bounded late-origin window")
+        self.log.info("Retaining QQP3 claims through every bounded late-origin age")
         stale_parent = node.getbestblockhash()
-        self.generatetoaddress(self.nodes[1], 3, self.nodes[1].get_deterministic_priv_key().address, sync_fun=self.no_op)
+        self._assert_qqp3_recovery_age(wallet, stale_claim["txid"], 0)
+
+        # First advance the claim-aware node with an explicitly empty block,
+        # then replace that sibling with a two-block peer branch. This covers
+        # ages 1 and 2 while retaining the original reorg assertion.
+        self.generateblock(
+            node,
+            output=node.get_deterministic_priv_key().address,
+            transactions=[],
+            sync_fun=self.no_op,
+        )
+        node.syncwithvalidationinterfacequeue()
+        self._assert_qqp3_recovery_age(wallet, stale_claim["txid"], 1)
+        self.generatetoaddress(
+            self.nodes[1],
+            2,
+            self.nodes[1].get_deterministic_priv_key().address,
+            sync_fun=self.no_op,
+        )
         self.connect_nodes(0, 1)
         self.sync_blocks()
         assert node.getbestblockhash() != stale_parent
-        assert_equal(self._mempool_pow_claims(node), [stale_claim["txid"]])
+        self._assert_qqp3_recovery_age(wallet, stale_claim["txid"], 2)
 
-        self.log.info("Expiring QQP3 claims only after their 64-block late-origin window")
-        blocks_to_expire = claim_origin_height + QQP3_LATE_ORIGIN_WINDOW - node.getblockcount()
-        assert blocks_to_expire > 0
-        self._generate_with_peer_offline(
-            self.nodes[1],
-            blocks_to_expire,
-            self.nodes[1].get_deterministic_priv_key().address,
+        for origin_age in range(3, QQP3_LATE_ORIGIN_WINDOW + 1):
+            self.generateblock(
+                node,
+                output=node.get_deterministic_priv_key().address,
+                transactions=[],
+                sync_fun=self.no_op,
+            )
+            node.syncwithvalidationinterfacequeue()
+            self._assert_qqp3_recovery_age(
+                wallet, stale_claim["txid"], origin_age
+            )
+
+        self.log.info("Making QQP3 recovery eligible only at expired origin age 65")
+        assert_equal(
+            node.getblockcount(),
+            claim_origin_height + QQP3_LATE_ORIGIN_WINDOW - 1,
         )
+        self.generateblock(
+            node,
+            output=node.get_deterministic_priv_key().address,
+            transactions=[],
+            sync_fun=self.no_op,
+        )
+        node.syncwithvalidationinterfacequeue()
         self.wait_until(lambda: stale_claim["txid"] not in node.getrawmempool(), timeout=10)
         stale_accept = node.testmempoolaccept([stale_claim["hex"]])[0]
         assert_equal(stale_accept["allowed"], False)
         assert_equal(stale_accept["reject-reason"], "shadow-proof-origin-expired")
+        expired_info = wallet.getpowclaimrecoveryinfo(True)
+        expired_component = next(
+            component
+            for component in expired_info["component_details"]
+            if stale_claim["txid"] in component["claim_txids"]
+        )
+        expired_node = next(
+            graph_node
+            for graph_node in expired_component["nodes"]
+            if graph_node["txid"] == stale_claim["txid"]
+        )
+        assert_equal(expired_node["disposition"], "origin_expired")
+        assert_equal(expired_node["in_mempool"], False)
+        assert_equal(expired_node["quarantined"], True)
+        assert_equal(expired_component["classification"], "terminal_on_pinned_tip")
+        expired_preview = wallet.resolveallshadowpowclaims()
+        assert_equal(expired_preview["actionable_components"], 1)
+        assert_equal(expired_preview["refused_components"], 0)
+        assert_equal(expired_preview["actions"][0]["claim_txids"], [stale_claim["txid"]])
+        assert_equal(expired_preview["actions"][0]["status"], "ready")
 
         if self.is_cli_compiled():
             self.log.info("Checking miner work and broadcasting non-whitelisted PoW claim via CLI")

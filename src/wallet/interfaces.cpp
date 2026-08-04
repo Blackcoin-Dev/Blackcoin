@@ -2926,8 +2926,8 @@ public:
         case StakingTelemetryState::NO_ELIGIBLE_COINS:
             info.state = interfaces::WalletStakingState::NO_ELIGIBLE_COINS;
             break;
-        case StakingTelemetryState::ERROR:
-            info.state = interfaces::WalletStakingState::ERROR;
+        case StakingTelemetryState::FAULT:
+            info.state = interfaces::WalletStakingState::FAULT;
             break;
         case StakingTelemetryState::STOPPED:
             info.state = interfaces::WalletStakingState::STOPPED;

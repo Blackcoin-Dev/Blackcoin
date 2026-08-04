@@ -128,7 +128,7 @@ enum class StakingTelemetryState : uint8_t {
     SYNCING,
     SEARCHING,
     NO_ELIGIBLE_COINS,
-    ERROR,
+    FAULT,
     STOPPED,
 };
 
@@ -142,7 +142,7 @@ inline constexpr std::string_view StakingTelemetryStateName(
     case StakingTelemetryState::SYNCING: return "syncing";
     case StakingTelemetryState::SEARCHING: return "searching";
     case StakingTelemetryState::NO_ELIGIBLE_COINS: return "no_eligible_coins";
-    case StakingTelemetryState::ERROR: return "error";
+    case StakingTelemetryState::FAULT: return "error";
     case StakingTelemetryState::STOPPED: return "stopped";
     }
     return "error";

@@ -54,7 +54,7 @@ enum class WalletStakingState : uint8_t {
     SYNCING,
     SEARCHING,
     NO_ELIGIBLE_COINS,
-    ERROR,
+    FAULT,
     STOPPED,
 };
 
@@ -67,7 +67,7 @@ constexpr std::string_view WalletStakingStateName(WalletStakingState state) noex
     case WalletStakingState::SYNCING: return "syncing";
     case WalletStakingState::SEARCHING: return "searching";
     case WalletStakingState::NO_ELIGIBLE_COINS: return "no_eligible_coins";
-    case WalletStakingState::ERROR: return "error";
+    case WalletStakingState::FAULT: return "error";
     case WalletStakingState::STOPPED: return "stopped";
     }
     return "error";

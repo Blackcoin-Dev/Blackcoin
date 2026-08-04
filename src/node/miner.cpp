@@ -1196,7 +1196,7 @@ void PoSMiner(CWallet *pwallet)
             {
                 pwallet->WalletLogPrintf("PoSMiner runtime error: %s\n", e.what());
                 PublishStakingStateAtCurrentTip(
-                    pwallet, wallet::StakingTelemetryState::ERROR,
+                    pwallet, wallet::StakingTelemetryState::FAULT,
                     strprintf("staking block assembly error: %s", e.what()));
                 assembly_failures = std::min(assembly_failures + 1, 6U);
                 const uint64_t backoff_ms = std::min<uint64_t>(250ULL << (assembly_failures - 1), 5000ULL);
@@ -1215,7 +1215,7 @@ void PoSMiner(CWallet *pwallet)
                 pwallet->WalletLogPrintf("Error in PoSMiner: Keypool ran out, please call keypoolrefill before restarting the mining thread\n");
                 pwallet->m_enabled_staking = false;
                 PublishStakingStateAtCurrentTip(
-                    pwallet, wallet::StakingTelemetryState::ERROR,
+                    pwallet, wallet::StakingTelemetryState::FAULT,
                     "staking worker stopped because the keypool is empty");
                 if (!SleepStaker(pwallet, 10000))
                    return;
@@ -1304,7 +1304,7 @@ void static ThreadStakeMiner(CWallet *pwallet)
         }
         if (pwallet->IsStakeClosing()) break;
         PublishStakingStateAtCurrentTip(
-            pwallet, wallet::StakingTelemetryState::ERROR,
+            pwallet, wallet::StakingTelemetryState::FAULT,
             "staking worker exited unexpectedly and is restarting");
         restart_failures = std::min(restart_failures + 1, 6U);
         const uint64_t backoff_ms = std::min<uint64_t>(1000ULL << (restart_failures - 1), 30000ULL);

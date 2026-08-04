@@ -39,12 +39,6 @@ static CFeeRate FeeRateFromSatVbValue(const UniValue& value)
     return CFeeRate{AmountFromValue(value, /*decimals=*/3)};
 }
 
-static bool IsDirectQuantumMigrationScript(const CScript& script_pub_key)
-{
-    const auto tier = GetQuantumStakeTierProgram(script_pub_key);
-    return tier && !tier->tiered && !tier->cold_stake;
-}
-
 static std::optional<CCoinControl::InputFamily> InferRecipientInputFamily(const CScript& script_pub_key)
 {
     if (script_pub_key.empty() || script_pub_key.IsUnspendable()) return std::nullopt;

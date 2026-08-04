@@ -414,7 +414,7 @@ Q_SIGNALS:
     void encryptionStatusChanged();
 
     // Staking donation percentage changed
-    void donationPercentageChanged(unsigned int percentage);
+    void qqDevelopmentDonationChanged(unsigned int percentage);
 
     // Signal emitted when wallet needs to be unlocked
     // It is valid behaviour for listeners to keep the wallet locked after this signal;

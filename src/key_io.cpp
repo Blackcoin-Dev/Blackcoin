@@ -289,7 +289,12 @@ std::string EncodeExtKey(const CExtKey& key)
 
 std::string EncodeDestination(const CTxDestination& dest)
 {
-    return std::visit(DestinationEncoder(Params()), dest);
+    return EncodeDestination(dest, Params());
+}
+
+std::string EncodeDestination(const CTxDestination& dest, const CChainParams& params)
+{
+    return std::visit(DestinationEncoder(params), dest);
 }
 
 CTxDestination DecodeDestination(const std::string& str, std::string& error_msg, std::vector<int>* error_locations)

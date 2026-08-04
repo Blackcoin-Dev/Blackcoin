@@ -4,6 +4,20 @@ Blackcoin Core v30.1.4 is a wallet-safety and observability maintenance
 release. It does not change consensus, rewards, Gold Rush eligibility, quantum
 lifecycle rules, or wallet ownership.
 
+## Development-fund retirement and quantum replacement
+
+The legacy development-fund address and coinstake payment path are removed.
+`-donatetodevfund` is compatibility-only, nonzero values are ignored with a
+warning, and the legacy RPC setter cannot enable a payment.
+
+The separate Quantum Quasar development donation defaults to zero and requires
+a fresh choice in each wallet. Consent is durably bound to the active network,
+exact direct quantum recipient, and percentage. A recipient rotation disables
+the prior choice until the operator explicitly authorizes the new address.
+There is no mandatory treasury or consensus tax. Full address, checksum,
+startup, RPC, GUI, lifecycle, and fail-closed details are in
+`doc/qq-development-donation.md`.
+
 ## Gold Rush PoW claim lifecycle
 
 New wallet-authored QQP3/QQP4 claim carriers are removed from the local

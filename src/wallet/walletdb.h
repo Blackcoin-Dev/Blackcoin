@@ -11,6 +11,7 @@
 #include <script/sign.h>
 #include <wallet/crypter.h>
 #include <wallet/db.h>
+#include <wallet/qq_development_donation.h>
 #include <wallet/shadow_pow_claim_recovery_types.h>
 #include <wallet/walletutil.h>
 #include <key.h>
@@ -106,6 +107,7 @@ extern const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT;
 extern const std::string QUANTUM_REDELEGATION_LAST_SUCCESS;
 extern const std::string QUANTUM_REDELEGATION_LAST_WIN;
 extern const std::string SETTINGS;
+extern const std::string QQ_DEVELOPMENT_DONATION_CONSENT;
 extern const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY;
 extern const std::string TX;
 extern const std::string VERSION;
@@ -320,6 +322,12 @@ public:
     bool HasShadowPowClaimRecoveryPolicy() { return m_batch->Exists(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY); }
     DBErrors ReadShadowPowClaimRecoveryPolicy(ShadowPowClaimRecoveryPolicy& policy, std::string* error = nullptr);
     bool EraseShadowPowClaimRecoveryPolicy();
+
+    /** Optional wallet-scoped Quantum Quasar development-donation consent. */
+    bool WriteQQDevelopmentDonationConsent(const QQDevelopmentDonationConsent& consent);
+    bool HasQQDevelopmentDonationConsent() { return m_batch->Exists(DBKeys::QQ_DEVELOPMENT_DONATION_CONSENT); }
+    DBErrors ReadQQDevelopmentDonationConsent(QQDevelopmentDonationConsent& consent, std::string* error = nullptr);
+    bool EraseQQDevelopmentDonationConsent();
 
     bool WriteAddressPreviouslySpent(const CTxDestination& dest, bool previously_spent);
     bool WriteAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& receive_request);

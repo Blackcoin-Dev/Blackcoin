@@ -47,14 +47,12 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
             "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
-            # Regression: a legacy dev-fund output must be suppressed when a
-            # migration-phase coinstake spends a quantum input.
-            "-donatetodevfund=1",
             "-shadowwhitelistheight=1",
             f"-shadowgoldrushblocks={GOLD_RUSH_END_HEIGHT - 1}",
             f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
             f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
             f"-qqstaketierheight={GOLD_RUSH_END_HEIGHT + 1}",
+            "-qqstakesplitheight=1000000",
         ]
         self.extra_args = [args, args]
 
@@ -212,6 +210,10 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
         staker = self.nodes[0].get_wallet_rpc("tier_staker")
         funder.staking(False)
         staker.staking(False)
+        donation_info = staker.getqqdevelopmentdonationinfo()
+        donation_address = donation_info["recipient"]
+        donation_script = self.nodes[0].validateaddress(donation_address)["scriptPubKey"]
+        staker.setqqdevelopmentdonation(10, donation_address)
 
         self.log.info("Creating a wallet-backed 7-day Vault quantum staking address")
         stake_info = staker.getnewquantumstakeaddress("vault-7d", VAULT_7D_BLOCKS)
@@ -263,6 +265,12 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
         ]
         assert tiered_outputs, "tiered quantum coinstake must return principal to the same tiered script"
         assert sum(tiered_outputs) >= stake_amount
+        donation_outputs = [
+            vout for vout in coinstake["vout"]
+            if vout["scriptPubKey"]["hex"] == donation_script
+        ]
+        assert_equal(len(donation_outputs), 1)
+        assert Decimal(str(donation_outputs[0]["value"])) > 0
 
         self.log.info("Rejecting a signed tiered coinstake that redirects bonded principal")
         raw_tiered_block = self.nodes[0].getblock(block_hash, 0)

@@ -7,6 +7,13 @@ local mempool. It also protects mature legacy stake capacity, publishes
 coherent PoS worker state, makes claim-recovery review atomic, and exposes
 wallet-specific QQSIGNAL lifecycle evidence.
 
+It also permanently disables the legacy development-fund recipient and old
+payment controls. A separate Quantum Quasar development donation is available
+only through fresh wallet-scoped consent bound to the exact active-network
+direct quantum address and percentage. It defaults to zero and never inherits
+`-donatetodevfund` or prior GUI consent. See
+`doc/qq-development-donation.md`.
+
 This maintenance release does not change consensus, reward amounts, Gold Rush
 eligibility, the quantum lifecycle, or wallet ownership. It changes local
 wallet policy, recovery safety, and telemetry. Existing authenticated
@@ -28,10 +35,12 @@ The production defaults are fail-closed:
 - `getgoldrushinfo.wallet_qqsignal` reports only the selected wallet's exact
   mempool, confirmed, expired, superseded, and reorg-removed signal records,
   including durable manual/automatic provenance for newly created signals;
-  and
 - review of recovery inventory, plan, policy, and usage is one read-only,
   tip-pinned Core snapshot. Execution still revalidates immediately before
-  persistence and broadcast.
+  persistence and broadcast; and
+- legacy development-fund payments cannot be re-enabled; the replacement
+  quantum facility remains off unless the wallet durably records fresh,
+  exact-recipient consent.
 
 Back up each wallet before upgrade. Stop the prior daemon or GUI cleanly and
 retain a cold copy of the datadir until the canary has verified wallet names,

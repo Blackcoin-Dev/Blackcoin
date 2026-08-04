@@ -547,10 +547,8 @@ limited by the fee estimate for the longest target
 .HP
 \fB\-donatetodevfund=\fR<n>
 .IP
-Percentage of staking rewards contributed to the dev treasury (0 to 95,
-default: 0). Set 0 to opt out at any time. The GUI suggests 1%
-before wallet migration is complete and defaults to 5% after
-wallet migration is complete unless the user chooses otherwise.
+Retired compatibility option. Legacy development\-fund payments are
+permanently disabled; nonzero values are ignored with a warning.
 .HP
 \fB\-keypool=\fR<n>
 .IP
@@ -639,6 +637,18 @@ durably stored ordinary direct (non\-tiered, non\-cold\-stake)
 quantum address owned by the loaded wallet. When omitted, change
 returns to the selected wallet\-owned direct quantum fee\-input
 address; no new key is created.
+.HP
+\fB\-qqdevelopmentdonation=\fR<n>
+.IP
+Fresh wallet\-scoped opt\-in percentage for the Quantum Quasar development
+recipient (0 to 95, default: 0). This never inherits
+\fB\-donatetodevfund\fR consent.
+.HP
+\fB\-qqdevelopmentdonationrecipient=\fR<address>
+.IP
+Exact active\-network direct quantum recipient displayed when recording a
+fresh \fB\-qqdevelopmentdonation\fR choice. A different or rotated
+address is rejected.
 .HP
 \fB\-qqpospayoutaddress=\fR<address>
 .IP

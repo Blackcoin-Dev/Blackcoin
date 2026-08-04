@@ -528,12 +528,6 @@ std::string QuantumQuasarPhaseName(Consensus::QuantumQuasarPhase phase)
     return "unknown";
 }
 
-bool IsDirectQuantumMigrationScript(const CScript& script_pub_key)
-{
-    const auto tier = GetQuantumStakeTierProgram(script_pub_key);
-    return tier && !tier->tiered && !tier->cold_stake;
-}
-
 std::optional<bilingual_str> QuantumMigrationSweepPhaseError(
     const CWallet& wallet,
     bool goldrush_rewards_only)
@@ -2843,10 +2837,23 @@ public:
     {
         RemoveWallet(m_context, m_wallet, /*load_on_start=*/false);
     }
-    unsigned int getDonationPercentage() override { return m_wallet->m_donation_percentage; }
-    void setDonationPercentage(unsigned int percentage) override
+    unsigned int getQQDevelopmentDonationPercentage() override
     {
-        m_wallet->m_donation_percentage = std::min<unsigned int>(percentage, MAX_DONATION_PERCENTAGE);
+        return m_wallet->GetQQDevelopmentDonationPercentage();
+    }
+    std::string getQQDevelopmentDonationAddress() override
+    {
+        return Params().GetQQDevelopmentDonationAddress();
+    }
+    bool setQQDevelopmentDonation(unsigned int percentage,
+                                  const std::string& recipient,
+                                  std::string& error) override
+    {
+        bilingual_str wallet_error;
+        const bool success = m_wallet->SetQQDevelopmentDonationConsent(
+            percentage, recipient, wallet_error);
+        error = wallet_error.original;
+        return success;
     }
     bool tryGetStakeWeight(uint64_t& nWeight) override
     {

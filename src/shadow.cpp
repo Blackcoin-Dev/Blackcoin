@@ -27,6 +27,12 @@
 #include <set>
 #include <stdexcept>
 
+bool IsDirectQuantumMigrationScript(const CScript& script)
+{
+    const auto tier = GetQuantumStakeTierProgram(script);
+    return tier && !tier->tiered && !tier->cold_stake;
+}
+
 namespace {
 
 using valtype = std::vector<unsigned char>;
@@ -112,12 +118,6 @@ static constexpr size_t MAX_SHADOW_STATE_MARKER_BYTES = MAX_SIZE - 1024;
 // them back from disk. Keep every persisted auxiliary marker comfortably below
 // that hard boundary and split logical state across deterministic shards.
 static constexpr size_t MAX_SHADOW_SHARD_DATA_BYTES = 8000;
-
-bool IsDirectQuantumMigrationScript(const CScript& script)
-{
-    const auto tier = GetQuantumStakeTierProgram(script);
-    return tier && !tier->tiered && !tier->cold_stake;
-}
 
 bool IsLegacyShadowTargetScript(const CScript& script)
 {

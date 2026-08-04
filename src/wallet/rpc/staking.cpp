@@ -96,12 +96,6 @@ static std::string DurableQuantumKeyFailureMessage(
             : failure);
 }
 
-static bool IsDirectQuantumMigrationScript(const CScript& script_pub_key)
-{
-    const auto tier = GetQuantumStakeTierProgram(script_pub_key);
-    return tier && !tier->tiered && !tier->cold_stake;
-}
-
 static void CommitWalletTransactionOrThrow(
     CWallet& wallet,
     const CTransactionRef& tx,
@@ -619,19 +613,51 @@ static bool RequireNewQuantumKeyConsent(const UniValue& options, const std::stri
     return true;
 }
 
-static UniValue StakingDonationInfoToJSON(const CWallet& wallet)
+static UniValue RetiredStakingDonationInfoToJSON()
 {
-    const unsigned int percentage = wallet.m_donation_percentage;
     UniValue obj(UniValue::VOBJ);
-    obj.pushKV("enabled", percentage > 0);
-    obj.pushKV("percentage", percentage);
-    obj.pushKV("minimum_percentage", MIN_DONATION_PERCENTAGE);
-    obj.pushKV("maximum_percentage", MAX_DONATION_PERCENTAGE);
-    obj.pushKV("default_percentage", DEFAULT_DONATION_PERCENTAGE);
-    obj.pushKV("pre_migration_suggested_percentage", DEFAULT_DONATION_SUGGESTED_PERCENTAGE);
-    obj.pushKV("post_migration_default_percentage", DEFAULT_POST_MIGRATION_DONATION_PERCENTAGE);
-    obj.pushKV("target_address", Params().GetDevFundAddress());
-    obj.pushKV("note", "Set percentage to 0 to disable staking donations. Nonzero values are honored when the active staking reward format permits donation outputs.");
+    obj.pushKV("retired", true);
+    obj.pushKV("enabled", false);
+    obj.pushKV("percentage", 0);
+    obj.pushKV("target_address", "");
+    obj.pushKV("note", "Legacy development-fund staking payments are permanently disabled. This interface cannot authorize the separate Quantum Quasar development donation facility.");
+    return obj;
+}
+
+static UniValue QQDevelopmentDonationInfoToJSON(const CWallet& wallet)
+{
+    LOCK(wallet.cs_wallet);
+    const QQDevelopmentDonationConsent consent =
+        wallet.GetQQDevelopmentDonationConsent();
+    const std::string current_network = Params().GetChainTypeString();
+    const std::string current_recipient =
+        Params().GetQQDevelopmentDonationAddress();
+    const bool database_ambiguous =
+        wallet.IsQQDevelopmentDonationDatabaseAmbiguous();
+    const bool consent_matches_current =
+        consent.choice_recorded == 1 &&
+        consent.network == current_network &&
+        consent.recipient == current_recipient;
+    const unsigned int effective_percentage =
+        wallet.GetQQDevelopmentDonationPercentage();
+
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("enabled", effective_percentage > 0);
+    obj.pushKV("percentage", effective_percentage);
+    obj.pushKV("stored_percentage", consent.percentage);
+    obj.pushKV("choice_recorded", consent.choice_recorded == 1);
+    obj.pushKV("network", current_network);
+    obj.pushKV("recipient", current_recipient);
+    obj.pushKV("consent_network", consent.network);
+    obj.pushKV("consent_recipient", consent.recipient);
+    obj.pushKV("consent_matches_current", consent_matches_current);
+    obj.pushKV("reauthorization_required",
+               consent.HasDonationAuthority() && !consent_matches_current);
+    obj.pushKV("database_outcome_ambiguous", database_ambiguous);
+    obj.pushKV("minimum_percentage", MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE);
+    obj.pushKV("maximum_percentage", MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE);
+    obj.pushKV("default_percentage", DEFAULT_QQ_DEVELOPMENT_DONATION_PERCENTAGE);
+    obj.pushKV("note", "This optional wallet policy is not a consensus tax. A nonzero choice is effective only for the exact network and direct quantum recipient shown here.");
     return obj;
 }
 
@@ -966,17 +992,13 @@ static RPCHelpMan reservebalance()
 static RPCHelpMan getstakingdonationinfo()
 {
     return RPCHelpMan{"getstakingdonationinfo",
-        "\nReturns wallet staking donation settings used by coinstake creation.\n",
+        "\nReturns the permanently retired legacy staking-donation state.\n",
         {},
         RPCResult{RPCResult::Type::OBJ, "", "", {
-            {RPCResult::Type::BOOL, "enabled", "true when staking donations are enabled"},
-            {RPCResult::Type::NUM, "percentage", "Percentage of eligible stake rewards to donate"},
-            {RPCResult::Type::NUM, "minimum_percentage", "Minimum accepted donation percentage"},
-            {RPCResult::Type::NUM, "maximum_percentage", "Maximum accepted donation percentage"},
-            {RPCResult::Type::NUM, "default_percentage", "Startup default donation percentage"},
-            {RPCResult::Type::NUM, "pre_migration_suggested_percentage", "GUI suggested percentage before migration completes"},
-            {RPCResult::Type::NUM, "post_migration_default_percentage", "GUI default after migration completes when the user has not chosen otherwise"},
-            {RPCResult::Type::STR, "target_address", "Configured project donation address"},
+            {RPCResult::Type::BOOL, "retired", "Always true"},
+            {RPCResult::Type::BOOL, "enabled", "Always false"},
+            {RPCResult::Type::NUM, "percentage", "Always zero"},
+            {RPCResult::Type::STR, "target_address", "Always empty"},
             {RPCResult::Type::STR, "note", "Operational note"},
         }},
         RPCExamples{HelpExampleCli("getstakingdonationinfo", "")},
@@ -985,8 +1007,7 @@ static RPCHelpMan getstakingdonationinfo()
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
 
-    LOCK(pwallet->cs_wallet);
-    return StakingDonationInfoToJSON(*pwallet);
+    return RetiredStakingDonationInfoToJSON();
 },
     };
 }
@@ -994,20 +1015,19 @@ static RPCHelpMan getstakingdonationinfo()
 static RPCHelpMan setstakingdonation()
 {
     return RPCHelpMan{"setstakingdonation",
-        "\nSets the wallet staking donation percentage. Use 0 to turn donations off.\n",
+        "\nRetired compatibility command. Only 0 is accepted; nonzero legacy payments cannot be re-enabled.\n",
         {
-            {"percentage", RPCArg::Type::NUM, RPCArg::Optional::NO, "Donation percentage from 0 to 95."},
+            {"percentage", RPCArg::Type::NUM, RPCArg::Optional::NO, "Must be 0."},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
-            {RPCResult::Type::BOOL, "enabled", "true when staking donations are enabled"},
-            {RPCResult::Type::NUM, "percentage", "Percentage of eligible stake rewards to donate"},
-            {RPCResult::Type::NUM, "minimum_percentage", "Minimum accepted donation percentage"},
-            {RPCResult::Type::NUM, "maximum_percentage", "Maximum accepted donation percentage"},
-            {RPCResult::Type::STR, "target_address", "Configured project donation address"},
+            {RPCResult::Type::BOOL, "retired", "Always true"},
+            {RPCResult::Type::BOOL, "enabled", "Always false"},
+            {RPCResult::Type::NUM, "percentage", "Always zero"},
+            {RPCResult::Type::STR, "target_address", "Always empty"},
+            {RPCResult::Type::STR, "note", "Operational note"},
         }},
         RPCExamples{
-            HelpExampleCli("setstakingdonation", "0") +
-            HelpExampleCli("setstakingdonation", "5")
+            HelpExampleCli("setstakingdonation", "0")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -1018,13 +1038,97 @@ static RPCHelpMan setstakingdonation()
     if (!ParseInt64(request.params[0].getValStr(), &percentage_signed)) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "percentage must be an integer");
     }
-    if (percentage_signed < MIN_DONATION_PERCENTAGE || percentage_signed > MAX_DONATION_PERCENTAGE) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("percentage must be between %u and %u", MIN_DONATION_PERCENTAGE, MAX_DONATION_PERCENTAGE));
+    if (percentage_signed != 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "legacy development-fund payments are retired and cannot be enabled; use setqqdevelopmentdonation with fresh recipient-bound consent");
     }
+    return RetiredStakingDonationInfoToJSON();
+},
+    };
+}
 
-    LOCK(pwallet->cs_wallet);
-    pwallet->m_donation_percentage = static_cast<unsigned int>(percentage_signed);
-    return StakingDonationInfoToJSON(*pwallet);
+static RPCHelpMan getqqdevelopmentdonationinfo()
+{
+    return RPCHelpMan{"getqqdevelopmentdonationinfo",
+        "\nReturns fresh wallet-scoped Quantum Quasar development-donation consent and its effective state.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::BOOL, "enabled", "true only when exact current consent is effective"},
+            {RPCResult::Type::NUM, "percentage", "Effective percentage, or zero when fail-closed"},
+            {RPCResult::Type::NUM, "stored_percentage", "Percentage in the persisted choice"},
+            {RPCResult::Type::BOOL, "choice_recorded", "Whether this wallet has a fresh recorded choice"},
+            {RPCResult::Type::STR, "network", "Current network"},
+            {RPCResult::Type::STR, "recipient", "Current approved direct quantum recipient"},
+            {RPCResult::Type::STR, "consent_network", "Network bound in persisted consent"},
+            {RPCResult::Type::STR, "consent_recipient", "Recipient bound in persisted consent"},
+            {RPCResult::Type::BOOL, "consent_matches_current", "Whether persisted network and recipient match this build"},
+            {RPCResult::Type::BOOL, "reauthorization_required", "Whether a previously enabled choice is stale"},
+            {RPCResult::Type::BOOL, "database_outcome_ambiguous", "Whether donation is latched off pending reload"},
+            {RPCResult::Type::NUM, "minimum_percentage", "Minimum percentage"},
+            {RPCResult::Type::NUM, "maximum_percentage", "Maximum percentage"},
+            {RPCResult::Type::NUM, "default_percentage", "Default percentage"},
+            {RPCResult::Type::STR, "note", "Operational note"},
+        }},
+        RPCExamples{HelpExampleCli("getqqdevelopmentdonationinfo", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+    return QQDevelopmentDonationInfoToJSON(*pwallet);
+},
+    };
+}
+
+static RPCHelpMan setqqdevelopmentdonation()
+{
+    return RPCHelpMan{"setqqdevelopmentdonation",
+        "\nDurably records a fresh wallet-scoped choice bound to the exact current network, recipient, and percentage. Use 0 with the same recipient to opt out.\n",
+        {
+            {"percentage", RPCArg::Type::NUM, RPCArg::Optional::NO, "Percentage from 0 to 95."},
+            {"recipient", RPCArg::Type::STR, RPCArg::Optional::NO, "Exact recipient returned by getqqdevelopmentdonationinfo."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::BOOL, "enabled", "Effective donation state"},
+            {RPCResult::Type::NUM, "percentage", "Effective percentage"},
+            {RPCResult::Type::NUM, "stored_percentage", "Percentage in the persisted choice"},
+            {RPCResult::Type::BOOL, "choice_recorded", "Whether this wallet has a fresh recorded choice"},
+            {RPCResult::Type::STR, "network", "Current network"},
+            {RPCResult::Type::STR, "recipient", "Approved direct quantum recipient"},
+            {RPCResult::Type::STR, "consent_network", "Network bound in persisted consent"},
+            {RPCResult::Type::STR, "consent_recipient", "Recipient bound in persisted consent"},
+            {RPCResult::Type::BOOL, "consent_matches_current", "Whether the new consent matches this build"},
+            {RPCResult::Type::BOOL, "reauthorization_required", "Whether a previously enabled choice is stale"},
+            {RPCResult::Type::BOOL, "database_outcome_ambiguous", "Whether donation is latched off pending reload"},
+            {RPCResult::Type::NUM, "minimum_percentage", "Minimum percentage"},
+            {RPCResult::Type::NUM, "maximum_percentage", "Maximum percentage"},
+            {RPCResult::Type::NUM, "default_percentage", "Default percentage"},
+            {RPCResult::Type::STR, "note", "Operational note"},
+        }},
+        RPCExamples{
+            HelpExampleCli("setqqdevelopmentdonation", "5 \"quantum_recipient_from_getqqdevelopmentdonationinfo\"") +
+            HelpExampleCli("setqqdevelopmentdonation", "0 \"quantum_recipient_from_getqqdevelopmentdonationinfo\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+    int64_t percentage{0};
+    if (!ParseInt64(request.params[0].getValStr(), &percentage)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "percentage must be an integer");
+    }
+    if (percentage < MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE ||
+        percentage > MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf(
+            "percentage must be between %u and %u",
+            MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE,
+            MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE));
+    }
+    bilingual_str error;
+    if (!pwallet->SetQQDevelopmentDonationConsent(
+            static_cast<unsigned int>(percentage),
+            request.params[1].get_str(), error)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, error.original);
+    }
+    return QQDevelopmentDonationInfoToJSON(*pwallet);
 },
     };
 }
@@ -4790,6 +4894,8 @@ static const CRPCCommand commands[] =
     { "staking",            &getstakinginfo,                 },
     { "staking",            &getstakingdonationinfo,         },
     { "staking",            &setstakingdonation,             },
+    { "staking",            &getqqdevelopmentdonationinfo,   },
+    { "staking",            &setqqdevelopmentdonation,       },
     { "staking",            &getgoldrushinfo,                },
     { "staking",            &reservebalance,                 },
     { "staking",            &sendshadowsignal,               },

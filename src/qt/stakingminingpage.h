@@ -305,8 +305,7 @@ private:
     void applyOperatorRegistry(const interfaces::WalletQuantumPoolInfo& pool);
     void refreshControlsEnabled();
     void resetStatusForNoWallet();
-    void applyDonationPercentage(unsigned int percentage);
-    void applyDonationDefaults(bool wallet_migration_complete);
+    bool applyDonationPercentage(unsigned int percentage);
     void refreshDonationControls();
     void onAutomationToggled(QCheckBox* control, const std::string& setting, bool enabled);
     void refreshAutomationControls();

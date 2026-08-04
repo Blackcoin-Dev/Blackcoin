@@ -129,9 +129,12 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
 
     argsman.AddArg("-minstakingamount=<amt>", strprintf("Minimum input value to be used for staking (default: %u)", wallet::DEFAULT_MIN_STAKING_AMOUNT), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-reservebalance=<amt>", strprintf("Reserved balance not used for staking (default: %u)", wallet::DEFAULT_RESERVE_BALANCE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
-    argsman.AddArg("-donatetodevfund=<n>", strprintf("Percentage of staking rewards contributed to the dev treasury (%u to %u, default: %u). Set 0 to opt out at any time. The GUI suggests %u%% before wallet migration is complete and defaults to %u%% after wallet migration is complete unless the user chooses otherwise.",
-        wallet::MIN_DONATION_PERCENTAGE, wallet::MAX_DONATION_PERCENTAGE, wallet::DEFAULT_DONATION_PERCENTAGE,
-        wallet::DEFAULT_DONATION_SUGGESTED_PERCENTAGE, wallet::DEFAULT_POST_MIGRATION_DONATION_PERCENTAGE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-donatetodevfund=<n>", "Retired compatibility option. Legacy development-fund payments are permanently disabled; nonzero values are ignored with a warning.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqdevelopmentdonation=<n>", strprintf("Fresh wallet-scoped opt-in percentage for the Quantum Quasar development recipient (%u to %u, default: %u). This never inherits -donatetodevfund consent.",
+        wallet::MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE,
+        wallet::MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE,
+        wallet::DEFAULT_QQ_DEVELOPMENT_DONATION_PERCENTAGE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqdevelopmentdonationrecipient=<address>", "Exact active-network direct quantum recipient displayed when recording a fresh -qqdevelopmentdonation choice. A different or rotated address is rejected.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqautoredelegate=<true/false>", strprintf("Enable process-wide autonomous fee-paying Quantum cold-stake redelegation in every eligible normally unlocked owner wallet (default: %u). This can move delegated funds to a new owner-controlled delegation, generates a new non-HD owner key, and requires separate -qqallowautokeycreation=1 consent plus a new backup of every affected wallet.", wallet::DEFAULT_AUTO_REDELEGATE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqredelegationtriggermultiplier=<n>", "Autonomous redelegation trigger multiplier over expected zero-win interval (default: 6)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
     argsman.AddArg("-qqredelegationmaxpatienceblocks=<n>", "Autonomous redelegation maximum zero-win patience in blocks (default: 4050)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
@@ -186,6 +189,24 @@ bool WalletInit::ParameterInteraction() const
     if (reserve_stake_coins < 0 || reserve_stake_coins > 1000000) {
         return InitError(Untranslated(
             "-powclaimreservestakecoins must be between 0 and 1000000."));
+    }
+
+    if (gArgs.IsArgSet("-donatetodevfund") &&
+        gArgs.GetIntArg("-donatetodevfund", 0) != 0) {
+        InitWarning(Untranslated("-donatetodevfund is retired and its legacy recipient is disabled. The configured nonzero value is ignored. Use the separate -qqdevelopmentdonation facility only after reviewing its exact quantum recipient."));
+    }
+    const int64_t qq_development_donation = gArgs.GetIntArg(
+        "-qqdevelopmentdonation",
+        wallet::DEFAULT_QQ_DEVELOPMENT_DONATION_PERCENTAGE);
+    if (qq_development_donation < wallet::MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE ||
+        qq_development_donation > wallet::MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE) {
+        return InitError(Untranslated(strprintf(
+            "-qqdevelopmentdonation must be between %u and %u.",
+            wallet::MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE,
+            wallet::MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE)));
+    }
+    if (gArgs.GetArgs("-qqdevelopmentdonationrecipient").size() > 1) {
+        return InitError(Untranslated("-qqdevelopmentdonationrecipient must be specified at most once."));
     }
 
     std::optional<ShadowPowClaimRecoveryPolicy> recovery_policy_seed;

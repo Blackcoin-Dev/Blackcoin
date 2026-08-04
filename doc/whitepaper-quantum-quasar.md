@@ -673,7 +673,8 @@ RPC set.
 |-----|---------|
 | `getstakinginfo` / `staking` | Read / start-stop legacy PoS staking |
 | `reservebalance` | Reserve coins from staking/spending |
-| `getstakingdonationinfo` / `setstakingdonation` | Read / set staking-reward donation percentage |
+| `getstakingdonationinfo` / `setstakingdonation` | Inspect the retired legacy facility / confirm it remains disabled |
+| `getqqdevelopmentdonationinfo` / `setqqdevelopmentdonation` | Review and durably record fresh wallet-scoped consent for the exact direct-quantum development recipient |
 | `checkkernel` | Test whether an input is a valid PoS kernel now |
 | `sendshadowsignal` | Broadcast a QQSIGNAL for a recent PoS solve (Gold Rush PoS credit) |
 | `sendshadowpowclaim` | Grind and submit a QQSPROOF Argon2id PoW claim |

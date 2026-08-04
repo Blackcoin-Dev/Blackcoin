@@ -6,6 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <test/util/setup_common.h>
+#include <chainparams.h>
 #include <clientversion.h>
 #include <streams.h>
 #include <uint256.h>
@@ -58,6 +59,150 @@ BOOST_AUTO_TEST_CASE(walletdb_read_write_deadlock)
         // Now delete all records, which performs a read write operation.
         BOOST_CHECK(wallet->GetLegacyScriptPubKeyMan()->DeleteRecords());
     }
+}
+
+BOOST_AUTO_TEST_CASE(qq_development_donation_consent_validation_and_roundtrip)
+{
+    const QQDevelopmentDonationConsent defaults =
+        DefaultQQDevelopmentDonationConsent();
+    BOOST_CHECK(ValidateQQDevelopmentDonationConsent(defaults));
+    BOOST_CHECK(!defaults.HasDonationAuthority());
+
+    QQDevelopmentDonationConsent invalid = defaults;
+    invalid.percentage = 1;
+    BOOST_CHECK(!ValidateQQDevelopmentDonationConsent(invalid));
+    invalid = defaults;
+    invalid.choice_recorded = 2;
+    BOOST_CHECK(!ValidateQQDevelopmentDonationConsent(invalid));
+    invalid = defaults;
+    invalid.choice_recorded = 1;
+    invalid.percentage = MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE + 1;
+    invalid.network = "main";
+    invalid.recipient = "recipient";
+    BOOST_CHECK(!ValidateQQDevelopmentDonationConsent(invalid));
+
+    std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+    WalletBatch batch(*database, /*flush_on_close=*/false);
+    QQDevelopmentDonationConsent output;
+    std::string error{"not cleared"};
+    BOOST_CHECK_EQUAL(batch.ReadQQDevelopmentDonationConsent(output, &error), DBErrors::LOAD_OK);
+    BOOST_CHECK(output == defaults);
+    BOOST_CHECK(error.empty());
+
+    QQDevelopmentDonationConsent input;
+    input.choice_recorded = 1;
+    input.percentage = 7;
+    input.network = "main";
+    input.recipient = Params().GetQQDevelopmentDonationAddress();
+    BOOST_REQUIRE(ValidateQQDevelopmentDonationConsent(input));
+    BOOST_REQUIRE(batch.WriteQQDevelopmentDonationConsent(input));
+    BOOST_CHECK_EQUAL(batch.ReadQQDevelopmentDonationConsent(output, &error), DBErrors::LOAD_OK);
+    BOOST_CHECK(output == input);
+
+    invalid = input;
+    invalid.recipient.clear();
+    BOOST_CHECK(!batch.WriteQQDevelopmentDonationConsent(invalid));
+    BOOST_CHECK_EQUAL(batch.ReadQQDevelopmentDonationConsent(output, &error), DBErrors::LOAD_OK);
+    BOOST_CHECK(output == input);
+}
+
+BOOST_AUTO_TEST_CASE(qq_development_donation_runtime_is_recipient_bound)
+{
+    std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+    const std::shared_ptr<CWallet> wallet(
+        new CWallet(m_node.chain.get(), "qq-development-donation", std::move(database)));
+    const std::string recipient = Params().GetQQDevelopmentDonationAddress();
+    bilingual_str error;
+
+    BOOST_CHECK_EQUAL(wallet->GetQQDevelopmentDonationPercentage(), 0U);
+    BOOST_REQUIRE(wallet->SetQQDevelopmentDonationConsent(7, recipient, error));
+    BOOST_CHECK_EQUAL(wallet->GetQQDevelopmentDonationPercentage(), 7U);
+    const QQDevelopmentDonationConsent consent =
+        wallet->GetQQDevelopmentDonationConsent();
+    BOOST_CHECK(consent.HasDonationAuthority());
+    BOOST_CHECK_EQUAL(consent.network, Params().GetChainTypeString());
+    BOOST_CHECK_EQUAL(consent.recipient, recipient);
+
+    BOOST_CHECK(!wallet->SetQQDevelopmentDonationConsent(8, recipient + "wrong", error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK_EQUAL(wallet->GetQQDevelopmentDonationPercentage(), 7U);
+
+    MockableDatabase& mock = GetMockableDatabase(*wallet);
+    mock.m_fail_write_at = 0;
+    BOOST_CHECK(!wallet->SetQQDevelopmentDonationConsent(8, recipient, error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK_EQUAL(wallet->GetQQDevelopmentDonationPercentage(), 7U);
+    BOOST_CHECK_EQUAL(wallet->GetQQDevelopmentDonationConsent().percentage, 7U);
+    BOOST_CHECK(!wallet->IsQQDevelopmentDonationDatabaseAmbiguous());
+    mock.m_fail_write_at.reset();
+
+    // A failed durable commit leaves the on-disk outcome unknowable. Never
+    // publish either possible consent as authority until the wallet reloads.
+    mock.m_fail_commit = true;
+    BOOST_CHECK(!wallet->SetQQDevelopmentDonationConsent(8, recipient, error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK_EQUAL(wallet->GetQQDevelopmentDonationPercentage(), 0U);
+    BOOST_CHECK(wallet->IsQQDevelopmentDonationDatabaseAmbiguous());
+    BOOST_CHECK(!wallet->SetQQDevelopmentDonationConsent(9, recipient, error));
+    BOOST_CHECK_EQUAL(wallet->GetQQDevelopmentDonationPercentage(), 0U);
+    mock.m_fail_commit = false;
+}
+
+BOOST_AUTO_TEST_CASE(qq_development_donation_malformed_and_rotation_fail_closed)
+{
+    auto check_malformed = [this](const auto& malformed_value) {
+        std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+        {
+            std::unique_ptr<DatabaseBatch> raw_batch =
+                database->MakeBatch(/*flush_on_close=*/false);
+            BOOST_REQUIRE(raw_batch->Write(
+                DBKeys::QQ_DEVELOPMENT_DONATION_CONSENT, malformed_value));
+        }
+
+        const std::shared_ptr<CWallet> wallet(new CWallet(
+            m_node.chain.get(), "malformed-donation-consent", std::move(database)));
+        BOOST_CHECK_EQUAL(wallet->LoadWallet(), DBErrors::NONCRITICAL_ERROR);
+        BOOST_CHECK_EQUAL(wallet->GetQQDevelopmentDonationPercentage(), 0U);
+        BOOST_CHECK(!wallet->GetQQDevelopmentDonationConsent().HasDonationAuthority());
+
+        QQDevelopmentDonationConsent output;
+        std::string error;
+        WalletBatch batch(wallet->GetDatabase(), /*flush_on_close=*/false);
+        BOOST_CHECK_EQUAL(
+            batch.ReadQQDevelopmentDonationConsent(output, &error),
+            DBErrors::NONCRITICAL_ERROR);
+        BOOST_CHECK(output == DefaultQQDevelopmentDonationConsent());
+        BOOST_CHECK(!error.empty());
+    };
+
+    check_malformed(std::string{"truncated"});
+
+    QQDevelopmentDonationConsent unknown_version;
+    unknown_version.version = QQDevelopmentDonationConsent::VERSION + 1;
+    unknown_version.choice_recorded = 1;
+    unknown_version.percentage = 7;
+    unknown_version.network = Params().GetChainTypeString();
+    unknown_version.recipient = Params().GetQQDevelopmentDonationAddress();
+    check_malformed(unknown_version);
+
+    // A valid consent record for an older/rotated recipient remains visible
+    // for audit, but grants no payment authority under the current identity.
+    std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+    QQDevelopmentDonationConsent rotated;
+    rotated.choice_recorded = 1;
+    rotated.percentage = 7;
+    rotated.network = Params().GetChainTypeString();
+    rotated.recipient = "retired-quantum-recipient";
+    {
+        WalletBatch batch(*database, /*flush_on_close=*/false);
+        BOOST_REQUIRE(batch.WriteQQDevelopmentDonationConsent(rotated));
+    }
+    const std::shared_ptr<CWallet> wallet(new CWallet(
+        m_node.chain.get(), "rotated-donation-consent", std::move(database)));
+    BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(wallet->GetQQDevelopmentDonationConsent() == rotated);
+    BOOST_CHECK_EQUAL(wallet->GetQQDevelopmentDonationPercentage(), 0U);
+
 }
 
 BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_validation)

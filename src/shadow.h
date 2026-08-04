@@ -26,6 +26,10 @@ namespace Consensus {
 struct Params;
 }
 
+/** True only for an ordinary direct (non-tiered, non-cold-stake) witness-v16
+ * Quantum Quasar output. */
+bool IsDirectQuantumMigrationScript(const CScript& script);
+
 struct ShadowGoldRushInfo {
     CAmount pow_amount{0};
     CAmount pos_amount{0};

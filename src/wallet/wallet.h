@@ -34,6 +34,7 @@
 #include <util/ui_change_type.h>
 #include <wallet/crypter.h>
 #include <wallet/db.h>
+#include <wallet/qq_development_donation.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/shadow_pow_claim_recovery_types.h>
 #include <wallet/transaction.h>
@@ -338,13 +339,6 @@ static constexpr bool DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION{false};
  * consent, while -autostartstaking always takes precedence when both exist.
  */
 bool IsStakingAutostartEnabled();
-//! -donatetodevfund default
-static const unsigned int DEFAULT_DONATION_PERCENTAGE = 0;
-static const unsigned int DEFAULT_DONATION_SUGGESTED_PERCENTAGE = 1;
-static const unsigned int DEFAULT_POST_MIGRATION_DONATION_PERCENTAGE = 5;
-static const unsigned int MIN_DONATION_PERCENTAGE = 0;
-static const unsigned int MAX_DONATION_PERCENTAGE = 95;
-
 class CCoinControl;
 
 //! Default for -addresstype
@@ -877,6 +871,14 @@ private:
     // wallet is reloaded, no recovery path may create or promote another
     // transaction for the same anchor generation.
     bool m_shadow_pow_claim_recovery_db_ambiguous GUARDED_BY(cs_wallet){false};
+    QQDevelopmentDonationConsent m_qq_development_donation_consent GUARDED_BY(cs_wallet) =
+        DefaultQQDevelopmentDonationConsent();
+    // Published only after validated load or durable consent commit so GUI
+    // status polling never waits behind a long wallet operation.
+    std::atomic<unsigned int> m_qq_development_donation_effective_percentage{0};
+    // An indeterminate commit can represent either the old or requested
+    // consent on disk. Donation stays disabled until reload resolves it.
+    bool m_qq_development_donation_db_ambiguous GUARDED_BY(cs_wallet){false};
     using ShadowPowClaimRecoveryRecordMutation =
         std::function<bool(CWalletTx&)>;
     /**
@@ -899,6 +901,7 @@ private:
     friend class WalletBatch;
     /** Install an already validated database record without writing it again. */
     bool LoadShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool LoadQQDevelopmentDonationConsent(const QQDevelopmentDonationConsent& consent) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /**
      * The following is used to keep track of how far behind the wallet is
@@ -969,6 +972,14 @@ public:
      * wallet has no persisted recovery-policy record. */
     bool ApplyShadowPowClaimRecoveryStartupPolicy(
         const ArgsManager& args, bilingual_str& error);
+    bool ApplyQQDevelopmentDonationStartupConsent(
+        const ArgsManager& args, bilingual_str& error);
+    QQDevelopmentDonationConsent GetQQDevelopmentDonationConsent() const;
+    unsigned int GetQQDevelopmentDonationPercentage() const;
+    bool SetQQDevelopmentDonationConsent(unsigned int percentage,
+                                         const std::string& recipient,
+                                         bilingual_str& error);
+    bool IsQQDevelopmentDonationDatabaseAmbiguous() const;
     bool IsShadowPowClaimRecoveryDatabaseAmbiguous() const;
     void MarkShadowPowClaimRecoveryDatabaseAmbiguous()
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
@@ -1285,7 +1296,6 @@ public:
     uint256 m_last_coin_stake_search_tip GUARDED_BY(cs_wallet){};
     CAmount m_min_staking_amount{DEFAULT_MIN_STAKING_AMOUNT};
     CAmount m_reserve_balance{DEFAULT_RESERVE_BALANCE};
-    unsigned int m_donation_percentage{DEFAULT_DONATION_PERCENTAGE};
     std::atomic<bool> m_enabled_staking{false};
     std::atomic<bool> m_stop_staking_thread{false};
     mutable Mutex m_staking_telemetry_mutex;

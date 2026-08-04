@@ -298,11 +298,12 @@ public:
     // Remove wallet.
     virtual void remove() = 0;
 
-    //! Get donation percentage
-    virtual unsigned int getDonationPercentage() = 0;
-
-    //! Set donation percentage for this wallet instance
-    virtual void setDonationPercentage(unsigned int percentage) = 0;
+    //! Effective fresh, recipient-bound Quantum Quasar development donation.
+    virtual unsigned int getQQDevelopmentDonationPercentage() = 0;
+    virtual std::string getQQDevelopmentDonationAddress() = 0;
+    virtual bool setQQDevelopmentDonation(unsigned int percentage,
+                                          const std::string& recipient,
+                                          std::string& error) = 0;
 
     //! Try get the stake weight
     virtual bool tryGetStakeWeight(uint64_t& nWeight) = 0;

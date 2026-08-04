@@ -123,6 +123,7 @@ BASE_SCRIPTS = [
     'wallet_quantum_key_safety.py --descriptors',
     'wallet_quantum_fleet_bindings.py --legacy-wallet',
     'wallet_quantum_fleet_bindings.py --descriptors',
+    'wallet_qq_development_donation.py --descriptors',
     'feature_segwit.py --legacy-wallet',
     'feature_segwit.py --descriptors',
     'feature_segwit.py --descriptors --v2transport',

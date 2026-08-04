@@ -361,6 +361,7 @@ BITCOIN_CORE_H = \
   wallet/fees.h \
   wallet/load.h \
   wallet/quantum_stake_ops.h \
+  wallet/qq_development_donation.h \
   wallet/receive.h \
   wallet/redelegation.h \
   wallet/rpc/staking.h \

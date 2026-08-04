@@ -69,6 +69,7 @@ const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT{"quantumredelegationlastatte
 const std::string QUANTUM_REDELEGATION_LAST_SUCCESS{"quantumredelegationlastsuccess"};
 const std::string QUANTUM_REDELEGATION_LAST_WIN{"quantumredelegationlastwin"};
 const std::string SETTINGS{"settings"};
+const std::string QQ_DEVELOPMENT_DONATION_CONSENT{"qqdevelopmentdonationconsent"};
 const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY{"shadowpowclaimrecoverypolicy"};
 const std::string TX{"tx"};
 const std::string VERSION{"version"};
@@ -463,6 +464,39 @@ DBErrors WalletBatch::ReadShadowPowClaimRecoveryPolicy(ShadowPowClaimRecoveryPol
 bool WalletBatch::EraseShadowPowClaimRecoveryPolicy()
 {
     return EraseIC(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY);
+}
+
+bool WalletBatch::WriteQQDevelopmentDonationConsent(const QQDevelopmentDonationConsent& consent)
+{
+    if (!ValidateQQDevelopmentDonationConsent(consent)) return false;
+    return WriteIC(DBKeys::QQ_DEVELOPMENT_DONATION_CONSENT, consent);
+}
+
+DBErrors WalletBatch::ReadQQDevelopmentDonationConsent(QQDevelopmentDonationConsent& consent, std::string* error)
+{
+    consent = DefaultQQDevelopmentDonationConsent();
+    if (error) error->clear();
+    if (!m_batch->Exists(DBKeys::QQ_DEVELOPMENT_DONATION_CONSENT)) {
+        return DBErrors::LOAD_OK;
+    }
+
+    QQDevelopmentDonationConsent stored;
+    if (!m_batch->Read(DBKeys::QQ_DEVELOPMENT_DONATION_CONSENT, stored)) {
+        if (error) *error = "malformed quantum development donation consent; donation remains disabled";
+        return DBErrors::NONCRITICAL_ERROR;
+    }
+    std::string validation_error;
+    if (!ValidateQQDevelopmentDonationConsent(stored, &validation_error)) {
+        if (error) *error = "invalid quantum development donation consent (" + validation_error + "); donation remains disabled";
+        return DBErrors::NONCRITICAL_ERROR;
+    }
+    consent = std::move(stored);
+    return DBErrors::LOAD_OK;
+}
+
+bool WalletBatch::EraseQQDevelopmentDonationConsent()
+{
+    return EraseIC(DBKeys::QQ_DEVELOPMENT_DONATION_CONSENT);
 }
 
 bool LoadKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr)
@@ -1759,6 +1793,21 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
             // records with the disabled default. Keep this defensive path
             // fail-closed if those invariants ever diverge.
             pwallet->WalletLogPrintf("Error reading wallet database: automated PoW claim recovery policy failed runtime validation; automation remains disabled\n");
+            result = std::max(result, DBErrors::NONCRITICAL_ERROR);
+        }
+
+        // This is a separate, new consent domain. No legacy donation option
+        // or settings record is consulted while loading it.
+        QQDevelopmentDonationConsent donation_consent;
+        std::string donation_consent_error;
+        const DBErrors donation_consent_result =
+            ReadQQDevelopmentDonationConsent(donation_consent, &donation_consent_error);
+        if (donation_consent_result != DBErrors::LOAD_OK) {
+            pwallet->WalletLogPrintf("Error reading wallet database: %s\n", donation_consent_error);
+        }
+        result = std::max(result, donation_consent_result);
+        if (!pwallet->LoadQQDevelopmentDonationConsent(donation_consent)) {
+            pwallet->WalletLogPrintf("Error reading wallet database: quantum development donation consent failed runtime validation; donation remains disabled\n");
             result = std::max(result, DBErrors::NONCRITICAL_ERROR);
         }
 

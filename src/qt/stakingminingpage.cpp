@@ -76,9 +76,8 @@ constexpr int OPERATOR_REGISTRY_PUBKEY_HASH_ROLE = Qt::UserRole + 1;
 constexpr int OPERATOR_REGISTRY_SELECTABLE_ROLE = Qt::UserRole + 2;
 constexpr int RECOVERY_SELECTOR_ROLE = Qt::UserRole;
 constexpr int RECOVERY_FINGERPRINT_ROLE = Qt::UserRole + 1;
-const QString DONATION_PERCENT_SETTING = QStringLiteral("StakingMiningDonationPercent");
-const QString DONATION_USER_CONFIGURED_SETTING = QStringLiteral("StakingMiningDonationUserConfigured");
-const QString DONATION_POST_MIGRATION_DEFAULT_SETTING = QStringLiteral("StakingMiningDonationPostMigrationDefaultApplied");
+const QString QQ_DEVELOPMENT_DONATION_PERCENT_SETTING =
+    QStringLiteral("QQDevelopmentDonationPreferredPercent");
 
 struct StakeLockPreset
 {
@@ -639,21 +638,21 @@ void StakingMiningPage::setupUi()
            "<p>Use staking-only unlock for passive legacy staking. Use the quantum unlock when you are actively participating in Gold Rush or setting up quantum/cold-staking features.</p>"),
         stakingBox);
 
-    m_donation_enable = new QCheckBox(tr("Donate a share of staking rewards"), stakingBox);
-    m_donation_enable->setObjectName(QStringLiteral("stakingDonationEnable"));
-    m_donation_enable->setToolTip(tr("When enabled, this wallet contributes the selected percentage of each staking reward to the configured project treasury. Set it to off to opt out."));
+    m_donation_enable = new QCheckBox(tr("Opt in to Quantum Quasar development donations"), stakingBox);
+    m_donation_enable->setObjectName(QStringLiteral("qqDevelopmentDonationEnable"));
+    m_donation_enable->setToolTip(tr("Records fresh wallet-scoped consent for the exact direct quantum recipient displayed below. This is optional wallet policy, not a consensus payment."));
 
     m_donation_percent = new QSpinBox(stakingBox);
-    m_donation_percent->setObjectName(QStringLiteral("stakingDonationPercent"));
-    m_donation_percent->setRange(std::max<unsigned int>(1, wallet::MIN_DONATION_PERCENTAGE), wallet::MAX_DONATION_PERCENTAGE);
+    m_donation_percent->setObjectName(QStringLiteral("qqDevelopmentDonationPercent"));
+    m_donation_percent->setRange(std::max<unsigned int>(1, wallet::MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE), wallet::MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE);
     m_donation_percent->setSuffix(QStringLiteral(" %"));
-    m_donation_percent->setToolTip(tr("Percentage of staking rewards donated when the donation toggle is on."));
+    m_donation_percent->setToolTip(tr("Percentage of eligible staking rewards donated after fresh consent is recorded."));
     QSettings settings;
-    const int saved_donation = settings.value(DONATION_PERCENT_SETTING, int{wallet::DEFAULT_DONATION_SUGGESTED_PERCENTAGE}).toInt();
+    const int saved_donation = settings.value(QQ_DEVELOPMENT_DONATION_PERCENT_SETTING, 1).toInt();
     m_donation_percent->setValue(std::clamp(saved_donation, m_donation_percent->minimum(), m_donation_percent->maximum()));
 
-    m_donation_status = new QLabel(tr("Donations are off"), stakingBox);
-    m_donation_status->setObjectName(QStringLiteral("stakingDonationStatus"));
+    m_donation_status = new QLabel(tr("Quantum Quasar development donations are off"), stakingBox);
+    m_donation_status->setObjectName(QStringLiteral("qqDevelopmentDonationStatus"));
     m_donation_status->setWordWrap(true);
 
     m_optimize_amount = new BitcoinAmountField(stakingBox);
@@ -681,7 +680,7 @@ void StakingMiningPage::setupUi()
     sgrid->addWidget(m_pos_goldrush_status, 8, 0, 1, 3);
     sgrid->addWidget(m_staking_summary, 9, 0, 1, 3);
     sgrid->addWidget(m_donation_enable, 10, 0, 1, 3);
-    sgrid->addWidget(new QLabel(tr("Donation:"), stakingBox), 11, 0);
+    sgrid->addWidget(new QLabel(tr("QQ development donation:"), stakingBox), 11, 0);
     sgrid->addWidget(m_donation_percent, 11, 1);
     sgrid->addWidget(m_donation_status, 12, 0, 1, 3);
     sgrid->addWidget(new QLabel(tr("UTXO size:"), stakingBox), 13, 0);
@@ -2902,62 +2901,38 @@ void StakingMiningPage::onDonationToggled(bool enabled)
 {
     if (m_updating || !m_wallet_model) return;
     QSettings settings;
-    settings.setValue(DONATION_USER_CONFIGURED_SETTING, true);
-    if (enabled) settings.setValue(DONATION_PERCENT_SETTING, m_donation_percent->value());
-    applyDonationPercentage(enabled ? static_cast<unsigned int>(m_donation_percent->value()) : 0);
-    updateStatus();
+    if (enabled) settings.setValue(QQ_DEVELOPMENT_DONATION_PERCENT_SETTING, m_donation_percent->value());
+    if (applyDonationPercentage(enabled ? static_cast<unsigned int>(m_donation_percent->value()) : 0)) {
+        updateStatus();
+    }
 }
 
 void StakingMiningPage::onDonationPercentChanged(int percentage)
 {
     QSettings settings;
-    settings.setValue(DONATION_PERCENT_SETTING, percentage);
-    if (!m_updating && m_donation_percent->hasFocus() && m_donation_enable->isChecked()) {
-        settings.setValue(DONATION_USER_CONFIGURED_SETTING, true);
-    }
+    settings.setValue(QQ_DEVELOPMENT_DONATION_PERCENT_SETTING, percentage);
     if (m_updating || !m_wallet_model || !m_donation_enable->isChecked()) return;
-    applyDonationPercentage(static_cast<unsigned int>(percentage));
-    updateStatus();
+    if (applyDonationPercentage(static_cast<unsigned int>(percentage))) {
+        updateStatus();
+    }
 }
 
-void StakingMiningPage::applyDonationPercentage(unsigned int percentage)
+bool StakingMiningPage::applyDonationPercentage(unsigned int percentage)
 {
-    if (!m_wallet_model) return;
-    percentage = std::min<unsigned int>(percentage, wallet::MAX_DONATION_PERCENTAGE);
-    m_wallet_model->wallet().setDonationPercentage(percentage);
-    if (OptionsModel* options_model = m_wallet_model->getOptionsModel()) {
-        options_model->setOption(OptionsModel::DonationPercentage, qlonglong{percentage});
+    if (!m_wallet_model) return false;
+    percentage = std::min<unsigned int>(percentage, wallet::MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE);
+    interfaces::Wallet& wallet = m_wallet_model->wallet();
+    const std::string recipient = wallet.getQQDevelopmentDonationAddress();
+    std::string error;
+    if (!wallet.setQQDevelopmentDonation(percentage, recipient, error)) {
+        m_donation_status->setText(tr("Could not save the Quantum Quasar development donation choice: %1")
+                                       .arg(QString::fromStdString(error)));
+        QSignalBlocker blocker(m_donation_enable);
+        m_donation_enable->setChecked(wallet.getQQDevelopmentDonationPercentage() > 0);
+        return false;
     }
-    Q_EMIT m_wallet_model->donationPercentageChanged(percentage);
-}
-
-void StakingMiningPage::applyDonationDefaults(bool wallet_migration_complete)
-{
-    if (!m_wallet_model || !m_donation_percent) return;
-
-    QSettings settings;
-    const bool user_configured = settings.value(DONATION_USER_CONFIGURED_SETTING, false).toBool();
-    if (user_configured) return;
-
-    const bool post_default_applied = settings.value(DONATION_POST_MIGRATION_DEFAULT_SETTING, false).toBool();
-    if (wallet_migration_complete) {
-        if (!post_default_applied && !m_donation_percent->hasFocus()) {
-            const unsigned int percentage = wallet::DEFAULT_POST_MIGRATION_DONATION_PERCENTAGE;
-            {
-                QSignalBlocker blocker(m_donation_percent);
-                m_donation_percent->setValue(static_cast<int>(percentage));
-            }
-            settings.setValue(DONATION_PERCENT_SETTING, static_cast<int>(percentage));
-            settings.setValue(DONATION_POST_MIGRATION_DEFAULT_SETTING, true);
-        }
-        return;
-    }
-
-    if (!m_donation_percent->hasFocus()) {
-        QSignalBlocker blocker(m_donation_percent);
-        m_donation_percent->setValue(static_cast<int>(wallet::DEFAULT_DONATION_SUGGESTED_PERCENTAGE));
-    }
-    settings.setValue(DONATION_PERCENT_SETTING, static_cast<int>(wallet::DEFAULT_DONATION_SUGGESTED_PERCENTAGE));
+    Q_EMIT m_wallet_model->qqDevelopmentDonationChanged(percentage);
+    return true;
 }
 
 void StakingMiningPage::refreshDonationControls()
@@ -2965,17 +2940,16 @@ void StakingMiningPage::refreshDonationControls()
     if (!m_wallet_model || !m_donation_enable || !m_donation_percent || !m_donation_status) return;
 
     interfaces::Wallet& w = m_wallet_model->wallet();
-    const unsigned int donation_percentage = w.getDonationPercentage();
+    const unsigned int donation_percentage = w.getQQDevelopmentDonationPercentage();
+    const QString recipient = QString::fromStdString(w.getQQDevelopmentDonationAddress());
     m_donation_enable->setChecked(donation_percentage > 0);
     if (donation_percentage > 0 && !m_donation_percent->hasFocus()) {
         QSignalBlocker blocker(m_donation_percent);
         m_donation_percent->setValue(static_cast<int>(donation_percentage));
     }
     m_donation_status->setText(donation_percentage > 0
-        ? tr("Donating %1% of staking rewards.").arg(donation_percentage)
-        : tr("Staking reward donations are off. Suggested default is %1% before full migration and %2% after migration; manual opt-in is required.")
-              .arg(wallet::DEFAULT_DONATION_SUGGESTED_PERCENTAGE)
-              .arg(wallet::DEFAULT_POST_MIGRATION_DONATION_PERCENTAGE));
+        ? tr("Authorized: %1% of eligible staking rewards to %2").arg(donation_percentage).arg(recipient)
+        : tr("Quantum Quasar development donations are off by default. Fresh consent will be bound to this exact direct quantum recipient: %1").arg(recipient));
 }
 
 void StakingMiningPage::onPowEnableToggled(bool /*enabled*/)
@@ -4521,8 +4495,6 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         goldrush_reward_amount_needing_move = migration.goldrush_reward_amount_needing_move;
         goldrush_reward_outputs_needing_move = migration.goldrush_reward_outputs_needing_move;
         staked_quantum_amount = migration.staked_quantum_amount;
-        const bool wallet_migration_complete = migration.eligible_legacy_inputs == 0;
-        applyDonationDefaults(wallet_migration_complete);
         refreshDonationControls();
         m_coldstake_fund_available = direct_delegation_balance > 0;
         const QString staked_note = migration.staked_quantum_amount > 0
@@ -4990,7 +4962,7 @@ void StakingMiningPage::resetStatusForNoWallet()
     if (m_refresh_hint) m_refresh_hint->setText(tr("Load a wallet to refresh detail panels."));
 
     m_donation_enable->setChecked(false);
-    m_donation_status->setText(tr("Load a wallet to configure staking reward donations."));
+    m_donation_status->setText(tr("Load a wallet to configure the optional Quantum Quasar development donation."));
 
     m_pow_enable->setChecked(false);
     m_pow_unlock_wallet->setChecked(false);

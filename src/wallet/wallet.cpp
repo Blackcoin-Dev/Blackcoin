@@ -1039,6 +1039,11 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
             status = DatabaseStatus::FAILED_LOAD;
             return nullptr;
         }
+        if (!wallet->ApplyQQDevelopmentDonationStartupConsent(*context.args, error)) {
+            error = Untranslated("Wallet loading failed to apply the Quantum Quasar development donation startup choice. ") + error;
+            status = DatabaseStatus::FAILED_LOAD;
+            return nullptr;
+        }
 
         // Legacy wallets are being deprecated, warn if the loaded wallet is legacy
         if (!wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
@@ -1225,6 +1230,11 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
 
     if (!wallet->ApplyShadowPowClaimRecoveryStartupPolicy(*context.args, error)) {
         error = Untranslated("Wallet creation failed to apply the PoW claim recovery startup policy. ") + error;
+        status = DatabaseStatus::FAILED_CREATE;
+        return nullptr;
+    }
+    if (!wallet->ApplyQQDevelopmentDonationStartupConsent(*context.args, error)) {
+        error = Untranslated("Wallet creation failed to apply the Quantum Quasar development donation startup choice. ") + error;
         status = DatabaseStatus::FAILED_CREATE;
         return nullptr;
     }
@@ -3146,6 +3156,138 @@ bool CWallet::ApplyShadowPowClaimRecoveryStartupPolicy(
     return true;
 }
 
+bool CWallet::ApplyQQDevelopmentDonationStartupConsent(
+    const ArgsManager& args, bilingual_str& error)
+{
+    error.clear();
+    const bool percentage_set = args.IsArgSet("-qqdevelopmentdonation");
+    const bool recipient_set = args.IsArgSet("-qqdevelopmentdonationrecipient");
+    if (!percentage_set && !recipient_set) return true;
+
+    const std::vector<std::string> recipients =
+        args.GetArgs("-qqdevelopmentdonationrecipient");
+    if (recipients.size() > 1) {
+        error = Untranslated("-qqdevelopmentdonationrecipient must be specified at most once");
+        return false;
+    }
+    const int64_t percentage = args.GetIntArg(
+        "-qqdevelopmentdonation", DEFAULT_QQ_DEVELOPMENT_DONATION_PERCENTAGE);
+    if (percentage < MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE ||
+        percentage > MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE) {
+        error = Untranslated(strprintf(
+            "-qqdevelopmentdonation must be between %u and %u",
+            MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE,
+            MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE));
+        return false;
+    }
+
+    const std::string expected = Params().GetQQDevelopmentDonationAddress();
+    const std::string recipient = recipients.empty() ? expected : recipients.front();
+    if (recipient != expected) {
+        error = Untranslated(strprintf(
+            "-qqdevelopmentdonationrecipient must exactly match the approved %s recipient %s",
+            Params().GetChainTypeString(), expected));
+        return false;
+    }
+
+    WalletBatch batch(GetDatabase(), /*flush_on_close=*/false);
+    if (batch.HasQQDevelopmentDonationConsent()) {
+        WalletLogPrintf("Ignoring Quantum Quasar development donation startup choice because this wallet already has persisted consent metadata\n");
+        return true;
+    }
+    if (GetQQDevelopmentDonationConsent().choice_recorded != 0) {
+        WalletLogPrintf("Ignoring Quantum Quasar development donation startup choice because this wallet already has an in-memory choice\n");
+        return true;
+    }
+    if (!SetQQDevelopmentDonationConsent(
+            static_cast<unsigned int>(percentage), recipient, error)) {
+        return false;
+    }
+    WalletLogPrintf("Seeded fresh wallet-scoped Quantum Quasar development donation consent (percentage=%d recipient=%s network=%s)\n",
+                    percentage, recipient, Params().GetChainTypeString());
+    return true;
+}
+
+QQDevelopmentDonationConsent CWallet::GetQQDevelopmentDonationConsent() const
+{
+    LOCK(cs_wallet);
+    return m_qq_development_donation_consent;
+}
+
+unsigned int CWallet::GetQQDevelopmentDonationPercentage() const
+{
+    return m_qq_development_donation_effective_percentage.load(
+        std::memory_order_acquire);
+}
+
+bool CWallet::SetQQDevelopmentDonationConsent(
+    unsigned int percentage, const std::string& recipient, bilingual_str& error)
+{
+    LOCK(cs_wallet);
+    error.clear();
+    if (m_qq_development_donation_db_ambiguous) {
+        error = Untranslated("a prior donation-consent database commit had an ambiguous outcome; reload the wallet before changing or relying on donation consent");
+        return false;
+    }
+    if (percentage > MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE) {
+        error = Untranslated(strprintf("percentage must be between %u and %u",
+            MIN_QQ_DEVELOPMENT_DONATION_PERCENTAGE,
+            MAX_QQ_DEVELOPMENT_DONATION_PERCENTAGE));
+        return false;
+    }
+    const std::string expected = Params().GetQQDevelopmentDonationAddress();
+    if (recipient != expected) {
+        error = Untranslated(strprintf(
+            "recipient must exactly match the approved %s Quantum Quasar development address %s",
+            Params().GetChainTypeString(), expected));
+        return false;
+    }
+
+    QQDevelopmentDonationConsent consent;
+    consent.choice_recorded = 1;
+    consent.percentage = percentage;
+    consent.network = Params().GetChainTypeString();
+    consent.recipient = recipient;
+    std::string validation_error;
+    if (!ValidateQQDevelopmentDonationConsent(consent, &validation_error)) {
+        error = Untranslated("invalid quantum development donation consent: " + validation_error);
+        return false;
+    }
+
+    WalletBatch batch(GetDatabase());
+    if (!batch.TxnBegin(/*durable=*/true)) {
+        error = Untranslated("failed to begin durable quantum development donation consent update");
+        return false;
+    }
+    if (!batch.WriteQQDevelopmentDonationConsent(consent)) {
+        if (!batch.TxnAbort()) {
+            m_qq_development_donation_db_ambiguous = true;
+            m_qq_development_donation_effective_percentage.store(0, std::memory_order_release);
+            error = Untranslated("donation consent write and rollback outcomes are ambiguous; donation remains disabled until wallet reload");
+            return false;
+        }
+        error = Untranslated("failed to write quantum development donation consent");
+        return false;
+    }
+    if (!batch.TxnCommit()) {
+        batch.TxnAbort();
+        m_qq_development_donation_db_ambiguous = true;
+        m_qq_development_donation_effective_percentage.store(0, std::memory_order_release);
+        error = Untranslated("donation consent commit outcome is ambiguous; donation remains disabled until wallet reload");
+        return false;
+    }
+    m_qq_development_donation_consent = std::move(consent);
+    m_qq_development_donation_effective_percentage.store(
+        percentage, std::memory_order_release);
+    return true;
+}
+
+bool CWallet::IsQQDevelopmentDonationDatabaseAmbiguous() const
+{
+    LOCK(cs_wallet);
+    return m_qq_development_donation_db_ambiguous;
+}
+
 ShadowPowClaimRecoveryPolicy CWallet::GetShadowPowClaimRecoveryPolicy() const
 {
     LOCK(cs_wallet);
@@ -3187,6 +3329,25 @@ bool CWallet::LoadShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolic
         return false;
     }
     m_shadow_pow_claim_recovery_policy = policy;
+    return true;
+}
+
+bool CWallet::LoadQQDevelopmentDonationConsent(const QQDevelopmentDonationConsent& consent)
+{
+    AssertLockHeld(cs_wallet);
+    m_qq_development_donation_db_ambiguous = false;
+    if (!ValidateQQDevelopmentDonationConsent(consent)) {
+        m_qq_development_donation_consent = DefaultQQDevelopmentDonationConsent();
+        m_qq_development_donation_effective_percentage.store(0, std::memory_order_release);
+        return false;
+    }
+    m_qq_development_donation_consent = consent;
+    const bool effective = consent.HasDonationAuthority() &&
+        consent.network == Params().GetChainTypeString() &&
+        consent.recipient == Params().GetQQDevelopmentDonationAddress() &&
+        IsDirectQuantumMigrationScript(Params().GetQQDevelopmentDonationScript());
+    m_qq_development_donation_effective_percentage.store(
+        effective ? consent.percentage : 0, std::memory_order_release);
     return true;
 }
 
@@ -7528,12 +7689,6 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
 
     std::optional<CAmount> reserve_balance = ParseMoney(gArgs.GetArg("-reservebalance", FormatMoney(DEFAULT_RESERVE_BALANCE)));
     walletInstance->m_reserve_balance = reserve_balance.value_or(DEFAULT_RESERVE_BALANCE);
-
-    const int64_t donation_arg = args.GetIntArg("-donatetodevfund", DEFAULT_DONATION_PERCENTAGE);
-    const unsigned int donation_percentage = donation_arg <= 0
-                                                 ? MIN_DONATION_PERCENTAGE
-                                                 : static_cast<unsigned int>(std::min<int64_t>(donation_arg, MAX_DONATION_PERCENTAGE));
-    walletInstance->m_donation_percentage = donation_percentage;
 
     walletInstance->WalletLogPrintf("Wallet completed loading in %15dms\n", Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
 

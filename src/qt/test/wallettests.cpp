@@ -590,7 +590,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(walletModel.wallet().getEnabledStaking());
     QCOMPARE(staking_thread_count(), size_t{1});
     walletModel.wallet().setEnabledStaking(false);
-    walletModel.wallet().setDonationPercentage(0);
+    std::string donation_error;
+    QVERIFY(walletModel.wallet().setQQDevelopmentDonation(
+        0, walletModel.wallet().getQQDevelopmentDonationAddress(), donation_error));
 
     OverviewPage overview_page(platformStyle);
     overview_page.setClientModel(mini_gui.clientModel.get());
@@ -609,9 +611,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QLabel* staking_status = page.findChild<QLabel*>("stakingStatus");
     QCheckBox* pow_enable = page.findChild<QCheckBox*>("powEnable");
     QCheckBox* pow_unlock_wallet = page.findChild<QCheckBox*>("powUnlockWallet");
-    QCheckBox* donation_enable = page.findChild<QCheckBox*>("stakingDonationEnable");
-    QSpinBox* donation_percent = page.findChild<QSpinBox*>("stakingDonationPercent");
-    QLabel* donation_status = page.findChild<QLabel*>("stakingDonationStatus");
+    QCheckBox* donation_enable = page.findChild<QCheckBox*>("qqDevelopmentDonationEnable");
+    QSpinBox* donation_percent = page.findChild<QSpinBox*>("qqDevelopmentDonationPercent");
+    QLabel* donation_status = page.findChild<QLabel*>("qqDevelopmentDonationStatus");
     QSpinBox* pow_cores = page.findChild<QSpinBox*>("powCores");
     QSpinBox* pow_percent = page.findChild<QSpinBox*>("powPercent");
     QLineEdit* pow_payout = page.findChild<QLineEdit*>("powPayout");
@@ -770,7 +772,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(!pow_unlock_wallet->isEnabled());
     QCOMPARE(staking_status->text(), QString("Staking is off"));
     QCOMPARE(donation_enable->isChecked(), false);
-    QCOMPARE(walletModel.wallet().getDonationPercentage(), 0U);
+    QCOMPARE(walletModel.wallet().getQQDevelopmentDonationPercentage(), 0U);
     QVERIFY(donation_status->text().contains(QString("off")));
     QVERIFY(overview_donations->text().contains(QString("0%")));
     QVERIFY(!migration_phase->text().isEmpty());
@@ -910,18 +912,18 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     donation_percent->setValue(15);
     donation_enable->click();
-    QCOMPARE(walletModel.wallet().getDonationPercentage(), 15U);
+    QCOMPARE(walletModel.wallet().getQQDevelopmentDonationPercentage(), 15U);
     QVERIFY(donation_status->text().contains(QString("15")));
     QCOMPARE(overview_donations->text(), QString("15% of stake rewards"));
 
     donation_percent->setValue(7);
     qApp->processEvents();
-    QCOMPARE(walletModel.wallet().getDonationPercentage(), 7U);
+    QCOMPARE(walletModel.wallet().getQQDevelopmentDonationPercentage(), 7U);
     QVERIFY(donation_status->text().contains(QString("7")));
     QCOMPARE(overview_donations->text(), QString("7% of stake rewards"));
 
     donation_enable->click();
-    QCOMPARE(walletModel.wallet().getDonationPercentage(), 0U);
+    QCOMPARE(walletModel.wallet().getQQDevelopmentDonationPercentage(), 0U);
     QVERIFY(donation_status->text().contains(QString("off")));
     QCOMPARE(overview_donations->text(), QString("0% of stake rewards"));
 
@@ -2076,8 +2078,8 @@ void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, co
 
     QCheckBox* staking_enable = page.findChild<QCheckBox*>("stakingEnable");
     QLabel* staking_status = page.findChild<QLabel*>("stakingStatus");
-    QCheckBox* donation_enable = page.findChild<QCheckBox*>("stakingDonationEnable");
-    QSpinBox* donation_percent = page.findChild<QSpinBox*>("stakingDonationPercent");
+    QCheckBox* donation_enable = page.findChild<QCheckBox*>("qqDevelopmentDonationEnable");
+    QSpinBox* donation_percent = page.findChild<QSpinBox*>("qqDevelopmentDonationPercent");
     QCheckBox* pow_enable = page.findChild<QCheckBox*>("powEnable");
     QLineEdit* pow_payout = page.findChild<QLineEdit*>("powPayout");
     QLabel* pow_status = page.findChild<QLabel*>("powStatus");

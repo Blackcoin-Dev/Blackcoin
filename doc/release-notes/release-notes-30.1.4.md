@@ -33,6 +33,12 @@ default-off fallback for components that cannot safely use zero-payment
 retirement. Preview, persistence, and broadcast authority remain separate and
 all execution paths revalidate the exact plan.
 
+`getpowmininginfo.quarantined_claims` retains its legacy miner-gating meaning,
+so existing supervisors do not stall on history already resolved on the active
+chain. `raw_quarantined_claims` separately reports the complete retained audit
+and reorg history. A nonzero raw count alone neither pauses mining nor
+authorizes a recovery fee.
+
 ## PoS and PoW coexistence
 
 When staking is enabled, PoW claim input selection protects one mature,

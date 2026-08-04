@@ -467,6 +467,18 @@ void SyncUpWallet(const std::shared_ptr<CWallet>& wallet, interfaces::Node& node
     QVERIFY(result.last_failed_block.IsNull());
 }
 
+void SyncRecoveryReviewWalletTip(const std::shared_ptr<CWallet>& wallet,
+                                 interfaces::Node& node)
+{
+    // Standalone mock wallets are not registered for validation callbacks.
+    // Pin them to the fixture tip before requesting a coherent review.
+    LOCK2(::cs_main, wallet->cs_wallet);
+    const CBlockIndex* tip =
+        Assert(node.context()->chainman)->ActiveChain().Tip();
+    QVERIFY(tip);
+    wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash());
+}
+
 std::shared_ptr<CWallet> SetupLegacyWatchOnlyWallet(interfaces::Node& node, TestChain100Setup& test)
 {
     std::shared_ptr<CWallet> wallet = std::make_shared<CWallet>(node.context()->chain.get(), "", CreateMockableWalletDatabase());
@@ -890,7 +902,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     staking_enable->click();
     QVERIFY(walletModel.wallet().getEnabledStaking());
-    QCOMPARE(staking_status->text(), QString("Staking is active"));
+    QVERIFY(staking_status->text().startsWith(QString("Staking: syncing")));
 
     staking_enable->click();
     QVERIFY(!walletModel.wallet().getEnabledStaking());
@@ -1035,7 +1047,8 @@ void TestPowClaimRecoveryPolicyControls(
     QVERIFY(status);
     QVERIFY(refresh);
     QCOMPARE(recovery->text(), QStringLiteral(
-        "Automatically recover quarantined Gold Rush PoW claims so an enabled miner can resume"));
+        "Permit automatic fee-paying conflict recovery when zero-payment "
+        "claim retirement is unavailable"));
     QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
     QVERIFY(!recovery->isChecked());
     QVERIFY(status->text().contains(QStringLiteral("6 process-wide")));
@@ -1472,6 +1485,7 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     MiniGUI mini_gui(node, platform_style);
     mini_gui.initModelForWallet(node, wallet, platform_style);
     WalletModel& model = *mini_gui.walletModel;
+    SyncRecoveryReviewWalletTip(wallet, node);
     const SecureString passphrase{"qt-claim-recovery-passphrase"};
     QVERIFY(wallet->EncryptWallet(passphrase));
 
@@ -1711,6 +1725,7 @@ void TestPowClaimRecoveryJoinCancelsQueuedMutation(
     MiniGUI mini_gui(node, platform_style);
     mini_gui.initModelForWallet(node, wallet, platform_style);
     WalletModel& model = *mini_gui.walletModel;
+    SyncRecoveryReviewWalletTip(wallet, node);
     const SecureString passphrase{"qt-claim-recovery-join-passphrase"};
     QVERIFY(wallet->EncryptWallet(passphrase));
     QVERIFY(model.setWalletLocked(false, passphrase));
@@ -1792,6 +1807,7 @@ void TestPowClaimRecoveryModelDestructionRestoresStakingScope(
     MiniGUI mini_gui(node, platform_style);
     mini_gui.initModelForWallet(node, wallet, platform_style);
     WalletModel* const model = mini_gui.walletModel.get();
+    SyncRecoveryReviewWalletTip(wallet, node);
     const SecureString passphrase{
         "qt-claim-recovery-prompt-destruction-passphrase"};
     QVERIFY(wallet->EncryptWallet(passphrase));

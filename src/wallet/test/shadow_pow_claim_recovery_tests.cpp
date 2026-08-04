@@ -2579,7 +2579,8 @@ BOOST_FIXTURE_TEST_CASE(
                          origin_parent->nHeight,
                          origin_parent->GetBlockHash());
 
-    BOOST_CHECK(wallet->IsSpent(anchor));
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet,
+                          return wallet->IsSpent(anchor)));
     BOOST_CHECK_EQUAL(wallet->RetireExpiredShadowPowClaims(), 0U);
 
     CBlock expiry_block;

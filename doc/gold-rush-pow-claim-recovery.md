@@ -33,6 +33,11 @@ or indeterminate components, current anchors, and pending or confirmed
 resolutions. Resolved descendants remain in wallet history for audit and reorg
 safety, but do not independently create another recovery action.
 
+For compatibility with existing mining supervisors, `getpowmininginfo` keeps
+`quarantined_claims` as the count that blocks claim creation. The complete
+audit count is reported separately as `raw_quarantined_claims`; resolved
+active-chain history can make that raw count nonzero without pausing PoW.
+
 The built-in miner pauses while a quarantined component is actionable or cannot
 be classified safely. It does not consume another fee input merely because a
 different input is available. When all blocking components resolve, a miner

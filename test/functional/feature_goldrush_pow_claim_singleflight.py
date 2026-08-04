@@ -136,7 +136,8 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
     @staticmethod
     def _assert_claim_inventory(wallet, raw, actionable, resolved, indeterminate, components=None):
         info = wallet.getpowmininginfo()
-        assert_equal(info["quarantined_claims"], raw)
+        assert_equal(info["quarantined_claims"], actionable + indeterminate)
+        assert_equal(info["raw_quarantined_claims"], raw)
         assert_equal(info["blocking_quarantined_claims"], actionable + indeterminate)
         assert_equal(info["actionable_quarantined_claims"], actionable)
         assert_equal(info["resolved_on_active_chain_claims"], resolved)

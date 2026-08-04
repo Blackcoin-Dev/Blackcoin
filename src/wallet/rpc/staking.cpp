@@ -3905,7 +3905,8 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "claims_submitted", "Claims submitted by this miner since it started."},
             {RPCResult::Type::NUM, "unresolved_claims", "Unconfirmed wallet QQSPROOF transactions, whether live or quarantined."},
             {RPCResult::Type::NUM, "live_claims", "Unconfirmed wallet QQSPROOF transactions currently in the local mempool."},
-            {RPCResult::Type::NUM, "quarantined_claims", "All wallet-authored unconfirmed QQSPROOF objects absent from the local mempool, including history already resolved on the active chain (compatibility field)."},
+            {RPCResult::Type::NUM, "quarantined_claims", "Backward-compatible count of quarantined claim objects that currently gate claim creation (same as blocking_quarantined_claims)."},
+            {RPCResult::Type::NUM, "raw_quarantined_claims", "All wallet-authored unconfirmed QQSPROOF objects absent from the local mempool, including history already resolved on the active chain."},
             {RPCResult::Type::NUM, "blocking_quarantined_claims", "Quarantined claim objects that currently gate claim creation (actionable plus indeterminate)."},
             {RPCResult::Type::NUM, "actionable_quarantined_claims", "Quarantined objects whose confirmed anchor remains unspent on the active chain."},
             {RPCResult::Type::NUM, "resolved_on_active_chain_claims", "Historical quarantined objects whose confirmed anchor is already spent on the active chain; retained for reorg safety but not miner-gating."},
@@ -3970,7 +3971,8 @@ static RPCHelpMan getpowmininginfo()
             recovery_policy.rolling_fee_window_seconds);
         stake_reserve = pwallet->GetShadowPowClaimStakeReserveInfoLocked();
     }
-    obj.pushKV("quarantined_claims", static_cast<uint64_t>(claim_inventory.raw_quarantined_claims));
+    obj.pushKV("quarantined_claims", static_cast<uint64_t>(claim_inventory.BlockingClaims()));
+    obj.pushKV("raw_quarantined_claims", static_cast<uint64_t>(claim_inventory.raw_quarantined_claims));
     obj.pushKV("blocking_quarantined_claims", static_cast<uint64_t>(claim_inventory.BlockingClaims()));
     obj.pushKV("actionable_quarantined_claims", static_cast<uint64_t>(claim_inventory.actionable_claims));
     obj.pushKV("resolved_on_active_chain_claims", static_cast<uint64_t>(claim_inventory.resolved_on_active_chain_claims));

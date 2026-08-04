@@ -72,6 +72,12 @@ recovery fee. That durable retirement is reversed and reclassified if its
 observation block leaves the active chain. Fee-paying conflict recovery remains
 an explicit, default-off fallback for components that cannot use this path.
 
+`getpowmininginfo.quarantined_claims` retains its legacy miner-gating meaning
+so existing supervisors continue to start PoW when all historical components
+are resolved. The new `raw_quarantined_claims` field exposes retained audit and
+reorg history separately; a nonzero raw count alone never authorizes a fee or
+pauses mining.
+
 A chainstate that already carries the authenticated Quantum Quasar schema-12
 replay marker for its exact active tip starts normally on v30.1.4. Upgrading
 from a compatible v30.1.x release does not trigger another Gold Rush rewind or

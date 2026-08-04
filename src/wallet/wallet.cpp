@@ -9482,15 +9482,21 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
             fs::remove(dir);
         }
 
-        // Restore the backup
+        // RestoreWallet writes its own diagnostic through the error reference,
+        // including clearing it on success. Preserve the migration failure
+        // before cleanup so a successful restore cannot erase the reason the
+        // RPC failed.
+        const bilingual_str migration_error = error;
+        bilingual_str restore_error;
         DatabaseStatus status;
         std::vector<bilingual_str> warnings;
-        if (!RestoreWallet(context, backup_path, wallet_name, /*load_on_start=*/std::nullopt, status, error, warnings)) {
-            error += _("\nUnable to restore backup of wallet.");
-            return util::Error{error};
+        if (!RestoreWallet(context, backup_path, wallet_name, /*load_on_start=*/std::nullopt, status, restore_error, warnings)) {
+            return util::Error{
+                migration_error + _("\nUnable to restore backup of wallet: ") +
+                restore_error};
         }
 
-        return util::Error{error};
+        return util::Error{migration_error};
     }
     return res;
 }

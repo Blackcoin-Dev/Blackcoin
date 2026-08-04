@@ -191,6 +191,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "adoptshadowpowclaimcomponent", 3, "acknowledge_provenance_and_conflict_risk" },
     { "getpowclaimrecoveryinfo", 0, "verbose" },
     { "setpowclaimrecovery", 1, "options" },
+    { "setqqdevelopmentdonation", 0, "percentage" },
     { "getnewquantumstakeaddress", 1, "unbonding_blocks" },
     { "getnewquantumcoldstakingaddress", 2, "options" },
     { "submitquantumpoolclaim", 1, "delegations" },

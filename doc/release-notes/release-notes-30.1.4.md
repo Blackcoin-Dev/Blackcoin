@@ -57,6 +57,14 @@ confirmation, solve, target, and payout data; and retains per-wallet history.
 New signals persist `manual` or `automatic` provenance. Older records without
 durable provenance report `unknown`.
 
+## Wallet and CLI reliability
+
+`setqqdevelopmentdonation` now parses its percentage consistently in the CLI
+and RPC named-argument paths. Failed legacy-wallet migration also preserves
+the original database-creation diagnostic after a successful automatic backup
+restore, instead of returning an empty error message. The original wallet and
+its migration backup remain intact.
+
 ## Upgrade and rollback
 
 A datadir whose exact active tip already has authenticated Quantum Quasar

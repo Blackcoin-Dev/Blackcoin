@@ -99,6 +99,22 @@ bool ParsePositiveMetadataTime(const mapValue_t& values, const char* key,
     return true;
 }
 
+bool HasActiveBranchObservation(const mapValue_t& values,
+                                const char* height_key,
+                                const char* tip_key,
+                                const CChain& active_chain)
+{
+    int height{-1};
+    uint256 block_hash;
+    if (!ParseMetadataHeight(values, height_key, height) ||
+        !ParseMetadataHash(values, tip_key, block_hash) ||
+        height > active_chain.Height()) {
+        return false;
+    }
+    const CBlockIndex* observed = active_chain[height];
+    return observed && observed->GetBlockHash() == block_hash;
+}
+
 ShadowPowClaimRecoveryProvenance ClaimProvenance(
     const CWalletTx& wtx, ShadowPowClaimRecoveryNode& node,
     const uint256* generation_fingerprint = nullptr)
@@ -175,6 +191,8 @@ uint256 FingerprintComponent(const uint256& active_tip,
     hasher << component.has_legacy_resolution;
     hasher << component.has_live_resolution;
     hasher << component.all_claims_terminal_on_pinned_tip;
+    hasher << component.all_claims_zero_payment_retirable;
+    hasher << component.all_claims_expired_locally_retired;
     hasher << component.has_branch_relative_ineligibility;
     hasher << static_cast<uint64_t>(component.descendant_claims);
     hasher << component.minimum_stale_depth;
@@ -190,6 +208,7 @@ uint256 FingerprintComponent(const uint256& active_tip,
         hasher << node.in_mempool;
         hasher << node.abandoned;
         hasher << node.quarantined;
+        hasher << node.expired_locally_retired;
         hasher << node.expected_shape;
         hasher << node.wallet_authored;
         hasher << node.created_height;
@@ -562,6 +581,8 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         }
 
         bool all_claims_terminal{true};
+        bool all_claims_zero_payment_retirable{true};
+        bool all_claims_expired_locally_retired{true};
         bool have_claim{false};
         bool all_stale_depth_known{true};
         int minimum_stale_depth = std::numeric_limits<int>::max();
@@ -582,6 +603,15 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                 node.wallet_authored = GetDebit(tx, ISMINE_SPENDABLE) > 0;
                 node.quarantined = MetadataFlag(
                     wtx.mapValue, SHADOW_POW_QUARANTINE_MARKER_KEY);
+                node.expired_locally_retired = node.abandoned &&
+                    MetadataFlag(
+                        wtx.mapValue,
+                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY) &&
+                    HasActiveBranchObservation(
+                        wtx.mapValue,
+                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY,
+                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY,
+                        active_chain);
                 node.expected_shape = tx.vin.size() == 1 &&
                                       !tx.vin.front().prevout.IsNull() &&
                                       !tx.IsCoinBase() && !tx.IsCoinStake();
@@ -663,6 +693,19 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                 const bool typed_terminal =
                     IsShadowPowClaimCurrentBranchTerminal(node.disposition);
                 if (!typed_terminal) all_claims_terminal = false;
+                const bool zero_payment_retirable =
+                    node.provenance ==
+                        ShadowPowClaimRecoveryProvenance::EXPLICIT_AUTHORED &&
+                    node.wallet_authored && node.expected_shape &&
+                    node.quarantined && !node.in_mempool &&
+                    node.disposition ==
+                        ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED;
+                if (!zero_payment_retirable) {
+                    all_claims_zero_payment_retirable = false;
+                }
+                if (!node.expired_locally_retired) {
+                    all_claims_expired_locally_retired = false;
+                }
 
                 if (node.in_mempool ||
                     node.disposition == ShadowPowClaimMempoolDisposition::ELIGIBLE) {
@@ -764,6 +807,10 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
 
         component.all_claims_terminal_on_pinned_tip =
             have_claim && all_claims_terminal;
+        component.all_claims_zero_payment_retirable =
+            have_claim && all_claims_zero_payment_retirable;
+        component.all_claims_expired_locally_retired =
+            have_claim && all_claims_expired_locally_retired;
         component.stale_depth_known = have_claim && all_stale_depth_known;
         component.minimum_stale_depth = component.stale_depth_known
                                             ? minimum_stale_depth
@@ -785,6 +832,12 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         } else if (!component.resolution_txids.empty()) {
             component.state = ShadowPowClaimRecoveryState::RESOLUTION_PENDING;
             ++inventory.blocking_components;
+        } else if (component.all_claims_zero_payment_retirable &&
+                   component.all_claims_expired_locally_retired) {
+            component.state =
+                ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH;
+            inventory.retired_claim_objects += component.claim_txids.size();
+            ++inventory.retired_components;
         } else if (component.all_claims_terminal_on_pinned_tip) {
             component.state = component.has_branch_relative_ineligibility
                                   ? ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE
@@ -1049,6 +1102,17 @@ bool SafeClaimGraphForRecovery(
         reason = message;
         return false;
     };
+    if (component.state ==
+        ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH) {
+        return refuse(
+            "claim-expired-locally-retired",
+            "the origin-bound claim is already retired locally without a recovery transaction on this active branch");
+    }
+    if (component.all_claims_zero_payment_retirable) {
+        return refuse(
+            "zero-payment-retirement-pending",
+            "the origin-bound claim qualifies for durable local retirement without a recovery transaction; fee-paying recovery is refused while Core retries that zero-payment operation");
+    }
     if (!component.anchor_authenticated || component.anchor.IsNull() ||
         component.generation_fingerprint.IsNull()) {
         return refuse("anchor-not-authenticated",
@@ -1821,6 +1885,89 @@ ShadowPowClaimRecoveryUsage CWallet::GetShadowPowClaimRecoveryUsage(
         rolling_window_seconds);
 }
 
+ShadowPowClaimRecoveryReview CWallet::GetShadowPowClaimRecoveryReview(
+    const ShadowPowClaimRecoveryRequest& request) const
+{
+    ShadowPowClaimRecoveryReview review;
+    if (!HaveChain()) {
+        review.reason_code = "chain-unavailable";
+        review.detail = "wallet has no chain interface";
+        return review;
+    }
+
+    LOCK2(::cs_main, cs_wallet);
+    const ShadowPowClaimRecoveryPolicyMutationResult policy_state =
+        GetShadowPowClaimRecoveryPolicyState();
+    review.policy = policy_state.authoritative_state_available
+        ? policy_state.authoritative_policy
+        : DefaultShadowPowClaimRecoveryPolicy();
+
+    ShadowPowClaimRecoveryRequest effective = request;
+    const ShadowPowClaimRecoveryPolicy* automatic_policy{nullptr};
+    if (effective.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC &&
+        policy_state.authoritative_state_available) {
+        effective.max_fee_per_resolution =
+            review.policy.max_fee_per_resolution;
+        effective.aggregate_batch_fee_cap =
+            review.policy.aggregate_batch_fee_cap;
+        automatic_policy = &review.policy;
+    }
+
+    review.inventory = GetShadowPowClaimRecoveryInventoryLocked();
+    review.plan = BuildRecoveryPlanLocked(
+        *this, effective, automatic_policy);
+    review.usage = BuildRecoveryUsageLocked(
+        *this, review.inventory,
+        review.policy.rolling_fee_window_seconds);
+    review.active_tip = review.inventory.active_tip;
+    review.active_height = review.inventory.active_height;
+    review.wallet_generation = review.inventory.wallet_generation;
+    const std::optional<int> wallet_height = GetLastBlockHeightIfSet();
+    if (wallet_height) {
+        review.wallet_height = *wallet_height;
+        review.wallet_tip = GetLastBlockHash();
+    }
+
+    review.consistent = policy_state.authoritative_state_available &&
+        review.inventory.wallet_tip_matches &&
+        !review.active_tip.IsNull() &&
+        review.active_tip == review.plan.active_tip &&
+        review.active_height == review.plan.active_height &&
+        review.wallet_generation == review.plan.wallet_generation &&
+        review.plan.wallet_tip_matches;
+    if (!policy_state.authoritative_state_available) {
+        review.status =
+            ShadowPowClaimRecoveryReviewStatus::POLICY_UNAVAILABLE;
+        review.reason_code = "policy-unavailable";
+        review.detail = policy_state.detail.empty()
+            ? "recovery policy authority is unavailable; reload the wallet"
+            : policy_state.detail;
+    } else if (review.active_tip.IsNull()) {
+        review.status =
+            ShadowPowClaimRecoveryReviewStatus::CHAIN_UNAVAILABLE;
+        review.reason_code = "chain-unavailable";
+        review.detail = "active chain tip is unavailable";
+    } else if (!review.inventory.wallet_tip_matches) {
+        review.status =
+            ShadowPowClaimRecoveryReviewStatus::WALLET_TIP_STALE;
+        review.reason_code = "wallet-tip-stale";
+        review.detail =
+            "wallet-processed tip does not match the active chain tip";
+    } else if (!review.consistent) {
+        review.status =
+            ShadowPowClaimRecoveryReviewStatus::WALLET_TIP_STALE;
+        review.reason_code = "snapshot-inconsistent";
+        review.detail =
+            "recovery inventory and plan did not bind to one snapshot";
+    } else {
+        review.status = ShadowPowClaimRecoveryReviewStatus::AVAILABLE;
+        review.available = true;
+        review.reason_code = "available";
+        review.detail = "recovery review is one coherent read-only snapshot";
+    }
+    return review;
+}
+
 ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
     const ShadowPowClaimRecoveryRequest& request)
 {
@@ -1946,6 +2093,8 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
             result.error = "tip or wallet generation changed before recovery signing";
             return result;
         }
+        const unsigned int script_verify_flags =
+            GetNextBlockPolicyScriptFlags(tip, chain().chainman());
 
         struct Prepared {
             size_t action_index{0};
@@ -1982,7 +2131,8 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
             if (newly_signed) {
                 CMutableTransaction mutable_tx{*action.transaction};
                 std::map<int, bilingual_str> input_errors;
-                if (!SignTransaction(mutable_tx, input_errors)) {
+                if (!SignTransactionWithScriptVerifyFlags(
+                        mutable_tx, input_errors, script_verify_flags)) {
                     result.error = input_errors.empty()
                                        ? "failed to sign recovery transaction"
                                        : "failed to sign recovery transaction: " +

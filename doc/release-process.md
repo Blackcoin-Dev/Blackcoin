@@ -1,11 +1,62 @@
 # Blackcoin Core release process
 
-This is the release runbook for Blackcoin Core v30.1.3. A successful local
+This is the release runbook for Blackcoin Core v30.1.4. A successful local
 build is not release authorization. Production publication is allowed only for
 the exact commit that satisfies the mandatory safety gate and the controls
 below.
 
-## v30.1.3 signed corrective supersession
+## v30.1.4 signed maintenance release
+
+v30.1.4 changes wallet, staking, mining-policy, telemetry, GUI, RPC, and test
+code. It therefore cannot inherit the v30.1.3 corrective-release evidence or
+use the corrective fast path. The exact v30.1.4 source must pass the complete
+current-SHA unit, lint, functional, extended, sanitizer, fuzz,
+interoperability, native-platform, resource, package, and two-builder
+reproducibility gates before publication.
+
+The exact source commit and annotated `v30.1.4` tag must both be SSH-signed by
+Blackcoin-Dev with the allowlisted key and verified by GitHub. The protected
+`production-release` acknowledgement is exactly `V30.1.4`. The signatures
+authenticate the Git objects; they do not code-sign the packages. Windows
+packages remain without Authenticode signatures. macOS applications retain
+identity-free ad-hoc signatures and are not Developer-ID signed or notarized.
+
+Publication begins only when the release commit is reviewed, every required
+check is green, the protected environment value has been updated, immutable
+GitHub releases are enabled, and the signed annotated tag is pushed. The tag
+workflow builds two isolated copies of every platform package, requires
+byte-for-byte equality, assembles checksums, SBOM and provenance, creates GitHub
+attestations, and publishes one immutable release.
+
+The v30.1.4 execution order is:
+
+1. Create the exact final source commit with the release-team identity and the
+   allowlisted SSH key. Push it to the review branch without creating the final
+   tag.
+2. Require the complete current-SHA pull-request gate. Download its native
+   Linux x86-64 candidate only from that run and verify the embedded source
+   identity.
+3. Back up one canary wallet and its complete datadir. Stop that canary
+   cleanly, install the exact candidate, and prove wallet names, existing
+   legacy and quantum keys, transaction history, configuration, block paths,
+   active tip, P2P, PoS, PoW, clean restart, and rollback preservation. Do not
+   create a replacement wallet, address, key, or payout destination.
+4. Fast-forward the default branch to the same reviewed, signed commit. Do not
+   recreate or squash the commit, because the final tag and canary must remain
+   bound to the same Git object.
+5. Confirm repository immutable releases, tag protection, and the exact
+   protected `V30.1.4` acknowledgement. Create and verify the annotated,
+   SSH-signed `v30.1.4` tag, then push it once.
+6. Treat any failed production job as a release blocker. Publication is
+   complete only after every exact-tag gate, both builders, reproducibility,
+   package verification, attestations, and immutable release publication
+   succeed and the published checksums verify.
+
+The remaining version-specific sections are historical controls. They do not
+authorize v30.1.4 to inherit tests, use unsigned source objects, or skip the
+canary and duplicate-build requirements above.
+
+## v30.1.3 signed corrective history
 
 The `v30.1.2` production attempt stopped during the release-tool gate before
 package assembly or publication. Two tests changed tracked fixture files but
@@ -58,7 +109,7 @@ If any corrective-scope, fresh-build, provenance, reproducibility, assembly,
 attestation, protected-tag, or immutable-publication check fails, publication
 stops. The next roadmap release returns to the complete current-SHA gate.
 
-## Release classes
+## Historical v30.1.1 release classes
 
 ### Unsigned alpha canary
 
@@ -415,7 +466,7 @@ acknowledgement, a platform unsigned-status mismatch, a draft-release upload
 failure, and a post-publication defect. Confirm that no rehearsal can overwrite
 a tag or published asset.
 
-## Production completion record
+## Historical v30.1.1 production completion record
 
 The release record must contain:
 

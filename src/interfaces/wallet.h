@@ -325,6 +325,10 @@ public:
     //! Get wallet enabled for staking
     virtual bool getEnabledStaking() = 0;
 
+    //! Read one coherent wallet-scoped PoS worker snapshot. This does not
+    //! infer liveness from the timing-dependent last search interval.
+    virtual WalletStakingInfo getStakingInfo() = 0;
+
     //! Configure the built-in (in-process) Gold Rush PoW miner. No external miner is used.
     //! @param enabled  start/stop in-process PoW mining
     //! @param threads  worker threads / CPU cores (>=1)
@@ -685,6 +689,14 @@ struct WalletPowMiningInfo
     bool wallet_active_signal{false}; //!< wallet has an active QQSIGNAL entry
     int wallet_blocks_until_solver_expiry{0}; //!< max recent-solver expiry across wallet-owned whitelisted scripts
     bool payout_address_available{true}; //!< false when the wallet lock is busy and the cached address was not read
+    bool stake_reserve_available{false}; //!< one chain/wallet snapshot was acquired
+    int configured_stake_reserve_coins{0};
+    int mature_stakeable_legacy_coins{0};
+    CAmount mature_stakeable_legacy_weight{0};
+    int reserved_stake_coins{0};
+    CAmount reserved_stake_weight{0};
+    int claim_coins_after_stake_reserve{0};
+    bool last_stake_coin_guard{false};
 };
 
 //! Explicit wallet-scoped choice for automated Gold Rush PoW claim recovery.
@@ -773,6 +785,7 @@ enum class WalletPowClaimRecoveryState : uint8_t {
     INDETERMINATE,
     CURRENT_BRANCH_INELIGIBLE,
     TERMINAL_ON_PINNED_TIP,
+    RETIRED_ON_ACTIVE_BRANCH,
     RESOLUTION_PENDING,
     RESOLVED_ON_ACTIVE_CHAIN,
 };
@@ -821,6 +834,7 @@ struct WalletPowClaimRecoveryNode
     bool in_mempool{false};
     bool quarantined{false};
     bool abandoned{false};
+    bool expired_locally_retired{false};
     bool expected_shape{false};
     bool wallet_authored{false};
     int created_height{-1};
@@ -847,6 +861,8 @@ struct WalletPowClaimRecoveryComponent
     bool anchor_authenticated{false};
     bool anchor_unspent{false};
     bool all_claims_explicitly_provenanced{false};
+    bool all_claims_zero_payment_retirable{false};
+    bool all_claims_expired_locally_retired{false};
     bool has_revalidating_unbound_proof{false};
     size_t descendant_claims{0};
     int minimum_stale_depth{0};
@@ -904,8 +920,7 @@ struct WalletPowClaimRecoveryUsage
     size_t recycled_outputs{0};
 };
 
-//! One immutable review snapshot. `consistent` is false if the chain or
-//! wallet generation changed between the Core inventory and preview calls.
+//! One immutable review snapshot assembled under one Core chain/wallet lock.
 struct WalletPowClaimRecoveryReview
 {
     std::string active_tip;
@@ -913,10 +928,15 @@ struct WalletPowClaimRecoveryReview
     uint64_t wallet_generation{0};
     bool wallet_tip_matches{false};
     bool consistent{false};
+    bool policy_available{false};
+    WalletPowClaimRecoveryPolicy policy;
+    std::string reason_code;
     size_t raw_claim_objects{0};
     size_t live_claim_objects{0};
     size_t quarantined_claim_objects{0};
     size_t blocking_components{0};
+    size_t retired_claim_objects{0};
+    size_t retired_components{0};
     size_t resolved_components{0};
     std::vector<WalletPowClaimRecoveryComponent> components;
     std::vector<std::string> unanchored_claim_txids;

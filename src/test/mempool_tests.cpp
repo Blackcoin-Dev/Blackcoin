@@ -7,6 +7,7 @@
 
 #include <common/system.h>
 #include <policy/policy.h>
+#include <shadow.h>
 #include <test/util/txmempool.h>
 #include <txmempool.h>
 #include <util/time.h>
@@ -117,6 +118,49 @@ BOOST_AUTO_TEST_CASE(MempoolRemoveTest)
     testPool.removeRecursive(CTransaction(txParent), REMOVAL_REASON_DUMMY);
     BOOST_CHECK_EQUAL(testPool.size(), poolSize - 6);
     BOOST_CHECK_EQUAL(testPool.size(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_expiry_is_selective)
+{
+    using namespace std::chrono_literals;
+
+    CTxMemPool& pool = *Assert(m_node.mempool);
+    LOCK2(::cs_main, pool.cs);
+    TestMemPoolEntryHelper entry;
+
+    CMutableTransaction ordinary_old;
+    ordinary_old.vin.emplace_back(COutPoint{uint256{1}, 0});
+    ordinary_old.vout.emplace_back(1000, CScript{} << OP_TRUE);
+
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '2'});
+    CMutableTransaction claim_old;
+    claim_old.vin.emplace_back(COutPoint{uint256{2}, 0});
+    claim_old.vout.emplace_back(1000, CScript{} << OP_TRUE);
+    claim_old.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    BOOST_REQUIRE(TransactionHasShadowProof(CTransaction{claim_old}));
+
+    CMutableTransaction claim_child;
+    claim_child.vin.emplace_back(COutPoint{claim_old.GetHash(), 0});
+    claim_child.vout.emplace_back(500, CScript{} << OP_TRUE);
+
+    CMutableTransaction claim_fresh{claim_old};
+    claim_fresh.vin.front().prevout.hash = uint256{3};
+
+    pool.addUnchecked(entry.Time(NodeSeconds{1s}).FromTx(ordinary_old));
+    pool.addUnchecked(entry.Time(NodeSeconds{1s}).FromTx(claim_old));
+    pool.addUnchecked(entry.Time(NodeSeconds{1s}).FromTx(claim_child));
+    pool.addUnchecked(entry.Time(NodeSeconds{3600s}).FromTx(claim_fresh));
+
+    const int removed = pool.ExpireMatching(
+        3600s,
+        [](const CTransaction& tx) { return TransactionHasShadowProof(tx); },
+        MemPoolRemovalReason::SHADOW_TIMEOUT);
+    BOOST_CHECK_EQUAL(removed, 2);
+    BOOST_CHECK(pool.exists(GenTxid::Txid(ordinary_old.GetHash())));
+    BOOST_CHECK(!pool.exists(GenTxid::Txid(claim_old.GetHash())));
+    BOOST_CHECK(!pool.exists(GenTxid::Txid(claim_child.GetHash())));
+    BOOST_CHECK(pool.exists(GenTxid::Txid(claim_fresh.GetHash())));
 }
 
 template <typename name>

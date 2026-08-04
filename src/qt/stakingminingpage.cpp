@@ -125,6 +125,7 @@ QString recoveryStateText(interfaces::WalletPowClaimRecoveryState state)
     case State::INDETERMINATE: return QObject::tr("Indeterminate — no action");
     case State::CURRENT_BRANCH_INELIGIBLE: return QObject::tr("Ineligible on current branch");
     case State::TERMINAL_ON_PINNED_TIP: return QObject::tr("Terminal on reviewed tip");
+    case State::RETIRED_ON_ACTIVE_BRANCH: return QObject::tr("Expired; retired without payment");
     case State::RESOLUTION_PENDING: return QObject::tr("Resolution pending");
     case State::RESOLVED_ON_ACTIVE_CHAIN: return QObject::tr("Resolved on active chain");
     }
@@ -708,11 +709,12 @@ void StakingMiningPage::setupUi()
     m_allow_auto_key_creation = new QCheckBox(tr("Allow background creation of new non-HD quantum keys"), automationBox);
     m_allow_auto_key_creation->setObjectName(QStringLiteral("automationAllowNewKeys"));
     m_auto_claim_recovery = new QCheckBox(
-        tr("Automatically recover quarantined Gold Rush PoW claims so an enabled miner can resume"),
+        tr("Permit automatic fee-paying conflict recovery when zero-payment claim retirement is unavailable"),
         automationBox);
     m_auto_claim_recovery->setObjectName(QStringLiteral("automationClaimRecovery"));
     m_auto_claim_recovery->setToolTip(tr(
-        "Wallet-scoped standing consent with explicit fee, rate, and staleness limits. "
+        "Newly authored origin-bound claims retire without a second transaction after their full eligibility window. "
+        "This wallet-scoped standing consent is only for remaining conflict cases and has explicit fee, rate, and staleness limits. "
         "Recovery can only unblock an already-enabled miner; it never unlocks this wallet "
         "and never enables or starts a miner that is off."));
     m_automation_status = new QLabel(automationBox);
@@ -1431,8 +1433,9 @@ bool StakingMiningPage::confirmAutomaticClaimRecoveryPolicy(
     wallet_identity->setWordWrap(true);
     root->addWidget(wallet_identity);
     auto* explanation = new QLabel(tr(
+        "Newly authored origin-bound claims normally retire without a second transaction or recovery fee after their full block-height eligibility window. "
         "Automatic recovery may create, persist, and broadcast fee-paying on-chain conflicts "
-        "for this wallet only after Core classifies the claim component as recoverable on a "
+        "only for remaining components after Core classifies the claim component as recoverable on a "
         "pinned active-chain tip and every configured staleness, rate, and fee limit passes. "
         "A legacy QQP2 unbound proof may become eligible again at a later height; for that "
         "component, either the original claim or the conflicting recovery may confirm. The "
@@ -1594,7 +1597,9 @@ bool StakingMiningPage::chooseInitialPowClaimRecoveryPolicy(
     root->addWidget(wallet_identity);
     auto* explanation = new QLabel(tr(
         "A Gold Rush PoW claim can leave the local mempool while another peer may still retain it. "
-        "The wallet then pauses new claims and keeps the input reserved until the conflict is safely resolved.\n\n"
+        "The wallet then pauses new claims and keeps the input reserved. A newly authored, origin-bound "
+        "claim is retired without a second transaction or recovery fee only after its full block-height "
+        "eligibility window expires on the active branch.\n\n"
         "A legacy QQP2 unbound proof may become eligible again at a later height. If recovery is "
         "authorized for that claim, either the original claim or the conflicting recovery may confirm.\n\n"
         "Choose the wallet-scoped behavior now. Automatic recovery requires separate fee, rate, and "
@@ -1607,7 +1612,7 @@ bool StakingMiningPage::chooseInitialPowClaimRecoveryPolicy(
 
     auto* buttons = new QDialogButtonBox(&dialog);
     auto* automatic = buttons->addButton(
-        tr("Configure automatic recovery (recommended)"), QDialogButtonBox::ActionRole);
+        tr("Configure fee-paying fallback"), QDialogButtonBox::ActionRole);
     automatic->setObjectName(QStringLiteral("powClaimRecoveryInitialAutomatic"));
     auto* pause = buttons->addButton(
         tr("Pause and ask"), QDialogButtonBox::ActionRole);
@@ -1692,7 +1697,8 @@ void StakingMiningPage::onPowClaimRecoveryReview()
     auto* layout = new QVBoxLayout(dialog);
     auto* explanation = new QLabel(
         tr("This screen asks Core for a read-only, active-tip-pinned view of every wallet-known claim component. "
-           "Wait is the safe default. A recovery spends each confirmed anchor back to the same wallet script, pays the displayed transaction fee, and conflicts with the claims in that anchor generation. "
+           "Wait is the safe default. Core retires eligible locally authored origin-bound claims without a second transaction or recovery fee after their complete block-height window expires. "
+           "For components that cannot use that path, an explicitly authorized conflict recovery spends each confirmed anchor back to the same wallet script, pays the displayed transaction fee, and conflicts with the claims in that anchor generation. "
            "A legacy QQP2 unbound proof may become eligible again at a later height; if the displayed plan includes one, either the original claim or the conflicting recovery may confirm. "
            "Opening or refreshing this screen never unlocks the wallet, signs, broadcasts, changes mining, or grants automatic authority."),
         dialog);
@@ -1887,8 +1893,9 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
         contains_unbound_legacy_proof);
     m_pow_recovery_summary->setText(
         tr("Wallet: %1 | active height: %2 | tip: %3 | plan: %4\n"
-           "%5 claim object(s), %6 live, %7 quarantined; %8 blocking component(s), %9 resolved. "
-           "Persisted recovery facts: %10 manual pending, %11 automatic pending, %12 recycled output(s), %13 total confirmed fees.")
+           "%5 claim object(s), %6 live, %7 quarantined; %8 blocking component(s), %9 retired without payment, %10 resolved. "
+           "Persisted recovery facts: %11 manual pending, %12 automatic pending, %13 recycled output(s), %14 total confirmed fees. "
+           "Snapshot policy: %15; minimum stale depth %16 block(s).")
             .arg(QString::fromStdString(m_wallet_model
                                             ? m_wallet_model->wallet().getWalletName()
                                             : std::string{}))
@@ -1899,11 +1906,18 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
             .arg(review.live_claim_objects)
             .arg(review.quarantined_claim_objects)
             .arg(review.blocking_components)
+            .arg(review.retired_components)
             .arg(review.resolved_components)
             .arg(review.usage.pending_manual)
             .arg(review.usage.pending_automatic)
             .arg(review.usage.recycled_outputs)
-            .arg(formatBLK(review.usage.confirmed_resolution_fees)));
+            .arg(formatBLK(review.usage.confirmed_resolution_fees))
+            .arg(review.policy.mode == interfaces::WalletPowClaimRecoveryMode::AUTOMATIC
+                     ? tr("automatic fee fallback")
+                     : review.policy.mode == interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK
+                         ? tr("pause and ask")
+                         : tr("unset"))
+            .arg(review.policy.minimum_stale_blocks));
     if (has_unbound_legacy_proof) {
         m_pow_recovery_summary->setText(
             m_pow_recovery_summary->text() + QStringLiteral("\n") +
@@ -3052,7 +3066,7 @@ void StakingMiningPage::applyPowWithCurrentRecoveryPolicy()
     const interfaces::WalletPowMiningInfo current_info = m_wallet_model->wallet().getPowMiningInfo();
 
     if (enabled && !current_info.enabled) {
-        const QString body = tr("This will start the built-in Gold Rush PoW miner with %1 CPU core(s) at %2% target duty cycle.\n\n"
+        QString body = tr("This will start the built-in Gold Rush PoW miner with %1 CPU core(s) at %2% target duty cycle.\n\n"
                                 "The wallet must be normally unlocked so it can sign QQSPROOF claim transactions. "
                                 "The miner also needs a confirmed, spendable legacy BLK UTXO to authenticate and pay the fee for each claim. "
                                 "If no existing payout key is available, approving this dialog is one-time consent to create one new non-HD quantum key. "
@@ -3060,6 +3074,11 @@ void StakingMiningPage::applyPowWithCurrentRecoveryPolicy()
                                 "Start mining now?")
                                  .arg(cores)
                                  .arg(percent);
+        if (current_info.stake_reserve_available &&
+            current_info.last_stake_coin_guard) {
+            body.prepend(tr(
+                "Staking protection is active: this wallet has one mature legacy staking coin, and Core will reserve it from PoW claims. The miner may start but remain paused until another eligible claim input exists. No coin will be split, generated, or spent automatically.\n\n"));
+        }
         if (!confirmBroadcast(this, tr("Start Gold Rush PoW mining"), body)) {
             abortPendingPowStart(tr("Gold Rush PoW mining was not started."));
             return;
@@ -4061,7 +4080,8 @@ void StakingMiningPage::updateStatus()
     const interfaces::WalletBalances balances = m_wallet_model->getCachedBalance();
 
     // Staking
-    const bool staking = w.getEnabledStaking();
+    const interfaces::WalletStakingInfo staking_info = w.getStakingInfo();
+    const bool staking = staking_info.enabled;
     // Never enter cs_wallet from this timer-driven GUI callback. QQSIGNAL
     // construction and signing may legitimately own the wallet mutex for a
     // bounded interval; waiting here would stop the entire Qt event loop.
@@ -4072,12 +4092,24 @@ void StakingMiningPage::updateStatus()
     m_staking_enable->setChecked(staking);
     m_unlock_staking_only->setChecked(w.getWalletUnlockStakingOnly());
     m_unlock_quantum_legacy_staking->setChecked(normal_unlocked);
-    m_staking_status->setText(staking ? tr("Staking is active") : tr("Staking is off"));
+    const bool actively_searching = staking_info.enabled &&
+        staking_info.worker_running && staking_info.eligible &&
+        staking_info.state == interfaces::WalletStakingState::SEARCHING;
+    if (actively_searching) {
+        m_staking_status->setText(tr("Staking is searching"));
+    } else if (staking_info.enabled) {
+        m_staking_status->setText(tr("Staking: %1 (%2)")
+            .arg(QString::fromStdString(std::string(
+                interfaces::WalletStakingStateName(staking_info.state))))
+            .arg(QString::fromStdString(staking_info.reason)));
+    } else {
+        m_staking_status->setText(tr("Staking is off"));
+    }
     // Read the stake weight the WalletModel already keeps cached (recomputed on
     // its worker thread on block/balance changes), never a fresh
     // GetStakeWeight() here: that walks the wallet's coins and would lag the
     // first click on this tab on large wallets.
-    m_stake_weight->setText(QString::number(static_cast<qulonglong>(m_wallet_model->getStakeWeight())));
+    m_stake_weight->setText(QString::number(static_cast<qulonglong>(staking_info.weight)));
 
     refreshDonationControls();
 
@@ -4190,7 +4222,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
 
     interfaces::Wallet& w = m_wallet_model->wallet();
     const interfaces::WalletBalances balances = m_wallet_model->getCachedBalance();
-    const bool staking = w.getEnabledStaking();
+    const bool staking = w.getStakingInfo().enabled;
     const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getCachedEncryptionStatus();
     const bool normal_unlocked = encryption_status == WalletModel::Unlocked &&
                                  !w.getWalletUnlockStakingOnly();
@@ -4317,6 +4349,9 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     case interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO:
         pow_runtime_summary = tr("waiting for a spendable legacy fee UTXO");
         break;
+    case interfaces::WalletPowMiningState::STAKE_RESERVE_PROTECTED:
+        pow_runtime_summary = tr("paused to protect mature legacy staking capacity");
+        break;
     case interfaces::WalletPowMiningState::EPOCH_INACTIVE:
         pow_runtime_summary = tr("waiting for Gold Rush");
         break;
@@ -4324,7 +4359,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         pow_runtime_summary = tr("waiting for the submitted claim to resolve");
         break;
     case interfaces::WalletPowMiningState::CLAIM_QUARANTINED:
-        pow_runtime_summary = tr("paused for a quarantined claim");
+        pow_runtime_summary = tr("claim input reserved until origin expiry or reviewed recovery");
         break;
     case interfaces::WalletPowMiningState::READY:
         pow_runtime_summary = tr("ready at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1));
@@ -4340,13 +4375,17 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         "<b>Wallet mining snapshot</b><br>"
         "Legacy spendable: %1 &nbsp;|&nbsp; Quantum-controlled: %2<br>"
         "PoS: %3; next active-signal split %4 &nbsp;|&nbsp; PoW: %5; next claim %6<br>"
-        "Unlock mode: %7")
+        "Stake reserve: %7 coin(s), %8 protected; %9 claim coin(s) remain<br>"
+        "Unlock mode: %10")
         .arg(formatBLK(balances.legacy_balance))
         .arg(formatBLK(balances.quantum_balance))
         .arg(wallet_signal_text)
         .arg(formatBLK(info.pos_estimated_payout_per_signaler))
         .arg(pow_runtime_summary)
         .arg(formatBLK(info.next_claim_payout))
+        .arg(info.reserved_stake_coins)
+        .arg(formatBLK(info.reserved_stake_weight))
+        .arg(info.claim_coins_after_stake_reserve)
         .arg(unlock_mode));
 
     const bool autostart_staking = wallet::IsStakingAutostartEnabled();
@@ -4388,6 +4427,8 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     QString recommended_action;
     if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
         recommended_action = tr("Send this wallet a confirmed, spendable legacy BLK UTXO so it can authenticate and pay the fee for a Gold Rush PoW claim.");
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STAKE_RESERVE_PROTECTED) {
+        recommended_action = tr("PoW is paused because the remaining mature legacy coin is protected for PoS. Add another confirmed mature legacy coin, disable staking, or explicitly set -powclaimreservestakecoins=0 on restart if you accept losing current legacy stake capacity. Core will not split or spend funds automatically.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
         recommended_action = tr("A prior Gold Rush PoW claim is quarantined outside the local mempool. Its fee input remains reserved so the wallet does not create an unsafe competing claim. Waiting for on-chain resolution is safest. To inspect or resolve it, select <b>Review claim recovery...</b>, review Core's exact plan and fee limits, then explicitly acknowledge that plan before Resolve is enabled.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
@@ -4415,6 +4456,11 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         m_pow_status->setText(tr("PoW miner settings changed. Click Apply to update the miner."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
         m_pow_status->setText(tr("PoW mining is enabled but waiting for a confirmed, spendable legacy BLK UTXO to authenticate and pay the next claim fee."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STAKE_RESERVE_PROTECTED) {
+        m_pow_status->setText(tr("PoW mining is enabled but paused to protect %1 mature legacy staking coin(s) (%2). %3 claim input(s) remain after the reserve.")
+            .arg(info.reserved_stake_coins)
+            .arg(formatBLK(info.reserved_stake_weight))
+            .arg(info.claim_coins_after_stake_reserve));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
         m_pow_status->setText(tr("PoW mining is enabled but waiting for a normal wallet unlock; locked and staking-only wallets cannot sign claims."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CHAIN_UNAVAILABLE) {

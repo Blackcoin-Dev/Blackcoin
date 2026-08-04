@@ -107,6 +107,7 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-powmining=<true/false>", "Auto-start one built-in Gold Rush Proof-of-Work miner for every eligible private-key wallet loaded by this process (default: false). Each wallet uses the configured thread and per-core CPU limits, must be normally unlocked, needs a spendable legacy fee UTXO, and must already own a payout key unless -qqallowautokeycreation=1 was separately authorized.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingthreads=<n>", "Worker threads (CPU cores) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingcpu=<n>", "Per-core CPU utilization target (1-100) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-powclaimreservestakecoins=<n>", strprintf("Minimum number of mature, stakeable legacy wallet coins protected from Gold Rush PoW claim input selection while staking is enabled (default: %u; set 0 to disable the reserve)", wallet::DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-autoresolvefailedclaims=<mode>", "Seed wallets whose recovery policy is still unset with an explicit Gold Rush PoW claim-recovery choice: automatic (or 1) or pause-and-ask (or 0). Default: no seed and no spending authority. A persisted wallet choice always wins. Automatic mode requires every -autoresolve* limit below and is standing consent to conflict with a disclosed legacy QQP2 proof that is invalid on the pinned tip but may validate on a normal descendant; either transaction may confirm. Generic transient/local failures and future-origin/future-version proofs remain refused.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-autoresolvemaxfee=<amt>", strprintf("Maximum fee for one automatic claim resolution in %s; required with -autoresolvefailedclaims=automatic", CURRENCY_UNIT), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-autoresolvebatchfeecap=<amt>", strprintf("Maximum aggregate fees for one automatic recovery batch in %s; required with -autoresolvefailedclaims=automatic", CURRENCY_UNIT), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
@@ -178,6 +179,13 @@ bool WalletInit::ParameterInteraction() const
         if (pow_cpu < 1 || pow_cpu > 100) {
             return InitError(Untranslated("-powminingcpu must be between 1 and 100."));
         }
+    }
+    const int64_t reserve_stake_coins = gArgs.GetIntArg(
+        "-powclaimreservestakecoins",
+        wallet::DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS);
+    if (reserve_stake_coins < 0 || reserve_stake_coins > 1000000) {
+        return InitError(Untranslated(
+            "-powclaimreservestakecoins must be between 0 and 1000000."));
     }
 
     std::optional<ShadowPowClaimRecoveryPolicy> recovery_policy_seed;

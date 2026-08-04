@@ -94,6 +94,7 @@ class GoldRushPosSignalRecoveryTest(BitcoinTestFramework):
         node.createwallet(wallet_name=WALLET_NAME)
         wallet = node.get_wallet_rpc(WALLET_NAME)
         wallet.staking(False)
+        assert_equal(wallet.getgoldrushinfo()["wallet_qqsignal"]["status"], "none")
         signal_address = wallet.getnewaddress("signal-target", "legacy")
         funding_address = node.get_wallet_rpc(self.default_wallet_name).getnewaddress("funding", "legacy")
 
@@ -112,6 +113,14 @@ class GoldRushPosSignalRecoveryTest(BitcoinTestFramework):
         signal_input = decoded["vin"][0]
         signal_outpoint = {"txid": signal_input["txid"], "vout": signal_input["vout"]}
         assert first_signal["txid"] in node.getrawmempool()
+        first_status = wallet.getgoldrushinfo()["wallet_qqsignal"]
+        assert_equal(first_status["active"], False)
+        assert_equal(first_status["status"], "mempool")
+        assert_equal(first_status["txid"], first_signal["txid"])
+        assert_equal(first_status["signal_height"], 0)
+        assert_equal(first_status["expiry_height"], 0)
+        assert_equal(first_status["confirmations"], 0)
+        assert_equal(first_status["source"], "manual")
 
         self.log.info("A valid non-broadcast signal releases its input only after the bounded retry ceiling")
         restart_args = self.extra_args[0] + [
@@ -127,6 +136,7 @@ class GoldRushPosSignalRecoveryTest(BitcoinTestFramework):
         node.loadwallet(WALLET_NAME)
         wallet = node.get_wallet_rpc(WALLET_NAME)
         assert first_signal["txid"] not in node.getrawmempool()
+        assert_equal(wallet.getgoldrushinfo()["wallet_qqsignal"]["status"], "none")
         assert node.gettxout(signal_outpoint["txid"], signal_outpoint["vout"], False) is not None
         assert_equal(self._is_abandoned(wallet, first_signal["txid"]), False)
 
@@ -161,6 +171,10 @@ class GoldRushPosSignalRecoveryTest(BitcoinTestFramework):
         second_input = second_decoded["vin"][0]
         second_outpoint = {"txid": second_input["txid"], "vout": second_input["vout"]}
         assert second_signal["txid"] in node.getrawmempool()
+        second_status = wallet.getgoldrushinfo()["wallet_qqsignal"]
+        assert_equal(second_status["status"], "mempool")
+        assert_equal(second_status["txid"], second_signal["txid"])
+        assert_equal(second_status["source"], "manual")
 
         self.log.info("A peer insertion at the cleanup barrier prevents abandonment of the now-live transaction")
         race_args = self.extra_args[0] + [
@@ -238,6 +252,11 @@ class GoldRushPosSignalRecoveryTest(BitcoinTestFramework):
             wallet.staking(False)
 
         assert_equal(self._is_abandoned(wallet, second_signal["txid"]), True)
+        expired_status = wallet.getgoldrushinfo()["wallet_qqsignal"]
+        assert_equal(expired_status["active"], False)
+        assert_equal(expired_status["status"], "expired")
+        assert_equal(expired_status["txid"], second_signal["txid"])
+        assert_equal(expired_status["source"], "manual")
         assert second_signal["txid"] not in node.getrawmempool()
         spendable = wallet.listunspent(1, 9999999)
         assert any(

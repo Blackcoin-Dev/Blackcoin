@@ -33,6 +33,8 @@
 #include <boost/multi_index/tag.hpp>
 #include <boost/multi_index_container.hpp>
 
+#include <functional>
+
 #include <atomic>
 #include <map>
 #include <optional>
@@ -645,6 +647,12 @@ public:
 
     /** Expire all transaction (and their dependencies) in the mempool older than time. Return the number of removed transactions. */
     int Expire(std::chrono::seconds time) EXCLUSIVE_LOCKS_REQUIRED(cs);
+    /** Expire matching transactions (and every descendant) older than time.
+     *  Nonmatching transactions retain their ordinary mempool lifetime. */
+    int ExpireMatching(
+        std::chrono::seconds time,
+        const std::function<bool(const CTransaction&)>& predicate,
+        MemPoolRemovalReason reason) EXCLUSIVE_LOCKS_REQUIRED(cs);
 
     /**
      * Calculate the ancestor and descendant count for the given transaction.

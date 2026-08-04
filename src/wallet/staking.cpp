@@ -1670,6 +1670,7 @@ int MaybeAutoShadowSignal(CWallet& wallet)
 
     mapValue_t map_value;
     map_value["comment"] = SHADOW_SIGNAL_COMMENT;
+    map_value["qq_shadow_signal_source"] = "automatic";
     try {
         std::string broadcast_error;
         if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error)) {
@@ -1922,6 +1923,9 @@ void StartStake(CWallet& wallet) {
     else {
         wallet.m_stop_staking_thread = false;
         wallet.m_enabled_staking = true;
+        wallet.PublishStakingTelemetry(
+            StakingTelemetryState::STARTING, uint256{}, -1,
+            /*worker_running=*/false, "staking worker start requested");
     }
     StakeCoins(wallet, wallet.m_enabled_staking);
 }
@@ -1930,6 +1934,9 @@ void StopStake(CWallet& wallet) {
     LOCK(wallet.m_staking_thread_mutex);
     if (!wallet.threadStakeMinerGroup) {
         wallet.m_enabled_staking = false;
+        wallet.PublishStakingTelemetry(
+            StakingTelemetryState::DISABLED, uint256{}, -1,
+            /*worker_running=*/false, "staking is disabled");
     }
     else {
         wallet.m_stop_staking_thread = true;
@@ -1937,6 +1944,9 @@ void StopStake(CWallet& wallet) {
         StakeCoins(wallet, false);
         wallet.threadStakeMinerGroup.reset();
         wallet.m_stop_staking_thread = false;
+        wallet.PublishStakingTelemetry(
+            StakingTelemetryState::DISABLED, uint256{}, -1,
+            /*worker_running=*/false, "staking is disabled");
     }
 }
 
@@ -2194,6 +2204,11 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
         const CAmount available = nValueRet > wallet.m_reserve_balance
             ? nValueRet - wallet.m_reserve_balance
             : 0;
+        // Publish the cache pair under the same mutex used to assemble the
+        // typed staking snapshot. The atomics keep legacy low-latency readers
+        // available, while telemetry never combines weight from one scan with
+        // the height from another.
+        LOCK(wallet.m_staking_telemetry_mutex);
         wallet.m_cached_stake_weight.store(static_cast<uint64_t>(available), std::memory_order_relaxed);
         const CBlockIndex* tip = wallet.chain().getTip();
         wallet.m_cached_stake_weight_height.store(tip ? tip->nHeight : -1, std::memory_order_release);

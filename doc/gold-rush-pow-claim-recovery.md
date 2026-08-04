@@ -15,7 +15,9 @@ will be included or credited.
 A live claim and a quarantined claim are different states:
 
 - A **live claim** is an unconfirmed wallet-authored claim currently in the
-  local mempool.
+  local mempool. QQSPROOF carriers have a dedicated one-hour relay residence
+  limit; ordinary transactions retain the node's existing mempool-expiry
+  policy.
 - A **quarantined claim** is an unconfirmed wallet-authored claim that is no
   longer in the local mempool. Another peer may still retain and later confirm
   it, so the wallet keeps its fee input reserved and generic abandonment remains
@@ -35,6 +37,29 @@ The built-in miner pauses while a quarantined component is actionable or cannot
 be classified safely. It does not consume another fee input merely because a
 different input is available. When all blocking components resolve, a miner
 that was already enabled may resume. Recovery never enables mining itself.
+
+## Zero-payment retirement for origin-bound claims
+
+The normal v30.1.4 lifecycle for a newly wallet-authored QQP3 or QQP4 claim does
+not create a conflicting recovery transaction. While the claim is eligible on
+the active branch, the wallet retains the exact transaction and reserves its
+input even after the one-hour mempool residence limit removes it from local
+relay. Startup, import, periodic resend, and reorg retry do not grant an
+over-age claim a new local relay lifetime.
+
+After the authenticated origin plus the inclusive 64-block late window has
+expired on one pinned active branch, Core may durably mark the exact locally
+authored, single-input claim component retired on that branch. This transition
+creates, signs, and broadcasts no transaction, pays no recovery fee, and
+releases the local reservation. The marker records the observation height and
+block hash. A reorg that removes that observation reopens and reclassifies the
+claim before the input can be reused inconsistently.
+
+This path is deliberately narrow. QQP2, adopted or foreign history, a future
+origin or version, malformed or mixed graphs, ordinary descendants, active
+mempool claims, and indeterminate local state remain reserved. Fee-paying
+conflict recovery is an optional, default-off last resort for those separately
+reviewed components; it is not the ordinary PoW liveness loop.
 
 ## QQP2 and QQP3 eligibility
 
@@ -150,7 +175,8 @@ treated as age zero when their stored time is ahead of the current chain clock,
 without moving the window past other recent actions. Their transaction
 timestamp provides a floor when old metadata is behind it.
 
-Once the wallet has explicitly committed exact resolution bytes, safe retries
+Once the wallet has explicitly committed exact resolution bytes for a component
+that cannot use zero-payment retirement, safe retries
 may continue across restart without creating a new spend. Disabling automatic
 recovery prevents new automatic actions; it cannot recall a transaction that
 was already propagated. Disabling the built-in PoW miner and committing a
@@ -174,11 +200,13 @@ confirms pays its base-chain fee.
   a new frontier after the claim output is confirmed and spendable. A later
   frontier is a new plan; one call cannot promise to finish every future branch.
 
-The wallet releases no reservation merely because a claim looks stale. An
-active-chain confirmation must resolve the conflict. If that confirmation is
-disconnected, the wallet reclassifies the component on the new pinned tip,
-restores any required quarantine, and remains correct whichever transaction
-later confirms. A transaction already seen by peers cannot be withdrawn.
+The wallet releases no reservation merely because a claim left the mempool or
+exceeded one hour of relay residence. It releases only after an active-chain
+confirmation resolves the conflict or after the narrow, branch-scoped
+origin-expiry retirement above. If the controlling block is disconnected, the
+wallet reopens and reclassifies the component on the new pinned tip and restores
+any required quarantine. A transaction already seen by peers cannot be
+withdrawn.
 
 ## Operator checks
 

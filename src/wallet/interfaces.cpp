@@ -121,6 +121,7 @@ interfaces::WalletPowClaimRecoveryState MakeRecoveryState(
     case ShadowPowClaimRecoveryState::INDETERMINATE: return Out::INDETERMINATE;
     case ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE: return Out::CURRENT_BRANCH_INELIGIBLE;
     case ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP: return Out::TERMINAL_ON_PINNED_TIP;
+    case ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH: return Out::RETIRED_ON_ACTIVE_BRANCH;
     case ShadowPowClaimRecoveryState::RESOLUTION_PENDING: return Out::RESOLUTION_PENDING;
     case ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN: return Out::RESOLVED_ON_ACTIVE_CHAIN;
     }
@@ -213,6 +214,7 @@ interfaces::WalletPowClaimRecoveryNode MakeRecoveryNode(
     out.in_mempool = node.in_mempool;
     out.quarantined = node.quarantined;
     out.abandoned = node.abandoned;
+    out.expired_locally_retired = node.expired_locally_retired;
     out.expected_shape = node.expected_shape;
     out.wallet_authored = node.wallet_authored;
     out.created_height = node.created_height;
@@ -250,6 +252,10 @@ interfaces::WalletPowClaimRecoveryComponent MakeRecoveryComponent(
     out.anchor_authenticated = component.anchor_authenticated;
     out.anchor_unspent = component.anchor_unspent;
     out.all_claims_explicitly_provenanced = component.all_claims_explicitly_provenanced;
+    out.all_claims_zero_payment_retirable =
+        component.all_claims_zero_payment_retirable;
+    out.all_claims_expired_locally_retired =
+        component.all_claims_expired_locally_retired;
     out.has_revalidating_unbound_proof =
         component.has_revalidating_unbound_proof;
     out.descendant_claims = component.descendant_claims;
@@ -2887,6 +2893,48 @@ public:
     {
         return m_wallet->m_enabled_staking;
     }
+    interfaces::WalletStakingInfo getStakingInfo() override
+    {
+        const StakingTelemetrySnapshot snapshot =
+            m_wallet->GetStakingTelemetrySnapshot();
+        interfaces::WalletStakingInfo info;
+        info.sequence = snapshot.sequence;
+        info.enabled = snapshot.enabled;
+        info.worker_running = snapshot.worker_running;
+        info.eligible = snapshot.eligible;
+        info.tip_height = snapshot.tip_height;
+        info.weight = snapshot.weight;
+        info.weight_cache_height = snapshot.weight_cache_height;
+        info.search_interval = snapshot.search_interval;
+        info.reason = snapshot.reason;
+        switch (snapshot.state) {
+        case StakingTelemetryState::DISABLED:
+            info.state = interfaces::WalletStakingState::DISABLED;
+            break;
+        case StakingTelemetryState::STARTING:
+            info.state = interfaces::WalletStakingState::STARTING;
+            break;
+        case StakingTelemetryState::LOCKED:
+            info.state = interfaces::WalletStakingState::LOCKED;
+            break;
+        case StakingTelemetryState::SYNCING:
+            info.state = interfaces::WalletStakingState::SYNCING;
+            break;
+        case StakingTelemetryState::SEARCHING:
+            info.state = interfaces::WalletStakingState::SEARCHING;
+            break;
+        case StakingTelemetryState::NO_ELIGIBLE_COINS:
+            info.state = interfaces::WalletStakingState::NO_ELIGIBLE_COINS;
+            break;
+        case StakingTelemetryState::ERROR:
+            info.state = interfaces::WalletStakingState::ERROR;
+            break;
+        case StakingTelemetryState::STOPPED:
+            info.state = interfaces::WalletStakingState::STOPPED;
+            break;
+        }
+        return info;
+    }
     bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
                       bool allow_new_payout_key, bool* created_payout_key) override
     {
@@ -2925,6 +2973,21 @@ public:
             TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
             if (wallet_lock) {
                 info.payout_address = m_wallet->m_pow_payout_quantum;
+                const ShadowPowClaimStakeReserveInfo reserve =
+                    m_wallet->GetShadowPowClaimStakeReserveInfoLocked();
+                info.stake_reserve_available = reserve.wallet_tip_matches;
+                info.configured_stake_reserve_coins =
+                    reserve.configured_reserve_coins;
+                info.mature_stakeable_legacy_coins = static_cast<int>(
+                    reserve.mature_stakeable_legacy_coins);
+                info.mature_stakeable_legacy_weight =
+                    reserve.mature_stakeable_legacy_weight;
+                info.reserved_stake_coins = static_cast<int>(
+                    reserve.reserved_stake_coins);
+                info.reserved_stake_weight = reserve.reserved_stake_weight;
+                info.claim_coins_after_stake_reserve = static_cast<int>(
+                    reserve.claim_coins_after_reserve);
+                info.last_stake_coin_guard = reserve.last_stake_coin_guard;
                 const std::vector<CScript> known_scripts =
                     m_wallet->GetOwnedLegacyShadowScripts(MAX_WALLET_SHADOW_SOLVE_REFERENCES);
                 wallet_scripts.insert(known_scripts.begin(), known_scripts.end());
@@ -3043,19 +3106,11 @@ public:
         core_request.acknowledge_fee_and_conflict_risk = false;
         core_request.expected_plan_id.reset();
 
-        const ShadowPowClaimRecoveryInventory inventory =
-            m_wallet->GetShadowPowClaimRecoveryInventory();
-        const ShadowPowClaimRecoveryPlan plan =
-            m_wallet->PlanShadowPowClaimRecovery(core_request);
-        const ShadowPowClaimRecoveryPolicyMutationResult policy_state =
-            m_wallet->GetShadowPowClaimRecoveryPolicyState();
-        const ShadowPowClaimRecoveryPolicy policy =
-            policy_state.authoritative_state_available
-                ? policy_state.authoritative_policy
-                : DefaultShadowPowClaimRecoveryPolicy();
-        const ShadowPowClaimRecoveryUsage usage =
-            m_wallet->GetShadowPowClaimRecoveryUsage(
-                policy.rolling_fee_window_seconds);
+        const ShadowPowClaimRecoveryReview core_review =
+            m_wallet->GetShadowPowClaimRecoveryReview(core_request);
+        const ShadowPowClaimRecoveryInventory& inventory =
+            core_review.inventory;
+        const ShadowPowClaimRecoveryPlan& plan = core_review.plan;
 
         review.active_tip = inventory.active_tip.GetHex();
         review.active_height = inventory.active_height;
@@ -3065,6 +3120,8 @@ public:
         review.live_claim_objects = inventory.live_claim_objects;
         review.quarantined_claim_objects = inventory.quarantined_claim_objects;
         review.blocking_components = inventory.blocking_components;
+        review.retired_claim_objects = inventory.retired_claim_objects;
+        review.retired_components = inventory.retired_components;
         review.resolved_components = inventory.resolved_components;
         review.components.reserve(inventory.components.size());
         for (const auto& component : inventory.components) {
@@ -3073,20 +3130,14 @@ public:
         review.unanchored_claim_txids =
             HashStrings(inventory.unanchored_claim_txids);
         review.plan = MakeRecoveryPlan(plan);
-        review.usage = MakeRecoveryUsage(usage);
-        review.consistent = inventory.active_tip == plan.active_tip &&
-            inventory.active_height == plan.active_height &&
-            inventory.wallet_generation == plan.wallet_generation &&
-            inventory.wallet_tip_matches == plan.wallet_tip_matches &&
-            policy_state.authoritative_state_available;
-        if (!policy_state.authoritative_state_available) {
-            review.error = policy_state.detail.empty()
-                ? "Recovery policy authority is unavailable; reload the wallet before acting"
-                : policy_state.detail;
-        } else if (!review.consistent) {
-            review.error =
-                "Chain or wallet state changed while building the recovery review; refresh before acting";
-        }
+        review.usage = MakeRecoveryUsage(core_review.usage);
+        review.policy_available = core_review.available ||
+            core_review.status !=
+                ShadowPowClaimRecoveryReviewStatus::POLICY_UNAVAILABLE;
+        review.policy = MakeRecoveryPolicy(core_review.policy);
+        review.reason_code = core_review.reason_code;
+        review.consistent = core_review.consistent;
+        if (!core_review.available) review.error = core_review.detail;
         return review;
     }
     interfaces::WalletPowClaimRecoveryExecution resolvePowClaims(

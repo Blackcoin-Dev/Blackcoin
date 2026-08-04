@@ -13,7 +13,7 @@ import sys
 
 
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
-EXPECTED_ACKNOWLEDGEMENT = "V30.1.3"
+EXPECTED_ACKNOWLEDGEMENT = "V30.1.4"
 EXPECTED_SSH_SIGNING_FINGERPRINT = (
     "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70"
 )
@@ -108,6 +108,7 @@ def generate_metadata(
         f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.zip",
         f"Blackcoin-{version}-SBOM.spdx.json",
         f"Blackcoin-{version}-provenance.intoto.json",
+        f"Blackcoin-{version}-REPRODUCIBILITY.txt",
     }
     missing_assets = sorted(
         name for name in required_assets
@@ -156,10 +157,9 @@ def generate_metadata(
         "packages. Windows packages have no Authenticode signature. macOS "
         "applications carry only identity-free ad-hoc launch signatures and are "
         "not Developer-ID signed or notarized. Verify SHA256SUMS.txt, the exact "
-        "signed source commit and tag, fresh package structural checks, SBOM, "
-        "provenance, and GitHub OIDC attestations before installing. The "
-        "v30.1.3 corrective quick path does not claim a new duplicate-builder "
-        "reproducibility result.\n",
+        "signed source commit and tag, fresh package structural checks, "
+        "exact-source duplicate-builder reproducibility report, SBOM, provenance, "
+        "and GitHub OIDC attestations before installing.\n",
         encoding="utf-8",
     )
 
@@ -223,8 +223,8 @@ def generate_metadata(
         "integrity": {
             "checksum_manifest": "SHA256SUMS.txt",
             "reproducibility": {
-                "current_source_rerun": False,
-                "historical_evidence_separately_labeled": True,
+                "current_source_rerun": True,
+                "report": f"Blackcoin-{version}-REPRODUCIBILITY.txt",
             },
             "sbom": f"Blackcoin-{version}-SBOM.spdx.json",
             "provenance": f"Blackcoin-{version}-provenance.intoto.json",

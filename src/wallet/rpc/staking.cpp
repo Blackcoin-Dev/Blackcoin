@@ -182,6 +182,226 @@ static bool HasUnconfirmedWalletShadowSignal(const CWallet& wallet) EXCLUSIVE_LO
     return false;
 }
 
+struct WalletQQSignalStatus
+{
+    bool active{false};
+    std::string status{"none"};
+    uint256 txid;
+    int signal_height{0};
+    int expiry_height{0};
+    int confirmations{0};
+    std::string source{"unknown"};
+    CScript target;
+    CScript payout_script;
+    uint32_t solve_height{0};
+    uint256 solve_hash;
+    int64_t wallet_order{-1};
+    int64_t received_time{0};
+};
+
+struct WalletQQSignalReport
+{
+    WalletQQSignalStatus current;
+    std::vector<WalletQQSignalStatus> history;
+};
+
+static WalletQQSignalReport GetWalletQQSignalStatusLocked(
+    const CWallet& wallet,
+    const std::map<CScript, ShadowActiveSignalInfo>& active_signals,
+    int tip_height)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
+{
+    WalletQQSignalReport report;
+    int selected_rank{-1};
+    const CBlockIndex* tip = wallet.chain().chainman().ActiveChain().Tip();
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const auto signal_is_expired = [&](const ShadowSignalInfo& signal) {
+        if (!tip) return false;
+        if (!IsShadowGoldRushRewardActive(
+                consensus, tip->GetMedianTimePast(), tip->nHeight + 1)) {
+            return true;
+        }
+        if (signal.solve_height == 0 ||
+            signal.solve_height > static_cast<uint32_t>(tip->nHeight) ||
+            tip->nHeight - static_cast<int>(signal.solve_height) >
+                SHADOW_SOLVER_ACTIVITY_WINDOW) {
+            return true;
+        }
+        const CBlockIndex* solved =
+            wallet.chain().chainman().ActiveChain()[signal.solve_height];
+        return solved && solved->GetBlockHash() == signal.solve_hash &&
+            tip->GetBlockTime() - solved->GetBlockTime() >
+                SHADOW_SOLVER_ACTIVITY_SECONDS;
+    };
+
+    for (const auto& [txid, wtx] : wallet.mapWallet) {
+        const auto comment = wtx.mapValue.find("comment");
+        ShadowSignalInfo signal;
+        if (!DecodeShadowSignal(*wtx.tx, signal)) continue;
+        const bool wallet_authored =
+            (comment != wtx.mapValue.end() &&
+             (comment->second == "PoS Claim" ||
+              comment->second == "Quantum PoS Claim")) ||
+            wallet.GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0;
+        if (!wallet_authored) continue;
+
+        WalletQQSignalStatus candidate;
+        candidate.txid = txid;
+        candidate.target = CanonicalizeLegacyStakeScript(signal.target);
+        candidate.payout_script = signal.payout_script;
+        candidate.solve_height = signal.solve_height;
+        candidate.solve_hash = signal.solve_hash;
+        candidate.wallet_order = wtx.nOrderPos;
+        candidate.received_time = wtx.nTimeReceived;
+        const auto source = wtx.mapValue.find("qq_shadow_signal_source");
+        if (source != wtx.mapValue.end() &&
+            (source->second == "manual" || source->second == "automatic")) {
+            candidate.source = source->second;
+        }
+
+        int rank{100};
+        if (const auto* confirmed = wtx.state<TxStateConfirmed>()) {
+            candidate.signal_height = confirmed->confirmed_block_height;
+            candidate.expiry_height = confirmed->confirmed_block_height +
+                SHADOW_SOLVER_ACTIVITY_WINDOW;
+            candidate.confirmations = std::max(
+                0, tip_height - confirmed->confirmed_block_height + 1);
+            const auto active = active_signals.find(candidate.target);
+            candidate.active = active != active_signals.end() &&
+                active->second.signal_height ==
+                    static_cast<uint32_t>(confirmed->confirmed_block_height) &&
+                active->second.payout_script == candidate.payout_script;
+            if (candidate.active) {
+                candidate.status = "confirmed";
+                rank = 600;
+            } else if (tip_height > candidate.expiry_height) {
+                candidate.status = "expired";
+                rank = 200;
+            } else if (active != active_signals.end() &&
+                       (active->second.signal_height >
+                            static_cast<uint32_t>(confirmed->confirmed_block_height) ||
+                        active->second.payout_script != candidate.payout_script)) {
+                candidate.status = "superseded";
+                rank = 300;
+            } else {
+                // The transaction is confirmed as an ordinary transaction,
+                // but authenticated active-signal state does not establish
+                // current membership. Keep `active=false` rather than
+                // inferring wallet participation from global counters.
+                candidate.status = "confirmed";
+                rank = 250;
+            }
+        } else if (wtx.InMempool()) {
+            candidate.status = "mempool";
+            rank = 500;
+        } else {
+            const auto reorg_height = wtx.mapValue.find(
+                "qq_shadow_signal_reorg_height");
+            const auto reorg_hash = wtx.mapValue.find(
+                "qq_shadow_signal_reorg_hash");
+            int parsed_height{0};
+            uint256 parsed_reorg_hash;
+            if (reorg_height != wtx.mapValue.end() &&
+                reorg_hash != wtx.mapValue.end() &&
+                ParseInt32(reorg_height->second, &parsed_height) &&
+                parsed_height > 0 &&
+                parsed_height <=
+                    std::numeric_limits<int>::max() -
+                        SHADOW_SOLVER_ACTIVITY_WINDOW &&
+                reorg_hash->second.size() == uint256::size() * 2 &&
+                IsHex(reorg_hash->second) &&
+                !(parsed_reorg_hash = uint256S(reorg_hash->second)).IsNull() &&
+                (parsed_height > tip_height ||
+                 !wallet.chain().chainman().ActiveChain()[parsed_height] ||
+                 wallet.chain().chainman().ActiveChain()[parsed_height]
+                         ->GetBlockHash() != parsed_reorg_hash)) {
+                candidate.status = "reorg_removed";
+                candidate.signal_height = parsed_height;
+                candidate.expiry_height = parsed_height +
+                    SHADOW_SOLVER_ACTIVITY_WINDOW;
+                rank = 400;
+            } else if (wtx.isConflicted()) {
+                candidate.status = "superseded";
+                rank = 300;
+            } else if (signal_is_expired(signal)) {
+                candidate.status = "expired";
+                rank = 200;
+            }
+        }
+
+        const bool candidate_has_order = candidate.wallet_order >= 0;
+        const bool selected_has_order = report.current.wallet_order >= 0;
+        const bool candidate_is_newer =
+            candidate_has_order != selected_has_order
+                ? candidate_has_order
+                : candidate_has_order
+                    ? candidate.wallet_order > report.current.wallet_order ||
+                          (candidate.wallet_order == report.current.wallet_order &&
+                           (candidate.received_time > report.current.received_time ||
+                            (candidate.received_time == report.current.received_time &&
+                             report.current.txid < candidate.txid)))
+                    : candidate.received_time > report.current.received_time ||
+                          (candidate.received_time == report.current.received_time &&
+                           report.current.txid < candidate.txid);
+        if (rank > selected_rank ||
+            (rank == selected_rank && candidate_is_newer)) {
+            report.current = candidate;
+            selected_rank = rank;
+        }
+        report.history.push_back(std::move(candidate));
+    }
+    std::sort(report.history.begin(), report.history.end(),
+              [](const WalletQQSignalStatus& left,
+                 const WalletQQSignalStatus& right) {
+                  const bool left_has_order = left.wallet_order >= 0;
+                  const bool right_has_order = right.wallet_order >= 0;
+                  if (left_has_order != right_has_order) {
+                      return left_has_order;
+                  }
+                  if (left_has_order &&
+                      left.wallet_order != right.wallet_order) {
+                      return left.wallet_order > right.wallet_order;
+                  }
+                  if (left.received_time != right.received_time) {
+                      return left.received_time > right.received_time;
+                  }
+                  return right.txid < left.txid;
+              });
+    return report;
+}
+
+static UniValue WalletQQSignalEntryToJSON(
+    const WalletQQSignalStatus& status)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("active", status.active);
+    result.pushKV("status", status.status);
+    result.pushKV("txid", status.txid.IsNull() ? "" : status.txid.GetHex());
+    result.pushKV("signal_height", status.signal_height);
+    result.pushKV("activation_height", status.signal_height);
+    result.pushKV("expiry_height", status.expiry_height);
+    result.pushKV("confirmations", status.confirmations);
+    result.pushKV("source", status.source);
+    result.pushKV("target_script", HexStr(status.target));
+    result.pushKV("payout_script", HexStr(status.payout_script));
+    result.pushKV("solve_height", status.solve_height);
+    result.pushKV("solve_hash",
+                  status.solve_hash.IsNull() ? "" : status.solve_hash.GetHex());
+    return result;
+}
+
+static UniValue WalletQQSignalStatusToJSON(
+    const WalletQQSignalReport& report)
+{
+    UniValue result = WalletQQSignalEntryToJSON(report.current);
+    UniValue history(UniValue::VARR);
+    for (const WalletQQSignalStatus& entry : report.history) {
+        history.push_back(WalletQQSignalEntryToJSON(entry));
+    }
+    result.pushKV("history", std::move(history));
+    return result;
+}
+
 static UniValue QuantumOperatorBondInfoToJSON(const interfaces::WalletQuantumOperatorBondInfo& info)
 {
     UniValue obj(UniValue::VOBJ);
@@ -469,6 +689,13 @@ static RPCHelpMan getstakinginfo()
                     {
                         {RPCResult::Type::BOOL, "enabled", "'true' if staking is enabled"},
                         {RPCResult::Type::BOOL, "staking", "'true' if wallet is currently staking"},
+                        {RPCResult::Type::STR, "staking_state", "Stable worker state: disabled, starting, locked, syncing, searching, no_eligible_coins, error, or stopped."},
+                        {RPCResult::Type::STR, "staking_reason", "Typed worker-state explanation suitable for monitoring."},
+                        {RPCResult::Type::BOOL, "worker_running", "Whether the wallet's PoS worker thread is running."},
+                        {RPCResult::Type::BOOL, "eligible", "Whether the published coherent snapshot has positive eligible stake weight."},
+                        {RPCResult::Type::BOOL, "staking_snapshot_current", "Whether the published staking snapshot is for the current active-chain tip."},
+                        {RPCResult::Type::NUM, "staking_snapshot_sequence", "Monotonic per-wallet telemetry publication sequence."},
+                        {RPCResult::Type::NUM, "active_blocks", "Current active-chain height, which may be ahead of the last complete staking snapshot during a normal tip refresh."},
                         {RPCResult::Type::BOOL, "autostart_staking", "Effective process-wide consent to start staking for every eligible loaded wallet."},
                         {RPCResult::Type::STR, "autostart_staking_source", "Source of the effective state: autostartstaking, legacy_staking, or default_off."},
                         {RPCResult::Type::BOOL, "automatic_qqsignal", "Whether process-wide optional fee-paying Gold Rush PoS QQSIGNAL automation is enabled for eligible loaded wallets."},
@@ -502,21 +729,36 @@ static RPCHelpMan getstakinginfo()
     if (!pwallet) return NullUniValue;
     ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
 
-    // GetStakeWeight walks the complete wallet. The staking worker publishes
-    // the last completed result, so this health RPC remains responsive while
-    // block assembly or QQSIGNAL signing owns the chain/wallet locks.
-    const int weight_cache_height = pwallet->m_cached_stake_weight_height.load(std::memory_order_acquire);
+    const StakingTelemetrySnapshot staking_snapshot =
+        pwallet->GetStakingTelemetrySnapshot();
+    const bool staking_snapshot_available = staking_snapshot.sequence > 0 &&
+        staking_snapshot.tip_height >= 0;
+    const int weight_cache_height = staking_snapshot_available
+        ? staking_snapshot.weight_cache_height
+        : pwallet->m_cached_stake_weight_height.load(
+              std::memory_order_acquire);
     const bool weight_cached = weight_cache_height >= 0;
-    const uint64_t nWeight = weight_cached
-        ? pwallet->m_cached_stake_weight.load(std::memory_order_relaxed)
-        : 0;
-    const uint64_t lastCoinStakeSearchInterval = pwallet->m_enabled_staking
-        ? static_cast<uint64_t>(std::max<int64_t>(0, pwallet->m_last_coin_stake_search_interval.load(std::memory_order_relaxed)))
+    const uint64_t nWeight = staking_snapshot_available
+        ? staking_snapshot.weight
+        : weight_cached
+            ? pwallet->m_cached_stake_weight.load(std::memory_order_relaxed)
+            : 0;
+    const uint64_t lastCoinStakeSearchInterval = staking_snapshot.enabled
+        ? static_cast<uint64_t>(std::max<int64_t>(
+              0, staking_snapshot.search_interval))
         : 0;
 
     const CTxMemPool& mempool = pwallet->chain().mempool();
     ChainstateManager& chainman = pwallet->chain().chainman();
-    int blocks = g_staking_rpc_chain_snapshot.height.load(std::memory_order_acquire);
+    int active_blocks = g_staking_rpc_chain_snapshot.height.load(
+        std::memory_order_acquire);
+    if (active_blocks < 0 && staking_snapshot_available) {
+        active_blocks = staking_snapshot.tip_height;
+    }
+    uint256 active_tip;
+    int blocks = staking_snapshot_available
+        ? staking_snapshot.tip_height
+        : active_blocks;
     uint64_t nNetworkWeight = g_staking_rpc_chain_snapshot.network_weight.load(std::memory_order_relaxed);
     double difficulty = g_staking_rpc_chain_snapshot.difficulty.load(std::memory_order_relaxed);
     bool chainstate_cached{true};
@@ -526,7 +768,11 @@ static RPCHelpMan getstakinginfo()
         TRY_LOCK(::cs_main, main_lock);
         if (main_lock) {
             chainstate_cached = false;
-            blocks = chainman.ActiveChain().Height();
+            active_blocks = chainman.ActiveChain().Height();
+            if (const CBlockIndex* tip = chainman.ActiveChain().Tip()) {
+                active_tip = tip->GetBlockHash();
+            }
+            if (!staking_snapshot_available) blocks = active_blocks;
             nNetworkWeight = static_cast<uint64_t>(1.1429 * GetPoSKernelPS(chainman));
             if (chainman.m_best_header) {
                 difficulty = GetDifficulty(GetLastBlockIndex(chainman.m_best_header, true));
@@ -535,27 +781,41 @@ static RPCHelpMan getstakinginfo()
             if (BlockAssembler::m_last_block_num_txs) current_block_txs = *BlockAssembler::m_last_block_num_txs;
             g_staking_rpc_chain_snapshot.network_weight.store(nNetworkWeight, std::memory_order_relaxed);
             g_staking_rpc_chain_snapshot.difficulty.store(difficulty, std::memory_order_relaxed);
-            g_staking_rpc_chain_snapshot.height.store(blocks, std::memory_order_release);
+            g_staking_rpc_chain_snapshot.height.store(active_blocks, std::memory_order_release);
         }
     }
-    if (blocks < 0) {
+    if (active_blocks < 0 || blocks < 0) {
         TRY_LOCK(pwallet->cs_wallet, wallet_lock);
         const std::optional<int> wallet_height = wallet_lock
             ? pwallet->GetLastBlockHeightIfSet()
             : std::nullopt;
-        blocks = wallet_height.value_or(0);
+        const int fallback_height = wallet_height.value_or(0);
+        if (active_blocks < 0) active_blocks = fallback_height;
+        if (blocks < 0) blocks = fallback_height;
     }
 
     UniValue obj(UniValue::VOBJ);
 
-    bool staking = lastCoinStakeSearchInterval && nWeight;
+    const bool staking = staking_snapshot.enabled &&
+        staking_snapshot.worker_running && staking_snapshot.eligible &&
+        staking_snapshot.state == StakingTelemetryState::SEARCHING;
+    const bool staking_snapshot_current = staking_snapshot_available &&
+        staking_snapshot.tip_height == active_blocks &&
+        (active_tip.IsNull() || staking_snapshot.tip == active_tip);
 
     const Consensus::Params& consensusParams = Params().GetConsensus();
     int64_t nTargetSpacing = consensusParams.nTargetSpacing;
     uint64_t nExpectedTime = staking ? 1.0455 * nTargetSpacing * nNetworkWeight / nWeight : 0;
 
-    obj.pushKV("enabled", pwallet->m_enabled_staking.load());
+    obj.pushKV("enabled", staking_snapshot.enabled);
     obj.pushKV("staking", staking);
+    obj.pushKV("staking_state", std::string(
+        StakingTelemetryStateName(staking_snapshot.state)));
+    obj.pushKV("staking_reason", staking_snapshot.reason);
+    obj.pushKV("worker_running", staking_snapshot.worker_running);
+    obj.pushKV("eligible", staking_snapshot.eligible);
+    obj.pushKV("staking_snapshot_current", staking_snapshot_current);
+    obj.pushKV("staking_snapshot_sequence", staking_snapshot.sequence);
     obj.pushKV("autostart_staking", IsStakingAutostartEnabled());
     obj.pushKV("autostart_staking_source", gArgs.IsArgSet("-autostartstaking")
         ? "autostartstaking"
@@ -567,6 +827,7 @@ static RPCHelpMan getstakinginfo()
     obj.pushKV("consensus_demurrage_automatic", true);
 
     obj.pushKV("blocks", blocks);
+    obj.pushKV("active_blocks", active_blocks);
     if (current_block_weight) obj.pushKV("currentblockweight", *current_block_weight);
     if (current_block_txs) obj.pushKV("currentblocktx", *current_block_txs);
     obj.pushKV("pooledtx", (uint64_t)mempool.size());
@@ -1396,6 +1657,7 @@ static RPCHelpMan sendshadowsignal()
     const std::string hex = EncodeHexTx(*tx);
     mapValue_t map_value;
     map_value["comment"] = "PoS Claim";
+    map_value["qq_shadow_signal_source"] = "manual";
     CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "PoS Claim");
 
     UniValue result(UniValue::VOBJ);
@@ -1745,6 +2007,7 @@ static const char* ShadowPowRecoveryStateName(ShadowPowClaimRecoveryState state)
     case ShadowPowClaimRecoveryState::INDETERMINATE: return "indeterminate";
     case ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE: return "current_branch_ineligible";
     case ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP: return "terminal_on_pinned_tip";
+    case ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH: return "retired_on_active_branch";
     case ShadowPowClaimRecoveryState::RESOLUTION_PENDING: return "resolution_pending";
     case ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN: return "resolved_on_active_chain";
     }
@@ -2071,6 +2334,7 @@ static UniValue ShadowPowRecoveryNodeToJSON(const ShadowPowClaimRecoveryNode& no
     result.pushKV("expected_shape", node.expected_shape);
     result.pushKV("wallet_authored", node.wallet_authored);
     result.pushKV("abandoned", node.abandoned);
+    result.pushKV("expired_locally_retired", node.expired_locally_retired);
     result.pushKV("stale_depth", node.stale_depth);
     result.pushKV("stale_depth_known", node.stale_depth_known);
     result.pushKV("resolution_metadata_valid", node.resolution_metadata_valid);
@@ -2101,6 +2365,10 @@ static UniValue ShadowPowRecoveryComponentToJSON(const ShadowPowClaimRecoveryCom
     result.pushKV("anchor_unspent", component.anchor_unspent);
     result.pushKV("all_claims_quarantined", component.all_claims_quarantined);
     result.pushKV("all_claims_explicitly_provenanced", component.all_claims_explicitly_provenanced);
+    result.pushKV("all_claims_zero_payment_retirable",
+                  component.all_claims_zero_payment_retirable);
+    result.pushKV("all_claims_expired_locally_retired",
+                  component.all_claims_expired_locally_retired);
     result.pushKV("has_revalidating_unbound_proof",
                   component.has_revalidating_unbound_proof);
     UniValue nodes(UniValue::VARR);
@@ -2656,6 +2924,39 @@ static RPCHelpMan getgoldrushinfo()
                         {RPCResult::Type::BOOL, "qqp4_active", "Whether the active tip uses QQP4 exact-input proof rules."},
                         {RPCResult::Type::BOOL, "qqp4_active_next_block", "Whether the next block requires QQP4 exact-input proof rules."},
                         {RPCResult::Type::BOOL, "wallet_recent_solve_qualified", "Whether this wallet has at least one known whitelisted script with a recent solver marker."},
+                        {RPCResult::Type::OBJ, "wallet_qqsignal", "Authenticated QQSIGNAL state for only the selected -rpcwallet; global active-signal counts are never used to infer local membership.",
+                        {
+                            {RPCResult::Type::BOOL, "active", "Whether this wallet transaction is the authenticated active signal for its target."},
+                            {RPCResult::Type::STR, "status", "One of none, mempool, confirmed, expired, superseded, or reorg_removed."},
+                            {RPCResult::Type::STR_HEX, "txid", "Wallet signal transaction id, or an empty string when none is available."},
+                            {RPCResult::Type::NUM, "signal_height", "Confirmation/activation height, or zero before confirmation."},
+                            {RPCResult::Type::NUM, "activation_height", "Alias for signal_height."},
+                            {RPCResult::Type::NUM, "expiry_height", "Last height at which this confirmed signal can remain active, or zero before confirmation."},
+                            {RPCResult::Type::NUM, "confirmations", "Active-chain confirmations for the selected wallet signal."},
+                            {RPCResult::Type::STR, "source", "manual, automatic, or unknown for records created before provenance was persisted."},
+                            {RPCResult::Type::STR_HEX, "target_script", "Legacy signaling script from the wallet transaction."},
+                            {RPCResult::Type::STR_HEX, "payout_script", "Quantum payout script linked by the wallet transaction."},
+                            {RPCResult::Type::NUM, "solve_height", "Solver height referenced by the QQSIGNAL payload."},
+                            {RPCResult::Type::STR_HEX, "solve_hash", "Solver block hash referenced by the QQSIGNAL payload."},
+                            {RPCResult::Type::ARR, "history", "Wallet-authored QQSIGNAL records with the same lifecycle fields; superseded, expired, and reorg-removed records remain auditable.",
+                            {
+                                {RPCResult::Type::OBJ, "", "One wallet-authored signal record.",
+                                {
+                                    {RPCResult::Type::BOOL, "active", "Whether this exact record is the authenticated active signal."},
+                                    {RPCResult::Type::STR, "status", "Lifecycle state for this exact record."},
+                                    {RPCResult::Type::STR_HEX, "txid", "Signal transaction id."},
+                                    {RPCResult::Type::NUM, "signal_height", "Confirmation/activation height, or zero."},
+                                    {RPCResult::Type::NUM, "activation_height", "Alias for signal_height."},
+                                    {RPCResult::Type::NUM, "expiry_height", "Last active height, or zero."},
+                                    {RPCResult::Type::NUM, "confirmations", "Active-chain confirmations."},
+                                    {RPCResult::Type::STR, "source", "manual, automatic, or unknown."},
+                                    {RPCResult::Type::STR_HEX, "target_script", "Legacy target script."},
+                                    {RPCResult::Type::STR_HEX, "payout_script", "Quantum payout script."},
+                                    {RPCResult::Type::NUM, "solve_height", "Referenced solver height."},
+                                    {RPCResult::Type::STR_HEX, "solve_hash", "Referenced solver hash."},
+                                }},
+                            }},
+                        }},
                         {RPCResult::Type::ARR, "wallet_scripts", "Bounded wallet-known scripts relevant to Gold Rush signaling; transaction construction performs the final spendability check.",
                         {
                             {RPCResult::Type::OBJ, "", "",
@@ -2712,6 +3013,7 @@ static RPCHelpMan getgoldrushinfo()
     int qqp4_activation_height{0};
     bool qqp4_active{false};
     bool qqp4_active_next_block{false};
+    UniValue wallet_qqsignal(UniValue::VOBJ);
     {
         ChainstateManager& chainman = pwallet->chain().chainman();
         LOCK(cs_main);
@@ -2741,7 +3043,15 @@ static RPCHelpMan getgoldrushinfo()
         qqp4_active_next_block =
             consensus.IsShadowQQP4Active(tip->nHeight + 1);
         shadow_info = GetShadowGoldRushInfo(active_chainstate.CoinsTip(), tip);
-        active_signalers = GetActiveShadowSignalCount(active_chainstate.CoinsTip(), tip);
+        const std::map<CScript, ShadowActiveSignalInfo> active_signal_details =
+            GetActiveShadowSignalDetails(active_chainstate.CoinsTip(), tip);
+        active_signalers = active_signal_details.size();
+        {
+            LOCK(pwallet->cs_wallet);
+            wallet_qqsignal = WalletQQSignalStatusToJSON(
+                GetWalletQQSignalStatusLocked(
+                    *pwallet, active_signal_details, tip_height));
+        }
 
         for (const WalletShadowSolveReference& solve : wallet_solves) {
             if (!wallet_scripts.count(solve.target) || !IsWhitelisted(active_chainstate.CoinsTip(), solve.target)) continue;
@@ -2833,6 +3143,7 @@ static RPCHelpMan getgoldrushinfo()
     result.pushKV("qqp4_active", qqp4_active);
     result.pushKV("qqp4_active_next_block", qqp4_active_next_block);
     result.pushKV("wallet_recent_solve_qualified", wallet_recent_solve_qualified);
+    result.pushKV("wallet_qqsignal", std::move(wallet_qqsignal));
     result.pushKV("wallet_scripts", std::move(wallet_entries));
     return result;
 },
@@ -3195,6 +3506,8 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             {RPCResult::Type::NUM, "live_claim_objects", "Claim objects currently in the local mempool."},
             {RPCResult::Type::NUM, "quarantined_claim_objects", "Claim objects marked quarantined for audit and reorg safety."},
             {RPCResult::Type::NUM, "blocking_components", "Typed components that currently gate new mining claims."},
+            {RPCResult::Type::NUM, "retired_claim_objects", "Origin-expired, locally-authored claim objects durably retired on the active branch without a recovery transaction."},
+            {RPCResult::Type::NUM, "retired_components", "Typed components retired on the active branch without a recovery transaction or recovery fee."},
             {RPCResult::Type::NUM, "resolved_components", "Typed components resolved on the active chain."},
             {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual resolutions."},
             {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic resolutions."},
@@ -3270,6 +3583,8 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     result.pushKV("live_claim_objects", static_cast<uint64_t>(inventory.live_claim_objects));
     result.pushKV("quarantined_claim_objects", static_cast<uint64_t>(inventory.quarantined_claim_objects));
     result.pushKV("blocking_components", static_cast<uint64_t>(inventory.blocking_components));
+    result.pushKV("retired_claim_objects", static_cast<uint64_t>(inventory.retired_claim_objects));
+    result.pushKV("retired_components", static_cast<uint64_t>(inventory.retired_components));
     result.pushKV("resolved_components", static_cast<uint64_t>(inventory.resolved_components));
     result.pushKV("pending_manual_resolutions", static_cast<uint64_t>(usage.pending_manual));
     result.pushKV("pending_automatic_resolutions", static_cast<uint64_t>(usage.pending_automatic));
@@ -3298,7 +3613,7 @@ static RPCHelpMan setpowclaimrecovery()
     return RPCHelpMan{
         "setpowclaimrecovery",
         "\nPersist this wallet's Gold Rush PoW claim-recovery choice.\n"
-        "automatic is explicit standing consent to create fee-paying on-chain conflicts only after the component engine classifies the complete graph as conflict-resolvable on one pinned active-chain tip. This may include a disclosed unbound QQP2 proof that is invalid now but may become valid on a descendant. Generic retryable and indeterminate states remain refused. All six positive limits are required when enabling it. pause_and_ask keeps recovery manual. unset removes standing consent. This call never starts mining and never creates, signs, or broadcasts a transaction.\n",
+        "Newly authored origin-bound claims retire without a second transaction or recovery fee after their full block-height eligibility window. automatic is explicit standing consent to create fee-paying on-chain conflicts only for remaining components after the component engine classifies the complete graph as conflict-resolvable on one pinned active-chain tip. This may include a disclosed unbound QQP2 proof that is invalid now but may become valid on a descendant. Generic retryable and indeterminate states remain refused. All six positive limits are required when enabling it. pause_and_ask keeps conflict recovery manual. unset removes standing consent. This call never starts mining and never creates, signs, or broadcasts a transaction.\n",
         {
             {"mode", RPCArg::Type::STR, RPCArg::Optional::NO, "automatic, pause_and_ask, or unset."},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Wallet-scoped spending and staleness limits.", {
@@ -3469,7 +3784,7 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is enabled."},
             {RPCResult::Type::BOOL, "autostart", "Whether process-wide persistent consent was given to start PoW mining for every eligible loaded wallet."},
             {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether process-wide background automation may create new non-HD keys in loaded wallets."},
-            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, epoch_inactive, claim_in_flight, claim_quarantined, ready, hashing, or error."},
+            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, ready, hashing, or error."},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
             {RPCResult::Type::NUM, "cpu_percent", "Per-core CPU duty-cycle target."},
             {RPCResult::Type::NUM, "hashrate", "Aggregate Argon2id tries per second."},
@@ -3500,6 +3815,14 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "claims_recycled", "Later claim transactions that spent a confirmed resolution output."},
             {RPCResult::Type::STR_AMOUNT, "cumulative_resolution_fees", "Fees paid by all confirmed managed claim resolutions."},
             {RPCResult::Type::BOOL, "claim_recovery_database_outcome_ambiguous", "Whether recovery database state requires wallet reload and inspection before any further recovery action."},
+            {RPCResult::Type::NUM, "configured_stake_reserve_coins", "Mature legacy stake coins protected from PoW claims while staking is enabled."},
+            {RPCResult::Type::NUM, "mature_stakeable_legacy_coins", "Mature legacy coins eligible for PoS in the coherent selector snapshot."},
+            {RPCResult::Type::STR_AMOUNT, "mature_stakeable_legacy_weight", "Total mature legacy PoS weight before PoW selection."},
+            {RPCResult::Type::NUM, "reserved_stake_coins", "Mature legacy coins currently excluded from PoW claim selection."},
+            {RPCResult::Type::STR_AMOUNT, "reserved_stake_weight", "Legacy PoS weight protected from PoW claim selection."},
+            {RPCResult::Type::NUM, "claim_coins_after_stake_reserve", "Confirmed legacy claim inputs left after applying the stake reserve."},
+            {RPCResult::Type::BOOL, "last_stake_coin_guard", "Whether the only mature legacy PoS coin is claim-eligible and therefore protected."},
+            {RPCResult::Type::BOOL, "stake_reserve_snapshot_available", "Whether the stake-reserve counts match the wallet-processed active tip."},
         }},
         RPCExamples{
             HelpExampleCli("getpowmininginfo", "")
@@ -3527,6 +3850,7 @@ static RPCHelpMan getpowmininginfo()
     ShadowPowClaimRecoveryUsage recovery_usage;
     ShadowPowClaimRecoveryPolicyMutationResult recovery_policy_state;
     bool recovery_database_ambiguous{false};
+    ShadowPowClaimStakeReserveInfo stake_reserve;
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
         claim_inventory = pwallet->GetShadowPowClaimInventoryLocked();
@@ -3540,6 +3864,7 @@ static RPCHelpMan getpowmininginfo()
         }
         recovery_usage = pwallet->GetShadowPowClaimRecoveryUsage(
             recovery_policy.rolling_fee_window_seconds);
+        stake_reserve = pwallet->GetShadowPowClaimStakeReserveInfoLocked();
     }
     obj.pushKV("quarantined_claims", static_cast<uint64_t>(claim_inventory.raw_quarantined_claims));
     obj.pushKV("blocking_quarantined_claims", static_cast<uint64_t>(claim_inventory.BlockingClaims()));
@@ -3555,6 +3880,14 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("claims_recycled", static_cast<uint64_t>(recovery_usage.recycled_outputs));
     obj.pushKV("cumulative_resolution_fees", ValueFromAmount(recovery_usage.confirmed_resolution_fees));
     obj.pushKV("claim_recovery_database_outcome_ambiguous", recovery_database_ambiguous);
+    obj.pushKV("configured_stake_reserve_coins", stake_reserve.configured_reserve_coins);
+    obj.pushKV("mature_stakeable_legacy_coins", static_cast<uint64_t>(stake_reserve.mature_stakeable_legacy_coins));
+    obj.pushKV("mature_stakeable_legacy_weight", ValueFromAmount(stake_reserve.mature_stakeable_legacy_weight));
+    obj.pushKV("reserved_stake_coins", static_cast<uint64_t>(stake_reserve.reserved_stake_coins));
+    obj.pushKV("reserved_stake_weight", ValueFromAmount(stake_reserve.reserved_stake_weight));
+    obj.pushKV("claim_coins_after_stake_reserve", static_cast<uint64_t>(stake_reserve.claim_coins_after_reserve));
+    obj.pushKV("last_stake_coin_guard", stake_reserve.last_stake_coin_guard);
+    obj.pushKV("stake_reserve_snapshot_available", stake_reserve.wallet_tip_matches);
     {
         LOCK(pwallet->cs_wallet);
         obj.pushKV("payout_address", pwallet->m_pow_payout_quantum);

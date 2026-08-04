@@ -53,6 +53,21 @@ private:
     int m_gold_rush_blocks;
 };
 
+class RecoveryQQP3TestingSetup : public TestChain100Setup
+{
+public:
+    RecoveryQQP3TestingSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-regtest",
+              "-shadowwhitelistheight=99",
+              "-shadowgoldrushstartheight=100",
+              "-shadowgoldrushblocks=1000",
+              "-shadowcompetingclaimsheight=100",
+          }}
+    {
+    }
+};
+
 CTransactionRef MakeRecoveryTestClaim(const COutPoint& input, CAmount value,
                                       const CScript& wallet_script)
 {
@@ -173,6 +188,81 @@ void SyncRecoveryTestWalletTip(CWallet& wallet, ChainstateManager& chainman)
 
 BOOST_FIXTURE_TEST_SUITE(shadow_pow_claim_recovery_tests, TestChain100Setup)
 
+BOOST_AUTO_TEST_CASE(aggregate_review_tracks_policy_tip_and_wallet_generation_atomically)
+{
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+
+    ShadowPowClaimRecoveryPolicy first_policy =
+        DefaultShadowPowClaimRecoveryPolicy();
+    first_policy.choice_recorded = 1;
+    first_policy.automatic_enabled = 1;
+    first_policy.max_fee_per_resolution = CENT / 4;
+    first_policy.aggregate_batch_fee_cap = CENT / 2;
+    bilingual_str policy_error;
+    BOOST_REQUIRE(wallet->SetShadowPowClaimRecoveryPolicy(
+        first_policy, policy_error));
+
+    ShadowPowClaimRecoveryRequest request;
+    request.origin = ShadowPowClaimRecoveryOrigin::AUTOMATIC;
+    const ShadowPowClaimRecoveryReview before =
+        wallet->GetShadowPowClaimRecoveryReview(request);
+    BOOST_REQUIRE(before.available);
+    BOOST_REQUIRE(before.consistent);
+    BOOST_CHECK(before.policy == first_policy);
+    BOOST_CHECK_EQUAL(before.plan.max_fee_per_resolution,
+                      first_policy.max_fee_per_resolution);
+    BOOST_CHECK_EQUAL(before.plan.aggregate_batch_fee_cap,
+                      first_policy.aggregate_batch_fee_cap);
+    BOOST_CHECK(before.active_tip == before.inventory.active_tip);
+    BOOST_CHECK(before.active_tip == before.plan.active_tip);
+    BOOST_CHECK_EQUAL(before.wallet_generation,
+                      before.inventory.wallet_generation);
+    BOOST_CHECK_EQUAL(before.wallet_generation,
+                      before.plan.wallet_generation);
+
+    CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    SyncRecoveryTestWalletTip(*wallet, *Assert(m_node.chainman));
+
+    ShadowPowClaimRecoveryPolicy second_policy = first_policy;
+    second_policy.max_fee_per_resolution = CENT / 2;
+    second_policy.aggregate_batch_fee_cap = CENT;
+    second_policy.rolling_fee_window_seconds = 12 * 60 * 60;
+    BOOST_REQUIRE(wallet->SetShadowPowClaimRecoveryPolicy(
+        second_policy, policy_error));
+    // The in-memory mock database intentionally does not advance its update
+    // counter on writes. Advance it explicitly to model an intervening wallet
+    // mutation exactly as a production SQLite/BDB backend would.
+    wallet->GetDatabase().nUpdateCounter.fetch_add(1);
+
+    const ShadowPowClaimRecoveryReview after =
+        wallet->GetShadowPowClaimRecoveryReview(request);
+    BOOST_REQUIRE(after.available);
+    BOOST_REQUIRE(after.consistent);
+    BOOST_CHECK(after.policy == second_policy);
+    BOOST_CHECK_EQUAL(after.plan.max_fee_per_resolution,
+                      second_policy.max_fee_per_resolution);
+    BOOST_CHECK_EQUAL(after.plan.aggregate_batch_fee_cap,
+                      second_policy.aggregate_batch_fee_cap);
+    BOOST_CHECK(after.active_tip == after.inventory.active_tip);
+    BOOST_CHECK(after.active_tip == after.plan.active_tip);
+    BOOST_CHECK_EQUAL(after.wallet_generation,
+                      after.inventory.wallet_generation);
+    BOOST_CHECK_EQUAL(after.wallet_generation,
+                      after.plan.wallet_generation);
+
+    // Both immutable refresh results remain internally coherent even though
+    // policy, chain tip, and wallet database generation changed between them.
+    BOOST_CHECK(before.active_tip != after.active_tip);
+    BOOST_CHECK(before.active_height < after.active_height);
+    BOOST_CHECK(before.wallet_generation < after.wallet_generation);
+    BOOST_CHECK(before.policy == first_policy);
+    BOOST_CHECK(after.policy == second_policy);
+}
+
 BOOST_AUTO_TEST_CASE(full_graph_groups_conflicts_branches_and_independent_anchors)
 {
     auto wallet = CreateSyncedWallet(
@@ -240,6 +330,24 @@ BOOST_AUTO_TEST_CASE(full_graph_groups_conflicts_branches_and_independent_anchor
     const ShadowPowClaimRecoveryInventory repeat =
         wallet->GetShadowPowClaimRecoveryInventory();
     BOOST_REQUIRE(first.wallet_tip_matches);
+    ShadowPowClaimRecoveryRequest review_request;
+    const ShadowPowClaimRecoveryReview review =
+        wallet->GetShadowPowClaimRecoveryReview(review_request);
+    BOOST_CHECK(review.available);
+    BOOST_CHECK(review.consistent);
+    BOOST_CHECK(review.status ==
+                ShadowPowClaimRecoveryReviewStatus::AVAILABLE);
+    BOOST_CHECK_EQUAL(review.reason_code, "available");
+    BOOST_CHECK(review.active_tip == first.active_tip);
+    BOOST_CHECK_EQUAL(review.active_height, first.active_height);
+    BOOST_CHECK_EQUAL(review.wallet_generation, first.wallet_generation);
+    BOOST_CHECK(review.inventory.active_tip == review.plan.active_tip);
+    BOOST_CHECK_EQUAL(review.inventory.active_height,
+                      review.plan.active_height);
+    BOOST_CHECK_EQUAL(review.inventory.wallet_generation,
+                      review.plan.wallet_generation);
+    BOOST_CHECK_EQUAL(review.usage.pending_manual, 0U);
+    BOOST_CHECK_EQUAL(review.usage.pending_automatic, 0U);
     BOOST_CHECK_EQUAL(first.raw_claim_objects, 6U);
     BOOST_CHECK_EQUAL(first.components.size(), 3U);
     BOOST_CHECK_EQUAL(first.unanchored_claim_txids.size(), 1U);
@@ -2303,10 +2411,13 @@ BOOST_AUTO_TEST_CASE(manual_scheduler_retries_exact_authorized_fee_above_preview
         anchor, CScript(), std::numeric_limits<uint32_t>::max());
     resolution.vout.emplace_back(
         anchor_tx->vout.at(0).nValue - reviewed_fee, script);
+    const unsigned int script_verify_flags =
+        wallet->GetActiveScriptVerifyFlags();
     {
         LOCK(wallet->cs_wallet);
         std::map<int, bilingual_str> input_errors;
-        BOOST_REQUIRE(wallet->SignTransaction(resolution, input_errors));
+        BOOST_REQUIRE(wallet->SignTransactionWithScriptVerifyFlags(
+            resolution, input_errors, script_verify_flags));
     }
     const CTransactionRef exact =
         MakeTransactionRef(std::move(resolution));
@@ -2368,6 +2479,12 @@ BOOST_AUTO_TEST_CASE(stale_plan_and_unsafe_graph_fail_before_signing)
     AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
                          tip->GetBlockHash(), tip->nHeight,
                          tip->GetBlockHash());
+    // Canonical QQP2 bytes are unbound and may revalidate on a descendant.
+    // Zero-payment retirement must never release their input.
+    BOOST_CHECK_EQUAL(wallet->RetireExpiredShadowPowClaims(), 0U);
+    BOOST_CHECK(!WITH_LOCK(
+        wallet->cs_wallet,
+        return wallet->mapWallet.at(claim->GetHash()).isAbandoned()));
 
     ShadowPowClaimRecoveryRequest request;
     request.selectors = {claim->GetHash()};
@@ -2413,6 +2530,136 @@ BOOST_AUTO_TEST_CASE(stale_plan_and_unsafe_graph_fail_before_signing)
     BOOST_REQUIRE_EQUAL(unsafe.refused.size(), 1U);
     BOOST_CHECK_EQUAL(unsafe.refused.front().reason_code,
                       "ordinary-conflict");
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    origin_expiry_retires_without_transaction_and_reopens_on_reorg,
+    RecoveryQQP3TestingSetup)
+{
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    auto notifications_handler = m_node.chain->handleNotifications(
+        {wallet.get(), [](CWallet*) {}});
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CScript wallet_script = anchor_tx->vout.at(0).scriptPubKey;
+    const CScript quantum_payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x51)});
+
+    std::vector<unsigned char> proof;
+    const CBlockIndex* origin_parent{nullptr};
+    {
+        LOCK(::cs_main);
+        origin_parent = chainman.ActiveChain().Tip();
+        BOOST_REQUIRE(origin_parent);
+        BOOST_REQUIRE(MineShadowProofData(
+            wallet_script, quantum_payout, origin_parent,
+            chainman.ActiveChainstate().CoinsTip(), 2000000, proof));
+    }
+    const std::vector<unsigned char> qqp3_magic{'Q', 'Q', 'P', '3'};
+    BOOST_REQUIRE(std::search(proof.begin(), proof.end(),
+                              qqp3_magic.begin(), qqp3_magic.end()) !=
+                  proof.end());
+
+    CMutableTransaction claim_mutable;
+    claim_mutable.vin.emplace_back(anchor);
+    claim_mutable.vout.emplace_back(
+        anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        wallet_script);
+    claim_mutable.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const CTransactionRef claim =
+        MakeTransactionRef(std::move(claim_mutable));
+    AddRecoveryTestClaim(*wallet, claim, origin_parent->nHeight,
+                         origin_parent->GetBlockHash(),
+                         origin_parent->nHeight,
+                         origin_parent->GetBlockHash());
+
+    BOOST_CHECK(wallet->IsSpent(anchor));
+    BOOST_CHECK_EQUAL(wallet->RetireExpiredShadowPowClaims(), 0U);
+
+    CBlock expiry_block;
+    for (unsigned int age = 1;
+         age <= SHADOW_POW_LATE_ORIGIN_WINDOW + 1; ++age) {
+        expiry_block = CreateAndProcessBlock(
+            {}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+        SyncWithValidationInterfaceQueue();
+    }
+    SyncRecoveryTestWalletTip(*wallet, chainman);
+
+    ShadowPowClaimRecoveryRequest pending_request;
+    pending_request.selectors = {claim->GetHash()};
+    const ShadowPowClaimRecoveryPlan pending_preview =
+        wallet->PlanShadowPowClaimRecovery(pending_request);
+    BOOST_CHECK(pending_preview.actions.empty());
+    BOOST_REQUIRE_EQUAL(pending_preview.refused.size(), 1U);
+    BOOST_CHECK_EQUAL(pending_preview.refused.front().reason_code,
+                      "zero-payment-retirement-pending");
+    BOOST_CHECK_EQUAL(pending_preview.total_fee, 0);
+
+    const size_t transaction_count_before = WITH_LOCK(
+        wallet->cs_wallet, return wallet->mapWallet.size());
+    BOOST_CHECK_EQUAL(wallet->RetireExpiredShadowPowClaims(), 1U);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+                          wallet->cs_wallet, return wallet->mapWallet.size()),
+                      transaction_count_before);
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& retired = wallet->mapWallet.at(claim->GetHash());
+        BOOST_CHECK(retired.isAbandoned());
+        BOOST_CHECK_EQUAL(
+            retired.mapValue.at(SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY), "1");
+        BOOST_CHECK_EQUAL(
+            retired.mapValue.at(SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY),
+            expiry_block.GetHash().GetHex());
+        BOOST_CHECK(!wallet->IsSpent(anchor));
+    }
+    BOOST_CHECK_EQUAL(wallet->CountQuarantinedShadowPowClaims(), 0U);
+
+    const ShadowPowClaimRecoveryInventory retired_inventory =
+        wallet->GetShadowPowClaimRecoveryInventory();
+    const auto& retired_component =
+        FindRecoveryComponent(retired_inventory, anchor);
+    BOOST_CHECK(retired_component.state ==
+                ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH);
+    BOOST_CHECK(retired_component.all_claims_expired_locally_retired);
+    BOOST_CHECK_EQUAL(retired_inventory.retired_claim_objects, 1U);
+    BOOST_CHECK_EQUAL(retired_inventory.retired_components, 1U);
+    BOOST_CHECK_EQUAL(retired_inventory.blocking_components, 0U);
+
+    ShadowPowClaimRecoveryRequest preview_request;
+    preview_request.selectors = {claim->GetHash()};
+    const ShadowPowClaimRecoveryPlan retired_preview =
+        wallet->PlanShadowPowClaimRecovery(preview_request);
+    BOOST_CHECK(retired_preview.actions.empty());
+    BOOST_REQUIRE_EQUAL(retired_preview.refused.size(), 1U);
+    BOOST_CHECK_EQUAL(retired_preview.refused.front().reason_code,
+                      "claim-expired-locally-retired");
+    BOOST_CHECK_EQUAL(retired_preview.total_fee, 0);
+
+    CBlockIndex* expiry_index = WITH_LOCK(
+        ::cs_main,
+        return chainman.m_blockman.LookupBlockIndex(expiry_block.GetHash()));
+    BOOST_REQUIRE(expiry_index);
+    BlockValidationState state;
+    BOOST_REQUIRE(chainman.ActiveChainstate().InvalidateBlock(
+        state, expiry_index));
+    SyncWithValidationInterfaceQueue();
+    SyncRecoveryTestWalletTip(*wallet, chainman);
+
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& reopened = wallet->mapWallet.at(claim->GetHash());
+        BOOST_CHECK(!reopened.isAbandoned());
+        BOOST_CHECK(reopened.mapValue.count(
+                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY) == 0);
+        BOOST_CHECK(wallet->IsSpent(anchor));
+    }
+    BOOST_CHECK(wallet->CountQuarantinedShadowPowClaims() > 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

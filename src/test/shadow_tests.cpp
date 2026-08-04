@@ -2589,7 +2589,10 @@ BOOST_AUTO_TEST_CASE(pow_shadow_mempool_policy_is_next_tip_bound_and_not_whiteli
     BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
                     *claim_tx, &claim_index, view, true, reject_reason,
                     &disposition) == ShadowProofValidationResult::INVALID);
-    BOOST_CHECK(disposition == ShadowPowClaimMempoolDisposition::INVALID_PROOF);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE);
+    BOOST_CHECK(IsShadowPowClaimMempoolRetryable(disposition));
+    BOOST_CHECK(!IsShadowPowClaimCurrentBranchTerminal(disposition));
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-invalid");
 }
 

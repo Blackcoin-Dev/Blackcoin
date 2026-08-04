@@ -198,10 +198,25 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         )
 
     def _assert_no_automatic_claim_cleanup(self, wallet, claim_txid):
-        """Terminal claims stay quarantined; the wallet must not pay to race them."""
+        """No automatic path may pay to race a terminal claim."""
         assert not any(
             entry.get("qq_shadow_pow_cleanup_for") == claim_txid
             for entry in wallet.listtransactions("*", 1000, 0, True)
+        )
+
+    def _assert_zero_payment_retired_claim(self, wallet, txid, address, claim_input):
+        """An origin-expired authored claim releases its input without a new tx."""
+        node = self.nodes[0]
+        self.wait_until(lambda: txid not in node.getrawmempool(), timeout=20)
+        self.wait_until(lambda: self._is_abandoned(wallet, txid), timeout=20)
+        record = wallet.gettransaction(txid)
+        assert_equal(record["qq_shadow_pow_expired_retired"], "1")
+        assert int(record["qq_shadow_pow_expired_retired_height"]) > 0
+        assert_equal(len(record["qq_shadow_pow_expired_retired_tip"]), 64)
+        self._assert_no_automatic_claim_cleanup(wallet, txid)
+        assert any(
+            {"txid": utxo["txid"], "vout": utxo["vout"]} == claim_input
+            for utxo in wallet.listunspent(1, 9999999, [address])
         )
 
     def _assert_confirmed_claim(self, wallet, txid, block_hash):
@@ -441,7 +456,7 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
             self.generateblock(node, output=staker_address, transactions=[])
         self.wait_until(lambda: repair_txid not in node.getrawmempool(), timeout=10)
 
-        self.log.info("Restarting before wallet load exercises persisted stale-claim repair")
+        self.log.info("Restarting before wallet load exercises zero-payment stale-claim retirement")
         self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={self.mock_time}"])
         node = self.nodes[0]
         node.setmocktime(self.mock_time)
@@ -452,9 +467,9 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         self._assert_confirmed_claim(age_miner, age_txid, age_block_hash)
 
         repair_miner = self._load_wallet("goldrush_pow_repair")
-        self._assert_quarantined_claim(repair_miner, repair_txid, repair_address, repair_input)
-        self._assert_no_automatic_claim_cleanup(repair_miner, repair_txid)
-        assert_equal(len(repair_miner.listunspent(1, 9999999, [repair_address])), 0)
+        self._assert_zero_payment_retired_claim(
+            repair_miner, repair_txid, repair_address, repair_input
+        )
         self._sync_mocktime_to_tip()
 
         self.log.info("Submitting a fresh built-in miner claim and mining it in a PoS block")

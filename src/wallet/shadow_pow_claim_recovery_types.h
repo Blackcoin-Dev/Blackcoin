@@ -32,6 +32,14 @@ inline constexpr char SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY[]{"qq_shadow_pow
 // audit provenance and is never used to infer current-branch age.
 inline constexpr char SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY[]{"qq_shadow_pow_branch_quarantine_height"};
 inline constexpr char SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY[]{"qq_shadow_pow_branch_quarantine_tip"};
+// A zero-payment retirement is a reversible, branch-scoped wallet fact. It
+// releases only a locally-authored origin-bound claim after Core has proved
+// ORIGIN_EXPIRED on the active branch. The observation block must remain an
+// ancestor of the active tip; otherwise the wallet reopens and reclassifies
+// the claim before permitting reuse of its input.
+inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY[]{"qq_shadow_pow_expired_retired"};
+inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY[]{"qq_shadow_pow_expired_retired_height"};
+inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY[]{"qq_shadow_pow_expired_retired_tip"};
 inline constexpr char SHADOW_POW_CLAIM_ADOPTED_KEY[]{"qq_shadow_pow_adopted"};
 // Explicit adoption is authenticated to both the tip at which the operator
 // reviewed the component and the stable anchor-generation identity that was
@@ -65,6 +73,7 @@ enum class ShadowPowClaimRecoveryState : uint8_t {
     INDETERMINATE,
     CURRENT_BRANCH_INELIGIBLE,
     TERMINAL_ON_PINNED_TIP,
+    RETIRED_ON_ACTIVE_BRANCH,
     RESOLUTION_PENDING,
     RESOLVED_ON_ACTIVE_CHAIN,
 };
@@ -96,6 +105,7 @@ struct ShadowPowClaimRecoveryNode
     bool in_mempool{false};
     bool abandoned{false};
     bool quarantined{false};
+    bool expired_locally_retired{false};
     bool expected_shape{false};
     bool wallet_authored{false};
     int created_height{-1};
@@ -147,6 +157,8 @@ struct ShadowPowClaimRecoveryComponent
     bool has_legacy_resolution{false};
     bool has_live_resolution{false};
     bool all_claims_terminal_on_pinned_tip{false};
+    bool all_claims_zero_payment_retirable{false};
+    bool all_claims_expired_locally_retired{false};
     bool has_branch_relative_ineligibility{false};
     size_t descendant_claims{0};
     int minimum_stale_depth{0};
@@ -165,6 +177,8 @@ struct ShadowPowClaimRecoveryInventory
     size_t live_claim_objects{0};
     size_t quarantined_claim_objects{0};
     size_t blocking_components{0};
+    size_t retired_claim_objects{0};
+    size_t retired_components{0};
     size_t resolved_components{0};
     std::vector<ShadowPowClaimRecoveryComponent> components;
     std::vector<uint256> unanchored_claim_txids;
@@ -434,6 +448,33 @@ struct ShadowPowClaimRecoveryPolicyMutationResult
     bool durable_state_ambiguous{false};
     bool authoritative_state_available{false};
     ShadowPowClaimRecoveryPolicy authoritative_policy;
+    std::string detail;
+};
+
+enum class ShadowPowClaimRecoveryReviewStatus : uint8_t {
+    AVAILABLE,
+    CHAIN_UNAVAILABLE,
+    WALLET_TIP_STALE,
+    POLICY_UNAVAILABLE,
+};
+
+/** Read-only recovery review assembled under one cs_main/cs_wallet snapshot. */
+struct ShadowPowClaimRecoveryReview
+{
+    ShadowPowClaimRecoveryReviewStatus status{
+        ShadowPowClaimRecoveryReviewStatus::CHAIN_UNAVAILABLE};
+    bool available{false};
+    bool consistent{false};
+    uint256 active_tip;
+    int active_height{-1};
+    uint256 wallet_tip;
+    int wallet_height{-1};
+    uint64_t wallet_generation{0};
+    ShadowPowClaimRecoveryInventory inventory;
+    ShadowPowClaimRecoveryPlan plan;
+    ShadowPowClaimRecoveryPolicy policy;
+    ShadowPowClaimRecoveryUsage usage;
+    std::string reason_code;
     std::string detail;
 };
 

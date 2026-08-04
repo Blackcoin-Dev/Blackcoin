@@ -118,6 +118,10 @@ extern const std::vector<std::string> CHECKLEVEL_DOC;
 
 /** Run instances of script checking worker threads */
 void StartScriptCheckWorkerThreads(int threads_num);
+
+/** Remove QQSPROOF carriers that exceeded their claim-only one-hour mempool
+ *  lifetime. Wallets retain their inputs until branch-aware expiry. */
+void ExpireShadowPowClaimsFromMempool(CTxMemPool& pool);
 /** Stop all of the script checking worker threads */
 void StopScriptCheckWorkerThreads();
 

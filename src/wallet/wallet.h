@@ -102,10 +102,72 @@ struct ShadowPowClaimInput {
     CAmount value{0};
 };
 
+static constexpr int DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS{1};
+
+/** One coherent wallet/chain snapshot of the legacy stake capacity protected
+ * from Gold Rush PoW claim input selection. Synthetic quantum rewards are not
+ * legacy stake candidates and therefore never enter these counts. */
+struct ShadowPowClaimStakeReserveInfo {
+    uint256 active_tip;
+    uint64_t wallet_generation{0};
+    bool wallet_tip_matches{false};
+    bool staking_enabled{false};
+    int configured_reserve_coins{DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS};
+    size_t mature_stakeable_legacy_coins{0};
+    CAmount mature_stakeable_legacy_weight{0};
+    size_t reserved_stake_coins{0};
+    CAmount reserved_stake_weight{0};
+    size_t claim_coins_after_reserve{0};
+    bool last_stake_coin_guard{false};
+};
+
+enum class StakingTelemetryState : uint8_t {
+    DISABLED,
+    STARTING,
+    LOCKED,
+    SYNCING,
+    SEARCHING,
+    NO_ELIGIBLE_COINS,
+    ERROR,
+    STOPPED,
+};
+
+inline constexpr std::string_view StakingTelemetryStateName(
+    StakingTelemetryState state) noexcept
+{
+    switch (state) {
+    case StakingTelemetryState::DISABLED: return "disabled";
+    case StakingTelemetryState::STARTING: return "starting";
+    case StakingTelemetryState::LOCKED: return "locked";
+    case StakingTelemetryState::SYNCING: return "syncing";
+    case StakingTelemetryState::SEARCHING: return "searching";
+    case StakingTelemetryState::NO_ELIGIBLE_COINS: return "no_eligible_coins";
+    case StakingTelemetryState::ERROR: return "error";
+    case StakingTelemetryState::STOPPED: return "stopped";
+    }
+    return "error";
+}
+
+/** Stable, internally coherent PoS worker snapshot for RPC/GUI monitoring. */
+struct StakingTelemetrySnapshot {
+    uint64_t sequence{0};
+    StakingTelemetryState state{StakingTelemetryState::DISABLED};
+    bool enabled{false};
+    bool worker_running{false};
+    bool eligible{false};
+    uint256 tip;
+    int tip_height{-1};
+    uint64_t weight{0};
+    int weight_cache_height{-1};
+    int64_t search_interval{0};
+    std::string reason{"staking is disabled"};
+};
+
 enum class ShadowPowClaimInputSelectionResult {
     SELECTED,
     NO_ELIGIBLE_INPUT,
     FEE_EXCEEDS_MAX,
+    STAKE_RESERVE_PROTECTED,
 };
 
 enum class ShadowPowClaimSubmitResult {
@@ -1124,8 +1186,14 @@ public:
     bool SignTransaction(CMutableTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Fetch the inputs and sign with SIGHASH_ALL, returning per-input errors. */
     bool SignTransaction(CMutableTransaction& tx, std::map<int, bilingual_str>& input_errors) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Sign using script flags captured from the same cs_main-pinned snapshot
+     * as the caller's wallet mutation. This avoids reacquiring cs_main while
+     * cs_wallet is held by atomic recovery paths. */
+    bool SignTransactionWithScriptVerifyFlags(CMutableTransaction& tx, std::map<int, bilingual_str>& input_errors, unsigned int script_verify_flags) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Sign the tx given the input coins and sighash. */
     bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const;
+    /** Sign with input coins and an already pinned script-policy snapshot. */
+    bool SignTransactionWithScriptVerifyFlags(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, unsigned int script_verify_flags) const;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const;
     SigningResult SignBlockHash(const uint256 &hash, const PKHash& pkhash, std::vector<unsigned char>& vchSig) const;
 
@@ -1220,6 +1288,9 @@ public:
     unsigned int m_donation_percentage{DEFAULT_DONATION_PERCENTAGE};
     std::atomic<bool> m_enabled_staking{false};
     std::atomic<bool> m_stop_staking_thread{false};
+    mutable Mutex m_staking_telemetry_mutex;
+    StakingTelemetrySnapshot m_staking_telemetry
+        GUARDED_BY(m_staking_telemetry_mutex);
     int m_demurrage_last_auto_attest_scan_height GUARDED_BY(cs_wallet){-1};
     std::map<uint256, int> m_demurrage_last_auto_attest_attempt_height GUARDED_BY(cs_wallet);
     int m_shadow_signal_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
@@ -1681,6 +1752,10 @@ public:
 
     /* Is staking closing */
     bool IsStakeClosing();
+    void PublishStakingTelemetry(
+        StakingTelemetryState state, const uint256& tip, int tip_height,
+        bool worker_running, std::string reason);
+    StakingTelemetrySnapshot GetStakingTelemetrySnapshot() const;
 
     /* Staking thread group */
     Mutex m_staking_thread_mutex;
@@ -1751,6 +1826,8 @@ public:
     /** Reconstruct policy usage from persisted resolution transactions. */
     ShadowPowClaimRecoveryUsage GetShadowPowClaimRecoveryUsage(
         uint32_t rolling_window_seconds) const;
+    ShadowPowClaimRecoveryReview GetShadowPowClaimRecoveryReview(
+        const ShadowPowClaimRecoveryRequest& request) const;
     /** Explicitly authenticate one reviewed historical component. */
     ShadowPowClaimRecoveryAdoptionResult AdoptShadowPowClaimRecoveryComponent(
         const uint256& selector, const uint256& expected_tip,
@@ -1766,6 +1843,10 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Periodic wallet-scoped automatic execution; never enables the miner. */
     void MaybeAutoResolveShadowPowClaims();
+    /** Durably release authenticated, locally-authored QQP3/QQP4 claims only
+     * after their origin window is expired on the pinned active branch. This
+     * creates, signs, and broadcasts no transaction and is reorg-reversible. */
+    size_t RetireExpiredShadowPowClaims();
     /** Count quarantined claim objects that currently gate claim creation.
      * This is actionable plus indeterminate objects, not raw wallet history. */
     size_t CountQuarantinedShadowPowClaims() const;
@@ -1786,6 +1867,8 @@ public:
         const CCoinControl& coin_control,
         ShadowPowClaimInput& selected,
         bilingual_str& error) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    ShadowPowClaimStakeReserveInfo GetShadowPowClaimStakeReserveInfoLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     void MaybeDelayShadowPowClaimSubmissionForTest(const COutPoint& selected_outpoint);
     ShadowPowClaimSubmitResult SubmitShadowPowClaim(const ShadowPowClaimInput& selected_input, const ShadowPowWork& work, const std::vector<unsigned char>& proof, bilingual_str& error);
     std::unique_ptr<std::vector<std::thread>> threadPowMinerGroup GUARDED_BY(m_pow_miner_mutex);

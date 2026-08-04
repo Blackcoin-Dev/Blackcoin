@@ -20,6 +20,7 @@ std::string RemovalReasonToString(const MemPoolRemovalReason& r) noexcept
         case MemPoolRemovalReason::CONFLICT: return "conflict";
         case MemPoolRemovalReason::REPLACED: return "replaced";
         case MemPoolRemovalReason::SHADOW_STALE: return "shadow-stale";
+        case MemPoolRemovalReason::SHADOW_TIMEOUT: return "shadow-timeout";
     }
     assert(false);
 }

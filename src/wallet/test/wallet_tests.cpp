@@ -775,6 +775,197 @@ static void AddKey(CWallet& wallet, const CKey& key)
     if (!wallet.AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
 }
 
+BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
+                        TestChain100Setup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script =
+        GetScriptForRawPubKey(wallet_key.GetPubKey());
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        wallet_key);
+
+    const CBlockIndex* confirmation_block = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain()[1]);
+    BOOST_REQUIRE(confirmation_block);
+    auto add_confirmed_coin = [&](uint8_t tag, CAmount value) {
+        CMutableTransaction funding;
+        funding.vin.emplace_back(COutPoint{uint256{tag}, 0});
+        funding.vout.emplace_back(value, wallet_script);
+        const CTransactionRef tx = MakeTransactionRef(std::move(funding));
+        BOOST_REQUIRE(wallet->AddToWallet(
+            tx, TxStateConfirmed{confirmation_block->GetBlockHash(),
+                                 confirmation_block->nHeight, 1}));
+        return COutPoint{tx->GetHash(), 0};
+    };
+
+    const COutPoint first = add_confirmed_coin(0x41, 10 * COIN);
+    const CScript quantum_payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x51)});
+    CCoinControl control;
+    control.m_allow_other_inputs = false;
+    control.m_avoid_address_reuse = false;
+    control.m_min_depth = 1;
+    ShadowPowClaimInput selected;
+    bilingual_str error;
+
+    wallet->m_enabled_staking = true;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const ShadowPowClaimStakeReserveInfo info =
+            wallet->GetShadowPowClaimStakeReserveInfoLocked();
+        BOOST_CHECK(info.wallet_tip_matches);
+        BOOST_CHECK_EQUAL(info.configured_reserve_coins, 1);
+        BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_coins, 1U);
+        BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_weight, 10 * COIN);
+        BOOST_CHECK_EQUAL(info.reserved_stake_coins, 1U);
+        BOOST_CHECK_EQUAL(info.reserved_stake_weight, 10 * COIN);
+        BOOST_CHECK_EQUAL(info.claim_coins_after_reserve, 0U);
+        BOOST_CHECK(info.last_stake_coin_guard);
+        BOOST_CHECK(
+            wallet->SelectShadowPowClaimInput(
+                std::nullopt, quantum_payout, nullptr, control, selected,
+                error) ==
+            ShadowPowClaimInputSelectionResult::STAKE_RESERVE_PROTECTED);
+    }
+    BOOST_CHECK(error.original.find("protect 1 mature legacy staking coin") !=
+                std::string::npos);
+
+    // A protected coin that cannot satisfy fee policy must report the fee
+    // failure, not claim that the stake reserve was the deciding blocker.
+    const CAmount original_max_fee = wallet->m_default_max_tx_fee;
+    wallet->m_default_max_tx_fee = 0;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_CHECK(
+            wallet->SelectShadowPowClaimInput(
+                std::nullopt, quantum_payout, nullptr, control, selected,
+                error) ==
+            ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX);
+    }
+    wallet->m_default_max_tx_fee = original_max_fee;
+
+    wallet->m_enabled_staking = false;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_CHECK(wallet->SelectShadowPowClaimInput(
+                        std::nullopt, quantum_payout, nullptr, control,
+                        selected, error) ==
+                    ShadowPowClaimInputSelectionResult::SELECTED);
+        BOOST_CHECK(selected.outpoint == first);
+    }
+
+    const COutPoint second = add_confirmed_coin(0x42, 20 * COIN);
+    wallet->m_enabled_staking = true;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const ShadowPowClaimStakeReserveInfo info =
+            wallet->GetShadowPowClaimStakeReserveInfoLocked();
+        BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_coins, 2U);
+        BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_weight, 30 * COIN);
+        BOOST_CHECK_EQUAL(info.reserved_stake_coins, 1U);
+        BOOST_CHECK_EQUAL(info.reserved_stake_weight, 20 * COIN);
+        BOOST_CHECK_EQUAL(info.claim_coins_after_reserve, 1U);
+        BOOST_CHECK(!info.last_stake_coin_guard);
+        BOOST_CHECK(wallet->SelectShadowPowClaimInput(
+                        std::nullopt, quantum_payout, nullptr, control,
+                        selected, error) ==
+                    ShadowPowClaimInputSelectionResult::SELECTED);
+        BOOST_CHECK(selected.outpoint == first);
+        BOOST_CHECK(selected.outpoint != second);
+    }
+
+    // Reserve policy and telemetry are wallet-scoped. A second wallet on the
+    // same chain cannot inherit the first wallet's enabled state, coins, or
+    // protected outpoints.
+    CKey peer_key;
+    peer_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript peer_script =
+        GetScriptForRawPubKey(peer_key.GetPubKey());
+    auto peer_wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        peer_key);
+    CMutableTransaction peer_funding;
+    peer_funding.vin.emplace_back(COutPoint{uint256{0x43}, 0});
+    peer_funding.vout.emplace_back(15 * COIN, peer_script);
+    const CTransactionRef peer_tx =
+        MakeTransactionRef(std::move(peer_funding));
+    BOOST_REQUIRE(peer_wallet->AddToWallet(
+        peer_tx, TxStateConfirmed{confirmation_block->GetBlockHash(),
+                                  confirmation_block->nHeight, 1}));
+    peer_wallet->m_enabled_staking = false;
+    {
+        LOCK2(::cs_main, peer_wallet->cs_wallet);
+        const ShadowPowClaimStakeReserveInfo peer_info =
+            peer_wallet->GetShadowPowClaimStakeReserveInfoLocked();
+        BOOST_CHECK(!peer_info.staking_enabled);
+        BOOST_CHECK_EQUAL(peer_info.mature_stakeable_legacy_coins, 1U);
+        BOOST_CHECK_EQUAL(peer_info.reserved_stake_coins, 0U);
+        BOOST_CHECK(peer_wallet->SelectShadowPowClaimInput(
+                        std::nullopt, quantum_payout, nullptr, control,
+                        selected, error) ==
+                    ShadowPowClaimInputSelectionResult::SELECTED);
+        BOOST_CHECK(selected.outpoint == COutPoint(peer_tx->GetHash(), 0));
+    }
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const ShadowPowClaimStakeReserveInfo original_info =
+            wallet->GetShadowPowClaimStakeReserveInfoLocked();
+        BOOST_CHECK(original_info.staking_enabled);
+        BOOST_CHECK_EQUAL(original_info.reserved_stake_coins, 1U);
+        BOOST_CHECK_EQUAL(original_info.reserved_stake_weight, 20 * COIN);
+    }
+    wallet->m_enabled_staking = false;
+}
+
+BOOST_FIXTURE_TEST_CASE(staking_telemetry_does_not_treat_zero_search_interval_as_stopped,
+                        TestChain100Setup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        wallet_key);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+
+    wallet->m_enabled_staking = true;
+    wallet->m_cached_stake_weight = 10 * COIN;
+    wallet->m_cached_stake_weight_height = tip->nHeight;
+    wallet->m_last_coin_stake_search_interval = 0;
+    wallet->PublishStakingTelemetry(
+        StakingTelemetryState::SEARCHING, tip->GetBlockHash(), tip->nHeight,
+        /*worker_running=*/true, "searching eligible stake coins");
+
+    const StakingTelemetrySnapshot searching =
+        wallet->GetStakingTelemetrySnapshot();
+    BOOST_CHECK(searching.enabled);
+    BOOST_CHECK(searching.worker_running);
+    BOOST_CHECK(searching.eligible);
+    BOOST_CHECK(searching.state == StakingTelemetryState::SEARCHING);
+    BOOST_CHECK_EQUAL(searching.search_interval, 0);
+    BOOST_CHECK_EQUAL(searching.weight, 10 * COIN);
+    BOOST_CHECK_EQUAL(searching.tip_height, tip->nHeight);
+    BOOST_CHECK(searching.tip == tip->GetBlockHash());
+
+    wallet->m_enabled_staking = false;
+    const StakingTelemetrySnapshot disabled =
+        wallet->GetStakingTelemetrySnapshot();
+    BOOST_CHECK(!disabled.enabled);
+    BOOST_CHECK(!disabled.worker_running);
+    BOOST_CHECK(!disabled.eligible);
+    BOOST_CHECK(disabled.state == StakingTelemetryState::DISABLED);
+}
+
 BOOST_FIXTURE_TEST_CASE(commit_refreshes_mempool_state_before_async_callbacks, TestChain100Setup)
 {
     CKey wallet_key;

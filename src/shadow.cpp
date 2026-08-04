@@ -4740,6 +4740,19 @@ std::map<CScript, CScript> GetActiveShadowSignalPayouts(const CCoinsViewCache& v
     return ActiveSignalPayoutScripts(ReadActiveShadowSignals(view, pindex, pindex->nHeight));
 }
 
+std::map<CScript, ShadowActiveSignalInfo> GetActiveShadowSignalDetails(
+    const CCoinsViewCache& view, const CBlockIndex* pindex)
+{
+    std::map<CScript, ShadowActiveSignalInfo> details;
+    if (!pindex) return details;
+    for (const auto& [target, signal] :
+         ReadActiveShadowSignals(view, pindex, pindex->nHeight)) {
+        details.emplace(target, ShadowActiveSignalInfo{
+            signal.target, signal.payout_script, signal.last_signal_height});
+    }
+    return details;
+}
+
 CAmount ShadowBaseReward(int height)
 {
     if (height < SHADOW_REWARD_START_HEIGHT || height > SHADOW_REWARD_END_HEIGHT) return 0;
@@ -6664,6 +6677,26 @@ bool TransactionHasShadowSignal(const CTransaction& tx)
         if (ExtractSignalPayload(out.scriptPubKey)) return true;
     }
     return false;
+}
+
+bool DecodeShadowSignal(const CTransaction& tx, ShadowSignalInfo& signal_out)
+{
+    std::optional<ShadowSignal> decoded;
+    for (const CTxOut& out : tx.vout) {
+        const auto payload = ExtractSignalPayload(out.scriptPubKey);
+        if (!payload) continue;
+        ShadowSignal signal;
+        if (decoded || !DecodeSignalPayload(*payload, signal) ||
+            !signal.quantum_linked) {
+            return false;
+        }
+        decoded = std::move(signal);
+    }
+    if (!decoded) return false;
+    signal_out = ShadowSignalInfo{
+        decoded->target, decoded->payout_script, decoded->solve_height,
+        decoded->solve_hash};
+    return true;
 }
 
 bool CheckShadowSignalForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev,

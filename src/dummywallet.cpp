@@ -64,6 +64,7 @@ void DummyWalletInit::AddWalletOptions(ArgsManager& argsman) const
         "-powmining=<true/false>",
         "-powminingthreads=<n>",
         "-powminingcpu=<n>",
+        "-powclaimreservestakecoins=<n>",
         "-qqallowautokeycreation=<true/false>",
         "-autoresolvefailedclaims=<mode>",
         "-autoresolvemaxfee=<amt>",

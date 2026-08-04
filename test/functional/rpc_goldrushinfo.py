@@ -9,6 +9,7 @@ QQSPROOF_HEX = "51515350524f4f46"
 GOLD_RUSH_END_HEIGHT = 501
 MIGRATION_END_HEIGHT = 700
 QQP3_LATE_ORIGIN_WINDOW = 64
+QQSPROOF_MEMPOOL_TTL_SECONDS = 60 * 60
 POW_WALLET_PASSPHRASE = "goldrush-pow-state-test"
 
 class GoldRushInfoTest(BitcoinTestFramework):
@@ -56,10 +57,12 @@ class GoldRushInfoTest(BitcoinTestFramework):
                 claims.append(txid)
         return claims
 
-    def _assert_qqp3_recovery_age(self, wallet, claim_txid, origin_age):
+    def _assert_qqp3_recovery_age(
+        self, wallet, claim_txid, origin_age, *, expect_in_mempool=True
+    ):
         """Pin the recovery engine to every still-live QQP3 origin age."""
         node = self.nodes[0]
-        assert claim_txid in node.getrawmempool()
+        assert_equal(claim_txid in node.getrawmempool(), expect_in_mempool)
         info = wallet.getpowclaimrecoveryinfo(True)
         component = next(
             component
@@ -72,10 +75,13 @@ class GoldRushInfoTest(BitcoinTestFramework):
             if graph_node["txid"] == claim_txid
         )
         assert_equal(claim_node["kind"], "claim")
-        assert_equal(claim_node["in_mempool"], True)
+        assert_equal(claim_node["in_mempool"], expect_in_mempool)
         assert_equal(claim_node["disposition"], "eligible")
         assert_equal(claim_node["proof_may_revalidate_on_descendant"], False)
-        assert_equal(info["live_claim_objects"], 1)
+        assert_equal(info["live_claim_objects"], int(expect_in_mempool))
+        if not expect_in_mempool:
+            assert_equal(claim_node["quarantined"], True)
+            assert_equal(component["classification"], "live")
 
         # Recovery planning must revalidate the complete component, not infer
         # terminality merely from age. The inclusive QQP3 late-origin window
@@ -83,12 +89,16 @@ class GoldRushInfoTest(BitcoinTestFramework):
         preview = wallet.resolveallshadowpowclaims()
         assert_equal(preview["actionable_components"], 0)
         assert_equal(preview["refused_components"], 1)
-        assert_equal(preview["refused"][0]["reason_code"], "claim-live")
+        assert_equal(
+            preview["refused"][0]["reason_code"],
+            "claim-live" if expect_in_mempool else "claim-not-terminal",
+        )
         assert_equal(preview["refused"][0]["claim_txids"], [claim_txid])
         self.log.debug(
-            "QQP3 claim %s remains live and non-resolvable at origin age %d",
+            "QQP3 claim %s remains height-live and non-resolvable at origin age %d (in_mempool=%s)",
             claim_txid,
             origin_age,
+            expect_in_mempool,
         )
 
     def _assert_builtin_pow_miner_lifecycle(self):
@@ -326,9 +336,31 @@ class GoldRushInfoTest(BitcoinTestFramework):
         )
         assert_equal(self._mempool_pow_claims(node), [stale_claim["txid"]])
 
-        self.log.info("Retaining QQP3 claims through every bounded late-origin age")
+        self.log.info("Expiring QQP3 relay residence after one hour without releasing its input")
+        claim_entry_time = node.getmempoolentry(stale_claim["txid"])["time"]
+        node.setmocktime(claim_entry_time + QQSPROOF_MEMPOOL_TTL_SECONDS + 1)
+        node.mockscheduler(60)
+        self.wait_until(
+            lambda: stale_claim["txid"] not in node.getrawmempool(),
+            timeout=10,
+        )
+        node.syncwithvalidationinterfacequeue()
+        self._assert_qqp3_recovery_age(
+            wallet, stale_claim["txid"], 0, expect_in_mempool=False
+        )
+
+        self.log.info("Wallet reload does not grant an expired claim a fresh relay lifetime")
+        node.unloadwallet(wallet_name)
+        node.loadwallet(wallet_name)
+        wallet = node.get_wallet_rpc(wallet_name)
+        node.syncwithvalidationinterfacequeue()
+        assert stale_claim["txid"] not in node.getrawmempool()
+        self._assert_qqp3_recovery_age(
+            wallet, stale_claim["txid"], 0, expect_in_mempool=False
+        )
+
+        self.log.info("Keeping the timed-out claim reserved through every bounded late-origin height")
         stale_parent = node.getbestblockhash()
-        self._assert_qqp3_recovery_age(wallet, stale_claim["txid"], 0)
 
         # First advance the claim-aware node with an explicitly empty block,
         # then replace that sibling with a two-block peer branch. This covers
@@ -340,7 +372,9 @@ class GoldRushInfoTest(BitcoinTestFramework):
             sync_fun=self.no_op,
         )
         node.syncwithvalidationinterfacequeue()
-        self._assert_qqp3_recovery_age(wallet, stale_claim["txid"], 1)
+        self._assert_qqp3_recovery_age(
+            wallet, stale_claim["txid"], 1, expect_in_mempool=False
+        )
         self.generatetoaddress(
             self.nodes[1],
             2,
@@ -350,7 +384,9 @@ class GoldRushInfoTest(BitcoinTestFramework):
         self.connect_nodes(0, 1)
         self.sync_blocks()
         assert node.getbestblockhash() != stale_parent
-        self._assert_qqp3_recovery_age(wallet, stale_claim["txid"], 2)
+        self._assert_qqp3_recovery_age(
+            wallet, stale_claim["txid"], 2, expect_in_mempool=False
+        )
 
         for origin_age in range(3, QQP3_LATE_ORIGIN_WINDOW + 1):
             self.generateblock(
@@ -361,7 +397,10 @@ class GoldRushInfoTest(BitcoinTestFramework):
             )
             node.syncwithvalidationinterfacequeue()
             self._assert_qqp3_recovery_age(
-                wallet, stale_claim["txid"], origin_age
+                wallet,
+                stale_claim["txid"],
+                origin_age,
+                expect_in_mempool=False,
             )
 
         self.log.info("Making QQP3 recovery eligible only at expired origin age 65")
@@ -395,11 +434,47 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(expired_node["in_mempool"], False)
         assert_equal(expired_node["quarantined"], True)
         assert_equal(expired_component["classification"], "terminal_on_pinned_tip")
-        expired_preview = wallet.resolveallshadowpowclaims()
-        assert_equal(expired_preview["actionable_components"], 1)
-        assert_equal(expired_preview["refused_components"], 0)
-        assert_equal(expired_preview["actions"][0]["claim_txids"], [stale_claim["txid"]])
-        assert_equal(expired_preview["actions"][0]["status"], "ready")
+        txcount_before_retirement = wallet.getwalletinfo()["txcount"]
+        node.mockscheduler(60)
+        self.wait_until(
+            lambda: wallet.getpowclaimrecoveryinfo(True)["retired_components"] == 1,
+            timeout=10,
+        )
+        assert_equal(wallet.getwalletinfo()["txcount"], txcount_before_retirement)
+        retired_info = wallet.getpowclaimrecoveryinfo(True)
+        retired_component = next(
+            component
+            for component in retired_info["component_details"]
+            if stale_claim["txid"] in component["claim_txids"]
+        )
+        retired_node = next(
+            graph_node
+            for graph_node in retired_component["nodes"]
+            if graph_node["txid"] == stale_claim["txid"]
+        )
+        assert_equal(retired_component["classification"], "retired_on_active_branch")
+        assert_equal(retired_component["all_claims_expired_locally_retired"], True)
+        assert_equal(retired_node["expired_locally_retired"], True)
+        assert_equal(retired_info["retired_claim_objects"], 1)
+        assert_equal(retired_info["blocking_components"], 0)
+        retired_preview = wallet.resolveallshadowpowclaims()
+        assert_equal(retired_preview["actionable_components"], 0)
+        assert_equal(retired_preview["refused_components"], 1)
+        assert_equal(
+            retired_preview["refused"][0]["reason_code"],
+            "claim-expired-locally-retired",
+        )
+        assert_equal(retired_preview["total_fee"], 0)
+
+        self.log.info("Zero-payment retirement persists across wallet reload")
+        node.unloadwallet(wallet_name)
+        node.loadwallet(wallet_name)
+        wallet = node.get_wallet_rpc(wallet_name)
+        node.syncwithvalidationinterfacequeue()
+        persisted_retirement = wallet.getpowclaimrecoveryinfo(True)
+        assert_equal(persisted_retirement["retired_claim_objects"], 1)
+        assert_equal(persisted_retirement["retired_components"], 1)
+        assert_equal(persisted_retirement["blocking_components"], 0)
 
         if self.is_cli_compiled():
             self.log.info("Checking miner work and broadcasting non-whitelisted PoW claim via CLI")

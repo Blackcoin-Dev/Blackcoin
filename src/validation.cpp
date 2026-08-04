@@ -350,10 +350,36 @@ static void LimitMempoolSize(CTxMemPool& pool, CCoinsViewCache& coins_cache)
         LogPrint(BCLog::MEMPOOL, "Expired %i transactions from the memory pool\n", expired);
     }
 
+    const int expired_shadow_claims = pool.ExpireMatching(
+        GetTime<std::chrono::seconds>() -
+            std::chrono::seconds{SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS},
+        [](const CTransaction& tx) { return TransactionHasShadowProof(tx); },
+        MemPoolRemovalReason::SHADOW_TIMEOUT);
+    if (expired_shadow_claims != 0) {
+        LogPrint(BCLog::MEMPOOL,
+                 "Expired %i transaction(s) from over-age Quantum Quasar shadow PoW claim packages\n",
+                 expired_shadow_claims);
+    }
+
     std::vector<COutPoint> vNoSpendsRemaining;
     pool.TrimToSize(pool.m_max_size_bytes, &vNoSpendsRemaining);
     for (const COutPoint& removed : vNoSpendsRemaining)
         coins_cache.Uncache(removed);
+}
+
+void ExpireShadowPowClaimsFromMempool(CTxMemPool& pool)
+{
+    LOCK(pool.cs);
+    const int expired = pool.ExpireMatching(
+        GetTime<std::chrono::seconds>() -
+            std::chrono::seconds{SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS},
+        [](const CTransaction& tx) { return TransactionHasShadowProof(tx); },
+        MemPoolRemovalReason::SHADOW_TIMEOUT);
+    if (expired != 0) {
+        LogPrint(BCLog::MEMPOOL,
+                 "Expired %i transaction(s) from over-age Quantum Quasar shadow PoW claim packages\n",
+                 expired);
+    }
 }
 
 void Chainstate::MaybeUpdateMempoolForReorg(

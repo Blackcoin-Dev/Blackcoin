@@ -39,6 +39,21 @@ struct ShadowGoldRushInfo {
     unsigned int pow_target_bits{0};
 };
 
+/** Decoded wallet/RPC-safe QQSIGNAL payload. */
+struct ShadowSignalInfo {
+    CScript target;
+    CScript payout_script;
+    uint32_t solve_height{0};
+    uint256 solve_hash;
+};
+
+/** Authenticated active-signal member state at an exact chain tip. */
+struct ShadowActiveSignalInfo {
+    CScript target;
+    CScript payout_script;
+    uint32_t signal_height{0};
+};
+
 /** Maximum serialized active-signal state derived from the authenticated
  * whitelist manifest. The limits describe logical payload bytes before
  * deterministic 8,000-byte sharding; they do not include LevelDB overhead. */
@@ -371,6 +386,11 @@ static constexpr unsigned int MAX_SHADOW_POW_EVALS_PER_BLOCK = 64;
 /** A QQP4 proof remains relayable and fee-reimbursable through this many
  *  blocks after its committed origin height. */
 static constexpr uint32_t SHADOW_POW_LATE_ORIGIN_WINDOW = 64;
+/** A QQSPROOF carrier is a short-lived relay object. Keep this independent
+ *  from the ordinary mempool expiry so normal wallet transactions retain the
+ *  node's configured policy. Wallet input release remains height-gated by
+ *  SHADOW_POW_LATE_ORIGIN_WINDOW and never follows this wall-clock timeout. */
+static constexpr int64_t SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS = 60 * 60;
 /** A serialized CTxOut consumes at least 9 non-witness bytes (36 weight).
  *  This is therefore a conservative consensus-derived ceiling on the number
  *  of QQSPROOF-shaped outputs in any V4-valid block. */
@@ -459,6 +479,8 @@ std::map<CScript, ShadowSolverActivity> GetRecentShadowSolverActivity(const CCoi
 std::optional<ShadowSolverActivity> GetRecentShadowSolverActivityForScript(const CCoinsViewCache& view, const CBlockIndex* pindex, const CScript& target);
 uint64_t GetActiveShadowSignalCount(const CCoinsViewCache& view, const CBlockIndex* pindex);
 std::map<CScript, CScript> GetActiveShadowSignalPayouts(const CCoinsViewCache& view, const CBlockIndex* pindex);
+std::map<CScript, ShadowActiveSignalInfo> GetActiveShadowSignalDetails(
+    const CCoinsViewCache& view, const CBlockIndex* pindex);
 bool HasRecentShadowSolverActivity(const CCoinsViewCache& view, const CBlockIndex* pindex, const CScript& target, uint32_t solve_height, const uint256& solve_hash);
 
 /** Compute PoS Gold Rush shadow-ledger credits implied by a candidate block.
@@ -674,6 +696,8 @@ std::vector<ShadowProofObservation> GetShadowProofObservations(
     ShadowProofObservationSummary& summary);
 bool TransactionHasShadowProof(const CTransaction& tx);
 bool TransactionHasShadowSignal(const CTransaction& tx);
+/** Decode exactly one valid quantum-linked QQSIGNAL payload from a transaction. */
+bool DecodeShadowSignal(const CTransaction& tx, ShadowSignalInfo& signal_out);
 ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
     const CTransaction& tx, const CBlockIndex* pindexPrev,
     const CCoinsViewCache& view, bool gold_rush_active,

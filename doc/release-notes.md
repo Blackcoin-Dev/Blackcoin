@@ -1,5 +1,44 @@
-Issue #37 Later-Release Development Note
-========================================
+30.1.4 Maintenance Release Notes
+================================
+
+Blackcoin Core v30.1.4 removes the recurring fee-paying operator stopgap that
+was required when a wallet-authored, origin-bound Gold Rush PoW claim left the
+local mempool. It also protects mature legacy stake capacity, publishes
+coherent PoS worker state, makes claim-recovery review atomic, and exposes
+wallet-specific QQSIGNAL lifecycle evidence.
+
+This maintenance release does not change consensus, reward amounts, Gold Rush
+eligibility, the quantum lifecycle, or wallet ownership. It changes local
+wallet policy, recovery safety, and telemetry. Existing authenticated
+schema-12 chainstate at the exact active tip is reused; a compatible v30.1.x
+datadir is not rewound or reindexed merely because v30.1.4 starts.
+
+The production defaults are fail-closed:
+
+- wallet-authored QQP3/QQP4 carriers have a one-hour local mempool residence
+  limit, while ordinary transactions retain the existing mempool policy;
+- after the complete origin-plus-64 window expires, an exact eligible local
+  claim reservation is retired durably without another transaction or fee;
+- fee-paying conflict recovery remains an explicit, default-off fallback for
+  components that cannot use zero-payment retirement;
+- while staking is enabled, PoW claim selection protects one mature,
+  stakeable legacy coin by default (`-powclaimreservestakecoins=1`);
+- `getstakinginfo` reports a coherent worker snapshot and no longer treats a
+  zero-length search interval during a normal tip transition as an outage;
+- `getgoldrushinfo.wallet_qqsignal` reports only the selected wallet's exact
+  mempool, confirmed, expired, superseded, and reorg-removed signal records,
+  including durable manual/automatic provenance for newly created signals;
+  and
+- review of recovery inventory, plan, policy, and usage is one read-only,
+  tip-pinned Core snapshot. Execution still revalidates immediately before
+  persistence and broadcast.
+
+Back up each wallet before upgrade. Stop the prior daemon or GUI cleanly and
+retain a cold copy of the datadir until the canary has verified wallet names,
+legacy and quantum keys, transaction history, configured data paths, active
+tip, and normal restart. If rollback is required, stop v30.1.4 cleanly and
+restore the complete pre-upgrade datadir copy before starting the older
+binary; do not run two versions against one datadir.
 
 Issue #37 adds wallet-side Gold Rush PoW claim-component recovery after
 v30.1.3. This work does not change QQP2/QQP3 consensus or rewrite the behavior
@@ -14,6 +53,23 @@ commit-and-broadcast authority. Manual GUI and headless paths share that engine.
 Wallet-scoped automatic recovery is a seventh optional automation, is off by
 default, requires explicit positive fee/rate/staleness bounds, and never unlocks
 the wallet or enables mining.
+
+Newly authored origin-bound QQP3/QQP4 carriers have a dedicated one-hour local
+mempool residence limit. Eviction does not release their inputs while the proof
+remains height-eligible. After the complete origin-plus-64 window expires on a
+pinned active branch, Core retires an authenticated local claim reservation
+without creating, signing, or broadcasting another transaction and without a
+recovery fee. That durable retirement is reversed and reclassified if its
+observation block leaves the active chain. Fee-paying conflict recovery remains
+an explicit, default-off fallback for components that cannot use this path.
+
+A chainstate that already carries the authenticated Quantum Quasar schema-12
+replay marker for its exact active tip starts normally on v30.1.4. Upgrading
+from a compatible v30.1.x release does not trigger another Gold Rush rewind or
+reindex. The explicit `-reindex-chainstate` and `-reindex` command-line options
+remain operator-requested one-shot maintenance actions and are never added
+automatically; persistent configuration entries remain rejected to prevent
+restart loops.
 
 Automatic action and fee windows are anchored to active-chain median time, so
 host-clock changes cannot erase budget usage. Claim-recovery metadata is

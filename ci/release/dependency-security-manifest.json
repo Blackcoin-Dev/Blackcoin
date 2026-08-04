@@ -59,10 +59,10 @@
     {
       "package": "freetype",
       "recipe": "depends/packages/freetype.mk",
-      "recipe_sha256": "8fb1d7b76e499d0a37d0e28a6a245454682aec63b069da257a60448407dab6f0",
+      "recipe_sha256": "2a01aace532bb9d25902c40faaa5afbcc03f036f038a2e76edf04d798e50477f",
       "version": "2.14.3",
       "sources": [
-        {"url": "https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz", "sha256": "36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f"}
+        {"url": "https://download-mirror.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz", "sha256": "36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f"}
       ]
     },
     {

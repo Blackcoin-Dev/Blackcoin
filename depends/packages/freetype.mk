@@ -1,6 +1,6 @@
 package=freetype
 $(package)_version=2.14.3
-$(package)_download_path=https://download.savannah.gnu.org/releases/$(package)
+$(package)_download_path=https://download-mirror.savannah.gnu.org/releases/$(package)
 $(package)_file_name=$(package)-$($(package)_version).tar.xz
 $(package)_sha256_hash=36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f
 $(package)_patches=disable_refdoc_warning.patch

@@ -214,6 +214,13 @@ class QuantumStakeRewardSplitTest(BitcoinTestFramework):
         for wallet in (funder, self_staker, owner, cold_staker):
             wallet.staking(False)
 
+        # Fresh consent remains effective in wallet state, but the exact B4
+        # participant/operator format must suppress optional extra outputs.
+        donation_address = self_staker.getqqdevelopmentdonationinfo()["recipient"]
+        donation_script = self._script_for_address(donation_address)
+        self_staker.setqqdevelopmentdonation(10, donation_address)
+        cold_staker.setqqdevelopmentdonation(10, donation_address)
+
         funder_address = funder.getnewaddress("", "legacy")
         self._generate(COINBASE_MATURITY + 2, funder_address)
         self._wait_for_txindex()
@@ -241,6 +248,10 @@ class QuantumStakeRewardSplitTest(BitcoinTestFramework):
         ]
         assert self_stake_outputs, "self-stake must pay the staking script"
         assert_equal(sum(self_stake_outputs), SELF_STAKE_AMOUNT + BASE_POS_SUBSIDY)
+        assert_equal(sum(
+            bytes.fromhex(vout["scriptPubKey"]["hex"]) == donation_script
+            for vout in self_coinstake["vout"]
+        ), 0)
 
         self.log.info("Creating and funding a delegated QCS output")
         staker_quantum = cold_staker.getnewquantumaddress()["address"]
@@ -283,6 +294,10 @@ class QuantumStakeRewardSplitTest(BitcoinTestFramework):
         assert qcs_outputs, "delegated coinstake must preserve delegated principal"
         assert_equal(sum(qcs_outputs), COLD_STAKE_AMOUNT + BASE_POS_SUBSIDY - OPERATOR_FLOOR)
         assert_equal(sum(operator_outputs), OPERATOR_FLOOR)
+        assert_equal(sum(
+            bytes.fromhex(vout["scriptPubKey"]["hex"]) == donation_script
+            for vout in cold_coinstake["vout"]
+        ), 0)
 
         self.log.info("Rejecting a signed block that redirects operator compensation")
         raw_cold_block = node.getblock(cold_block_hash, 0)

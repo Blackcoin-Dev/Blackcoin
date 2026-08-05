@@ -694,6 +694,20 @@ for required in maintenance-marker-activated.json crash-recovery-procedure.json 
     maintenance-marker-released.json maintenance-state-complete.txt; do
     grep -Fq -- "$required" "$TMP/canary-consumer"
 done
+grep -Fq -- \
+    'export PUBLISHED_CANARY_RESULT="/mnt/pulsar/Blackcoin_Blocks/operations/releases/v30.1.4-${SOURCE_COMMIT}/node27-canary-__CANARY_TIMESTAMP_YYYYMMDDTHHMMSSZ__/evidence/RESULT.json"' \
+    "$ROOT/rollout.env.example"
+grep -Fq -- \
+    'export PUBLISHED_CANARY_EVIDENCE_MANIFEST="/mnt/pulsar/Blackcoin_Blocks/operations/releases/v30.1.4-${SOURCE_COMMIT}/node27-canary-__CANARY_TIMESTAMP_YYYYMMDDTHHMMSSZ__/evidence/SHA256SUMS"' \
+    "$ROOT/rollout.env.example"
+! grep -Fq -- '__FINAL_RELEASE__' "$ROOT/rollout.env.example"
+for required in \
+    "export CANDIDATE_IMAGE_REF='qqblackcoin/blackcoin-v4-gui@sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2'" \
+    "export CANDIDATE_IMAGE_ID='sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909'" \
+    "export BLACKCOIND_SHA256='f18b4f191599dcb8318008f6758c80c89e473733ef2d8bd06b83d7155618dfb8'" \
+    "export BLACKCOIN_CLI_SHA256='3f56bbb180042ace003db62038c47a441b01a6b72ac19497f96c34c9b107ec83'"; do
+    grep -Fq -- "$required" "$ROOT/rollout.env.example"
+done
 pass canary-consumer-and-snapshot-retention-gates
 
 if [[ "$UPDATE_MANIFEST" == 1 ]]; then

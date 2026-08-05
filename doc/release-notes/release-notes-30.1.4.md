@@ -39,6 +39,10 @@ chain. `raw_quarantined_claims` separately reports the complete retained audit
 and reorg history. A nonzero raw count alone neither pauses mining nor
 authorizes a recovery fee.
 
+Disabling the built-in PoW miner now cancels a proof that has been found but
+has not yet entered claim submission. The stop operation therefore cannot
+create a new fee-paying wallet transaction from that pending proof.
+
 ## PoS and PoW coexistence
 
 When staking is enabled, PoW claim input selection protects one mature,

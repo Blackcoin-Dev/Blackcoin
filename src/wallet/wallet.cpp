@@ -10851,6 +10851,15 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 m_pow_claim_inflight = true;
             }
             MaybeDelayShadowPowClaimSubmissionForTest(selected_input.outpoint);
+            // A stop request that arrives after the proof is found but before
+            // submission must not create a new wallet transaction. The stop
+            // path joins this worker, so clearing the single-flight marker here
+            // leaves the wallet disabled without an unrequested fee spend.
+            if (IsPowMiningClosing() || !m_pow_mining_enabled.load()) {
+                LOCK(m_pow_miner_mutex);
+                m_pow_claim_inflight = false;
+                continue;
+            }
             const ShadowPowClaimSubmitResult submit_result = SubmitShadowPowClaim(selected_input, work, proof, error);
             if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED) {
                 ++m_pow_claims_submitted;

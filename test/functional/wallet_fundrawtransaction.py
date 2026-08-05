@@ -1081,9 +1081,11 @@ class RawTransactionsTest(BitcoinTestFramework):
         high_input_weight = input_weight * 2
 
         # Funding should also work if the input weight is provided. This fork's
-        # policy floor is 100 sat/vB, so use that instead of Bitcoin's 2 sat/vB
-        # fixture while preserving the input-weight coverage.
-        input_weight_fee_rate = 100
+        # policy floor is 100 sat/vB, so use a small margin above it instead of
+        # Bitcoin's 2 sat/vB fixture. A newly generated DER signature can be one
+        # byte larger than the signature used to estimate input_weight above;
+        # funding at the exact floor would then be rejected nondeterministically.
+        input_weight_fee_rate = 110
         funded_tx = wallet.fundrawtransaction(raw_tx, input_weights=[{"txid": ext_utxo["txid"], "vout": ext_utxo["vout"], "weight": input_weight}], fee_rate=input_weight_fee_rate)
         signed_tx = wallet.signrawtransactionwithwallet(funded_tx["hex"])
         signed_tx = self.nodes[0].signrawtransactionwithwallet(signed_tx["hex"])

@@ -2551,6 +2551,33 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "committer is"):
                 identity.verify_commit(legacy_sha)
 
+    def test_source_identity_github_merge_exception_is_sha_pinned(self):
+        identity = load_module("verify_source_identity")
+        merge_sha = "957b41d22c8d96131a0ec87fff1e2f4c20a5caa2"
+        merge_metadata = (
+            "Blackcoin-Dev\0"
+            "298119138+Blackcoin-Dev@users.noreply.github.com\0"
+            "GitHub\0noreply@github.com\0Merge v30.1.1 final integration"
+        )
+        with mock.patch.object(identity, "git", return_value=merge_metadata):
+            identity.verify_commit(merge_sha)
+            with self.assertRaisesRegex(RuntimeError, "committer is"):
+                identity.verify_commit("0" * 40)
+
+        untrusted_author = merge_metadata.replace(
+            "Blackcoin-Dev\0", "attacker\0", 1,
+        )
+        with mock.patch.object(identity, "git", return_value=untrusted_author):
+            with self.assertRaisesRegex(RuntimeError, "author is"):
+                identity.verify_commit(merge_sha)
+
+        untrusted_committer = merge_metadata.replace(
+            "GitHub\0noreply@github.com", "GitHub\0attacker@example.invalid",
+        )
+        with mock.patch.object(identity, "git", return_value=untrusted_committer):
+            with self.assertRaisesRegex(RuntimeError, "committer is"):
+                identity.verify_commit(merge_sha)
+
     def test_windows_payload_inventory_is_exact_and_excludes_test_binary(self):
         verifier = load_module("verify_windows_payload")
         self.assertIn("blackcoin-util.exe", verifier.EXPECTED_EXECUTABLES)

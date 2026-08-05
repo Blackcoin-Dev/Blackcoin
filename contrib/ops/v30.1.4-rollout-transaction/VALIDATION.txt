@@ -1,0 +1,26 @@
+validated_at=2026-08-05T22:19:02Z
+scope=local-static-targeted-fixture-only
+live_unraid_mutation=false
+docker_invoked=false
+network_invoked=false
+github_invoked=false
+PASS bash-syntax
+PASS shellcheck-actionable
+PASS wave-plan-and-mappings
+PASS compose-renderer-positive-and-negative
+PASS policy-renderer-positive-and-negative
+PASS guard-renderer
+PASS package-integrity-positive-negative-and-entrypoints
+PASS zero-broadcast-normal-install-and-purpose-bound-emergency-containment
+PASS triplet-commit-and-byte-exact-internal-restoration
+PASS claim-safe-and-clean-stop-boundaries
+PASS fresh-final-fleet-and-efficient-soak-resume
+PASS crash-safe-supervisor-fresh-finalization-and-rollback-release-order
+PASS vpn-commit-rollback-and-final-uniqueness
+PASS fee-baseline-no-automatic-recovery-and-full-runtime-gates
+PASS identity-wave-evidence-and-precommit-publication
+PASS forbidden-operation-and-build-invariants
+PASS build-base-schema-and-package-path-negative-fixtures
+PASS canary-consumer-and-snapshot-retention-gates
+PASS package-manifest-generation
+RESULT=passed

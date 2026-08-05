@@ -1,0 +1,3894 @@
+#!/usr/bin/env bash
+
+# Fail-closed, resumable v30.1.4 fleet rollout. The default action is `plan`,
+# which performs no live operation. `apply` requires an explicit confirmation.
+
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C TZ=UTC
+
+PACKAGE_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
+readonly PACKAGE_ROOT
+bootstrap_package_integrity()
+{
+    local owner mode
+    [[ -d "$PACKAGE_ROOT" && ! -L "$PACKAGE_ROOT" &&
+       -f "$PACKAGE_ROOT/SHA256SUMS" && ! -L "$PACKAGE_ROOT/SHA256SUMS" &&
+       "$(realpath -e -- "$PACKAGE_ROOT/SHA256SUMS")" == "$PACKAGE_ROOT/SHA256SUMS" &&
+       "$(stat -c '%u:%g:%a' "$PACKAGE_ROOT/SHA256SUMS")" == 0:0:600 ]] || return 1
+    owner=$(stat -c '%u:%g' "$PACKAGE_ROOT") || return 1
+    mode=$(stat -c '%a' "$PACKAGE_ROOT") || return 1
+    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    [[ -z "$(find "$PACKAGE_ROOT" -type l -print -quit)" &&
+       -z "$(find "$PACKAGE_ROOT" ! -type d ! -type f -print -quit)" ]] || return 1
+    cmp -s \
+        <(cd "$PACKAGE_ROOT" && find . -type f ! -path './SHA256SUMS' -print | sort) \
+        <(awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ {
+            name=$2; sub(/^\\*/, "", name); sub(/^[.]\//, "", name); print "./" name
+        }' "$PACKAGE_ROOT/SHA256SUMS" | sort) || return 1
+    (cd "$PACKAGE_ROOT" && sha256sum --strict -c SHA256SUMS >/dev/null)
+}
+bootstrap_package_integrity || {
+    printf '%s\n' 'FATAL: rollout package failed bootstrap integrity verification' >&2
+    exit 1
+}
+unset -f bootstrap_package_integrity
+# shellcheck source=lib/live_checks.sh
+source "$PACKAGE_ROOT/lib/live_checks.sh"
+# shellcheck source=lib/data_rollback.sh
+source "$PACKAGE_ROOT/lib/data_rollback.sh"
+
+readonly ACTION=${1:-plan}
+readonly WAVE_PLAN=${WAVE_PLAN:-$PACKAGE_ROOT/waves.txt}
+readonly RENDER_COMPOSE="$PACKAGE_ROOT/render_compose_images.awk"
+readonly RENDER_POLICY="$PACKAGE_ROOT/render_policy.sh"
+readonly RENDER_GUARD="$PACKAGE_ROOT/render_guard_pin.sh"
+readonly SOAK_AUDITOR="$PACKAGE_ROOT/fleet_soak_audit.sh"
+readonly INHIBITOR_INSTALLER="$PACKAGE_ROOT/install_transaction_inhibitors.sh"
+readonly INHIBITOR_RELEASER="$PACKAGE_ROOT/release_transaction_inhibitors.sh"
+readonly RUNTIME_COMPAT_INSTALLER="$PACKAGE_ROOT/install_runtime_guard_3014_compat.sh"
+readonly NORMAL_UNLOCK_HELPER="$STATE_DIR/blackcoin_node_normal_unlock.sh"
+readonly POW_START_HELPER="$STATE_DIR/blackcoin_pow_start_only.sh"
+readonly NORMAL_UNLOCK_HELPER_SHA256='acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1'
+readonly POW_START_HELPER_SHA256='21808f232ca3961e180a4c2dd3853e4aef93c2dfdf4821b5d63ca5106c5676ea'
+readonly FREE_CLAIM_PAUSE_CONTENT='schema=1 state=paused authority=v30.1.4-fleet-transaction'
+
+RUN_DIR=${RESUME_RUN_DIR:-}
+CURRENT_WAVE_DIR=
+CURRENT_WAVE_NODES=()
+CURRENT_WAVE_COMMITTED=0
+CURRENT_WAVE_ROLLED_BACK=0
+CURRENT_WAVE_LAUNCH_ATTEMPTED=0
+WAVE_LOCKS_HELD=0
+FREE_CLAIM_LOCK_HELD=0
+FINALIZATION_ACTIVE=0
+FINALIZATION_LOCKS_HELD=0
+TERMINAL_COMMIT_ACTIVE=0
+TERMINAL_FINALIZED=0
+
+candidate_recovery_baseline_path()
+{
+    [[ -n "$CURRENT_WAVE_DIR" && -d "$CURRENT_WAVE_DIR" && ! -L "$CURRENT_WAVE_DIR" ]] || return 1
+    printf '%s/candidate-recovery-node-%s.json\n' "$CURRENT_WAVE_DIR" "$(node_padded "$1")"
+}
+
+verify_candidate_recovery_baseline()
+{
+    local node="$1" path metadata actual_sha expected_sha prelaunch_sha first_sha transaction_set
+    valid_node "$node" || return 1
+    path=$(candidate_recovery_baseline_path "$node")
+    metadata="${path}.sha256"
+    [[ -f "$path" && ! -L "$path" && -f "$metadata" && ! -L "$metadata" &&
+       "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 &&
+       "$(stat -c '%u:%g:%a' "$metadata")" == 0:0:600 ]] || return 1
+    actual_sha=$(sha256sum "$path" | awk '{print $1}') || return 1
+    expected_sha=$(awk 'NF == 1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$metadata") || return 1
+    [[ -n "$expected_sha" && "$actual_sha" == "$expected_sha" ]] || return 1
+    for transaction_set in \
+        "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.before.json" \
+        "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.first-v3014.json"; do
+        [[ -f "$transaction_set" && ! -L "$transaction_set" &&
+           "$(stat -c '%u:%g:%a' "$transaction_set")" == 0:0:600 ]] || return 1
+    done
+    prelaunch_sha=$(sha256sum "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.before.json" |
+        awk '{print $1}') || return 1
+    first_sha=$(sha256sum "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.first-v3014.json" |
+        awk '{print $1}') || return 1
+    [[ "$prelaunch_sha" == "$first_sha" ]] || return 1
+    jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg source "$SOURCE_COMMIT" --argjson node "$node" \
+        --arg prelaunch_sha "$prelaunch_sha" --arg first_sha "$first_sha" \
+        --arg wave_dir "$CURRENT_WAVE_DIR" '
+        .schema == 1 and .node == $node and .candidate_image == $image and
+        .candidate_image_id == $image_id and .source_commit == $source and
+        .wave_dir == $wave_dir and
+        (.captured_at | type) == "string" and
+        .recovery.policy_authoritative == true and
+        .recovery.policy.automatic_authorized == false and
+        .recovery.database_outcome_ambiguous == false and
+        .recovery.chain_ready == true and .recovery.wallet_tip_matches == true and
+        .recovery.blocking_quarantined_claims == 0 and .recovery.blocking_components == 0 and
+        .recovery.indeterminate_quarantined_claims == 0 and
+        .recovery.pending_manual_resolutions == 0 and
+        .recovery.pending_automatic_resolutions == 0 and
+        (.recovery.confirmed_resolution_fees | type) == "number" and
+        .wallet_transaction_guard.prelaunch_sha256 == $prelaunch_sha and
+        .wallet_transaction_guard.first_v3014_sha256 == $first_sha and
+        .wallet_transaction_guard.exactly_unchanged == true
+    ' "$path" >/dev/null
+}
+
+candidate_recovery_fee_for()
+{
+    local node="$1" path
+    verify_candidate_recovery_baseline "$node" || return 1
+    path=$(candidate_recovery_baseline_path "$node")
+    jq -er '.recovery.confirmed_resolution_fees | select(type == "number")' "$path"
+}
+
+capture_wallet_txid_set()
+{
+    local node="$1" output="$2" transactions
+    transactions=$(wallet_rpc_for "$node" listtransactions '*' 1000000 0 true) || return 1
+    jq -e 'type == "array" and all(.[];
+        (.txid | type) == "string" and (.txid | test("^[0-9a-f]{64}$")))' \
+        >/dev/null <<< "$transactions" || return 1
+    jq -cS '[.[].txid | select(type == "string" and test("^[0-9a-f]{64}$"))] |
+        unique | sort' <<< "$transactions" > "$output"
+}
+
+establish_candidate_recovery_baseline()
+{
+    local node="$1" path metadata recovery temporary metadata_tmp image id ready=0 deadline
+    local mining staking txids_before txids_after txids_tmp prelaunch_sha first_sha
+    [[ " ${CURRENT_WAVE_NODES[*]} " == *" $node "* ]] || return 1
+    if [[ "$node" -eq "$FREE_CLAIM_NODE" && "$FREE_CLAIM_LOCK_HELD" -ne 1 ]]; then
+        return 1
+    fi
+    path=$(candidate_recovery_baseline_path "$node")
+    metadata="${path}.sha256"
+    if [[ -e "$path" || -L "$path" || -e "$metadata" || -L "$metadata" ]]; then
+        verify_candidate_recovery_baseline "$node" || return 1
+        return 0
+    fi
+    image=$(docker inspect -f '{{.Config.Image}}' "$(container_for "$node")")
+    id=$(docker inspect -f '{{.Image}}' "$(container_for "$node")")
+    [[ "$image" == "$CANDIDATE_IMAGE_REF" && "$id" == "$CANDIDATE_IMAGE_ID" ]] ||
+        return 1
+    txids_before="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.before.json"
+    [[ -f "$txids_before" && ! -L "$txids_before" ]] || return 1
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        recovery=$(wallet_rpc_for "$node" getpowclaimrecoveryinfo 2>/dev/null || true)
+        if [[ -z "$recovery" ]]; then
+            sleep 5
+            continue
+        fi
+        mining=$(wallet_rpc_for "$node" getpowmininginfo 2>/dev/null || true)
+        staking=$(wallet_rpc_for "$node" getstakinginfo 2>/dev/null || true)
+        jq -e '.enabled == false and .live_claims == 0 and
+            .allow_automatic_quantum_key_creation == false' >/dev/null 2>&1 <<< "$mining" ||
+            return 1
+        jq -e '.staking == false and .worker_running == false and
+            .automatic_qqsignal == false and .automatic_demurrage_attestation == false and
+            .automatic_redelegation == false and
+            .allow_automatic_quantum_key_creation == false' >/dev/null 2>&1 <<< "$staking" ||
+            return 1
+        verify_donation_defaults_off "$node" || return 1
+        jq -e '.policy_authoritative == true and .policy.automatic_authorized == false and
+            .database_outcome_ambiguous == false' >/dev/null 2>&1 <<< "$recovery" ||
+            return 1
+        if jq -e '.chain_ready == true and .wallet_tip_matches == true' \
+            >/dev/null 2>&1 <<< "$recovery"; then
+            jq -e '.blocking_quarantined_claims == 0 and .blocking_components == 0 and
+                .indeterminate_quarantined_claims == 0 and .pending_manual_resolutions == 0 and
+                .pending_automatic_resolutions == 0 and
+                (.confirmed_resolution_fees | type) == "number"' >/dev/null <<< "$recovery" ||
+                return 1
+            ready=1
+            break
+        fi
+        sleep 5
+    done
+    ((ready == 1)) || return 1
+    txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.node-$(node_padded "$node")-wallet-txids.XXXXXX")
+    capture_wallet_txid_set "$node" "$txids_tmp" || {
+        rm -f -- "$txids_tmp"
+        return 1
+    }
+    txids_after="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.first-v3014.json"
+    chmod 600 "$txids_tmp"
+    chown root:root "$txids_tmp"
+    mv -fT -- "$txids_tmp" "$txids_after"
+    cmp -s "$txids_before" "$txids_after" || return 1
+    prelaunch_sha=$(sha256sum "$txids_before" | awk '{print $1}') || return 1
+    first_sha=$(sha256sum "$txids_after" | awk '{print $1}') || return 1
+    install -d -m 700 -o root -g root "${path%/*}"
+    temporary=$(mktemp "${path%/*}/.node-recovery-baseline.XXXXXX")
+    metadata_tmp=$(mktemp "${path%/*}/.node-recovery-baseline-sha.XXXXXX")
+    jq -n --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg source "$SOURCE_COMMIT" --arg captured_at "$(date -u +%FT%TZ)" \
+        --argjson node "$node" --argjson recovery "$recovery" \
+        --arg prelaunch_sha "$prelaunch_sha" --arg first_sha "$first_sha" \
+        --arg wave_dir "$CURRENT_WAVE_DIR" \
+        '{schema:1,node:$node,candidate_image:$image,candidate_image_id:$image_id,
+          source_commit:$source,wave_dir:$wave_dir,captured_at:$captured_at,recovery:$recovery,
+          wallet_transaction_guard:{prelaunch_sha256:$prelaunch_sha,
+            first_v3014_sha256:$first_sha,exactly_unchanged:true}}' > "$temporary"
+    chmod 600 "$temporary"
+    chown root:root "$temporary"
+    sha256sum "$temporary" | awk '{print $1}' > "$metadata_tmp"
+    chmod 600 "$metadata_tmp"
+    chown root:root "$metadata_tmp"
+    sync -f "$temporary"; sync -f "$metadata_tmp"
+    if ! mv -fT -- "$temporary" "$path"; then
+        rm -f -- "$temporary" "$metadata_tmp"
+        return 1
+    fi
+    if ! mv -fT -- "$metadata_tmp" "$metadata"; then
+        rm -f -- "$path" "$metadata_tmp"
+        return 1
+    fi
+    sync -f "$RUN_DIR"
+    verify_candidate_recovery_baseline "$node"
+}
+
+establish_wave_recovery_baselines()
+{
+    local node pid failed=0
+    local -a pids=() nodes=()
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        establish_candidate_recovery_baseline "$node" \
+            > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-recovery-baseline.log" 2>&1 &
+        pids+=("$!")
+        nodes+=("$node")
+    done
+    for index in "${!pids[@]}"; do
+        pid=${pids[$index]}
+        if ! wait "$pid"; then
+            log "node ${nodes[$index]} candidate recovery baseline failed"
+            failed=1
+        fi
+    done
+    ((failed == 0)) || die 'one or more candidate recovery baselines failed'
+}
+
+usage()
+{
+    cat <<'EOF'
+Usage:
+  fleet_rollout.sh plan
+  fleet_rollout.sh preflight
+  CONFIRM_APPLY=v30.1.4-exact-32 fleet_rollout.sh apply
+  CONFIRM_ROLLBACK=v30.1.4-rollback fleet_rollout.sh rollback RUN_DIR
+
+All artifact identity variables shown in rollout.env.example are mandatory for
+preflight/apply/rollback. No image pull, reindex, chainstate parking, address
+generation, wallet creation, or automatic fee-paying claim recovery is used.
+EOF
+}
+
+require_host_tools()
+{
+    ((BASH_VERSINFO[0] >= 4)) || die 'Bash 4 or newer is required'
+    require_command awk bash cmp cp date diff docker find findmnt flock grep install jq \
+        mktemp mountpoint mv od readlink realpath rm rsync sed seq sha256sum sort stat sync tar timeout tr wc xargs zfs
+    docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
+}
+
+verify_activation_helper()
+{
+    local path="$1" expected_sha="$2"
+    [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+       "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+    [[ "$(sha256sum "$path" | awk '{print $1}')" == "$expected_sha" ]]
+}
+
+run_activation_helper()
+{
+    local path="$1" expected_sha="$2" node="$3"
+    verify_activation_helper "$path" "$expected_sha" || return 1
+    /bin/bash "$path" "$node"
+}
+
+verify_runtime_guard_3014_compatibility()
+{
+    local pinned guard marker_begin marker_end
+    marker_begin='# BEGIN V30.1.4 DURABLE ROLLOUT MAINTENANCE INHIBITOR'
+    marker_end='# END V30.1.4 DURABLE ROLLOUT MAINTENANCE INHIBITOR'
+    assert_protected_file "$WALLET_RUNTIME_GUARD" 600
+    assert_protected_file "$ENDPOINT_GUARD" 600
+    bash -n "$WALLET_RUNTIME_GUARD" || return 1
+    bash -n "$ENDPOINT_GUARD" || return 1
+    [[ "$(sha256sum "$WALLET_RUNTIME_GUARD" | awk '{print $1}')" == \
+       "$EXPECTED_WALLET_RUNTIME_GUARD_SHA256" ]] || return 1
+    grep -Fq '[[ "$class" == final3013 || "$class" == node16fix || "$class" == final3014 ]] && expected_replay_schema=12' \
+        "$WALLET_RUNTIME_GUARD" || return 1
+    pinned=$(sed -n "s/^EXPECTED_RUNTIME_GUARD_SHA='\([0-9a-f]\{64\}\)'$/\1/p" \
+        "$ENDPOINT_GUARD") || return 1
+    [[ "$pinned" == "$EXPECTED_WALLET_RUNTIME_GUARD_SHA256" ]] || return 1
+    for guard in "$WALLET_RUNTIME_GUARD" "$ENDPOINT_GUARD"; do
+        [[ "$(grep -Fxc -- "$marker_begin" "$guard")" -eq 1 &&
+           "$(grep -Fxc -- "$marker_end" "$guard")" -eq 1 ]] || return 1
+    done
+}
+
+verify_node_policy_manifests()
+{
+    local node="$1" padded wallet wallet_manifest identity_manifest pow_manifest backup backup_sha enabled
+    padded=$(node_padded "$node") || return 1
+    wallet=$(single_wallet_for "$node") || return 1
+    wallet_manifest="$STATE_DIR/runtime-wallet-manifests/node-$padded.json"
+    identity_manifest="$STATE_DIR/runtime-identity-manifests/node-$padded.json"
+    pow_manifest="$STATE_DIR/pow-wallet-manifests/node-$padded.json"
+    for protected in "$wallet_manifest" "$identity_manifest" "$pow_manifest"; do
+        [[ -f "$protected" && ! -L "$protected" && "$(realpath -e -- "$protected")" == "$protected" &&
+           "$(stat -c '%u:%g:%a' "$protected")" == 0:0:600 ]] || return 1
+    done
+    jq -e --arg wallet "$wallet" '. == [$wallet]' "$wallet_manifest" >/dev/null || return 1
+    jq -e --arg node "$padded" --arg wallet "$wallet" '
+        .schema == 2 and .node_id == $node and .wallet == $wallet and
+        (.legacy_descriptors_sha256 | test("^[0-9a-f]{64}$")) and
+        (.quantum_identity_sha256 | test("^[0-9a-f]{64}$")) and
+        (.trusted_policy_sha256 | test("^[0-9a-f]{64}$")) and
+        (.trusted_legacy_descriptor_set_sha256 | test("^[0-9a-f]{64}$")) and
+        (.trusted_quantum_address_set_sha256 | test("^[0-9a-f]{64}$")) and
+        (.trusted_quantum_address_count | type) == "number" and
+        .trusted_quantum_address_count >= 1
+    ' "$identity_manifest" >/dev/null || return 1
+    [[ "$node" -eq "$FREE_CLAIM_NODE" ]] && enabled=false || enabled=true
+    jq -e --arg node "$padded" --arg wallet "$wallet" --argjson enabled "$enabled" '
+        .schema == 1 and .node_id == $node and .wallet == $wallet and
+        .enabled == $enabled and
+        (.payout_address | test("^blk1s[0-9a-z]+$")) and
+        .label == "PoW - Quantum Claim Address" and
+        (.backup_sha256 | test("^[0-9a-f]{64}$")) and
+        (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
+        (.wallet_fingerprint | test("^[0-9a-f]{64}$"))
+    ' "$pow_manifest" >/dev/null || return 1
+    backup=$(jq -er '.backup_path' "$pow_manifest") || return 1
+    backup_sha=$(jq -er '.backup_sha256' "$pow_manifest") || return 1
+    [[ -f "$backup" && ! -L "$backup" && "$(sha256sum "$backup" | awk '{print $1}')" == "$backup_sha" ]]
+}
+
+verify_all_policy_manifests()
+{
+    local node pid failed=0
+    local -a pids=() nodes=()
+    for node in $(seq 1 "$NODE_COUNT"); do
+        verify_node_policy_manifests "$node" &
+        pids+=("$!")
+        nodes+=("$node")
+    done
+    for index in "${!pids[@]}"; do
+        pid=${pids[$index]}
+        if ! wait "$pid"; then
+            log "policy manifest verification failed node=${nodes[$index]}"
+            failed=1
+        fi
+    done
+    ((failed == 0))
+}
+
+assert_protected_file()
+{
+    local path="$1" expected_mode="$2" canonical state
+    [[ -f "$path" && ! -L "$path" ]] || die "protected file is missing or unsafe: $path"
+    canonical=$(realpath -e -- "$path")
+    [[ "$canonical" == "$path" ]] || die "protected file is not canonical: $path"
+    state=$(stat -c '%u:%g:%a' "$path")
+    [[ "$state" == "0:0:$expected_mode" ]] || die "protected file ownership/mode mismatch: $path ($state)"
+}
+
+assert_marker_state()
+{
+    local path="$1" expected_content="${2:-}"
+    [[ -f "$path" && ! -L "$path" && "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+    [[ -z "$expected_content" || "$(cat -- "$path")" == "$expected_content" ]]
+}
+
+assert_empty_control_marker()
+{
+    local path="$1"
+    [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+       "$(stat -c '%u:%g:%a:%s' "$path")" == 0:0:600:0 ]]
+}
+
+publish_state_token()
+{
+    local path="$1" value="$2" directory temporary owner mode
+    directory=${path%/*}
+    [[ -d "$directory" && ! -L "$directory" && "$(realpath -e -- "$directory")" == "$directory" ]] ||
+        return 1
+    owner=$(stat -c '%u:%g' "$directory") || return 1
+    mode=$(stat -c '%a' "$directory") || return 1
+    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    if [[ -e "$path" || -L "$path" ]]; then
+        [[ -f "$path" && ! -L "$path" && "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] ||
+            return 1
+    fi
+    temporary=$(mktemp "$directory/.state-token.XXXXXX") || return 1
+    printf '%s\n' "$value" > "$temporary" || return 1
+    chmod 600 "$temporary" || return 1
+    chown root:root "$temporary" || return 1
+    sync -f "$temporary" || return 1
+    mv -fT -- "$temporary" "$path" || return 1
+    sync -f "$directory" || return 1
+    [[ -f "$path" && ! -L "$path" && "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 &&
+       "$(cat "$path")" == "$value" ]]
+}
+
+maintenance_nonce_path()
+{
+    printf '%s/MAINTENANCE-NONCE\n' "$RUN_DIR"
+}
+
+create_maintenance_nonce()
+{
+    local path temporary nonce
+    path=$(maintenance_nonce_path)
+    [[ ! -e "$path" && ! -L "$path" ]] || die 'maintenance nonce path already exists'
+    nonce=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    valid_sha256_hex "$nonce" || die 'could not generate a 256-bit maintenance nonce'
+    temporary=$(mktemp "$RUN_DIR/.maintenance-nonce.XXXXXX")
+    printf '%s\n' "$nonce" > "$temporary"
+    chmod 600 "$temporary"
+    chown root:root "$temporary"
+    sync -f "$temporary"
+    mv -fT -- "$temporary" "$path"
+    sync -f "$RUN_DIR"
+}
+
+verify_maintenance_marker()
+{
+    local nonce run_canonical
+    nonce=$(cat "$(maintenance_nonce_path)" 2>/dev/null) || return 1
+    valid_sha256_hex "$nonce" || return 1
+    run_canonical=$(realpath -e -- "$RUN_DIR") || return 1
+    [[ "$run_canonical" == "$RUN_DIR" && -f "$ROLLOUT_MAINTENANCE_MARKER" &&
+       ! -L "$ROLLOUT_MAINTENANCE_MARKER" &&
+       "$(realpath -e -- "$ROLLOUT_MAINTENANCE_MARKER")" == "$ROLLOUT_MAINTENANCE_MARKER" &&
+       "$(stat -c '%u:%g:%a' "$ROLLOUT_MAINTENANCE_MARKER")" == 0:0:600 ]] || return 1
+    jq -e --arg nonce "$nonce" --arg run "$RUN_DIR" '
+        . == {schema:1,transaction:"v30.1.4-fleet-rollout",state:"active",
+              run_nonce:$nonce,run_dir:$run}
+    ' "$ROLLOUT_MAINTENANCE_MARKER" >/dev/null
+}
+
+activate_maintenance_marker()
+{
+    local nonce temporary
+    if [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
+        verify_maintenance_marker || die 'foreign or malformed rollout maintenance marker exists'
+        return 0
+    fi
+    nonce=$(cat "$(maintenance_nonce_path)")
+    valid_sha256_hex "$nonce" || die 'maintenance nonce is invalid'
+    temporary=$(mktemp "$STATE_DIR/.v3014-maintenance.XXXXXX")
+    jq -n --arg nonce "$nonce" --arg run "$RUN_DIR" \
+        '{schema:1,transaction:"v30.1.4-fleet-rollout",state:"active",
+          run_nonce:$nonce,run_dir:$run}' > "$temporary"
+    chmod 600 "$temporary"
+    chown root:root "$temporary"
+    sync -f "$temporary"
+    mv -fT -- "$temporary" "$ROLLOUT_MAINTENANCE_MARKER"
+    sync -f "$STATE_DIR"
+    verify_maintenance_marker || die 'maintenance marker failed post-commit verification'
+}
+
+release_maintenance_marker()
+{
+    verify_maintenance_marker || return 1
+    rm -f -- "$ROLLOUT_MAINTENANCE_MARKER" || return 1
+    [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] || return 1
+    sync -f "$STATE_DIR"
+}
+
+finalization_state_path()
+{
+    printf '%s/FINALIZATION-STATE\n' "$RUN_DIR"
+}
+
+maintenance_released_epoch_path()
+{
+    printf '%s/MAINTENANCE-RELEASED-EPOCH\n' "$RUN_DIR"
+}
+
+valid_maintenance_released_epoch()
+{
+    local path epoch now
+    path=$(maintenance_released_epoch_path) || return 1
+    [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+       "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 && "$(wc -l < "$path")" -eq 1 ]] ||
+        return 1
+    epoch=$(<"$path")
+    [[ "$epoch" =~ ^[1-9][0-9]{8,10}$ ]] || return 1
+    now=$(date +%s) || return 1
+    ((10#$epoch <= now))
+}
+
+publish_maintenance_released_epoch()
+{
+    publish_state_token "$(maintenance_released_epoch_path)" "$(date +%s)" || return 1
+    valid_maintenance_released_epoch
+}
+
+invalidate_maintenance_released_epoch()
+{
+    local path
+    path=$(maintenance_released_epoch_path) || return 1
+    if [[ -e "$path" || -L "$path" ]]; then
+        [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+           "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+        rm -f -- "$path" || return 1
+        sync -f "$RUN_DIR" || return 1
+    fi
+    [[ ! -e "$path" && ! -L "$path" ]]
+}
+
+acquire_finalization_guard_locks()
+{
+    [[ "$FINALIZATION_LOCKS_HELD" -eq 0 ]] || return 1
+    [[ ! -L /run/blackcoin-endpoint-guard.lock &&
+       ! -L /var/run/blackcoin-node-cutover.lock &&
+       ! -L /run/blackcoin-pow-quarantine-cycle.lock &&
+       ! -L /var/run/blackcoin-wallet-runtime-guard.lock &&
+       ! -L /var/run/blackcoin-free-claim-pause-transition.lock &&
+       ! -L /var/run/blackcoin-free-claim-pool.lock ]] || return 1
+    exec 20>/run/blackcoin-endpoint-guard.lock
+    flock -w 1800 20 || { exec 20>&-; return 1; }
+    exec 22>/var/run/blackcoin-node-cutover.lock
+    if ! flock -w 1800 22; then
+        exec 22>&-
+        flock -u 20 2>/dev/null || true
+        exec 20>&-
+        return 1
+    fi
+    exec 23>/run/blackcoin-pow-quarantine-cycle.lock
+    if ! flock -w 1800 23; then
+        exec 23>&-
+        flock -u 22 2>/dev/null || true
+        exec 22>&-
+        flock -u 20 2>/dev/null || true
+        exec 20>&-
+        return 1
+    fi
+    exec 21>/var/run/blackcoin-wallet-runtime-guard.lock
+    if ! flock -w 1800 21; then
+        exec 21>&-
+        flock -u 23 2>/dev/null || true
+        exec 23>&-
+        flock -u 22 2>/dev/null || true
+        exec 22>&-
+        flock -u 20 2>/dev/null || true
+        exec 20>&-
+        return 1
+    fi
+    exec 24>/var/run/blackcoin-free-claim-pause-transition.lock
+    if ! flock -w 1800 24; then
+        exec 24>&-
+        flock -u 21 2>/dev/null || true
+        exec 21>&-
+        flock -u 23 2>/dev/null || true
+        exec 23>&-
+        flock -u 22 2>/dev/null || true
+        exec 22>&-
+        flock -u 20 2>/dev/null || true
+        exec 20>&-
+        return 1
+    fi
+    exec 25>/var/run/blackcoin-free-claim-pool.lock
+    if ! flock -w 1800 25; then
+        exec 25>&-
+        flock -u 24 2>/dev/null || true
+        exec 24>&-
+        flock -u 21 2>/dev/null || true
+        exec 21>&-
+        flock -u 23 2>/dev/null || true
+        exec 23>&-
+        flock -u 22 2>/dev/null || true
+        exec 22>&-
+        flock -u 20 2>/dev/null || true
+        exec 20>&-
+        return 1
+    fi
+    FINALIZATION_LOCKS_HELD=1
+}
+
+release_finalization_guard_locks()
+{
+    flock -u 25 2>/dev/null || true
+    exec 25>&- 2>/dev/null || true
+    flock -u 24 2>/dev/null || true
+    exec 24>&- 2>/dev/null || true
+    flock -u 21 2>/dev/null || true
+    exec 21>&- 2>/dev/null || true
+    flock -u 23 2>/dev/null || true
+    exec 23>&- 2>/dev/null || true
+    flock -u 22 2>/dev/null || true
+    exec 22>&- 2>/dev/null || true
+    flock -u 20 2>/dev/null || true
+    exec 20>&- 2>/dev/null || true
+    FINALIZATION_LOCKS_HELD=0
+}
+
+activate_free_claim_pause_safely()
+{
+    local temporary owner mode
+    [[ "$FINALIZATION_LOCKS_HELD" -eq 1 ]] || return 1
+    [[ -d "$FREE_CLAIM_ROOT" && ! -L "$FREE_CLAIM_ROOT" &&
+       "$(realpath -e -- "$FREE_CLAIM_ROOT")" == "$FREE_CLAIM_ROOT" ]] || return 1
+    owner=$(stat -c '%u:%g' "$FREE_CLAIM_ROOT") || return 1
+    mode=$(stat -c '%a' "$FREE_CLAIM_ROOT") || return 1
+    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    if [[ -e "$FREE_CLAIM_PAUSE_MARKER" || -L "$FREE_CLAIM_PAUSE_MARKER" ]]; then
+        verify_free_claim_pause
+        return
+    fi
+    temporary=$(mktemp "$FREE_CLAIM_ROOT/.v30.1.4-free-claim-paused.contain.XXXXXX") || return 1
+    if ! printf '%s\n' "$FREE_CLAIM_PAUSE_CONTENT" > "$temporary" ||
+       ! chmod 600 "$temporary" || ! chown root:root "$temporary" || ! sync -f "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if ! mv -T -- "$temporary" "$FREE_CLAIM_PAUSE_MARKER" || ! sync -f "$FREE_CLAIM_ROOT"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    verify_free_claim_pause
+}
+
+activate_maintenance_marker_safely()
+{
+    local nonce temporary
+    if [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
+        verify_maintenance_marker
+        return
+    fi
+    nonce=$(cat "$(maintenance_nonce_path)" 2>/dev/null) || return 1
+    valid_sha256_hex "$nonce" || return 1
+    temporary=$(mktemp "$STATE_DIR/.v3014-maintenance.XXXXXX") || return 1
+    if ! jq -n --arg nonce "$nonce" --arg run "$RUN_DIR" \
+        '{schema:1,transaction:"v30.1.4-fleet-rollout",state:"active",
+          run_nonce:$nonce,run_dir:$run}' > "$temporary" ||
+       ! chmod 600 "$temporary" || ! chown root:root "$temporary" || ! sync -f "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if ! mv -fT -- "$temporary" "$ROLLOUT_MAINTENANCE_MARKER" || ! sync -f "$STATE_DIR"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    verify_maintenance_marker
+}
+
+release_maintenance_for_finalization()
+{
+    local rc=0 marker_was_active=0
+    acquire_finalization_guard_locks || return 1
+    verify_free_claim_pause || rc=1
+    if ((rc == 0)) && [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
+        if verify_maintenance_marker; then
+            marker_was_active=1
+            invalidate_maintenance_released_epoch || rc=1
+        fi
+        if ((rc == 0 && marker_was_active == 1)); then
+            release_maintenance_marker || rc=1
+        elif ((marker_was_active == 0)); then
+            rc=1
+        fi
+    elif ((rc == 0)) && ! valid_maintenance_released_epoch; then
+        # A crash may occur after the marker removal but before publishing its
+        # epoch. A new epoch deliberately requires a newer supervisor sample.
+        marker_was_active=1
+    fi
+    if ((rc == 0 && marker_was_active == 1)); then
+        publish_maintenance_released_epoch || rc=1
+    elif ((rc == 0)); then
+        valid_maintenance_released_epoch || rc=1
+    fi
+    if ((rc == 0)); then
+        publish_state_token "$(finalization_state_path)" maintenance-released || rc=1
+    fi
+    release_finalization_guard_locks
+    return "$rc"
+}
+
+ensure_finalization_containment()
+{
+    local rc=0 inhibitor_state
+    if acquire_finalization_guard_locks; then
+        inhibitor_state=$(/bin/bash "$INHIBITOR_RELEASER" probe 2>/dev/null || true)
+        case "$inhibitor_state" in
+            'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused') ;;
+            'state=installed-and-released cycle=v30.1.4-no-spend free_claim=enabled')
+                activate_free_claim_pause_safely || rc=1
+                ;;
+            *) rc=1 ;;
+        esac
+        ((rc != 0)) || verify_free_claim_pause || rc=1
+        ((rc != 0)) || activate_maintenance_marker_safely || rc=1
+        if ((rc == 0)); then
+            publish_state_token "$(finalization_state_path)" contained || rc=1
+        fi
+        ((rc != 0)) || verify_free_claim_pause || rc=1
+        ((rc != 0)) || verify_maintenance_marker || rc=1
+        release_finalization_guard_locks
+    else
+        rc=1
+    fi
+    inhibitor_state=$(/bin/bash "$INHIBITOR_RELEASER" probe 2>/dev/null || true)
+    [[ "$inhibitor_state" == \
+       'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused' ]] || rc=1
+    verify_maintenance_marker || rc=1
+    ((rc == 0))
+}
+
+terminal_receipt_dir()
+{
+    printf '%s/terminal-finalization\n' "$RUN_DIR"
+}
+
+terminal_receipt_path()
+{
+    printf '%s/terminal-finalization/RESULT.json\n' "$RUN_DIR"
+}
+
+terminal_receipt_sha_path()
+{
+    printf '%s/terminal-finalization/SHA256SUMS\n' "$RUN_DIR"
+}
+
+validate_preserved_hour_paths()
+{
+    local audit="$1" manifest="$2" directories="$3" invalid result_count rel extra
+    local target ancestor
+    [[ -d "$audit" && ! -L "$audit" && "$(realpath -e -- "$audit")" == "$audit" ]] || return 1
+    invalid=$(awk '
+        NF != 2 || $1 !~ /^[0-9a-f]{64}$/ {print; next}
+        {
+          name=$2
+          if (seen[name]++) {print; next}
+          if (name == "../HOUR-SOAK-DIRECTORIES") {bound_directories++; next}
+          if (name !~ /^[.]\/[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/ ||
+              name == "./DIRECTORIES") print
+        }
+        END {if (bound_directories != 1) print "invalid-directory-binding"}
+    ' "$manifest") || return 1
+    [[ -z "$invalid" ]] || return 1
+    invalid=$(awk '
+        $0 !~ /^[.]\/[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/ {print}
+    ' "$directories") || return 1
+    [[ -z "$invalid" ]] || return 1
+    cmp -s "$directories" <(sort -u "$directories") || return 1
+    while IFS= read -r rel; do
+        rel=${rel#./}
+        target="$audit/$rel"
+        [[ -d "$target" && ! -L "$target" && "$(realpath -e -- "$target")" == "$target" ]] ||
+            return 1
+    done < "$directories"
+    while read -r _ rel extra; do
+        [[ -z "$extra" ]] || return 1
+        [[ "$rel" == "../HOUR-SOAK-DIRECTORIES" ]] && continue
+        rel=${rel#./}
+        target="$audit/$rel"
+        [[ -f "$target" && ! -L "$target" && "$(realpath -e -- "$target")" == "$target" ]] ||
+            return 1
+        ancestor=${rel%/*}
+        while [[ "$ancestor" != "$rel" ]]; do
+            grep -Fxq -- "./$ancestor" "$directories" || return 1
+            [[ "$ancestor" == */* ]] || break
+            ancestor=${ancestor%/*}
+        done
+    done < "$manifest"
+    result_count=$(awk '$2 == "./RESULT.json" {count++} END {print count+0}' "$manifest") ||
+        return 1
+    [[ "$result_count" -eq 1 ]]
+}
+
+verify_success_post_release_evidence()
+{
+    local audit="$RUN_DIR/exact-32-soak" post="$RUN_DIR/exact-32-soak/POST-RELEASE.json"
+    local transaction="$RUN_DIR/TRANSACTION.json" nonce_file="$RUN_DIR/MAINTENANCE-NONCE"
+    local hour_manifest="$RUN_DIR/HOUR-SOAK-SHA256SUMS"
+    local hour_directories="$RUN_DIR/HOUR-SOAK-DIRECTORIES" path
+    local release_receipt="$RUN_DIR/FREE-CLAIM-RELEASED.json"
+    local release_sidecar="$RUN_DIR/FREE-CLAIM-RELEASED.sha256"
+    local identity_rel supervisor_rel generation_expected_rel generation_final_rel attempt_rel
+    local identity supervisor generation_expected generation_final transaction_sha nonce
+    local hour_manifest_sha hour_result_sha identity_sha supervisor_sha expected_sha final_sha
+    local supervisor_timestamp supervisor_epoch released_epoch release_receipt_sha expected_release_sha
+    local free_claim_released_epoch now_epoch
+    [[ -d "$audit" && ! -L "$audit" && "$(realpath -e -- "$audit")" == "$audit" &&
+       "$(stat -c '%u:%g:%a' "$audit")" == 0:0:700 &&
+       -z "$(find "$audit" -type l -print -quit)" &&
+       -z "$(find "$audit" ! -type d ! -type f -print -quit)" ]] || return 1
+    while IFS= read -r -d '' path; do
+        [[ "$(stat -c '%u:%g:%a' "$path")" == 0:0:700 ]] || return 1
+    done < <(find "$audit" -mindepth 1 -type d -print0)
+    while IFS= read -r -d '' path; do
+        [[ "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+    done < <(find "$audit" -type f -print0)
+    for path in "$audit/DIRECTORIES" "$audit/SHA256SUMS" "$audit/RESULT.json" "$post" \
+        "$transaction" "$nonce_file" "$hour_manifest" "$hour_directories" \
+        "$release_receipt" "$release_sidecar"; do
+        [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+           "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+    done
+    [[ -f "$RUN_DIR/MAINTENANCE-RELEASED-EPOCH" &&
+       ! -L "$RUN_DIR/MAINTENANCE-RELEASED-EPOCH" &&
+       "$(realpath -e -- "$RUN_DIR/MAINTENANCE-RELEASED-EPOCH")" == \
+          "$RUN_DIR/MAINTENANCE-RELEASED-EPOCH" &&
+       "$(stat -c '%u:%g:%a' "$RUN_DIR/MAINTENANCE-RELEASED-EPOCH")" == 0:0:600 ]] || return 1
+    cmp -s <(cd "$audit" && find . -mindepth 1 -type d -print | sort) \
+        <(sort "$audit/DIRECTORIES") || return 1
+    cmp -s "$audit/DIRECTORIES" <(sort -u "$audit/DIRECTORIES") || return 1
+    cmp -s <(cd "$audit" && find . -type f ! -path './SHA256SUMS' -print | sort) \
+        <(awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ {print $2}' "$audit/SHA256SUMS" | sort) ||
+        return 1
+    (cd "$audit" && sha256sum --strict -c SHA256SUMS >/dev/null) || return 1
+    validate_preserved_hour_paths "$audit" "$hour_manifest" "$hour_directories" || return 1
+    (cd "$audit" && sha256sum --strict -c "$hour_manifest" >/dev/null) || return 1
+    transaction_sha=$(sha256sum "$transaction" | awk '{print $1}') || return 1
+    nonce=$(<"$nonce_file")
+    valid_sha256_hex "$nonce" || return 1
+    [[ "$(wc -l < "$nonce_file")" -eq 1 ]] || return 1
+    jq -e --arg nonce "$nonce" '.maintenance.run_nonce == $nonce' "$transaction" >/dev/null || return 1
+    hour_manifest_sha=$(sha256sum "$hour_manifest" | awk '{print $1}') || return 1
+    hour_result_sha=$(sha256sum "$audit/RESULT.json" | awk '{print $1}') || return 1
+    release_receipt_sha=$(sha256sum "$release_receipt" | awk '{print $1}') || return 1
+    expected_release_sha=$(awk 'NF == 1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' \
+        "$release_sidecar") || return 1
+    [[ -n "$expected_release_sha" && "$(wc -l < "$release_sidecar")" -eq 1 &&
+       "$release_receipt_sha" == "$expected_release_sha" ]] || return 1
+    free_claim_released_epoch=$(jq -er '.released_at_epoch | select(type == "number")' \
+        "$release_receipt") || return 1
+    now_epoch=$(date +%s) || return 1
+    [[ "$free_claim_released_epoch" =~ ^[1-9][0-9]*$ &&
+       "$free_claim_released_epoch" -le "$now_epoch" ]] || return 1
+    identity_rel=$(jq -er '.fleet_identity_evidence' "$post") || return 1
+    supervisor_rel=$(jq -er '.supervisor_evidence' "$post") || return 1
+    generation_expected_rel=$(jq -er '.generation_expected_evidence' "$post") || return 1
+    generation_final_rel=$(jq -er '.generation_before_publication_evidence' "$post") || return 1
+    [[ "$identity_rel" =~ ^finalization-post-release-attempt-[0-9]{3,}/FLEET-IDENTITY[.]json$ &&
+       "$supervisor_rel" =~ ^finalization-post-release-attempt-[0-9]{3,}/SUPERVISOR-STATUS[.]json$ &&
+       "$generation_expected_rel" =~ ^finalization-post-release-attempt-[0-9]{3,}/GENERATIONS[.]expected$ &&
+       "$generation_final_rel" =~ ^finalization-post-release-attempt-[0-9]{3,}/GENERATIONS[.]before-publication$ ]] ||
+        return 1
+    attempt_rel=${identity_rel%/FLEET-IDENTITY.json}
+    [[ "${supervisor_rel%/SUPERVISOR-STATUS.json}" == "$attempt_rel" &&
+       "${generation_expected_rel%/GENERATIONS.expected}" == "$attempt_rel" &&
+       "${generation_final_rel%/GENERATIONS.before-publication}" == "$attempt_rel" ]] || return 1
+    identity="$audit/$identity_rel"
+    supervisor="$audit/$supervisor_rel"
+    generation_expected="$audit/$generation_expected_rel"
+    generation_final="$audit/$generation_final_rel"
+    identity_sha=$(sha256sum "$identity" | awk '{print $1}') || return 1
+    supervisor_sha=$(sha256sum "$supervisor" | awk '{print $1}') || return 1
+    expected_sha=$(sha256sum "$generation_expected" | awk '{print $1}') || return 1
+    final_sha=$(sha256sum "$generation_final" | awk '{print $1}') || return 1
+    [[ "$expected_sha" == "$final_sha" ]] && cmp -s "$generation_expected" "$generation_final" ||
+        return 1
+    supervisor_timestamp=$(jq -er '.timestamp | select(type == "string")' "$supervisor") || return 1
+    supervisor_epoch=$(date -d "$supervisor_timestamp" +%s 2>/dev/null) || return 1
+    released_epoch=$(<"$RUN_DIR/MAINTENANCE-RELEASED-EPOCH")
+    [[ "$(wc -l < "$RUN_DIR/MAINTENANCE-RELEASED-EPOCH")" -eq 1 &&
+       "$supervisor_epoch" =~ ^[1-9][0-9]*$ && "$released_epoch" =~ ^[1-9][0-9]*$ ]] || return 1
+    ((free_claim_released_epoch > 10#$released_epoch &&
+      supervisor_epoch > free_claim_released_epoch)) || return 1
+    jq -e --arg timestamp "$supervisor_timestamp" '
+        .timestamp == $timestamp and .state == "healthy" and .verified == 32 and
+        .running == 32 and .operational == 32 and .failures == 0
+    ' "$supervisor" >/dev/null || return 1
+    jq -e --slurpfile transaction "$transaction" \
+        -f "$PACKAGE_ROOT/lib/hour_soak_result.jq" "$audit/RESULT.json" >/dev/null || return 1
+    jq -e --arg run "$RUN_DIR" --arg transaction_sha "$transaction_sha" --arg nonce "$nonce" \
+        --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg source "$SOURCE_COMMIT" --arg hour_result_sha "$hour_result_sha" \
+        --arg hour_manifest_sha "$hour_manifest_sha" --arg identity_rel "$identity_rel" \
+        --arg identity_sha "$identity_sha" --arg supervisor_rel "$supervisor_rel" \
+        --arg supervisor_sha "$supervisor_sha" --arg supervisor_timestamp "$supervisor_timestamp" \
+        --arg generation_expected_rel "$generation_expected_rel" --arg expected_sha "$expected_sha" \
+        --arg generation_final_rel "$generation_final_rel" --arg final_sha "$final_sha" \
+        --arg release_receipt_sha "$release_receipt_sha" \
+        --argjson free_claim_released_epoch "$free_claim_released_epoch" \
+        --argjson supervisor_epoch "$supervisor_epoch" --argjson released_epoch "$((10#$released_epoch))" \
+        --slurpfile transaction "$transaction" --slurpfile hour "$audit/RESULT.json" \
+        --slurpfile identity "$identity" '
+        ($transaction | length) == 1 and ($hour | length) == 1 and ($identity | length) == 1 and
+        ($identity[0].schema == 1) and ($identity[0].nodes | length) == 32 and
+        [$identity[0].nodes[].node] == [range(1;33)] and
+        all($identity[0].nodes[]; .config_image == $image and .image_id == $image_id) and
+        .schema == 1 and .result == "passed" and .phase == "post-release" and
+        .run_dir == $run and .transaction_manifest_sha256 == $transaction_sha and
+        .run_nonce == $nonce and $transaction[0].maintenance.run_nonce == $nonce and
+        .image == $image and .image_id == $image_id and .source_commit == $source and
+        .prior_hour_soak_result_sha256 == $hour_result_sha and
+        .prior_authenticated_manifest_path == "../HOUR-SOAK-SHA256SUMS" and
+        .prior_authenticated_manifest_sha256 == $hour_manifest_sha and
+        .maintenance_marker_absent == true and .maintenance_released_epoch == $released_epoch and
+        .free_claim_broadcasts_paused == false and .free_claim_service_healthy == true and
+        .free_claim_release_receipt_path == "../FREE-CLAIM-RELEASED.json" and
+        .free_claim_release_receipt_sha256 == $release_receipt_sha and
+        .free_claim_released_at_epoch == $free_claim_released_epoch and
+        .supervisor_timestamp_epoch > $free_claim_released_epoch and
+        .stale_broadcast_gate_passed == true and
+        .supervisor_evidence == $supervisor_rel and .supervisor_status_sha256 == $supervisor_sha and
+        .supervisor_timestamp == $supervisor_timestamp and
+        .supervisor_timestamp_epoch == $supervisor_epoch and
+        .fleet_identity_evidence == $identity_rel and .fleet_identity_evidence_sha256 == $identity_sha and
+        .generation_expected_evidence == $generation_expected_rel and
+        .generation_expected_sha256 == $expected_sha and
+        .generation_before_publication_evidence == $generation_final_rel and
+        .generation_before_publication_sha256 == $final_sha and
+        .compose_sha256 == $identity[0].compose_sha256 and
+        .image_policy_sha256 == $identity[0].image_policy_sha256 and
+        .endpoint_guard_sha256 == $identity[0].endpoint_guard_sha256 and
+        .wallet_runtime_guard_sha256 == $identity[0].wallet_runtime_guard_sha256 and
+        .nodes_healthy == 32 and .pos_active == 32 and .regular_pow_active == 31 and
+        .free_claim_node == 30 and .free_claim_regular_pow == false and
+        .final_concurrent_dynamic_gate == true and .final_exact_32_generation_fence == true and
+        .global_chain_convergence == true and .vpn_proofs_valid_unique == 32 and
+        .final_policy_assets_valid == true and .live_compose_container_policy_match == true and
+        .identity_recovery_baselines_unchanged == true and
+        .claim_recovery_fee_unchanged == true and .fee_payments_authorized == false and
+        .claim_recovery_baseline_sha256s == $hour[0].claim_recovery_baseline_sha256s and
+        .claim_recovery_baseline_set_sha256 == $hour[0].claim_recovery_baseline_set_sha256
+    ' "$post" >/dev/null
+}
+
+capture_terminal_generation_fence()
+{
+    local outcome="$1" source relative expected output
+    case "$outcome" in
+        complete)
+            source="$RUN_DIR/exact-32-soak/POST-RELEASE.json"
+            relative=$(jq -er '.generation_before_publication_evidence' "$source") || return 1
+            [[ "$relative" =~ ^finalization-post-release-attempt-[0-9]{3,}/GENERATIONS[.]before-publication$ ]] ||
+                return 1
+            expected="$RUN_DIR/exact-32-soak/$relative"
+            output="$RUN_DIR/final-generations.post-release"
+            ;;
+        rolled-back)
+            source="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json"
+            relative=$(jq -er '.generation_before_publication_evidence' "$source") || return 1
+            [[ "$relative" =~ ^rollback-finalization-attempt-[0-9]{3,}/GENERATIONS[.]before-publication$ ]] ||
+                return 1
+            expected="$RUN_DIR/$relative"
+            output="$RUN_DIR/rollback-final-generations.post-release"
+            ;;
+        *) return 1 ;;
+    esac
+    [[ -f "$expected" && ! -L "$expected" && "$(realpath -e -- "$expected")" == "$expected" &&
+       "$(stat -c '%u:%g:%a' "$expected")" == 0:0:600 ]] || return 1
+    capture_exact_32_generation_map "$output" || return 1
+    cmp -s "$expected" "$output"
+}
+
+verify_terminal_receipt()
+{
+    local expected_outcome="$1" verify_live="${2:-1}" receipt_dir_override="${3:-}"
+    local receipt receipt_sha_path expected_receipt_sha actual_receipt_sha
+    local state finalization_state result ready terminal_result fleet_identity free_claim_identity path
+    local cleanup transaction release_receipt release_sidecar transaction_sha release_sha ready_sha result_sha
+    local release_result_sha expected_release_sha nonce released_at maintenance_epoch supervisor_epoch now_epoch
+    local fleet_identity_sha free_claim_identity_sha cleanup_sha completed receipt_dir
+    local evidence_manifest evidence_manifest_path evidence_manifest_sha directories_path directories_sha
+    local hour_manifest_path hour_manifest_sha hour_directories_path hour_directories_sha
+    local generation_expected_rel generation_expected generation_final generation_expected_sha generation_final_sha
+    [[ "$verify_live" == 0 || "$verify_live" == 1 ]] || return 1
+    if [[ -n "$receipt_dir_override" ]]; then
+        [[ "$verify_live" == 0 &&
+           "$receipt_dir_override" == "$RUN_DIR"/.terminal-finalization.* ]] || return 1
+        receipt_dir="$receipt_dir_override"
+        receipt="$receipt_dir/RESULT.json"
+        receipt_sha_path="$receipt_dir/SHA256SUMS"
+    else
+        receipt_dir=$(terminal_receipt_dir) || return 1
+        receipt=$(terminal_receipt_path) || return 1
+        receipt_sha_path=$(terminal_receipt_sha_path) || return 1
+    fi
+    [[ -d "$receipt_dir" && ! -L "$receipt_dir" && "$(realpath -e -- "$receipt_dir")" == "$receipt_dir" &&
+       "$(stat -c '%u:%g:%a' "$receipt_dir")" == 0:0:700 &&
+       "$(find "$receipt_dir" -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2 &&
+       -z "$(find "$receipt_dir" -mindepth 1 ! -type f -print -quit)" &&
+       -f "$receipt" && ! -L "$receipt" && "$(realpath -e -- "$receipt")" == "$receipt" &&
+       "$(stat -c '%u:%g:%a' "$receipt")" == 0:0:600 &&
+       -f "$receipt_sha_path" && ! -L "$receipt_sha_path" &&
+       "$(realpath -e -- "$receipt_sha_path")" == "$receipt_sha_path" &&
+       "$(stat -c '%u:%g:%a' "$receipt_sha_path")" == 0:0:600 ]] || return 1
+    expected_receipt_sha=$(awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ && $2 == "./RESULT.json" {print $1}' \
+        "$receipt_sha_path") || return 1
+    actual_receipt_sha=$(sha256sum "$receipt" | awk '{print $1}') || return 1
+    [[ -n "$expected_receipt_sha" && "$(wc -l < "$receipt_sha_path")" -eq 1 &&
+       "$actual_receipt_sha" == "$expected_receipt_sha" ]] || return 1
+    (cd "$receipt_dir" && sha256sum --strict -c SHA256SUMS >/dev/null) || return 1
+    [[ -f "$RUN_DIR/STATE" && ! -L "$RUN_DIR/STATE" &&
+       "$(stat -c '%u:%g:%a' "$RUN_DIR/STATE")" == 0:0:600 &&
+       -f "$(finalization_state_path)" && ! -L "$(finalization_state_path)" &&
+       "$(stat -c '%u:%g:%a' "$(finalization_state_path)")" == 0:0:600 ]] || return 1
+    state=$(<"$RUN_DIR/STATE")
+    finalization_state=$(<"$(finalization_state_path)")
+    [[ "$state" == "$expected_outcome" && "$finalization_state" == finalized ]] || return 1
+    case "$expected_outcome" in
+        complete)
+            result="$RUN_DIR/exact-32-soak/RESULT.json"
+            ready="$RUN_DIR/exact-32-soak/FINALIZATION-READY.json"
+            terminal_result="$RUN_DIR/exact-32-soak/POST-RELEASE.json"
+            fleet_identity="$RUN_DIR/final-fleet-identity.post-release.json"
+            free_claim_identity="$RUN_DIR/final-free-claim-container-identity.post-release.json"
+            evidence_manifest_path="$RUN_DIR/exact-32-soak/SHA256SUMS"
+            directories_path="$RUN_DIR/exact-32-soak/DIRECTORIES"
+            hour_manifest_path="$RUN_DIR/HOUR-SOAK-SHA256SUMS"
+            hour_directories_path="$RUN_DIR/HOUR-SOAK-DIRECTORIES"
+            verify_success_post_release_evidence || return 1
+            for path in "$evidence_manifest_path" "$directories_path" \
+                "$hour_manifest_path" "$hour_directories_path"; do
+                [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+                   "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+            done
+            (cd "$RUN_DIR/exact-32-soak" && sha256sum --strict -c SHA256SUMS >/dev/null) || return 1
+            (cd "$RUN_DIR/exact-32-soak" && \
+                sha256sum --strict -c "$hour_manifest_path" >/dev/null) || return 1
+            evidence_manifest_sha=$(sha256sum "$evidence_manifest_path" | awk '{print $1}') || return 1
+            directories_sha=$(sha256sum "$directories_path" | awk '{print $1}') || return 1
+            hour_manifest_sha=$(sha256sum "$hour_manifest_path" | awk '{print $1}') || return 1
+            hour_directories_sha=$(sha256sum "$hour_directories_path" | awk '{print $1}') || return 1
+            evidence_manifest=$(jq -cn --arg path "${evidence_manifest_path#"$RUN_DIR/"}" \
+                --arg sha "$evidence_manifest_sha" --arg directories "${directories_path#"$RUN_DIR/"}" \
+                --arg directories_sha "$directories_sha" \
+                --arg hour_manifest "${hour_manifest_path#"$RUN_DIR/"}" \
+                --arg hour_manifest_sha "$hour_manifest_sha" \
+                --arg hour_directories "${hour_directories_path#"$RUN_DIR/"}" \
+                --arg hour_directories_sha "$hour_directories_sha" \
+                '{path:$path,sha256:$sha,directories_path:$directories,directories_sha256:$directories_sha,
+                  hour_manifest_path:$hour_manifest,hour_manifest_sha256:$hour_manifest_sha,
+                  hour_directories_path:$hour_directories,hour_directories_sha256:$hour_directories_sha}') ||
+                return 1
+            generation_expected_rel=$(jq -er '.generation_before_publication_evidence' \
+                "$terminal_result") || return 1
+            [[ "$generation_expected_rel" =~ ^finalization-post-release-attempt-[0-9]{3,}/GENERATIONS[.]before-publication$ ]] ||
+                return 1
+            generation_expected="$RUN_DIR/exact-32-soak/$generation_expected_rel"
+            generation_final="$RUN_DIR/final-generations.post-release"
+            ;;
+        rolled-back)
+            result="$RUN_DIR/ROLLBACK_RESULT.json"
+            ready="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json"
+            terminal_result="$RUN_DIR/rollback-post-release/RESULT.json"
+            fleet_identity="$RUN_DIR/rollback-final-fleet-identity.post-release.json"
+            free_claim_identity="$RUN_DIR/rollback-free-claim-container-identity.post-release.json"
+            evidence_manifest_path="$RUN_DIR/rollback-post-release/SHA256SUMS"
+            directories_path="$RUN_DIR/rollback-post-release/DIRECTORIES"
+            for path in "$evidence_manifest_path" "$directories_path"; do
+                [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+                   "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+            done
+            evidence_manifest_sha=$(sha256sum "$evidence_manifest_path" | awk '{print $1}') || return 1
+            directories_sha=$(sha256sum "$directories_path" | awk '{print $1}') || return 1
+            evidence_manifest=$(jq -cn --arg path "${evidence_manifest_path#"$RUN_DIR/"}" \
+                --arg sha "$evidence_manifest_sha" --arg directories "${directories_path#"$RUN_DIR/"}" \
+                --arg directories_sha "$directories_sha" \
+                '{path:$path,sha256:$sha,directories_path:$directories,directories_sha256:$directories_sha,
+                  hour_manifest_path:null,hour_manifest_sha256:null,
+                  hour_directories_path:null,hour_directories_sha256:null}') || return 1
+            generation_expected_rel=$(jq -er '.generation_before_publication_evidence' "$ready") || return 1
+            [[ "$generation_expected_rel" =~ ^rollback-finalization-attempt-[0-9]{3,}/GENERATIONS[.]before-publication$ ]] ||
+                return 1
+            generation_expected="$RUN_DIR/$generation_expected_rel"
+            generation_final="$RUN_DIR/rollback-final-generations.post-release"
+            verify_rollback_post_release_evidence || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    cleanup="$RUN_DIR/snapshot-cleanup/RESULT.json"
+    transaction="$RUN_DIR/TRANSACTION.json"
+    release_receipt="$RUN_DIR/FREE-CLAIM-RELEASED.json"
+    release_sidecar="$RUN_DIR/FREE-CLAIM-RELEASED.sha256"
+    for path in "$transaction" "$release_receipt" "$ready" "$terminal_result" \
+        "$release_sidecar" "$fleet_identity" "$free_claim_identity" "$cleanup" \
+        "$RUN_DIR/snapshot-cleanup/RESULT.json.sha256" \
+        "$generation_expected" "$generation_final"; do
+        [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+           "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+    done
+    transaction_sha=$(sha256sum "$transaction" | awk '{print $1}') || return 1
+    release_sha=$(sha256sum "$release_receipt" | awk '{print $1}') || return 1
+    expected_release_sha=$(awk 'NF == 1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' \
+        "$release_sidecar") || return 1
+    [[ -n "$expected_release_sha" && "$(wc -l < "$release_sidecar")" -eq 1 &&
+       "$expected_release_sha" == "$release_sha" ]] || return 1
+    ready_sha=$(sha256sum "$ready" | awk '{print $1}') || return 1
+    release_result_sha=$(sha256sum "$result" | awk '{print $1}') || return 1
+    result_sha=$(sha256sum "$terminal_result" | awk '{print $1}') || return 1
+    fleet_identity_sha=$(sha256sum "$fleet_identity" | awk '{print $1}') || return 1
+    free_claim_identity_sha=$(sha256sum "$free_claim_identity" | awk '{print $1}') || return 1
+    cleanup_sha=$(sha256sum "$cleanup" | awk '{print $1}') || return 1
+    generation_expected_sha=$(sha256sum "$generation_expected" | awk '{print $1}') || return 1
+    generation_final_sha=$(sha256sum "$generation_final" | awk '{print $1}') || return 1
+    [[ "$generation_expected_sha" == "$generation_final_sha" ]] || return 1
+    cmp -s "$generation_expected" "$generation_final" || return 1
+    [[ "$(<"$RUN_DIR/snapshot-cleanup/RESULT.json.sha256")" == "$cleanup_sha" ]] || return 1
+    nonce=$(jq -er '.maintenance.run_nonce | select(type == "string")' "$transaction") || return 1
+    valid_sha256_hex "$nonce" || return 1
+    maintenance_epoch=$(jq -er '.maintenance_released_epoch | select(type == "number")' "$ready") ||
+        return 1
+    supervisor_epoch=$(jq -er '.supervisor_timestamp_epoch | select(type == "number")' "$ready") ||
+        return 1
+    released_at=$(jq -er '.released_at_epoch | select(type == "number")' "$release_receipt") ||
+        return 1
+    now_epoch=$(date +%s) || return 1
+    ((maintenance_epoch < supervisor_epoch && supervisor_epoch <= released_at &&
+      released_at <= supervisor_epoch + 300 && released_at <= now_epoch)) || return 1
+    jq -e --arg run "$RUN_DIR" --arg state "$expected_outcome" \
+        --arg result_sha "$release_result_sha" --arg ready "$ready" --arg ready_sha "$ready_sha" \
+        --arg transaction_sha "$transaction_sha" --arg nonce "$nonce" \
+        --argjson maintenance_epoch "$maintenance_epoch" \
+        --argjson supervisor_epoch "$supervisor_epoch" --argjson released_at "$released_at" '
+        .schema == 1 and .transaction == "v30.1.4-free-claim-release" and
+        .run_dir == $run and .state == $state and .result_sha256 == $result_sha and
+        .finalization_path == $ready and .finalization_sha256 == $ready_sha and
+        .transaction_manifest_sha256 == $transaction_sha and .run_nonce == $nonce and
+        .maintenance_released_epoch == $maintenance_epoch and
+        .supervisor_timestamp_epoch == $supervisor_epoch and .released_at_epoch == $released_at and
+        .supervisor_fresh_at_release == true and .maintenance_marker_absent == true and
+        .free_claim_pause_absent == true and
+        .receipt_published_before_pause_removal == true and
+        .release_protocol == "write-ahead-v1" and
+        .release_order == "maintenance-then-supervisor-then-free-claim"
+    ' "$release_receipt" >/dev/null || return 1
+    if [[ "$verify_live" -eq 1 ]]; then
+        /bin/bash "$INHIBITOR_RELEASER" verify-release \
+            "$result" "$RUN_DIR/STATE" "$ready" >/dev/null || return 1
+    fi
+    jq -e --arg run "$RUN_DIR" '
+        .schema == 1 and .transaction == "v30.1.4-snapshot-cleanup" and
+        .run_dir == $run and .result == "passed" and .cleanup_complete == true and
+        .unrelated_snapshots_destroyed == 0 and .recursive_destroy_used == false
+    ' "$cleanup" >/dev/null || return 1
+    completed=$(jq -er '.completed_at | select(type == "string")' "$receipt") || return 1
+    [[ "$completed" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+    jq -e --arg run "$RUN_DIR" --arg outcome "$expected_outcome" --arg completed "$completed" \
+        --arg transaction_sha "$transaction_sha" --arg release_sha "$release_sha" \
+        --arg ready_rel "${ready#"$RUN_DIR/"}" --arg ready_sha "$ready_sha" \
+        --arg result_rel "${terminal_result#"$RUN_DIR/"}" --arg result_sha "$result_sha" \
+        --arg fleet_rel "${fleet_identity#"$RUN_DIR/"}" --arg fleet_sha "$fleet_identity_sha" \
+        --arg free_claim_rel "${free_claim_identity#"$RUN_DIR/"}" \
+        --arg free_claim_sha "$free_claim_identity_sha" --arg cleanup_sha "$cleanup_sha" \
+        --arg generation_expected_rel "${generation_expected#"$RUN_DIR/"}" \
+        --arg generation_expected_sha "$generation_expected_sha" \
+        --arg generation_final_rel "${generation_final#"$RUN_DIR/"}" \
+        --arg generation_final_sha "$generation_final_sha" \
+        --argjson evidence_manifest "$evidence_manifest" '
+        . == {schema:1,transaction:"v30.1.4-fleet-finalization",run_dir:$run,
+          outcome:$outcome,state_token:$outcome,finalization_state:"finalized",completed_at:$completed,
+          transaction_manifest_sha256:$transaction_sha,free_claim_release_receipt_sha256:$release_sha,
+          finalization_ready_evidence:$ready_rel,finalization_ready_sha256:$ready_sha,
+          terminal_evidence_manifest:$evidence_manifest,
+          terminal_result_evidence:$result_rel,terminal_result_sha256:$result_sha,
+          fleet_identity_evidence:$fleet_rel,fleet_identity_sha256:$fleet_sha,
+          free_claim_identity_evidence:$free_claim_rel,
+          free_claim_identity_sha256:$free_claim_sha,
+          snapshot_cleanup_evidence:"snapshot-cleanup/RESULT.json",
+          snapshot_cleanup_sha256:$cleanup_sha,
+          terminal_generation_expected_evidence:$generation_expected_rel,
+          terminal_generation_expected_sha256:$generation_expected_sha,
+          terminal_generation_evidence:$generation_final_rel,
+          terminal_generation_sha256:$generation_final_sha,
+          nodes_operational:32,pos_active:32,
+          regular_pow_active:31,free_claim_node:30,free_claim_regular_pow:false,
+          fee_payments_authorized:false,terminal_evidence_bound:true}
+    ' "$receipt" >/dev/null
+}
+
+write_terminal_receipt()
+{
+    local outcome="$1" receipt_dir staging ready terminal_result fleet_identity
+    local free_claim_identity cleanup transaction release_receipt transaction_sha release_sha
+    local ready_sha result_sha fleet_identity_sha free_claim_identity_sha cleanup_sha temporary sha_tmp
+    local result evidence_manifest evidence_manifest_path evidence_manifest_sha directories_path directories_sha path
+    local hour_manifest_path hour_manifest_sha hour_directories_path hour_directories_sha
+    local generation_expected_rel generation_expected generation_final generation_expected_sha generation_final_sha
+    receipt_dir=$(terminal_receipt_dir) || return 1
+    [[ ! -e "$receipt_dir" && ! -L "$receipt_dir" ]] || return 1
+    case "$outcome" in
+        complete)
+            result="$RUN_DIR/exact-32-soak/RESULT.json"
+            ready="$RUN_DIR/exact-32-soak/FINALIZATION-READY.json"
+            terminal_result="$RUN_DIR/exact-32-soak/POST-RELEASE.json"
+            fleet_identity="$RUN_DIR/final-fleet-identity.post-release.json"
+            free_claim_identity="$RUN_DIR/final-free-claim-container-identity.post-release.json"
+            evidence_manifest_path="$RUN_DIR/exact-32-soak/SHA256SUMS"
+            directories_path="$RUN_DIR/exact-32-soak/DIRECTORIES"
+            hour_manifest_path="$RUN_DIR/HOUR-SOAK-SHA256SUMS"
+            hour_directories_path="$RUN_DIR/HOUR-SOAK-DIRECTORIES"
+            verify_success_post_release_evidence || return 1
+            for path in "$evidence_manifest_path" "$directories_path" \
+                "$hour_manifest_path" "$hour_directories_path"; do
+                [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+                   "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+            done
+            (cd "$RUN_DIR/exact-32-soak" && sha256sum --strict -c SHA256SUMS >/dev/null) || return 1
+            (cd "$RUN_DIR/exact-32-soak" && \
+                sha256sum --strict -c "$hour_manifest_path" >/dev/null) || return 1
+            evidence_manifest_sha=$(sha256sum "$evidence_manifest_path" | awk '{print $1}') || return 1
+            directories_sha=$(sha256sum "$directories_path" | awk '{print $1}') || return 1
+            hour_manifest_sha=$(sha256sum "$hour_manifest_path" | awk '{print $1}') || return 1
+            hour_directories_sha=$(sha256sum "$hour_directories_path" | awk '{print $1}') || return 1
+            evidence_manifest=$(jq -cn --arg path "${evidence_manifest_path#"$RUN_DIR/"}" \
+                --arg sha "$evidence_manifest_sha" --arg directories "${directories_path#"$RUN_DIR/"}" \
+                --arg directories_sha "$directories_sha" \
+                --arg hour_manifest "${hour_manifest_path#"$RUN_DIR/"}" \
+                --arg hour_manifest_sha "$hour_manifest_sha" \
+                --arg hour_directories "${hour_directories_path#"$RUN_DIR/"}" \
+                --arg hour_directories_sha "$hour_directories_sha" \
+                '{path:$path,sha256:$sha,directories_path:$directories,directories_sha256:$directories_sha,
+                  hour_manifest_path:$hour_manifest,hour_manifest_sha256:$hour_manifest_sha,
+                  hour_directories_path:$hour_directories,hour_directories_sha256:$hour_directories_sha}') ||
+                return 1
+            generation_expected_rel=$(jq -er '.generation_before_publication_evidence' \
+                "$terminal_result") || return 1
+            [[ "$generation_expected_rel" =~ ^finalization-post-release-attempt-[0-9]{3,}/GENERATIONS[.]before-publication$ ]] ||
+                return 1
+            generation_expected="$RUN_DIR/exact-32-soak/$generation_expected_rel"
+            generation_final="$RUN_DIR/final-generations.post-release"
+            ;;
+        rolled-back)
+            result="$RUN_DIR/ROLLBACK_RESULT.json"
+            ready="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json"
+            terminal_result="$RUN_DIR/rollback-post-release/RESULT.json"
+            fleet_identity="$RUN_DIR/rollback-final-fleet-identity.post-release.json"
+            free_claim_identity="$RUN_DIR/rollback-free-claim-container-identity.post-release.json"
+            evidence_manifest_path="$RUN_DIR/rollback-post-release/SHA256SUMS"
+            directories_path="$RUN_DIR/rollback-post-release/DIRECTORIES"
+            for path in "$evidence_manifest_path" "$directories_path"; do
+                [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+                   "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+            done
+            evidence_manifest_sha=$(sha256sum "$evidence_manifest_path" | awk '{print $1}') || return 1
+            directories_sha=$(sha256sum "$directories_path" | awk '{print $1}') || return 1
+            evidence_manifest=$(jq -cn --arg path "${evidence_manifest_path#"$RUN_DIR/"}" \
+                --arg sha "$evidence_manifest_sha" --arg directories "${directories_path#"$RUN_DIR/"}" \
+                --arg directories_sha "$directories_sha" \
+                '{path:$path,sha256:$sha,directories_path:$directories,directories_sha256:$directories_sha,
+                  hour_manifest_path:null,hour_manifest_sha256:null,
+                  hour_directories_path:null,hour_directories_sha256:null}') || return 1
+            generation_expected_rel=$(jq -er '.generation_before_publication_evidence' "$ready") || return 1
+            [[ "$generation_expected_rel" =~ ^rollback-finalization-attempt-[0-9]{3,}/GENERATIONS[.]before-publication$ ]] ||
+                return 1
+            generation_expected="$RUN_DIR/$generation_expected_rel"
+            generation_final="$RUN_DIR/rollback-final-generations.post-release"
+            verify_rollback_post_release_evidence || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    cleanup="$RUN_DIR/snapshot-cleanup/RESULT.json"
+    transaction="$RUN_DIR/TRANSACTION.json"
+    release_receipt="$RUN_DIR/FREE-CLAIM-RELEASED.json"
+    for path in "$transaction" "$release_receipt" "$ready" "$terminal_result" \
+        "$fleet_identity" "$free_claim_identity" "$cleanup" "$RUN_DIR/snapshot-cleanup/RESULT.json.sha256" \
+        "$evidence_manifest_path" "$generation_expected" "$generation_final"; do
+        [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+           "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+    done
+    [[ -f "$RUN_DIR/STATE" && ! -L "$RUN_DIR/STATE" &&
+       "$(stat -c '%u:%g:%a' "$RUN_DIR/STATE")" == 0:0:600 &&
+       -f "$(finalization_state_path)" && ! -L "$(finalization_state_path)" &&
+       "$(stat -c '%u:%g:%a' "$(finalization_state_path)")" == 0:0:600 &&
+       "$(<"$RUN_DIR/STATE")" == "$outcome" ]] || return 1
+    case "$(<"$(finalization_state_path)")" in
+        post-release-passed|finalized) ;;
+        *) return 1 ;;
+    esac
+    /bin/bash "$INHIBITOR_RELEASER" verify-release \
+        "$result" "$RUN_DIR/STATE" "$ready" >/dev/null || return 1
+    transaction_sha=$(sha256sum "$transaction" | awk '{print $1}') || return 1
+    release_sha=$(sha256sum "$release_receipt" | awk '{print $1}') || return 1
+    ready_sha=$(sha256sum "$ready" | awk '{print $1}') || return 1
+    result_sha=$(sha256sum "$terminal_result" | awk '{print $1}') || return 1
+    fleet_identity_sha=$(sha256sum "$fleet_identity" | awk '{print $1}') || return 1
+    free_claim_identity_sha=$(sha256sum "$free_claim_identity" | awk '{print $1}') || return 1
+    cleanup_sha=$(sha256sum "$cleanup" | awk '{print $1}') || return 1
+    generation_expected_sha=$(sha256sum "$generation_expected" | awk '{print $1}') || return 1
+    generation_final_sha=$(sha256sum "$generation_final" | awk '{print $1}') || return 1
+    [[ "$generation_expected_sha" == "$generation_final_sha" ]] || return 1
+    cmp -s "$generation_expected" "$generation_final" || return 1
+    [[ "$(<"$RUN_DIR/snapshot-cleanup/RESULT.json.sha256")" == "$cleanup_sha" ]] || return 1
+    jq -e --arg run "$RUN_DIR" '
+        .schema == 1 and .transaction == "v30.1.4-snapshot-cleanup" and
+        .run_dir == $run and .result == "passed" and .cleanup_complete == true and
+        .unrelated_snapshots_destroyed == 0 and .recursive_destroy_used == false
+    ' "$cleanup" >/dev/null || return 1
+    publish_state_token "$(finalization_state_path)" finalized || return 1
+    staging=$(mktemp -d "$RUN_DIR/.terminal-finalization.XXXXXX") || return 1
+    chmod 700 "$staging" && chown root:root "$staging" || return 1
+    temporary="$staging/RESULT.json"
+    jq -n --arg run "$RUN_DIR" --arg outcome "$outcome" --arg completed "$(date -u +%FT%TZ)" \
+        --arg transaction_sha "$transaction_sha" --arg release_sha "$release_sha" \
+        --arg ready_rel "${ready#"$RUN_DIR/"}" --arg ready_sha "$ready_sha" \
+        --arg result_rel "${terminal_result#"$RUN_DIR/"}" --arg result_sha "$result_sha" \
+        --arg fleet_rel "${fleet_identity#"$RUN_DIR/"}" --arg fleet_sha "$fleet_identity_sha" \
+        --arg free_claim_rel "${free_claim_identity#"$RUN_DIR/"}" \
+        --arg free_claim_sha "$free_claim_identity_sha" --arg cleanup_sha "$cleanup_sha" \
+        --arg generation_expected_rel "${generation_expected#"$RUN_DIR/"}" \
+        --arg generation_expected_sha "$generation_expected_sha" \
+        --arg generation_final_rel "${generation_final#"$RUN_DIR/"}" \
+        --arg generation_final_sha "$generation_final_sha" \
+        --argjson evidence_manifest "$evidence_manifest" '
+        {schema:1,transaction:"v30.1.4-fleet-finalization",run_dir:$run,
+         outcome:$outcome,state_token:$outcome,finalization_state:"finalized",completed_at:$completed,
+         transaction_manifest_sha256:$transaction_sha,free_claim_release_receipt_sha256:$release_sha,
+         finalization_ready_evidence:$ready_rel,finalization_ready_sha256:$ready_sha,
+         terminal_evidence_manifest:$evidence_manifest,
+         terminal_result_evidence:$result_rel,terminal_result_sha256:$result_sha,
+         fleet_identity_evidence:$fleet_rel,fleet_identity_sha256:$fleet_sha,
+         free_claim_identity_evidence:$free_claim_rel,free_claim_identity_sha256:$free_claim_sha,
+         snapshot_cleanup_evidence:"snapshot-cleanup/RESULT.json",
+         snapshot_cleanup_sha256:$cleanup_sha,
+         terminal_generation_expected_evidence:$generation_expected_rel,
+         terminal_generation_expected_sha256:$generation_expected_sha,
+         terminal_generation_evidence:$generation_final_rel,
+         terminal_generation_sha256:$generation_final_sha,
+         nodes_operational:32,pos_active:32,
+         regular_pow_active:31,free_claim_node:30,free_claim_regular_pow:false,
+         fee_payments_authorized:false,terminal_evidence_bound:true}
+    ' > "$temporary" || return 1
+    chmod 600 "$temporary" && chown root:root "$temporary" && sync -f "$temporary" || return 1
+    sha_tmp="$staging/SHA256SUMS"
+    (cd "$staging" && sha256sum ./RESULT.json) > "$sha_tmp" || return 1
+    chmod 600 "$sha_tmp" && chown root:root "$sha_tmp" && sync -f "$sha_tmp" || return 1
+    sync -f "$staging" || return 1
+    verify_terminal_receipt "$outcome" 0 "$staging" || return 1
+    trap '' INT TERM
+    if ! mv -T -- "$staging" "$receipt_dir"; then
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        return 1
+    fi
+    # The fully verified terminal directory is now atomically visible. Masked
+    # signals close the command-boundary gap, and the terminal flag is set
+    # before parent fsync: after a power loss the rename is either replayable or
+    # absent, while this process must never recontain a visible terminal receipt.
+    TERMINAL_FINALIZED=1
+    TERMINAL_COMMIT_ACTIVE=0
+    FINALIZATION_ACTIVE=0
+    if ! sync -f "$RUN_DIR"; then
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        return 1
+    fi
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    verify_terminal_receipt "$outcome" 0 || return 1
+    verify_terminal_receipt "$outcome" 1
+}
+
+verify_snapshot_cleanup_resume_prefix()
+{
+    local cleanup_dir="$RUN_DIR/snapshot-cleanup" plan_sha
+    valid_rollout_run_dir "$RUN_DIR" || return 1
+    verify_transaction_manifest || return 1
+    data_rollback_cleanup_allowed || return 1
+    data_rollback_verify_cleanup_plan_dir "$cleanup_dir" || return 1
+    data_rollback_verify_cleanup_sources "$cleanup_dir" || return 1
+    plan_sha=$(<"$cleanup_dir/PLAN.tsv.sha256")
+    [[ "$plan_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    data_rollback_verify_cleanup_journal_topology "$cleanup_dir" "$plan_sha"
+}
+
+verify_terminal_cleanup_prerequisites()
+{
+    local outcome="$1" terminal_result fleet_identity free_claim_identity
+    local generation_source generation_rel generation_expected generation_final path finalization_state
+    [[ -f "$RUN_DIR/STATE" && ! -L "$RUN_DIR/STATE" &&
+       "$(stat -c '%u:%g:%a' "$RUN_DIR/STATE")" == 0:0:600 &&
+       "$(<"$RUN_DIR/STATE")" == "$outcome" &&
+       -f "$(finalization_state_path)" && ! -L "$(finalization_state_path)" &&
+       "$(stat -c '%u:%g:%a' "$(finalization_state_path)")" == 0:0:600 ]] || return 1
+    finalization_state=$(<"$(finalization_state_path)")
+    [[ "$finalization_state" == post-release-passed || "$finalization_state" == finalized ]] ||
+        return 1
+    case "$outcome" in
+        complete)
+            verify_success_post_release_evidence || return 1
+            terminal_result="$RUN_DIR/exact-32-soak/POST-RELEASE.json"
+            generation_source="$terminal_result"
+            fleet_identity="$RUN_DIR/final-fleet-identity.post-release.json"
+            free_claim_identity="$RUN_DIR/final-free-claim-container-identity.post-release.json"
+            generation_final="$RUN_DIR/final-generations.post-release"
+            ;;
+        rolled-back)
+            verify_rollback_post_release_evidence || return 1
+            terminal_result="$RUN_DIR/rollback-post-release/RESULT.json"
+            generation_source="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json"
+            fleet_identity="$RUN_DIR/rollback-final-fleet-identity.post-release.json"
+            free_claim_identity="$RUN_DIR/rollback-free-claim-container-identity.post-release.json"
+            generation_final="$RUN_DIR/rollback-final-generations.post-release"
+            ;;
+        *) return 1 ;;
+    esac
+    generation_rel=$(jq -er '.generation_before_publication_evidence' "$generation_source") ||
+        return 1
+    case "$outcome:$generation_rel" in
+        complete:finalization-post-release-attempt-[0-9][0-9][0-9]*'/GENERATIONS.before-publication')
+            generation_expected="$RUN_DIR/exact-32-soak/$generation_rel"
+            ;;
+        rolled-back:rollback-finalization-attempt-[0-9][0-9][0-9]*'/GENERATIONS.before-publication')
+            generation_expected="$RUN_DIR/$generation_rel"
+            ;;
+        *) return 1 ;;
+    esac
+    for path in "$terminal_result" "$fleet_identity" "$free_claim_identity" \
+        "$generation_expected" "$generation_final" \
+        "$RUN_DIR/baseline/fleet-identity.json" \
+        "$RUN_DIR/baseline/free-claim-container-identity.json"; do
+        [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+           "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+    done
+    jq -e -n --slurpfile before "$RUN_DIR/baseline/fleet-identity.json" \
+        --slurpfile after "$fleet_identity" '
+        def identity($rows): $rows[0] | map({node,wallets_json,legacy_addresses_sha256,
+          quantum_addresses_sha256,quantum_inventory_sha256,runtime_manifest_sha256,
+          identity_manifest_sha256,pow_manifest_sha256,blackcoin_conf_sha256,
+          settings_json_sha256,vpn_id});
+        ($before | length) == 1 and ($after | length) == 1 and
+        ($before[0] | type) == "array" and ($after[0] | type) == "array" and
+        ($before[0] | length) == 32 and ($after[0] | length) == 32 and
+        identity($before) == identity($after)
+    ' >/dev/null || return 1
+    cmp -s "$RUN_DIR/baseline/free-claim-container-identity.json" "$free_claim_identity" ||
+        return 1
+    cmp -s "$generation_expected" "$generation_final"
+}
+
+finalize_completed_rollout()
+{
+    local inhibitor_state deadline finalization_ready release_required=0 resume_finalization_state
+    [[ -f "$RUN_DIR/STATE" && ! -L "$RUN_DIR/STATE" && "$(cat "$RUN_DIR/STATE")" == complete ]] ||
+        return 1
+    if [[ -e "$(terminal_receipt_dir)" || -L "$(terminal_receipt_dir)" ]]; then
+        trap '' INT TERM
+        if ! verify_terminal_receipt complete 0; then
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            return 1
+        fi
+        TERMINAL_FINALIZED=1
+        FINALIZATION_ACTIVE=0
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        verify_terminal_receipt complete 1 || return 1
+        return 0
+    fi
+    if [[ -e "$RUN_DIR/snapshot-cleanup" || -L "$RUN_DIR/snapshot-cleanup" ]]; then
+        verify_snapshot_cleanup_resume_prefix || return 1
+        resume_finalization_state=$(<"$(finalization_state_path)") || return 1
+        case "$resume_finalization_state" in
+            post-release-passed|finalized)
+                verify_terminal_cleanup_prerequisites complete || return 1
+                if data_rollback_finalization_released; then
+                    TERMINAL_COMMIT_ACTIVE=1
+                    FINALIZATION_ACTIVE=0
+                    cleanup_transaction_snapshots || return 1
+                    write_terminal_receipt complete || return 1
+                    TERMINAL_COMMIT_ACTIVE=0
+                    return 0
+                fi
+                ;;
+            contained)
+                # The cleanup prefix is authenticated, but no destructive
+                # cleanup resumes until the normal release state machine below
+                # proves fresh post-release evidence again.
+                ;;
+            *) return 1 ;;
+        esac
+    fi
+    inhibitor_state=$(/bin/bash "$INHIBITOR_RELEASER" probe) || return 1
+    finalization_ready="$RUN_DIR/exact-32-soak/FINALIZATION-READY.json"
+    case "$inhibitor_state" in
+        'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused')
+            release_maintenance_for_finalization || return 1
+            SOAK_PHASE=pre-release "$SOAK_AUDITOR" "$RUN_DIR" || return 1
+            publish_state_token "$(finalization_state_path)" pre-release-passed || return 1
+            release_required=1
+            ;;
+        'state=installed-and-released cycle=v30.1.4-no-spend free_claim=enabled')
+            [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" &&
+               ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] || {
+                ensure_finalization_containment
+                return 1
+            }
+            valid_maintenance_released_epoch || return 1
+            if ! /bin/bash "$INHIBITOR_RELEASER" verify-release \
+                "$RUN_DIR/exact-32-soak/RESULT.json" "$RUN_DIR/STATE" "$finalization_ready"; then
+                ensure_finalization_containment
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    if ((release_required == 1)); then
+        CONFIRM_RELEASE_TRANSACTION_INHIBITORS=v30.1.4-release-free-claim-after-success \
+            /bin/bash "$INHIBITOR_RELEASER" release \
+            "$RUN_DIR/exact-32-soak/RESULT.json" "$RUN_DIR/STATE" "$finalization_ready" || return 1
+    fi
+    /bin/bash "$INHIBITOR_RELEASER" verify-release \
+        "$RUN_DIR/exact-32-soak/RESULT.json" "$RUN_DIR/STATE" "$finalization_ready" || return 1
+    publish_state_token "$(finalization_state_path)" free-claim-released || return 1
+    inhibitor_state=$(/bin/bash "$INHIBITOR_RELEASER" probe) || return 1
+    [[ "$inhibitor_state" == 'state=installed-and-released cycle=v30.1.4-no-spend free_claim=enabled' ]] ||
+        return 1
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        verify_node30_free_claim_service && break
+        sleep 5
+    done
+    verify_node30_free_claim_service || return 1
+    [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] || return 1
+    SOAK_PHASE=post-release "$SOAK_AUDITOR" "$RUN_DIR" || return 1
+    publish_state_token "$(finalization_state_path)" post-release-passed || return 1
+    assert_fleet_identity_matches_baseline "$RUN_DIR/final-fleet-identity.post-release.json" || return 1
+    assert_free_claim_container_identity_matches_baseline \
+        "$RUN_DIR/final-free-claim-container-identity.post-release.json" || return 1
+    capture_terminal_generation_fence complete || return 1
+    verify_terminal_cleanup_prerequisites complete || return 1
+    data_rollback_prepare_cleanup_plan "$RUN_DIR/snapshot-cleanup" || return 1
+    verify_snapshot_cleanup_resume_prefix || return 1
+    data_rollback_finalization_released || return 1
+    TERMINAL_COMMIT_ACTIVE=1
+    FINALIZATION_ACTIVE=0
+    cleanup_transaction_snapshots || return 1
+    write_terminal_receipt complete || return 1
+    verify_terminal_receipt complete || return 1
+    TERMINAL_COMMIT_ACTIVE=0
+}
+
+verify_all_baseline_runtime_once()
+{
+    local node pid failed=0
+    local -a pids=() nodes=()
+    for node in $(seq 1 "$NODE_COUNT"); do
+        verify_policy_runtime_node "$node" &
+        pids+=("$!")
+        nodes+=("$node")
+    done
+    for index in "${!pids[@]}"; do
+        pid=${pids[$index]}
+        if ! wait "$pid"; then
+            log "rollback finalization runtime gate failed node=${nodes[$index]}"
+            failed=1
+        fi
+    done
+    ((failed == 0)) && assert_unique_vpn_proofs && verify_node30_free_claim_service
+}
+
+capture_rollback_chain_convergence()
+{
+    local root="$1" attempt attempt_dir node pid count
+    local -a pids=()
+    install -d -m 700 -o root -g root "$root" || return 1
+    for attempt in $(seq 1 120); do
+        attempt_dir=$(printf '%s/attempt-%03d' "$root" "$attempt")
+        install -d -m 700 -o root -g root "$attempt_dir" || return 1
+        pids=()
+        for node in $(seq 1 "$NODE_COUNT"); do
+            (
+                rpc_for "$node" getblockchaininfo | jq -c --argjson node "$node" \
+                    '{node:$node,chain,blocks,headers,bestblockhash,chainwork,initialblockdownload}' \
+                    > "$attempt_dir/node-$(node_padded "$node").json"
+            ) &
+            pids+=("$!")
+        done
+        for pid in "${pids[@]}"; do wait "$pid" || true; done
+        count=$(find "$attempt_dir" -maxdepth 1 -type f -name 'node-*.json' | wc -l) || return 1
+        if [[ "$count" -eq "$NODE_COUNT" ]] && jq -e -s '
+            length == 32 and all(.[]; .chain == "main" and .initialblockdownload == false and
+              .headers >= .blocks and (.headers - .blocks) <= 2) and
+            ([.[].blocks] | unique | length) == 1 and
+            ([.[].bestblockhash] | unique | length) == 1 and
+            ([.[].chainwork] | unique | length) == 1
+        ' "$attempt_dir"/node-*.json >/dev/null; then
+            jq -s 'sort_by(.node)' "$attempt_dir"/node-*.json > "$root/PASSED.json" || return 1
+            chmod 600 "$root/PASSED.json" && chown root:root "$root/PASSED.json" || return 1
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+verify_rollback_post_release_evidence()
+{
+    local require_current_ready="${1:-1}"
+    local evidence="$RUN_DIR/rollback-post-release" ready="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json"
+    local ready_copy="$RUN_DIR/rollback-post-release/ROLLBACK-FINALIZATION-READY.json"
+    local relative expected before after chain result ready_sha expected_sha before_sha after_sha chain_sha
+    [[ -d "$evidence" && ! -L "$evidence" && "$(realpath -e -- "$evidence")" == "$evidence" &&
+       "$(stat -c '%u:%g:%a' "$evidence")" == 0:0:700 &&
+       -z "$(find "$evidence" -type l -print -quit)" &&
+       -z "$(find "$evidence" ! -type d ! -type f -print -quit)" ]] || return 1
+    while IFS= read -r -d '' relative; do
+        [[ "$(stat -c '%u:%g:%a' "$relative")" == 0:0:700 ]] || return 1
+    done < <(find "$evidence" -mindepth 1 -type d -print0)
+    while IFS= read -r -d '' relative; do
+        [[ "$(stat -c '%u:%g:%a' "$relative")" == 0:0:600 ]] || return 1
+    done < <(find "$evidence" -type f -print0)
+    [[ -f "$evidence/DIRECTORIES" && -f "$evidence/SHA256SUMS" ]] || return 1
+    cmp -s <(cd "$evidence" && find . -mindepth 1 -type d -print | sort) \
+        <(sort "$evidence/DIRECTORIES") || return 1
+    cmp -s "$evidence/DIRECTORIES" <(sort -u "$evidence/DIRECTORIES") || return 1
+    cmp -s <(cd "$evidence" && find . -type f ! -path './SHA256SUMS' -print | sort) \
+        <(awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ {print $2}' "$evidence/SHA256SUMS" | sort) ||
+        return 1
+    (cd "$evidence" && sha256sum --strict -c SHA256SUMS >/dev/null) || return 1
+    [[ "$require_current_ready" == 0 || "$require_current_ready" == 1 ]] || return 1
+    result="$evidence/RESULT.json"
+    expected="$evidence/GENERATIONS.expected"
+    before="$evidence/GENERATIONS.before"
+    after="$evidence/GENERATIONS.after"
+    chain="$evidence/chain/PASSED.json"
+    [[ -f "$ready_copy" && ! -L "$ready_copy" ]] || return 1
+    ready_sha=$(sha256sum "$ready_copy" | awk '{print $1}') || return 1
+    if [[ "$require_current_ready" -eq 1 ]]; then
+        [[ -f "$ready" && ! -L "$ready" &&
+           "$(sha256sum "$ready" | awk '{print $1}')" == "$ready_sha" ]] || return 1
+    fi
+    expected_sha=$(sha256sum "$expected" | awk '{print $1}') || return 1
+    before_sha=$(sha256sum "$before" | awk '{print $1}') || return 1
+    after_sha=$(sha256sum "$after" | awk '{print $1}') || return 1
+    chain_sha=$(sha256sum "$chain" | awk '{print $1}') || return 1
+    [[ "$expected_sha" == "$before_sha" && "$expected_sha" == "$after_sha" ]] || return 1
+    cmp -s "$expected" "$before" && cmp -s "$expected" "$after" || return 1
+    jq -e '
+        type == "array" and length == 32 and [.[] | .node] == [range(1;33)] and
+        all(.[]; .chain == "main" and .initialblockdownload == false) and
+        ([.[].blocks] | unique | length) == 1 and
+        ([.[].bestblockhash] | unique | length) == 1 and
+        ([.[].chainwork] | unique | length) == 1
+    ' "$chain" >/dev/null || return 1
+    jq -e --arg run "$RUN_DIR" --arg ready_sha "$ready_sha" \
+        --arg expected_sha "$expected_sha" --arg before_sha "$before_sha" \
+        --arg after_sha "$after_sha" --arg chain_sha "$chain_sha" '
+        .schema == 1 and .transaction == "v30.1.4-rollback-post-release" and
+        .run_dir == $run and .result == "passed" and
+        .rollback_finalization_ready_sha256 == $ready_sha and
+        .generation_expected_evidence == "GENERATIONS.expected" and
+        .generation_expected_sha256 == $expected_sha and
+        .generation_before_evidence == "GENERATIONS.before" and
+        .generation_before_sha256 == $before_sha and
+        .generation_after_evidence == "GENERATIONS.after" and
+        .generation_after_sha256 == $after_sha and
+        .chain_convergence_evidence == "chain/PASSED.json" and
+        .chain_convergence_sha256 == $chain_sha and
+        .nodes_operational == 32 and .pos_active == 32 and .regular_pow_active == 31 and
+        .free_claim_node == 30 and .free_claim_regular_pow == false and
+        .vpn_proofs_valid_unique == 32 and .exact_32_generation_fence == true and
+        .global_chain_convergence == true and .free_claim_service_healthy == true and
+        .fee_payments_authorized == false
+    ' "$result" >/dev/null
+}
+
+write_rollback_post_release_evidence()
+{
+    local canonical="$RUN_DIR/rollback-post-release" staging archive_index=1 archive ready
+    local ready_rel expected ready_sha expected_sha before_sha after_sha chain_sha temporary
+    if [[ -e "$canonical" || -L "$canonical" ]]; then
+        verify_rollback_post_release_evidence 0 || return 1
+        while [[ -e "$(printf '%s/rollback-post-release-prior-%03d' "$RUN_DIR" "$archive_index")" ||
+                 -L "$(printf '%s/rollback-post-release-prior-%03d' "$RUN_DIR" "$archive_index")" ]]; do
+            archive_index=$((archive_index + 1))
+        done
+        archive=$(printf '%s/rollback-post-release-prior-%03d' "$RUN_DIR" "$archive_index")
+        mv -T -- "$canonical" "$archive" || return 1
+        sync -f "$RUN_DIR" || return 1
+    fi
+    staging=$(mktemp -d "$RUN_DIR/.rollback-post-release.XXXXXX") || return 1
+    chmod 700 "$staging" && chown root:root "$staging" || return 1
+    ready="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json"
+    ready_rel=$(jq -er '.generation_before_publication_evidence' "$ready") || return 1
+    [[ "$ready_rel" =~ ^rollback-finalization-attempt-[0-9]{3,}/GENERATIONS[.]before-publication$ ]] ||
+        return 1
+    expected="$RUN_DIR/$ready_rel"
+    install -m 600 -o root -g root "$ready" \
+        "$staging/ROLLBACK-FINALIZATION-READY.json" || return 1
+    install -m 600 -o root -g root "$expected" "$staging/GENERATIONS.expected" || return 1
+    capture_exact_32_generation_map "$staging/GENERATIONS.before" || return 1
+    cmp -s "$staging/GENERATIONS.expected" "$staging/GENERATIONS.before" || return 1
+    verify_all_baseline_runtime_once || return 1
+    capture_rollback_chain_convergence "$staging/chain" || return 1
+    verify_all_baseline_runtime_once || return 1
+    capture_exact_32_generation_map "$staging/GENERATIONS.after" || return 1
+    cmp -s "$staging/GENERATIONS.expected" "$staging/GENERATIONS.after" || return 1
+    ready_sha=$(sha256sum "$staging/ROLLBACK-FINALIZATION-READY.json" | awk '{print $1}') || return 1
+    expected_sha=$(sha256sum "$staging/GENERATIONS.expected" | awk '{print $1}') || return 1
+    before_sha=$(sha256sum "$staging/GENERATIONS.before" | awk '{print $1}') || return 1
+    after_sha=$(sha256sum "$staging/GENERATIONS.after" | awk '{print $1}') || return 1
+    chain_sha=$(sha256sum "$staging/chain/PASSED.json" | awk '{print $1}') || return 1
+    [[ "$expected_sha" == "$before_sha" && "$expected_sha" == "$after_sha" ]] || return 1
+    temporary="$staging/RESULT.json"
+    jq -n --arg run "$RUN_DIR" --arg completed "$(date -u +%FT%TZ)" \
+        --arg ready_sha "$ready_sha" --arg expected_sha "$expected_sha" \
+        --arg before_sha "$before_sha" --arg after_sha "$after_sha" --arg chain_sha "$chain_sha" '
+        {schema:1,transaction:"v30.1.4-rollback-post-release",run_dir:$run,
+         result:"passed",completed_at:$completed,rollback_finalization_ready_sha256:$ready_sha,
+         generation_expected_evidence:"GENERATIONS.expected",generation_expected_sha256:$expected_sha,
+         generation_before_evidence:"GENERATIONS.before",generation_before_sha256:$before_sha,
+         generation_after_evidence:"GENERATIONS.after",generation_after_sha256:$after_sha,
+         chain_convergence_evidence:"chain/PASSED.json",chain_convergence_sha256:$chain_sha,
+         nodes_operational:32,pos_active:32,regular_pow_active:31,free_claim_node:30,
+         free_claim_regular_pow:false,vpn_proofs_valid_unique:32,
+         exact_32_generation_fence:true,global_chain_convergence:true,
+         free_claim_service_healthy:true,fee_payments_authorized:false}
+    ' > "$temporary" || return 1
+    chmod 600 "$temporary" && chown root:root "$temporary" || return 1
+    (cd "$staging" && find . -mindepth 1 -type d -print | sort) > "$staging/DIRECTORIES" || return 1
+    chmod 600 "$staging/DIRECTORIES" && chown root:root "$staging/DIRECTORIES" || return 1
+    find "$staging" -type d -exec chmod 700 {} + -exec chown root:root {} + || return 1
+    find "$staging" -type f -exec chmod 600 {} + -exec chown root:root {} + || return 1
+    (cd "$staging" && find . -type f ! -path './SHA256SUMS' -print0 | sort -z | xargs -0 sha256sum) \
+        > "$staging/SHA256SUMS" || return 1
+    chmod 600 "$staging/SHA256SUMS" && chown root:root "$staging/SHA256SUMS" || return 1
+    while IFS= read -r -d '' temporary; do sync -f "$temporary" || return 1; done \
+        < <(find "$staging" -type f -print0)
+    sync -f "$staging" || return 1
+    mv -T -- "$staging" "$canonical" || return 1
+    sync -f "$RUN_DIR" || return 1
+    verify_rollback_post_release_evidence
+}
+
+capture_exact_32_generation_map()
+{
+    local output="$1" node generation temporary
+    temporary="${output}.tmp.$$"
+    : > "$temporary" || return 1
+    for node in $(seq 1 "$NODE_COUNT"); do
+        generation=$(container_generation_for "$node") || { rm -f -- "$temporary"; return 1; }
+        printf '%02d|%s\n' "$node" "$generation" >> "$temporary" || {
+            rm -f -- "$temporary"; return 1;
+        }
+    done
+    if ! chmod 600 "$temporary" || ! chown root:root "$temporary" || ! sync -f "$temporary"; then
+        rm -f -- "$temporary"; return 1;
+    fi
+    mv -fT -- "$temporary" "$output" || { rm -f -- "$temporary"; return 1; }
+    sync -f "$output"
+}
+
+capture_fresh_rollback_supervisor()
+{
+    local output="$1" released_epoch="$2" supervisor before copied after temporary
+    local timestamp timestamp_epoch now owner mode deadline=$((SECONDS + 1200))
+    supervisor=/mnt/pulsar/Blackcoin_Blocks/operations/fleet-supervisor-status.json
+    while ((SECONDS < deadline)); do
+        verify_free_claim_pause || return 1
+        [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] || return 1
+        if [[ -f "$supervisor" && ! -L "$supervisor" &&
+              "$(realpath -e -- "$supervisor" 2>/dev/null || true)" == "$supervisor" ]]; then
+            owner=$(stat -c '%u:%g' "$supervisor" 2>/dev/null || true)
+            mode=$(stat -c '%a' "$supervisor" 2>/dev/null || true)
+            if [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ ]] &&
+               (( (8#$mode & 0022) == 0 )); then
+                before=$(sha256sum "$supervisor" | awk '{print $1}') || before=''
+                temporary=$(mktemp "${output%/*}/.supervisor.XXXXXX") || return 1
+                if install -m 600 -o root -g root "$supervisor" "$temporary"; then
+                    copied=$(sha256sum "$temporary" | awk '{print $1}') || copied=''
+                    after=$(sha256sum "$supervisor" | awk '{print $1}') || after=''
+                    timestamp=$(jq -er '.timestamp | select(type == "string")' \
+                        "$temporary" 2>/dev/null || true)
+                    if [[ "$timestamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+                        timestamp_epoch=$(date -d "$timestamp" +%s 2>/dev/null || true)
+                    else
+                        timestamp_epoch=''
+                    fi
+                    now=$(date +%s)
+                    if valid_sha256_hex "$before" && [[ "$before" == "$copied" && "$before" == "$after" &&
+                       "$timestamp_epoch" =~ ^[1-9][0-9]*$ ]] &&
+                       ((timestamp_epoch > released_epoch && timestamp_epoch <= now &&
+                         timestamp_epoch >= now - 300)) &&
+                       jq -e '.state == "healthy" and .verified == 32 and .running == 32 and
+                           .operational == 32 and .failures == 0' "$temporary" >/dev/null; then
+                        sync -f "$temporary" || { rm -f -- "$temporary"; return 1; }
+                        mv -fT -- "$temporary" "$output" || {
+                            rm -f -- "$temporary"; return 1;
+                        }
+                        sync -f "$output" || return 1
+                        return 0
+                    fi
+                fi
+                rm -f -- "$temporary"
+            fi
+        fi
+        ((SECONDS < deadline)) && sleep 5
+    done
+    return 1
+}
+
+write_rollback_finalization_ready()
+{
+    local attempt=1 attempt_dir ready="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json"
+    local result="$RUN_DIR/ROLLBACK_RESULT.json" epoch supervisor identity generations_before
+    local generations_after generations_final supervisor_sha identity_sha result_sha transaction_sha
+    local generations_before_sha generations_final_sha nonce timestamp timestamp_epoch
+    local ready_tmp ready_sha_tmp
+    [[ "$(<"$RUN_DIR/STATE")" == rolled-back ]] || return 1
+    valid_maintenance_released_epoch || return 1
+    epoch=$(<"$(maintenance_released_epoch_path)")
+    verify_free_claim_pause || return 1
+    [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] || return 1
+    while [[ -e "$(printf '%s/rollback-finalization-attempt-%03d' "$RUN_DIR" "$attempt")" ||
+             -L "$(printf '%s/rollback-finalization-attempt-%03d' "$RUN_DIR" "$attempt")" ]]; do
+        attempt=$((attempt + 1))
+    done
+    attempt_dir=$(printf '%s/rollback-finalization-attempt-%03d' "$RUN_DIR" "$attempt")
+    install -d -m 700 -o root -g root "$attempt_dir" || return 1
+    generations_before="$attempt_dir/GENERATIONS.before"
+    generations_after="$attempt_dir/GENERATIONS.after"
+    generations_final="$attempt_dir/GENERATIONS.before-publication"
+    supervisor="$attempt_dir/SUPERVISOR-STATUS.json"
+    identity="$attempt_dir/FLEET-IDENTITY.json"
+    verify_all_baseline_runtime_once || return 1
+    capture_exact_32_generation_map "$generations_before" || return 1
+    capture_fresh_rollback_supervisor "$supervisor" "$((10#$epoch))" || return 1
+    capture_exact_32_generation_map "$generations_after" || return 1
+    cmp -s "$generations_before" "$generations_after" || return 1
+    verify_all_baseline_runtime_once || return 1
+    assert_fleet_identity_matches_baseline "$identity" || return 1
+    verify_free_claim_pause || return 1
+    [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] || return 1
+    capture_exact_32_generation_map "$generations_final" || return 1
+    cmp -s "$generations_before" "$generations_final" || return 1
+    supervisor_sha=$(sha256sum "$supervisor" | awk '{print $1}') || return 1
+    identity_sha=$(sha256sum "$identity" | awk '{print $1}') || return 1
+    generations_before_sha=$(sha256sum "$generations_before" | awk '{print $1}') || return 1
+    generations_final_sha=$(sha256sum "$generations_final" | awk '{print $1}') || return 1
+    [[ "$generations_before_sha" == "$generations_final_sha" ]] || return 1
+    result_sha=$(sha256sum "$result" | awk '{print $1}') || return 1
+    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
+    nonce=$(<"$(maintenance_nonce_path)")
+    valid_sha256_hex "$nonce" || return 1
+    timestamp=$(jq -er '.timestamp' "$supervisor") || return 1
+    timestamp_epoch=$(date -d "$timestamp" +%s) || return 1
+    ready_tmp=$(mktemp "$RUN_DIR/.rollback-finalization-ready.XXXXXX") || return 1
+    jq -n --arg result passed --arg phase rollback-pre-release --arg run "$RUN_DIR" \
+        --arg rollback_sha "$result_sha" --arg transaction_sha "$transaction_sha" \
+        --arg supervisor_rel "${supervisor#"$RUN_DIR/"}" --arg supervisor_sha "$supervisor_sha" \
+        --arg supervisor_timestamp "$timestamp" --arg identity_rel "${identity#"$RUN_DIR/"}" \
+        --arg identity_sha "$identity_sha" --argjson supervisor_epoch "$timestamp_epoch" \
+        --arg generations_before_rel "${generations_before#"$RUN_DIR/"}" \
+        --arg generations_before_sha "$generations_before_sha" \
+        --arg generations_final_rel "${generations_final#"$RUN_DIR/"}" \
+        --arg generations_final_sha "$generations_final_sha" --arg nonce "$nonce" \
+        --argjson released_epoch "$((10#$epoch))" '
+        {schema:1,result:$result,phase:$phase,run_dir:$run,
+         rollback_result_sha256:$rollback_sha,transaction_manifest_sha256:$transaction_sha,
+         run_nonce:$nonce,
+         maintenance_marker_absent:true,maintenance_released_epoch:$released_epoch,
+         free_claim_broadcasts_paused:true,supervisor_evidence:$supervisor_rel,
+         supervisor_status_sha256:$supervisor_sha,supervisor_timestamp:$supervisor_timestamp,
+         supervisor_timestamp_epoch:$supervisor_epoch,fleet_identity_evidence:$identity_rel,
+         fleet_identity_evidence_sha256:$identity_sha,nodes_healthy:32,pos_active:32,
+         generation_before_evidence:$generations_before_rel,
+         generation_before_sha256:$generations_before_sha,
+         generation_before_publication_evidence:$generations_final_rel,
+         generation_before_publication_sha256:$generations_final_sha,
+         regular_pow_active:31,free_claim_node:30,free_claim_regular_pow:false,
+         exact_32_generation_fence:true,vpn_proofs_valid_unique:32,
+         baseline_identity_restored:true,claim_recovery_fee_unchanged:true,
+         fee_payments_authorized:false}
+    ' > "$ready_tmp" || return 1
+    chmod 600 "$ready_tmp" && chown root:root "$ready_tmp" && sync -f "$ready_tmp" || return 1
+    mv -fT -- "$ready_tmp" "$ready" || return 1
+    ready_sha_tmp=$(mktemp "$RUN_DIR/.rollback-finalization-ready-sha.XXXXXX") || return 1
+    sha256sum "$ready" | awk '{print $1}' > "$ready_sha_tmp" || return 1
+    chmod 600 "$ready_sha_tmp" && chown root:root "$ready_sha_tmp" && sync -f "$ready_sha_tmp" || return 1
+    mv -fT -- "$ready_sha_tmp" "$RUN_DIR/ROLLBACK-FINALIZATION-READY.sha256" || return 1
+    sync -f "$RUN_DIR"
+}
+
+finalize_rolled_back_run()
+{
+    local inhibitor_state ready="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json" release_required=0
+    local resume_finalization_state
+    if [[ -e "$(terminal_receipt_dir)" || -L "$(terminal_receipt_dir)" ]]; then
+        trap '' INT TERM
+        if ! verify_terminal_receipt rolled-back 0; then
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            return 1
+        fi
+        TERMINAL_FINALIZED=1
+        FINALIZATION_ACTIVE=0
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        verify_terminal_receipt rolled-back 1 || return 1
+        return 0
+    fi
+    if [[ -e "$RUN_DIR/snapshot-cleanup" || -L "$RUN_DIR/snapshot-cleanup" ]]; then
+        verify_snapshot_cleanup_resume_prefix || return 1
+        resume_finalization_state=$(<"$(finalization_state_path)") || return 1
+        case "$resume_finalization_state" in
+            post-release-passed|finalized)
+                verify_terminal_cleanup_prerequisites rolled-back || return 1
+                if data_rollback_finalization_released; then
+                    TERMINAL_COMMIT_ACTIVE=1
+                    FINALIZATION_ACTIVE=0
+                    cleanup_transaction_snapshots || return 1
+                    write_terminal_receipt rolled-back || return 1
+                    TERMINAL_COMMIT_ACTIVE=0
+                    return 0
+                fi
+                ;;
+            contained)
+                # Preserve the authenticated cleanup prefix and reacquire a
+                # fresh release proof through the normal state machine below.
+                ;;
+            *) return 1 ;;
+        esac
+    fi
+    inhibitor_state=$(/bin/bash "$INHIBITOR_RELEASER" probe) || return 1
+    case "$inhibitor_state" in
+        'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused')
+            release_maintenance_for_finalization || return 1
+            write_rollback_finalization_ready || return 1
+            release_required=1
+            ;;
+        'state=installed-and-released cycle=v30.1.4-no-spend free_claim=enabled')
+            [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] || {
+                ensure_finalization_containment
+                return 1
+            }
+            if ! /bin/bash "$INHIBITOR_RELEASER" verify-release \
+                "$RUN_DIR/ROLLBACK_RESULT.json" "$RUN_DIR/STATE" "$ready"; then
+                ensure_finalization_containment
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    if ((release_required == 1)); then
+        CONFIRM_RELEASE_TRANSACTION_INHIBITORS=v30.1.4-release-free-claim-after-success \
+            /bin/bash "$INHIBITOR_RELEASER" release \
+            "$RUN_DIR/ROLLBACK_RESULT.json" "$RUN_DIR/STATE" "$ready" || return 1
+    fi
+    /bin/bash "$INHIBITOR_RELEASER" verify-release \
+        "$RUN_DIR/ROLLBACK_RESULT.json" "$RUN_DIR/STATE" "$ready" || return 1
+    verify_node30_free_claim_service || return 1
+    write_rollback_post_release_evidence || return 1
+    assert_fleet_identity_matches_baseline \
+        "$RUN_DIR/rollback-final-fleet-identity.post-release.json" || return 1
+    assert_free_claim_container_identity_matches_baseline \
+        "$RUN_DIR/rollback-free-claim-container-identity.post-release.json" || return 1
+    verify_all_baseline_runtime_once || return 1
+    capture_terminal_generation_fence rolled-back || return 1
+    publish_state_token "$(finalization_state_path)" post-release-passed || return 1
+    verify_terminal_cleanup_prerequisites rolled-back || return 1
+    data_rollback_prepare_cleanup_plan "$RUN_DIR/snapshot-cleanup" || return 1
+    verify_snapshot_cleanup_resume_prefix || return 1
+    data_rollback_finalization_released || return 1
+    TERMINAL_COMMIT_ACTIVE=1
+    FINALIZATION_ACTIVE=0
+    cleanup_transaction_snapshots || return 1
+    write_terminal_receipt rolled-back || return 1
+    verify_terminal_receipt rolled-back || return 1
+    TERMINAL_COMMIT_ACTIVE=0
+}
+
+write_rollback_success_evidence()
+{
+    local transaction_sha temporary result_sha sha_tmp
+    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
+    temporary=$(mktemp "$RUN_DIR/.ROLLBACK_RESULT.XXXXXX")
+    jq -n --arg transaction_sha "$transaction_sha" \
+        '{schema:1,transaction:"v30.1.4-fleet-rollout",result:"rolled-back",
+          state:"rolled-back",transaction_manifest_sha256:$transaction_sha,
+          nodes_healthy:32,pos_active:32,regular_pow_active:31,free_claim_node:30,
+          free_claim_regular_pow:false,free_claim_broadcasts_paused:true,
+          vpn_proofs_valid_unique:32,baseline_identity_restored:true,
+          claim_recovery_fee_unchanged:true,fee_payments_authorized:false,
+          rollback_verified:true}' > "$temporary" || return 1
+    chmod 600 "$temporary"
+    chown root:root "$temporary"
+    sync -f "$temporary"
+    mv -fT -- "$temporary" "$RUN_DIR/ROLLBACK_RESULT.json"
+    result_sha=$(sha256sum "$RUN_DIR/ROLLBACK_RESULT.json" | awk '{print $1}') || return 1
+    sha_tmp=$(mktemp "$RUN_DIR/.ROLLBACK_RESULT.sha256.XXXXXX")
+    printf '%s\n' "$result_sha" > "$sha_tmp"
+    chmod 600 "$sha_tmp"
+    chown root:root "$sha_tmp"
+    sync -f "$sha_tmp"
+    mv -fT -- "$sha_tmp" "$RUN_DIR/ROLLBACK_RESULT.sha256"
+    sync -f "$RUN_DIR"
+}
+
+verify_current_policy_assets()
+{
+    assert_protected_file "$IMAGE_POLICY" 600
+    assert_protected_file "$ENDPOINT_GUARD" 600
+    triplet_policy_guard_valid "$IMAGE_POLICY" "$ENDPOINT_GUARD" ||
+        die 'endpoint guard does not pin a valid current image policy'
+}
+
+triplet_policy_guard_valid()
+{
+    local policy="$1" guard="$2" policy_sha pin_sha
+    [[ -f "$policy" && ! -L "$policy" && -f "$guard" && ! -L "$guard" ]] || return 1
+    policy_sha=$(sha256sum "$policy" | awk '{print $1}') || return 1
+    pin_sha=$(sed -n "s/^EXPECTED_IMAGE_POLICY_SHA='\([0-9a-f]\{64\}\)'$/\1/p" "$guard") || return 1
+    [[ -n "$pin_sha" && "$policy_sha" == "$pin_sha" ]] || return 1
+    jq -e '.schema == 1 and (.images | type == "object" and length >= 1) and
+        (.nodes | type == "object" and length == 32)' "$policy" >/dev/null ||
+        return 1
+}
+
+verify_live_fleet_matches_policy()
+{
+    local model node padded class expected_ref expected_id service container
+    model=$(docker compose -f "$COMPOSE_FILE" config --format json) || return 1
+    for node in $(seq 1 "$NODE_COUNT"); do
+        padded=$(node_padded "$node")
+        service=$(service_for "$node")
+        container=$(container_for "$node")
+        class=$(jq -er --arg node "$padded" '.nodes[$node]' "$IMAGE_POLICY") || return 1
+        expected_ref=$(jq -er --arg class "$class" '.images[$class].config_image' "$IMAGE_POLICY") || return 1
+        expected_id=$(jq -er --arg class "$class" '.images[$class].image_id' "$IMAGE_POLICY") || return 1
+        jq -e --arg service "$service" --arg ref "$expected_ref" \
+            '.services[$service].image == $ref' >/dev/null <<< "$model" || return 1
+        [[ "$(docker inspect -f '{{.Config.Image}}' "$container")" == "$expected_ref" ]] || return 1
+        [[ "$(docker inspect -f '{{.Image}}' "$container")" == "$expected_id" ]] || return 1
+    done
+}
+
+verify_baseline_hashes()
+{
+    require_baseline_identity
+    [[ "$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')" == "$EXPECTED_COMPOSE_SHA256" ]] ||
+        die 'live Compose bytes differ from the audited baseline'
+    [[ "$(sha256sum "$IMAGE_POLICY" | awk '{print $1}')" == "$EXPECTED_IMAGE_POLICY_SHA256" ]] ||
+        die 'live image-policy bytes differ from the audited baseline'
+    [[ "$(sha256sum "$ENDPOINT_GUARD" | awk '{print $1}')" == "$EXPECTED_ENDPOINT_GUARD_SHA256" ]] ||
+        die 'live endpoint-guard bytes differ from the audited baseline'
+    [[ "$(sha256sum "$WALLET_RUNTIME_GUARD" | awk '{print $1}')" == \
+       "$EXPECTED_WALLET_RUNTIME_GUARD_SHA256" ]] ||
+        die 'live wallet-runtime-guard bytes differ from the audited compatible baseline'
+}
+
+require_baseline_identity()
+{
+    : "${EXPECTED_COMPOSE_SHA256:?EXPECTED_COMPOSE_SHA256 is required}"
+    : "${EXPECTED_IMAGE_POLICY_SHA256:?EXPECTED_IMAGE_POLICY_SHA256 is required}"
+    : "${EXPECTED_ENDPOINT_GUARD_SHA256:?EXPECTED_ENDPOINT_GUARD_SHA256 is required}"
+    : "${EXPECTED_WALLET_RUNTIME_GUARD_SHA256:?EXPECTED_WALLET_RUNTIME_GUARD_SHA256 is required}"
+    valid_sha256_hex "$EXPECTED_COMPOSE_SHA256" || die 'expected Compose hash is malformed'
+    valid_sha256_hex "$EXPECTED_IMAGE_POLICY_SHA256" || die 'expected policy hash is malformed'
+    valid_sha256_hex "$EXPECTED_ENDPOINT_GUARD_SHA256" || die 'expected endpoint-guard hash is malformed'
+    valid_sha256_hex "$EXPECTED_WALLET_RUNTIME_GUARD_SHA256" ||
+        die 'expected wallet-runtime-guard hash is malformed'
+}
+
+verify_resume_run()
+{
+    local result state wave wave_name wave_index node
+    local -a resume_wave_nodes=()
+    valid_rollout_run_dir "$RUN_DIR" ||
+        die 'resume directory is unsafe or outside the rollout root'
+    [[ -f "$RUN_DIR/STATE" && ! -L "$RUN_DIR/STATE" ]] || die 'resume run state is unsafe'
+    state=$(cat "$RUN_DIR/STATE")
+    [[ "$state" == prepared || "$state" == applying || "$state" == complete ]] ||
+        die 'resume run is not in a prepared, applying, or finalization-eligible complete state'
+    [[ -d "$RUN_DIR/baseline" && ! -L "$RUN_DIR/baseline" ]] || die 'resume baseline is absent'
+    for file in docker-compose.yml fleet-image-policy.json blackcoin_endpoint_guard.sh \
+        blackcoin_wallet_runtime_guard.sh blackcoin_node_normal_unlock.sh blackcoin_pow_start_only.sh \
+        fleet-identity.json free-claim-status.json free-claim-container-identity.json SHA256SUMS; do
+        [[ -f "$RUN_DIR/baseline/$file" && ! -L "$RUN_DIR/baseline/$file" ]] ||
+            die "resume baseline file is absent or unsafe: $file"
+    done
+    for node in $(seq 1 "$NODE_COUNT"); do
+        [[ -f "$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json" &&
+           ! -L "$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json" ]] ||
+            die "resume legacy PoW baseline is absent for node $node"
+    done
+    (cd "$RUN_DIR/baseline" && sha256sum --strict -c SHA256SUMS >/dev/null) ||
+        die 'resume baseline evidence checksum failed'
+    [[ "$(sha256sum "$RUN_DIR/baseline/docker-compose.yml" | awk '{print $1}')" == \
+       "$EXPECTED_COMPOSE_SHA256" ]] || die 'resume Compose baseline differs from the audited bytes'
+    [[ "$(sha256sum "$RUN_DIR/baseline/fleet-image-policy.json" | awk '{print $1}')" == \
+       "$EXPECTED_IMAGE_POLICY_SHA256" ]] || die 'resume policy baseline differs from the audited bytes'
+    [[ "$(sha256sum "$RUN_DIR/baseline/blackcoin_endpoint_guard.sh" | awk '{print $1}')" == \
+       "$EXPECTED_ENDPOINT_GUARD_SHA256" ]] || die 'resume guard baseline differs from the audited bytes'
+    [[ "$(sha256sum "$RUN_DIR/baseline/blackcoin_wallet_runtime_guard.sh" | awk '{print $1}')" == \
+       "$EXPECTED_WALLET_RUNTIME_GUARD_SHA256" ]] ||
+        die 'resume wallet runtime guard differs from the audited compatible bytes'
+    [[ "$(sha256sum "$RUN_DIR/baseline/blackcoin_node_normal_unlock.sh" | awk '{print $1}')" == \
+       "$NORMAL_UNLOCK_HELPER_SHA256" ]] || die 'resume unlock helper differs from audited bytes'
+    [[ "$(sha256sum "$RUN_DIR/baseline/blackcoin_pow_start_only.sh" | awk '{print $1}')" == \
+       "$POW_START_HELPER_SHA256" ]] || die 'resume PoW helper differs from audited bytes'
+    assert_empty_control_marker "$ENABLE_GUARD_STARTS" ||
+        die 'live guard-start authority marker is absent, nonempty, or unsafe during resume'
+    verify_transaction_manifest || die 'resume transaction identity or package bytes changed'
+    while IFS= read -r wave; do
+        wave_name=${wave##*/}
+        [[ "$wave_name" =~ ^wave-([0-9]{2})-nodes- ]] ||
+            die "resume contains an invalid wave directory: $wave"
+        wave_index=$((10#${BASH_REMATCH[1]}))
+        verify_wave_evidence_manifest "$wave" "$wave_index" ||
+            die "resume wave evidence or node identity changed: $wave"
+        CURRENT_WAVE_DIR="$wave"
+        read -r -a resume_wave_nodes < "$wave/NODES"
+        if [[ -f "$wave/RESULT" && ! -L "$wave/RESULT" ]]; then
+            result=$(cat "$wave/RESULT")
+            [[ "$result" == passed || "$result" == rolled-back ]] ||
+                die "resume contains an invalid wave result: $wave"
+            if [[ "$result" == passed ]]; then
+                CURRENT_WAVE_NODES=("${resume_wave_nodes[@]}")
+                verify_wave_runtime_evidence ||
+                    die "resume passed-wave runtime evidence changed: $wave"
+            fi
+        else
+            [[ -f "$wave/COMMIT_STATE" && ! -L "$wave/COMMIT_STATE" ]] ||
+                die "resume contains an unauthenticated unterminated wave: $wave"
+        fi
+    done < <(find "$RUN_DIR" -maxdepth 1 -type d -name 'wave-*' -print | sort)
+}
+
+single_interrupted_wave()
+{
+    local wave found='' count=0
+    while IFS= read -r wave; do
+        [[ -f "$wave/RESULT" || -L "$wave/RESULT" ]] && continue
+        [[ -f "$wave/COMMIT_STATE" && ! -L "$wave/COMMIT_STATE" ]] || continue
+        found="$wave"
+        count=$((count + 1))
+    done < <(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -type d -name 'wave-*' -print | sort)
+    if ((count > 1)); then
+        printf '%s\n' __MULTIPLE_INTERRUPTED_WAVES__
+        return 0
+    fi
+    [[ "$count" -eq 1 ]] && printf '%s\n' "$found"
+    return 0
+}
+
+live_file_matches_wave_generation()
+{
+    local live="$1" before="$2" candidate="$3" actual before_sha candidate_sha
+    [[ -f "$live" && ! -L "$live" && -f "$before" && ! -L "$before" &&
+       -f "$candidate" && ! -L "$candidate" ]] || return 1
+    actual=$(sha256sum "$live" | awk '{print $1}') || return 1
+    before_sha=$(sha256sum "$before" | awk '{print $1}') || return 1
+    candidate_sha=$(sha256sum "$candidate" | awk '{print $1}') || return 1
+    [[ "$actual" == "$before_sha" || "$actual" == "$candidate_sha" ]]
+}
+
+candidate_launch_attempt_marker_valid()
+{
+    local marker="$CURRENT_WAVE_DIR/CANDIDATE_LAUNCH_ATTEMPTED"
+    [[ -f "$marker" && ! -L "$marker" && "$(realpath -e -- "$marker")" == "$marker" &&
+       "$(stat -c '%u:%g:%a' "$marker")" == 0:0:600 && "$(cat -- "$marker")" == yes ]]
+}
+
+expected_old_container_id()
+{
+    local node="$1" id
+    id=$(jq -er --argjson node "$node" \
+        '.[] | select(.node == $node) | .container_id' \
+        "$RUN_DIR/baseline/fleet-identity.json") || return 1
+    [[ "$id" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$id"
+}
+
+absent_target_state_safe()
+{
+    local node="$1" container service vpn old_id ids inventory vpn_pid vpn_netns
+    local process process_comm exe process_netns cgroup
+    container=$(container_for "$node") || return 1
+    service=$(service_for "$node") || return 1
+    vpn=$(vpn_for "$node") || return 1
+    old_id=$(expected_old_container_id "$node") || return 1
+    candidate_launch_attempt_marker_valid || return 1
+    ! docker container inspect "$container" >/dev/null 2>&1 || return 1
+    ! docker container inspect "$old_id" >/dev/null 2>&1 || return 1
+    ids=$(docker ps -aq --no-trunc) || return 1
+    if [[ -n "$ids" ]]; then
+        # shellcheck disable=SC2086
+        inventory=$(docker inspect $ids) || return 1
+    else
+        inventory='[]'
+    fi
+    jq -e --arg id "$old_id" --arg name "/$container" --arg service "$service" '
+        type == "array" and all(.[];
+          .Id != $id and .Name != $name and
+          ((.Config.Labels["com.docker.compose.service"] // "") != $service))
+    ' >/dev/null <<< "$inventory" || return 1
+    vpn_pid=$(docker inspect -f '{{.State.Pid}}' "$vpn") || return 1
+    [[ "$vpn_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    vpn_netns=$(readlink "/proc/$vpn_pid/ns/net") || return 1
+    [[ -n "$vpn_netns" ]] || return 1
+    for process in /proc/[0-9]*; do
+        [[ -d "$process" ]] || continue
+        process_comm=$(cat "$process/comm" 2>/dev/null || true)
+        exe=$(readlink "$process/exe" 2>/dev/null || true)
+        case "$process_comm|${exe##*/}" in
+            blackcoind\|*|blackcoin-qt\|*|*\|blackcoind|*\|blackcoin-qt|\
+            *\|blackcoind\ \(deleted\)|*\|blackcoin-qt\ \(deleted\))
+                process_netns=$(readlink "$process/ns/net" 2>/dev/null || true)
+                [[ -z "$process_netns" || "$process_netns" != "$vpn_netns" ]] || return 1
+                ;;
+        esac
+        cgroup="$process/cgroup"
+        [[ ! -r "$cgroup" ]] || ! grep -Fq -- "$old_id" "$cgroup" || return 1
+    done
+}
+
+publish_absent_target_evidence()
+{
+    local node="$1" container service vpn old_id vpn_id vpn_pid vpn_netns path temporary
+    absent_target_state_safe "$node" || return 1
+    container=$(container_for "$node") || return 1
+    service=$(service_for "$node") || return 1
+    vpn=$(vpn_for "$node") || return 1
+    old_id=$(expected_old_container_id "$node") || return 1
+    vpn_id=$(docker inspect -f '{{.Id}}' "$vpn") || return 1
+    vpn_pid=$(docker inspect -f '{{.State.Pid}}' "$vpn") || return 1
+    vpn_netns=$(readlink "/proc/$vpn_pid/ns/net") || return 1
+    path="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-candidate-container-absent.json"
+    if [[ -e "$path" || -L "$path" ]]; then
+        [[ -f "$path" && ! -L "$path" && "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] ||
+            return 1
+    fi
+    temporary=$(mktemp "$CURRENT_WAVE_DIR/.candidate-container-absent.XXXXXX") || return 1
+    jq -S -n --argjson node "$node" --arg container "$container" --arg service "$service" \
+        --arg old_id "$old_id" --arg vpn "$vpn" --arg vpn_id "$vpn_id" \
+        --argjson vpn_pid "$vpn_pid" --arg vpn_netns "$vpn_netns" \
+        --arg observed_at "$(date -u +%FT%TZ)" '
+        {schema:1,node:$node,container:$container,service:$service,
+         expected_old_container_id:$old_id,candidate_launch_attempted:true,
+         container_absent_by_exact_name:true,old_container_absent_by_exact_id:true,
+         compose_service_container_absent:true,target_wallet_process_absent:true,
+         vpn:{name:$vpn,id:$vpn_id,pid:$vpn_pid,netns:$vpn_netns},observed_at:$observed_at}
+    ' > "$temporary" || {
+        rm -f -- "$temporary"
+        return 1
+    }
+    chmod 600 "$temporary" || return 1
+    chown root:root "$temporary" || return 1
+    sync -f "$temporary" || return 1
+    mv -fT -- "$temporary" "$path" || return 1
+    sync -f "$CURRENT_WAVE_DIR" || return 1
+    jq -e --argjson node "$node" --arg container "$container" --arg service "$service" \
+        --arg old_id "$old_id" '
+        .schema == 1 and .node == $node and .container == $container and .service == $service and
+        .expected_old_container_id == $old_id and .candidate_launch_attempted == true and
+        .container_absent_by_exact_name == true and .old_container_absent_by_exact_id == true and
+        .compose_service_container_absent == true and .target_wallet_process_absent == true
+    ' "$path" >/dev/null
+}
+
+verify_interrupted_target_container()
+{
+    local node="$1" padded before_class candidate_class before_ref before_id candidate_ref candidate_id
+    local container vpn vpn_id inspect
+    padded=$(node_padded "$node") || return 1
+    before_class=$(jq -er --arg node "$padded" '.nodes[$node]' \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.before.json") || return 1
+    candidate_class=$(jq -er --arg node "$padded" '.nodes[$node]' \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.candidate.json") || return 1
+    before_ref=$(jq -er --arg class "$before_class" '.images[$class].config_image' \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.before.json") || return 1
+    before_id=$(jq -er --arg class "$before_class" '.images[$class].image_id' \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.before.json") || return 1
+    candidate_ref=$(jq -er --arg class "$candidate_class" '.images[$class].config_image' \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.candidate.json") || return 1
+    candidate_id=$(jq -er --arg class "$candidate_class" '.images[$class].image_id' \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.candidate.json") || return 1
+    container=$(container_for "$node")
+    vpn=$(vpn_for "$node")
+    vpn_id=$(docker inspect -f '{{.Id}}' "$vpn") || return 1
+    if ! inspect=$(docker inspect "$container" 2>/dev/null); then
+        absent_target_state_safe "$node"
+        return
+    fi
+    jq -e --arg before_ref "$before_ref" --arg before_id "$before_id" \
+        --arg candidate_ref "$candidate_ref" --arg candidate_id "$candidate_id" \
+        --arg mode "container:$vpn_id" --arg data "$(host_datadir_for "$node")" \
+        --arg blocks "$(host_blocks_for "$node")" '
+        length == 1 and
+        ((.[0].Config.Image == $before_ref and .[0].Image == $before_id) or
+         (.[0].Config.Image == $candidate_ref and .[0].Image == $candidate_id)) and
+        .[0].HostConfig.NetworkMode == $mode and
+        .[0].HostConfig.RestartPolicy.Name == "on-failure" and
+        .[0].HostConfig.RestartPolicy.MaximumRetryCount == 3 and
+        .[0].HostConfig.Privileged == false and .[0].HostConfig.AutoRemove == false and
+        ([.[0].Mounts[] | select(.Destination == "/home/blackcoin/.blackcoin" and
+            .Source == $data and .RW == true)] | length) == 1 and
+        ([.[0].Mounts[] | select(.Destination == "/home/blackcoin/blocks_storage" and
+            .Source == $blocks and .RW == true)] | length) == 1
+    ' >/dev/null <<< "$inspect"
+}
+
+resume_interrupted_wave_before_live_preflight()
+{
+    local interrupted="$1" wave_name wave_index node temporary
+    require_host_tools
+    [[ "$(id -u)" -eq 0 ]] || die 'root is required on the Unraid host'
+    verify_package_integrity "$PACKAGE_ROOT" || die 'resume package bytes changed'
+    require_rollout_identity
+    require_baseline_identity
+    verify_resume_run
+    verify_maintenance_marker || die 'interrupted resume maintenance marker is absent or changed'
+    assert_empty_control_marker "$ENABLE_GUARD_STARTS" ||
+        die 'guard-start authority is unsafe during interrupted resume'
+    /bin/bash "$INHIBITOR_INSTALLER" probe >/dev/null ||
+        die 'transaction inhibitors changed during interrupted resume'
+    verify_free_claim_pause || die 'Free Claim pause changed during interrupted resume'
+    CURRENT_WAVE_DIR=$(realpath -e -- "$interrupted")
+    wave_name=${CURRENT_WAVE_DIR##*/}
+    [[ "$wave_name" =~ ^wave-([0-9]{2})-nodes- ]] || die 'interrupted wave name is invalid'
+    wave_index=$((10#${BASH_REMATCH[1]}))
+    verify_wave_evidence_manifest "$CURRENT_WAVE_DIR" "$wave_index" ||
+        die 'interrupted wave preparation evidence changed'
+    read -r -a CURRENT_WAVE_NODES < "$CURRENT_WAVE_DIR/NODES"
+    live_file_matches_wave_generation "$COMPOSE_FILE" \
+        "$CURRENT_WAVE_DIR/docker-compose.before.yml" \
+        "$CURRENT_WAVE_DIR/docker-compose.candidate.yml" ||
+        die 'live Compose is outside the interrupted wave generations'
+    live_file_matches_wave_generation "$IMAGE_POLICY" \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.before.json" \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.candidate.json" ||
+        die 'live image policy is outside the interrupted wave generations'
+    live_file_matches_wave_generation "$ENDPOINT_GUARD" \
+        "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.before.sh" \
+        "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.candidate.sh" ||
+        die 'live endpoint guard is outside the interrupted wave generations'
+    verify_runtime_guard_3014_compatibility ||
+        die 'runtime guard compatibility changed during interrupted resume'
+    temporary=$(mktemp "$RUN_DIR/.unaffected-resume.XXXXXX")
+    capture_unaffected_generations "$temporary" "$(IFS=,; printf '%s' "${CURRENT_WAVE_NODES[*]}")" ||
+        die 'unaffected generation capture failed during interrupted resume'
+    cmp -s "$CURRENT_WAVE_DIR/unaffected.before" "$temporary" ||
+        die 'an unaffected node or VPN generation changed during interrupted wave'
+    rm -f -- "$temporary"
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        verify_interrupted_target_container "$node" ||
+            die "interrupted target topology/image is outside the rollback boundary: node $node"
+        verify_vpn_pair "$node" || die "interrupted target VPN proof changed: node $node"
+    done
+    assert_unique_vpn_proofs || die 'VPN proof set changed during interrupted resume'
+    verify_all_data_domains || die 'data rollback domains changed during interrupted resume'
+}
+
+verify_image_policy_local_images()
+{
+    local class ref expected_id actual_id
+    while IFS= read -r class; do
+        ref=$(jq -er --arg class "$class" '.images[$class].config_image' "$IMAGE_POLICY") || return 1
+        expected_id=$(jq -er --arg class "$class" '.images[$class].image_id' "$IMAGE_POLICY") || return 1
+        actual_id=$(docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null) || return 1
+        [[ "$actual_id" == "$expected_id" ]] || return 1
+    done < <(jq -r '.images | keys[]' "$IMAGE_POLICY")
+}
+
+verify_node30_role_policy()
+{
+    local manifest="$STATE_DIR/pow-wallet-manifests/node-30.json"
+    assert_protected_file "$manifest" 600
+    jq -e '.schema == 1 and .node_id == "30" and .enabled == false' "$manifest" >/dev/null ||
+        die 'node30 PoW manifest does not preserve the Free Claim-only role'
+    [[ -x "$FREE_CLAIM_ROOT/pool_daemon.sh" && -x "$FREE_CLAIM_ROOT/pool_keeper.sh" ]] ||
+        die 'Free Claim worker assets are unavailable'
+}
+
+verify_no_forbidden_compose_directive()
+{
+    ! grep -Eiq '(^|[[:space:]])-?(reindex|reindex-chainstate)(=|[[:space:]]|$)' "$COMPOSE_FILE" ||
+        die 'persistent Compose reindex directive detected'
+    ! grep -Eiq 'chainstate.*(park|move|rename)|schema-11' "$COMPOSE_FILE" ||
+        die 'obsolete chainstate migration directive detected'
+}
+
+live_preflight()
+{
+    local node container status health run_state='' inhibitor_probe compat_probe
+    require_host_tools
+    verify_package_integrity "$PACKAGE_ROOT" ||
+        die 'rollout package bytes differ from the validated manifest'
+    [[ "$(id -u)" -eq 0 ]] || die 'root is required on the Unraid host'
+    mountpoint -q /mnt/pulsar || die 'Pulsar storage is not mounted'
+    [[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" ]] || die 'Compose file is missing or unsafe'
+    assert_marker_state "$CUTOVER_MARKER" 'cutover_ready=yes containers=32 state=created' ||
+        die 'Pulsar cutover marker is absent or unsafe'
+    require_baseline_identity
+    if [[ -z "$RUN_DIR" ]]; then
+        assert_empty_control_marker "$ENABLE_GUARD_STARTS" ||
+            die 'automatic-start authority marker is absent, nonempty, or unsafe'
+        [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] ||
+            die 'a prior rollout maintenance marker must be resumed or audited'
+    else
+        verify_resume_run
+        run_state=$(cat "$RUN_DIR/STATE")
+        if [[ "$run_state" == applying ]]; then
+            verify_maintenance_marker || die 'resume maintenance marker is absent or changed'
+        elif [[ "$run_state" == prepared &&
+                ( -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ) ]]; then
+            verify_maintenance_marker || die 'prepared-run maintenance marker is foreign or changed'
+        elif [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
+            verify_maintenance_marker || die 'complete-run maintenance marker is foreign or changed'
+        fi
+    fi
+    [[ "$(cat /boot/config/plugins/compose.manager/projects/blackcoin30/autostart 2>/dev/null)" == false ]] ||
+        die 'Compose autostart is not fail-closed'
+    require_rollout_identity
+    validate_wave_plan "$WAVE_PLAN" || die 'wave plan is invalid, duplicates nodes, or violates role isolation'
+    verify_current_policy_assets
+    verify_runtime_guard_3014_compatibility ||
+        die 'wallet runtime guard is not the audited v30.1.3/v30.1.4-compatible build'
+    if [[ -z "$RUN_DIR" ]]; then
+        compat_probe=$(/bin/bash "$RUNTIME_COMPAT_INSTALLER" probe) ||
+            die 'runtime-guard compatibility transaction state is not auditable'
+        [[ "$compat_probe" == "state=installed runtime_sha256=$EXPECTED_WALLET_RUNTIME_GUARD_SHA256 endpoint_sha256=$EXPECTED_ENDPOINT_GUARD_SHA256" ]] ||
+            die 'runtime-guard compatibility transaction is not the exact installed generation'
+    fi
+    verify_activation_helper "$NORMAL_UNLOCK_HELPER" "$NORMAL_UNLOCK_HELPER_SHA256" ||
+        die 'normal-unlock helper bytes or protection changed'
+    verify_activation_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA256" ||
+        die 'PoW-start helper bytes or protection changed'
+    if [[ -z "$RUN_DIR" ]]; then
+        verify_baseline_hashes
+    fi
+    verify_image_policy_local_images || die 'an image pinned by the current policy is absent or has the wrong ID'
+    verify_live_fleet_matches_policy || die 'live Compose/container identities differ from the current policy'
+    verify_image_identity || die 'candidate image identity, labels, or binary hashes failed'
+    verify_published_canary || die 'published-package node27 canary evidence does not match this exact image'
+    verify_node30_role_policy
+    inhibitor_probe=$(/bin/bash "$INHIBITOR_RELEASER" probe) ||
+        die 'permanent no-spend cycle and Free Claim state are not auditable'
+    if [[ -z "$RUN_DIR" || "$run_state" == prepared || "$run_state" == applying ]]; then
+        [[ "$inhibitor_probe" == 'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused' ]] ||
+            die 'transaction inhibitors are not in the required paused state'
+        verify_free_claim_pause || die 'Free Claim broadcasts are not durably paused'
+    else
+        [[ "$inhibitor_probe" == 'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused' ||
+           "$inhibitor_probe" == 'state=installed-and-released cycle=v30.1.4-no-spend free_claim=enabled' ]] ||
+            die 'complete-run inhibitor state is invalid'
+    fi
+    verify_all_policy_manifests || die 'wallet/identity/PoW policy manifests are not exact-32 and coherent'
+    verify_all_data_domains || die 'fleet data rollback domains are not safe and dedicated/classified'
+    verify_no_forbidden_compose_directive
+    assert_no_reindex_directive $(seq 1 "$NODE_COUNT") || die 'a persistent per-node reindex directive exists'
+    assert_unique_vpn_proofs || die 'all 32 VPN proofs must be valid and public-IP unique before rollout'
+    for node in $(seq 1 "$NODE_COUNT"); do
+        container=$(container_for "$node")
+        read -r status health < <(docker inspect -f \
+            '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container") ||
+            die "node $node container is absent"
+        [[ "$status" == running && "$health" == healthy ]] || die "node $node is not running and healthy"
+        verify_vpn_pair "$node" || die "node $node VPN pair failed preflight"
+        single_wallet_for "$node" >/dev/null || die "node $node does not have exactly one loaded wallet"
+    done
+}
+
+capture_fleet_identity()
+{
+    local output="$1" node container vpn wallet wallets qaddr qinv legacy manifest identity pow_manifest
+    local runtime_sha identity_sha pow_sha conf_sha settings_sha container_id container_started vpn_id vpn_started
+    : > "$output"
+    for node in $(seq 1 "$NODE_COUNT"); do
+        container=$(container_for "$node")
+        vpn=$(vpn_for "$node")
+        wallets=$(rpc_for "$node" listwallets | jq -cS .) || return 1
+        wallet=$(jq -er 'select(type == "array" and length == 1) | .[0]' <<< "$wallets") || return 1
+        qaddr=$(timeout -k 2 45 docker exec "$container" "$CLI_PATH" -datadir="$DATADIR" \
+            -rpcwallet="$wallet" listquantumaddresses | jq -cS . | sha256sum | awk '{print $1}') || return 1
+        qinv=$(timeout -k 2 45 docker exec "$container" "$CLI_PATH" -datadir="$DATADIR" \
+            -rpcwallet="$wallet" getquantumkeyinventory | jq -cS . | sha256sum | awk '{print $1}') || return 1
+        legacy=$(timeout -k 2 45 docker exec "$container" "$CLI_PATH" -datadir="$DATADIR" \
+            -rpcwallet="$wallet" getgoldrushinfo | jq -cS \
+            '[.wallet_scripts[].address] | unique | sort | select(length > 0)' | \
+            sha256sum | awk '{print $1}') || return 1
+        manifest="$STATE_DIR/runtime-wallet-manifests/node-$(node_padded "$node").json"
+        identity="$STATE_DIR/runtime-identity-manifests/node-$(node_padded "$node").json"
+        pow_manifest="$STATE_DIR/pow-wallet-manifests/node-$(node_padded "$node").json"
+        runtime_sha=$(sha256sum "$manifest" | awk '{print $1}') || return 1
+        identity_sha=$(sha256sum "$identity" | awk '{print $1}') || return 1
+        pow_sha=$(sha256sum "$pow_manifest" | awk '{print $1}') || return 1
+        conf_sha=$(sha256sum "$(host_datadir_for "$node")/blackcoin.conf" | awk '{print $1}') || return 1
+        if [[ -f "$(host_datadir_for "$node")/settings.json" ]]; then
+            settings_sha=$(sha256sum "$(host_datadir_for "$node")/settings.json" | awk '{print $1}') || return 1
+        else
+            settings_sha=absent
+        fi
+        container_id=$(docker inspect -f '{{.Id}}' "$container") || return 1
+        container_started=$(docker inspect -f '{{.State.StartedAt}}' "$container") || return 1
+        vpn_id=$(docker inspect -f '{{.Id}}' "$vpn") || return 1
+        vpn_started=$(docker inspect -f '{{.State.StartedAt}}' "$vpn") || return 1
+        jq -cn \
+            --argjson node "$node" --arg container "$container" --arg vpn "$vpn" \
+            --arg wallets "$wallets" --arg qaddr "$qaddr" --arg qinv "$qinv" --arg legacy "$legacy" \
+            --arg runtime_manifest "$runtime_sha" --arg identity_manifest "$identity_sha" \
+            --arg pow_manifest "$pow_sha" --arg conf "$conf_sha" --arg settings "$settings_sha" \
+            --arg container_id "$container_id" --arg container_started "$container_started" \
+            --arg vpn_id "$vpn_id" --arg vpn_started "$vpn_started" \
+            '{node:$node,container:$container,vpn:$vpn,wallets_json:$wallets,
+              quantum_addresses_sha256:$qaddr,quantum_inventory_sha256:$qinv,
+              legacy_addresses_sha256:$legacy,
+              runtime_manifest_sha256:$runtime_manifest,
+              identity_manifest_sha256:$identity_manifest,pow_manifest_sha256:$pow_manifest,
+              blackcoin_conf_sha256:$conf,settings_json_sha256:$settings,container_id:$container_id,
+              container_started_at:$container_started,vpn_id:$vpn_id,vpn_started_at:$vpn_started}' \
+            >> "$output"
+    done
+    jq -s 'sort_by(.node)' "$output" > "${output}.json"
+    mv -- "${output}.json" "$output"
+}
+
+capture_free_claim_container_identity()
+{
+    local output="$1" inspect temporary
+    inspect=$(docker inspect blackcoin-pool-api) || return 1
+    temporary="${output}.tmp.$$"
+    jq -S 'if length == 1 then .[0] else error("expected one Free Claim API container") end |
+        {id:.Id,image_id:.Image,name:.Name,
+          config:{image:.Config.Image,user:.Config.User,entrypoint:.Config.Entrypoint,
+            cmd:.Config.Cmd,labels:.Config.Labels,healthcheck:.Config.Healthcheck},
+          host:{restart_policy:.HostConfig.RestartPolicy,network_mode:.HostConfig.NetworkMode,
+            privileged:.HostConfig.Privileged,readonly_rootfs:.HostConfig.ReadonlyRootfs,
+            binds:.HostConfig.Binds,tmpfs:.HostConfig.Tmpfs,security_opt:.HostConfig.SecurityOpt,
+            cap_add:.HostConfig.CapAdd,cap_drop:.HostConfig.CapDrop},
+          mounts:[.Mounts[] | {type:.Type,source:.Source,destination:.Destination,rw:.RW}] | sort_by(.destination)}' \
+        <<< "$inspect" > "$temporary" || {
+        rm -f -- "$temporary"
+        return 1
+    }
+    chmod 600 "$temporary"
+    chown root:root "$temporary"
+    mv -fT -- "$temporary" "$output"
+}
+
+assert_free_claim_container_identity_matches_baseline()
+{
+    local output="$1"
+    capture_free_claim_container_identity "$output" || return 1
+    cmp -s "$RUN_DIR/baseline/free-claim-container-identity.json" "$output"
+}
+
+assert_fleet_identity_matches_baseline()
+{
+    local output="$1"
+    capture_fleet_identity "$output" || return 1
+    jq -e -n --slurpfile before "$RUN_DIR/baseline/fleet-identity.json" \
+        --slurpfile after "$output" '
+        def identity($rows): $rows[0] | map({node,wallets_json,legacy_addresses_sha256,
+          quantum_addresses_sha256,
+          quantum_inventory_sha256,runtime_manifest_sha256,identity_manifest_sha256,
+          pow_manifest_sha256,blackcoin_conf_sha256,settings_json_sha256,vpn_id});
+        identity($before) == identity($after)
+    ' >/dev/null
+}
+
+wave_nodes_for_index()
+{
+    local wanted="$1" line index=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%%#*}
+        line=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<< "$line")
+        [[ -n "$line" ]] || continue
+        index=$((index + 1))
+        if [[ "$index" -eq "$wanted" ]]; then
+            read -r -a expected_nodes <<< "$line"
+            printf '%s\n' "${expected_nodes[*]}"
+            return 0
+        fi
+    done < "$WAVE_PLAN"
+    return 1
+}
+
+verify_wave_node_identity()
+{
+    local wave_dir="$1" wave_index="$2" expected actual node
+    local -A seen=()
+    [[ "$wave_index" =~ ^[1-9][0-9]*$ ]] || return 1
+    expected=$(wave_nodes_for_index "$wave_index") || return 1
+    [[ -f "$wave_dir/NODES" && ! -L "$wave_dir/NODES" ]] || return 1
+    read -r -a actual_nodes < "$wave_dir/NODES"
+    actual=${actual_nodes[*]}
+    [[ "$actual" == "$expected" ]] || return 1
+    ((${#actual_nodes[@]} >= 1 && ${#actual_nodes[@]} <= MAX_WAVE_SIZE)) || return 1
+    for node in "${actual_nodes[@]}"; do
+        valid_node "$node" || return 1
+        [[ -z "${seen[$node]:-}" ]] || return 1
+        seen[$node]=1
+    done
+}
+
+write_wave_evidence_manifest()
+{
+    local wave_index="$1" wave_plan_sha temporary node
+    local files=(
+        NODES unaffected.before
+        docker-compose.before.yml fleet-image-policy.before.json blackcoin_endpoint_guard.before.sh
+        docker-compose.candidate.yml fleet-image-policy.candidate.json blackcoin_endpoint_guard.candidate.sh
+    )
+    if [[ -f "$CURRENT_WAVE_DIR/node30-legacy-pow.before.json" ]]; then
+        files+=(node30-legacy-pow.before.json)
+    fi
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        files+=("node-$(node_padded "$node")-loaded-wallet.txt")
+        files+=("node-$(node_padded "$node")-wallet-txids.before.json")
+    done
+    verify_wave_node_identity "$CURRENT_WAVE_DIR" "$wave_index" ||
+        die 'wave nodes do not match the pinned wave plan'
+    wave_plan_sha=$(sha256sum "$WAVE_PLAN" | awk '{print $1}')
+    jq -n --argjson index "$wave_index" --arg nodes "${CURRENT_WAVE_NODES[*]}" \
+        --arg wave_plan_sha256 "$wave_plan_sha" \
+        '{schema:1,wave_index:$index,nodes:$nodes,wave_plan_sha256:$wave_plan_sha256}' \
+        > "$CURRENT_WAVE_DIR/WAVE-IDENTITY.json"
+    files+=(WAVE-IDENTITY.json)
+    temporary="$CURRENT_WAVE_DIR/.WAVE-EVIDENCE.sha256.$$"
+    (
+        cd "$CURRENT_WAVE_DIR"
+        sha256sum "${files[@]}"
+    ) > "$temporary"
+    mv -fT -- "$temporary" "$CURRENT_WAVE_DIR/WAVE-EVIDENCE.sha256"
+    sync -f "$CURRENT_WAVE_DIR/WAVE-EVIDENCE.sha256"
+    sync -f "$CURRENT_WAVE_DIR"
+}
+
+verify_wave_evidence_manifest()
+{
+    local wave_dir="$1" wave_index="$2" expected_nodes wave_plan_sha
+    [[ -d "$wave_dir" && ! -L "$wave_dir" && "$wave_dir" == "$RUN_DIR"/wave-* ]] || return 1
+    [[ -f "$wave_dir/WAVE-EVIDENCE.sha256" && ! -L "$wave_dir/WAVE-EVIDENCE.sha256" &&
+       -f "$wave_dir/WAVE-IDENTITY.json" && ! -L "$wave_dir/WAVE-IDENTITY.json" ]] || return 1
+    (cd "$wave_dir" && sha256sum --strict -c WAVE-EVIDENCE.sha256 >/dev/null) || return 1
+    verify_wave_node_identity "$wave_dir" "$wave_index" || return 1
+    expected_nodes=$(wave_nodes_for_index "$wave_index") || return 1
+    wave_plan_sha=$(sha256sum "$WAVE_PLAN" | awk '{print $1}') || return 1
+    jq -e --argjson index "$wave_index" --arg nodes "$expected_nodes" \
+        --arg wave_plan_sha256 "$wave_plan_sha" '
+        . == {schema:1,wave_index:$index,nodes:$nodes,wave_plan_sha256:$wave_plan_sha256}
+    ' "$wave_dir/WAVE-IDENTITY.json" >/dev/null
+}
+
+write_wave_runtime_evidence()
+{
+    local node temporary
+    local -a files=(wave-chain-convergence/PASSED.json)
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        verify_candidate_recovery_baseline "$node" || return 1
+        files+=("node-$(node_padded "$node")-wallet-txids.first-v3014.json")
+        files+=("candidate-recovery-node-$(node_padded "$node").json")
+        files+=("candidate-recovery-node-$(node_padded "$node").json.sha256")
+    done
+    publish_state_token "$CURRENT_WAVE_DIR/RUNTIME-GATE-PASSED" \
+        exact-wave-runtime-gate-passed || return 1
+    files+=(RUNTIME-GATE-PASSED)
+    temporary="$CURRENT_WAVE_DIR/.WAVE-RUNTIME-EVIDENCE.sha256.$$"
+    (cd "$CURRENT_WAVE_DIR" && sha256sum "${files[@]}") > "$temporary" || return 1
+    chmod 600 "$temporary"
+    chown root:root "$temporary"
+    sync -f "$temporary"
+    mv -fT -- "$temporary" "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    sync -f "$CURRENT_WAVE_DIR"
+}
+
+verify_wave_runtime_evidence()
+{
+    local node
+    [[ -f "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256" &&
+       ! -L "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256" &&
+       "$(stat -c '%u:%g:%a' "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256")" == 0:0:600 ]] ||
+        return 1
+    (cd "$CURRENT_WAVE_DIR" && sha256sum --strict -c WAVE-RUNTIME-EVIDENCE.sha256 >/dev/null) ||
+        return 1
+    [[ "$(cat "$CURRENT_WAVE_DIR/RUNTIME-GATE-PASSED")" == exact-wave-runtime-gate-passed ]] ||
+        return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        verify_candidate_recovery_baseline "$node" || return 1
+    done
+}
+
+capture_unaffected_generations()
+{
+    local output="$1" skip_csv="$2" node generation
+    : > "$output"
+    for node in $(seq 1 "$NODE_COUNT"); do
+        [[ ",$skip_csv," == *",$node,"* ]] && continue
+        generation=$(container_generation_for "$node") || return 1
+        printf '%02d|%s\n' "$node" "$generation" >> "$output"
+    done
+}
+
+capture_transaction_baseline()
+{
+    local marker_dir="$RUN_DIR/baseline/markers-present" node pid failed=0
+    local -a pids=() nodes=()
+    install -d -m 700 -o root -g root "$RUN_DIR/baseline" "$marker_dir"
+    install -m 600 -o root -g root "$COMPOSE_FILE" "$RUN_DIR/baseline/docker-compose.yml"
+    install -m 600 -o root -g root "$IMAGE_POLICY" "$RUN_DIR/baseline/fleet-image-policy.json"
+    install -m 600 -o root -g root "$ENDPOINT_GUARD" "$RUN_DIR/baseline/blackcoin_endpoint_guard.sh"
+    install -m 600 -o root -g root "$WALLET_RUNTIME_GUARD" \
+        "$RUN_DIR/baseline/blackcoin_wallet_runtime_guard.sh"
+    install -m 600 -o root -g root "$NORMAL_UNLOCK_HELPER" \
+        "$RUN_DIR/baseline/blackcoin_node_normal_unlock.sh"
+    install -m 600 -o root -g root "$POW_START_HELPER" \
+        "$RUN_DIR/baseline/blackcoin_pow_start_only.sh"
+    if [[ -e "$ENABLE_GUARD_STARTS" || -L "$ENABLE_GUARD_STARTS" ]]; then
+        assert_empty_control_marker "$ENABLE_GUARD_STARTS" || die 'guard-start marker became unsafe or nonempty'
+        install -m 600 -o root -g root "$ENABLE_GUARD_STARTS" "$marker_dir/ENABLE_GUARD_STARTS"
+    fi
+    capture_fleet_identity "$RUN_DIR/baseline/fleet-identity.json"
+    capture_free_claim_container_identity "$RUN_DIR/baseline/free-claim-container-identity.json" ||
+        die 'Free Claim API container identity could not be captured'
+    for node in $(seq 1 "$NODE_COUNT"); do
+        (
+            wallet_rpc_for "$node" getpowmininginfo \
+                > "$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+        ) &
+        pids+=("$!")
+        nodes+=("$node")
+    done
+    for index in "${!pids[@]}"; do
+        pid=${pids[$index]}
+        if ! wait "$pid"; then
+            log "failed to capture v30.1.3 PoW baseline for node ${nodes[$index]}"
+            failed=1
+        fi
+    done
+    ((failed == 0)) || die 'one or more v30.1.3 PoW baselines could not be captured'
+    docker exec blackcoin-pool-api curl -fsS --max-time 5 http://127.0.0.1:8377/status \
+        > "$RUN_DIR/baseline/free-claim-status.json"
+    (
+        cd "$RUN_DIR/baseline"
+        find . -type f -print0 | sort -z | xargs -0 sha256sum
+    ) > "$RUN_DIR/.baseline-SHA256SUMS"
+    mv -- "$RUN_DIR/.baseline-SHA256SUMS" "$RUN_DIR/baseline/SHA256SUMS"
+    sync -f "$RUN_DIR/baseline/SHA256SUMS"
+    sync -f "$RUN_DIR/baseline"
+}
+
+verify_legacy_rollback_readiness_all_nodes()
+{
+    local node pid failed=0 baseline
+    local -a pids=() nodes=()
+    for node in $(seq 1 "$NODE_COUNT"); do
+        baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+        verify_policy_legacy_runtime_gate "$node" "$baseline" &
+        pids+=("$!")
+        nodes+=("$node")
+    done
+    for index in "${!pids[@]}"; do
+        pid=${pids[$index]}
+        if ! wait "$pid"; then
+            log "legacy rollback-readiness gate failed node=${nodes[$index]}"
+            failed=1
+        fi
+    done
+    ((failed == 0)) || return 1
+    assert_unique_vpn_proofs || return 1
+    assert_empty_control_marker "$ENABLE_GUARD_STARTS"
+}
+
+write_transaction_manifest()
+{
+    local package_manifest_sha canary_sha canary_manifest_sha wave_sha temporary maintenance_nonce
+    [[ ! -e "$RUN_DIR/package-files.sha256" && ! -e "$RUN_DIR/TRANSACTION.json" ]] ||
+        die 'transaction identity outputs already exist'
+    (
+        cd "$PACKAGE_ROOT"
+        find . -type f -print0 | sort -z | xargs -0 sha256sum
+    ) > "$RUN_DIR/package-files.sha256"
+    package_manifest_sha=$(sha256sum "$RUN_DIR/package-files.sha256" | awk '{print $1}')
+    canary_sha=$(sha256sum "$PUBLISHED_CANARY_RESULT" | awk '{print $1}')
+    canary_manifest_sha=$(sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" | awk '{print $1}')
+    [[ "$canary_sha" == "$EXPECTED_CANARY_RESULT_SHA256" &&
+       "$canary_manifest_sha" == "$EXPECTED_CANARY_EVIDENCE_MANIFEST_SHA256" ]] ||
+        die 'canary evidence changed before transaction manifest creation'
+    wave_sha=$(sha256sum "$WAVE_PLAN" | awk '{print $1}')
+    maintenance_nonce=$(cat "$(maintenance_nonce_path)")
+    valid_sha256_hex "$maintenance_nonce" || die 'maintenance nonce changed before manifest creation'
+    temporary="$RUN_DIR/.TRANSACTION.json.$$"
+    jq -n \
+        --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg source "$SOURCE_COMMIT" --arg source_key "$SOURCE_LABEL_KEY" \
+        --arg source_value "$SOURCE_LABEL_VALUE" --arg version_key "$VERSION_LABEL_KEY" \
+        --arg version_value "$VERSION_LABEL_VALUE" --arg daemon "$BLACKCOIND_SHA256" \
+        --arg cli "$BLACKCOIN_CLI_SHA256" --arg canary_path "$PUBLISHED_CANARY_RESULT" \
+        --arg canary_sha "$canary_sha" --arg canary_manifest "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" \
+        --arg canary_manifest_sha "$canary_manifest_sha" --arg wave_sha "$wave_sha" \
+        --arg package_sha "$package_manifest_sha" --arg compose "$EXPECTED_COMPOSE_SHA256" \
+        --arg policy "$EXPECTED_IMAGE_POLICY_SHA256" --arg guard "$EXPECTED_ENDPOINT_GUARD_SHA256" \
+        --arg runtime_guard "$EXPECTED_WALLET_RUNTIME_GUARD_SHA256" \
+        --arg unlock_helper "$NORMAL_UNLOCK_HELPER_SHA256" --arg pow_helper "$POW_START_HELPER_SHA256" \
+        --arg maintenance_nonce "$maintenance_nonce" \
+        '{schema:1,candidate_image:$image,candidate_image_id:$image_id,source_commit:$source,
+          source_label:{key:$source_key,value:$source_value},
+          version_label:{key:$version_key,value:$version_value},
+          blackcoind_sha256:$daemon,blackcoin_cli_sha256:$cli,
+          published_canary:{path:$canary_path,sha256:$canary_sha,
+            evidence_manifest:{path:$canary_manifest,sha256:$canary_manifest_sha}},
+          wave_plan_sha256:$wave_sha,package_files_manifest_sha256:$package_sha,
+          maintenance:{marker:"/boot/config/plugins/blackcoin-quantum-nodes/V30_1_4_ROLLOUT_MAINTENANCE.json",
+            run_nonce:$maintenance_nonce},
+          audited_baseline:{compose_sha256:$compose,image_policy_sha256:$policy,
+            endpoint_guard_sha256:$guard,wallet_runtime_guard_sha256:$runtime_guard,
+            normal_unlock_helper_sha256:$unlock_helper,pow_start_helper_sha256:$pow_helper}}' > "$temporary"
+    install -m 600 -o root -g root "$temporary" "$RUN_DIR/TRANSACTION.json"
+    rm -f -- "$temporary"
+    chmod 600 "$RUN_DIR/package-files.sha256"
+    chown root:root "$RUN_DIR/package-files.sha256"
+    sync -f "$RUN_DIR/package-files.sha256"
+    sync -f "$RUN_DIR/TRANSACTION.json"
+}
+
+verify_transaction_manifest()
+{
+    local canary_sha canary_manifest_sha wave_sha package_sha maintenance_nonce
+    [[ -f "$RUN_DIR/TRANSACTION.json" && ! -L "$RUN_DIR/TRANSACTION.json" &&
+       -f "$RUN_DIR/package-files.sha256" && ! -L "$RUN_DIR/package-files.sha256" ]] || return 1
+    (cd "$PACKAGE_ROOT" && sha256sum --strict -c "$RUN_DIR/package-files.sha256" >/dev/null) || return 1
+    canary_sha=$(sha256sum "$PUBLISHED_CANARY_RESULT" | awk '{print $1}') || return 1
+    canary_manifest_sha=$(sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" | awk '{print $1}') || return 1
+    wave_sha=$(sha256sum "$WAVE_PLAN" | awk '{print $1}') || return 1
+    package_sha=$(sha256sum "$RUN_DIR/package-files.sha256" | awk '{print $1}') || return 1
+    maintenance_nonce=$(cat "$(maintenance_nonce_path)" 2>/dev/null) || return 1
+    valid_sha256_hex "$maintenance_nonce" || return 1
+    jq -e \
+        --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg source "$SOURCE_COMMIT" --arg source_key "$SOURCE_LABEL_KEY" \
+        --arg source_value "$SOURCE_LABEL_VALUE" --arg version_key "$VERSION_LABEL_KEY" \
+        --arg version_value "$VERSION_LABEL_VALUE" --arg daemon "$BLACKCOIND_SHA256" \
+        --arg cli "$BLACKCOIN_CLI_SHA256" --arg canary_path "$PUBLISHED_CANARY_RESULT" \
+        --arg canary_sha "$canary_sha" --arg canary_manifest "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" \
+        --arg canary_manifest_sha "$canary_manifest_sha" --arg wave_sha "$wave_sha" \
+        --arg package_sha "$package_sha" --arg compose "$EXPECTED_COMPOSE_SHA256" \
+        --arg policy "$EXPECTED_IMAGE_POLICY_SHA256" --arg guard "$EXPECTED_ENDPOINT_GUARD_SHA256" \
+        --arg runtime_guard "$EXPECTED_WALLET_RUNTIME_GUARD_SHA256" \
+        --arg unlock_helper "$NORMAL_UNLOCK_HELPER_SHA256" --arg pow_helper "$POW_START_HELPER_SHA256" \
+        --arg maintenance_nonce "$maintenance_nonce" '
+        .schema == 1 and .candidate_image == $image and .candidate_image_id == $image_id and
+        .source_commit == $source and .source_label == {key:$source_key,value:$source_value} and
+        .version_label == {key:$version_key,value:$version_value} and
+        .blackcoind_sha256 == $daemon and .blackcoin_cli_sha256 == $cli and
+        .published_canary == {path:$canary_path,sha256:$canary_sha,
+          evidence_manifest:{path:$canary_manifest,sha256:$canary_manifest_sha}} and
+        .wave_plan_sha256 == $wave_sha and .package_files_manifest_sha256 == $package_sha and
+        .maintenance == {marker:"/boot/config/plugins/blackcoin-quantum-nodes/V30_1_4_ROLLOUT_MAINTENANCE.json",
+          run_nonce:$maintenance_nonce} and
+        .audited_baseline == {compose_sha256:$compose,image_policy_sha256:$policy,
+          endpoint_guard_sha256:$guard,wallet_runtime_guard_sha256:$runtime_guard,
+          normal_unlock_helper_sha256:$unlock_helper,pow_start_helper_sha256:$pow_helper}
+    ' "$RUN_DIR/TRANSACTION.json" >/dev/null
+}
+
+acquire_wave_locks()
+{
+    [[ "$WAVE_LOCKS_HELD" -eq 0 ]] || die 'wave locks are already held'
+    exec 15>/run/blackcoin-endpoint-guard.lock
+    flock -w 1800 15 || die 'endpoint guard did not drain'
+    exec 16>/var/run/blackcoin-node-cutover.lock
+    flock -x -w 1800 16 || die 'node cutover lock did not drain'
+    exec 14>/run/blackcoin-pow-quarantine-cycle.lock
+    flock -w 1800 14 || die 'PoW quarantine cycle did not drain'
+    exec 17>/var/run/blackcoin-wallet-runtime-guard.lock
+    flock -w 1800 17 || die 'wallet runtime guard did not drain'
+    if [[ " ${CURRENT_WAVE_NODES[*]} " == *" 30 "* ]]; then
+        exec 18>"$FREE_CLAIM_LOCK"
+        flock -w 1800 18 || die 'Free Claim worker did not drain'
+        FREE_CLAIM_LOCK_HELD=1
+    fi
+    WAVE_LOCKS_HELD=1
+}
+
+release_free_claim_lock()
+{
+    [[ "$FREE_CLAIM_LOCK_HELD" -eq 1 ]] || return 0
+    flock -u 18 2>/dev/null || true
+    exec 18>&- 2>/dev/null || true
+    FREE_CLAIM_LOCK_HELD=0
+}
+
+reacquire_free_claim_lock()
+{
+    [[ " ${CURRENT_WAVE_NODES[*]} " == *" 30 "* ]] || return 0
+    [[ "$FREE_CLAIM_LOCK_HELD" -eq 0 ]] || return 0
+    exec 18>"$FREE_CLAIM_LOCK"
+    flock -w 1800 18 || return 1
+    FREE_CLAIM_LOCK_HELD=1
+}
+
+release_wave_locks()
+{
+    release_free_claim_lock
+    flock -u 17 2>/dev/null || true
+    exec 17>&- 2>/dev/null || true
+    flock -u 14 2>/dev/null || true
+    exec 14>&- 2>/dev/null || true
+    flock -u 16 2>/dev/null || true
+    exec 16>&- 2>/dev/null || true
+    flock -u 15 2>/dev/null || true
+    exec 15>&- 2>/dev/null || true
+    WAVE_LOCKS_HELD=0
+}
+
+stop_wave_cleanly()
+{
+    local node container mining unresolved deadline
+    local -A pending=()
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        if [[ "$node" -ne "$FREE_CLAIM_NODE" ]]; then
+            wallet_rpc_for "$node" setpowmining false 1 1 \
+                > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-pow-stop.json"
+        fi
+        pending[$node]=1
+    done
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        unresolved=0
+        for node in "${CURRENT_WAVE_NODES[@]}"; do
+            [[ -n "${pending[$node]:-}" ]] || continue
+            mining=$(wallet_rpc_for "$node" getpowmininginfo 2>/dev/null || true)
+            if jq -e '.enabled == false and .live_claims == 0' >/dev/null 2>&1 <<< "$mining"; then
+                unset 'pending[$node]'
+            else
+                unresolved=$((unresolved + 1))
+            fi
+        done
+        ((unresolved == 0)) && break
+        sleep 5
+    done
+    ((unresolved == 0)) || die 'wave did not reach a claim-safe stop boundary within 20 minutes'
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        rpc_for "$node" stop >/dev/null 2>&1 || true
+    done
+
+    pending=()
+    for node in "${CURRENT_WAVE_NODES[@]}"; do pending[$node]=1; done
+    deadline=$((SECONDS + 180))
+    while ((SECONDS < deadline)); do
+        unresolved=0
+        for node in "${CURRENT_WAVE_NODES[@]}"; do
+            [[ -n "${pending[$node]:-}" ]] || continue
+            container=$(container_for "$node")
+            if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" != true ]]; then
+                unset 'pending[$node]'
+            else
+                unresolved=$((unresolved + 1))
+            fi
+        done
+        ((unresolved == 0)) && break
+        sleep 1
+    done
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        container=$(container_for "$node")
+        if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == true ]]; then
+            timeout --kill-after=30 660 docker stop -t 600 "$container" >/dev/null
+        fi
+        [[ "$(docker inspect -f '{{.State.Running}}' "$container")" == false ]] ||
+            die "node $node did not stop cleanly"
+        assert_node_cleanly_stopped "$node" ||
+            die "node $node stopped with a non-clean exit; refusing cold backup or image change"
+    done
+}
+
+assert_node_cleanly_stopped()
+{
+    local node="$1" inspect
+    inspect=$(docker inspect "$(container_for "$node")") || return 1
+    jq -e 'length == 1 and .[0].State.Running == false and
+        .[0].State.ExitCode == 0 and .[0].State.OOMKilled == false and
+        .[0].State.Error == ""' >/dev/null <<< "$inspect"
+}
+
+backup_cold_wallets_and_snapshots()
+{
+    local node host_data wallet wallet_path wallet_relative
+    install -d -m 700 -o root -g root "$CURRENT_WAVE_DIR/cold-backups"
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        host_data=$(host_datadir_for "$node")
+        wallet=$(cat "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-loaded-wallet.txt")
+        if [[ -z "$wallet" ]]; then
+            wallet_relative=wallet.dat
+        else
+            [[ "$wallet" != */* && "$wallet" != .* && "$wallet" != *'..'* ]] ||
+                die "node $node loaded wallet name is unsafe"
+            wallet_relative="$wallet"
+        fi
+        wallet_path="$host_data/$wallet_relative"
+        [[ -e "$wallet_path" && ! -L "$wallet_path" ]] ||
+            die "node $node exact loaded wallet path is absent or unsafe"
+        tar --acls --xattrs --numeric-owner -cpf \
+            "$CURRENT_WAVE_DIR/cold-backups/node-$(node_padded "$node")-loaded-wallet.tar" \
+            -C "$host_data" -- "$wallet_relative"
+        install -m 600 -o root -g root "$host_data/blackcoin.conf" \
+            "$CURRENT_WAVE_DIR/cold-backups/node-$(node_padded "$node")-blackcoin.conf"
+        if [[ -f "$host_data/settings.json" && ! -L "$host_data/settings.json" ]]; then
+            install -m 600 -o root -g root "$host_data/settings.json" \
+                "$CURRENT_WAVE_DIR/cold-backups/node-$(node_padded "$node")-settings.json"
+        fi
+    done
+    sha256sum "$CURRENT_WAVE_DIR/cold-backups"/* > "$CURRENT_WAVE_DIR/cold-backups/SHA256SUMS"
+    snapshot_wave_data || die 'complete held pre-upgrade data snapshots could not be published'
+    verify_wave_snapshot_inventory || die 'published data snapshot inventory failed verification'
+}
+
+prepare_wave_candidates()
+{
+    local services_csv='' node service policy_sha
+    install -m 600 -o root -g root "$COMPOSE_FILE" "$CURRENT_WAVE_DIR/docker-compose.before.yml"
+    install -m 600 -o root -g root "$IMAGE_POLICY" "$CURRENT_WAVE_DIR/fleet-image-policy.before.json"
+    install -m 600 -o root -g root "$ENDPOINT_GUARD" "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.before.sh"
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        service=$(service_for "$node")
+        services_csv+="${services_csv:+,}$service"
+    done
+    awk -v targets="$services_csv" -v image="$CANDIDATE_IMAGE_REF" \
+        -f "$RENDER_COMPOSE" "$COMPOSE_FILE" > "$CURRENT_WAVE_DIR/docker-compose.candidate.yml"
+    "$RENDER_POLICY" "$IMAGE_POLICY" "$CURRENT_WAVE_DIR/fleet-image-policy.candidate.json" \
+        "$CANDIDATE_IMAGE_REF" "$CANDIDATE_IMAGE_ID" "${CURRENT_WAVE_NODES[@]}"
+    policy_sha=$(sha256sum "$CURRENT_WAVE_DIR/fleet-image-policy.candidate.json" | awk '{print $1}')
+    "$RENDER_GUARD" "$ENDPOINT_GUARD" "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.candidate.sh" "$policy_sha"
+    verify_compose_candidate "$services_csv"
+}
+
+verify_compose_candidate()
+{
+    local services_csv="$1" targets_json before_json after_json
+    targets_json=$(tr ',' '\n' <<< "$services_csv" | jq -Rsc 'split("\n") | map(select(length > 0))')
+    before_json=$(docker compose -f "$COMPOSE_FILE" config --format json) || die 'current Compose model is invalid'
+    after_json=$(docker compose -f "$CURRENT_WAVE_DIR/docker-compose.candidate.yml" config --format json) ||
+        die 'candidate Compose model is invalid'
+    jq -e --arg image "$CANDIDATE_IMAGE_REF" --argjson targets "$targets_json" '
+        . as $model | all($targets[]; $model.services[.].image == $image)
+    ' >/dev/null <<< "$after_json" || die 'candidate Compose did not set every wave image'
+    jq -e -n --argjson before "$before_json" --argjson after "$after_json" --argjson targets "$targets_json" '
+        def neutralize($doc):
+          reduce $targets[] as $service ($doc; .services[$service].image = "__WAVE_IMAGE__");
+        neutralize($before) == neutralize($after)
+    ' >/dev/null || die 'candidate Compose changes more than the selected image scalars'
+}
+
+install_triplet()
+{
+    local compose_candidate="$1" policy_candidate="$2" guard_candidate="$3"
+    local compose_tmp policy_tmp guard_tmp compose_backup policy_backup guard_backup
+    local compose_mode policy_mode guard_mode rc=0 compose_done=0 policy_done=0 guard_done=0
+    local compose_restore_rc=0 policy_restore_rc=0 guard_restore_rc=0
+    local compose_original_sha policy_original_sha guard_original_sha
+    local compose_candidate_sha policy_candidate_sha guard_candidate_sha
+    compose_mode=$(stat -c '%a' "$COMPOSE_FILE")
+    policy_mode=$(stat -c '%a' "$IMAGE_POLICY")
+    guard_mode=$(stat -c '%a' "$ENDPOINT_GUARD")
+    compose_original_sha=$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')
+    policy_original_sha=$(sha256sum "$IMAGE_POLICY" | awk '{print $1}')
+    guard_original_sha=$(sha256sum "$ENDPOINT_GUARD" | awk '{print $1}')
+    compose_candidate_sha=$(sha256sum "$compose_candidate" | awk '{print $1}')
+    policy_candidate_sha=$(sha256sum "$policy_candidate" | awk '{print $1}')
+    guard_candidate_sha=$(sha256sum "$guard_candidate" | awk '{print $1}')
+    compose_tmp=$(mktemp "${COMPOSE_FILE%/*}/.v3014-compose.XXXXXX")
+    policy_tmp=$(mktemp "${IMAGE_POLICY%/*}/.v3014-policy.XXXXXX")
+    guard_tmp=$(mktemp "${ENDPOINT_GUARD%/*}/.v3014-guard.XXXXXX")
+    compose_backup=$(mktemp "${COMPOSE_FILE%/*}/.v3014-compose-rollback.XXXXXX")
+    policy_backup=$(mktemp "${IMAGE_POLICY%/*}/.v3014-policy-rollback.XXXXXX")
+    guard_backup=$(mktemp "${ENDPOINT_GUARD%/*}/.v3014-guard-rollback.XXXXXX")
+    trap 'rm -f -- "${compose_tmp:-}" "${policy_tmp:-}" "${guard_tmp:-}" \
+        "${compose_backup:-}" "${policy_backup:-}" "${guard_backup:-}"' RETURN
+    install -m "$compose_mode" -o root -g root "$compose_candidate" "$compose_tmp"
+    install -m "$policy_mode" -o root -g root "$policy_candidate" "$policy_tmp"
+    install -m "$guard_mode" -o root -g root "$guard_candidate" "$guard_tmp"
+    install -m "$compose_mode" -o root -g root "$COMPOSE_FILE" "$compose_backup"
+    install -m "$policy_mode" -o root -g root "$IMAGE_POLICY" "$policy_backup"
+    install -m "$guard_mode" -o root -g root "$ENDPOINT_GUARD" "$guard_backup"
+    bash -n "$guard_tmp"
+    triplet_policy_guard_valid "$policy_tmp" "$guard_tmp"
+    docker compose -f "$compose_tmp" config --quiet
+    sync -f "$compose_tmp"; sync -f "$policy_tmp"; sync -f "$guard_tmp"
+    sync -f "$compose_backup"; sync -f "$policy_backup"; sync -f "$guard_backup"
+
+    if mv -fT -- "$compose_tmp" "$COMPOSE_FILE"; then compose_done=1; compose_tmp=; else rc=$?; fi
+    if ((rc == 0)); then
+        if mv -fT -- "$policy_tmp" "$IMAGE_POLICY"; then policy_done=1; policy_tmp=; else rc=$?; fi
+    fi
+    if ((rc == 0)); then
+        if mv -fT -- "$guard_tmp" "$ENDPOINT_GUARD"; then guard_done=1; guard_tmp=; else rc=$?; fi
+    fi
+    if ((rc == 0)) && ! triplet_policy_guard_valid "$IMAGE_POLICY" "$ENDPOINT_GUARD"; then rc=1; fi
+    if ((rc == 0)) &&
+       [[ "$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')" != "$compose_candidate_sha" ||
+          "$(sha256sum "$IMAGE_POLICY" | awk '{print $1}')" != "$policy_candidate_sha" ||
+          "$(sha256sum "$ENDPOINT_GUARD" | awk '{print $1}')" != "$guard_candidate_sha" ]]; then
+        rc=1
+    fi
+
+    if ((rc != 0)); then
+        log 'triplet commit failed; restoring all original bytes before returning failure'
+        set +e
+        ((compose_done == 0)) || mv -fT -- "$compose_backup" "$COMPOSE_FILE"
+        compose_restore_rc=$?
+        ((policy_done == 0)) || mv -fT -- "$policy_backup" "$IMAGE_POLICY"
+        policy_restore_rc=$?
+        ((guard_done == 0)) || mv -fT -- "$guard_backup" "$ENDPOINT_GUARD"
+        guard_restore_rc=$?
+        sync -f "${COMPOSE_FILE%/*}" || compose_restore_rc=1
+        sync -f "$STATE_DIR" || policy_restore_rc=1
+        [[ "$(sha256sum "$COMPOSE_FILE" 2>/dev/null | awk '{print $1}')" == \
+           "$compose_original_sha" ]] || compose_restore_rc=1
+        [[ "$(sha256sum "$IMAGE_POLICY" 2>/dev/null | awk '{print $1}')" == \
+           "$policy_original_sha" ]] || policy_restore_rc=1
+        [[ "$(sha256sum "$ENDPOINT_GUARD" 2>/dev/null | awk '{print $1}')" == \
+           "$guard_original_sha" ]] || guard_restore_rc=1
+        triplet_policy_guard_valid "$IMAGE_POLICY" "$ENDPOINT_GUARD" || guard_restore_rc=1
+        set -e
+        ((compose_restore_rc == 0 && policy_restore_rc == 0 && guard_restore_rc == 0)) ||
+            die 'triplet commit and internal byte restoration both failed; operator intervention required'
+        return "$rc"
+    fi
+    sync -f "${COMPOSE_FILE%/*}"; sync -f "$STATE_DIR"
+    trap - RETURN
+    rm -f -- "$compose_backup" "$policy_backup" "$guard_backup"
+    triplet_policy_guard_valid "$IMAGE_POLICY" "$ENDPOINT_GUARD"
+}
+
+commit_wave_triplet()
+{
+    CURRENT_WAVE_COMMITTED=1
+    publish_state_token "$CURRENT_WAVE_DIR/COMMIT_STATE" commit-started ||
+        die 'wave commit-started state could not be published'
+    install_triplet "$CURRENT_WAVE_DIR/docker-compose.candidate.yml" \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.candidate.json" \
+        "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.candidate.sh" ||
+        die 'wave triplet commit failed after internal restoration'
+    publish_state_token "$CURRENT_WAVE_DIR/COMMIT_STATE" committed ||
+        die 'wave committed state could not be published'
+    sha256sum "$COMPOSE_FILE" "$IMAGE_POLICY" "$ENDPOINT_GUARD" > "$CURRENT_WAVE_DIR/live-triplet.sha256"
+}
+
+start_wave_candidate()
+{
+    local node service services=()
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        services+=("$(service_for "$node")")
+    done
+    docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate --pull never "${services[@]}"
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        service=$(container_for "$node")
+        [[ "$(docker inspect -f '{{.Config.Image}}' "$service")" == "$CANDIDATE_IMAGE_REF" ]] ||
+            die "node $node configured image mismatch after recreation"
+        [[ "$(docker inspect -f '{{.Image}}' "$service")" == "$CANDIDATE_IMAGE_ID" ]] ||
+            die "node $node image ID mismatch after recreation"
+    done
+}
+
+activate_wave_phase()
+{
+    local phase="$1" node pid failed=0 marker temporary
+    local -a pids=() nodes=()
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        [[ "$phase" != pow || "$node" -ne "$FREE_CLAIM_NODE" ]] || continue
+        if [[ "$phase" == pow ]]; then
+            marker="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-pow-activation-attempted"
+            temporary=$(mktemp "$CURRENT_WAVE_DIR/.pow-activation.XXXXXX")
+            printf '%s\n' yes > "$temporary"
+            chmod 600 "$temporary"
+            chown root:root "$temporary"
+            sync -f "$temporary"
+            mv -fT -- "$temporary" "$marker"
+            sync -f "$CURRENT_WAVE_DIR"
+        fi
+        activate_one_node_phase "$phase" "$node" \
+            > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-${phase}-activation.log" 2>&1 &
+        pids+=("$!")
+        nodes+=("$node")
+    done
+    for index in "${!pids[@]}"; do
+        pid=${pids[$index]}
+        if ! wait "$pid"; then
+            log "node ${nodes[$index]} $phase activation failed"
+            failed=1
+        fi
+    done
+    ((failed == 0)) || die "one or more wave $phase activations failed"
+}
+
+activate_one_node_phase()
+{
+    local phase="$1" node="$2" deadline path sha
+    if [[ "$phase" == staking ]]; then
+        path=$NORMAL_UNLOCK_HELPER
+        sha=$NORMAL_UNLOCK_HELPER_SHA256
+    else
+        [[ "$phase" == pow && "$node" -ne "$FREE_CLAIM_NODE" ]] || return 1
+        path=$POW_START_HELPER
+        sha=$POW_START_HELPER_SHA256
+    fi
+    deadline=$((SECONDS + 300))
+    while ((SECONDS < deadline)); do
+        run_activation_helper "$path" "$sha" "$node" && return 0
+        sleep 5
+    done
+    return 1
+}
+
+probe_wave_nodes_once()
+{
+    local probe_dir="$1" node result fee generation_before generation_after pid failed=0
+    local -a pids=()
+    install -d -m 700 -o root -g root "$probe_dir"
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        result="$probe_dir/node-$(node_padded "$node").result"
+        (
+            fee=$(candidate_recovery_fee_for "$node") || exit 1
+            generation_before=$(container_generation_for "$node") || exit 1
+            verify_node_runtime_gate "$node" "$fee" || exit 1
+            generation_after=$(container_generation_for "$node") || exit 1
+            [[ "$generation_before" == "$generation_after" ]] || exit 1
+            printf '%s\n' "$generation_after" > "${result}.generation"
+            printf '%s\n' pass > "$result"
+        ) &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+    ((failed == 0)) || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        result="$probe_dir/node-$(node_padded "$node").result"
+        [[ -f "$result" && "$(cat "$result")" == pass ]] || return 1
+        generation_after=$(container_generation_for "$node") || return 1
+        [[ "$generation_after" == "$(cat "${result}.generation")" ]] || return 1
+    done
+}
+
+verify_wave_chain_convergence()
+{
+    local root="$CURRENT_WAVE_DIR/wave-chain-convergence" attempt dir node pid count
+    local -a pids=()
+    install -d -m 700 -o root -g root "$root"
+    for attempt in $(seq 1 120); do
+        dir=$(printf '%s/attempt-%03d' "$root" "$attempt")
+        install -d -m 700 -o root -g root "$dir"
+        pids=()
+        for node in $(seq 1 "$NODE_COUNT"); do
+            (rpc_for "$node" getblockchaininfo | jq -c --argjson node "$node" \
+                '{node:$node,chain,blocks,headers,bestblockhash,chainwork,initialblockdownload}' \
+                > "$dir/node-$(node_padded "$node").json") &
+            pids+=("$!")
+        done
+        for pid in "${pids[@]}"; do wait "$pid" || true; done
+        count=$(find "$dir" -maxdepth 1 -type f -name 'node-*.json' | wc -l)
+        if [[ "$count" -eq "$NODE_COUNT" ]] && jq -e -s '
+            length == 32 and all(.[]; .chain == "main" and .initialblockdownload == false and
+              .headers >= .blocks and (.headers - .blocks) <= 2) and
+            ([.[].blocks] | unique | length) == 1 and
+            ([.[].bestblockhash] | unique | length) == 1 and
+            ([.[].chainwork] | unique | length) == 1
+        ' "$dir"/node-*.json >/dev/null; then
+            jq -s 'sort_by(.node)' "$dir"/node-*.json > "$root/PASSED.json"
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+wait_wave_gate()
+{
+    local deadline attempt=0 probe_dir
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        attempt=$((attempt + 1))
+        probe_dir=$(printf '%s/gate-probes/attempt-%03d' "$CURRENT_WAVE_DIR" "$attempt")
+        if probe_wave_nodes_once "$probe_dir"; then
+            verify_wave_chain_convergence || die 'wave did not converge with the exact-32 canonical tip'
+            assert_unique_vpn_proofs || die 'VPN uniqueness changed during wave validation'
+            probe_wave_nodes_once "$CURRENT_WAVE_DIR/gate-probes/final-same-generation" ||
+                die 'wave failed final concurrent same-generation gate'
+            return 0
+        fi
+        sleep 5
+    done
+    die 'wave did not pass the v30.1.4 runtime gate within the bounded 20-minute window'
+}
+
+wait_node30_service_gate()
+{
+    local attempt=0 deadline
+    [[ " ${CURRENT_WAVE_NODES[*]} " == *" 30 "* ]] || return 0
+    release_free_claim_lock
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        attempt=$((attempt + 1))
+        if verify_free_claim_pause && verify_node30_free_claim_service; then
+            log "node30 Free Claim service gate passed attempt=$attempt"
+            return 0
+        fi
+        sleep 5
+    done
+    die 'node30 Free Claim service did not recover within 20 minutes'
+}
+
+assert_unaffected_unchanged()
+{
+    local before="$1" after="$2" csv="$3"
+    capture_unaffected_generations "$after" "$csv"
+    cmp -s "$before" "$after" || die 'a non-wave node or VPN container generation changed'
+}
+
+verify_policy_runtime_node()
+{
+    local node="$1" baseline
+    baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+    verify_policy_legacy_runtime_gate "$node" "$baseline"
+}
+
+stop_wave_for_rollback()
+{
+    local node container mining deadline inspect evidence
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        container=$(container_for "$node")
+        [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == true ]] || continue
+        if [[ "$node" -ne "$FREE_CLAIM_NODE" ]]; then
+            wallet_rpc_for "$node" setpowmining false 1 1 >/dev/null 2>&1 || true
+        fi
+        deadline=$((SECONDS + 120))
+        while ((SECONDS < deadline)); do
+            mining=$(wallet_rpc_for "$node" getpowmininginfo 2>/dev/null || true)
+            jq -e '.enabled == false and .live_claims == 0' >/dev/null 2>&1 <<< "$mining" && break
+            sleep 1
+        done
+        jq -e '.enabled == false and .live_claims == 0' >/dev/null 2>&1 <<< "$mining" || {
+            log "rollback refused before node=$node reached a claim-safe stop boundary"
+            return 1
+        }
+        rpc_for "$node" stop >/dev/null 2>&1 || true
+    done
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        container=$(container_for "$node")
+        if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == true ]]; then
+            timeout --kill-after=30 660 docker stop -t 600 "$container" >/dev/null || return 1
+        fi
+        if assert_node_cleanly_stopped "$node"; then
+            continue
+        fi
+        [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 1 &&
+           ( "$node" -eq "$FREE_CLAIM_NODE" ||
+             ! -e "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-pow-activation-attempted" ) ]] ||
+            return 1
+        if ! inspect=$(docker inspect "$container" 2>/dev/null); then
+            publish_absent_target_evidence "$node" || return 1
+            continue
+        fi
+        jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg id "$CANDIDATE_IMAGE_ID" '
+            length == 1 and .[0].State.Running == false and .[0].State.Pid == 0 and
+            .[0].Config.Image == $image and .[0].Image == $id and
+            ((.[0].State.ExitCode | type) == "number")
+        ' >/dev/null <<< "$inspect" || return 1
+        evidence="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-candidate-nonclean-exit.json"
+        jq -S '.[0] | {id:.Id,image:.Image,config_image:.Config.Image,
+            state:{status:.State.Status,running:.State.Running,pid:.State.Pid,
+              exit_code:.State.ExitCode,oom_killed:.State.OOMKilled,error:.State.Error,
+              started_at:.State.StartedAt,finished_at:.State.FinishedAt}}' \
+            <<< "$inspect" > "$evidence" || return 1
+        chmod 600 "$evidence"
+        chown root:root "$evidence"
+        sync -f "$evidence"
+    done
+}
+
+rollback_current_wave()
+{
+    local node services=() all_ready deadline
+    [[ "$CURRENT_WAVE_COMMITTED" -eq 1 && "$CURRENT_WAVE_ROLLED_BACK" -eq 0 ]] || return 0
+    log "rolling back current wave: ${CURRENT_WAVE_NODES[*]}"
+    [[ -f "$CURRENT_WAVE_DIR/docker-compose.before.yml" &&
+       -f "$CURRENT_WAVE_DIR/fleet-image-policy.before.json" &&
+       -f "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.before.sh" ]] || return 1
+    if [[ "$WAVE_LOCKS_HELD" -eq 0 ]]; then
+        acquire_wave_locks || return 1
+    elif ! reacquire_free_claim_lock; then
+        return 1
+    fi
+    publish_state_token "$CURRENT_WAVE_DIR/ROLLBACK_STATE" rollback-started || return 1
+    if [[ -e "$CURRENT_WAVE_DIR/CANDIDATE_LAUNCH_ATTEMPTED" ||
+          -L "$CURRENT_WAVE_DIR/CANDIDATE_LAUNCH_ATTEMPTED" ]]; then
+        candidate_launch_attempt_marker_valid || return 1
+        CURRENT_WAVE_LAUNCH_ATTEMPTED=1
+    fi
+    stop_wave_for_rollback || return 1
+    if [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 1 ]]; then
+        restore_wave_preupgrade_data || {
+            log 'pre-upgrade dataset restoration failed; old binary will not be started'
+            return 1
+        }
+        jq -e '.pre_upgrade_data_restored == true and
+            .snapshot_identity_verified == true and .snapshot_zero_diff_verified == true and
+            (.fileset_restore_proofs | type) == "number" and .fileset_restore_proofs >= 0 and
+            (.zfs_rollback_proofs | type) == "number" and .zfs_rollback_proofs >= 1' \
+            "$CURRENT_WAVE_DIR/DATA-RESTORED.json" >/dev/null || return 1
+    fi
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        services+=("$(service_for "$node")")
+    done
+    install_triplet "$CURRENT_WAVE_DIR/docker-compose.before.yml" \
+        "$CURRENT_WAVE_DIR/fleet-image-policy.before.json" \
+        "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.before.sh" || return 1
+    [[ "$(sha256sum "$COMPOSE_FILE" | awk '{print $1}')" == \
+       "$(sha256sum "$CURRENT_WAVE_DIR/docker-compose.before.yml" | awk '{print $1}')" ]] || return 1
+    [[ "$(sha256sum "$IMAGE_POLICY" | awk '{print $1}')" == \
+       "$(sha256sum "$CURRENT_WAVE_DIR/fleet-image-policy.before.json" | awk '{print $1}')" ]] || return 1
+    [[ "$(sha256sum "$ENDPOINT_GUARD" | awk '{print $1}')" == \
+       "$(sha256sum "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.before.sh" | awk '{print $1}')" ]] || return 1
+    docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate --pull never "${services[@]}" || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        run_activation_helper "$NORMAL_UNLOCK_HELPER" "$NORMAL_UNLOCK_HELPER_SHA256" "$node" \
+            >/dev/null 2>&1 || return 1
+        if [[ "$node" -ne "$FREE_CLAIM_NODE" ]]; then
+            run_activation_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA256" "$node" \
+                >/dev/null 2>&1 || return 1
+        fi
+    done
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        all_ready=1
+        for node in "${CURRENT_WAVE_NODES[@]}"; do
+            verify_policy_runtime_node "$node" || all_ready=0
+        done
+        ((all_ready == 1)) && break
+        sleep 5
+    done
+    ((all_ready == 1)) || return 1
+    if [[ " ${CURRENT_WAVE_NODES[*]} " == *" 30 "* ]]; then
+        release_free_claim_lock
+        deadline=$((SECONDS + 600))
+        while ((SECONDS < deadline)); do
+            verify_node30_free_claim_service && break
+            sleep 5
+        done
+        verify_node30_free_claim_service || return 1
+    fi
+    CURRENT_WAVE_ROLLED_BACK=1
+    publish_state_token "$CURRENT_WAVE_DIR/RESULT" rolled-back || return 1
+    publish_state_token "$CURRENT_WAVE_DIR/ROLLBACK_STATE" rollback-passed || return 1
+}
+
+on_exit()
+{
+    local rc=$? containment_proven=0 inhibitor_state=''
+    trap - EXIT INT TERM
+    if ((rc != 0)); then
+        if [[ "$TERMINAL_FINALIZED" -eq 1 ]]; then
+            log 'terminal receipt is finalized; live verification drift is post-transaction and no rollout state will be mutated'
+            release_finalization_guard_locks
+            release_wave_locks
+            exit "$rc"
+        fi
+        if [[ "$TERMINAL_COMMIT_ACTIVE" -eq 1 ]]; then
+            if verify_snapshot_cleanup_resume_prefix && data_rollback_finalization_released; then
+                log 'terminal evidence commit was interrupted after its durable cleanup prefix; rerun resumes cleanup and atomic receipt publication'
+                release_finalization_guard_locks
+                release_wave_locks
+                exit "$rc"
+            fi
+            log 'terminal commit prefix or live release proof is invalid; restoring fail-closed containment'
+            TERMINAL_COMMIT_ACTIVE=0
+            FINALIZATION_ACTIVE=1
+        fi
+        if [[ "$FINALIZATION_LOCKS_HELD" -eq 1 ]]; then
+            activate_free_claim_pause_safely ||
+                log 'ERROR: could not re-pause Free Claim while held finalization locks were active'
+            activate_maintenance_marker_safely ||
+                log 'ERROR: could not reactivate maintenance while held finalization locks were active'
+        fi
+        # Also closes any prefix acquired before a signal interrupted the
+        # canonical lock sequence and before FINALIZATION_LOCKS_HELD was set.
+        release_finalization_guard_locks
+        if [[ "$CURRENT_WAVE_COMMITTED" -eq 0 && -n "$CURRENT_WAVE_DIR" &&
+              "$CURRENT_WAVE_DIR" == "$RUN_DIR"/.pre-wave-* &&
+              -d "$CURRENT_WAVE_DIR" && ! -L "$CURRENT_WAVE_DIR" ]]; then
+            publish_state_token "$CURRENT_WAVE_DIR/PRECOMMIT_STATE" precommit-aborted || true
+            log "wave preparation aborted before the rollback boundary; hidden evidence retained at $CURRENT_WAVE_DIR"
+        fi
+        if ! rollback_current_wave; then
+            log 'ERROR: current-wave rollback could not be proven; affected nodes remain fail-closed'
+        fi
+        if [[ "$FINALIZATION_ACTIVE" -eq 1 ]]; then
+            ensure_finalization_containment && containment_proven=1
+        else
+            inhibitor_state=$(/bin/bash "$INHIBITOR_RELEASER" probe 2>/dev/null || true)
+            if [[ "$inhibitor_state" == \
+                  'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused' ]] &&
+               verify_maintenance_marker; then
+                containment_proven=1
+            fi
+        fi
+        if [[ "$containment_proven" -eq 1 ]]; then
+            log 'transaction stopped fail-closed; Free Claim and fleet supervisors are durably inhibited'
+        else
+            log 'ERROR: transaction stopped but final inhibitor containment could not be proven'
+        fi
+    fi
+    release_finalization_guard_locks
+    release_wave_locks
+    exit "$rc"
+}
+
+run_one_wave()
+{
+    local wave_index="$1" csv node base canonical precommit_dir launch_marker_tmp retry=0 result fee=''
+    local next_retry stray retry_index
+    local -a recorded_nodes=()
+    shift
+    CURRENT_WAVE_NODES=("$@")
+    csv=$(IFS=,; printf '%s' "${CURRENT_WAVE_NODES[*]}")
+    base=$(printf '%s/wave-%02d-nodes-%s' "$RUN_DIR" "$wave_index" "${csv//,/-}")
+    canonical="$base"
+    while [[ -e "$canonical" || -L "$canonical" ]]; do
+        [[ -d "$canonical" && ! -L "$canonical" ]] || die "existing wave path is unsafe: $canonical"
+        verify_wave_evidence_manifest "$canonical" "$wave_index" ||
+            die "existing wave evidence changed: $canonical"
+        if [[ -f "$canonical/RESULT" && ! -L "$canonical/RESULT" ]]; then
+            result=$(cat "$canonical/RESULT")
+        else
+            result=interrupted
+        fi
+        case "$result" in
+            passed)
+                CURRENT_WAVE_DIR="$canonical"
+                verify_wave_runtime_evidence ||
+                    die "passed wave runtime evidence changed: $canonical"
+                next_retry=$(printf '%s-retry-%02d' "$base" "$((retry + 1))")
+                [[ ! -e "$next_retry" && ! -L "$next_retry" ]] ||
+                    die 'a retry exists after a passed wave attempt'
+                for node in "${CURRENT_WAVE_NODES[@]}"; do
+                    fee=$(candidate_recovery_fee_for "$node") ||
+                        die "passed node $node wave has no valid recovery-fee baseline"
+                    verify_node_gate "$node" "$fee" ||
+                        die "previously passed wave regressed at node $node"
+                done
+                log "wave $wave_index remains passed; no known-good work repeated: ${CURRENT_WAVE_NODES[*]}"
+                return 0
+                ;;
+            rolled-back) ;;
+            interrupted)
+                CURRENT_WAVE_DIR="$canonical"
+                read -r -a recorded_nodes < "$canonical/NODES"
+                [[ "${recorded_nodes[*]}" == "${CURRENT_WAVE_NODES[*]}" ]] ||
+                    die 'interrupted wave node identity changed'
+                acquire_wave_locks
+                CURRENT_WAVE_COMMITTED=1
+                CURRENT_WAVE_ROLLED_BACK=0
+                CURRENT_WAVE_LAUNCH_ATTEMPTED=0
+                rollback_current_wave || die 'interrupted wave could not be rolled back safely'
+                release_wave_locks
+                CURRENT_WAVE_COMMITTED=0
+                ;;
+            *) die "existing wave has unsafe result: $result" ;;
+        esac
+        retry=$((retry + 1))
+        canonical=$(printf '%s-retry-%02d' "$base" "$retry")
+    done
+    while IFS= read -r stray; do
+        [[ "${stray##*/}" =~ -retry-([0-9]{2})$ ]] ||
+            die "foreign retry directory exists: $stray"
+        retry_index=$((10#${BASH_REMATCH[1]}))
+        ((retry_index < retry)) || die "noncontiguous retry directory exists: $stray"
+    done < <(find "$RUN_DIR" -maxdepth 1 -type d -name "${base##*/}-retry-*" -print | sort)
+    precommit_dir=$(mktemp -d "$RUN_DIR/.pre-wave-${wave_index}.XXXXXX")
+    chmod 700 "$precommit_dir"
+    chown root:root "$precommit_dir"
+    CURRENT_WAVE_DIR="$precommit_dir"
+    printf '%s\n' "${CURRENT_WAVE_NODES[*]}" > "$CURRENT_WAVE_DIR/NODES"
+    CURRENT_WAVE_COMMITTED=0
+    CURRENT_WAVE_ROLLED_BACK=0
+    CURRENT_WAVE_LAUNCH_ATTEMPTED=0
+
+    acquire_wave_locks
+    capture_unaffected_generations "$CURRENT_WAVE_DIR/unaffected.before" "$csv"
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        single_wallet_for "$node" > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-loaded-wallet.txt" ||
+            die "node $node loaded wallet could not be captured before stop"
+        capture_wallet_txid_set "$node" \
+            "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.before.json" ||
+            die "node $node wallet transaction identity could not be captured before candidate launch"
+    done
+    if [[ " ${CURRENT_WAVE_NODES[*]} " == *" 30 "* ]]; then
+        wallet_rpc_for "$FREE_CLAIM_NODE" getpowmininginfo > \
+            "$CURRENT_WAVE_DIR/node30-legacy-pow.before.json"
+    fi
+    prepare_wave_candidates
+    publish_state_token "$CURRENT_WAVE_DIR/COMMIT_STATE" rollback-boundary-established ||
+        die 'rollback boundary state could not be durably published'
+    write_wave_evidence_manifest "$wave_index"
+    [[ ! -e "$canonical" && ! -L "$canonical" ]] ||
+        die "canonical wave path appeared during preparation: $canonical"
+    mv -- "$CURRENT_WAVE_DIR" "$canonical"
+    CURRENT_WAVE_DIR="$canonical"
+    sync -f "$RUN_DIR"
+    verify_wave_evidence_manifest "$CURRENT_WAVE_DIR" "$wave_index" ||
+        die 'canonical wave evidence changed during atomic publication'
+    # From this point forward any failure must recreate the selected nodes on
+    # the captured before-triplet, even if no triplet byte has changed yet.
+    CURRENT_WAVE_COMMITTED=1
+    stop_wave_cleanly
+    backup_cold_wallets_and_snapshots
+    commit_wave_triplet
+    launch_marker_tmp=$(mktemp "$CURRENT_WAVE_DIR/.candidate-launch.XXXXXX")
+    printf '%s\n' yes > "$launch_marker_tmp"
+    chmod 600 "$launch_marker_tmp"
+    chown root:root "$launch_marker_tmp"
+    sync -f "$launch_marker_tmp"
+    mv -fT -- "$launch_marker_tmp" "$CURRENT_WAVE_DIR/CANDIDATE_LAUNCH_ATTEMPTED"
+    sync -f "$CURRENT_WAVE_DIR"
+    CURRENT_WAVE_LAUNCH_ATTEMPTED=1
+    start_wave_candidate
+    establish_wave_recovery_baselines
+    activate_wave_phase staking
+    activate_wave_phase pow
+    wait_wave_gate
+    assert_unaffected_unchanged "$CURRENT_WAVE_DIR/unaffected.before" \
+        "$CURRENT_WAVE_DIR/unaffected.after" "$csv"
+    wait_node30_service_gate
+    write_wave_runtime_evidence || die 'wave runtime evidence could not be durably published'
+    verify_wave_runtime_evidence || die 'published wave runtime evidence changed'
+    publish_state_token "$CURRENT_WAVE_DIR/RESULT" passed ||
+        die 'passed wave result could not be durably published'
+    release_wave_locks
+    CURRENT_WAVE_COMMITTED=0
+    log "wave $wave_index complete: ${CURRENT_WAVE_NODES[*]}"
+}
+
+apply_rollout()
+{
+    local stamp line wave_index=0 resume_state='' interrupted=''
+    [[ "${CONFIRM_APPLY:-}" == v30.1.4-exact-32 ]] ||
+        die 'apply requires CONFIRM_APPLY=v30.1.4-exact-32'
+    require_command flock
+    exec 19>/var/run/blackcoin-v30.1.4-fleet-rollout.lock
+    flock -n 19 || die 'another v30.1.4 fleet transaction is active'
+    if [[ -n "$RUN_DIR" ]]; then
+        if [[ ! -f "$RUN_DIR/STATE" || -L "$RUN_DIR/STATE" ]] ||
+           ! valid_rollout_run_dir "$RUN_DIR"; then
+            die 'resume run path/state is unsafe'
+        fi
+        resume_state=$(cat "$RUN_DIR/STATE")
+        if [[ "$resume_state" == applying ]]; then
+            interrupted=$(single_interrupted_wave)
+            [[ "$interrupted" != __MULTIPLE_INTERRUPTED_WAVES__ ]] ||
+                die 'resume contains more than one interrupted committed wave'
+            if [[ -n "$interrupted" ]]; then
+                resume_interrupted_wave_before_live_preflight "$interrupted"
+                acquire_wave_locks
+                resume_interrupted_wave_before_live_preflight "$interrupted"
+                trap on_exit EXIT
+                trap 'exit 130' INT
+                trap 'exit 143' TERM
+                CURRENT_WAVE_COMMITTED=1
+                CURRENT_WAVE_ROLLED_BACK=0
+                CURRENT_WAVE_LAUNCH_ATTEMPTED=0
+                rollback_current_wave || die 'interrupted wave could not be restored before live preflight'
+                release_wave_locks
+                CURRENT_WAVE_COMMITTED=0
+                trap - EXIT INT TERM
+                CURRENT_WAVE_DIR=
+                CURRENT_WAVE_NODES=()
+            fi
+        fi
+    fi
+    CURRENT_WAVE_NODES=(30)
+    acquire_wave_locks
+    live_preflight
+    [[ -z "$RUN_DIR" ]] || resume_state=$(cat "$RUN_DIR/STATE")
+    if [[ -z "$RUN_DIR" ]]; then
+        stamp=$(date -u +%Y%m%dT%H%M%SZ)
+        RUN_DIR="$OPS_ROOT/rollout-$stamp"
+        [[ ! -e "$RUN_DIR" && ! -L "$RUN_DIR" ]] || die 'rollout directory already exists'
+        install -d -m 700 -o root -g root "$OPS_ROOT" "$RUN_DIR"
+        capture_transaction_baseline
+        verify_legacy_rollback_readiness_all_nodes ||
+            die 'fresh exact-32 v30.1.3 rollback-readiness gate failed before first mutation'
+        create_maintenance_nonce
+        write_transaction_manifest
+        publish_state_token "$RUN_DIR/STATE" prepared || die 'prepared run state publication failed'
+        activate_maintenance_marker
+        publish_state_token "$RUN_DIR/STATE" applying || die 'applying run state publication failed'
+    else
+        verify_transaction_manifest || die 'resume identity changed after locked preflight'
+        if [[ "$resume_state" == prepared ]]; then
+            activate_maintenance_marker
+            publish_state_token "$RUN_DIR/STATE" applying || die 'resume applying state publication failed'
+            resume_state=applying
+        elif [[ "$resume_state" == applying ]]; then
+            verify_maintenance_marker || die 'resume maintenance marker identity changed'
+        elif [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
+            verify_maintenance_marker || die 'complete-run maintenance marker identity changed'
+        fi
+    fi
+    trap on_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    release_wave_locks
+    CURRENT_WAVE_NODES=()
+    CURRENT_WAVE_DIR=
+
+    if [[ "$resume_state" == complete ]]; then
+        FINALIZATION_ACTIVE=1
+        finalize_completed_rollout || die 'completed rollout finalization could not be proven'
+        FINALIZATION_ACTIVE=0
+        trap - EXIT INT TERM
+        log "v30.1.4 rollout finalization complete: $RUN_DIR"
+        return 0
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%%#*}
+        line=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<< "$line")
+        [[ -n "$line" ]] || continue
+        read -r -a wave_nodes <<< "$line"
+        wave_index=$((wave_index + 1))
+        run_one_wave "$wave_index" "${wave_nodes[@]}"
+    done < "$WAVE_PLAN"
+
+    # The auditor reuses the hour-long evidence only after a fresh, cheap
+    # exact-32 dynamic/generation and same-tip/chainwork revalidation. A fleet
+    # regression invalidates the prior result and begins a new soak window.
+    SOAK_RESUME=1 "$SOAK_AUDITOR" "$RUN_DIR" || die 'exact-32 soak audit failed'
+    assert_fleet_identity_matches_baseline "$RUN_DIR/final-fleet-identity.json" ||
+        die 'wallet, quantum-key, config, or role identity changed during rollout'
+    assert_free_claim_container_identity_matches_baseline \
+        "$RUN_DIR/final-free-claim-container-identity.pre-release.json" ||
+        die 'Free Claim API container identity changed during rollout'
+    publish_state_token "$RUN_DIR/STATE" complete || die 'complete run state publication failed'
+    FINALIZATION_ACTIVE=1
+    finalize_completed_rollout || die 'successful rollout could not safely release transaction inhibitors'
+    FINALIZATION_ACTIVE=0
+    trap - EXIT INT TERM
+    log "v30.1.4 rollout and exact-32 soak complete: $RUN_DIR"
+}
+
+rollback_run()
+{
+    local requested=${2:-} wave result node all_ready wave_name wave_index rollback_state deadline
+    local inhibitor_state
+    [[ "${CONFIRM_ROLLBACK:-}" == v30.1.4-rollback ]] ||
+        die 'rollback requires CONFIRM_ROLLBACK=v30.1.4-rollback'
+    [[ -n "$requested" && -d "$requested" && ! -L "$requested" ]] || die 'rollback run directory is unsafe'
+    RUN_DIR=$(realpath -e -- "$requested")
+    valid_rollout_run_dir "$RUN_DIR" || die 'rollback run is outside the rollout root'
+    require_host_tools
+    [[ "$(id -u)" -eq 0 ]] || die 'root is required'
+    require_rollout_identity
+    require_baseline_identity
+    verify_transaction_manifest || die 'rollback transaction identity or package bytes changed'
+    rollback_state=$(cat "$RUN_DIR/STATE" 2>/dev/null) || die 'run state is unavailable'
+    [[ "$rollback_state" == complete || "$rollback_state" == applying ||
+       "$rollback_state" == prepared ||
+       "$rollback_state" == rolled-back ]] || die 'run state is not rollback-eligible'
+    exec 19>/var/run/blackcoin-v30.1.4-fleet-rollout.lock
+    flock -n 19 || die 'another rollout transaction is active'
+    trap on_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [[ "$rollback_state" == rolled-back ]]; then
+        FINALIZATION_ACTIVE=1
+        finalize_rolled_back_run || die 'rolled-back run finalization could not be proven'
+        FINALIZATION_ACTIVE=0
+        trap - EXIT INT TERM
+        log "full fleet rollback finalization complete: $RUN_DIR"
+        return 0
+    fi
+    assert_empty_control_marker "$ENABLE_GUARD_STARTS" ||
+        die 'guard-start authority marker is absent, nonempty, or unsafe'
+    inhibitor_state=$(/bin/bash "$INHIBITOR_RELEASER" probe 2>/dev/null || true)
+    case "$inhibitor_state" in
+        'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused') ;;
+        'state=installed-and-released cycle=v30.1.4-no-spend free_claim=enabled')
+            CONFIRM_EMERGENCY_CONTAIN=v30.1.4-emergency-repause \
+                /bin/bash "$INHIBITOR_INSTALLER" emergency-contain ||
+                die 'could not re-pause Free Claim before rollback'
+            ;;
+        *)
+            CONFIRM_INSTALL_TRANSACTION_INHIBITORS=v30.1.4-install-transaction-inhibitors \
+                /bin/bash "$INHIBITOR_INSTALLER" install ||
+                die 'could not durably pause Free Claim and enforce the no-spend cycle before rollback'
+            ;;
+    esac
+    [[ "$(/bin/bash "$INHIBITOR_RELEASER" probe)" == \
+       'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused' ]] ||
+        die 'exact transaction inhibitor state did not verify before rollback'
+    verify_free_claim_pause || die 'Free Claim pause did not verify before rollback'
+    activate_maintenance_marker
+    verify_maintenance_marker || die 'rollback maintenance marker did not verify'
+
+    while IFS= read -r wave; do
+        wave_name=${wave##*/}
+        [[ "$wave_name" =~ ^wave-([0-9]{2})-nodes- ]] ||
+            die "rollback contains an invalid wave directory: $wave"
+        wave_index=$((10#${BASH_REMATCH[1]}))
+        verify_wave_evidence_manifest "$wave" "$wave_index" ||
+            die "rollback wave evidence or node identity changed: $wave"
+        result="$wave/RESULT"
+        if [[ -f "$result" ]]; then
+            [[ "$(cat "$result")" == passed ]] || continue
+        else
+            # An interrupted wave can have established its before-triplet and
+            # stopped nodes before it wrote RESULT. Recover that boundary too.
+            [[ -f "$wave/docker-compose.before.yml" &&
+               -f "$wave/fleet-image-policy.before.json" &&
+               -f "$wave/blackcoin_endpoint_guard.before.sh" ]] || continue
+        fi
+        CURRENT_WAVE_DIR="$wave"
+        [[ -f "$wave/NODES" && ! -L "$wave/NODES" ]] || die "wave node manifest is absent: $wave"
+        read -r -a CURRENT_WAVE_NODES < "$wave/NODES"
+        ((${#CURRENT_WAVE_NODES[@]} >= 1 && ${#CURRENT_WAVE_NODES[@]} <= MAX_WAVE_SIZE)) ||
+            die "cannot parse wave nodes: $wave"
+        acquire_wave_locks
+        CURRENT_WAVE_COMMITTED=1
+        CURRENT_WAVE_ROLLED_BACK=0
+        CURRENT_WAVE_LAUNCH_ATTEMPTED=0
+        rollback_current_wave || die "wave rollback failed: $wave"
+        release_wave_locks
+        CURRENT_WAVE_COMMITTED=0
+    done < <(find "$RUN_DIR" -maxdepth 1 -type d -name 'wave-*' -print | sort -r)
+    CURRENT_WAVE_NODES=(30)
+    acquire_wave_locks
+    install_triplet "$RUN_DIR/baseline/docker-compose.yml" \
+        "$RUN_DIR/baseline/fleet-image-policy.json" \
+        "$RUN_DIR/baseline/blackcoin_endpoint_guard.sh" || die 'final baseline triplet restoration failed'
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        all_ready=1
+        for node in $(seq 1 "$NODE_COUNT"); do
+            verify_policy_runtime_node "$node" || all_ready=0
+        done
+        ((all_ready == 1)) && break
+        sleep 5
+    done
+    ((all_ready == 1)) || die 'restored fleet did not pass the baseline operational gate'
+    assert_unique_vpn_proofs || die 'restored fleet VPN proofs are not exact-32 unique'
+    release_free_claim_lock
+    verify_node30_free_claim_service || die 'restored node30 Free Claim service is not healthy'
+    assert_fleet_identity_matches_baseline "$RUN_DIR/rollback-final-fleet-identity.json" ||
+        die 'rollback did not restore the original wallet, quantum-key, config, or role identity'
+    assert_free_claim_container_identity_matches_baseline \
+        "$RUN_DIR/rollback-free-claim-container-identity.json" ||
+        die 'rollback did not preserve the original Free Claim API container identity'
+    release_wave_locks
+    write_rollback_success_evidence || die 'rollback success evidence could not be committed'
+    publish_state_token "$RUN_DIR/STATE" rolled-back || die 'rolled-back run state publication failed'
+    FINALIZATION_ACTIVE=1
+    finalize_rolled_back_run || die 'rollback finalization could not be proven'
+    FINALIZATION_ACTIVE=0
+    trap - EXIT INT TERM
+    log "full fleet configuration/image rollback completed: $RUN_DIR"
+}
+
+plan_only()
+{
+    validate_wave_plan "$WAVE_PLAN" || die 'wave plan is invalid'
+    printf 'PACKAGE=%s\nACTION=plan\nWAVE_PLAN=%s\n' "$PACKAGE_ROOT" "$WAVE_PLAN"
+    awk 'BEGIN {w=0;n=0} /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
+         {w++; n+=NF; printf "wave=%02d size=%d nodes=%s\n",w,NF,$0}
+         END {printf "waves=%d nodes=%d max_wave=4\n",w,n}' "$WAVE_PLAN"
+    printf '%s\n' 'No live command was executed.'
+}
+
+case "$ACTION" in
+    plan)
+        plan_only
+        ;;
+    preflight)
+        live_preflight
+        log 'preflight passed; no rollout mutation was performed'
+        ;;
+    apply)
+        apply_rollout
+        ;;
+    rollback)
+        rollback_run "$@"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 64
+        ;;
+esac

@@ -1,4 +1,4 @@
-validated_at=2026-08-05T22:40:52Z
+validated_at=2026-08-05T23:05:02Z
 scope=local-static-targeted-fixture-only
 live_unraid_mutation=false
 docker_invoked=false
@@ -21,6 +21,7 @@ PASS fee-baseline-no-automatic-recovery-and-full-runtime-gates
 PASS identity-wave-evidence-and-precommit-publication
 PASS forbidden-operation-and-build-invariants
 PASS build-base-schema-and-package-path-negative-fixtures
+PASS canary-legacy-quarantine-preservation-and-candidate-pow-gates
 PASS canary-consumer-and-snapshot-retention-gates
 PASS package-manifest-generation
 RESULT=passed

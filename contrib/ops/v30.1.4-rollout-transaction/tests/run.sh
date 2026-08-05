@@ -4,9 +4,12 @@ umask 077
 export LC_ALL=C TZ=UTC
 
 ROOT=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)
+CANARY=$(realpath "$ROOT/../v30.1.4-canary/node27-v30.1.4-canary.no-spend.sh")
 TMP=$(mktemp -d)
 TMP=$(realpath "$TMP")
 trap 'rm -rf -- "$TMP"' EXIT
+
+(cd "${CANARY%/*}" && sha256sum --strict -c SHA256SUMS >/dev/null)
 RESULTS="$TMP/results.txt"
 : > "$RESULTS"
 UPDATE_MANIFEST=${UPDATE_MANIFEST:-0}
@@ -694,6 +697,104 @@ for required in maintenance-marker-activated.json crash-recovery-procedure.json 
     maintenance-marker-released.json maintenance-state-complete.txt; do
     grep -Fq -- "$required" "$TMP/canary-consumer"
 done
+for required in legacy_baseline_pow_mode legacy_baseline_quarantined_claims \
+    restored_legacy_quarantined_claims legacy_quarantined_claim_count_preserved \
+    legacy_quarantined_claim_resolution_attempted legacy_quarantined_claim_fee_paid \
+    candidate_pow_clean_hashing_verified claim_recovery_fee_baseline \
+    claim_recovery_fee_final baseline-pow.json restored-pow.json \
+    candidate-pow-clean-1.json candidate-pow-clean-2.json; do
+    grep -Fq -- "$required" "$TMP/canary-consumer"
+done
+function_body legacy_pow_snapshot_mode "$CANARY" > "$TMP/legacy-pow-functions"
+function_body legacy_pow_state_matches_baseline "$CANARY" >> "$TMP/legacy-pow-functions"
+function_body restored_runtime_is_ready "$CANARY" >> "$TMP/legacy-pow-functions"
+jq -n '{enabled:true,threads:1,hashrate:10,live_claims:0,quarantined_claims:0}' \
+    > "$TMP/legacy-pow-clean.json"
+jq -n '{enabled:false,threads:0,hashrate:0,live_claims:0,quarantined_claims:1}' \
+    > "$TMP/legacy-pow-quarantined.json"
+jq -n '{enabled:false,threads:0,hashrate:0,live_claims:0,quarantined_claims:2}' \
+    > "$TMP/legacy-pow-quarantine-drift.json"
+jq -n '{enabled:true,threads:1,hashrate:10,live_claims:0,quarantined_claims:1}' \
+    > "$TMP/legacy-pow-unsafe.json"
+jq -n '{chain:"main",initialblockdownload:false,headers:100,blocks:100}' \
+    > "$TMP/legacy-chain-ready.json"
+(
+    # shellcheck disable=SC1091
+    source "$TMP/legacy-pow-functions"
+    [[ "$(legacy_pow_snapshot_mode "$TMP/legacy-pow-clean.json")" == clean-hashing ]]
+    [[ "$(legacy_pow_snapshot_mode "$TMP/legacy-pow-quarantined.json")" == \
+        quarantined-disabled ]]
+    ! legacy_pow_snapshot_mode "$TMP/legacy-pow-quarantine-drift.json" >/dev/null
+    ! legacy_pow_snapshot_mode "$TMP/legacy-pow-unsafe.json" >/dev/null
+    LEGACY_BASELINE_LIVE_CLAIMS=0
+    LEGACY_BASELINE_QUARANTINED_CLAIMS=0
+    LEGACY_BASELINE_POW_MODE=clean-hashing
+    legacy_pow_state_matches_baseline "$TMP/legacy-pow-clean.json"
+    restored_runtime_is_ready "$TMP/legacy-chain-ready.json" "$TMP/legacy-pow-clean.json"
+    ! legacy_pow_state_matches_baseline "$TMP/legacy-pow-quarantined.json"
+    LEGACY_BASELINE_QUARANTINED_CLAIMS=1
+    LEGACY_BASELINE_POW_MODE=quarantined-disabled
+    legacy_pow_state_matches_baseline "$TMP/legacy-pow-quarantined.json"
+    restored_runtime_is_ready "$TMP/legacy-chain-ready.json" \
+        "$TMP/legacy-pow-quarantined.json"
+    ! legacy_pow_state_matches_baseline "$TMP/legacy-pow-quarantine-drift.json"
+)
+function_body published_canary_pow_transition_is_valid "$ROOT/lib/live_checks.sh" \
+    > "$TMP/published-canary-pow-transition"
+jq -n '{legacy_baseline_pow_mode:"quarantined-disabled",
+    legacy_baseline_live_claims:0,legacy_baseline_quarantined_claims:1,
+    restored_legacy_live_claims:0,restored_legacy_quarantined_claims:1,
+    claim_recovery_fee_baseline:0,claim_recovery_fee_final:0}' \
+    > "$TMP/canary-pow-result-quarantined.json"
+jq -n '{legacy_baseline_pow_mode:"clean-hashing",
+    legacy_baseline_live_claims:0,legacy_baseline_quarantined_claims:0,
+    restored_legacy_live_claims:0,restored_legacy_quarantined_claims:0,
+    claim_recovery_fee_baseline:0,claim_recovery_fee_final:0}' \
+    > "$TMP/canary-pow-result-clean.json"
+jq -n '{policy_authoritative:true,policy:{automatic_authorized:false},
+    database_outcome_ambiguous:false,wallet_tip_matches:true,
+    blocking_quarantined_claims:0,blocking_components:0,
+    indeterminate_quarantined_claims:0,pending_manual_resolutions:0,
+    pending_automatic_resolutions:0,confirmed_resolution_fees:0}' \
+    > "$TMP/canary-recovery-clean.json"
+jq -n '{enabled:true,threads:1,cpu_percent:1,hashrate:10,live_claims:0,
+    quarantined_claims:0,blocking_quarantined_claims:0,raw_quarantined_claims:1,
+    claim_recovery_database_outcome_ambiguous:false,
+    allow_automatic_quantum_key_creation:false}' > "$TMP/candidate-pow-clean.json"
+jq '.hashrate=0' "$TMP/candidate-pow-clean.json" > "$TMP/candidate-pow-stopped.json"
+(
+    # shellcheck disable=SC1091
+    source "$TMP/published-canary-pow-transition"
+    published_canary_pow_transition_is_valid \
+        "$TMP/canary-pow-result-quarantined.json" \
+        "$TMP/legacy-pow-quarantined.json" "$TMP/legacy-pow-quarantined.json" \
+        "$TMP/canary-recovery-clean.json" "$TMP/canary-recovery-clean.json" \
+        "$TMP/candidate-pow-clean.json" "$TMP/candidate-pow-clean.json"
+    published_canary_pow_transition_is_valid "$TMP/canary-pow-result-clean.json" \
+        "$TMP/legacy-pow-clean.json" "$TMP/legacy-pow-clean.json" \
+        "$TMP/canary-recovery-clean.json" "$TMP/canary-recovery-clean.json" \
+        "$TMP/candidate-pow-clean.json" "$TMP/candidate-pow-clean.json"
+    ! published_canary_pow_transition_is_valid \
+        "$TMP/canary-pow-result-quarantined.json" \
+        "$TMP/legacy-pow-quarantined.json" "$TMP/legacy-pow-quarantine-drift.json" \
+        "$TMP/canary-recovery-clean.json" "$TMP/canary-recovery-clean.json" \
+        "$TMP/candidate-pow-clean.json" "$TMP/candidate-pow-clean.json"
+    ! published_canary_pow_transition_is_valid \
+        "$TMP/canary-pow-result-quarantined.json" \
+        "$TMP/legacy-pow-quarantined.json" "$TMP/legacy-pow-quarantined.json" \
+        "$TMP/canary-recovery-clean.json" "$TMP/canary-recovery-clean.json" \
+        "$TMP/candidate-pow-clean.json" "$TMP/candidate-pow-stopped.json"
+)
+function_body restore_original "$CANARY" > "$TMP/canary-restore-original"
+assert_order "$TMP/canary-restore-original" \
+    'run_helper "$NORMAL_UNLOCK_HELPER"' \
+    'if [[ "$LEGACY_BASELINE_POW_MODE" == clean-hashing ]]' \
+    'run_helper "$POW_START_HELPER"' \
+    'elif [[ "$LEGACY_BASELINE_POW_MODE" != quarantined-disabled ]]'
+grep -Fq 'legacy_pow_state_matches_baseline "${EVIDENCE}/legacy-prelaunch-pow.json"' "$CANARY"
+grep -Fq 'legacy_quarantined_claim_resolution_attempted:false' "$CANARY"
+grep -Fq 'candidate_pow_clean_hashing_verified:true' "$CANARY"
+pass canary-legacy-quarantine-preservation-and-candidate-pow-gates
 grep -Fq -- \
     'export PUBLISHED_CANARY_RESULT="/mnt/pulsar/Blackcoin_Blocks/operations/releases/v30.1.4-${SOURCE_COMMIT}/node27-canary-__CANARY_TIMESTAMP_YYYYMMDDTHHMMSSZ__/evidence/RESULT.json"' \
     "$ROOT/rollout.env.example"

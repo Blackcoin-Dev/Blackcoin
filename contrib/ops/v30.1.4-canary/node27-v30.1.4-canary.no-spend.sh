@@ -74,6 +74,13 @@ MAINTENANCE_COMPLETE_STATE_SHA=''
 GUARD_IDENTITIES_SHA=''
 SNAPSHOT_COUNT=0
 POW_DRAIN_SEQUENCE=0
+LEGACY_BASELINE_POW_MODE=''
+LEGACY_BASELINE_LIVE_CLAIMS=''
+LEGACY_BASELINE_QUARANTINED_CLAIMS=''
+RESTORED_LEGACY_LIVE_CLAIMS=''
+RESTORED_LEGACY_QUARANTINED_CLAIMS=''
+BASELINE_RECOVERY_FEE=''
+LAST_CONFIRMED_RECOVERY_FEE=''
 
 fail()
 {
@@ -238,8 +245,8 @@ publish_crash_recovery_procedure()
            "Inspect CANDIDATE-LAUNCH-ATTEMPTED.json. If it exists, validate its image, snapshot, hold, nonce, and marker hashes before trusting any rollback evidence.",
            "Disable container restart. If a candidate is running and RPC is safe, stop PoW and require a claim-clean boundary; otherwise contain it without unlocking or fee-paying recovery, then stop it.",
            "When candidate launch was attempted, validate the exact four held snapshot identities, roll back children before parents with plain zfs rollback only, and require zero zfs diff for every dataset. Never use recursive, destructive, or forced rollback flags.",
-           "Recreate node27 only from the pinned base Compose model and original immutable image, then run only the pinned normal-unlock and PoW helpers.",
-           "Prove the original image and invocation, healthy RPC/network/chain, active PoS, clean one-thread PoW, wallet/config/address/key/transaction identity, and exact pre-upgrade data restoration.",
+           "Recreate node27 only from the pinned base Compose model and original immutable image, then run the pinned normal-unlock helper. Run the pinned PoW helper only when baseline-pow.json proves the legacy baseline was clean one-thread hashing; when it proves disabled PoW with zero live claims and exactly one quarantined claim, do not run the PoW helper or attempt claim resolution.",
+           "Prove the original image and invocation, healthy RPC/network/chain, active PoS, either clean one-thread PoW or the exact disabled legacy quarantined-claim count, wallet/config/address/key/transaction identity, and exact pre-upgrade data restoration.",
            "Release transaction-specific snapshot holds, restore ENABLE_GUARD_STARTS, and prove both supervisor guard bytes are still pinned.",
            "Only after every prior proof succeeds may recovery unlink and sync the maintenance marker, atomically set STATE to complete, and publish release evidence. Any uncertainty leaves marker and STATE active."
          ]}
@@ -615,6 +622,9 @@ require_claim_recovery_clean()
                 echo 'claim-recovery fee total changed during the no-spend canary' >&2
                 return 1
             }
+            LAST_CONFIRMED_RECOVERY_FEE=$current_fee
+            install -m 600 -o root -g root "$info" \
+                "${EVIDENCE}/${evidence_prefix}-recovery-clean.json" || return 1
             return 0
         fi
         echo 'blocking claim recovery is present; no-spend canary refuses resolution' >&2
@@ -622,6 +632,62 @@ require_claim_recovery_clean()
     done
     echo 'wallet/chain claim-recovery tips did not converge within 20 minutes' >&2
     return 1
+}
+
+legacy_pow_snapshot_mode()
+{
+    local mining_file="$1"
+    if jq -e '
+        type == "object" and
+        (.enabled | type == "boolean" and . == true) and
+        (.threads | type == "number" and floor == . and . == 1) and
+        (.hashrate | type == "number" and . > 0) and
+        (.live_claims | type == "number" and floor == . and . == 0) and
+        (.quarantined_claims | type == "number" and floor == . and . == 0)
+    ' "$mining_file" >/dev/null; then
+        printf '%s\n' clean-hashing
+        return 0
+    fi
+    if jq -e '
+        type == "object" and
+        (.enabled | type == "boolean" and . == false) and
+        (.live_claims | type == "number" and floor == . and . == 0) and
+        (.quarantined_claims | type == "number" and floor == . and . == 1)
+    ' "$mining_file" >/dev/null; then
+        printf '%s\n' quarantined-disabled
+        return 0
+    fi
+    return 1
+}
+
+legacy_pow_state_matches_baseline()
+{
+    local mining_file="$1"
+    case "$LEGACY_BASELINE_POW_MODE" in
+        clean-hashing)
+            jq -e --argjson live "$LEGACY_BASELINE_LIVE_CLAIMS" \
+                --argjson quarantined "$LEGACY_BASELINE_QUARANTINED_CLAIMS" '
+                type == "object" and
+                (.enabled | type == "boolean" and . == true) and
+                (.threads | type == "number" and floor == . and . == 1) and
+                (.hashrate | type == "number" and . > 0) and
+                (.live_claims | type == "number" and floor == . and . == $live) and
+                (.quarantined_claims | type == "number" and floor == . and
+                    . == $quarantined)
+            ' "$mining_file" >/dev/null
+            ;;
+        quarantined-disabled)
+            jq -e --argjson live "$LEGACY_BASELINE_LIVE_CLAIMS" \
+                --argjson quarantined "$LEGACY_BASELINE_QUARANTINED_CLAIMS" '
+                type == "object" and
+                (.enabled | type == "boolean" and . == false) and
+                (.live_claims | type == "number" and floor == . and . == $live) and
+                (.quarantined_claims | type == "number" and floor == . and
+                    . == $quarantined)
+            ' "$mining_file" >/dev/null
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 pow_drain_is_clean()
@@ -760,11 +826,7 @@ restored_runtime_is_ready()
         (.blocks | type == "number" and floor == .) and
         .headers >= .blocks and (.headers - .blocks) <= 2
     ' "$chain_file" >/dev/null &&
-        jq -e '
-            .enabled == true and .threads == 1 and .hashrate > 0 and
-            (.live_claims | type == "number" and floor == . and . == 0) and
-            (.quarantined_claims | type == "number" and floor == . and . == 0)
-        ' "$mining_file" >/dev/null
+        legacy_pow_state_matches_baseline "$mining_file"
 }
 
 wait_restored_runtime_gate()
@@ -777,21 +839,19 @@ wait_restored_runtime_gate()
             sleep 5
             continue
         fi
-        if jq -e '(.quarantined_claims | type == "number" and . > 0)' \
-            "$mining" >/dev/null; then
-            echo 'restored 30.1.3 node reports quarantined PoW claims' >&2
-            return 1
-        fi
         if restored_runtime_is_ready "$chain" "$mining"; then
             install -m 600 -o root -g root "$chain" "${EVIDENCE}/restored-blockchain.json" ||
                 return 1
             install -m 600 -o root -g root "$mining" "${EVIDENCE}/restored-pow.json" ||
                 return 1
+            RESTORED_LEGACY_LIVE_CLAIMS=$(jq -er '.live_claims' "$mining") || return 1
+            RESTORED_LEGACY_QUARANTINED_CLAIMS=$(jq -er '.quarantined_claims' "$mining") ||
+                return 1
             return 0
         fi
         sleep 5
     done
-    echo 'restored 30.1.3 chain and PoW did not converge within 20 minutes' >&2
+    echo 'restored 30.1.3 chain and baseline PoW state did not converge within 20 minutes' >&2
     return 1
 }
 
@@ -1129,7 +1189,11 @@ restore_original()
     fi
     if (( restore_rc == 0 )); then
         run_helper "$NORMAL_UNLOCK_HELPER" "$NORMAL_UNLOCK_HELPER_SHA" || restore_rc=1
-        run_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA" || restore_rc=1
+        if [[ "$LEGACY_BASELINE_POW_MODE" == clean-hashing ]]; then
+            run_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA" || restore_rc=1
+        elif [[ "$LEGACY_BASELINE_POW_MODE" != quarantined-disabled ]]; then
+            restore_rc=1
+        fi
     fi
     if (( restore_rc == 0 )); then
         local restored_image restored_id
@@ -1378,7 +1442,16 @@ for sample in $(seq 1 12); do
 done
 (( baseline_staking_ok == 1 )) || fail 'baseline staking is not active'
 jq -e '.unlocked_until > now' "${EVIDENCE}/baseline-wallet.json" >/dev/null || fail 'baseline wallet is not normally unlocked'
-jq -e '.enabled == true and .threads == 1 and .hashrate > 0 and .live_claims == 0 and .quarantined_claims == 0' "${EVIDENCE}/baseline-pow.json" >/dev/null || fail 'baseline PoW is not clean and hashing'
+LEGACY_BASELINE_POW_MODE=$(legacy_pow_snapshot_mode "${EVIDENCE}/baseline-pow.json") ||
+    fail 'baseline PoW is neither clean one-thread hashing nor the expected single disabled legacy quarantine'
+LEGACY_BASELINE_LIVE_CLAIMS=$(jq -er \
+    '.live_claims | select(type == "number" and floor == . and . == 0)' \
+    "${EVIDENCE}/baseline-pow.json") || fail 'baseline live-claim count is invalid'
+LEGACY_BASELINE_QUARANTINED_CLAIMS=$(jq -er \
+    '.quarantined_claims | select(type == "number" and floor == . and . >= 0)' \
+    "${EVIDENCE}/baseline-pow.json") || fail 'baseline quarantined-claim count is invalid'
+legacy_pow_state_matches_baseline "${EVIDENCE}/baseline-pow.json" ||
+    fail 'baseline PoW mode and claim counters are inconsistent'
 
 # Validate that the exact published binaries can execute without network or
 # wallet/data access before touching the live container.
@@ -1408,9 +1481,15 @@ install -m 600 "${HOST_DATADIR}/backups/${HOT_BACKUP}" "${OPS}/wallet-hot.dat"
 sha256sum "${OPS}/wallet-hot.dat" >"${EVIDENCE}/wallet-hot.sha256"
 
 suspend_guard_starts || fail 'could not durably suspend automatic-start authority'
-if ! stop_and_drain_candidate_pow; then
-    run_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA" || true
-    fail 'original node could not reach a no-spend claim-clean stop boundary'
+if [[ "$LEGACY_BASELINE_POW_MODE" == clean-hashing ]]; then
+    if ! stop_and_drain_candidate_pow; then
+        run_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA" || true
+        fail 'original node could not reach a no-spend claim-clean stop boundary'
+    fi
+else
+    rpc getpowmininginfo >"${EVIDENCE}/legacy-prelaunch-pow.json"
+    legacy_pow_state_matches_baseline "${EVIDENCE}/legacy-prelaunch-pow.json" ||
+        fail 'disabled legacy quarantine changed before candidate launch'
 fi
 rpc listtransactions '*' 1000000 0 true | jq -S '[.[].txid] | unique | sort' \
     >"${EVIDENCE}/prelaunch-transaction-txids.json"
@@ -1632,8 +1711,20 @@ done
 pow_ok=0
 for sample in $(seq 1 20); do
     rpc getpowmininginfo >"${EVIDENCE}/candidate-pow-sample-${sample}.json"
-    if jq -e '.enabled == true and .threads == 1 and .cpu_percent == 1 and .hashrate > 0 and .live_claims == 0 and .quarantined_claims == 0 and .blocking_quarantined_claims == 0 and .raw_quarantined_claims >= 0 and .claim_recovery_database_outcome_ambiguous == false and .allow_automatic_quantum_key_creation == false' \
+    if jq -e '.enabled == true and
+        (.threads | type == "number" and floor == . and . == 1) and
+        (.cpu_percent | type == "number" and . == 1) and
+        (.hashrate | type == "number" and . > 0) and
+        (.live_claims | type == "number" and floor == . and . == 0) and
+        (.quarantined_claims | type == "number" and floor == . and . == 0) and
+        (.blocking_quarantined_claims | type == "number" and floor == . and . == 0) and
+        (.raw_quarantined_claims | type == "number" and floor == . and . >= 0) and
+        .claim_recovery_database_outcome_ambiguous == false and
+        .allow_automatic_quantum_key_creation == false' \
         "${EVIDENCE}/candidate-pow-sample-${sample}.json" >/dev/null; then
+        install -m 600 -o root -g root \
+            "${EVIDENCE}/candidate-pow-sample-${sample}.json" \
+            "${EVIDENCE}/candidate-pow-clean-1.json"
         pow_ok=1
         break
     fi
@@ -1707,8 +1798,20 @@ done
 second_pow_ok=0
 for sample in $(seq 1 20); do
     rpc getpowmininginfo >"${EVIDENCE}/candidate-pow-2-sample-${sample}.json"
-    if jq -e '.enabled == true and .threads == 1 and .cpu_percent == 1 and .hashrate > 0 and .live_claims == 0 and .quarantined_claims == 0 and .blocking_quarantined_claims == 0 and .raw_quarantined_claims >= 0 and .claim_recovery_database_outcome_ambiguous == false and .allow_automatic_quantum_key_creation == false' \
+    if jq -e '.enabled == true and
+        (.threads | type == "number" and floor == . and . == 1) and
+        (.cpu_percent | type == "number" and . == 1) and
+        (.hashrate | type == "number" and . > 0) and
+        (.live_claims | type == "number" and floor == . and . == 0) and
+        (.quarantined_claims | type == "number" and floor == . and . == 0) and
+        (.blocking_quarantined_claims | type == "number" and floor == . and . == 0) and
+        (.raw_quarantined_claims | type == "number" and floor == . and . >= 0) and
+        .claim_recovery_database_outcome_ambiguous == false and
+        .allow_automatic_quantum_key_creation == false' \
         "${EVIDENCE}/candidate-pow-2-sample-${sample}.json" >/dev/null; then
+        install -m 600 -o root -g root \
+            "${EVIDENCE}/candidate-pow-2-sample-${sample}.json" \
+            "${EVIDENCE}/candidate-pow-clean-2.json"
         second_pow_ok=1
         break
     fi
@@ -1741,6 +1844,12 @@ release_canary_maintenance_marker ||
    ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" &&
    "$(cat "$CANARY_STATE")" == complete ]] ||
     fail 'canary maintenance release proof is incomplete'
+[[ "$RESTORED_LEGACY_LIVE_CLAIMS" == "$LEGACY_BASELINE_LIVE_CLAIMS" &&
+   "$RESTORED_LEGACY_QUARANTINED_CLAIMS" == "$LEGACY_BASELINE_QUARANTINED_CLAIMS" ]] ||
+    fail 'restored legacy PoW claim counts differ from the pre-upgrade baseline'
+[[ -n "$LAST_CONFIRMED_RECOVERY_FEE" &&
+   "$LAST_CONFIRMED_RECOVERY_FEE" == "$BASELINE_RECOVERY_FEE" ]] ||
+    fail 'final candidate claim-recovery fee does not match its locked baseline'
 
 jq -n \
     --argjson schema 1 \
@@ -1758,6 +1867,7 @@ jq -n \
     --arg launch_marker_sha "$CANDIDATE_LAUNCH_MARKER_SHA" \
     --arg prelaunch_transaction_set_sha "$PRELAUNCH_TRANSACTION_SET_SHA" \
     --arg locked_candidate_transaction_set_sha "$LOCKED_CANDIDATE_TRANSACTION_SET_SHA" \
+    --arg legacy_baseline_pow_mode "$LEGACY_BASELINE_POW_MODE" \
     --arg maintenance_marker "$ROLLOUT_MAINTENANCE_MARKER" \
     --arg maintenance_run_dir "$OPS" \
     --arg maintenance_nonce_sha "$MAINTENANCE_NONCE_SHA" \
@@ -1778,6 +1888,12 @@ jq -n \
     --argjson first_height "$FIRST_HEIGHT" \
     --argjson second_height "$SECOND_HEIGHT" \
     --argjson staking_samples "$staking_ok" \
+    --argjson legacy_baseline_live_claims "$LEGACY_BASELINE_LIVE_CLAIMS" \
+    --argjson legacy_baseline_quarantined_claims "$LEGACY_BASELINE_QUARANTINED_CLAIMS" \
+    --argjson restored_legacy_live_claims "$RESTORED_LEGACY_LIVE_CLAIMS" \
+    --argjson restored_legacy_quarantined_claims "$RESTORED_LEGACY_QUARANTINED_CLAIMS" \
+    --argjson claim_recovery_fee_baseline "$BASELINE_RECOVERY_FEE" \
+    --argjson claim_recovery_fee_final "$LAST_CONFIRMED_RECOVERY_FEE" \
     '{schema:$schema,node:$node,result:$result,source_sha:$source_sha,candidate_mode:$candidate_mode,
       candidate_image:$candidate_image,candidate_image_id:$candidate_image_id,
       timestamp:$stamp,development_recipient:$dev_recipient,
@@ -1791,6 +1907,17 @@ jq -n \
       second_height:$second_height,active_staking_samples:$staking_samples,
       rolled_back_to:"30.1.3",same_effective_entrypoint:true,
       fee_payments_authorized:false,claim_recovery_fee_unchanged:true,
+      claim_recovery_fee_baseline:$claim_recovery_fee_baseline,
+      claim_recovery_fee_final:$claim_recovery_fee_final,
+      legacy_baseline_pow_mode:$legacy_baseline_pow_mode,
+      legacy_baseline_live_claims:$legacy_baseline_live_claims,
+      legacy_baseline_quarantined_claims:$legacy_baseline_quarantined_claims,
+      restored_legacy_live_claims:$restored_legacy_live_claims,
+      restored_legacy_quarantined_claims:$restored_legacy_quarantined_claims,
+      legacy_quarantined_claim_count_preserved:true,
+      legacy_quarantined_claim_resolution_attempted:false,
+      legacy_quarantined_claim_fee_paid:false,
+      candidate_pow_clean_hashing_verified:true,
       recovery_fee_baseline_established_while_wallet_locked:true,
       locked_candidate_transaction_set_unchanged:true,
       prelaunch_transaction_set_sha256:$prelaunch_transaction_set_sha,

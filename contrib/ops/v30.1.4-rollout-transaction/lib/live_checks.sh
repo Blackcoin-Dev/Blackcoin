@@ -27,10 +27,70 @@ verify_image_identity()
     [[ "$daemon_hash" == "$BLACKCOIND_SHA256" && "$cli_hash" == "$BLACKCOIN_CLI_SHA256" ]]
 }
 
+published_canary_pow_transition_is_valid()
+{
+    local result_file="$1" baseline_file="$2" restored_file="$3"
+    local fee_baseline_file="$4" fee_final_file="$5" pow_first_file="$6" pow_second_file="$7"
+    jq -en --slurpfile result "$result_file" \
+        --slurpfile baseline "$baseline_file" --slurpfile restored "$restored_file" \
+        --slurpfile fee_baseline "$fee_baseline_file" --slurpfile fee_final "$fee_final_file" \
+        --slurpfile pow_first "$pow_first_file" --slurpfile pow_second "$pow_second_file" '
+        def legacy_clean:
+          type == "object" and .enabled == true and
+          (.threads | type == "number" and floor == . and . == 1) and
+          (.hashrate | type == "number" and . > 0) and
+          (.live_claims | type == "number" and floor == . and . == 0) and
+          (.quarantined_claims | type == "number" and floor == . and . == 0);
+        def legacy_quarantined($count):
+          type == "object" and .enabled == false and
+          (.live_claims | type == "number" and floor == . and . == 0) and
+          (.quarantined_claims | type == "number" and floor == . and . == $count);
+        def candidate_clean:
+          type == "object" and .enabled == true and
+          (.threads | type == "number" and floor == . and . == 1) and
+          (.cpu_percent | type == "number" and . == 1) and
+          (.hashrate | type == "number" and . > 0) and
+          (.live_claims | type == "number" and floor == . and . == 0) and
+          (.quarantined_claims | type == "number" and floor == . and . == 0) and
+          (.blocking_quarantined_claims | type == "number" and floor == . and . == 0) and
+          (.raw_quarantined_claims | type == "number" and floor == . and . >= 0) and
+          .claim_recovery_database_outcome_ambiguous == false and
+          .allow_automatic_quantum_key_creation == false;
+        def recovery_clean($fee):
+          type == "object" and .policy_authoritative == true and
+          .policy.automatic_authorized == false and
+          .database_outcome_ambiguous == false and .wallet_tip_matches == true and
+          .blocking_quarantined_claims == 0 and .blocking_components == 0 and
+          .indeterminate_quarantined_claims == 0 and
+          .pending_manual_resolutions == 0 and .pending_automatic_resolutions == 0 and
+          (.confirmed_resolution_fees | type == "number" and . == $fee);
+        ($result | length) == 1 and ($baseline | length) == 1 and
+        ($restored | length) == 1 and ($fee_baseline | length) == 1 and
+        ($fee_final | length) == 1 and ($pow_first | length) == 1 and
+        ($pow_second | length) == 1 and
+        ($result[0] as $r |
+          $baseline[0].live_claims == $r.legacy_baseline_live_claims and
+          $baseline[0].quarantined_claims == $r.legacy_baseline_quarantined_claims and
+          $restored[0].live_claims == $r.restored_legacy_live_claims and
+          $restored[0].quarantined_claims == $r.restored_legacy_quarantined_claims and
+          (if $r.legacy_baseline_pow_mode == "clean-hashing" then
+             ($baseline[0] | legacy_clean) and ($restored[0] | legacy_clean)
+           else
+             ($baseline[0] | legacy_quarantined($r.legacy_baseline_quarantined_claims)) and
+             ($restored[0] | legacy_quarantined($r.legacy_baseline_quarantined_claims))
+           end) and
+          ($fee_baseline[0] | recovery_clean($r.claim_recovery_fee_baseline)) and
+          ($fee_final[0] | recovery_clean($r.claim_recovery_fee_final)) and
+          ($pow_first[0] | candidate_clean) and ($pow_second[0] | candidate_clean))
+    ' >/dev/null
+}
+
 verify_published_canary()
 {
     local evidence_dir ops_dir stamp actual_result_sha actual_manifest_sha protected suffix
     local identity_file restore_file launch_file prelaunch_txids_file locked_txids_file
+    local baseline_pow_file restored_pow_file recovery_fee_baseline_file recovery_fee_final_file
+    local candidate_pow_first_file candidate_pow_second_file
     local activation_file nonce_evidence_file active_state_file release_file complete_state_file
     local recovery_file guard_identities_file nonce_file state_file parent_recovery_file nonce
     local identity_sha restore_sha launch_sha expected_identity_sha expected_restore_sha
@@ -101,6 +161,29 @@ verify_published_canary()
         .candidate_image_id == $image_id and .rolled_back_to == "30.1.3" and
         .same_effective_entrypoint == true and .fee_payments_authorized == false and
         .claim_recovery_fee_unchanged == true and .wallet_identity_unchanged == true and
+        (.claim_recovery_fee_baseline | type) == "number" and
+        (.claim_recovery_fee_final | type) == "number" and
+        .claim_recovery_fee_baseline >= 0 and
+        .claim_recovery_fee_final == .claim_recovery_fee_baseline and
+        (.legacy_baseline_pow_mode == "clean-hashing" or
+          .legacy_baseline_pow_mode == "quarantined-disabled") and
+        (.legacy_baseline_live_claims | type) == "number" and
+        .legacy_baseline_live_claims == 0 and
+        (.legacy_baseline_quarantined_claims | type) == "number" and
+        (.legacy_baseline_quarantined_claims | floor == .) and
+        (if .legacy_baseline_pow_mode == "clean-hashing" then
+           .legacy_baseline_quarantined_claims == 0
+         else .legacy_baseline_quarantined_claims == 1 end) and
+        (.restored_legacy_live_claims | type) == "number" and
+        (.restored_legacy_live_claims | floor == .) and
+        (.restored_legacy_quarantined_claims | type) == "number" and
+        (.restored_legacy_quarantined_claims | floor == .) and
+        .restored_legacy_live_claims == .legacy_baseline_live_claims and
+        .restored_legacy_quarantined_claims == .legacy_baseline_quarantined_claims and
+        .legacy_quarantined_claim_count_preserved == true and
+        .legacy_quarantined_claim_resolution_attempted == false and
+        .legacy_quarantined_claim_fee_paid == false and
+        .candidate_pow_clean_hashing_verified == true and
         .configuration_identity_unchanged == true and .reindex_observed == false and
         .reindex_or_replay_rebuild_observed == false and
         .recovery_fee_baseline_established_while_wallet_locked == true and
@@ -165,6 +248,12 @@ verify_published_canary()
     launch_file="$evidence_dir/CANDIDATE-LAUNCH-ATTEMPTED.json"
     prelaunch_txids_file="$evidence_dir/prelaunch-transaction-txids.json"
     locked_txids_file="$evidence_dir/candidate-preactivation-transaction-txids.json"
+    baseline_pow_file="$evidence_dir/baseline-pow.json"
+    restored_pow_file="$evidence_dir/restored-pow.json"
+    recovery_fee_baseline_file="$evidence_dir/candidate-recovery-fee-baseline.json"
+    recovery_fee_final_file="$evidence_dir/candidate-pre-rollback-recovery-clean.json"
+    candidate_pow_first_file="$evidence_dir/candidate-pow-clean-1.json"
+    candidate_pow_second_file="$evidence_dir/candidate-pow-clean-2.json"
     activation_file="$evidence_dir/maintenance-marker-activated.json"
     nonce_evidence_file="$evidence_dir/maintenance-nonce.txt"
     active_state_file="$evidence_dir/maintenance-state-active.txt"
@@ -177,6 +266,8 @@ verify_published_canary()
     parent_recovery_file="$ops_dir/CRASH-RECOVERY.json"
     for protected in "$identity_file" "$restore_file" "$launch_file" \
         "$prelaunch_txids_file" "$locked_txids_file" "$activation_file" \
+        "$baseline_pow_file" "$restored_pow_file" "$recovery_fee_baseline_file" \
+        "$recovery_fee_final_file" "$candidate_pow_first_file" "$candidate_pow_second_file" \
         "$nonce_evidence_file" "$active_state_file" "$release_file" \
         "$complete_state_file" "$recovery_file" "$guard_identities_file" \
         "$nonce_file" "$state_file" "$parent_recovery_file"; do
@@ -236,6 +327,10 @@ verify_published_canary()
         cmp -s "$protected" <(jq -S . "$protected") || return 1
     done
     cmp -s "$prelaunch_txids_file" "$locked_txids_file" || return 1
+    published_canary_pow_transition_is_valid "$PUBLISHED_CANARY_RESULT" \
+        "$baseline_pow_file" "$restored_pow_file" "$recovery_fee_baseline_file" \
+        "$recovery_fee_final_file" "$candidate_pow_first_file" "$candidate_pow_second_file" ||
+        return 1
     [[ "$(wc -l < "$identity_file" | awk '{print $1}')" == 4 &&
        "$(awk -F '\t' 'NF == 4 {count++} END {print count+0}' "$identity_file")" == 4 &&
        "$(wc -l < "$restore_file" | awk '{print $1}')" == 4 &&
@@ -303,8 +398,8 @@ verify_published_canary()
             "Inspect CANDIDATE-LAUNCH-ATTEMPTED.json. If it exists, validate its image, snapshot, hold, nonce, and marker hashes before trusting any rollback evidence.",
             "Disable container restart. If a candidate is running and RPC is safe, stop PoW and require a claim-clean boundary; otherwise contain it without unlocking or fee-paying recovery, then stop it.",
             "When candidate launch was attempted, validate the exact four held snapshot identities, roll back children before parents with plain zfs rollback only, and require zero zfs diff for every dataset. Never use recursive, destructive, or forced rollback flags.",
-            "Recreate node27 only from the pinned base Compose model and original immutable image, then run only the pinned normal-unlock and PoW helpers.",
-            "Prove the original image and invocation, healthy RPC/network/chain, active PoS, clean one-thread PoW, wallet/config/address/key/transaction identity, and exact pre-upgrade data restoration.",
+            "Recreate node27 only from the pinned base Compose model and original immutable image, then run the pinned normal-unlock helper. Run the pinned PoW helper only when baseline-pow.json proves the legacy baseline was clean one-thread hashing; when it proves disabled PoW with zero live claims and exactly one quarantined claim, do not run the PoW helper or attempt claim resolution.",
+            "Prove the original image and invocation, healthy RPC/network/chain, active PoS, either clean one-thread PoW or the exact disabled legacy quarantined-claim count, wallet/config/address/key/transaction identity, and exact pre-upgrade data restoration.",
             "Release transaction-specific snapshot holds, restore ENABLE_GUARD_STARTS, and prove both supervisor guard bytes are still pinned.",
             "Only after every prior proof succeeds may recovery unlink and sync the maintenance marker, atomically set STATE to complete, and publish release evidence. Any uncertainty leaves marker and STATE active."
           ]}

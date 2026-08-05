@@ -28,8 +28,32 @@ PINNED_IDENTITY_EXCEPTIONS = {
     # its numeric noreply address was configured. Keep this exception scoped to
     # the immutable commit; do not accept the legacy address generally.
     "4f87d05a741013d1e55fd9caa1c2a1cc4a6e570d": (
-        "Blackcoin-Dev",
-        "Blackcoin-Dev@users.noreply.github.com",
+        ("Blackcoin-Dev", "Blackcoin-Dev@users.noreply.github.com"),
+        ("Blackcoin-Dev", "Blackcoin-Dev@users.noreply.github.com"),
+    ),
+    # GitHub creates verified merge commits with the initiating account as the
+    # author and its own signing identity as the committer. These exact objects
+    # are the reviewed release-line merges; accepting the identities generally
+    # would let an unrelated GitHub merge satisfy the release-history policy.
+    "957b41d22c8d96131a0ec87fff1e2f4c20a5caa2": (
+        (EXPECTED_NAME, EXPECTED_EMAIL),
+        ("GitHub", "noreply@github.com"),
+    ),
+    "f06033966ccc1ad8ba2b3329f3af69cd9c99acb9": (
+        (EXPECTED_NAME, EXPECTED_EMAIL),
+        ("GitHub", "noreply@github.com"),
+    ),
+    "39ac8f41b0904a6c9db37cde6a2a9670bb11f6a5": (
+        (EXPECTED_NAME, EXPECTED_EMAIL),
+        ("GitHub", "noreply@github.com"),
+    ),
+    "ac4f2e1718023c82ea2cd087f4a355609453f09d": (
+        (EXPECTED_NAME, EXPECTED_EMAIL),
+        ("GitHub", "noreply@github.com"),
+    ),
+    "8e0db55a05ed03fba80bbd2e7ddfebef581043ae": (
+        (EXPECTED_NAME, EXPECTED_EMAIL),
+        ("GitHub", "noreply@github.com"),
     ),
 }
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -64,19 +88,16 @@ def verify_commit(commit):
     author_name, author_email, committer_name, committer_email, message = fields
     expected = (EXPECTED_NAME, EXPECTED_EMAIL)
     pinned_expected = PINNED_IDENTITY_EXCEPTIONS.get(commit)
+    expected_author, expected_committer = pinned_expected or (expected, expected)
     author = (author_name, author_email)
     committer = (committer_name, committer_email)
-    if author != expected and author != pinned_expected:
+    if author != expected_author:
         raise RuntimeError(
             f"{commit} author is {author_name} <{author_email}>; expected the release team identity"
         )
-    if committer != expected and committer != pinned_expected:
+    if committer != expected_committer:
         raise RuntimeError(
             f"{commit} committer is {committer_name} <{committer_email}>; expected the release team identity"
-        )
-    if pinned_expected is not None and author != committer:
-        raise RuntimeError(
-            f"{commit} must use the same pinned release team identity for author and committer"
         )
     for line in message.splitlines():
         if ATTRIBUTION_TRAILER_RE.match(line.strip()):

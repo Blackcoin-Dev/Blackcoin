@@ -39,6 +39,11 @@ class ListTransactionsTest(BitcoinTestFramework):
         def submit_wallet_tx(from_node, to_node, txid):
             if txid not in to_node.getrawmempool():
                 to_node.sendrawtransaction(from_node.gettransaction(txid)["hex"])
+            # sendrawtransaction returns after mempool acceptance, before the
+            # receiving wallet's validation-interface callback is guaranteed
+            # to run. This test checks wallet accounting, not notification
+            # timing, so flush the callback queue before listtransactions.
+            to_node.syncwithvalidationinterfacequeue()
 
         self.log.info("Test simple send from node0 to node1")
         txid = self.nodes[0].sendtoaddress(self.nodes[1].getnewaddress(), 0.1)

@@ -168,8 +168,23 @@ acquire_inhibitor_locks()
     [[ ! -L "$ENDPOINT_LOCK" && ! -L "$CUTOVER_LOCK" && ! -L "$CYCLE_LOCK" &&
        ! -L "$WALLET_LOCK" && ! -L "$TRANSITION_LOCK" && ! -L "$FREE_CLAIM_LOCK" ]] ||
         return 1
-    exec 12>"$ENDPOINT_LOCK"
-    flock -w 1800 12 || return 1
+    case "${INHERITED_ENDPOINT_LOCK_FD:-}" in
+        '')
+            exec 12>"$ENDPOINT_LOCK"
+            flock -w 1800 12 || return 1
+            ;;
+        20)
+            # A root operator may hand the already-held endpoint lock from the
+            # reserved maintenance shell to this transaction.  Duplicating the
+            # inherited open-file description avoids an unlock/relock race with
+            # a queued supervisor.  No arbitrary descriptor is accepted.
+            [[ "$(readlink -f "/proc/$$/fd/20" 2>/dev/null || true)" == \
+               "$ENDPOINT_LOCK" ]] || return 1
+            exec 12>&20
+            flock -n 12 || return 1
+            ;;
+        *) return 1 ;;
+    esac
     exec 13>"$CUTOVER_LOCK"
     flock -w 1800 13 || return 1
     exec 9>"$CYCLE_LOCK"
@@ -300,7 +315,7 @@ emergency_contain()
         "$broadcast_count"
 }
 
-for command in awk chmod chown cmp date find flock install jq mktemp mv realpath rm sha256sum sort stat sync wc; do
+for command in awk chmod chown cmp date find flock install jq mktemp mv readlink realpath rm sha256sum sort stat sync wc; do
     command -v "$command" >/dev/null 2>&1 || die "required command unavailable: $command"
 done
 

@@ -3,17 +3,22 @@ name: v30.1.4 signed maintenance release build
 on:
   workflow_dispatch:
     inputs:
+      publication_recovery:
+        description: Recover the immutable v30.1.4 signed-tag publication (exact pins only)
+        required: true
+        default: false
+        type: boolean
       target_sha:
-        description: Full 40-character commit SHA to build
+        description: Full 40-character commit SHA (must be the frozen v30.1.4 SHA for recovery)
         required: true
         type: string
       package_label:
-        description: Explicit unpublished prerelease label (must match source RC)
+        description: Prerelease label, or exactly 30.1.4 for publication recovery
         required: true
         default: 30.1.4-alpha1
         type: string
       target:
-        description: Build target to run (manual runs never publish)
+        description: Build target (recovery requires all; other manual runs never publish)
         required: true
         type: choice
         default: all
@@ -52,12 +57,31 @@ jobs:
       target: ${{ steps.resolve.outputs.target }}
       publish: ${{ steps.resolve.outputs.publish }}
       tag: ${{ steps.resolve.outputs.tag }}
+      recovery: ${{ steps.resolve.outputs.recovery }}
+      control_workflow_sha: ${{ steps.resolve.outputs.control_workflow_sha }}
+      control_workflow_ref: ${{ steps.resolve.outputs.control_workflow_ref }}
+      control_workflow_event: ${{ steps.resolve.outputs.control_workflow_event }}
+      control_tag_object_sha: ${{ steps.resolve.outputs.control_tag_object_sha }}
     steps:
       - name: Checkout requested target
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.publication_recovery && '13262151077cce3f72d07d17dc7725b2b6a8e1ab' || (github.event_name == 'workflow_dispatch' && inputs.target_sha || github.ref) }}
           fetch-depth: 0
+          fetch-tags: true
+
+      - name: Checkout the pinned corrected identity verifier from main
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publication_recovery }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: 6e1fe69700e3c6495ddbd5d3746d6d91d8b26538
+          fetch-depth: 1
+          persist-credentials: false
+          path: .release-recovery-tools
+          sparse-checkout: |
+            ci/release/blackcoin-dev-release-signing.allowed_signers
+            ci/release/verify_source_identity.py
+          sparse-checkout-cone-mode: false
 
       - id: resolve
         name: Verify identity, tag, version, and exact SHA
@@ -66,11 +90,21 @@ jobs:
           REQUESTED_SHA: ${{ inputs.target_sha }}
           REQUESTED_PACKAGE_LABEL: ${{ inputs.package_label }}
           REQUESTED_TARGET: ${{ inputs.target }}
+          REQUESTED_RECOVERY: ${{ inputs.publication_recovery }}
           CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
           EVENT_SHA: ${{ github.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          FROZEN_SOURCE_SHA=13262151077cce3f72d07d17dc7725b2b6a8e1ab
+          FROZEN_TAG_OBJECT_SHA=efe2b2d55355474fc7803f57d94df3579b8b84cb
+          CONTROL_TAG=v30.1.4-publication-recovery-1
+          CONTROL_BASE_SHA=19baffef25af36e177db2975780e0641b59753aa
+          IDENTITY_TOOLS_SHA=6e1fe69700e3c6495ddbd5d3746d6d91d8b26538
+          IDENTITY_VERIFIER_SHA256=68aaef3472ce552d1f261652e9b751f81073740f842574cf832fa8cd6ad6f462
+          ALLOWED_SIGNERS_SHA256=4625f57db75b831cd947cee314b5b2ff5c3f79fdbfa29d64fbb8882d599e8451
+          RECOVERY=false
+          CONTROL_TAG_OBJECT_SHA=
           TARGET_SHA=$(git rev-parse HEAD)
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
           MAJOR=$(sed -n "s/^define(_CLIENT_VERSION_MAJOR, \([0-9]*\))$/\1/p" configure.ac)
@@ -89,7 +123,157 @@ jobs:
             CONFIGURED_VERSION="${BASE_VERSION}rc${RC}"
           fi
 
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$REQUESTED_RECOVERY" == "true" ]]; then
+            RECOVERY=true
+            test "$GITHUB_REPOSITORY" = Blackcoin-Dev/Blackcoin
+            test "$GITHUB_ACTOR" = Blackcoin-Dev
+            test "$GITHUB_REF" = "refs/tags/$CONTROL_TAG"
+            test "$GITHUB_REF_NAME" = "$CONTROL_TAG"
+            test "$GITHUB_REF_TYPE" = tag
+            [[ "$CALLER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$CALLER_WORKFLOW_SHA" = "$EVENT_SHA" || {
+              echo "::error::The recovery workflow and selected control-tag revision differ"
+              exit 1
+            }
+            test "$REQUESTED_SHA" = "$FROZEN_SOURCE_SHA"
+            test "$TARGET_SHA" = "$FROZEN_SOURCE_SHA"
+            test "$REQUESTED_PACKAGE_LABEL" = 30.1.4
+            test "$REQUESTED_TARGET" = all
+            test "$BASE_VERSION" = 30.1.4
+            test "$RC" = 0
+            test "$IS_RELEASE" = true
+            test "$(git rev-parse "refs/tags/v30.1.4^{tag}")" = "$FROZEN_TAG_OBJECT_SHA"
+            test "$(git rev-parse "refs/tags/v30.1.4^{commit}")" = "$FROZEN_SOURCE_SHA"
+            CONTROL_TAG_OBJECT_SHA=$(git rev-parse "refs/tags/$CONTROL_TAG^{tag}")
+            [[ "$CONTROL_TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$(git rev-parse "refs/tags/$CONTROL_TAG^{commit}")" = "$CALLER_WORKFLOW_SHA"
+            mapfile -t control_parents < <(git rev-parse "$CALLER_WORKFLOW_SHA^@")
+            test "${#control_parents[@]}" = 1
+            test "${control_parents[0]}" = "$CONTROL_BASE_SHA"
+            git merge-base --is-ancestor "$CONTROL_BASE_SHA" "$CALLER_WORKFLOW_SHA"
+            test "$(git rev-list --count "$CONTROL_BASE_SHA..$CALLER_WORKFLOW_SHA")" = 1
+            mapfile -t control_paths < <(git diff --name-only "$CONTROL_BASE_SHA" "$CALLER_WORKFLOW_SHA")
+            test "${#control_paths[@]}" = 1
+            test "${control_paths[0]}" = .github/workflows/build.yml
+
+            test "$(git -C .release-recovery-tools rev-parse HEAD)" = "$IDENTITY_TOOLS_SHA"
+            printf '%s  %s\n' \
+              "$IDENTITY_VERIFIER_SHA256" \
+              .release-recovery-tools/ci/release/verify_source_identity.py \
+              "$ALLOWED_SIGNERS_SHA256" \
+              .release-recovery-tools/ci/release/blackcoin-dev-release-signing.allowed_signers \
+              | sha256sum --check --strict
+
+            CONTROL_TAG="$CONTROL_TAG" CALLER_WORKFLOW_SHA="$CALLER_WORKFLOW_SHA" python3 - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+
+          verifier_path = Path(".release-recovery-tools/ci/release/verify_source_identity.py")
+          spec = importlib.util.spec_from_file_location("recovery_identity", verifier_path)
+          verifier = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(verifier)
+          verifier.verify_tag(
+              os.environ["CONTROL_TAG"],
+              os.environ["CALLER_WORKFLOW_SHA"],
+              verifier.EXPECTED_SSH_FINGERPRINT,
+          )
+          verifier.verify_ssh_signature(
+              os.environ["CALLER_WORKFLOW_SHA"],
+              "commit",
+              verifier.EXPECTED_SSH_FINGERPRINT,
+          )
+          PY
+
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$CALLER_WORKFLOW_SHA" > control-commit.json
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$CONTROL_TAG" > control-tag-ref.json
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/$CONTROL_TAG_OBJECT_SHA" > control-tag.json
+            gh api "repos/$GITHUB_REPOSITORY/compare/$CONTROL_BASE_SHA...$CALLER_WORKFLOW_SHA" > control-base.json
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$IDENTITY_TOOLS_SHA" > tools-commit.json
+            gh api "repos/$GITHUB_REPOSITORY/compare/$IDENTITY_TOOLS_SHA...$CONTROL_BASE_SHA" > tools-base.json
+            CALLER_WORKFLOW_SHA="$CALLER_WORKFLOW_SHA" \
+              CONTROL_TAG="$CONTROL_TAG" \
+              CONTROL_TAG_OBJECT_SHA="$CONTROL_TAG_OBJECT_SHA" \
+              CONTROL_BASE_SHA="$CONTROL_BASE_SHA" \
+              IDENTITY_TOOLS_SHA="$IDENTITY_TOOLS_SHA" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          control = json.loads(Path("control-commit.json").read_text(encoding="utf-8"))
+          control_tag_ref = json.loads(Path("control-tag-ref.json").read_text(encoding="utf-8"))
+          control_tag = json.loads(Path("control-tag.json").read_text(encoding="utf-8"))
+          control_base = json.loads(Path("control-base.json").read_text(encoding="utf-8"))
+          tools = json.loads(Path("tools-commit.json").read_text(encoding="utf-8"))
+          tools_base = json.loads(Path("tools-base.json").read_text(encoding="utf-8"))
+          workflow_sha = os.environ["CALLER_WORKFLOW_SHA"]
+          control_tag_name = os.environ["CONTROL_TAG"]
+          control_tag_object = os.environ["CONTROL_TAG_OBJECT_SHA"]
+          control_base_sha = os.environ["CONTROL_BASE_SHA"]
+          tools_sha = os.environ["IDENTITY_TOOLS_SHA"]
+
+          for label, commit, expected in (
+              ("control workflow", control, workflow_sha),
+              ("identity tools", tools, tools_sha),
+          ):
+              if commit.get("sha") != expected:
+                  raise SystemExit(f"GitHub {label} commit differs")
+              if commit.get("verification", {}).get("verified") is not True:
+                  raise SystemExit(f"GitHub does not verify the {label} commit")
+              if commit.get("verification", {}).get("reason") != "valid":
+                  raise SystemExit(f"GitHub {label} signature reason is not valid")
+          expected_identity = ("Blackcoin-Dev", "298119138+Blackcoin-Dev@users.noreply.github.com")
+          if (control.get("author", {}).get("name"), control.get("author", {}).get("email")) != expected_identity:
+              raise SystemExit("control workflow author identity differs")
+          if (control.get("committer", {}).get("name"), control.get("committer", {}).get("email")) != expected_identity:
+              raise SystemExit("control workflow committer identity differs")
+          if control_tag_ref.get("ref") != f"refs/tags/{control_tag_name}":
+              raise SystemExit("control tag ref name differs")
+          if (control_tag_ref.get("object", {}).get("type"), control_tag_ref.get("object", {}).get("sha")) != ("tag", control_tag_object):
+              raise SystemExit("control tag ref object differs")
+          if control_tag.get("sha") != control_tag_object or control_tag.get("tag") != control_tag_name:
+              raise SystemExit("control annotated tag identity differs")
+          if (control_tag.get("object", {}).get("type"), control_tag.get("object", {}).get("sha")) != ("commit", workflow_sha):
+              raise SystemExit("control annotated tag target differs")
+          if control_tag.get("verification", {}).get("verified") is not True:
+              raise SystemExit("GitHub does not verify the control tag signature")
+          if control_tag.get("verification", {}).get("reason") != "valid":
+              raise SystemExit("GitHub control tag signature reason is not valid")
+          if control_base.get("status") != "ahead" or control_base.get("ahead_by") != 1 or control_base.get("behind_by") != 0:
+              raise SystemExit("control workflow must be the one-shot descendant of the audited main head")
+          if control_base.get("base_commit", {}).get("sha") != control_base_sha:
+              raise SystemExit("control workflow audited base differs")
+          if control_base.get("merge_base_commit", {}).get("sha") != control_base_sha:
+              raise SystemExit("audited main head is not the control workflow parent")
+          commits = control_base.get("commits", [])
+          if len(commits) != 1 or commits[0].get("sha") != workflow_sha:
+              raise SystemExit("control workflow comparison commit inventory differs")
+          if tools_base.get("status") not in ("ahead", "identical"):
+              raise SystemExit("the corrected identity verifier is not on the audited main history")
+          if tools_base.get("base_commit", {}).get("sha") != tools_sha:
+              raise SystemExit("the corrected identity verifier base differs")
+          if tools_base.get("merge_base_commit", {}).get("sha") != tools_sha:
+              raise SystemExit("the corrected identity verifier is not an ancestor of the audited main head")
+          PY
+
+            TAG=v30.1.4
+            VERSION=30.1.4
+            PACKAGE_LABEL=30.1.4
+            PRERELEASE_CHANNEL=production
+            ASSET_PREFIX=Blackcoin-30.1.4
+            TARGET=all
+            PUBLISH=true
+            python3 .release-recovery-tools/ci/release/verify_source_identity.py \
+              --head "$TARGET_SHA" \
+              --repository "$GITHUB_REPOSITORY" \
+              --require-actor \
+              --actor "$GITHUB_ACTOR" \
+              --tag "$TAG" \
+              --require-signatures \
+              --signing-fingerprint 'SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70'
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            test "$REQUESTED_RECOVERY" = false
             [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
               echo "::error::target_sha must be a full 40-character commit SHA"
               exit 1
@@ -133,6 +317,11 @@ jobs:
               --require-actor \
               --actor "$GITHUB_ACTOR"
           else
+            [[ -z "$REQUESTED_RECOVERY" || "$REQUESTED_RECOVERY" == false ]]
+            test "$GITHUB_EVENT_NAME" = push
+            test "$GITHUB_REF" = refs/tags/v30.1.4
+            test "$GITHUB_REF_NAME" = v30.1.4
+            test "$GITHUB_REF_TYPE" = tag
             TAG="$GITHUB_REF_NAME"
             VERSION="${TAG#v}"
             PACKAGE_LABEL="$VERSION"
@@ -148,10 +337,17 @@ jobs:
               --tag "$TAG" \
               --require-signatures \
               --signing-fingerprint 'SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70'
+          fi
+
+          if [[ "$PUBLISH" == true ]]; then
             TAG_OBJECT_SHA=$(git rev-parse "refs/tags/$TAG^{tag}")
             [[ "$TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            if [[ "$RECOVERY" == true ]]; then
+              test "$TAG_OBJECT_SHA" = "$FROZEN_TAG_OBJECT_SHA"
+            fi
             gh api "repos/$GITHUB_REPOSITORY/git/commits/$TARGET_SHA" > commit-verification.json
             gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT_SHA" > tag-verification.json
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > tag-ref.json
             TARGET_SHA="$TARGET_SHA" TAG="$TAG" TAG_OBJECT_SHA="$TAG_OBJECT_SHA" python3 - <<'PY'
           import json
           import os
@@ -159,9 +355,14 @@ jobs:
 
           commit = json.loads(Path("commit-verification.json").read_text(encoding="utf-8"))
           tag = json.loads(Path("tag-verification.json").read_text(encoding="utf-8"))
+          tag_ref = json.loads(Path("tag-ref.json").read_text(encoding="utf-8"))
           target = os.environ["TARGET_SHA"]
           tag_name = os.environ["TAG"]
           tag_object = os.environ["TAG_OBJECT_SHA"]
+          if tag_ref.get("ref") != f"refs/tags/{tag_name}":
+              raise SystemExit("GitHub tag ref name differs")
+          if (tag_ref.get("object", {}).get("type"), tag_ref.get("object", {}).get("sha")) != ("tag", tag_object):
+              raise SystemExit("GitHub tag ref does not resolve to the exact annotated tag object")
           if commit.get("sha") != target:
               raise SystemExit("GitHub commit verification resolved a different source")
           if commit.get("verification", {}).get("verified") is not True:
@@ -182,6 +383,42 @@ jobs:
           if tag.get("verification", {}).get("reason") != "valid":
               raise SystemExit("GitHub annotated tag signature reason is not valid")
           PY
+
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > existing-release.json
+              RECOVERY="$RECOVERY" TARGET_SHA="$TARGET_SHA" TAG="$TAG" \
+                CONTROL_WORKFLOW_REF="$GITHUB_REF" \
+                CONTROL_WORKFLOW_SHA="$CALLER_WORKFLOW_SHA" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          release = json.loads(Path("existing-release.json").read_text(encoding="utf-8"))
+          if release.get("draft") is not True:
+              raise SystemExit("an existing public release is immutable")
+          author = release.get("author", {})
+          if (author.get("id"), author.get("login"), author.get("type")) != (41898282, "github-actions[bot]", "Bot"):
+              raise SystemExit("existing draft author differs from the pinned GitHub Actions bot")
+          if os.environ["RECOVERY"] != "true":
+              raise SystemExit("only the exact publication recovery may resume a draft")
+          if release.get("tag_name") != os.environ["TAG"]:
+              raise SystemExit("existing draft tag differs")
+          if release.get("prerelease") is not False or release.get("name") != "Blackcoin Core v30.1.4":
+              raise SystemExit("existing draft title or prerelease state differs")
+          body = release.get("body") or ""
+          required = (
+              os.environ["TARGET_SHA"],
+              os.environ["CONTROL_WORKFLOW_REF"],
+              os.environ["CONTROL_WORKFLOW_SHA"],
+          )
+          if any(value not in body for value in required):
+              raise SystemExit("existing draft is not bound to the exact source and recovery control")
+          run_markers = re.findall(r"Recovery workflow run: `([1-9][0-9]*)`[.]", body)
+          if len(run_markers) != 1:
+              raise SystemExit("existing draft does not bind one prior recovery run")
+          PY
+            fi
           fi
 
           test "$VERSION" = "$BASE_VERSION"
@@ -214,12 +451,18 @@ jobs:
             echo "target=$TARGET"
             echo "publish=$PUBLISH"
             echo "tag=$TAG"
+            echo "recovery=$RECOVERY"
+            echo "control_workflow_sha=$CALLER_WORKFLOW_SHA"
+            echo "control_workflow_ref=$GITHUB_REF"
+            echo "control_workflow_event=$GITHUB_EVENT_NAME"
+            echo "control_tag_object_sha=$CONTROL_TAG_OBJECT_SHA"
           } >> "$GITHUB_OUTPUT"
 
   safety-gate:
     name: Exact-SHA prerelease or production safety gate
     needs:
       - resolve-target
+    if: ${{ needs.resolve-target.outputs.recovery != 'true' }}
     permissions:
       contents: read
     uses: ./.github/workflows/pr-gate.yml
@@ -227,18 +470,353 @@ jobs:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
       # Alpha artifacts wait for the core gate. A beta adds native-platform,
       # sanitizer, pinned-fuzz, and complete extended functional evidence.
-      # v30.1.4 changes runtime and wallet behavior, so every exact-SHA
-      # production gate runs against this source. No inherited corrective
-      # evidence or fast path is permitted.
+      # Normal production runs execute every exact-SHA gate. The one-time
+      # recovery separately verifies the already-complete 16-job exact-SHA run
+      # through immutable GitHub API identities before it may skip this work.
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
       run_extended_functional: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
       corrective_fast_path: false
+
+  recovery-safety-gate:
+    name: Verify API-bound exact-SHA v30.1.4 safety evidence
+    needs:
+      - resolve-target
+    if: ${{ needs.resolve-target.outputs.recovery == 'true' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: 13262151077cce3f72d07d17dc7725b2b6a8e1ab
+      SAFETY_RUN_ID: '30973290346'
+      SAFETY_RUN_ATTEMPT: '1'
+      FAILED_RELEASE_RUN_ID: '30982555787'
+      FAILED_RELEASE_RUN_ATTEMPT: '1'
+      CONTROL_WORKFLOW_SHA: ${{ needs.resolve-target.outputs.control_workflow_sha }}
+      CONTROL_WORKFLOW_REF: ${{ needs.resolve-target.outputs.control_workflow_ref }}
+      CONTROL_TAG_OBJECT_SHA: ${{ needs.resolve-target.outputs.control_tag_object_sha }}
+    steps:
+      - name: Verify the prior release failure and all 16 successful safety jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = Blackcoin-Dev/Blackcoin
+          test "$GITHUB_ACTOR" = Blackcoin-Dev
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SAFETY_RUN_ID" > safety-run.json
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$SAFETY_RUN_ID/attempts/$SAFETY_RUN_ATTEMPT/jobs?per_page=100" \
+            > safety-jobs.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$FAILED_RELEASE_RUN_ID" > failed-run.json
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$FAILED_RELEASE_RUN_ID/attempts/$FAILED_RELEASE_RUN_ATTEMPT/jobs?per_page=100" \
+            > failed-jobs.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/92229936569/logs" \
+            > failed-resolve.log
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SAFETY_RUN_ID/artifacts?per_page=100" \
+            > safety-artifacts.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$FAILED_RELEASE_RUN_ID/artifacts?per_page=100" \
+            > failed-artifacts.json
+          SOURCE_SHA="$SOURCE_SHA" \
+            SAFETY_RUN_ID="$SAFETY_RUN_ID" \
+            SAFETY_RUN_ATTEMPT="$SAFETY_RUN_ATTEMPT" \
+            FAILED_RELEASE_RUN_ID="$FAILED_RELEASE_RUN_ID" \
+            FAILED_RELEASE_RUN_ATTEMPT="$FAILED_RELEASE_RUN_ATTEMPT" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          source = os.environ["SOURCE_SHA"]
+          safety_run_id = int(os.environ["SAFETY_RUN_ID"])
+          safety_attempt = int(os.environ["SAFETY_RUN_ATTEMPT"])
+          failed_run_id = int(os.environ["FAILED_RELEASE_RUN_ID"])
+          failed_attempt = int(os.environ["FAILED_RELEASE_RUN_ATTEMPT"])
+          safety = json.loads(Path("safety-run.json").read_text(encoding="utf-8"))
+          safety_jobs_doc = json.loads(Path("safety-jobs.json").read_text(encoding="utf-8"))
+          failed = json.loads(Path("failed-run.json").read_text(encoding="utf-8"))
+          failed_jobs_doc = json.loads(Path("failed-jobs.json").read_text(encoding="utf-8"))
+          failed_resolve_log = Path("failed-resolve.log").read_text(encoding="utf-8")
+          safety_artifacts_doc = json.loads(Path("safety-artifacts.json").read_text(encoding="utf-8"))
+          failed_artifacts_doc = json.loads(Path("failed-artifacts.json").read_text(encoding="utf-8"))
+
+          expected_safety_run = {
+              "id": safety_run_id,
+              "run_attempt": safety_attempt,
+              "event": "pull_request",
+              "head_branch": "fix/issue-37-claim-component-recovery",
+              "head_sha": source,
+              "path": ".github/workflows/pr-gate.yml",
+              "workflow_id": 312550330,
+              "check_suite_id": 84000462133,
+              "status": "completed",
+              "conclusion": "success",
+          }
+          for key, expected in expected_safety_run.items():
+              if safety.get(key) != expected:
+                  raise SystemExit(f"safety run {key} differs: {safety.get(key)!r}")
+          expected_repository = (1290339568, "Blackcoin-Dev/Blackcoin")
+          expected_actor = (298119138, "Blackcoin-Dev", "User")
+          for label, run in (("safety", safety),):
+              if (run.get("repository", {}).get("id"), run.get("repository", {}).get("full_name")) != expected_repository:
+                  raise SystemExit(f"{label} run repository differs")
+              if (run.get("head_repository", {}).get("id"), run.get("head_repository", {}).get("full_name")) != expected_repository:
+                  raise SystemExit(f"{label} run head repository differs")
+              if (run.get("actor", {}).get("id"), run.get("actor", {}).get("login"), run.get("actor", {}).get("type")) != expected_actor:
+                  raise SystemExit(f"{label} run actor differs")
+              if (run.get("triggering_actor", {}).get("id"), run.get("triggering_actor", {}).get("login"), run.get("triggering_actor", {}).get("type")) != expected_actor:
+                  raise SystemExit(f"{label} run triggering actor differs")
+
+          expected_safety_jobs = {
+              92202021026: "Build pinned Windows x86_64 vector binaries",
+              92202021040: "macOS Intel native cryptographic vectors",
+              92202021049: "macOS Apple Silicon native cryptographic vectors",
+              92202021052: "source identity, workflow syntax, and lint",
+              92202021058: "pinned native build and unit tests",
+              92202021062: "Linux ARM64 native cryptographic vectors and resources",
+              92202021067: "pinned independent quantum crypto provenance",
+              92202021077: "source-pinned sanitizer regression smoke",
+              92202021084: "address-undefined-sanitizer consensus and liveness gate",
+              92202021088: "thread-sanitizer consensus and liveness gate",
+              92203366708: "Linux ARM64 native UBSan block-harness gate",
+              92203394934: "Windows x86_64 native cryptographic vectors and resources",
+              92205992833: "real v26.2, v28.4, v30.1, and candidate interoperability",
+              92205992852: "complete extended functional suite",
+              92205992874: "critical Gold Rush, lifecycle, wallet, and recovery tests",
+              92205992883: "measured worst-case quantum crypto resources (Linux x86_64)",
+          }
+          safety_jobs = safety_jobs_doc.get("jobs", [])
+          if safety_jobs_doc.get("total_count") != 16 or len(safety_jobs) != 16:
+              raise SystemExit("safety run must contain exactly 16 jobs")
+          actual_safety_jobs = {job.get("id"): job for job in safety_jobs}
+          if len(actual_safety_jobs) != len(safety_jobs):
+              raise SystemExit("safety run contains duplicate job identities")
+          if set(actual_safety_jobs) != set(expected_safety_jobs):
+              raise SystemExit("safety run job identities differ")
+          for job_id, expected_name in expected_safety_jobs.items():
+              job = actual_safety_jobs[job_id]
+              if job.get("name") != expected_name:
+                  raise SystemExit(f"safety job {job_id} name differs")
+              if job.get("status") != "completed" or job.get("conclusion") != "success":
+                  raise SystemExit(f"safety job {job_id} did not complete successfully")
+              if job.get("run_id") != safety_run_id or job.get("run_attempt") != safety_attempt:
+                  raise SystemExit(f"safety job {job_id} run identity differs")
+
+          expected_failed_run = {
+              "id": failed_run_id,
+              "run_attempt": failed_attempt,
+              "event": "push",
+              "head_branch": "v30.1.4",
+              "head_sha": source,
+              "path": ".github/workflows/build.yml",
+              "workflow_id": 307671160,
+              "check_suite_id": 84025455489,
+              "status": "completed",
+              "conclusion": "failure",
+          }
+          for key, expected in expected_failed_run.items():
+              if failed.get(key) != expected:
+                  raise SystemExit(f"failed release run {key} differs: {failed.get(key)!r}")
+          for label, run in (("failed release", failed),):
+              if (run.get("repository", {}).get("id"), run.get("repository", {}).get("full_name")) != expected_repository:
+                  raise SystemExit(f"{label} run repository differs")
+              if (run.get("head_repository", {}).get("id"), run.get("head_repository", {}).get("full_name")) != expected_repository:
+                  raise SystemExit(f"{label} run head repository differs")
+              if (run.get("actor", {}).get("id"), run.get("actor", {}).get("login"), run.get("actor", {}).get("type")) != expected_actor:
+                  raise SystemExit(f"{label} run actor differs")
+              if (run.get("triggering_actor", {}).get("id"), run.get("triggering_actor", {}).get("login"), run.get("triggering_actor", {}).get("type")) != expected_actor:
+                  raise SystemExit(f"{label} run triggering actor differs")
+          failed_jobs = failed_jobs_doc.get("jobs", [])
+          if failed_jobs_doc.get("total_count") != 9 or len(failed_jobs) != 9:
+              raise SystemExit("failed release run job inventory differs")
+          failed_by_id = {job.get("id"): job for job in failed_jobs}
+          if len(failed_by_id) != len(failed_jobs):
+              raise SystemExit("failed release run contains duplicate job identities")
+          matrix_build_name = "$" + "{{ matrix.name }} ($" + "{{ matrix.builder }})"
+          matrix_macos_name = (
+              "Ad-hoc sign and validate macOS $" + "{{ matrix.label }} "
+              "($" + "{{ matrix.builder }})"
+          )
+          expected_failed_jobs = {
+              92229936569: ("Resolve and authorize immutable release target", "failure"),
+              92229970025: ("Exact-SHA prerelease or production safety gate", "skipped"),
+              92229970155: ("Require explicit v30.1.4 signed-source publication acknowledgement", "skipped"),
+              92229970620: (matrix_build_name, "skipped"),
+              92229970664: ("Select build target", "skipped"),
+              92229970782: ("Require native macOS validation when selected", "failure"),
+              92229971102: (matrix_macos_name, "skipped"),
+              92229985103: ("Verify independent byte-for-byte rebuilds", "skipped"),
+              92229985539: ("Publish authorized GitHub release", "skipped"),
+          }
+          if set(failed_by_id) != set(expected_failed_jobs):
+              raise SystemExit("failed release run job identities differ")
+          for job_id, (name, conclusion) in expected_failed_jobs.items():
+              job = failed_by_id[job_id]
+              if job.get("name") != name:
+                  raise SystemExit(f"failed release job name differs: {job_id}")
+              if job.get("status") != "completed" or job.get("conclusion") != conclusion:
+                  raise SystemExit(f"failed release job state differs: {job_id}")
+              if job.get("run_id") != failed_run_id or job.get("run_attempt") != failed_attempt:
+                  raise SystemExit(f"failed release job run identity differs: {job_id}")
+          failure_step = "Verify identity, tag, version, and exact SHA"
+          failure_reason = (
+              "identity verification failed: "
+              "957b41d22c8d96131a0ec87fff1e2f4c20a5caa2 committer is "
+              "GitHub <noreply@github.com>; expected the release team identity"
+          )
+          resolve_steps = failed_by_id[92229936569].get("steps", [])
+          failed_steps = [step.get("name") for step in resolve_steps if step.get("conclusion") == "failure"]
+          if failed_steps != [failure_step]:
+              raise SystemExit("the original release failed outside the reviewed identity verifier step")
+          failed_log_lines = failed_resolve_log.splitlines()
+          if sum(line.endswith(failure_reason) for line in failed_log_lines) != 1:
+              raise SystemExit("the original resolver failure reason differs")
+          exit_marker = "##[error]Process completed with exit code 1."
+          if sum(line.endswith(exit_marker) for line in failed_log_lines) != 1:
+              raise SystemExit("the original resolver exit status differs")
+
+          expected_safety_artifacts = {
+              8917317280: ("quantum-crypto-provenance-" + source, 3414, "sha256:e1f2f3e829414b974766909b38e0ced5fee92f03c53b9e0fe826aeecd4113e3c"),
+              8917475829: ("quantum-resource-benchmarks-linux-arm64-" + source, 6340, "sha256:c6ca060e948c9854df975c424980dc50978216d96f59f6518ed053d095a8918c"),
+              8917479439: ("windows-native-vector-inputs-" + source, 19039230, "sha256:a413de0a2b89ca60c371d62b57d6b56e9aa31d59323e97fe87dc1392b4a0ec87"),
+              8917507887: ("quantum-resource-benchmarks-macos-arm64-" + source, 6450, "sha256:452e20de05e29023e70de7b14871c2d7c42329eff1887a6f207a0d87e5a8da0a"),
+              8917576628: ("quantum-resource-benchmarks-windows-x86_64-" + source, 6233, "sha256:7188ac436a0510b3d466fd66358c8a0a28ed858fd6fc8ccddb8c89ee5aa1e1dc"),
+              8917783906: ("safety-gate-native-" + source, 426031275, "sha256:a078db0b9a274ea0de723b860b4972f477c77780f0c2dd405025f11f647d253f"),
+              8917804609: ("quantum-resource-benchmarks-macos-x86_64-" + source, 6571, "sha256:f424229b33e8b7cd89eb19fce349b969a843b4b31a2759a88795f1bd5801a2de"),
+              8917840072: ("quantum-resource-benchmarks-linux-x86_64-" + source, 6374, "sha256:4051be3a118b806002a2f07beea153ed965d66698cc24f6e98f421594025e657"),
+              8917858205: ("mixed-version-provenance-" + source, 1059, "sha256:637ac7a7804a9772f716d2ca3bfd93a69cd78a7aeb6fda59bdcacd437d3b5bc8"),
+          }
+          safety_artifacts = safety_artifacts_doc.get("artifacts", [])
+          if safety_artifacts_doc.get("total_count") != 9 or len(safety_artifacts) != 9:
+              raise SystemExit("safety artifact inventory differs")
+          actual_safety_artifacts = {artifact.get("id"): artifact for artifact in safety_artifacts}
+          if set(actual_safety_artifacts) != set(expected_safety_artifacts):
+              raise SystemExit("safety artifact identities differ")
+          for artifact_id, (name, size, digest) in expected_safety_artifacts.items():
+              artifact = actual_safety_artifacts[artifact_id]
+              if (artifact.get("name"), artifact.get("size_in_bytes"), artifact.get("digest")) != (name, size, digest):
+                  raise SystemExit(f"safety artifact {artifact_id} metadata differs")
+              if artifact.get("expired") is not False:
+                  raise SystemExit(f"safety artifact {artifact_id} is expired")
+          if failed_artifacts_doc.get("total_count") != 0 or failed_artifacts_doc.get("artifacts") != []:
+              raise SystemExit("failed release run unexpectedly produced artifacts")
+
+          evidence = {
+              "schema": 1,
+              "release": "v30.1.4",
+              "runtime_source": {"commit": source, "tag": "v30.1.4"},
+              "publication_control": {
+                  "event": "workflow_dispatch",
+                  "ref": os.environ["CONTROL_WORKFLOW_REF"],
+                  "commit": os.environ["CONTROL_WORKFLOW_SHA"],
+                  "tag_object": os.environ["CONTROL_TAG_OBJECT_SHA"],
+                  "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              },
+              "reused_safety_run": {
+                  "id": safety_run_id,
+                  "url": f"https://github.com/Blackcoin-Dev/Blackcoin/actions/runs/{safety_run_id}",
+                  "attempt": safety_attempt,
+                  "workflow_id": expected_safety_run["workflow_id"],
+                  "check_suite_id": expected_safety_run["check_suite_id"],
+                  "head_sha": source,
+                  "repository": {"id": 1290339568, "full_name": "Blackcoin-Dev/Blackcoin"},
+                  "head_repository": {"id": 1290339568, "full_name": "Blackcoin-Dev/Blackcoin"},
+                  "actor": {"id": 298119138, "login": "Blackcoin-Dev", "type": "User"},
+                  "triggering_actor": {"id": 298119138, "login": "Blackcoin-Dev", "type": "User"},
+                  "conclusion": "success",
+                  "jobs": [
+                      {
+                          "id": job_id,
+                          "url": f"https://github.com/Blackcoin-Dev/Blackcoin/actions/runs/{safety_run_id}/job/{job_id}",
+                          "name": expected_safety_jobs[job_id],
+                          "conclusion": "success",
+                      }
+                      for job_id in sorted(expected_safety_jobs)
+                  ],
+                  "artifacts": [
+                      {
+                          "id": artifact_id,
+                          "name": expected_safety_artifacts[artifact_id][0],
+                          "size_in_bytes": expected_safety_artifacts[artifact_id][1],
+                          "digest": expected_safety_artifacts[artifact_id][2],
+                          "expired": False,
+                      }
+                      for artifact_id in sorted(expected_safety_artifacts)
+                  ],
+              },
+              "failed_tag_publication_run": {
+                  "id": failed_run_id,
+                  "url": f"https://github.com/Blackcoin-Dev/Blackcoin/actions/runs/{failed_run_id}",
+                  "attempt": failed_attempt,
+                  "workflow_id": expected_failed_run["workflow_id"],
+                  "check_suite_id": expected_failed_run["check_suite_id"],
+                  "head_sha": source,
+                  "repository": {"id": 1290339568, "full_name": "Blackcoin-Dev/Blackcoin"},
+                  "head_repository": {"id": 1290339568, "full_name": "Blackcoin-Dev/Blackcoin"},
+                  "actor": {"id": 298119138, "login": "Blackcoin-Dev", "type": "User"},
+                  "triggering_actor": {"id": 298119138, "login": "Blackcoin-Dev", "type": "User"},
+                  "conclusion": "failure",
+                  "failure_step": failure_step,
+                  "failure_reason": failure_reason,
+                  "exit_code": 1,
+                  "artifact_total_count": 0,
+                  "jobs": [
+                      {
+                          "id": job_id,
+                          "url": f"https://github.com/Blackcoin-Dev/Blackcoin/actions/runs/{failed_run_id}/job/{job_id}",
+                          "name": name,
+                          "conclusion": conclusion,
+                      }
+                      for job_id, (name, conclusion) in sorted(expected_failed_jobs.items())
+                  ],
+              },
+          }
+          output = Path("release-recovery-evidence/Blackcoin-30.1.4-RELEASE-RECOVERY-EVIDENCE.json")
+          output.parent.mkdir(parents=True, exist_ok=False)
+          output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload exact API-bound release recovery evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-recovery-evidence-${{ needs.resolve-target.outputs.target_sha }}-${{ needs.resolve-target.outputs.control_workflow_sha }}
+          path: release-recovery-evidence/Blackcoin-30.1.4-RELEASE-RECOVERY-EVIDENCE.json
+          if-no-files-found: error
+          retention-days: 7
+
+  safety-gate-required:
+    name: Require fresh or API-bound exact-SHA safety evidence
+    needs:
+      - resolve-target
+      - safety-gate
+      - recovery-safety-gate
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    env:
+      RESOLVE_RESULT: ${{ needs.resolve-target.result }}
+      RECOVERY: ${{ needs.resolve-target.outputs.recovery }}
+      FRESH_GATE_RESULT: ${{ needs.safety-gate.result }}
+      RECOVERY_GATE_RESULT: ${{ needs.recovery-safety-gate.result }}
+    steps:
+      - name: Fail closed unless exactly one required gate passed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RESOLVE_RESULT" = success
+          if [[ "$RECOVERY" == true ]]; then
+            test "$FRESH_GATE_RESULT" = skipped
+            test "$RECOVERY_GATE_RESULT" = success
+          else
+            test "$FRESH_GATE_RESULT" = success
+            test "$RECOVERY_GATE_RESULT" = skipped
+          fi
 
   select-targets:
     name: Select build target
     needs:
       - resolve-target
-      - safety-gate
+      - safety-gate-required
+      - signed-final-preflight
+    if: ${{ always() && needs.resolve-target.result == 'success' && needs.safety-gate-required.result == 'success' && (needs.signed-final-preflight.result == 'success' || (needs.resolve-target.outputs.publish != 'true' && needs.signed-final-preflight.result == 'skipped')) }}
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -338,7 +916,7 @@ jobs:
     name: ${{ matrix.name }} (${{ matrix.builder }})
     needs:
       - resolve-target
-      - safety-gate
+      - safety-gate-required
       - select-targets
     runs-on: ${{ matrix.os }}
     env:
@@ -1107,7 +1685,7 @@ jobs:
     name: Require explicit v30.1.4 signed-source publication acknowledgement
     needs:
       - resolve-target
-      - safety-gate
+      - safety-gate-required
     if: ${{ needs.resolve-target.outputs.publish == 'true' }}
     runs-on: ubuntu-22.04
     environment: production-release
@@ -1148,6 +1726,11 @@ jobs:
       ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
       TAG: ${{ needs.resolve-target.outputs.tag }}
       SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
+      RECOVERY: ${{ needs.resolve-target.outputs.recovery }}
+      CONTROL_WORKFLOW_SHA: ${{ needs.resolve-target.outputs.control_workflow_sha }}
+      CONTROL_WORKFLOW_REF: ${{ needs.resolve-target.outputs.control_workflow_ref }}
+      CONTROL_WORKFLOW_EVENT: ${{ needs.resolve-target.outputs.control_workflow_event }}
+      CONTROL_TAG_OBJECT_SHA: ${{ needs.resolve-target.outputs.control_tag_object_sha }}
       UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}
     steps:
       - name: Checkout immutable release source
@@ -1155,6 +1738,7 @@ jobs:
         with:
           ref: ${{ needs.resolve-target.outputs.target_sha }}
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Download only exact-SHA release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1167,6 +1751,13 @@ jobs:
         with:
           path: gate-evidence/reproducibility
           name: release-${{ needs.resolve-target.outputs.package_label }}-reproducibility-${{ needs.resolve-target.outputs.target_sha }}
+
+      - name: Download exact API-bound release recovery evidence
+        if: ${{ needs.resolve-target.outputs.recovery == 'true' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: gate-evidence/recovery
+          name: release-recovery-evidence-${{ needs.resolve-target.outputs.target_sha }}-${{ needs.resolve-target.outputs.control_workflow_sha }}
 
       - name: Install final release verification tools
         run: |
@@ -1214,6 +1805,55 @@ jobs:
           cp "gate-evidence/reproducibility/$ASSET_PREFIX-REPRODUCIBILITY.txt" \
             "dist/$ASSET_PREFIX-REPRODUCIBILITY.txt"
           printf '%s\n' "$TARGET_SHA" > dist/SOURCE_COMMIT.txt
+          recovery_evidence="dist/$ASSET_PREFIX-RELEASE-RECOVERY-EVIDENCE.json"
+          if [[ "$RECOVERY" == true ]]; then
+            source_evidence="gate-evidence/recovery/$ASSET_PREFIX-RELEASE-RECOVERY-EVIDENCE.json"
+            test -s "$source_evidence" && test ! -L "$source_evidence"
+            test "$(find gate-evidence/recovery -mindepth 1 -maxdepth 1 -type f | wc -l)" = 1
+            cp "$source_evidence" "$recovery_evidence"
+            TARGET_SHA="$TARGET_SHA" CONTROL_WORKFLOW_SHA="$CONTROL_WORKFLOW_SHA" \
+              CONTROL_WORKFLOW_REF="$CONTROL_WORKFLOW_REF" \
+              CONTROL_TAG_OBJECT_SHA="$CONTROL_TAG_OBJECT_SHA" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = json.loads(
+              Path("dist/Blackcoin-30.1.4-RELEASE-RECOVERY-EVIDENCE.json").read_text(encoding="utf-8")
+          )
+          if evidence.get("schema") != 1 or evidence.get("release") != "v30.1.4":
+              raise SystemExit("release recovery evidence schema or release differs")
+          if evidence.get("runtime_source") != {
+              "commit": os.environ["TARGET_SHA"],
+              "tag": "v30.1.4",
+          }:
+              raise SystemExit("release recovery evidence runtime source differs")
+          control = evidence.get("publication_control", {})
+          expected_control = {
+              "event": "workflow_dispatch",
+              "ref": os.environ["CONTROL_WORKFLOW_REF"],
+              "commit": os.environ["CONTROL_WORKFLOW_SHA"],
+              "tag_object": os.environ["CONTROL_TAG_OBJECT_SHA"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+          }
+          if control != expected_control:
+              raise SystemExit("release recovery evidence publication control differs")
+          reused = evidence.get("reused_safety_run", {})
+          if reused.get("id") != 30973290346 or len(reused.get("jobs", [])) != 16:
+              raise SystemExit("release recovery safety evidence differs")
+          if len(reused.get("artifacts", [])) != 9:
+              raise SystemExit("release recovery safety artifact evidence differs")
+          failed = evidence.get("failed_tag_publication_run", {})
+          if failed.get("id") != 30982555787 or len(failed.get("jobs", [])) != 9:
+              raise SystemExit("failed publication evidence differs")
+          if failed.get("artifact_total_count") != 0:
+              raise SystemExit("failed publication artifact evidence differs")
+          PY
+          else
+            test "$RECOVERY" = false
+            test ! -e "$recovery_evidence"
+            test ! -e gate-evidence/recovery
+          fi
 
           python3 ci/release/verify_dependency_security.py
           python3 ci/release/generate_spdx_sbom.py \
@@ -1228,17 +1868,257 @@ jobs:
             --workflow-run-id "$GITHUB_RUN_ID" \
             --output "dist/Blackcoin-$VERSION-provenance.intoto.json"
 
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          repository = "Blackcoin-Dev/Blackcoin"
+          source_sha = os.environ["TARGET_SHA"]
+          source_tag = os.environ["TAG"]
+          source_ref = f"refs/tags/{source_tag}"
+          workflow_sha = os.environ["CONTROL_WORKFLOW_SHA"]
+          workflow_ref = os.environ["CONTROL_WORKFLOW_REF"]
+          workflow_event = os.environ["CONTROL_WORKFLOW_EVENT"]
+          control_tag_object = os.environ["CONTROL_TAG_OBJECT_SHA"]
+          recovery = os.environ["RECOVERY"] == "true"
+          full_sha = re.compile(r"^[0-9a-f]{40}$")
+          if not full_sha.fullmatch(source_sha) or not full_sha.fullmatch(workflow_sha):
+              raise SystemExit("source or control workflow SHA is not a full commit identity")
+          if workflow_event not in ("push", "workflow_dispatch"):
+              raise SystemExit("release workflow event is not an authorized publication event")
+          if recovery:
+              if workflow_event != "workflow_dispatch":
+                  raise SystemExit("publication recovery must record workflow_dispatch")
+              if workflow_ref != "refs/tags/v30.1.4-publication-recovery-1":
+                  raise SystemExit("publication recovery control ref differs")
+              if workflow_sha == source_sha:
+                  raise SystemExit("recovery control and runtime source identities must be separate")
+              if not full_sha.fullmatch(control_tag_object):
+                  raise SystemExit("publication recovery control tag object is missing")
+          else:
+              if workflow_event != "push" or workflow_ref != source_ref:
+                  raise SystemExit("normal publication control identity differs")
+              if workflow_sha != source_sha or control_tag_object:
+                  raise SystemExit("normal tag publication unexpectedly has a recovery control identity")
+
+          repository_uri = f"git+https://github.com/{repository}.git"
+          workflow_uri = f"https://github.com/{repository}/.github/workflows/build.yml"
+          provenance_path = Path(f"dist/Blackcoin-{os.environ['VERSION']}-provenance.intoto.json")
+          provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+          definition = provenance["predicate"]["buildDefinition"]
+          if definition.get("buildType") != f"{workflow_uri}@{source_sha}":
+              raise SystemExit("source generator provenance build type differs from its reviewed contract")
+          source = definition.get("externalParameters", {}).get("source", {})
+          if source != {"uri": repository_uri, "digest": {"gitCommit": source_sha}}:
+              raise SystemExit("provenance runtime source identity differs")
+          definition["buildType"] = f"{workflow_uri}@{workflow_sha}"
+          definition["externalParameters"]["controlWorkflow"] = {
+              "uri": workflow_uri,
+              "ref": workflow_ref,
+              "digest": {"gitCommit": workflow_sha},
+              "event": workflow_event,
+          }
+          definition["externalParameters"]["releaseSourceRef"] = source_ref
+          definition["internalParameters"].update({
+              "workflowCommit": workflow_sha,
+              "workflowEvent": workflow_event,
+              "workflowRef": workflow_ref,
+              "publicationRecovery": recovery,
+          })
+          if recovery:
+              definition["internalParameters"]["controlTagObject"] = control_tag_object
+          definition["resolvedDependencies"] = [
+              {"uri": repository_uri, "digest": {"gitCommit": source_sha}},
+              {"uri": workflow_uri, "digest": {"gitCommit": workflow_sha}},
+          ]
+          provenance_path.write_text(
+              json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
           python3 ci/release/generate_unsigned_release_metadata.py \
             --artifacts dist --version "$VERSION" --source-sha "$TARGET_SHA" \
             --tag "$TAG" --workflow-run-id "$GITHUB_RUN_ID" \
             --acknowledgement "$UNSIGNED_FINAL_ACK" --macos-adhoc-signed \
             --notice "dist/Blackcoin-$VERSION-UNSIGNED-PRODUCTION.txt" \
             --manifest "dist/Blackcoin-$VERSION-UNSIGNED-PRODUCTION.json"
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          source_sha = os.environ["TARGET_SHA"]
+          source_tag = os.environ["TAG"]
+          source_ref = f"refs/tags/{source_tag}"
+          workflow_sha = os.environ["CONTROL_WORKFLOW_SHA"]
+          workflow_ref = os.environ["CONTROL_WORKFLOW_REF"]
+          workflow_event = os.environ["CONTROL_WORKFLOW_EVENT"]
+          control_tag_object = os.environ["CONTROL_TAG_OBJECT_SHA"]
+          recovery = os.environ["RECOVERY"] == "true"
+          full_sha = re.compile(r"^[0-9a-f]{40}$")
+          if not full_sha.fullmatch(source_sha) or not full_sha.fullmatch(workflow_sha):
+              raise SystemExit("source or control workflow SHA is not a full commit identity")
+
+          manifest_path = Path(f"dist/Blackcoin-{os.environ['VERSION']}-UNSIGNED-PRODUCTION.json")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          expected_workflow = {
+              "event": "push",
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "protected_environment": "production-release",
+          }
+          if manifest.get("workflow") != expected_workflow:
+              raise SystemExit("source generator workflow metadata differs from its reviewed contract")
+          manifest["workflow"] = {
+              "event": workflow_event,
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "protected_environment": "production-release",
+              "definition": {
+                  "path": ".github/workflows/build.yml",
+                  "ref": workflow_ref,
+                  "commit": workflow_sha,
+              },
+              "release_source": {
+                  "ref": source_ref,
+                  "tag": source_tag,
+                  "commit": source_sha,
+              },
+              "publication_recovery": recovery,
+          }
+          if recovery:
+              manifest["workflow"]["definition"]["control_tag_object"] = control_tag_object
+
+          notice_path = Path(f"dist/Blackcoin-{os.environ['VERSION']}-UNSIGNED-PRODUCTION.txt")
+          notice = notice_path.read_text(encoding="utf-8")
+          marker = f"workflow_run_id={os.environ['GITHUB_RUN_ID']}\n"
+          if notice.count(marker) != 1:
+              raise SystemExit("unsigned production notice workflow marker differs")
+          control_lines = (
+              f"workflow_event={workflow_event}\n"
+              f"control_workflow_ref={workflow_ref}\n"
+              f"control_workflow_commit={workflow_sha}\n"
+              f"release_source_ref={source_ref}\n"
+              f"publication_recovery={str(recovery).lower()}\n"
+          )
+          if recovery:
+              control_lines += f"control_tag_object={control_tag_object}\n"
+          notice_path.write_text(
+              notice.replace(marker, marker + control_lines),
+              encoding="utf-8",
+          )
+          subjects = []
+          for path in sorted(Path("dist").iterdir()):
+              if path == manifest_path:
+                  continue
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"release metadata subject is unsafe: {path}")
+              subjects.append({
+                  "name": path.name,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "size": path.stat().st_size,
+              })
+          if not subjects:
+              raise SystemExit("release metadata subject inventory is empty")
+          version = os.environ["VERSION"]
+          expected_subject_names = {
+              f"Blackcoin-{version}-Linux-x86_64.tar.gz",
+              f"Blackcoin-{version}-Linux-ARM64.tar.gz",
+              f"Blackcoin-{version}-Windows-x86_64-Portable.zip",
+              f"Blackcoin-{version}-Windows-x86_64-Installer.exe",
+              f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.zip",
+              f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.tar.gz",
+              f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.zip",
+              f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz",
+              f"Blackcoin-{version}-linux-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-linux-arm-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-windows-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-macos-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-macos-arm-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-REPRODUCIBILITY.txt",
+              f"Blackcoin-{version}-SBOM.spdx.json",
+              f"Blackcoin-{version}-provenance.intoto.json",
+              f"Blackcoin-{version}-UNSIGNED-PRODUCTION.txt",
+              "SOURCE_COMMIT.txt",
+          }
+          if recovery:
+              expected_subject_names.add(
+                  f"Blackcoin-{version}-RELEASE-RECOVERY-EVIDENCE.json"
+              )
+          actual_subject_names = {subject["name"] for subject in subjects}
+          if actual_subject_names != expected_subject_names:
+              raise SystemExit(
+                  "release metadata subject names differ: "
+                  f"missing={sorted(expected_subject_names - actual_subject_names)}, "
+                  f"extra={sorted(actual_subject_names - expected_subject_names)}"
+              )
+          manifest["artifacts_before_manifest_and_checksums"] = subjects
+          manifest_path.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          verified_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if verified_manifest.get("artifacts_before_manifest_and_checksums") != subjects:
+              raise SystemExit("final release manifest subject names, sizes, or SHA256 digests differ")
+          PY
+
           test -z "$(find dist -maxdepth 1 -type f \
             \( -name '*.asc' -o -name '*RELEASE-KEY*' \) -print -quit)"
           (cd dist && find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%P\n' |
             sort | while IFS= read -r file; do sha256sum "$file"; done > SHA256SUMS.txt)
           (cd dist && sha256sum --check --strict SHA256SUMS.txt)
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = "30.1.4"
+          expected = {
+              f"Blackcoin-{version}-Linux-x86_64.tar.gz",
+              f"Blackcoin-{version}-Linux-ARM64.tar.gz",
+              f"Blackcoin-{version}-Windows-x86_64-Portable.zip",
+              f"Blackcoin-{version}-Windows-x86_64-Installer.exe",
+              f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.zip",
+              f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.tar.gz",
+              f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.zip",
+              f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz",
+              f"Blackcoin-{version}-linux-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-linux-arm-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-windows-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-macos-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-macos-arm-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-REPRODUCIBILITY.txt",
+              f"Blackcoin-{version}-SBOM.spdx.json",
+              f"Blackcoin-{version}-provenance.intoto.json",
+              f"Blackcoin-{version}-UNSIGNED-PRODUCTION.txt",
+              f"Blackcoin-{version}-UNSIGNED-PRODUCTION.json",
+              "SOURCE_COMMIT.txt",
+              "SHA256SUMS.txt",
+          }
+          recovery = os.environ["RECOVERY"]
+          if recovery == "true":
+              expected.add(f"Blackcoin-{version}-RELEASE-RECOVERY-EVIDENCE.json")
+          elif recovery != "false":
+              raise SystemExit("release recovery mode is not boolean")
+          dist = Path("dist")
+          entries = list(dist.iterdir())
+          actual = {path.name for path in entries}
+          if actual != expected:
+              raise SystemExit(
+                  f"release inventory differs: missing={sorted(expected - actual)}, "
+                  f"extra={sorted(actual - expected)}"
+              )
+          unsafe = sorted(path.name for path in entries if path.is_symlink() or not path.is_file())
+          if unsafe:
+              raise SystemExit(f"unsafe release entries: {unsafe}")
+          empty = sorted(path.name for path in entries if path.stat().st_size == 0)
+          if empty:
+              raise SystemExit(f"empty release entries: {empty}")
+          PY
 
           {
             echo '# Blackcoin-Dev source-signed production release'
@@ -1248,6 +2128,15 @@ jobs:
             echo 'Verify the platform-signing notice, SHA256 checksums, exact signed source commit and tag, SBOM, provenance, and GitHub attestations before installing.'
             echo
             cat "doc/release-notes/release-notes-$VERSION.md"
+            if [[ "$RECOVERY" == true ]]; then
+              echo '## Publication recovery'
+              echo
+              echo "The immutable runtime source remains \`$TARGET_SHA\` at the signed annotated tag \`$TAG\`."
+              echo "Publication was recovered with \`workflow_dispatch\` from the separately signed control ref \`$CONTROL_WORKFLOW_REF\` at \`$CONTROL_WORKFLOW_SHA\`."
+              echo "Recovery workflow run: \`$GITHUB_RUN_ID\`."
+              echo 'The release includes API-bound evidence for successful safety run 30973290346 and failed tag-publication run 30982555787.'
+              echo
+            fi
             echo "## Source commit"
             echo
             echo "\`$TARGET_SHA\`"
@@ -1272,21 +2161,401 @@ jobs:
           subject-checksums: dist/SHA256SUMS.txt
           sbom-path: dist/Blackcoin-${{ needs.resolve-target.outputs.version }}-SBOM.spdx.json
 
-      - name: Create an immutable release at the annotated SSH-signed tag
+      - name: Verify every exact release subject has control-bound SLSA and SPDX attestations
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$TARGET_SHA"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true || {
-            echo '::error::Repository-level immutable releases must be enabled'
-            exit 1
-          }
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release $TAG already exists; production releases are immutable"
-            exit 1
+          mkdir attestation-verification
+          mapfile -t subjects < <(awk '{print $2}' dist/SHA256SUMS.txt)
+          expected_count=19
+          if [[ "$RECOVERY" == true ]]; then
+            expected_count=20
+          else
+            test "$RECOVERY" = false
           fi
-          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft \
-            --verify-tag --title "Blackcoin Core v$VERSION" --notes-file RELEASE_NOTES.md
+          test "${#subjects[@]}" = "$expected_count"
+          for subject in "${subjects[@]}"; do
+            test "$subject" = "$(basename "$subject")"
+            test -s "dist/$subject" && test ! -L "dist/$subject"
+          done
+          common_args=(
+            --repo "$GITHUB_REPOSITORY"
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build.yml"
+            --signer-digest "$CONTROL_WORKFLOW_SHA"
+            --source-digest "$CONTROL_WORKFLOW_SHA"
+            --source-ref "$CONTROL_WORKFLOW_REF"
+            --deny-self-hosted-runners
+            --format json
+          )
+
+          indexed=false
+          probe="dist/${subjects[0]}"
+          for _ in {1..12}; do
+            if gh attestation verify "$probe" "${common_args[@]}" \
+                > attestation-verification/index-slsa.json 2>/dev/null && \
+              gh attestation verify "$probe" "${common_args[@]}" \
+                --predicate-type 'https://spdx.dev/Document/v2.3' \
+                > attestation-verification/index-spdx.json 2>/dev/null; then
+              indexed=true
+              break
+            fi
+            sleep 5
+          done
+          test "$indexed" = true
+
+          EXPECTED_COUNT="$expected_count" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected = {}
+          for line in Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, name = line.split(maxsplit=1)
+              name = name.strip()
+              if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                  raise SystemExit("checksum manifest contains a malformed SHA256 digest")
+              if name in expected:
+                  raise SystemExit("checksum manifest contains a duplicate subject")
+              expected[name] = digest
+          expected_count = int(os.environ["EXPECTED_COUNT"])
+          if len(expected) != expected_count:
+              raise SystemExit("checksum subject count differs")
+
+          recovery = os.environ["RECOVERY"]
+          if recovery == "true":
+              expected_trigger = "workflow_dispatch"
+          elif recovery == "false":
+              expected_trigger = "push"
+          else:
+              raise SystemExit("release recovery mode is not boolean")
+          control_sha = os.environ["CONTROL_WORKFLOW_SHA"]
+          control_ref = os.environ["CONTROL_WORKFLOW_REF"]
+          expected_certificate = {
+              "githubWorkflowTrigger": expected_trigger,
+              "githubWorkflowSHA": control_sha,
+              "githubWorkflowRef": control_ref,
+              "buildSignerDigest": control_sha,
+              "runnerEnvironment": "github-hosted",
+              "sourceRepositoryDigest": control_sha,
+              "sourceRepositoryRef": control_ref,
+              "sourceRepositoryIdentifier": "1290339568",
+              "sourceRepositoryOwnerIdentifier": "298119138",
+              "buildConfigDigest": control_sha,
+              "runInvocationURI": (
+                  "https://github.com/Blackcoin-Dev/Blackcoin/actions/runs/"
+                  f"{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}"
+              ),
+          }
+
+          def subject_map(entry):
+              subjects = entry["verificationResult"]["statement"]["subject"]
+              return {subject["name"]: subject["digest"]["sha256"] for subject in subjects}
+
+          for predicate, expected_type in (
+              ("slsa", "https://slsa.dev/provenance/v1"),
+              ("spdx", "https://spdx.dev/Document/v2.3"),
+          ):
+              path = Path(f"attestation-verification/index-{predicate}.json")
+              entries = json.loads(path.read_text(encoding="utf-8"))
+              if not entries:
+                  raise SystemExit(f"{path.name} has no verified attestations")
+              matching = [
+                  entry for entry in entries
+                  if entry["verificationResult"]["statement"].get("predicateType") == expected_type
+                  and subject_map(entry) == expected
+                  and all(
+                      entry["verificationResult"]["signature"]["certificate"].get(key) == value
+                      for key, value in expected_certificate.items()
+                  )
+              ]
+              if not matching:
+                  raise SystemExit(
+                      f"{path.name} does not bind every exact release subject to the exact publication control"
+                  )
+          PY
+
+      - name: Create, byte-verify, and publish the immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_WORKFLOW_SHA" = "$CONTROL_WORKFLOW_SHA"
+          test "$GITHUB_SHA" = "$CONTROL_WORKFLOW_SHA"
+          test "$GITHUB_REF" = "$CONTROL_WORKFLOW_REF"
+          test "$GITHUB_EVENT_NAME" = "$CONTROL_WORKFLOW_EVENT"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$TARGET_SHA"
+          if [[ "$RECOVERY" == true ]]; then
+            test "$CONTROL_WORKFLOW_REF" = refs/tags/v30.1.4-publication-recovery-1
+            test "$(git rev-parse "${CONTROL_WORKFLOW_REF}^{tag}")" = "$CONTROL_TAG_OBJECT_SHA"
+            test "$(git rev-parse "${CONTROL_WORKFLOW_REF}^{commit}")" = "$CONTROL_WORKFLOW_SHA"
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/${CONTROL_WORKFLOW_REF#refs/tags/}" \
+              > final-control-tag-ref.json
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/$CONTROL_TAG_OBJECT_SHA" \
+              > final-control-tag.json
+            CONTROL_WORKFLOW_REF="$CONTROL_WORKFLOW_REF" \
+              CONTROL_WORKFLOW_SHA="$CONTROL_WORKFLOW_SHA" \
+              CONTROL_TAG_OBJECT_SHA="$CONTROL_TAG_OBJECT_SHA" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          ref = json.loads(Path("final-control-tag-ref.json").read_text(encoding="utf-8"))
+          tag = json.loads(Path("final-control-tag.json").read_text(encoding="utf-8"))
+          control_ref = os.environ["CONTROL_WORKFLOW_REF"]
+          control_sha = os.environ["CONTROL_WORKFLOW_SHA"]
+          tag_object = os.environ["CONTROL_TAG_OBJECT_SHA"]
+          if ref.get("ref") != control_ref:
+              raise SystemExit("publication-time control tag ref name differs")
+          if (ref.get("object", {}).get("type"), ref.get("object", {}).get("sha")) != ("tag", tag_object):
+              raise SystemExit("publication-time control tag ref object differs")
+          if tag.get("sha") != tag_object:
+              raise SystemExit("publication-time control tag object differs")
+          if (tag.get("object", {}).get("type"), tag.get("object", {}).get("sha")) != ("commit", control_sha):
+              raise SystemExit("publication-time control tag target differs")
+          if tag.get("verification", {}).get("verified") is not True:
+              raise SystemExit("publication-time control tag is not GitHub-verified")
+          if tag.get("verification", {}).get("reason") != "valid":
+              raise SystemExit("publication-time control tag signature reason is not valid")
+          PY
+          else
+            test "$RECOVERY" = false
+            test -z "$CONTROL_TAG_OBJECT_SHA"
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > candidate-draft.json
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --verify-tag --title "Blackcoin Core v$VERSION" --notes-file RELEASE_NOTES.md
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > candidate-draft.json
+          fi
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          release = json.loads(Path("candidate-draft.json").read_text(encoding="utf-8"))
+          if release.get("draft") is not True:
+              raise SystemExit("an existing public release must never be replaced")
+          author = release.get("author", {})
+          if (author.get("id"), author.get("login"), author.get("type")) != (41898282, "github-actions[bot]", "Bot"):
+              raise SystemExit("existing draft author differs from the pinned GitHub Actions bot")
+          if release.get("tag_name") != os.environ["TAG"]:
+              raise SystemExit("existing draft tag differs")
+          if release.get("prerelease") is not False or release.get("name") != f"Blackcoin Core v{os.environ['VERSION']}":
+              raise SystemExit("existing draft title or prerelease state differs")
+          release_id = release.get("id")
+          if not isinstance(release_id, int) or release_id <= 0:
+              raise SystemExit("existing draft numeric release identity is invalid")
+          body = release.get("body") or ""
+          recovery = os.environ["RECOVERY"]
+          if recovery == "true":
+              required_identity = (
+                  os.environ["TARGET_SHA"],
+                  os.environ["CONTROL_WORKFLOW_REF"],
+                  os.environ["CONTROL_WORKFLOW_SHA"],
+              )
+              if any(value not in body for value in required_identity):
+                  raise SystemExit("existing draft is not bound to the exact source and recovery control")
+              run_markers = re.findall(r"Recovery workflow run: `([1-9][0-9]*)`[.]", body)
+              if len(run_markers) != 1:
+                  raise SystemExit("existing draft does not identify one recovery run")
+          elif recovery != "false":
+              raise SystemExit("release recovery mode is not boolean")
+
+          expected = {}
+          for path in Path("dist").iterdir():
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"unsafe local release asset: {path}")
+              expected[path.name] = (
+                  path.stat().st_size,
+                  f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+              )
+          release_assets = release.get("assets", [])
+          assets = {
+              asset["name"]: (asset["size"], asset.get("digest"))
+              for asset in release_assets
+          }
+          exact_current_body = body == Path("RELEASE_NOTES.md").read_text(encoding="utf-8")
+          exact_current_subset = (
+              len(assets) == len(release_assets)
+              and set(assets).issubset(expected)
+              and all(value == expected[name] for name, value in assets.items())
+          )
+          if recovery == "false" and not (exact_current_body and exact_current_subset):
+              raise SystemExit("normal tag publication cannot replace an existing draft")
+          decision = "resume" if exact_current_body and exact_current_subset else "replace"
+          Path("draft-decision.txt").write_text(decision + "\n", encoding="utf-8")
+          Path("draft-release-id.txt").write_text(str(release_id) + "\n", encoding="utf-8")
+          PY
+
+          draft_decision=$(tr -d '\r\n' < draft-decision.txt)
+          if [[ "$draft_decision" == replace ]]; then
+            draft_release_id=$(tr -d '\r\n' < draft-release-id.txt)
+            [[ "$draft_release_id" =~ ^[1-9][0-9]*$ ]]
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$draft_release_id"
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > releases-after-delete.json
+            DRAFT_RELEASE_ID="$draft_release_id" TAG="$TAG" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          releases = json.loads(Path("releases-after-delete.json").read_text(encoding="utf-8"))
+          if len(releases) >= 100:
+              raise SystemExit("release inventory pagination prevents deletion confirmation")
+          release_id = int(os.environ["DRAFT_RELEASE_ID"])
+          tag = os.environ["TAG"]
+          if any(release.get("id") == release_id or release.get("tag_name") == tag for release in releases):
+              raise SystemExit("the exact stale draft still exists after numeric-ID deletion")
+          PY
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --verify-tag --title "Blackcoin Core v$VERSION" --notes-file RELEASE_NOTES.md
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > candidate-draft.json
+          else
+            test "$draft_decision" = resume
+          fi
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          release = json.loads(Path("candidate-draft.json").read_text(encoding="utf-8"))
+          expected_name = f"Blackcoin Core v{os.environ['VERSION']}"
+          if release.get("tag_name") != os.environ["TAG"] or release.get("draft") is not True:
+              raise SystemExit("an existing release is public or is not the expected draft")
+          author = release.get("author", {})
+          if (author.get("id"), author.get("login"), author.get("type")) != (41898282, "github-actions[bot]", "Bot"):
+              raise SystemExit("the existing draft author differs")
+          if release.get("prerelease") is not False or release.get("name") != expected_name:
+              raise SystemExit("the existing draft title or prerelease state differs")
+          if release.get("body") != Path("RELEASE_NOTES.md").read_text(encoding="utf-8"):
+              raise SystemExit("the existing draft release notes differ")
+          expected = {}
+          for path in Path("dist").iterdir():
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"unsafe local release asset: {path}")
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              expected[path.name] = (path.stat().st_size, f"sha256:{digest}")
+          release_assets = release.get("assets", [])
+          assets = {
+              asset["name"]: (asset["size"], asset.get("digest"))
+              for asset in release_assets
+          }
+          if len(assets) != len(release_assets):
+              raise SystemExit("the existing draft contains duplicate asset names")
+          extra = sorted(set(assets) - set(expected))
+          if extra:
+              raise SystemExit(f"the existing draft contains unexpected assets: {extra}")
+          mismatched = sorted(name for name, value in assets.items() if value != expected[name])
+          if mismatched:
+              raise SystemExit(f"the existing draft contains mismatched assets: {mismatched}")
+          missing = sorted(set(expected) - set(assets))
+          Path("missing-draft-assets.txt").write_text(
+              "".join(f"{name}\n" for name in missing), encoding="utf-8"
+          )
+          PY
+
+          while IFS= read -r asset; do
+            test -n "$asset"
+            gh release upload "$TAG" "dist/$asset" --repo "$GITHUB_REPOSITORY"
+          done < missing-draft-assets.txt
+
+          draft_verified=false
+          for _ in {1..12}; do
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > draft-release.json
+            if python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          release = json.loads(Path("draft-release.json").read_text(encoding="utf-8"))
+          if release.get("tag_name") != os.environ["TAG"] or release.get("draft") is not True:
+              raise SystemExit("the uploaded release is not the expected draft")
+          author = release.get("author", {})
+          if (author.get("id"), author.get("login"), author.get("type")) != (41898282, "github-actions[bot]", "Bot"):
+              raise SystemExit("the uploaded draft author differs")
+          if release.get("prerelease") is not False or release.get("name") != f"Blackcoin Core v{os.environ['VERSION']}":
+              raise SystemExit("the uploaded draft title or prerelease state differs")
+          if release.get("body") != Path("RELEASE_NOTES.md").read_text(encoding="utf-8"):
+              raise SystemExit("the uploaded draft release notes differ")
+          expected = {
+              path.name: (
+                  path.stat().st_size,
+                  f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+              )
+              for path in Path("dist").iterdir()
+              if path.is_file() and not path.is_symlink()
+          }
+          if len(expected) != len(list(Path("dist").iterdir())):
+              raise SystemExit("local release inventory contains an unsafe entry")
+          release_assets = release.get("assets", [])
+          assets = {
+              asset["name"]: (asset["size"], asset.get("digest"))
+              for asset in release_assets
+          }
+          if len(assets) != len(release_assets) or assets != expected:
+              raise SystemExit("uploaded draft asset names, sizes, or SHA256 digests differ")
+          PY
+            then
+              draft_verified=true
+              break
+            fi
+            sleep 5
+          done
+          test "$draft_verified" = true
+
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          verified=false
+          for _ in {1..12}; do
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > final-release.json
+            gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-release.json
+            if python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          release = json.loads(Path("final-release.json").read_text(encoding="utf-8"))
+          latest = json.loads(Path("latest-release.json").read_text(encoding="utf-8"))
+          if release.get("tag_name") != os.environ["TAG"]:
+              raise SystemExit("published release tag differs")
+          if release.get("draft") is not False or release.get("prerelease") is not False:
+              raise SystemExit("published release state differs")
+          author = release.get("author", {})
+          if (author.get("id"), author.get("login"), author.get("type")) != (41898282, "github-actions[bot]", "Bot"):
+              raise SystemExit("published release author differs")
+          if release.get("immutable") is not True:
+              raise SystemExit("published release is not immutable")
+          if release.get("name") != f"Blackcoin Core v{os.environ['VERSION']}":
+              raise SystemExit("published release title differs")
+          if release.get("body") != Path("RELEASE_NOTES.md").read_text(encoding="utf-8"):
+              raise SystemExit("published release notes differ")
+          if latest.get("id") != release.get("id"):
+              raise SystemExit("v30.1.4 is not the latest release")
+          expected = {}
+          for path in Path("dist").iterdir():
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              expected[path.name] = (path.stat().st_size, f"sha256:{digest}")
+          assets = {
+              asset["name"]: (asset["size"], asset.get("digest"))
+              for asset in release.get("assets", [])
+          }
+          if assets != expected:
+              raise SystemExit("published release asset names, sizes, or SHA256 digests differ")
+          print(release["html_url"])
+          PY
+            then
+              verified=true
+              break
+            fi
+            sleep 5
+          done
+          test "$verified" = true

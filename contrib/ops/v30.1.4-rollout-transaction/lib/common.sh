@@ -86,7 +86,8 @@ node_padded()
 
 service_for()
 {
-    printf 'node%d\n' "$1"
+    valid_node "$1" || return 1
+    printf 'node%02d\n' "$1"
 }
 
 container_for()

@@ -361,6 +361,7 @@ BITCOIN_CORE_H = \
   wallet/fees.h \
   wallet/load.h \
   wallet/quantum_stake_ops.h \
+  wallet/qq_development_donation.h \
   wallet/receive.h \
   wallet/redelegation.h \
   wallet/rpc/staking.h \
@@ -368,6 +369,9 @@ BITCOIN_CORE_H = \
   wallet/rpc/wallet.h \
   wallet/salvage.h \
   wallet/scriptpubkeyman.h \
+  wallet/shadow_pow_claim_recovery.h \
+  wallet/shadow_pow_claim_recovery_types.h \
+  wallet/shadow_pow_claim_recovery_args.h \
   wallet/spend.h \
   wallet/staking.h \
   wallet/sqlite.h \
@@ -544,6 +548,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/rpc/util.cpp \
   wallet/rpc/wallet.cpp \
   wallet/scriptpubkeyman.cpp \
+  wallet/shadow_pow_claim_recovery.cpp \
   wallet/spend.cpp \
   wallet/transaction.cpp \
   wallet/wallet.cpp \

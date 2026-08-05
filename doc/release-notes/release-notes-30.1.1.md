@@ -107,6 +107,16 @@ rebroadcast may continue across restart. The Qt dashboard presents the same
 warning and does not offer a
 one-click conflict broadcast.
 
+The preceding paragraphs record v30.1.1 behavior. The later Issue #37 recovery
+release permits up to 64 independent live wallet claims and treats non-mempool
+sibling and descendant records as components rooted at current confirmed
+anchors. It adds one shared recovery engine with read-only preview, explicit
+exact-plan sign-and-persist, and separate commit-and-broadcast authority, plus a
+manual GUI path and default-off bounded wallet automation. It never unlocks the
+wallet or enables mining. Both confirmation orders, QQP3 origin-plus-64
+eligibility, reorg reclassification, and frontier advancement are documented
+in [Gold Rush PoW claim lifecycle and recovery](../gold-rush-pow-claim-recovery.md).
+
 ## Wallet, GUI, and operator safety
 
 - Automatic staking restart, PoW restart, QQSIGNAL, demurrage attestations,

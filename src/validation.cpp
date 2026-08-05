@@ -350,10 +350,36 @@ static void LimitMempoolSize(CTxMemPool& pool, CCoinsViewCache& coins_cache)
         LogPrint(BCLog::MEMPOOL, "Expired %i transactions from the memory pool\n", expired);
     }
 
+    const int expired_shadow_claims = pool.ExpireMatching(
+        GetTime<std::chrono::seconds>() -
+            std::chrono::seconds{SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS},
+        [](const CTransaction& tx) { return TransactionHasShadowProof(tx); },
+        MemPoolRemovalReason::SHADOW_TIMEOUT);
+    if (expired_shadow_claims != 0) {
+        LogPrint(BCLog::MEMPOOL,
+                 "Expired %i transaction(s) from over-age Quantum Quasar shadow PoW claim packages\n",
+                 expired_shadow_claims);
+    }
+
     std::vector<COutPoint> vNoSpendsRemaining;
     pool.TrimToSize(pool.m_max_size_bytes, &vNoSpendsRemaining);
     for (const COutPoint& removed : vNoSpendsRemaining)
         coins_cache.Uncache(removed);
+}
+
+void ExpireShadowPowClaimsFromMempool(CTxMemPool& pool)
+{
+    LOCK(pool.cs);
+    const int expired = pool.ExpireMatching(
+        GetTime<std::chrono::seconds>() -
+            std::chrono::seconds{SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS},
+        [](const CTransaction& tx) { return TransactionHasShadowProof(tx); },
+        MemPoolRemovalReason::SHADOW_TIMEOUT);
+    if (expired != 0) {
+        LogPrint(BCLog::MEMPOOL,
+                 "Expired %i transaction(s) from over-age Quantum Quasar shadow PoW claim packages\n",
+                 expired);
+    }
 }
 
 void Chainstate::MaybeUpdateMempoolForReorg(
@@ -3421,7 +3447,7 @@ static bool GetDemurrageAdjustedInputPrincipals(const CTransaction& tx,
 
 bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo,
                             const std::map<CScript, CAmount>& shadow_direct_payouts,
-                            const CScript& dev_reward_script, std::string& reject_reason,
+                            std::string& reject_reason,
                             const std::vector<CAmount>* effective_principals)
 {
     std::map<CScript, CAmount> required; // principal that must be preserved, per cold-staking script
@@ -3462,9 +3488,6 @@ bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinst
             }
             available -= shadow_it->second;
         }
-        if (!dev_reward_script.empty() && spk == dev_reward_script) {
-            available = 0;
-        }
         if (available < req) { reject_reason = "bad-coldstake-covenant"; return false; }
     }
     return true;
@@ -3473,7 +3496,7 @@ bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinst
 bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo, std::string& reject_reason)
 {
     static const std::map<CScript, CAmount> empty_shadow_payouts;
-    return CheckColdStakeCovenant(coinstake, coinstake_undo, empty_shadow_payouts, CScript{}, reject_reason);
+    return CheckColdStakeCovenant(coinstake, coinstake_undo, empty_shadow_payouts, reject_reason);
 }
 
 bool FatalError(Notifications& notifications, BlockValidationState& state, const std::string& strMessage, const bilingual_str& userMessage)
@@ -4237,7 +4260,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 ? nullptr
                 : &coinstake_effective_principals;
             if (!CheckColdStakeCovenant(*block.vtx[1], blockundo.vtxundo.front(), {},
-                                        Params().GetDevRewardScript(), coldstake_reject_reason,
+                                        coldstake_reject_reason,
                                         effective_principals)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, coldstake_reject_reason);
             }
@@ -4276,10 +4299,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             }
         }
 
-        // Quantum Quasar treasury is a WALLET-LEVEL, opt-out staking contribution that
-        // begins only after the Gold Rush epoch (see wallet/staking.cpp). It is intentionally
-        // NOT a consensus rule: consensus does not require any treasury output, so a staker
-        // who opts out (-donatetodevfund=0) still produces a fully valid block.
+        // Optional development donations are wallet policy only. Consensus
+        // neither requires nor recognizes a treasury recipient or output.
     }
 
     if (!control.Wait()) {

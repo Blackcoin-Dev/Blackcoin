@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 
-class ArgsManager;
 class CScheduler;
 
 namespace interfaces {
@@ -20,6 +19,7 @@ class Chain;
 } // namespace interfaces
 
 namespace wallet {
+class CWallet;
 struct WalletContext;
 
 //! Responsible for reading and validating the -wallet arguments and verifying the wallet database.

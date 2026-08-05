@@ -63,6 +63,23 @@ namespace wallet {
 RPCHelpMan importmulti();
 RPCHelpMan dumpwallet();
 RPCHelpMan importwallet();
+static CMutableTransaction MakeDurabilityTestSpend(
+    const CTransaction& from, uint32_t index, const CKey& key,
+    const CScript& pubkey)
+{
+    CMutableTransaction mtx;
+    mtx.vout.emplace_back(
+        from.vout[index].nValue - DEFAULT_TRANSACTION_MAXFEE, pubkey);
+    mtx.vin.emplace_back(CTxIn{from.GetHash(), index});
+    FillableSigningProvider keystore;
+    keystore.AddKey(key);
+    std::map<COutPoint, Coin> coins;
+    coins[mtx.vin[0].prevout].out = from.vout[index];
+    std::map<int, bilingual_str> input_errors;
+    BOOST_REQUIRE(SignTransaction(
+        mtx, &keystore, coins, SIGHASH_ALL, input_errors));
+    return mtx;
+}
 
 class ScopedArgsSettings
 {
@@ -390,6 +407,13 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_submission_guard_is_single_flight_and_exce
 BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
 {
     CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    constexpr int first_quarantine_height{321};
+    const uint256 first_quarantine_tip{42};
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetLastBlockProcessed(
+            first_quarantine_height, first_quarantine_tip);
+    }
 
     CKey wallet_key;
     wallet_key.MakeNewKey(/*fCompressed=*/true);
@@ -416,7 +440,14 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
     claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
     const CTransactionRef claim_ref = MakeTransactionRef(std::move(claim));
     BOOST_REQUIRE(TransactionHasShadowProof(*claim_ref));
-    BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateInactive{}));
+    BOOST_REQUIRE(wallet.AddToWallet(
+        claim_ref, TxStateInactive{},
+        [](CWalletTx& wtx, bool) {
+            // A legacy display comment is not durable authorization for
+            // automatic claim recovery.
+            wtx.mapValue["comment"] = "PoW Claim";
+            return true;
+        }));
 
     // A proof need not carry the persistent marker to be unsafe to replace:
     // it can be absent from this mempool while another peer still has it.
@@ -430,7 +461,49 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
         LOCK(wallet.cs_wallet);
         const CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
         BOOST_CHECK(stored.isUnconfirmed());
-        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_quarantine"), "1");
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(SHADOW_POW_QUARANTINE_MARKER_KEY), "1");
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_quarantine_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_quarantine_tip.GetHex());
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_AUTHORED_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_CREATED_HEIGHT_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_CREATED_TIP_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY) == 0);
+    }
+
+    // Clearing the transient quarantine marker and observing the claim again
+    // must not rewrite its immutable first-observation provenance.
+    {
+        LOCK(wallet.cs_wallet);
+        CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
+        stored.mapValue.erase(SHADOW_POW_QUARANTINE_MARKER_KEY);
+        wallet.SetLastBlockProcessed(
+            first_quarantine_height + 1, uint256{43});
+    }
+    BOOST_REQUIRE(wallet.QuarantineShadowPowClaim(claim_ref->GetHash()));
+    {
+        LOCK(wallet.cs_wallet);
+        const CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_quarantine_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_quarantine_tip.GetHex());
     }
 
     // A removed claim can still be held by a peer. Generic abandonment must
@@ -443,7 +516,198 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
         LOCK(wallet.cs_wallet);
         const CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
         BOOST_CHECK(!stored.isAbandoned());
-        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_quarantine"), "1");
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(SHADOW_POW_QUARANTINE_MARKER_KEY), "1");
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    shadow_pow_claim_quarantine_metadata_is_durable_before_authoritative,
+    TestChain100Setup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script =
+        GetScriptForRawPubKey(wallet_key.GetPubKey());
+    const CMutableTransaction funding = MakeDurabilityTestSpend(
+        *m_coinbase_txns[0], /*index=*/0, coinbaseKey, wallet_script);
+    CreateAndProcessBlock(
+        {funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    auto baseline_wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return Assert(m_node.chainman)->ActiveChain()),
+        wallet_key);
+    CWallet& baseline = *baseline_wallet;
+    const int observation_height = WITH_LOCK(
+        Assert(m_node.chainman)->GetMutex(),
+        return Assert(m_node.chainman)->ActiveChain().Height());
+    const uint256 observation_tip = WITH_LOCK(
+        Assert(m_node.chainman)->GetMutex(),
+        return Assert(m_node.chainman)->ActiveChain().Tip()->GetBlockHash());
+    {
+        LOCK(baseline.cs_wallet);
+        baseline.SetLastBlockProcessed(observation_height, observation_tip);
+    }
+    const CTransactionRef funding_ref = MakeTransactionRef(funding);
+
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(),
+                 {'Q', 'Q', 'P', '2', 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    CMutableTransaction claim;
+    claim.vin.emplace_back(COutPoint{funding_ref->GetHash(), 0});
+    claim.vout.emplace_back(
+        funding.vout[0].nValue - DEFAULT_TRANSACTION_MAXFEE,
+        wallet_script);
+    claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const CTransactionRef claim_ref = MakeTransactionRef(std::move(claim));
+    BOOST_REQUIRE(baseline.AddToWallet(claim_ref, TxStateInactive{}));
+
+    const MockableData before_quarantine =
+        GetMockableDatabase(baseline).m_records;
+    enum class FailureStage { BEGIN, WRITE, COMMIT };
+    for (const FailureStage stage :
+         {FailureStage::BEGIN, FailureStage::WRITE, FailureStage::COMMIT}) {
+        CWallet failing(
+            m_node.chain.get(), "",
+            CreateMockableWalletDatabase(before_quarantine));
+        BOOST_REQUIRE_EQUAL(failing.LoadWallet(), DBErrors::LOAD_OK);
+        {
+            LOCK(failing.cs_wallet);
+            failing.SetLastBlockProcessed(
+                observation_height, observation_tip);
+        }
+        MockableDatabase& database = GetMockableDatabase(failing);
+        const MockableData before_attempt = database.m_records;
+        if (stage == FailureStage::BEGIN) database.m_fail_begin = true;
+        if (stage == FailureStage::WRITE) database.m_fail_write_at = 0;
+        if (stage == FailureStage::COMMIT) database.m_fail_commit = true;
+
+        BOOST_CHECK(!failing.QuarantineShadowPowClaim(claim_ref->GetHash()));
+        BOOST_CHECK(failing.IsShadowPowClaimRecoveryDatabaseAmbiguous());
+        BOOST_CHECK(database.m_records == before_attempt);
+        if (stage != FailureStage::BEGIN) {
+            BOOST_CHECK(database.m_last_txn_durable);
+        }
+        {
+            LOCK(failing.cs_wallet);
+            const CWalletTx& stored =
+                failing.mapWallet.at(claim_ref->GetHash());
+            BOOST_CHECK(stored.mapValue.count(
+                SHADOW_POW_QUARANTINE_MARKER_KEY) == 0);
+            BOOST_CHECK(stored.mapValue.count(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY) == 0);
+            BOOST_CHECK(stored.mapValue.count(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY) == 0);
+        }
+
+        ShadowPowClaimRecoveryRequest request;
+        request.mode = ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+        request.execution_authority =
+            ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+        request.acknowledge_fee_and_conflict_risk = true;
+        request.expected_plan_id = uint256{1};
+        const ShadowPowClaimRecoveryResult refused =
+            failing.ResolveShadowPowClaims(request);
+        BOOST_CHECK(!refused.success);
+        BOOST_CHECK(refused.durable_state_ambiguous);
+        BOOST_CHECK_EQUAL(refused.signed_and_persisted, 0U);
+        BOOST_CHECK_EQUAL(refused.relay_authority_granted, 0U);
+        BOOST_CHECK_EQUAL(refused.broadcast, 0U);
+        BOOST_CHECK_EQUAL(failing.mapWallet.size(), 2U);
+    }
+
+    CWallet successful(
+        m_node.chain.get(), "",
+        CreateMockableWalletDatabase(before_quarantine));
+    BOOST_REQUIRE_EQUAL(successful.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(successful.cs_wallet);
+        successful.SetLastBlockProcessed(
+            observation_height, observation_tip);
+    }
+    BOOST_REQUIRE(successful.QuarantineShadowPowClaim(claim_ref->GetHash()));
+    BOOST_CHECK(GetMockableDatabase(successful).m_last_txn_durable);
+    BOOST_CHECK(!successful.IsShadowPowClaimRecoveryDatabaseAmbiguous());
+    const MockableData quarantined_records =
+        GetMockableDatabase(successful).m_records;
+
+    CWallet reloaded(
+        m_node.chain.get(), "",
+        DuplicateMockDatabase(successful.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(reloaded.cs_wallet);
+        const CWalletTx& stored =
+            reloaded.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(SHADOW_POW_QUARANTINE_MARKER_KEY), "1");
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            observation_tip.GetHex());
+    }
+
+    // A failed clear is also copy-on-write: the durable quarantine remains
+    // authoritative and no optimistic in-memory clear is exposed.
+    CWallet failed_clear(
+        m_node.chain.get(), "",
+        CreateMockableWalletDatabase(quarantined_records));
+    BOOST_REQUIRE_EQUAL(failed_clear.LoadWallet(), DBErrors::LOAD_OK);
+    GetMockableDatabase(failed_clear).m_fail_write_at = 0;
+    failed_clear.transactionAddedToMempool(claim_ref);
+    BOOST_CHECK(failed_clear.IsShadowPowClaimRecoveryDatabaseAmbiguous());
+    {
+        LOCK(failed_clear.cs_wallet);
+        const CWalletTx& stored =
+            failed_clear.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(SHADOW_POW_QUARANTINE_MARKER_KEY), "1");
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY) != 0);
+    }
+    CWallet failed_clear_reloaded(
+        m_node.chain.get(), "",
+        DuplicateMockDatabase(failed_clear.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(
+        failed_clear_reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(failed_clear_reloaded.cs_wallet);
+        const CWalletTx& stored =
+            failed_clear_reloaded.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(SHADOW_POW_QUARANTINE_MARKER_KEY), "1");
+    }
+
+    successful.transactionAddedToMempool(claim_ref);
+    BOOST_CHECK(!successful.IsShadowPowClaimRecoveryDatabaseAmbiguous());
+    {
+        LOCK(successful.cs_wallet);
+        const CWalletTx& stored =
+            successful.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_QUARANTINE_MARKER_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY) == 0);
+        // Immutable first-observation audit provenance survives a live clear.
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY) != 0);
+    }
+    CWallet clear_reloaded(
+        m_node.chain.get(), "",
+        DuplicateMockDatabase(successful.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(clear_reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(clear_reloaded.cs_wallet);
+        const CWalletTx& stored =
+            clear_reloaded.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_QUARANTINE_MARKER_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY) != 0);
     }
 }
 
@@ -509,6 +773,197 @@ static void AddKey(CWallet& wallet, const CKey& key)
     assert(desc);
     WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
     if (!wallet.AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
+}
+
+BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
+                        TestChain100Setup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script =
+        GetScriptForRawPubKey(wallet_key.GetPubKey());
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        wallet_key);
+
+    const CBlockIndex* confirmation_block = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain()[1]);
+    BOOST_REQUIRE(confirmation_block);
+    auto add_confirmed_coin = [&](uint8_t tag, CAmount value) {
+        CMutableTransaction funding;
+        funding.vin.emplace_back(COutPoint{uint256{tag}, 0});
+        funding.vout.emplace_back(value, wallet_script);
+        const CTransactionRef tx = MakeTransactionRef(std::move(funding));
+        BOOST_REQUIRE(wallet->AddToWallet(
+            tx, TxStateConfirmed{confirmation_block->GetBlockHash(),
+                                 confirmation_block->nHeight, 1}));
+        return COutPoint{tx->GetHash(), 0};
+    };
+
+    const COutPoint first = add_confirmed_coin(0x41, 10 * COIN);
+    const CScript quantum_payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x51)});
+    CCoinControl control;
+    control.m_allow_other_inputs = false;
+    control.m_avoid_address_reuse = false;
+    control.m_min_depth = 1;
+    ShadowPowClaimInput selected;
+    bilingual_str error;
+
+    wallet->m_enabled_staking = true;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const ShadowPowClaimStakeReserveInfo info =
+            wallet->GetShadowPowClaimStakeReserveInfoLocked();
+        BOOST_CHECK(info.wallet_tip_matches);
+        BOOST_CHECK_EQUAL(info.configured_reserve_coins, 1);
+        BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_coins, 1U);
+        BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_weight, 10 * COIN);
+        BOOST_CHECK_EQUAL(info.reserved_stake_coins, 1U);
+        BOOST_CHECK_EQUAL(info.reserved_stake_weight, 10 * COIN);
+        BOOST_CHECK_EQUAL(info.claim_coins_after_reserve, 0U);
+        BOOST_CHECK(info.last_stake_coin_guard);
+        BOOST_CHECK(
+            wallet->SelectShadowPowClaimInput(
+                std::nullopt, quantum_payout, nullptr, control, selected,
+                error) ==
+            ShadowPowClaimInputSelectionResult::STAKE_RESERVE_PROTECTED);
+    }
+    BOOST_CHECK(error.original.find("protect 1 mature legacy staking coin") !=
+                std::string::npos);
+
+    // A protected coin that cannot satisfy fee policy must report the fee
+    // failure, not claim that the stake reserve was the deciding blocker.
+    const CAmount original_max_fee = wallet->m_default_max_tx_fee;
+    wallet->m_default_max_tx_fee = 0;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_CHECK(
+            wallet->SelectShadowPowClaimInput(
+                std::nullopt, quantum_payout, nullptr, control, selected,
+                error) ==
+            ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX);
+    }
+    wallet->m_default_max_tx_fee = original_max_fee;
+
+    wallet->m_enabled_staking = false;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_CHECK(wallet->SelectShadowPowClaimInput(
+                        std::nullopt, quantum_payout, nullptr, control,
+                        selected, error) ==
+                    ShadowPowClaimInputSelectionResult::SELECTED);
+        BOOST_CHECK(selected.outpoint == first);
+    }
+
+    const COutPoint second = add_confirmed_coin(0x42, 20 * COIN);
+    wallet->m_enabled_staking = true;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const ShadowPowClaimStakeReserveInfo info =
+            wallet->GetShadowPowClaimStakeReserveInfoLocked();
+        BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_coins, 2U);
+        BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_weight, 30 * COIN);
+        BOOST_CHECK_EQUAL(info.reserved_stake_coins, 1U);
+        BOOST_CHECK_EQUAL(info.reserved_stake_weight, 20 * COIN);
+        BOOST_CHECK_EQUAL(info.claim_coins_after_reserve, 1U);
+        BOOST_CHECK(!info.last_stake_coin_guard);
+        BOOST_CHECK(wallet->SelectShadowPowClaimInput(
+                        std::nullopt, quantum_payout, nullptr, control,
+                        selected, error) ==
+                    ShadowPowClaimInputSelectionResult::SELECTED);
+        BOOST_CHECK(selected.outpoint == first);
+        BOOST_CHECK(selected.outpoint != second);
+    }
+
+    // Reserve policy and telemetry are wallet-scoped. A second wallet on the
+    // same chain cannot inherit the first wallet's enabled state, coins, or
+    // protected outpoints.
+    CKey peer_key;
+    peer_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript peer_script =
+        GetScriptForRawPubKey(peer_key.GetPubKey());
+    auto peer_wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        peer_key);
+    CMutableTransaction peer_funding;
+    peer_funding.vin.emplace_back(COutPoint{uint256{0x43}, 0});
+    peer_funding.vout.emplace_back(15 * COIN, peer_script);
+    const CTransactionRef peer_tx =
+        MakeTransactionRef(std::move(peer_funding));
+    BOOST_REQUIRE(peer_wallet->AddToWallet(
+        peer_tx, TxStateConfirmed{confirmation_block->GetBlockHash(),
+                                  confirmation_block->nHeight, 1}));
+    peer_wallet->m_enabled_staking = false;
+    {
+        LOCK2(::cs_main, peer_wallet->cs_wallet);
+        const ShadowPowClaimStakeReserveInfo peer_info =
+            peer_wallet->GetShadowPowClaimStakeReserveInfoLocked();
+        BOOST_CHECK(!peer_info.staking_enabled);
+        BOOST_CHECK_EQUAL(peer_info.mature_stakeable_legacy_coins, 1U);
+        BOOST_CHECK_EQUAL(peer_info.reserved_stake_coins, 0U);
+        BOOST_CHECK(peer_wallet->SelectShadowPowClaimInput(
+                        std::nullopt, quantum_payout, nullptr, control,
+                        selected, error) ==
+                    ShadowPowClaimInputSelectionResult::SELECTED);
+        BOOST_CHECK(selected.outpoint == COutPoint(peer_tx->GetHash(), 0));
+    }
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const ShadowPowClaimStakeReserveInfo original_info =
+            wallet->GetShadowPowClaimStakeReserveInfoLocked();
+        BOOST_CHECK(original_info.staking_enabled);
+        BOOST_CHECK_EQUAL(original_info.reserved_stake_coins, 1U);
+        BOOST_CHECK_EQUAL(original_info.reserved_stake_weight, 20 * COIN);
+    }
+    wallet->m_enabled_staking = false;
+}
+
+BOOST_FIXTURE_TEST_CASE(staking_telemetry_does_not_treat_zero_search_interval_as_stopped,
+                        TestChain100Setup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        wallet_key);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+
+    wallet->m_enabled_staking = true;
+    wallet->m_cached_stake_weight = 10 * COIN;
+    wallet->m_cached_stake_weight_height = tip->nHeight;
+    wallet->m_last_coin_stake_search_interval = 0;
+    wallet->PublishStakingTelemetry(
+        StakingTelemetryState::SEARCHING, tip->GetBlockHash(), tip->nHeight,
+        /*worker_running=*/true, "searching eligible stake coins");
+
+    const StakingTelemetrySnapshot searching =
+        wallet->GetStakingTelemetrySnapshot();
+    BOOST_CHECK(searching.enabled);
+    BOOST_CHECK(searching.worker_running);
+    BOOST_CHECK(searching.eligible);
+    BOOST_CHECK(searching.state == StakingTelemetryState::SEARCHING);
+    BOOST_CHECK_EQUAL(searching.search_interval, 0);
+    BOOST_CHECK_EQUAL(searching.weight, 10 * COIN);
+    BOOST_CHECK_EQUAL(searching.tip_height, tip->nHeight);
+    BOOST_CHECK(searching.tip == tip->GetBlockHash());
+
+    wallet->m_enabled_staking = false;
+    const StakingTelemetrySnapshot disabled =
+        wallet->GetStakingTelemetrySnapshot();
+    BOOST_CHECK(!disabled.enabled);
+    BOOST_CHECK(!disabled.worker_running);
+    BOOST_CHECK(!disabled.eligible);
+    BOOST_CHECK(disabled.state == StakingTelemetryState::DISABLED);
 }
 
 BOOST_FIXTURE_TEST_CASE(commit_refreshes_mempool_state_before_async_callbacks, TestChain100Setup)
@@ -633,6 +1088,162 @@ BOOST_FIXTURE_TEST_CASE(legacy_shadow_pow_cleanup_is_quarantined_without_rebroad
         BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_legacy_cleanup_quarantine"), "1");
         BOOST_CHECK(wallet->IsSpent(cleanup_input));
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_inventory_is_tip_pinned_and_reorg_safe, TestChain100Setup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script = GetScriptForRawPubKey(wallet_key.GetPubKey());
+    const CMutableTransaction funding = TestSimpleSpend(
+        *m_coinbase_txns[0],
+        /*index=*/0,
+        coinbaseKey,
+        wallet_script);
+    CreateAndProcessBlock({funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()),
+        wallet_key);
+    BOOST_REQUIRE(m_node.chain->isReadyToBroadcast());
+
+    auto make_shadow_claim = [](const COutPoint& input, CAmount value, const CScript& output_script) {
+        std::vector<unsigned char> proof = GetShadowPrefix();
+        proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        CMutableTransaction claim;
+        claim.vin.emplace_back(input);
+        claim.vout.emplace_back(value, output_script);
+        claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+        return MakeTransactionRef(std::move(claim));
+    };
+    auto sync_wallet_tip = [&] {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const CBlockIndex* tip = Assert(m_node.chainman)->ActiveChain().Tip();
+        BOOST_REQUIRE(tip);
+        wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash());
+    };
+    auto check_inventory = [&](size_t raw, size_t actionable, size_t resolved, size_t indeterminate) {
+        const ShadowPowClaimInventory inventory = wallet->GetShadowPowClaimInventory();
+        BOOST_CHECK(inventory.wallet_tip_matches);
+        BOOST_CHECK_EQUAL(inventory.raw_quarantined_claims, raw);
+        BOOST_CHECK_EQUAL(inventory.actionable_claims, actionable);
+        BOOST_CHECK_EQUAL(inventory.resolved_on_active_chain_claims, resolved);
+        BOOST_CHECK_EQUAL(inventory.indeterminate_claims, indeterminate);
+        BOOST_CHECK_EQUAL(inventory.BlockingClaims(), actionable + indeterminate);
+        BOOST_CHECK_EQUAL(wallet->CountQuarantinedShadowPowClaims(), actionable + indeterminate);
+    };
+
+    const CTransactionRef funding_ref = MakeTransactionRef(funding);
+    const COutPoint funding_outpoint{funding_ref->GetHash(), 0};
+    const CTransactionRef stale_claim = make_shadow_claim(
+        funding_outpoint,
+        funding.vout[0].nValue - DEFAULT_TRANSACTION_MAXFEE,
+        wallet_script);
+    BOOST_REQUIRE(TransactionHasShadowProof(*stale_claim));
+    BOOST_REQUIRE(wallet->AddToWallet(stale_claim, TxStateInactive{}));
+
+    // This deliberately synthetic legacy record has no durable authored or
+    // quarantine provenance. The shared classifier must fail closed as
+    // indeterminate while still keeping claim creation blocked.
+    check_inventory(/*raw=*/1, /*actionable=*/0, /*resolved=*/0, /*indeterminate=*/1);
+
+    const int funding_height = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->ActiveChain().Height());
+    const CMutableTransaction competing_spend = CreateValidMempoolTransaction(
+        funding_ref,
+        /*input_vout=*/0,
+        funding_height,
+        wallet_key,
+        wallet_script,
+        funding.vout[0].nValue - DEFAULT_TRANSACTION_MAXFEE,
+        /*submit=*/true);
+
+    // A mempool-only conflict is not an active-chain resolution. Direct
+    // CoinsTip classification must continue to fail closed and block mining.
+    check_inventory(/*raw=*/1, /*actionable=*/0, /*resolved=*/0, /*indeterminate=*/1);
+
+    const CBlock resolution_block = CreateAndProcessBlock(
+        {competing_spend}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    sync_wallet_tip();
+
+    // Model a legacy wallet record that did not learn the conflict edge. The
+    // raw QQSPROOF history remains intact, while the active-chain spend of its
+    // authenticated anchor proves that this component is nonblocking.
+    check_inventory(/*raw=*/1, /*actionable=*/0, /*resolved=*/1, /*indeterminate=*/0);
+
+    // Import/reindex makes the active CoinsTip unsuitable for a new mining
+    // decision. Even though the same anchor is spent on the last processed
+    // tip, the lightweight one-second gate must fail closed until the chain is
+    // ready again. Keep the global flag scoped so a test failure cannot leak
+    // importing state into later fixtures.
+    {
+        struct ScopedImporting {
+            std::atomic<bool>& flag;
+            explicit ScopedImporting(std::atomic<bool>& importing)
+                : flag(importing)
+            {
+                flag = true;
+            }
+            ~ScopedImporting() { flag = false; }
+        } importing{Assert(m_node.chainman)->m_blockman.m_importing};
+        BOOST_CHECK(!m_node.chain->isReadyToBroadcast());
+        BOOST_CHECK_EQUAL(wallet->CountQuarantinedShadowPowClaims(), 1U);
+    }
+    BOOST_REQUIRE(m_node.chain->isReadyToBroadcast());
+    BOOST_CHECK_EQUAL(wallet->CountQuarantinedShadowPowClaims(), 0U);
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored = wallet->mapWallet.at(stale_claim->GetHash());
+        BOOST_CHECK(stored.isUnconfirmed());
+        BOOST_CHECK(!stored.InMempool());
+        BOOST_CHECK(!stored.isAbandoned());
+    }
+
+    CBlockIndex* resolution_index = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->m_blockman.LookupBlockIndex(resolution_block.GetHash()));
+    BOOST_REQUIRE(resolution_index);
+    BlockValidationState state;
+    BOOST_REQUIRE(Assert(m_node.chainman)->ActiveChainstate().InvalidateBlock(state, resolution_index));
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+
+    // Disconnecting the active-chain spend restores the anchor. Classification
+    // is reversible, so the same retained record immediately blocks again in
+    // its provenance-incomplete, indeterminate state.
+    check_inventory(/*raw=*/1, /*actionable=*/0, /*resolved=*/0, /*indeterminate=*/1);
+
+    const CTransactionRef competing_ref = MakeTransactionRef(competing_spend);
+    BOOST_REQUIRE(wallet->AddToWallet(competing_ref, TxStateInMempool{}));
+    const CTransactionRef malformed_ancestry_claim = make_shadow_claim(
+        COutPoint{competing_ref->GetHash(), 0},
+        competing_spend.vout[0].nValue - DEFAULT_TRANSACTION_MAXFEE,
+        wallet_script);
+    BOOST_REQUIRE(TransactionHasShadowProof(*malformed_ancestry_claim));
+    BOOST_REQUIRE(wallet->AddToWallet(malformed_ancestry_claim, TxStateInactive{}));
+
+    // A claim rooted in an unconfirmed ordinary transaction has no
+    // authenticated confirmed anchor. It must be indeterminate, never inferred
+    // resolved merely because an outpoint is absent from CoinsTip.
+    check_inventory(/*raw=*/2, /*actionable=*/0, /*resolved=*/0, /*indeterminate=*/2);
+
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const CBlockIndex* tip = Assert(m_node.chainman)->ActiveChain().Tip();
+        BOOST_REQUIRE(tip && tip->pprev);
+        wallet->SetLastBlockProcessed(tip->pprev->nHeight, tip->pprev->GetBlockHash());
+    }
+    const ShadowPowClaimInventory stale_snapshot = wallet->GetShadowPowClaimInventory();
+    BOOST_CHECK(!stale_snapshot.wallet_tip_matches);
+    BOOST_CHECK_EQUAL(stale_snapshot.raw_quarantined_claims, 2U);
+    BOOST_CHECK_EQUAL(stale_snapshot.actionable_claims, 0U);
+    BOOST_CHECK_EQUAL(stale_snapshot.resolved_on_active_chain_claims, 0U);
+    BOOST_CHECK_EQUAL(stale_snapshot.indeterminate_claims, 2U);
+    BOOST_CHECK_EQUAL(stale_snapshot.BlockingClaims(), 2U);
+    BOOST_CHECK_EQUAL(wallet->CountQuarantinedShadowPowClaims(), 2U);
+    sync_wallet_tip();
 }
 
 static void CheckLiveUnspentStakeIndex(CWallet& wallet)
@@ -903,6 +1514,244 @@ public:
     ~MockTimeScope() { SetMockTime(0); }
 };
 
+BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_branch_quarantine_resets_after_reorg, TestChain100Setup)
+{
+    ShadowScheduleScope schedule_scope;
+    const int initial_height = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->ActiveChain().Height());
+    const int original_whitelist_height = SHADOW_WHITELIST_HEIGHT;
+    const int original_reward_start_height = SHADOW_REWARD_START_HEIGHT;
+    const int original_gold_rush_blocks = SHADOW_GOLD_RUSH_BLOCKS;
+    const auto enable_gold_rush_classification = [&] {
+        SetShadowTestSchedule(
+            /*whitelist_height=*/initial_height,
+            /*reward_start_height=*/initial_height + 1,
+            /*gold_rush_blocks=*/32);
+    };
+    const auto restore_production_schedule = [&] {
+        SetShadowTestSchedule(
+            original_whitelist_height,
+            original_reward_start_height,
+            original_gold_rush_blocks);
+    };
+
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script =
+        GetScriptForRawPubKey(wallet_key.GetPubKey());
+    const CMutableTransaction funding = TestSimpleSpend(
+        *m_coinbase_txns[0], /*index=*/0, coinbaseKey, wallet_script);
+    CreateAndProcessBlock(
+        {funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return Assert(m_node.chainman)->ActiveChain()),
+        wallet_key);
+    wallet->SetBroadcastTransactions(/*broadcast=*/false);
+    SyncWithValidationInterfaceQueue();
+
+    auto sync_wallet_tip = [&] {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const CBlockIndex* tip =
+            Assert(m_node.chainman)->ActiveChain().Tip();
+        BOOST_REQUIRE(tip);
+        wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash());
+    };
+
+    const CBlock first_observation_block = CreateAndProcessBlock(
+        {}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+    const int first_observation_height = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->ActiveChain().Height());
+    const uint256 first_observation_tip =
+        first_observation_block.GetHash();
+
+    // A canonical QQP2 carrier with zero nonce is invalid work on this pinned
+    // tip but can become valid on a descendant because QQP2 has no origin
+    // binding. Recovery deliberately supports that one disclosed retryable
+    // state, so wallet repair must establish and reorg-reset its stale clock.
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0});
+    proof.insert(proof.end(), 8, 0);
+    proof.push_back(static_cast<unsigned char>(wallet_script.size() & 0xff));
+    proof.push_back(
+        static_cast<unsigned char>((wallet_script.size() >> 8) & 0xff));
+    proof.insert(proof.end(), wallet_script.begin(), wallet_script.end());
+    const CScript quantum_payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x51)});
+    proof.push_back(static_cast<unsigned char>(quantum_payout.size() & 0xff));
+    proof.push_back(
+        static_cast<unsigned char>((quantum_payout.size() >> 8) & 0xff));
+    proof.insert(proof.end(), quantum_payout.begin(), quantum_payout.end());
+    const CTransactionRef funding_ref = MakeTransactionRef(funding);
+    CMutableTransaction claim;
+    claim.vin.emplace_back(COutPoint{funding_ref->GetHash(), 0});
+    claim.vout.emplace_back(
+        funding.vout[0].nValue - DEFAULT_TRANSACTION_MAXFEE,
+        wallet_script);
+    claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const CTransactionRef claim_ref = MakeTransactionRef(std::move(claim));
+    BOOST_REQUIRE(TransactionHasShadowProof(*claim_ref));
+    BOOST_REQUIRE(wallet->AddToWallet(
+        claim_ref, TxStateInactive{},
+        [&](CWalletTx& wtx, bool) {
+            wtx.mapValue[SHADOW_POW_CLAIM_AUTHORED_KEY] = "1";
+            wtx.mapValue[SHADOW_POW_CLAIM_CREATED_HEIGHT_KEY] =
+                ToString(first_observation_height + 1);
+            wtx.mapValue[SHADOW_POW_CLAIM_CREATED_TIP_KEY] =
+                first_observation_tip.GetHex();
+            return true;
+        }));
+
+    // Change the schedule only around the side-effect-free claim
+    // classification. Blocks themselves must be built under the fixture's
+    // production schedule because this synthetic chain has no retroactive
+    // shadow-state history for an activation at height 101.
+    enable_gold_rush_classification();
+    wallet->RepairStaleShadowTransactions(/*force=*/true);
+    restore_production_schedule();
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored =
+            wallet->mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+    }
+
+    // The branch-relative pair is durable across a wallet reload.
+    CWallet reloaded(
+        m_node.chain.get(), "", DuplicateMockDatabase(wallet->GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(reloaded.cs_wallet);
+        const CWalletTx& stored =
+            reloaded.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+    }
+
+    // A descendant tip must mature, rather than overwrite, the observation.
+    CreateAndProcessBlock(
+        {}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+    enable_gold_rush_classification();
+    wallet->RepairStaleShadowTransactions(/*force=*/true);
+    restore_production_schedule();
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored =
+            wallet->mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+    }
+
+    CBlockIndex* first_observation_index = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->m_blockman.LookupBlockIndex(
+            first_observation_tip));
+    BOOST_REQUIRE(first_observation_index);
+    BlockValidationState state;
+    BOOST_REQUIRE(Assert(m_node.chainman)->ActiveChainstate().InvalidateBlock(
+        state, first_observation_index));
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+
+    // Replace the invalidated observation block with a byte-distinct block.
+    const CBlock replacement_block = CreateAndProcessBlock(
+        {}, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(replacement_block.GetHash() != first_observation_tip);
+    SyncWithValidationInterfaceQueue();
+    sync_wallet_tip();
+    enable_gold_rush_classification();
+    wallet->RepairStaleShadowTransactions(/*force=*/true);
+    restore_production_schedule();
+
+    const int replacement_height = WITH_LOCK(
+        ::cs_main,
+        return Assert(m_node.chainman)->ActiveChain().Height());
+    const uint256 replacement_tip = replacement_block.GetHash();
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored =
+            wallet->mapWallet.at(claim_ref->GetHash());
+        // Immutable audit provenance remains the original observation.
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+        // Stale-depth provenance restarts on the current branch.
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY),
+            ToString(replacement_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY),
+            replacement_tip.GetHex());
+    }
+
+    // If a quarantined claim becomes live again, any later failure must start
+    // a fresh continuous-terminal-age interval. Keep immutable provenance,
+    // but clear the current-branch age before automatic recovery can act.
+    wallet->transactionAddedToMempool(claim_ref);
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored =
+            wallet->mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_QUARANTINE_MARKER_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY) == 0);
+        BOOST_CHECK(stored.mapValue.count(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY) == 0);
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_HEIGHT_KEY),
+            ToString(first_observation_height));
+        BOOST_CHECK_EQUAL(
+            stored.mapValue.at(
+                SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY),
+            first_observation_tip.GetHex());
+    }
+}
+
 BOOST_AUTO_TEST_CASE(shadow_solve_index_is_bounded_ordered_and_disconnect_safe)
 {
     CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
@@ -1033,6 +1882,69 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_miner_lifecycle_creates_quantum_payout)
         LOCK(m_wallet.cs_wallet);
         BOOST_CHECK_EQUAL(m_wallet.m_pow_payout_quantum, original_payout);
     }
+
+    // Concurrent lifecycle requests must serialize the complete
+    // stop/validate/start transition. In particular, a second start must not
+    // destroy a vector that still owns joinable threads from the first.
+    std::array<bool, 2> concurrent_start_results{false, false};
+    std::array<bilingual_str, 2> concurrent_start_errors;
+    std::promise<void> release_starts;
+    const std::shared_future<void> starts_ready =
+        release_starts.get_future().share();
+    std::thread start_a([&] {
+        starts_ready.wait();
+        concurrent_start_results[0] = m_wallet.SetPowMining(
+            /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/1,
+            concurrent_start_errors[0]);
+    });
+    std::thread start_b([&] {
+        starts_ready.wait();
+        concurrent_start_results[1] = m_wallet.SetPowMining(
+            /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/1,
+            concurrent_start_errors[1]);
+    });
+    release_starts.set_value();
+    start_a.join();
+    start_b.join();
+    BOOST_CHECK(concurrent_start_results[0]);
+    BOOST_CHECK(concurrent_start_results[1]);
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup
+                             ? m_wallet.threadPowMinerGroup->size()
+                             : 0U),
+        1U);
+
+    // A racing stop and restart may linearize in either order, but the public
+    // enabled flag and owned worker group must describe the same final state.
+    bool restart_result{false};
+    bilingual_str restart_error;
+    std::promise<void> release_race;
+    const std::shared_future<void> race_ready =
+        release_race.get_future().share();
+    std::thread stopper([&] {
+        race_ready.wait();
+        m_wallet.StopPowMining();
+    });
+    std::thread starter([&] {
+        race_ready.wait();
+        restart_result = m_wallet.SetPowMining(
+            /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/1,
+            restart_error);
+    });
+    release_race.set_value();
+    stopper.join();
+    starter.join();
+    BOOST_CHECK(restart_result);
+    const bool final_enabled = m_wallet.m_pow_mining_enabled.load();
+    const size_t final_workers = WITH_LOCK(
+        m_wallet.m_pow_miner_mutex,
+        return m_wallet.threadPowMinerGroup
+                   ? m_wallet.threadPowMinerGroup->size()
+                   : 0U);
+    BOOST_CHECK_EQUAL(final_workers, final_enabled ? 1U : 0U);
+    m_wallet.StopPowMining();
 }
 
 BOOST_FIXTURE_TEST_CASE(lifecycle_balance_requires_matching_wallet_and_chain_tips, TestChain100Setup)

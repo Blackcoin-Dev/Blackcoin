@@ -36,6 +36,7 @@
 
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
@@ -669,6 +670,37 @@ BOOST_AUTO_TEST_CASE(quantum_migration_witness_v16_address_roundtrip)
 
     const CTxDestination wrong_version = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION - 1, commitment};
     BOOST_CHECK(!IsQuantumMigrationDestination(wrong_version));
+}
+
+BOOST_AUTO_TEST_CASE(qq_development_donation_recipient_is_exact_direct_quantum)
+{
+    SelectParams(ChainType::MAIN);
+    const std::string expected{
+        "blk1szuc2u0wfdnluf2m7m4smw68uzy42hjtmy27aywklqgx55w5erwqslnfs8h"};
+    BOOST_CHECK_EQUAL(Params().GetQQDevelopmentDonationAddress(), expected);
+
+    const CScript script = Params().GetQQDevelopmentDonationScript();
+    BOOST_REQUIRE(IsDirectQuantumMigrationScript(script));
+    CTxDestination destination;
+    BOOST_REQUIRE(ExtractDestination(script, destination));
+    BOOST_CHECK_EQUAL(EncodeDestination(destination), expected);
+
+    const auto* witness = std::get_if<WitnessUnknown>(&destination);
+    BOOST_REQUIRE(witness != nullptr);
+    BOOST_CHECK_EQUAL(witness->GetWitnessVersion(), QUANTUM_MIGRATION_WITNESS_VERSION);
+    BOOST_CHECK_EQUAL(
+        HexStr(witness->GetWitnessProgram()),
+        "1730ae3dc96cffc4ab7edd61b768fc112aabc97b22bdd23adf020d4a3a991b81");
+
+    // Encoding is a property of the params object, not whichever network is
+    // globally selected by the caller.
+    const std::unique_ptr<const CChainParams> regtest =
+        CreateChainParams(gArgs, ChainType::REGTEST);
+    const std::string regtest_address =
+        regtest->GetQQDevelopmentDonationAddress();
+    BOOST_CHECK_EQUAL(regtest_address.rfind("blrt1s", 0), 0U);
+    BOOST_CHECK(IsValidDestinationString(regtest_address, *regtest));
+    BOOST_CHECK(regtest->GetQQDevelopmentDonationScript() == script);
 }
 
 BOOST_AUTO_TEST_CASE(quantum_tiered_programs_parse_canonically)

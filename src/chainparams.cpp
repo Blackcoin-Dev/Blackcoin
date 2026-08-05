@@ -6,6 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparams.h>
+#include <addresstype.h>
 #include <base58.h>
 
 #include <chainparamsbase.h>
@@ -354,15 +355,23 @@ void SelectParams(const ChainType chain)
     globalChainParams = CreateChainParams(gArgs, chain);
 }
 
-// Blackcoin: Donations to dev fund 
-std::string CChainParams::GetDevFundAddress() const
-{
-    return !vDevFundAddress.empty() ? vDevFundAddress[0] : "";
+namespace {
+constexpr char QQ_DEVELOPMENT_DONATION_WITNESS_PROGRAM[]{
+    "1730ae3dc96cffc4ab7edd61b768fc112aabc97b22bdd23adf020d4a3a991b81"};
 }
 
-CScript CChainParams::GetDevRewardScript() const
+CScript CChainParams::GetQQDevelopmentDonationScript() const
 {
-    CTxDestination dest = DecodeDestination(GetDevFundAddress());
-    CScript scriptPubKey = GetScriptForDestination(dest);
-    return scriptPubKey;
+    const std::vector<unsigned char> program = ParseHex(QQ_DEVELOPMENT_DONATION_WITNESS_PROGRAM);
+    assert(program.size() == QUANTUM_MIGRATION_PROGRAM_SIZE);
+    return GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION, program});
+}
+
+std::string CChainParams::GetQQDevelopmentDonationAddress() const
+{
+    CTxDestination destination;
+    const bool extracted = ExtractDestination(GetQQDevelopmentDonationScript(), destination);
+    assert(extracted);
+    return EncodeDestination(destination, *this);
 }

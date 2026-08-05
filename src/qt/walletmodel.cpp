@@ -36,6 +36,7 @@
 
 #include <QDebug>
 #include <QMessageBox>
+#include <QPointer>
 #include <QSet>
 #include <QTimer>
 #include <QFile>
@@ -348,6 +349,584 @@ std::shared_ptr<const WalletModel::StakingMiningSnapshot> WalletModel::takeStaki
         return {};
     }
     return std::exchange(m_completed_staking_snapshot, {});
+}
+
+uint64_t WalletModel::requestPowClaimRecoveryPolicy(PowClaimRecoveryPolicyRequest request)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    // Policy reads and durable updates share WalletWorker with other wallet
+    // walks. The Qt event thread only owns request/result bookkeeping. Issue
+    // correlation lives here (rather than in a view) so recreated or parallel
+    // pages can never collide or cancel one another's request.
+    if (++m_pow_claim_recovery_policy_request_sequence == 0) {
+        ++m_pow_claim_recovery_policy_request_sequence;
+    }
+    request.request_id = m_pow_claim_recovery_policy_request_sequence;
+    request.wallet_name = m_wallet->getWalletName();
+    const auto cancel = std::make_shared<std::atomic<bool>>(false);
+    m_pow_claim_recovery_policy_cancels.emplace(request.request_id, cancel);
+
+    if (m_joined || !worker || !t.isRunning()) {
+        cancel->store(true, std::memory_order_release);
+        auto result = std::make_shared<PowClaimRecoveryPolicyResult>();
+        result->request = request;
+        result->cancelled = true;
+        result->error =
+            "Wallet worker is stopping; the PoW claim recovery policy request was not started";
+        const bool queued = QMetaObject::invokeMethod(
+            this, [this, result] {
+                const uint64_t request_id = result->request.request_id;
+                m_completed_pow_claim_recovery_policy_results[request_id] =
+                    result;
+                m_pow_claim_recovery_policy_cancels.erase(request_id);
+                QPointer<WalletModel> still_alive{this};
+                Q_EMIT powClaimRecoveryPolicyReady(
+                    request_id, result->request.generation);
+                if (!still_alive) return;
+                m_completed_pow_claim_recovery_policy_results.erase(
+                    request_id);
+            },
+            Qt::QueuedConnection);
+        assert(queued);
+        return request.request_id;
+    }
+
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel] {
+        assert(QThread::currentThread() == worker->thread());
+        auto result = std::make_shared<PowClaimRecoveryPolicyResult>();
+        result->request = request;
+
+        const auto publish = [this, result] {
+            QMetaObject::invokeMethod(this, [this, result] {
+                const uint64_t request_id = result->request.request_id;
+                m_completed_pow_claim_recovery_policy_results[request_id] = result;
+                m_pow_claim_recovery_policy_cancels.erase(request_id);
+                QPointer<WalletModel> still_alive{this};
+                Q_EMIT powClaimRecoveryPolicyReady(
+                    request_id, result->request.generation);
+                if (!still_alive) return;
+                // Connected GUI-thread slots consume their result
+                // synchronously. Drop an unclaimed result after notification
+                // (for example, when its originating view was destroyed).
+                m_completed_pow_claim_recovery_policy_results.erase(request_id);
+            }, Qt::QueuedConnection);
+        };
+        const auto checkpoint = [this, cancel, result] {
+            if (cancel->load(std::memory_order_acquire) || m_node.shutdownRequested()) {
+                result->cancelled = true;
+                return true;
+            }
+            return false;
+        };
+
+        if (checkpoint()) {
+            publish();
+            return;
+        }
+
+        try {
+            if (request.wallet_name != m_wallet->getWalletName()) {
+                result->error = "Wallet identity changed before the PoW claim recovery policy request";
+                publish();
+                return;
+            }
+            if (request.operation == PowClaimRecoveryPolicyRequest::Operation::SET_POLICY) {
+                // Cancellation is meaningful only before entering the durable
+                // Core write. Once entered, the result may be discarded but
+                // the committed operator choice is never represented as
+                // cancelled or rolled back by the GUI.
+                if (checkpoint()) {
+                    publish();
+                    return;
+                }
+                result->mutation_attempted = true;
+                result->mutation =
+                    m_wallet->setPowClaimRecoveryPolicyDetailed(request.policy);
+                result->authoritative_state_checked = true;
+                result->success = result->mutation.success;
+                result->error = result->mutation.detail;
+                result->policy_available =
+                    result->mutation.authoritative_state_available;
+                if (result->policy_available) {
+                    result->policy =
+                        result->mutation.authoritative_policy;
+                }
+            } else {
+                result->mutation =
+                    m_wallet->getPowClaimRecoveryPolicyState();
+                result->authoritative_state_checked = true;
+                result->success = result->mutation.success;
+                result->error = result->mutation.detail;
+                result->policy_available =
+                    result->mutation.authoritative_state_available;
+                if (result->policy_available) {
+                    result->policy =
+                        result->mutation.authoritative_policy;
+                }
+            }
+        } catch (const std::exception& e) {
+            result->success = false;
+            result->error = e.what();
+        } catch (...) {
+            result->success = false;
+            result->error = "Unknown error while reading or updating the PoW claim recovery policy";
+        }
+
+        publish();
+    }, Qt::QueuedConnection);
+    assert(invoked);
+    return request.request_id;
+}
+
+void WalletModel::cancelPowClaimRecoveryPolicy(uint64_t request_id)
+{
+    const auto it = m_pow_claim_recovery_policy_cancels.find(request_id);
+    if (it != m_pow_claim_recovery_policy_cancels.end()) {
+        it->second->store(true, std::memory_order_release);
+    }
+}
+
+std::shared_ptr<const WalletModel::PowClaimRecoveryPolicyResult>
+WalletModel::takePowClaimRecoveryPolicyResult(uint64_t request_id)
+{
+    const auto it = m_completed_pow_claim_recovery_policy_results.find(request_id);
+    if (it == m_completed_pow_claim_recovery_policy_results.end()) {
+        return {};
+    }
+    const auto result = it->second;
+    m_completed_pow_claim_recovery_policy_results.erase(it);
+    return result;
+}
+
+uint64_t WalletModel::requestPowClaimRecoveryOperation(
+    PowClaimRecoveryOperationRequest request)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (++m_pow_claim_recovery_operation_request_sequence == 0) {
+        ++m_pow_claim_recovery_operation_request_sequence;
+    }
+    const uint64_t request_id = m_pow_claim_recovery_operation_request_sequence;
+    request.request_id = request_id;
+    request.wallet_name = m_wallet->getWalletName();
+
+    const auto control =
+        std::make_shared<PowClaimRecoveryOperationControl>();
+    m_pow_claim_recovery_operation_controls.emplace(request_id, control);
+
+    const bool mutating =
+        request.operation == PowClaimRecoveryOperationRequest::Operation::EXECUTE ||
+        request.operation == PowClaimRecoveryOperationRequest::Operation::ADOPT;
+    const auto reject_queued = [this, &request](std::string error,
+                                                bool cancelled,
+                                                bool busy) {
+        auto result = std::make_shared<PowClaimRecoveryOperationResult>();
+        result->request = request;
+        result->cancelled = cancelled;
+        result->busy_rejected = busy;
+        result->error = std::move(error);
+        const bool invoked = QMetaObject::invokeMethod(
+            this, [this, result] {
+                publishPowClaimRecoveryOperationResult(result);
+            }, Qt::QueuedConnection);
+        assert(invoked);
+    };
+    if (m_joined || !worker || !t.isRunning()) {
+        control->cancel_requested.store(true, std::memory_order_release);
+        control->stage.store(
+            PowClaimRecoveryOperationStage::CANCELLED_BEFORE_CORE,
+            std::memory_order_release);
+        reject_queued(
+            "Wallet worker is stopping; the PoW claim recovery operation was not started",
+            true, false);
+        return request_id;
+    }
+    if (mutating && m_pow_claim_recovery_mutation_in_flight != 0) {
+        reject_queued(
+            "Another mutating PoW claim recovery or adoption operation is already in progress",
+            false, true);
+        return request_id;
+    }
+    if (mutating) {
+        m_pow_claim_recovery_mutation_in_flight = request_id;
+    }
+    if (mutating) {
+        // Defer the synchronous unlock prompt until after this method returns
+        // its request id. The view can then cancel by id even if a wallet
+        // switch/unload occurs inside the prompt's nested event loop.
+        const bool invoked = QMetaObject::invokeMethod(
+            this, [this, request = std::move(request), control]() mutable {
+                if (control->cancel_requested.load(std::memory_order_acquire) ||
+                    m_node.shutdownRequested() ||
+                    (request.view_current &&
+                     !request.view_current->load(std::memory_order_acquire))) {
+                    control->cancel_requested.store(
+                        true, std::memory_order_release);
+                    control->stage.store(
+                        PowClaimRecoveryOperationStage::CANCELLED_BEFORE_CORE,
+                        std::memory_order_release);
+                    auto result =
+                        std::make_shared<PowClaimRecoveryOperationResult>();
+                    result->request = std::move(request);
+                    result->cancelled = true;
+                    result->error =
+                        "The PoW claim recovery operation was cancelled before entering Core";
+                    publishPowClaimRecoveryOperationResult(result);
+                    return;
+                }
+
+                // This is deliberately after the view's exact-plan
+                // confirmation. The context lives through the Core call and
+                // restores the prior lock/scope before publishing the result.
+                const bool restore_staking_only =
+                    getWalletUnlockStakingOnly();
+                const bool initially_locked =
+                    getEncryptionStatus() == Locked;
+                request.staking_only_escalation =
+                    !initially_locked && restore_staking_only;
+                bool prompt_required = initially_locked;
+                if (request.staking_only_escalation) {
+                    // Register teardown restoration before changing either
+                    // the cryptographic lock or the staking-only marker. A
+                    // synchronous unlock handler is allowed to unload and
+                    // destroy this WalletModel; join() can then restore the
+                    // scope even though no UnlockContext was created yet.
+                    m_pow_claim_recovery_restore_staking_only.emplace(
+                        request.request_id, true);
+                    if (!setWalletLocked(true) ||
+                        getEncryptionStatus() != Locked) {
+                        request.unlock_granted = false;
+                        request.unlock_error =
+                            "Could not safely leave the wallet's staking-only unlock scope; no recovery operation was started";
+                        dispatchPowClaimRecoveryOperation(
+                            std::move(request), control);
+                        return;
+                    }
+                    prompt_required = true;
+                }
+                // Mode::Unlock initializes from this flag. Clear it while
+                // locked so the prompt asks for a full signing unlock.
+                if (restore_staking_only && prompt_required) {
+                    setWalletUnlockStakingOnly(false);
+                }
+
+                QPointer<WalletModel> still_alive{this};
+                if (prompt_required) Q_EMIT requireUnlock();
+                if (!still_alive) return;
+
+                const bool unlocked_after_prompt =
+                    getEncryptionStatus() != Locked;
+                request.unlock_granted = unlocked_after_prompt &&
+                    !getWalletUnlockStakingOnly();
+                if (request.unlock_granted) {
+                    m_pow_claim_recovery_operation_unlocks.emplace(
+                        request.request_id,
+                        std::make_unique<UnlockContext>(
+                            this, true, initially_locked));
+                    m_pow_claim_recovery_restore_staking_only.emplace(
+                        request.request_id, restore_staking_only);
+                } else if (restore_staking_only) {
+                    // A cancelled escalation cannot recreate the prior
+                    // staking-only unlock without retaining a passphrase.
+                    // Restore the scope marker and report whether the wallet
+                    // necessarily remains locked. If the user explicitly
+                    // chose staking-only in the prompt, that prior state is
+                    // already restored and remains unlocked.
+                    request.staking_only_escalation_left_locked =
+                        request.staking_only_escalation &&
+                        getEncryptionStatus() == Locked;
+                    setWalletUnlockStakingOnly(true);
+                }
+                if (control->cancel_requested.load(std::memory_order_acquire) ||
+                    (request.view_current &&
+                     !request.view_current->load(std::memory_order_acquire))) {
+                    control->cancel_requested.store(
+                        true, std::memory_order_release);
+                    // This request has not been dispatched yet, so Core
+                    // cannot have crossed the entry boundary. Cancellation
+                    // may already have won its CAS inside requireUnlock()'s
+                    // nested event loop, before the UnlockContext below was
+                    // created. Store the terminal pre-Core state and restore
+                    // unconditionally so that newly acquired signing scope
+                    // is not retained until worker publication.
+                    control->stage.store(
+                        PowClaimRecoveryOperationStage::CANCELLED_BEFORE_CORE,
+                        std::memory_order_release);
+                    restorePowClaimRecoveryUnlock(request.request_id);
+                    auto result =
+                        std::make_shared<PowClaimRecoveryOperationResult>();
+                    result->request = std::move(request);
+                    result->cancelled = true;
+                    result->error =
+                        "The PoW claim recovery operation was cancelled after unlock and before entering Core";
+                    publishPowClaimRecoveryOperationResult(result);
+                    return;
+                }
+                dispatchPowClaimRecoveryOperation(
+                    std::move(request), control);
+            },
+            Qt::QueuedConnection);
+        assert(invoked);
+    } else {
+        dispatchPowClaimRecoveryOperation(std::move(request), control);
+    }
+    return request_id;
+}
+
+void WalletModel::dispatchPowClaimRecoveryOperation(
+    PowClaimRecoveryOperationRequest request,
+    const std::shared_ptr<PowClaimRecoveryOperationControl>& control)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (!worker || !t.isRunning()) {
+        auto result = std::make_shared<PowClaimRecoveryOperationResult>();
+        result->request = std::move(request);
+        result->cancelled = true;
+        result->error =
+            "Wallet worker stopped before the PoW claim recovery operation entered Core";
+        const bool invoked = QMetaObject::invokeMethod(
+            this, [this, result] {
+                publishPowClaimRecoveryOperationResult(result);
+            }, Qt::QueuedConnection);
+        assert(invoked);
+        return;
+    }
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, control] {
+        assert(QThread::currentThread() == worker->thread());
+        auto result = std::make_shared<PowClaimRecoveryOperationResult>();
+        result->request = request;
+
+        const auto publish = [this, result] {
+            QMetaObject::invokeMethod(
+                this, [this, result] {
+                    publishPowClaimRecoveryOperationResult(result);
+                }, Qt::QueuedConnection);
+        };
+        const auto cancelled_before_core = [&] {
+            if (control->cancel_requested.load(std::memory_order_acquire) ||
+                m_node.shutdownRequested()) {
+                PowClaimRecoveryOperationStage expected =
+                    PowClaimRecoveryOperationStage::QUEUED;
+                control->stage.compare_exchange_strong(
+                    expected,
+                    PowClaimRecoveryOperationStage::CANCELLED_BEFORE_CORE,
+                    std::memory_order_acq_rel);
+                result->cancelled = true;
+                return true;
+            }
+            return false;
+        };
+
+        if (cancelled_before_core()) {
+            publish();
+            return;
+        }
+        if (request.wallet_name != m_wallet->getWalletName()) {
+            result->error = "Wallet identity changed before the PoW claim recovery operation";
+            publish();
+            return;
+        }
+        if (!request.unlock_granted) {
+            if (!request.unlock_error.empty()) {
+                result->error = request.unlock_error;
+            } else if (request.staking_only_escalation_left_locked) {
+                result->error =
+                    "Normal wallet unlock was cancelled or unavailable. The wallet was locked to leave staking-only mode and remains locked; unlock it for staking again when ready";
+            } else if (request.staking_only_escalation) {
+                result->error =
+                    "Normal wallet unlock was cancelled or unavailable. The prior staking-only unlock scope was restored; no recovery operation entered Core";
+            } else {
+                result->error =
+                    "Normal wallet unlock was cancelled or unavailable";
+            }
+            publish();
+            return;
+        }
+        if (cancelled_before_core()) {
+            publish();
+            return;
+        }
+
+        // Atomically cross the cancellation boundary. A GUI-thread cancel
+        // that wins this race may restore its temporary unlock immediately;
+        // once this compare/exchange succeeds, only publication/join may
+        // restore it because Core may need signing authority.
+        PowClaimRecoveryOperationStage expected =
+            PowClaimRecoveryOperationStage::QUEUED;
+        if (!control->stage.compare_exchange_strong(
+                expected, PowClaimRecoveryOperationStage::CORE_ENTERED,
+                std::memory_order_acq_rel)) {
+            result->cancelled = true;
+            publish();
+            return;
+        }
+        result->core_entered = true;
+        try {
+            switch (request.operation) {
+            case PowClaimRecoveryOperationRequest::Operation::REVIEW:
+                result->review =
+                    m_wallet->getPowClaimRecoveryReview(request.recovery);
+                result->error = result->review.error;
+                result->success = result->review.consistent &&
+                    result->error.empty();
+                break;
+            case PowClaimRecoveryOperationRequest::Operation::EXECUTE:
+                result->execution =
+                    m_wallet->resolvePowClaims(request.recovery);
+                result->error = result->execution.error;
+                result->success = result->execution.success;
+                break;
+            case PowClaimRecoveryOperationRequest::Operation::ADOPT:
+                result->adoption =
+                    m_wallet->adoptPowClaimRecoveryComponentDetailed(
+                    request.adoption_selector,
+                    request.adoption_tip,
+                    request.adoption_component_fingerprint);
+                result->adopted = result->adoption.adopted;
+                result->error = result->adoption.detail;
+                result->success = result->adoption.success;
+                break;
+            }
+        } catch (const std::exception& e) {
+            result->error = e.what();
+        } catch (...) {
+            result->error = "Unknown error during the PoW claim recovery operation";
+        }
+        result->cancel_requested_after_core =
+            control->cancel_requested.load(std::memory_order_acquire);
+        control->stage.store(
+            PowClaimRecoveryOperationStage::FINISHED,
+            std::memory_order_release);
+        publish();
+    }, Qt::QueuedConnection);
+    assert(invoked);
+}
+
+void WalletModel::publishPowClaimRecoveryOperationResult(
+    const std::shared_ptr<PowClaimRecoveryOperationResult>& result)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    const uint64_t request_id = result->request.request_id;
+    const auto control_it =
+        m_pow_claim_recovery_operation_controls.find(request_id);
+    const bool cancel_requested_now =
+        control_it != m_pow_claim_recovery_operation_controls.end() &&
+        control_it->second->cancel_requested.load(std::memory_order_acquire);
+    const bool originating_view_current =
+        !result->request.view_current ||
+        result->request.view_current->load(std::memory_order_acquire);
+    // The worker's post-Core sample is not the publication boundary. A
+    // dialog close or wallet switch can happen after that sample but before
+    // this GUI-thread callback. Re-evaluate both tokens here so a durable
+    // mutating outcome is never silently discarded with its old view.
+    result->cancel_requested_after_core =
+        result->cancel_requested_after_core ||
+        (result->core_entered &&
+         (cancel_requested_now || !originating_view_current));
+    m_completed_pow_claim_recovery_operation_results[request_id] = result;
+    m_pow_claim_recovery_operation_controls.erase(request_id);
+
+    // Restore the exact pre-request unlock state before making the result
+    // observable. For an initially staking-only-unlocked wallet the context
+    // deliberately does not relock; the marker is restored after its generic
+    // normal-unlock cleanup. Locked and normally unlocked wallets retain
+    // their original state as well.
+    restorePowClaimRecoveryUnlock(request_id);
+    if (m_pow_claim_recovery_mutation_in_flight == request_id) {
+        m_pow_claim_recovery_mutation_in_flight = 0;
+    }
+
+    if (result->cancel_requested_after_core &&
+        result->request.operation !=
+            PowClaimRecoveryOperationRequest::Operation::REVIEW) {
+        QPointer<WalletModel> still_alive{this};
+        QString body;
+        if (result->request.operation ==
+            PowClaimRecoveryOperationRequest::Operation::EXECUTE) {
+            if (result->execution.durable_state_ambiguous) {
+                body = tr("The recovery dialog closed after Core began. The durable database outcome is indeterminate: exact recovery bytes or relay authority may already exist. Reload the wallet and inspect the recovery screen before another action.");
+            } else if (result->success) {
+                body = tr("The recovery dialog closed after Core began, but Core completed the exact plan: %1 signed and persisted; %2 newly granted relay authority; %3 broadcast; %4 relay(s) deferred. Review the wallet's recovery screen before another action.")
+                           .arg(result->execution.signed_and_persisted)
+                           .arg(result->execution.relay_authority_granted)
+                           .arg(result->execution.broadcast)
+                           .arg(result->execution.relay_deferred);
+            } else {
+                body = tr("The recovery dialog closed after Core began. Core returned: %1%2")
+                           .arg(QString::fromStdString(result->error))
+                           .arg(result->execution.durable_state_changed ||
+                                        result->execution.relay_authority_granted != 0
+                                    ? tr(" Durable wallet state changed; reload and inspect the recovery screen before another action.")
+                                    : QString());
+            }
+        } else if (result->adoption.durable_state_ambiguous) {
+            body = tr("The adoption dialog closed after Core began. The durable adoption outcome is indeterminate; provenance may already have been stored. Reload the wallet and inspect its recovery records before another action.");
+        } else if (result->success) {
+            body = result->adoption.durable_state_changed
+                ? tr("The adoption dialog closed after Core began, but Core durably adopted the exact reviewed component. Refresh the recovery screen before another action.")
+                : tr("The adoption dialog closed after Core began. Core reports the exact reviewed component already authenticated. Refresh the recovery screen before another action.");
+        } else {
+            body = tr("The adoption dialog closed after Core began. Core returned: %1%2")
+                       .arg(QString::fromStdString(result->error))
+                       .arg(result->adoption.durable_state_changed
+                                ? tr(" Durable wallet state changed; reload and inspect its recovery records before another action.")
+                                : QString());
+        }
+        Q_EMIT message(
+            tr("Gold Rush claim recovery"), body,
+            result->success ? CClientUIInterface::MSG_INFORMATION
+                            : CClientUIInterface::MSG_ERROR);
+        if (!still_alive) return;
+    }
+    QPointer<WalletModel> still_alive{this};
+    Q_EMIT powClaimRecoveryOperationReady(
+        request_id, result->request.generation);
+    if (!still_alive) return;
+    m_completed_pow_claim_recovery_operation_results.erase(request_id);
+}
+
+void WalletModel::cancelPowClaimRecoveryOperation(uint64_t request_id)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    const auto it = m_pow_claim_recovery_operation_controls.find(request_id);
+    if (it != m_pow_claim_recovery_operation_controls.end()) {
+        const auto& control = it->second;
+        control->cancel_requested.store(true, std::memory_order_release);
+        PowClaimRecoveryOperationStage expected =
+            PowClaimRecoveryOperationStage::QUEUED;
+        if (control->stage.compare_exchange_strong(
+                expected,
+                PowClaimRecoveryOperationStage::CANCELLED_BEFORE_CORE,
+                std::memory_order_acq_rel)) {
+            // The worker can no longer enter Core. Restore any temporary
+            // normal signing scope synchronously on the GUI thread rather
+            // than holding it until this request reaches the worker queue.
+            restorePowClaimRecoveryUnlock(request_id);
+        }
+    }
+}
+
+void WalletModel::restorePowClaimRecoveryUnlock(uint64_t request_id)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    m_pow_claim_recovery_operation_unlocks.erase(request_id);
+    const auto restore_it =
+        m_pow_claim_recovery_restore_staking_only.find(request_id);
+    if (restore_it != m_pow_claim_recovery_restore_staking_only.end()) {
+        if (restore_it->second) setWalletUnlockStakingOnly(true);
+        m_pow_claim_recovery_restore_staking_only.erase(restore_it);
+    }
+}
+
+std::shared_ptr<const WalletModel::PowClaimRecoveryOperationResult>
+WalletModel::takePowClaimRecoveryOperationResult(uint64_t request_id)
+{
+    const auto it = m_completed_pow_claim_recovery_operation_results.find(request_id);
+    if (it == m_completed_pow_claim_recovery_operation_results.end()) {
+        return {};
+    }
+    const auto result = it->second;
+    m_completed_pow_claim_recovery_operation_results.erase(it);
+    return result;
 }
 
 void WalletModel::updateTransaction()
@@ -802,11 +1381,30 @@ void WalletModel::checkStakeWeightChanged()
 
 void WalletModel::join()
 {
+    m_joined = true;
+
     // Stop timer
     if (timer)
         timer->stop();
 
     cancelStakingMiningSnapshot();
+    for (const auto& entry : m_pow_claim_recovery_policy_cancels) {
+        entry.second->store(true, std::memory_order_release);
+    }
+    // Mutating recovery/adoption work can hold a temporary full wallet
+    // unlock. Mark every queued or running request cancelled before stopping
+    // the worker so no pre-Core request can survive wallet-model shutdown.
+    for (const auto& entry : m_pow_claim_recovery_operation_controls) {
+        entry.second->cancel_requested.store(true, std::memory_order_release);
+        PowClaimRecoveryOperationStage expected =
+            PowClaimRecoveryOperationStage::QUEUED;
+        if (entry.second->stage.compare_exchange_strong(
+                expected,
+                PowClaimRecoveryOperationStage::CANCELLED_BEFORE_CORE,
+                std::memory_order_acq_rel)) {
+            restorePowClaimRecoveryUnlock(entry.first);
+        }
+    }
 
     // Quit thread
     if (t.isRunning()) {
@@ -819,4 +1417,14 @@ void WalletModel::join()
         // pointer when join() is called again during WalletModel destruction.
         worker = nullptr;
     }
+
+    // A worker result normally performs this restoration on the GUI thread.
+    // join() may prevent that queued publication from running, so restore all
+    // temporary unlock contexts here after any in-Core operation has exited.
+    m_pow_claim_recovery_operation_unlocks.clear();
+    for (const auto& entry : m_pow_claim_recovery_restore_staking_only) {
+        if (entry.second) setWalletUnlockStakingOnly(true);
+    }
+    m_pow_claim_recovery_restore_staking_only.clear();
+    m_pow_claim_recovery_mutation_in_flight = 0;
 }

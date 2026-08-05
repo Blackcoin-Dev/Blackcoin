@@ -231,7 +231,7 @@ OverviewPage::~OverviewPage()
 void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
 {
     BitcoinUnit unit = walletModel->getOptionsModel()->getDisplayUnit();
-    unsigned int donation_percentage = walletModel->wallet().getDonationPercentage();
+    unsigned int donation_percentage = walletModel->wallet().getQQDevelopmentDonationPercentage();
     if (walletModel->wallet().isLegacy()) {
         if (walletModel->wallet().privateKeysDisabled()) {
             ui->labelBalance->setText(BitcoinUnits::formatWithPrivacy(unit, balances.watch_only_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
@@ -340,7 +340,7 @@ void OverviewPage::setWalletModel(WalletModel *model)
         // Keep up to date with wallet
         setBalance(model->getCachedBalance());
         connect(model, &WalletModel::balanceChanged, this, &OverviewPage::setBalance);
-        connect(model, &WalletModel::donationPercentageChanged, this, [this, model](unsigned int) {
+        connect(model, &WalletModel::qqDevelopmentDonationChanged, this, [this, model](unsigned int) {
             setBalance(model->getCachedBalance());
         });
 

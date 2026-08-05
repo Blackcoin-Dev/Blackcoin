@@ -128,8 +128,9 @@ public:
     }
 
     const ChainTxData& TxData() const { return chainTxData; }
-    std::string GetDevFundAddress() const;
-    CScript GetDevRewardScript() const;
+    /** Exact direct-quantum recipient for fresh wallet-level donation consent. */
+    std::string GetQQDevelopmentDonationAddress() const;
+    CScript GetQQDevelopmentDonationScript() const;
 
     /**
      * SigNetOptions holds configurations for creating a signet CChainParams.
@@ -225,7 +226,6 @@ protected:
     CCheckpointData checkpointData;
     std::vector<AssumeutxoData> m_assumeutxo_data;
     ChainTxData chainTxData;
-    std::vector<std::string> vDevFundAddress;
 };
 
 #endif // BITCOIN_KERNEL_CHAINPARAMS_H

@@ -10,6 +10,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <common/args.h>
+#include <core_io.h>
 #include <consensus/amount.h>
 #include <consensus/demurrage.h>
 #include <consensus/quantum_witness.h>
@@ -43,6 +44,7 @@
 #include <wallet/rpc/wallet.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
+#include <wallet/shadow_pow_claim_recovery.h>
 #include <wallet/wallet.h>
 
 #include <algorithm>
@@ -65,6 +67,9 @@ using interfaces::WalletBalances;
 using interfaces::WalletLoader;
 using interfaces::WalletMigrationResult;
 using interfaces::WalletMigrationStatus;
+using interfaces::WalletPowClaimRecoveryMode;
+using interfaces::WalletPowClaimRecoveryPolicy;
+using interfaces::WalletPowClaimRecoveryRequestMode;
 using interfaces::WalletPowMiningInfo;
 using interfaces::WalletDemurrageInfo;
 using interfaces::WalletDemurrageOutputInfo;
@@ -90,9 +95,428 @@ using interfaces::WalletTxStatus;
 using interfaces::WalletValueMap;
 
 namespace wallet {
+static_assert(WalletPowClaimRecoveryPolicy::VERSION == ShadowPowClaimRecoveryPolicy::VERSION);
+static_assert(WalletPowClaimRecoveryPolicy::MIN_FEE_PER_RESOLUTION == SHADOW_POW_RECOVERY_MIN_FEE_PER_RESOLUTION);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_FEE_PER_RESOLUTION == SHADOW_POW_RECOVERY_MAX_FEE_PER_RESOLUTION);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_BATCH_FEE_CAP == SHADOW_POW_RECOVERY_MAX_BATCH_FEE_CAP);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_ROLLING_FEE_BUDGET == SHADOW_POW_RECOVERY_MAX_ROLLING_FEE_BUDGET);
+static_assert(WalletPowClaimRecoveryPolicy::MIN_WINDOW_SECONDS == SHADOW_POW_RECOVERY_MIN_WINDOW_SECONDS);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_WINDOW_SECONDS == SHADOW_POW_RECOVERY_MAX_WINDOW_SECONDS);
+static_assert(WalletPowClaimRecoveryPolicy::MIN_ACTIONS_PER_WINDOW == SHADOW_POW_RECOVERY_MIN_ACTIONS_PER_WINDOW);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_ACTIONS_PER_WINDOW == SHADOW_POW_RECOVERY_MAX_ACTIONS_PER_WINDOW);
+static_assert(WalletPowClaimRecoveryPolicy::MIN_STALE_BLOCKS == SHADOW_POW_RECOVERY_MIN_STALE_BLOCKS);
+static_assert(WalletPowClaimRecoveryPolicy::MAX_STALE_BLOCKS == SHADOW_POW_RECOVERY_MAX_STALE_BLOCKS);
+
 // All members of the classes in this namespace are intentionally public, as the
 // classes themselves are private.
 namespace {
+
+interfaces::WalletPowClaimRecoveryState MakeRecoveryState(
+    ShadowPowClaimRecoveryState state)
+{
+    using Out = interfaces::WalletPowClaimRecoveryState;
+    switch (state) {
+    case ShadowPowClaimRecoveryState::LIVE: return Out::LIVE;
+    case ShadowPowClaimRecoveryState::TRANSIENT: return Out::TRANSIENT;
+    case ShadowPowClaimRecoveryState::INDETERMINATE: return Out::INDETERMINATE;
+    case ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE: return Out::CURRENT_BRANCH_INELIGIBLE;
+    case ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP: return Out::TERMINAL_ON_PINNED_TIP;
+    case ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH: return Out::RETIRED_ON_ACTIVE_BRANCH;
+    case ShadowPowClaimRecoveryState::RESOLUTION_PENDING: return Out::RESOLUTION_PENDING;
+    case ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN: return Out::RESOLVED_ON_ACTIVE_CHAIN;
+    }
+    return Out::INDETERMINATE;
+}
+
+interfaces::WalletPowClaimRecoveryProvenance MakeRecoveryProvenance(
+    ShadowPowClaimRecoveryProvenance provenance)
+{
+    using Out = interfaces::WalletPowClaimRecoveryProvenance;
+    switch (provenance) {
+    case ShadowPowClaimRecoveryProvenance::EXPLICIT_AUTHORED: return Out::EXPLICIT_AUTHORED;
+    case ShadowPowClaimRecoveryProvenance::EXPLICIT_ADOPTED: return Out::EXPLICIT_ADOPTED;
+    case ShadowPowClaimRecoveryProvenance::LEGACY_WALLET_AUTHORED: return Out::LEGACY_WALLET_AUTHORED;
+    case ShadowPowClaimRecoveryProvenance::UNKNOWN: return Out::UNKNOWN;
+    }
+    return Out::UNKNOWN;
+}
+
+interfaces::WalletPowClaimRecoveryNodeKind MakeRecoveryNodeKind(
+    ShadowPowClaimRecoveryNodeKind kind)
+{
+    using Out = interfaces::WalletPowClaimRecoveryNodeKind;
+    switch (kind) {
+    case ShadowPowClaimRecoveryNodeKind::CLAIM: return Out::CLAIM;
+    case ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION: return Out::MANAGED_RESOLUTION;
+    case ShadowPowClaimRecoveryNodeKind::LEGACY_RESOLUTION: return Out::LEGACY_RESOLUTION;
+    case ShadowPowClaimRecoveryNodeKind::ORDINARY: return Out::ORDINARY;
+    }
+    return Out::ORDINARY;
+}
+
+interfaces::WalletPowClaimRecoveryActionStatus MakeRecoveryActionStatus(
+    ShadowPowClaimRecoveryActionStatus status)
+{
+    using Out = interfaces::WalletPowClaimRecoveryActionStatus;
+    switch (status) {
+    case ShadowPowClaimRecoveryActionStatus::READY: return Out::READY;
+    case ShadowPowClaimRecoveryActionStatus::REUSE_MANAGED: return Out::REUSE_MANAGED;
+    case ShadowPowClaimRecoveryActionStatus::REUSE_LEGACY: return Out::REUSE_LEGACY;
+    case ShadowPowClaimRecoveryActionStatus::SIGNED_AND_PERSISTED: return Out::SIGNED_AND_PERSISTED;
+    case ShadowPowClaimRecoveryActionStatus::BROADCAST: return Out::BROADCAST;
+    case ShadowPowClaimRecoveryActionStatus::ALREADY_IN_MEMPOOL: return Out::ALREADY_IN_MEMPOOL;
+    case ShadowPowClaimRecoveryActionStatus::RELAY_DEFERRED: return Out::RELAY_DEFERRED;
+    case ShadowPowClaimRecoveryActionStatus::REFUSED: return Out::REFUSED;
+    case ShadowPowClaimRecoveryActionStatus::FAILED: return Out::FAILED;
+    }
+    return Out::FAILED;
+}
+
+std::string RecoveryDispositionName(ShadowPowClaimMempoolDisposition disposition)
+{
+    switch (disposition) {
+    case ShadowPowClaimMempoolDisposition::ELIGIBLE: return "eligible";
+    case ShadowPowClaimMempoolDisposition::INACTIVE: return "inactive";
+    case ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW: return "height_before_window";
+    case ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW: return "height_after_window";
+    case ShadowPowClaimMempoolDisposition::INVALID_LOCATION: return "invalid_location";
+    case ShadowPowClaimMempoolDisposition::MALFORMED: return "malformed";
+    case ShadowPowClaimMempoolDisposition::DUPLICATE: return "duplicate";
+    case ShadowPowClaimMempoolDisposition::WRONG_MODE: return "wrong_mode";
+    case ShadowPowClaimMempoolDisposition::UNKNOWN_MODE: return "unknown_mode";
+    case ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION: return "unsupported_version";
+    case ShadowPowClaimMempoolDisposition::VERSION_NOT_YET_ACTIVE: return "version_not_yet_active";
+    case ShadowPowClaimMempoolDisposition::INVALID_PROOF: return "invalid_proof";
+    case ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE: return "unbound_proof_may_revalidate";
+    case ShadowPowClaimMempoolDisposition::ORIGIN_MISMATCH: return "origin_mismatch";
+    case ShadowPowClaimMempoolDisposition::ORIGIN_NOT_YET_REACHED: return "origin_not_yet_reached";
+    case ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED: return "origin_expired";
+    case ShadowPowClaimMempoolDisposition::INPUT_MISMATCH: return "input_mismatch";
+    case ShadowPowClaimMempoolDisposition::ALREADY_ACCOUNTED: return "already_accounted";
+    case ShadowPowClaimMempoolDisposition::CAPACITY_LIMIT: return "capacity_limit";
+    case ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT: return "evaluation_limit";
+    case ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR: return "local_state_error";
+    }
+    return "local_state_error";
+}
+
+interfaces::WalletPowClaimRecoveryNode MakeRecoveryNode(
+    const ShadowPowClaimRecoveryNode& node)
+{
+    interfaces::WalletPowClaimRecoveryNode out;
+    out.txid = node.txid.GetHex();
+    out.kind = MakeRecoveryNodeKind(node.kind);
+    out.provenance = MakeRecoveryProvenance(node.provenance);
+    out.disposition = RecoveryDispositionName(node.disposition);
+    out.proof_may_revalidate_on_descendant =
+        node.proof_may_revalidate_on_descendant;
+    out.active_chain_confirmed = node.active_chain_confirmed;
+    out.in_mempool = node.in_mempool;
+    out.quarantined = node.quarantined;
+    out.abandoned = node.abandoned;
+    out.expired_locally_retired = node.expired_locally_retired;
+    out.expected_shape = node.expected_shape;
+    out.wallet_authored = node.wallet_authored;
+    out.created_height = node.created_height;
+    out.first_quarantine_height = node.first_quarantine_height;
+    out.branch_quarantine_height = node.branch_quarantine_height;
+    out.stale_depth = node.stale_depth;
+    out.stale_depth_known = node.stale_depth_known;
+    out.resolution_relay_authorized = node.resolution_relay_authorized;
+    return out;
+}
+
+std::vector<std::string> HashStrings(const std::vector<uint256>& hashes)
+{
+    std::vector<std::string> out;
+    out.reserve(hashes.size());
+    for (const uint256& hash : hashes) out.push_back(hash.GetHex());
+    return out;
+}
+
+interfaces::WalletPowClaimRecoveryComponent MakeRecoveryComponent(
+    const ShadowPowClaimRecoveryComponent& component)
+{
+    interfaces::WalletPowClaimRecoveryComponent out;
+    out.anchor_txid = component.anchor.hash.GetHex();
+    out.anchor_vout = component.anchor.n;
+    out.anchor_amount = component.anchor_amount;
+    out.generation_fingerprint = component.generation_fingerprint.GetHex();
+    out.component_fingerprint = component.fingerprint.GetHex();
+    out.state = MakeRecoveryState(component.state);
+    out.nodes.reserve(component.nodes.size());
+    for (const auto& node : component.nodes) out.nodes.push_back(MakeRecoveryNode(node));
+    out.claim_txids = HashStrings(component.claim_txids);
+    out.root_claim_txids = HashStrings(component.root_claim_txids);
+    out.resolution_txids = HashStrings(component.resolution_txids);
+    out.anchor_authenticated = component.anchor_authenticated;
+    out.anchor_unspent = component.anchor_unspent;
+    out.all_claims_explicitly_provenanced = component.all_claims_explicitly_provenanced;
+    out.all_claims_zero_payment_retirable =
+        component.all_claims_zero_payment_retirable;
+    out.all_claims_expired_locally_retired =
+        component.all_claims_expired_locally_retired;
+    out.has_revalidating_unbound_proof =
+        component.has_revalidating_unbound_proof;
+    out.descendant_claims = component.descendant_claims;
+    out.minimum_stale_depth = component.minimum_stale_depth;
+    out.stale_depth_known = component.stale_depth_known;
+    return out;
+}
+
+interfaces::WalletPowClaimRecoveryAction MakeRecoveryAction(
+    const ShadowPowClaimRecoveryAction& action)
+{
+    interfaces::WalletPowClaimRecoveryAction out;
+    out.anchor_txid = action.anchor.hash.GetHex();
+    out.anchor_vout = action.anchor.n;
+    out.generation_fingerprint = action.generation_fingerprint.GetHex();
+    out.component_fingerprint = action.component_fingerprint.GetHex();
+    out.claim_txids = HashStrings(action.claim_txids);
+    out.descendant_claims = action.descendant_claims;
+    out.component_state = MakeRecoveryState(action.component_state);
+    out.status = MakeRecoveryActionStatus(action.status);
+    out.fee = action.fee;
+    out.vsize = action.vsize;
+    if (action.transaction) out.transaction_txid = action.transaction->GetHash().GetHex();
+    out.persisted = action.persisted;
+    out.in_mempool = action.in_mempool;
+    out.relay_authorized = action.relay_authorized;
+    out.frontier_may_advance = action.frontier_may_advance;
+    out.conflicts_with_revalidating_unbound_proof =
+        action.conflicts_with_revalidating_unbound_proof;
+    out.reason_code = action.reason_code;
+    out.detail = action.detail;
+    return out;
+}
+
+interfaces::WalletPowClaimRecoveryPlan MakeRecoveryPlan(
+    const ShadowPowClaimRecoveryPlan& plan)
+{
+    interfaces::WalletPowClaimRecoveryPlan out;
+    out.active_tip = plan.active_tip.GetHex();
+    out.active_height = plan.active_height;
+    out.wallet_generation = plan.wallet_generation;
+    out.plan_id = plan.plan_id.GetHex();
+    out.max_fee_per_resolution = plan.max_fee_per_resolution;
+    out.aggregate_batch_fee_cap = plan.aggregate_batch_fee_cap;
+    out.fee_rate_atoms_per_k = plan.fee_rate_atoms_per_k;
+    out.total_fee = plan.total_fee;
+    out.actions.reserve(plan.actions.size());
+    for (const auto& action : plan.actions) out.actions.push_back(MakeRecoveryAction(action));
+    out.refused.reserve(plan.refused.size());
+    for (const auto& action : plan.refused) out.refused.push_back(MakeRecoveryAction(action));
+    out.wallet_tip_matches = plan.wallet_tip_matches;
+    out.complete = plan.complete;
+    return out;
+}
+
+interfaces::WalletPowClaimRecoveryUsage MakeRecoveryUsage(
+    const ShadowPowClaimRecoveryUsage& usage)
+{
+    interfaces::WalletPowClaimRecoveryUsage out;
+    out.pending_manual = usage.pending_manual;
+    out.pending_automatic = usage.pending_automatic;
+    out.confirmed_manual = usage.confirmed_manual;
+    out.confirmed_automatic = usage.confirmed_automatic;
+    out.confirmed_resolution_fees = usage.confirmed_resolution_fees;
+    out.automatic_actions_in_window = usage.automatic_actions_in_window;
+    out.automatic_fee_exposure_in_window = usage.automatic_fee_exposure_in_window;
+    out.reconciled_descendant_claims = usage.reconciled_descendant_claims;
+    out.recycled_outputs = usage.recycled_outputs;
+    return out;
+}
+
+interfaces::WalletPowClaimRecoveryPolicy MakeRecoveryPolicy(
+    const ShadowPowClaimRecoveryPolicy& policy)
+{
+    interfaces::WalletPowClaimRecoveryPolicy out;
+    out.version = policy.version;
+    out.mode = policy.choice_recorded == 0
+        ? interfaces::WalletPowClaimRecoveryMode::UNSET
+        : policy.automatic_enabled == 1
+            ? interfaces::WalletPowClaimRecoveryMode::AUTOMATIC
+            : interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK;
+    out.max_fee_per_resolution = policy.max_fee_per_resolution;
+    out.aggregate_batch_fee_cap = policy.aggregate_batch_fee_cap;
+    out.rolling_fee_budget = policy.rolling_fee_budget;
+    out.rolling_fee_window_seconds = policy.rolling_fee_window_seconds;
+    out.max_actions_per_window = policy.max_actions_per_window;
+    out.minimum_stale_blocks = policy.minimum_stale_blocks;
+    return out;
+}
+
+bool MakeCoreRecoveryPolicy(
+    const interfaces::WalletPowClaimRecoveryPolicy& policy,
+    ShadowPowClaimRecoveryPolicy& out, std::string& error)
+{
+    out.version = policy.version;
+    switch (policy.mode) {
+    case interfaces::WalletPowClaimRecoveryMode::UNSET:
+        out.choice_recorded = 0;
+        out.automatic_enabled = 0;
+        break;
+    case interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK:
+        out.choice_recorded = 1;
+        out.automatic_enabled = 0;
+        break;
+    case interfaces::WalletPowClaimRecoveryMode::AUTOMATIC:
+        out.choice_recorded = 1;
+        out.automatic_enabled = 1;
+        break;
+    default:
+        error = "Unknown PoW claim recovery policy mode";
+        return false;
+    }
+    out.max_fee_per_resolution = policy.max_fee_per_resolution;
+    out.aggregate_batch_fee_cap = policy.aggregate_batch_fee_cap;
+    out.rolling_fee_budget = policy.rolling_fee_budget;
+    out.rolling_fee_window_seconds = policy.rolling_fee_window_seconds;
+    out.max_actions_per_window = policy.max_actions_per_window;
+    out.minimum_stale_blocks = policy.minimum_stale_blocks;
+    error.clear();
+    return true;
+}
+
+interfaces::WalletPowClaimRecoveryPolicyMutationStatus
+MakeRecoveryPolicyMutationStatus(
+    ShadowPowClaimRecoveryPolicyMutationStatus status)
+{
+    using Out = interfaces::WalletPowClaimRecoveryPolicyMutationStatus;
+    switch (status) {
+    case ShadowPowClaimRecoveryPolicyMutationStatus::SUCCESS:
+        return Out::SUCCESS;
+    case ShadowPowClaimRecoveryPolicyMutationStatus::INVALID_POLICY:
+        return Out::INVALID_POLICY;
+    case ShadowPowClaimRecoveryPolicyMutationStatus::DATABASE_FAILURE:
+        return Out::DATABASE_FAILURE;
+    case ShadowPowClaimRecoveryPolicyMutationStatus::DATABASE_OUTCOME_AMBIGUOUS:
+        return Out::DATABASE_OUTCOME_AMBIGUOUS;
+    }
+    return Out::DATABASE_FAILURE;
+}
+
+interfaces::WalletPowClaimRecoveryPolicyMutationResult
+MakeRecoveryPolicyMutationResult(
+    const ShadowPowClaimRecoveryPolicyMutationResult& result)
+{
+    interfaces::WalletPowClaimRecoveryPolicyMutationResult out;
+    out.status = MakeRecoveryPolicyMutationStatus(result.status);
+    out.reason_code =
+        ShadowPowClaimRecoveryPolicyMutationStatusName(result.status);
+    out.success = result.success;
+    out.durable_state_changed = result.durable_state_changed;
+    out.durable_state_ambiguous = result.durable_state_ambiguous;
+    out.authoritative_state_available = result.authoritative_state_available;
+    if (result.authoritative_state_available) {
+        out.authoritative_policy =
+            MakeRecoveryPolicy(result.authoritative_policy);
+    }
+    out.detail = result.detail;
+    return out;
+}
+
+interfaces::WalletPowClaimRecoveryAdoptionStatus MakeRecoveryAdoptionStatus(
+    ShadowPowClaimRecoveryAdoptionStatus status)
+{
+    using Out = interfaces::WalletPowClaimRecoveryAdoptionStatus;
+    switch (status) {
+    case ShadowPowClaimRecoveryAdoptionStatus::SUCCESS: return Out::SUCCESS;
+    case ShadowPowClaimRecoveryAdoptionStatus::ALREADY_EXPLICIT: return Out::ALREADY_EXPLICIT;
+    case ShadowPowClaimRecoveryAdoptionStatus::NO_CHAIN: return Out::NO_CHAIN;
+    case ShadowPowClaimRecoveryAdoptionStatus::DATABASE_OUTCOME_AMBIGUOUS: return Out::DATABASE_OUTCOME_AMBIGUOUS;
+    case ShadowPowClaimRecoveryAdoptionStatus::SIGNING_UNAVAILABLE: return Out::SIGNING_UNAVAILABLE;
+    case ShadowPowClaimRecoveryAdoptionStatus::STALE_TIP: return Out::STALE_TIP;
+    case ShadowPowClaimRecoveryAdoptionStatus::SELECTOR_NOT_FOUND: return Out::SELECTOR_NOT_FOUND;
+    case ShadowPowClaimRecoveryAdoptionStatus::SELECTOR_NOT_CLAIM: return Out::SELECTOR_NOT_CLAIM;
+    case ShadowPowClaimRecoveryAdoptionStatus::SELECTOR_AMBIGUOUS: return Out::SELECTOR_AMBIGUOUS;
+    case ShadowPowClaimRecoveryAdoptionStatus::STALE_COMPONENT_FINGERPRINT: return Out::STALE_COMPONENT_FINGERPRINT;
+    case ShadowPowClaimRecoveryAdoptionStatus::UNSAFE_GRAPH: return Out::UNSAFE_GRAPH;
+    case ShadowPowClaimRecoveryAdoptionStatus::DATABASE_FAILURE: return Out::DATABASE_FAILURE;
+    }
+    return Out::DATABASE_FAILURE;
+}
+
+interfaces::WalletPowClaimRecoveryAdoptionResult MakeRecoveryAdoptionResult(
+    const ShadowPowClaimRecoveryAdoptionResult& result)
+{
+    interfaces::WalletPowClaimRecoveryAdoptionResult out;
+    out.status = MakeRecoveryAdoptionStatus(result.status);
+    out.reason_code = ShadowPowClaimRecoveryAdoptionStatusName(result.status);
+    out.success = result.IsSuccess();
+    out.adopted = result.adopted;
+    out.durable_state_changed = result.durable_state_changed;
+    out.durable_state_ambiguous = result.durable_state_ambiguous;
+    if (!result.active_tip.IsNull()) out.active_tip = result.active_tip.GetHex();
+    if (!result.generation_fingerprint.IsNull()) {
+        out.generation_fingerprint = result.generation_fingerprint.GetHex();
+    }
+    if (!result.reviewed_component_fingerprint.IsNull()) {
+        out.reviewed_component_fingerprint =
+            result.reviewed_component_fingerprint.GetHex();
+    }
+    if (!result.post_adoption_component_fingerprint.IsNull()) {
+        out.post_adoption_component_fingerprint =
+            result.post_adoption_component_fingerprint.GetHex();
+    }
+    out.claim_txids = HashStrings(result.claim_txids);
+    out.automatic_eligible_after_adoption =
+        result.automatic_eligible_after_adoption;
+    out.component_has_revalidating_unbound_proof =
+        result.component_has_revalidating_unbound_proof;
+    out.component_refusal_code = result.component_refusal_code;
+    out.detail = result.detail;
+    return out;
+}
+
+bool MakeCoreRecoveryRequest(
+    const interfaces::WalletPowClaimRecoveryRequest& request,
+    ShadowPowClaimRecoveryRequest& out, std::string& error)
+{
+    out.origin = ShadowPowClaimRecoveryOrigin::MANUAL;
+    switch (request.mode) {
+    case WalletPowClaimRecoveryRequestMode::PREVIEW:
+        out.mode = ShadowPowClaimRecoveryMode::PREVIEW;
+        out.execution_authority = ShadowPowClaimRecoveryExecutionAuthority::NONE;
+        break;
+    case WalletPowClaimRecoveryRequestMode::SIGN_ONLY:
+        out.mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
+        out.execution_authority = ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+        break;
+    case WalletPowClaimRecoveryRequestMode::COMMIT_AND_BROADCAST:
+        out.mode = ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+        out.execution_authority = ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+        break;
+    default:
+        error = "Unknown claim recovery request mode";
+        return false;
+    }
+    out.acknowledge_fee_and_conflict_risk = request.acknowledge_fee_and_conflict_risk;
+    out.max_fee_per_resolution = request.max_fee_per_resolution;
+    out.aggregate_batch_fee_cap = request.aggregate_batch_fee_cap;
+    if (request.fee_rate_atoms_per_k) {
+        out.fee_rate = CFeeRate{*request.fee_rate_atoms_per_k};
+    }
+    for (const std::string& selector : request.selectors) {
+        uint256 hash;
+        if (!ParseHashStr(selector, hash)) {
+            error = "Invalid claim or resolution transaction id: " + selector;
+            return false;
+        }
+        out.selectors.push_back(hash);
+    }
+    if (request.expected_plan_id) {
+        uint256 plan_id;
+        if (!ParseHashStr(*request.expected_plan_id, plan_id)) {
+            error = "Invalid recovery plan id";
+            return false;
+        }
+        out.expected_plan_id = plan_id;
+    }
+    error.clear();
+    return true;
+}
+
 std::string QuantumQuasarPhaseName(Consensus::QuantumQuasarPhase phase)
 {
     switch (phase) {
@@ -102,12 +526,6 @@ std::string QuantumQuasarPhaseName(Consensus::QuantumQuasarPhase phase)
     case Consensus::QuantumQuasarPhase::FINAL_LOCKOUT: return "final_lockout";
     }
     return "unknown";
-}
-
-bool IsDirectQuantumMigrationScript(const CScript& script_pub_key)
-{
-    const auto tier = GetQuantumStakeTierProgram(script_pub_key);
-    return tier && !tier->tiered && !tier->cold_stake;
 }
 
 std::optional<bilingual_str> QuantumMigrationSweepPhaseError(
@@ -2419,10 +2837,23 @@ public:
     {
         RemoveWallet(m_context, m_wallet, /*load_on_start=*/false);
     }
-    unsigned int getDonationPercentage() override { return m_wallet->m_donation_percentage; }
-    void setDonationPercentage(unsigned int percentage) override
+    unsigned int getQQDevelopmentDonationPercentage() override
     {
-        m_wallet->m_donation_percentage = std::min<unsigned int>(percentage, MAX_DONATION_PERCENTAGE);
+        return m_wallet->GetQQDevelopmentDonationPercentage();
+    }
+    std::string getQQDevelopmentDonationAddress() override
+    {
+        return Params().GetQQDevelopmentDonationAddress();
+    }
+    bool setQQDevelopmentDonation(unsigned int percentage,
+                                  const std::string& recipient,
+                                  std::string& error) override
+    {
+        bilingual_str wallet_error;
+        const bool success = m_wallet->SetQQDevelopmentDonationConsent(
+            percentage, recipient, wallet_error);
+        error = wallet_error.original;
+        return success;
     }
     bool tryGetStakeWeight(uint64_t& nWeight) override
     {
@@ -2469,6 +2900,48 @@ public:
     {
         return m_wallet->m_enabled_staking;
     }
+    interfaces::WalletStakingInfo getStakingInfo() override
+    {
+        const StakingTelemetrySnapshot snapshot =
+            m_wallet->GetStakingTelemetrySnapshot();
+        interfaces::WalletStakingInfo info;
+        info.sequence = snapshot.sequence;
+        info.enabled = snapshot.enabled;
+        info.worker_running = snapshot.worker_running;
+        info.eligible = snapshot.eligible;
+        info.tip_height = snapshot.tip_height;
+        info.weight = snapshot.weight;
+        info.weight_cache_height = snapshot.weight_cache_height;
+        info.search_interval = snapshot.search_interval;
+        info.reason = snapshot.reason;
+        switch (snapshot.state) {
+        case StakingTelemetryState::DISABLED:
+            info.state = interfaces::WalletStakingState::DISABLED;
+            break;
+        case StakingTelemetryState::STARTING:
+            info.state = interfaces::WalletStakingState::STARTING;
+            break;
+        case StakingTelemetryState::LOCKED:
+            info.state = interfaces::WalletStakingState::LOCKED;
+            break;
+        case StakingTelemetryState::SYNCING:
+            info.state = interfaces::WalletStakingState::SYNCING;
+            break;
+        case StakingTelemetryState::SEARCHING:
+            info.state = interfaces::WalletStakingState::SEARCHING;
+            break;
+        case StakingTelemetryState::NO_ELIGIBLE_COINS:
+            info.state = interfaces::WalletStakingState::NO_ELIGIBLE_COINS;
+            break;
+        case StakingTelemetryState::FAULT:
+            info.state = interfaces::WalletStakingState::FAULT;
+            break;
+        case StakingTelemetryState::STOPPED:
+            info.state = interfaces::WalletStakingState::STOPPED;
+            break;
+        }
+        return info;
+    }
     bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
                       bool allow_new_payout_key, bool* created_payout_key) override
     {
@@ -2507,6 +2980,21 @@ public:
             TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
             if (wallet_lock) {
                 info.payout_address = m_wallet->m_pow_payout_quantum;
+                const ShadowPowClaimStakeReserveInfo reserve =
+                    m_wallet->GetShadowPowClaimStakeReserveInfoLocked();
+                info.stake_reserve_available = reserve.wallet_tip_matches;
+                info.configured_stake_reserve_coins =
+                    reserve.configured_reserve_coins;
+                info.mature_stakeable_legacy_coins = static_cast<int>(
+                    reserve.mature_stakeable_legacy_coins);
+                info.mature_stakeable_legacy_weight =
+                    reserve.mature_stakeable_legacy_weight;
+                info.reserved_stake_coins = static_cast<int>(
+                    reserve.reserved_stake_coins);
+                info.reserved_stake_weight = reserve.reserved_stake_weight;
+                info.claim_coins_after_stake_reserve = static_cast<int>(
+                    reserve.claim_coins_after_reserve);
+                info.last_stake_coin_guard = reserve.last_stake_coin_guard;
                 const std::vector<CScript> known_scripts =
                     m_wallet->GetOwnedLegacyShadowScripts(MAX_WALLET_SHADOW_SOLVE_REFERENCES);
                 wallet_scripts.insert(known_scripts.begin(), known_scripts.end());
@@ -2565,6 +3053,167 @@ public:
             }
         }
         return info;
+    }
+    WalletPowClaimRecoveryPolicy getPowClaimRecoveryPolicy() override
+    {
+        return MakeRecoveryPolicy(
+            m_wallet->GetShadowPowClaimRecoveryPolicy());
+    }
+    interfaces::WalletPowClaimRecoveryPolicyMutationResult
+    getPowClaimRecoveryPolicyState() override
+    {
+        return MakeRecoveryPolicyMutationResult(
+            m_wallet->GetShadowPowClaimRecoveryPolicyState());
+    }
+    bool setPowClaimRecoveryPolicy(const WalletPowClaimRecoveryPolicy& policy,
+                                   std::string& error) override
+    {
+        const interfaces::WalletPowClaimRecoveryPolicyMutationResult result =
+            setPowClaimRecoveryPolicyDetailed(policy);
+        error = result.success ? std::string{} : result.detail;
+        return result.success;
+    }
+    interfaces::WalletPowClaimRecoveryPolicyMutationResult
+    setPowClaimRecoveryPolicyDetailed(
+        const WalletPowClaimRecoveryPolicy& policy) override
+    {
+        ShadowPowClaimRecoveryPolicy core;
+        std::string error;
+        if (!MakeCoreRecoveryPolicy(policy, core, error)) {
+            const ShadowPowClaimRecoveryPolicyMutationResult state =
+                m_wallet->GetShadowPowClaimRecoveryPolicyState();
+            if (!state.authoritative_state_available) {
+                return MakeRecoveryPolicyMutationResult(state);
+            }
+            interfaces::WalletPowClaimRecoveryPolicyMutationResult result;
+            result.status = interfaces::WalletPowClaimRecoveryPolicyMutationStatus::INVALID_POLICY;
+            result.reason_code = "invalid_policy";
+            result.detail = std::move(error);
+            result.authoritative_state_available = true;
+            result.authoritative_policy =
+                MakeRecoveryPolicy(state.authoritative_policy);
+            return result;
+        }
+        return MakeRecoveryPolicyMutationResult(
+            m_wallet->SetShadowPowClaimRecoveryPolicyDetailed(core));
+    }
+    interfaces::WalletPowClaimRecoveryReview getPowClaimRecoveryReview(
+        const interfaces::WalletPowClaimRecoveryRequest& request) override
+    {
+        interfaces::WalletPowClaimRecoveryReview review;
+        ShadowPowClaimRecoveryRequest core_request;
+        if (!MakeCoreRecoveryRequest(request, core_request, review.error)) {
+            return review;
+        }
+        // A review is always read-only even if a caller accidentally supplies
+        // a mutating interface mode. Execution has a separate method.
+        core_request.mode = ShadowPowClaimRecoveryMode::PREVIEW;
+        core_request.execution_authority =
+            ShadowPowClaimRecoveryExecutionAuthority::NONE;
+        core_request.acknowledge_fee_and_conflict_risk = false;
+        core_request.expected_plan_id.reset();
+
+        const ShadowPowClaimRecoveryReview core_review =
+            m_wallet->GetShadowPowClaimRecoveryReview(core_request);
+        const ShadowPowClaimRecoveryInventory& inventory =
+            core_review.inventory;
+        const ShadowPowClaimRecoveryPlan& plan = core_review.plan;
+
+        review.active_tip = inventory.active_tip.GetHex();
+        review.active_height = inventory.active_height;
+        review.wallet_generation = inventory.wallet_generation;
+        review.wallet_tip_matches = inventory.wallet_tip_matches;
+        review.raw_claim_objects = inventory.raw_claim_objects;
+        review.live_claim_objects = inventory.live_claim_objects;
+        review.quarantined_claim_objects = inventory.quarantined_claim_objects;
+        review.blocking_components = inventory.blocking_components;
+        review.retired_claim_objects = inventory.retired_claim_objects;
+        review.retired_components = inventory.retired_components;
+        review.resolved_components = inventory.resolved_components;
+        review.components.reserve(inventory.components.size());
+        for (const auto& component : inventory.components) {
+            review.components.push_back(MakeRecoveryComponent(component));
+        }
+        review.unanchored_claim_txids =
+            HashStrings(inventory.unanchored_claim_txids);
+        review.plan = MakeRecoveryPlan(plan);
+        review.usage = MakeRecoveryUsage(core_review.usage);
+        review.policy_available = core_review.available ||
+            core_review.status !=
+                ShadowPowClaimRecoveryReviewStatus::POLICY_UNAVAILABLE;
+        review.policy = MakeRecoveryPolicy(core_review.policy);
+        review.reason_code = core_review.reason_code;
+        review.consistent = core_review.consistent;
+        if (!core_review.available) review.error = core_review.detail;
+        return review;
+    }
+    interfaces::WalletPowClaimRecoveryExecution resolvePowClaims(
+        const interfaces::WalletPowClaimRecoveryRequest& request) override
+    {
+        interfaces::WalletPowClaimRecoveryExecution execution;
+        ShadowPowClaimRecoveryRequest core_request;
+        if (!MakeCoreRecoveryRequest(request, core_request, execution.error)) {
+            return execution;
+        }
+        const ShadowPowClaimRecoveryResult result =
+            m_wallet->ResolveShadowPowClaims(core_request);
+        execution.plan = MakeRecoveryPlan(result.plan);
+        execution.success = result.success;
+        execution.stale_plan = result.stale_plan;
+        execution.signed_and_persisted = result.signed_and_persisted;
+        execution.durable_state_changed = result.durable_state_changed;
+        execution.durable_state_ambiguous = result.durable_state_ambiguous;
+        execution.relay_authority_granted = result.relay_authority_granted;
+        execution.broadcast = result.broadcast;
+        execution.already_in_mempool = result.already_in_mempool;
+        execution.relay_deferred = result.relay_deferred;
+        execution.error = result.error;
+        return execution;
+    }
+    bool adoptPowClaimRecoveryComponent(
+        const std::string& selector_txid,
+        const std::string& expected_tip,
+        const std::string& expected_component_fingerprint,
+        std::string& error) override
+    {
+        const interfaces::WalletPowClaimRecoveryAdoptionResult result =
+            adoptPowClaimRecoveryComponentDetailed(
+                selector_txid, expected_tip,
+                expected_component_fingerprint);
+        error = result.success ? std::string{} : result.detail;
+        return result.success;
+    }
+    interfaces::WalletPowClaimRecoveryAdoptionResult
+    adoptPowClaimRecoveryComponentDetailed(
+        const std::string& selector_txid,
+        const std::string& expected_tip,
+        const std::string& expected_component_fingerprint) override
+    {
+        interfaces::WalletPowClaimRecoveryAdoptionResult invalid;
+        uint256 selector;
+        uint256 tip;
+        uint256 fingerprint;
+        if (!ParseHashStr(selector_txid, selector)) {
+            invalid.status = interfaces::WalletPowClaimRecoveryAdoptionStatus::SELECTOR_NOT_FOUND;
+            invalid.reason_code = "selector_not_found";
+            invalid.detail = "Invalid claim transaction id";
+            return invalid;
+        }
+        if (!ParseHashStr(expected_tip, tip)) {
+            invalid.status = interfaces::WalletPowClaimRecoveryAdoptionStatus::STALE_TIP;
+            invalid.reason_code = "stale_tip";
+            invalid.detail = "Invalid expected active tip";
+            return invalid;
+        }
+        if (!ParseHashStr(expected_component_fingerprint, fingerprint)) {
+            invalid.status = interfaces::WalletPowClaimRecoveryAdoptionStatus::STALE_COMPONENT_FINGERPRINT;
+            invalid.reason_code = "stale_component_fingerprint";
+            invalid.detail = "Invalid component fingerprint";
+            return invalid;
+        }
+        return MakeRecoveryAdoptionResult(
+            m_wallet->AdoptShadowPowClaimRecoveryComponent(
+                selector, tip, fingerprint));
     }
     util::Result<WalletQuantumAddressInfo> createQuantumAddress(const std::string& label) override
     {
@@ -3059,6 +3708,12 @@ public:
     void flush() override { return FlushWallets(m_context); }
     void stop() override { return StopWallets(m_context); }
     void setMockTime(int64_t time) override { return SetMockTime(time); }
+    void transactionSubmittedByRpc(const CTransactionRef& tx) override
+    {
+        for (const auto& wallet : GetWallets(m_context)) {
+            wallet->transactionSubmittedByRpc(tx);
+        }
+    }
 
     //! WalletLoader methods
     util::Result<std::unique_ptr<Wallet>> createWallet(const std::string& name, const SecureString& passphrase, uint64_t wallet_creation_flags, std::vector<bilingual_str>& warnings) override

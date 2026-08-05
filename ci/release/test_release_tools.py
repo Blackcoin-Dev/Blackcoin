@@ -116,8 +116,8 @@ class ReleaseToolTests(unittest.TestCase):
             "UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}",
             workflow,
         )
-        self.assertIn("expected='V30.1.3'", workflow)
-        self.assertIn("expected_ack='V30.1.3'", workflow)
+        self.assertIn("expected='V30.1.4'", workflow)
+        self.assertIn("expected_ack='V30.1.4'", workflow)
         self.assertIn("--require-signatures", workflow)
         self.assertIn(f"--signing-fingerprint '{FINGERPRINT}'", workflow)
         self.assertNotIn("--require-unsigned-objects", workflow)
@@ -1250,16 +1250,10 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("--build-profile native-walletless-default", gate)
         self.assertIn("--minimum-runtime-ms 250", gate)
         self.assertIn("--provenance-manifest", gate)
-        self.assertIn(
-            '"Exact-SHA prerelease or production safety gate / measured worst-case '
-            'quantum crypto resources (Linux x86_64)"',
-            release,
-        )
-        self.assertIn(
-            '"historical_resource_and_reproducibility_results_are_not_candidate_sha_results": True',
-            release,
-        )
-        self.assertIn("inherited-core-gate-30.1.3-", release)
+        self.assertIn("uses: ./.github/workflows/pr-gate.yml", release)
+        self.assertIn("corrective_fast_path: false", release)
+        self.assertIn("Verify independent byte-for-byte rebuilds", release)
+        self.assertIn("$ASSET_PREFIX-REPRODUCIBILITY.txt", release)
         self.assertNotIn("pattern: quantum-resource-benchmarks-*", release)
         self.assertNotIn(
             "python3 ci/release/verify_resource_benchmark_bundle.py",
@@ -1280,24 +1274,18 @@ class ReleaseToolTests(unittest.TestCase):
         release_workflow = (root / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            '"Exact-SHA prerelease or production safety gate / pinned independent '
-            'quantum crypto provenance"',
-            release_workflow,
-        )
-        self.assertIn(
-            '"historical_results_are_not_candidate_sha_results": True',
-            release_workflow,
-        )
-        self.assertIn(
-            '"runtime_or_consensus_source_changed": False',
-            release_workflow,
-        )
-        self.assertIn("Blackcoin-$VERSION-INHERITED-CORE-EVIDENCE.json", release_workflow)
+        self.assertIn("uses: ./.github/workflows/pr-gate.yml", release_workflow)
+        self.assertIn("corrective_fast_path: false", release_workflow)
+        self.assertIn("run_extended_functional:", release_workflow)
+        self.assertIn("Verify independent byte-for-byte rebuilds", release_workflow)
+        self.assertIn("$ASSET_PREFIX-REPRODUCIBILITY.txt", release_workflow)
+        self.assertIn('builders = ("primary", "verifier")', release_workflow)
         self.assertNotIn(
-            "Download exact-SHA quantum crypto provenance evidence",
+            'builders = ("primary",) if os.environ["PUBLISH"] == "true"',
             release_workflow,
         )
+        self.assertNotIn("INHERITED_UNCHANGED_CORE_TEST_EVIDENCE", release_workflow)
+        self.assertNotIn("INHERITED-CORE-EVIDENCE", release_workflow)
 
         manifest = json.loads(
             (root / "contrib" / "devtools" / "quantum-crypto-provenance.json").read_text(
@@ -2140,7 +2128,7 @@ class ReleaseToolTests(unittest.TestCase):
 
     def test_unsigned_final_metadata_is_explicit_and_source_bound(self):
         generator = load_module("generate_unsigned_release_metadata")
-        version = "30.1.3"
+        version = "30.1.4"
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = Path(temporary)
             required = (
@@ -2154,6 +2142,7 @@ class ReleaseToolTests(unittest.TestCase):
                 f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.zip",
                 f"Blackcoin-{version}-SBOM.spdx.json",
                 f"Blackcoin-{version}-provenance.intoto.json",
+                f"Blackcoin-{version}-REPRODUCIBILITY.txt",
             )
             for name in required:
                 (artifacts / name).write_bytes(name.encode("ascii"))
@@ -2233,13 +2222,12 @@ class ReleaseToolTests(unittest.TestCase):
                 FINGERPRINT,
             )
             self.assertTrue(document["release"]["macos_adhoc_signed"])
-            self.assertFalse(
+            self.assertTrue(
                 document["integrity"]["reproducibility"]["current_source_rerun"]
             )
-            self.assertTrue(
-                document["integrity"]["reproducibility"][
-                    "historical_evidence_separately_labeled"
-                ]
+            self.assertEqual(
+                document["integrity"]["reproducibility"]["report"],
+                f"Blackcoin-{version}-REPRODUCIBILITY.txt",
             )
             self.assertTrue(document["integrity"]["github_build_provenance_attestation"])
             self.assertTrue(document["integrity"]["github_sbom_attestation"])
@@ -2255,7 +2243,7 @@ class ReleaseToolTests(unittest.TestCase):
                 notice_text,
             )
             self.assertIn(
-                "does not claim a new duplicate-builder reproducibility result",
+                "exact-source duplicate-builder reproducibility report",
                 notice_text,
             )
             self.assertTrue(notice.name.endswith("-UNSIGNED-PRODUCTION.txt"))
@@ -2264,7 +2252,7 @@ class ReleaseToolTests(unittest.TestCase):
 
     def test_unsigned_final_metadata_rejects_missing_ack_or_signature_asset(self):
         generator = load_module("generate_unsigned_release_metadata")
-        version = "30.1.1"
+        version = "30.1.4"
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = Path(temporary)
             for name in (
@@ -2278,6 +2266,7 @@ class ReleaseToolTests(unittest.TestCase):
                 f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.zip",
                 f"Blackcoin-{version}-SBOM.spdx.json",
                 f"Blackcoin-{version}-provenance.intoto.json",
+                f"Blackcoin-{version}-REPRODUCIBILITY.txt",
             ):
                 (artifacts / name).write_bytes(b"artifact")
             (artifacts / "SOURCE_COMMIT.txt").write_text(
@@ -2309,7 +2298,7 @@ class ReleaseToolTests(unittest.TestCase):
         workflow = (TOOLS.parent.parent / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("default: 30.1.3-alpha1", workflow)
+        self.assertIn("default: 30.1.4-alpha1", workflow)
         self.assertIn("CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}", workflow)
         self.assertIn('test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA"', workflow)
         self.assertIn('test "$EVENT_SHA" = "$TARGET_SHA"', workflow)
@@ -2322,9 +2311,9 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('test "$IS_RELEASE" = "false"', workflow)
         self.assertIn('test "$RC" = "0"', workflow)
         self.assertIn('test "$IS_RELEASE" = "true"', workflow)
-        self.assertIn("- 'v30.1.3'", workflow)
-        self.assertNotIn("- 'v30.1.3-alpha", workflow)
-        self.assertNotIn("- 'v30.1.3-beta", workflow)
+        self.assertIn("- 'v30.1.4'", workflow)
+        self.assertNotIn("- 'v30.1.4-alpha", workflow)
+        self.assertNotIn("- 'v30.1.4-beta", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
         self.assertIn("Verify non-macOS binary identity", workflow)
         self.assertIn("verify_windows_payload.py identity", workflow)
@@ -2345,7 +2334,7 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('metadata["LSArchitecturePriority"] = [os.environ["EXPECTED_ARCH"]]', workflow)
         self.assertIn('verify_plist_architecture "$verified_plist"', workflow)
         self.assertIn(
-            "Require explicit v30.1.3 signed-source publication acknowledgement",
+            "Require explicit v30.1.4 signed-source publication acknowledgement",
             workflow,
         )
         self.assertIn("--require-signatures", workflow)

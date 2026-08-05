@@ -1678,9 +1678,11 @@ void BitcoinGUI::updateStakingIcon()
     }
     WalletModel * const walletModel = walletView->getWalletModel();
 
-    uint64_t nWeight = walletModel->getStakeWeight();
-    if (walletModel->wallet().getLastCoinStakeSearchInterval() &&
-            walletModel->wallet().getEnabledStaking() && nWeight)
+    const interfaces::WalletStakingInfo staking =
+        walletModel->wallet().getStakingInfo();
+    uint64_t nWeight = staking.weight;
+    if (staking.enabled && staking.worker_running && staking.eligible &&
+            staking.state == interfaces::WalletStakingState::SEARCHING)
     {
         uint64_t nNetworkWeight = 1.1429 * walletModel->node().getPoSKernelPS();
         const Consensus::Params& consensusParams = Params().GetConsensus();
@@ -1714,19 +1716,20 @@ void BitcoinGUI::updateStakingIcon()
     else
     {
         labelStakingIcon->setPixmap(platformStyle->SingleColorIcon(":/icons/staking_off").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
-        if (walletModel->wallet().getEnabledStaking()) {
+        if (staking.enabled) {
             if (m_node.getNodeCount(ConnectionDirection::Both) == 0)
                 labelStakingIcon->setToolTip(tr("Not staking because wallet is offline"));
             else if (m_node.isInitialBlockDownload())
                 labelStakingIcon->setToolTip(tr("Not staking because wallet is syncing"));
             else if (!walletModel->wallet().hasPrivateKeys())
                 labelStakingIcon->setToolTip(tr("Not staking because private keys are disabled"));
-            else if (!nWeight)
-                labelStakingIcon->setToolTip(tr("Not staking because you don't have mature coins"));
-            else if (walletModel->wallet().isLocked())
+            else if (staking.state == interfaces::WalletStakingState::LOCKED)
                 labelStakingIcon->setToolTip(tr("Not staking because wallet is locked"));
+            else if (staking.state == interfaces::WalletStakingState::NO_ELIGIBLE_COINS || !nWeight)
+                labelStakingIcon->setToolTip(tr("Not staking because you don't have mature coins"));
             else
-                labelStakingIcon->setToolTip(tr("Not staking"));
+                labelStakingIcon->setToolTip(tr("Not staking: %1")
+                    .arg(QString::fromStdString(staking.reason)));
         }
         else
             labelStakingIcon->setToolTip(tr("Not staking because staking is disabled"));

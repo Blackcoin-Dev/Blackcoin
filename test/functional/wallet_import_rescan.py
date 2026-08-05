@@ -144,12 +144,16 @@ IMPORT_NODES = [ImportNode(*fields) for fields in itertools.product((False, True
 # Rescans start at the earliest block up to 2 hours before the key timestamp.
 TIMESTAMP_WINDOW = 2 * 60 * 60
 
-AMOUNT_DUST = 0.00000546
+SATOSHI = Decimal("0.00000001")
+MIN_SEND_SATOSHIS = 18_201
 
 
 def get_rand_amount():
-    r = random.uniform(AMOUNT_DUST, 1)
-    return Decimal(str(round(r, 8)))
+    # Blackcoin's 100,000 sat/kvB default dust relay fee makes a standard
+    # P2PKH output dust below 18,200 satoshis.  The inherited Bitcoin fixture
+    # sampled from 546 satoshis and therefore failed nondeterministically.
+    # Sample integral satoshis strictly above Blackcoin's policy boundary.
+    return Decimal(random.randint(MIN_SEND_SATOSHIS, 100_000_000)) * SATOSHI
 
 
 class ImportRescanTest(BitcoinTestFramework):

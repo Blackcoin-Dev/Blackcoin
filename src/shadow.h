@@ -26,6 +26,10 @@ namespace Consensus {
 struct Params;
 }
 
+/** True only for an ordinary direct (non-tiered, non-cold-stake) witness-v16
+ * Quantum Quasar output. */
+bool IsDirectQuantumMigrationScript(const CScript& script);
+
 struct ShadowGoldRushInfo {
     CAmount pow_amount{0};
     CAmount pos_amount{0};
@@ -37,6 +41,21 @@ struct ShadowGoldRushInfo {
     uint8_t recent_count{0};
     uint64_t recent_modes{0};
     unsigned int pow_target_bits{0};
+};
+
+/** Decoded wallet/RPC-safe QQSIGNAL payload. */
+struct ShadowSignalInfo {
+    CScript target;
+    CScript payout_script;
+    uint32_t solve_height{0};
+    uint256 solve_hash;
+};
+
+/** Authenticated active-signal member state at an exact chain tip. */
+struct ShadowActiveSignalInfo {
+    CScript target;
+    CScript payout_script;
+    uint32_t signal_height{0};
 };
 
 /** Maximum serialized active-signal state derived from the authenticated
@@ -371,6 +390,11 @@ static constexpr unsigned int MAX_SHADOW_POW_EVALS_PER_BLOCK = 64;
 /** A QQP4 proof remains relayable and fee-reimbursable through this many
  *  blocks after its committed origin height. */
 static constexpr uint32_t SHADOW_POW_LATE_ORIGIN_WINDOW = 64;
+/** A QQSPROOF carrier is a short-lived relay object. Keep this independent
+ *  from the ordinary mempool expiry so normal wallet transactions retain the
+ *  node's configured policy. Wallet input release remains height-gated by
+ *  SHADOW_POW_LATE_ORIGIN_WINDOW and never follows this wall-clock timeout. */
+static constexpr int64_t SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS = 60 * 60;
 /** A serialized CTxOut consumes at least 9 non-witness bytes (36 weight).
  *  This is therefore a conservative consensus-derived ceiling on the number
  *  of QQSPROOF-shaped outputs in any V4-valid block. */
@@ -459,6 +483,8 @@ std::map<CScript, ShadowSolverActivity> GetRecentShadowSolverActivity(const CCoi
 std::optional<ShadowSolverActivity> GetRecentShadowSolverActivityForScript(const CCoinsViewCache& view, const CBlockIndex* pindex, const CScript& target);
 uint64_t GetActiveShadowSignalCount(const CCoinsViewCache& view, const CBlockIndex* pindex);
 std::map<CScript, CScript> GetActiveShadowSignalPayouts(const CCoinsViewCache& view, const CBlockIndex* pindex);
+std::map<CScript, ShadowActiveSignalInfo> GetActiveShadowSignalDetails(
+    const CCoinsViewCache& view, const CBlockIndex* pindex);
 bool HasRecentShadowSolverActivity(const CCoinsViewCache& view, const CBlockIndex* pindex, const CScript& target, uint32_t solve_height, const uint256& solve_hash);
 
 /** Compute PoS Gold Rush shadow-ledger credits implied by a candidate block.
@@ -504,6 +530,62 @@ enum class ShadowProofValidationResult {
     INVALID,
     LOCAL_INTERNAL_ERROR,
 };
+
+/** Typed mempool-policy disposition for one fee-paying Gold Rush PoW claim.
+ *
+ * This is intentionally more specific than ShadowProofValidationResult. The
+ * latter remains the validation/control-flow result, while this enum lets
+ * wallet recovery distinguish deterministic claim failures from conditions
+ * that can clear at another tip or after local state repair without parsing a
+ * user-facing reject string.
+ */
+enum class ShadowPowClaimMempoolDisposition : uint8_t {
+    ELIGIBLE,
+    INACTIVE,
+    HEIGHT_BEFORE_WINDOW,
+    HEIGHT_AFTER_WINDOW,
+    INVALID_LOCATION,
+    MALFORMED,
+    DUPLICATE,
+    WRONG_MODE,
+    UNKNOWN_MODE,
+    UNSUPPORTED_VERSION,
+    /** A recognized proof format is scheduled but not active at the current
+     * candidate height. A descendant may activate it. */
+    VERSION_NOT_YET_ACTIVE,
+    INVALID_PROOF,
+    /** A legacy quantum-linked proof without a committed origin failed at the
+     * current tip. Its hash context changes on descendants, so the same bytes
+     * can validate later and are not proof of permanent death. */
+    UNBOUND_PROOF_MAY_REVALIDATE,
+    /** The proof names an origin height after the current candidate height.
+     * It is not dead: a descendant tip may reach that origin. */
+    ORIGIN_NOT_YET_REACHED,
+    ORIGIN_MISMATCH,
+    ORIGIN_EXPIRED,
+    INPUT_MISMATCH,
+    ALREADY_ACCOUNTED,
+    CAPACITY_LIMIT,
+    EVALUATION_LIMIT,
+    LOCAL_STATE_ERROR,
+};
+
+/** Return true when the claim cannot become eligible on a descendant of the
+ * currently validated branch. ORIGIN_MISMATCH and ALREADY_ACCOUNTED are
+ * branch-relative: callers must revalidate after every reorg before acting.
+ * ORIGIN_NOT_YET_REACHED, VERSION_NOT_YET_ACTIVE, and
+ * UNBOUND_PROOF_MAY_REVALIDATE are deliberately retryable because a
+ * descendant may reach the proof's declared origin or format-activation
+ * height, or may give an unbound proof a different hash context.
+ */
+bool IsShadowPowClaimCurrentBranchTerminal(
+    ShadowPowClaimMempoolDisposition disposition);
+
+/** Return true for a disposition that can clear at a later tip or after local
+ * state repair and therefore must never authorize a conflicting recovery
+ * spend by itself. */
+bool IsShadowPowClaimMempoolRetryable(
+    ShadowPowClaimMempoolDisposition disposition);
 
 /** Typed result for a bounded PoW nonce search. */
 enum class ShadowPowGrindResult {
@@ -618,7 +700,13 @@ std::vector<ShadowProofObservation> GetShadowProofObservations(
     ShadowProofObservationSummary& summary);
 bool TransactionHasShadowProof(const CTransaction& tx);
 bool TransactionHasShadowSignal(const CTransaction& tx);
-ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);
+/** Decode exactly one valid quantum-linked QQSIGNAL payload from a transaction. */
+bool DecodeShadowSignal(const CTransaction& tx, ShadowSignalInfo& signal_out);
+ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
+    const CTransaction& tx, const CBlockIndex* pindexPrev,
+    const CCoinsViewCache& view, bool gold_rush_active,
+    std::string& reject_reason,
+    ShadowPowClaimMempoolDisposition* disposition_out = nullptr);
 bool CheckShadowPowClaimForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);
 bool CheckShadowSignalForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev,
                                  const CCoinsViewCache& view, bool gold_rush_active,

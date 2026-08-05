@@ -1670,6 +1670,7 @@ int MaybeAutoShadowSignal(CWallet& wallet)
 
     mapValue_t map_value;
     map_value["comment"] = SHADOW_SIGNAL_COMMENT;
+    map_value["qq_shadow_signal_source"] = "automatic";
     try {
         std::string broadcast_error;
         if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error)) {
@@ -1922,6 +1923,9 @@ void StartStake(CWallet& wallet) {
     else {
         wallet.m_stop_staking_thread = false;
         wallet.m_enabled_staking = true;
+        wallet.PublishStakingTelemetry(
+            StakingTelemetryState::STARTING, uint256{}, -1,
+            /*worker_running=*/false, "staking worker start requested");
     }
     StakeCoins(wallet, wallet.m_enabled_staking);
 }
@@ -1930,6 +1934,9 @@ void StopStake(CWallet& wallet) {
     LOCK(wallet.m_staking_thread_mutex);
     if (!wallet.threadStakeMinerGroup) {
         wallet.m_enabled_staking = false;
+        wallet.PublishStakingTelemetry(
+            StakingTelemetryState::DISABLED, uint256{}, -1,
+            /*worker_running=*/false, "staking is disabled");
     }
     else {
         wallet.m_stop_staking_thread = true;
@@ -1937,6 +1944,9 @@ void StopStake(CWallet& wallet) {
         StakeCoins(wallet, false);
         wallet.threadStakeMinerGroup.reset();
         wallet.m_stop_staking_thread = false;
+        wallet.PublishStakingTelemetry(
+            StakingTelemetryState::DISABLED, uint256{}, -1,
+            /*worker_running=*/false, "staking is disabled");
     }
 }
 
@@ -2194,6 +2204,11 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
         const CAmount available = nValueRet > wallet.m_reserve_balance
             ? nValueRet - wallet.m_reserve_balance
             : 0;
+        // Publish the cache pair under the same mutex used to assemble the
+        // typed staking snapshot. The atomics keep legacy low-latency readers
+        // available, while telemetry never combines weight from one scan with
+        // the height from another.
+        LOCK(wallet.m_staking_telemetry_mutex);
         wallet.m_cached_stake_weight.store(static_cast<uint64_t>(available), std::memory_order_relaxed);
         const CBlockIndex* tip = wallet.chain().getTip();
         wallet.m_cached_stake_weight_height.store(tip ? tip->nHeight : -1, std::memory_order_release);
@@ -2507,32 +2522,28 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
         LogPrint(BCLog::COINSTAKE, "CreateCoinStake : cold-stake subsidy discount applied\n");
     }
 
-    bool isDevFundEnabled = (wallet.m_donation_percentage > 0 && !Params().GetDevFundAddress().empty()) ? true : false;
-    int treasuryPercentage = wallet.m_donation_percentage;
+    const CScript qq_development_script =
+        Params().GetQQDevelopmentDonationScript();
+    const unsigned int qq_development_percentage =
+        wallet.GetQQDevelopmentDonationPercentage();
+    bool qq_development_donation_enabled =
+        qq_development_percentage > 0 &&
+        quantum_stake_rules_active &&
+        IsDirectQuantumMigrationScript(qq_development_script);
 
-    // Treasury contribution is WALLET-LEVEL and opt-in/opt-out (set -donatetodevfund).
-    // It is not consensus-enforced: consensus does not require any treasury output, so
-    // a staker who opts out still produces a fully valid block. The GUI keeps the
-    // default off until the wallet migration is complete, but a manual nonzero choice
-    // is honored whenever the coinstake format can safely include the extra output.
+    // This is wallet policy, never a consensus treasury or required payment.
+    // Exact reward-split formats cannot carry an additional optional output.
     if (stake_reward_split_active) {
-        isDevFundEnabled = false; // The stake-reward split enforces exact participant/operator split; no wallet-level extra value outputs.
-    }
-    if (isDevFundEnabled && (fQuantumKernel || final_quantum_lockout)) {
-        const CScript dev_reward_script = Params().GetDevRewardScript();
-        if (!IsQuantumMigrationScript(dev_reward_script) && !IsQuantumColdStakeScript(dev_reward_script) && !IsEUTXOScript(dev_reward_script)) {
-            wallet.WalletLogPrintf("Dev fund contribution disabled for a quantum coinstake because the configured dev reward script is legacy\n");
-            isDevFundEnabled = false;
-        }
+        qq_development_donation_enabled = false;
     }
 
-    CAmount nDevCredit = 0;
+    CAmount nQQDevelopmentCredit = 0;
     CAmount nMinerCredit = 0;
 
-    if (isDevFundEnabled)
+    if (qq_development_donation_enabled)
     {
-        nDevCredit = (nReward * treasuryPercentage) / 100;
-        nMinerCredit = nReward - nDevCredit;
+        nQQDevelopmentCredit = (nReward * qq_development_percentage) / 100;
+        nMinerCredit = nReward - nQQDevelopmentCredit;
         nCredit += nMinerCredit;
     }
     else
@@ -2544,21 +2555,21 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     if (nCredit >= GetStakeSplitThreshold())
         txNew.vout.push_back(CTxOut(0, scriptPubKeyOut));
 
-    if (isDevFundEnabled)
-        txNew.vout.push_back(CTxOut(0, Params().GetDevRewardScript()));
+    if (qq_development_donation_enabled)
+        txNew.vout.push_back(CTxOut(0, qq_development_script));
 
     // Set output amount
-    if (txNew.vout.size() == (isDevFundEnabled ? 4u : 3u) + bMinterKey) {
+    if (txNew.vout.size() == (qq_development_donation_enabled ? 4u : 3u) + bMinterKey) {
         txNew.vout[1 + bMinterKey].nValue = (nCredit / 2 / CENT) * CENT;
         txNew.vout[2 + bMinterKey].nValue = nCredit - txNew.vout[1 + bMinterKey].nValue;
-        if (isDevFundEnabled)
-            txNew.vout[3 + bMinterKey].nValue = nDevCredit;
+        if (qq_development_donation_enabled)
+            txNew.vout[3 + bMinterKey].nValue = nQQDevelopmentCredit;
     }
     else
     {
         txNew.vout[1 + bMinterKey].nValue = nCredit;
-        if (isDevFundEnabled)
-            txNew.vout[2 + bMinterKey].nValue = nDevCredit;
+        if (qq_development_donation_enabled)
+            txNew.vout[2 + bMinterKey].nValue = nQQDevelopmentCredit;
     }
 
     if (stake_reward_split_active && nOperatorCredit > 0) {

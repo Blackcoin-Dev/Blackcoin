@@ -210,6 +210,12 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
         node.createwallet(wallet_name=WALLET_NAME)
         wallet = node.get_wallet_rpc(WALLET_NAME)
         wallet.staking(False)
+        observer_name = "goldrush_pos_signal_observer"
+        node.createwallet(wallet_name=observer_name)
+        observer = node.get_wallet_rpc(observer_name)
+        observer.staking(False)
+        assert_equal(wallet.getgoldrushinfo()["wallet_qqsignal"]["status"], "none")
+        assert_equal(observer.getgoldrushinfo()["wallet_qqsignal"]["status"], "none")
         signal_address = wallet.getnewaddress("", "legacy")
         whitelist_script = wallet.getaddressinfo(signal_address)["scriptPubKey"]
 
@@ -288,6 +294,19 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
         assert_equal(combined_info["last_pow_height"], payout_height)
         assert combined_info["pos_count"] >= 1
         assert combined_info["pow_count"] >= 1
+        confirmed_signal = combined_info["wallet_qqsignal"]
+        assert_equal(confirmed_signal["active"], True)
+        assert_equal(confirmed_signal["status"], "confirmed")
+        assert_equal(confirmed_signal["txid"], signal_txid)
+        assert_equal(confirmed_signal["signal_height"], payout_height)
+        assert_equal(confirmed_signal["activation_height"], payout_height)
+        assert_equal(
+            confirmed_signal["expiry_height"],
+            payout_height + 18900,
+        )
+        assert_equal(confirmed_signal["confirmations"], 1)
+        assert_equal(confirmed_signal["source"], "automatic")
+        assert_equal(observer.getgoldrushinfo()["wallet_qqsignal"]["status"], "none")
 
         self.log.info("Repeatedly disconnecting and reconnecting the combined payout block while polling wallet RPC")
 
@@ -310,6 +329,11 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
                 assert node.gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is None
                 assert node.gettxout(pow_payout_utxo["txid"], pow_payout_utxo["vout"], False) is None
                 assert_equal(latest_signal_solve_height(), solve_height)
+                removed_signal = wallet.getgoldrushinfo()["wallet_qqsignal"]
+                assert_equal(removed_signal["active"], False)
+                assert removed_signal["status"] in ("mempool", "reorg_removed")
+                assert_equal(removed_signal["txid"], signal_txid)
+                assert_equal(observer.getgoldrushinfo()["wallet_qqsignal"]["status"], "none")
 
                 self.log.info(f"Reorg round {reorg_round + 1}: reconnect restores the newer indexed solve")
                 node.reconsiderblock(payout_block_hash)
@@ -319,12 +343,77 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
                 assert_equal(payout_utxo["confirmations"], 1)
                 assert_equal(pow_payout_utxo["confirmations"], 1)
                 assert_equal(latest_signal_solve_height(), payout_height)
+                restored_signal = wallet.getgoldrushinfo()["wallet_qqsignal"]
+                assert_equal(restored_signal["active"], True)
+                assert_equal(restored_signal["status"], "confirmed")
+                assert_equal(restored_signal["txid"], signal_txid)
         finally:
             reorg_poll_stop.set()
             reorg_poll_thread.join(timeout=5)
         assert not reorg_poll_thread.is_alive(), "getstakinginfo remained blocked during repeated reorgs"
         assert_equal(reorg_poll_errors, [])
         assert len(reorg_poll_samples) >= 3
+
+        self.log.info("A later externally submitted wallet-authored refresh supersedes the earlier QQSIGNAL record")
+        decoded_signal = node.getrawtransaction(signal_txid, True)
+        signal_change = next(
+            output for output in decoded_signal["vout"]
+            if QQSIGNAL_HEX not in output["scriptPubKey"]["hex"]
+        )
+        signal_payload = next(
+            output["scriptPubKey"]["asm"].split()[1]
+            for output in decoded_signal["vout"]
+            if QQSIGNAL_HEX in output["scriptPubKey"]["hex"]
+        )
+        refresh_raw = node.createrawtransaction(
+            [{"txid": signal_txid, "vout": signal_change["n"]}],
+            [
+                {signal_address: Decimal(str(signal_change["value"])) - Decimal("0.01")},
+                {"data": signal_payload},
+            ],
+        )
+        refresh_signed = wallet.signrawtransactionwithwallet(refresh_raw)
+        assert_equal(refresh_signed["complete"], True)
+        refresh_txid = node.sendrawtransaction(refresh_signed["hex"])
+        refresh_block_hash = self.generatetoaddress(
+            node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op
+        )[0]
+        assert refresh_txid in node.getblock(refresh_block_hash)["tx"]
+        refresh_info = wallet.getgoldrushinfo()["wallet_qqsignal"]
+        assert_equal(refresh_info["active"], True)
+        assert_equal(refresh_info["status"], "confirmed")
+        assert_equal(refresh_info["txid"], refresh_txid)
+        assert_equal(refresh_info["source"], "unknown")
+        old_signal_history = next(
+            entry for entry in refresh_info["history"]
+            if entry["txid"] == signal_txid
+        )
+        assert_equal(old_signal_history["active"], False)
+        assert_equal(old_signal_history["status"], "superseded")
+
+        self.log.info("Disconnecting the refresh preserves an auditable reorg-removed record without contaminating the mempool")
+        node.invalidateblock(refresh_block_hash)
+        self.restart_node(0, self.extra_args[0] + [
+            "-persistmempool=0",
+            "-walletbroadcast=0",
+            f"-mocktime={self.mock_time}",
+        ])
+        node = self.nodes[0]
+        node.loadwallet(WALLET_NAME)
+        node.loadwallet(observer_name)
+        wallet = node.get_wallet_rpc(WALLET_NAME)
+        observer = node.get_wallet_rpc(observer_name)
+        assert refresh_txid not in node.getrawmempool()
+        restored_info = wallet.getgoldrushinfo()["wallet_qqsignal"]
+        assert_equal(restored_info["active"], True)
+        assert_equal(restored_info["txid"], signal_txid)
+        refresh_history = next(
+            entry for entry in restored_info["history"]
+            if entry["txid"] == refresh_txid
+        )
+        assert_equal(refresh_history["active"], False)
+        assert_equal(refresh_history["status"], "reorg_removed")
+        assert_equal(observer.getgoldrushinfo()["wallet_qqsignal"]["status"], "none")
 
         self.log.info("Mining a follow-up PoS block with no QQSIGNAL still pays the active 14-day look-back signaler")
         locked_non_whitelist = self._lock_non_whitelist_script_utxos(wallet, whitelist_script)

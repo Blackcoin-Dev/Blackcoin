@@ -247,7 +247,6 @@ public:
         };
 
         // A vector of p2sh addresses
-        vDevFundAddress = { "BKDvboD1CzZ5KycP1FRSXRoi7XXhHoQhS1" };
     }
 };
 
@@ -432,7 +431,6 @@ public:
         };
 
         // A vector of p2sh addresses
-        vDevFundAddress = { "n14L5xqAs7QRzNiTLPNaPeqaF9CRoxzVnU" };
     }
 };
 
@@ -583,7 +581,6 @@ public:
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;
 
-        vDevFundAddress = {};
     }
 };
 
@@ -800,7 +797,6 @@ public:
 
         bech32_hrp = "blrt";
 
-        vDevFundAddress = {};
     }
 };
 

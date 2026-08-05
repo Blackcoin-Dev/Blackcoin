@@ -1,3 +1,112 @@
+30.1.4 Maintenance Release Notes
+================================
+
+Blackcoin Core v30.1.4 removes the recurring fee-paying operator stopgap that
+was required when a wallet-authored, origin-bound Gold Rush PoW claim left the
+local mempool. It also protects mature legacy stake capacity, publishes
+coherent PoS worker state, makes claim-recovery review atomic, and exposes
+wallet-specific QQSIGNAL lifecycle evidence.
+
+It also permanently disables the legacy development-fund recipient and old
+payment controls. A separate Quantum Quasar development donation is available
+only through fresh wallet-scoped consent bound to the exact active-network
+direct quantum address and percentage. It defaults to zero and never inherits
+`-donatetodevfund` or prior GUI consent. See
+`doc/qq-development-donation.md`.
+
+This maintenance release does not change consensus, reward amounts, Gold Rush
+eligibility, the quantum lifecycle, or wallet ownership. It changes local
+wallet policy, recovery safety, and telemetry. Existing authenticated
+schema-12 chainstate at the exact active tip is reused; a compatible v30.1.x
+datadir is not rewound or reindexed merely because v30.1.4 starts.
+
+The production defaults are fail-closed:
+
+- wallet-authored QQP3/QQP4 carriers have a one-hour local mempool residence
+  limit, while ordinary transactions retain the existing mempool policy;
+- after the complete origin-plus-64 window expires, an exact eligible local
+  claim reservation is retired durably without another transaction or fee;
+- fee-paying conflict recovery remains an explicit, default-off fallback for
+  components that cannot use zero-payment retirement;
+- while staking is enabled, PoW claim selection protects one mature,
+  stakeable legacy coin by default (`-powclaimreservestakecoins=1`);
+- `getstakinginfo` reports a coherent worker snapshot and no longer treats a
+  zero-length search interval during a normal tip transition as an outage;
+- `getgoldrushinfo.wallet_qqsignal` reports only the selected wallet's exact
+  mempool, confirmed, expired, superseded, and reorg-removed signal records,
+  including durable manual/automatic provenance for newly created signals;
+- review of recovery inventory, plan, policy, and usage is one read-only,
+  tip-pinned Core snapshot. Execution still revalidates immediately before
+  persistence and broadcast; and
+- legacy development-fund payments cannot be re-enabled; the replacement
+  quantum facility remains off unless the wallet durably records fresh,
+  exact-recipient consent.
+
+Back up each wallet before upgrade. Stop the prior daemon or GUI cleanly and
+retain a cold copy of the datadir until the canary has verified wallet names,
+legacy and quantum keys, transaction history, configured data paths, active
+tip, and normal restart. If rollback is required, stop v30.1.4 cleanly and
+restore the complete pre-upgrade datadir copy before starting the older
+binary; do not run two versions against one datadir.
+
+Issue #37 adds wallet-side Gold Rush PoW claim-component recovery after
+v30.1.3. This work does not change QQP2/QQP3 consensus or rewrite the behavior
+of historical v30.1.1 through v30.1.3 binaries. Sections below that describe a
+single unresolved claim, a one-claim compatibility RPC, or a debug-console-only
+manual path are retained as release history for those binaries.
+
+The later recovery model permits up to 64 independent live wallet claims,
+classifies non-mempool siblings and descendants as current-anchor components,
+and separates exact preview, signed-draft persistence, and explicit
+commit-and-broadcast authority. Manual GUI and headless paths share that engine.
+Wallet-scoped automatic recovery is a seventh optional automation, is off by
+default, requires explicit positive fee/rate/staleness bounds, and never unlocks
+the wallet or enables mining.
+
+Newly authored origin-bound QQP3/QQP4 carriers have a dedicated one-hour local
+mempool residence limit. Eviction does not release their inputs while the proof
+remains height-eligible. After the complete origin-plus-64 window expires on a
+pinned active branch, Core retires an authenticated local claim reservation
+without creating, signing, or broadcasting another transaction and without a
+recovery fee. That durable retirement is reversed and reclassified if its
+observation block leaves the active chain. Fee-paying conflict recovery remains
+an explicit, default-off fallback for components that cannot use this path.
+
+`getpowmininginfo.quarantined_claims` retains its legacy miner-gating meaning
+so existing supervisors continue to start PoW when all historical components
+are resolved. The new `raw_quarantined_claims` field exposes retained audit and
+reorg history separately; a nonzero raw count alone never authorizes a fee or
+pauses mining.
+
+A chainstate that already carries the authenticated Quantum Quasar schema-12
+replay marker for its exact active tip starts normally on v30.1.4. Upgrading
+from a compatible v30.1.x release does not trigger another Gold Rush rewind or
+reindex. The explicit `-reindex-chainstate` and `-reindex` command-line options
+remain operator-requested one-shot maintenance actions and are never added
+automatically; persistent configuration entries remain rejected to prevent
+restart loops.
+
+Automatic action and fee windows are anchored to active-chain median time, so
+host-clock changes cannot erase budget usage. Claim-recovery metadata is
+published to the running wallet only after durable commit; an indeterminate
+database outcome disables recovery until wallet reload. Miner disable/start and
+recovery mutation are serialized per wallet so recovery cannot silently
+re-enable a miner or acquire authority after an earlier disable.
+
+Either the original claim or the resolution may confirm. Only the confirming
+transaction pays a fee; a confirmed resolution fee is not shadow-reimbursed.
+Broadcast is not a confirmation promise, and reorg or original-claim
+confirmation can require a fresh frontier plan. See
+`doc/gold-rush-pow-claim-recovery.md` for the complete Issue #37 behavior.
+
+The later classifier gives legacy unbound QQP2 proofs a distinct typed result:
+a proof invalid on the pinned tip may validate on a normal descendant and is
+never represented as permanently dead or terminal. A real conflict therefore
+requires exact-plan manual fee/conflict consent, or explicit bounded automatic
+standing consent after the configured stale-depth, rate, and fee gates pass.
+Either transaction may confirm. Generic transient or local-state failures,
+future-origin proofs, and future-version proofs remain fail-closed.
+
 30.1.3 Signed Corrective Release Notes
 ======================================
 
@@ -417,7 +526,8 @@ sanitizer or changing CRC32C results.
   path.
 - Successful wallet broadcasts refresh mempool state before returning, which
   prevents rapid consecutive sends from observing stale spendability state.
-- PoW claim creation pauses during reindex, import, or initial sync and
+- In v30.1.1 through v30.1.3, PoW claim creation pauses during reindex,
+  import, or initial sync and
   rechecks the exact tip through commit. A claim that leaves the local mempool
   remains persisted and keeps its input reserved because a peer may still
   confirm it. Any unresolved quarantined claim pauses that wallet's
@@ -425,7 +535,8 @@ sanitizer or changing CRC32C results.
   `abandontransaction` intentionally refuses a quarantined Gold Rush PoW claim,
   and its exact fee input remains reserved until an on-chain claim or conflict
   resolves the reservation.
-- `getpowmininginfo` exposes unresolved, live, and quarantined wallet-authored
+- In those releases, `getpowmininginfo` exposes unresolved, live, and
+  quarantined wallet-authored
   claim counts. `createshadowpowclaimresolution` accepts only an exact persisted,
   wallet-authored, single-input quarantined `QQSPROOF`. It refuses a live claim,
   unresolved descendant or conflict, spent or foreign input, incomplete sync,
@@ -440,7 +551,8 @@ sanitizer or changing CRC32C results.
   After the operator explicitly broadcasts and the wallet learns the
   resolution, ordinary wallet rebroadcast may continue across restart; this is
   downstream of the explicit broadcast decision.
-- The Qt Staking & Mining page and embedded guide show the same quarantine and
+- In those releases, the Qt Staking & Mining page and embedded guide show the
+  same quarantine and
   fee/conflict warnings and direct advanced users to the preview RPC in the
   debug console. There is no one-click conflict broadcast.
 - Wallet backups reject destinations that resolve to the wallet root itself,

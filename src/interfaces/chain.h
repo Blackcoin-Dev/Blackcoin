@@ -420,6 +420,11 @@ public:
 
     //! Set mock time.
     virtual void setMockTime(int64_t time) = 0;
+
+    /** Notify clients only after a local sendrawtransaction RPC explicitly
+     * accepted these exact bytes. Unlike mempool callbacks, this carries an
+     * authenticated local operator-intent boundary. */
+    virtual void transactionSubmittedByRpc(const CTransactionRef& tx) {}
 };
 
 //! Return implementation of Chain interface.

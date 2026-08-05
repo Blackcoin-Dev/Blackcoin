@@ -372,26 +372,12 @@ BOOST_AUTO_TEST_CASE(coldstake_shadow_payout_does_not_count_as_principal)
     CTxUndo undo = MakeUndo({{qcs, 1000}});
     std::map<CScript, CAmount> shadow_payouts{{qcs, 1000}};
     std::string reason;
-    BOOST_CHECK(!CheckColdStakeCovenant(CTransaction(cs), undo, shadow_payouts, CScript{}, reason));
+    BOOST_CHECK(!CheckColdStakeCovenant(CTransaction(cs), undo, shadow_payouts, reason));
     BOOST_CHECK_EQUAL(reason, "bad-coldstake-covenant");
 
     cs.vout.emplace_back(1000, qcs);
     reason.clear();
-    BOOST_CHECK(CheckColdStakeCovenant(CTransaction(cs), undo, shadow_payouts, CScript{}, reason));
-}
-
-BOOST_AUTO_TEST_CASE(coldstake_dev_output_does_not_count_as_principal)
-{
-    const CScript qcs = QuantumColdStakeScript(0x42);
-    CMutableTransaction cs;
-    cs.vin.resize(1);
-    cs.vout.emplace_back(0, CScript());
-    cs.vout.emplace_back(1000, qcs);
-
-    CTxUndo undo = MakeUndo({{qcs, 1000}});
-    std::string reason;
-    BOOST_CHECK(!CheckColdStakeCovenant(CTransaction(cs), undo, {}, qcs, reason));
-    BOOST_CHECK_EQUAL(reason, "bad-coldstake-covenant");
+    BOOST_CHECK(CheckColdStakeCovenant(CTransaction(cs), undo, shadow_payouts, reason));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

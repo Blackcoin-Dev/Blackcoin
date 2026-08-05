@@ -1225,18 +1225,30 @@ void CTxMemPool::RemoveStaged(setEntries &stage, bool updateDescendants, MemPool
 
 int CTxMemPool::Expire(std::chrono::seconds time)
 {
+    return ExpireMatching(
+        time, [](const CTransaction&) { return true; },
+        MemPoolRemovalReason::EXPIRY);
+}
+
+int CTxMemPool::ExpireMatching(
+    std::chrono::seconds time,
+    const std::function<bool(const CTransaction&)>& predicate,
+    MemPoolRemovalReason reason)
+{
     AssertLockHeld(cs);
     indexed_transaction_set::index<entry_time>::type::iterator it = mapTx.get<entry_time>().begin();
     setEntries toremove;
     while (it != mapTx.get<entry_time>().end() && it->GetTime() < time) {
-        toremove.insert(mapTx.project<0>(it));
+        if (predicate(it->GetTx())) {
+            toremove.insert(mapTx.project<0>(it));
+        }
         it++;
     }
     setEntries stage;
     for (txiter removeit : toremove) {
         CalculateDescendants(removeit, stage);
     }
-    RemoveStaged(stage, false, MemPoolRemovalReason::EXPIRY);
+    RemoveStaged(stage, false, reason);
     return stage.size();
 }
 

@@ -281,7 +281,7 @@
             <item row="7" column="0">
              <widget class="QLabel" name="labelDonationsText">
               <property name="text">
-               <string>Donations:</string>
+               <string>QQ development donation:</string>
               </property>
              </widget>
             </item>
@@ -291,7 +291,7 @@
                <cursorShape>IBeamCursor</cursorShape>
               </property>
               <property name="toolTip">
-               <string>Total donations to the Blackcoin project</string>
+               <string>Optional share of eligible staking rewards sent to the exact Quantum Quasar development recipient</string>
               </property>
               <property name="text">
                <string>0</string>

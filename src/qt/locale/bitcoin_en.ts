@@ -1891,16 +1891,6 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+24"/>
-        <source>Percentage of stake going as a donation to the development team</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+13"/>
-        <source>(set preferrable value in %)</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <location line="+36"/>
         <source>W&amp;allet</source>
         <translation type="unfinished"></translation>
@@ -2285,13 +2275,13 @@ The migration process will create a backup of the wallet before migrating. This 
     </message>
     <message>
         <location line="+35"/>
-        <source>Donations:</source>
-        <translation type="unfinished"></translation>
+        <source>QQ development donation:</source>
+        <translation>QQ development donation:</translation>
     </message>
     <message>
         <location line="+10"/>
-        <source>Total donations to the Blackcoin team</source>
-        <translation type="unfinished"></translation>
+        <source>Optional share of eligible staking rewards sent to the exact Quantum Quasar development recipient</source>
+        <translation>Optional share of eligible staking rewards sent to the exact Quantum Quasar development recipient</translation>
     </message>
     <message>
         <location line="+3"/>

@@ -2293,6 +2293,16 @@ static bool AppInitMainImpl(NodeContext& node,
         client->start(*node.scheduler);
     }
 
+    // QQSPROOF carriers are short-lived relay objects. Sweep independently
+    // of ordinary mempool expiry even when no new transaction or block calls
+    // LimitMempoolSize(). Wallet callbacks quarantine local claims; their
+    // inputs remain reserved until the branch-aware height window expires.
+    node.scheduler->scheduleEvery([&node] {
+        if (!ShutdownRequested() && node.mempool) {
+            ExpireShadowPowClaimsFromMempool(*node.mempool);
+        }
+    }, std::chrono::minutes{1});
+
     BanMan* banman = node.banman.get();
     node.scheduler->scheduleEvery([banman]{
         banman->DumpBanlist();

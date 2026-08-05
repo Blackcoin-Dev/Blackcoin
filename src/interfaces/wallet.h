@@ -23,6 +23,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -56,6 +57,12 @@ struct WalletTxOut;
 struct WalletTxStatus;
 struct WalletMigrationResult;
 struct WalletPowMiningInfo;
+struct WalletPowClaimRecoveryPolicy;
+struct WalletPowClaimRecoveryPolicyMutationResult;
+struct WalletPowClaimRecoveryRequest;
+struct WalletPowClaimRecoveryReview;
+struct WalletPowClaimRecoveryExecution;
+struct WalletPowClaimRecoveryAdoptionResult;
 struct WalletQuantumAddressInfo;
 struct WalletQuantumColdStakeBalanceInfo;
 struct WalletQuantumColdStakeInfo;
@@ -291,11 +298,12 @@ public:
     // Remove wallet.
     virtual void remove() = 0;
 
-    //! Get donation percentage
-    virtual unsigned int getDonationPercentage() = 0;
-
-    //! Set donation percentage for this wallet instance
-    virtual void setDonationPercentage(unsigned int percentage) = 0;
+    //! Effective fresh, recipient-bound Quantum Quasar development donation.
+    virtual unsigned int getQQDevelopmentDonationPercentage() = 0;
+    virtual std::string getQQDevelopmentDonationAddress() = 0;
+    virtual bool setQQDevelopmentDonation(unsigned int percentage,
+                                          const std::string& recipient,
+                                          std::string& error) = 0;
 
     //! Try get the stake weight
     virtual bool tryGetStakeWeight(uint64_t& nWeight) = 0;
@@ -318,6 +326,10 @@ public:
     //! Get wallet enabled for staking
     virtual bool getEnabledStaking() = 0;
 
+    //! Read one coherent wallet-scoped PoS worker snapshot. This does not
+    //! infer liveness from the timing-dependent last search interval.
+    virtual WalletStakingInfo getStakingInfo() = 0;
+
     //! Configure the built-in (in-process) Gold Rush PoW miner. No external miner is used.
     //! @param enabled  start/stop in-process PoW mining
     //! @param threads  worker threads / CPU cores (>=1)
@@ -331,6 +343,51 @@ public:
 
     //! Read the built-in Gold Rush PoW miner status (config, hashrate, epoch, payout).
     virtual WalletPowMiningInfo getPowMiningInfo() = 0;
+
+    //! Return this wallet's in-memory Gold Rush PoW claim-recovery choice and
+    //! standing limits. Use getPowClaimRecoveryPolicyState() when durable
+    //! authority matters. This is wallet-scoped and never grants process-wide
+    //! authority.
+    virtual WalletPowClaimRecoveryPolicy getPowClaimRecoveryPolicy() = 0;
+    //! Read policy and durable database-authority state atomically. A caller
+    //! must not treat getPowClaimRecoveryPolicy() alone as persisted truth
+    //! after this result reports an ambiguous database outcome.
+    virtual WalletPowClaimRecoveryPolicyMutationResult
+    getPowClaimRecoveryPolicyState() = 0;
+
+    //! Validate and durably persist this wallet's complete recovery policy.
+    //! This call never starts mining and never creates, signs, or broadcasts a
+    //! transaction.
+    virtual bool setPowClaimRecoveryPolicy(const WalletPowClaimRecoveryPolicy& policy,
+                                           std::string& error) = 0;
+    virtual WalletPowClaimRecoveryPolicyMutationResult
+    setPowClaimRecoveryPolicyDetailed(
+        const WalletPowClaimRecoveryPolicy& policy) = 0;
+
+    //! Build one read-only, tip-pinned claim-component inventory and recovery
+    //! preview. The shared wallet resolver remains the sole authority for
+    //! classification, fee construction, and eligibility.
+    virtual WalletPowClaimRecoveryReview getPowClaimRecoveryReview(
+        const WalletPowClaimRecoveryRequest& request) = 0;
+
+    //! Execute an exact previewed recovery request. Mutating requests are
+    //! rejected by Core unless they carry the matching plan id and explicit
+    //! fee/conflict acknowledgement.
+    virtual WalletPowClaimRecoveryExecution resolvePowClaims(
+        const WalletPowClaimRecoveryRequest& request) = 0;
+
+    //! Explicitly authenticate one historical claim component that the
+    //! operator reviewed on the exact tip and component fingerprint.
+    virtual bool adoptPowClaimRecoveryComponent(
+        const std::string& selector_txid,
+        const std::string& expected_tip,
+        const std::string& expected_component_fingerprint,
+        std::string& error) = 0;
+    virtual WalletPowClaimRecoveryAdoptionResult
+    adoptPowClaimRecoveryComponentDetailed(
+        const std::string& selector_txid,
+        const std::string& expected_tip,
+        const std::string& expected_component_fingerprint) = 0;
 
     //! Create a wallet-backed Blackcoin ML-DSA migration address.
     virtual util::Result<WalletQuantumAddressInfo> createQuantumAddress(const std::string& label) = 0;
@@ -633,6 +690,322 @@ struct WalletPowMiningInfo
     bool wallet_active_signal{false}; //!< wallet has an active QQSIGNAL entry
     int wallet_blocks_until_solver_expiry{0}; //!< max recent-solver expiry across wallet-owned whitelisted scripts
     bool payout_address_available{true}; //!< false when the wallet lock is busy and the cached address was not read
+    bool stake_reserve_available{false}; //!< one chain/wallet snapshot was acquired
+    int configured_stake_reserve_coins{0};
+    int mature_stakeable_legacy_coins{0};
+    CAmount mature_stakeable_legacy_weight{0};
+    int reserved_stake_coins{0};
+    CAmount reserved_stake_weight{0};
+    int claim_coins_after_stake_reserve{0};
+    bool last_stake_coin_guard{false};
+};
+
+//! Explicit wallet-scoped choice for automated Gold Rush PoW claim recovery.
+enum class WalletPowClaimRecoveryMode : uint8_t {
+    UNSET,
+    PAUSE_AND_ASK,
+    AUTOMATIC,
+};
+
+/**
+ * Interface-safe copy of the persisted wallet recovery policy.
+ *
+ * The interface intentionally does not expose wallet-internal serialization
+ * types. Limits mirror the Core policy and are checked again by Core before a
+ * durable write. AUTOMATIC is the only mode that grants standing authority;
+ * storing this policy does not start the miner or authorize a wallet unlock.
+ */
+struct WalletPowClaimRecoveryPolicy
+{
+    static constexpr uint32_t VERSION{1};
+
+    // Public bounds used by GUI controls. wallet/interfaces.cpp has compile-
+    // time assertions that these remain identical to Core's policy bounds.
+    static constexpr CAmount MIN_FEE_PER_RESOLUTION{1};
+    static constexpr CAmount MAX_FEE_PER_RESOLUTION{CENT};
+    static constexpr CAmount MAX_BATCH_FEE_CAP{COIN};
+    static constexpr CAmount MAX_ROLLING_FEE_BUDGET{10 * COIN};
+    static constexpr uint32_t MIN_WINDOW_SECONDS{60};
+    static constexpr uint32_t MAX_WINDOW_SECONDS{7 * 24 * 60 * 60};
+    static constexpr uint32_t MIN_ACTIONS_PER_WINDOW{1};
+    static constexpr uint32_t MAX_ACTIONS_PER_WINDOW{1000};
+    static constexpr uint32_t MIN_STALE_BLOCKS{1};
+    static constexpr uint32_t MAX_STALE_BLOCKS{10080};
+
+    uint32_t version{VERSION};
+    WalletPowClaimRecoveryMode mode{WalletPowClaimRecoveryMode::UNSET};
+    CAmount max_fee_per_resolution{CENT};
+    CAmount aggregate_batch_fee_cap{10 * CENT};
+    CAmount rolling_fee_budget{COIN};
+    uint32_t rolling_fee_window_seconds{24 * 60 * 60};
+    uint32_t max_actions_per_window{100};
+    uint32_t minimum_stale_blocks{6};
+
+    bool automaticAuthorized() const
+    {
+        return mode == WalletPowClaimRecoveryMode::AUTOMATIC;
+    }
+
+    bool operator==(const WalletPowClaimRecoveryPolicy& other) const
+    {
+        return version == other.version &&
+               mode == other.mode &&
+               max_fee_per_resolution == other.max_fee_per_resolution &&
+               aggregate_batch_fee_cap == other.aggregate_batch_fee_cap &&
+               rolling_fee_budget == other.rolling_fee_budget &&
+               rolling_fee_window_seconds == other.rolling_fee_window_seconds &&
+               max_actions_per_window == other.max_actions_per_window &&
+               minimum_stale_blocks == other.minimum_stale_blocks;
+    }
+};
+
+enum class WalletPowClaimRecoveryPolicyMutationStatus : uint8_t {
+    SUCCESS,
+    INVALID_POLICY,
+    DATABASE_FAILURE,
+    DATABASE_OUTCOME_AMBIGUOUS,
+};
+
+struct WalletPowClaimRecoveryPolicyMutationResult
+{
+    WalletPowClaimRecoveryPolicyMutationStatus status{
+        WalletPowClaimRecoveryPolicyMutationStatus::DATABASE_FAILURE};
+    std::string reason_code{"database_failure"};
+    bool success{false};
+    bool durable_state_changed{false};
+    bool durable_state_ambiguous{false};
+    bool authoritative_state_available{false};
+    WalletPowClaimRecoveryPolicy authoritative_policy;
+    std::string detail;
+};
+
+//! Interface-safe claim lifecycle state reported by the shared Core graph.
+enum class WalletPowClaimRecoveryState : uint8_t {
+    LIVE,
+    TRANSIENT,
+    INDETERMINATE,
+    CURRENT_BRANCH_INELIGIBLE,
+    TERMINAL_ON_PINNED_TIP,
+    RETIRED_ON_ACTIVE_BRANCH,
+    RESOLUTION_PENDING,
+    RESOLVED_ON_ACTIVE_CHAIN,
+};
+
+enum class WalletPowClaimRecoveryProvenance : uint8_t {
+    EXPLICIT_AUTHORED,
+    EXPLICIT_ADOPTED,
+    LEGACY_WALLET_AUTHORED,
+    UNKNOWN,
+};
+
+enum class WalletPowClaimRecoveryNodeKind : uint8_t {
+    CLAIM,
+    MANAGED_RESOLUTION,
+    LEGACY_RESOLUTION,
+    ORDINARY,
+};
+
+enum class WalletPowClaimRecoveryActionStatus : uint8_t {
+    READY,
+    REUSE_MANAGED,
+    REUSE_LEGACY,
+    SIGNED_AND_PERSISTED,
+    BROADCAST,
+    ALREADY_IN_MEMPOOL,
+    RELAY_DEFERRED,
+    REFUSED,
+    FAILED,
+};
+
+enum class WalletPowClaimRecoveryRequestMode : uint8_t {
+    PREVIEW,
+    SIGN_ONLY,
+    COMMIT_AND_BROADCAST,
+};
+
+//! One wallet-known node in a claim/conflict/descendant component.
+struct WalletPowClaimRecoveryNode
+{
+    std::string txid;
+    WalletPowClaimRecoveryNodeKind kind{WalletPowClaimRecoveryNodeKind::ORDINARY};
+    WalletPowClaimRecoveryProvenance provenance{WalletPowClaimRecoveryProvenance::UNKNOWN};
+    std::string disposition;
+    bool proof_may_revalidate_on_descendant{false};
+    bool active_chain_confirmed{false};
+    bool in_mempool{false};
+    bool quarantined{false};
+    bool abandoned{false};
+    bool expired_locally_retired{false};
+    bool expected_shape{false};
+    bool wallet_authored{false};
+    int created_height{-1};
+    int first_quarantine_height{-1};
+    int branch_quarantine_height{-1};
+    int stale_depth{0};
+    bool stale_depth_known{false};
+    bool resolution_relay_authorized{false};
+};
+
+//! One transitive claim component rooted at the nearest confirmed wallet UTXO.
+struct WalletPowClaimRecoveryComponent
+{
+    std::string anchor_txid;
+    uint32_t anchor_vout{0};
+    CAmount anchor_amount{0};
+    std::string generation_fingerprint;
+    std::string component_fingerprint;
+    WalletPowClaimRecoveryState state{WalletPowClaimRecoveryState::INDETERMINATE};
+    std::vector<WalletPowClaimRecoveryNode> nodes;
+    std::vector<std::string> claim_txids;
+    std::vector<std::string> root_claim_txids;
+    std::vector<std::string> resolution_txids;
+    bool anchor_authenticated{false};
+    bool anchor_unspent{false};
+    bool all_claims_explicitly_provenanced{false};
+    bool all_claims_zero_payment_retirable{false};
+    bool all_claims_expired_locally_retired{false};
+    bool has_revalidating_unbound_proof{false};
+    size_t descendant_claims{0};
+    int minimum_stale_depth{0};
+    bool stale_depth_known{false};
+};
+
+struct WalletPowClaimRecoveryAction
+{
+    std::string anchor_txid;
+    uint32_t anchor_vout{0};
+    std::string generation_fingerprint;
+    std::string component_fingerprint;
+    std::vector<std::string> claim_txids;
+    size_t descendant_claims{0};
+    WalletPowClaimRecoveryState component_state{WalletPowClaimRecoveryState::INDETERMINATE};
+    WalletPowClaimRecoveryActionStatus status{WalletPowClaimRecoveryActionStatus::REFUSED};
+    CAmount fee{0};
+    int64_t vsize{-1};
+    std::string transaction_txid;
+    bool persisted{false};
+    bool in_mempool{false};
+    bool relay_authorized{false};
+    bool frontier_may_advance{true};
+    bool conflicts_with_revalidating_unbound_proof{false};
+    std::string reason_code;
+    std::string detail;
+};
+
+struct WalletPowClaimRecoveryPlan
+{
+    std::string active_tip;
+    int active_height{-1};
+    uint64_t wallet_generation{0};
+    std::string plan_id;
+    CAmount max_fee_per_resolution{0};
+    CAmount aggregate_batch_fee_cap{0};
+    std::optional<CAmount> fee_rate_atoms_per_k;
+    CAmount total_fee{0};
+    std::vector<WalletPowClaimRecoveryAction> actions;
+    std::vector<WalletPowClaimRecoveryAction> refused;
+    bool wallet_tip_matches{false};
+    bool complete{false};
+};
+
+struct WalletPowClaimRecoveryUsage
+{
+    size_t pending_manual{0};
+    size_t pending_automatic{0};
+    size_t confirmed_manual{0};
+    size_t confirmed_automatic{0};
+    CAmount confirmed_resolution_fees{0};
+    size_t automatic_actions_in_window{0};
+    CAmount automatic_fee_exposure_in_window{0};
+    size_t reconciled_descendant_claims{0};
+    size_t recycled_outputs{0};
+};
+
+//! One immutable review snapshot assembled under one Core chain/wallet lock.
+struct WalletPowClaimRecoveryReview
+{
+    std::string active_tip;
+    int active_height{-1};
+    uint64_t wallet_generation{0};
+    bool wallet_tip_matches{false};
+    bool consistent{false};
+    bool policy_available{false};
+    WalletPowClaimRecoveryPolicy policy;
+    std::string reason_code;
+    size_t raw_claim_objects{0};
+    size_t live_claim_objects{0};
+    size_t quarantined_claim_objects{0};
+    size_t blocking_components{0};
+    size_t retired_claim_objects{0};
+    size_t retired_components{0};
+    size_t resolved_components{0};
+    std::vector<WalletPowClaimRecoveryComponent> components;
+    std::vector<std::string> unanchored_claim_txids;
+    WalletPowClaimRecoveryPlan plan;
+    WalletPowClaimRecoveryUsage usage;
+    std::string error;
+};
+
+//! Shared resolver input used by GUI, RPC adapters, and headless callers.
+struct WalletPowClaimRecoveryRequest
+{
+    WalletPowClaimRecoveryRequestMode mode{WalletPowClaimRecoveryRequestMode::PREVIEW};
+    bool acknowledge_fee_and_conflict_risk{false};
+    std::vector<std::string> selectors;
+    CAmount max_fee_per_resolution{CENT};
+    CAmount aggregate_batch_fee_cap{10 * CENT};
+    std::optional<CAmount> fee_rate_atoms_per_k;
+    std::optional<std::string> expected_plan_id;
+};
+
+struct WalletPowClaimRecoveryExecution
+{
+    WalletPowClaimRecoveryPlan plan;
+    bool success{false};
+    bool stale_plan{false};
+    size_t signed_and_persisted{0};
+    bool durable_state_changed{false};
+    bool durable_state_ambiguous{false};
+    size_t relay_authority_granted{0};
+    size_t broadcast{0};
+    size_t already_in_mempool{0};
+    size_t relay_deferred{0};
+    std::string error;
+};
+
+enum class WalletPowClaimRecoveryAdoptionStatus : uint8_t {
+    SUCCESS,
+    ALREADY_EXPLICIT,
+    NO_CHAIN,
+    DATABASE_OUTCOME_AMBIGUOUS,
+    SIGNING_UNAVAILABLE,
+    STALE_TIP,
+    SELECTOR_NOT_FOUND,
+    SELECTOR_NOT_CLAIM,
+    SELECTOR_AMBIGUOUS,
+    STALE_COMPONENT_FINGERPRINT,
+    UNSAFE_GRAPH,
+    DATABASE_FAILURE,
+};
+
+struct WalletPowClaimRecoveryAdoptionResult
+{
+    WalletPowClaimRecoveryAdoptionStatus status{
+        WalletPowClaimRecoveryAdoptionStatus::DATABASE_FAILURE};
+    std::string reason_code{"database_failure"};
+    bool success{false};
+    bool adopted{false};
+    bool durable_state_changed{false};
+    bool durable_state_ambiguous{false};
+    std::string active_tip;
+    std::string generation_fingerprint;
+    std::string reviewed_component_fingerprint;
+    std::string post_adoption_component_fingerprint;
+    std::vector<std::string> claim_txids;
+    bool automatic_eligible_after_adoption{false};
+    bool component_has_revalidating_unbound_proof{false};
+    std::string component_refusal_code;
+    std::string detail;
 };
 
 //! Wallet-backed Blackcoin ML-DSA migration address metadata.

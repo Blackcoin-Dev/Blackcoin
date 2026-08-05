@@ -118,6 +118,10 @@ extern const std::vector<std::string> CHECKLEVEL_DOC;
 
 /** Run instances of script checking worker threads */
 void StartScriptCheckWorkerThreads(int threads_num);
+
+/** Remove QQSPROOF carriers that exceeded their claim-only one-hour mempool
+ *  lifetime. Wallets retain their inputs until branch-aware expiry. */
+void ExpireShadowPowClaimsFromMempool(CTxMemPool& pool);
 /** Stop all of the script checking worker threads */
 void StopScriptCheckWorkerThreads();
 
@@ -437,11 +441,11 @@ bool CheckTieredStakePrincipalCovenant(const CTransaction& tx, const CCoinsViewC
 
 /** Cold-staking covenant (Quantum Quasar QCS witness): a coinstake spending a
  *  quantum cold-staking output must return at least the spent principal to the
- *  same scriptPubKey. Shadow/dev emissions do not count as returned principal.
+ *  same scriptPubKey. Shadow emissions do not count as returned principal.
  *  Exposed for unit testing; ConnectBlock calls it for coinstakes once V4 is active. */
 bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo,
                             const std::map<CScript, CAmount>& shadow_direct_payouts,
-                            const CScript& dev_reward_script, std::string& reject_reason,
+                            std::string& reject_reason,
                             const std::vector<CAmount>* effective_principals = nullptr);
 bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo, std::string& reject_reason);
 

@@ -349,6 +349,37 @@ std::vector<unsigned char> MakeQQP3ProofData(
     return proof;
 }
 
+std::vector<unsigned char> MakeQQP4ProofData(
+    uint64_t nonce, uint32_t origin_height, const uint256& origin_parent,
+    const COutPoint& claim_outpoint, const CScript& target,
+    const CScript& payout_script)
+{
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '4', 0});
+    for (unsigned int i = 0; i < 8; ++i) {
+        proof.push_back(static_cast<unsigned char>((nonce >> (8 * i)) & 0xff));
+    }
+    for (unsigned int i = 0; i < 4; ++i) {
+        proof.push_back(static_cast<unsigned char>(
+            (origin_height >> (8 * i)) & 0xff));
+    }
+    proof.insert(proof.end(), origin_parent.begin(), origin_parent.end());
+    proof.insert(proof.end(), claim_outpoint.hash.begin(),
+                 claim_outpoint.hash.end());
+    for (unsigned int i = 0; i < 4; ++i) {
+        proof.push_back(static_cast<unsigned char>(
+            (claim_outpoint.n >> (8 * i)) & 0xff));
+    }
+    proof.push_back(static_cast<unsigned char>(target.size() & 0xff));
+    proof.push_back(static_cast<unsigned char>((target.size() >> 8) & 0xff));
+    proof.insert(proof.end(), target.begin(), target.end());
+    proof.push_back(static_cast<unsigned char>(payout_script.size() & 0xff));
+    proof.push_back(static_cast<unsigned char>(
+        (payout_script.size() >> 8) & 0xff));
+    proof.insert(proof.end(), payout_script.begin(), payout_script.end());
+    return proof;
+}
+
 CBlockUndo MakeUndoWithInputScripts(const CBlock& block, const std::map<size_t, CScript>& input_scripts)
 {
     CBlockUndo undo;
@@ -457,6 +488,383 @@ bool UndoShadowAndRewind(CCoinsViewCache& view, const CBlock& block,
 
 #define ApplyShadowBlock ApplyShadowAndCheckpoint
 #define UndoShadowBlock UndoShadowAndRewind
+
+BOOST_AUTO_TEST_CASE(pow_claim_mempool_dispositions_have_explicit_recovery_classes)
+{
+    constexpr std::array TERMINAL{
+        ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW,
+        ShadowPowClaimMempoolDisposition::INVALID_LOCATION,
+        ShadowPowClaimMempoolDisposition::MALFORMED,
+        ShadowPowClaimMempoolDisposition::DUPLICATE,
+        ShadowPowClaimMempoolDisposition::WRONG_MODE,
+        ShadowPowClaimMempoolDisposition::UNKNOWN_MODE,
+        ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION,
+        ShadowPowClaimMempoolDisposition::INVALID_PROOF,
+        ShadowPowClaimMempoolDisposition::ORIGIN_MISMATCH,
+        ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED,
+        ShadowPowClaimMempoolDisposition::INPUT_MISMATCH,
+        ShadowPowClaimMempoolDisposition::ALREADY_ACCOUNTED,
+    };
+    for (const auto disposition : TERMINAL) {
+        BOOST_CHECK(IsShadowPowClaimCurrentBranchTerminal(disposition));
+        BOOST_CHECK(!IsShadowPowClaimMempoolRetryable(disposition));
+    }
+
+    constexpr std::array RETRYABLE{
+        ShadowPowClaimMempoolDisposition::INACTIVE,
+        ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW,
+        ShadowPowClaimMempoolDisposition::VERSION_NOT_YET_ACTIVE,
+        ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE,
+        ShadowPowClaimMempoolDisposition::ORIGIN_NOT_YET_REACHED,
+        ShadowPowClaimMempoolDisposition::CAPACITY_LIMIT,
+        ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT,
+        ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR,
+    };
+    for (const auto disposition : RETRYABLE) {
+        BOOST_CHECK(!IsShadowPowClaimCurrentBranchTerminal(disposition));
+        BOOST_CHECK(IsShadowPowClaimMempoolRetryable(disposition));
+    }
+
+    BOOST_CHECK(!IsShadowPowClaimCurrentBranchTerminal(
+        ShadowPowClaimMempoolDisposition::ELIGIBLE));
+    BOOST_CHECK(!IsShadowPowClaimMempoolRetryable(
+        ShadowPowClaimMempoolDisposition::ELIGIBLE));
+}
+
+BOOST_AUTO_TEST_CASE(pow_claim_mempool_disposition_types_prevalidation_failures)
+{
+    const CScript target = CScript{} << OP_2;
+    std::vector<unsigned char> malformed_proof = GetShadowPrefix();
+    malformed_proof.push_back('Q');
+    const CTransactionRef claim = MakePowClaimTx(target, malformed_proof);
+
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+    uint256 before_hash;
+    CBlockIndex before;
+    InitIndex(before, SHADOW_REWARD_START_HEIGHT - 2, nullptr, before_hash);
+    uint256 active_hash;
+    CBlockIndex active_parent;
+    InitIndex(active_parent, SHADOW_REWARD_START_HEIGHT - 1, &before,
+              active_hash);
+    uint256 after_hash;
+    CBlockIndex after;
+    InitIndex(after, SHADOW_REWARD_END_HEIGHT, &active_parent, after_hash);
+
+    std::string reject_reason;
+    ShadowPowClaimMempoolDisposition disposition{
+        ShadowPowClaimMempoolDisposition::ELIGIBLE};
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim, &before, view, false, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW);
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-inactive");
+
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim, &active_parent, view, false, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition == ShadowPowClaimMempoolDisposition::INACTIVE);
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-inactive");
+
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim, &after, view, false, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW);
+    // The typed recovery state becomes terminal without changing the
+    // historical public reject string used by existing callers.
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-inactive");
+
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim, nullptr, view, true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR);
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-inactive");
+
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim, &before, view, true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::HEIGHT_BEFORE_WINDOW);
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-height");
+
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim, &after, view, true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW);
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-height");
+
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim, &active_parent, view, true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition == ShadowPowClaimMempoolDisposition::MALFORMED);
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-invalid");
+
+    CMutableTransaction ordinary;
+    ordinary.vin.emplace_back(COutPoint{uint256::ONE, 0});
+    ordinary.vout.emplace_back(COIN, target);
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    CTransaction{ordinary}, &active_parent, view, true,
+                    reject_reason, &disposition) ==
+                ShadowProofValidationResult::VALID);
+    BOOST_CHECK(disposition == ShadowPowClaimMempoolDisposition::ELIGIBLE);
+    BOOST_CHECK(reject_reason.empty());
+}
+
+BOOST_AUTO_TEST_CASE(pow_claim_future_origin_is_retryable_but_branch_mismatch_is_terminal)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int candidate_height =
+        consensus.nShadowCompetingClaimsActivationHeight;
+    BOOST_REQUIRE(candidate_height >= SHADOW_REWARD_START_HEIGHT);
+    BOOST_REQUIRE(candidate_height <= SHADOW_REWARD_END_HEIGHT);
+    BOOST_REQUIRE(consensus.IsShadowCompetingClaimsActive(candidate_height));
+    BOOST_REQUIRE(!consensus.IsShadowQQP4Active(candidate_height));
+
+    uint256 parent_hash;
+    CBlockIndex parent;
+    InitIndex(parent, candidate_height - 1, nullptr, parent_hash);
+
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+    const CScript target = CScript{} << OP_2;
+    const CScript payout = QuantumScript(0x39);
+
+    // A syntactically valid QQP3 carrier can name a scheduled origin that is
+    // later than the current candidate height. It is invalid for this tip,
+    // but a descendant can reach that origin, so recovery must fail closed as
+    // retryable instead of authorizing a conflicting spend.
+    const CTransactionRef future_origin = MakePowClaimTx(
+        target,
+        MakeQQP3ProofData(
+            /*nonce=*/0,
+            static_cast<uint32_t>(candidate_height + 1),
+            uint256S("1234"), target, payout));
+    std::string reject_reason;
+    ShadowPowClaimMempoolDisposition disposition{
+        ShadowPowClaimMempoolDisposition::ELIGIBLE};
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *future_origin, &parent, view,
+                    /*gold_rush_active=*/true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::ORIGIN_NOT_YET_REACHED);
+    BOOST_CHECK(!IsShadowPowClaimCurrentBranchTerminal(disposition));
+    BOOST_CHECK(IsShadowPowClaimMempoolRetryable(disposition));
+    // Keep the public reject string compatible; recovery consumes the typed
+    // disposition above rather than parsing this text.
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-origin-mismatch");
+
+    // Once the declared origin height is current, a different ancestor hash
+    // cannot become correct on a descendant of this branch. This is the true
+    // terminal ORIGIN_MISMATCH case and remains recoverable after all other
+    // graph and consent gates pass.
+    const uint256 wrong_parent = uint256S("5678");
+    BOOST_REQUIRE(wrong_parent != parent.GetBlockHash());
+    const CTransactionRef branch_mismatch = MakePowClaimTx(
+        target,
+        MakeQQP3ProofData(
+            /*nonce=*/0,
+            static_cast<uint32_t>(candidate_height),
+            wrong_parent, target, payout));
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *branch_mismatch, &parent, view,
+                    /*gold_rush_active=*/true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::ORIGIN_MISMATCH);
+    BOOST_CHECK(IsShadowPowClaimCurrentBranchTerminal(disposition));
+    BOOST_CHECK(!IsShadowPowClaimMempoolRetryable(disposition));
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-origin-mismatch");
+}
+
+BOOST_AUTO_TEST_CASE(pow_claim_unbound_qqp2_can_revalidate_on_a_descendant)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int current_height = SHADOW_REWARD_START_HEIGHT;
+    BOOST_REQUIRE_LT(current_height + 1,
+                     consensus.nShadowCompetingClaimsActivationHeight);
+
+    uint256 before_hash;
+    CBlockIndex before;
+    InitIndex(before, current_height - 2, nullptr, before_hash);
+    uint256 current_parent_hash;
+    CBlockIndex current_parent;
+    InitIndex(current_parent, current_height - 1, &before,
+              current_parent_hash);
+    uint256 descendant_parent_hash;
+    CBlockIndex descendant_parent;
+    InitIndex(descendant_parent, current_height, &current_parent,
+              descendant_parent_hash);
+
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+    const CScript target = CScript{} << OP_2;
+    const CScript payout = QuantumScript(0x38);
+    const COutPoint input{uint256{2}, 0};
+    AddCoinForScript(view, input, COIN, target);
+
+    // Mine bytes for the ordinary descendant context. QQP2 does not encode
+    // that context, so the carrier is structurally identical at both tips.
+    const ShadowPowWork descendant_work = PrepareShadowPowWork(
+        target, payout, &descendant_parent, view);
+    BOOST_REQUIRE(descendant_work.valid);
+    BOOST_REQUIRE(!descendant_work.origin_bound);
+    BOOST_REQUIRE(!descendant_work.input_bound);
+
+    CTransactionRef claim;
+    std::vector<unsigned char> proof;
+    ShadowPowClaimMempoolDisposition current_disposition{
+        ShadowPowClaimMempoolDisposition::ELIGIBLE};
+    std::string current_reject_reason;
+    uint64_t nonce_start{0};
+    // Each descendant-valid nonce has roughly even odds of also validating
+    // against the preceding QQP2 context at this one-bit test target. Use a
+    // generous deterministic bound so the test does not acquire a fragile
+    // one-in-sixteen failure probability if fixture hashes change.
+    for (unsigned int attempt = 0; attempt < 64; ++attempt) {
+        BOOST_REQUIRE(GrindShadowPowWork(descendant_work, nonce_start, 1,
+                                         100'000, proof));
+        claim = MakePowClaimTx(target, proof, input);
+        current_reject_reason.clear();
+        const ShadowProofValidationResult current_result =
+            CheckShadowPowClaimForMempoolDetailed(
+                *claim, &current_parent, view,
+                /*gold_rush_active=*/true, current_reject_reason,
+                &current_disposition);
+        if (current_result == ShadowProofValidationResult::INVALID &&
+            current_disposition ==
+                ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE) {
+            break;
+        }
+        nonce_start += 100'000;
+    }
+    BOOST_REQUIRE(claim);
+    BOOST_REQUIRE(current_disposition ==
+                  ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE);
+    BOOST_CHECK(!IsShadowPowClaimCurrentBranchTerminal(current_disposition));
+    BOOST_CHECK(IsShadowPowClaimMempoolRetryable(current_disposition));
+    BOOST_CHECK_EQUAL(current_reject_reason, "shadow-proof-invalid");
+
+    // The exact same transaction is eligible one ordinary descendant later.
+    std::string descendant_reject_reason;
+    ShadowPowClaimMempoolDisposition descendant_disposition{
+        ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR};
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim, &descendant_parent, view,
+                    /*gold_rush_active=*/true, descendant_reject_reason,
+                    &descendant_disposition) ==
+                ShadowProofValidationResult::VALID);
+    BOOST_CHECK(descendant_disposition ==
+                ShadowPowClaimMempoolDisposition::ELIGIBLE);
+    BOOST_CHECK(descendant_reject_reason.empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    pow_claim_future_version_is_retryable_only_for_a_structurally_possible_activation,
+    QQP4ActivationTestingSetup)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int activation_height = consensus.nShadowQQP4ActivationHeight;
+    BOOST_REQUIRE(activation_height > SHADOW_REWARD_START_HEIGHT);
+    BOOST_REQUIRE(activation_height <= SHADOW_REWARD_END_HEIGHT);
+    BOOST_REQUIRE(consensus.IsShadowCompetingClaimsActive(
+        activation_height - 1));
+    BOOST_REQUIRE(!consensus.IsShadowQQP4Active(activation_height - 1));
+    BOOST_REQUIRE(consensus.IsShadowQQP4Active(activation_height));
+
+    uint256 pre_activation_parent_hash;
+    CBlockIndex pre_activation_parent;
+    InitIndex(pre_activation_parent, activation_height - 2, nullptr,
+              pre_activation_parent_hash);
+    uint256 activation_parent_hash;
+    CBlockIndex activation_parent;
+    InitIndex(activation_parent, activation_height - 1,
+              &pre_activation_parent, activation_parent_hash);
+
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+    const CScript target = CScript{} << OP_2;
+    const CScript payout = QuantumScript(0x3a);
+    const COutPoint claim_outpoint{uint256{2}, 42};
+    const std::vector<unsigned char> future_proof = MakeQQP4ProofData(
+        /*nonce=*/0, static_cast<uint32_t>(activation_height),
+        activation_parent.GetBlockHash(), claim_outpoint, target, payout);
+    const CTransactionRef future_version = MakePowClaimTx(
+        target, future_proof, claim_outpoint.n);
+
+    std::string reject_reason;
+    ShadowPowClaimMempoolDisposition disposition{
+        ShadowPowClaimMempoolDisposition::ELIGIBLE};
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *future_version, &pre_activation_parent, view,
+                    /*gold_rush_active=*/true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::VERSION_NOT_YET_ACTIVE);
+    BOOST_CHECK(!IsShadowPowClaimCurrentBranchTerminal(disposition));
+    BOOST_CHECK(IsShadowPowClaimMempoolRetryable(disposition));
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-invalid");
+
+    // At the scheduled boundary the same bytes are no longer rejected merely
+    // because of their version. The carrier proceeds to proof/input
+    // validation, which is terminal for these test inputs regardless of
+    // whether this arbitrary nonce happens to satisfy the proof target.
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *future_version, &activation_parent, view,
+                    /*gold_rush_active=*/true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                    ShadowPowClaimMempoolDisposition::INVALID_PROOF ||
+                disposition ==
+                    ShadowPowClaimMempoolDisposition::INPUT_MISMATCH);
+    BOOST_CHECK(IsShadowPowClaimCurrentBranchTerminal(disposition));
+    BOOST_CHECK(!IsShadowPowClaimMempoolRetryable(disposition));
+
+    // QQP4 magic alone is not enough to defer recovery. Malformed bytes and a
+    // format whose declared origin predates its own activation remain the
+    // terminal UNSUPPORTED_VERSION class.
+    std::vector<unsigned char> malformed = future_proof;
+    malformed.pop_back();
+    const CTransactionRef malformed_version = MakePowClaimTx(
+        target, malformed, claim_outpoint.n);
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *malformed_version, &pre_activation_parent, view,
+                    /*gold_rush_active=*/true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION);
+    BOOST_CHECK(IsShadowPowClaimCurrentBranchTerminal(disposition));
+    BOOST_CHECK(!IsShadowPowClaimMempoolRetryable(disposition));
+
+    const std::vector<unsigned char> never_activates = MakeQQP4ProofData(
+        /*nonce=*/0, static_cast<uint32_t>(activation_height - 1),
+        pre_activation_parent.GetBlockHash(), claim_outpoint, target, payout);
+    const CTransactionRef retired_version = MakePowClaimTx(
+        target, never_activates, claim_outpoint.n);
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *retired_version, &pre_activation_parent, view,
+                    /*gold_rush_active=*/true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION);
+    BOOST_CHECK(IsShadowPowClaimCurrentBranchTerminal(disposition));
+    BOOST_CHECK(!IsShadowPowClaimMempoolRetryable(disposition));
+}
 
 BOOST_AUTO_TEST_CASE(synthetic_claim_limit_preserves_history_and_tightens_at_activation)
 {
@@ -2124,18 +2532,36 @@ BOOST_AUTO_TEST_CASE(pow_shadow_mempool_policy_is_next_tip_bound_and_not_whiteli
     BOOST_CHECK(CheckShadowPowClaimForMempool(*claim_tx, &first_index, view, true, reject_reason));
     BOOST_CHECK(reject_reason.empty());
 
+    ShadowPowClaimMempoolDisposition disposition{
+        ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR};
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim_tx, &first_index, view, true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::VALID);
+    BOOST_CHECK(disposition == ShadowPowClaimMempoolDisposition::ELIGIBLE);
+
     SetShadowArgon2FailuresForTesting();
-    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(*claim_tx, &first_index, view, true, reject_reason) ==
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim_tx, &first_index, view, true, reject_reason,
+                    &disposition) ==
                 ShadowProofValidationResult::LOCAL_INTERNAL_ERROR);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR);
     BOOST_CHECK_EQUAL(reject_reason, "local-shadow-proof-error");
     reject_reason.clear();
-    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(*claim_tx, &first_index, view, true, reject_reason) ==
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim_tx, &first_index, view, true, reject_reason,
+                    &disposition) ==
                 ShadowProofValidationResult::VALID);
+    BOOST_CHECK(disposition == ShadowPowClaimMempoolDisposition::ELIGIBLE);
     ClearShadowArgon2FailuresForTesting();
     BOOST_CHECK(reject_reason.empty());
 
     const CTransactionRef wrong_input_tx = MakePowClaimTx(pow_target, pow_proof, 1);
-    BOOST_CHECK(!CheckShadowPowClaimForMempool(*wrong_input_tx, &first_index, view, true, reject_reason));
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *wrong_input_tx, &first_index, view, true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::INPUT_MISMATCH);
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-input-mismatch");
 
     uint256 claim_hash;
@@ -2160,7 +2586,13 @@ BOOST_AUTO_TEST_CASE(pow_shadow_mempool_policy_is_next_tip_bound_and_not_whiteli
     BOOST_REQUIRE(ApplyShadowBlock(view, claim_block, &claim_index, &claim_undo));
 
     reject_reason.clear();
-    BOOST_CHECK(!CheckShadowPowClaimForMempool(*claim_tx, &claim_index, view, true, reject_reason));
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *claim_tx, &claim_index, view, true, reject_reason,
+                    &disposition) == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::UNBOUND_PROOF_MAY_REVALIDATE);
+    BOOST_CHECK(IsShadowPowClaimMempoolRetryable(disposition));
+    BOOST_CHECK(!IsShadowPowClaimCurrentBranchTerminal(disposition));
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-invalid");
 }
 
@@ -3421,25 +3853,36 @@ static void CheckQQP4PayloadModesAreStrictlyBoundToPowAccounting()
         2);
 
     std::string reject_reason;
+    ShadowPowClaimMempoolDisposition disposition{
+        ShadowPowClaimMempoolDisposition::ELIGIBLE};
     BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
                     *pos_tx, activation_parent, seed_view, true,
-                    reject_reason) == ShadowProofValidationResult::INVALID);
+                    reject_reason, &disposition) ==
+                ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition == ShadowPowClaimMempoolDisposition::WRONG_MODE);
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-wrong-mode-pos");
     reject_reason.clear();
     BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
                     *unknown_tx, activation_parent, seed_view, true,
-                    reject_reason) == ShadowProofValidationResult::INVALID);
+                    reject_reason, &disposition) ==
+                ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition == ShadowPowClaimMempoolDisposition::UNKNOWN_MODE);
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-unknown-mode");
     reject_reason.clear();
     BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
                     *duplicate_tx, activation_parent, seed_view, true,
-                    reject_reason) == ShadowProofValidationResult::INVALID);
+                    reject_reason, &disposition) ==
+                ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition == ShadowPowClaimMempoolDisposition::DUPLICATE);
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-duplicate");
     for (const CTransactionRef& retired_tx : {qqp1_tx, qqp2_tx, qqp3_tx}) {
         reject_reason.clear();
         BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
                         *retired_tx, activation_parent, seed_view, true,
-                        reject_reason) == ShadowProofValidationResult::INVALID);
+                        reject_reason, &disposition) ==
+                    ShadowProofValidationResult::INVALID);
+        BOOST_CHECK(disposition ==
+                    ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION);
         BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-version");
     }
 

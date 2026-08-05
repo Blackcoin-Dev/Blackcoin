@@ -25,6 +25,7 @@
 #include <system_error>
 
 namespace wallet {
+
 bool VerifyWallets(WalletContext& context)
 {
     interfaces::Chain& chain = *context.chain;
@@ -131,6 +132,13 @@ bool LoadWallets(WalletContext& context)
             if (!warnings.empty()) chain.initWarning(Join(warnings, Untranslated("\n")));
             if (!pwallet) {
                 chain.initError(error);
+                return false;
+            }
+
+            if (!pwallet->ApplyShadowPowClaimRecoveryStartupPolicy(*context.args, error)) {
+                chain.initError(Untranslated(strprintf(
+                    "Failed to seed PoW claim recovery policy for wallet %s: %s",
+                    name, error.original)));
                 return false;
             }
 

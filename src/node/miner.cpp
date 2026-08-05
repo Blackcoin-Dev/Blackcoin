@@ -411,6 +411,17 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
             pwallet->m_last_coin_stake_search_interval = nSearchTime - last_search_time;
             pwallet->m_last_coin_stake_search_time = nSearchTime;
             pwallet->m_last_coin_stake_search_tip = current_tip_hash;
+            const uint64_t published_weight =
+                pwallet->m_cached_stake_weight.load(std::memory_order_relaxed);
+            pwallet->PublishStakingTelemetry(
+                published_weight > 0
+                    ? wallet::StakingTelemetryState::SEARCHING
+                    : wallet::StakingTelemetryState::NO_ELIGIBLE_COINS,
+                current_tip_hash, pindexPrev->nHeight,
+                /*worker_running=*/true,
+                published_weight > 0
+                    ? "staking worker is actively searching"
+                    : "staking worker is running but no eligible stake coin is available");
         }
         if (*pfPoSCancel)
             return nullptr; // peercoin: there is no point to continue if we failed to create coinstake
@@ -1050,10 +1061,31 @@ bool SignBlock(CBlock& block, const CWallet& keystore, const Consensus::Params& 
 }
 
 // peercoin
+static void PublishStakingStateAtCurrentTip(
+    CWallet* pwallet, wallet::StakingTelemetryState state,
+    std::string reason, bool worker_running = true)
+{
+    uint256 tip_hash;
+    int tip_height{-1};
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip = pwallet->chain().getTip();
+        if (tip) {
+            tip_hash = tip->GetBlockHash();
+            tip_height = tip->nHeight;
+        }
+    }
+    pwallet->PublishStakingTelemetry(
+        state, tip_hash, tip_height, worker_running, std::move(reason));
+}
+
 void PoSMiner(CWallet *pwallet)
 {
     pwallet->WalletLogPrintf("PoSMiner started for proof-of-stake\n");
     util::ThreadRename(strprintf("blackcoin-stake-miner-%s", pwallet->GetName()));
+    PublishStakingStateAtCurrentTip(
+        pwallet, wallet::StakingTelemetryState::STARTING,
+        "staking worker is starting");
 
     unsigned int nExtraNonce = 0;
 
@@ -1099,6 +1131,15 @@ void PoSMiner(CWallet *pwallet)
         {
             while (pwallet->IsLocked() || !pwallet->m_enabled_staking || fReindex || pwallet->chain().chainman().m_blockman.m_importing) {
                 WITH_LOCK(pwallet->cs_wallet, pwallet->m_last_coin_stake_search_interval = 0);
+                if (pwallet->IsLocked()) {
+                    PublishStakingStateAtCurrentTip(
+                        pwallet, wallet::StakingTelemetryState::LOCKED,
+                        "staking worker is waiting for wallet unlock");
+                } else {
+                    PublishStakingStateAtCurrentTip(
+                        pwallet, wallet::StakingTelemetryState::SYNCING,
+                        "staking worker is waiting for reindex or block import");
+                }
                 if (!SleepStaker(pwallet, 5000))
                     return;
             }
@@ -1113,6 +1154,9 @@ void PoSMiner(CWallet *pwallet)
             if (!solo_staking) {
                 while (pwallet->chain().getNodeCount(ConnectionDirection::Both) == 0 || pwallet->chain().isInitialBlockDownload()) {
                     WITH_LOCK(pwallet->cs_wallet, pwallet->m_last_coin_stake_search_interval = 0);
+                    PublishStakingStateAtCurrentTip(
+                        pwallet, wallet::StakingTelemetryState::SYNCING,
+                        "staking worker is waiting for peers and initial sync");
                     if (!SleepStaker(pwallet, 10000))
                         return;
                 }
@@ -1120,6 +1164,9 @@ void PoSMiner(CWallet *pwallet)
 
             while (!solo_staking && GuessVerificationProgress(Params().TxData(), pwallet->chain().getTip()) < 0.996) {
                 WITH_LOCK(pwallet->cs_wallet, pwallet->m_last_coin_stake_search_interval = 0);
+                PublishStakingStateAtCurrentTip(
+                    pwallet, wallet::StakingTelemetryState::SYNCING,
+                    "staking worker is waiting for chain verification progress");
                 pwallet->WalletLogPrintf("Staker thread sleeps while sync at %f\n", GuessVerificationProgress(Params().TxData(), pwallet->chain().getTip()));
                 if (!SleepStaker(pwallet, 10000))
                     return;
@@ -1127,6 +1174,9 @@ void PoSMiner(CWallet *pwallet)
 
             wallet::MaybeAutoDemurrageAttest(*pwallet);
             wallet::MaybeAutoShadowSignal(*pwallet);
+            PublishStakingStateAtCurrentTip(
+                pwallet, wallet::StakingTelemetryState::SEARCHING,
+                "staking worker is preparing the next search interval");
 
             //
             // Create new block
@@ -1145,6 +1195,9 @@ void PoSMiner(CWallet *pwallet)
             catch (const std::runtime_error &e)
             {
                 pwallet->WalletLogPrintf("PoSMiner runtime error: %s\n", e.what());
+                PublishStakingStateAtCurrentTip(
+                    pwallet, wallet::StakingTelemetryState::FAULT,
+                    strprintf("staking block assembly error: %s", e.what()));
                 assembly_failures = std::min(assembly_failures + 1, 6U);
                 const uint64_t backoff_ms = std::min<uint64_t>(250ULL << (assembly_failures - 1), 5000ULL);
                 if (!SleepStaker(pwallet, backoff_ms)) return;
@@ -1161,6 +1214,9 @@ void PoSMiner(CWallet *pwallet)
                 }
                 pwallet->WalletLogPrintf("Error in PoSMiner: Keypool ran out, please call keypoolrefill before restarting the mining thread\n");
                 pwallet->m_enabled_staking = false;
+                PublishStakingStateAtCurrentTip(
+                    pwallet, wallet::StakingTelemetryState::FAULT,
+                    "staking worker stopped because the keypool is empty");
                 if (!SleepStaker(pwallet, 10000))
                    return;
 
@@ -1247,11 +1303,17 @@ void static ThreadStakeMiner(CWallet *pwallet)
             PrintExceptionContinue(nullptr, "ThreadStakeMiner()");
         }
         if (pwallet->IsStakeClosing()) break;
+        PublishStakingStateAtCurrentTip(
+            pwallet, wallet::StakingTelemetryState::FAULT,
+            "staking worker exited unexpectedly and is restarting");
         restart_failures = std::min(restart_failures + 1, 6U);
         const uint64_t backoff_ms = std::min<uint64_t>(1000ULL << (restart_failures - 1), 30000ULL);
         pwallet->WalletLogPrintf("ThreadStakeMiner restarting after unexpected exit in %ums\n", backoff_ms);
         if (!SleepStaker(pwallet, backoff_ms)) break;
     }
+    PublishStakingStateAtCurrentTip(
+        pwallet, wallet::StakingTelemetryState::STOPPED,
+        "staking worker stopped", /*worker_running=*/false);
     pwallet->WalletLogPrintf("ThreadStakeMiner stopped\n");
 }
 

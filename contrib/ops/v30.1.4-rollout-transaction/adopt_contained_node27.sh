@@ -994,7 +994,8 @@ wait_for_core_ready()
               (.[0].HostConfig.RestartPolicy.Name == "on-failure" and
                .[0].HostConfig.RestartPolicy.MaximumRetryCount == 3))
            ' >/dev/null <<< "$inspect" &&
-           verify_candidate_running_container "$TARGET_NODE" "${READOPTION_GENERATION%%|*}" &&
+           (verify_readoption_live_state "$READOPTION_GENERATION" true no ||
+            verify_readoption_live_state "$READOPTION_GENERATION" true on-failure) &&
            verify_vpn_pair "$TARGET_NODE" && live_netns_matches "$TARGET_NODE" &&
            assert_no_reindex_directive "$TARGET_NODE" &&
            verify_no_reindex_log "$TARGET_NODE" && verify_replay_state "$TARGET_NODE"; then

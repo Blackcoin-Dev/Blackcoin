@@ -123,6 +123,13 @@ grep -Fq 'key_generation_authorized:false' "$ROOT/adopt_contained_node27.sh"
 grep -Fq 'address_generation_authorized:false' "$ROOT/adopt_contained_node27.sh"
 ! grep -Eiq 'send(toaddress|many)|getnewaddress|createwallet|generatetoaddress|resolvepowclaim' \
     "$ROOT/adopt_contained_node27.sh"
+function_body wait_for_core_ready "$ROOT/adopt_contained_node27.sh" \
+    > "$TMP/readoption-core-ready"
+grep -Fq 'verify_readoption_live_state "$READOPTION_GENERATION" true no' \
+    "$TMP/readoption-core-ready"
+grep -Fq 'verify_readoption_live_state "$READOPTION_GENERATION" true on-failure' \
+    "$TMP/readoption-core-ready"
+! grep -Fq 'verify_candidate_running_container' "$TMP/readoption-core-ready"
 pass contained-node27-append-only-adoption-order-and-no-spend-scope
 
 function_body verify_candidate_activation_marker "$ROOT/fleet_rollout.sh" \

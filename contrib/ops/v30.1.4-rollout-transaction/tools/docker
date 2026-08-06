@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C TZ=UTC
+
+# Compatibility adapter for a transaction sealed before Docker Compose 2.40.3
+# exposed that `compose create` does not accept --no-deps. It rewrites only the
+# exact stopped-container recreation command emitted by that sealed package.
+# Every other Docker invocation is passed through byte-for-byte.
+REAL_DOCKER=/usr/bin/docker
+ROLLOUT_ROOT=/mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-fleet-rollout
+PROJECT_DIRECTORY=/boot/config/plugins/compose.manager/projects/blackcoin30
+
+legacy_stopped_create_shape()
+{
+    local -n candidate=$1
+    [[ "${#candidate[@]}" -eq 11 &&
+       "${candidate[0]}" == compose &&
+       "${candidate[1]}" == --project-directory &&
+       "${candidate[2]}" == "$PROJECT_DIRECTORY" &&
+       "${candidate[3]}" == -f &&
+       "${candidate[4]}" =~ ^${ROLLOUT_ROOT}/rollout-[0-9]{8}T[0-9]{6}Z/wave-[0-9]{2}-nodes-[0-9-]+(-retry-[0-9]{2})?/docker-compose\.(candidate|before)\.yml$ &&
+       "${candidate[5]}" == create &&
+       "${candidate[6]}" == --no-deps &&
+       "${candidate[7]}" == --no-recreate &&
+       "${candidate[8]}" == --pull &&
+       "${candidate[9]}" == never &&
+       "${candidate[10]}" =~ ^node(0[1-9]|[12][0-9]|3[0-2])$ ]]
+}
+
+validate_rewrite_authority()
+{
+    local compose_file=$1 owner mode
+    [[ "$(id -u)" -eq 0 && -x "$REAL_DOCKER" && ! -L "$REAL_DOCKER" &&
+       "$(realpath -e -- "$REAL_DOCKER")" == "$REAL_DOCKER" ]] || return 1
+    owner=$(stat -c '%u:%g' "$REAL_DOCKER") || return 1
+    mode=$(stat -c '%a' "$REAL_DOCKER") || return 1
+    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ &&
+       $((8#$mode & 0022)) -eq 0 ]] || return 1
+    [[ -f "$compose_file" && ! -L "$compose_file" &&
+       "$(realpath -e -- "$compose_file")" == "$compose_file" ]] || return 1
+    owner=$(stat -c '%u:%g' "$compose_file") || return 1
+    mode=$(stat -c '%a' "$compose_file") || return 1
+    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ &&
+       $((8#$mode & 0022)) -eq 0 ]]
+}
+
+rewrite_legacy_stopped_create()
+{
+    local -n command=$1
+    command=(
+        compose --project-directory "${command[2]}" -f "${command[4]}"
+        up --no-start --no-deps --no-recreate --no-build --pull never "${command[10]}"
+    )
+}
+
+main()
+{
+    local index
+    local -a command=("$@")
+    if legacy_stopped_create_shape command; then
+        validate_rewrite_authority "${command[4]}" || {
+            printf '%s\n' 'FATAL: legacy Compose compatibility authority is unsafe' >&2
+            return 1
+        }
+        printf 'compat: rewriting authenticated stopped-container create for %s\n' \
+            "${command[10]}" >&2
+        rewrite_legacy_stopped_create command
+    else
+        for ((index=0; index + 1 < ${#command[@]}; index++)); do
+            if [[ "${command[index]}" == create &&
+                  "${command[index + 1]}" == --no-deps ]]; then
+                printf '%s\n' 'FATAL: unrecognized legacy Compose create invocation' >&2
+                return 1
+            fi
+        done
+    fi
+    exec "$REAL_DOCKER" "${command[@]}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

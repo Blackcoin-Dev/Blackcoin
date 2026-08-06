@@ -63,6 +63,22 @@ pass bash-syntax
 shellcheck -x -e SC1091,SC2034,SC2016 "${scripts[@]}"
 pass shellcheck-actionable
 
+(
+    # shellcheck disable=SC1091
+    source "$ROOT/tools/docker"
+    command=(
+        compose --project-directory /boot/config/plugins/compose.manager/projects/blackcoin30
+        -f /mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-fleet-rollout/rollout-20260806T094713Z/wave-01-nodes-27/docker-compose.before.yml
+        create --no-deps --no-recreate --pull never node27
+    )
+    legacy_stopped_create_shape command
+    rewrite_legacy_stopped_create command
+    [[ "${command[*]}" == 'compose --project-directory /boot/config/plugins/compose.manager/projects/blackcoin30 -f /mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-fleet-rollout/rollout-20260806T094713Z/wave-01-nodes-27/docker-compose.before.yml up --no-start --no-deps --no-recreate --no-build --pull never node27' ]]
+    command+=(unexpected)
+    ! legacy_stopped_create_shape command
+)
+pass sealed-compose-create-compatibility-rewrite
+
 awk '
   /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
   {waves++; if (NF < 1 || NF > 4) exit 1; for (i=1;i<=NF;i++) {

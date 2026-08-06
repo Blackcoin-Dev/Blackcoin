@@ -700,32 +700,42 @@ done
 for required in legacy_baseline_pow_mode legacy_baseline_quarantined_claims \
     restored_legacy_quarantined_claims legacy_quarantined_claim_count_preserved \
     legacy_quarantined_claim_resolution_attempted legacy_quarantined_claim_fee_paid \
+    inherited_claim_inventory_present claim_baseline_transition_kind \
+    clean_q0_candidate_q0_no_payment_transition_verified \
     candidate_pow_clean_hashing_verified claim_recovery_fee_baseline \
     claim_recovery_fee_final baseline-pow.json restored-pow.json \
     candidate-pow-clean-1.json candidate-pow-clean-2.json; do
     grep -Fq -- "$required" "$TMP/canary-consumer"
 done
-function_body legacy_pow_snapshot_mode "$CANARY" > "$TMP/legacy-pow-functions"
+function_body legacy_pow_observed_mode "$CANARY" > "$TMP/legacy-pow-functions"
 function_body legacy_pow_state_matches_baseline "$CANARY" >> "$TMP/legacy-pow-functions"
 function_body restored_runtime_is_ready "$CANARY" >> "$TMP/legacy-pow-functions"
-jq -n '{enabled:true,threads:1,hashrate:10,live_claims:0,quarantined_claims:0}' \
+jq -n '{enabled:true,autostart:false,allow_automatic_quantum_key_creation:false,
+    state:"hashing",threads:1,cpu_percent:1,hashrate:10,unresolved_claims:0,
+    live_claims:0,quarantined_claims:0}' \
     > "$TMP/legacy-pow-clean.json"
-jq -n '{enabled:false,threads:0,hashrate:0,live_claims:0,quarantined_claims:1}' \
+jq -n '{enabled:false,autostart:false,allow_automatic_quantum_key_creation:false,
+    state:"disabled",threads:1,cpu_percent:1,hashrate:0,unresolved_claims:1,
+    live_claims:0,quarantined_claims:1}' \
     > "$TMP/legacy-pow-quarantined.json"
-jq -n '{enabled:false,threads:0,hashrate:0,live_claims:0,quarantined_claims:2}' \
+jq -n '{enabled:false,autostart:false,allow_automatic_quantum_key_creation:false,
+    state:"disabled",threads:1,cpu_percent:1,hashrate:0,unresolved_claims:2,
+    live_claims:0,quarantined_claims:2}' \
     > "$TMP/legacy-pow-quarantine-drift.json"
-jq -n '{enabled:true,threads:1,hashrate:10,live_claims:0,quarantined_claims:1}' \
+jq -n '{enabled:true,autostart:false,allow_automatic_quantum_key_creation:false,
+    state:"hashing",threads:1,cpu_percent:1,hashrate:10,unresolved_claims:1,
+    live_claims:0,quarantined_claims:1}' \
     > "$TMP/legacy-pow-unsafe.json"
 jq -n '{chain:"main",initialblockdownload:false,headers:100,blocks:100}' \
     > "$TMP/legacy-chain-ready.json"
 (
     # shellcheck disable=SC1091
     source "$TMP/legacy-pow-functions"
-    [[ "$(legacy_pow_snapshot_mode "$TMP/legacy-pow-clean.json")" == clean-hashing ]]
-    [[ "$(legacy_pow_snapshot_mode "$TMP/legacy-pow-quarantined.json")" == \
+    [[ "$(legacy_pow_observed_mode "$TMP/legacy-pow-clean.json")" == clean-hashing ]]
+    [[ "$(legacy_pow_observed_mode "$TMP/legacy-pow-quarantined.json")" == \
         quarantined-disabled ]]
-    ! legacy_pow_snapshot_mode "$TMP/legacy-pow-quarantine-drift.json" >/dev/null
-    ! legacy_pow_snapshot_mode "$TMP/legacy-pow-unsafe.json" >/dev/null
+    ! legacy_pow_observed_mode "$TMP/legacy-pow-quarantine-drift.json" >/dev/null
+    ! legacy_pow_observed_mode "$TMP/legacy-pow-unsafe.json" >/dev/null
     LEGACY_BASELINE_LIVE_CLAIMS=0
     LEGACY_BASELINE_QUARANTINED_CLAIMS=0
     LEGACY_BASELINE_POW_MODE=clean-hashing
@@ -741,14 +751,36 @@ jq -n '{chain:"main",initialblockdownload:false,headers:100,blocks:100}' \
 )
 function_body published_canary_pow_transition_is_valid "$ROOT/lib/live_checks.sh" \
     > "$TMP/published-canary-pow-transition"
-jq -n '{legacy_baseline_pow_mode:"quarantined-disabled",
+jq -n --arg sha 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    '{legacy_observed_pow_mode:"quarantined-disabled",
+    legacy_baseline_pow_mode:"quarantined-disabled",
     legacy_baseline_live_claims:0,legacy_baseline_quarantined_claims:1,
     restored_legacy_live_claims:0,restored_legacy_quarantined_claims:1,
+    legacy_quarantined_claim_count_preserved:true,
+    legacy_quarantined_claim_resolution_attempted:false,
+    legacy_quarantined_claim_fee_paid:false,inherited_claim_inventory_present:true,
+    inherited_claim_inventory_evidence:"candidate-inherited-claim-inventory.json",
+    inherited_claim_inventory_sha256:$sha,
+    inherited_claim_transition_evidence:"candidate-inherited-claim-transition.json",
+    inherited_claim_transition_sha256:$sha,
+    claim_baseline_transition_kind:"legacy_q1_to_candidate_q0_no_payment",
+    legacy_q1_candidate_q0_no_payment_reclassification_verified:true,
+    clean_q0_candidate_q0_no_payment_transition_verified:false,
     claim_recovery_fee_baseline:0,claim_recovery_fee_final:0}' \
     > "$TMP/canary-pow-result-quarantined.json"
-jq -n '{legacy_baseline_pow_mode:"clean-hashing",
+jq -n --arg sha 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+    '{legacy_observed_pow_mode:"clean-hashing",legacy_baseline_pow_mode:"clean-hashing",
     legacy_baseline_live_claims:0,legacy_baseline_quarantined_claims:0,
     restored_legacy_live_claims:0,restored_legacy_quarantined_claims:0,
+    legacy_quarantined_claim_count_preserved:true,
+    legacy_quarantined_claim_resolution_attempted:false,
+    legacy_quarantined_claim_fee_paid:false,inherited_claim_inventory_present:false,
+    inherited_claim_inventory_evidence:null,inherited_claim_inventory_sha256:null,
+    inherited_claim_transition_evidence:"candidate-inherited-claim-transition.json",
+    inherited_claim_transition_sha256:$sha,
+    claim_baseline_transition_kind:"clean_q0_to_candidate_q0_no_payment",
+    legacy_q1_candidate_q0_no_payment_reclassification_verified:false,
+    clean_q0_candidate_q0_no_payment_transition_verified:true,
     claim_recovery_fee_baseline:0,claim_recovery_fee_final:0}' \
     > "$TMP/canary-pow-result-clean.json"
 jq -n '{policy_authoritative:true,policy:{automatic_authorized:false},
@@ -785,6 +817,72 @@ jq '.hashrate=0' "$TMP/candidate-pow-clean.json" > "$TMP/candidate-pow-stopped.j
         "$TMP/canary-recovery-clean.json" "$TMP/canary-recovery-clean.json" \
         "$TMP/candidate-pow-clean.json" "$TMP/candidate-pow-stopped.json"
 )
+function_body candidate_claim_recovery_is_clean "$CANARY" \
+    > "$TMP/candidate-claim-transition-functions"
+function_body candidate_claim_transition_is_valid "$CANARY" \
+    >> "$TMP/candidate-claim-transition-functions"
+function_body candidate_claim_result_mode_is_valid "$CANARY" \
+    >> "$TMP/candidate-claim-transition-functions"
+jq -n '{policy_authoritative:true,policy:{automatic_authorized:false},
+    database_outcome_ambiguous:false,chain_ready:true,wallet_tip_matches:true,
+    blocking_quarantined_claims:0,blocking_components:0,
+    indeterminate_quarantined_claims:0,pending_manual_resolutions:0,
+    pending_automatic_resolutions:0,confirmed_resolution_fees:0,wallet_generation:7}' \
+    > "$TMP/claim-recovery-observed.json"
+jq '.normalized=true' "$TMP/claim-recovery-observed.json" \
+    > "$TMP/claim-recovery-normalized.json"
+printf '%s\n' '[]' > "$TMP/claim-transaction-txids.json"
+printf '%s\n' '{"schema":1,"components":1}' > "$TMP/claim-inventory.json"
+observed_sha=$(sha256sum "$TMP/claim-recovery-observed.json" | awk '{print $1}')
+normalized_sha=$(sha256sum "$TMP/claim-recovery-normalized.json" | awk '{print $1}')
+transaction_sha=$(sha256sum "$TMP/claim-transaction-txids.json" | awk '{print $1}')
+inventory_sha=$(sha256sum "$TMP/claim-inventory.json" | awk '{print $1}')
+jq -n --arg observed "$observed_sha" --arg normalized "$normalized_sha" \
+    --arg transactions "$transaction_sha" \
+    '{schema:1,legacy_mode:"clean-hashing",
+      legacy_q1_candidate_q0_no_payment_reclassification:false,
+      clean_q0_candidate_q0_no_payment_transition:true,
+      inherited_claim_inventory_sha256:null,observed_recovery_sha256:$observed,
+      normalized_recovery_sha256:$normalized,exact_transaction_set_sha256:$transactions,
+      confirmed_resolution_fees:0,resolver_invoked:false,payment_created:false}' \
+    > "$TMP/claim-transition-clean.json"
+jq -n --arg inventory "$inventory_sha" --arg observed "$observed_sha" \
+    --arg normalized "$normalized_sha" --arg transactions "$transaction_sha" \
+    '{schema:1,legacy_mode:"quarantined-disabled",
+      legacy_q1_candidate_q0_no_payment_reclassification:true,
+      inherited_claim_inventory_sha256:$inventory,observed_recovery_sha256:$observed,
+      normalized_recovery_sha256:$normalized,exact_transaction_set_sha256:$transactions,
+      confirmed_resolution_fees:0,resolver_invoked:false,payment_created:false}' \
+    > "$TMP/claim-transition-q1.json"
+jq '.payment_created=true' "$TMP/claim-transition-clean.json" \
+    > "$TMP/claim-transition-tampered.json"
+(
+    # shellcheck disable=SC1091
+    source "$TMP/candidate-claim-transition-functions"
+    BASELINE_RECOVERY_FEE=0
+    LEGACY_BASELINE_POW_MODE=clean-hashing
+    candidate_claim_transition_is_valid "$TMP/claim-transition-clean.json" \
+        "$TMP/claim-recovery-observed.json" "$TMP/claim-recovery-normalized.json" \
+        "$TMP/claim-transaction-txids.json" ''
+    ! candidate_claim_transition_is_valid "$TMP/claim-transition-clean.json" \
+        "$TMP/claim-recovery-observed.json" "$TMP/claim-recovery-normalized.json" \
+        "$TMP/claim-transaction-txids.json" "$TMP/claim-inventory.json"
+    ! candidate_claim_transition_is_valid "$TMP/claim-transition-tampered.json" \
+        "$TMP/claim-recovery-observed.json" "$TMP/claim-recovery-normalized.json" \
+        "$TMP/claim-transaction-txids.json" ''
+    candidate_claim_result_mode_is_valid "$TMP/canary-pow-result-clean.json"
+    ! candidate_claim_result_mode_is_valid \
+        <(jq '.legacy_q1_candidate_q0_no_payment_reclassification_verified=true' \
+            "$TMP/canary-pow-result-clean.json")
+    LEGACY_BASELINE_POW_MODE=quarantined-disabled
+    candidate_claim_transition_is_valid "$TMP/claim-transition-q1.json" \
+        "$TMP/claim-recovery-observed.json" "$TMP/claim-recovery-normalized.json" \
+        "$TMP/claim-transaction-txids.json" "$TMP/claim-inventory.json"
+    ! candidate_claim_transition_is_valid "$TMP/claim-transition-q1.json" \
+        "$TMP/claim-recovery-observed.json" "$TMP/claim-recovery-normalized.json" \
+        "$TMP/claim-transaction-txids.json" ''
+    candidate_claim_result_mode_is_valid "$TMP/canary-pow-result-quarantined.json"
+)
 function_body restore_original "$CANARY" > "$TMP/canary-restore-original"
 assert_order "$TMP/canary-restore-original" \
     'run_helper "$NORMAL_UNLOCK_HELPER"' \
@@ -793,8 +891,9 @@ assert_order "$TMP/canary-restore-original" \
     'elif [[ "$LEGACY_BASELINE_POW_MODE" != quarantined-disabled ]]'
 grep -Fq 'legacy_pow_state_matches_baseline "${EVIDENCE}/legacy-prelaunch-pow.json"' "$CANARY"
 grep -Fq 'legacy_quarantined_claim_resolution_attempted:false' "$CANARY"
+grep -Fq 'clean_q0_candidate_q0_no_payment_transition_verified:' "$CANARY"
 grep -Fq 'candidate_pow_clean_hashing_verified:true' "$CANARY"
-pass canary-legacy-quarantine-preservation-and-candidate-pow-gates
+pass canary-clean-and-legacy-quarantine-preservation-and-candidate-pow-gates
 grep -Fq -- \
     'export PUBLISHED_CANARY_RESULT="/mnt/pulsar/Blackcoin_Blocks/operations/releases/v30.1.4-${SOURCE_COMMIT}/node27-canary-__CANARY_TIMESTAMP_YYYYMMDDTHHMMSSZ__/evidence/RESULT.json"' \
     "$ROOT/rollout.env.example"

@@ -159,7 +159,7 @@ installed_bytes_valid()
            "$(file_sha "$CYCLE_DISABLED")" == "$CYCLE_OLD_SHA256" &&
            "$(file_sha "$DAEMON_LIVE")" == "$(file_sha "$WRAPPER_SOURCE")" &&
            "$(file_sha "$DAEMON_ORIGINAL")" == "$DAEMON_ORIGINAL_SHA256" &&
-           "$(stat -c '%a' "$CYCLE_LIVE")" == 700 &&
+           "$(stat -c '%a' "$CYCLE_LIVE")" == 600 &&
            "$(stat -c '%a' "$CYCLE_DISABLED")" == 600 &&
            "$(stat -c '%a' "$DAEMON_LIVE")" == 700 &&
            "$(stat -c '%a' "$DAEMON_ORIGINAL")" == 600 ]]

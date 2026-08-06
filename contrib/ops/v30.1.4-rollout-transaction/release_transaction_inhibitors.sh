@@ -109,7 +109,7 @@ prepared_release_window_is_fresh()
 
 installed_state_valid()
 {
-    protected_file "$CYCLE_LIVE" 700 && protected_file "$CYCLE_DISABLED" 600 &&
+    protected_file "$CYCLE_LIVE" 600 && protected_file "$CYCLE_DISABLED" 600 &&
         protected_file "$DAEMON_LIVE" 700 && protected_file "$DAEMON_ORIGINAL" 600 &&
         [[ "$(file_sha "$CYCLE_LIVE")" == "$(file_sha "$CYCLE_SOURCE")" &&
            "$(file_sha "$CYCLE_DISABLED")" == "$CYCLE_OLD_SHA256" &&

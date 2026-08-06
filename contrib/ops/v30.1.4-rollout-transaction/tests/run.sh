@@ -191,6 +191,11 @@ done
 ! grep -Fq "stat -c '%u:%g' \"\$FREE_CLAIM_ROOT\"" \
     "$ROOT/free_claim_daemon_pause_wrapper.sh"
 pass root-uid-nonwritable-free-claim-ownership
+grep -Fq '"$(stat -c '\''%a'\'' "$CYCLE_LIVE")" == 600' \
+    "$ROOT/install_transaction_inhibitors.sh"
+grep -Fq 'protected_file "$CYCLE_LIVE" 600' \
+    "$ROOT/release_transaction_inhibitors.sh"
+pass unraid-boot-cycle-mode
 
 function_body install_triplet "$ROOT/fleet_rollout.sh" > "$TMP/install-triplet"
 for required in compose_original_sha policy_original_sha guard_original_sha \

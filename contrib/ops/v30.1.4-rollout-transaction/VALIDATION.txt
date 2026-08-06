@@ -1,4 +1,4 @@
-validated_at=2026-08-06T08:48:07Z
+validated_at=2026-08-06T08:51:13Z
 scope=local-static-targeted-fixture-only
 live_unraid_mutation=false
 docker_invoked=false
@@ -13,6 +13,7 @@ PASS guard-renderer
 PASS package-integrity-positive-negative-and-entrypoints
 PASS zero-broadcast-normal-install-and-purpose-bound-emergency-containment
 PASS root-uid-nonwritable-free-claim-ownership
+PASS unraid-boot-cycle-mode
 PASS triplet-commit-and-byte-exact-internal-restoration
 PASS claim-safe-and-clean-stop-boundaries
 PASS attempted-only-data-rollback-filtering

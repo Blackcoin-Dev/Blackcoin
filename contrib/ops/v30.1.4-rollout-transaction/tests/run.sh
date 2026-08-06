@@ -221,6 +221,304 @@ for specification in \
 done
 pass claim-safe-and-clean-stop-boundaries
 
+for function_name in data_rollback_authority_path \
+    data_rollback_canonical_single_object_json data_rollback_validate_stopped_generation \
+    data_rollback_verify_authority_sealed; do
+    function_body "$function_name" "$ROOT/lib/data_rollback.sh"
+done > "$TMP/rollback-authority-functions"
+(
+    # Exercise the real authority parser and exact-key verifier with all external
+    # runtime checks replaced by immutable local fixture facts.
+    # shellcheck disable=SC1090
+    source "$TMP/rollback-authority-functions"
+    RUN_DIR="$TMP/rollback-authority-run"
+    CURRENT_WAVE_DIR="$RUN_DIR/wave-01-nodes-04"
+    ROLLOUT_MAINTENANCE_MARKER="$RUN_DIR/maintenance.json"
+    CURRENT_WAVE_NODES=(4)
+    mkdir -p "$CURRENT_WAVE_DIR"
+    printf '%s\n' '{"canary_handoff":{"required":true}}' > "$RUN_DIR/TRANSACTION.json"
+    printf '%s\n' handoff > "$RUN_DIR/CANARY-FLEET-HANDOFF.json"
+    printf '%s\n' maintenance > "$ROLLOUT_MAINTENANCE_MARKER"
+    printf '%s\n' drain > "$CURRENT_WAVE_DIR/WAVE-DRAIN-EVIDENCE.sha256"
+    printf '%s\n' inventory > "$CURRENT_WAVE_DIR/data-snapshots.tsv"
+    sha256sum "$CURRENT_WAVE_DIR/data-snapshots.tsv" | awk '{print $1}' \
+        > "$CURRENT_WAVE_DIR/data-snapshots.tsv.sha256"
+
+    valid_sha256_hex() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+    data_rollback_protected_file() { [[ -f "$1" && ! -L "$1" ]]; }
+    data_rollback_verify_authority_context_sealed() { return 0; }
+    wave_node_launch_attempt_path()
+    {
+        printf '%s/node-%02d-CANDIDATE-LAUNCH-ATTEMPTED.json\n' "$CURRENT_WAVE_DIR" "$1"
+    }
+    wave_node_safe_rollback_path()
+    {
+        printf '%s/node-%02d-SAFE-ROLLBACK.json\n' "$CURRENT_WAVE_DIR" "$1"
+    }
+    wave_node_activation_path()
+    {
+        printf '%s/node-%02d-CANDIDATE-ACTIVATION-ATTEMPTED.json\n' "$CURRENT_WAVE_DIR" "$1"
+    }
+
+    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}')
+    handoff_sha=$(sha256sum "$RUN_DIR/CANARY-FLEET-HANDOFF.json" | awk '{print $1}')
+    maintenance_sha=$(sha256sum "$ROLLOUT_MAINTENANCE_MARKER" | awk '{print $1}')
+    drain_sha=$(sha256sum "$CURRENT_WAVE_DIR/WAVE-DRAIN-EVIDENCE.sha256" | awk '{print $1}')
+    inventory_sha=$(sha256sum "$CURRENT_WAVE_DIR/data-snapshots.tsv" | awk '{print $1}')
+    generation="$(printf 'a%.0s' {1..64})|2026-08-06T00:00:00Z|$(printf 'b%.0s' {1..64})|2026-08-06T00:00:01Z"
+    jq -S -n --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        --arg transaction_sha "$transaction_sha" --arg handoff_sha "$handoff_sha" \
+        --arg maintenance_sha "$maintenance_sha" \
+        --arg drain_sha "$drain_sha" --arg inventory_sha "$inventory_sha" \
+        --arg generation "$generation" '
+        {schema:1,transaction:"v30.1.4-fleet-rollout",purpose:"pre-upgrade-data-restore",
+         run_dir:$run,wave_dir:$wave,transaction_manifest_sha256:$transaction_sha,
+         canary_fleet_handoff_sha256:$handoff_sha,maintenance_marker_sha256:$maintenance_sha,
+         wave_drain_manifest_sha256:$drain_sha,snapshot_inventory_sha256:$inventory_sha,
+         nodes:[{node:4,launch_state:"not-attempted",launch_marker_sha256:null,
+           safe_boundary_sha256:null,stopped_generation:$generation}],
+         published_at:"2026-08-06T00:00:02Z"}' > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    cp "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" "$TMP/rollback-authority.valid"
+    authority_sha=$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')
+    data_rollback_verify_authority_sealed "$authority_sha"
+
+    jq -S '.unexpected=true' "$TMP/rollback-authority.valid" \
+        > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    ! data_rollback_verify_authority_sealed \
+        "$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')"
+
+    jq -c . "$TMP/rollback-authority.valid" > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    ! data_rollback_verify_authority_sealed \
+        "$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')"
+
+    : > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    ! data_rollback_verify_authority_sealed \
+        "$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')"
+
+    printf '%s\n' '{"schema":1,"schema":1}' > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    ! data_rollback_verify_authority_sealed \
+        "$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')"
+
+    {
+        cat "$TMP/rollback-authority.valid"
+        cat "$TMP/rollback-authority.valid"
+    } > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    ! data_rollback_verify_authority_sealed \
+        "$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')"
+)
+
+for function_name in data_rollback_require_mutation_authority \
+    data_rollback_require_fileset_mutation_boundary; do
+    function_body "$function_name" "$ROOT/lib/data_rollback.sh"
+done > "$TMP/rollback-mutation-boundary-functions"
+function_body data_rollback_require_mutation_fences "$ROOT/lib/data_rollback.sh" \
+    > "$TMP/rollback-mutation-fences"
+for required in 'WAVE_LOCKS_HELD' \
+    'data_rollback_require_lock_fd 19 /var/run/blackcoin-v30.1.4-fleet-rollout.lock' \
+    'data_rollback_require_lock_fd 15 /run/blackcoin-endpoint-guard.lock' \
+    'data_rollback_require_lock_fd 16 /var/run/blackcoin-node-cutover.lock' \
+    'data_rollback_require_lock_fd 14 /run/blackcoin-pow-quarantine-cycle.lock' \
+    'data_rollback_require_lock_fd 17 /var/run/blackcoin-wallet-runtime-guard.lock' \
+    'data_rollback_require_lock_fd 18 "$FREE_CLAIM_LOCK"'; do
+    grep -Fq -- "$required" "$TMP/rollback-mutation-fences"
+done
+function_body restore_filesets_from_inventory "$ROOT/lib/data_rollback.sh" \
+    > "$TMP/restore-filesets-boundary"
+assert_order "$TMP/restore-filesets-boundary" \
+    'data_rollback_require_fileset_mutation_boundary' \
+    'rsync -aHAXx --numeric-ids --delete'
+function_body restore_zfs_from_inventory "$ROOT/lib/data_rollback.sh" \
+    > "$TMP/restore-zfs-boundary"
+assert_order "$TMP/restore-zfs-boundary" \
+    'data_rollback_require_zfs_rollback_boundary' 'zfs rollback "$snapshot"'
+assert_order "$TMP/restore-zfs-boundary" \
+    'data_rollback_require_zfs_rsync_boundary' \
+    'rsync -aHAXx --numeric-ids --delete'
+(
+    # shellcheck disable=SC1090
+    source "$TMP/rollback-mutation-boundary-functions"
+    FLEET_ZFS_PARENT=pool
+    MOUNT="$TMP/rollback-boundary-mount"
+    LIVE_PATH="$MOUNT/node-28/blocks"
+    SNAPSHOT_SOURCE="$MOUNT/.zfs/snapshot/preupgrade/node-28/blocks"
+    mkdir -p "$LIVE_PATH" "$SNAPSHOT_SOURCE"
+    AUTHORITY_SHA=$(printf 'c%.0s' {1..64})
+    FENCES_VALID=1
+    GENERATION_VALID=1
+    PATH_DRIFT=0
+    FENCE_CALLS=0
+    LIVE_AUTHORITY_CALLS=0
+    GENERATION_CALLS=0
+
+    valid_sha256_hex() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+    valid_node() { [[ "$1" -ge 1 && "$1" -le 32 ]]; }
+    host_blocks_for() { printf '%s/node-%s\n' "$MOUNT" "$1"; }
+    data_domain_for() { printf 'fileset|pool\n'; }
+    data_rollback_verify_snapshot_identity() { return 0; }
+    realpath()
+    {
+        [[ "$1" == -e ]] && shift
+        [[ "$1" == -- ]] && shift
+        printf '%s\n' "$1"
+    }
+    zfs() { [[ "$1" == get ]] && printf '%s\n' "$MOUNT"; }
+    findmnt() { printf '%s\n' pool; }
+    data_rollback_require_mutation_fences()
+    {
+        FENCE_CALLS=$((FENCE_CALLS + 1))
+        [[ "$FENCES_VALID" -eq 1 ]]
+    }
+    data_rollback_verify_authority_live()
+    {
+        LIVE_AUTHORITY_CALLS=$((LIVE_AUTHORITY_CALLS + 1))
+        if [[ "$PATH_DRIFT" -eq 1 ]]; then
+            mv -- "$LIVE_PATH" "${LIVE_PATH}.original"
+            ln -s -- "${LIVE_PATH}.original" "$LIVE_PATH"
+        fi
+    }
+    data_rollback_verify_authority_stopped_generations()
+    {
+        GENERATION_CALLS=$((GENERATION_CALLS + 1))
+        [[ "$GENERATION_VALID" -eq 1 ]]
+    }
+    check_boundary()
+    {
+        data_rollback_require_fileset_mutation_boundary "$AUTHORITY_SHA" 28 raw pool \
+            "$LIVE_PATH" pool@preupgrade 10 20 hold "$SNAPSHOT_SOURCE"
+    }
+
+    check_boundary
+    [[ "$FENCE_CALLS" -eq 2 && "$LIVE_AUTHORITY_CALLS" -eq 1 && "$GENERATION_CALLS" -eq 1 ]]
+
+    FENCES_VALID=0
+    FENCE_CALLS=0
+    LIVE_AUTHORITY_CALLS=0
+    GENERATION_CALLS=0
+    ! check_boundary
+    [[ "$FENCE_CALLS" -eq 1 && "$LIVE_AUTHORITY_CALLS" -eq 0 && "$GENERATION_CALLS" -eq 0 ]]
+
+    FENCES_VALID=1
+    PATH_DRIFT=1
+    FENCE_CALLS=0
+    LIVE_AUTHORITY_CALLS=0
+    GENERATION_CALLS=0
+    ! check_boundary
+    [[ "$FENCE_CALLS" -eq 1 && "$LIVE_AUTHORITY_CALLS" -eq 1 && "$GENERATION_CALLS" -eq 0 ]]
+    rm -f -- "$LIVE_PATH"
+    mv -- "${LIVE_PATH}.original" "$LIVE_PATH"
+    PATH_DRIFT=0
+
+    GENERATION_VALID=0
+    FENCE_CALLS=0
+    LIVE_AUTHORITY_CALLS=0
+    GENERATION_CALLS=0
+    ! check_boundary
+    [[ "$FENCE_CALLS" -eq 2 && "$LIVE_AUTHORITY_CALLS" -eq 1 && "$GENERATION_CALLS" -eq 1 ]]
+)
+
+for function_name in data_rollback_canonical_single_object_json \
+    data_rollback_restore_evidence_files data_rollback_verify_restore_evidence_manifest \
+    data_rollback_verify_data_restored_receipt_body data_rollback_verify_data_restored_receipt \
+    data_rollback_publish_data_restored_receipt restore_wave_preupgrade_data; do
+    function_body "$function_name" "$ROOT/lib/data_rollback.sh"
+done > "$TMP/rollback-resume-functions"
+(
+    # Test both authenticated crash-publication prefixes. Any invocation of a
+    # live restore primitive is a hard fixture failure.
+    # shellcheck disable=SC1090
+    source "$TMP/rollback-resume-functions"
+    RUN_DIR="$TMP/rollback-resume-run"
+    CURRENT_WAVE_DIR="$RUN_DIR/wave-01-nodes-28"
+    mkdir -p "$CURRENT_WAVE_DIR"
+    printf '%s\n' authority > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    AUTHORITY_SHA=$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')
+    printf '%s\n' 'FILESET|28|raw|pool|/mnt/pool/node-28/blocks|pool@preupgrade|10|20|hold|/mnt/pool/.zfs/snapshot/preupgrade/node-28/blocks' \
+        > "$CURRENT_WAVE_DIR/data-snapshots.tsv"
+    : > "$CURRENT_WAVE_DIR/fileset-restore-node-28-raw.diff"
+    (cd "$CURRENT_WAVE_DIR" && sha256sum fileset-restore-node-28-raw.diff \
+        > DATA-RESTORE-EVIDENCE.sha256)
+
+    RESTORE_FILESET_CALLS=0
+    RESTORE_ZFS_CALLS=0
+    LIVE_AUTHORITY_CALLS=0
+    SNAPSHOT_INVENTORY_CALLS=0
+    MANIFEST_PUBLISH_CALLS=0
+    valid_sha256_hex() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+    data_rollback_protected_file() { [[ -f "$1" && ! -L "$1" ]]; }
+    data_rollback_verify_authority_sealed()
+    {
+        [[ "$1" == "$AUTHORITY_SHA" &&
+           "$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')" == "$1" ]]
+    }
+    chown() { return 0; }
+    sync() { return 0; }
+    data_rollback_verify_authority_live()
+    {
+        LIVE_AUTHORITY_CALLS=$((LIVE_AUTHORITY_CALLS + 1))
+        return 1
+    }
+    verify_wave_snapshot_inventory()
+    {
+        SNAPSHOT_INVENTORY_CALLS=$((SNAPSHOT_INVENTORY_CALLS + 1))
+        return 1
+    }
+    restore_filesets_from_inventory()
+    {
+        RESTORE_FILESET_CALLS=$((RESTORE_FILESET_CALLS + 1))
+        return 1
+    }
+    restore_zfs_from_inventory()
+    {
+        RESTORE_ZFS_CALLS=$((RESTORE_ZFS_CALLS + 1))
+        return 1
+    }
+    data_rollback_publish_restore_evidence_manifest()
+    {
+        MANIFEST_PUBLISH_CALLS=$((MANIFEST_PUBLISH_CALLS + 1))
+        return 1
+    }
+
+    restore_wave_preupgrade_data "$AUTHORITY_SHA"
+    data_rollback_verify_data_restored_receipt "$AUTHORITY_SHA"
+    [[ -f "$CURRENT_WAVE_DIR/DATA-RESTORED.json" &&
+       -f "$CURRENT_WAVE_DIR/DATA-RESTORED.json.sha256" ]]
+    [[ "$RESTORE_FILESET_CALLS" -eq 0 && "$RESTORE_ZFS_CALLS" -eq 0 &&
+       "$LIVE_AUTHORITY_CALLS" -eq 0 && "$SNAPSHOT_INVENTORY_CALLS" -eq 0 &&
+       "$MANIFEST_PUBLISH_CALLS" -eq 0 ]]
+
+    cp "$CURRENT_WAVE_DIR/DATA-RESTORED.json" "$TMP/data-restored.valid"
+    jq -S '.unexpected=true' "$TMP/data-restored.valid" > "$CURRENT_WAVE_DIR/DATA-RESTORED.json"
+    ! data_rollback_verify_data_restored_receipt_body "$AUTHORITY_SHA"
+    jq -c . "$TMP/data-restored.valid" > "$CURRENT_WAVE_DIR/DATA-RESTORED.json"
+    ! data_rollback_verify_data_restored_receipt_body "$AUTHORITY_SHA"
+    : > "$CURRENT_WAVE_DIR/DATA-RESTORED.json"
+    ! data_rollback_verify_data_restored_receipt_body "$AUTHORITY_SHA"
+    printf '%s\n' '{"schema":2,"schema":2}' > "$CURRENT_WAVE_DIR/DATA-RESTORED.json"
+    ! data_rollback_verify_data_restored_receipt_body "$AUTHORITY_SHA"
+    {
+        cat "$TMP/data-restored.valid"
+        cat "$TMP/data-restored.valid"
+    } > "$CURRENT_WAVE_DIR/DATA-RESTORED.json"
+    ! data_rollback_verify_data_restored_receipt_body "$AUTHORITY_SHA"
+
+    cp "$TMP/data-restored.valid" "$CURRENT_WAVE_DIR/DATA-RESTORED.json"
+    receipt_sha=$(sha256sum "$CURRENT_WAVE_DIR/DATA-RESTORED.json" | awk '{print $1}')
+    rm -f -- "$CURRENT_WAVE_DIR/DATA-RESTORED.json.sha256"
+    RESTORE_FILESET_CALLS=0
+    RESTORE_ZFS_CALLS=0
+    LIVE_AUTHORITY_CALLS=0
+    SNAPSHOT_INVENTORY_CALLS=0
+    MANIFEST_PUBLISH_CALLS=0
+    restore_wave_preupgrade_data "$AUTHORITY_SHA"
+    [[ "$(sha256sum "$CURRENT_WAVE_DIR/DATA-RESTORED.json" | awk '{print $1}')" == "$receipt_sha" &&
+       "$(cat "$CURRENT_WAVE_DIR/DATA-RESTORED.json.sha256")" == "$receipt_sha" ]]
+    data_rollback_verify_data_restored_receipt "$AUTHORITY_SHA"
+    [[ "$RESTORE_FILESET_CALLS" -eq 0 && "$RESTORE_ZFS_CALLS" -eq 0 &&
+       "$LIVE_AUTHORITY_CALLS" -eq 0 && "$SNAPSHOT_INVENTORY_CALLS" -eq 0 &&
+       "$MANIFEST_PUBLISH_CALLS" -eq 0 ]]
+)
+pass authenticated-data-rollback-boundaries-and-resume
+
 function_body run_finalization_phase "$ROOT/fleet_soak_audit.sh" > "$TMP/finalization-phase"
 assert_order "$TMP/finalization-phase" 'verify_recovery_baselines_unchanged' \
     'verify_global_chain_convergence' 'assert_unique_vpn_proofs' \

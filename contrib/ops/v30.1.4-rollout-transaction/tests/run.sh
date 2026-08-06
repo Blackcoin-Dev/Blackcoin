@@ -75,6 +75,42 @@ grep -Fq "printf 'pia-vpn-%d" "$ROOT/lib/common.sh"
 grep -Fq '@sha256:' "$ROOT/lib/common.sh"
 pass wave-plan-and-mappings
 
+function_body verify_all_data_domains "$ROOT/lib/data_rollback.sh" \
+    > "$TMP/verify-all-data-domains"
+(
+    # shellcheck disable=SC1090
+    source "$TMP/verify-all-data-domains"
+    NODE_COUNT=1
+    FLEET_ZFS_PARENT=pool
+    OPS_PARENT="$TMP/rollback-operations"
+    OPS_ROOT="$OPS_PARENT/v30.1.4-fleet-rollout"
+    mkdir -p "$OPS_PARENT"
+    data_domain_for() { printf '%s\n' 'fileset|pool'; }
+    host_datadir_for() { printf '%s\n' "$TMP/data-$1"; }
+    host_blocks_for() { printf '%s\n' "$TMP/raw-$1"; }
+    FINDMNT_SOURCE=pool
+    FINDMNT_EXPECT="$OPS_PARENT"
+    findmnt()
+    {
+        [[ "$1" == -n && "$2" == -o && "$3" == SOURCE && "$4" == -T &&
+           "$5" == "$FINDMNT_EXPECT" ]] || return 1
+        printf '%s\n' "$FINDMNT_SOURCE"
+    }
+
+    verify_all_data_domains
+    mkdir "$OPS_ROOT"
+    FINDMNT_EXPECT="$OPS_ROOT"
+    verify_all_data_domains
+    rmdir "$OPS_ROOT"
+    ln -s "$OPS_PARENT" "$OPS_ROOT"
+    ! verify_all_data_domains
+    rm "$OPS_ROOT"
+    FINDMNT_EXPECT="$OPS_PARENT"
+    FINDMNT_SOURCE=other-pool
+    ! verify_all_data_domains
+)
+pass rollback-operations-root-absent-and-existing-domain-gates
+
 {
     printf '%s\n' 'services:'
     for node in $(seq 1 32); do

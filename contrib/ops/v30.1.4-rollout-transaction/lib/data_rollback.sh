@@ -27,6 +27,7 @@ data_domain_for()
 verify_all_data_domains()
 {
     local node data_path raw_path data_domain raw_domain dataset key prior
+    local ops_parent ops_probe
     local -A seen=()
     local -a roots=()
     for node in $(seq 1 "$NODE_COUNT"); do
@@ -46,7 +47,17 @@ verify_all_data_domains()
             fi
         done
     done
-    dataset=$(findmnt -n -o SOURCE -T "$OPS_ROOT") || return 1
+    ops_parent=${OPS_ROOT%/*}
+    [[ "$ops_parent" != "$OPS_ROOT" && -d "$ops_parent" && ! -L "$ops_parent" &&
+       "$(realpath -e -- "$ops_parent")" == "$ops_parent" ]] || return 1
+    if [[ -e "$OPS_ROOT" || -L "$OPS_ROOT" ]]; then
+        [[ -d "$OPS_ROOT" && ! -L "$OPS_ROOT" &&
+           "$(realpath -e -- "$OPS_ROOT")" == "$OPS_ROOT" ]] || return 1
+        ops_probe=$OPS_ROOT
+    else
+        ops_probe=$ops_parent
+    fi
+    dataset=$(findmnt -n -o SOURCE -T "$ops_probe") || return 1
     [[ "$dataset" == "$FLEET_ZFS_PARENT" ]] || return 1
 }
 

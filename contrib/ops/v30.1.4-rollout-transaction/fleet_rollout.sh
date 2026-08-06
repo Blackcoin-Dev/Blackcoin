@@ -499,7 +499,7 @@ establish_candidate_recovery_baseline()
 
 terminate_and_join_candidate_baseline_helpers()
 {
-    local pid deadline alive
+    local pid deadline alive index
     ((${#CANDIDATE_BASELINE_HELPER_PIDS[@]} > 0)) || return 0
     for pid in "${CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
@@ -508,18 +508,28 @@ terminate_and_join_candidate_baseline_helpers()
     deadline=$((SECONDS + 20))
     while ((SECONDS < deadline)); do
         alive=0
-        for pid in "${CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
+        for index in "${!CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
+            pid=${CANDIDATE_BASELINE_HELPER_PIDS[index]}
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
             if kill -0 -- "-$pid" 2>/dev/null; then
                 alive=1
+            else
+                wait "$pid" 2>/dev/null || true
+                CANDIDATE_BASELINE_HELPER_PIDS[index]=''
             fi
         done
         ((alive == 0)) && break
         sleep 1
     done
-    for pid in "${CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
+    for index in "${!CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
+        pid=${CANDIDATE_BASELINE_HELPER_PIDS[index]}
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        kill -KILL -- "-$pid" 2>/dev/null || true
+        if kill -0 -- "-$pid" 2>/dev/null; then
+            kill -KILL -- "-$pid" 2>/dev/null || true
+        else
+            wait "$pid" 2>/dev/null || true
+            CANDIDATE_BASELINE_HELPER_PIDS[index]=''
+        fi
     done
     for pid in "${CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
@@ -528,10 +538,13 @@ terminate_and_join_candidate_baseline_helpers()
     deadline=$((SECONDS + 5))
     while ((SECONDS < deadline)); do
         alive=0
-        for pid in "${CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
+        for index in "${!CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
+            pid=${CANDIDATE_BASELINE_HELPER_PIDS[index]}
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
             if kill -0 -- "-$pid" 2>/dev/null; then
                 alive=1
+            else
+                CANDIDATE_BASELINE_HELPER_PIDS[index]=''
             fi
         done
         ((alive == 0)) && break
@@ -546,6 +559,7 @@ establish_wave_recovery_baselines()
 {
     local node pid failed=0 index monitor_was_enabled=0 launch_signal=0
     local remaining completed_pid wait_rc found
+    local -a active_pids=()
     ((${#CANDIDATE_BASELINE_HELPER_PIDS[@]} == 0)) ||
         die 'a prior candidate baseline helper set is still live'
     [[ $- == *m* ]] && monitor_was_enabled=1
@@ -568,7 +582,12 @@ establish_wave_recovery_baselines()
     remaining=${#CANDIDATE_BASELINE_HELPER_PIDS[@]}
     while ((remaining > 0 && launch_signal == 0)); do
         completed_pid=''
-        if wait -n -p completed_pid; then wait_rc=0; else wait_rc=$?; fi
+        active_pids=()
+        for pid in "${CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] && active_pids+=("$pid")
+        done
+        ((${#active_pids[@]} == remaining)) || { failed=1; break; }
+        if wait -n -p completed_pid "${active_pids[@]}"; then wait_rc=0; else wait_rc=$?; fi
         ((launch_signal == 0)) || break
         [[ "$completed_pid" =~ ^[1-9][0-9]*$ ]] || { failed=1; break; }
         found=-1
@@ -586,6 +605,7 @@ establish_wave_recovery_baselines()
         if kill -0 -- "-$completed_pid" 2>/dev/null; then
             log "node ${CANDIDATE_BASELINE_HELPER_NODES[found]} left a baseline descendant live"
             failed=1
+            break
         else
             CANDIDATE_BASELINE_HELPER_PIDS[found]=''
         fi
@@ -6615,7 +6635,7 @@ publish_candidate_activation_marker()
 
 terminate_and_join_activation_helpers()
 {
-    local pid deadline alive
+    local pid deadline alive index
     ((${#ACTIVATION_HELPER_PIDS[@]} > 0)) || return 0
     for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
@@ -6624,16 +6644,28 @@ terminate_and_join_activation_helpers()
     deadline=$((SECONDS + 20))
     while ((SECONDS < deadline)); do
         alive=0
-        for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
+        for index in "${!ACTIVATION_HELPER_PIDS[@]}"; do
+            pid=${ACTIVATION_HELPER_PIDS[index]}
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-            kill -0 -- "-$pid" 2>/dev/null && alive=1
+            if kill -0 -- "-$pid" 2>/dev/null; then
+                alive=1
+            else
+                wait "$pid" 2>/dev/null || true
+                ACTIVATION_HELPER_PIDS[index]=''
+            fi
         done
         ((alive == 0)) && break
         sleep 1
     done
-    for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
+    for index in "${!ACTIVATION_HELPER_PIDS[@]}"; do
+        pid=${ACTIVATION_HELPER_PIDS[index]}
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        kill -KILL -- "-$pid" 2>/dev/null || true
+        if kill -0 -- "-$pid" 2>/dev/null; then
+            kill -KILL -- "-$pid" 2>/dev/null || true
+        else
+            wait "$pid" 2>/dev/null || true
+            ACTIVATION_HELPER_PIDS[index]=''
+        fi
     done
     for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
@@ -6642,9 +6674,14 @@ terminate_and_join_activation_helpers()
     deadline=$((SECONDS + 5))
     while ((SECONDS < deadline)); do
         alive=0
-        for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
+        for index in "${!ACTIVATION_HELPER_PIDS[@]}"; do
+            pid=${ACTIVATION_HELPER_PIDS[index]}
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-            kill -0 -- "-$pid" 2>/dev/null && alive=1
+            if kill -0 -- "-$pid" 2>/dev/null; then
+                alive=1
+            else
+                ACTIVATION_HELPER_PIDS[index]=''
+            fi
         done
         ((alive == 0)) && break
         sleep 1
@@ -6674,6 +6711,7 @@ activate_wave_phase()
 {
     local phase="$1" node pid failed=0 marker index path sha worker_source
     local launch_signal=0 monitor_was_enabled=0 remaining completed_pid wait_rc found
+    local -a active_pids=()
     ((${#ACTIVATION_HELPER_PIDS[@]} == 0)) ||
         die 'a prior activation helper set is still live'
     for node in "${CURRENT_WAVE_NODES[@]}"; do
@@ -6716,7 +6754,12 @@ activate_wave_phase()
     remaining=${#ACTIVATION_HELPER_PIDS[@]}
     while ((remaining > 0 && launch_signal == 0)); do
         completed_pid=''
-        if wait -n -p completed_pid; then wait_rc=0; else wait_rc=$?; fi
+        active_pids=()
+        for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] && active_pids+=("$pid")
+        done
+        ((${#active_pids[@]} == remaining)) || { failed=1; break; }
+        if wait -n -p completed_pid "${active_pids[@]}"; then wait_rc=0; else wait_rc=$?; fi
         ((launch_signal == 0)) || break
         [[ "$completed_pid" =~ ^[1-9][0-9]*$ ]] || { failed=1; break; }
         found=-1
@@ -6734,6 +6777,7 @@ activate_wave_phase()
         if kill -0 -- "-$completed_pid" 2>/dev/null; then
             log "node ${ACTIVATION_HELPER_NODES[found]} ${ACTIVATION_HELPER_PHASES[found]} left an activation descendant live"
             failed=1
+            break
         else
             ACTIVATION_HELPER_PIDS[found]=''
         fi
@@ -7306,7 +7350,7 @@ publish_complete_containment_manifest()
 
 terminate_and_join_containment_helpers()
 {
-    local pid deadline alive
+    local pid deadline alive index
     ((${#CONTAINMENT_HELPER_PIDS[@]} > 0)) || return 0
     for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
@@ -7315,18 +7359,28 @@ terminate_and_join_containment_helpers()
     deadline=$((SECONDS + 20))
     while ((SECONDS < deadline)); do
         alive=0
-        for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
+        for index in "${!CONTAINMENT_HELPER_PIDS[@]}"; do
+            pid=${CONTAINMENT_HELPER_PIDS[index]}
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
             if kill -0 -- "-$pid" 2>/dev/null; then
                 alive=1
+            else
+                wait "$pid" 2>/dev/null || true
+                CONTAINMENT_HELPER_PIDS[index]=''
             fi
         done
         ((alive == 0)) && break
         sleep 1
     done
-    for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
+    for index in "${!CONTAINMENT_HELPER_PIDS[@]}"; do
+        pid=${CONTAINMENT_HELPER_PIDS[index]}
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        kill -KILL -- "-$pid" 2>/dev/null || true
+        if kill -0 -- "-$pid" 2>/dev/null; then
+            kill -KILL -- "-$pid" 2>/dev/null || true
+        else
+            wait "$pid" 2>/dev/null || true
+            CONTAINMENT_HELPER_PIDS[index]=''
+        fi
     done
     for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
         [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
@@ -7335,10 +7389,13 @@ terminate_and_join_containment_helpers()
     deadline=$((SECONDS + 5))
     while ((SECONDS < deadline)); do
         alive=0
-        for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
+        for index in "${!CONTAINMENT_HELPER_PIDS[@]}"; do
+            pid=${CONTAINMENT_HELPER_PIDS[index]}
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
             if kill -0 -- "-$pid" 2>/dev/null; then
                 alive=1
+            else
+                CONTAINMENT_HELPER_PIDS[index]=''
             fi
         done
         ((alive == 0)) && break
@@ -7353,6 +7410,7 @@ contain_wave_without_rollback()
 {
     local reason="$1" node pid failed=0 index monitor_was_enabled=0 signal_received=0
     local int_trap term_trap trap_mode remaining completed_pid wait_rc found
+    local -a active_pids=()
     terminate_and_join_containment_helpers || return 1
     terminate_and_join_activation_helpers || return 1
     int_trap=$(trap -p INT)
@@ -7381,7 +7439,12 @@ contain_wave_without_rollback()
     remaining=${#CONTAINMENT_HELPER_PIDS[@]}
     while ((remaining > 0 && signal_received == 0)); do
         completed_pid=''
-        if wait -n -p completed_pid; then wait_rc=0; else wait_rc=$?; fi
+        active_pids=()
+        for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] && active_pids+=("$pid")
+        done
+        ((${#active_pids[@]} == remaining)) || { failed=1; break; }
+        if wait -n -p completed_pid "${active_pids[@]}"; then wait_rc=0; else wait_rc=$?; fi
         ((signal_received == 0)) || break
         [[ "$completed_pid" =~ ^[1-9][0-9]*$ ]] || { failed=1; break; }
         found=-1
@@ -7399,6 +7462,7 @@ contain_wave_without_rollback()
         if kill -0 -- "-$completed_pid" 2>/dev/null; then
             log "containment node=${CONTAINMENT_HELPER_NODES[found]} left a descendant live"
             failed=1
+            break
         else
             CONTAINMENT_HELPER_PIDS[found]=''
         fi

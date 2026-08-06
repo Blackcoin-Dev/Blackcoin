@@ -492,6 +492,32 @@ verify_published_canary()
        "$(sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" | awk '{print $1}')" == "$actual_manifest_sha" ]]
 }
 
+published_canary_recovery_is_valid()
+{
+    [[ "$#" == 4 ]] || return 1
+    local recovery_file="$1" transaction_file="$2"
+    local baseline_transactions_file="$3" fee="$4"
+    jq -en --argjson fee "$fee" --slurpfile recovery "$recovery_file" \
+        --slurpfile transactions "$transaction_file" '
+        def hex64: type == "string" and test("^[0-9a-f]{64}$");
+        def integer: type == "number" and floor == .;
+        ($recovery | length) == 1 and ($transactions | length) == 1 and
+        ($recovery[0] |
+          type == "object" and .policy_authoritative == true and
+          .policy.automatic_authorized == false and
+          .database_outcome_ambiguous == false and .chain_ready == true and
+          .wallet_tip_matches == true and .blocking_quarantined_claims == 0 and
+          .blocking_components == 0 and .indeterminate_quarantined_claims == 0 and
+          .pending_manual_resolutions == 0 and .pending_automatic_resolutions == 0 and
+          (.confirmed_resolution_fees | type) == "number" and
+          .confirmed_resolution_fees == $fee and
+          (.wallet_generation | integer and . >= 0)) and
+        ($transactions[0] |
+          type == "array" and all(.[]; hex64) and . == (unique | sort))
+    ' >/dev/null || return 1
+    cmp -s "$baseline_transactions_file" "$transaction_file"
+}
+
 published_canary_recovery_inventory_is_valid()
 {
     local recovery_file="$1" transaction_file="$2" inventory_file="$3" fee="$4"
@@ -556,9 +582,10 @@ published_canary_recovery_inventory_is_valid()
 
 published_canary_candidate_disabled_boundary_is_valid()
 {
+    [[ "$#" == 9 ]] || return 1
     local wallet_file="$1" staking_file="$2" pow_file="$3" recovery_file="$4"
     local transaction_file="$5" baseline_transactions_file="$6" inventory_file="$7"
-    local fee="$8"
+    local claim_mode="$8" fee="$9"
     jq -en --argjson fee "$fee" --slurpfile wallet "$wallet_file" \
         --slurpfile staking "$staking_file" --slurpfile pow "$pow_file" \
         --slurpfile recovery "$recovery_file" '
@@ -598,26 +625,33 @@ published_canary_candidate_disabled_boundary_is_valid()
           .confirmed_resolution_fees == $fee and
           (.wallet_generation | integer and . >= 0))
     ' >/dev/null || return 1
-    jq -se 'length == 1 and (.[0] | type == "array" and
-        all(.[]; type == "string" and test("^[0-9a-f]{64}$")) and
-        . == (unique | sort))' "$transaction_file" >/dev/null || return 1
-    cmp -s "$baseline_transactions_file" "$transaction_file" || return 1
-    published_canary_recovery_inventory_is_valid \
-        "$recovery_file" "$transaction_file" "$inventory_file" "$fee"
+    published_canary_recovery_is_valid "$recovery_file" "$transaction_file" \
+        "$baseline_transactions_file" "$fee" || return 1
+    case "$claim_mode" in
+        clean-hashing)
+            [[ -z "$inventory_file" ]]
+            ;;
+        quarantined-disabled)
+            [[ -n "$inventory_file" ]] && published_canary_recovery_inventory_is_valid \
+                "$recovery_file" "$transaction_file" "$inventory_file" "$fee"
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 published_canary_activation_boundary_is_valid()
 {
-    [[ "$#" == 16 ]] || return 1
+    [[ "$#" == 17 ]] || return 1
     local sequence="$1" purpose="$2" marker_file="$3" wallet_file="$4"
     local staking_file="$5" pow_file="$6" recovery_file="$7" transaction_file="$8"
     local baseline_transactions_file="$9" inventory_file="${10}" image="${11}"
-    local image_id="${12}" launch_sha="${13}" nonce_sha="${14}"
-    local transition_sha="${15}" fee="${16}" timestamp wallet_sha staking_sha pow_sha
+    local claim_mode="${11}" image="${12}" image_id="${13}" launch_sha="${14}"
+    local nonce_sha="${15}" transition_sha="${16}" fee="${17}"
+    local timestamp wallet_sha staking_sha pow_sha
     local recovery_sha transaction_sha
     published_canary_candidate_disabled_boundary_is_valid "$wallet_file" "$staking_file" \
         "$pow_file" "$recovery_file" "$transaction_file" "$baseline_transactions_file" \
-        "$inventory_file" "$fee" || return 1
+        "$inventory_file" "$claim_mode" "$fee" || return 1
     timestamp=$(jq -er '.timestamp | select(type == "string" and
         test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' \
         "$marker_file") || return 1
@@ -649,15 +683,16 @@ published_canary_activation_boundary_is_valid()
 
 published_canary_safe_boundary_is_valid()
 {
-    [[ "$#" == 14 ]] || return 1
+    [[ "$#" == 15 ]] || return 1
     local sequence="$1" purpose="$2" marker_file="$3" activation_sha="$4"
     local wallet_file="$5" staking_file="$6" pow_file="$7" recovery_file="$8"
     local transaction_file="$9" baseline_transactions_file="${10}" inventory_file="${11}"
-    local image="${12}" image_id="${13}" fee="${14}" timestamp wallet_generation
+    local claim_mode="${12}" image="${13}" image_id="${14}" fee="${15}"
+    local timestamp wallet_generation
     local wallet_sha staking_sha pow_sha recovery_sha transaction_sha
     published_canary_candidate_disabled_boundary_is_valid "$wallet_file" "$staking_file" \
         "$pow_file" "$recovery_file" "$transaction_file" "$baseline_transactions_file" \
-        "$inventory_file" "$fee" || return 1
+        "$inventory_file" "$claim_mode" "$fee" || return 1
     timestamp=$(jq -er '.timestamp | select(type == "string" and
         test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' \
         "$marker_file") || return 1
@@ -759,13 +794,17 @@ published_canary_legacy_q1_transition_is_valid()
           $r.legacy_quarantined_claim_count_preserved == true and
           $r.legacy_quarantined_claim_resolution_attempted == false and
           $r.legacy_quarantined_claim_fee_paid == false and
+          $r.inherited_claim_inventory_present == true and
           $r.inherited_claim_inventory_evidence ==
             "candidate-inherited-claim-inventory.json" and
           $r.inherited_claim_inventory_sha256 == $inventory_sha and
           $r.inherited_claim_transition_evidence ==
             "candidate-inherited-claim-transition.json" and
           $r.inherited_claim_transition_sha256 == $transition_sha and
+          $r.claim_baseline_transition_kind ==
+            "legacy_q1_to_candidate_q0_no_payment" and
           $r.legacy_q1_candidate_q0_no_payment_reclassification_verified == true and
+          $r.clean_q0_candidate_q0_no_payment_transition_verified == false and
           $r.claim_recovery_fee_baseline == $fee and
           $r.claim_recovery_fee_final == $fee and
           (if $r.legacy_observed_pow_mode == "quarantined-stalled" then
@@ -784,6 +823,121 @@ published_canary_legacy_q1_transition_is_valid()
     ' >/dev/null
 }
 
+published_canary_clean_q0_transition_is_valid()
+{
+    [[ "$#" == 9 ]] || return 1
+    local result_file="$1" baseline_pow_file="$2" restored_pow_file="$3"
+    local transition_file="$4" observed_recovery_file="$5"
+    local normalized_recovery_file="$6" normalized_pow_file="$7"
+    local normalized_transactions_file="$8" baseline_transactions_file="$9"
+    local transition_sha observed_sha normalized_sha transaction_sha fee
+    transition_sha=$(sha256sum "$transition_file" | awk '{print $1}') || return 1
+    observed_sha=$(sha256sum "$observed_recovery_file" | awk '{print $1}') || return 1
+    normalized_sha=$(sha256sum "$normalized_recovery_file" | awk '{print $1}') || return 1
+    transaction_sha=$(sha256sum "$normalized_transactions_file" | awk '{print $1}') || return 1
+    fee=$(jq -er '.claim_recovery_fee_baseline |
+        select(type == "number" and . >= 0)' "$result_file") || return 1
+    published_canary_recovery_is_valid "$observed_recovery_file" \
+        "$normalized_transactions_file" "$baseline_transactions_file" "$fee" || return 1
+    published_canary_recovery_is_valid "$normalized_recovery_file" \
+        "$normalized_transactions_file" "$baseline_transactions_file" "$fee" || return 1
+    jq -en --arg transition_sha "$transition_sha" --arg observed_sha "$observed_sha" \
+        --arg normalized_sha "$normalized_sha" --arg transaction_sha "$transaction_sha" \
+        --argjson fee "$fee" --slurpfile result "$result_file" \
+        --slurpfile baseline "$baseline_pow_file" --slurpfile restored "$restored_pow_file" \
+        --slurpfile normalized_pow "$normalized_pow_file" \
+        --slurpfile transition "$transition_file" '
+        def integer: type == "number" and floor == .;
+        def legacy_q0_hashing:
+          type == "object" and .enabled == true and .autostart == false and
+          (.threads | integer and . == 1) and
+          (.cpu_percent | type) == "number" and .cpu_percent == 1 and
+          (.hashrate | type) == "number" and .hashrate > 0 and
+          (.unresolved_claims | integer and . == 0) and
+          (.live_claims | integer and . == 0) and
+          (.quarantined_claims | integer and . == 0) and
+          .allow_automatic_quantum_key_creation == false;
+        def candidate_q0_disabled:
+          type == "object" and .enabled == false and .autostart == false and
+          .state == "disabled" and (.threads | integer and . == 1) and
+          (.cpu_percent | type) == "number" and .cpu_percent == 1 and
+          (.hashrate | type) == "number" and .hashrate == 0 and
+          (.unresolved_claims | integer and . == 0) and
+          (.live_claims | integer and . == 0) and
+          (.quarantined_claims | integer and . == 0) and
+          (.blocking_quarantined_claims | integer and . == 0) and
+          (.indeterminate_quarantined_claims | integer and . == 0) and
+          .claim_recovery_database_outcome_ambiguous == false and
+          .allow_automatic_quantum_key_creation == false;
+        ($result | length) == 1 and ($baseline | length) == 1 and
+        ($restored | length) == 1 and ($normalized_pow | length) == 1 and
+        ($transition | length) == 1 and
+        ($result[0] as $r |
+          $r.legacy_observed_pow_mode == "clean-hashing" and
+          $r.legacy_baseline_pow_mode == "clean-hashing" and
+          $r.legacy_baseline_live_claims == 0 and
+          $r.legacy_baseline_quarantined_claims == 0 and
+          $r.restored_legacy_live_claims == 0 and
+          $r.restored_legacy_quarantined_claims == 0 and
+          $r.legacy_quarantined_claim_count_preserved == true and
+          $r.legacy_quarantined_claim_resolution_attempted == false and
+          $r.legacy_quarantined_claim_fee_paid == false and
+          $r.inherited_claim_inventory_present == false and
+          $r.inherited_claim_inventory_evidence == null and
+          $r.inherited_claim_inventory_sha256 == null and
+          $r.inherited_claim_transition_evidence ==
+            "candidate-inherited-claim-transition.json" and
+          $r.inherited_claim_transition_sha256 == $transition_sha and
+          $r.claim_baseline_transition_kind ==
+            "clean_q0_to_candidate_q0_no_payment" and
+          $r.legacy_q1_candidate_q0_no_payment_reclassification_verified == false and
+          $r.clean_q0_candidate_q0_no_payment_transition_verified == true and
+          $r.claim_recovery_fee_baseline == $fee and
+          $r.claim_recovery_fee_final == $fee and
+          ($baseline[0] | legacy_q0_hashing) and
+          ($restored[0] | legacy_q0_hashing) and
+          ($normalized_pow[0] | candidate_q0_disabled) and
+          $transition[0] == {
+            schema:1,legacy_mode:"clean-hashing",
+            legacy_q1_candidate_q0_no_payment_reclassification:false,
+            clean_q0_candidate_q0_no_payment_transition:true,
+            inherited_claim_inventory_sha256:null,
+            observed_recovery_sha256:$observed_sha,
+            normalized_recovery_sha256:$normalized_sha,
+            exact_transaction_set_sha256:$transaction_sha,
+            confirmed_resolution_fees:$fee,resolver_invoked:false,payment_created:false})
+    ' >/dev/null
+}
+
+published_canary_claim_transition_is_valid()
+{
+    [[ "$#" == 10 ]] || return 1
+    local result_file="$1" baseline_pow_file="$2" restored_pow_file="$3"
+    local inventory_file="$4" transition_file="$5" observed_recovery_file="$6"
+    local normalized_recovery_file="$7" normalized_pow_file="$8"
+    local normalized_transactions_file="$9" baseline_transactions_file="${10}"
+    local claim_mode
+    claim_mode=$(jq -er '.legacy_baseline_pow_mode' "$result_file") || return 1
+    case "$claim_mode" in
+        clean-hashing)
+            [[ ! -e "$inventory_file" && ! -L "$inventory_file" ]] || return 1
+            published_canary_clean_q0_transition_is_valid "$result_file" \
+                "$baseline_pow_file" "$restored_pow_file" "$transition_file" \
+                "$observed_recovery_file" "$normalized_recovery_file" \
+                "$normalized_pow_file" "$normalized_transactions_file" \
+                "$baseline_transactions_file"
+            ;;
+        quarantined-disabled)
+            published_canary_legacy_q1_transition_is_valid "$result_file" \
+                "$baseline_pow_file" "$restored_pow_file" "$inventory_file" \
+                "$transition_file" "$observed_recovery_file" \
+                "$normalized_recovery_file" "$normalized_pow_file" \
+                "$normalized_transactions_file" "$baseline_transactions_file"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 verify_published_canary_handoff_ready()
 {
     local evidence_dir ops_dir stamp protected actual_result_sha actual_manifest_sha nonce
@@ -797,6 +951,7 @@ verify_published_canary_handoff_ready()
     local activation_one_sha activation_two_sha safe_one_sha safe_two_sha handoff_sha
     local inventory_file transition_file inherited_observed_file inherited_normalized_file
     local inherited_pow_file inherited_txids_file nonce_sha transition_sha fee sequence purpose
+    local claim_mode boundary_inventory_file
     local boundary_wallet boundary_staking boundary_pow boundary_recovery boundary_txids
     local first_wallet first_staking first_pow first_recovery first_txids first_generation
     local second_generation boundary_marker boundary_activation_sha
@@ -859,28 +1014,44 @@ verify_published_canary_handoff_ready()
         (.claim_recovery_fee_baseline | type) == "number" and
         .claim_recovery_fee_baseline >= 0 and
         .claim_recovery_fee_final == .claim_recovery_fee_baseline and
-        (.legacy_observed_pow_mode == "quarantined-disabled" or
-          .legacy_observed_pow_mode == "quarantined-stalled") and
-        .legacy_baseline_pow_mode == "quarantined-disabled" and
         (.legacy_baseline_live_claims | type) == "number" and
         (.legacy_baseline_live_claims | floor) == .legacy_baseline_live_claims and
         .legacy_baseline_live_claims == 0 and
         (.legacy_baseline_quarantined_claims | type) == "number" and
         (.legacy_baseline_quarantined_claims | floor) ==
           .legacy_baseline_quarantined_claims and
-        .legacy_baseline_quarantined_claims == 1 and
         .restored_legacy_live_claims == .legacy_baseline_live_claims and
         .restored_legacy_quarantined_claims == .legacy_baseline_quarantined_claims and
         .legacy_quarantined_claim_count_preserved == true and
         .legacy_quarantined_claim_resolution_attempted == false and
         .legacy_quarantined_claim_fee_paid == false and
-        .inherited_claim_inventory_evidence ==
-          "candidate-inherited-claim-inventory.json" and
-        (.inherited_claim_inventory_sha256 | test("^[0-9a-f]{64}$")) and
         .inherited_claim_transition_evidence ==
           "candidate-inherited-claim-transition.json" and
         (.inherited_claim_transition_sha256 | test("^[0-9a-f]{64}$")) and
-        .legacy_q1_candidate_q0_no_payment_reclassification_verified == true and
+        (if .legacy_baseline_pow_mode == "clean-hashing" then
+           .legacy_observed_pow_mode == "clean-hashing" and
+           .legacy_baseline_quarantined_claims == 0 and
+           .inherited_claim_inventory_present == false and
+           .inherited_claim_inventory_evidence == null and
+           .inherited_claim_inventory_sha256 == null and
+           .claim_baseline_transition_kind ==
+             "clean_q0_to_candidate_q0_no_payment" and
+           .legacy_q1_candidate_q0_no_payment_reclassification_verified == false and
+           .clean_q0_candidate_q0_no_payment_transition_verified == true
+         elif .legacy_baseline_pow_mode == "quarantined-disabled" then
+           (.legacy_observed_pow_mode == "quarantined-disabled" or
+             .legacy_observed_pow_mode == "quarantined-stalled") and
+           .legacy_baseline_quarantined_claims == 1 and
+           .inherited_claim_inventory_present == true and
+           .inherited_claim_inventory_evidence ==
+             "candidate-inherited-claim-inventory.json" and
+           (.inherited_claim_inventory_sha256 | type == "string" and
+             test("^[0-9a-f]{64}$")) and
+           .claim_baseline_transition_kind ==
+             "legacy_q1_to_candidate_q0_no_payment" and
+           .legacy_q1_candidate_q0_no_payment_reclassification_verified == true and
+           .clean_q0_candidate_q0_no_payment_transition_verified == false
+         else false end) and
         .candidate_pow_clean_hashing_verified == true and
         .recovery_fee_baseline_established_while_wallet_locked == true and
         .locked_candidate_transaction_set_unchanged == true and
@@ -948,13 +1119,14 @@ verify_published_canary_handoff_ready()
     nonce_file="$ops_dir/MAINTENANCE-NONCE"
     state_file="$ops_dir/STATE"
     parent_recovery_file="$ops_dir/CRASH-RECOVERY.json"
+    claim_mode=$(jq -er '.legacy_baseline_pow_mode' "$PUBLISHED_CANARY_RESULT") || return 1
     for protected in "$identity_file" "$restore_file" "$launch_file" \
         "$prelaunch_txids_file" "$locked_txids_file" "$baseline_pow_file" \
         "$restored_pow_file" "$recovery_fee_baseline_file" "$recovery_fee_final_file" \
         "$candidate_pow_first_file" "$candidate_pow_second_file" "$activation_file" \
         "$nonce_evidence_file" "$active_state_file" "$recovery_file" \
         "$guard_identities_file" "$activation_one_file" "$activation_two_file" \
-        "$safe_one_file" "$safe_two_file" "$handoff_file" "$inventory_file" \
+        "$safe_one_file" "$safe_two_file" "$handoff_file" \
         "$transition_file" "$inherited_observed_file" "$inherited_normalized_file" \
         "$inherited_pow_file" "$inherited_txids_file" "$nonce_file" "$state_file" \
         "$parent_recovery_file" "$ROLLOUT_MAINTENANCE_MARKER"; do
@@ -962,6 +1134,19 @@ verify_published_canary_handoff_ready()
            "$(realpath -e -- "$protected")" == "$protected" &&
            "$(stat -c '%u:%g:%a' "$protected")" == 0:0:600 ]] || return 1
     done
+    case "$claim_mode" in
+        clean-hashing)
+            [[ ! -e "$inventory_file" && ! -L "$inventory_file" ]] || return 1
+            boundary_inventory_file=''
+            ;;
+        quarantined-disabled)
+            [[ -f "$inventory_file" && ! -L "$inventory_file" &&
+               "$(realpath -e -- "$inventory_file")" == "$inventory_file" &&
+               "$(stat -c '%u:%g:%a' "$inventory_file")" == 0:0:600 ]] || return 1
+            boundary_inventory_file=$inventory_file
+            ;;
+        *) return 1 ;;
+    esac
     for protected in "$evidence_dir/maintenance-marker-released.json" \
         "$evidence_dir/maintenance-state-complete.txt"; do
         [[ ! -e "$protected" && ! -L "$protected" ]] || return 1
@@ -1061,7 +1246,7 @@ verify_published_canary_handoff_ready()
         "$baseline_pow_file" "$restored_pow_file" "$recovery_fee_baseline_file" \
         "$recovery_fee_final_file" "$candidate_pow_first_file" "$candidate_pow_second_file" ||
         return 1
-    published_canary_legacy_q1_transition_is_valid "$PUBLISHED_CANARY_RESULT" \
+    published_canary_claim_transition_is_valid "$PUBLISHED_CANARY_RESULT" \
         "$baseline_pow_file" "$restored_pow_file" "$inventory_file" "$transition_file" \
         "$inherited_observed_file" "$inherited_normalized_file" "$inherited_pow_file" \
         "$inherited_txids_file" "$prelaunch_txids_file" || return 1
@@ -1086,7 +1271,8 @@ verify_published_canary_handoff_ready()
         published_canary_activation_boundary_is_valid "$sequence" "$purpose" \
             "$boundary_marker" "$boundary_wallet" "$boundary_staking" "$boundary_pow" \
             "$boundary_recovery" "$boundary_txids" "$prelaunch_txids_file" \
-            "$inventory_file" "$CANDIDATE_IMAGE_REF" "$CANDIDATE_IMAGE_ID" \
+            "$boundary_inventory_file" "$claim_mode" "$CANDIDATE_IMAGE_REF" \
+            "$CANDIDATE_IMAGE_ID" \
             "$launch_sha" "$nonce_sha" "$transition_sha" "$fee" || return 1
     done
     for sequence in 1 2; do
@@ -1111,7 +1297,8 @@ verify_published_canary_handoff_ready()
         boundary_txids="$evidence_dir/candidate-safe-${sequence}-transaction-txids-2.json"
         published_canary_candidate_disabled_boundary_is_valid "$first_wallet" \
             "$first_staking" "$first_pow" "$first_recovery" "$first_txids" \
-            "$prelaunch_txids_file" "$inventory_file" "$fee" || return 1
+            "$prelaunch_txids_file" "$boundary_inventory_file" "$claim_mode" "$fee" ||
+            return 1
         first_generation=$(jq -er '.wallet_generation |
             select(type == "number" and floor == . and . >= 0)' "$first_recovery") || return 1
         second_generation=$(jq -er '.wallet_generation |
@@ -1122,8 +1309,8 @@ verify_published_canary_handoff_ready()
         published_canary_safe_boundary_is_valid "$sequence" "$purpose" "$boundary_marker" \
             "$boundary_activation_sha" "$boundary_wallet" "$boundary_staking" \
             "$boundary_pow" "$boundary_recovery" "$boundary_txids" \
-            "$prelaunch_txids_file" "$inventory_file" "$CANDIDATE_IMAGE_REF" \
-            "$CANDIDATE_IMAGE_ID" "$fee" || return 1
+            "$prelaunch_txids_file" "$boundary_inventory_file" "$claim_mode" \
+            "$CANDIDATE_IMAGE_REF" "$CANDIDATE_IMAGE_ID" "$fee" || return 1
     done
 
     [[ "$(wc -l < "$identity_file" | awk '{print $1}')" == 4 &&

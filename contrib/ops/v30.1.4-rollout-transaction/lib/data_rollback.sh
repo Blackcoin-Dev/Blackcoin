@@ -413,12 +413,13 @@ data_rollback_authority_path()
 
 data_rollback_canonical_single_object_json()
 {
-    local path="$1"
+    local path="$1" canonical
     data_rollback_protected_file "$path" 600 || return 1
-    cmp -s "$path" <(jq -S -e -s '
+    canonical=$(jq -S -e -s '
         if length == 1 and (.[0] | type == "object") then .[0]
         else error("exactly one object required") end
-    ' "$path")
+    ' "$path") || return 1
+    printf '%s\n' "$canonical" | cmp -s "$path" -
 }
 
 data_rollback_validate_stopped_generation()

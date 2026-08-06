@@ -129,6 +129,7 @@ function_body verify_legacy_rollback_readiness_all_nodes \
     verify_policy_legacy_runtime_gate()
     {
         local node="$1" file count
+        [[ "$#" -eq 1 ]]
         file="$COUNTS/$node"
         count=$(cat "$file" 2>/dev/null || printf '0\n')
         count=$((count + 1))
@@ -145,6 +146,7 @@ function_body verify_legacy_rollback_readiness_all_nodes \
     verify_policy_legacy_runtime_gate()
     {
         local node="$1" file count
+        [[ "$#" -eq 1 ]]
         file="$COUNTS/$node"
         count=$(cat "$file" 2>/dev/null || printf '0\n')
         count=$((count + 1))
@@ -156,6 +158,20 @@ function_body verify_legacy_rollback_readiness_all_nodes \
     [[ "$(cat "$COUNTS/4")" == 6 ]]
 )
 pass bounded-retry-only-failed-legacy-readiness-gate
+
+function_body legacy_restore_counts "$ROOT/fleet_rollout.sh" \
+    > "$TMP/legacy-restore-counts-function"
+function_body verify_policy_runtime_node "$ROOT/fleet_rollout.sh" \
+    > "$TMP/policy-runtime-node-function"
+grep -Fq 'mining=$(wallet_rpc_for "$node" getpowmininginfo | jq -ceS .)' \
+    "$TMP/legacy-restore-counts-function"
+grep -Fq 'mode=$(_legacy_pow_snapshot_mode_json "$node" "$mining")' \
+    "$TMP/legacy-restore-counts-function"
+grep -Fq 'verify_policy_legacy_runtime_gate "$node"' \
+    "$TMP/policy-runtime-node-function"
+! grep -Fq 'baseline="$RUN_DIR/baseline/legacy-node-' \
+    "$TMP/policy-runtime-node-function"
+pass untouched-legacy-nodes-use-live-allowed-mode-not-stale-snapshot
 
 {
     printf '%s\n' 'services:'

@@ -2241,7 +2241,7 @@ verify_all_baseline_runtime_once()
 
 legacy_restore_counts()
 {
-    local node baseline mode lookup_rc active=0 quarantined=0
+    local node baseline mode mining lookup_rc active=0 quarantined=0
     for node in $(seq 1 "$NODE_COUNT"); do
         [[ "$node" -ne "$FREE_CLAIM_NODE" ]] || continue
         if baseline=$(legacy_plan_file_for_node "$node" 2>/dev/null); then
@@ -2249,9 +2249,13 @@ legacy_restore_counts()
         else
             lookup_rc=$?
             [[ "$lookup_rc" -eq 2 ]] || return 1
-            baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+            mining=$(wallet_rpc_for "$node" getpowmininginfo | jq -ceS .) || return 1
+            mode=$(_legacy_pow_snapshot_mode_json "$node" "$mining") || return 1
+            baseline=
         fi
-        mode=$(legacy_pow_baseline_mode "$node" "$baseline") || return 1
+        if [[ -n "$baseline" ]]; then
+            mode=$(legacy_pow_baseline_mode "$node" "$baseline") || return 1
+        fi
         case "$mode" in
             clean-hashing) active=$((active + 1)) ;;
             quarantined-disabled) quarantined=$((quarantined + 1)) ;;
@@ -5954,7 +5958,7 @@ capture_transaction_baseline()
 
 verify_legacy_rollback_readiness_all_nodes()
 {
-    local node pid baseline attempt index batch_start batch_end
+    local node pid attempt index batch_start batch_end
     local -a readiness_pending=() readiness_next=() pids=() nodes=()
     for node in $(seq 1 "$NODE_COUNT"); do readiness_pending+=("$node"); done
     for attempt in $(seq 1 6); do
@@ -5967,8 +5971,7 @@ verify_legacy_rollback_readiness_all_nodes()
             nodes=()
             for ((index=batch_start; index<batch_end; index++)); do
                 node=${readiness_pending[$index]}
-                baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
-                verify_policy_legacy_runtime_gate "$node" "$baseline" &
+                verify_policy_legacy_runtime_gate "$node" &
                 pids+=("$!")
                 nodes+=("$node")
             done
@@ -6993,9 +6996,13 @@ verify_policy_runtime_node()
     else
         lookup_rc=$?
         [[ "$lookup_rc" -eq 2 ]] || return 1
-        baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+        baseline=
     fi
-    verify_policy_legacy_runtime_gate "$node" "$baseline"
+    if [[ -n "$baseline" ]]; then
+        verify_policy_legacy_runtime_gate "$node" "$baseline"
+    else
+        verify_policy_legacy_runtime_gate "$node"
+    fi
 }
 
 verify_safe_rollback_marker()

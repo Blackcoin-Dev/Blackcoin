@@ -1,4 +1,4 @@
-validated_at=2026-08-06T08:59:13Z
+validated_at=2026-08-06T09:28:47Z
 scope=local-static-targeted-fixture-only
 live_unraid_mutation=false
 docker_invoked=false
@@ -8,6 +8,7 @@ PASS bash-syntax
 PASS shellcheck-actionable
 PASS wave-plan-and-mappings
 PASS rollback-operations-root-absent-and-existing-domain-gates
+PASS bounded-retry-only-failed-legacy-readiness-gate
 PASS compose-renderer-positive-and-negative
 PASS policy-renderer-positive-and-negative
 PASS guard-renderer

@@ -111,6 +111,52 @@ function_body verify_all_data_domains "$ROOT/lib/data_rollback.sh" \
 )
 pass rollback-operations-root-absent-and-existing-domain-gates
 
+function_body verify_legacy_rollback_readiness_all_nodes \
+    "$ROOT/fleet_rollout.sh" > "$TMP/legacy-readiness-function"
+(
+    # shellcheck disable=SC1090
+    source "$TMP/legacy-readiness-function"
+    NODE_COUNT=6
+    RUN_DIR="$TMP/legacy-readiness-run"
+    ENABLE_GUARD_STARTS="$TMP/enable-guard-starts"
+    COUNTS="$TMP/legacy-readiness-counts"
+    mkdir -p "$RUN_DIR/baseline" "$COUNTS"
+    node_padded() { printf '%02d\n' "$1"; }
+    log() { :; }
+    sleep() { :; }
+    assert_unique_vpn_proofs() { return 0; }
+    assert_empty_control_marker() { return 0; }
+    verify_policy_legacy_runtime_gate()
+    {
+        local node="$1" file count
+        file="$COUNTS/$node"
+        count=$(cat "$file" 2>/dev/null || printf '0\n')
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$file"
+        [[ "$node" -ne 3 || "$count" -ge 3 ]]
+    }
+
+    verify_legacy_rollback_readiness_all_nodes
+    for node in 1 2 4 5 6; do [[ "$(cat "$COUNTS/$node")" == 1 ]]; done
+    [[ "$(cat "$COUNTS/3")" == 3 ]]
+
+    rm -rf -- "$COUNTS"
+    mkdir "$COUNTS"
+    verify_policy_legacy_runtime_gate()
+    {
+        local node="$1" file count
+        file="$COUNTS/$node"
+        count=$(cat "$file" 2>/dev/null || printf '0\n')
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$file"
+        [[ "$node" -ne 4 ]]
+    }
+    ! verify_legacy_rollback_readiness_all_nodes
+    for node in 1 2 3 5 6; do [[ "$(cat "$COUNTS/$node")" == 1 ]]; done
+    [[ "$(cat "$COUNTS/4")" == 6 ]]
+)
+pass bounded-retry-only-failed-legacy-readiness-gate
+
 {
     printf '%s\n' 'services:'
     for node in $(seq 1 32); do

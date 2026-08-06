@@ -5954,24 +5954,47 @@ capture_transaction_baseline()
 
 verify_legacy_rollback_readiness_all_nodes()
 {
-    local node pid failed=0 baseline
-    local -a pids=() nodes=()
-    for node in $(seq 1 "$NODE_COUNT"); do
-        baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
-        verify_policy_legacy_runtime_gate "$node" "$baseline" &
-        pids+=("$!")
-        nodes+=("$node")
-    done
-    for index in "${!pids[@]}"; do
-        pid=${pids[$index]}
-        if ! wait "$pid"; then
-            log "legacy rollback-readiness gate failed node=${nodes[$index]}"
-            failed=1
+    local node pid baseline attempt index batch_start batch_end
+    local -a readiness_pending=() readiness_next=() pids=() nodes=()
+    for node in $(seq 1 "$NODE_COUNT"); do readiness_pending+=("$node"); done
+    for attempt in $(seq 1 6); do
+        readiness_next=()
+        batch_start=0
+        while ((batch_start < ${#readiness_pending[@]})); do
+            batch_end=$((batch_start + 4))
+            ((batch_end <= ${#readiness_pending[@]})) || batch_end=${#readiness_pending[@]}
+            pids=()
+            nodes=()
+            for ((index=batch_start; index<batch_end; index++)); do
+                node=${readiness_pending[$index]}
+                baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+                verify_policy_legacy_runtime_gate "$node" "$baseline" &
+                pids+=("$!")
+                nodes+=("$node")
+            done
+            for index in "${!pids[@]}"; do
+                pid=${pids[$index]}
+                if ! wait "$pid"; then
+                    readiness_next+=("${nodes[$index]}")
+                fi
+            done
+            batch_start=$batch_end
+        done
+        if ((${#readiness_next[@]} == 0)); then
+            assert_unique_vpn_proofs || return 1
+            assert_empty_control_marker "$ENABLE_GUARD_STARTS"
+            return
+        fi
+        readiness_pending=("${readiness_next[@]}")
+        if ((attempt < 6)); then
+            log "retrying transient legacy rollback-readiness nodes: ${readiness_pending[*]}"
+            sleep 2
         fi
     done
-    ((failed == 0)) || return 1
-    assert_unique_vpn_proofs || return 1
-    assert_empty_control_marker "$ENABLE_GUARD_STARTS"
+    for node in "${readiness_pending[@]}"; do
+        log "legacy rollback-readiness gate failed node=$node"
+    done
+    return 1
 }
 
 write_transaction_manifest()

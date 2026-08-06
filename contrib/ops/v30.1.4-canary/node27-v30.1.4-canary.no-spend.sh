@@ -977,9 +977,119 @@ inherited_claim_inventory_is_resolved()
     rm -f -- "$current"
 }
 
-normalize_inherited_candidate_claim()
+candidate_claim_recovery_is_clean()
 {
-    local attempt initial recovery pow wallet staking txids transition_tmp
+    local recovery_file="$1"
+    jq -e --argjson fee "$BASELINE_RECOVERY_FEE" '
+        type == "object" and .policy_authoritative == true and
+        .policy.automatic_authorized == false and
+        .database_outcome_ambiguous == false and .chain_ready == true and
+        .wallet_tip_matches == true and .blocking_quarantined_claims == 0 and
+        .blocking_components == 0 and .indeterminate_quarantined_claims == 0 and
+        .pending_manual_resolutions == 0 and .pending_automatic_resolutions == 0 and
+        (.confirmed_resolution_fees | type == "number" and . == $fee) and
+        (.wallet_generation | type == "number" and floor == . and . >= 0)
+    ' "$recovery_file" >/dev/null
+}
+
+candidate_claim_transition_is_valid()
+{
+    [[ "$#" == 5 ]] || return 1
+    local transition_file="$1" observed_file="$2" normalized_file="$3"
+    local transaction_file="$4" inventory_file="$5"
+    local observed_sha normalized_sha transaction_sha inventory_sha=''
+    observed_sha=$(sha256sum "$observed_file" | awk '{print $1}') || return 1
+    normalized_sha=$(sha256sum "$normalized_file" | awk '{print $1}') || return 1
+    transaction_sha=$(sha256sum "$transaction_file" | awk '{print $1}') || return 1
+    candidate_claim_recovery_is_clean "$observed_file" || return 1
+    candidate_claim_recovery_is_clean "$normalized_file" || return 1
+    jq -e 'type == "array" and
+        all(.[]; type == "string" and test("^[0-9a-f]{64}$")) and
+        . == (unique | sort)' "$transaction_file" >/dev/null || return 1
+    case "$LEGACY_BASELINE_POW_MODE" in
+        clean-hashing)
+            [[ -z "$inventory_file" ]] || return 1
+            jq -e --arg observed_sha "$observed_sha" \
+                --arg normalized_sha "$normalized_sha" \
+                --arg transaction_sha "$transaction_sha" \
+                --argjson fee "$BASELINE_RECOVERY_FEE" '
+                . == {schema:1,legacy_mode:"clean-hashing",
+                  legacy_q1_candidate_q0_no_payment_reclassification:false,
+                  clean_q0_candidate_q0_no_payment_transition:true,
+                  inherited_claim_inventory_sha256:null,
+                  observed_recovery_sha256:$observed_sha,
+                  normalized_recovery_sha256:$normalized_sha,
+                  exact_transaction_set_sha256:$transaction_sha,
+                  confirmed_resolution_fees:$fee,resolver_invoked:false,
+                  payment_created:false}
+            ' "$transition_file" >/dev/null
+            ;;
+        quarantined-disabled)
+            [[ -n "$inventory_file" && -f "$inventory_file" && ! -L "$inventory_file" ]] ||
+                return 1
+            inventory_sha=$(sha256sum "$inventory_file" | awk '{print $1}') || return 1
+            jq -e --arg inventory_sha "$inventory_sha" --arg observed_sha "$observed_sha" \
+                --arg normalized_sha "$normalized_sha" \
+                --arg transaction_sha "$transaction_sha" \
+                --argjson fee "$BASELINE_RECOVERY_FEE" '
+                . == {schema:1,legacy_mode:"quarantined-disabled",
+                  legacy_q1_candidate_q0_no_payment_reclassification:true,
+                  inherited_claim_inventory_sha256:$inventory_sha,
+                  observed_recovery_sha256:$observed_sha,
+                  normalized_recovery_sha256:$normalized_sha,
+                  exact_transaction_set_sha256:$transaction_sha,
+                  confirmed_resolution_fees:$fee,resolver_invoked:false,
+                  payment_created:false}
+            ' "$transition_file" >/dev/null
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+candidate_claim_result_mode_is_valid()
+{
+    local result_file="$1"
+    jq -e '
+        .legacy_baseline_live_claims == 0 and
+        .restored_legacy_live_claims == .legacy_baseline_live_claims and
+        .restored_legacy_quarantined_claims == .legacy_baseline_quarantined_claims and
+        .legacy_quarantined_claim_count_preserved == true and
+        .legacy_quarantined_claim_resolution_attempted == false and
+        .legacy_quarantined_claim_fee_paid == false and
+        .inherited_claim_transition_evidence ==
+          "candidate-inherited-claim-transition.json" and
+        (.inherited_claim_transition_sha256 | type == "string" and
+          test("^[0-9a-f]{64}$")) and
+        (if .legacy_baseline_pow_mode == "clean-hashing" then
+           .legacy_observed_pow_mode == "clean-hashing" and
+           .legacy_baseline_quarantined_claims == 0 and
+           .inherited_claim_inventory_present == false and
+           .inherited_claim_inventory_evidence == null and
+           .inherited_claim_inventory_sha256 == null and
+           .claim_baseline_transition_kind ==
+             "clean_q0_to_candidate_q0_no_payment" and
+           .legacy_q1_candidate_q0_no_payment_reclassification_verified == false and
+           .clean_q0_candidate_q0_no_payment_transition_verified == true
+         elif .legacy_baseline_pow_mode == "quarantined-disabled" then
+           (.legacy_observed_pow_mode == "quarantined-disabled" or
+             .legacy_observed_pow_mode == "quarantined-stalled") and
+           .legacy_baseline_quarantined_claims == 1 and
+           .inherited_claim_inventory_present == true and
+           .inherited_claim_inventory_evidence ==
+             "candidate-inherited-claim-inventory.json" and
+           (.inherited_claim_inventory_sha256 | type == "string" and
+             test("^[0-9a-f]{64}$")) and
+           .claim_baseline_transition_kind ==
+             "legacy_q1_to_candidate_q0_no_payment" and
+           .legacy_q1_candidate_q0_no_payment_reclassification_verified == true and
+           .clean_q0_candidate_q0_no_payment_transition_verified == false
+         else false end)
+    ' "$result_file" >/dev/null
+}
+
+normalize_candidate_claim_state()
+{
+    local attempt initial recovery pow wallet staking txids transition_tmp inventory_file=''
     initial="${EVIDENCE}/candidate-inherited-recovery-observed.json"
     rpc setpowmining false 1 1 false >"${EVIDENCE}/candidate-inherited-pow-stop.json" ||
         return 1
@@ -1020,9 +1130,13 @@ normalize_inherited_candidate_claim()
             if [[ "$LEGACY_BASELINE_POW_MODE" == quarantined-disabled ]]; then
                 extract_inherited_claim_inventory "$initial" "$txids" \
                     "${EVIDENCE}/candidate-inherited-claim-inventory.json" || return 1
+                inventory_file="${EVIDENCE}/candidate-inherited-claim-inventory.json"
                 INHERITED_CLAIM_INVENTORY_SHA=$(sha256sum \
                     "${EVIDENCE}/candidate-inherited-claim-inventory.json" | awk '{print $1}') ||
                     return 1
+            else
+                [[ ! -e "${EVIDENCE}/candidate-inherited-claim-inventory.json" &&
+                   ! -L "${EVIDENCE}/candidate-inherited-claim-inventory.json" ]] || return 1
             fi
         fi
         [[ "$(jq -er '.confirmed_resolution_fees' "$recovery")" == "$BASELINE_RECOVERY_FEE" ]] ||
@@ -1050,26 +1164,46 @@ normalize_inherited_candidate_claim()
             [[ "$LOCKED_CANDIDATE_TRANSACTION_SET_SHA" == "$PRELAUNCH_TRANSACTION_SET_SHA" ]] ||
                 return 1
             transition_tmp=$(mktemp "${OPS}/.candidate-inherited-transition.XXXXXX") || return 1
-            jq -n --arg mode "$LEGACY_BASELINE_POW_MODE" \
-                --arg inventory_sha "$INHERITED_CLAIM_INVENTORY_SHA" \
-                --arg observed_sha "$(sha256sum "$initial" | awk '{print $1}')" \
-                --arg normalized_sha "$(sha256sum "${EVIDENCE}/candidate-inherited-recovery-normalized.json" | awk '{print $1}')" \
-                --arg txids_sha "$LOCKED_CANDIDATE_TRANSACTION_SET_SHA" \
-                --argjson fee "$BASELINE_RECOVERY_FEE" \
-                '{schema:1,legacy_mode:$mode,
-                  legacy_q1_candidate_q0_no_payment_reclassification:true,
-                  inherited_claim_inventory_sha256:$inventory_sha,
-                  observed_recovery_sha256:$observed_sha,
-                  normalized_recovery_sha256:$normalized_sha,
-                  exact_transaction_set_sha256:$txids_sha,
-                  confirmed_resolution_fees:$fee,resolver_invoked:false,
-                  payment_created:false}' >"$transition_tmp" || return 1
+            if [[ "$LEGACY_BASELINE_POW_MODE" == quarantined-disabled ]]; then
+                jq -n --arg inventory_sha "$INHERITED_CLAIM_INVENTORY_SHA" \
+                    --arg observed_sha "$(sha256sum "$initial" | awk '{print $1}')" \
+                    --arg normalized_sha "$(sha256sum "${EVIDENCE}/candidate-inherited-recovery-normalized.json" | awk '{print $1}')" \
+                    --arg txids_sha "$LOCKED_CANDIDATE_TRANSACTION_SET_SHA" \
+                    --argjson fee "$BASELINE_RECOVERY_FEE" \
+                    '{schema:1,legacy_mode:"quarantined-disabled",
+                      legacy_q1_candidate_q0_no_payment_reclassification:true,
+                      inherited_claim_inventory_sha256:$inventory_sha,
+                      observed_recovery_sha256:$observed_sha,
+                      normalized_recovery_sha256:$normalized_sha,
+                      exact_transaction_set_sha256:$txids_sha,
+                      confirmed_resolution_fees:$fee,resolver_invoked:false,
+                      payment_created:false}' >"$transition_tmp" || return 1
+            else
+                jq -n --arg observed_sha "$(sha256sum "$initial" | awk '{print $1}')" \
+                    --arg normalized_sha "$(sha256sum "${EVIDENCE}/candidate-inherited-recovery-normalized.json" | awk '{print $1}')" \
+                    --arg txids_sha "$LOCKED_CANDIDATE_TRANSACTION_SET_SHA" \
+                    --argjson fee "$BASELINE_RECOVERY_FEE" \
+                    '{schema:1,legacy_mode:"clean-hashing",
+                      legacy_q1_candidate_q0_no_payment_reclassification:false,
+                      clean_q0_candidate_q0_no_payment_transition:true,
+                      inherited_claim_inventory_sha256:null,
+                      observed_recovery_sha256:$observed_sha,
+                      normalized_recovery_sha256:$normalized_sha,
+                      exact_transaction_set_sha256:$txids_sha,
+                      confirmed_resolution_fees:$fee,resolver_invoked:false,
+                      payment_created:false}' >"$transition_tmp" || return 1
+            fi
             chmod 600 "$transition_tmp" && chown root:root "$transition_tmp" &&
                 sync -f "$transition_tmp" || return 1
             mv -fT -- "$transition_tmp" "${EVIDENCE}/candidate-inherited-claim-transition.json" ||
                 return 1
             sync -f "${EVIDENCE}/candidate-inherited-claim-transition.json" || return 1
             sync -f "$EVIDENCE" || return 1
+            candidate_claim_transition_is_valid \
+                "${EVIDENCE}/candidate-inherited-claim-transition.json" "$initial" \
+                "${EVIDENCE}/candidate-inherited-recovery-normalized.json" \
+                "${EVIDENCE}/candidate-inherited-transaction-txids-normalized.json" \
+                "$inventory_file" || return 1
             INHERITED_CLAIM_TRANSITION_SHA=$(sha256sum \
                 "${EVIDENCE}/candidate-inherited-claim-transition.json" | awk '{print $1}') ||
                 return 1
@@ -1078,7 +1212,7 @@ normalize_inherited_candidate_claim()
         fi
         sleep 5
     done
-    echo 'legacy q1 did not reclassify to an exact candidate q0 state without payment within 20 minutes' >&2
+    echo 'baseline PoW claim state did not normalize to exact candidate q0 without payment within 20 minutes' >&2
     return 1
 }
 
@@ -2233,10 +2367,10 @@ docker inspect "$CONTAINER" | jq -S '.[0] | {path:.Path,args:.Args,
 cmp -s "${EVIDENCE}/baseline-invocation.json" "${EVIDENCE}/candidate-invocation.json" ||
     fail 'candidate effective entrypoint or command differs from the fleet invocation'
 
-# Establish the immutable no-spend counter and, for the exact inherited q1
-# exception, verify Core's full historical inventory is authoritatively
-# reclassified to q0 without a payment. The wallet
-# remains locked and staking/PoW remain disabled throughout this transition.
+# Establish the immutable no-spend counter.  A clean q0 baseline must remain
+# q0; for the exact inherited q1 exception, Core's full historical inventory
+# must be authoritatively reclassified to q0 without a payment.  The wallet
+# remains locked and staking/PoW remain disabled throughout either transition.
 rpc getwalletinfo >"${EVIDENCE}/candidate-preactivation-wallet-initial.json"
 rpc getstakinginfo >"${EVIDENCE}/candidate-preactivation-staking-initial.json"
 rpc getpowmininginfo >"${EVIDENCE}/candidate-preactivation-pow-initial.json"
@@ -2260,8 +2394,8 @@ automatic_wallet_features_are_off \
 candidate_staking_is_strictly_stopped \
     "${EVIDENCE}/candidate-preactivation-staking-initial.json" ||
     fail 'candidate staking was not disabled before inherited-claim normalization'
-normalize_inherited_candidate_claim ||
-    fail 'candidate did not reclassify the inherited legacy q1 state to exact q0 without payment'
+normalize_candidate_claim_state ||
+    fail 'candidate did not preserve or reclassify the baseline claim state to exact q0 without payment'
 rpc getwalletinfo >"${EVIDENCE}/candidate-recovery-baseline-wallet-locked.json"
 rpc getstakinginfo >"${EVIDENCE}/candidate-recovery-baseline-staking-defaults.json"
 rpc getpowmininginfo >"${EVIDENCE}/candidate-recovery-baseline-pow-defaults.json"
@@ -2601,11 +2735,24 @@ jq -n \
       legacy_quarantined_claim_count_preserved:true,
       legacy_quarantined_claim_resolution_attempted:false,
       legacy_quarantined_claim_fee_paid:false,
-      inherited_claim_inventory_evidence:"candidate-inherited-claim-inventory.json",
-      inherited_claim_inventory_sha256:$inherited_claim_inventory_sha,
+      inherited_claim_inventory_present:
+        ($legacy_baseline_pow_mode == "quarantined-disabled"),
+      inherited_claim_inventory_evidence:
+        (if $legacy_baseline_pow_mode == "quarantined-disabled" then
+           "candidate-inherited-claim-inventory.json" else null end),
+      inherited_claim_inventory_sha256:
+        (if $legacy_baseline_pow_mode == "quarantined-disabled" then
+           $inherited_claim_inventory_sha else null end),
       inherited_claim_transition_evidence:"candidate-inherited-claim-transition.json",
       inherited_claim_transition_sha256:$inherited_claim_transition_sha,
-      legacy_q1_candidate_q0_no_payment_reclassification_verified:true,
+      claim_baseline_transition_kind:
+        (if $legacy_baseline_pow_mode == "quarantined-disabled" then
+           "legacy_q1_to_candidate_q0_no_payment"
+         else "clean_q0_to_candidate_q0_no_payment" end),
+      legacy_q1_candidate_q0_no_payment_reclassification_verified:
+        ($legacy_baseline_pow_mode == "quarantined-disabled"),
+      clean_q0_candidate_q0_no_payment_transition_verified:
+        ($legacy_baseline_pow_mode == "clean-hashing"),
       candidate_pow_clean_hashing_verified:true,
       recovery_fee_baseline_established_while_wallet_locked:true,
       locked_candidate_transaction_set_unchanged:true,
@@ -2650,6 +2797,14 @@ jq -n \
       crash_safe_supervisor_inhibition_verified:true,
       rollback_verified:true}' \
     >"${EVIDENCE}/RESULT.json"
+
+candidate_claim_result_mode_is_valid "${EVIDENCE}/RESULT.json" ||
+    fail 'final canary result does not authenticate its baseline claim-state mode'
+if [[ "$LEGACY_BASELINE_POW_MODE" == clean-hashing ]]; then
+    [[ ! -e "${EVIDENCE}/candidate-inherited-claim-inventory.json" &&
+       ! -L "${EVIDENCE}/candidate-inherited-claim-inventory.json" ]] ||
+        fail 'clean q0 canary fabricated inherited legacy claim-inventory evidence'
+fi
 
 validate_canary_maintenance_marker ||
     fail 'active maintenance marker changed before final evidence sealing'

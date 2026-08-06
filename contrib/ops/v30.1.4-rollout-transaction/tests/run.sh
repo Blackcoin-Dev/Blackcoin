@@ -917,6 +917,257 @@ grep -Fq 'verify_policy_compatible_runtime_gate "$NODE" "$RECOVERY_FEE_BASELINE"
     "$ROOT/repair_vpn_pair.sh"
 pass fee-baseline-no-automatic-recovery-and-full-runtime-gates
 
+! grep -Fq -- '--force-recreate' "$ROOT/fleet_rollout.sh"
+function_body ensure_candidate_stopped_container "$ROOT/fleet_rollout.sh" \
+    > "$TMP/candidate-replacement"
+assert_order "$TMP/candidate-replacement" \
+    'verify_sealed_wave_evidence_files' \
+    'verify_local_image_reference_identity "$CANDIDATE_IMAGE_REF" "$CANDIDATE_IMAGE_ID"' \
+    'docker rm "$source_id"' \
+    '[[ "$state" == absent-after-authorized-replacement ]]'
+grep -Fq 'create --no-deps' "$TMP/candidate-replacement"
+grep -Fq -- '--no-recreate --pull never "$service"' "$TMP/candidate-replacement"
+
+function_body start_wave_candidate "$ROOT/fleet_rollout.sh" > "$TMP/start-candidate"
+assert_order "$TMP/start-candidate" \
+    'verify_candidate_stopped_container_contract "$node" "$candidate_generation"' \
+    'publish_candidate_launch_attempt_marker "$node"' \
+    'verify_sealed_wave_evidence_files' \
+    'data_rollback_require_mutation_fences' \
+    'docker start "$candidate_id"' \
+    'verify_candidate_running_container "$node" "$candidate_id"'
+function_body verify_candidate_running_container "$ROOT/fleet_rollout.sh" \
+    > "$TMP/candidate-running"
+for required in '.[0].Id == $id' '.[0].Name == $name' \
+    '.[0].Config.Image == $image' '.[0].Image == $image_id' \
+    '.[0].State.Running == true' \
+    'verify_candidate_present_exclusive "$node" "$generation" "$source_generation" true'; do
+    grep -Fq -- "$required" "$TMP/candidate-running"
+done
+
+function_body ensure_rollback_old_image_node "$ROOT/fleet_rollout.sh" \
+    > "$TMP/old-image-replacement"
+[[ "$(grep -Fc 'docker rm "$removal_id"' "$TMP/old-image-replacement")" -eq 2 ]]
+grep -Fq -- '--no-recreate --pull never "$service"' "$TMP/old-image-replacement"
+grep -Fq 'docker start "$selected_id"' "$TMP/old-image-replacement"
+function_body classify_rollback_old_image_node "$ROOT/fleet_rollout.sh" \
+    > "$TMP/old-image-classifier"
+for state in wrong-stopped-after-authorized-recreate old-stopped old-running; do
+    grep -Fq "$state" "$TMP/old-image-classifier"
+done
+function_body verify_candidate_replacement_restart_policy "$ROOT/fleet_rollout.sh" \
+    > "$TMP/candidate-restart-policy"
+grep -Fq 'assert_marker_state "$rollback_state" rollback-started' \
+    "$TMP/candidate-restart-policy"
+grep -Fq '.[0].HostConfig.RestartPolicy.Name == "no"' \
+    "$TMP/candidate-restart-policy"
+[[ "$(grep -Fc '.[0].HostConfig.RestartPolicy.Name == "on-failure"' \
+    "$TMP/candidate-restart-policy")" -eq 2 ]]
+for function_name in absent_target_state_safe rollback_absent_target_state_safe; do
+    function_body "$function_name" "$ROOT/fleet_rollout.sh" > "$TMP/$function_name"
+    [[ "$(grep -Fc '! docker container inspect' "$TMP/$function_name")" -eq 6 ]]
+    for required in 'docker ps -aq --no-trunc' '.Mounts[]?' '/proc/[0-9]*' \
+        'process/ns/net' 'process/cmdline' 'process/cwd' 'process"/fd/*' 'process/cgroup' \
+        'verify_rollback_vpn_generation'; do
+        grep -Fq -- "$required" "$TMP/$function_name"
+    done
+done
+pass exact-id-no-force-container-replacement-and-absence-proof
+
+function_body write_wave_candidate_source_inventory "$ROOT/fleet_rollout.sh" \
+    > "$TMP/source-inventory-write"
+for required in 'container_generation_for "$node"' 'docker inspect "$(container_for "$node")"' \
+    '.[0].State.Running == true' 'atomic_write_json "$path"' \
+    'verify_wave_candidate_source_inventory'; do
+    grep -Fq -- "$required" "$TMP/source-inventory-write"
+done
+function_body verify_wave_candidate_source_inventory "$ROOT/fleet_rollout.sh" \
+    > "$TMP/source-inventory-verify"
+grep -Fq 'local wave_dir="${1:-$CURRENT_WAVE_DIR}"' "$TMP/source-inventory-verify"
+grep -Fq 'local CURRENT_WAVE_DIR="$wave_dir"' "$TMP/source-inventory-verify"
+function_body write_wave_evidence_manifest "$ROOT/fleet_rollout.sh" > "$TMP/wave-manifest-new"
+assert_order "$TMP/wave-manifest-new" 'candidate-launch-sources.json' \
+    'write_wave_candidate_source_inventory' 'sha256sum "${files[@]}"'
+function_body verify_wave_evidence_manifest "$ROOT/fleet_rollout.sh" \
+    > "$TMP/wave-manifest-verify"
+grep -Fq 'verify_wave_candidate_source_inventory "$wave_dir"' "$TMP/wave-manifest-verify"
+
+function_body verify_prelaunch_candidate_authorization_prefix "$ROOT/fleet_rollout.sh" \
+    > "$TMP/partial-launch-authority"
+for required in 'actual_count=$(find' '((actual_count == 0)) || require_stopped=true' \
+    'verify_prelaunch_source_node "$node" "$require_stopped"' \
+    '$(expected_prelaunch_generation "$node")' '[[ "$actual_count" -eq "$count" ]]'; do
+    grep -Fq -- "$required" "$TMP/partial-launch-authority"
+done
+function_body recover_wave_drain_evidence_prefix "$ROOT/fleet_rollout.sh" \
+    > "$TMP/drain-prefix"
+assert_order "$TMP/drain-prefix" \
+    'data_rollback_protected_file "$commit_state" 600' \
+    'assert_marker_state "$commit_state" rollback-boundary-established' \
+    '[[ "$(live_wave_triplet_state)" == before ]]' \
+    '[[ ! -e "$CURRENT_WAVE_DIR/CANDIDATE_LAUNCH_AUTHORIZED"' \
+    'verify_prelaunch_source_node "$node" false' \
+    'stop_wave_cleanly'
+function_body write_wave_drain_evidence "$ROOT/fleet_rollout.sh" > "$TMP/drain-write"
+assert_order "$TMP/drain-write" 'if [[ -e "$plan" || -L "$plan" ]]' \
+    'publish_wave_drain_evidence_manifest'
+
+function_body live_wave_triplet_state "$ROOT/fleet_rollout.sh" > "$TMP/triplet-state"
+for state in 'printf '\''%s\n'\'' before' 'printf '\''%s\n'\'' candidate' \
+    'printf '\''%s\n'\'' mixed'; do
+    grep -Fq "$state" "$TMP/triplet-state"
+done
+function_body recover_no_launch_triplet_for_rollback "$ROOT/fleet_rollout.sh" \
+    > "$TMP/triplet-recovery"
+for required in 'rollback-boundary-established)' '[[ "$live_state" == before ]]' \
+    'commit-started|committed)' 'data_rollback_require_mutation_fences' \
+    'install_triplet "$CURRENT_WAVE_DIR/docker-compose.before.yml"'; do
+    grep -Fq -- "$required" "$TMP/triplet-recovery"
+done
+function_body publish_rollback_old_image_authority "$ROOT/fleet_rollout.sh" \
+    > "$TMP/old-image-authority"
+for required in 'live_triplet_state=candidate' 'live_triplet_state=before' \
+    'live_triplet_state_at_authorization:$live_triplet_state' \
+    'before_triplet:{compose_sha256:$before_compose_sha' \
+    'candidate_triplet:{compose_sha256:$candidate_compose_sha'; do
+    grep -Fq -- "$required" "$TMP/old-image-authority"
+done
+pass sealed-source-drain-triplet-and-rollback-authority-recovery
+
+function_body establish_candidate_recovery_baseline "$ROOT/fleet_rollout.sh" \
+    > "$TMP/baseline-establish"
+assert_order "$TMP/baseline-establish" \
+    'sync -f "$txids_tmp"' \
+    'mv -fT -- "$txids_tmp" "$txids_after"' \
+    'sync -f "$CURRENT_WAVE_DIR"' \
+    'mv -fT -- "$temporary" "$path"' \
+    'sync -f "${path%/*}"' \
+    'mv -fT -- "$metadata_tmp" "$metadata"' \
+    'sync -f "${path%/*}"'
+! grep -Fq 'rm -f -- "$path"' "$TMP/baseline-establish"
+function_body recover_candidate_recovery_baseline_prefix "$ROOT/fleet_rollout.sh" \
+    > "$TMP/baseline-recover"
+for required in 'verify_candidate_recovery_baseline_digest "$node"' \
+    'verify_candidate_recovery_baseline_payload "$node"' \
+    'reprove_candidate_recovery_baseline_live_state "$node" "$txids_tmp"' \
+    'mv -fT -- "$txids_tmp" "$first"' 'mv -T -- "$metadata_tmp" "$metadata"' \
+    'verify_candidate_recovery_baseline "$node"'; do
+    grep -Fq -- "$required" "$TMP/baseline-recover"
+done
+function_body reprove_candidate_recovery_baseline_live_state "$ROOT/fleet_rollout.sh" \
+    > "$TMP/baseline-reprove"
+for required in 'verify_candidate_running_container "$node" "$expected_id"' \
+    '.unlocked_until == 0' '.enabled == false and .autostart == false' \
+    '.enabled == false and .staking == false' 'verify_donation_defaults_off "$node"' \
+    '.policy_authoritative == true and .policy.automatic_authorized == false' \
+    '[[ "$current_fee" == "$expected_fee" ]]' 'cmp -s "$prelaunch" "$txids_output"' \
+    '[[ "$(container_generation_for "$node")" == "$generation" ]]'; do
+    grep -Fq -- "$required" "$TMP/baseline-reprove"
+done
+function_body verify_candidate_recovery_baseline_payload "$ROOT/fleet_rollout.sh" \
+    > "$TMP/baseline-payload"
+grep -Fq '.staking_final.enabled == false' "$TMP/baseline-payload"
+pass crash-resumable-candidate-recovery-baseline-publication
+
+function_body require_host_tools "$ROOT/fleet_rollout.sh" > "$TMP/host-tools"
+grep -Fq 'Bash 5.1 or newer is required' "$TMP/host-tools"
+for function_name in establish_wave_recovery_baselines activate_wave_phase \
+    contain_wave_without_rollback; do
+    function_body "$function_name" "$ROOT/fleet_rollout.sh" > "$TMP/$function_name"
+    grep -Fq 'wait -n -p completed_pid "${active_pids[@]}"' "$TMP/$function_name"
+    grep -Fq '((${#active_pids[@]} == remaining))' "$TMP/$function_name"
+    grep -Fq 'completed_pid=' "$TMP/$function_name"
+    grep -Fq "trap '" "$TMP/$function_name"
+done
+grep -Fq "trap 'launch_signal=129' HUP" "$TMP/establish_wave_recovery_baselines"
+grep -Fq "trap 'launch_signal=129' HUP" "$TMP/activate_wave_phase"
+grep -Fq "trap 'signal_received=129' HUP" "$TMP/contain_wave_without_rollback"
+assert_order "$TMP/establish_wave_recovery_baselines" 'pid=$!' \
+    'CANDIDATE_BASELINE_HELPER_PIDS+=("$pid")' '((launch_signal == 0)) || break' \
+    'terminate_and_join_candidate_baseline_helpers'
+assert_order "$TMP/activate_wave_phase" 'pid=$!' \
+    'ACTIVATION_HELPER_PIDS+=("$pid")' '((launch_signal == 0)) || break' \
+    'terminate_and_join_activation_helpers'
+assert_order "$TMP/contain_wave_without_rollback" 'pid=$!' \
+    'CONTAINMENT_HELPER_PIDS+=("$pid")' '((signal_received == 0)) || break' \
+    'terminate_and_join_containment_helpers'
+for function_name in terminate_and_join_candidate_baseline_helpers \
+    terminate_and_join_activation_helpers terminate_and_join_containment_helpers; do
+    function_body "$function_name" "$ROOT/fleet_rollout.sh" > "$TMP/$function_name"
+    grep -Fq 'kill -TERM -- "-$pid"' "$TMP/$function_name"
+    grep -Fq 'kill -KILL -- "-$pid"' "$TMP/$function_name"
+    grep -Fq 'wait "$pid"' "$TMP/$function_name"
+    [[ "$(grep -Fc 'deadline=$((SECONDS + 5))' "$TMP/$function_name")" -eq 1 ]]
+    [[ "$(grep -Fc "_PIDS[index]=''" "$TMP/$function_name")" -ge 3 ]]
+    ! grep -Fq 'kill -TERM "$pid"' "$TMP/$function_name"
+    ! grep -Fq 'kill -KILL "$pid"' "$TMP/$function_name"
+done
+function_body on_exit "$ROOT/fleet_rollout.sh" > "$TMP/rollout-exit"
+assert_order "$TMP/rollout-exit" 'terminate_and_join_containment_helpers' \
+    'terminate_and_join_candidate_baseline_helpers' 'terminate_and_join_activation_helpers' \
+    'rollback_current_wave'
+grep -Fq 'trap - EXIT HUP INT TERM' "$TMP/rollout-exit"
+function_body rollback_current_wave "$ROOT/fleet_rollout.sh" > "$TMP/wave-rollback-workers"
+assert_order "$TMP/wave-rollback-workers" 'terminate_and_join_containment_helpers' \
+    'terminate_and_join_candidate_baseline_helpers' 'publish_state_token'
+function_body stop_wave_for_rollback "$ROOT/fleet_rollout.sh" > "$TMP/stop-wave-workers"
+assert_order "$TMP/stop-wave-workers" 'terminate_and_join_activation_helpers' \
+    'docker inspect'
+function_body publish_wave_activation_markers "$ROOT/fleet_rollout.sh" \
+    > "$TMP/activation-publication"
+grep -Fq '((${#CANDIDATE_BASELINE_HELPER_PIDS[@]} == 0))' "$TMP/activation-publication"
+grep -Fq '((${#ACTIVATION_HELPER_PIDS[@]} == 0))' "$TMP/activation-publication"
+function_body publish_complete_containment_manifest "$ROOT/fleet_rollout.sh" \
+    > "$TMP/containment-publication"
+grep -Fq '((${#CONTAINMENT_HELPER_PIDS[@]} == 0))' "$TMP/containment-publication"
+function_body activate_one_node_phase "$ROOT/fleet_rollout.sh" > "$TMP/activation-worker"
+grep -Fq "trap 'cleanup_activation_child; exit 129' HUP" "$TMP/activation-worker"
+grep -Fq 'trap - HUP INT TERM' "$TMP/activation-worker"
+function_body write_terminal_receipt "$ROOT/fleet_rollout.sh" > "$TMP/terminal-receipt-signals"
+grep -Fq "trap '' HUP INT TERM" "$TMP/terminal-receipt-signals"
+grep -Fq "trap 'exit 129' HUP" "$TMP/terminal-receipt-signals"
+function_body run_one_wave "$ROOT/fleet_rollout.sh" > "$TMP/run-wave-signals"
+grep -Fq "trap '' HUP INT TERM" "$TMP/run-wave-signals"
+grep -Fq "trap 'exit 129' HUP" "$TMP/run-wave-signals"
+for function_name in apply_rollout rollback_run; do
+    function_body "$function_name" "$ROOT/fleet_rollout.sh" > "$TMP/$function_name"
+    grep -Fq "trap 'exit 129' HUP" "$TMP/$function_name"
+    grep -Fq 'trap - EXIT HUP INT TERM' "$TMP/$function_name"
+done
+timeout_files=("$ROOT/fleet_rollout.sh" "$ROOT/lib/common.sh" "$ROOT/lib/live_checks.sh" \
+    "$ROOT/blackcoin_pow_quarantine_cycle_v30.1.4_nospend.sh" \
+    "$ROOT/repair_vpn_pair.sh" "$ROOT/recover_clean_guard_stop.sh")
+! grep -E 'timeout[[:space:]]+(-k|--kill-after|--signal)' "${timeout_files[@]}"
+[[ "$(grep -hEc 'timeout[[:space:]]+--foreground' "${timeout_files[@]}" | \
+    awk '{total += $1} END {print total}')" -ge 17 ]]
+pass joined-process-group-workers-hup-and-nested-timeout-containment
+
+function_body verify_canary_fleet_handoff "$ROOT/fleet_rollout.sh" \
+    > "$TMP/canary-handoff-verify"
+for required in 'if [[ "$verify_live" == 1 ]]' \
+    '.published_canary.sha256' '.published_canary.evidence_manifest.sha256' \
+    '[[ "$result_sha" == "$EXPECTED_CANARY_RESULT_SHA256"' \
+    'marker_sha=$(jq -n --arg nonce "$fleet_nonce" --arg run "$RUN_DIR"'; do
+    grep -Fq -- "$required" "$TMP/canary-handoff-verify"
+done
+function_body publish_canary_fleet_handoff "$ROOT/fleet_rollout.sh" \
+    > "$TMP/canary-handoff-publish"
+assert_order "$TMP/canary-handoff-publish" 'verify_canary_fleet_handoff 0' \
+    'verify_maintenance_marker'
+for required in 'sha256sum "$PUBLISHED_CANARY_RESULT"' \
+    'sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST"' \
+    'atomic_write_json "$evidence"'; do
+    grep -Fq -- "$required" "$TMP/canary-handoff-publish"
+done
+function_body write_transaction_manifest "$ROOT/fleet_rollout.sh" \
+    > "$TMP/transaction-manifest"
+assert_order "$TMP/transaction-manifest" \
+    'canary_sha=$(sha256sum "$PUBLISHED_CANARY_RESULT"' \
+    '[[ "$canary_sha" == "$EXPECTED_CANARY_RESULT_SHA256"' \
+    'install -m 600 -o root -g root "$temporary" "$RUN_DIR/TRANSACTION.json"' \
+    'sync -f "$RUN_DIR/TRANSACTION.json"'
+pass offline-canary-handoff-and-transaction-identity-pinning
+
 function_body assert_fleet_identity_matches_baseline "$ROOT/fleet_rollout.sh" > "$TMP/identity"
 for field in wallets_json legacy_addresses_sha256 quantum_addresses_sha256 \
     quantum_inventory_sha256 runtime_manifest_sha256 identity_manifest_sha256 \

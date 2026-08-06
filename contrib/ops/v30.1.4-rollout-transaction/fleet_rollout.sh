@@ -69,6 +69,7 @@ FINALIZATION_LOCKS_HELD=0
 TERMINAL_COMMIT_ACTIVE=0
 TERMINAL_FINALIZED=0
 CANARY_HANDOFF_PENDING=0
+ALLOW_PENDING_RESUME_COMPATIBILITY=0
 ACTIVATION_HELPER_PIDS=()
 ACTIVATION_HELPER_NODES=()
 ACTIVATION_HELPER_PHASES=()
@@ -129,6 +130,11 @@ wave_node_readoption_authorization_path()
 resume_compatibility_path()
 {
     printf '%s/RESUME-COMPATIBILITY.json\n' "$RUN_DIR"
+}
+
+resume_compatibility_supersession_path()
+{
+    printf '%s/RESUME-COMPATIBILITY-SUPERSEDED.json\n' "$RUN_DIR"
 }
 
 wave_node_launch_attempt_path()
@@ -5828,6 +5834,7 @@ legacy_plan_file_for_node()
 wave_runtime_evidence_expected_files()
 {
     local node padded supersession authorization containment containment_complete compatibility
+    local compatibility_supersession
     local successful_attempt chain_text entry prior i j
     local -a files=(wave-chain-convergence/PASSED.json WAVE-DRAIN-EVIDENCE.sha256
         CANDIDATE_LAUNCH_AUTHORIZED CANDIDATE_LAUNCH_ATTEMPTED)
@@ -5865,6 +5872,10 @@ wave_runtime_evidence_expected_files()
                 files+=("$entry")
             done <<< "$chain_text"
             files+=("$compatibility")
+            compatibility_supersession=$(resume_compatibility_supersession_path) || return 1
+            if [[ -e "$compatibility_supersession" || -L "$compatibility_supersession" ]]; then
+                files+=("$compatibility_supersession")
+            fi
         fi
     done
     files+=(RUNTIME-GATE-PASSED)
@@ -5881,17 +5892,22 @@ wave_runtime_evidence_expected_files()
 
 wave_runtime_evidence_file_is_regular()
 {
-    local entry="$1" path wave_root path_root compatibility run_root
+    local entry="$1" path wave_root path_root compatibility compatibility_supersession run_root
     [[ -n "$entry" && "$entry" != *$'\n'* && "$entry" != *\\* ]] || return 1
     if [[ "$entry" == /* ]]; then
         compatibility=$(resume_compatibility_path) || return 1
-        [[ "$RUN_DIR" == /* && "$entry" == "$compatibility" &&
-           "$compatibility" == "$RUN_DIR/RESUME-COMPATIBILITY.json" ]] || return 1
+        compatibility_supersession=$(resume_compatibility_supersession_path) || return 1
+        [[ "$RUN_DIR" == /* &&
+           ( "$entry" == "$compatibility" || "$entry" == "$compatibility_supersession" ) &&
+           "$compatibility" == "$RUN_DIR/RESUME-COMPATIBILITY.json" &&
+           "$compatibility_supersession" == "$RUN_DIR/RESUME-COMPATIBILITY-SUPERSEDED.json" ]] ||
+            return 1
         [[ -f "$entry" && ! -L "$entry" ]] || return 1
         run_root=$(realpath -e -- "$RUN_DIR") || return 1
         path_root=$(realpath -e -- "$entry") || return 1
         [[ "$run_root" == "$RUN_DIR" && "$path_root" == "$entry" &&
-           "$path_root" == "$run_root/RESUME-COMPATIBILITY.json" ]]
+           ( "$path_root" == "$run_root/RESUME-COMPATIBILITY.json" ||
+             "$path_root" == "$run_root/RESUME-COMPATIBILITY-SUPERSEDED.json" ) ]]
         return
     fi
     [[ "$entry" != . && "$entry" != .. && "$entry" != ./* &&
@@ -6196,15 +6212,16 @@ write_transaction_manifest()
     sync -f "$RUN_DIR/TRANSACTION.json"
 }
 
-verify_resume_compatibility_authority()
+verify_resume_compatibility_receipt_for_root()
 {
-    local transaction_root="$1" receipt transaction_manifest_sha transaction_files_sha
-    local transaction_package_sha resume_package_sha
+    local transaction_root="$1" resume_root="$2" receipt transaction_manifest_sha
+    local transaction_files_sha transaction_package_sha resume_package_sha
     receipt=$(resume_compatibility_path) || return 1
-    [[ "$transaction_root" != "$PACKAGE_ROOT" && -d "$transaction_root" &&
-       ! -L "$transaction_root" && "$(realpath -e -- "$transaction_root")" == "$transaction_root" ]] ||
-        return 1
-    verify_package_integrity "$PACKAGE_ROOT" || return 1
+    [[ "$transaction_root" != "$resume_root" && -d "$transaction_root" &&
+       ! -L "$transaction_root" && "$(realpath -e -- "$transaction_root")" == "$transaction_root" &&
+       -d "$resume_root" && ! -L "$resume_root" &&
+       "$(realpath -e -- "$resume_root")" == "$resume_root" ]] || return 1
+    verify_package_integrity "$resume_root" || return 1
     verify_package_integrity "$transaction_root" || return 1
     data_rollback_protected_file "$receipt" 600 || return 1
     data_rollback_canonical_single_object_json "$receipt" || return 1
@@ -6218,12 +6235,12 @@ verify_resume_compatibility_authority()
         return 1
     transaction_package_sha=$(sha256sum "$transaction_root/SHA256SUMS" | awk '{print $1}') ||
         return 1
-    resume_package_sha=$(sha256sum "$PACKAGE_ROOT/SHA256SUMS" | awk '{print $1}') || return 1
+    resume_package_sha=$(sha256sum "$resume_root/SHA256SUMS" | awk '{print $1}') || return 1
     jq -e --arg run "$RUN_DIR" --arg transaction_root "$transaction_root" \
         --arg transaction_package_sha "$transaction_package_sha" \
         --arg transaction_files_sha "$transaction_files_sha" \
         --arg transaction_manifest_sha "$transaction_manifest_sha" \
-        --arg resume_root "$PACKAGE_ROOT" --arg resume_package_sha "$resume_package_sha" \
+        --arg resume_root "$resume_root" --arg resume_package_sha "$resume_package_sha" \
         --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" '
         (keys | sort) == (["schema","transaction","state","run_dir",
           "transaction_package_root","transaction_package_manifest_sha256",
@@ -6251,6 +6268,75 @@ verify_resume_compatibility_authority()
         .key_generation_authorized == false and .address_generation_authorized == false and
         (.created_at | type) == "string" and (.created_at | length) > 0
     ' "$receipt" >/dev/null
+}
+
+verify_resume_compatibility_supersession_authority()
+{
+    local transaction_root="$1" receipt supersession prior_root prior_sha replacement_sha
+    local receipt_sha
+    receipt=$(resume_compatibility_path) || return 1
+    supersession=$(resume_compatibility_supersession_path) || return 1
+    data_rollback_protected_file "$receipt" 600 || return 1
+    data_rollback_protected_file "$supersession" 600 || return 1
+    data_rollback_canonical_single_object_json "$supersession" || return 1
+    prior_root=$(jq -er '.resume_package_root | select(type == "string")' "$receipt") || return 1
+    prior_sha=$(jq -er '.resume_package_manifest_sha256 |
+        select(type == "string" and test("^[0-9a-f]{64}$"))' "$receipt") || return 1
+    verify_resume_compatibility_receipt_for_root "$transaction_root" "$prior_root" || return 1
+    verify_package_integrity "$PACKAGE_ROOT" || return 1
+    receipt_sha=$(sha256sum "$receipt" | awk '{print $1}') || return 1
+    replacement_sha=$(sha256sum "$PACKAGE_ROOT/SHA256SUMS" | awk '{print $1}') || return 1
+    [[ "$prior_root" != "$PACKAGE_ROOT" ]] || return 1
+    jq -e --arg run "$RUN_DIR" --arg transaction_root "$transaction_root" \
+        --arg receipt_sha "$receipt_sha" --arg prior_root "$prior_root" \
+        --arg prior_sha "$prior_sha" --arg replacement_root "$PACKAGE_ROOT" \
+        --arg replacement_sha "$replacement_sha" --arg image "$CANDIDATE_IMAGE_REF" \
+        --arg image_id "$CANDIDATE_IMAGE_ID" '
+        (keys | sort) == (["schema","transaction","state","run_dir",
+          "transaction_package_root","prior_resume_compatibility_sha256",
+          "prior_resume_package_root","prior_resume_package_manifest_sha256",
+          "replacement_resume_package_root","replacement_resume_package_manifest_sha256",
+          "authorized_fix","candidate_image","candidate_image_id",
+          "managed_recovery_payments_authorized",
+          "protocol_pow_claim_transactions_authorized",
+          "unexpected_wallet_transactions_authorized","key_generation_authorized",
+          "address_generation_authorized","created_at"] | sort) and
+        .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+        .state == "resume-compatibility-superseded" and .run_dir == $run and
+        .transaction_package_root == $transaction_root and
+        .prior_resume_compatibility_sha256 == $receipt_sha and
+        .prior_resume_package_root == $prior_root and
+        .prior_resume_package_manifest_sha256 == $prior_sha and
+        .replacement_resume_package_root == $replacement_root and
+        .replacement_resume_package_manifest_sha256 == $replacement_sha and
+        .authorized_fix == "contained-readoption-ready-state" and
+        .candidate_image == $image and .candidate_image_id == $image_id and
+        .managed_recovery_payments_authorized == false and
+        .protocol_pow_claim_transactions_authorized == true and
+        .unexpected_wallet_transactions_authorized == false and
+        .key_generation_authorized == false and .address_generation_authorized == false and
+        (.created_at | type) == "string" and (.created_at | length) > 0
+    ' "$supersession" >/dev/null
+}
+
+verify_resume_compatibility_authority()
+{
+    local transaction_root="$1" receipt supersession prior_root
+    receipt=$(resume_compatibility_path) || return 1
+    supersession=$(resume_compatibility_supersession_path) || return 1
+    data_rollback_protected_file "$receipt" 600 || return 1
+    prior_root=$(jq -er '.resume_package_root | select(type == "string")' "$receipt") || return 1
+    if [[ "$prior_root" == "$PACKAGE_ROOT" ]]; then
+        [[ ! -e "$supersession" && ! -L "$supersession" ]] || return 1
+        verify_resume_compatibility_receipt_for_root "$transaction_root" "$PACKAGE_ROOT"
+        return
+    fi
+    verify_resume_compatibility_receipt_for_root "$transaction_root" "$prior_root" || return 1
+    if [[ -e "$supersession" || -L "$supersession" ]]; then
+        verify_resume_compatibility_supersession_authority "$transaction_root"
+        return
+    fi
+    [[ "${ALLOW_PENDING_RESUME_COMPATIBILITY:-0}" == 1 ]]
 }
 
 transaction_package_root()

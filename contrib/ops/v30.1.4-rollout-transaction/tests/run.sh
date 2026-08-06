@@ -539,6 +539,10 @@ done
     {
         printf '%s/RESUME-COMPATIBILITY.json\n' "$RUN_DIR"
     }
+    resume_compatibility_supersession_path()
+    {
+        printf '%s/RESUME-COMPATIBILITY-SUPERSEDED.json\n' "$RUN_DIR"
+    }
     write_runtime_evidence_fixture()
     {
         local names="$1" entry path
@@ -620,10 +624,16 @@ done
            "node-27-readoption-attempts/attempt-01-WALLET-SEND-AUDIT.json",
          readoption_attempt_chain:$chain}' \
         > "$CURRENT_WAVE_DIR/node-27-CANDIDATE-ACTIVATION-SUPERSEDED.json"
+    printf '%s\n' compatibility-superseded \
+        > "$RUN_DIR/RESUME-COMPATIBILITY-SUPERSEDED.json"
     write_runtime_evidence_fixture "$TMP/runtime-evidence-node27.names"
     wave_runtime_evidence_manifest_has_exact_names
     grep -Fqx "$RUN_DIR/RESUME-COMPATIBILITY.json" \
         "$TMP/runtime-evidence-node27.names"
+    grep -Fqx "$RUN_DIR/RESUME-COMPATIBILITY-SUPERSEDED.json" \
+        "$TMP/runtime-evidence-node27.names"
+    printf '%s\n' unrelated > "$RUN_DIR/UNRELATED.json"
+    ! wave_runtime_evidence_file_is_regular "$RUN_DIR/UNRELATED.json"
     ! grep -Fqx ROLLBACK_STATE "$TMP/runtime-evidence-node27.names"
     for entry in attempt-01-START-AUTHORIZED.json attempt-01-STARTED.json \
         attempt-01-POLICY-PROMOTION-AUTHORIZED.json \
@@ -664,8 +674,13 @@ done
 )
 pass exact-ordinary-and-node27-runtime-evidence-manifest-sets
 
-function_body verify_resume_compatibility_authority "$ROOT/fleet_rollout.sh" \
-    > "$TMP/resume-compatibility-function"
+for function_name in verify_resume_compatibility_receipt_for_root \
+    verify_resume_compatibility_supersession_authority \
+    verify_resume_compatibility_authority; do
+    function_body "$function_name" "$ROOT/fleet_rollout.sh" \
+        >> "$TMP/resume-compatibility-function"
+done
+grep -Fq 'ALLOW_PENDING_RESUME_COMPATIBILITY=0' "$ROOT/fleet_rollout.sh"
 (
     # shellcheck disable=SC1090
     source "$TMP/resume-compatibility-function"
@@ -685,6 +700,10 @@ function_body verify_resume_compatibility_authority "$ROOT/fleet_rollout.sh" \
     data_rollback_protected_file() { return 0; }
     data_rollback_canonical_single_object_json() { return 0; }
     resume_compatibility_path() { printf '%s/RESUME-COMPATIBILITY.json\n' "$RUN_DIR"; }
+    resume_compatibility_supersession_path()
+    {
+        printf '%s/RESUME-COMPATIBILITY-SUPERSEDED.json\n' "$RUN_DIR"
+    }
     transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}')
     transaction_files_sha=$(sha256sum "$RUN_DIR/package-files.sha256" | awk '{print $1}')
     transaction_package_sha=$(sha256sum "$transaction_root/SHA256SUMS" | awk '{print $1}')
@@ -716,6 +735,49 @@ function_body verify_resume_compatibility_authority "$ROOT/fleet_rollout.sh" \
         > "$RUN_DIR/RESUME-COMPATIBILITY.tampered.json"
     mv "$RUN_DIR/RESUME-COMPATIBILITY.tampered.json" \
         "$RUN_DIR/RESUME-COMPATIBILITY.json"
+    ! verify_resume_compatibility_authority "$transaction_root"
+
+    # Restore the valid original authority, then prove that a different sealed
+    # package is accepted only through the append-only supersession receipt.
+    jq -S '.unexpected_wallet_transactions_authorized=false' \
+        "$RUN_DIR/RESUME-COMPATIBILITY.json" > "$RUN_DIR/RESUME-COMPATIBILITY.valid"
+    mv "$RUN_DIR/RESUME-COMPATIBILITY.valid" "$RUN_DIR/RESUME-COMPATIBILITY.json"
+    prior_root=$PACKAGE_ROOT
+    prior_sha=$(sha256sum "$prior_root/SHA256SUMS" | awk '{print $1}')
+    receipt_sha=$(sha256sum "$RUN_DIR/RESUME-COMPATIBILITY.json" | awk '{print $1}')
+    PACKAGE_ROOT="$TMP/replacement-resume-package"
+    mkdir -p "$PACKAGE_ROOT"
+    printf '%s\n' replacement > "$PACKAGE_ROOT/payload"
+    (cd "$PACKAGE_ROOT" && sha256sum payload > SHA256SUMS)
+    replacement_sha=$(sha256sum "$PACKAGE_ROOT/SHA256SUMS" | awk '{print $1}')
+    ! verify_resume_compatibility_authority "$transaction_root"
+    ALLOW_PENDING_RESUME_COMPATIBILITY=1
+    verify_resume_compatibility_authority "$transaction_root"
+    ALLOW_PENDING_RESUME_COMPATIBILITY=0
+    jq -n --arg run "$RUN_DIR" --arg transaction_root "$transaction_root" \
+        --arg receipt_sha "$receipt_sha" --arg prior_root "$prior_root" \
+        --arg prior_sha "$prior_sha" --arg replacement_root "$PACKAGE_ROOT" \
+        --arg replacement_sha "$replacement_sha" --arg image "$CANDIDATE_IMAGE_REF" \
+        --arg image_id "$CANDIDATE_IMAGE_ID" '
+        {schema:1,transaction:"v30.1.4-fleet-rollout",
+         state:"resume-compatibility-superseded",run_dir:$run,
+         transaction_package_root:$transaction_root,
+         prior_resume_compatibility_sha256:$receipt_sha,
+         prior_resume_package_root:$prior_root,
+         prior_resume_package_manifest_sha256:$prior_sha,
+         replacement_resume_package_root:$replacement_root,
+         replacement_resume_package_manifest_sha256:$replacement_sha,
+         authorized_fix:"contained-readoption-ready-state",candidate_image:$image,
+         candidate_image_id:$image_id,managed_recovery_payments_authorized:false,
+         protocol_pow_claim_transactions_authorized:true,
+         unexpected_wallet_transactions_authorized:false,key_generation_authorized:false,
+         address_generation_authorized:false,created_at:"2026-08-06T00:00:01Z"}' \
+        > "$RUN_DIR/RESUME-COMPATIBILITY-SUPERSEDED.json"
+    verify_resume_compatibility_authority "$transaction_root"
+    jq -S '.authorized_fix="wrong"' "$RUN_DIR/RESUME-COMPATIBILITY-SUPERSEDED.json" \
+        > "$RUN_DIR/RESUME-COMPATIBILITY-SUPERSEDED.tampered"
+    mv "$RUN_DIR/RESUME-COMPATIBILITY-SUPERSEDED.tampered" \
+        "$RUN_DIR/RESUME-COMPATIBILITY-SUPERSEDED.json"
     ! verify_resume_compatibility_authority "$transaction_root"
 )
 function_body transaction_package_root "$ROOT/fleet_rollout.sh" \

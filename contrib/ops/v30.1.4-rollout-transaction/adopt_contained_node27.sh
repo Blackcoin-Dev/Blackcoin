@@ -205,9 +205,47 @@ verify_initial_containment()
 
 publish_resume_compatibility()
 {
-    local path transaction_sha transaction_files_sha transaction_package_sha resume_package_sha
+    local path supersession prior_root prior_sha receipt_sha replacement_sha
+    local transaction_sha transaction_files_sha transaction_package_sha resume_package_sha
     path=$(resume_receipt_path) || return 1
     if [[ -e "$path" || -L "$path" ]]; then
+        if verify_resume_compatibility_authority "$TRANSACTION_PACKAGE_ROOT"; then
+            return 0
+        fi
+        supersession=$(resume_compatibility_supersession_path) || return 1
+        [[ ! -e "$supersession" && ! -L "$supersession" ]] || return 1
+        prior_root=$(jq -er '.resume_package_root | select(type == "string")' "$path") || return 1
+        prior_sha=$(jq -er '.resume_package_manifest_sha256 |
+            select(type == "string" and test("^[0-9a-f]{64}$"))' "$path") || return 1
+        [[ "$prior_root" != "$PACKAGE_ROOT" ]] || return 1
+        ALLOW_PENDING_RESUME_COMPATIBILITY=1
+        if ! verify_resume_compatibility_authority "$TRANSACTION_PACKAGE_ROOT"; then
+            ALLOW_PENDING_RESUME_COMPATIBILITY=0
+            return 1
+        fi
+        ALLOW_PENDING_RESUME_COMPATIBILITY=0
+        receipt_sha=$(sha256sum "$path" | awk '{print $1}') || return 1
+        replacement_sha=$(sha256sum "$PACKAGE_ROOT/SHA256SUMS" | awk '{print $1}') || return 1
+        jq -n --arg run "$TARGET_RUN" --arg transaction_root "$TRANSACTION_PACKAGE_ROOT" \
+            --arg receipt_sha "$receipt_sha" --arg prior_root "$prior_root" \
+            --arg prior_sha "$prior_sha" --arg replacement_root "$PACKAGE_ROOT" \
+            --arg replacement_sha "$replacement_sha" --arg image "$CANDIDATE_IMAGE_REF" \
+            --arg image_id "$CANDIDATE_IMAGE_ID" --arg created_at "$(date -u +%FT%TZ)" '
+            {schema:1,transaction:"v30.1.4-fleet-rollout",
+             state:"resume-compatibility-superseded",run_dir:$run,
+             transaction_package_root:$transaction_root,
+             prior_resume_compatibility_sha256:$receipt_sha,
+             prior_resume_package_root:$prior_root,
+             prior_resume_package_manifest_sha256:$prior_sha,
+             replacement_resume_package_root:$replacement_root,
+             replacement_resume_package_manifest_sha256:$replacement_sha,
+             authorized_fix:"contained-readoption-ready-state",
+             candidate_image:$image,candidate_image_id:$image_id,
+             managed_recovery_payments_authorized:false,
+             protocol_pow_claim_transactions_authorized:true,
+             unexpected_wallet_transactions_authorized:false,
+             key_generation_authorized:false,address_generation_authorized:false,
+             created_at:$created_at}' | atomic_write_json_exclusive "$supersession" || return 1
         verify_resume_compatibility_authority "$TRANSACTION_PACKAGE_ROOT"
         return
     fi
@@ -1628,6 +1666,7 @@ verify_adoption_reentry_state()
 
 adoption_preflight()
 {
+    local receipt supersession prior_root
     require_host_tools
     verify_package_integrity "$ADOPTION_PACKAGE_ROOT" || die 'readoption package is invalid'
     [[ "$(sha256sum "$TRANSACTION_PACKAGE_ROOT/SHA256SUMS" | awk '{print $1}')" == \
@@ -1643,8 +1682,21 @@ adoption_preflight()
     (cd "$TRANSACTION_PACKAGE_ROOT" &&
         sha256sum --strict -c "$TARGET_RUN/package-files.sha256" >/dev/null) ||
         die 'run no longer matches its sealed transaction package'
+    receipt=$(resume_receipt_path) || die 'resume compatibility path is invalid'
+    supersession=$(resume_compatibility_supersession_path) ||
+        die 'resume compatibility supersession path is invalid'
+    ALLOW_PENDING_RESUME_COMPATIBILITY=0
+    if [[ -e "$receipt" && ! -L "$receipt" &&
+          ! -e "$supersession" && ! -L "$supersession" ]]; then
+        prior_root=$(jq -er '.resume_package_root | select(type == "string")' "$receipt") ||
+            die 'prior resume compatibility root is invalid'
+        if [[ "$prior_root" != "$PACKAGE_ROOT" ]]; then
+            ALLOW_PENDING_RESUME_COMPATIBILITY=1
+        fi
+    fi
     ADOPTION_REENTRY_STATE=$(verify_adoption_reentry_state) ||
         die 'node27 append-only readoption state or fleet invariant changed'
+    ALLOW_PENDING_RESUME_COMPATIBILITY=0
     log "node27 append-only readoption preflight passed state=$ADOPTION_REENTRY_STATE; no live mutation performed"
 }
 
@@ -1707,6 +1759,8 @@ adoption_apply()
     acquire_wave_locks
     cleanup_readoption_publication_residue ||
         die 'node27 interrupted evidence-publication residue could not be removed'
+    publish_resume_compatibility ||
+        die 'resume compatibility authority could not be published or superseded'
     state=$(verify_adoption_reentry_state) ||
         die 'node27 readoption state changed after locks were acquired'
     if [[ "$state" == passed ]]; then
@@ -1726,8 +1780,6 @@ adoption_apply()
                 verify_initial_containment ||
                     die 'node27 initial containment changed after locks were acquired'
             fi
-            publish_resume_compatibility ||
-                die 'resume compatibility authority could not be published'
             publish_readoption_authorization ||
                 die 'node27 readoption authority could not be published'
             ensure_readoption_candidate_running ||

@@ -1,4 +1,4 @@
-validated_at=2026-08-06T10:24:40Z
+validated_at=2026-08-06T13:02:58Z
 scope=local-static-targeted-fixture-only
 live_unraid_mutation=false
 docker_invoked=false
@@ -7,11 +7,19 @@ github_invoked=false
 PASS bash-syntax
 PASS shellcheck-actionable
 PASS sealed-compose-create-compatibility-rewrite
+PASS contained-node27-append-only-adoption-order-and-no-spend-scope
+PASS activation-supersession-and-historical-containment-contract
+PASS readoption-wallet-send-audit-protocol-claim-provenance-and-exact-schema
+PASS embedded-readoption-chain-semantic-retry-linkage-and-monotonic-prefixes
+PASS exact-ordinary-and-node27-runtime-evidence-manifest-sets
+PASS sealed-transaction-to-corrected-package-compatibility-authority
+PASS exact-activation-worker-setsid-match-and-delegation-shape
 PASS wave-plan-and-mappings
 PASS rollback-operations-root-absent-and-existing-domain-gates
 PASS bounded-retry-only-failed-legacy-readiness-gate
 PASS untouched-legacy-nodes-use-live-allowed-mode-not-stale-snapshot
-PASS compose-renderer-positive-and-negative
+PASS compose-renderer-padded-services-negative-and-cardinality
+PASS sealed-compose-renderer-compatibility-rewrite
 PASS policy-renderer-positive-and-negative
 PASS guard-renderer
 PASS package-integrity-positive-negative-and-entrypoints
@@ -25,11 +33,13 @@ PASS authenticated-data-rollback-boundaries-and-resume
 PASS fresh-final-fleet-and-efficient-soak-resume
 PASS crash-safe-supervisor-fresh-finalization-and-rollback-release-order
 PASS vpn-commit-rollback-and-final-uniqueness
+PASS soak-schema2-prelaunch-recovery-baseline-and-json-numeric-zero
 PASS fee-baseline-no-automatic-recovery-and-full-runtime-gates
 PASS exact-id-no-force-container-replacement-and-absence-proof
 PASS sealed-source-drain-triplet-and-rollback-authority-recovery
 PASS crash-resumable-candidate-recovery-baseline-publication
 PASS joined-process-group-workers-hup-and-nested-timeout-containment
+PASS activation-worker-setsid-delegation-transient-drain-and-persistent-residue
 PASS offline-canary-handoff-and-transaction-identity-pinning
 PASS identity-wave-evidence-and-precommit-publication
 PASS forbidden-operation-and-build-invariants

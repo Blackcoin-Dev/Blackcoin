@@ -116,6 +116,21 @@ wave_node_activation_path()
     printf '%s-CANDIDATE-ACTIVATION-ATTEMPTED.json\n' "$(wave_node_prefix "$1")"
 }
 
+wave_node_activation_supersession_path()
+{
+    printf '%s-CANDIDATE-ACTIVATION-SUPERSEDED.json\n' "$(wave_node_prefix "$1")"
+}
+
+wave_node_readoption_authorization_path()
+{
+    printf '%s-READOPTION-AUTHORIZED.json\n' "$(wave_node_prefix "$1")"
+}
+
+resume_compatibility_path()
+{
+    printf '%s/RESUME-COMPATIBILITY.json\n' "$RUN_DIR"
+}
+
 wave_node_launch_attempt_path()
 {
     printf '%s-CANDIDATE-LAUNCH-ATTEMPTED.json\n' "$(wave_node_prefix "$1")"
@@ -5810,27 +5825,131 @@ legacy_plan_file_for_node()
     return 2
 }
 
-write_wave_runtime_evidence()
+wave_runtime_evidence_expected_files()
 {
-    local node temporary
+    local node padded supersession authorization containment containment_complete compatibility
+    local successful_attempt chain_text entry prior i j
     local -a files=(wave-chain-convergence/PASSED.json WAVE-DRAIN-EVIDENCE.sha256
         CANDIDATE_LAUNCH_AUTHORIZED CANDIDATE_LAUNCH_ATTEMPTED)
+    ((${#CURRENT_WAVE_NODES[@]} >= 1)) || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        padded=$(node_padded "$node") || return 1
+        files+=("node-${padded}-wallet-txids.first-v3014.json")
+        files+=("candidate-recovery-node-${padded}.json")
+        files+=("candidate-recovery-node-${padded}.json.sha256")
+        files+=("node-${padded}-CANDIDATE-LAUNCH-AUTHORIZED.json")
+        files+=("node-${padded}-CANDIDATE-LAUNCH-ATTEMPTED.json")
+        files+=("node-${padded}-CANDIDATE-ACTIVATION-ATTEMPTED.json")
+        supersession=$(wave_node_activation_supersession_path "$node") || return 1
+        if [[ -e "$supersession" || -L "$supersession" ]]; then
+            # Readoption is a one-time compatibility path for the singleton
+            # node-27 canary. No other wave may acquire this larger evidence set.
+            [[ "${#CURRENT_WAVE_NODES[@]}" -eq 1 && "$padded" == 27 ]] || return 1
+            authorization=$(wave_node_readoption_authorization_path "$node") || return 1
+            containment=$(wave_node_containment_path "$node") || return 1
+            containment_complete=$(wave_containment_complete_path) || return 1
+            compatibility=$(resume_compatibility_path) || return 1
+            [[ "$RUN_DIR" == /* && "$compatibility" == "$RUN_DIR/RESUME-COMPATIBILITY.json" &&
+               "$compatibility" != *$'\n'* && "$compatibility" != *\\* ]] || return 1
+            successful_attempt=$(jq -er '.successful_readoption_attempt |
+                select(type == "number" and floor == . and . >= 1 and . <= 3)' \
+                "$supersession") || return 1
+            chain_text=$(candidate_readoption_embedded_chain_paths \
+                "$node" "$supersession" "$successful_attempt") || return 1
+            files+=("${supersession##*/}")
+            files+=("${authorization##*/}" "${containment##*/}" \
+                "${containment_complete##*/}" unaffected.after \
+                "node-${padded}-pow-activation.log")
+            while IFS= read -r entry; do
+                [[ -n "$entry" ]] || return 1
+                files+=("$entry")
+            done <<< "$chain_text"
+            files+=("$compatibility")
+        fi
+    done
+    files+=(RUNTIME-GATE-PASSED)
+    for ((i = 0; i < ${#files[@]}; i++)); do
+        entry=${files[$i]}
+        [[ -n "$entry" && "$entry" != *$'\n'* && "$entry" != *\\* ]] || return 1
+        for ((j = 0; j < i; j++)); do
+            prior=${files[$j]}
+            [[ "$entry" != "$prior" ]] || return 1
+        done
+    done
+    printf '%s\n' "${files[@]}"
+}
+
+wave_runtime_evidence_file_is_regular()
+{
+    local entry="$1" path wave_root path_root compatibility run_root
+    [[ -n "$entry" && "$entry" != *$'\n'* && "$entry" != *\\* ]] || return 1
+    if [[ "$entry" == /* ]]; then
+        compatibility=$(resume_compatibility_path) || return 1
+        [[ "$RUN_DIR" == /* && "$entry" == "$compatibility" &&
+           "$compatibility" == "$RUN_DIR/RESUME-COMPATIBILITY.json" ]] || return 1
+        [[ -f "$entry" && ! -L "$entry" ]] || return 1
+        run_root=$(realpath -e -- "$RUN_DIR") || return 1
+        path_root=$(realpath -e -- "$entry") || return 1
+        [[ "$run_root" == "$RUN_DIR" && "$path_root" == "$entry" &&
+           "$path_root" == "$run_root/RESUME-COMPATIBILITY.json" ]]
+        return
+    fi
+    [[ "$entry" != . && "$entry" != .. && "$entry" != ./* &&
+       "$entry" != ../* && "$entry" != */../* && "$entry" != */.. &&
+       "$entry" != */./* && "$entry" != */. ]] || return 1
+    path="$CURRENT_WAVE_DIR/$entry"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    wave_root=$(realpath -e -- "$CURRENT_WAVE_DIR") || return 1
+    path_root=$(realpath -e -- "$path") || return 1
+    [[ "$wave_root" == "$CURRENT_WAVE_DIR" && "$path_root" == "$wave_root/$entry" ]]
+}
+
+wave_runtime_evidence_manifest_has_exact_names()
+{
+    local expected_text line checksum entry index=0
+    local manifest="$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    local -a expected=()
+    expected_text=$(wave_runtime_evidence_expected_files) || return 1
+    while IFS= read -r entry; do
+        expected+=("$entry")
+    done <<< "$expected_text"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((index < ${#expected[@]})) || return 1
+        ((${#line} >= 67)) || return 1
+        checksum=${line:0:64}
+        [[ "$checksum" =~ ^[0-9a-f]{64}$ && "${line:64:2}" == '  ' ]] || return 1
+        entry=${line:66}
+        [[ -n "$entry" && "$entry" == "${expected[$index]}" ]] || return 1
+        wave_runtime_evidence_file_is_regular "$entry" || return 1
+        ((index += 1))
+    done < "$manifest"
+    ((index == ${#expected[@]}))
+}
+
+write_wave_runtime_evidence()
+{
+    local node temporary expected_text entry
+    local -a files=()
     verify_wave_drain_evidence || return 1
     verify_complete_wave_candidate_launch_markers || return 1
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         verify_candidate_recovery_baseline "$node" || return 1
-        files+=("node-$(node_padded "$node")-wallet-txids.first-v3014.json")
-        files+=("candidate-recovery-node-$(node_padded "$node").json")
-        files+=("candidate-recovery-node-$(node_padded "$node").json.sha256")
-        files+=("node-$(node_padded "$node")-CANDIDATE-LAUNCH-AUTHORIZED.json")
-        files+=("node-$(node_padded "$node")-CANDIDATE-LAUNCH-ATTEMPTED.json")
-        files+=("node-$(node_padded "$node")-CANDIDATE-ACTIVATION-ATTEMPTED.json")
+        verify_candidate_activation_marker "$node" || return 1
     done
     publish_state_token "$CURRENT_WAVE_DIR/RUNTIME-GATE-PASSED" \
         exact-wave-runtime-gate-passed || return 1
-    files+=(RUNTIME-GATE-PASSED)
+    expected_text=$(wave_runtime_evidence_expected_files) || return 1
+    while IFS= read -r entry; do
+        files+=("$entry")
+    done <<< "$expected_text"
+    for entry in "${files[@]}"; do
+        wave_runtime_evidence_file_is_regular "$entry" || return 1
+    done
     temporary="$CURRENT_WAVE_DIR/.WAVE-RUNTIME-EVIDENCE.sha256.$$"
-    (cd "$CURRENT_WAVE_DIR" && sha256sum "${files[@]}") > "$temporary" || return 1
+    if ! (cd "$CURRENT_WAVE_DIR" && sha256sum -- "${files[@]}") > "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
     chmod 600 "$temporary"
     chown root:root "$temporary"
     sync -f "$temporary"
@@ -5847,6 +5966,7 @@ verify_wave_runtime_evidence()
        ! -L "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256" &&
        "$(stat -c '%u:%g:%a' "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256")" == 0:0:600 ]] ||
         return 1
+    wave_runtime_evidence_manifest_has_exact_names || return 1
     (cd "$CURRENT_WAVE_DIR" && sha256sum --strict -c WAVE-RUNTIME-EVIDENCE.sha256 >/dev/null) ||
         return 1
     [[ "$(cat "$CURRENT_WAVE_DIR/RUNTIME-GATE-PASSED")" == exact-wave-runtime-gate-passed ]] ||
@@ -6076,14 +6196,85 @@ write_transaction_manifest()
     sync -f "$RUN_DIR/TRANSACTION.json"
 }
 
+verify_resume_compatibility_authority()
+{
+    local transaction_root="$1" receipt transaction_manifest_sha transaction_files_sha
+    local transaction_package_sha resume_package_sha
+    receipt=$(resume_compatibility_path) || return 1
+    [[ "$transaction_root" != "$PACKAGE_ROOT" && -d "$transaction_root" &&
+       ! -L "$transaction_root" && "$(realpath -e -- "$transaction_root")" == "$transaction_root" ]] ||
+        return 1
+    verify_package_integrity "$PACKAGE_ROOT" || return 1
+    verify_package_integrity "$transaction_root" || return 1
+    data_rollback_protected_file "$receipt" 600 || return 1
+    data_rollback_canonical_single_object_json "$receipt" || return 1
+    data_rollback_protected_file "$RUN_DIR/TRANSACTION.json" 600 || return 1
+    data_rollback_protected_file "$RUN_DIR/package-files.sha256" 600 || return 1
+    (cd "$transaction_root" &&
+        sha256sum --strict -c "$RUN_DIR/package-files.sha256" >/dev/null) || return 1
+    transaction_manifest_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') ||
+        return 1
+    transaction_files_sha=$(sha256sum "$RUN_DIR/package-files.sha256" | awk '{print $1}') ||
+        return 1
+    transaction_package_sha=$(sha256sum "$transaction_root/SHA256SUMS" | awk '{print $1}') ||
+        return 1
+    resume_package_sha=$(sha256sum "$PACKAGE_ROOT/SHA256SUMS" | awk '{print $1}') || return 1
+    jq -e --arg run "$RUN_DIR" --arg transaction_root "$transaction_root" \
+        --arg transaction_package_sha "$transaction_package_sha" \
+        --arg transaction_files_sha "$transaction_files_sha" \
+        --arg transaction_manifest_sha "$transaction_manifest_sha" \
+        --arg resume_root "$PACKAGE_ROOT" --arg resume_package_sha "$resume_package_sha" \
+        --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" '
+        (keys | sort) == (["schema","transaction","state","run_dir",
+          "transaction_package_root","transaction_package_manifest_sha256",
+          "transaction_package_files_sha256","transaction_manifest_sha256",
+          "resume_package_root","resume_package_manifest_sha256","candidate_image",
+          "candidate_image_id","authorized_fixes","managed_recovery_payments_authorized",
+          "protocol_pow_claim_transactions_authorized",
+          "unexpected_wallet_transactions_authorized","key_generation_authorized",
+          "address_generation_authorized","created_at"] | sort) and
+        .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+        .state == "resume-compatibility-authorized" and .run_dir == $run and
+        .transaction_package_root == $transaction_root and
+        .transaction_package_manifest_sha256 == $transaction_package_sha and
+        .transaction_package_files_sha256 == $transaction_files_sha and
+        .transaction_manifest_sha256 == $transaction_manifest_sha and
+        .resume_package_root == $resume_root and
+        .resume_package_manifest_sha256 == $resume_package_sha and
+        .candidate_image == $image and .candidate_image_id == $image_id and
+        .authorized_fixes == ["compose-create-compatibility",
+          "activation-journal-descendant-drain","zero-padded-compose-renderer",
+          "contained-node27-readoption"] and
+        .managed_recovery_payments_authorized == false and
+        .protocol_pow_claim_transactions_authorized == true and
+        .unexpected_wallet_transactions_authorized == false and
+        .key_generation_authorized == false and .address_generation_authorized == false and
+        (.created_at | type) == "string" and (.created_at | length) > 0
+    ' "$receipt" >/dev/null
+}
+
+transaction_package_root()
+{
+    local root=${SEALED_TRANSACTION_PACKAGE_ROOT:-}
+    if [[ -z "$root" ]]; then
+        printf '%s\n' "$PACKAGE_ROOT"
+        return 0
+    fi
+    [[ "$root" == "$(realpath -e -- "$root")" ]] || return 1
+    verify_resume_compatibility_authority "$root" || return 1
+    printf '%s\n' "$root"
+}
+
 verify_transaction_manifest()
 {
     local canary_sha canary_manifest_sha wave_sha package_sha maintenance_nonce baseline_manifest_sha
     local handoff_required=true predecessor_sha predecessor_run predecessor_nonce
-    local predecessor
+    local predecessor transaction_root
     [[ -f "$RUN_DIR/TRANSACTION.json" && ! -L "$RUN_DIR/TRANSACTION.json" &&
        -f "$RUN_DIR/package-files.sha256" && ! -L "$RUN_DIR/package-files.sha256" ]] || return 1
-    (cd "$PACKAGE_ROOT" && sha256sum --strict -c "$RUN_DIR/package-files.sha256" >/dev/null) || return 1
+    transaction_root=$(transaction_package_root) || return 1
+    (cd "$transaction_root" &&
+        sha256sum --strict -c "$RUN_DIR/package-files.sha256" >/dev/null) || return 1
     canary_sha=$EXPECTED_CANARY_RESULT_SHA256
     canary_manifest_sha=$EXPECTED_CANARY_EVIDENCE_MANIFEST_SHA256
     valid_sha256_hex "$canary_sha" && valid_sha256_hex "$canary_manifest_sha" || return 1
@@ -6612,9 +6803,633 @@ start_wave_candidate()
         die 'complete per-node candidate launch-attempt manifest could not be durably published'
 }
 
+verify_candidate_readoption_authorization()
+{
+    local node="$1" original_generation="$2"
+    local authorization activation containment containment_complete compatibility protected
+    local activation_sha containment_sha containment_complete_sha compatibility_sha
+    authorization=$(wave_node_readoption_authorization_path "$node") || return 1
+    activation=$(wave_node_activation_path "$node") || return 1
+    containment=$(wave_node_containment_path "$node") || return 1
+    containment_complete=$(wave_containment_complete_path) || return 1
+    compatibility=$(resume_compatibility_path) || return 1
+    for protected in "$authorization" "$activation" "$containment" "$containment_complete" \
+        "$compatibility"; do
+        data_rollback_protected_file "$protected" 600 || return 1
+    done
+    data_rollback_canonical_single_object_json "$authorization" || return 1
+    activation_sha=$(sha256sum "$activation" | awk '{print $1}') || return 1
+    containment_sha=$(sha256sum "$containment" | awk '{print $1}') || return 1
+    containment_complete_sha=$(sha256sum "$containment_complete" | awk '{print $1}') || return 1
+    compatibility_sha=$(sha256sum "$compatibility" | awk '{print $1}') || return 1
+    data_rollback_validate_stopped_generation "$original_generation" || return 1
+    verify_resume_compatibility_authority "${SEALED_TRANSACTION_PACKAGE_ROOT:-}" || return 1
+    jq -e --argjson node "$node" --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg generation "$original_generation" --arg activation_sha "$activation_sha" \
+        --arg containment_sha "$containment_sha" \
+        --arg containment_complete_sha "$containment_complete_sha" \
+        --arg compatibility_sha "$compatibility_sha" '
+        (keys | sort) == (["schema","transaction","state","node","run_dir","wave_dir",
+          "reason","candidate_image","candidate_image_id","contained_container_generation",
+          "original_activation_marker_sha256","containment_marker_sha256",
+          "containment_complete_sha256","resume_compatibility_sha256","allowed_actions",
+          "managed_recovery_payments_authorized",
+          "protocol_pow_claim_transactions_authorized",
+          "unexpected_wallet_transactions_authorized","key_generation_authorized",
+          "address_generation_authorized","created_at"] | sort) and
+        .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+        .state == "readoption-authorized" and .node == $node and .run_dir == $run and
+        .wave_dir == $wave and .reason == "transient-pow-helper-journal-tee-drain" and
+        .candidate_image == $image and .candidate_image_id == $image_id and
+        .contained_container_generation == $generation and
+        .original_activation_marker_sha256 == $activation_sha and
+        .containment_marker_sha256 == $containment_sha and
+        .containment_complete_sha256 == $containment_complete_sha and
+        .resume_compatibility_sha256 == $compatibility_sha and
+        .allowed_actions == ["restart-policy-no-to-on-failure-3","same-container-start",
+          "existing-wallet-unlock","legacy-pos-start","one-thread-one-percent-pow-start",
+          "runtime-gate-and-evidence-publication"] and
+        .managed_recovery_payments_authorized == false and
+        .protocol_pow_claim_transactions_authorized == true and
+        .unexpected_wallet_transactions_authorized == false and
+        .key_generation_authorized == false and .address_generation_authorized == false and
+        (.created_at | type) == "string" and (.created_at | length) > 0
+    ' "$authorization" >/dev/null || return 1
+    jq -e --arg activation_sha "$activation_sha" --arg generation "$original_generation" '
+        .activation_marker_sha256 == $activation_sha and
+        .container_generation == $generation and .state == "contained-no-rollback" and
+        .rollback_permitted == false and .shutdown_proves_runtime_inactive == true
+    ' "$containment" >/dev/null || return 1
+    (cd "$CURRENT_WAVE_DIR" && sha256sum --strict -c "${containment_complete##*/}" >/dev/null)
+}
+
+candidate_readoption_embedded_chain_paths()
+{
+    local node="$1" marker="$2" successful_attempt="$3"
+    local padded dir listing file name attempt_token file_attempt count index relative
+    local expected_path expected_sha actual_sha
+    local -a actual_paths=()
+    padded=$(node_padded "$node") || return 1
+    [[ "$padded" == 27 && "$successful_attempt" =~ ^[1-3]$ ]] || return 1
+    data_rollback_protected_file "$marker" 600 || return 1
+    data_rollback_canonical_single_object_json "$marker" || return 1
+    dir="$CURRENT_WAVE_DIR/node-${padded}-readoption-attempts"
+    data_rollback_protected_directory "$dir" 700 || return 1
+    [[ -z "$(find "$dir" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]] || return 1
+    jq -e '
+        (.readoption_attempt_chain | type) == "array" and
+        (.readoption_attempt_chain | length) >= 6 and
+        (.readoption_attempt_chain | length) <= 20 and
+        (.readoption_attempt_chain | all(
+          (keys | sort) == ["path","sha256"] and
+          (.path | test("^node-27-readoption-attempts/attempt-0[1-3]-(START-AUTHORIZED|STARTED|POLICY-PROMOTION-AUTHORIZED|FAILED-CONTAINED|WALLET-SEND-AUDIT)\\.json$|^node-27-readoption-attempts/attempt-0[1-3]-(staking|pow)\\.log$")) and
+          (.sha256 | test("^[0-9a-f]{64}$")))) and
+        (.readoption_attempt_chain == (.readoption_attempt_chain | sort_by(.path))) and
+        ([.readoption_attempt_chain[].path] | length) ==
+          ([.readoption_attempt_chain[].path] | unique | length)
+    ' "$marker" >/dev/null || return 1
+    listing=$(find "$dir" -mindepth 1 -maxdepth 1 -type f -print | sort) || return 1
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        name=${file##*/}
+        [[ "$name" =~ ^attempt-0[1-3]-(START-AUTHORIZED|STARTED|POLICY-PROMOTION-AUTHORIZED|FAILED-CONTAINED|WALLET-SEND-AUDIT)[.]json$ ||
+           "$name" =~ ^attempt-0[1-3]-(staking|pow)[.]log$ ]] || return 1
+        attempt_token=${name#attempt-}
+        attempt_token=${attempt_token%%-*}
+        [[ "$attempt_token" =~ ^0[1-3]$ ]] || return 1
+        file_attempt=$((10#$attempt_token))
+        ((file_attempt <= successful_attempt)) || return 1
+        data_rollback_protected_file "$file" 600 || return 1
+        if [[ "$name" == *.json ]]; then
+            data_rollback_canonical_single_object_json "$file" || return 1
+        fi
+        actual_paths+=("node-${padded}-readoption-attempts/$name")
+    done <<< "$listing"
+    count=$(jq -er '.readoption_attempt_chain | length' "$marker") || return 1
+    ((count == ${#actual_paths[@]})) || return 1
+    for ((index = 0; index < count; index++)); do
+        expected_path=$(jq -er --argjson index "$index" \
+            '.readoption_attempt_chain[$index].path' "$marker") || return 1
+        expected_sha=$(jq -er --argjson index "$index" \
+            '.readoption_attempt_chain[$index].sha256' "$marker") || return 1
+        relative=${actual_paths[$index]}
+        [[ "$expected_path" == "$relative" ]] || return 1
+        actual_sha=$(sha256sum "$CURRENT_WAVE_DIR/$relative" | awk '{print $1}') || return 1
+        [[ "$actual_sha" == "$expected_sha" ]] || return 1
+        printf '%s\n' "$relative"
+    done
+}
+
+candidate_readoption_generation_matches_lineage()
+{
+    local generation="$1" original="$2"
+    local id started vpn vpn_started original_id original_started original_vpn
+    local original_vpn_started
+    data_rollback_validate_stopped_generation "$generation" || return 1
+    data_rollback_validate_stopped_generation "$original" || return 1
+    IFS='|' read -r id started vpn vpn_started <<< "$generation" || return 1
+    IFS='|' read -r original_id original_started original_vpn original_vpn_started \
+        <<< "$original" || return 1
+    [[ "$id" == "$original_id" && "$vpn" == "$original_vpn" &&
+       "$vpn_started" == "$original_vpn_started" && -n "$started" ]]
+}
+
+candidate_readoption_phase_log_is_valid()
+{
+    local node="$1" attempt="$2" phase="$3" path
+    [[ "$node" -eq 27 && "$attempt" =~ ^[1-3]$ &&
+       ( "$phase" == staking || "$phase" == pow ) ]] || return 1
+    path="$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-$(printf '%02d' \
+        "$attempt")-${phase}.log"
+    data_rollback_protected_file "$path" 600 || return 1
+    grep -Fq "complete node=$node" "$path" || return 1
+    if [[ "$phase" == staking ]]; then
+        grep -Fq 'wallet=normally_unlocked pos=active' "$path"
+    else
+        grep -Fq 'pow=hashing' "$path"
+    fi
+}
+
+candidate_readoption_policy_is_valid()
+{
+    local node="$1" attempt="$2" expected_generation="$3"
+    local prefix policy started staking_log pow_log started_sha staking_sha pow_sha
+    prefix="$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-$(printf '%02d' "$attempt")"
+    policy="${prefix}-POLICY-PROMOTION-AUTHORIZED.json"
+    started="${prefix}-STARTED.json"
+    staking_log="${prefix}-staking.log"
+    pow_log="${prefix}-pow.log"
+    for protected in "$policy" "$started" "$staking_log" "$pow_log"; do
+        data_rollback_protected_file "$protected" 600 || return 1
+    done
+    candidate_readoption_phase_log_is_valid "$node" "$attempt" staking || return 1
+    candidate_readoption_phase_log_is_valid "$node" "$attempt" pow || return 1
+    started_sha=$(sha256sum "$started" | awk '{print $1}') || return 1
+    staking_sha=$(sha256sum "$staking_log" | awk '{print $1}') || return 1
+    pow_sha=$(sha256sum "$pow_log" | awk '{print $1}') || return 1
+    jq -e --argjson attempt "$attempt" --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg generation "$expected_generation" --arg started_sha "$started_sha" \
+        --arg staking_sha "$staking_sha" --arg pow_sha "$pow_sha" '
+        (keys | sort) == (["schema","transaction","state","attempt","run_dir",
+          "wave_dir","node","candidate_image","candidate_image_id",
+          "container_generation","started_evidence_sha256",
+          "staking_activation_log_sha256","pow_activation_log_sha256",
+          "from_restart_policy","to_restart_policy","runtime_activation_proven",
+          "managed_recovery_payments_authorized",
+          "protocol_pow_claim_transactions_authorized",
+          "unexpected_wallet_transactions_authorized",
+          "key_generation_authorized","address_generation_authorized","created_at"] | sort) and
+        .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+        .state == "readoption-policy-promotion-authorized" and .attempt == $attempt and
+        .run_dir == $run and .wave_dir == $wave and .node == 27 and
+        .candidate_image == $image and .candidate_image_id == $image_id and
+        .container_generation == $generation and .started_evidence_sha256 == $started_sha and
+        .staking_activation_log_sha256 == $staking_sha and
+        .pow_activation_log_sha256 == $pow_sha and
+        .from_restart_policy == {name:"no",maximum_retry_count:0} and
+        .to_restart_policy == {name:"on-failure",maximum_retry_count:3} and
+        .runtime_activation_proven == true and
+        .managed_recovery_payments_authorized == false and
+        .protocol_pow_claim_transactions_authorized == true and
+        .unexpected_wallet_transactions_authorized == false and
+        .key_generation_authorized == false and
+        .address_generation_authorized == false and (.created_at | type) == "string"
+    ' "$policy" >/dev/null
+}
+
+verify_candidate_readoption_attempt_chain()
+{
+    local node="$1" marker="$2" successful_attempt="$3" original_generation="$4"
+    local live_generation="$5" readoption_authorization_sha="$6"
+    local chain_text attempt prefix authorization started policy normal_failure wallet_audit
+    local staking_log pow_log authorization_sha started_sha policy_sha failure_sha wallet_audit_sha
+    local prior_generation started_generation terminal_generation
+    local expected_prior="$original_generation" expected_previous=__NULL__
+    local prior_id prior_started prior_vpn prior_vpn_started
+    local started_id started_at started_vpn started_vpn_started
+    local policy_present staking_present pow_present wallet_audit_present
+    chain_text=$(candidate_readoption_embedded_chain_paths \
+        "$node" "$marker" "$successful_attempt") || return 1
+    [[ -n "$chain_text" ]] || return 1
+    for attempt in $(seq 1 "$successful_attempt"); do
+        prefix="$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-$(printf '%02d' "$attempt")"
+        authorization="${prefix}-START-AUTHORIZED.json"
+        started="${prefix}-STARTED.json"
+        policy="${prefix}-POLICY-PROMOTION-AUTHORIZED.json"
+        normal_failure="${prefix}-FAILED-CONTAINED.json"
+        wallet_audit="${prefix}-WALLET-SEND-AUDIT.json"
+        staking_log="${prefix}-staking.log"
+        pow_log="${prefix}-pow.log"
+        data_rollback_protected_file "$authorization" 600 || return 1
+        data_rollback_protected_file "$started" 600 || return 1
+        authorization_sha=$(sha256sum "$authorization" | awk '{print $1}') || return 1
+        prior_generation=$(jq -er '.prior_container_generation' "$authorization") || return 1
+        [[ "$prior_generation" == "$expected_prior" ]] || return 1
+        candidate_readoption_generation_matches_lineage \
+            "$prior_generation" "$original_generation" || return 1
+        jq -e --argjson attempt "$attempt" --arg run "$RUN_DIR" \
+            --arg wave "$CURRENT_WAVE_DIR" --arg image "$CANDIDATE_IMAGE_REF" \
+            --arg image_id "$CANDIDATE_IMAGE_ID" --arg prior "$prior_generation" \
+            --arg readoption_sha "$readoption_authorization_sha" \
+            --arg previous_sha "$expected_previous" '
+            (keys | sort) == (["schema","transaction","state","attempt","run_dir",
+              "wave_dir","node","candidate_image","candidate_image_id",
+              "prior_container_generation","readoption_authorization_sha256",
+              "previous_failed_containment_sha256","allowed_action",
+              "restart_policy_during_start","managed_recovery_payments_authorized",
+              "protocol_pow_claim_transactions_authorized",
+              "unexpected_wallet_transactions_authorized","key_generation_authorized",
+              "address_generation_authorized","created_at"] | sort) and
+            .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+            .state == "readoption-start-authorized" and .attempt == $attempt and
+            .run_dir == $run and .wave_dir == $wave and .node == 27 and
+            .candidate_image == $image and .candidate_image_id == $image_id and
+            .prior_container_generation == $prior and
+            .readoption_authorization_sha256 == $readoption_sha and
+            .previous_failed_containment_sha256 ==
+              (if $previous_sha == "__NULL__" then null else $previous_sha end) and
+            .allowed_action == "same-container-start" and
+            .restart_policy_during_start == "no" and
+            .managed_recovery_payments_authorized == false and
+            .protocol_pow_claim_transactions_authorized == true and
+            .unexpected_wallet_transactions_authorized == false and
+            .key_generation_authorized == false and .address_generation_authorized == false and
+            (.created_at | type) == "string"
+        ' "$authorization" >/dev/null || return 1
+        started_sha=$(sha256sum "$started" | awk '{print $1}') || return 1
+        started_generation=$(jq -er '.started_container_generation' "$started") || return 1
+        candidate_readoption_generation_matches_lineage \
+            "$started_generation" "$original_generation" || return 1
+        IFS='|' read -r prior_id prior_started prior_vpn prior_vpn_started \
+            <<< "$prior_generation" || return 1
+        IFS='|' read -r started_id started_at started_vpn started_vpn_started \
+            <<< "$started_generation" || return 1
+        [[ "$started_id" == "$prior_id" && "$started_at" != "$prior_started" &&
+           "$started_vpn" == "$prior_vpn" &&
+           "$started_vpn_started" == "$prior_vpn_started" ]] || return 1
+        jq -e --argjson attempt "$attempt" --arg run "$RUN_DIR" \
+            --arg wave "$CURRENT_WAVE_DIR" --arg image "$CANDIDATE_IMAGE_REF" \
+            --arg image_id "$CANDIDATE_IMAGE_ID" --arg prior "$prior_generation" \
+            --arg generation "$started_generation" --arg auth_sha "$authorization_sha" '
+            (keys | sort) == (["schema","transaction","state","attempt","run_dir",
+              "wave_dir","node","candidate_image","candidate_image_id",
+              "prior_container_generation","started_container_generation",
+              "start_authorization_sha256","restart_policy",
+              "container_running_when_recorded","managed_recovery_payment_created",
+              "unexpected_wallet_transaction_created","created_at"] | sort) and
+            .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+            .state == "readoption-started" and .attempt == $attempt and
+            .run_dir == $run and .wave_dir == $wave and .node == 27 and
+            .candidate_image == $image and .candidate_image_id == $image_id and
+            .prior_container_generation == $prior and
+            .started_container_generation == $generation and
+            .start_authorization_sha256 == $auth_sha and .restart_policy == "no" and
+            (.container_running_when_recorded | type) == "boolean" and
+            .managed_recovery_payment_created == false and
+            .unexpected_wallet_transaction_created == false and
+            (.created_at | type) == "string"
+        ' "$started" >/dev/null || return 1
+        policy_present=0
+        staking_present=0
+        pow_present=0
+        [[ ! -e "$policy" && ! -L "$policy" ]] || policy_present=1
+        [[ ! -e "$staking_log" && ! -L "$staking_log" ]] || staking_present=1
+        [[ ! -e "$pow_log" && ! -L "$pow_log" ]] || pow_present=1
+        ((pow_present == 0 || staking_present == 1)) || return 1
+        if ((staking_present == 1)); then
+            candidate_readoption_phase_log_is_valid "$node" "$attempt" staking || return 1
+        fi
+        if ((pow_present == 1)); then
+            candidate_readoption_phase_log_is_valid "$node" "$attempt" pow || return 1
+        fi
+        if ((policy_present == 1)); then
+            ((staking_present == 1 && pow_present == 1)) || return 1
+            candidate_readoption_policy_is_valid \
+                "$node" "$attempt" "$started_generation" || return 1
+            policy_sha=$(sha256sum "$policy" | awk '{print $1}') || return 1
+        else
+            policy_sha=__ABSENT__
+        fi
+        wallet_audit_present=0
+        [[ ! -e "$wallet_audit" && ! -L "$wallet_audit" ]] || wallet_audit_present=1
+        if ((wallet_audit_present == 1)); then
+            ((staking_present == 1 && pow_present == 1)) || return 1
+            verify_candidate_readoption_wallet_send_audit \
+                "$node" "$attempt" "$started_generation" || return 1
+            wallet_audit_sha=$(sha256sum "$wallet_audit" | awk '{print $1}') || return 1
+        else
+            wallet_audit_sha=__ABSENT__
+        fi
+        if ((attempt == successful_attempt && policy_present == 1)); then
+            ((wallet_audit_present == 1)) || return 1
+        fi
+        if ((attempt == successful_attempt)); then
+            [[ ! -e "$normal_failure" && ! -L "$normal_failure" ]] || return 1
+            [[ "$policy_sha" != __ABSENT__ && -f "$staking_log" && ! -L "$staking_log" &&
+               -f "$pow_log" && ! -L "$pow_log" &&
+               "$wallet_audit_sha" != __ABSENT__ &&
+               "$started_generation" == "$live_generation" ]] || return 1
+            jq -e '.container_running_when_recorded == true' "$started" >/dev/null || return 1
+            staking_sha=$(sha256sum "$staking_log" | awk '{print $1}') || return 1
+            pow_sha=$(sha256sum "$pow_log" | awk '{print $1}') || return 1
+            jq -e --argjson attempt "$attempt" --arg auth_sha "$authorization_sha" \
+                --arg started_sha "$started_sha" --arg policy_sha "$policy_sha" \
+                --arg staking_path "${staking_log#"$CURRENT_WAVE_DIR/"}" \
+                --arg staking_sha "$staking_sha" \
+                --arg pow_path "${pow_log#"$CURRENT_WAVE_DIR/"}" --arg pow_sha "$pow_sha" \
+                --arg wallet_path "${wallet_audit#"$CURRENT_WAVE_DIR/"}" \
+                --arg wallet_sha "$wallet_audit_sha" '
+                .successful_readoption_attempt == $attempt and
+                .successful_start_authorization_sha256 == $auth_sha and
+                .successful_started_evidence_sha256 == $started_sha and
+                .policy_promotion_authorization_sha256 == $policy_sha and
+                .successful_staking_activation_log_path == $staking_path and
+                .successful_staking_activation_log_sha256 == $staking_sha and
+                .successful_pow_activation_log_path == $pow_path and
+                .successful_pow_activation_log_sha256 == $pow_sha and
+                .wallet_send_audit_path == $wallet_path and
+                .wallet_send_audit_sha256 == $wallet_sha
+            ' "$marker" >/dev/null || return 1
+            continue
+        fi
+        data_rollback_protected_file "$normal_failure" 600 || return 1
+        terminal_generation=$(jq -er '.container_generation' "$normal_failure") || return 1
+        candidate_readoption_generation_matches_lineage \
+            "$terminal_generation" "$original_generation" || return 1
+        IFS='|' read -r prior_id prior_started prior_vpn prior_vpn_started \
+            <<< "$started_generation" || return 1
+        IFS='|' read -r started_id started_at started_vpn started_vpn_started \
+            <<< "$terminal_generation" || return 1
+        [[ "$started_id" == "$prior_id" && "$started_vpn" == "$prior_vpn" &&
+           "$started_vpn_started" == "$prior_vpn_started" && -n "$started_at" ]] || return 1
+        jq -e --argjson attempt "$attempt" --arg run "$RUN_DIR" \
+            --arg wave "$CURRENT_WAVE_DIR" --arg image "$CANDIDATE_IMAGE_REF" \
+            --arg image_id "$CANDIDATE_IMAGE_ID" --arg generation "$terminal_generation" \
+            --arg started_sha "$started_sha" '
+            (keys | sort) == (["schema","transaction","state","attempt","run_dir",
+              "wave_dir","node","candidate_image","candidate_image_id",
+              "container_generation","started_evidence_sha256","restart_policy",
+              "container_running","container_pid","shutdown_proves_runtime_inactive",
+              "result_published","created_at"] | sort) and
+            .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+            .state == "readoption-failed-contained" and .attempt == $attempt and
+            .run_dir == $run and .wave_dir == $wave and .node == 27 and
+            .candidate_image == $image and .candidate_image_id == $image_id and
+            .container_generation == $generation and
+            .started_evidence_sha256 == $started_sha and .restart_policy == "no" and
+            .container_running == false and .container_pid == 0 and
+            .shutdown_proves_runtime_inactive == true and .result_published == false and
+            (.created_at | type) == "string" and (.created_at | length) > 0
+        ' "$normal_failure" >/dev/null || return 1
+        failure_sha=$(sha256sum "$normal_failure" | awk '{print $1}') || return 1
+        expected_prior=$terminal_generation
+        expected_previous=$failure_sha
+    done
+    return 0
+}
+
+verify_candidate_readoption_wallet_send_audit()
+{
+    local node="$1" attempt="$2" live_generation="$3" padded path prelaunch prelaunch_sha
+    padded=$(node_padded "$node") || return 1
+    [[ "$padded" == 27 && "$attempt" =~ ^[1-3]$ ]] || return 1
+    path="$CURRENT_WAVE_DIR/node-${padded}-readoption-attempts/attempt-$(printf '%02d' \
+        "$attempt")-WALLET-SEND-AUDIT.json"
+    prelaunch="$CURRENT_WAVE_DIR/node-${padded}-wallet-txids.prelaunch.json"
+    data_rollback_protected_file "$path" 600 || return 1
+    data_rollback_protected_file "$prelaunch" 600 || return 1
+    data_rollback_canonical_single_object_json "$path" || return 1
+    data_rollback_validate_stopped_generation "$live_generation" || return 1
+    prelaunch_sha=$(sha256sum "$prelaunch" | awk '{print $1}') || return 1
+    jq -e --arg generation "$live_generation" --arg prelaunch_sha "$prelaunch_sha" \
+        --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" '
+        def is_protocol_pow_claim:
+          .comment == "PoW Claim" and .qq_shadow_pow_authored == "1" and
+          (.qq_shadow_pow_created_height | type) == "string" and
+          (.qq_shadow_pow_created_height | test("^[0-9]+$")) and
+          (.qq_shadow_pow_created_tip | type) == "string" and
+          (.qq_shadow_pow_created_tip | test("^[0-9a-f]{64}$")) and
+          (.fee | type) == "number" and .fee <= 0 and
+          (.amount | type) == "number" and .amount == 0 and .abandoned == false;
+        (keys | sort) == (["schema","transaction","state","node","run_dir","wave_dir",
+          "container_generation","prelaunch_wallet_txids_sha256",
+          "observed_new_send_transactions","authorized_protocol_pow_claim_txids",
+          "unexpected_send_transactions","managed_recovery_payment_created",
+          "created_at"] | sort) and
+        .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+        .state == "readoption-wallet-send-audited" and .node == 27 and
+        .run_dir == $run and .wave_dir == $wave and
+        .container_generation == $generation and
+        .prelaunch_wallet_txids_sha256 == $prelaunch_sha and
+        (.observed_new_send_transactions | type) == "array" and
+        all(.observed_new_send_transactions[];
+          (keys | sort) == (["txid","comment","qq_shadow_pow_authored",
+            "qq_shadow_pow_created_height","qq_shadow_pow_created_tip","fee","amount",
+            "abandoned"] | sort) and
+          (.txid | type) == "string" and (.txid | test("^[0-9a-f]{64}$"))) and
+        (.observed_new_send_transactions ==
+          (.observed_new_send_transactions |
+            sort_by([.txid,(.amount | tostring),(.fee | tostring),(.comment | tostring)]))) and
+        (.authorized_protocol_pow_claim_txids | type) == "array" and
+        (.authorized_protocol_pow_claim_txids ==
+          (.authorized_protocol_pow_claim_txids | unique | sort)) and
+        all(.authorized_protocol_pow_claim_txids[];
+          type == "string" and test("^[0-9a-f]{64}$")) and
+        (.authorized_protocol_pow_claim_txids ==
+          ([.observed_new_send_transactions[] |
+            select(is_protocol_pow_claim) | .txid] | unique | sort)) and
+        (.unexpected_send_transactions ==
+          [.observed_new_send_transactions[] | select(is_protocol_pow_claim | not)]) and
+        .unexpected_send_transactions == [] and
+        .managed_recovery_payment_created == false and
+        (.created_at | type) == "string" and (.created_at | length) > 0
+    ' "$path" >/dev/null
+}
+
+verify_candidate_activation_supersession()
+{
+    local node="$1" original_generation="$2" live_generation="$3"
+    local path authorization activation containment containment_complete compatibility inspect
+    local original_pow_log start_authorization started policy_authorization
+    local successful_staking_log successful_pow_log successful_staking_path successful_pow_path
+    local wallet_send_audit wallet_send_audit_path successful_attempt chain_text
+    local authorization_sha activation_sha containment_sha containment_complete_sha
+    local compatibility_sha original_pow_log_sha staking_log_sha pow_log_sha protected
+    local start_authorization_sha started_sha policy_authorization_sha wallet_send_audit_sha
+    local old_id old_started old_vpn_id old_vpn_started
+    local replacement_id replacement_started replacement_vpn_id replacement_vpn_started
+    local live_id live_started live_vpn_id live_vpn_started replacement_generation
+    path=$(wave_node_activation_supersession_path "$node") || return 1
+    authorization=$(wave_node_readoption_authorization_path "$node") || return 1
+    activation=$(wave_node_activation_path "$node") || return 1
+    containment=$(wave_node_containment_path "$node") || return 1
+    containment_complete=$(wave_containment_complete_path) || return 1
+    compatibility=$(resume_compatibility_path) || return 1
+    original_pow_log="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-pow-activation.log"
+    data_rollback_protected_file "$path" 600 || return 1
+    data_rollback_canonical_single_object_json "$path" || return 1
+    successful_attempt=$(jq -er '.successful_readoption_attempt |
+        select(type == "number" and floor == . and . >= 1 and . <= 3)' "$path") || return 1
+    start_authorization="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-readoption-attempts/attempt-$(printf '%02d' "$successful_attempt")-START-AUTHORIZED.json"
+    started="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-readoption-attempts/attempt-$(printf '%02d' "$successful_attempt")-STARTED.json"
+    policy_authorization="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-readoption-attempts/attempt-$(printf '%02d' "$successful_attempt")-POLICY-PROMOTION-AUTHORIZED.json"
+    successful_staking_path=$(jq -er '.successful_staking_activation_log_path |
+        select(type == "string")' "$path") || return 1
+    successful_pow_path=$(jq -er '.successful_pow_activation_log_path |
+        select(type == "string")' "$path") || return 1
+    wallet_send_audit_path=$(jq -er '.wallet_send_audit_path |
+        select(type == "string")' "$path") || return 1
+    [[ "$successful_staking_path" == \
+       "node-27-readoption-attempts/attempt-$(printf '%02d' "$successful_attempt")-staking.log" &&
+       "$successful_pow_path" == \
+       "node-27-readoption-attempts/attempt-$(printf '%02d' "$successful_attempt")-pow.log" &&
+       "$wallet_send_audit_path" == \
+       "node-27-readoption-attempts/attempt-$(printf '%02d' "$successful_attempt")-WALLET-SEND-AUDIT.json" ]] || return 1
+    successful_staking_log="$CURRENT_WAVE_DIR/$successful_staking_path"
+    successful_pow_log="$CURRENT_WAVE_DIR/$successful_pow_path"
+    wallet_send_audit="$CURRENT_WAVE_DIR/$wallet_send_audit_path"
+    for protected in "$path" "$authorization" "$activation" "$containment" "$containment_complete" \
+        "$compatibility" "$original_pow_log" "$start_authorization" "$started" \
+        "$policy_authorization" "$successful_staking_log" "$successful_pow_log" \
+        "$wallet_send_audit"; do
+        data_rollback_protected_file "$protected" 600 || return 1
+    done
+    authorization_sha=$(sha256sum "$authorization" | awk '{print $1}') || return 1
+    activation_sha=$(sha256sum "$activation" | awk '{print $1}') || return 1
+    containment_sha=$(sha256sum "$containment" | awk '{print $1}') || return 1
+    containment_complete_sha=$(sha256sum "$containment_complete" | awk '{print $1}') || return 1
+    compatibility_sha=$(sha256sum "$compatibility" | awk '{print $1}') || return 1
+    original_pow_log_sha=$(sha256sum "$original_pow_log" | awk '{print $1}') || return 1
+    staking_log_sha=$(sha256sum "$successful_staking_log" | awk '{print $1}') || return 1
+    pow_log_sha=$(sha256sum "$successful_pow_log" | awk '{print $1}') || return 1
+    start_authorization_sha=$(sha256sum "$start_authorization" | awk '{print $1}') || return 1
+    started_sha=$(sha256sum "$started" | awk '{print $1}') || return 1
+    policy_authorization_sha=$(sha256sum "$policy_authorization" | awk '{print $1}') || return 1
+    wallet_send_audit_sha=$(sha256sum "$wallet_send_audit" | awk '{print $1}') || return 1
+    chain_text=$(candidate_readoption_embedded_chain_paths \
+        "$node" "$path" "$successful_attempt") || return 1
+    [[ -n "$chain_text" ]] || return 1
+    verify_activation_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA256" || return 1
+    verify_resume_compatibility_authority "${SEALED_TRANSACTION_PACKAGE_ROOT:-}" || return 1
+    grep -Fq 'exec > >(tee -a "$journal") 2>&1' "$POW_START_HELPER" || return 1
+    candidate_readoption_phase_log_is_valid \
+        "$node" "$successful_attempt" staking || return 1
+    candidate_readoption_phase_log_is_valid "$node" "$successful_attempt" pow || return 1
+    data_rollback_validate_stopped_generation "$original_generation" || return 1
+    data_rollback_validate_stopped_generation "$live_generation" || return 1
+    replacement_generation=$(jq -er '.replacement_container_generation |
+        select(type == "string")' "$path") || return 1
+    data_rollback_validate_stopped_generation "$replacement_generation" || return 1
+    verify_candidate_readoption_authorization "$node" "$original_generation" || return 1
+    verify_candidate_readoption_attempt_chain "$node" "$path" "$successful_attempt" \
+        "$original_generation" "$replacement_generation" "$authorization_sha" || return 1
+    verify_candidate_readoption_wallet_send_audit \
+        "$node" "$successful_attempt" "$replacement_generation" || return 1
+    IFS='|' read -r old_id old_started old_vpn_id old_vpn_started <<< "$original_generation" ||
+        return 1
+    IFS='|' read -r replacement_id replacement_started replacement_vpn_id \
+        replacement_vpn_started <<< "$replacement_generation" || return 1
+    IFS='|' read -r live_id live_started live_vpn_id live_vpn_started <<< "$live_generation" ||
+        return 1
+    [[ "$old_id" == "$replacement_id" && "$old_started" != "$replacement_started" &&
+       "$old_vpn_id" == "$replacement_vpn_id" &&
+       "$old_vpn_started" == "$replacement_vpn_started" &&
+       "$replacement_id" == "$live_id" && "$replacement_vpn_id" == "$live_vpn_id" &&
+       "$replacement_vpn_started" == "$live_vpn_started" &&
+       "$live_started" != "$old_started" ]] ||
+        return 1
+    jq -e --argjson node "$node" --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg original_generation "$original_generation" \
+        --arg live_generation "$replacement_generation" \
+        --arg authorization_sha "$authorization_sha" --arg activation_sha "$activation_sha" \
+        --arg containment_sha "$containment_sha" \
+        --arg containment_complete_sha "$containment_complete_sha" \
+        --arg compatibility_sha "$compatibility_sha" --arg helper_sha "$POW_START_HELPER_SHA256" \
+        --arg original_pow_log_sha "$original_pow_log_sha" \
+        --arg staking_log_sha "$staking_log_sha" --arg pow_log_sha "$pow_log_sha" \
+        --argjson successful_attempt "$successful_attempt" \
+        --arg start_authorization_sha "$start_authorization_sha" \
+        --arg started_sha "$started_sha" --arg policy_sha "$policy_authorization_sha" \
+        --arg staking_path "$successful_staking_path" --arg pow_path "$successful_pow_path" \
+        --arg wallet_send_audit_path "$wallet_send_audit_path" \
+        --arg wallet_send_audit_sha "$wallet_send_audit_sha" '
+        (keys | sort) == (["schema","transaction","state","node","run_dir","wave_dir",
+          "reason","candidate_image","candidate_image_id","original_container_generation",
+          "replacement_container_generation","original_activation_marker_sha256",
+          "readoption_authorization_sha256",
+          "containment_marker_sha256","containment_complete_sha256",
+          "resume_compatibility_sha256","pow_start_helper_sha256",
+          "original_pow_activation_log_sha256",
+          "successful_readoption_attempt",
+          "successful_start_authorization_sha256","successful_started_evidence_sha256",
+          "policy_promotion_authorization_sha256",
+          "successful_staking_activation_log_path",
+          "successful_staking_activation_log_sha256",
+          "successful_pow_activation_log_path","successful_pow_activation_log_sha256",
+          "wallet_send_audit_path","wallet_send_audit_sha256",
+          "readoption_attempt_chain","same_container_restart",
+          "original_evidence_retained",
+          "managed_recovery_payment_created",
+          "protocol_pow_claim_transactions_authorized",
+          "unexpected_wallet_transaction_created","key_generation_authorized",
+          "address_generation_authorized","created_at"] | sort) and
+        .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+        .state == "contained-activation-superseded" and .node == $node and
+        .run_dir == $run and .wave_dir == $wave and
+        .reason == "transient-pow-helper-journal-tee-drain" and
+        .candidate_image == $image and .candidate_image_id == $image_id and
+        .original_container_generation == $original_generation and
+        .replacement_container_generation == $live_generation and
+        .readoption_authorization_sha256 == $authorization_sha and
+        .original_activation_marker_sha256 == $activation_sha and
+        .containment_marker_sha256 == $containment_sha and
+        .containment_complete_sha256 == $containment_complete_sha and
+        .resume_compatibility_sha256 == $compatibility_sha and
+        .pow_start_helper_sha256 == $helper_sha and
+        .original_pow_activation_log_sha256 == $original_pow_log_sha and
+        .successful_readoption_attempt == $successful_attempt and
+        .successful_start_authorization_sha256 == $start_authorization_sha and
+        .successful_started_evidence_sha256 == $started_sha and
+        .policy_promotion_authorization_sha256 == $policy_sha and
+        .successful_staking_activation_log_path == $staking_path and
+        .successful_staking_activation_log_sha256 == $staking_log_sha and
+        .successful_pow_activation_log_path == $pow_path and
+        .successful_pow_activation_log_sha256 == $pow_log_sha and
+        .wallet_send_audit_path == $wallet_send_audit_path and
+        .wallet_send_audit_sha256 == $wallet_send_audit_sha and
+        .same_container_restart == true and .original_evidence_retained == true and
+        .managed_recovery_payment_created == false and
+        .protocol_pow_claim_transactions_authorized == true and
+        .unexpected_wallet_transaction_created == false and
+        .key_generation_authorized == false and .address_generation_authorized == false and
+        (.created_at | type) == "string" and (.created_at | length) > 0
+    ' "$path" >/dev/null || return 1
+    jq -e --arg activation_sha "$activation_sha" --arg generation "$original_generation" \
+        '.activation_marker_sha256 == $activation_sha and
+         .container_generation == $generation and .state == "contained-no-rollback" and
+         .rollback_permitted == false and .shutdown_proves_runtime_inactive == true' \
+        "$containment" >/dev/null || return 1
+    (cd "$CURRENT_WAVE_DIR" && sha256sum --strict -c "${containment_complete##*/}" >/dev/null) ||
+        return 1
+    inspect=$(docker inspect "$(container_for "$node")") || return 1
+    jq -e --arg id "$live_id" --arg image "$CANDIDATE_IMAGE_REF" \
+        --arg image_id "$CANDIDATE_IMAGE_ID" '
+        length == 1 and .[0].Id == $id and .[0].Config.Image == $image and
+        .[0].Image == $image_id and .[0].State.Paused == false and
+        .[0].State.Restarting == false and
+        .[0].HostConfig.RestartPolicy.Name == "on-failure" and
+        .[0].HostConfig.RestartPolicy.MaximumRetryCount == 3
+    ' >/dev/null <<< "$inspect" || return 1
+    [[ "$(container_generation_for "$node")" == "$live_generation" ]]
+}
+
 verify_candidate_activation_marker()
 {
-    local node="$1" path baseline prelaunch generation transaction_sha drain_sha baseline_sha txids_sha
+    local node="$1" path baseline prelaunch generation marker_generation
+    local transaction_sha drain_sha baseline_sha txids_sha
     path=$(wave_node_activation_path "$node") || return 1
     baseline=$(candidate_recovery_baseline_path "$node") || return 1
     prelaunch="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json"
@@ -6624,10 +7439,13 @@ verify_candidate_activation_marker()
     drain_sha=$(sha256sum "$(wave_drain_manifest_path)" | awk '{print $1}') || return 1
     baseline_sha=$(sha256sum "$baseline" | awk '{print $1}') || return 1
     txids_sha=$(sha256sum "$prelaunch" | awk '{print $1}') || return 1
+    marker_generation=$(jq -er '.container_generation | select(type == "string")' "$path") ||
+        return 1
+    data_rollback_validate_stopped_generation "$marker_generation" || return 1
     generation=$(container_generation_for "$node") || return 1
     jq -e --argjson node "$node" --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
         --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
-        --arg generation "$generation" --arg transaction_sha "$transaction_sha" \
+        --arg generation "$marker_generation" --arg transaction_sha "$transaction_sha" \
         --arg drain_sha "$drain_sha" --arg baseline_sha "$baseline_sha" --arg txids_sha "$txids_sha" '
         .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
         .boundary == "before-first-wallet-unlock" and .activation_attempted == true and
@@ -6640,7 +7458,25 @@ verify_candidate_activation_marker()
         .prelaunch_wallet_txids_sha256 == $txids_sha and
         .fee_payments_authorized == false and
         (.created_at | type == "string")
-    ' "$path" >/dev/null
+    ' "$path" >/dev/null || return 1
+    if [[ "$generation" == "$marker_generation" ]]; then
+        return 0
+    fi
+    verify_candidate_activation_supersession "$node" "$marker_generation" "$generation"
+}
+
+effective_candidate_activation_generation()
+{
+    local node="$1" activation supersession
+    activation=$(wave_node_activation_path "$node") || return 1
+    supersession=$(wave_node_activation_supersession_path "$node") || return 1
+    verify_candidate_activation_marker "$node" || return 1
+    if [[ -e "$supersession" || -L "$supersession" ]]; then
+        data_rollback_protected_file "$supersession" 600 || return 1
+        container_generation_for "$node"
+    else
+        jq -er '.container_generation | select(type == "string")' "$activation"
+    fi
 }
 
 publish_candidate_activation_marker()
@@ -7035,7 +7871,7 @@ verify_safe_rollback_marker()
     candidate_safe_rollback_state_is_clean "$wallet" "$staking" "$mining" "$recovery" "$fee" ||
         return 1
     cmp -s "$prelaunch" "$txids" || return 1
-    generation=$(jq -er '.container_generation' "$activation") || return 1
+    generation=$(effective_candidate_activation_generation "$node") || return 1
     [[ "$(container_generation_for "$node")" == "$generation" ]] || return 1
     activation_sha=$(sha256sum "$activation" | awk '{print $1}') || return 1
     transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
@@ -7081,7 +7917,7 @@ publish_safe_rollback_marker()
     prefix=$(wave_node_prefix "$node") || return 1
     prelaunch="${prefix}-wallet-txids.prelaunch.json"
     fee=$(candidate_recovery_fee_for "$node") || return 1
-    generation=$(jq -er '.container_generation' "$activation") || return 1
+    generation=$(effective_candidate_activation_generation "$node") || return 1
     txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.safe-wallet-txids.XXXXXX") || return 1
     [[ "$node" -eq "$FREE_CLAIM_NODE" ]] ||
         wallet_rpc_for "$node" setpowmining false 1 1 >/dev/null 2>&1 || true
@@ -7148,11 +7984,27 @@ publish_safe_rollback_marker()
 
 containment_evidence_present()
 {
+    local node
     [[ -n "$CURRENT_WAVE_DIR" && -d "$CURRENT_WAVE_DIR" && ! -L "$CURRENT_WAVE_DIR" ]] ||
         return 1
-    [[ -e "$(wave_containment_complete_path)" || -L "$(wave_containment_complete_path)" ]] ||
-        find "$CURRENT_WAVE_DIR" -maxdepth 1 \( -type f -o -type l \) \
-            -name 'node-*-CONTAINED-NO-ROLLBACK.json' -print -quit | grep -q .
+    if [[ ! -e "$(wave_containment_complete_path)" &&
+          ! -L "$(wave_containment_complete_path)" ]] &&
+       ! find "$CURRENT_WAVE_DIR" -maxdepth 1 \( -type f -o -type l \) \
+            -name 'node-*-CONTAINED-NO-ROLLBACK.json' -print -quit | grep -q .; then
+        return 1
+    fi
+    # A completed, checksum-sealed readoption makes the original containment
+    # historical evidence. Preserve its bytes, but do not let it block a later
+    # explicit rollback of an otherwise valid passed wave.
+    if [[ -f "$CURRENT_WAVE_DIR/RESULT" && ! -L "$CURRENT_WAVE_DIR/RESULT" &&
+          "$(cat "$CURRENT_WAVE_DIR/RESULT")" == passed ]]; then
+        for node in "${CURRENT_WAVE_NODES[@]}"; do
+            [[ -f "$(wave_node_activation_supersession_path "$node")" &&
+               ! -L "$(wave_node_activation_supersession_path "$node")" ]] || return 0
+        done
+        verify_wave_runtime_evidence && return 1
+    fi
+    return 0
 }
 
 verify_node_containment_marker()
@@ -7772,7 +8624,7 @@ verify_stopped_candidate_safe_boundaries()
         verify_candidate_launch_attempt_marker "$node" 0 || return 1
         verify_candidate_activation_marker "$node" || return 1
         verify_safe_rollback_marker "$node" || return 1
-        generation=$(jq -er '.container_generation' "$activation") || return 1
+        generation=$(effective_candidate_activation_generation "$node") || return 1
         [[ "$(container_generation_for "$node")" == "$generation" ]] || return 1
         inspect=$(docker inspect "$(container_for "$node")") || return 1
         jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg id "$CANDIDATE_IMAGE_ID" '

@@ -126,7 +126,7 @@ validate_recovery_baseline()
 {
     local node="$1" expected_sha="${2:-}" expected_fee="${3:-}"
     local padded path metadata actual_sha metadata_sha fee wave transaction_set
-    local transaction_before transaction_first prelaunch_sha first_sha
+    local transaction_prelaunch transaction_first prelaunch_sha first_sha
     padded=$(node_padded "$node") || return 1
     wave=$(passed_wave_for_node "$node") || return 1
     path="$wave/candidate-recovery-node-${padded}.json"
@@ -140,9 +140,9 @@ validate_recovery_baseline()
     [[ "$(wc -l < "$metadata")" -eq 1 && "$metadata_sha" =~ ^[0-9a-f]{64}$ &&
        "$actual_sha" == "$metadata_sha" ]] || return 1
     [[ -z "$expected_sha" || "$actual_sha" == "$expected_sha" ]] || return 1
-    transaction_before="$wave/node-${padded}-wallet-txids.before.json"
+    transaction_prelaunch="$wave/node-${padded}-wallet-txids.prelaunch.json"
     transaction_first="$wave/node-${padded}-wallet-txids.first-v3014.json"
-    for transaction_set in "$transaction_before" "$transaction_first"; do
+    for transaction_set in "$transaction_prelaunch" "$transaction_first"; do
         [[ -f "$transaction_set" && ! -L "$transaction_set" &&
            "$(realpath -e -- "$transaction_set")" == "$transaction_set" &&
            "$(stat -c '%u:%g:%a' "$transaction_set")" == 0:0:600 ]] || return 1
@@ -150,35 +150,55 @@ validate_recovery_baseline()
             type == "string" and test("^[0-9a-f]{64}$"))' "$transaction_set" >/dev/null ||
             return 1
     done
-    prelaunch_sha=$(sha256sum "$transaction_before" | awk '{print $1}') || return 1
+    prelaunch_sha=$(sha256sum "$transaction_prelaunch" | awk '{print $1}') || return 1
     first_sha=$(sha256sum "$transaction_first" | awk '{print $1}') || return 1
     [[ "$prelaunch_sha" == "$first_sha" ]] || return 1
     jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
         --arg source "$SOURCE_COMMIT" --argjson node "$node" \
         --arg prelaunch_sha "$prelaunch_sha" --arg first_sha "$first_sha" \
         --arg wave_dir "$wave" '
-        .schema == 1 and .node == $node and .candidate_image == $image and
+        .schema == 2 and .node == $node and .candidate_image == $image and
         .candidate_image_id == $image_id and .source_commit == $source and
         .wave_dir == $wave_dir and
         (.captured_at | type) == "string" and
-        .recovery.policy_authoritative == true and
-        .recovery.policy.automatic_authorized == false and
-        .recovery.database_outcome_ambiguous == false and
-        .recovery.chain_ready == true and .recovery.wallet_tip_matches == true and
-        .recovery.blocking_quarantined_claims == 0 and .recovery.blocking_components == 0 and
-        .recovery.indeterminate_quarantined_claims == 0 and
-        .recovery.pending_manual_resolutions == 0 and
-        .recovery.pending_automatic_resolutions == 0 and
-        (.recovery.confirmed_resolution_fees | type) == "number" and
-        .recovery.confirmed_resolution_fees >= 0 and
+        (.container_generation | type) == "string" and
+        .wallet_locked_throughout == true and .wallet_final.unlocked_until == 0 and
+        .staking_final.enabled == false and .staking_final.staking == false and
+        .staking_final.worker_running == false and
+        .staking_final.allow_automatic_quantum_key_creation == false and
+        .mining_final.enabled == false and .mining_final.autostart == false and
+        .mining_final.state == "disabled" and .mining_final.hashrate == 0 and
+        .mining_final.live_claims == 0 and .mining_final.quarantined_claims == 0 and
+        .mining_final.blocking_quarantined_claims == 0 and
+        .mining_final.allow_automatic_quantum_key_creation == false and
+        .recovery_initial.policy_authoritative == true and
+        .recovery_initial.policy.automatic_authorized == false and
+        .recovery_initial.database_outcome_ambiguous == false and
+        .recovery_final.policy_authoritative == true and
+        .recovery_final.policy.automatic_authorized == false and
+        .recovery_final.database_outcome_ambiguous == false and
+        .recovery_final.chain_ready == true and .recovery_final.wallet_tip_matches == true and
+        .recovery_final.blocking_quarantined_claims == 0 and
+        .recovery_final.blocking_components == 0 and
+        .recovery_final.indeterminate_quarantined_claims == 0 and
+        .recovery_final.pending_manual_resolutions == 0 and
+        .recovery_final.pending_automatic_resolutions == 0 and
+        (.recovery_initial.confirmed_resolution_fees | type) == "number" and
+        .recovery_initial.confirmed_resolution_fees >= 0 and
+        .recovery_final.confirmed_resolution_fees ==
+          .recovery_initial.confirmed_resolution_fees and
         .wallet_transaction_guard.prelaunch_sha256 == $prelaunch_sha and
         .wallet_transaction_guard.first_v3014_sha256 == $first_sha and
         .wallet_transaction_guard.exactly_unchanged == true
     ' "$path" >/dev/null || return 1
-    fee=$(jq -er '.recovery.confirmed_resolution_fees | select(type == "number" and . >= 0)' \
+    fee=$(jq -er '.recovery_initial.confirmed_resolution_fees |
+        select(type == "number" and . >= 0)' \
         "$path") || return 1
-    [[ "$fee" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
-    [[ -z "$expected_fee" || "$fee" == "$expected_fee" ]] || return 1
+    jq -e -n --argjson fee "$fee" '$fee | type == "number" and . >= 0' >/dev/null || return 1
+    if [[ -n "$expected_fee" ]]; then
+        jq -e -n --argjson fee "$fee" --argjson expected "$expected_fee" \
+            '$fee == $expected' >/dev/null || return 1
+    fi
     printf '%s|%s\n' "$actual_sha" "$fee"
 }
 

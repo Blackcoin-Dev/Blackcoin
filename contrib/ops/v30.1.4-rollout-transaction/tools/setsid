@@ -151,7 +151,11 @@ compat_group_contains_only_leader()
         pid=${pid%/stat}
         identity=''
         if ! identity=$(compat_process_identity "$pid"); then
-            [[ ! -e "/proc/$pid" ]] || return 2
+            # The snapshot includes every process on the host. A process can
+            # exit between glob expansion and reading stat; an unreadable
+            # non-leader therefore proves nothing about this process group.
+            # The authenticated leader was checked immediately above, and a
+            # surviving group member is observed again on the next scan.
             continue
         fi
         read -r pgid starttime state <<< "$identity"

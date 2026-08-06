@@ -57,6 +57,7 @@ scripts=()
 while IFS= read -r script; do scripts+=("$script"); done < <(
     find "$ROOT" -type f -name '*.sh' ! -path '*/tests/*' -print | sort
 )
+scripts+=("$ROOT/tools/setsid")
 bash -n "${scripts[@]}"
 pass bash-syntax
 
@@ -82,6 +83,678 @@ pass shellcheck-actionable
     exercise_caller_local_rewrite
 )
 pass sealed-compose-create-compatibility-rewrite
+
+for recovery_script in adopt_contained_node27.sh resume_compatible_rollout.sh; do
+    [[ -x "$ROOT/$recovery_script" ]]
+done
+[[ "$(tail -n 1 "$ROOT/fleet_rollout.sh")" == esac ]]
+function_body adoption_apply "$ROOT/adopt_contained_node27.sh" > "$TMP/adoption-apply"
+assert_order "$TMP/adoption-apply" \
+    'flock -n 19' \
+    'adoption_preflight' \
+    'acquire_wave_locks' \
+    'publish_resume_compatibility' \
+    'publish_readoption_authorization' \
+    'ensure_readoption_candidate_running' \
+    'wait_for_core_ready' \
+    'activate_or_resume_readoption_phases' \
+    'verify_postactivation_no_spend_state' \
+    'verify_wave_chain_convergence' \
+    'cleanup_readoption_partial_logs' \
+    'publish_readoption_policy_promotion_authorization "$READOPTION_ATTEMPT"' \
+    'docker update --restart=on-failure:3' \
+    'verify_readoption_live_state "$READOPTION_GENERATION" true on-failure' \
+    'verify_node_runtime_gate "$TARGET_NODE" "$fee"' \
+    'publish_wallet_send_audit' \
+    'publish_activation_supersession'
+assert_order_last "$TMP/adoption-apply" \
+    'publish_activation_supersession' \
+    'verify_node_runtime_gate "$TARGET_NODE" "$fee"' \
+    'verify_postactivation_no_spend_state' \
+    'finalize_adoption_evidence' \
+    'ADOPTION_COMPLETE=1'
+grep -Fq 'same-container-start' "$ROOT/adopt_contained_node27.sh"
+grep -Fq 'managed_recovery_payments_authorized:false' "$ROOT/adopt_contained_node27.sh"
+grep -Fq 'protocol_pow_claim_transactions_authorized:true' \
+    "$ROOT/adopt_contained_node27.sh"
+grep -Fq 'unexpected_wallet_transactions_authorized:false' \
+    "$ROOT/adopt_contained_node27.sh"
+grep -Fq 'key_generation_authorized:false' "$ROOT/adopt_contained_node27.sh"
+grep -Fq 'address_generation_authorized:false' "$ROOT/adopt_contained_node27.sh"
+! grep -Eiq 'send(toaddress|many)|getnewaddress|createwallet|generatetoaddress|resolvepowclaim' \
+    "$ROOT/adopt_contained_node27.sh"
+pass contained-node27-append-only-adoption-order-and-no-spend-scope
+
+function_body verify_candidate_activation_marker "$ROOT/fleet_rollout.sh" \
+    > "$TMP/activation-marker-function"
+grep -Fq 'marker_generation=$(jq -er' "$TMP/activation-marker-function"
+assert_order "$TMP/activation-marker-function" \
+    'data_rollback_validate_stopped_generation "$marker_generation"' \
+    'generation=$(container_generation_for "$node")' \
+    'if [[ "$generation" == "$marker_generation" ]]' \
+    'verify_candidate_activation_supersession "$node" "$marker_generation" "$generation"'
+function_body verify_candidate_readoption_authorization "$ROOT/fleet_rollout.sh" \
+    > "$TMP/readoption-authorization-function"
+for required in 'state == "readoption-authorized"' \
+    'reason == "transient-pow-helper-journal-tee-drain"' \
+    'restart-policy-no-to-on-failure-3' 'same-container-start' \
+    '.managed_recovery_payments_authorized == false' \
+    '.protocol_pow_claim_transactions_authorized == true' \
+    '.unexpected_wallet_transactions_authorized == false' \
+    '.key_generation_authorized == false' '.address_generation_authorized == false'; do
+    grep -Fq -- "$required" "$TMP/readoption-authorization-function"
+done
+function_body verify_candidate_activation_supersession "$ROOT/fleet_rollout.sh" \
+    > "$TMP/activation-supersession-function"
+for required in 'verify_candidate_readoption_authorization' \
+    'verify_candidate_readoption_attempt_chain' \
+    'verify_candidate_readoption_wallet_send_audit' \
+    'policy_promotion_authorization_sha256' \
+    'successful_staking_activation_log_path' \
+    'successful_pow_activation_log_path' 'wallet_send_audit_path' 'wallet_send_audit_sha256' \
+    '"$old_id" == "$replacement_id"' '"$old_started" != "$replacement_started"' \
+    '"$replacement_id" == "$live_id"' '"$live_started" != "$old_started"' \
+    '"$replacement_vpn_id" == "$live_vpn_id"' \
+    'state == "contained-activation-superseded"' '.original_evidence_retained == true' \
+    '.managed_recovery_payment_created == false' \
+    '.protocol_pow_claim_transactions_authorized == true' \
+    '.unexpected_wallet_transaction_created == false'; do
+    grep -Fq -- "$required" "$TMP/activation-supersession-function"
+done
+function_body wave_runtime_evidence_expected_files "$ROOT/fleet_rollout.sh" \
+    > "$TMP/wave-runtime-evidence-function"
+for required in 'wave_node_readoption_authorization_path' 'wave_node_containment_path' \
+    'wave_containment_complete_path' 'resume_compatibility_path' \
+    'candidate_readoption_embedded_chain_paths' \
+    'unaffected.after' 'pow-activation.log'; do
+    grep -Fq -- "$required" "$TMP/wave-runtime-evidence-function"
+done
+! grep -Fq 'ROLLBACK_STATE' "$TMP/wave-runtime-evidence-function"
+! grep -Eq 'READOPTION-ATTEMPT-CHAIN|readoption-(staking|pow)-activation[.]log' \
+    "$TMP/wave-runtime-evidence-function"
+function_body containment_evidence_present "$ROOT/fleet_rollout.sh" \
+    > "$TMP/containment-evidence-function"
+assert_order "$TMP/containment-evidence-function" \
+    '"$(cat "$CURRENT_WAVE_DIR/RESULT")" == passed' \
+    'wave_node_activation_supersession_path' \
+    'verify_wave_runtime_evidence && return 1'
+pass activation-supersession-and-historical-containment-contract
+
+function_body verify_candidate_readoption_wallet_send_audit "$ROOT/fleet_rollout.sh" \
+    > "$TMP/readoption-wallet-send-audit-function"
+(
+    # shellcheck disable=SC1090
+    source "$TMP/readoption-wallet-send-audit-function"
+    node_padded() { printf '%02d\n' "$1"; }
+    data_rollback_protected_file() { [[ -f "$1" && ! -L "$1" ]]; }
+    data_rollback_validate_stopped_generation() { [[ -n "$1" ]]; }
+    data_rollback_canonical_single_object_json()
+    {
+        local canonical
+        canonical=$(jq -S -e -s '
+            if length == 1 and (.[0] | type == "object") then .[0]
+            else error("exactly one object required") end
+        ' "$1") || return 1
+        printf '%s\n' "$canonical" | cmp -s "$1" -
+    }
+    RUN_DIR="$TMP/wallet-send-audit-run"
+    CURRENT_WAVE_DIR="$RUN_DIR/wave-01-nodes-27-retry-01"
+    generation="$(printf 'a%.0s' {1..64})|2026-08-06T00:00:01Z|$(printf 'b%.0s' \
+        {1..64})|2026-08-06T00:00:00Z"
+    txid=$(printf 'c%.0s' {1..64})
+    tip=$(printf 'd%.0s' {1..64})
+    mkdir -p "$CURRENT_WAVE_DIR/node-27-readoption-attempts"
+    jq -nS '[]' > "$CURRENT_WAVE_DIR/node-27-wallet-txids.prelaunch.json"
+    prelaunch_sha=$(sha256sum \
+        "$CURRENT_WAVE_DIR/node-27-wallet-txids.prelaunch.json" | awk '{print $1}')
+    jq -nS --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        --arg generation "$generation" --arg prelaunch_sha "$prelaunch_sha" \
+        --arg txid "$txid" --arg tip "$tip" '
+        {schema:1,transaction:"v30.1.4-fleet-rollout",
+         state:"readoption-wallet-send-audited",node:27,run_dir:$run,wave_dir:$wave,
+         container_generation:$generation,prelaunch_wallet_txids_sha256:$prelaunch_sha,
+         observed_new_send_transactions:[{txid:$txid,comment:"PoW Claim",
+           qq_shadow_pow_authored:"1",qq_shadow_pow_created_height:"123",
+           qq_shadow_pow_created_tip:$tip,fee:-0.01,amount:0,abandoned:false}],
+         authorized_protocol_pow_claim_txids:[$txid],unexpected_send_transactions:[],
+         managed_recovery_payment_created:false,created_at:"2026-08-06T00:00:02Z"}' \
+        > "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-01-WALLET-SEND-AUDIT.json"
+    verify_candidate_readoption_wallet_send_audit 27 1 "$generation"
+    cp "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-01-WALLET-SEND-AUDIT.json" \
+        "$TMP/readoption-wallet-send-audit.valid"
+    jq -S '.observed_new_send_transactions[0].comment="ordinary send"' \
+        "$TMP/readoption-wallet-send-audit.valid" \
+        > "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-01-WALLET-SEND-AUDIT.json"
+    ! verify_candidate_readoption_wallet_send_audit 27 1 "$generation"
+    jq -S '.unexpected_send_transactions=[.observed_new_send_transactions[0]]' \
+        "$TMP/readoption-wallet-send-audit.valid" \
+        > "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-01-WALLET-SEND-AUDIT.json"
+    ! verify_candidate_readoption_wallet_send_audit 27 1 "$generation"
+    jq -S '.extra=true' "$TMP/readoption-wallet-send-audit.valid" \
+        > "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-01-WALLET-SEND-AUDIT.json"
+    ! verify_candidate_readoption_wallet_send_audit 27 1 "$generation"
+    cp "$TMP/readoption-wallet-send-audit.valid" \
+        "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-01-WALLET-SEND-AUDIT.json"
+    ! verify_candidate_readoption_wallet_send_audit 27 1 "${generation}changed"
+)
+pass readoption-wallet-send-audit-protocol-claim-provenance-and-exact-schema
+
+for function_name in candidate_readoption_embedded_chain_paths \
+    candidate_readoption_generation_matches_lineage \
+    candidate_readoption_phase_log_is_valid candidate_readoption_policy_is_valid \
+    verify_candidate_readoption_wallet_send_audit \
+    verify_candidate_readoption_attempt_chain; do
+    function_body "$function_name" "$ROOT/fleet_rollout.sh" \
+        >> "$TMP/readoption-attempt-chain-functions"
+done
+(
+    # shellcheck disable=SC1090
+    source "$TMP/readoption-attempt-chain-functions"
+    node_padded() { printf '%02d\n' "$1"; }
+    data_rollback_protected_file() { [[ -f "$1" && ! -L "$1" ]]; }
+    data_rollback_protected_directory() { [[ -d "$1" && ! -L "$1" ]]; }
+    data_rollback_validate_stopped_generation()
+    {
+        [[ "$1" =~ ^[0-9a-f]{64}\|[^\|[:space:]]+\|[0-9a-f]{64}\|[^\|[:space:]]+$ ]]
+    }
+    data_rollback_canonical_single_object_json()
+    {
+        local canonical
+        data_rollback_protected_file "$1" 600 || return 1
+        canonical=$(jq -S -e -s '
+            if length == 1 and (.[0] | type == "object") then .[0]
+            else error("exactly one object required") end
+        ' "$1") || return 1
+        printf '%s\n' "$canonical" | cmp -s "$1" -
+    }
+    RUN_DIR="$TMP/readoption-chain-run"
+    CURRENT_WAVE_DIR="$RUN_DIR/wave-01-nodes-27-retry-01"
+    CANDIDATE_IMAGE_REF='registry.example/blackcoin@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    CANDIDATE_IMAGE_ID='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    ATTEMPT_DIR="$CURRENT_WAVE_DIR/node-27-readoption-attempts"
+    mkdir -p "$ATTEMPT_DIR"
+    container_id=$(printf 'c%.0s' {1..64})
+    vpn_id=$(printf 'd%.0s' {1..64})
+    readoption_sha=$(printf 'e%.0s' {1..64})
+    original_generation="$container_id|2026-08-06T00:00:00Z|$vpn_id|2026-08-06T00:00:00Z"
+    generation_one="$container_id|2026-08-06T00:00:01Z|$vpn_id|2026-08-06T00:00:00Z"
+    generation_one_terminal="$container_id|2026-08-06T00:00:01.500000000Z|$vpn_id|2026-08-06T00:00:00Z"
+    generation_two="$container_id|2026-08-06T00:00:02Z|$vpn_id|2026-08-06T00:00:00Z"
+    jq -nS '[]' > "$CURRENT_WAVE_DIR/node-27-wallet-txids.prelaunch.json"
+    prelaunch_sha=$(sha256sum \
+        "$CURRENT_WAVE_DIR/node-27-wallet-txids.prelaunch.json" | awk '{print $1}')
+
+    write_start_authorization_fixture()
+    {
+        local attempt="$1" prior="$2" previous_sha="$3" path
+        path="$ATTEMPT_DIR/attempt-$(printf '%02d' "$attempt")-START-AUTHORIZED.json"
+        jq -nS --argjson attempt "$attempt" --arg run "$RUN_DIR" \
+            --arg wave "$CURRENT_WAVE_DIR" --arg image "$CANDIDATE_IMAGE_REF" \
+            --arg image_id "$CANDIDATE_IMAGE_ID" --arg prior "$prior" \
+            --arg readoption_sha "$readoption_sha" --arg previous_sha "$previous_sha" '
+            {schema:1,transaction:"v30.1.4-fleet-rollout",
+             state:"readoption-start-authorized",attempt:$attempt,run_dir:$run,wave_dir:$wave,
+             node:27,candidate_image:$image,candidate_image_id:$image_id,
+             prior_container_generation:$prior,
+             readoption_authorization_sha256:$readoption_sha,
+             previous_failed_containment_sha256:
+               (if $previous_sha == "__NULL__" then null else $previous_sha end),
+             allowed_action:"same-container-start",restart_policy_during_start:"no",
+             managed_recovery_payments_authorized:false,
+             protocol_pow_claim_transactions_authorized:true,
+             unexpected_wallet_transactions_authorized:false,key_generation_authorized:false,
+             address_generation_authorized:false,created_at:"2026-08-06T00:00:00Z"}' \
+            > "$path"
+    }
+    write_started_fixture()
+    {
+        local attempt="$1" prior="$2" generation="$3" authorization path
+        authorization="$ATTEMPT_DIR/attempt-$(printf '%02d' "$attempt")-START-AUTHORIZED.json"
+        path="$ATTEMPT_DIR/attempt-$(printf '%02d' "$attempt")-STARTED.json"
+        jq -nS --argjson attempt "$attempt" --arg run "$RUN_DIR" \
+            --arg wave "$CURRENT_WAVE_DIR" --arg image "$CANDIDATE_IMAGE_REF" \
+            --arg image_id "$CANDIDATE_IMAGE_ID" --arg prior "$prior" \
+            --arg generation "$generation" \
+            --arg auth_sha "$(sha256sum "$authorization" | awk '{print $1}')" '
+            {schema:1,transaction:"v30.1.4-fleet-rollout",state:"readoption-started",
+             attempt:$attempt,run_dir:$run,wave_dir:$wave,node:27,candidate_image:$image,
+             candidate_image_id:$image_id,prior_container_generation:$prior,
+             started_container_generation:$generation,start_authorization_sha256:$auth_sha,
+             restart_policy:"no",container_running_when_recorded:true,
+             managed_recovery_payment_created:false,
+             unexpected_wallet_transaction_created:false,created_at:"2026-08-06T00:00:01Z"}' \
+            > "$path"
+    }
+    write_phase_logs_fixture()
+    {
+        local attempt="$1" prefix
+        prefix="$ATTEMPT_DIR/attempt-$(printf '%02d' "$attempt")"
+        printf '%s\n' 'complete node=27 wallet=normally_unlocked pos=active' \
+            > "${prefix}-staking.log"
+        printf '%s\n' 'complete node=27 pow=hashing' > "${prefix}-pow.log"
+    }
+    write_wallet_audit_fixture()
+    {
+        local attempt="$1" generation="$2" path
+        path="$ATTEMPT_DIR/attempt-$(printf '%02d' "$attempt")-WALLET-SEND-AUDIT.json"
+        jq -nS --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+            --arg generation "$generation" --arg prelaunch_sha "$prelaunch_sha" '
+            {schema:1,transaction:"v30.1.4-fleet-rollout",
+             state:"readoption-wallet-send-audited",node:27,run_dir:$run,wave_dir:$wave,
+             container_generation:$generation,prelaunch_wallet_txids_sha256:$prelaunch_sha,
+             observed_new_send_transactions:[],authorized_protocol_pow_claim_txids:[],
+             unexpected_send_transactions:[],managed_recovery_payment_created:false,
+             created_at:"2026-08-06T00:00:02Z"}' > "$path"
+    }
+    write_policy_fixture()
+    {
+        local attempt="$1" generation="$2" prefix started staking pow path
+        prefix="$ATTEMPT_DIR/attempt-$(printf '%02d' "$attempt")"
+        started="${prefix}-STARTED.json"
+        staking="${prefix}-staking.log"
+        pow="${prefix}-pow.log"
+        path="${prefix}-POLICY-PROMOTION-AUTHORIZED.json"
+        jq -nS --argjson attempt "$attempt" --arg run "$RUN_DIR" \
+            --arg wave "$CURRENT_WAVE_DIR" --arg image "$CANDIDATE_IMAGE_REF" \
+            --arg image_id "$CANDIDATE_IMAGE_ID" --arg generation "$generation" \
+            --arg started_sha "$(sha256sum "$started" | awk '{print $1}')" \
+            --arg staking_sha "$(sha256sum "$staking" | awk '{print $1}')" \
+            --arg pow_sha "$(sha256sum "$pow" | awk '{print $1}')" '
+            {schema:1,transaction:"v30.1.4-fleet-rollout",
+             state:"readoption-policy-promotion-authorized",attempt:$attempt,run_dir:$run,
+             wave_dir:$wave,node:27,candidate_image:$image,candidate_image_id:$image_id,
+             container_generation:$generation,started_evidence_sha256:$started_sha,
+             staking_activation_log_sha256:$staking_sha,pow_activation_log_sha256:$pow_sha,
+             from_restart_policy:{name:"no",maximum_retry_count:0},
+             to_restart_policy:{name:"on-failure",maximum_retry_count:3},
+             runtime_activation_proven:true,managed_recovery_payments_authorized:false,
+             protocol_pow_claim_transactions_authorized:true,
+             unexpected_wallet_transactions_authorized:false,key_generation_authorized:false,
+             address_generation_authorized:false,created_at:"2026-08-06T00:00:03Z"}' \
+            > "$path"
+    }
+    write_failure_fixture()
+    {
+        local attempt="$1" generation="$2" prefix started path
+        prefix="$ATTEMPT_DIR/attempt-$(printf '%02d' "$attempt")"
+        started="${prefix}-STARTED.json"
+        path="${prefix}-FAILED-CONTAINED.json"
+        jq -nS --argjson attempt "$attempt" --arg run "$RUN_DIR" \
+            --arg wave "$CURRENT_WAVE_DIR" --arg image "$CANDIDATE_IMAGE_REF" \
+            --arg image_id "$CANDIDATE_IMAGE_ID" --arg generation "$generation" \
+            --arg started_sha "$(sha256sum "$started" | awk '{print $1}')" '
+            {schema:1,transaction:"v30.1.4-fleet-rollout",
+             state:"readoption-failed-contained",attempt:$attempt,run_dir:$run,wave_dir:$wave,
+             node:27,candidate_image:$image,candidate_image_id:$image_id,
+             container_generation:$generation,started_evidence_sha256:$started_sha,
+             restart_policy:"no",container_running:false,container_pid:0,
+             shutdown_proves_runtime_inactive:true,result_published:false,
+             created_at:"2026-08-06T00:00:04Z"}' > "$path"
+    }
+    write_chain_marker_fixture()
+    {
+        local attempt="$1" prefix chain marker
+        prefix="$ATTEMPT_DIR/attempt-$(printf '%02d' "$attempt")"
+        chain=$(
+            find "$ATTEMPT_DIR" -type f -print | sort |
+            while IFS= read -r path; do
+                jq -cn --arg path "node-27-readoption-attempts/${path##*/}" \
+                    --arg sha "$(sha256sum "$path" | awk '{print $1}')" \
+                    '{path:$path,sha256:$sha}'
+            done | jq -cs 'sort_by(.path)'
+        )
+        marker="$CURRENT_WAVE_DIR/node-27-CANDIDATE-ACTIVATION-SUPERSEDED.json"
+        jq -nS --argjson attempt "$attempt" --argjson chain "$chain" \
+            --arg auth_sha "$(sha256sum "${prefix}-START-AUTHORIZED.json" | awk '{print $1}')" \
+            --arg started_sha "$(sha256sum "${prefix}-STARTED.json" | awk '{print $1}')" \
+            --arg policy_sha "$(sha256sum \
+                "${prefix}-POLICY-PROMOTION-AUTHORIZED.json" | awk '{print $1}')" \
+            --arg staking_sha "$(sha256sum "${prefix}-staking.log" | awk '{print $1}')" \
+            --arg pow_sha "$(sha256sum "${prefix}-pow.log" | awk '{print $1}')" \
+            --arg wallet_sha "$(sha256sum \
+                "${prefix}-WALLET-SEND-AUDIT.json" | awk '{print $1}')" '
+            {successful_readoption_attempt:$attempt,
+             successful_start_authorization_sha256:$auth_sha,
+             successful_started_evidence_sha256:$started_sha,
+             policy_promotion_authorization_sha256:$policy_sha,
+             successful_staking_activation_log_path:
+               ("node-27-readoption-attempts/attempt-0" + ($attempt | tostring) +
+                "-staking.log"),
+             successful_staking_activation_log_sha256:$staking_sha,
+             successful_pow_activation_log_path:
+               ("node-27-readoption-attempts/attempt-0" + ($attempt | tostring) + "-pow.log"),
+             successful_pow_activation_log_sha256:$pow_sha,
+             wallet_send_audit_path:
+               ("node-27-readoption-attempts/attempt-0" + ($attempt | tostring) +
+                "-WALLET-SEND-AUDIT.json"),wallet_send_audit_sha256:$wallet_sha,
+             readoption_attempt_chain:$chain}' > "$marker"
+    }
+
+    write_start_authorization_fixture 1 "$original_generation" __NULL__
+    write_started_fixture 1 "$original_generation" "$generation_one"
+    write_phase_logs_fixture 1
+    write_wallet_audit_fixture 1 "$generation_one"
+    write_failure_fixture 1 "$generation_one_terminal"
+    failure_sha=$(sha256sum "$ATTEMPT_DIR/attempt-01-FAILED-CONTAINED.json" | awk '{print $1}')
+    write_start_authorization_fixture 2 "$generation_one_terminal" "$failure_sha"
+    write_started_fixture 2 "$generation_one_terminal" "$generation_two"
+    write_phase_logs_fixture 2
+    write_wallet_audit_fixture 2 "$generation_two"
+    write_policy_fixture 2 "$generation_two"
+    write_chain_marker_fixture 2
+    marker="$CURRENT_WAVE_DIR/node-27-CANDIDATE-ACTIVATION-SUPERSEDED.json"
+    verify_candidate_readoption_attempt_chain 27 "$marker" 2 \
+        "$original_generation" "$generation_two" "$readoption_sha"
+
+    cp "$ATTEMPT_DIR/attempt-02-START-AUTHORIZED.json" \
+        "$TMP/readoption-attempt-02-authorization.valid"
+    jq -S --arg bad "$(printf 'f%.0s' {1..64})" \
+        '.previous_failed_containment_sha256=$bad' \
+        "$TMP/readoption-attempt-02-authorization.valid" \
+        > "$ATTEMPT_DIR/attempt-02-START-AUTHORIZED.json"
+    write_chain_marker_fixture 2
+    ! verify_candidate_readoption_attempt_chain 27 "$marker" 2 \
+        "$original_generation" "$generation_two" "$readoption_sha"
+    cp "$TMP/readoption-attempt-02-authorization.valid" \
+        "$ATTEMPT_DIR/attempt-02-START-AUTHORIZED.json"
+
+    rm -f "$ATTEMPT_DIR/attempt-01-pow.log" \
+        "$ATTEMPT_DIR/attempt-01-WALLET-SEND-AUDIT.json"
+    write_chain_marker_fixture 2
+    verify_candidate_readoption_attempt_chain 27 "$marker" 2 \
+        "$original_generation" "$generation_two" "$readoption_sha"
+    printf '%s\n' 'complete node=27 pow=hashing' > "$ATTEMPT_DIR/attempt-01-pow.log"
+    rm -f "$ATTEMPT_DIR/attempt-01-staking.log"
+    write_chain_marker_fixture 2
+    ! verify_candidate_readoption_attempt_chain 27 "$marker" 2 \
+        "$original_generation" "$generation_two" "$readoption_sha"
+    printf '%s\n' 'complete node=27 wallet=normally_unlocked pos=active' \
+        > "$ATTEMPT_DIR/attempt-01-staking.log"
+    write_wallet_audit_fixture 1 "$generation_one"
+    write_policy_fixture 1 "$generation_one"
+    rm -f "$ATTEMPT_DIR/attempt-01-WALLET-SEND-AUDIT.json"
+    write_chain_marker_fixture 2
+    verify_candidate_readoption_attempt_chain 27 "$marker" 2 \
+        "$original_generation" "$generation_two" "$readoption_sha"
+)
+pass embedded-readoption-chain-semantic-retry-linkage-and-monotonic-prefixes
+
+for function_name in candidate_readoption_embedded_chain_paths \
+    wave_runtime_evidence_expected_files \
+    wave_runtime_evidence_file_is_regular \
+    wave_runtime_evidence_manifest_has_exact_names; do
+    function_body "$function_name" "$ROOT/fleet_rollout.sh" \
+        >> "$TMP/wave-runtime-evidence-functions"
+done
+(
+    # shellcheck disable=SC1090
+    source "$TMP/wave-runtime-evidence-functions"
+    data_rollback_protected_file()
+    {
+        [[ -f "$1" && ! -L "$1" ]]
+    }
+    data_rollback_protected_directory()
+    {
+        [[ -d "$1" && ! -L "$1" ]]
+    }
+    data_rollback_canonical_single_object_json()
+    {
+        local canonical
+        data_rollback_protected_file "$1" 600 || return 1
+        canonical=$(jq -S -e -s '
+            if length == 1 and (.[0] | type == "object") then .[0]
+            else error("exactly one object required") end
+        ' "$1") || return 1
+        printf '%s\n' "$canonical" | cmp -s "$1" -
+    }
+    node_padded() { printf '%02d\n' "$1"; }
+    wave_node_prefix()
+    {
+        printf '%s/node-%s\n' "$CURRENT_WAVE_DIR" "$(node_padded "$1")"
+    }
+    wave_node_activation_supersession_path()
+    {
+        printf '%s-CANDIDATE-ACTIVATION-SUPERSEDED.json\n' "$(wave_node_prefix "$1")"
+    }
+    wave_node_readoption_authorization_path()
+    {
+        printf '%s-READOPTION-AUTHORIZED.json\n' "$(wave_node_prefix "$1")"
+    }
+    wave_node_containment_path()
+    {
+        printf '%s-CONTAINED-NO-ROLLBACK.json\n' "$(wave_node_prefix "$1")"
+    }
+    wave_containment_complete_path()
+    {
+        printf '%s/CONTAINMENT-COMPLETE.sha256\n' "$CURRENT_WAVE_DIR"
+    }
+    resume_compatibility_path()
+    {
+        printf '%s/RESUME-COMPATIBILITY.json\n' "$RUN_DIR"
+    }
+    write_runtime_evidence_fixture()
+    {
+        local names="$1" entry path
+        local -a entries=()
+        wave_runtime_evidence_expected_files > "$names"
+        while IFS= read -r entry; do
+            if [[ "$entry" == /* ]]; then
+                path=$entry
+            else
+                path="$CURRENT_WAVE_DIR/$entry"
+            fi
+            mkdir -p -- "${path%/*}"
+            if [[ ! -e "$path" && ! -L "$path" ]]; then
+                printf 'evidence:%s\n' "$entry" > "$path"
+            fi
+            entries+=("$entry")
+        done < "$names"
+        (cd "$CURRENT_WAVE_DIR" && sha256sum -- "${entries[@]}") \
+            > "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    }
+
+    RUN_DIR="$TMP/runtime-evidence-ordinary"
+    CURRENT_WAVE_DIR="$RUN_DIR/wave-03-nodes-01-02"
+    CURRENT_WAVE_NODES=(1 2)
+    mkdir -p "$CURRENT_WAVE_DIR"
+    write_runtime_evidence_fixture "$TMP/runtime-evidence-ordinary.names"
+    wave_runtime_evidence_manifest_has_exact_names
+    cp "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256" \
+        "$TMP/runtime-evidence-ordinary.valid"
+
+    cp "$TMP/runtime-evidence-ordinary.valid" \
+        "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    printf '%064d  unexpected-runtime-evidence\n' 0 \
+        >> "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    ! wave_runtime_evidence_manifest_has_exact_names
+
+    sed '$d' "$TMP/runtime-evidence-ordinary.valid" \
+        > "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    ! wave_runtime_evidence_manifest_has_exact_names
+
+    {
+        cat "$TMP/runtime-evidence-ordinary.valid"
+        sed -n '1p' "$TMP/runtime-evidence-ordinary.valid"
+    } > "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    ! wave_runtime_evidence_manifest_has_exact_names
+
+    cp "$TMP/runtime-evidence-ordinary.valid" \
+        "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    mv "$CURRENT_WAVE_DIR/RUNTIME-GATE-PASSED" \
+        "$CURRENT_WAVE_DIR/RUNTIME-GATE-PASSED.regular"
+    ln -s wave-chain-convergence/PASSED.json "$CURRENT_WAVE_DIR/RUNTIME-GATE-PASSED"
+    ! wave_runtime_evidence_manifest_has_exact_names
+
+    RUN_DIR="$TMP/runtime-evidence-node27"
+    CURRENT_WAVE_DIR="$RUN_DIR/wave-01-nodes-27-retry-01"
+    CURRENT_WAVE_NODES=(27)
+    mkdir -p "$CURRENT_WAVE_DIR/node-27-readoption-attempts"
+    for entry in attempt-01-START-AUTHORIZED.json attempt-01-STARTED.json \
+        attempt-01-POLICY-PROMOTION-AUTHORIZED.json \
+        attempt-01-WALLET-SEND-AUDIT.json; do
+        jq -nS --arg fixture "$entry" '{fixture:$fixture}' \
+            > "$CURRENT_WAVE_DIR/node-27-readoption-attempts/$entry"
+    done
+    for entry in attempt-01-staking.log attempt-01-pow.log; do
+        printf 'chain:%s\n' "$entry" \
+            > "$CURRENT_WAVE_DIR/node-27-readoption-attempts/$entry"
+    done
+    chain_json=$(
+        find "$CURRENT_WAVE_DIR/node-27-readoption-attempts" -type f -print | sort |
+        while IFS= read -r path; do
+            jq -cn --arg path "node-27-readoption-attempts/${path##*/}" \
+                --arg sha "$(sha256sum "$path" | awk '{print $1}')" \
+                '{path:$path,sha256:$sha}'
+        done | jq -cs 'sort_by(.path)'
+    )
+    jq -nS --argjson chain "$chain_json" '
+        {successful_readoption_attempt:1,
+         wallet_send_audit_path:
+           "node-27-readoption-attempts/attempt-01-WALLET-SEND-AUDIT.json",
+         readoption_attempt_chain:$chain}' \
+        > "$CURRENT_WAVE_DIR/node-27-CANDIDATE-ACTIVATION-SUPERSEDED.json"
+    write_runtime_evidence_fixture "$TMP/runtime-evidence-node27.names"
+    wave_runtime_evidence_manifest_has_exact_names
+    grep -Fqx "$RUN_DIR/RESUME-COMPATIBILITY.json" \
+        "$TMP/runtime-evidence-node27.names"
+    ! grep -Fqx ROLLBACK_STATE "$TMP/runtime-evidence-node27.names"
+    for entry in attempt-01-START-AUTHORIZED.json attempt-01-STARTED.json \
+        attempt-01-POLICY-PROMOTION-AUTHORIZED.json \
+        attempt-01-WALLET-SEND-AUDIT.json attempt-01-staking.log attempt-01-pow.log; do
+        grep -Fqx "node-27-readoption-attempts/$entry" \
+            "$TMP/runtime-evidence-node27.names"
+    done
+    cp "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256" \
+        "$TMP/runtime-evidence-node27.valid"
+    cp "$CURRENT_WAVE_DIR/node-27-CANDIDATE-ACTIVATION-SUPERSEDED.json" \
+        "$TMP/runtime-evidence-node27.marker"
+    jq -S '.readoption_attempt_chain |= reverse' \
+        "$TMP/runtime-evidence-node27.marker" \
+        > "$CURRENT_WAVE_DIR/node-27-CANDIDATE-ACTIVATION-SUPERSEDED.json"
+    ! wave_runtime_evidence_expected_files >/dev/null
+    cp "$TMP/runtime-evidence-node27.marker" \
+        "$CURRENT_WAVE_DIR/node-27-CANDIDATE-ACTIVATION-SUPERSEDED.json"
+    printf '%s\n' tampered \
+        >> "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-01-pow.log"
+    ! wave_runtime_evidence_expected_files >/dev/null
+    printf 'chain:%s\n' attempt-01-pow.log \
+        > "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-01-pow.log"
+    printf '%s\n' unbound \
+        > "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-02-STARTED.json"
+    ! wave_runtime_evidence_expected_files >/dev/null
+    rm -f "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-02-STARTED.json"
+    ln -s attempt-01-pow.log \
+        "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-02-pow.log"
+    ! wave_runtime_evidence_expected_files >/dev/null
+    rm -f "$CURRENT_WAVE_DIR/node-27-readoption-attempts/attempt-02-pow.log"
+    printf '%064d  ROLLBACK_STATE\n' 0 \
+        >> "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    ! wave_runtime_evidence_manifest_has_exact_names
+    cp "$TMP/runtime-evidence-node27.valid" \
+        "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256"
+    CURRENT_WAVE_NODES=(26 27)
+    ! wave_runtime_evidence_expected_files >/dev/null
+)
+pass exact-ordinary-and-node27-runtime-evidence-manifest-sets
+
+function_body verify_resume_compatibility_authority "$ROOT/fleet_rollout.sh" \
+    > "$TMP/resume-compatibility-function"
+(
+    # shellcheck disable=SC1090
+    source "$TMP/resume-compatibility-function"
+    PACKAGE_ROOT="$TMP/resume-package"
+    RUN_DIR="$TMP/resume-run"
+    CANDIDATE_IMAGE_REF='registry.example/blackcoin@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    CANDIDATE_IMAGE_ID='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    transaction_root="$TMP/transaction-package"
+    mkdir -p "$PACKAGE_ROOT" "$RUN_DIR" "$transaction_root"
+    printf '%s\n' resume > "$PACKAGE_ROOT/payload"
+    printf '%s\n' transaction > "$transaction_root/payload"
+    (cd "$PACKAGE_ROOT" && sha256sum payload > SHA256SUMS)
+    (cd "$transaction_root" && sha256sum payload > SHA256SUMS)
+    (cd "$transaction_root" && sha256sum payload > "$RUN_DIR/package-files.sha256")
+    printf '%s\n' '{}' > "$RUN_DIR/TRANSACTION.json"
+    verify_package_integrity() { return 0; }
+    data_rollback_protected_file() { return 0; }
+    data_rollback_canonical_single_object_json() { return 0; }
+    resume_compatibility_path() { printf '%s/RESUME-COMPATIBILITY.json\n' "$RUN_DIR"; }
+    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}')
+    transaction_files_sha=$(sha256sum "$RUN_DIR/package-files.sha256" | awk '{print $1}')
+    transaction_package_sha=$(sha256sum "$transaction_root/SHA256SUMS" | awk '{print $1}')
+    resume_package_sha=$(sha256sum "$PACKAGE_ROOT/SHA256SUMS" | awk '{print $1}')
+    jq -n --arg run "$RUN_DIR" --arg transaction_root "$transaction_root" \
+        --arg transaction_package_sha "$transaction_package_sha" \
+        --arg transaction_files_sha "$transaction_files_sha" \
+        --arg transaction_sha "$transaction_sha" --arg resume_root "$PACKAGE_ROOT" \
+        --arg resume_package_sha "$resume_package_sha" --arg image "$CANDIDATE_IMAGE_REF" \
+        --arg image_id "$CANDIDATE_IMAGE_ID" '
+        {schema:1,transaction:"v30.1.4-fleet-rollout",
+         state:"resume-compatibility-authorized",run_dir:$run,
+         transaction_package_root:$transaction_root,
+         transaction_package_manifest_sha256:$transaction_package_sha,
+         transaction_package_files_sha256:$transaction_files_sha,
+         transaction_manifest_sha256:$transaction_sha,resume_package_root:$resume_root,
+         resume_package_manifest_sha256:$resume_package_sha,candidate_image:$image,
+         candidate_image_id:$image_id,
+         authorized_fixes:["compose-create-compatibility",
+           "activation-journal-descendant-drain","zero-padded-compose-renderer",
+           "contained-node27-readoption"],managed_recovery_payments_authorized:false,
+         protocol_pow_claim_transactions_authorized:true,
+         unexpected_wallet_transactions_authorized:false,key_generation_authorized:false,
+         address_generation_authorized:false,created_at:"2026-08-06T00:00:00Z"}' \
+        > "$RUN_DIR/RESUME-COMPATIBILITY.json"
+    verify_resume_compatibility_authority "$transaction_root"
+    jq '.unexpected_wallet_transactions_authorized=true' \
+        "$RUN_DIR/RESUME-COMPATIBILITY.json" \
+        > "$RUN_DIR/RESUME-COMPATIBILITY.tampered.json"
+    mv "$RUN_DIR/RESUME-COMPATIBILITY.tampered.json" \
+        "$RUN_DIR/RESUME-COMPATIBILITY.json"
+    ! verify_resume_compatibility_authority "$transaction_root"
+)
+function_body transaction_package_root "$ROOT/fleet_rollout.sh" \
+    > "$TMP/transaction-package-root-function"
+grep -Fq 'SEALED_TRANSACTION_PACKAGE_ROOT' "$TMP/transaction-package-root-function"
+grep -Fq 'verify_resume_compatibility_authority "$root"' \
+    "$TMP/transaction-package-root-function"
+grep -Fq 'transaction_root=$(transaction_package_root)' "$ROOT/fleet_rollout.sh"
+grep -Fq 'export SEALED_TRANSACTION_PACKAGE_ROOT="$TRANSACTION_PACKAGE_ROOT"' \
+    "$ROOT/resume_compatible_rollout.sh"
+pass sealed-transaction-to-corrected-package-compatibility-authority
+
+(
+    # shellcheck disable=SC1091
+    source "$ROOT/tools/setsid"
+    exercise_exact_activation_match()
+    {
+        local worker_source
+        local -a command
+        worker_source=$(declare -f verify_activation_helper activate_one_node_phase)
+        worker_source+=$'\n''activate_one_node_phase "$1" "$2" "$3" "$4"'
+        command=(
+            /bin/bash -c "$worker_source" activation-worker staking 27
+            "$NORMAL_UNLOCK_HELPER" "$NORMAL_UNLOCK_HELPER_SHA256"
+        )
+        legacy_activation_worker_shape command
+        command[2]+=' '
+        ! legacy_activation_worker_shape command
+        command[2]=${worker_source}
+        command[4]=pow
+        command[6]=$POW_START_HELPER
+        command[7]=$POW_START_HELPER_SHA256
+        legacy_activation_worker_shape command
+        command[5]=30
+        ! legacy_activation_worker_shape command
+        command[5]=29
+        command[6]=/tmp/blackcoin_pow_start_only.sh
+        ! legacy_activation_worker_shape command
+        command[6]=$POW_START_HELPER
+        command+=(unexpected)
+        ! legacy_activation_worker_shape command
+    }
+    exercise_exact_activation_match
+)
+grep -Fqx '    exec "$REAL_SETSID" "$@"' "$ROOT/tools/setsid"
+pass exact-activation-worker-setsid-match-and-delegation-shape
 
 awk '
   /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
@@ -196,17 +869,101 @@ pass untouched-legacy-nodes-use-live-allowed-mode-not-stale-snapshot
 {
     printf '%s\n' 'services:'
     for node in $(seq 1 32); do
-        printf '  node%d:\n    image: registry.example/old:node%d\n    restart: on-failure:3\n' "$node" "$node"
+        printf '  node%02d:\n    image: registry.example/old:node%02d\n    restart: on-failure:3\n' \
+            "$node" "$node"
     done
 } > "$TMP/compose.yml"
 digest='registry.example/blackcoin@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
-awk -v targets='node1,node9,node10,node32' -v image="$digest" \
+awk -v targets='node01,node09,node10,node32' -v image="$digest" \
     -f "$ROOT/render_compose_images.awk" "$TMP/compose.yml" > "$TMP/compose.out.yml"
 [[ "$(grep -Fc "image: $digest" "$TMP/compose.out.yml")" -eq 4 ]]
 [[ "$(grep -Fc 'image: registry.example/old:' "$TMP/compose.out.yml")" -eq 28 ]]
+for invalid_targets in node1 node9 node00 node33 node001 node01,node01; do
+    ! awk -v targets="$invalid_targets" -v image="$digest" \
+        -f "$ROOT/render_compose_images.awk" "$TMP/compose.yml" >/dev/null 2>&1
+done
+
+{
+    printf '%s\n' 'services:'
+    printf '%s\n' '  node1:' '    image: registry.example/old:node1'
+} > "$TMP/compose.unpadded-service.yml"
 ! awk -v targets='node01' -v image="$digest" -f "$ROOT/render_compose_images.awk" \
-    "$TMP/compose.yml" >/dev/null 2>&1
-pass compose-renderer-positive-and-negative
+    "$TMP/compose.unpadded-service.yml" >/dev/null 2> "$TMP/compose.unpadded-service.err"
+grep -Fqx 'render cardinality failure service=node01 seen=0 changed=0' \
+    "$TMP/compose.unpadded-service.err"
+
+{
+    printf '%s\n' 'services:'
+    printf '%s\n' '  node02:' '    image: registry.example/old:node02'
+} > "$TMP/compose.missing-target.yml"
+! awk -v targets='node01' -v image="$digest" -f "$ROOT/render_compose_images.awk" \
+    "$TMP/compose.missing-target.yml" >/dev/null 2> "$TMP/compose.missing-target.err"
+grep -Fqx 'render cardinality failure service=node01 seen=0 changed=0' \
+    "$TMP/compose.missing-target.err"
+
+{
+    printf '%s\n' 'services:'
+    printf '%s\n' '  node01:' '    image: registry.example/old:first' \
+        '    image: registry.example/old:second'
+} > "$TMP/compose.duplicate-image.yml"
+! awk -v targets='node01' -v image="$digest" -f "$ROOT/render_compose_images.awk" \
+    "$TMP/compose.duplicate-image.yml" >/dev/null 2> "$TMP/compose.duplicate-image.err"
+grep -Fqx 'render cardinality failure service=node01 seen=1 changed=2' \
+    "$TMP/compose.duplicate-image.err"
+
+{
+    printf '%s\n' 'services:'
+    printf '%s\n' '  node01:' '    image: registry.example/old:first' \
+        '  node01:' '    image: registry.example/old:second'
+} > "$TMP/compose.duplicate-service.yml"
+! awk -v targets='node01' -v image="$digest" -f "$ROOT/render_compose_images.awk" \
+    "$TMP/compose.duplicate-service.yml" >/dev/null 2> "$TMP/compose.duplicate-service.err"
+grep -Fqx 'render cardinality failure service=node01 seen=2 changed=2' \
+    "$TMP/compose.duplicate-service.err"
+pass compose-renderer-padded-services-negative-and-cardinality
+
+(
+    # shellcheck disable=SC1091
+    source "$ROOT/tools/awk"
+    [[ "$REAL_AWK" == /usr/bin/awk ]]
+    [[ "$OLD_RENDERER" == /mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-packages/rollout-express-c15d60a/seal-root/v30.1.4-rollout-transaction/render_compose_images.awk ]]
+    [[ "$CORRECTED_RENDERER" == /mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-packages/rollout-express-compose-up-20260806T1007Z/seal-root/v30.1.4-rollout-transaction/render_compose_images.awk ]]
+    exercise_sealed_renderer_rewrite()
+    {
+        local -a invocation=(
+            -v 'targets=node01,node09,node10,node32'
+            -v "image=$CANDIDATE_IMAGE"
+            -f "$OLD_RENDERER" "$COMPOSE_FILE"
+        )
+        sealed_fleet_renderer_shape invocation
+        rewrite_sealed_fleet_renderer invocation
+        [[ "${invocation[*]}" == "-v targets=node01,node09,node10,node32 -v image=$CANDIDATE_IMAGE -f $CORRECTED_RENDERER $COMPOSE_FILE" ]]
+
+        invocation=(
+            -v targets=node1 -v "image=$CANDIDATE_IMAGE"
+            -f "$OLD_RENDERER" "$COMPOSE_FILE"
+        )
+        ! sealed_fleet_renderer_shape invocation
+        invocation[1]=targets=node01,node01
+        ! sealed_fleet_renderer_shape invocation
+        invocation[1]=targets=node01
+        invocation[3]=image=registry.example/unrecognized@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        ! sealed_fleet_renderer_shape invocation
+        invocation[3]="image=$CANDIDATE_IMAGE"
+        invocation[5]=$CORRECTED_RENDERER
+        ! sealed_fleet_renderer_shape invocation
+        invocation[5]=$OLD_RENDERER
+        invocation[6]="$TMP/not-the-live-compose.yml"
+        ! sealed_fleet_renderer_shape invocation
+        invocation[6]=$COMPOSE_FILE
+        invocation+=(unexpected)
+        ! sealed_fleet_renderer_shape invocation
+    }
+    exercise_sealed_renderer_rewrite
+)
+function_body main "$ROOT/tools/awk" > "$TMP/awk-compat-main"
+grep -Fq 'exec "$REAL_AWK" "${command[@]}"' "$TMP/awk-compat-main"
+pass sealed-compose-renderer-compatibility-rewrite
 
 jq -n '
   {schema:1,images:{old:{config_image:"registry.example/old:fixed",
@@ -1037,6 +1794,91 @@ done
 grep -Fq 'proof_is_unique || die' "$ROOT/repair_vpn_pair.sh"
 pass vpn-commit-rollback-and-final-uniqueness
 
+function_body validate_recovery_baseline "$ROOT/fleet_soak_audit.sh" \
+    > "$TMP/validate-soak-recovery-baseline"
+for required in 'wallet-txids.prelaunch.json' 'wallet-txids.first-v3014.json' \
+    '.schema == 2' '.recovery_initial.policy_authoritative == true' \
+    '.recovery_final.policy_authoritative == true' \
+    '.recovery_final.confirmed_resolution_fees ==' \
+    '.recovery_initial.confirmed_resolution_fees' \
+    'jq -e -n --argjson fee "$fee"' \
+    'jq -e -n --argjson fee "$fee" --argjson expected "$expected_fee"'; do
+    grep -Fq -- "$required" "$TMP/validate-soak-recovery-baseline"
+done
+! grep -Fq 'wallet-txids.before.json' "$TMP/validate-soak-recovery-baseline"
+(
+    # shellcheck disable=SC1090
+    source "$TMP/validate-soak-recovery-baseline"
+    CANDIDATE_IMAGE_REF='registry.example/blackcoin@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    CANDIDATE_IMAGE_ID='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    SOURCE_COMMIT=13262151077cce3f72d07d17dc7725b2b6a8e1ab
+    WAVE="$TMP/soak-recovery-wave"
+    mkdir -p "$WAVE"
+    node_padded() { printf '%02d\n' "$1"; }
+    passed_wave_for_node()
+    {
+        [[ "$1" -eq 1 ]] || return 1
+        printf '%s\n' "$WAVE"
+    }
+    txid=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    jq -n --arg txid "$txid" '[$txid]' > "$WAVE/node-01-wallet-txids.prelaunch.json"
+    cp "$WAVE/node-01-wallet-txids.prelaunch.json" \
+        "$WAVE/node-01-wallet-txids.first-v3014.json"
+    chmod 600 "$WAVE/node-01-wallet-txids.prelaunch.json" \
+        "$WAVE/node-01-wallet-txids.first-v3014.json"
+    prelaunch_sha=$(sha256sum "$WAVE/node-01-wallet-txids.prelaunch.json" | awk '{print $1}')
+    jq -n --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg source "$SOURCE_COMMIT" --arg wave "$WAVE" --arg txids "$prelaunch_sha" '
+        {schema:2,node:1,candidate_image:$image,candidate_image_id:$image_id,
+         source_commit:$source,wave_dir:$wave,captured_at:"2026-08-06T00:00:00Z",
+         container_generation:"candidate|generation|vpn|generation",
+         wallet_locked_throughout:true,wallet_final:{unlocked_until:0},
+         staking_final:{enabled:false,staking:false,worker_running:false,
+           allow_automatic_quantum_key_creation:false},
+         mining_final:{enabled:false,autostart:false,state:"disabled",hashrate:0,
+           live_claims:0,quarantined_claims:0,blocking_quarantined_claims:0,
+           allow_automatic_quantum_key_creation:false},
+         recovery_initial:{policy_authoritative:true,
+           policy:{automatic_authorized:false},database_outcome_ambiguous:false,
+           confirmed_resolution_fees:0},
+         recovery_final:{policy_authoritative:true,
+           policy:{automatic_authorized:false},database_outcome_ambiguous:false,
+           chain_ready:true,wallet_tip_matches:true,blocking_quarantined_claims:0,
+           blocking_components:0,indeterminate_quarantined_claims:0,
+           pending_manual_resolutions:0,pending_automatic_resolutions:0,
+           confirmed_resolution_fees:0},
+         wallet_transaction_guard:{prelaunch_sha256:$txids,
+           first_v3014_sha256:$txids,exactly_unchanged:true}}
+    ' > "$TMP/soak-recovery-canonical.json"
+    sed 's/"confirmed_resolution_fees": 0/"confirmed_resolution_fees": 0E-8/g' \
+        "$TMP/soak-recovery-canonical.json" \
+        > "$WAVE/candidate-recovery-node-01.json"
+    [[ "$(grep -Ec 'confirmed_resolution_fees.*0E-8' \
+        "$WAVE/candidate-recovery-node-01.json")" -eq 2 ]]
+    chmod 600 "$WAVE/candidate-recovery-node-01.json"
+    baseline_sha=$(sha256sum "$WAVE/candidate-recovery-node-01.json" | awk '{print $1}')
+    printf '%s\n' "$baseline_sha" > "$WAVE/candidate-recovery-node-01.json.sha256"
+    chmod 600 "$WAVE/candidate-recovery-node-01.json.sha256"
+    info=$(validate_recovery_baseline 1 '' 0)
+    IFS='|' read -r returned_sha returned_fee <<< "$info"
+    [[ "$returned_sha" == "$baseline_sha" ]]
+    jq -e -n --argjson fee "$returned_fee" '$fee == 0' >/dev/null
+
+    mv "$WAVE/node-01-wallet-txids.prelaunch.json" \
+        "$WAVE/node-01-wallet-txids.before.json"
+    ! validate_recovery_baseline 1 '' 0 >/dev/null
+    mv "$WAVE/node-01-wallet-txids.before.json" \
+        "$WAVE/node-01-wallet-txids.prelaunch.json"
+
+    cp "$WAVE/candidate-recovery-node-01.json" "$TMP/soak-recovery-schema2.valid"
+    jq '.schema=1' "$TMP/soak-recovery-schema2.valid" \
+        > "$WAVE/candidate-recovery-node-01.json"
+    sha256sum "$WAVE/candidate-recovery-node-01.json" | awk '{print $1}' \
+        > "$WAVE/candidate-recovery-node-01.json.sha256"
+    ! validate_recovery_baseline 1 '' 0 >/dev/null
+)
+pass soak-schema2-prelaunch-recovery-baseline-and-json-numeric-zero
+
 [[ "$(grep -Fc '.policy.automatic_authorized == false' "$ROOT/lib/live_checks.sh")" -ge 2 ]]
 grep -Fq 'verify_candidate_recovery_baseline "$node"' "$ROOT/fleet_rollout.sh"
 grep -Fq 'validate_recovery_baseline "$node"' "$ROOT/fleet_soak_audit.sh"
@@ -1278,6 +2120,64 @@ timeout_files=("$ROOT/fleet_rollout.sh" "$ROOT/lib/common.sh" "$ROOT/lib/live_ch
 [[ "$(grep -hEc 'timeout[[:space:]]+--foreground' "${timeout_files[@]}" | \
     awk '{total += $1} END {print total}')" -ge 17 ]]
 pass joined-process-group-workers-hup-and-nested-timeout-containment
+
+if [[ "$(uname -s)" == Linux && -d /proc && -x /usr/bin/setsid ]]; then
+    (
+        # shellcheck disable=SC1091
+        source "$ROOT/tools/setsid"
+        local_supervisor_source=$(declare -f compat_process_identity \
+            compat_group_contains_only_leader activation_worker_supervisor)
+        local_supervisor_source+=$'\n''activation_worker_supervisor "$@"'
+        cleanup_groups=()
+        cleanup_sets_id_test_groups()
+        {
+            local group tick
+            for group in "${cleanup_groups[@]}"; do
+                [[ "$group" =~ ^[1-9][0-9]*$ ]] || continue
+                kill -TERM -- "-$group" 2>/dev/null || true
+                for ((tick = 0; tick < 50; tick++)); do
+                    kill -0 -- "-$group" 2>/dev/null || break
+                    sleep 0.02
+                done
+                kill -KILL -- "-$group" 2>/dev/null || true
+            done
+        }
+        trap cleanup_sets_id_test_groups EXIT
+
+        "$ROOT/tools/setsid" /bin/bash -c \
+            '[[ "$#" -eq 3 && "$1" == "alpha beta" && -z "$2" && "$3" == "*" ]]' \
+            delegation-check 'alpha beta' '' '*'
+
+        started=$SECONDS
+        /usr/bin/setsid /bin/bash -c "$local_supervisor_source" \
+            activation-transient 3 /bin/bash -c 'sleep 0.2 &' &
+        transient_group=$!
+        cleanup_groups+=("$transient_group")
+        wait "$transient_group"
+        ((SECONDS - started <= 5))
+        ! kill -0 -- "-$transient_group" 2>/dev/null
+
+        started=$SECONDS
+        /usr/bin/setsid /bin/bash -c "$local_supervisor_source" \
+            activation-persistent 1 /bin/bash -c 'sleep 30 &' &
+        persistent_group=$!
+        cleanup_groups+=("$persistent_group")
+        wait "$persistent_group"
+        ((SECONDS - started <= 3))
+        kill -0 -- "-$persistent_group" 2>/dev/null
+        kill -TERM -- "-$persistent_group" 2>/dev/null || true
+        for ((tick = 0; tick < 100; tick++)); do
+            kill -0 -- "-$persistent_group" 2>/dev/null || break
+            sleep 0.02
+        done
+        kill -KILL -- "-$persistent_group" 2>/dev/null || true
+        ! kill -0 -- "-$persistent_group" 2>/dev/null
+        trap - EXIT
+    )
+    pass activation-worker-setsid-delegation-transient-drain-and-persistent-residue
+else
+    printf '%s\n' 'SKIP activation-worker-setsid-native-proc-tests (Linux /proc required)'
+fi
 
 function_body verify_canary_fleet_handoff "$ROOT/fleet_rollout.sh" \
     > "$TMP/canary-handoff-verify"

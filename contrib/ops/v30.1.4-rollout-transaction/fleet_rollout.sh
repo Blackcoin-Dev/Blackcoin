@@ -48,6 +48,8 @@ readonly SOAK_AUDITOR="$PACKAGE_ROOT/fleet_soak_audit.sh"
 readonly INHIBITOR_INSTALLER="$PACKAGE_ROOT/install_transaction_inhibitors.sh"
 readonly INHIBITOR_RELEASER="$PACKAGE_ROOT/release_transaction_inhibitors.sh"
 readonly RUNTIME_COMPAT_INSTALLER="$PACKAGE_ROOT/install_runtime_guard_3014_compat.sh"
+# STATE_DIR is assigned by the integrity-checked live_checks.sh source above.
+# shellcheck disable=SC2153
 readonly NORMAL_UNLOCK_HELPER="$STATE_DIR/blackcoin_node_normal_unlock.sh"
 readonly POW_START_HELPER="$STATE_DIR/blackcoin_pow_start_only.sh"
 readonly NORMAL_UNLOCK_HELPER_SHA256='acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1'
@@ -70,12 +72,548 @@ TERMINAL_COMMIT_ACTIVE=0
 TERMINAL_FINALIZED=0
 CANARY_HANDOFF_PENDING=0
 ACTIVATION_HELPER_PIDS=()
+ACTIVATION_HELPER_STARTTIMES=()
+ACTIVATION_HELPER_PGIDS=()
+ACTIVATION_HELPER_CONTROL_FDS=()
+ACTIVATION_HELPER_STATE_DIRS=()
+ACTIVATION_HELPER_TOKENS=()
 ACTIVATION_HELPER_NODES=()
 ACTIVATION_HELPER_PHASES=()
 CANDIDATE_BASELINE_HELPER_PIDS=()
+CANDIDATE_BASELINE_HELPER_STARTTIMES=()
+CANDIDATE_BASELINE_HELPER_PGIDS=()
+CANDIDATE_BASELINE_HELPER_CONTROL_FDS=()
+CANDIDATE_BASELINE_HELPER_STATE_DIRS=()
+CANDIDATE_BASELINE_HELPER_TOKENS=()
 CANDIDATE_BASELINE_HELPER_NODES=()
 CONTAINMENT_HELPER_PIDS=()
+CONTAINMENT_HELPER_STARTTIMES=()
+CONTAINMENT_HELPER_PGIDS=()
+CONTAINMENT_HELPER_CONTROL_FDS=()
+CONTAINMENT_HELPER_STATE_DIRS=()
+CONTAINMENT_HELPER_TOKENS=()
 CONTAINMENT_HELPER_NODES=()
+STABLE_WORKER_PARENT_CONTROL_FDS=()
+STABLE_WORKER_NEW_PID=
+STABLE_WORKER_NEW_STARTTIME=
+STABLE_WORKER_NEW_PGID=
+STABLE_WORKER_NEW_CONTROL_FD=
+STABLE_WORKER_NEW_STATE_DIR=
+STABLE_WORKER_NEW_TOKEN=
+STABLE_WORKER_RESULT_RC=
+STABLE_WORKER_WAIT_RC=
+STABLE_WORKER_SIGNAL_TRAP_MODE=
+
+stable_worker_process_identity()
+{
+    local pid="$1" stat_line stat_tail
+    local -a stat_fields=()
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/stat" ]] || return 1
+    IFS= read -r stat_line < "/proc/$pid/stat" || return 1
+    stat_tail=${stat_line##*) }
+    [[ "$stat_tail" != "$stat_line" ]] || return 1
+    read -r -a stat_fields <<< "$stat_tail"
+    ((${#stat_fields[@]} >= 20)) || return 1
+    [[ "${stat_fields[2]}" =~ ^[1-9][0-9]*$ &&
+       "${stat_fields[19]}" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s %s %s\n' "${stat_fields[2]}" "${stat_fields[19]}" "${stat_fields[0]}"
+}
+
+stable_worker_identity_matches()
+{
+    local pid="$1" expected_starttime="$2" expected_pgid="$3" identity
+    local actual_pgid actual_starttime actual_state
+    identity=$(stable_worker_process_identity "$pid") || return 1
+    read -r actual_pgid actual_starttime actual_state <<< "$identity"
+    [[ "$actual_pgid" == "$expected_pgid" &&
+       "$actual_starttime" == "$expected_starttime" &&
+       "$actual_state" != Z && "$actual_state" != X &&
+       "$expected_pgid" == "$pid" ]]
+}
+
+stable_worker_group_contains_only_sentinel()
+{
+    local sentinel_pid="$1" expected_starttime="$2" expected_pgid="$3"
+    local stat_path process_pid identity process_pgid process_starttime process_state count=0
+    stable_worker_identity_matches "$sentinel_pid" "$expected_starttime" "$expected_pgid" ||
+        return 1
+    for stat_path in /proc/[1-9]*/stat; do
+        [[ -r "$stat_path" ]] || continue
+        process_pid=${stat_path#/proc/}
+        process_pid=${process_pid%/stat}
+        identity=$(stable_worker_process_identity "$process_pid" 2>/dev/null) || continue
+        read -r process_pgid process_starttime process_state <<< "$identity"
+        [[ "$process_pgid" == "$expected_pgid" ]] || continue
+        [[ "$process_pid" == "$sentinel_pid" &&
+           "$process_starttime" == "$expected_starttime" ]] || return 1
+        count=$((count + 1))
+    done
+    ((count == 1))
+}
+
+stable_worker_atomic_line()
+{
+    local path="$1" line="$2" directory temporary
+    directory=${path%/*}
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    temporary=$(mktemp "$directory/.stable-worker-marker.XXXXXX") || return 1
+    if ! printf '%s\n' "$line" > "$temporary" ||
+       ! chmod 600 "$temporary" || ! chown root:root "$temporary" ||
+       ! sync -f "$temporary" || ! mv -fT -- "$temporary" "$path" ||
+       ! sync -f "$directory"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+stable_worker_self_kill_group()
+{
+    local sentinel_pid="$1" sentinel_starttime="$2" sentinel_pgid="$3"
+    trap - HUP INT TERM
+    [[ "$sentinel_pid" == "$BASHPID" ]] || exit 125
+    stable_worker_identity_matches "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid" ||
+        exit 125
+    kill -KILL -- "-$sentinel_pgid"
+    exit 125
+}
+
+stable_worker_self_term_group()
+{
+    local sentinel_pid="$1" sentinel_starttime="$2" sentinel_pgid="$3"
+    [[ "$sentinel_pid" == "$BASHPID" ]] || return 1
+    stable_worker_identity_matches "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid" ||
+        return 1
+    kill -TERM -- "-$sentinel_pgid"
+}
+
+stable_worker_self_kill_before_group_authority()
+{
+    local sentinel_pid="$1"
+    trap - HUP INT TERM
+    [[ "$sentinel_pid" == "$BASHPID" ]] || exit 125
+    kill -KILL "$sentinel_pid"
+    exit 125
+}
+
+stable_worker_sentinel()
+{
+    local state_dir="$1" token="$2" inherited_control_fds="$3" worker_function="$4"
+    local fifo started result complete control_read_fd inherited_fd sentinel_pid identity
+    local sentinel_pgid sentinel_starttime sentinel_state worker_pid worker_rc=125
+    local message message_token extra
+    local signal_interrupted=0
+    shift 4
+    fifo="$state_dir/control.fifo"
+    started="$state_dir/STARTED"
+    result="$state_dir/RESULT"
+    complete="$state_dir/COMPLETE"
+    sentinel_pid=$BASHPID
+    trap 'signal_interrupted=1' HUP INT TERM
+    exec {control_read_fd}< "$fifo" || stable_worker_self_kill_before_group_authority "$sentinel_pid"
+    for inherited_fd in $inherited_control_fds; do
+        [[ "$inherited_fd" =~ ^[1-9][0-9]*$ ]] ||
+            stable_worker_self_kill_before_group_authority "$sentinel_pid"
+        exec {inherited_fd}>&-
+    done
+    set +m
+    identity=$(stable_worker_process_identity "$sentinel_pid") ||
+        stable_worker_self_kill_before_group_authority "$sentinel_pid"
+    read -r sentinel_pgid sentinel_starttime sentinel_state <<< "$identity"
+    [[ "$sentinel_pgid" == "$sentinel_pid" ]] ||
+        stable_worker_self_kill_before_group_authority "$sentinel_pid"
+    stable_worker_atomic_line "$started" \
+        "started $token $sentinel_pid $sentinel_starttime $sentinel_pgid" ||
+        stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+    while :; do
+        message='' message_token='' extra=''
+        if IFS=' ' read -r message message_token extra <&"$control_read_fd"; then
+            if [[ "$message" == "start" && "$message_token" == "$token" && -z "$extra" ]]; then
+                break
+            fi
+            if [[ "$message" == abort && "$message_token" == "$token" && -z "$extra" ]]; then
+                stable_worker_self_term_group \
+                    "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid" ||
+                    stable_worker_self_kill_group \
+                        "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+                continue
+            fi
+            stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+        fi
+        if ((signal_interrupted == 1)); then
+            signal_interrupted=0
+            continue
+        fi
+        stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+    done
+    (
+        local child_rc
+        exec {control_read_fd}<&-
+        trap - HUP INT TERM
+        # shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap.
+        stable_worker_child_result()
+        {
+            child_rc=$?
+            trap - EXIT
+            if ! stable_worker_atomic_line "$result" "result $token $child_rc"; then
+                child_rc=125
+                stable_worker_atomic_line "$result" "result $token $child_rc" || true
+            fi
+            printf 'done %s\n' "$token" > "$fifo" || true
+            exit "$child_rc"
+        }
+        trap stable_worker_child_result EXIT
+        "$worker_function" "$@"
+    ) &
+    worker_pid=$!
+    while :; do
+        message='' message_token='' extra=''
+        if IFS=' ' read -r message message_token extra <&"$control_read_fd"; then
+            if [[ "$message" == "done" && "$message_token" == "$token" && -z "$extra" ]]; then
+                break
+            fi
+            if [[ "$message" == abort && "$message_token" == "$token" && -z "$extra" ]]; then
+                stable_worker_self_term_group \
+                    "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid" ||
+                    stable_worker_self_kill_group \
+                        "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+                continue
+            fi
+            stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+        fi
+        if ((signal_interrupted == 1)); then
+            signal_interrupted=0
+            continue
+        fi
+        stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+    done
+    if wait "$worker_pid"; then worker_rc=0; else worker_rc=$?; fi
+    stable_worker_verify_result "$state_dir" "$token" ||
+        stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+    [[ "$STABLE_WORKER_RESULT_RC" -eq "$worker_rc" ]] ||
+        stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+    stable_worker_group_contains_only_sentinel \
+        "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid" ||
+        stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+    stable_worker_atomic_line "$complete" \
+        "complete $token $sentinel_pid $sentinel_starttime $sentinel_pgid $worker_rc" ||
+        stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+    while :; do
+        message='' message_token='' extra=''
+        if IFS=' ' read -r message message_token extra <&"$control_read_fd"; then
+            if [[ "$message" == ack && "$message_token" == "$token" && -z "$extra" ]]; then
+                exec {control_read_fd}<&-
+                exit "$worker_rc"
+            fi
+            if [[ "$message" == abort && "$message_token" == "$token" && -z "$extra" ]]; then
+                stable_worker_self_term_group \
+                    "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid" ||
+                    stable_worker_self_kill_group \
+                        "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+                continue
+            fi
+            stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+        fi
+        if ((signal_interrupted == 1)); then
+            signal_interrupted=0
+            continue
+        fi
+        stable_worker_self_kill_group "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid"
+    done
+}
+
+stable_worker_verify_protected_marker()
+{
+    local path="$1"
+    [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+       "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]]
+}
+
+stable_worker_verify_started()
+{
+    local pid="$1" starttime="$2" pgid="$3" state_dir="$4" token="$5"
+    local kind marker_token marker_pid marker_starttime marker_pgid extra path
+    path="$state_dir/STARTED"
+    stable_worker_verify_protected_marker "$path" || return 1
+    read -r kind marker_token marker_pid marker_starttime marker_pgid extra < "$path" || return 1
+    [[ "$kind" == started && "$marker_token" == "$token" && "$marker_pid" == "$pid" &&
+       "$marker_starttime" == "$starttime" && "$marker_pgid" == "$pgid" && -z "$extra" ]] ||
+        return 1
+    stable_worker_identity_matches "$pid" "$starttime" "$pgid"
+}
+
+stable_worker_verify_result()
+{
+    local state_dir="$1" token="$2" kind marker_token result_rc extra path
+    path="$state_dir/RESULT"
+    stable_worker_verify_protected_marker "$path" || return 1
+    read -r kind marker_token result_rc extra < "$path" || return 1
+    [[ "$kind" == result && "$marker_token" == "$token" &&
+       "$result_rc" =~ ^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ &&
+       -z "$extra" ]] || return 1
+    STABLE_WORKER_RESULT_RC=$result_rc
+}
+
+stable_worker_completion_ready()
+{
+    local pid="$1" starttime="$2" pgid="$3" state_dir="$4" token="$5"
+    local kind marker_token marker_pid marker_starttime marker_pgid marker_rc extra path result_rc
+    stable_worker_verify_result "$state_dir" "$token" || return 1
+    result_rc=$STABLE_WORKER_RESULT_RC
+    path="$state_dir/COMPLETE"
+    stable_worker_verify_protected_marker "$path" || return 1
+    read -r kind marker_token marker_pid marker_starttime marker_pgid marker_rc extra < "$path" ||
+        return 1
+    [[ "$kind" == complete && "$marker_token" == "$token" && "$marker_pid" == "$pid" &&
+       "$marker_starttime" == "$starttime" && "$marker_pgid" == "$pgid" &&
+       "$marker_rc" == "$result_rc" && -z "$extra" ]] || return 1
+    stable_worker_group_contains_only_sentinel "$pid" "$starttime" "$pgid"
+}
+
+stable_worker_close_parent_control_fd()
+{
+    local control_fd="$1" closed_fd registered_fd
+    local -a remaining_fds=()
+    [[ "$control_fd" =~ ^[1-9][0-9]*$ ]] || return 1
+    closed_fd=$control_fd
+    exec {control_fd}>&-
+    for registered_fd in "${STABLE_WORKER_PARENT_CONTROL_FDS[@]}"; do
+        [[ "$registered_fd" == "$closed_fd" || -z "$registered_fd" ]] ||
+            remaining_fds+=("$registered_fd")
+    done
+    STABLE_WORKER_PARENT_CONTROL_FDS=("${remaining_fds[@]}")
+}
+
+stable_worker_cleanup_state_dir()
+{
+    local state_dir="$1"
+    [[ -d "$state_dir" && ! -L "$state_dir" ]] || return 1
+    rm -f -- "$state_dir/control.fifo" "$state_dir/STARTED" \
+        "$state_dir/RESULT" "$state_dir/COMPLETE" "$state_dir"/.stable-worker-marker.*
+    rmdir -- "$state_dir"
+}
+
+stable_worker_wait_direct_child()
+{
+    local pid="$1" wait_rc
+    if wait "$pid"; then wait_rc=0; else wait_rc=$?; fi
+    STABLE_WORKER_WAIT_RC=$wait_rc
+}
+
+stable_worker_start_registered()
+{
+    local pid="$1" starttime="$2" pgid="$3" control_fd="$4" state_dir="$5" token="$6"
+    stable_worker_verify_started "$pid" "$starttime" "$pgid" "$state_dir" "$token" ||
+        return 1
+    stable_worker_group_contains_only_sentinel "$pid" "$starttime" "$pgid" || return 1
+    printf 'start %s\n' "$token" >&"$control_fd"
+}
+
+stable_worker_mask_terminal_signals()
+{
+    local hup_trap int_trap term_trap
+    hup_trap=$(trap -p HUP)
+    int_trap=$(trap -p INT)
+    term_trap=$(trap -p TERM)
+    if [[ -z "$hup_trap" && -z "$int_trap" && -z "$term_trap" ]]; then
+        STABLE_WORKER_SIGNAL_TRAP_MODE=default
+    elif [[ "$hup_trap" == "trap -- 'launch_signal=129' SIGHUP" &&
+            "$int_trap" == "trap -- 'launch_signal=130' SIGINT" &&
+            "$term_trap" == "trap -- 'launch_signal=143' SIGTERM" ]]; then
+        STABLE_WORKER_SIGNAL_TRAP_MODE=launch
+    elif [[ "$hup_trap" == "trap -- 'signal_received=129' SIGHUP" &&
+            "$int_trap" == "trap -- 'signal_received=130' SIGINT" &&
+            "$term_trap" == "trap -- 'signal_received=143' SIGTERM" ]]; then
+        STABLE_WORKER_SIGNAL_TRAP_MODE=containment
+    elif [[ "$hup_trap" == "trap -- 'exit 129' SIGHUP" &&
+            "$int_trap" == "trap -- 'exit 130' SIGINT" &&
+            "$term_trap" == "trap -- 'exit 143' SIGTERM" ]]; then
+        STABLE_WORKER_SIGNAL_TRAP_MODE=rollout
+    else
+        return 1
+    fi
+    trap '' HUP INT TERM
+}
+
+stable_worker_restore_terminal_signals()
+{
+    case "$STABLE_WORKER_SIGNAL_TRAP_MODE" in
+        default) trap - HUP INT TERM ;;
+        launch)
+            trap 'launch_signal=129' HUP
+            trap 'launch_signal=130' INT
+            trap 'launch_signal=143' TERM
+            ;;
+        containment)
+            trap 'signal_received=129' HUP
+            trap 'signal_received=130' INT
+            trap 'signal_received=143' TERM
+            ;;
+        rollout)
+            trap 'exit 129' HUP
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            ;;
+        *) return 1 ;;
+    esac
+    STABLE_WORKER_SIGNAL_TRAP_MODE=
+}
+
+stable_worker_ack_and_join()
+{
+    local pid="$1" starttime="$2" pgid="$3" control_fd="$4" state_dir="$5" token="$6"
+    local result_rc sentinel_rc ack_written=0 fd_closed=0 child_waited=0 restore_rc=0
+    stable_worker_completion_ready "$pid" "$starttime" "$pgid" "$state_dir" "$token" ||
+        return 1
+    result_rc=$STABLE_WORKER_RESULT_RC
+    stable_worker_mask_terminal_signals || return 1
+    printf 'ack %s\n' "$token" >&"$control_fd" && ack_written=1
+    stable_worker_close_parent_control_fd "$control_fd" && fd_closed=1
+    stable_worker_wait_direct_child "$pid" && child_waited=1
+    sentinel_rc=$STABLE_WORKER_WAIT_RC
+    stable_worker_restore_terminal_signals || restore_rc=1
+    ((ack_written == 1 && fd_closed == 1 && child_waited == 1 && restore_rc == 0)) || return 1
+    [[ "$sentinel_rc" -eq "$result_rc" ]] || return 1
+    stable_worker_cleanup_state_dir "$state_dir" || return 1
+    STABLE_WORKER_RESULT_RC=$result_rc
+}
+
+stable_worker_force_kill_and_join()
+{
+    local pid="$1" starttime="$2" pgid="$3" control_fd="$4" state_dir="$5"
+    local identity_live="$6" killed=0 child_waited=0 fd_closed=0 cleanup_done=0 restore_rc=0
+    [[ "$identity_live" == 0 || "$identity_live" == 1 ]] || return 1
+    stable_worker_mask_terminal_signals || return 1
+    if [[ "$identity_live" -eq 1 ]] &&
+       stable_worker_identity_matches "$pid" "$starttime" "$pgid"; then
+        kill -KILL -- "-$pgid" 2>/dev/null && killed=1
+    elif [[ "$identity_live" -eq 0 ]]; then
+        killed=1
+    fi
+    stable_worker_close_parent_control_fd "$control_fd" && fd_closed=1
+    stable_worker_wait_direct_child "$pid" && child_waited=1
+    stable_worker_cleanup_state_dir "$state_dir" && cleanup_done=1
+    stable_worker_restore_terminal_signals || restore_rc=1
+    ((killed == 1 && fd_closed == 1 && child_waited == 1 &&
+      cleanup_done == 1 && restore_rc == 0))
+}
+
+launch_stable_worker()
+{
+    local label="$1" log_path="$2" worker_function="$3" state_dir fifo token inherited_fds
+    local sentinel_pid identity sentinel_pgid sentinel_starttime deadline monitor_was_enabled=0
+    shift 3
+    STABLE_WORKER_NEW_PID=
+    STABLE_WORKER_NEW_STARTTIME=
+    STABLE_WORKER_NEW_PGID=
+    STABLE_WORKER_NEW_CONTROL_FD=
+    STABLE_WORKER_NEW_STATE_DIR=
+    STABLE_WORKER_NEW_TOKEN=
+    state_dir=$(mktemp -d "$CURRENT_WAVE_DIR/.${label}.sentinel.XXXXXX") || return 1
+    chmod 700 "$state_dir" || return 1
+    chown root:root "$state_dir" || return 1
+    fifo="$state_dir/control.fifo"
+    mkfifo "$fifo" || return 1
+    chmod 600 "$fifo" || return 1
+    chown root:root "$fifo" || return 1
+    token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || return 1
+    [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 1
+    exec {STABLE_WORKER_NEW_CONTROL_FD}<> "$fifo" || return 1
+    STABLE_WORKER_PARENT_CONTROL_FDS+=("$STABLE_WORKER_NEW_CONTROL_FD")
+    inherited_fds=$(printf '%s\n' "${STABLE_WORKER_PARENT_CONTROL_FDS[@]}" |
+        awk '/^[1-9][0-9]*$/ {printf "%s%s", separator, $0; separator=" "}') || return 1
+    [[ $- == *m* ]] && monitor_was_enabled=1
+    ((monitor_was_enabled == 1)) || set -m
+    stable_worker_sentinel "$state_dir" "$token" "$inherited_fds" "$worker_function" "$@" \
+        > "$log_path" 2>&1 &
+    sentinel_pid=$!
+    ((monitor_was_enabled == 1)) || set +m
+    STABLE_WORKER_NEW_PID=$sentinel_pid
+    STABLE_WORKER_NEW_STATE_DIR=$state_dir
+    STABLE_WORKER_NEW_TOKEN=$token
+    identity=$(stable_worker_process_identity "$sentinel_pid") || return 1
+    read -r sentinel_pgid sentinel_starttime <<< "$identity"
+    [[ "$sentinel_pgid" == "$sentinel_pid" ]] || return 1
+    STABLE_WORKER_NEW_STARTTIME=$sentinel_starttime
+    STABLE_WORKER_NEW_PGID=$sentinel_pgid
+    deadline=$((SECONDS + 10))
+    while ((SECONDS < deadline)); do
+        stable_worker_verify_started "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid" \
+            "$state_dir" "$token" && return 0
+        stable_worker_identity_matches "$sentinel_pid" "$sentinel_starttime" "$sentinel_pgid" ||
+            return 1
+        sleep 0.1
+    done
+    return 1
+}
+
+terminate_and_join_stable_worker_set()
+{
+    local -n helper_pids=$1 helper_starttimes=$2 helper_pgids=$3 helper_control_fds=$4
+    local -n helper_state_dirs=$5 helper_tokens=$6
+    local index pid starttime pgid control_fd state_dir token deadline all_complete failed=0
+    ((${#helper_pids[@]} > 0)) || return 0
+    for index in "${!helper_pids[@]}"; do
+        pid=${helper_pids[index]}
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+        starttime=${helper_starttimes[index]}
+        pgid=${helper_pgids[index]}
+        if stable_worker_identity_matches "$pid" "$starttime" "$pgid"; then
+            printf 'abort %s\n' "${helper_tokens[index]}" >&"${helper_control_fds[index]}" ||
+                failed=1
+        else
+            failed=1
+        fi
+    done
+    deadline=$((SECONDS + 20))
+    while ((SECONDS < deadline)); do
+        all_complete=1
+        for index in "${!helper_pids[@]}"; do
+            pid=${helper_pids[index]}
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+            stable_worker_completion_ready "$pid" "${helper_starttimes[index]}" \
+                "${helper_pgids[index]}" "${helper_state_dirs[index]}" \
+                "${helper_tokens[index]}" || { all_complete=0; break; }
+        done
+        ((all_complete == 1)) && break
+        sleep 0.1
+    done
+    for index in "${!helper_pids[@]}"; do
+        pid=${helper_pids[index]}
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+        starttime=${helper_starttimes[index]}
+        pgid=${helper_pgids[index]}
+        control_fd=${helper_control_fds[index]}
+        state_dir=${helper_state_dirs[index]}
+        token=${helper_tokens[index]}
+        if stable_worker_completion_ready "$pid" "$starttime" "$pgid" "$state_dir" "$token"; then
+            if ! stable_worker_ack_and_join \
+                "$pid" "$starttime" "$pgid" "$control_fd" "$state_dir" "$token"; then
+                failed=1
+                continue
+            fi
+        elif stable_worker_identity_matches "$pid" "$starttime" "$pgid"; then
+            stable_worker_force_kill_and_join \
+                "$pid" "$starttime" "$pgid" "$control_fd" "$state_dir" 1 || failed=1
+        else
+            failed=1
+            stable_worker_force_kill_and_join \
+                "$pid" "$starttime" "$pgid" "$control_fd" "$state_dir" 0 || true
+        fi
+        helper_pids[index]=''
+        helper_starttimes[index]=''
+        helper_pgids[index]=''
+        helper_control_fds[index]=''
+        helper_state_dirs[index]=''
+        helper_tokens[index]=''
+    done
+    ((failed == 0)) || return 1
+    helper_pids=()
+    helper_starttimes=()
+    helper_pgids=()
+    helper_control_fds=()
+    helper_state_dirs=()
+    helper_tokens=()
+}
 
 atomic_write_json()
 {
@@ -499,117 +1037,79 @@ establish_candidate_recovery_baseline()
 
 terminate_and_join_candidate_baseline_helpers()
 {
-    local pid deadline alive index
-    ((${#CANDIDATE_BASELINE_HELPER_PIDS[@]} > 0)) || return 0
-    for pid in "${CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
-        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        kill -TERM -- "-$pid" 2>/dev/null || true
-    done
-    deadline=$((SECONDS + 20))
-    while ((SECONDS < deadline)); do
-        alive=0
-        for index in "${!CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
-            pid=${CANDIDATE_BASELINE_HELPER_PIDS[index]}
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-            if kill -0 -- "-$pid" 2>/dev/null; then
-                alive=1
-            else
-                wait "$pid" 2>/dev/null || true
-                CANDIDATE_BASELINE_HELPER_PIDS[index]=''
-            fi
-        done
-        ((alive == 0)) && break
-        sleep 1
-    done
-    for index in "${!CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
-        pid=${CANDIDATE_BASELINE_HELPER_PIDS[index]}
-        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        if kill -0 -- "-$pid" 2>/dev/null; then
-            kill -KILL -- "-$pid" 2>/dev/null || true
-        else
-            wait "$pid" 2>/dev/null || true
-            CANDIDATE_BASELINE_HELPER_PIDS[index]=''
-        fi
-    done
-    for pid in "${CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
-        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        wait "$pid" 2>/dev/null || true
-    done
-    deadline=$((SECONDS + 5))
-    while ((SECONDS < deadline)); do
-        alive=0
-        for index in "${!CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
-            pid=${CANDIDATE_BASELINE_HELPER_PIDS[index]}
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-            if kill -0 -- "-$pid" 2>/dev/null; then
-                alive=1
-            else
-                CANDIDATE_BASELINE_HELPER_PIDS[index]=''
-            fi
-        done
-        ((alive == 0)) && break
-        sleep 1
-    done
-    ((alive == 0)) || return 1
-    CANDIDATE_BASELINE_HELPER_PIDS=()
+    terminate_and_join_stable_worker_set \
+        CANDIDATE_BASELINE_HELPER_PIDS CANDIDATE_BASELINE_HELPER_STARTTIMES \
+        CANDIDATE_BASELINE_HELPER_PGIDS CANDIDATE_BASELINE_HELPER_CONTROL_FDS \
+        CANDIDATE_BASELINE_HELPER_STATE_DIRS CANDIDATE_BASELINE_HELPER_TOKENS || return 1
     CANDIDATE_BASELINE_HELPER_NODES=()
 }
 
 establish_wave_recovery_baselines()
 {
-    local node pid failed=0 index monitor_was_enabled=0 launch_signal=0
-    local remaining completed_pid wait_rc found
-    local -a active_pids=()
+    local node failed=0 index launch_signal=0 remaining found launch_rc
     ((${#CANDIDATE_BASELINE_HELPER_PIDS[@]} == 0)) ||
         die 'a prior candidate baseline helper set is still live'
-    [[ $- == *m* ]] && monitor_was_enabled=1
-    # Monitor mode gives every asynchronous function a process group whose
-    # PGID is its recorded leader PID. Rollback can then kill the worker and
-    # any timeout/docker RPC descendants before it reads or mutates evidence.
     trap 'launch_signal=129' HUP
     trap 'launch_signal=130' INT
     trap 'launch_signal=143' TERM
-    ((monitor_was_enabled == 1)) || set -m
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         ((launch_signal == 0)) || break
-        establish_candidate_recovery_baseline "$node" \
-            > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-recovery-baseline.log" 2>&1 &
-        pid=$!
-        CANDIDATE_BASELINE_HELPER_PIDS+=("$pid")
+        if launch_stable_worker "baseline-node-$node" \
+            "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-recovery-baseline.log" \
+            establish_candidate_recovery_baseline "$node"; then launch_rc=0; else launch_rc=$?; fi
+        if [[ -n "$STABLE_WORKER_NEW_PID" ]]; then
+            CANDIDATE_BASELINE_HELPER_PIDS+=("$STABLE_WORKER_NEW_PID")
+            CANDIDATE_BASELINE_HELPER_STARTTIMES+=("$STABLE_WORKER_NEW_STARTTIME")
+            CANDIDATE_BASELINE_HELPER_PGIDS+=("$STABLE_WORKER_NEW_PGID")
+            CANDIDATE_BASELINE_HELPER_CONTROL_FDS+=("$STABLE_WORKER_NEW_CONTROL_FD")
+            CANDIDATE_BASELINE_HELPER_STATE_DIRS+=("$STABLE_WORKER_NEW_STATE_DIR")
+            CANDIDATE_BASELINE_HELPER_TOKENS+=("$STABLE_WORKER_NEW_TOKEN")
+        fi
         CANDIDATE_BASELINE_HELPER_NODES+=("$node")
+        ((launch_rc == 0)) || { failed=1; break; }
         ((launch_signal == 0)) || break
+        stable_worker_start_registered \
+            "$STABLE_WORKER_NEW_PID" "$STABLE_WORKER_NEW_STARTTIME" \
+            "$STABLE_WORKER_NEW_PGID" "$STABLE_WORKER_NEW_CONTROL_FD" \
+            "$STABLE_WORKER_NEW_STATE_DIR" "$STABLE_WORKER_NEW_TOKEN" ||
+            { failed=1; break; }
     done
-    ((monitor_was_enabled == 1)) || set +m
     remaining=${#CANDIDATE_BASELINE_HELPER_PIDS[@]}
     while ((remaining > 0 && launch_signal == 0)); do
-        completed_pid=''
-        active_pids=()
-        for pid in "${CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] && active_pids+=("$pid")
-        done
-        ((${#active_pids[@]} == remaining)) || { failed=1; break; }
-        if wait -n -p completed_pid "${active_pids[@]}"; then wait_rc=0; else wait_rc=$?; fi
-        ((launch_signal == 0)) || break
-        [[ "$completed_pid" =~ ^[1-9][0-9]*$ ]] || { failed=1; break; }
         found=-1
         for index in "${!CANDIDATE_BASELINE_HELPER_PIDS[@]}"; do
-            if [[ "${CANDIDATE_BASELINE_HELPER_PIDS[index]}" == "$completed_pid" ]]; then
+            [[ "${CANDIDATE_BASELINE_HELPER_PIDS[index]}" =~ ^[1-9][0-9]*$ ]] || continue
+            if stable_worker_completion_ready \
+                "${CANDIDATE_BASELINE_HELPER_PIDS[index]}" \
+                "${CANDIDATE_BASELINE_HELPER_STARTTIMES[index]}" \
+                "${CANDIDATE_BASELINE_HELPER_PGIDS[index]}" \
+                "${CANDIDATE_BASELINE_HELPER_STATE_DIRS[index]}" \
+                "${CANDIDATE_BASELINE_HELPER_TOKENS[index]}"; then
                 found=$index
                 break
             fi
         done
-        ((found >= 0)) || { failed=1; break; }
-        if ((wait_rc != 0)); then
+        if ((found < 0)); then
+            sleep 0.1
+            continue
+        fi
+        stable_worker_ack_and_join \
+            "${CANDIDATE_BASELINE_HELPER_PIDS[found]}" \
+            "${CANDIDATE_BASELINE_HELPER_STARTTIMES[found]}" \
+            "${CANDIDATE_BASELINE_HELPER_PGIDS[found]}" \
+            "${CANDIDATE_BASELINE_HELPER_CONTROL_FDS[found]}" \
+            "${CANDIDATE_BASELINE_HELPER_STATE_DIRS[found]}" \
+            "${CANDIDATE_BASELINE_HELPER_TOKENS[found]}" || { failed=1; break; }
+        if ((STABLE_WORKER_RESULT_RC != 0)); then
             log "node ${CANDIDATE_BASELINE_HELPER_NODES[found]} candidate recovery baseline failed"
             failed=1
         fi
-        if kill -0 -- "-$completed_pid" 2>/dev/null; then
-            log "node ${CANDIDATE_BASELINE_HELPER_NODES[found]} left a baseline descendant live"
-            failed=1
-            break
-        else
-            CANDIDATE_BASELINE_HELPER_PIDS[found]=''
-        fi
+        CANDIDATE_BASELINE_HELPER_PIDS[found]=''
+        CANDIDATE_BASELINE_HELPER_STARTTIMES[found]=''
+        CANDIDATE_BASELINE_HELPER_PGIDS[found]=''
+        CANDIDATE_BASELINE_HELPER_CONTROL_FDS[found]=''
+        CANDIDATE_BASELINE_HELPER_STATE_DIRS[found]=''
+        CANDIDATE_BASELINE_HELPER_TOKENS[found]=''
         remaining=$((remaining - 1))
     done
     terminate_and_join_candidate_baseline_helpers || failed=1
@@ -641,7 +1141,7 @@ require_host_tools()
        (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1))) ||
         die 'Bash 5.1 or newer is required'
     require_command awk bash cmp cp date diff docker find findmnt flock grep install jq \
-        mktemp mountpoint mv od readlink realpath rm rsync sed seq setsid sha256sum sort stat sync tar timeout tr wc xargs zfs
+        mkfifo mktemp mountpoint mv od readlink realpath rm rmdir rsync sed seq sha256sum sort stat sync tar timeout tr wc xargs zfs
     docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
 }
 
@@ -6644,59 +7144,10 @@ publish_candidate_activation_marker()
 
 terminate_and_join_activation_helpers()
 {
-    local pid deadline alive index
-    ((${#ACTIVATION_HELPER_PIDS[@]} > 0)) || return 0
-    for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
-        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        kill -TERM -- "-$pid" 2>/dev/null || true
-    done
-    deadline=$((SECONDS + 20))
-    while ((SECONDS < deadline)); do
-        alive=0
-        for index in "${!ACTIVATION_HELPER_PIDS[@]}"; do
-            pid=${ACTIVATION_HELPER_PIDS[index]}
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-            if kill -0 -- "-$pid" 2>/dev/null; then
-                alive=1
-            else
-                wait "$pid" 2>/dev/null || true
-                ACTIVATION_HELPER_PIDS[index]=''
-            fi
-        done
-        ((alive == 0)) && break
-        sleep 1
-    done
-    for index in "${!ACTIVATION_HELPER_PIDS[@]}"; do
-        pid=${ACTIVATION_HELPER_PIDS[index]}
-        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        if kill -0 -- "-$pid" 2>/dev/null; then
-            kill -KILL -- "-$pid" 2>/dev/null || true
-        else
-            wait "$pid" 2>/dev/null || true
-            ACTIVATION_HELPER_PIDS[index]=''
-        fi
-    done
-    for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
-        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        wait "$pid" 2>/dev/null || true
-    done
-    deadline=$((SECONDS + 5))
-    while ((SECONDS < deadline)); do
-        alive=0
-        for index in "${!ACTIVATION_HELPER_PIDS[@]}"; do
-            pid=${ACTIVATION_HELPER_PIDS[index]}
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-            if kill -0 -- "-$pid" 2>/dev/null; then
-                alive=1
-            else
-                ACTIVATION_HELPER_PIDS[index]=''
-            fi
-        done
-        ((alive == 0)) && break
-        sleep 1
-    done
-    ((alive == 0)) || return 1
-    ACTIVATION_HELPER_PIDS=()
+    terminate_and_join_stable_worker_set \
+        ACTIVATION_HELPER_PIDS ACTIVATION_HELPER_STARTTIMES ACTIVATION_HELPER_PGIDS \
+        ACTIVATION_HELPER_CONTROL_FDS ACTIVATION_HELPER_STATE_DIRS \
+        ACTIVATION_HELPER_TOKENS || return 1
     ACTIVATION_HELPER_NODES=()
     ACTIVATION_HELPER_PHASES=()
 }
@@ -6704,8 +7155,22 @@ terminate_and_join_activation_helpers()
 publish_wave_activation_markers()
 {
     local node
-    ((${#CANDIDATE_BASELINE_HELPER_PIDS[@]} == 0)) || return 1
-    ((${#ACTIVATION_HELPER_PIDS[@]} == 0)) || return 1
+    ((${#CANDIDATE_BASELINE_HELPER_PIDS[@]} == 0 &&
+       ${#CANDIDATE_BASELINE_HELPER_STARTTIMES[@]} == 0 &&
+       ${#CANDIDATE_BASELINE_HELPER_PGIDS[@]} == 0 &&
+       ${#CANDIDATE_BASELINE_HELPER_CONTROL_FDS[@]} == 0 &&
+       ${#CANDIDATE_BASELINE_HELPER_STATE_DIRS[@]} == 0 &&
+       ${#CANDIDATE_BASELINE_HELPER_TOKENS[@]} == 0 &&
+       ${#CANDIDATE_BASELINE_HELPER_NODES[@]} == 0)) || return 1
+    ((${#ACTIVATION_HELPER_PIDS[@]} == 0 &&
+       ${#ACTIVATION_HELPER_STARTTIMES[@]} == 0 &&
+       ${#ACTIVATION_HELPER_PGIDS[@]} == 0 &&
+       ${#ACTIVATION_HELPER_CONTROL_FDS[@]} == 0 &&
+       ${#ACTIVATION_HELPER_STATE_DIRS[@]} == 0 &&
+       ${#ACTIVATION_HELPER_TOKENS[@]} == 0 &&
+       ${#ACTIVATION_HELPER_NODES[@]} == 0 &&
+       ${#ACTIVATION_HELPER_PHASES[@]} == 0 &&
+       ${#STABLE_WORKER_PARENT_CONTROL_FDS[@]} == 0)) || return 1
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         publish_candidate_activation_marker "$node" || return 1
     done
@@ -6718,9 +7183,8 @@ publish_wave_activation_markers()
 
 activate_wave_phase()
 {
-    local phase="$1" node pid failed=0 marker index path sha worker_source
-    local launch_signal=0 monitor_was_enabled=0 remaining completed_pid wait_rc found
-    local -a active_pids=()
+    local phase="$1" node failed=0 marker index path sha launch_rc
+    local launch_signal=0 remaining found
     ((${#ACTIVATION_HELPER_PIDS[@]} == 0)) ||
         die 'a prior activation helper set is still live'
     for node in "${CURRENT_WAVE_NODES[@]}"; do
@@ -6742,59 +7206,76 @@ activate_wave_phase()
         path=$POW_START_HELPER
         sha=$POW_START_HELPER_SHA256
     fi
-    worker_source=$(declare -f verify_activation_helper activate_one_node_phase) ||
-        die 'activation worker functions could not be serialized'
-    [[ $- == *m* ]] && monitor_was_enabled=1
     trap 'launch_signal=129' HUP
     trap 'launch_signal=130' INT
     trap 'launch_signal=143' TERM
-    ((monitor_was_enabled == 0)) || set +m
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         ((launch_signal == 0)) || break
         [[ "$phase" != pow || "$node" -ne "$FREE_CLAIM_NODE" ]] || continue
-        setsid /bin/bash -c "$worker_source"$'\n''activate_one_node_phase "$1" "$2" "$3" "$4"' \
-            activation-worker "$phase" "$node" "$path" "$sha" \
-            > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-${phase}-activation.log" 2>&1 &
-        pid=$!
-        ACTIVATION_HELPER_PIDS+=("$pid")
+        if launch_stable_worker "activation-$phase-node-$node" \
+            "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-${phase}-activation.log" \
+            activate_one_node_phase "$phase" "$node" "$path" "$sha"; then
+            launch_rc=0
+        else
+            launch_rc=$?
+        fi
+        if [[ -n "$STABLE_WORKER_NEW_PID" ]]; then
+            ACTIVATION_HELPER_PIDS+=("$STABLE_WORKER_NEW_PID")
+            ACTIVATION_HELPER_STARTTIMES+=("$STABLE_WORKER_NEW_STARTTIME")
+            ACTIVATION_HELPER_PGIDS+=("$STABLE_WORKER_NEW_PGID")
+            ACTIVATION_HELPER_CONTROL_FDS+=("$STABLE_WORKER_NEW_CONTROL_FD")
+            ACTIVATION_HELPER_STATE_DIRS+=("$STABLE_WORKER_NEW_STATE_DIR")
+            ACTIVATION_HELPER_TOKENS+=("$STABLE_WORKER_NEW_TOKEN")
+        fi
         ACTIVATION_HELPER_NODES+=("$node")
         ACTIVATION_HELPER_PHASES+=("$phase")
+        ((launch_rc == 0)) || { failed=1; break; }
         ((launch_signal == 0)) || break
+        stable_worker_start_registered \
+            "$STABLE_WORKER_NEW_PID" "$STABLE_WORKER_NEW_STARTTIME" \
+            "$STABLE_WORKER_NEW_PGID" "$STABLE_WORKER_NEW_CONTROL_FD" \
+            "$STABLE_WORKER_NEW_STATE_DIR" "$STABLE_WORKER_NEW_TOKEN" ||
+            { failed=1; break; }
     done
     remaining=${#ACTIVATION_HELPER_PIDS[@]}
     while ((remaining > 0 && launch_signal == 0)); do
-        completed_pid=''
-        active_pids=()
-        for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] && active_pids+=("$pid")
-        done
-        ((${#active_pids[@]} == remaining)) || { failed=1; break; }
-        if wait -n -p completed_pid "${active_pids[@]}"; then wait_rc=0; else wait_rc=$?; fi
-        ((launch_signal == 0)) || break
-        [[ "$completed_pid" =~ ^[1-9][0-9]*$ ]] || { failed=1; break; }
         found=-1
         for index in "${!ACTIVATION_HELPER_PIDS[@]}"; do
-            if [[ "${ACTIVATION_HELPER_PIDS[index]}" == "$completed_pid" ]]; then
+            [[ "${ACTIVATION_HELPER_PIDS[index]}" =~ ^[1-9][0-9]*$ ]] || continue
+            if stable_worker_completion_ready \
+                "${ACTIVATION_HELPER_PIDS[index]}" \
+                "${ACTIVATION_HELPER_STARTTIMES[index]}" \
+                "${ACTIVATION_HELPER_PGIDS[index]}" \
+                "${ACTIVATION_HELPER_STATE_DIRS[index]}" \
+                "${ACTIVATION_HELPER_TOKENS[index]}"; then
                 found=$index
                 break
             fi
         done
-        ((found >= 0)) || { failed=1; break; }
-        if ((wait_rc != 0)); then
+        if ((found < 0)); then
+            sleep 0.1
+            continue
+        fi
+        stable_worker_ack_and_join \
+            "${ACTIVATION_HELPER_PIDS[found]}" \
+            "${ACTIVATION_HELPER_STARTTIMES[found]}" \
+            "${ACTIVATION_HELPER_PGIDS[found]}" \
+            "${ACTIVATION_HELPER_CONTROL_FDS[found]}" \
+            "${ACTIVATION_HELPER_STATE_DIRS[found]}" \
+            "${ACTIVATION_HELPER_TOKENS[found]}" || { failed=1; break; }
+        if ((STABLE_WORKER_RESULT_RC != 0)); then
             log "node ${ACTIVATION_HELPER_NODES[found]} ${ACTIVATION_HELPER_PHASES[found]} activation failed"
             failed=1
         fi
-        if kill -0 -- "-$completed_pid" 2>/dev/null; then
-            log "node ${ACTIVATION_HELPER_NODES[found]} ${ACTIVATION_HELPER_PHASES[found]} left an activation descendant live"
-            failed=1
-            break
-        else
-            ACTIVATION_HELPER_PIDS[found]=''
-        fi
+        ACTIVATION_HELPER_PIDS[found]=''
+        ACTIVATION_HELPER_STARTTIMES[found]=''
+        ACTIVATION_HELPER_PGIDS[found]=''
+        ACTIVATION_HELPER_CONTROL_FDS[found]=''
+        ACTIVATION_HELPER_STATE_DIRS[found]=''
+        ACTIVATION_HELPER_TOKENS[found]=''
         remaining=$((remaining - 1))
     done
     terminate_and_join_activation_helpers || failed=1
-    ((monitor_was_enabled == 0)) || set -m
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -6809,12 +7290,12 @@ activate_one_node_phase()
     {
         local tick
         [[ -n "$helper_pid" ]] || return 0
-        kill -TERM -- "-$helper_pid" 2>/dev/null || kill -TERM "$helper_pid" 2>/dev/null || true
+        kill -TERM "$helper_pid" 2>/dev/null || true
         for ((tick = 0; tick < 50; tick++)); do
             kill -0 "$helper_pid" 2>/dev/null || break
             sleep 0.1
         done
-        kill -KILL -- "-$helper_pid" 2>/dev/null || kill -KILL "$helper_pid" 2>/dev/null || true
+        kill -KILL "$helper_pid" 2>/dev/null || true
         wait "$helper_pid" 2>/dev/null || true
         helper_pid=''
     }
@@ -7334,7 +7815,14 @@ contain_node_without_rollback()
 publish_complete_containment_manifest()
 {
     local marker temporary node
-    ((${#CONTAINMENT_HELPER_PIDS[@]} == 0)) || return 1
+    ((${#CONTAINMENT_HELPER_PIDS[@]} == 0 &&
+       ${#CONTAINMENT_HELPER_STARTTIMES[@]} == 0 &&
+       ${#CONTAINMENT_HELPER_PGIDS[@]} == 0 &&
+       ${#CONTAINMENT_HELPER_CONTROL_FDS[@]} == 0 &&
+       ${#CONTAINMENT_HELPER_STATE_DIRS[@]} == 0 &&
+       ${#CONTAINMENT_HELPER_TOKENS[@]} == 0 &&
+       ${#CONTAINMENT_HELPER_NODES[@]} == 0 &&
+       ${#STABLE_WORKER_PARENT_CONTROL_FDS[@]} == 0)) || return 1
     marker=$(wave_containment_complete_path) || return 1
     if [[ -e "$marker" || -L "$marker" ]]; then
         containment_complete_manifest_valid
@@ -7362,67 +7850,17 @@ publish_complete_containment_manifest()
 
 terminate_and_join_containment_helpers()
 {
-    local pid deadline alive index
-    ((${#CONTAINMENT_HELPER_PIDS[@]} > 0)) || return 0
-    for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
-        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        kill -TERM -- "-$pid" 2>/dev/null || true
-    done
-    deadline=$((SECONDS + 20))
-    while ((SECONDS < deadline)); do
-        alive=0
-        for index in "${!CONTAINMENT_HELPER_PIDS[@]}"; do
-            pid=${CONTAINMENT_HELPER_PIDS[index]}
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-            if kill -0 -- "-$pid" 2>/dev/null; then
-                alive=1
-            else
-                wait "$pid" 2>/dev/null || true
-                CONTAINMENT_HELPER_PIDS[index]=''
-            fi
-        done
-        ((alive == 0)) && break
-        sleep 1
-    done
-    for index in "${!CONTAINMENT_HELPER_PIDS[@]}"; do
-        pid=${CONTAINMENT_HELPER_PIDS[index]}
-        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        if kill -0 -- "-$pid" 2>/dev/null; then
-            kill -KILL -- "-$pid" 2>/dev/null || true
-        else
-            wait "$pid" 2>/dev/null || true
-            CONTAINMENT_HELPER_PIDS[index]=''
-        fi
-    done
-    for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
-        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-        wait "$pid" 2>/dev/null || true
-    done
-    deadline=$((SECONDS + 5))
-    while ((SECONDS < deadline)); do
-        alive=0
-        for index in "${!CONTAINMENT_HELPER_PIDS[@]}"; do
-            pid=${CONTAINMENT_HELPER_PIDS[index]}
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-            if kill -0 -- "-$pid" 2>/dev/null; then
-                alive=1
-            else
-                CONTAINMENT_HELPER_PIDS[index]=''
-            fi
-        done
-        ((alive == 0)) && break
-        sleep 1
-    done
-    ((alive == 0)) || return 1
-    CONTAINMENT_HELPER_PIDS=()
+    terminate_and_join_stable_worker_set \
+        CONTAINMENT_HELPER_PIDS CONTAINMENT_HELPER_STARTTIMES CONTAINMENT_HELPER_PGIDS \
+        CONTAINMENT_HELPER_CONTROL_FDS CONTAINMENT_HELPER_STATE_DIRS \
+        CONTAINMENT_HELPER_TOKENS || return 1
     CONTAINMENT_HELPER_NODES=()
 }
 
 contain_wave_without_rollback()
 {
-    local reason="$1" node pid failed=0 index monitor_was_enabled=0 signal_received=0
-    local hup_trap int_trap term_trap trap_mode remaining completed_pid wait_rc found
-    local -a active_pids=()
+    local reason="$1" node failed=0 index signal_received=0 launch_rc
+    local hup_trap int_trap term_trap trap_mode remaining found
     terminate_and_join_containment_helpers || return 1
     terminate_and_join_activation_helpers || return 1
     hup_trap=$(trap -p HUP)
@@ -7437,50 +7875,71 @@ contain_wave_without_rollback()
     else
         return 1
     fi
-    [[ $- == *m* ]] && monitor_was_enabled=1
     trap 'signal_received=129' HUP
     trap 'signal_received=130' INT
     trap 'signal_received=143' TERM
-    ((monitor_was_enabled == 1)) || set -m
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         ((signal_received == 0)) || break
-        contain_node_without_rollback "$node" "$reason" &
-        pid=$!
-        CONTAINMENT_HELPER_PIDS+=("$pid")
+        if launch_stable_worker "containment-node-$node" \
+            "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-containment.log" \
+            contain_node_without_rollback "$node" "$reason"; then
+            launch_rc=0
+        else
+            launch_rc=$?
+        fi
+        if [[ -n "$STABLE_WORKER_NEW_PID" ]]; then
+            CONTAINMENT_HELPER_PIDS+=("$STABLE_WORKER_NEW_PID")
+            CONTAINMENT_HELPER_STARTTIMES+=("$STABLE_WORKER_NEW_STARTTIME")
+            CONTAINMENT_HELPER_PGIDS+=("$STABLE_WORKER_NEW_PGID")
+            CONTAINMENT_HELPER_CONTROL_FDS+=("$STABLE_WORKER_NEW_CONTROL_FD")
+            CONTAINMENT_HELPER_STATE_DIRS+=("$STABLE_WORKER_NEW_STATE_DIR")
+            CONTAINMENT_HELPER_TOKENS+=("$STABLE_WORKER_NEW_TOKEN")
+        fi
         CONTAINMENT_HELPER_NODES+=("$node")
+        ((launch_rc == 0)) || { failed=1; break; }
         ((signal_received == 0)) || break
+        stable_worker_start_registered \
+            "$STABLE_WORKER_NEW_PID" "$STABLE_WORKER_NEW_STARTTIME" \
+            "$STABLE_WORKER_NEW_PGID" "$STABLE_WORKER_NEW_CONTROL_FD" \
+            "$STABLE_WORKER_NEW_STATE_DIR" "$STABLE_WORKER_NEW_TOKEN" ||
+            { failed=1; break; }
     done
-    ((monitor_was_enabled == 1)) || set +m
     remaining=${#CONTAINMENT_HELPER_PIDS[@]}
     while ((remaining > 0 && signal_received == 0)); do
-        completed_pid=''
-        active_pids=()
-        for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] && active_pids+=("$pid")
-        done
-        ((${#active_pids[@]} == remaining)) || { failed=1; break; }
-        if wait -n -p completed_pid "${active_pids[@]}"; then wait_rc=0; else wait_rc=$?; fi
-        ((signal_received == 0)) || break
-        [[ "$completed_pid" =~ ^[1-9][0-9]*$ ]] || { failed=1; break; }
         found=-1
         for index in "${!CONTAINMENT_HELPER_PIDS[@]}"; do
-            if [[ "${CONTAINMENT_HELPER_PIDS[index]}" == "$completed_pid" ]]; then
+            [[ "${CONTAINMENT_HELPER_PIDS[index]}" =~ ^[1-9][0-9]*$ ]] || continue
+            if stable_worker_completion_ready \
+                "${CONTAINMENT_HELPER_PIDS[index]}" \
+                "${CONTAINMENT_HELPER_STARTTIMES[index]}" \
+                "${CONTAINMENT_HELPER_PGIDS[index]}" \
+                "${CONTAINMENT_HELPER_STATE_DIRS[index]}" \
+                "${CONTAINMENT_HELPER_TOKENS[index]}"; then
                 found=$index
                 break
             fi
         done
-        ((found >= 0)) || { failed=1; break; }
-        if ((wait_rc != 0)); then
+        if ((found < 0)); then
+            sleep 0.1
+            continue
+        fi
+        stable_worker_ack_and_join \
+            "${CONTAINMENT_HELPER_PIDS[found]}" \
+            "${CONTAINMENT_HELPER_STARTTIMES[found]}" \
+            "${CONTAINMENT_HELPER_PGIDS[found]}" \
+            "${CONTAINMENT_HELPER_CONTROL_FDS[found]}" \
+            "${CONTAINMENT_HELPER_STATE_DIRS[found]}" \
+            "${CONTAINMENT_HELPER_TOKENS[found]}" || { failed=1; break; }
+        if ((STABLE_WORKER_RESULT_RC != 0)); then
             log "containment failed or remained ambiguous for node=${CONTAINMENT_HELPER_NODES[found]}"
             failed=1
         fi
-        if kill -0 -- "-$completed_pid" 2>/dev/null; then
-            log "containment node=${CONTAINMENT_HELPER_NODES[found]} left a descendant live"
-            failed=1
-            break
-        else
-            CONTAINMENT_HELPER_PIDS[found]=''
-        fi
+        CONTAINMENT_HELPER_PIDS[found]=''
+        CONTAINMENT_HELPER_STARTTIMES[found]=''
+        CONTAINMENT_HELPER_PGIDS[found]=''
+        CONTAINMENT_HELPER_CONTROL_FDS[found]=''
+        CONTAINMENT_HELPER_STATE_DIRS[found]=''
+        CONTAINMENT_HELPER_TOKENS[found]=''
         remaining=$((remaining - 1))
     done
     terminate_and_join_containment_helpers || failed=1
@@ -7753,6 +8212,7 @@ rollback_current_wave()
     local authority_sha=- old_authority_sha=- containment_pending=0
     terminate_and_join_containment_helpers || return 1
     terminate_and_join_candidate_baseline_helpers || return 1
+    terminate_and_join_activation_helpers || return 1
     if [[ "$CURRENT_WAVE_CONTAINED" -ne 0 ]] || containment_evidence_present; then
         containment_pending=1
     fi
@@ -7946,10 +8406,16 @@ rollback_current_wave()
 on_exit()
 {
     local rc=$? containment_proven=0 containment_prefix_ready=0 inhibitor_state=''
+    local worker_helpers_joined=1
     trap - EXIT HUP INT TERM
-    terminate_and_join_containment_helpers || true
-    terminate_and_join_candidate_baseline_helpers || true
-    terminate_and_join_activation_helpers || true
+    terminate_and_join_containment_helpers || worker_helpers_joined=0
+    terminate_and_join_candidate_baseline_helpers || worker_helpers_joined=0
+    terminate_and_join_activation_helpers || worker_helpers_joined=0
+    if [[ "$worker_helpers_joined" -ne 1 ]]; then
+        log 'ERROR: worker sentinel identity or join became ambiguous; refusing rollback and further live mutation'
+        ((rc != 0)) || rc=1
+        exit "$rc"
+    fi
     if ((rc != 0)); then
         if [[ "$TERMINAL_FINALIZED" -eq 1 ]]; then
             log 'terminal receipt is finalized; live verification drift is post-transaction and no rollout state will be mutated'

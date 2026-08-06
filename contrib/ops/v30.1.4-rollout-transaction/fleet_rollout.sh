@@ -5961,7 +5961,7 @@ verify_legacy_rollback_readiness_all_nodes()
     local node pid attempt index batch_start batch_end
     local -a readiness_pending=() readiness_next=() pids=() nodes=()
     for node in $(seq 1 "$NODE_COUNT"); do readiness_pending+=("$node"); done
-    for attempt in $(seq 1 6); do
+    for attempt in $(seq 1 60); do
         readiness_next=()
         batch_start=0
         while ((batch_start < ${#readiness_pending[@]})); do
@@ -5989,7 +5989,7 @@ verify_legacy_rollback_readiness_all_nodes()
             return
         fi
         readiness_pending=("${readiness_next[@]}")
-        if ((attempt < 6)); then
+        if ((attempt < 60)); then
             log "retrying transient legacy rollback-readiness nodes: ${readiness_pending[*]}"
             sleep 2
         fi

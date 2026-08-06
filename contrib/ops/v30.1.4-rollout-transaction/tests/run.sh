@@ -155,7 +155,7 @@ function_body verify_legacy_rollback_readiness_all_nodes \
     }
     ! verify_legacy_rollback_readiness_all_nodes
     for node in 1 2 3 5 6; do [[ "$(cat "$COUNTS/$node")" == 1 ]]; done
-    [[ "$(cat "$COUNTS/4")" == 6 ]]
+    [[ "$(cat "$COUNTS/4")" == 60 ]]
 )
 pass bounded-retry-only-failed-legacy-readiness-gate
 

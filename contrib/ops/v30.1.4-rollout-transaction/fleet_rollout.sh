@@ -5500,10 +5500,20 @@ run_one_wave()
     wait_node30_service_gate
     write_wave_runtime_evidence || die 'wave runtime evidence could not be durably published'
     verify_wave_runtime_evidence || die 'published wave runtime evidence changed'
-    publish_state_token "$CURRENT_WAVE_DIR/RESULT" passed ||
+    # RESULT is the durable authority that this wave must never be rolled back
+    # as an interrupted attempt. Mask termination across publication and the
+    # in-memory boundary so on_exit cannot observe RESULT=passed while the
+    # rollback flag still describes an in-progress wave.
+    trap '' INT TERM
+    if ! publish_state_token "$CURRENT_WAVE_DIR/RESULT" passed; then
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
         die 'passed wave result could not be durably published'
-    release_wave_locks
+    fi
     CURRENT_WAVE_COMMITTED=0
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    release_wave_locks
     log "wave $wave_index complete: ${CURRENT_WAVE_NODES[*]}"
 }
 

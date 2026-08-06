@@ -70,7 +70,7 @@ awk '
   }}
   END {exit !(waves >= 8 && nodes == 32 && seen[30] && seen[31] && seen[32])}
 ' "$ROOT/waves.txt"
-grep -Fq "printf 'node%d" "$ROOT/lib/common.sh"
+grep -Fq "printf 'node%02d" "$ROOT/lib/common.sh"
 grep -Fq "printf 'pia-vpn-%d" "$ROOT/lib/common.sh"
 grep -Fq '@sha256:' "$ROOT/lib/common.sh"
 pass wave-plan-and-mappings

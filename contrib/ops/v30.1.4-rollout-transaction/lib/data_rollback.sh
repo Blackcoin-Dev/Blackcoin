@@ -415,8 +415,10 @@ data_rollback_canonical_single_object_json()
 {
     local path="$1"
     data_rollback_protected_file "$path" 600 || return 1
-    cmp -s "$path" <(jq -S -e 'if type == "object" then . else error("object required") end' \
-        "$path")
+    cmp -s "$path" <(jq -S -e -s '
+        if length == 1 and (.[0] | type == "object") then .[0]
+        else error("exactly one object required") end
+    ' "$path")
 }
 
 data_rollback_validate_stopped_generation()
@@ -1440,6 +1442,12 @@ data_rollback_verify_data_restored_receipt_body()
         --arg authority_sha "$expected_authority_sha" --arg inventory_sha "$inventory_sha" \
         --arg manifest_sha "$manifest_sha" --argjson fileset_expected "$fileset_expected" \
         --argjson zfs_expected "$zfs_expected" '
+        (keys | sort) == (["schema","transaction","purpose","run_dir","wave_dir",
+          "pre_upgrade_data_restored","restored_at","rollback_authority_sha256",
+          "snapshot_inventory_sha256","restore_evidence_manifest_sha256",
+          "snapshot_identity_verified","snapshot_zero_diff_verified",
+          "fileset_restore_expected","fileset_restore_completed","zfs_restore_expected",
+          "zfs_restore_completed","fileset_restore_proofs","zfs_rollback_proofs"] | sort) and
         .schema == 2 and .transaction == "v30.1.4-fleet-rollout" and
         .purpose == "pre-upgrade-data-restored" and .run_dir == $run and .wave_dir == $wave and
         .pre_upgrade_data_restored == true and (.restored_at | type) == "string" and

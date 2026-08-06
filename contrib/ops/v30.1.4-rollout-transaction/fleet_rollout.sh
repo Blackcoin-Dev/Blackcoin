@@ -600,7 +600,7 @@ verify_canary_fleet_handoff()
 {
     local verify_live="${1:-1}"
     local predecessor evidence predecessor_sha marker_sha transaction_sha result_sha manifest_sha
-    local canary_run canary_nonce fleet_nonce
+    local canary_run canary_nonce fleet_nonce transaction="$RUN_DIR/TRANSACTION.json"
     [[ "$verify_live" == 0 || "$verify_live" == 1 ]] || return 1
     predecessor=$(canary_predecessor_path) || return 1
     evidence="$RUN_DIR/CANARY-FLEET-HANDOFF.json"
@@ -613,9 +613,21 @@ verify_canary_fleet_handoff()
         (.run_nonce | type == "string" and test("^[0-9a-f]{64}$")) and
         (.run_dir | type == "string")' "$predecessor" >/dev/null || return 1
     predecessor_sha=$(sha256sum "$predecessor" | awk '{print $1}') || return 1
-    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
-    result_sha=$(sha256sum "$PUBLISHED_CANARY_RESULT" | awk '{print $1}') || return 1
-    manifest_sha=$(sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" | awk '{print $1}') || return 1
+    data_rollback_protected_file "$transaction" 600 || return 1
+    transaction_sha=$(sha256sum "$transaction" | awk '{print $1}') || return 1
+    if [[ "$verify_live" == 1 ]]; then
+        result_sha=$(sha256sum "$PUBLISHED_CANARY_RESULT" | awk '{print $1}') || return 1
+        manifest_sha=$(sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" | awk '{print $1}') ||
+            return 1
+    else
+        result_sha=$(jq -er '.published_canary.sha256 | select(test("^[0-9a-f]{64}$"))' \
+            "$transaction") || return 1
+        manifest_sha=$(jq -er \
+            '.published_canary.evidence_manifest.sha256 | select(test("^[0-9a-f]{64}$"))' \
+            "$transaction") || return 1
+        [[ "$result_sha" == "$EXPECTED_CANARY_RESULT_SHA256" &&
+           "$manifest_sha" == "$EXPECTED_CANARY_EVIDENCE_MANIFEST_SHA256" ]] || return 1
+    fi
     canary_run=$(jq -er '.run_dir' "$predecessor") || return 1
     canary_nonce=$(jq -er '.run_nonce' "$predecessor") || return 1
     fleet_nonce=$(cat "$(maintenance_nonce_path)") || return 1
@@ -632,7 +644,7 @@ verify_canary_fleet_handoff()
         .canary_handoff == {required:true,protocol:"atomic-replace-v1",
           predecessor_marker_sha256:$predecessor_sha,
           predecessor_run_dir:$canary_run,predecessor_run_nonce:$canary_nonce}
-    ' "$RUN_DIR/TRANSACTION.json" >/dev/null || return 1
+    ' "$transaction" >/dev/null || return 1
     jq -e --arg run "$RUN_DIR" --arg canary_run "$canary_run" --arg canary_nonce "$canary_nonce" \
         --arg fleet_nonce "$fleet_nonce" --arg predecessor_sha "$predecessor_sha" \
         --arg marker_sha "$marker_sha" --arg transaction_sha "$transaction_sha" \
@@ -655,7 +667,7 @@ publish_canary_fleet_handoff()
     predecessor=$(canary_predecessor_path) || return 1
     evidence="$RUN_DIR/CANARY-FLEET-HANDOFF.json"
     if [[ -e "$evidence" || -L "$evidence" ]]; then
-        verify_canary_fleet_handoff
+        verify_canary_fleet_handoff 0
         return
     fi
     verify_maintenance_marker || return 1
@@ -746,7 +758,7 @@ activate_maintenance_marker()
     mv -fT -- "$temporary" "$ROLLOUT_MAINTENANCE_MARKER"
     sync -f "$STATE_DIR"
     verify_maintenance_marker || die 'maintenance marker failed post-commit verification'
-    verify_canary_fleet_handoff ||
+    verify_canary_fleet_handoff 0 ||
         die 'post-handoff maintenance reactivation did not bind to the atomic handoff record'
 }
 
@@ -939,13 +951,15 @@ activate_maintenance_marker_safely()
 
 release_maintenance_for_finalization()
 {
-    local rc=0 marker_was_active=0
+    local rc=0 marker_was_active=0 release_epoch release_state
     acquire_finalization_guard_locks || return 1
     verify_free_claim_pause || rc=1
     if ((rc == 0)) && [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
         if verify_maintenance_marker; then
             marker_was_active=1
             invalidate_maintenance_released_epoch || rc=1
+            ((rc != 0)) || publish_state_token "$(finalization_state_path)" \
+                maintenance-release-authorized || rc=1
         fi
         if ((rc == 0 && marker_was_active == 1)); then
             release_maintenance_marker || rc=1
@@ -954,8 +968,24 @@ release_maintenance_for_finalization()
         fi
     elif ((rc == 0)) && ! valid_maintenance_released_epoch; then
         # A crash may occur after the marker removal but before publishing its
-        # epoch. A new epoch deliberately requires a newer supervisor sample.
-        marker_was_active=1
+        # epoch. Only the durable pre-removal authority can resume that prefix;
+        # a merely missing marker is never treated as an intentional release.
+        [[ -f "$(finalization_state_path)" && ! -L "$(finalization_state_path)" &&
+           "$(stat -c '%u:%g:%a' "$(finalization_state_path)")" == 0:0:600 &&
+           "$(<"$(finalization_state_path)")" == maintenance-release-authorized ]] || rc=1
+        ((rc != 0)) || marker_was_active=1
+    elif ((rc == 0)); then
+        release_epoch=$(<"$(maintenance_released_epoch_path)") || rc=1
+        [[ "$release_epoch" =~ ^[1-9][0-9]{8,10}$ ]] || rc=1
+        ((rc != 0)) || data_rollback_protected_file "$(finalization_state_path)" 600 || rc=1
+        if ((rc == 0)); then
+            release_state=$(<"$(finalization_state_path)") || rc=1
+            case "$release_state" in
+                maintenance-release-authorized|maintenance-released|pre-release-passed|\
+                free-claim-released|post-release-passed|finalized) ;;
+                *) rc=1 ;;
+            esac
+        fi
     fi
     if ((rc == 0 && marker_was_active == 1)); then
         publish_maintenance_released_epoch || rc=1
@@ -969,18 +999,80 @@ release_maintenance_for_finalization()
     return "$rc"
 }
 
+verify_released_finalization_resume_state()
+{
+    local state finalization inhibitor epoch_path receipt_dir
+    [[ -n "$RUN_DIR" && -n "$ROLLOUT_MAINTENANCE_MARKER" &&
+       ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] ||
+        return 1
+    data_rollback_protected_file "$RUN_DIR/STATE" 600 || return 1
+    state=$(<"$RUN_DIR/STATE")
+    [[ "$state" == complete ]] || return 1
+    data_rollback_protected_file "$(finalization_state_path)" 600 || return 1
+    finalization=$(<"$(finalization_state_path)")
+    verify_canary_fleet_handoff 0 || return 1
+    inhibitor=$(/bin/bash "$INHIBITOR_RELEASER" probe) || return 1
+    epoch_path=$(maintenance_released_epoch_path) || return 1
+    case "$finalization" in
+        maintenance-release-authorized)
+            [[ "$inhibitor" == \
+               'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused' ]] ||
+                return 1
+            verify_free_claim_pause || return 1
+            if [[ -e "$epoch_path" || -L "$epoch_path" ]]; then
+                valid_maintenance_released_epoch || return 1
+            fi
+            ;;
+        maintenance-released|pre-release-passed)
+            valid_maintenance_released_epoch || return 1
+            case "$inhibitor" in
+                'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused')
+                    verify_free_claim_pause || return 1
+                    ;;
+                'state=installed-and-released cycle=v30.1.4-no-spend free_claim=enabled')
+                    data_rollback_finalization_released || return 1
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        free-claim-released|post-release-passed)
+            valid_maintenance_released_epoch || return 1
+            data_rollback_finalization_released || return 1
+            ;;
+        finalized)
+            valid_maintenance_released_epoch || return 1
+            receipt_dir=$(terminal_receipt_dir) || return 1
+            if [[ -e "$receipt_dir" || -L "$receipt_dir" ]]; then
+                verify_terminal_receipt complete 0 || return 1
+            else
+                verify_snapshot_cleanup_resume_prefix || return 1
+                verify_terminal_cleanup_prerequisites complete || return 1
+                data_rollback_finalization_released || return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 ensure_finalization_containment()
 {
     local rc=0 inhibitor_state
     if acquire_finalization_guard_locks; then
+        # Recontainment is a new transaction boundary. Publish its authority and
+        # revoke every prior release epoch before changing either live inhibitor;
+        # a crash in any later prefix can then resume only toward containment.
+        publish_state_token "$(finalization_state_path)" containment-authorized || rc=1
+        ((rc != 0)) || invalidate_maintenance_released_epoch || rc=1
         inhibitor_state=$(/bin/bash "$INHIBITOR_RELEASER" probe 2>/dev/null || true)
-        case "$inhibitor_state" in
-            'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused') ;;
-            'state=installed-and-released cycle=v30.1.4-no-spend free_claim=enabled')
-                activate_free_claim_pause_safely || rc=1
-                ;;
-            *) rc=1 ;;
-        esac
+        if ((rc == 0)); then
+            case "$inhibitor_state" in
+                'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused') ;;
+                'state=installed-and-released cycle=v30.1.4-no-spend free_claim=enabled')
+                    activate_free_claim_pause_safely || rc=1
+                    ;;
+                *) rc=1 ;;
+            esac
+        fi
         ((rc != 0)) || verify_free_claim_pause || rc=1
         ((rc != 0)) || activate_maintenance_marker_safely || rc=1
         if ((rc == 0)); then
@@ -995,8 +1087,49 @@ ensure_finalization_containment()
     inhibitor_state=$(/bin/bash "$INHIBITOR_RELEASER" probe 2>/dev/null || true)
     [[ "$inhibitor_state" == \
        'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused' ]] || rc=1
+    [[ ! -e "$(maintenance_released_epoch_path)" &&
+       ! -L "$(maintenance_released_epoch_path)" ]] || rc=1
+    data_rollback_protected_file "$(finalization_state_path)" 600 || rc=1
+    [[ "$(<"$(finalization_state_path)")" == contained ]] || rc=1
     verify_maintenance_marker || rc=1
     ((rc == 0))
+}
+
+recover_interrupted_finalization_containment_before_preflight()
+{
+    local run_state finalization state_path
+    [[ -n "$RUN_DIR" ]] || return 0
+    state_path=$(finalization_state_path) || return 1
+    if [[ ! -e "$state_path" && ! -L "$state_path" ]]; then
+        return 0
+    fi
+    data_rollback_protected_file "$state_path" 600 || return 1
+    finalization=$(<"$state_path") || return 1
+    [[ "$finalization" == containment-authorized ]] || return 0
+
+    require_host_tools
+    [[ "$(id -u)" -eq 0 ]] || return 1
+    valid_rollout_run_dir "$RUN_DIR" || return 1
+    data_rollback_protected_file "$RUN_DIR/STATE" 600 || return 1
+    run_state=$(<"$RUN_DIR/STATE") || return 1
+    [[ "$run_state" == complete || "$run_state" == rolled-back ]] || return 1
+    [[ ! -e "$(terminal_receipt_dir)" && ! -L "$(terminal_receipt_dir)" ]] || return 1
+    require_rollout_identity
+    require_baseline_identity
+    verify_transaction_manifest || return 1
+    verify_canary_fleet_handoff 0 || return 1
+    [[ -d "$RUN_DIR/baseline" && ! -L "$RUN_DIR/baseline" &&
+       -f "$RUN_DIR/baseline/SHA256SUMS" && ! -L "$RUN_DIR/baseline/SHA256SUMS" ]] ||
+        return 1
+    (cd "$RUN_DIR/baseline" && sha256sum --strict -c SHA256SUMS >/dev/null) || return 1
+
+    ensure_finalization_containment || return 1
+    data_rollback_protected_file "$state_path" 600 || return 1
+    [[ "$(<"$state_path")" == contained &&
+       ! -e "$(maintenance_released_epoch_path)" &&
+       ! -L "$(maintenance_released_epoch_path)" ]] || return 1
+    verify_maintenance_marker || return 1
+    verify_free_claim_pause
 }
 
 terminal_receipt_dir()
@@ -4257,8 +4390,14 @@ live_preflight()
                     die 'prepared-run canary handoff evidence changed'
                 CANARY_HANDOFF_PENDING=1
             fi
-        elif [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
-            verify_maintenance_marker || die 'complete-run maintenance marker is foreign or changed'
+        elif [[ "$run_state" == complete ]]; then
+            if [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
+                verify_maintenance_marker ||
+                    die 'complete-run maintenance marker is foreign or changed'
+            else
+                verify_released_finalization_resume_state ||
+                    die 'complete-run released finalization state is absent or changed'
+            fi
         fi
     fi
     [[ "$(cat /boot/config/plugins/compose.manager/projects/blackcoin30/autostart 2>/dev/null)" == false ]] ||
@@ -4289,7 +4428,8 @@ live_preflight()
             die 'active canary handoff authority changed during locked preflight'
     elif [[ -n "$RUN_DIR" ]] &&
          jq -e '.canary_handoff.required == true' "$RUN_DIR/TRANSACTION.json" >/dev/null 2>&1; then
-        verify_canary_fleet_handoff || die 'canary-to-fleet maintenance handoff evidence changed'
+        verify_canary_fleet_handoff 0 ||
+            die 'sealed canary-to-fleet maintenance handoff evidence changed'
     elif [[ "$ACTION" == apply ]]; then
         die 'fleet apply/resume lacks mandatory canary-to-fleet handoff authority'
     else
@@ -4997,8 +5137,9 @@ verify_transaction_manifest()
     [[ -f "$RUN_DIR/TRANSACTION.json" && ! -L "$RUN_DIR/TRANSACTION.json" &&
        -f "$RUN_DIR/package-files.sha256" && ! -L "$RUN_DIR/package-files.sha256" ]] || return 1
     (cd "$PACKAGE_ROOT" && sha256sum --strict -c "$RUN_DIR/package-files.sha256" >/dev/null) || return 1
-    canary_sha=$(sha256sum "$PUBLISHED_CANARY_RESULT" | awk '{print $1}') || return 1
-    canary_manifest_sha=$(sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" | awk '{print $1}') || return 1
+    canary_sha=$EXPECTED_CANARY_RESULT_SHA256
+    canary_manifest_sha=$EXPECTED_CANARY_EVIDENCE_MANIFEST_SHA256
+    valid_sha256_hex "$canary_sha" && valid_sha256_hex "$canary_manifest_sha" || return 1
     wave_sha=$(sha256sum "$WAVE_PLAN" | awk '{print $1}') || return 1
     package_sha=$(sha256sum "$RUN_DIR/package-files.sha256" | awk '{print $1}') || return 1
     baseline_manifest_sha=$(sha256sum "$RUN_DIR/baseline/SHA256SUMS" | awk '{print $1}') || return 1
@@ -6512,7 +6653,7 @@ rollback_current_wave()
 
 on_exit()
 {
-    local rc=$? containment_proven=0 inhibitor_state=''
+    local rc=$? containment_proven=0 containment_prefix_ready=0 inhibitor_state=''
     trap - EXIT INT TERM
     terminate_and_join_activation_helpers || true
     if ((rc != 0)); then
@@ -6534,10 +6675,22 @@ on_exit()
             FINALIZATION_ACTIVE=1
         fi
         if [[ "$FINALIZATION_LOCKS_HELD" -eq 1 ]]; then
-            activate_free_claim_pause_safely ||
-                log 'ERROR: could not re-pause Free Claim while held finalization locks were active'
-            activate_maintenance_marker_safely ||
-                log 'ERROR: could not reactivate maintenance while held finalization locks were active'
+            # A signal may interrupt release or recontainment while this process
+            # owns every guard lock. Establish the same durable monotonic prefix
+            # as ensure_finalization_containment before any direct live mutation.
+            if [[ -n "$RUN_DIR" ]] && valid_rollout_run_dir "$RUN_DIR" &&
+               publish_state_token "$(finalization_state_path)" containment-authorized &&
+               invalidate_maintenance_released_epoch; then
+                containment_prefix_ready=1
+            else
+                log 'ERROR: could not publish the held-lock containment authority and revoke the release epoch'
+            fi
+            if [[ "$containment_prefix_ready" -eq 1 ]]; then
+                activate_free_claim_pause_safely ||
+                    log 'ERROR: could not re-pause Free Claim while held finalization locks were active'
+                activate_maintenance_marker_safely ||
+                    log 'ERROR: could not reactivate maintenance while held finalization locks were active'
+            fi
         fi
         # Also closes any prefix acquired before a signal interrupted the
         # canonical lock sequence and before FINALIZATION_LOCKS_HELD was set.
@@ -6716,6 +6869,10 @@ apply_rollout()
             die 'resume run path/state is unsafe'
         fi
         resume_state=$(cat "$RUN_DIR/STATE")
+        if [[ "$resume_state" == complete ]]; then
+            recover_interrupted_finalization_containment_before_preflight ||
+                die 'interrupted finalization recontainment could not be recovered safely'
+        fi
         if [[ "$resume_state" == applying ]]; then
             interrupted=$(single_interrupted_wave)
             [[ "$interrupted" != __MULTIPLE_INTERRUPTED_WAVES__ ]] ||
@@ -6764,13 +6921,13 @@ apply_rollout()
         verify_transaction_manifest || die 'resume identity changed after locked preflight'
         if [[ "$resume_state" == prepared ]]; then
             activate_maintenance_marker
-            verify_canary_fleet_handoff ||
+            verify_canary_fleet_handoff 0 ||
                 die 'prepared resume did not complete the mandatory atomic canary-to-fleet handoff'
             publish_state_token "$RUN_DIR/STATE" applying || die 'resume applying state publication failed'
             resume_state=applying
         elif [[ "$resume_state" == applying ]]; then
             verify_maintenance_marker || die 'resume maintenance marker identity changed'
-            verify_canary_fleet_handoff ||
+            verify_canary_fleet_handoff 0 ||
                 die 'resume canary-to-fleet maintenance handoff evidence changed'
         elif [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
             verify_maintenance_marker || die 'complete-run maintenance marker identity changed'
@@ -6841,6 +6998,10 @@ rollback_run()
     trap on_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    if [[ "$rollback_state" == complete || "$rollback_state" == rolled-back ]]; then
+        recover_interrupted_finalization_containment_before_preflight ||
+            die 'interrupted finalization recontainment could not be recovered safely before rollback'
+    fi
     if [[ "$rollback_state" == rolled-back ]]; then
         FINALIZATION_ACTIVE=1
         finalize_rolled_back_run || die 'rolled-back run finalization could not be proven'

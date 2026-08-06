@@ -74,6 +74,8 @@ ACTIVATION_HELPER_NODES=()
 ACTIVATION_HELPER_PHASES=()
 CANDIDATE_BASELINE_HELPER_PIDS=()
 CANDIDATE_BASELINE_HELPER_NODES=()
+CONTAINMENT_HELPER_PIDS=()
+CONTAINMENT_HELPER_NODES=()
 
 atomic_write_json()
 {
@@ -577,7 +579,7 @@ establish_wave_recovery_baselines()
         else
             # Once the leader is reaped and its group is empty, clearing the
             # slot prevents a later signal from acting on a reused PID.
-            CANDIDATE_BASELINE_HELPER_PIDS[$index]=''
+            CANDIDATE_BASELINE_HELPER_PIDS[index]=''
         fi
     done
     terminate_and_join_candidate_baseline_helpers
@@ -7218,6 +7220,7 @@ contain_node_without_rollback()
 publish_complete_containment_manifest()
 {
     local marker temporary node
+    ((${#CONTAINMENT_HELPER_PIDS[@]} == 0)) || return 1
     marker=$(wave_containment_complete_path) || return 1
     if [[ -e "$marker" || -L "$marker" ]]; then
         containment_complete_manifest_valid
@@ -7243,23 +7246,101 @@ publish_complete_containment_manifest()
     containment_complete_manifest_valid
 }
 
+terminate_and_join_containment_helpers()
+{
+    local pid deadline alive
+    ((${#CONTAINMENT_HELPER_PIDS[@]} > 0)) || return 0
+    for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    done
+    deadline=$((SECONDS + 20))
+    while ((SECONDS < deadline)); do
+        alive=0
+        for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+            if kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; then
+                alive=1
+            fi
+        done
+        ((alive == 0)) && break
+        sleep 1
+    done
+    for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    done
+    for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+        wait "$pid" 2>/dev/null || true
+    done
+    deadline=$((SECONDS + 5))
+    while ((SECONDS < deadline)); do
+        alive=0
+        for pid in "${CONTAINMENT_HELPER_PIDS[@]}"; do
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+            if kill -0 -- "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; then
+                alive=1
+            fi
+        done
+        ((alive == 0)) && break
+        sleep 1
+    done
+    ((alive == 0)) || return 1
+    CONTAINMENT_HELPER_PIDS=()
+    CONTAINMENT_HELPER_NODES=()
+}
+
 contain_wave_without_rollback()
 {
-    local reason="$1" node pid failed=0
-    local -a pids=() nodes=()
+    local reason="$1" node pid failed=0 index monitor_was_enabled=0 signal_received=0
+    local int_trap term_trap trap_mode
+    terminate_and_join_containment_helpers || return 1
     terminate_and_join_activation_helpers || return 1
+    int_trap=$(trap -p INT)
+    term_trap=$(trap -p TERM)
+    if [[ -z "$int_trap" && -z "$term_trap" ]]; then
+        trap_mode=default
+    elif [[ "$int_trap" == "trap -- 'exit 130' SIGINT" &&
+            "$term_trap" == "trap -- 'exit 143' SIGTERM" ]]; then
+        trap_mode=rollout
+    else
+        return 1
+    fi
+    [[ $- == *m* ]] && monitor_was_enabled=1
+    trap 'signal_received=130' INT
+    trap 'signal_received=143' TERM
+    ((monitor_was_enabled == 1)) || set -m
     for node in "${CURRENT_WAVE_NODES[@]}"; do
-        (contain_node_without_rollback "$node" "$reason") &
-        pids+=("$!")
-        nodes+=("$node")
+        ((signal_received == 0)) || break
+        contain_node_without_rollback "$node" "$reason" &
+        pid=$!
+        CONTAINMENT_HELPER_PIDS+=("$pid")
+        CONTAINMENT_HELPER_NODES+=("$node")
     done
-    for node in "${!pids[@]}"; do
-        pid=${pids[$node]}
+    ((monitor_was_enabled == 1)) || set +m
+    for index in "${!CONTAINMENT_HELPER_PIDS[@]}"; do
+        ((signal_received == 0)) || break
+        pid=${CONTAINMENT_HELPER_PIDS[$index]}
         if ! wait "$pid"; then
-            log "containment failed or remained ambiguous for node=${nodes[$node]}"
+            log "containment failed or remained ambiguous for node=${CONTAINMENT_HELPER_NODES[$index]}"
             failed=1
         fi
+        if kill -0 -- "-$pid" 2>/dev/null; then
+            log "containment node=${CONTAINMENT_HELPER_NODES[$index]} left a descendant live"
+            failed=1
+        else
+            CONTAINMENT_HELPER_PIDS[index]=''
+        fi
     done
+    terminate_and_join_containment_helpers || failed=1
+    if [[ "$trap_mode" == rollout ]]; then
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+    else
+        trap - INT TERM
+    fi
+    ((signal_received == 0)) || exit "$signal_received"
     ((failed == 0)) || return 1
     publish_complete_containment_manifest || return 1
     publish_state_token "$CURRENT_WAVE_DIR/ROLLBACK_STATE" contained-no-rollback || return 1
@@ -7519,6 +7600,7 @@ rollback_current_wave()
     local node all_ready deadline plan action txids_tmp restored_pow phase_record rollback_phase
     local attempt state
     local authority_sha=- old_authority_sha=- containment_pending=0
+    terminate_and_join_containment_helpers || return 1
     terminate_and_join_candidate_baseline_helpers || return 1
     if [[ "$CURRENT_WAVE_CONTAINED" -ne 0 ]] || containment_evidence_present; then
         containment_pending=1
@@ -7712,6 +7794,7 @@ on_exit()
 {
     local rc=$? containment_proven=0 containment_prefix_ready=0 inhibitor_state=''
     trap - EXIT INT TERM
+    terminate_and_join_containment_helpers || true
     terminate_and_join_candidate_baseline_helpers || true
     terminate_and_join_activation_helpers || true
     if ((rc != 0)); then

@@ -252,7 +252,9 @@ restore_filesets_from_inventory()
     while IFS='|' read -r type node role root path snapshot guid txg hold_tag source; do
         [[ "$type" == FILESET ]] || continue
         [[ -d "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" ]] || return 1
-        data_rollback_require_mutation_authority "$expected_authority_sha" || return 1
+        data_rollback_require_fileset_mutation_boundary "$expected_authority_sha" \
+            "$node" "$role" "$root" "$path" "$snapshot" "$guid" "$txg" "$hold_tag" \
+            "$source" || return 1
         rsync -aHAXx --numeric-ids --delete -- "$source/" "$path/" || return 1
         proof="$CURRENT_WAVE_DIR/fileset-restore-node-${node}-${role}.diff"
         rsync -aHAXxnc --numeric-ids --delete --itemize-changes -- "$source/" "$path/" > "$proof" || return 1
@@ -342,7 +344,8 @@ restore_zfs_from_inventory()
         if [[ ! -s "$newer_before" ]]; then
             # Never pass -r/-R: a concurrently-created newer snapshot makes this
             # exact rollback fail instead of destroying it.
-            data_rollback_require_mutation_authority "$expected_authority_sha" || return 1
+            data_rollback_require_zfs_rollback_boundary "$expected_authority_sha" \
+                "$snapshot" "$guid" "$txg" "$hold_tag" || return 1
             zfs rollback "$snapshot" || return 1
             mode=rollback
         else
@@ -354,7 +357,9 @@ restore_zfs_from_inventory()
                "$(findmnt -n -o TARGET -T "$mountpoint")" == "$mountpoint" ]] || return 1
             snapshot_source="$mountpoint/.zfs/snapshot/${snapshot#*@}"
             [[ -d "$snapshot_source" && ! -L "$snapshot_source" ]] || return 1
-            data_rollback_require_mutation_authority "$expected_authority_sha" || return 1
+            data_rollback_require_zfs_rsync_boundary "$expected_authority_sha" "$dataset" \
+                "$snapshot" "$guid" "$txg" "$hold_tag" "$mountpoint" "$snapshot_source" ||
+                return 1
             rsync -aHAXx --numeric-ids --delete -- "$snapshot_source/" "$mountpoint/" || return 1
             data_rollback_capture_newer_snapshots "$dataset" "$txg" "$newer_after" || return 1
             cmp -s "$newer_before" "$newer_after" || return 1
@@ -404,6 +409,14 @@ data_rollback_protected_directory()
 data_rollback_authority_path()
 {
     printf '%s/ROLLBACK-AUTHORITY.json\n' "$CURRENT_WAVE_DIR"
+}
+
+data_rollback_canonical_single_object_json()
+{
+    local path="$1"
+    data_rollback_protected_file "$path" 600 || return 1
+    cmp -s "$path" <(jq -S -e 'if type == "object" then . else error("object required") end' \
+        "$path")
 }
 
 data_rollback_validate_stopped_generation()
@@ -534,10 +547,11 @@ data_rollback_verify_authority_sealed()
     local expected_sha=${1:-} authority transaction handoff maintenance drain inventory
     local actual_sha transaction_sha handoff_sha maintenance_sha drain_sha inventory_sha
     local handoff_required launch_marker launch_state launch_sha node expected_nodes_json
-    local safe safe_sha stopped_generation entry_count
+    local safe safe_sha stopped_generation entry_count attempted_count=0 actual_marker_count
     authority=$(data_rollback_authority_path) || return 1
     valid_sha256_hex "$expected_sha" || return 1
     data_rollback_protected_file "$authority" 600 || return 1
+    data_rollback_canonical_single_object_json "$authority" || return 1
     actual_sha=$(sha256sum "$authority" | awk '{print $1}') || return 1
     [[ "$actual_sha" == "$expected_sha" ]] || return 1
     data_rollback_verify_authority_context_sealed || return 1
@@ -584,16 +598,6 @@ data_rollback_verify_authority_sealed()
           (keys | sort) == (["node","launch_state","launch_marker_sha256",
             "safe_boundary_sha256","stopped_generation"] | sort))
     ' "$authority" >/dev/null || return 1
-    launch_marker="$CURRENT_WAVE_DIR/CANDIDATE_LAUNCH_ATTEMPTED"
-    if [[ -e "$launch_marker" || -L "$launch_marker" ]]; then
-        data_rollback_protected_file "$launch_marker" 600 || return 1
-        candidate_launch_attempt_marker_valid || return 1
-        launch_state=candidate-attempted
-        launch_sha=$(sha256sum "$launch_marker" | awk '{print $1}') || return 1
-    else
-        launch_state=not-attempted
-        launch_sha=__NULL__
-    fi
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         entry_count=$(jq -r --argjson node "$node" '[.nodes[] | select(.node == $node)] | length' \
             "$authority") || return 1
@@ -601,12 +605,20 @@ data_rollback_verify_authority_sealed()
         stopped_generation=$(jq -er --argjson node "$node" \
             '.nodes[] | select(.node == $node) | .stopped_generation' "$authority") || return 1
         data_rollback_validate_stopped_generation "$stopped_generation" || return 1
+        launch_marker=$(wave_node_launch_attempt_path "$node") || return 1
         safe=$(wave_node_safe_rollback_path "$node") || return 1
-        if [[ "$launch_state" == candidate-attempted ]]; then
+        if [[ -e "$launch_marker" || -L "$launch_marker" ]]; then
+            data_rollback_protected_file "$launch_marker" 600 || return 1
+            verify_candidate_launch_attempt_marker "$node" 0 || return 1
+            launch_state=candidate-attempted
+            launch_sha=$(sha256sum "$launch_marker" | awk '{print $1}') || return 1
             data_rollback_protected_file "$safe" 600 || return 1
             data_rollback_verify_safe_boundary_sealed "$node" "$stopped_generation" || return 1
             safe_sha=$(sha256sum "$safe" | awk '{print $1}') || return 1
+            attempted_count=$((attempted_count + 1))
         else
+            launch_state=not-attempted
+            launch_sha=__NULL__
             [[ ! -e "$safe" && ! -L "$safe" ]] || return 1
             [[ ! -e "$(wave_node_activation_path "$node")" &&
                ! -L "$(wave_node_activation_path "$node")" ]] || return 1
@@ -621,13 +633,20 @@ data_rollback_verify_authority_sealed()
               stopped_generation:$generation}]
         ' "$authority" >/dev/null || return 1
     done
+    ! find "$CURRENT_WAVE_DIR" -maxdepth 1 -type l \
+        -name 'node-*-CANDIDATE-LAUNCH-ATTEMPTED.json' -print -quit | grep -q . || return 1
+    actual_marker_count=$(find "$CURRENT_WAVE_DIR" -maxdepth 1 -type f \
+        -name 'node-*-CANDIDATE-LAUNCH-ATTEMPTED.json' -print | wc -l) || return 1
+    [[ "$actual_marker_count" -eq "$attempted_count" ]]
 }
 
-data_rollback_verify_authority_live()
+data_rollback_verify_authority_stopped_generations()
 {
     local expected_sha=${1:-} authority node generation inspect
-    data_rollback_verify_authority_sealed "$expected_sha" || return 1
+    valid_sha256_hex "$expected_sha" || return 1
     authority=$(data_rollback_authority_path) || return 1
+    data_rollback_canonical_single_object_json "$authority" || return 1
+    [[ "$(sha256sum "$authority" | awk '{print $1}')" == "$expected_sha" ]] || return 1
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         generation=$(jq -er --argjson node "$node" \
             '.nodes[] | select(.node == $node) | .stopped_generation' "$authority") || return 1
@@ -640,11 +659,112 @@ data_rollback_verify_authority_live()
     done
 }
 
+data_rollback_verify_authority_live()
+{
+    local expected_sha=${1:-}
+    data_rollback_verify_authority_sealed "$expected_sha" || return 1
+    data_rollback_verify_authority_stopped_generations "$expected_sha"
+}
+
+data_rollback_require_lock_fd()
+{
+    local fd="$1" expected_path="$2" actual_path expected_canonical
+    [[ "$fd" =~ ^[0-9]+$ && -n "$expected_path" ]] || return 1
+    [[ -e "/proc/$$/fd/$fd" ]] || return 1
+    actual_path=$(readlink -f -- "/proc/$$/fd/$fd") || return 1
+    expected_canonical=$(realpath -e -- "$expected_path") || return 1
+    [[ "$actual_path" == "$expected_canonical" ]] || return 1
+    # This is idempotent for caller-held OFD locks and acquires an omitted lock
+    # on the already-open descriptor without changing the established order.
+    flock -n -x "$fd"
+}
+
+data_rollback_require_mutation_fences()
+{
+    [[ "${WAVE_LOCKS_HELD:-0}" -eq 1 ]] || return 1
+    data_rollback_require_lock_fd 19 /var/run/blackcoin-v30.1.4-fleet-rollout.lock || return 1
+    data_rollback_require_lock_fd 15 /run/blackcoin-endpoint-guard.lock || return 1
+    data_rollback_require_lock_fd 16 /var/run/blackcoin-node-cutover.lock || return 1
+    data_rollback_require_lock_fd 14 /run/blackcoin-pow-quarantine-cycle.lock || return 1
+    data_rollback_require_lock_fd 17 /var/run/blackcoin-wallet-runtime-guard.lock || return 1
+    if [[ " ${CURRENT_WAVE_NODES[*]} " == *" 30 "* ]]; then
+        [[ "${FREE_CLAIM_LOCK_HELD:-0}" -eq 1 && -n "${FREE_CLAIM_LOCK:-}" ]] || return 1
+        data_rollback_require_lock_fd 18 "$FREE_CLAIM_LOCK" || return 1
+    fi
+}
+
 data_rollback_require_mutation_authority()
 {
     local expected_sha=${1:-}
     valid_sha256_hex "$expected_sha" || return 1
+    data_rollback_require_mutation_fences || return 1
     data_rollback_verify_authority_live "$expected_sha"
+}
+
+data_rollback_require_fileset_mutation_boundary()
+{
+    local expected_sha="$1" node="$2" role="$3" root="$4" path="$5"
+    local snapshot="$6" guid="$7" txg="$8" hold_tag="$9" source="${10}"
+    local node_number domain kind dataset mountpoint expected_source
+    node_number=$((10#$node))
+    valid_node "$node_number" || return 1
+    [[ "$role" == raw && "$root" == "$FLEET_ZFS_PARENT" &&
+       "$path" == "$(host_blocks_for "$node_number")/blocks" ]] || return 1
+    domain=$(data_domain_for "$node_number" "$role" "$path") || return 1
+    IFS='|' read -r kind dataset <<< "$domain"
+    [[ "$kind" == fileset && "$dataset" == "$root" && "$snapshot" == "$root@"* ]] || return 1
+    data_rollback_verify_snapshot_identity "$snapshot" "$guid" "$txg" "$hold_tag" || return 1
+    mountpoint=$(zfs get -H -o value mountpoint "$root") || return 1
+    expected_source="$mountpoint/.zfs/snapshot/${snapshot#*@}/${path#"$mountpoint"/}"
+    [[ "$path" == "$mountpoint"/* && -d "$path" && ! -L "$path" &&
+       "$(realpath -e -- "$path")" == "$path" &&
+       -d "$source" && ! -L "$source" && "$(realpath -e -- "$source")" == "$source" &&
+       "$source" == "$expected_source" &&
+       "$(findmnt -n -o SOURCE -T "$path")" == "$root" ]] || return 1
+    data_rollback_require_mutation_authority "$expected_sha" || return 1
+    [[ -d "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+       -d "$source" && ! -L "$source" && "$(realpath -e -- "$source")" == "$source" &&
+       "$source" == "$expected_source" &&
+       "$(findmnt -n -o SOURCE -T "$path")" == "$root" ]] || return 1
+    data_rollback_require_mutation_fences || return 1
+    data_rollback_verify_authority_stopped_generations "$expected_sha"
+}
+
+data_rollback_require_zfs_rollback_boundary()
+{
+    local expected_sha="$1" snapshot="$2" guid="$3" txg="$4" hold_tag="$5"
+    data_rollback_verify_snapshot_identity "$snapshot" "$guid" "$txg" "$hold_tag" || return 1
+    data_rollback_require_mutation_authority "$expected_sha" || return 1
+    data_rollback_verify_snapshot_identity "$snapshot" "$guid" "$txg" "$hold_tag" || return 1
+    data_rollback_require_mutation_fences || return 1
+    data_rollback_verify_authority_stopped_generations "$expected_sha"
+}
+
+data_rollback_require_zfs_rsync_boundary()
+{
+    local expected_sha="$1" dataset="$2" snapshot="$3" guid="$4" txg="$5" hold_tag="$6"
+    local mountpoint="$7" snapshot_source="$8"
+    [[ "$(zfs get -H -o value mounted "$dataset")" == yes &&
+       "$(zfs get -H -o value mountpoint "$dataset")" == "$mountpoint" &&
+       "$mountpoint" == /* && -d "$mountpoint" && ! -L "$mountpoint" &&
+       "$(realpath -e -- "$mountpoint")" == "$mountpoint" &&
+       "$(findmnt -n -o SOURCE -T "$mountpoint")" == "$dataset" &&
+       "$(findmnt -n -o TARGET -T "$mountpoint")" == "$mountpoint" &&
+       "$snapshot_source" == "$mountpoint/.zfs/snapshot/${snapshot#*@}" &&
+       -d "$snapshot_source" && ! -L "$snapshot_source" &&
+       "$(realpath -e -- "$snapshot_source")" == "$snapshot_source" ]] || return 1
+    data_rollback_verify_snapshot_identity "$snapshot" "$guid" "$txg" "$hold_tag" || return 1
+    data_rollback_require_mutation_authority "$expected_sha" || return 1
+    [[ "$(zfs get -H -o value mounted "$dataset")" == yes &&
+       "$(zfs get -H -o value mountpoint "$dataset")" == "$mountpoint" &&
+       -d "$mountpoint" && ! -L "$mountpoint" &&
+       "$(realpath -e -- "$mountpoint")" == "$mountpoint" &&
+       "$(findmnt -n -o SOURCE -T "$mountpoint")" == "$dataset" &&
+       "$(findmnt -n -o TARGET -T "$mountpoint")" == "$mountpoint" &&
+       -d "$snapshot_source" && ! -L "$snapshot_source" &&
+       "$(realpath -e -- "$snapshot_source")" == "$snapshot_source" ]] || return 1
+    data_rollback_require_mutation_fences || return 1
+    data_rollback_verify_authority_stopped_generations "$expected_sha"
 }
 
 data_rollback_publish_authority()
@@ -671,16 +791,6 @@ data_rollback_publish_authority()
     else
         handoff_sha=__NULL__
     fi
-    launch_marker="$CURRENT_WAVE_DIR/CANDIDATE_LAUNCH_ATTEMPTED"
-    if [[ -e "$launch_marker" || -L "$launch_marker" ]]; then
-        data_rollback_protected_file "$launch_marker" 600 || return 1
-        candidate_launch_attempt_marker_valid || return 1
-        launch_state=candidate-attempted
-        launch_sha=$(sha256sum "$launch_marker" | awk '{print $1}') || return 1
-    else
-        launch_state=not-attempted
-        launch_sha=__NULL__
-    fi
     temporary=$(mktemp "$CURRENT_WAVE_DIR/.rollback-authority.XXXXXX") || return 1
     nodes_tmp=$(mktemp "$CURRENT_WAVE_DIR/.rollback-authority-nodes.XXXXXX") || {
         rm -f -- "$temporary"
@@ -704,7 +814,19 @@ data_rollback_publish_authority()
         safe=$(wave_node_safe_rollback_path "$node") || {
             rm -f -- "$temporary" "$nodes_tmp"; return 1;
         }
-        if [[ "$launch_state" == candidate-attempted ]]; then
+        launch_marker=$(wave_node_launch_attempt_path "$node") || {
+            rm -f -- "$temporary" "$nodes_tmp"; return 1;
+        }
+        if [[ -e "$launch_marker" || -L "$launch_marker" ]]; then
+            if ! data_rollback_protected_file "$launch_marker" 600 ||
+               ! verify_candidate_launch_attempt_marker "$node" 0; then
+                rm -f -- "$temporary" "$nodes_tmp"
+                return 1
+            fi
+            launch_state=candidate-attempted
+            launch_sha=$(sha256sum "$launch_marker" | awk '{print $1}') || {
+                rm -f -- "$temporary" "$nodes_tmp"; return 1;
+            }
             data_rollback_verify_safe_boundary_sealed "$node" "$generation" || {
                 rm -f -- "$temporary" "$nodes_tmp"; return 1;
             }
@@ -712,6 +834,8 @@ data_rollback_publish_authority()
                 rm -f -- "$temporary" "$nodes_tmp"; return 1;
             }
         else
+            launch_state=not-attempted
+            launch_sha=__NULL__
             [[ ! -e "$safe" && ! -L "$safe" &&
                ! -e "$(wave_node_activation_path "$node")" &&
                ! -L "$(wave_node_activation_path "$node")" ]] || {
@@ -743,6 +867,8 @@ data_rollback_publish_authority()
     rm -f -- "$nodes_tmp"
     jq -S . "$temporary" > "${temporary}.sorted" || { rm -f -- "$temporary" "${temporary}.sorted"; return 1; }
     mv -f -- "${temporary}.sorted" "$temporary" || { rm -f -- "$temporary"; return 1; }
+    cmp -s "$temporary" <(jq -S -e 'if type == "object" then . else error("object required") end' \
+        "$temporary") || { rm -f -- "$temporary"; return 1; }
     if ! chmod 600 "$temporary" || ! chown root:root "$temporary" ||
        ! sync -f "$temporary"; then
         rm -f -- "$temporary"; return 1;
@@ -762,6 +888,7 @@ data_rollback_prepare_restore_authority()
     authority=$(data_rollback_authority_path) || return 1
     if [[ -e "$authority" || -L "$authority" ]]; then
         data_rollback_protected_file "$authority" 600 || return 1
+        data_rollback_canonical_single_object_json "$authority" || return 1
         expected_sha=$(sha256sum "$authority" | awk '{print $1}') || return 1
         data_rollback_verify_authority_live "$expected_sha" || return 1
         printf '%s\n' "$expected_sha"
@@ -1291,22 +1418,17 @@ data_rollback_publish_restore_evidence_manifest()
     sync -f "$CURRENT_WAVE_DIR"
 }
 
-data_rollback_verify_data_restored_receipt()
+data_rollback_verify_data_restored_receipt_body()
 {
     local expected_authority_sha=${1:-}
     local receipt="$CURRENT_WAVE_DIR/DATA-RESTORED.json"
-    local sidecar="$CURRENT_WAVE_DIR/DATA-RESTORED.json.sha256"
     local manifest="$CURRENT_WAVE_DIR/DATA-RESTORE-EVIDENCE.sha256"
-    local receipt_sha expected_receipt_sha inventory_sha manifest_sha fileset_expected zfs_expected
+    local inventory_sha manifest_sha fileset_expected zfs_expected
     valid_sha256_hex "$expected_authority_sha" || return 1
     data_rollback_verify_authority_sealed "$expected_authority_sha" || return 1
     data_rollback_protected_file "$receipt" 600 || return 1
-    data_rollback_protected_file "$sidecar" 600 || return 1
+    data_rollback_canonical_single_object_json "$receipt" || return 1
     data_rollback_protected_file "$manifest" 600 || return 1
-    expected_receipt_sha=$(awk 'NF == 1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$sidecar") || return 1
-    [[ -n "$expected_receipt_sha" && "$(wc -l < "$sidecar")" -eq 1 ]] || return 1
-    receipt_sha=$(sha256sum "$receipt" | awk '{print $1}') || return 1
-    [[ "$receipt_sha" == "$expected_receipt_sha" ]] || return 1
     inventory_sha=$(sha256sum "$CURRENT_WAVE_DIR/data-snapshots.tsv" | awk '{print $1}') || return 1
     manifest_sha=$(sha256sum "$manifest" | awk '{print $1}') || return 1
     fileset_expected=$(awk -F'|' '$1 == "FILESET" {count++} END {print count+0}' \
@@ -1332,49 +1454,78 @@ data_rollback_verify_data_restored_receipt()
     ' "$receipt" >/dev/null
 }
 
+data_rollback_verify_data_restored_receipt()
+{
+    local expected_authority_sha=${1:-}
+    local receipt="$CURRENT_WAVE_DIR/DATA-RESTORED.json"
+    local sidecar="$CURRENT_WAVE_DIR/DATA-RESTORED.json.sha256"
+    local receipt_sha expected_receipt_sha
+    data_rollback_verify_data_restored_receipt_body "$expected_authority_sha" || return 1
+    data_rollback_protected_file "$sidecar" 600 || return 1
+    expected_receipt_sha=$(awk 'NF == 1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$sidecar") || return 1
+    [[ -n "$expected_receipt_sha" && "$(wc -l < "$sidecar")" -eq 1 ]] || return 1
+    receipt_sha=$(sha256sum "$receipt" | awk '{print $1}') || return 1
+    [[ "$receipt_sha" == "$expected_receipt_sha" ]]
+}
+
 data_rollback_publish_data_restored_receipt()
 {
     local expected_authority_sha="$1" fileset_expected="$2" zfs_expected="$3"
     local receipt="$CURRENT_WAVE_DIR/DATA-RESTORED.json"
     local sidecar="$CURRENT_WAVE_DIR/DATA-RESTORED.json.sha256"
     local manifest="$CURRENT_WAVE_DIR/DATA-RESTORE-EVIDENCE.sha256"
-    local temporary sidecar_tmp inventory_sha manifest_sha
-    [[ ! -e "$receipt" && ! -L "$receipt" && ! -e "$sidecar" && ! -L "$sidecar" ]] || return 1
+    local temporary='' sidecar_tmp inventory_sha manifest_sha
+    valid_sha256_hex "$expected_authority_sha" || return 1
+    [[ "$fileset_expected" =~ ^[0-9]+$ && "$zfs_expected" =~ ^[0-9]+$ ]] || return 1
+    data_rollback_verify_authority_sealed "$expected_authority_sha" || return 1
+    data_rollback_verify_restore_evidence_manifest "$fileset_expected" "$zfs_expected" || return 1
+    if [[ -e "$sidecar" || -L "$sidecar" ]]; then
+        [[ -e "$receipt" || -L "$receipt" ]] || return 1
+        data_rollback_verify_data_restored_receipt "$expected_authority_sha"
+        return
+    fi
     inventory_sha=$(sha256sum "$CURRENT_WAVE_DIR/data-snapshots.tsv" | awk '{print $1}') || return 1
     manifest_sha=$(sha256sum "$manifest" | awk '{print $1}') || return 1
-    temporary=$(mktemp "$CURRENT_WAVE_DIR/.data-restored.XXXXXX") || return 1
-    sidecar_tmp=$(mktemp "$CURRENT_WAVE_DIR/.data-restored-sha.XXXXXX") || {
-        rm -f -- "$temporary"; return 1;
-    }
-    jq -S -n --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
-        --arg restored_at "$(date -u +%FT%TZ)" --arg authority_sha "$expected_authority_sha" \
-        --arg inventory_sha "$inventory_sha" --arg manifest_sha "$manifest_sha" \
-        --argjson fileset_expected "$fileset_expected" --argjson zfs_expected "$zfs_expected" '
-        {schema:2,transaction:"v30.1.4-fleet-rollout",purpose:"pre-upgrade-data-restored",
-         run_dir:$run,wave_dir:$wave,pre_upgrade_data_restored:true,restored_at:$restored_at,
-         rollback_authority_sha256:$authority_sha,snapshot_inventory_sha256:$inventory_sha,
-         restore_evidence_manifest_sha256:$manifest_sha,snapshot_identity_verified:true,
-         snapshot_zero_diff_verified:true,fileset_restore_expected:$fileset_expected,
-         fileset_restore_completed:$fileset_expected,zfs_restore_expected:$zfs_expected,
-         zfs_restore_completed:$zfs_expected,fileset_restore_proofs:$fileset_expected,
-         zfs_rollback_proofs:$zfs_expected}' > "$temporary" || {
-            rm -f -- "$temporary" "$sidecar_tmp"; return 1;
-        }
-    if ! chmod 600 "$temporary" || ! chown root:root "$temporary" ||
-       ! sync -f "$temporary"; then
-        rm -f -- "$temporary" "$sidecar_tmp"; return 1;
+    if [[ -e "$receipt" || -L "$receipt" ]]; then
+        data_rollback_verify_data_restored_receipt_body "$expected_authority_sha" || return 1
+    else
+        temporary=$(mktemp "$CURRENT_WAVE_DIR/.data-restored.XXXXXX") || return 1
+        jq -S -n --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+            --arg restored_at "$(date -u +%FT%TZ)" --arg authority_sha "$expected_authority_sha" \
+            --arg inventory_sha "$inventory_sha" --arg manifest_sha "$manifest_sha" \
+            --argjson fileset_expected "$fileset_expected" --argjson zfs_expected "$zfs_expected" '
+            {schema:2,transaction:"v30.1.4-fleet-rollout",purpose:"pre-upgrade-data-restored",
+             run_dir:$run,wave_dir:$wave,pre_upgrade_data_restored:true,restored_at:$restored_at,
+             rollback_authority_sha256:$authority_sha,snapshot_inventory_sha256:$inventory_sha,
+             restore_evidence_manifest_sha256:$manifest_sha,snapshot_identity_verified:true,
+             snapshot_zero_diff_verified:true,fileset_restore_expected:$fileset_expected,
+             fileset_restore_completed:$fileset_expected,zfs_restore_expected:$zfs_expected,
+             zfs_restore_completed:$zfs_expected,fileset_restore_proofs:$fileset_expected,
+             zfs_rollback_proofs:$zfs_expected}' > "$temporary" || {
+                rm -f -- "$temporary"; return 1;
+            }
+        if ! chmod 600 "$temporary" || ! chown root:root "$temporary" ||
+           ! sync -f "$temporary"; then
+            rm -f -- "$temporary"; return 1
+        fi
+        ln -- "$temporary" "$receipt" || { rm -f -- "$temporary"; return 1; }
+        rm -f -- "$temporary"
+        sync -f "$CURRENT_WAVE_DIR" || return 1
+        data_rollback_verify_data_restored_receipt_body "$expected_authority_sha" || return 1
     fi
-    sha256sum "$temporary" | awk '{print $1}' > "$sidecar_tmp" || {
-        rm -f -- "$temporary" "$sidecar_tmp"; return 1;
+    sidecar_tmp=$(mktemp "$CURRENT_WAVE_DIR/.data-restored-sha.XXXXXX") || return 1
+    sha256sum "$receipt" | awk '{print $1}' > "$sidecar_tmp" || {
+        rm -f -- "$sidecar_tmp"; return 1;
     }
     if ! chmod 600 "$sidecar_tmp" || ! chown root:root "$sidecar_tmp" ||
        ! sync -f "$sidecar_tmp"; then
-        rm -f -- "$temporary" "$sidecar_tmp"; return 1;
+        rm -f -- "$sidecar_tmp"; return 1;
     fi
-    ln -- "$temporary" "$receipt" || { rm -f -- "$temporary" "$sidecar_tmp"; return 1; }
-    rm -f -- "$temporary"
-    sync -f "$CURRENT_WAVE_DIR" || { rm -f -- "$sidecar_tmp"; return 1; }
-    ln -- "$sidecar_tmp" "$sidecar" || { rm -f -- "$sidecar_tmp"; return 1; }
+    if ! ln -- "$sidecar_tmp" "$sidecar"; then
+        rm -f -- "$sidecar_tmp"
+        data_rollback_verify_data_restored_receipt "$expected_authority_sha"
+        return
+    fi
     rm -f -- "$sidecar_tmp"
     sync -f "$CURRENT_WAVE_DIR" || return 1
     data_rollback_verify_data_restored_receipt "$expected_authority_sha"
@@ -1388,20 +1539,33 @@ restore_wave_preupgrade_data()
     local manifest="$CURRENT_WAVE_DIR/DATA-RESTORE-EVIDENCE.sha256"
     local fileset_expected zfs_expected
     valid_sha256_hex "$expected_authority_sha" || return 1
+    fileset_expected=$(awk -F'|' '$1 == "FILESET" {count++} END {print count+0}' \
+        "$CURRENT_WAVE_DIR/data-snapshots.tsv") || return 1
+    zfs_expected=$(awk -F'|' '$1 == "ZFS" {count++} END {print count+0}' \
+        "$CURRENT_WAVE_DIR/data-snapshots.tsv") || return 1
     if [[ -e "$receipt" || -L "$receipt" || -e "$sidecar" || -L "$sidecar" ]]; then
-        data_rollback_verify_data_restored_receipt "$expected_authority_sha"
+        if [[ -e "$sidecar" || -L "$sidecar" ]]; then
+            [[ -e "$receipt" || -L "$receipt" ]] || return 1
+            data_rollback_verify_data_restored_receipt "$expected_authority_sha"
+        else
+            data_rollback_publish_data_restored_receipt "$expected_authority_sha" \
+                "$fileset_expected" "$zfs_expected"
+        fi
         return
     fi
-    [[ ! -e "$manifest" && ! -L "$manifest" ]] || return 1
+    if [[ -e "$manifest" || -L "$manifest" ]]; then
+        data_rollback_verify_authority_sealed "$expected_authority_sha" || return 1
+        data_rollback_verify_restore_evidence_manifest "$fileset_expected" "$zfs_expected" ||
+            return 1
+        data_rollback_publish_data_restored_receipt "$expected_authority_sha" \
+            "$fileset_expected" "$zfs_expected"
+        return
+    fi
     data_rollback_verify_authority_live "$expected_authority_sha" || return 1
     verify_wave_snapshot_inventory || return 1
     restore_filesets_from_inventory "$expected_authority_sha" || return 1
     restore_zfs_from_inventory "$expected_authority_sha" || return 1
     verify_wave_snapshot_inventory || return 1
-    fileset_expected=$(awk -F'|' '$1 == "FILESET" {count++} END {print count+0}' \
-        "$CURRENT_WAVE_DIR/data-snapshots.tsv") || return 1
-    zfs_expected=$(awk -F'|' '$1 == "ZFS" {count++} END {print count+0}' \
-        "$CURRENT_WAVE_DIR/data-snapshots.tsv") || return 1
     data_rollback_publish_restore_evidence_manifest || return 1
     data_rollback_verify_restore_evidence_manifest "$fileset_expected" "$zfs_expected" || return 1
     data_rollback_publish_data_restored_receipt "$expected_authority_sha" \

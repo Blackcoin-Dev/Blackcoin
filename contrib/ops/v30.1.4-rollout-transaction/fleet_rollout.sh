@@ -60,12 +60,67 @@ CURRENT_WAVE_NODES=()
 CURRENT_WAVE_COMMITTED=0
 CURRENT_WAVE_ROLLED_BACK=0
 CURRENT_WAVE_LAUNCH_ATTEMPTED=0
+CURRENT_WAVE_ACTIVATED=0
+CURRENT_WAVE_CONTAINED=0
 WAVE_LOCKS_HELD=0
 FREE_CLAIM_LOCK_HELD=0
 FINALIZATION_ACTIVE=0
 FINALIZATION_LOCKS_HELD=0
 TERMINAL_COMMIT_ACTIVE=0
 TERMINAL_FINALIZED=0
+CANARY_HANDOFF_PENDING=0
+ACTIVATION_HELPER_PIDS=()
+ACTIVATION_HELPER_NODES=()
+ACTIVATION_HELPER_PHASES=()
+
+atomic_write_json()
+{
+    local destination="$1" directory temporary
+    directory=${destination%/*}
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    temporary=$(mktemp "$directory/.json-evidence.XXXXXX") || return 1
+    if ! jq -S . > "$temporary" || ! chmod 600 "$temporary" ||
+       ! chown root:root "$temporary" || ! sync -f "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if ! mv -fT -- "$temporary" "$destination" || ! sync -f "$directory"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    [[ -f "$destination" && ! -L "$destination" &&
+       "$(stat -c '%u:%g:%a' "$destination")" == 0:0:600 ]]
+}
+
+wave_node_prefix()
+{
+    printf '%s/node-%s\n' "$CURRENT_WAVE_DIR" "$(node_padded "$1")"
+}
+
+wave_drain_plan_path()
+{
+    printf '%s/LEGACY-POW-DRAIN.json\n' "$CURRENT_WAVE_DIR"
+}
+
+wave_drain_manifest_path()
+{
+    printf '%s/WAVE-DRAIN-EVIDENCE.sha256\n' "$CURRENT_WAVE_DIR"
+}
+
+wave_node_activation_path()
+{
+    printf '%s-CANDIDATE-ACTIVATION-ATTEMPTED.json\n' "$(wave_node_prefix "$1")"
+}
+
+wave_node_safe_rollback_path()
+{
+    printf '%s-SAFE-ROLLBACK.json\n' "$(wave_node_prefix "$1")"
+}
+
+wave_node_containment_path()
+{
+    printf '%s-CONTAINED-NO-ROLLBACK.json\n' "$(wave_node_prefix "$1")"
+}
 
 candidate_recovery_baseline_path()
 {
@@ -86,12 +141,12 @@ verify_candidate_recovery_baseline()
     expected_sha=$(awk 'NF == 1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$metadata") || return 1
     [[ -n "$expected_sha" && "$actual_sha" == "$expected_sha" ]] || return 1
     for transaction_set in \
-        "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.before.json" \
+        "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json" \
         "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.first-v3014.json"; do
         [[ -f "$transaction_set" && ! -L "$transaction_set" &&
            "$(stat -c '%u:%g:%a' "$transaction_set")" == 0:0:600 ]] || return 1
     done
-    prelaunch_sha=$(sha256sum "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.before.json" |
+    prelaunch_sha=$(sha256sum "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json" |
         awk '{print $1}') || return 1
     first_sha=$(sha256sum "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.first-v3014.json" |
         awk '{print $1}') || return 1
@@ -100,19 +155,39 @@ verify_candidate_recovery_baseline()
         --arg source "$SOURCE_COMMIT" --argjson node "$node" \
         --arg prelaunch_sha "$prelaunch_sha" --arg first_sha "$first_sha" \
         --arg wave_dir "$CURRENT_WAVE_DIR" '
-        .schema == 1 and .node == $node and .candidate_image == $image and
+        .schema == 2 and .node == $node and .candidate_image == $image and
         .candidate_image_id == $image_id and .source_commit == $source and
         .wave_dir == $wave_dir and
         (.captured_at | type) == "string" and
-        .recovery.policy_authoritative == true and
-        .recovery.policy.automatic_authorized == false and
-        .recovery.database_outcome_ambiguous == false and
-        .recovery.chain_ready == true and .recovery.wallet_tip_matches == true and
-        .recovery.blocking_quarantined_claims == 0 and .recovery.blocking_components == 0 and
-        .recovery.indeterminate_quarantined_claims == 0 and
-        .recovery.pending_manual_resolutions == 0 and
-        .recovery.pending_automatic_resolutions == 0 and
-        (.recovery.confirmed_resolution_fees | type) == "number" and
+        (.container_generation | type) == "string" and (.container_generation | length) > 0 and
+        .wallet_locked_throughout == true and
+        .wallet_final.unlocked_until == 0 and
+        .staking_final.staking == false and .staking_final.worker_running == false and
+        .staking_final.automatic_qqsignal == false and
+        .staking_final.automatic_demurrage_attestation == false and
+        .staking_final.automatic_redelegation == false and
+        .staking_final.allow_automatic_quantum_key_creation == false and
+        .mining_final.enabled == false and .mining_final.autostart == false and
+        .mining_final.state == "disabled" and .mining_final.hashrate == 0 and
+        .mining_final.live_claims == 0 and .mining_final.quarantined_claims == 0 and
+        .mining_final.blocking_quarantined_claims == 0 and
+        .mining_final.claim_recovery_database_outcome_ambiguous == false and
+        .mining_final.allow_automatic_quantum_key_creation == false and
+        .recovery_initial.policy_authoritative == true and
+        .recovery_initial.policy.automatic_authorized == false and
+        .recovery_initial.database_outcome_ambiguous == false and
+        .recovery_final.policy_authoritative == true and
+        .recovery_final.policy.automatic_authorized == false and
+        .recovery_final.database_outcome_ambiguous == false and
+        .recovery_final.chain_ready == true and .recovery_final.wallet_tip_matches == true and
+        .recovery_final.blocking_quarantined_claims == 0 and
+        .recovery_final.blocking_components == 0 and
+        .recovery_final.indeterminate_quarantined_claims == 0 and
+        .recovery_final.pending_manual_resolutions == 0 and
+        .recovery_final.pending_automatic_resolutions == 0 and
+        (.recovery_initial.confirmed_resolution_fees | type) == "number" and
+        .recovery_final.confirmed_resolution_fees ==
+          .recovery_initial.confirmed_resolution_fees and
         .wallet_transaction_guard.prelaunch_sha256 == $prelaunch_sha and
         .wallet_transaction_guard.first_v3014_sha256 == $first_sha and
         .wallet_transaction_guard.exactly_unchanged == true
@@ -124,7 +199,7 @@ candidate_recovery_fee_for()
     local node="$1" path
     verify_candidate_recovery_baseline "$node" || return 1
     path=$(candidate_recovery_baseline_path "$node")
-    jq -er '.recovery.confirmed_resolution_fees | select(type == "number")' "$path"
+    jq -er '.recovery_initial.confirmed_resolution_fees | select(type == "number")' "$path"
 }
 
 capture_wallet_txid_set()
@@ -140,8 +215,9 @@ capture_wallet_txid_set()
 
 establish_candidate_recovery_baseline()
 {
-    local node="$1" path metadata recovery temporary metadata_tmp image id ready=0 deadline
-    local mining staking txids_before txids_after txids_tmp prelaunch_sha first_sha
+    local node="$1" path metadata recovery recovery_initial='' temporary metadata_tmp image id
+    local ready=0 deadline mining staking wallet_info txids_before txids_after txids_tmp
+    local prelaunch_sha first_sha generation generation_now initial_fee
     [[ " ${CURRENT_WAVE_NODES[*]} " == *" $node "* ]] || return 1
     if [[ "$node" -eq "$FREE_CLAIM_NODE" && "$FREE_CLAIM_LOCK_HELD" -ne 1 ]]; then
         return 1
@@ -156,47 +232,69 @@ establish_candidate_recovery_baseline()
     id=$(docker inspect -f '{{.Image}}' "$(container_for "$node")")
     [[ "$image" == "$CANDIDATE_IMAGE_REF" && "$id" == "$CANDIDATE_IMAGE_ID" ]] ||
         return 1
-    txids_before="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.before.json"
+    verify_wave_drain_evidence || return 1
+    txids_before="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json"
     [[ -f "$txids_before" && ! -L "$txids_before" ]] || return 1
+    generation=$(container_generation_for "$node") || return 1
+    txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.node-$(node_padded "$node")-candidate-txids.XXXXXX") ||
+        return 1
     deadline=$((SECONDS + 1200))
     while ((SECONDS < deadline)); do
         recovery=$(wallet_rpc_for "$node" getpowclaimrecoveryinfo 2>/dev/null || true)
-        if [[ -z "$recovery" ]]; then
+        mining=$(wallet_rpc_for "$node" getpowmininginfo 2>/dev/null || true)
+        staking=$(wallet_rpc_for "$node" getstakinginfo 2>/dev/null || true)
+        wallet_info=$(wallet_rpc_for "$node" getwalletinfo 2>/dev/null || true)
+        if [[ -z "$recovery" || -z "$mining" || -z "$staking" || -z "$wallet_info" ]]; then
             sleep 5
             continue
         fi
-        mining=$(wallet_rpc_for "$node" getpowmininginfo 2>/dev/null || true)
-        staking=$(wallet_rpc_for "$node" getstakinginfo 2>/dev/null || true)
-        jq -e '.enabled == false and .live_claims == 0 and
+        generation_now=$(container_generation_for "$node") || { rm -f -- "$txids_tmp"; return 1; }
+        [[ "$generation_now" == "$generation" ]] || { rm -f -- "$txids_tmp"; return 1; }
+        jq -e '.unlocked_until == 0' >/dev/null 2>&1 <<< "$wallet_info" || {
+            rm -f -- "$txids_tmp"; return 1;
+        }
+        jq -e '.enabled == false and .autostart == false and .state == "disabled" and
+            .hashrate == 0 and .live_claims == 0 and
+            (.quarantined_claims == 0 or .quarantined_claims == 1) and
+            .claim_recovery_database_outcome_ambiguous == false and
             .allow_automatic_quantum_key_creation == false' >/dev/null 2>&1 <<< "$mining" ||
-            return 1
-        jq -e '.staking == false and .worker_running == false and
+            { rm -f -- "$txids_tmp"; return 1; }
+        jq -e '.enabled == false and .staking == false and .worker_running == false and
             .automatic_qqsignal == false and .automatic_demurrage_attestation == false and
             .automatic_redelegation == false and
             .allow_automatic_quantum_key_creation == false' >/dev/null 2>&1 <<< "$staking" ||
-            return 1
-        verify_donation_defaults_off "$node" || return 1
+            { rm -f -- "$txids_tmp"; return 1; }
+        verify_donation_defaults_off "$node" || { rm -f -- "$txids_tmp"; return 1; }
         jq -e '.policy_authoritative == true and .policy.automatic_authorized == false and
-            .database_outcome_ambiguous == false' >/dev/null 2>&1 <<< "$recovery" ||
-            return 1
-        if jq -e '.chain_ready == true and .wallet_tip_matches == true' \
-            >/dev/null 2>&1 <<< "$recovery"; then
-            jq -e '.blocking_quarantined_claims == 0 and .blocking_components == 0 and
+            .database_outcome_ambiguous == false and
+            (.confirmed_resolution_fees | type) == "number"' >/dev/null 2>&1 <<< "$recovery" ||
+            { rm -f -- "$txids_tmp"; return 1; }
+        if [[ -z "$recovery_initial" ]]; then
+            recovery_initial=$recovery
+            initial_fee=$(jq -c '.confirmed_resolution_fees' <<< "$recovery") || {
+                rm -f -- "$txids_tmp"; return 1;
+            }
+        else
+            jq -e --argjson fee "$initial_fee" '.confirmed_resolution_fees == $fee' \
+                >/dev/null <<< "$recovery" || { rm -f -- "$txids_tmp"; return 1; }
+        fi
+        capture_wallet_txid_set "$node" "$txids_tmp" || { rm -f -- "$txids_tmp"; return 1; }
+        cmp -s "$txids_before" "$txids_tmp" || { rm -f -- "$txids_tmp"; return 1; }
+        if jq -e '.chain_ready == true and .wallet_tip_matches == true and
+                .blocking_quarantined_claims == 0 and .blocking_components == 0 and
                 .indeterminate_quarantined_claims == 0 and .pending_manual_resolutions == 0 and
-                .pending_automatic_resolutions == 0 and
-                (.confirmed_resolution_fees | type) == "number"' >/dev/null <<< "$recovery" ||
-                return 1
+                .pending_automatic_resolutions == 0' >/dev/null <<< "$recovery" &&
+           jq -e '.enabled == false and .autostart == false and .state == "disabled" and
+               .hashrate == 0 and .live_claims == 0 and .quarantined_claims == 0 and
+               .blocking_quarantined_claims == 0 and
+               .claim_recovery_database_outcome_ambiguous == false and
+               .allow_automatic_quantum_key_creation == false' >/dev/null <<< "$mining"; then
             ready=1
             break
         fi
         sleep 5
     done
-    ((ready == 1)) || return 1
-    txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.node-$(node_padded "$node")-wallet-txids.XXXXXX")
-    capture_wallet_txid_set "$node" "$txids_tmp" || {
-        rm -f -- "$txids_tmp"
-        return 1
-    }
+    ((ready == 1)) || { rm -f -- "$txids_tmp"; return 1; }
     txids_after="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.first-v3014.json"
     chmod 600 "$txids_tmp"
     chown root:root "$txids_tmp"
@@ -209,11 +307,16 @@ establish_candidate_recovery_baseline()
     metadata_tmp=$(mktemp "${path%/*}/.node-recovery-baseline-sha.XXXXXX")
     jq -n --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
         --arg source "$SOURCE_COMMIT" --arg captured_at "$(date -u +%FT%TZ)" \
-        --argjson node "$node" --argjson recovery "$recovery" \
+        --argjson node "$node" --argjson recovery_initial "$recovery_initial" \
+        --argjson recovery_final "$recovery" --argjson wallet_final "$wallet_info" \
+        --argjson staking_final "$staking" --argjson mining_final "$mining" \
         --arg prelaunch_sha "$prelaunch_sha" --arg first_sha "$first_sha" \
-        --arg wave_dir "$CURRENT_WAVE_DIR" \
-        '{schema:1,node:$node,candidate_image:$image,candidate_image_id:$image_id,
-          source_commit:$source,wave_dir:$wave_dir,captured_at:$captured_at,recovery:$recovery,
+        --arg wave_dir "$CURRENT_WAVE_DIR" --arg generation "$generation" \
+        '{schema:2,node:$node,candidate_image:$image,candidate_image_id:$image_id,
+          source_commit:$source,wave_dir:$wave_dir,captured_at:$captured_at,
+          container_generation:$generation,wallet_locked_throughout:true,
+          wallet_final:$wallet_final,staking_final:$staking_final,mining_final:$mining_final,
+          recovery_initial:$recovery_initial,recovery_final:$recovery_final,
           wallet_transaction_guard:{prelaunch_sha256:$prelaunch_sha,
             first_v3014_sha256:$first_sha,exactly_unchanged:true}}' > "$temporary"
     chmod 600 "$temporary"
@@ -273,7 +376,7 @@ require_host_tools()
 {
     ((BASH_VERSINFO[0] >= 4)) || die 'Bash 4 or newer is required'
     require_command awk bash cmp cp date diff docker find findmnt flock grep install jq \
-        mktemp mountpoint mv od readlink realpath rm rsync sed seq sha256sum sort stat sync tar timeout tr wc xargs zfs
+        mktemp mountpoint mv od readlink realpath rm rsync sed seq setsid sha256sum sort stat sync tar timeout tr wc xargs zfs
     docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
 }
 
@@ -457,13 +560,149 @@ verify_maintenance_marker()
     ' "$ROLLOUT_MAINTENANCE_MARKER" >/dev/null
 }
 
+canary_predecessor_path()
+{
+    printf '%s/baseline/CANARY-MAINTENANCE-PREDECESSOR.json\n' "$RUN_DIR"
+}
+
+verify_canary_fleet_handoff()
+{
+    local verify_live="${1:-1}"
+    local predecessor evidence predecessor_sha marker_sha transaction_sha result_sha manifest_sha
+    local canary_run canary_nonce fleet_nonce
+    [[ "$verify_live" == 0 || "$verify_live" == 1 ]] || return 1
+    predecessor=$(canary_predecessor_path) || return 1
+    evidence="$RUN_DIR/CANARY-FLEET-HANDOFF.json"
+    [[ -f "$predecessor" && ! -L "$predecessor" &&
+       "$(stat -c '%u:%g:%a' "$predecessor")" == 0:0:600 &&
+       -f "$evidence" && ! -L "$evidence" &&
+       "$(stat -c '%u:%g:%a' "$evidence")" == 0:0:600 ]] || return 1
+    jq -e '. == {schema:1,transaction:"v30.1.4-node27-canary",state:"active",
+        run_nonce:.run_nonce,run_dir:.run_dir} and
+        (.run_nonce | type == "string" and test("^[0-9a-f]{64}$")) and
+        (.run_dir | type == "string")' "$predecessor" >/dev/null || return 1
+    predecessor_sha=$(sha256sum "$predecessor" | awk '{print $1}') || return 1
+    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
+    result_sha=$(sha256sum "$PUBLISHED_CANARY_RESULT" | awk '{print $1}') || return 1
+    manifest_sha=$(sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" | awk '{print $1}') || return 1
+    canary_run=$(jq -er '.run_dir' "$predecessor") || return 1
+    canary_nonce=$(jq -er '.run_nonce' "$predecessor") || return 1
+    fleet_nonce=$(cat "$(maintenance_nonce_path)") || return 1
+    if [[ "$verify_live" == 1 ]]; then
+        verify_maintenance_marker || return 1
+        marker_sha=$(sha256sum "$ROLLOUT_MAINTENANCE_MARKER" | awk '{print $1}') || return 1
+    else
+        marker_sha=$(jq -n --arg nonce "$fleet_nonce" --arg run "$RUN_DIR" '
+            {schema:1,transaction:"v30.1.4-fleet-rollout",state:"active",
+             run_nonce:$nonce,run_dir:$run}' | sha256sum | awk '{print $1}') || return 1
+    fi
+    jq -e --arg predecessor_sha "$predecessor_sha" --arg canary_run "$canary_run" \
+        --arg canary_nonce "$canary_nonce" '
+        .canary_handoff == {required:true,protocol:"atomic-replace-v1",
+          predecessor_marker_sha256:$predecessor_sha,
+          predecessor_run_dir:$canary_run,predecessor_run_nonce:$canary_nonce}
+    ' "$RUN_DIR/TRANSACTION.json" >/dev/null || return 1
+    jq -e --arg run "$RUN_DIR" --arg canary_run "$canary_run" --arg canary_nonce "$canary_nonce" \
+        --arg fleet_nonce "$fleet_nonce" --arg predecessor_sha "$predecessor_sha" \
+        --arg marker_sha "$marker_sha" --arg transaction_sha "$transaction_sha" \
+        --arg result_sha "$result_sha" --arg manifest_sha "$manifest_sha" '
+        .schema == 1 and .transaction == "v30.1.4-canary-fleet-handoff" and
+        .protocol == "atomic-replace-v1" and .continuous_maintenance == true and
+        .canary == {run_dir:$canary_run,run_nonce:$canary_nonce,
+          marker_sha256:$predecessor_sha,result_sha256:$result_sha,
+          evidence_manifest_sha256:$manifest_sha} and
+        .fleet == {run_dir:$run,run_nonce:$fleet_nonce,
+          transaction_manifest_sha256:$transaction_sha,marker_sha256:$marker_sha} and
+        (.adopted_at | type == "string")
+    ' "$evidence" >/dev/null
+}
+
+publish_canary_fleet_handoff()
+{
+    local predecessor evidence predecessor_sha marker_sha transaction_sha result_sha manifest_sha
+    local canary_run canary_nonce fleet_nonce
+    predecessor=$(canary_predecessor_path) || return 1
+    evidence="$RUN_DIR/CANARY-FLEET-HANDOFF.json"
+    if [[ -e "$evidence" || -L "$evidence" ]]; then
+        verify_canary_fleet_handoff
+        return
+    fi
+    verify_maintenance_marker || return 1
+    predecessor_sha=$(sha256sum "$predecessor" | awk '{print $1}') || return 1
+    marker_sha=$(sha256sum "$ROLLOUT_MAINTENANCE_MARKER" | awk '{print $1}') || return 1
+    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
+    result_sha=$(sha256sum "$PUBLISHED_CANARY_RESULT" | awk '{print $1}') || return 1
+    manifest_sha=$(sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" | awk '{print $1}') || return 1
+    canary_run=$(jq -er '.run_dir' "$predecessor") || return 1
+    canary_nonce=$(jq -er '.run_nonce' "$predecessor") || return 1
+    fleet_nonce=$(cat "$(maintenance_nonce_path)") || return 1
+    jq -n --arg run "$RUN_DIR" --arg canary_run "$canary_run" --arg canary_nonce "$canary_nonce" \
+        --arg fleet_nonce "$fleet_nonce" --arg predecessor_sha "$predecessor_sha" \
+        --arg marker_sha "$marker_sha" --arg transaction_sha "$transaction_sha" \
+        --arg result_sha "$result_sha" --arg manifest_sha "$manifest_sha" \
+        --arg adopted_at "$(date -u +%FT%TZ)" '
+        {schema:1,transaction:"v30.1.4-canary-fleet-handoff",protocol:"atomic-replace-v1",
+         continuous_maintenance:true,
+         canary:{run_dir:$canary_run,run_nonce:$canary_nonce,marker_sha256:$predecessor_sha,
+           result_sha256:$result_sha,evidence_manifest_sha256:$manifest_sha},
+         fleet:{run_dir:$run,run_nonce:$fleet_nonce,
+           transaction_manifest_sha256:$transaction_sha,marker_sha256:$marker_sha},
+         adopted_at:$adopted_at}' | atomic_write_json "$evidence" || return 1
+    verify_canary_fleet_handoff
+}
+
+adopt_canary_maintenance_marker()
+{
+    local predecessor nonce temporary
+    [[ "$WAVE_LOCKS_HELD" -eq 1 && "$FREE_CLAIM_LOCK_HELD" -eq 1 ]] || return 1
+    predecessor=$(canary_predecessor_path) || return 1
+    [[ -f "$predecessor" && ! -L "$predecessor" ]] || return 1
+    if verify_maintenance_marker; then
+        publish_canary_fleet_handoff
+        return
+    fi
+    verify_published_canary_handoff_ready || return 1
+    cmp -s "$predecessor" "$ROLLOUT_MAINTENANCE_MARKER" || return 1
+    nonce=$(cat "$(maintenance_nonce_path)") || return 1
+    valid_sha256_hex "$nonce" || return 1
+    temporary=$(mktemp "$STATE_DIR/.v3014-maintenance-handoff.XXXXXX") || return 1
+    jq -n --arg nonce "$nonce" --arg run "$RUN_DIR" \
+        '{schema:1,transaction:"v30.1.4-fleet-rollout",state:"active",
+          run_nonce:$nonce,run_dir:$run}' > "$temporary" || return 1
+    chmod 600 "$temporary" && chown root:root "$temporary" && sync -f "$temporary" || return 1
+    mv -fT -- "$temporary" "$ROLLOUT_MAINTENANCE_MARKER" || return 1
+    sync -f "$STATE_DIR" || return 1
+    verify_maintenance_marker || return 1
+    publish_canary_fleet_handoff
+}
+
 activate_maintenance_marker()
 {
-    local nonce temporary
+    local reactivation_mode="${1:-initial-handoff}" nonce temporary
+    [[ "$reactivation_mode" == initial-handoff ||
+       "$reactivation_mode" == post-handoff-reactivation ]] ||
+        die 'invalid maintenance-marker activation mode'
     if [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
-        verify_maintenance_marker || die 'foreign or malformed rollout maintenance marker exists'
+        if [[ -f "$(canary_predecessor_path)" && ! -L "$(canary_predecessor_path)" ]]; then
+            adopt_canary_maintenance_marker ||
+                die 'active canary marker could not be atomically adopted by the fleet transaction'
+        else
+            verify_maintenance_marker || die 'foreign or malformed rollout maintenance marker exists'
+        fi
         return 0
     fi
+    if [[ "$reactivation_mode" == initial-handoff ]]; then
+        die 'the exact active canary marker is absent; fresh fleet-marker creation is prohibited'
+    fi
+    [[ -f "$RUN_DIR/CANARY-FLEET-HANDOFF.json" &&
+       ! -L "$RUN_DIR/CANARY-FLEET-HANDOFF.json" ]] ||
+        die 'post-handoff maintenance reactivation has no durable canary-to-fleet authority'
+    jq -e '.canary_handoff.required == true and
+        .canary_handoff.protocol == "atomic-replace-v1"' \
+        "$RUN_DIR/TRANSACTION.json" >/dev/null ||
+        die 'post-handoff maintenance reactivation has no mandatory handoff identity'
+    verify_canary_fleet_handoff 0 ||
+        die 'post-handoff maintenance reactivation authority is invalid'
     nonce=$(cat "$(maintenance_nonce_path)")
     valid_sha256_hex "$nonce" || die 'maintenance nonce is invalid'
     temporary=$(mktemp "$STATE_DIR/.v3014-maintenance.XXXXXX")
@@ -476,6 +715,8 @@ activate_maintenance_marker()
     mv -fT -- "$temporary" "$ROLLOUT_MAINTENANCE_MARKER"
     sync -f "$STATE_DIR"
     verify_maintenance_marker || die 'maintenance marker failed post-commit verification'
+    verify_canary_fleet_handoff ||
+        die 'post-handoff maintenance reactivation did not bind to the atomic handoff record'
 }
 
 release_maintenance_marker()
@@ -979,6 +1220,7 @@ verify_terminal_receipt()
     local evidence_manifest evidence_manifest_path evidence_manifest_sha directories_path directories_sha
     local hour_manifest_path hour_manifest_sha hour_directories_path hour_directories_sha
     local generation_expected_rel generation_expected generation_final generation_expected_sha generation_final_sha
+    local regular_pow_active legacy_quarantined_disabled
     [[ "$verify_live" == 0 || "$verify_live" == 1 ]] || return 1
     if [[ -n "$receipt_dir_override" ]]; then
         [[ "$verify_live" == 0 &&
@@ -1054,6 +1296,8 @@ verify_terminal_receipt()
                 return 1
             generation_expected="$RUN_DIR/exact-32-soak/$generation_expected_rel"
             generation_final="$RUN_DIR/final-generations.post-release"
+            regular_pow_active=31
+            legacy_quarantined_disabled=0
             ;;
         rolled-back)
             result="$RUN_DIR/ROLLBACK_RESULT.json"
@@ -1081,6 +1325,8 @@ verify_terminal_receipt()
             generation_expected="$RUN_DIR/$generation_expected_rel"
             generation_final="$RUN_DIR/rollback-final-generations.post-release"
             verify_rollback_post_release_evidence || return 1
+            regular_pow_active=$(jq -er '.regular_pow_active' "$ready") || return 1
+            legacy_quarantined_disabled=$(jq -er '.legacy_quarantined_disabled' "$ready") || return 1
             ;;
         *) return 1 ;;
     esac
@@ -1162,7 +1408,9 @@ verify_terminal_receipt()
         --arg generation_expected_sha "$generation_expected_sha" \
         --arg generation_final_rel "${generation_final#"$RUN_DIR/"}" \
         --arg generation_final_sha "$generation_final_sha" \
-        --argjson evidence_manifest "$evidence_manifest" '
+        --argjson evidence_manifest "$evidence_manifest" \
+        --argjson regular_pow_active "$regular_pow_active" \
+        --argjson legacy_quarantined_disabled "$legacy_quarantined_disabled" '
         . == {schema:1,transaction:"v30.1.4-fleet-finalization",run_dir:$run,
           outcome:$outcome,state_token:$outcome,finalization_state:"finalized",completed_at:$completed,
           transaction_manifest_sha256:$transaction_sha,free_claim_release_receipt_sha256:$release_sha,
@@ -1179,7 +1427,9 @@ verify_terminal_receipt()
           terminal_generation_evidence:$generation_final_rel,
           terminal_generation_sha256:$generation_final_sha,
           nodes_operational:32,pos_active:32,
-          regular_pow_active:31,free_claim_node:30,free_claim_regular_pow:false,
+          regular_pow_active:$regular_pow_active,
+          legacy_quarantined_disabled:$legacy_quarantined_disabled,
+          free_claim_node:30,free_claim_regular_pow:false,
           fee_payments_authorized:false,terminal_evidence_bound:true}
     ' "$receipt" >/dev/null
 }
@@ -1192,6 +1442,7 @@ write_terminal_receipt()
     local result evidence_manifest evidence_manifest_path evidence_manifest_sha directories_path directories_sha path
     local hour_manifest_path hour_manifest_sha hour_directories_path hour_directories_sha
     local generation_expected_rel generation_expected generation_final generation_expected_sha generation_final_sha
+    local regular_pow_active legacy_quarantined_disabled
     receipt_dir=$(terminal_receipt_dir) || return 1
     [[ ! -e "$receipt_dir" && ! -L "$receipt_dir" ]] || return 1
     case "$outcome" in
@@ -1235,6 +1486,8 @@ write_terminal_receipt()
                 return 1
             generation_expected="$RUN_DIR/exact-32-soak/$generation_expected_rel"
             generation_final="$RUN_DIR/final-generations.post-release"
+            regular_pow_active=31
+            legacy_quarantined_disabled=0
             ;;
         rolled-back)
             result="$RUN_DIR/ROLLBACK_RESULT.json"
@@ -1262,6 +1515,8 @@ write_terminal_receipt()
             generation_expected="$RUN_DIR/$generation_expected_rel"
             generation_final="$RUN_DIR/rollback-final-generations.post-release"
             verify_rollback_post_release_evidence || return 1
+            regular_pow_active=$(jq -er '.regular_pow_active' "$ready") || return 1
+            legacy_quarantined_disabled=$(jq -er '.legacy_quarantined_disabled' "$ready") || return 1
             ;;
         *) return 1 ;;
     esac
@@ -1317,7 +1572,9 @@ write_terminal_receipt()
         --arg generation_expected_sha "$generation_expected_sha" \
         --arg generation_final_rel "${generation_final#"$RUN_DIR/"}" \
         --arg generation_final_sha "$generation_final_sha" \
-        --argjson evidence_manifest "$evidence_manifest" '
+        --argjson evidence_manifest "$evidence_manifest" \
+        --argjson regular_pow_active "$regular_pow_active" \
+        --argjson legacy_quarantined_disabled "$legacy_quarantined_disabled" '
         {schema:1,transaction:"v30.1.4-fleet-finalization",run_dir:$run,
          outcome:$outcome,state_token:$outcome,finalization_state:"finalized",completed_at:$completed,
          transaction_manifest_sha256:$transaction_sha,free_claim_release_receipt_sha256:$release_sha,
@@ -1333,7 +1590,9 @@ write_terminal_receipt()
          terminal_generation_evidence:$generation_final_rel,
          terminal_generation_sha256:$generation_final_sha,
          nodes_operational:32,pos_active:32,
-         regular_pow_active:31,free_claim_node:30,free_claim_regular_pow:false,
+         regular_pow_active:$regular_pow_active,
+         legacy_quarantined_disabled:$legacy_quarantined_disabled,
+         free_claim_node:30,free_claim_regular_pow:false,
          fee_payments_authorized:false,terminal_evidence_bound:true}
     ' > "$temporary" || return 1
     chmod 600 "$temporary" && chown root:root "$temporary" && sync -f "$temporary" || return 1
@@ -1565,6 +1824,29 @@ verify_all_baseline_runtime_once()
     ((failed == 0)) && assert_unique_vpn_proofs && verify_node30_free_claim_service
 }
 
+legacy_restore_counts()
+{
+    local node baseline mode lookup_rc active=0 quarantined=0
+    for node in $(seq 1 "$NODE_COUNT"); do
+        [[ "$node" -ne "$FREE_CLAIM_NODE" ]] || continue
+        if baseline=$(legacy_plan_file_for_node "$node" 2>/dev/null); then
+            :
+        else
+            lookup_rc=$?
+            [[ "$lookup_rc" -eq 2 ]] || return 1
+            baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+        fi
+        mode=$(legacy_pow_baseline_mode "$node" "$baseline") || return 1
+        case "$mode" in
+            clean-hashing) active=$((active + 1)) ;;
+            quarantined-disabled) quarantined=$((quarantined + 1)) ;;
+            *) return 1 ;;
+        esac
+    done
+    ((active + quarantined == NODE_COUNT - 1)) || return 1
+    printf '%s %s\n' "$active" "$quarantined"
+}
+
 capture_rollback_chain_convergence()
 {
     local root="$1" attempt attempt_dir node pid count
@@ -1606,6 +1888,7 @@ verify_rollback_post_release_evidence()
     local evidence="$RUN_DIR/rollback-post-release" ready="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json"
     local ready_copy="$RUN_DIR/rollback-post-release/ROLLBACK-FINALIZATION-READY.json"
     local relative expected before after chain result ready_sha expected_sha before_sha after_sha chain_sha
+    local regular_pow_active legacy_quarantined_disabled
     [[ -d "$evidence" && ! -L "$evidence" && "$(realpath -e -- "$evidence")" == "$evidence" &&
        "$(stat -c '%u:%g:%a' "$evidence")" == 0:0:700 &&
        -z "$(find "$evidence" -type l -print -quit)" &&
@@ -1632,6 +1915,8 @@ verify_rollback_post_release_evidence()
     chain="$evidence/chain/PASSED.json"
     [[ -f "$ready_copy" && ! -L "$ready_copy" ]] || return 1
     ready_sha=$(sha256sum "$ready_copy" | awk '{print $1}') || return 1
+    regular_pow_active=$(jq -er '.regular_pow_active' "$ready_copy") || return 1
+    legacy_quarantined_disabled=$(jq -er '.legacy_quarantined_disabled' "$ready_copy") || return 1
     if [[ "$require_current_ready" -eq 1 ]]; then
         [[ -f "$ready" && ! -L "$ready" &&
            "$(sha256sum "$ready" | awk '{print $1}')" == "$ready_sha" ]] || return 1
@@ -1651,7 +1936,9 @@ verify_rollback_post_release_evidence()
     ' "$chain" >/dev/null || return 1
     jq -e --arg run "$RUN_DIR" --arg ready_sha "$ready_sha" \
         --arg expected_sha "$expected_sha" --arg before_sha "$before_sha" \
-        --arg after_sha "$after_sha" --arg chain_sha "$chain_sha" '
+        --arg after_sha "$after_sha" --arg chain_sha "$chain_sha" \
+        --argjson regular_pow_active "$regular_pow_active" \
+        --argjson legacy_quarantined_disabled "$legacy_quarantined_disabled" '
         .schema == 1 and .transaction == "v30.1.4-rollback-post-release" and
         .run_dir == $run and .result == "passed" and
         .rollback_finalization_ready_sha256 == $ready_sha and
@@ -1663,7 +1950,10 @@ verify_rollback_post_release_evidence()
         .generation_after_sha256 == $after_sha and
         .chain_convergence_evidence == "chain/PASSED.json" and
         .chain_convergence_sha256 == $chain_sha and
-        .nodes_operational == 32 and .pos_active == 32 and .regular_pow_active == 31 and
+        .nodes_operational == 32 and .pos_active == 32 and
+        .regular_pow_active == $regular_pow_active and
+        .legacy_quarantined_disabled == $legacy_quarantined_disabled and
+        .regular_pow_active + .legacy_quarantined_disabled == 31 and
         .free_claim_node == 30 and .free_claim_regular_pow == false and
         .vpn_proofs_valid_unique == 32 and .exact_32_generation_fence == true and
         .global_chain_convergence == true and .free_claim_service_healthy == true and
@@ -1675,6 +1965,7 @@ write_rollback_post_release_evidence()
 {
     local canonical="$RUN_DIR/rollback-post-release" staging archive_index=1 archive ready
     local ready_rel expected ready_sha expected_sha before_sha after_sha chain_sha temporary
+    local regular_pow_active legacy_quarantined_disabled
     if [[ -e "$canonical" || -L "$canonical" ]]; then
         verify_rollback_post_release_evidence 0 || return 1
         while [[ -e "$(printf '%s/rollback-post-release-prior-%03d' "$RUN_DIR" "$archive_index")" ||
@@ -1707,18 +1998,22 @@ write_rollback_post_release_evidence()
     before_sha=$(sha256sum "$staging/GENERATIONS.before" | awk '{print $1}') || return 1
     after_sha=$(sha256sum "$staging/GENERATIONS.after" | awk '{print $1}') || return 1
     chain_sha=$(sha256sum "$staging/chain/PASSED.json" | awk '{print $1}') || return 1
+    read -r regular_pow_active legacy_quarantined_disabled < <(legacy_restore_counts) || return 1
     [[ "$expected_sha" == "$before_sha" && "$expected_sha" == "$after_sha" ]] || return 1
     temporary="$staging/RESULT.json"
     jq -n --arg run "$RUN_DIR" --arg completed "$(date -u +%FT%TZ)" \
         --arg ready_sha "$ready_sha" --arg expected_sha "$expected_sha" \
-        --arg before_sha "$before_sha" --arg after_sha "$after_sha" --arg chain_sha "$chain_sha" '
+        --arg before_sha "$before_sha" --arg after_sha "$after_sha" --arg chain_sha "$chain_sha" \
+        --argjson regular_pow_active "$regular_pow_active" \
+        --argjson legacy_quarantined_disabled "$legacy_quarantined_disabled" '
         {schema:1,transaction:"v30.1.4-rollback-post-release",run_dir:$run,
          result:"passed",completed_at:$completed,rollback_finalization_ready_sha256:$ready_sha,
          generation_expected_evidence:"GENERATIONS.expected",generation_expected_sha256:$expected_sha,
          generation_before_evidence:"GENERATIONS.before",generation_before_sha256:$before_sha,
          generation_after_evidence:"GENERATIONS.after",generation_after_sha256:$after_sha,
          chain_convergence_evidence:"chain/PASSED.json",chain_convergence_sha256:$chain_sha,
-         nodes_operational:32,pos_active:32,regular_pow_active:31,free_claim_node:30,
+         nodes_operational:32,pos_active:32,regular_pow_active:$regular_pow_active,
+         legacy_quarantined_disabled:$legacy_quarantined_disabled,free_claim_node:30,
          free_claim_regular_pow:false,vpn_proofs_valid_unique:32,
          exact_32_generation_fence:true,global_chain_convergence:true,
          free_claim_service_healthy:true,fee_payments_authorized:false}
@@ -1812,7 +2107,7 @@ write_rollback_finalization_ready()
     local result="$RUN_DIR/ROLLBACK_RESULT.json" epoch supervisor identity generations_before
     local generations_after generations_final supervisor_sha identity_sha result_sha transaction_sha
     local generations_before_sha generations_final_sha nonce timestamp timestamp_epoch
-    local ready_tmp ready_sha_tmp
+    local ready_tmp ready_sha_tmp regular_pow_active legacy_quarantined_disabled
     [[ "$(<"$RUN_DIR/STATE")" == rolled-back ]] || return 1
     valid_maintenance_released_epoch || return 1
     epoch=$(<"$(maintenance_released_epoch_path)")
@@ -1851,6 +2146,7 @@ write_rollback_finalization_ready()
     valid_sha256_hex "$nonce" || return 1
     timestamp=$(jq -er '.timestamp' "$supervisor") || return 1
     timestamp_epoch=$(date -d "$timestamp" +%s) || return 1
+    read -r regular_pow_active legacy_quarantined_disabled < <(legacy_restore_counts) || return 1
     ready_tmp=$(mktemp "$RUN_DIR/.rollback-finalization-ready.XXXXXX") || return 1
     jq -n --arg result passed --arg phase rollback-pre-release --arg run "$RUN_DIR" \
         --arg rollback_sha "$result_sha" --arg transaction_sha "$transaction_sha" \
@@ -1861,7 +2157,9 @@ write_rollback_finalization_ready()
         --arg generations_before_sha "$generations_before_sha" \
         --arg generations_final_rel "${generations_final#"$RUN_DIR/"}" \
         --arg generations_final_sha "$generations_final_sha" --arg nonce "$nonce" \
-        --argjson released_epoch "$((10#$epoch))" '
+        --argjson released_epoch "$((10#$epoch))" \
+        --argjson regular_pow_active "$regular_pow_active" \
+        --argjson legacy_quarantined_disabled "$legacy_quarantined_disabled" '
         {schema:1,result:$result,phase:$phase,run_dir:$run,
          rollback_result_sha256:$rollback_sha,transaction_manifest_sha256:$transaction_sha,
          run_nonce:$nonce,
@@ -1874,7 +2172,9 @@ write_rollback_finalization_ready()
          generation_before_sha256:$generations_before_sha,
          generation_before_publication_evidence:$generations_final_rel,
          generation_before_publication_sha256:$generations_final_sha,
-         regular_pow_active:31,free_claim_node:30,free_claim_regular_pow:false,
+         regular_pow_active:$regular_pow_active,
+         legacy_quarantined_disabled:$legacy_quarantined_disabled,
+         free_claim_node:30,free_claim_regular_pow:false,
          exact_32_generation_fence:true,vpn_proofs_valid_unique:32,
          baseline_identity_restored:true,claim_recovery_fee_unchanged:true,
          fee_payments_authorized:false}
@@ -1978,13 +2278,17 @@ finalize_rolled_back_run()
 
 write_rollback_success_evidence()
 {
-    local transaction_sha temporary result_sha sha_tmp
+    local transaction_sha temporary result_sha sha_tmp regular_pow_active legacy_quarantined_disabled
     transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
+    read -r regular_pow_active legacy_quarantined_disabled < <(legacy_restore_counts) || return 1
     temporary=$(mktemp "$RUN_DIR/.ROLLBACK_RESULT.XXXXXX")
     jq -n --arg transaction_sha "$transaction_sha" \
+        --argjson regular_pow_active "$regular_pow_active" \
+        --argjson legacy_quarantined_disabled "$legacy_quarantined_disabled" \
         '{schema:1,transaction:"v30.1.4-fleet-rollout",result:"rolled-back",
           state:"rolled-back",transaction_manifest_sha256:$transaction_sha,
-          nodes_healthy:32,pos_active:32,regular_pow_active:31,free_claim_node:30,
+          nodes_healthy:32,pos_active:32,regular_pow_active:$regular_pow_active,
+          legacy_quarantined_disabled:$legacy_quarantined_disabled,free_claim_node:30,
           free_claim_regular_pow:false,free_claim_broadcasts_paused:true,
           vpn_proofs_valid_unique:32,baseline_identity_restored:true,
           claim_recovery_fee_unchanged:true,fee_payments_authorized:false,
@@ -2081,7 +2385,8 @@ verify_resume_run()
     [[ -d "$RUN_DIR/baseline" && ! -L "$RUN_DIR/baseline" ]] || die 'resume baseline is absent'
     for file in docker-compose.yml fleet-image-policy.json blackcoin_endpoint_guard.sh \
         blackcoin_wallet_runtime_guard.sh blackcoin_node_normal_unlock.sh blackcoin_pow_start_only.sh \
-        fleet-identity.json free-claim-status.json free-claim-container-identity.json SHA256SUMS; do
+        fleet-identity.json free-claim-status.json free-claim-container-identity.json \
+        LEGACY-POW-INITIAL.json SHA256SUMS; do
         [[ -f "$RUN_DIR/baseline/$file" && ! -L "$RUN_DIR/baseline/$file" ]] ||
             die "resume baseline file is absent or unsafe: $file"
     done
@@ -2329,6 +2634,10 @@ resume_interrupted_wave_before_live_preflight()
     verify_wave_evidence_manifest "$CURRENT_WAVE_DIR" "$wave_index" ||
         die 'interrupted wave preparation evidence changed'
     read -r -a CURRENT_WAVE_NODES < "$CURRENT_WAVE_DIR/NODES"
+    if find "$CURRENT_WAVE_DIR" -maxdepth 1 -type f -name 'node-*-CONTAINED-NO-ROLLBACK.json' \
+        -print -quit | grep -q .; then
+        die 'interrupted wave is durably contained after activation; automatic rollback is prohibited'
+    fi
     live_file_matches_wave_generation "$COMPOSE_FILE" \
         "$CURRENT_WAVE_DIR/docker-compose.before.yml" \
         "$CURRENT_WAVE_DIR/docker-compose.candidate.yml" ||
@@ -2402,8 +2711,17 @@ live_preflight()
     if [[ -z "$RUN_DIR" ]]; then
         assert_empty_control_marker "$ENABLE_GUARD_STARTS" ||
             die 'automatic-start authority marker is absent, nonempty, or unsafe'
-        [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] ||
-            die 'a prior rollout maintenance marker must be resumed or audited'
+        if [[ "$ACTION" == apply ]]; then
+            [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]] ||
+                die 'apply requires the exact active handoff-ready canary marker'
+            verify_published_canary_handoff_ready ||
+                die 'existing maintenance marker is not the exact handoff-ready canary authority'
+            CANARY_HANDOFF_PENDING=1
+        elif [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
+            verify_published_canary_handoff_ready ||
+                die 'existing maintenance marker is not the exact handoff-ready canary authority'
+            CANARY_HANDOFF_PENDING=1
+        fi
     else
         verify_resume_run
         run_state=$(cat "$RUN_DIR/STATE")
@@ -2411,7 +2729,22 @@ live_preflight()
             verify_maintenance_marker || die 'resume maintenance marker is absent or changed'
         elif [[ "$run_state" == prepared &&
                 ( -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ) ]]; then
-            verify_maintenance_marker || die 'prepared-run maintenance marker is foreign or changed'
+            if verify_maintenance_marker; then
+                if [[ -f "$(canary_predecessor_path)" &&
+                      ! -L "$(canary_predecessor_path)" ]]; then
+                    publish_canary_fleet_handoff ||
+                        die 'prepared-run atomic canary handoff record could not be recovered'
+                fi
+            else
+                [[ -f "$(canary_predecessor_path)" &&
+                   ! -L "$(canary_predecessor_path)" ]] ||
+                    die 'prepared-run maintenance marker is foreign or changed'
+                cmp -s "$(canary_predecessor_path)" "$ROLLOUT_MAINTENANCE_MARKER" ||
+                    die 'prepared-run canary predecessor marker changed'
+                verify_published_canary_handoff_ready ||
+                    die 'prepared-run canary handoff evidence changed'
+                CANARY_HANDOFF_PENDING=1
+            fi
         elif [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
             verify_maintenance_marker || die 'complete-run maintenance marker is foreign or changed'
         fi
@@ -2439,7 +2772,18 @@ live_preflight()
     verify_image_policy_local_images || die 'an image pinned by the current policy is absent or has the wrong ID'
     verify_live_fleet_matches_policy || die 'live Compose/container identities differ from the current policy'
     verify_image_identity || die 'candidate image identity, labels, or binary hashes failed'
-    verify_published_canary || die 'published-package node27 canary evidence does not match this exact image'
+    if [[ "$CANARY_HANDOFF_PENDING" -eq 1 ]]; then
+        verify_published_canary_handoff_ready ||
+            die 'active canary handoff authority changed during locked preflight'
+    elif [[ -n "$RUN_DIR" ]] &&
+         jq -e '.canary_handoff.required == true' "$RUN_DIR/TRANSACTION.json" >/dev/null 2>&1; then
+        verify_canary_fleet_handoff || die 'canary-to-fleet maintenance handoff evidence changed'
+    elif [[ "$ACTION" == apply ]]; then
+        die 'fleet apply/resume lacks mandatory canary-to-fleet handoff authority'
+    else
+        verify_published_canary ||
+            die 'published-package node27 canary evidence does not match this exact image'
+    fi
     verify_node30_role_policy
     inhibitor_probe=$(/bin/bash "$INHIBITOR_RELEASER" probe) ||
         die 'permanent no-spend cycle and Free Claim state are not auditable'
@@ -2614,7 +2958,7 @@ write_wave_evidence_manifest()
     fi
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         files+=("node-$(node_padded "$node")-loaded-wallet.txt")
-        files+=("node-$(node_padded "$node")-wallet-txids.before.json")
+        files+=("node-$(node_padded "$node")-legacy-pow.before-drain.json")
     done
     verify_wave_node_identity "$CURRENT_WAVE_DIR" "$wave_index" ||
         die 'wave nodes do not match the pinned wave plan'
@@ -2650,15 +2994,256 @@ verify_wave_evidence_manifest()
     ' "$wave_dir/WAVE-IDENTITY.json" >/dev/null
 }
 
+write_wave_drain_evidence()
+{
+    local node padded before after wallet staking txids node_plan mode role action temporary entries
+    local before_sha after_sha wallet_sha staking_sha txids_sha
+    local -a files=()
+    [[ ! -e "$(wave_drain_plan_path)" && ! -L "$(wave_drain_plan_path)" &&
+       ! -e "$(wave_drain_manifest_path)" && ! -L "$(wave_drain_manifest_path)" ]] || return 1
+    entries=$(mktemp "$CURRENT_WAVE_DIR/.legacy-pow-drain-entries.XXXXXX") || return 1
+    : > "$entries"
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        padded=$(node_padded "$node") || { rm -f -- "$entries"; return 1; }
+        before="$CURRENT_WAVE_DIR/node-${padded}-legacy-pow.before-drain.json"
+        after="$CURRENT_WAVE_DIR/node-${padded}-legacy-pow.after-drain.json"
+        wallet="$CURRENT_WAVE_DIR/node-${padded}-wallet.after-drain.json"
+        staking="$CURRENT_WAVE_DIR/node-${padded}-staking.after-drain.json"
+        txids="$CURRENT_WAVE_DIR/node-${padded}-wallet-txids.prelaunch.json"
+        node_plan="$CURRENT_WAVE_DIR/node-${padded}-legacy-pow-rollback-plan.json"
+        for temporary in "$before" "$after" "$wallet" "$staking" "$txids"; do
+            [[ -f "$temporary" && ! -L "$temporary" &&
+               "$(stat -c '%u:%g:%a' "$temporary")" == 0:0:600 ]] || {
+                rm -f -- "$entries"; return 1;
+            }
+        done
+        mode=$(legacy_pow_snapshot_mode "$node" "$before") || {
+            rm -f -- "$entries"; return 1;
+        }
+        legacy_pow_projection_is_valid "$node" "$mode" "$before" pre-drain || {
+            rm -f -- "$entries"; return 1;
+        }
+        legacy_pow_projection_is_valid "$node" "$mode" "$after" drained || {
+            rm -f -- "$entries"; return 1;
+        }
+        jq -e '.unlocked_until == 0' "$wallet" >/dev/null || {
+            rm -f -- "$entries"; return 1;
+        }
+        jq -e '.enabled == false and .staking == false and
+            ((has("worker_running") | not) or .worker_running == false) and
+            .automatic_qqsignal == false and .automatic_demurrage_attestation == false and
+            .automatic_redelegation == false and
+            .allow_automatic_quantum_key_creation == false' "$staking" >/dev/null || {
+            rm -f -- "$entries"; return 1;
+        }
+        jq -e 'type == "array" and . == (unique | sort) and
+            all(.[]; type == "string" and test("^[0-9a-f]{64}$"))' "$txids" >/dev/null || {
+            rm -f -- "$entries"; return 1;
+        }
+        if [[ "$node" -eq "$FREE_CLAIM_NODE" ]]; then
+            role=free-claim
+            action=skip-pow
+        else
+            role=regular-pow
+            [[ "$mode" == clean-hashing ]] && action=start-pow-helper || action=skip-pow
+        fi
+        before_sha=$(sha256sum "$before" | awk '{print $1}') || return 1
+        after_sha=$(sha256sum "$after" | awk '{print $1}') || return 1
+        wallet_sha=$(sha256sum "$wallet" | awk '{print $1}') || return 1
+        staking_sha=$(sha256sum "$staking" | awk '{print $1}') || return 1
+        txids_sha=$(sha256sum "$txids" | awk '{print $1}') || return 1
+        jq -cn --argjson node "$node" --arg role "$role" --arg mode "$mode" \
+            --arg action "$action" --arg before_sha "$before_sha" --arg after_sha "$after_sha" \
+            --arg wallet_sha "$wallet_sha" --arg staking_sha "$staking_sha" \
+            --arg txids_sha "$txids_sha" --slurpfile before "$before" --slurpfile after "$after" '
+            {node:$node,role:$role,mode:$mode,rollback_pow_action:$action,
+             before_drain_sha256:$before_sha,post_drain_sha256:$after_sha,
+             post_drain_wallet_sha256:$wallet_sha,post_drain_staking_sha256:$staking_sha,
+             prelaunch_wallet_txids_sha256:$txids_sha,
+             baseline:($before[0] | {enabled,autostart,state,threads,cpu_percent,hashrate,
+               unresolved_claims,live_claims,quarantined_claims,
+               allow_automatic_quantum_key_creation}),
+             post_drain:($after[0] | {enabled,autostart,state,threads,cpu_percent,hashrate,
+               unresolved_claims,live_claims,quarantined_claims,
+               allow_automatic_quantum_key_creation})}' | atomic_write_json "$node_plan" || {
+            rm -f -- "$entries"; return 1;
+        }
+        jq -cS . "$node_plan" >> "$entries" || { rm -f -- "$entries"; return 1; }
+        files+=("node-${padded}-legacy-pow.before-drain.json"
+            "node-${padded}-legacy-pow.after-drain.json"
+            "node-${padded}-legacy-pow-rollback-plan.json"
+            "node-${padded}-wallet.after-drain.json"
+            "node-${padded}-staking.after-drain.json"
+            "node-${padded}-wallet-txids.prelaunch.json")
+    done
+    jq -sS --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        '{schema:1,transaction:"v30.1.4-fleet-rollout",run_dir:$run,wave_dir:$wave,
+          authority:"post-drain-prelaunch",fee_payments_authorized:false,
+          entries:(sort_by(.node))}' "$entries" | atomic_write_json "$(wave_drain_plan_path)" || {
+        rm -f -- "$entries"; return 1;
+    }
+    rm -f -- "$entries"
+    files+=(LEGACY-POW-DRAIN.json)
+    temporary=$(mktemp "$CURRENT_WAVE_DIR/.WAVE-DRAIN-EVIDENCE.XXXXXX") || return 1
+    (cd "$CURRENT_WAVE_DIR" && sha256sum "${files[@]}") > "$temporary" || {
+        rm -f -- "$temporary"; return 1;
+    }
+    chmod 600 "$temporary" && chown root:root "$temporary" && sync -f "$temporary" || return 1
+    mv -fT -- "$temporary" "$(wave_drain_manifest_path)" || return 1
+    sync -f "$CURRENT_WAVE_DIR" || return 1
+    verify_wave_drain_evidence
+}
+
+verify_wave_drain_evidence()
+{
+    local plan manifest node padded before after wallet staking txids node_plan entry mode
+    plan=$(wave_drain_plan_path) || return 1
+    manifest=$(wave_drain_manifest_path) || return 1
+    [[ -f "$plan" && ! -L "$plan" && -f "$manifest" && ! -L "$manifest" &&
+       "$(stat -c '%u:%g:%a' "$plan")" == 0:0:600 &&
+       "$(stat -c '%u:%g:%a' "$manifest")" == 0:0:600 ]] || return 1
+    (cd "$CURRENT_WAVE_DIR" && sha256sum --strict -c "${manifest##*/}" >/dev/null) || return 1
+    jq -e --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        --argjson count "${#CURRENT_WAVE_NODES[@]}" '
+        .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+        .run_dir == $run and .wave_dir == $wave and .authority == "post-drain-prelaunch" and
+        .fee_payments_authorized == false and (.entries | length) == $count and
+        [.entries[].node] == ([.entries[].node] | sort)
+    ' "$plan" >/dev/null || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        padded=$(node_padded "$node") || return 1
+        before="$CURRENT_WAVE_DIR/node-${padded}-legacy-pow.before-drain.json"
+        after="$CURRENT_WAVE_DIR/node-${padded}-legacy-pow.after-drain.json"
+        wallet="$CURRENT_WAVE_DIR/node-${padded}-wallet.after-drain.json"
+        staking="$CURRENT_WAVE_DIR/node-${padded}-staking.after-drain.json"
+        txids="$CURRENT_WAVE_DIR/node-${padded}-wallet-txids.prelaunch.json"
+        node_plan="$CURRENT_WAVE_DIR/node-${padded}-legacy-pow-rollback-plan.json"
+        [[ -f "$node_plan" && ! -L "$node_plan" &&
+           "$(stat -c '%u:%g:%a' "$node_plan")" == 0:0:600 ]] || return 1
+        entry=$(jq -ce --argjson node "$node" '.entries[] | select(.node == $node)' "$plan") ||
+            return 1
+        [[ "$(jq -c --argjson node "$node" '[.entries[] | select(.node == $node)] | length' "$plan")" == 1 ]] ||
+            return 1
+        mode=$(jq -er '.mode' <<< "$entry") || return 1
+        cmp -s "$node_plan" <(jq -S . <<< "$entry") || return 1
+        legacy_pow_projection_is_valid "$node" "$mode" "$before" pre-drain || return 1
+        legacy_pow_projection_is_valid "$node" "$mode" "$after" drained || return 1
+        verify_legacy_pow_drain_exact "$node" "$node_plan" "$after" || return 1
+        jq -e '.unlocked_until == 0' "$wallet" >/dev/null || return 1
+        jq -e '.enabled == false and .staking == false and
+            ((has("worker_running") | not) or .worker_running == false) and
+            .automatic_qqsignal == false and .automatic_demurrage_attestation == false and
+            .automatic_redelegation == false and
+            .allow_automatic_quantum_key_creation == false' "$staking" >/dev/null || return 1
+        jq -e 'type == "array" and . == (unique | sort) and
+            all(.[]; type == "string" and test("^[0-9a-f]{64}$"))' "$txids" >/dev/null || return 1
+        jq -e --argjson node "$node" --arg before "$(sha256sum "$before" | awk '{print $1}')" \
+            --arg after "$(sha256sum "$after" | awk '{print $1}')" \
+            --arg wallet "$(sha256sum "$wallet" | awk '{print $1}')" \
+            --arg staking "$(sha256sum "$staking" | awk '{print $1}')" \
+            --arg txids "$(sha256sum "$txids" | awk '{print $1}')" '
+            .node == $node and .before_drain_sha256 == $before and
+            .post_drain_sha256 == $after and .post_drain_wallet_sha256 == $wallet and
+            .post_drain_staking_sha256 == $staking and
+            .prelaunch_wallet_txids_sha256 == $txids
+        ' <<< "$entry" >/dev/null || return 1
+    done
+}
+
+wave_legacy_plan_entry()
+{
+    local node="$1" path
+    verify_wave_drain_evidence || return 1
+    path="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-legacy-pow-rollback-plan.json"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    printf '%s\n' "$path"
+}
+
+legacy_plan_file_for_node()
+{
+    local node="$1" wave plan node_plan count result rollback_state current_plan=''
+    local wave_name lineage authority_lineage=''
+    local caller_wave_dir="${CURRENT_WAVE_DIR:-}"
+    local CURRENT_WAVE_DIR
+    local -a CURRENT_WAVE_NODES=()
+    local -a passed_plans=() interrupted_plans=() restored_plans=()
+    while IFS= read -r wave; do
+        plan="$wave/LEGACY-POW-DRAIN.json"
+        [[ -f "$plan" && ! -L "$plan" ]] || continue
+        count=$(jq -r --argjson node "$node" '[.entries[] | select(.node == $node)] | length' \
+            "$plan" 2>/dev/null) || return 1
+        if [[ "$count" == 1 ]]; then
+            wave_name=${wave##*/}
+            [[ "$wave_name" =~ ^(wave-[0-9]{2}-nodes-[0-9]+(-[0-9]+)*)(-retry-[0-9]{2})?$ ]] ||
+                return 1
+            lineage=${BASH_REMATCH[1]}
+            if [[ -z "$authority_lineage" ]]; then
+                authority_lineage=$lineage
+            else
+                [[ "$lineage" == "$authority_lineage" ]] || return 1
+            fi
+            node_plan="$wave/node-$(node_padded "$node")-legacy-pow-rollback-plan.json"
+            [[ -f "$node_plan" && ! -L "$node_plan" && -f "$wave/NODES" &&
+               ! -L "$wave/NODES" ]] || return 1
+            CURRENT_WAVE_DIR="$wave"
+            read -r -a CURRENT_WAVE_NODES < "$wave/NODES"
+            verify_wave_drain_evidence || return 1
+            [[ "$wave" == "$caller_wave_dir" ]] && current_plan="$node_plan"
+            if [[ -f "$wave/RESULT" && ! -L "$wave/RESULT" ]]; then
+                result=$(cat "$wave/RESULT") || return 1
+                case "$result" in
+                    passed) passed_plans+=("$node_plan") ;;
+                    rolled-back)
+                        [[ -f "$wave/ROLLBACK_STATE" && ! -L "$wave/ROLLBACK_STATE" ]] || return 1
+                        rollback_state=$(cat "$wave/ROLLBACK_STATE") || return 1
+                        [[ "$rollback_state" == rollback-passed ]] || return 1
+                        restored_plans+=("$node_plan")
+                        ;;
+                    *) return 1 ;;
+                esac
+            else
+                [[ -f "$wave/COMMIT_STATE" && ! -L "$wave/COMMIT_STATE" ]] || return 1
+                interrupted_plans+=("$node_plan")
+            fi
+            continue
+        fi
+        [[ "$count" == 0 ]] || return 1
+    done < <(find "$RUN_DIR" -maxdepth 1 -type d -name 'wave-*' -print | sort)
+    ((${#passed_plans[@]} <= 1 && ${#interrupted_plans[@]} <= 1)) || return 1
+    if ((${#interrupted_plans[@]} == 1)); then
+        ((${#passed_plans[@]} == 0)) || return 1
+        [[ -n "$current_plan" && "$current_plan" == "${interrupted_plans[0]}" ]] || return 1
+        printf '%s\n' "$current_plan"
+        return 0
+    fi
+    if ((${#passed_plans[@]} == 1)); then
+        if [[ -n "$current_plan" ]]; then
+            [[ "$current_plan" == "${passed_plans[0]}" ]] || return 1
+        fi
+        printf '%s\n' "${passed_plans[0]}"
+        return 0
+    fi
+    if ((${#restored_plans[@]} >= 1)); then
+        # Attempts are discovered in canonical base/retry order. The final
+        # rollback-passed attempt is the only authority for the live legacy
+        # state after all newer passed/current authorities have been excluded.
+        printf '%s\n' "${restored_plans[${#restored_plans[@]} - 1]}"
+        return 0
+    fi
+    return 2
+}
+
 write_wave_runtime_evidence()
 {
     local node temporary
-    local -a files=(wave-chain-convergence/PASSED.json)
+    local -a files=(wave-chain-convergence/PASSED.json WAVE-DRAIN-EVIDENCE.sha256)
+    verify_wave_drain_evidence || return 1
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         verify_candidate_recovery_baseline "$node" || return 1
         files+=("node-$(node_padded "$node")-wallet-txids.first-v3014.json")
         files+=("candidate-recovery-node-$(node_padded "$node").json")
         files+=("candidate-recovery-node-$(node_padded "$node").json.sha256")
+        files+=("node-$(node_padded "$node")-CANDIDATE-ACTIVATION-ATTEMPTED.json")
     done
     publish_state_token "$CURRENT_WAVE_DIR/RUNTIME-GATE-PASSED" \
         exact-wave-runtime-gate-passed || return 1
@@ -2675,6 +3260,7 @@ write_wave_runtime_evidence()
 verify_wave_runtime_evidence()
 {
     local node
+    verify_wave_drain_evidence || return 1
     [[ -f "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256" &&
        ! -L "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256" &&
        "$(stat -c '%u:%g:%a' "$CURRENT_WAVE_DIR/WAVE-RUNTIME-EVIDENCE.sha256")" == 0:0:600 ]] ||
@@ -2685,6 +3271,7 @@ verify_wave_runtime_evidence()
         return 1
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         verify_candidate_recovery_baseline "$node" || return 1
+        verify_candidate_activation_marker "$node" || return 1
     done
 }
 
@@ -2701,7 +3288,8 @@ capture_unaffected_generations()
 
 capture_transaction_baseline()
 {
-    local marker_dir="$RUN_DIR/baseline/markers-present" node pid failed=0
+    local marker_dir="$RUN_DIR/baseline/markers-present" node pid failed=0 entries temporary mode role
+    local deadline round_dir padded captured=0
     local -a pids=() nodes=()
     install -d -m 700 -o root -g root "$RUN_DIR/baseline" "$marker_dir"
     install -m 600 -o root -g root "$COMPOSE_FILE" "$RUN_DIR/baseline/docker-compose.yml"
@@ -2713,6 +3301,12 @@ capture_transaction_baseline()
         "$RUN_DIR/baseline/blackcoin_node_normal_unlock.sh"
     install -m 600 -o root -g root "$POW_START_HELPER" \
         "$RUN_DIR/baseline/blackcoin_pow_start_only.sh"
+    if [[ "$CANARY_HANDOFF_PENDING" -eq 1 ]]; then
+        verify_published_canary_handoff_ready ||
+            die 'active canary handoff evidence changed before baseline capture'
+        install -m 600 -o root -g root "$ROLLOUT_MAINTENANCE_MARKER" \
+            "$RUN_DIR/baseline/CANARY-MAINTENANCE-PREDECESSOR.json"
+    fi
     if [[ -e "$ENABLE_GUARD_STARTS" || -L "$ENABLE_GUARD_STARTS" ]]; then
         assert_empty_control_marker "$ENABLE_GUARD_STARTS" || die 'guard-start marker became unsafe or nonempty'
         install -m 600 -o root -g root "$ENABLE_GUARD_STARTS" "$marker_dir/ENABLE_GUARD_STARTS"
@@ -2720,22 +3314,62 @@ capture_transaction_baseline()
     capture_fleet_identity "$RUN_DIR/baseline/fleet-identity.json"
     capture_free_claim_container_identity "$RUN_DIR/baseline/free-claim-container-identity.json" ||
         die 'Free Claim API container identity could not be captured'
-    for node in $(seq 1 "$NODE_COUNT"); do
-        (
-            wallet_rpc_for "$node" getpowmininginfo \
-                > "$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
-        ) &
-        pids+=("$!")
-        nodes+=("$node")
-    done
-    for index in "${!pids[@]}"; do
-        pid=${pids[$index]}
-        if ! wait "$pid"; then
-            log "failed to capture v30.1.3 PoW baseline for node ${nodes[$index]}"
-            failed=1
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        round_dir=$(mktemp -d "$RUN_DIR/baseline/.legacy-pow-round.XXXXXX")
+        chmod 700 "$round_dir" && chown root:root "$round_dir"
+        pids=()
+        for node in $(seq 1 "$NODE_COUNT"); do
+            padded=$(node_padded "$node")
+            (wallet_rpc_for "$node" getpowmininginfo | jq -S . > "$round_dir/node-${padded}.json") &
+            pids+=("$!")
+        done
+        failed=0
+        for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+        for node in $(seq 1 "$NODE_COUNT"); do
+            padded=$(node_padded "$node")
+            temporary="$round_dir/node-${padded}.json"
+            [[ "$failed" -eq 0 && -s "$temporary" ]] || { failed=1; continue; }
+            chmod 600 "$temporary" && chown root:root "$temporary"
+            mode=$(legacy_pow_snapshot_mode "$node" "$temporary" 2>/dev/null || true)
+            [[ -n "$mode" ]] &&
+                legacy_pow_projection_is_valid "$node" "$mode" "$temporary" pre-drain || failed=1
+        done
+        if ((failed == 0)); then
+            for node in $(seq 1 "$NODE_COUNT"); do
+                padded=$(node_padded "$node")
+                temporary="$round_dir/node-${padded}.json"
+                sync -f "$temporary"
+                mv -fT -- "$temporary" "$RUN_DIR/baseline/legacy-node-${padded}-pow.json"
+            done
+            rmdir "$round_dir"
+            sync -f "$RUN_DIR/baseline"
+            captured=1
+            break
         fi
+        rm -rf -- "$round_dir"
+        sleep 5
     done
-    ((failed == 0)) || die 'one or more v30.1.3 PoW baselines could not be captured'
+    ((captured == 1)) ||
+        die 'all 32 nodes did not concurrently reach an allowed pre-drain PoW state within 20 minutes'
+    entries=$(mktemp "$RUN_DIR/baseline/.legacy-pow-initial.XXXXXX")
+    : > "$entries"
+    for node in $(seq 1 "$NODE_COUNT"); do
+        temporary="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+        mode=$(legacy_pow_snapshot_mode "$node" "$temporary") ||
+            die "node $node initial legacy PoW mode is invalid"
+        if [[ "$node" -eq "$FREE_CLAIM_NODE" ]]; then role=free-claim; else role=regular-pow; fi
+        jq -cn --argjson node "$node" --arg role "$role" --arg mode "$mode" \
+            --arg sha "$(sha256sum "$temporary" | awk '{print $1}')" --slurpfile raw "$temporary" '
+            {node:$node,role:$role,mode:$mode,raw_sha256:$sha,
+             projection:($raw[0] | {enabled,autostart,state,threads,cpu_percent,hashrate,
+               unresolved_claims,live_claims,quarantined_claims,
+               allow_automatic_quantum_key_creation})}' >> "$entries"
+    done
+    jq -sS '{schema:1,authority:"transaction-start-audit-only",entries:(sort_by(.node))}' \
+        "$entries" | atomic_write_json "$RUN_DIR/baseline/LEGACY-POW-INITIAL.json" ||
+        die 'initial legacy PoW inventory could not be committed'
+    rm -f -- "$entries"
     docker exec blackcoin-pool-api curl -fsS --max-time 5 http://127.0.0.1:8377/status \
         > "$RUN_DIR/baseline/free-claim-status.json"
     (
@@ -2772,6 +3406,8 @@ verify_legacy_rollback_readiness_all_nodes()
 write_transaction_manifest()
 {
     local package_manifest_sha canary_sha canary_manifest_sha wave_sha temporary maintenance_nonce
+    local baseline_manifest_sha handoff_required=true predecessor_sha predecessor_run
+    local predecessor_nonce predecessor
     [[ ! -e "$RUN_DIR/package-files.sha256" && ! -e "$RUN_DIR/TRANSACTION.json" ]] ||
         die 'transaction identity outputs already exist'
     (
@@ -2785,6 +3421,14 @@ write_transaction_manifest()
        "$canary_manifest_sha" == "$EXPECTED_CANARY_EVIDENCE_MANIFEST_SHA256" ]] ||
         die 'canary evidence changed before transaction manifest creation'
     wave_sha=$(sha256sum "$WAVE_PLAN" | awk '{print $1}')
+    baseline_manifest_sha=$(sha256sum "$RUN_DIR/baseline/SHA256SUMS" | awk '{print $1}')
+    predecessor=$(canary_predecessor_path)
+    [[ -f "$predecessor" && ! -L "$predecessor" &&
+       "$(stat -c '%u:%g:%a' "$predecessor")" == 0:0:600 ]] ||
+        die 'transaction manifest requires the authenticated active canary predecessor'
+    predecessor_sha=$(sha256sum "$predecessor" | awk '{print $1}')
+    predecessor_run=$(jq -er '.run_dir' "$predecessor")
+    predecessor_nonce=$(jq -er '.run_nonce' "$predecessor")
     maintenance_nonce=$(cat "$(maintenance_nonce_path)")
     valid_sha256_hex "$maintenance_nonce" || die 'maintenance nonce changed before manifest creation'
     temporary="$RUN_DIR/.TRANSACTION.json.$$"
@@ -2796,11 +3440,14 @@ write_transaction_manifest()
         --arg cli "$BLACKCOIN_CLI_SHA256" --arg canary_path "$PUBLISHED_CANARY_RESULT" \
         --arg canary_sha "$canary_sha" --arg canary_manifest "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" \
         --arg canary_manifest_sha "$canary_manifest_sha" --arg wave_sha "$wave_sha" \
-        --arg package_sha "$package_manifest_sha" --arg compose "$EXPECTED_COMPOSE_SHA256" \
+        --arg package_sha "$package_manifest_sha" --arg baseline_sha "$baseline_manifest_sha" \
+        --arg compose "$EXPECTED_COMPOSE_SHA256" \
         --arg policy "$EXPECTED_IMAGE_POLICY_SHA256" --arg guard "$EXPECTED_ENDPOINT_GUARD_SHA256" \
         --arg runtime_guard "$EXPECTED_WALLET_RUNTIME_GUARD_SHA256" \
         --arg unlock_helper "$NORMAL_UNLOCK_HELPER_SHA256" --arg pow_helper "$POW_START_HELPER_SHA256" \
-        --arg maintenance_nonce "$maintenance_nonce" \
+        --arg maintenance_nonce "$maintenance_nonce" --argjson handoff_required "$handoff_required" \
+        --arg predecessor_sha "$predecessor_sha" --arg predecessor_run "$predecessor_run" \
+        --arg predecessor_nonce "$predecessor_nonce" \
         '{schema:1,candidate_image:$image,candidate_image_id:$image_id,source_commit:$source,
           source_label:{key:$source_key,value:$source_value},
           version_label:{key:$version_key,value:$version_value},
@@ -2808,6 +3455,10 @@ write_transaction_manifest()
           published_canary:{path:$canary_path,sha256:$canary_sha,
             evidence_manifest:{path:$canary_manifest,sha256:$canary_manifest_sha}},
           wave_plan_sha256:$wave_sha,package_files_manifest_sha256:$package_sha,
+          baseline_manifest_sha256:$baseline_sha,
+          canary_handoff:{required:$handoff_required,protocol:(if $handoff_required then
+            "atomic-replace-v1" else "none" end),predecessor_marker_sha256:$predecessor_sha,
+            predecessor_run_dir:$predecessor_run,predecessor_run_nonce:$predecessor_nonce},
           maintenance:{marker:"/boot/config/plugins/blackcoin-quantum-nodes/V30_1_4_ROLLOUT_MAINTENANCE.json",
             run_nonce:$maintenance_nonce},
           audited_baseline:{compose_sha256:$compose,image_policy_sha256:$policy,
@@ -2823,7 +3474,9 @@ write_transaction_manifest()
 
 verify_transaction_manifest()
 {
-    local canary_sha canary_manifest_sha wave_sha package_sha maintenance_nonce
+    local canary_sha canary_manifest_sha wave_sha package_sha maintenance_nonce baseline_manifest_sha
+    local handoff_required=true predecessor_sha predecessor_run predecessor_nonce
+    local predecessor
     [[ -f "$RUN_DIR/TRANSACTION.json" && ! -L "$RUN_DIR/TRANSACTION.json" &&
        -f "$RUN_DIR/package-files.sha256" && ! -L "$RUN_DIR/package-files.sha256" ]] || return 1
     (cd "$PACKAGE_ROOT" && sha256sum --strict -c "$RUN_DIR/package-files.sha256" >/dev/null) || return 1
@@ -2831,6 +3484,13 @@ verify_transaction_manifest()
     canary_manifest_sha=$(sha256sum "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" | awk '{print $1}') || return 1
     wave_sha=$(sha256sum "$WAVE_PLAN" | awk '{print $1}') || return 1
     package_sha=$(sha256sum "$RUN_DIR/package-files.sha256" | awk '{print $1}') || return 1
+    baseline_manifest_sha=$(sha256sum "$RUN_DIR/baseline/SHA256SUMS" | awk '{print $1}') || return 1
+    predecessor=$(canary_predecessor_path) || return 1
+    [[ -f "$predecessor" && ! -L "$predecessor" &&
+       "$(stat -c '%u:%g:%a' "$predecessor")" == 0:0:600 ]] || return 1
+    predecessor_sha=$(sha256sum "$predecessor" | awk '{print $1}') || return 1
+    predecessor_run=$(jq -er '.run_dir' "$predecessor") || return 1
+    predecessor_nonce=$(jq -er '.run_nonce' "$predecessor") || return 1
     maintenance_nonce=$(cat "$(maintenance_nonce_path)" 2>/dev/null) || return 1
     valid_sha256_hex "$maintenance_nonce" || return 1
     jq -e \
@@ -2841,11 +3501,14 @@ verify_transaction_manifest()
         --arg cli "$BLACKCOIN_CLI_SHA256" --arg canary_path "$PUBLISHED_CANARY_RESULT" \
         --arg canary_sha "$canary_sha" --arg canary_manifest "$PUBLISHED_CANARY_EVIDENCE_MANIFEST" \
         --arg canary_manifest_sha "$canary_manifest_sha" --arg wave_sha "$wave_sha" \
-        --arg package_sha "$package_sha" --arg compose "$EXPECTED_COMPOSE_SHA256" \
+        --arg package_sha "$package_sha" --arg baseline_sha "$baseline_manifest_sha" \
+        --arg compose "$EXPECTED_COMPOSE_SHA256" \
         --arg policy "$EXPECTED_IMAGE_POLICY_SHA256" --arg guard "$EXPECTED_ENDPOINT_GUARD_SHA256" \
         --arg runtime_guard "$EXPECTED_WALLET_RUNTIME_GUARD_SHA256" \
         --arg unlock_helper "$NORMAL_UNLOCK_HELPER_SHA256" --arg pow_helper "$POW_START_HELPER_SHA256" \
-        --arg maintenance_nonce "$maintenance_nonce" '
+        --arg maintenance_nonce "$maintenance_nonce" --argjson handoff_required "$handoff_required" \
+        --arg predecessor_sha "$predecessor_sha" --arg predecessor_run "$predecessor_run" \
+        --arg predecessor_nonce "$predecessor_nonce" '
         .schema == 1 and .candidate_image == $image and .candidate_image_id == $image_id and
         .source_commit == $source and .source_label == {key:$source_key,value:$source_value} and
         .version_label == {key:$version_key,value:$version_value} and
@@ -2853,12 +3516,21 @@ verify_transaction_manifest()
         .published_canary == {path:$canary_path,sha256:$canary_sha,
           evidence_manifest:{path:$canary_manifest,sha256:$canary_manifest_sha}} and
         .wave_plan_sha256 == $wave_sha and .package_files_manifest_sha256 == $package_sha and
+        .baseline_manifest_sha256 == $baseline_sha and
+        .canary_handoff == {required:$handoff_required,
+          protocol:(if $handoff_required then "atomic-replace-v1" else "none" end),
+          predecessor_marker_sha256:$predecessor_sha,
+          predecessor_run_dir:$predecessor_run,predecessor_run_nonce:$predecessor_nonce} and
         .maintenance == {marker:"/boot/config/plugins/blackcoin-quantum-nodes/V30_1_4_ROLLOUT_MAINTENANCE.json",
           run_nonce:$maintenance_nonce} and
         .audited_baseline == {compose_sha256:$compose,image_policy_sha256:$policy,
           endpoint_guard_sha256:$guard,wallet_runtime_guard_sha256:$runtime_guard,
           normal_unlock_helper_sha256:$unlock_helper,pow_start_helper_sha256:$pow_helper}
-    ' "$RUN_DIR/TRANSACTION.json" >/dev/null
+    ' "$RUN_DIR/TRANSACTION.json" >/dev/null || return 1
+    if [[ -e "$RUN_DIR/CANARY-FLEET-HANDOFF.json" ||
+          -L "$RUN_DIR/CANARY-FLEET-HANDOFF.json" ]]; then
+        verify_canary_fleet_handoff 0 || return 1
+    fi
 }
 
 acquire_wave_locks()
@@ -2911,15 +3583,69 @@ release_wave_locks()
     WAVE_LOCKS_HELD=0
 }
 
+capture_wave_legacy_predrain_snapshots()
+{
+    local node padded temporary mode failed deadline round_dir pid
+    local -a pids=()
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        round_dir=$(mktemp -d "$CURRENT_WAVE_DIR/.predrain-round.XXXXXX") || return 1
+        chmod 700 "$round_dir" && chown root:root "$round_dir" || return 1
+        pids=()
+        for node in "${CURRENT_WAVE_NODES[@]}"; do
+            padded=$(node_padded "$node")
+            (wallet_rpc_for "$node" getpowmininginfo | jq -S . > "$round_dir/node-${padded}.json") &
+            pids+=("$!")
+        done
+        failed=0
+        for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+        for node in "${CURRENT_WAVE_NODES[@]}"; do
+            padded=$(node_padded "$node")
+            temporary="$round_dir/node-${padded}.json"
+            [[ "$failed" -eq 0 && -s "$temporary" ]] || { failed=1; continue; }
+            chmod 600 "$temporary" && chown root:root "$temporary" || return 1
+            mode=$(legacy_pow_snapshot_mode "$node" "$temporary" 2>/dev/null || true)
+            [[ -n "$mode" ]] &&
+                legacy_pow_projection_is_valid "$node" "$mode" "$temporary" pre-drain || failed=1
+        done
+        if ((failed == 0)); then
+            for node in "${CURRENT_WAVE_NODES[@]}"; do
+                padded=$(node_padded "$node")
+                temporary="$round_dir/node-${padded}.json"
+                sync -f "$temporary" || return 1
+                mv -fT -- "$temporary" \
+                    "$CURRENT_WAVE_DIR/node-${padded}-legacy-pow.before-drain.json" || return 1
+            done
+            rmdir "$round_dir" || return 1
+            sync -f "$CURRENT_WAVE_DIR"
+            return 0
+        fi
+        rm -rf -- "$round_dir"
+        sleep 5
+    done
+    return 1
+}
+
 stop_wave_cleanly()
 {
-    local node container mining unresolved deadline
+    local node padded container mining staking wallet_info unresolved deadline before mode mining_probe
     local -A pending=()
     for node in "${CURRENT_WAVE_NODES[@]}"; do
-        if [[ "$node" -ne "$FREE_CLAIM_NODE" ]]; then
+        padded=$(node_padded "$node")
+        before="$CURRENT_WAVE_DIR/node-${padded}-legacy-pow.before-drain.json"
+        mode=$(legacy_pow_snapshot_mode "$node" "$before") ||
+            die "node $node legacy PoW state is not an allowed rollback mode"
+        legacy_pow_projection_is_valid "$node" "$mode" "$before" pre-drain ||
+            die "node $node legacy PoW pre-drain projection is not exact"
+        if [[ "$node" -ne "$FREE_CLAIM_NODE" ]] &&
+           { [[ "$mode" == clean-hashing ]] || jq -e '.enabled == true' "$before" >/dev/null; }; then
             wallet_rpc_for "$node" setpowmining false 1 1 \
-                > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-pow-stop.json"
+                > "$CURRENT_WAVE_DIR/node-${padded}-pow-stop.json"
         fi
+        wallet_rpc_for "$node" staking false >/dev/null ||
+            die "node $node staking could not be disabled before the rollback checkpoint"
+        wallet_rpc_for "$node" walletlock >/dev/null ||
+            die "node $node wallet could not be locked before the rollback checkpoint"
         pending[$node]=1
     done
     deadline=$((SECONDS + 1200))
@@ -2928,9 +3654,47 @@ stop_wave_cleanly()
         for node in "${CURRENT_WAVE_NODES[@]}"; do
             [[ -n "${pending[$node]:-}" ]] || continue
             mining=$(wallet_rpc_for "$node" getpowmininginfo 2>/dev/null || true)
-            if jq -e '.enabled == false and .live_claims == 0' >/dev/null 2>&1 <<< "$mining"; then
+            staking=$(wallet_rpc_for "$node" getstakinginfo 2>/dev/null || true)
+            wallet_info=$(wallet_rpc_for "$node" getwalletinfo 2>/dev/null || true)
+            padded=$(node_padded "$node")
+            before="$CURRENT_WAVE_DIR/node-${padded}-legacy-pow.before-drain.json"
+            mode=$(legacy_pow_snapshot_mode "$node" "$before" 2>/dev/null || true)
+            mining_probe=$(mktemp "$CURRENT_WAVE_DIR/.node-${padded}-drain-pow.XXXXXX") ||
+                die "node $node drain probe could not be created"
+            if ! jq -S . <<< "$mining" > "$mining_probe" || ! chmod 600 "$mining_probe" ||
+               ! chown root:root "$mining_probe"; then
+                rm -f -- "$mining_probe"
+                die "node $node drain probe could not be protected"
+            fi
+            if [[ -n "$mode" ]] &&
+               legacy_pow_projection_is_valid "$node" "$mode" "$mining_probe" drained 2>/dev/null &&
+               jq -e '.unlocked_until == 0' >/dev/null 2>&1 <<< "$wallet_info" &&
+               jq -e '.enabled == false and .staking == false and
+                   ((has("worker_running") | not) or .worker_running == false) and
+                   .automatic_qqsignal == false and
+                   .automatic_demurrage_attestation == false and
+                   .automatic_redelegation == false and
+                   .allow_automatic_quantum_key_creation == false' \
+                   >/dev/null 2>&1 <<< "$staking"; then
+                sync -f "$mining_probe" || die "node $node drain probe could not be synced"
+                mv -fT -- "$mining_probe" \
+                    "$CURRENT_WAVE_DIR/node-${padded}-legacy-pow.after-drain.json" ||
+                    die "node $node post-drain PoW checkpoint could not be committed"
+                printf '%s\n' "$wallet_info" | atomic_write_json \
+                    "$CURRENT_WAVE_DIR/node-${padded}-wallet.after-drain.json" ||
+                    die "node $node post-drain wallet checkpoint could not be committed"
+                printf '%s\n' "$staking" | atomic_write_json \
+                    "$CURRENT_WAVE_DIR/node-${padded}-staking.after-drain.json" ||
+                    die "node $node post-drain staking checkpoint could not be committed"
+                capture_wallet_txid_set "$node" \
+                    "$CURRENT_WAVE_DIR/node-${padded}-wallet-txids.prelaunch.json" ||
+                    die "node $node post-drain wallet transaction set could not be committed"
+                chmod 600 "$CURRENT_WAVE_DIR/node-${padded}-wallet-txids.prelaunch.json"
+                chown root:root "$CURRENT_WAVE_DIR/node-${padded}-wallet-txids.prelaunch.json"
+                sync -f "$CURRENT_WAVE_DIR/node-${padded}-wallet-txids.prelaunch.json"
                 unset 'pending[$node]'
             else
+                rm -f -- "$mining_probe"
                 unresolved=$((unresolved + 1))
             fi
         done
@@ -2938,6 +3702,8 @@ stop_wave_cleanly()
         sleep 5
     done
     ((unresolved == 0)) || die 'wave did not reach a claim-safe stop boundary within 20 minutes'
+    write_wave_drain_evidence ||
+        die 'authoritative post-drain rollback plan could not be durably committed'
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         rpc_for "$node" stop >/dev/null 2>&1 || true
     done
@@ -3159,53 +3925,211 @@ start_wave_candidate()
     done
 }
 
+verify_candidate_activation_marker()
+{
+    local node="$1" path baseline prelaunch generation transaction_sha drain_sha baseline_sha txids_sha
+    path=$(wave_node_activation_path "$node") || return 1
+    baseline=$(candidate_recovery_baseline_path "$node") || return 1
+    prelaunch="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json"
+    [[ -f "$path" && ! -L "$path" && "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 &&
+       -f "$baseline" && ! -L "$baseline" && -f "$prelaunch" && ! -L "$prelaunch" ]] || return 1
+    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
+    drain_sha=$(sha256sum "$(wave_drain_manifest_path)" | awk '{print $1}') || return 1
+    baseline_sha=$(sha256sum "$baseline" | awk '{print $1}') || return 1
+    txids_sha=$(sha256sum "$prelaunch" | awk '{print $1}') || return 1
+    generation=$(container_generation_for "$node") || return 1
+    jq -e --argjson node "$node" --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg generation "$generation" --arg transaction_sha "$transaction_sha" \
+        --arg drain_sha "$drain_sha" --arg baseline_sha "$baseline_sha" --arg txids_sha "$txids_sha" '
+        .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+        .boundary == "before-first-wallet-unlock" and .activation_attempted == true and
+        .node == $node and .run_dir == $run and .wave_dir == $wave and
+        .candidate_image == $image and .candidate_image_id == $image_id and
+        .container_generation == $generation and
+        .transaction_manifest_sha256 == $transaction_sha and
+        .wave_drain_manifest_sha256 == $drain_sha and
+        .candidate_recovery_baseline_sha256 == $baseline_sha and
+        .prelaunch_wallet_txids_sha256 == $txids_sha and
+        .fee_payments_authorized == false and
+        (.created_at | type == "string")
+    ' "$path" >/dev/null
+}
+
+publish_candidate_activation_marker()
+{
+    local node="$1" path baseline prelaunch generation transaction_sha drain_sha baseline_sha txids_sha
+    verify_candidate_recovery_baseline "$node" || return 1
+    verify_wave_drain_evidence || return 1
+    path=$(wave_node_activation_path "$node") || return 1
+    if [[ -e "$path" || -L "$path" ]]; then
+        verify_candidate_activation_marker "$node"
+        return
+    fi
+    baseline=$(candidate_recovery_baseline_path "$node") || return 1
+    prelaunch="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json"
+    generation=$(container_generation_for "$node") || return 1
+    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
+    drain_sha=$(sha256sum "$(wave_drain_manifest_path)" | awk '{print $1}') || return 1
+    baseline_sha=$(sha256sum "$baseline" | awk '{print $1}') || return 1
+    txids_sha=$(sha256sum "$prelaunch" | awk '{print $1}') || return 1
+    jq -n --argjson node "$node" --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg generation "$generation" --arg transaction_sha "$transaction_sha" \
+        --arg drain_sha "$drain_sha" --arg baseline_sha "$baseline_sha" --arg txids_sha "$txids_sha" \
+        --arg created_at "$(date -u +%FT%TZ)" '
+        {schema:1,transaction:"v30.1.4-fleet-rollout",boundary:"before-first-wallet-unlock",
+         activation_attempted:true,node:$node,run_dir:$run,wave_dir:$wave,
+         candidate_image:$image,candidate_image_id:$image_id,container_generation:$generation,
+         transaction_manifest_sha256:$transaction_sha,wave_drain_manifest_sha256:$drain_sha,
+         candidate_recovery_baseline_sha256:$baseline_sha,
+         prelaunch_wallet_txids_sha256:$txids_sha,fee_payments_authorized:false,
+         created_at:$created_at}' | atomic_write_json "$path" || return 1
+    verify_candidate_activation_marker "$node"
+}
+
+terminate_and_join_activation_helpers()
+{
+    local pid deadline alive
+    ((${#ACTIVATION_HELPER_PIDS[@]} > 0)) || return 0
+    for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    done
+    deadline=$((SECONDS + 20))
+    while ((SECONDS < deadline)); do
+        alive=0
+        for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        ((alive == 0)) && break
+        sleep 1
+    done
+    for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    done
+    for pid in "${ACTIVATION_HELPER_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    ACTIVATION_HELPER_PIDS=()
+    ACTIVATION_HELPER_NODES=()
+    ACTIVATION_HELPER_PHASES=()
+}
+
+publish_wave_activation_markers()
+{
+    local node
+    ((${#ACTIVATION_HELPER_PIDS[@]} == 0)) || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        publish_candidate_activation_marker "$node" || return 1
+    done
+    sync -f "$CURRENT_WAVE_DIR" || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        verify_candidate_activation_marker "$node" || return 1
+    done
+    CURRENT_WAVE_ACTIVATED=1
+}
+
 activate_wave_phase()
 {
-    local phase="$1" node pid failed=0 marker temporary
-    local -a pids=() nodes=()
+    local phase="$1" node pid failed=0 marker index path sha worker_source
+    ((${#ACTIVATION_HELPER_PIDS[@]} == 0)) ||
+        die 'a prior activation helper set is still live'
     for node in "${CURRENT_WAVE_NODES[@]}"; do
+        verify_candidate_activation_marker "$node" ||
+            die "node $node activation boundary changed before $phase helpers"
         [[ "$phase" != pow || "$node" -ne "$FREE_CLAIM_NODE" ]] || continue
         if [[ "$phase" == pow ]]; then
             marker="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-pow-activation-attempted"
-            temporary=$(mktemp "$CURRENT_WAVE_DIR/.pow-activation.XXXXXX")
-            printf '%s\n' yes > "$temporary"
-            chmod 600 "$temporary"
-            chown root:root "$temporary"
-            sync -f "$temporary"
-            mv -fT -- "$temporary" "$marker"
-            sync -f "$CURRENT_WAVE_DIR"
+            publish_state_token "$marker" yes ||
+                die "node $node PoW activation boundary could not be committed"
         fi
-        activate_one_node_phase "$phase" "$node" \
-            > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-${phase}-activation.log" 2>&1 &
-        pids+=("$!")
-        nodes+=("$node")
     done
-    for index in "${!pids[@]}"; do
-        pid=${pids[$index]}
+    sync -f "$CURRENT_WAVE_DIR" || die "$phase activation boundaries were not durable"
+    if [[ "$phase" == staking ]]; then
+        path=$NORMAL_UNLOCK_HELPER
+        sha=$NORMAL_UNLOCK_HELPER_SHA256
+    else
+        [[ "$phase" == pow ]] || die "invalid wave activation phase: $phase"
+        path=$POW_START_HELPER
+        sha=$POW_START_HELPER_SHA256
+    fi
+    worker_source=$(declare -f verify_activation_helper activate_one_node_phase) ||
+        die 'activation worker functions could not be serialized'
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        [[ "$phase" != pow || "$node" -ne "$FREE_CLAIM_NODE" ]] || continue
+        setsid /bin/bash -c "$worker_source"$'\n''activate_one_node_phase "$1" "$2" "$3" "$4"' \
+            activation-worker "$phase" "$node" "$path" "$sha" \
+            > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-${phase}-activation.log" 2>&1 &
+        ACTIVATION_HELPER_PIDS+=("$!")
+        ACTIVATION_HELPER_NODES+=("$node")
+        ACTIVATION_HELPER_PHASES+=("$phase")
+    done
+    for index in "${!ACTIVATION_HELPER_PIDS[@]}"; do
+        pid=${ACTIVATION_HELPER_PIDS[$index]}
         if ! wait "$pid"; then
-            log "node ${nodes[$index]} $phase activation failed"
+            log "node ${ACTIVATION_HELPER_NODES[$index]} ${ACTIVATION_HELPER_PHASES[$index]} activation failed"
             failed=1
         fi
     done
+    ACTIVATION_HELPER_PIDS=()
+    ACTIVATION_HELPER_NODES=()
+    ACTIVATION_HELPER_PHASES=()
     ((failed == 0)) || die "one or more wave $phase activations failed"
 }
 
 activate_one_node_phase()
 {
-    local phase="$1" node="$2" deadline path sha
-    if [[ "$phase" == staking ]]; then
-        path=$NORMAL_UNLOCK_HELPER
-        sha=$NORMAL_UNLOCK_HELPER_SHA256
-    else
-        [[ "$phase" == pow && "$node" -ne "$FREE_CLAIM_NODE" ]] || return 1
-        path=$POW_START_HELPER
-        sha=$POW_START_HELPER_SHA256
+    local phase="$1" node="$2" path="${3:-}" sha="${4:-}" deadline helper_pid='' attempt_rc
+    cleanup_activation_child()
+    {
+        local tick
+        [[ -n "$helper_pid" ]] || return 0
+        kill -TERM -- "-$helper_pid" 2>/dev/null || kill -TERM "$helper_pid" 2>/dev/null || true
+        for ((tick = 0; tick < 50; tick++)); do
+            kill -0 "$helper_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL -- "-$helper_pid" 2>/dev/null || kill -KILL "$helper_pid" 2>/dev/null || true
+        wait "$helper_pid" 2>/dev/null || true
+        helper_pid=''
+    }
+    trap 'cleanup_activation_child; exit 143' TERM
+    trap 'cleanup_activation_child; exit 130' INT
+    if [[ -z "$path" || -z "$sha" ]]; then
+        if [[ "$phase" == staking ]]; then
+            path=${NORMAL_UNLOCK_HELPER:-}
+            sha=${NORMAL_UNLOCK_HELPER_SHA256:-}
+        else
+            [[ "$phase" == pow && "$node" -ne "${FREE_CLAIM_NODE:-30}" ]] || return 1
+            path=${POW_START_HELPER:-}
+            sha=${POW_START_HELPER_SHA256:-}
+        fi
     fi
+    [[ -n "$path" && -n "$sha" && ( "$phase" == staking || "$phase" == pow ) ]] || return 1
     deadline=$((SECONDS + 300))
     while ((SECONDS < deadline)); do
-        run_activation_helper "$path" "$sha" "$node" && return 0
+        verify_activation_helper "$path" "$sha" || {
+            trap - INT TERM
+            return 1
+        }
+        timeout --signal=TERM --kill-after=15 120 /bin/bash "$path" "$node" &
+        helper_pid=$!
+        if wait "$helper_pid"; then
+            helper_pid=''
+            trap - INT TERM
+            return 0
+        else
+            attempt_rc=$?
+        fi
+        helper_pid=''
+        [[ "$attempt_rc" -ne 130 && "$attempt_rc" -ne 143 ]] || {
+            trap - INT TERM
+            return "$attempt_rc"
+        }
         sleep 5
     done
+    cleanup_activation_child
+    trap - INT TERM
     return 1
 }
 
@@ -3314,14 +4238,240 @@ assert_unaffected_unchanged()
 
 verify_policy_runtime_node()
 {
-    local node="$1" baseline
-    baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+    local node="$1" baseline lookup_rc
+    if baseline=$(legacy_plan_file_for_node "$node" 2>/dev/null); then
+        :
+    else
+        lookup_rc=$?
+        [[ "$lookup_rc" -eq 2 ]] || return 1
+        baseline="$RUN_DIR/baseline/legacy-node-$(node_padded "$node")-pow.json"
+    fi
     verify_policy_legacy_runtime_gate "$node" "$baseline"
+}
+
+verify_safe_rollback_marker()
+{
+    local node="$1" path activation prefix prelaunch fee generation
+    local wallet staking mining recovery txids activation_sha transaction_sha drain_sha
+    path=$(wave_node_safe_rollback_path "$node") || return 1
+    activation=$(wave_node_activation_path "$node") || return 1
+    prefix=$(wave_node_prefix "$node") || return 1
+    wallet="${prefix}-safe-wallet.json"
+    staking="${prefix}-safe-staking.json"
+    mining="${prefix}-safe-mining.json"
+    recovery="${prefix}-safe-recovery.json"
+    txids="${prefix}-safe-wallet-txids.json"
+    prelaunch="${prefix}-wallet-txids.prelaunch.json"
+    for file in "$path" "$activation" "$wallet" "$staking" "$mining" "$recovery" "$txids" \
+        "$prelaunch"; do
+        [[ -f "$file" && ! -L "$file" && "$(stat -c '%u:%g:%a' "$file")" == 0:0:600 ]] ||
+            return 1
+    done
+    verify_candidate_activation_marker "$node" || return 1
+    fee=$(candidate_recovery_fee_for "$node") || return 1
+    candidate_safe_rollback_state_is_clean "$wallet" "$staking" "$mining" "$recovery" "$fee" ||
+        return 1
+    cmp -s "$prelaunch" "$txids" || return 1
+    generation=$(jq -er '.container_generation' "$activation") || return 1
+    [[ "$(container_generation_for "$node")" == "$generation" ]] || return 1
+    activation_sha=$(sha256sum "$activation" | awk '{print $1}') || return 1
+    transaction_sha=$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}') || return 1
+    drain_sha=$(sha256sum "$(wave_drain_manifest_path)" | awk '{print $1}') || return 1
+    jq -e --argjson node "$node" --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+        --arg generation "$generation" --arg activation_sha "$activation_sha" \
+        --arg transaction_sha "$transaction_sha" --arg drain_sha "$drain_sha" \
+        --arg wallet_sha "$(sha256sum "$wallet" | awk '{print $1}')" \
+        --arg staking_sha "$(sha256sum "$staking" | awk '{print $1}')" \
+        --arg mining_sha "$(sha256sum "$mining" | awk '{print $1}')" \
+        --arg recovery_sha "$(sha256sum "$recovery" | awk '{print $1}')" \
+        --arg txids_sha "$(sha256sum "$txids" | awk '{print $1}')" \
+        --arg prelaunch_sha "$(sha256sum "$prelaunch" | awk '{print $1}')" \
+        --argjson fee "$fee" '
+        .schema == 1 and .transaction == "v30.1.4-fleet-rollout" and
+        .boundary == "candidate-safe-for-data-rollback" and .rollback_permitted == true and
+        .node == $node and .run_dir == $run and .wave_dir == $wave and
+        .container_generation == $generation and
+        .activation_marker_sha256 == $activation_sha and
+        .transaction_manifest_sha256 == $transaction_sha and
+        .wave_drain_manifest_sha256 == $drain_sha and
+        .wallet_locked == true and .staking_off == true and .pow_clean_off == true and
+        .recovery_clean == true and .confirmed_resolution_fees == $fee and
+        .fee_unchanged == true and .wallet_transaction_set_unchanged == true and
+        .evidence == {wallet_sha256:$wallet_sha,staking_sha256:$staking_sha,
+          mining_sha256:$mining_sha,recovery_sha256:$recovery_sha,
+          wallet_txids_sha256:$txids_sha,prelaunch_wallet_txids_sha256:$prelaunch_sha} and
+        (.created_at | type) == "string"
+    ' "$path" >/dev/null
+}
+
+publish_safe_rollback_marker()
+{
+    local node="$1" path activation prefix prelaunch fee generation wallet_info staking mining recovery
+    local txids_tmp deadline activation_sha
+    path=$(wave_node_safe_rollback_path "$node") || return 1
+    if [[ -e "$path" || -L "$path" ]]; then
+        verify_safe_rollback_marker "$node"
+        return
+    fi
+    activation=$(wave_node_activation_path "$node") || return 1
+    verify_candidate_activation_marker "$node" || return 1
+    prefix=$(wave_node_prefix "$node") || return 1
+    prelaunch="${prefix}-wallet-txids.prelaunch.json"
+    fee=$(candidate_recovery_fee_for "$node") || return 1
+    generation=$(jq -er '.container_generation' "$activation") || return 1
+    txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.safe-wallet-txids.XXXXXX") || return 1
+    [[ "$node" -eq "$FREE_CLAIM_NODE" ]] ||
+        wallet_rpc_for "$node" setpowmining false 1 1 >/dev/null 2>&1 || true
+    wallet_rpc_for "$node" staking false >/dev/null 2>&1 || true
+    wallet_rpc_for "$node" walletlock >/dev/null 2>&1 || true
+    deadline=$((SECONDS + 120))
+    while ((SECONDS < deadline)); do
+        [[ "$(container_generation_for "$node" 2>/dev/null || true)" == "$generation" ]] || break
+        wallet_info=$(wallet_rpc_for "$node" getwalletinfo 2>/dev/null || true)
+        staking=$(wallet_rpc_for "$node" getstakinginfo 2>/dev/null || true)
+        mining=$(wallet_rpc_for "$node" getpowmininginfo 2>/dev/null || true)
+        recovery=$(wallet_rpc_for "$node" getpowclaimrecoveryinfo 2>/dev/null || true)
+        [[ -n "$wallet_info" && -n "$staking" && -n "$mining" && -n "$recovery" ]] || {
+            sleep 2; continue;
+        }
+        printf '%s\n' "$wallet_info" | atomic_write_json "${prefix}-safe-wallet.json" || break
+        printf '%s\n' "$staking" | atomic_write_json "${prefix}-safe-staking.json" || break
+        printf '%s\n' "$mining" | atomic_write_json "${prefix}-safe-mining.json" || break
+        printf '%s\n' "$recovery" | atomic_write_json "${prefix}-safe-recovery.json" || break
+        capture_wallet_txid_set "$node" "$txids_tmp" || { sleep 2; continue; }
+        if ! chmod 600 "$txids_tmp" || ! chown root:root "$txids_tmp"; then
+            break
+        fi
+        mv -fT -- "$txids_tmp" "${prefix}-safe-wallet-txids.json" || break
+        txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.safe-wallet-txids.XXXXXX") || break
+        if candidate_safe_rollback_state_is_clean "${prefix}-safe-wallet.json" \
+             "${prefix}-safe-staking.json" "${prefix}-safe-mining.json" \
+             "${prefix}-safe-recovery.json" "$fee" &&
+           cmp -s "$prelaunch" "${prefix}-safe-wallet-txids.json"; then
+            activation_sha=$(sha256sum "$activation" | awk '{print $1}') || break
+            jq -n --argjson node "$node" --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+                --arg generation "$generation" --arg activation_sha "$activation_sha" \
+                --arg transaction_sha "$(sha256sum "$RUN_DIR/TRANSACTION.json" | awk '{print $1}')" \
+                --arg drain_sha "$(sha256sum "$(wave_drain_manifest_path)" | awk '{print $1}')" \
+                --arg wallet_sha "$(sha256sum "${prefix}-safe-wallet.json" | awk '{print $1}')" \
+                --arg staking_sha "$(sha256sum "${prefix}-safe-staking.json" | awk '{print $1}')" \
+                --arg mining_sha "$(sha256sum "${prefix}-safe-mining.json" | awk '{print $1}')" \
+                --arg recovery_sha "$(sha256sum "${prefix}-safe-recovery.json" | awk '{print $1}')" \
+                --arg txids_sha "$(sha256sum "${prefix}-safe-wallet-txids.json" | awk '{print $1}')" \
+                --arg prelaunch_sha "$(sha256sum "$prelaunch" | awk '{print $1}')" \
+                --argjson fee "$fee" --arg created_at "$(date -u +%FT%TZ)" '
+                {schema:1,transaction:"v30.1.4-fleet-rollout",
+                 boundary:"candidate-safe-for-data-rollback",rollback_permitted:true,node:$node,
+                 run_dir:$run,wave_dir:$wave,container_generation:$generation,
+                 activation_marker_sha256:$activation_sha,
+                 transaction_manifest_sha256:$transaction_sha,wave_drain_manifest_sha256:$drain_sha,
+                 wallet_locked:true,staking_off:true,pow_clean_off:true,recovery_clean:true,
+                 confirmed_resolution_fees:$fee,fee_unchanged:true,
+                 wallet_transaction_set_unchanged:true,
+                 evidence:{wallet_sha256:$wallet_sha,staking_sha256:$staking_sha,
+                   mining_sha256:$mining_sha,recovery_sha256:$recovery_sha,
+                   wallet_txids_sha256:$txids_sha,
+                   prelaunch_wallet_txids_sha256:$prelaunch_sha},created_at:$created_at}' |
+                atomic_write_json "$path" || break
+            rm -f -- "$txids_tmp"
+            verify_safe_rollback_marker "$node"
+            return
+        fi
+        sleep 2
+    done
+    rm -f -- "$txids_tmp"
+    return 1
+}
+
+contain_wave_without_rollback()
+{
+    local reason="$1" node container path activation activation_sha inspect generation
+    local activation_present container_present
+    CURRENT_WAVE_CONTAINED=1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        activation=$(wave_node_activation_path "$node")
+        activation_present=false
+        activation_sha=absent
+        generation=absent
+        if [[ -f "$activation" && ! -L "$activation" ]]; then
+            activation_present=true
+            activation_sha=$(sha256sum "$activation" | awk '{print $1}') || return 1
+            generation=$(jq -er '.container_generation' "$activation") || return 1
+        elif [[ -e "$activation" || -L "$activation" ]]; then
+            return 1
+        fi
+        container=$(container_for "$node")
+        container_present=false
+        if docker inspect "$container" >/dev/null 2>&1; then
+            container_present=true
+            [[ "$generation" != absent ]] ||
+                generation=$(container_generation_for "$node" 2>/dev/null || printf '%s' unknown)
+            docker update --restart=no "$container" >/dev/null 2>&1 || true
+            if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" == true ]]; then
+                timeout --kill-after=30 660 docker stop -t 600 "$container" >/dev/null 2>&1 ||
+                    docker kill "$container" >/dev/null 2>&1 || true
+            fi
+            inspect=$(docker inspect "$container" 2>/dev/null || true)
+            jq -e 'length == 1 and .[0].State.Running == false and .[0].State.Pid == 0 and
+                .[0].HostConfig.RestartPolicy.Name == "no"' >/dev/null 2>&1 <<< "$inspect" || return 1
+        fi
+        path=$(wave_node_containment_path "$node") || return 1
+        jq -n --argjson node "$node" --arg run "$RUN_DIR" --arg wave "$CURRENT_WAVE_DIR" \
+            --arg reason "$reason" --arg generation "$generation" \
+            --arg activation_sha "$activation_sha" --argjson activation_present "$activation_present" \
+            --argjson container_present "$container_present" --arg created_at "$(date -u +%FT%TZ)" '
+            {schema:1,transaction:"v30.1.4-fleet-rollout",state:"contained-no-rollback",
+             rollback_permitted:false,node:$node,run_dir:$run,wave_dir:$wave,reason:$reason,
+             candidate_generation:$generation,activation_marker_present:$activation_present,
+             activation_marker_sha256:$activation_sha,container_present:$container_present,
+             restart_policy:(if $container_present then "no" else "absent" end),
+             container_running:false,container_pid:0,
+             candidate_triplet_retained:true,snapshots_and_holds_retained:true,
+             maintenance_and_inhibitors_retained:true,created_at:$created_at}' |
+            atomic_write_json "$path" || return 1
+    done
+    publish_state_token "$CURRENT_WAVE_DIR/ROLLBACK_STATE" contained-no-rollback || return 1
+    return 0
 }
 
 stop_wave_for_rollback()
 {
-    local node container mining deadline inspect evidence
+    local node container mining deadline inspect evidence activation
+    terminate_and_join_activation_helpers || return 1
+    if [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 1 ]]; then
+        for node in "${CURRENT_WAVE_NODES[@]}"; do
+            activation=$(wave_node_activation_path "$node") || return 1
+            if [[ ! -e "$activation" && ! -L "$activation" ]]; then
+                if ! establish_candidate_recovery_baseline "$node" ||
+                   ! publish_candidate_activation_marker "$node"; then
+                    contain_wave_without_rollback preactivation-safe-boundary-unavailable || true
+                    return 1
+                fi
+            fi
+            verify_candidate_activation_marker "$node" || {
+                contain_wave_without_rollback activation-marker-ambiguous || true
+                return 1
+            }
+            CURRENT_WAVE_ACTIVATED=1
+            if ! publish_safe_rollback_marker "$node"; then
+                contain_wave_without_rollback post-activation-rpc-or-state-ambiguous || true
+                return 1
+            fi
+        done
+        [[ "$CURRENT_WAVE_ACTIVATED" -eq 1 ]] || {
+            contain_wave_without_rollback activation-boundary-state-ambiguous || true
+            return 1
+        }
+    fi
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        container=$(container_for "$node")
+        if ! docker update --restart=no "$container" >/dev/null 2>&1 ||
+           [[ "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$container" 2>/dev/null)" != no ]]; then
+            [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 0 ]] ||
+                contain_wave_without_rollback restart-disable-ambiguous || true
+            return 1
+        fi
+    done
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         container=$(container_for "$node")
         [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == true ]] || continue
@@ -3348,10 +4498,11 @@ stop_wave_for_rollback()
         if assert_node_cleanly_stopped "$node"; then
             continue
         fi
-        [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 1 &&
-           ( "$node" -eq "$FREE_CLAIM_NODE" ||
-             ! -e "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-pow-activation-attempted" ) ]] ||
-            return 1
+        [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 1 ]] || return 1
+        if [[ "$node" -ne "$FREE_CLAIM_NODE" &&
+              -e "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-pow-activation-attempted" ]]; then
+            verify_safe_rollback_marker "$node" || return 1
+        fi
         if ! inspect=$(docker inspect "$container" 2>/dev/null); then
             publish_absent_target_evidence "$node" || return 1
             continue
@@ -3373,9 +4524,35 @@ stop_wave_for_rollback()
     done
 }
 
+verify_stopped_candidate_safe_boundaries()
+{
+    local node activation generation inspect
+    [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 1 ]] || return 0
+    ((${#ACTIVATION_HELPER_PIDS[@]} == 0)) || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        activation=$(wave_node_activation_path "$node") || return 1
+        verify_candidate_activation_marker "$node" || return 1
+        verify_safe_rollback_marker "$node" || return 1
+        generation=$(jq -er '.container_generation' "$activation") || return 1
+        [[ "$(container_generation_for "$node")" == "$generation" ]] || return 1
+        inspect=$(docker inspect "$(container_for "$node")") || return 1
+        jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg id "$CANDIDATE_IMAGE_ID" '
+            length == 1 and .[0].State.Running == false and .[0].State.Pid == 0 and
+            .[0].State.Restarting == false and .[0].Config.Image == $image and
+            .[0].Image == $id and .[0].HostConfig.RestartPolicy.Name == "no"
+        ' >/dev/null <<< "$inspect" || return 1
+    done
+}
+
 rollback_current_wave()
 {
-    local node services=() all_ready deadline
+    local node services=() all_ready deadline plan action wallet_info txids_tmp restored_pow
+    if [[ "$CURRENT_WAVE_CONTAINED" -ne 0 ]] ||
+       find "$CURRENT_WAVE_DIR" -maxdepth 1 -type f -name 'node-*-CONTAINED-NO-ROLLBACK.json' \
+           -print -quit | grep -q .; then
+        CURRENT_WAVE_CONTAINED=1
+        return 1
+    fi
     [[ "$CURRENT_WAVE_COMMITTED" -eq 1 && "$CURRENT_WAVE_ROLLED_BACK" -eq 0 ]] || return 0
     log "rolling back current wave: ${CURRENT_WAVE_NODES[*]}"
     [[ -f "$CURRENT_WAVE_DIR/docker-compose.before.yml" &&
@@ -3392,8 +4569,16 @@ rollback_current_wave()
         candidate_launch_attempt_marker_valid || return 1
         CURRENT_WAVE_LAUNCH_ATTEMPTED=1
     fi
+    verify_wave_drain_evidence || {
+        log 'rollback refused because the immutable post-drain authority is absent or changed'
+        return 1
+    }
     stop_wave_for_rollback || return 1
     if [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 1 ]]; then
+        verify_stopped_candidate_safe_boundaries || {
+            contain_wave_without_rollback stopped-generation-or-safe-boundary-ambiguous || true
+            return 1
+        }
         restore_wave_preupgrade_data || {
             log 'pre-upgrade dataset restoration failed; old binary will not be started'
             return 1
@@ -3417,12 +4602,38 @@ rollback_current_wave()
     [[ "$(sha256sum "$ENDPOINT_GUARD" | awk '{print $1}')" == \
        "$(sha256sum "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.before.sh" | awk '{print $1}')" ]] || return 1
     docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate --pull never "${services[@]}" || return 1
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        all_ready=1
+        for node in "${CURRENT_WAVE_NODES[@]}"; do
+            wallet_info=$(wallet_rpc_for "$node" getwalletinfo 2>/dev/null || true)
+            jq -e '.unlocked_until == 0' >/dev/null 2>&1 <<< "$wallet_info" || {
+                all_ready=0
+                continue
+            }
+            txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.old-locked-txids.XXXXXX") || return 1
+            if ! capture_wallet_txid_set "$node" "$txids_tmp" ||
+               ! cmp -s "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json" \
+                   "$txids_tmp"; then
+                rm -f -- "$txids_tmp"
+                return 1
+            fi
+            rm -f -- "$txids_tmp"
+        done
+        ((all_ready == 1)) && break
+        sleep 5
+    done
+    ((all_ready == 1)) || return 1
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         run_activation_helper "$NORMAL_UNLOCK_HELPER" "$NORMAL_UNLOCK_HELPER_SHA256" "$node" \
             >/dev/null 2>&1 || return 1
-        if [[ "$node" -ne "$FREE_CLAIM_NODE" ]]; then
+        plan=$(wave_legacy_plan_entry "$node") || return 1
+        action=$(jq -er '.rollback_pow_action' "$plan") || return 1
+        if [[ "$action" == start-pow-helper ]]; then
             run_activation_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA256" "$node" \
                 >/dev/null 2>&1 || return 1
+        elif [[ "$action" != skip-pow ]]; then
+            return 1
         fi
     done
     deadline=$((SECONDS + 1200))
@@ -3435,6 +4646,17 @@ rollback_current_wave()
         sleep 5
     done
     ((all_ready == 1)) || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        plan=$(wave_legacy_plan_entry "$node") || return 1
+        restored_pow="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-legacy-pow.restored.json"
+        wallet_rpc_for "$node" getpowmininginfo | atomic_write_json "$restored_pow" || return 1
+        verify_legacy_pow_rollback_exact "$node" "$plan" "$restored_pow" || return 1
+        txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.old-restored-txids.XXXXXX") || return 1
+        capture_wallet_txid_set "$node" "$txids_tmp" || { rm -f -- "$txids_tmp"; return 1; }
+        cmp -s "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json" \
+            "$txids_tmp" || { rm -f -- "$txids_tmp"; return 1; }
+        rm -f -- "$txids_tmp"
+    done
     if [[ " ${CURRENT_WAVE_NODES[*]} " == *" 30 "* ]]; then
         release_free_claim_lock
         deadline=$((SECONDS + 600))
@@ -3453,6 +4675,7 @@ on_exit()
 {
     local rc=$? containment_proven=0 inhibitor_state=''
     trap - EXIT INT TERM
+    terminate_and_join_activation_helpers || true
     if ((rc != 0)); then
         if [[ "$TERMINAL_FINALIZED" -eq 1 ]]; then
             log 'terminal receipt is finalized; live verification drift is post-transaction and no rollout state will be mutated'
@@ -3486,7 +4709,9 @@ on_exit()
             publish_state_token "$CURRENT_WAVE_DIR/PRECOMMIT_STATE" precommit-aborted || true
             log "wave preparation aborted before the rollback boundary; hidden evidence retained at $CURRENT_WAVE_DIR"
         fi
-        if ! rollback_current_wave; then
+        if [[ "$CURRENT_WAVE_CONTAINED" -eq 1 ]]; then
+            log 'ERROR: activated candidate is contained; automatic data rollback remains prohibited'
+        elif ! rollback_current_wave; then
             log 'ERROR: current-wave rollback could not be proven; affected nodes remain fail-closed'
         fi
         if [[ "$FINALIZATION_ACTIVE" -eq 1 ]]; then
@@ -3579,20 +4804,17 @@ run_one_wave()
     CURRENT_WAVE_COMMITTED=0
     CURRENT_WAVE_ROLLED_BACK=0
     CURRENT_WAVE_LAUNCH_ATTEMPTED=0
+    CURRENT_WAVE_ACTIVATED=0
+    CURRENT_WAVE_CONTAINED=0
 
     acquire_wave_locks
     capture_unaffected_generations "$CURRENT_WAVE_DIR/unaffected.before" "$csv"
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         single_wallet_for "$node" > "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-loaded-wallet.txt" ||
             die "node $node loaded wallet could not be captured before stop"
-        capture_wallet_txid_set "$node" \
-            "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.before.json" ||
-            die "node $node wallet transaction identity could not be captured before candidate launch"
     done
-    if [[ " ${CURRENT_WAVE_NODES[*]} " == *" 30 "* ]]; then
-        wallet_rpc_for "$FREE_CLAIM_NODE" getpowmininginfo > \
-            "$CURRENT_WAVE_DIR/node30-legacy-pow.before.json"
-    fi
+    capture_wave_legacy_predrain_snapshots ||
+        die 'wave did not naturally drain to an allowed legacy PoW state within 20 minutes'
     prepare_wave_candidates
     publish_state_token "$CURRENT_WAVE_DIR/COMMIT_STATE" rollback-boundary-established ||
         die 'rollback boundary state could not be durably published'
@@ -3608,7 +4830,9 @@ run_one_wave()
     # the captured before-triplet, even if no triplet byte has changed yet.
     CURRENT_WAVE_COMMITTED=1
     stop_wave_cleanly
+    verify_wave_drain_evidence || die 'post-drain evidence changed before cold backup'
     backup_cold_wallets_and_snapshots
+    verify_wave_drain_evidence || die 'post-drain evidence changed before candidate commit'
     commit_wave_triplet
     launch_marker_tmp=$(mktemp "$CURRENT_WAVE_DIR/.candidate-launch.XXXXXX")
     printf '%s\n' yes > "$launch_marker_tmp"
@@ -3620,6 +4844,8 @@ run_one_wave()
     CURRENT_WAVE_LAUNCH_ATTEMPTED=1
     start_wave_candidate
     establish_wave_recovery_baselines
+    publish_wave_activation_markers ||
+        die 'all candidate activation boundaries were not durable before helper launch'
     activate_wave_phase staking
     activate_wave_phase pow
     wait_wave_gate
@@ -3663,6 +4889,8 @@ apply_rollout()
                 CURRENT_WAVE_COMMITTED=1
                 CURRENT_WAVE_ROLLED_BACK=0
                 CURRENT_WAVE_LAUNCH_ATTEMPTED=0
+                CURRENT_WAVE_ACTIVATED=0
+                CURRENT_WAVE_CONTAINED=0
                 rollback_current_wave || die 'interrupted wave could not be restored before live preflight'
                 release_wave_locks
                 CURRENT_WAVE_COMMITTED=0
@@ -3688,15 +4916,21 @@ apply_rollout()
         write_transaction_manifest
         publish_state_token "$RUN_DIR/STATE" prepared || die 'prepared run state publication failed'
         activate_maintenance_marker
+        verify_canary_fleet_handoff ||
+            die 'fresh apply did not complete the mandatory atomic canary-to-fleet handoff'
         publish_state_token "$RUN_DIR/STATE" applying || die 'applying run state publication failed'
     else
         verify_transaction_manifest || die 'resume identity changed after locked preflight'
         if [[ "$resume_state" == prepared ]]; then
             activate_maintenance_marker
+            verify_canary_fleet_handoff ||
+                die 'prepared resume did not complete the mandatory atomic canary-to-fleet handoff'
             publish_state_token "$RUN_DIR/STATE" applying || die 'resume applying state publication failed'
             resume_state=applying
         elif [[ "$resume_state" == applying ]]; then
             verify_maintenance_marker || die 'resume maintenance marker identity changed'
+            verify_canary_fleet_handoff ||
+                die 'resume canary-to-fleet maintenance handoff evidence changed'
         elif [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
             verify_maintenance_marker || die 'complete-run maintenance marker identity changed'
         fi
@@ -3794,7 +5028,7 @@ rollback_run()
        'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused' ]] ||
         die 'exact transaction inhibitor state did not verify before rollback'
     verify_free_claim_pause || die 'Free Claim pause did not verify before rollback'
-    activate_maintenance_marker
+    activate_maintenance_marker post-handoff-reactivation
     verify_maintenance_marker || die 'rollback maintenance marker did not verify'
 
     while IFS= read -r wave; do

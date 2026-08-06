@@ -1037,8 +1037,8 @@ assert_order "$TMP/candidate-replacement" \
     'verify_local_image_reference_identity "$CANDIDATE_IMAGE_REF" "$CANDIDATE_IMAGE_ID"' \
     'docker rm "$source_id"' \
     '[[ "$state" == absent-after-authorized-replacement ]]'
-grep -Fq 'create --no-deps' "$TMP/candidate-replacement"
-grep -Fq -- '--no-recreate --pull never "$service"' "$TMP/candidate-replacement"
+grep -Fq 'up --no-start --no-deps' "$TMP/candidate-replacement"
+grep -Fq -- '--no-recreate --no-build --pull never "$service"' "$TMP/candidate-replacement"
 
 function_body start_wave_candidate "$ROOT/fleet_rollout.sh" > "$TMP/start-candidate"
 assert_order "$TMP/start-candidate" \
@@ -1060,7 +1060,8 @@ done
 function_body ensure_rollback_old_image_node "$ROOT/fleet_rollout.sh" \
     > "$TMP/old-image-replacement"
 [[ "$(grep -Fc 'docker rm "$removal_id"' "$TMP/old-image-replacement")" -eq 2 ]]
-grep -Fq -- '--no-recreate --pull never "$service"' "$TMP/old-image-replacement"
+grep -Fq 'up --no-start --no-deps' "$TMP/old-image-replacement"
+grep -Fq -- '--no-recreate --no-build --pull never "$service"' "$TMP/old-image-replacement"
 grep -Fq 'docker start "$selected_id"' "$TMP/old-image-replacement"
 function_body classify_rollback_old_image_node "$ROOT/fleet_rollout.sh" \
     > "$TMP/old-image-classifier"
@@ -1183,6 +1184,10 @@ pass crash-resumable-candidate-recovery-baseline-publication
 
 function_body require_host_tools "$ROOT/fleet_rollout.sh" > "$TMP/host-tools"
 grep -Fq 'Bash 5.1 or newer is required' "$TMP/host-tools"
+grep -Fq 'docker compose up --help' "$TMP/host-tools"
+for option in --no-start --no-deps --no-recreate --no-build --pull; do
+    grep -Fq -- "$option" "$TMP/host-tools"
+done
 for function_name in establish_wave_recovery_baselines activate_wave_phase \
     contain_wave_without_rollback; do
     function_body "$function_name" "$ROOT/fleet_rollout.sh" > "$TMP/$function_name"

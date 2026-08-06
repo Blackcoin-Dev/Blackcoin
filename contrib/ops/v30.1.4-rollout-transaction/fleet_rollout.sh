@@ -637,12 +637,19 @@ EOF
 
 require_host_tools()
 {
+    local compose_up_help option
     ((BASH_VERSINFO[0] > 5 ||
        (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1))) ||
         die 'Bash 5.1 or newer is required'
     require_command awk bash cmp cp date diff docker find findmnt flock grep install jq \
         mktemp mountpoint mv od readlink realpath rm rsync sed seq setsid sha256sum sort stat sync tar timeout tr wc xargs zfs
     docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 is unavailable'
+    compose_up_help=$(docker compose up --help 2>&1) ||
+        die 'Docker Compose up capability probe failed'
+    for option in --no-start --no-deps --no-recreate --no-build --pull; do
+        grep -Fq -- "$option" <<< "$compose_up_help" ||
+            die "Docker Compose up lacks required option: $option"
+    done
 }
 
 verify_activation_helper()
@@ -3926,8 +3933,8 @@ ensure_candidate_stopped_container()
         # --no-recreate makes an object introduced after the absence proof fail
         # closed instead of invoking Compose's non-atomic replacement sequence.
         docker compose --project-directory "${COMPOSE_FILE%/*}" \
-            -f "$CURRENT_WAVE_DIR/docker-compose.candidate.yml" create --no-deps \
-            --no-recreate --pull never "$service" || return 1
+            -f "$CURRENT_WAVE_DIR/docker-compose.candidate.yml" up --no-start --no-deps \
+            --no-recreate --no-build --pull never "$service" || return 1
         state=$(classify_candidate_replacement_node "$node") || return 1
     fi
     [[ "$state" == candidate-stopped ]]
@@ -4687,8 +4694,8 @@ ensure_rollback_old_image_node()
             old_id=$(rollback_old_image_id_for "$node") || return 1
             verify_local_image_reference_identity "$old_ref" "$old_id" || return 1
             docker compose --project-directory "${COMPOSE_FILE%/*}" \
-                -f "$CURRENT_WAVE_DIR/docker-compose.before.yml" create --no-deps \
-                --no-recreate --pull never "$service" || return 1
+                -f "$CURRENT_WAVE_DIR/docker-compose.before.yml" up --no-start --no-deps \
+                --no-recreate --no-build --pull never "$service" || return 1
             state=$(classify_rollback_old_image_node "$node" "$authority_sha") || return 1
             case "$state" in
                 old-stopped) break ;;

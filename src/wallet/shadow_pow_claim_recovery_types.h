@@ -33,10 +33,10 @@ inline constexpr char SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY[]{"qq_shadow_pow
 inline constexpr char SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY[]{"qq_shadow_pow_branch_quarantine_height"};
 inline constexpr char SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY[]{"qq_shadow_pow_branch_quarantine_tip"};
 // A zero-payment retirement is a reversible, branch-scoped wallet fact. It
-// releases only a locally-authored origin-bound claim after Core has proved
-// ORIGIN_EXPIRED on the active branch. The observation block must remain an
-// ancestor of the active tip; otherwise the wallet reopens and reclassifies
-// the claim before permitting reuse of its input.
+// releases only a locally-authored legacy claim that cannot qualify for the
+// authenticated same-anchor lineage. Recoverable bound/schema claims are
+// never retired. The observation block must remain an ancestor of the active
+// tip; otherwise the wallet reopens and reclassifies the claim.
 inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY[]{"qq_shadow_pow_expired_retired"};
 inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY[]{"qq_shadow_pow_expired_retired_height"};
 inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY[]{"qq_shadow_pow_expired_retired_tip"};
@@ -46,6 +46,17 @@ inline constexpr char SHADOW_POW_CLAIM_ADOPTED_KEY[]{"qq_shadow_pow_adopted"};
 // reviewed.  The marker alone never grants trusted provenance.
 inline constexpr char SHADOW_POW_CLAIM_ADOPTION_TIP_KEY[]{"qq_shadow_pow_adoption_tip"};
 inline constexpr char SHADOW_POW_CLAIM_ADOPTION_FINGERPRINT_KEY[]{"qq_shadow_pow_adoption_fingerprint"};
+// Same-anchor claim refreshes form one durable, append-only lineage. The
+// Every newly-authored root carries ordinal zero and names itself as the root;
+// later siblings name their direct parent. A narrowly-defined legacy QQP2 root
+// may be reconstructed without these fields. All hashes are authenticated
+// again against the confirmed anchor generation before another refresh.
+inline constexpr char SHADOW_POW_CLAIM_LINEAGE_SCHEMA_KEY[]{"qq_shadow_pow_lineage_schema"};
+inline constexpr char SHADOW_POW_CLAIM_LINEAGE_SCHEMA_VERSION[]{"1"};
+inline constexpr char SHADOW_POW_CLAIM_LINEAGE_FAMILY_KEY[]{"qq_shadow_pow_lineage_family"};
+inline constexpr char SHADOW_POW_CLAIM_LINEAGE_ROOT_KEY[]{"qq_shadow_pow_lineage_root"};
+inline constexpr char SHADOW_POW_CLAIM_LINEAGE_PARENT_KEY[]{"qq_shadow_pow_lineage_parent"};
+inline constexpr char SHADOW_POW_CLAIM_LINEAGE_ORDINAL_KEY[]{"qq_shadow_pow_lineage_ordinal"};
 inline constexpr char SHADOW_POW_RESOLUTION_SCHEMA_KEY[]{"qq_shadow_pow_resolution_schema"};
 inline constexpr char SHADOW_POW_RESOLUTION_SCHEMA_VERSION[]{"1"};
 inline constexpr char SHADOW_POW_RESOLUTION_ANCHOR_TXID_KEY[]{"qq_shadow_pow_resolution_anchor_txid"};
@@ -108,9 +119,35 @@ struct ShadowPowClaimRecoveryNode
     bool expired_locally_retired{false};
     bool expected_shape{false};
     bool wallet_authored{false};
+    bool wallet_from_me{false};
     int created_height{-1};
     uint256 created_tip;
     bool authored_metadata_valid{false};
+    /** The authored next-block height and its preceding-tip hash identify an
+     * active-branch edge in the inventory snapshot. Parsing the fields alone
+     * is not sufficient authority for the mining compatibility gate. */
+    bool authored_tip_active_branch_bound{false};
+    bool claim_descriptor_valid{false};
+    bool proof_evaluation_skipped_resolved_anchor{false};
+    uint8_t proof_version{0};
+    ShadowProofPayloadMode proof_mode{ShadowProofPayloadMode::MALFORMED};
+    bool proof_origin_bound{false};
+    uint32_t proof_origin_height{0};
+    uint256 proof_origin_previous_block_hash;
+    bool proof_input_bound{false};
+    uint32_t proof_output_index{0};
+    CScript proof_target;
+    CScript proof_payout_script;
+    CAmount claim_fee{0};
+    bool exact_authored_carrier_shape{false};
+    bool relay_ttl_expired{false};
+    int64_t relay_expiry_time{0};
+    bool lineage_metadata_present{false};
+    bool lineage_metadata_valid{false};
+    uint256 lineage_family_fingerprint;
+    uint256 lineage_root_txid;
+    uint256 lineage_parent_txid;
+    uint32_t lineage_ordinal{0};
     uint256 adoption_tip;
     uint256 adoption_generation_fingerprint;
     bool adoption_metadata_valid{false};
@@ -172,7 +209,9 @@ struct ShadowPowClaimRecoveryInventory
     uint256 wallet_processed_tip;
     int wallet_processed_height{-1};
     uint64_t wallet_generation{0};
+    uint256 candidate_state_fingerprint;
     bool wallet_tip_matches{false};
+    bool recovery_database_ambiguous{false};
     size_t raw_claim_objects{0};
     size_t live_claim_objects{0};
     size_t quarantined_claim_objects{0};
@@ -182,6 +221,79 @@ struct ShadowPowClaimRecoveryInventory
     size_t resolved_components{0};
     std::vector<ShadowPowClaimRecoveryComponent> components;
     std::vector<uint256> unanchored_claim_txids;
+};
+
+enum class ShadowPowClaimMiningGateAction : uint8_t {
+    CREATE_NEW_ANCHOR,
+    WAIT_FOR_LIVE,
+    WAIT_FOR_NEXT_TIP,
+    RELAY_EXISTING,
+    REFRESH_SAME_ANCHOR,
+    UNSAFE,
+};
+
+/** Read-only, active-tip-pinned wallet action for QQSPROOF production. A
+ * refresh never selects a second fee UTXO: it spends the same authenticated
+ * confirmed anchor as every older member of one strictly linear, authenticated
+ * QQP2/QQP3/QQP4 family. */
+struct ShadowPowClaimMiningGate
+{
+    ShadowPowClaimMiningGateAction action{
+        ShadowPowClaimMiningGateAction::UNSAFE};
+    uint256 active_tip;
+    int active_height{-1};
+    uint64_t wallet_generation{0};
+    uint256 candidate_state_fingerprint;
+    bool coherent{false};
+    bool recovery_database_ambiguous{false};
+    size_t unresolved_components{0};
+    size_t live_claims{0};
+    size_t eligible_claims{0};
+    size_t family_claims{0};
+    size_t unsafe_claims{0};
+    size_t unsafe_components{0};
+    COutPoint anchor;
+    CAmount anchor_amount{0};
+    CScript target;
+    CScript payout_script;
+    uint256 generation_fingerprint;
+    uint256 lineage_root_txid;
+    uint256 lineage_head_txid;
+    uint32_t next_lineage_ordinal{0};
+    uint256 relay_txid;
+    int64_t relay_expiry_time{0};
+
+    bool HasUnsafeClaims() const
+    {
+        return action == ShadowPowClaimMiningGateAction::UNSAFE ||
+               unsafe_claims != 0 || unsafe_components != 0;
+    }
+
+    bool MayCreateClaim() const
+    {
+        return coherent && !recovery_database_ambiguous &&
+               (action == ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR ||
+                action == ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR);
+    }
+
+    bool MayCreateNewAnchorClaim() const
+    {
+        return MayCreateClaim() &&
+               action == ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR;
+    }
+
+    bool MayRefreshSameAnchor() const
+    {
+        return MayCreateClaim() &&
+               action == ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR;
+    }
+
+    bool ShouldRelayExisting() const
+    {
+        return coherent && !recovery_database_ambiguous &&
+               action == ShadowPowClaimMiningGateAction::RELAY_EXISTING &&
+               !relay_txid.IsNull();
+    }
 };
 
 /**

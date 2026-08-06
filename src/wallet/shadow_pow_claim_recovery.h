@@ -9,6 +9,17 @@
 
 namespace wallet {
 
+/** Stable identity of one confirmed wallet anchor generation. */
+uint256 ComputeShadowPowClaimLineageFamilyFingerprint(
+    const COutPoint& anchor, CAmount anchor_amount,
+    const CScript& anchor_script);
+
+/** Derive the mining decision from an already-built coherent recovery
+ * inventory. Callers that also need telemetry should share this snapshot so
+ * QQ proof validation is not repeated. */
+ShadowPowClaimMiningGate BuildShadowPowClaimMiningGate(
+    const ShadowPowClaimRecoveryInventory& inventory);
+
 const char* ShadowPowClaimRecoveryAdoptionStatusName(
     ShadowPowClaimRecoveryAdoptionStatus status);
 

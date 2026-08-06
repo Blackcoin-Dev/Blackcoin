@@ -21,7 +21,14 @@ readonly CANDIDATE_REF=qqblackcoin/blackcoin-v4-gui@sha256:7a384dd5f12c15fb41b36
 readonly CANDIDATE_ID=sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909
 readonly PER_NODE_FEE=0.000191
 readonly CONFIRM_VALUE=v30.1.4-resolve-pinned-legacy-pow-blockers
-NODES=({1..29} 31 32)
+case "${LEGACY_POW_RECOVERY_SCOPE:-all}" in
+    all) NODES=({1..29} 31 32) ;;
+    surfaced-19-28) NODES=(19 28) ;;
+    *)
+        printf '%s FATAL: unsupported recovery scope\n' "$(date -u +%FT%TZ)" >&2
+        exit 64
+        ;;
+esac
 readonly -a NODES
 readonly -A EXPECTED_ANCHOR_TXID=(
     [1]=0f278cbdbb1708db349f7d31f348197a564fa2e647ca1e4ea1432b1041853cfb

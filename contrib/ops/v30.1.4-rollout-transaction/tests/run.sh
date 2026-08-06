@@ -1351,7 +1351,8 @@ for required in legacy_baseline_pow_mode legacy_baseline_quarantined_claims \
     clean_q0_candidate_q0_no_payment_transition_verified \
     candidate_pow_clean_hashing_verified claim_recovery_fee_baseline \
     claim_recovery_fee_final baseline-pow.json restored-pow.json \
-    candidate-pow-clean-1.json candidate-pow-clean-2.json; do
+    candidate-pow-clean-1.json candidate-pow-clean-2.json \
+    candidate-safe-2-recovery-clean.json; do
     grep -Fq -- "$required" "$TMP/canary-consumer"
 done
 function_body legacy_pow_observed_mode "$CANARY" > "$TMP/legacy-pow-functions"

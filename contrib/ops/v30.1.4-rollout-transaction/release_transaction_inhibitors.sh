@@ -51,16 +51,16 @@ protected_file()
 {
     local path="$1" mode="${2:-600}"
     [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
-       "$(stat -c '%u:%g:%a' "$path")" == "0:0:$mode" ]]
+       "$(stat -c '%u:%a' "$path")" == "0:$mode" ]]
 }
 
 protected_directory()
 {
-    local path="$1" owner mode
+    local path="$1" owner_uid mode
     [[ -d "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" ]] || return 1
-    owner=$(stat -c '%u:%g' "$path") || return 1
+    owner_uid=$(stat -c '%u' "$path") || return 1
     mode=$(stat -c '%a' "$path") || return 1
-    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [[ "$owner_uid" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
     (( (8#$mode & 0022) == 0 ))
 }
 

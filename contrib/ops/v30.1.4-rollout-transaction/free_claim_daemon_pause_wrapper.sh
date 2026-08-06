@@ -35,19 +35,19 @@ valid_original_daemon()
     local actual
     [[ -f "$ORIGINAL_DAEMON" && ! -L "$ORIGINAL_DAEMON" &&
        "$(realpath -e -- "$ORIGINAL_DAEMON")" == "$ORIGINAL_DAEMON" &&
-       "$(stat -c '%u:%g' "$ORIGINAL_DAEMON")" == 0:0 ]] || return 1
+       "$(stat -c '%u:%a' "$ORIGINAL_DAEMON")" == 0:600 ]] || return 1
     actual=$(sha256sum "$ORIGINAL_DAEMON" | awk '{print $1}') || return 1
     [[ "$actual" == "$ORIGINAL_DAEMON_SHA256" ]]
 }
 
 valid_root_directory()
 {
-    local owner mode
+    local owner_uid mode
     [[ -d "$FREE_CLAIM_ROOT" && ! -L "$FREE_CLAIM_ROOT" &&
        "$(realpath -e -- "$FREE_CLAIM_ROOT")" == "$FREE_CLAIM_ROOT" ]] || return 1
-    owner=$(stat -c '%u:%g' "$FREE_CLAIM_ROOT") || return 1
+    owner_uid=$(stat -c '%u' "$FREE_CLAIM_ROOT") || return 1
     mode=$(stat -c '%a' "$FREE_CLAIM_ROOT") || return 1
-    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [[ "$owner_uid" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
     (( (8#$mode & 0022) == 0 ))
 }
 

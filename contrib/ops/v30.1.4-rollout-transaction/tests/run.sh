@@ -183,6 +183,15 @@ assert_order "$TMP/inhibitor-locks" 'exec 12>"$ENDPOINT_LOCK"' 'exec 13>"$CUTOVE
     'exec 11>"$TRANSITION_LOCK"' 'exec 10>"$FREE_CLAIM_LOCK"'
 pass zero-broadcast-normal-install-and-purpose-bound-emergency-containment
 
+for ownership_consumer in install_transaction_inhibitors.sh \
+    free_claim_daemon_pause_wrapper.sh release_transaction_inhibitors.sh; do
+    grep -Fq "stat -c '%u'" "$ROOT/$ownership_consumer"
+    grep -Fq '8#$mode & 0022' "$ROOT/$ownership_consumer"
+done
+! grep -Fq "stat -c '%u:%g' \"\$FREE_CLAIM_ROOT\"" \
+    "$ROOT/free_claim_daemon_pause_wrapper.sh"
+pass root-uid-nonwritable-free-claim-ownership
+
 function_body install_triplet "$ROOT/fleet_rollout.sh" > "$TMP/install-triplet"
 for required in compose_original_sha policy_original_sha guard_original_sha \
     compose_candidate_sha policy_candidate_sha guard_candidate_sha \

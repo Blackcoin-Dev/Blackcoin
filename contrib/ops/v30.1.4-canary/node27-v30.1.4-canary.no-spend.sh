@@ -45,6 +45,11 @@ SNAP="v30.1.4-node27-${STAMP}"
 ZFS_HOLD_TAG="blackcoin-v3014-node27-${STAMP}"
 SUSPENDED_START_MARKER="${STATE_ROOT}/ENABLE_GUARD_STARTS.node27-${STAMP}.suspended"
 CANDIDATE_LAUNCH_MARKER="${EVIDENCE}/CANDIDATE-LAUNCH-ATTEMPTED.json"
+CANDIDATE_ACTIVATION_MARKER_1="${EVIDENCE}/candidate-activation-attempted-01.json"
+CANDIDATE_ACTIVATION_MARKER_2="${EVIDENCE}/candidate-activation-attempted-02.json"
+CANDIDATE_SAFE_MARKER_1="${EVIDENCE}/candidate-safe-boundary-01.json"
+CANDIDATE_SAFE_MARKER_2="${EVIDENCE}/candidate-safe-boundary-02.json"
+MAINTENANCE_HANDOFF_READY="${EVIDENCE}/maintenance-handoff-ready.json"
 MAINTENANCE_NONCE="${OPS}/MAINTENANCE-NONCE"
 CANARY_STATE="${OPS}/STATE"
 CANARY_RECOVERY_PROCEDURE="${OPS}/CRASH-RECOVERY.json"
@@ -54,7 +59,7 @@ result='failed'
 candidate_launch_attempted=0
 start_authority_suspended=0
 maintenance_marker_activated=0
-maintenance_marker_released=false
+maintenance_handoff_ready=false
 pre_upgrade_data_restored=false
 restored_runtime_verified=false
 snapshot_identity_verified=false
@@ -67,13 +72,21 @@ PRELAUNCH_TRANSACTION_SET_SHA=''
 LOCKED_CANDIDATE_TRANSACTION_SET_SHA=''
 MAINTENANCE_NONCE_SHA=''
 MAINTENANCE_MARKER_ACTIVATION_SHA=''
-MAINTENANCE_MARKER_RELEASE_SHA=''
 RECOVERY_PROCEDURE_SHA=''
 MAINTENANCE_ACTIVE_STATE_SHA=''
-MAINTENANCE_COMPLETE_STATE_SHA=''
 GUARD_IDENTITIES_SHA=''
+CANDIDATE_ACTIVATION_MARKER_1_SHA=''
+CANDIDATE_ACTIVATION_MARKER_2_SHA=''
+CANDIDATE_SAFE_MARKER_1_SHA=''
+CANDIDATE_SAFE_MARKER_2_SHA=''
+MAINTENANCE_HANDOFF_READY_SHA=''
+INHERITED_CLAIM_INVENTORY_SHA=''
+INHERITED_CLAIM_TRANSITION_SHA=''
 SNAPSHOT_COUNT=0
 POW_DRAIN_SEQUENCE=0
+ACTIVATION_SEQUENCE=0
+SAFE_SEQUENCE=0
+LEGACY_OBSERVED_POW_MODE=''
 LEGACY_BASELINE_POW_MODE=''
 LEGACY_BASELINE_LIVE_CLAIMS=''
 LEGACY_BASELINE_QUARANTINED_CLAIMS=''
@@ -243,12 +256,14 @@ publish_crash_recovery_procedure()
            "Do not delete the maintenance marker, start or unlock node27, or run either supervisor before recovery locks are held.",
            "Acquire all four required locks in the listed order and validate the exact compatible guard hashes, canonical run directory, active state, nonce hash, and exact marker object.",
            "Inspect CANDIDATE-LAUNCH-ATTEMPTED.json. If it exists, validate its image, snapshot, hold, nonce, and marker hashes before trusting any rollback evidence.",
-           "Disable container restart. If a candidate is running and RPC is safe, stop PoW and require a claim-clean boundary; otherwise contain it without unlocking or fee-paying recovery, then stop it.",
-           "When candidate launch was attempted, validate the exact four held snapshot identities, roll back children before parents with plain zfs rollback only, and require zero zfs diff for every dataset. Never use recursive, destructive, or forced rollback flags.",
-           "Recreate node27 only from the pinned base Compose model and original immutable image, then run the pinned normal-unlock helper. Run the pinned PoW helper only when baseline-pow.json proves the legacy baseline was clean one-thread hashing; when it proves disabled PoW with zero live claims and exactly one quarantined claim, do not run the PoW helper or attempt claim resolution.",
+           "Inspect every immutable candidate-activation-attempted and candidate-safe-boundary marker. After candidate launch, the absence of an activation marker is not rollback authority: startup may have violated locked/off assumptions, so RPC loss, absence, or identity ambiguity requires containment and forbids ZFS rollback.",
+           "After activation, rollback is permitted only after RPC explicitly disables staking and PoW, locks the wallet, proves two fresh exact transaction-set and unchanged-fee q0 samples, durably publishes the matching safe-boundary marker, and cleanly stops the exact candidate.",
+           "When candidate launch was attempted and the safe boundary is proven, validate the exact four held snapshot identities, roll back children before parents with plain zfs rollback only, and require zero zfs diff for every dataset. Never use recursive, destructive, or forced rollback flags.",
+           "If the exact old image and invocation already exist, do not apply the candidate drain to it and do not repeat rollback until exact zero-diff restoration is proven.",
+           "Recreate node27 only from the pinned base Compose model and original immutable image. Before unlock, require the exact locked transaction set and normalized cold legacy PoW projection. Then run the pinned normal-unlock helper. Run the pinned PoW helper only when the observed legacy baseline was clean one-thread hashing; for the exact disabled q1 exception, never run the PoW helper or attempt claim resolution.",
            "Prove the original image and invocation, healthy RPC/network/chain, active PoS, either clean one-thread PoW or the exact disabled legacy quarantined-claim count, wallet/config/address/key/transaction identity, and exact pre-upgrade data restoration.",
-           "Release transaction-specific snapshot holds, restore ENABLE_GUARD_STARTS, and prove both supervisor guard bytes are still pinned.",
-           "Only after every prior proof succeeds may recovery unlink and sync the maintenance marker, atomically set STATE to complete, and publish release evidence. Any uncertainty leaves marker and STATE active."
+           "Release transaction-specific snapshot holds and restore ENABLE_GUARD_STARTS only after the exact old runtime is verified; the still-active canary marker continues to inhibit both supervisors.",
+           "Keep the exact maintenance marker and STATE active. Seal maintenance-handoff-ready.json, RESULT.json, and SHA256SUMS for an authenticated atomic fleet-marker takeover. Never unlink the marker or set STATE complete in this canary."
          ]}
     ' > "$temporary" || return 1
     chmod 600 "$temporary" || return 1
@@ -359,14 +374,15 @@ activate_canary_maintenance_marker()
     maintenance_marker_activated=1
 }
 
-release_canary_maintenance_marker()
+publish_maintenance_handoff_ready()
 {
-    local state_tmp release_tmp
+    local temporary attempt health_ready=false
     [[ "$phase" == restored && "$pre_upgrade_data_restored" == true &&
        "$restored_runtime_verified" == true &&
        "$snapshot_identity_verified" == true && "$snapshot_zero_diff_verified" == true &&
        "$snapshot_holds_released" == true && "$start_authority_suspended" == 0 &&
-       "$maintenance_marker_activated" == 1 ]] || return 1
+       "$maintenance_marker_activated" == 1 && "$maintenance_handoff_ready" == false ]] ||
+        return 1
     verify_rollback_image_ready || return 1
     verify_guard_compatibility || return 1
     [[ "$(sha256sum "${EVIDENCE}/maintenance-compatible-guard-identities.tsv" | awk '{print $1}')" == "$GUARD_IDENTITIES_SHA" ]] ||
@@ -374,13 +390,21 @@ release_canary_maintenance_marker()
     validate_canary_maintenance_marker || return 1
     assert_empty_control_marker "$ENABLE_GUARD_STARTS" || return 1
     [[ ! -e "$SUSPENDED_START_MARKER" && ! -L "$SUSPENDED_START_MARKER" ]] || return 1
-    local attempt health_ready=false
+    [[ "$ACTIVATION_SEQUENCE" == 2 && "$SAFE_SEQUENCE" == 2 ]] || return 1
+    [[ "$CANDIDATE_ACTIVATION_MARKER_1_SHA" =~ ^[0-9a-f]{64}$ &&
+       "$CANDIDATE_ACTIVATION_MARKER_2_SHA" =~ ^[0-9a-f]{64}$ &&
+       "$CANDIDATE_SAFE_MARKER_1_SHA" =~ ^[0-9a-f]{64}$ &&
+       "$CANDIDATE_SAFE_MARKER_2_SHA" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$(sha256sum "$CANDIDATE_ACTIVATION_MARKER_1" | awk '{print $1}')" == "$CANDIDATE_ACTIVATION_MARKER_1_SHA" &&
+       "$(sha256sum "$CANDIDATE_ACTIVATION_MARKER_2" | awk '{print $1}')" == "$CANDIDATE_ACTIVATION_MARKER_2_SHA" &&
+       "$(sha256sum "$CANDIDATE_SAFE_MARKER_1" | awk '{print $1}')" == "$CANDIDATE_SAFE_MARKER_1_SHA" &&
+       "$(sha256sum "$CANDIDATE_SAFE_MARKER_2" | awk '{print $1}')" == "$CANDIDATE_SAFE_MARKER_2_SHA" ]] || return 1
+
     for attempt in $(seq 1 120); do
-        if docker inspect "$CONTAINER" | jq -e --arg image "$ORIGINAL_IMAGE" \
-            --arg image_id "$ORIGINAL_IMAGE_ID" 'length == 1 and
-            .[0].Config.Image == $image and .[0].Image == $image_id and
-            .[0].State.Running == true and .[0].State.Health.Status == "healthy"' \
-            >/dev/null 2>&1; then
+        if [[ "$(container_runtime_kind 2>/dev/null || true)" == original ]] &&
+           docker inspect "$CONTAINER" | jq -e 'length == 1 and
+               .[0].State.Running == true and .[0].State.Health.Status == "healthy"' \
+               >/dev/null 2>&1; then
             health_ready=true
             break
         fi
@@ -388,61 +412,50 @@ release_canary_maintenance_marker()
     done
     [[ "$health_ready" == true ]] || return 1
 
-    state_tmp=$(mktemp "${OPS}/.canary-state-complete.XXXXXX") || return 1
-    printf '%s\n' complete > "$state_tmp" || return 1
-    chmod 600 "$state_tmp" || return 1
-    chown root:root "$state_tmp" || return 1
-    sync -f "$state_tmp" || return 1
-    MAINTENANCE_COMPLETE_STATE_SHA=$(sha256sum "$state_tmp" | awk '{print $1}') || return 1
-    [[ "$MAINTENANCE_COMPLETE_STATE_SHA" =~ ^[0-9a-f]{64}$ ]] || return 1
-    release_tmp=$(mktemp "${OPS}/.maintenance-marker-release.XXXXXX") || return 1
+    temporary=$(mktemp "${OPS}/.maintenance-handoff-ready.XXXXXX") || return 1
     jq -n --arg marker "$ROLLOUT_MAINTENANCE_MARKER" --arg run "$OPS" \
         --arg nonce_sha "$MAINTENANCE_NONCE_SHA" \
-        --arg activation_sha "$MAINTENANCE_MARKER_ACTIVATION_SHA" \
+        --arg marker_activation_sha "$MAINTENANCE_MARKER_ACTIVATION_SHA" \
         --arg recovery_sha "$RECOVERY_PROCEDURE_SHA" \
         --arg active_state_sha "$MAINTENANCE_ACTIVE_STATE_SHA" \
-        --arg complete_state_sha "$MAINTENANCE_COMPLETE_STATE_SHA" \
         --arg guard_identities_sha "$GUARD_IDENTITIES_SHA" \
-        --arg runtime_guard_sha "$WALLET_RUNTIME_GUARD_SHA" \
-        --arg endpoint_guard_sha "$ENDPOINT_GUARD_SHA" \
-        --arg timestamp "$(date -u +%FT%TZ)" \
-        '{schema:1,transaction:"v30.1.4-node27-canary",marker:$marker,
-          run_dir:$run,run_nonce_sha256:$nonce_sha,
-          marker_activation_sha256:$activation_sha,marker_released:true,
-          crash_recovery_procedure_sha256:$recovery_sha,
-          active_state_evidence_sha256:$active_state_sha,
-          complete_state_evidence_sha256:$complete_state_sha,
-          guard_identity_evidence_sha256:$guard_identities_sha,
-          wallet_runtime_guard_sha256:$runtime_guard_sha,
-          endpoint_guard_sha256:$endpoint_guard_sha,
-          pre_upgrade_data_restored:true,old_container_runtime_verified:true,
-          automatic_start_authority_restored:true,state_after_release:"complete",
-          timestamp:$timestamp}' > "$release_tmp" || return 1
-    chmod 600 "$release_tmp" || return 1
-    chown root:root "$release_tmp" || return 1
-    sync -f "$release_tmp" || return 1
-
-    rm -f -- "$ROLLOUT_MAINTENANCE_MARKER" || return 1
-    sync -f "$STATE_ROOT" || return 1
-    [[ ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" ]] ||
-        return 1
-    mv -fT -- "$state_tmp" "$CANARY_STATE" || return 1
-    sync -f "$CANARY_STATE" || return 1
-    sync -f "$OPS" || return 1
-    protected_root_file_0600 "$CANARY_STATE" && [[ "$(cat "$CANARY_STATE")" == complete ]] ||
-        return 1
-    mv -fT -- "$release_tmp" "${EVIDENCE}/maintenance-marker-released.json" || return 1
-    sync -f "${EVIDENCE}/maintenance-marker-released.json" || return 1
-    install -m 600 -o root -g root "$CANARY_STATE" \
-        "${EVIDENCE}/maintenance-state-complete.txt" || return 1
-    sync -f "${EVIDENCE}/maintenance-state-complete.txt" || return 1
+        --arg activation_1_sha "$CANDIDATE_ACTIVATION_MARKER_1_SHA" \
+        --arg activation_2_sha "$CANDIDATE_ACTIVATION_MARKER_2_SHA" \
+        --arg safe_1_sha "$CANDIDATE_SAFE_MARKER_1_SHA" \
+        --arg safe_2_sha "$CANDIDATE_SAFE_MARKER_2_SHA" \
+        --arg timestamp "$(date -u +%FT%TZ)" '
+        {schema:1,transaction:"v30.1.4-node27-canary",state:"active",
+         marker:$marker,run_dir:$run,run_nonce_sha256:$nonce_sha,
+         marker_activation_sha256:$marker_activation_sha,
+         crash_recovery_procedure_sha256:$recovery_sha,
+         active_state_evidence_sha256:$active_state_sha,
+         guard_identity_evidence_sha256:$guard_identities_sha,
+         candidate_activation_markers:[
+           {sequence:1,file:"candidate-activation-attempted-01.json",sha256:$activation_1_sha},
+           {sequence:2,file:"candidate-activation-attempted-02.json",sha256:$activation_2_sha}],
+         candidate_safe_markers:[
+           {sequence:1,purpose:"pre_restart",file:"candidate-safe-boundary-01.json",sha256:$safe_1_sha},
+           {sequence:2,purpose:"pre_rollback",file:"candidate-safe-boundary-02.json",sha256:$safe_2_sha}],
+         pre_upgrade_data_restored:true,old_container_runtime_verified:true,
+         snapshot_holds_released:true,automatic_start_authority_restored:true,
+         marker_released:false,live_marker_active:true,
+         maintenance_handoff_ready:true,
+         required_next_action:"atomic_authenticated_fleet_marker_takeover",
+         timestamp:$timestamp}
+    ' > "$temporary" || return 1
+    chmod 600 "$temporary" || return 1
+    chown root:root "$temporary" || return 1
+    sync -f "$temporary" || return 1
+    mv -fT -- "$temporary" "$MAINTENANCE_HANDOFF_READY" || return 1
+    sync -f "$MAINTENANCE_HANDOFF_READY" || return 1
     sync -f "$EVIDENCE" || return 1
-    MAINTENANCE_MARKER_RELEASE_SHA=$(sha256sum \
-        "${EVIDENCE}/maintenance-marker-released.json" | awk '{print $1}') || return 1
-    [[ "$MAINTENANCE_MARKER_RELEASE_SHA" =~ ^[0-9a-f]{64}$ &&
-       "$(sha256sum "${EVIDENCE}/maintenance-state-complete.txt" | awk '{print $1}')" == "$MAINTENANCE_COMPLETE_STATE_SHA" ]] ||
+    MAINTENANCE_HANDOFF_READY_SHA=$(sha256sum "$MAINTENANCE_HANDOFF_READY" | awk '{print $1}') ||
         return 1
-    maintenance_marker_released=true
+    [[ "$MAINTENANCE_HANDOFF_READY_SHA" =~ ^[0-9a-f]{64}$ ]] || return 1
+    validate_canary_maintenance_marker || return 1
+    protected_root_file_0600 "$CANARY_STATE" && [[ "$(cat "$CANARY_STATE")" == active ]] ||
+        return 1
+    maintenance_handoff_ready=true
 }
 
 verify_rollback_image_ready()
@@ -634,14 +647,18 @@ require_claim_recovery_clean()
     return 1
 }
 
-legacy_pow_snapshot_mode()
+legacy_pow_observed_mode()
 {
     local mining_file="$1"
     if jq -e '
         type == "object" and
         (.enabled | type == "boolean" and . == true) and
+        (.autostart | type == "boolean" and . == false) and
+        (.allow_automatic_quantum_key_creation | type == "boolean" and . == false) and
         (.threads | type == "number" and floor == . and . == 1) and
+        (.cpu_percent | type == "number" and . == 1) and
         (.hashrate | type == "number" and . > 0) and
+        (.unresolved_claims | type == "number" and floor == . and . == 0) and
         (.live_claims | type == "number" and floor == . and . == 0) and
         (.quarantined_claims | type == "number" and floor == . and . == 0)
     ' "$mining_file" >/dev/null; then
@@ -651,13 +668,54 @@ legacy_pow_snapshot_mode()
     if jq -e '
         type == "object" and
         (.enabled | type == "boolean" and . == false) and
+        (.autostart | type == "boolean" and . == false) and
+        (.allow_automatic_quantum_key_creation | type == "boolean" and . == false) and
+        (.state | type == "string" and . == "disabled") and
+        (.threads | type == "number" and floor == . and . == 1) and
+        (.cpu_percent | type == "number" and . == 1) and
+        (.hashrate | type == "number" and . == 0) and
+        (.unresolved_claims | type == "number" and floor == . and . == 1) and
         (.live_claims | type == "number" and floor == . and . == 0) and
         (.quarantined_claims | type == "number" and floor == . and . == 1)
     ' "$mining_file" >/dev/null; then
         printf '%s\n' quarantined-disabled
         return 0
     fi
+    if jq -e '
+        type == "object" and
+        (.enabled | type == "boolean" and . == true) and
+        (.autostart | type == "boolean" and . == false) and
+        (.allow_automatic_quantum_key_creation | type == "boolean" and . == false) and
+        (.state | type == "string" and . == "claim_quarantined") and
+        (.threads | type == "number" and floor == . and . == 1) and
+        (.cpu_percent | type == "number" and . == 1) and
+        (.hashrate | type == "number" and . == 0) and
+        (.unresolved_claims | type == "number" and floor == . and . == 1) and
+        (.live_claims | type == "number" and floor == . and . == 0) and
+        (.quarantined_claims | type == "number" and floor == . and . == 1)
+    ' "$mining_file" >/dev/null; then
+        printf '%s\n' quarantined-stalled
+        return 0
+    fi
     return 1
+}
+
+legacy_cold_pow_is_exact()
+{
+    local mining_file="$1" quarantined="$2"
+    jq -e --argjson quarantined "$quarantined" '
+        type == "object" and
+        (.enabled | type == "boolean" and . == false) and
+        (.autostart | type == "boolean" and . == false) and
+        (.allow_automatic_quantum_key_creation | type == "boolean" and . == false) and
+        (.state | type == "string" and . == "disabled") and
+        (.threads | type == "number" and floor == . and . == 1) and
+        (.cpu_percent | type == "number" and . == 1) and
+        (.hashrate | type == "number" and . == 0) and
+        (.unresolved_claims | type == "number" and floor == . and . == $quarantined) and
+        (.live_claims | type == "number" and floor == . and . == 0) and
+        (.quarantined_claims | type == "number" and floor == . and . == $quarantined)
+    ' "$mining_file" >/dev/null
 }
 
 legacy_pow_state_matches_baseline()
@@ -669,8 +727,12 @@ legacy_pow_state_matches_baseline()
                 --argjson quarantined "$LEGACY_BASELINE_QUARANTINED_CLAIMS" '
                 type == "object" and
                 (.enabled | type == "boolean" and . == true) and
+                (.autostart | type == "boolean" and . == false) and
+                (.allow_automatic_quantum_key_creation | type == "boolean" and . == false) and
                 (.threads | type == "number" and floor == . and . == 1) and
+                (.cpu_percent | type == "number" and . == 1) and
                 (.hashrate | type == "number" and . > 0) and
+                (.unresolved_claims | type == "number" and floor == . and . == 0) and
                 (.live_claims | type == "number" and floor == . and . == $live) and
                 (.quarantined_claims | type == "number" and floor == . and
                     . == $quarantined)
@@ -681,6 +743,13 @@ legacy_pow_state_matches_baseline()
                 --argjson quarantined "$LEGACY_BASELINE_QUARANTINED_CLAIMS" '
                 type == "object" and
                 (.enabled | type == "boolean" and . == false) and
+                (.autostart | type == "boolean" and . == false) and
+                (.allow_automatic_quantum_key_creation | type == "boolean" and . == false) and
+                (.state | type == "string" and . == "disabled") and
+                (.threads | type == "number" and floor == . and . == 1) and
+                (.cpu_percent | type == "number" and . == 1) and
+                (.hashrate | type == "number" and . == 0) and
+                (.unresolved_claims | type == "number" and floor == . and . == $quarantined) and
                 (.live_claims | type == "number" and floor == . and . == $live) and
                 (.quarantined_claims | type == "number" and floor == . and
                     . == $quarantined)
@@ -815,6 +884,489 @@ locked_recovery_counter_is_safe()
             .confirmed_resolution_fees >= 0
         ' "$recovery_file" >/dev/null &&
         automatic_wallet_features_are_off "$staking_file" "$mining_file"
+}
+
+candidate_pow_is_strictly_stopped()
+{
+    local mining_file="$1"
+    jq -e '
+        type == "object" and .enabled == false and .autostart == false and
+        .state == "disabled" and .threads == 1 and .cpu_percent == 1 and
+        .hashrate == 0 and .unresolved_claims == 0 and .live_claims == 0 and
+        .quarantined_claims == 0 and
+        .blocking_quarantined_claims == 0 and
+        .indeterminate_quarantined_claims == 0 and
+        .claim_recovery_database_outcome_ambiguous == false and
+        .allow_automatic_quantum_key_creation == false
+    ' "$mining_file" >/dev/null
+}
+
+candidate_staking_is_strictly_stopped()
+{
+    local staking_file="$1"
+    jq -e '
+        .enabled == false and .staking == false and .worker_running == false and
+        .staking_state == "disabled" and .automatic_qqsignal == false and
+        .automatic_demurrage_attestation == false and
+        .automatic_redelegation == false and
+        .allow_automatic_quantum_key_creation == false
+    ' "$staking_file" >/dev/null
+}
+
+extract_inherited_claim_inventory()
+{
+    local recovery_file="$1" transaction_file="$2" output_file="$3"
+    jq -e -n --slurpfile recovery "$recovery_file" --slurpfile transactions "$transaction_file" '
+        def hex64: type == "string" and test("^[0-9a-f]{64}$");
+        def integer: type == "number" and floor == .;
+        select(($recovery | length) == 1 and ($transactions | length) == 1 and
+          ($transactions[0] | type == "array" and
+            all(.[]; hex64) and . == (unique | sort))) |
+        $recovery[0] as $r |
+        select($r.policy_authoritative == true and
+          $r.policy.automatic_authorized == false and
+          $r.database_outcome_ambiguous == false and
+          $r.chain_ready == true and $r.wallet_tip_matches == true and
+          $r.blocking_quarantined_claims == 0 and $r.blocking_components == 0 and
+          $r.indeterminate_quarantined_claims == 0 and
+          $r.pending_manual_resolutions == 0 and $r.pending_automatic_resolutions == 0 and
+          ($r.raw_claim_objects | integer and . > 0) and
+          ($r.quarantined_claim_objects | integer and . > 0 and . <= $r.raw_claim_objects) and
+          ($r.components | integer and . > 0) and
+          ($r.resolved_components | integer and . == $r.components) and
+          ($r.retired_components | integer and . == 0) and
+          ($r.component_details | type == "array" and length == $r.components and all(.[];
+            .classification == "resolved_on_active_chain" and
+            .anchor_authenticated == true and .anchor_unspent == false and
+            (.anchor.txid | hex64) and
+            (.anchor.vout | integer and . >= 0) and
+            (.generation_fingerprint | hex64) and
+            (.claim_txids | type == "array" and length > 0 and all(.[]; hex64)) and
+            (.root_claim_txids | type == "array" and length > 0 and all(.[]; hex64)) and
+            (.resolution_txids | type == "array" and length == 0)))) |
+        ([ $r.component_details[].claim_txids[] ] | unique | sort) as $claim_txids |
+        select($claim_txids |
+          all(. as $txid | $transactions[0] | index($txid) != null)) |
+        {schema:1,classification:"resolved_on_active_chain",
+         raw_claim_objects:$r.raw_claim_objects,
+         quarantined_claim_objects:$r.quarantined_claim_objects,
+         components:$r.components,resolved_components:$r.resolved_components,
+         retired_components:$r.retired_components,
+         claim_txids:$claim_txids,
+         component_identities:([$r.component_details[] |
+           {anchor,generation_fingerprint,
+            claim_txids:(.claim_txids | unique | sort),
+            root_claim_txids:(.root_claim_txids | unique | sort)}] |
+           sort_by(.anchor.txid,.anchor.vout,.generation_fingerprint))}
+    ' > "$output_file"
+    jq -e 'type == "object" and .schema == 1 and .components > 0 and
+        (.component_identities | type == "array") and
+        (.component_identities | length) == .components and
+        (.claim_txids | type == "array" and length > 0)' "$output_file" >/dev/null
+}
+
+inherited_claim_inventory_is_resolved()
+{
+    local recovery_file="$1" transaction_file="$2" inventory_file="$3" current
+    current=$(mktemp "${OPS}/.candidate-inherited-inventory.XXXXXX") || return 1
+    if ! extract_inherited_claim_inventory "$recovery_file" "$transaction_file" "$current" ||
+       ! cmp -s "$inventory_file" "$current"; then
+        rm -f -- "$current"
+        return 1
+    fi
+    rm -f -- "$current"
+}
+
+normalize_inherited_candidate_claim()
+{
+    local attempt initial recovery pow wallet staking txids transition_tmp
+    initial="${EVIDENCE}/candidate-inherited-recovery-observed.json"
+    rpc setpowmining false 1 1 false >"${EVIDENCE}/candidate-inherited-pow-stop.json" ||
+        return 1
+    for attempt in $(seq 1 240); do
+        recovery="${EVIDENCE}/candidate-inherited-recovery-${attempt}.json"
+        wallet="${EVIDENCE}/candidate-inherited-wallet-${attempt}.json"
+        staking="${EVIDENCE}/candidate-inherited-staking-${attempt}.json"
+        pow="${EVIDENCE}/candidate-inherited-pow-${attempt}.json"
+        txids="${EVIDENCE}/candidate-inherited-transaction-txids-${attempt}.json"
+        rpc getpowclaimrecoveryinfo true >"$recovery" || return 1
+        rpc getwalletinfo >"$wallet" || return 1
+        rpc getstakinginfo >"$staking" || return 1
+        rpc getpowmininginfo >"$pow" || return 1
+        rpc listtransactions '*' 1000000 0 true | jq -S '[.[].txid] | unique | sort' >"$txids" ||
+            return 1
+        jq -e '.private_keys_enabled == true and .unlocked_until == 0' "$wallet" >/dev/null ||
+            return 1
+        candidate_staking_is_strictly_stopped "$staking" || return 1
+        automatic_wallet_features_are_off "$staking" "$pow" || return 1
+        transaction_sets_match_exactly "${EVIDENCE}/prelaunch-transaction-txids.json" "$txids" ||
+            return 1
+        jq -e '.policy_authoritative == true and
+            .policy.automatic_authorized == false and
+            .database_outcome_ambiguous == false and .chain_ready == true and
+            .wallet_tip_matches == true and .pending_manual_resolutions == 0 and
+            .pending_automatic_resolutions == 0' "$recovery" >/dev/null || {
+            sleep 5
+            continue
+        }
+        if [[ ! -s "$initial" ]]; then
+            install -m 600 -o root -g root "$recovery" "$initial" || return 1
+            BASELINE_RECOVERY_FEE=$(jq -er '.confirmed_resolution_fees' "$initial") || return 1
+            jq -S '{pending_manual_resolutions,pending_automatic_resolutions,
+                confirmed_manual_resolutions,confirmed_automatic_resolutions,
+                confirmed_resolution_fees,automatic_actions_in_window,
+                automatic_fee_exposure_in_window,reconciled_descendant_claims,claims_recycled}' \
+                "$initial" >"${EVIDENCE}/candidate-inherited-accounting-baseline.json" || return 1
+            if [[ "$LEGACY_BASELINE_POW_MODE" == quarantined-disabled ]]; then
+                extract_inherited_claim_inventory "$initial" "$txids" \
+                    "${EVIDENCE}/candidate-inherited-claim-inventory.json" || return 1
+                INHERITED_CLAIM_INVENTORY_SHA=$(sha256sum \
+                    "${EVIDENCE}/candidate-inherited-claim-inventory.json" | awk '{print $1}') ||
+                    return 1
+            fi
+        fi
+        [[ "$(jq -er '.confirmed_resolution_fees' "$recovery")" == "$BASELINE_RECOVERY_FEE" ]] ||
+            return 1
+        jq -S '{pending_manual_resolutions,pending_automatic_resolutions,
+            confirmed_manual_resolutions,confirmed_automatic_resolutions,
+            confirmed_resolution_fees,automatic_actions_in_window,
+            automatic_fee_exposure_in_window,reconciled_descendant_claims,claims_recycled}' \
+            "$recovery" >"${EVIDENCE}/candidate-inherited-accounting-current.json" || return 1
+        cmp -s "${EVIDENCE}/candidate-inherited-accounting-baseline.json" \
+            "${EVIDENCE}/candidate-inherited-accounting-current.json" || return 1
+        if candidate_pow_is_strictly_stopped "$pow" &&
+           { [[ "$LEGACY_BASELINE_POW_MODE" == clean-hashing ]] ||
+             inherited_claim_inventory_is_resolved "$recovery" "$txids" \
+                 "${EVIDENCE}/candidate-inherited-claim-inventory.json"; }; then
+            install -m 600 -o root -g root "$recovery" \
+                "${EVIDENCE}/candidate-inherited-recovery-normalized.json" || return 1
+            install -m 600 -o root -g root "$pow" \
+                "${EVIDENCE}/candidate-inherited-pow-normalized.json" || return 1
+            install -m 600 -o root -g root "$txids" \
+                "${EVIDENCE}/candidate-inherited-transaction-txids-normalized.json" || return 1
+            LOCKED_CANDIDATE_TRANSACTION_SET_SHA=$(sha256sum \
+                "${EVIDENCE}/candidate-inherited-transaction-txids-normalized.json" | awk '{print $1}') ||
+                return 1
+            [[ "$LOCKED_CANDIDATE_TRANSACTION_SET_SHA" == "$PRELAUNCH_TRANSACTION_SET_SHA" ]] ||
+                return 1
+            transition_tmp=$(mktemp "${OPS}/.candidate-inherited-transition.XXXXXX") || return 1
+            jq -n --arg mode "$LEGACY_BASELINE_POW_MODE" \
+                --arg inventory_sha "$INHERITED_CLAIM_INVENTORY_SHA" \
+                --arg observed_sha "$(sha256sum "$initial" | awk '{print $1}')" \
+                --arg normalized_sha "$(sha256sum "${EVIDENCE}/candidate-inherited-recovery-normalized.json" | awk '{print $1}')" \
+                --arg txids_sha "$LOCKED_CANDIDATE_TRANSACTION_SET_SHA" \
+                --argjson fee "$BASELINE_RECOVERY_FEE" \
+                '{schema:1,legacy_mode:$mode,
+                  legacy_q1_candidate_q0_no_payment_reclassification:true,
+                  inherited_claim_inventory_sha256:$inventory_sha,
+                  observed_recovery_sha256:$observed_sha,
+                  normalized_recovery_sha256:$normalized_sha,
+                  exact_transaction_set_sha256:$txids_sha,
+                  confirmed_resolution_fees:$fee,resolver_invoked:false,
+                  payment_created:false}' >"$transition_tmp" || return 1
+            chmod 600 "$transition_tmp" && chown root:root "$transition_tmp" &&
+                sync -f "$transition_tmp" || return 1
+            mv -fT -- "$transition_tmp" "${EVIDENCE}/candidate-inherited-claim-transition.json" ||
+                return 1
+            sync -f "${EVIDENCE}/candidate-inherited-claim-transition.json" || return 1
+            sync -f "$EVIDENCE" || return 1
+            INHERITED_CLAIM_TRANSITION_SHA=$(sha256sum \
+                "${EVIDENCE}/candidate-inherited-claim-transition.json" | awk '{print $1}') ||
+                return 1
+            LAST_CONFIRMED_RECOVERY_FEE=$BASELINE_RECOVERY_FEE
+            return 0
+        fi
+        sleep 5
+    done
+    echo 'legacy q1 did not reclassify to an exact candidate q0 state without payment within 20 minutes' >&2
+    return 1
+}
+
+container_is_authoritatively_absent()
+{
+    local names
+    docker info >/dev/null 2>&1 || return 1
+    names=$(docker ps -a --format '{{.Names}}') || return 1
+    ! grep -Fqx -- "$CONTAINER" <<<"$names"
+}
+
+container_runtime_kind()
+{
+    local inspect image image_id invocation
+    inspect=$(docker inspect "$CONTAINER" 2>/dev/null) || {
+        if container_is_authoritatively_absent; then
+            printf '%s\n' absent
+        else
+            printf '%s\n' unknown
+        fi
+        return 0
+    }
+    image=$(jq -er '.[0].Config.Image' <<<"$inspect") || return 1
+    image_id=$(jq -er '.[0].Image' <<<"$inspect") || return 1
+    invocation=$(mktemp "${OPS}/.container-runtime-invocation.XXXXXX") || return 1
+    jq -S '.[0] | {path:.Path,args:.Args,entrypoint:.Config.Entrypoint,
+        cmd:.Config.Cmd}' <<<"$inspect" >"$invocation" || return 1
+    if [[ "$image" == "$ORIGINAL_IMAGE" && "$image_id" == "$ORIGINAL_IMAGE_ID" ]] &&
+       cmp -s "$invocation" "${EVIDENCE}/baseline-invocation.json"; then
+        rm -f -- "$invocation"
+        printf '%s\n' original
+        return 0
+    fi
+    if [[ "$image" == "$CANDIDATE_IMAGE" && "$image_id" == "$CANDIDATE_IMAGE_ID" ]] &&
+       cmp -s "$invocation" "${EVIDENCE}/baseline-invocation.json"; then
+        rm -f -- "$invocation"
+        printf '%s\n' candidate
+        return 0
+    fi
+    rm -f -- "$invocation"
+    printf '%s\n' unknown
+}
+
+candidate_activation_marker_path()
+{
+    case "$1" in
+        1) printf '%s\n' "$CANDIDATE_ACTIVATION_MARKER_1" ;;
+        2) printf '%s\n' "$CANDIDATE_ACTIVATION_MARKER_2" ;;
+        *) return 1 ;;
+    esac
+}
+
+candidate_safe_marker_path()
+{
+    case "$1" in
+        1) printf '%s\n' "$CANDIDATE_SAFE_MARKER_1" ;;
+        2) printf '%s\n' "$CANDIDATE_SAFE_MARKER_2" ;;
+        *) return 1 ;;
+    esac
+}
+
+publish_candidate_activation_marker()
+{
+    local sequence="$1" purpose="$2" marker temporary wallet staking pow recovery txids marker_sha
+    [[ "$sequence" == 1 || "$sequence" == 2 ]] || return 1
+    [[ "$ACTIVATION_SEQUENCE" == $((sequence - 1)) ]] || return 1
+    if [[ "$sequence" == 2 ]]; then
+        [[ "$SAFE_SEQUENCE" == 1 ]] && validate_candidate_safe_marker 1 || return 1
+    fi
+    marker=$(candidate_activation_marker_path "$sequence") || return 1
+    [[ ! -e "$marker" && ! -L "$marker" ]] || return 1
+    validate_canary_maintenance_marker || return 1
+    [[ "$(container_runtime_kind)" == candidate ]] || return 1
+    [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == true ]] ||
+        return 1
+    wallet="${EVIDENCE}/candidate-activation-${sequence}-wallet-locked.json"
+    staking="${EVIDENCE}/candidate-activation-${sequence}-staking-disabled.json"
+    pow="${EVIDENCE}/candidate-activation-${sequence}-pow-disabled.json"
+    recovery="${EVIDENCE}/candidate-activation-${sequence}-recovery-clean.json"
+    txids="${EVIDENCE}/candidate-activation-${sequence}-transaction-txids.json"
+    rpc getwalletinfo >"$wallet" || return 1
+    rpc getstakinginfo >"$staking" || return 1
+    rpc getpowmininginfo >"$pow" || return 1
+    rpc getpowclaimrecoveryinfo true >"$recovery" || return 1
+    rpc listtransactions '*' 1000000 0 true | jq -S '[.[].txid] | unique | sort' >"$txids" ||
+        return 1
+    jq -e '.private_keys_enabled == true and .unlocked_until == 0' "$wallet" >/dev/null ||
+        return 1
+    candidate_staking_is_strictly_stopped "$staking" || return 1
+    candidate_pow_is_strictly_stopped "$pow" || return 1
+    locked_recovery_counter_is_safe "$wallet" "$recovery" "$staking" "$pow" || return 1
+    [[ "$(jq -er '.confirmed_resolution_fees' "$recovery")" == "$BASELINE_RECOVERY_FEE" ]] ||
+        return 1
+    transaction_sets_match_exactly "${EVIDENCE}/prelaunch-transaction-txids.json" "$txids" ||
+        return 1
+    if [[ "$LEGACY_BASELINE_POW_MODE" == quarantined-disabled ]]; then
+        inherited_claim_inventory_is_resolved "$recovery" "$txids" \
+            "${EVIDENCE}/candidate-inherited-claim-inventory.json" || return 1
+    fi
+    temporary=$(mktemp "${OPS}/.candidate-activation-${sequence}.XXXXXX") || return 1
+    jq -n --argjson sequence "$sequence" --arg purpose "$purpose" \
+        --arg image "$CANDIDATE_IMAGE" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg launch_sha "$CANDIDATE_LAUNCH_MARKER_SHA" \
+        --arg nonce_sha "$MAINTENANCE_NONCE_SHA" \
+        --arg txids_sha "$(sha256sum "$txids" | awk '{print $1}')" \
+        --arg recovery_sha "$(sha256sum "$recovery" | awk '{print $1}')" \
+        --arg pow_sha "$(sha256sum "$pow" | awk '{print $1}')" \
+        --arg staking_sha "$(sha256sum "$staking" | awk '{print $1}')" \
+        --arg wallet_sha "$(sha256sum "$wallet" | awk '{print $1}')" \
+        --arg inherited_transition_sha "$INHERITED_CLAIM_TRANSITION_SHA" \
+        --argjson fee "$BASELINE_RECOVERY_FEE" --arg timestamp "$(date -u +%FT%TZ)" '
+        {schema:1,sequence:$sequence,purpose:$purpose,
+         signing_authority_may_have_been_granted:true,
+         candidate_image:$image,candidate_image_id:$image_id,
+         candidate_launch_marker_sha256:$launch_sha,
+         maintenance_nonce_sha256:$nonce_sha,
+         exact_transaction_set_sha256:$txids_sha,
+         recovery_evidence_sha256:$recovery_sha,pow_evidence_sha256:$pow_sha,
+         staking_evidence_sha256:$staking_sha,wallet_evidence_sha256:$wallet_sha,
+         inherited_claim_transition_sha256:$inherited_transition_sha,
+         confirmed_resolution_fees:$fee,timestamp:$timestamp}
+    ' >"$temporary" || return 1
+    chmod 600 "$temporary" && chown root:root "$temporary" && sync -f "$temporary" || return 1
+    mv -fT -- "$temporary" "$marker" || return 1
+    sync -f "$marker" && sync -f "$EVIDENCE" || return 1
+    marker_sha=$(sha256sum "$marker" | awk '{print $1}') || return 1
+    [[ "$marker_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    if [[ "$sequence" == 1 ]]; then
+        CANDIDATE_ACTIVATION_MARKER_1_SHA=$marker_sha
+    else
+        CANDIDATE_ACTIVATION_MARKER_2_SHA=$marker_sha
+    fi
+    ACTIVATION_SEQUENCE=$sequence
+}
+
+validate_candidate_safe_marker()
+{
+    local sequence="$1" marker activation_marker expected_sha activation_sha
+    local wallet staking pow recovery txids wallet_generation evidence_file
+    marker=$(candidate_safe_marker_path "$sequence") || return 1
+    activation_marker=$(candidate_activation_marker_path "$sequence") || return 1
+    if [[ "$sequence" == 1 ]]; then
+        expected_sha=$CANDIDATE_SAFE_MARKER_1_SHA
+        activation_sha=$CANDIDATE_ACTIVATION_MARKER_1_SHA
+    else
+        expected_sha=$CANDIDATE_SAFE_MARKER_2_SHA
+        activation_sha=$CANDIDATE_ACTIVATION_MARKER_2_SHA
+    fi
+    protected_root_file_0600 "$marker" || return 1
+    [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$activation_sha" =~ ^[0-9a-f]{64}$ &&
+       "$(sha256sum "$marker" | awk '{print $1}')" == "$expected_sha" ]] || return 1
+    wallet="${EVIDENCE}/candidate-safe-${sequence}-wallet-2.json"
+    staking="${EVIDENCE}/candidate-safe-${sequence}-staking-2.json"
+    pow="${EVIDENCE}/candidate-safe-${sequence}-pow-2.json"
+    recovery="${EVIDENCE}/candidate-safe-${sequence}-recovery-2.json"
+    txids="${EVIDENCE}/candidate-safe-${sequence}-transaction-txids-2.json"
+    for evidence_file in "$wallet" "$staking" "$pow" "$recovery" "$txids"; do
+        protected_root_file_0600 "$evidence_file" || return 1
+    done
+    wallet_generation=$(jq -er '.wallet_generation |
+        select(type == "number" and floor == . and . >= 0)' "$recovery") || return 1
+    jq -e '.private_keys_enabled == true and .unlocked_until == 0' "$wallet" >/dev/null ||
+        return 1
+    candidate_staking_is_strictly_stopped "$staking" || return 1
+    candidate_pow_is_strictly_stopped "$pow" || return 1
+    locked_recovery_counter_is_safe "$wallet" "$recovery" "$staking" "$pow" || return 1
+    transaction_sets_match_exactly "${EVIDENCE}/prelaunch-transaction-txids.json" "$txids" ||
+        return 1
+    jq -e --argjson sequence "$sequence" --arg activation_sha "$activation_sha" \
+        --arg image "$CANDIDATE_IMAGE" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg txids_sha "$PRELAUNCH_TRANSACTION_SET_SHA" --argjson fee "$BASELINE_RECOVERY_FEE" \
+        --argjson wallet_generation "$wallet_generation" \
+        --arg wallet_sha "$(sha256sum "$wallet" | awk '{print $1}')" \
+        --arg staking_sha "$(sha256sum "$staking" | awk '{print $1}')" \
+        --arg pow_sha "$(sha256sum "$pow" | awk '{print $1}')" \
+        --arg recovery_sha "$(sha256sum "$recovery" | awk '{print $1}')" '
+        .schema == 1 and .sequence == $sequence and .safe_to_stop_or_rollback == true and
+        .candidate_image == $image and .candidate_image_id == $image_id and
+        .activation_marker_sha256 == $activation_sha and
+        .exact_transaction_set_sha256 == $txids_sha and
+        .confirmed_resolution_fees == $fee and .staking_disabled == true and
+        .pow_disabled == true and .wallet_locked == true and .claim_gate_q0 == true and
+        .wallet_generation == $wallet_generation and
+        .wallet_evidence_sha256 == $wallet_sha and
+        .staking_evidence_sha256 == $staking_sha and .pow_evidence_sha256 == $pow_sha and
+        .recovery_evidence_sha256 == $recovery_sha
+    ' "$marker" >/dev/null
+}
+
+quiesce_candidate_and_publish_safe()
+{
+    local sequence="$1" purpose="$2" marker activation_marker activation_sha
+    local wallet staking pow recovery txids wallet2 staking2 pow2 recovery2 txids2 temporary marker_sha
+    [[ "$sequence" == "$ACTIVATION_SEQUENCE" && "$SAFE_SEQUENCE" == $((sequence - 1)) ]] ||
+        return 1
+    [[ "$(container_runtime_kind)" == candidate ]] || return 1
+    [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == true ]] ||
+        return 1
+    rpc staking false >"${EVIDENCE}/candidate-safe-${sequence}-staking-stop.json" || return 1
+    rpc setpowmining false 1 1 false >"${EVIDENCE}/candidate-safe-${sequence}-pow-stop.json" ||
+        return 1
+    rpc walletlock >"${EVIDENCE}/candidate-safe-${sequence}-wallet-lock.json" || return 1
+    stop_and_drain_candidate_pow || return 1
+    require_claim_recovery_clean "candidate-safe-${sequence}" || return 1
+    wallet="${EVIDENCE}/candidate-safe-${sequence}-wallet-1.json"
+    staking="${EVIDENCE}/candidate-safe-${sequence}-staking-1.json"
+    pow="${EVIDENCE}/candidate-safe-${sequence}-pow-1.json"
+    recovery="${EVIDENCE}/candidate-safe-${sequence}-recovery-1.json"
+    txids="${EVIDENCE}/candidate-safe-${sequence}-transaction-txids-1.json"
+    wallet2="${EVIDENCE}/candidate-safe-${sequence}-wallet-2.json"
+    staking2="${EVIDENCE}/candidate-safe-${sequence}-staking-2.json"
+    pow2="${EVIDENCE}/candidate-safe-${sequence}-pow-2.json"
+    recovery2="${EVIDENCE}/candidate-safe-${sequence}-recovery-2.json"
+    txids2="${EVIDENCE}/candidate-safe-${sequence}-transaction-txids-2.json"
+    for attempt in 1 2; do
+        if [[ "$attempt" == 1 ]]; then
+            local w="$wallet" s="$staking" p="$pow" r="$recovery" t="$txids"
+        else
+            sleep 2
+            local w="$wallet2" s="$staking2" p="$pow2" r="$recovery2" t="$txids2"
+        fi
+        rpc getwalletinfo >"$w" || return 1
+        rpc getstakinginfo >"$s" || return 1
+        rpc getpowmininginfo >"$p" || return 1
+        rpc getpowclaimrecoveryinfo true >"$r" || return 1
+        rpc listtransactions '*' 1000000 0 true | jq -S '[.[].txid] | unique | sort' >"$t" ||
+            return 1
+        jq -e '.private_keys_enabled == true and .unlocked_until == 0' "$w" >/dev/null ||
+            return 1
+        candidate_staking_is_strictly_stopped "$s" || return 1
+        candidate_pow_is_strictly_stopped "$p" || return 1
+        locked_recovery_counter_is_safe "$w" "$r" "$s" "$p" || return 1
+        [[ "$(jq -er '.confirmed_resolution_fees' "$r")" == "$BASELINE_RECOVERY_FEE" ]] ||
+            return 1
+        transaction_sets_match_exactly "${EVIDENCE}/prelaunch-transaction-txids.json" "$t" ||
+            return 1
+        if [[ "$LEGACY_BASELINE_POW_MODE" == quarantined-disabled ]]; then
+            inherited_claim_inventory_is_resolved "$r" "$t" \
+                "${EVIDENCE}/candidate-inherited-claim-inventory.json" || return 1
+        fi
+    done
+    cmp -s "$txids" "$txids2" || return 1
+    [[ "$(jq -er '.confirmed_resolution_fees' "$recovery")" == \
+       "$(jq -er '.confirmed_resolution_fees' "$recovery2")" ]] || return 1
+    [[ "$(jq -er '.wallet_generation | select(type == "number" and floor == . and . >= 0)' \
+        "$recovery")" == "$(jq -er '.wallet_generation | select(type == "number" and floor == . and . >= 0)' \
+        "$recovery2")" ]] || return 1
+    marker=$(candidate_safe_marker_path "$sequence") || return 1
+    activation_marker=$(candidate_activation_marker_path "$sequence") || return 1
+    [[ ! -e "$marker" && ! -L "$marker" ]] || return 1
+    if [[ "$sequence" == 1 ]]; then
+        activation_sha=$CANDIDATE_ACTIVATION_MARKER_1_SHA
+    else
+        activation_sha=$CANDIDATE_ACTIVATION_MARKER_2_SHA
+    fi
+    [[ "$(sha256sum "$activation_marker" | awk '{print $1}')" == "$activation_sha" ]] || return 1
+    temporary=$(mktemp "${OPS}/.candidate-safe-${sequence}.XXXXXX") || return 1
+    jq -n --argjson sequence "$sequence" --arg purpose "$purpose" \
+        --arg image "$CANDIDATE_IMAGE" --arg image_id "$CANDIDATE_IMAGE_ID" \
+        --arg activation_sha "$activation_sha" --arg txids_sha "$PRELAUNCH_TRANSACTION_SET_SHA" \
+        --arg wallet_sha "$(sha256sum "$wallet2" | awk '{print $1}')" \
+        --arg staking_sha "$(sha256sum "$staking2" | awk '{print $1}')" \
+        --arg pow_sha "$(sha256sum "$pow2" | awk '{print $1}')" \
+        --arg recovery_sha "$(sha256sum "$recovery2" | awk '{print $1}')" \
+        --argjson wallet_generation "$(jq -er '.wallet_generation' "$recovery2")" \
+        --argjson fee "$BASELINE_RECOVERY_FEE" --arg timestamp "$(date -u +%FT%TZ)" '
+        {schema:1,sequence:$sequence,purpose:$purpose,safe_to_stop_or_rollback:true,
+         candidate_image:$image,candidate_image_id:$image_id,
+         activation_marker_sha256:$activation_sha,
+         exact_transaction_set_sha256:$txids_sha,
+         wallet_evidence_sha256:$wallet_sha,staking_evidence_sha256:$staking_sha,
+         pow_evidence_sha256:$pow_sha,recovery_evidence_sha256:$recovery_sha,
+         confirmed_resolution_fees:$fee,staking_disabled:true,pow_disabled:true,
+         wallet_locked:true,claim_gate_q0:true,wallet_generation:$wallet_generation,
+         timestamp:$timestamp}
+    ' >"$temporary" || return 1
+    chmod 600 "$temporary" && chown root:root "$temporary" && sync -f "$temporary" || return 1
+    mv -fT -- "$temporary" "$marker" || return 1
+    sync -f "$marker" && sync -f "$EVIDENCE" || return 1
+    marker_sha=$(sha256sum "$marker" | awk '{print $1}') || return 1
+    [[ "$marker_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    if [[ "$sequence" == 1 ]]; then
+        CANDIDATE_SAFE_MARKER_1_SHA=$marker_sha
+    else
+        CANDIDATE_SAFE_MARKER_2_SHA=$marker_sha
+    fi
+    SAFE_SEQUENCE=$sequence
+    validate_candidate_safe_marker "$sequence"
 }
 
 restored_runtime_is_ready()
@@ -1075,28 +1627,63 @@ release_snapshot_holds()
     snapshot_holds_released=true
 }
 
+verify_pre_upgrade_data_zero_diff()
+{
+    local snapshot guid createtxg hold extra dataset probe
+    verify_snapshot_inventory_identity || return 1
+    while IFS=$'\t' read -r snapshot guid createtxg hold extra; do
+        [[ -n "$snapshot" && -n "$guid" && -n "$createtxg" &&
+           "$hold" == "$ZFS_HOLD_TAG" && -z "$extra" ]] || return 1
+        dataset=${snapshot%@*}
+        probe=$(mktemp "${OPS}/.zfs-reentry-diff.XXXXXX") || return 1
+        zfs diff -FH "$snapshot" "$dataset" >"$probe" || return 1
+        [[ ! -s "$probe" ]] || return 1
+        rm -f -- "$probe"
+    done <"${EVIDENCE}/zfs-snapshot-identities.tsv"
+    snapshot_zero_diff_verified=true
+    pre_upgrade_data_restored=true
+}
+
 stop_candidate_for_restore()
 {
-    local attempt stop_mode='already-stopped' was_running=0
-    if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == true ]]; then
-        was_running=1
-        if rpc getblockchaininfo >/dev/null 2>&1; then
-            stop_and_drain_candidate_pow || return 1
-            stop_mode='rpc-stop'
-            rpc stop >/dev/null 2>&1 || true
-            for attempt in $(seq 1 180); do
-                [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != true ]] && break
-                sleep 1
-            done
-        fi
-        if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == true ]]; then
-            stop_mode='docker-stop'
-            timeout --kill-after=30 360 docker stop -t 300 "$CONTAINER" >/dev/null || return 1
-        fi
+    local attempt running stop_mode runtime_kind
+    runtime_kind=$(container_runtime_kind) || return 1
+    [[ "$runtime_kind" == candidate ]] || {
+        echo "refusing candidate stop for unauthenticated runtime kind: $runtime_kind" >&2
+        return 1
+    }
+    # Candidate startup is itself an untrusted boundary. Until an activation
+    # marker has been published, there is no durable proof that the released
+    # binary stayed locked/off. Contain any preactivation failure and never
+    # rewind data that might already reflect an unexpected signing action.
+    (( ACTIVATION_SEQUENCE > 0 )) || return 1
+    running=$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)
+    if [[ "$running" != true ]]; then
+        echo 'activated candidate is already stopped without a durable safe-boundary proof' >&2
+        return 1
     fi
-    [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != true ]] || return 1
-    (( was_running == 0 )) || assert_container_cleanly_stopped || return 1
-    printf '%s\n' "$stop_mode" > "${EVIDENCE}/candidate-restore-stop-mode.txt"
+    # After any durable activation-attempt marker, loss of RPC authority is
+    # ambiguous. Never infer safety from a stopped process or Docker state.
+    rpc getblockchaininfo >/dev/null 2>&1 || return 1
+    [[ "$SAFE_SEQUENCE" == "$ACTIVATION_SEQUENCE" ]] ||
+        quiesce_candidate_and_publish_safe "$ACTIVATION_SEQUENCE" emergency-rollback ||
+        return 1
+    validate_candidate_safe_marker "$ACTIVATION_SEQUENCE" || return 1
+    stop_mode='rpc-stop-after-durable-safe-boundary'
+    rpc stop >/dev/null 2>&1 || return 1
+    for attempt in $(seq 1 180); do
+        [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != true ]] &&
+            break
+        sleep 1
+    done
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == true ]]; then
+        return 1
+    fi
+    assert_container_cleanly_stopped || return 1
+    printf '%s\n' "$stop_mode" >"${EVIDENCE}/candidate-restore-stop-mode.txt" || return 1
+    chmod 600 "${EVIDENCE}/candidate-restore-stop-mode.txt" || return 1
+    chown root:root "${EVIDENCE}/candidate-restore-stop-mode.txt" || return 1
+    sync -f "${EVIDENCE}/candidate-restore-stop-mode.txt" || return 1
 }
 
 contain_node()
@@ -1120,7 +1707,7 @@ contain_node()
             fi
             sleep 1
         done
-    elif guard_starts_are_suspended; then
+    elif container_is_authoritatively_absent && guard_starts_are_suspended; then
         containment_verified=true
         running=absent
         restart=absent
@@ -1147,7 +1734,7 @@ contain_node()
 
 restore_original()
 {
-    local restore_rc=0
+    local restore_rc=0 runtime_kind
     if (( candidate_launch_attempted == 1 )) ||
        [[ -e "$CANDIDATE_LAUNCH_MARKER" || -L "$CANDIDATE_LAUNCH_MARKER" ]]; then
         validate_candidate_launch_marker || {
@@ -1156,23 +1743,52 @@ restore_original()
             return 1
         }
         candidate_launch_attempted=1
-        stop_candidate_for_restore || {
-            echo 'Candidate could not be stopped at a safe boundary.' >&2
-            contain_node
-            return 1
-        }
-        phase='candidate_stopped'
-        verify_rollback_image_ready || {
-            echo 'Pinned 30.1.3 rollback image or base Compose model is no longer ready.' >&2
-            contain_node
-            return 1
-        }
-        restore_pre_upgrade_data || {
-            echo 'Exact pre-upgrade ZFS restoration could not be proven.' >&2
-            contain_node
-            return 1
-        }
-        phase='data_restored'
+        runtime_kind=$(container_runtime_kind) || runtime_kind=unknown
+        case "$runtime_kind" in
+            original)
+                # A prior restoration attempt already recreated the exact old
+                # image and invocation. Never feed its legitimate q1 state to
+                # the candidate q0 drain. Prove the datasets are already exact.
+                verify_pre_upgrade_data_zero_diff || {
+                    echo 'Original runtime exists but exact restored data cannot be proven.' >&2
+                    contain_node
+                    return 1
+                }
+                [[ -f "${EVIDENCE}/zfs-restore-proof.tsv" ]] &&
+                    SNAPSHOT_RESTORE_PROOF_SHA=$(sha256sum \
+                        "${EVIDENCE}/zfs-restore-proof.tsv" | awk '{print $1}')
+                phase='data_restored'
+                ;;
+            candidate)
+                stop_candidate_for_restore || {
+                    echo 'Candidate could not be stopped at a safe boundary.' >&2
+                    contain_node
+                    return 1
+                }
+                phase='candidate_stopped'
+                verify_rollback_image_ready || {
+                    echo 'Pinned 30.1.3 rollback image or base Compose model is no longer ready.' >&2
+                    contain_node
+                    return 1
+                }
+                restore_pre_upgrade_data || {
+                    echo 'Exact pre-upgrade ZFS restoration could not be proven.' >&2
+                    contain_node
+                    return 1
+                }
+                phase='data_restored'
+                ;;
+            absent)
+                echo 'Candidate is absent after launch; runtime state is ambiguous and rollback is forbidden.' >&2
+                contain_node
+                return 1
+                ;;
+            *)
+                echo 'Container image or invocation is not an authenticated candidate or original runtime.' >&2
+                contain_node
+                return 1
+                ;;
+        esac
     fi
     verify_rollback_image_ready || {
         echo 'Pinned 30.1.3 rollback image or base Compose model changed before restoration.' >&2
@@ -1186,6 +1802,22 @@ restore_original()
     }
     if (( restore_rc == 0 )); then
         wait_rpc || restore_rc=1
+    fi
+    if (( restore_rc == 0 )); then
+        [[ "$(container_runtime_kind)" == original ]] || restore_rc=1
+        rpc staking false >"${EVIDENCE}/restored-cold-staking-stop.json" || restore_rc=1
+        rpc setpowmining false 1 1 false >"${EVIDENCE}/restored-cold-pow-stop.json" || restore_rc=1
+        rpc walletlock >"${EVIDENCE}/restored-cold-wallet-lock.json" || restore_rc=1
+        rpc getwalletinfo >"${EVIDENCE}/restored-cold-wallet.json" || restore_rc=1
+        rpc getpowmininginfo >"${EVIDENCE}/restored-cold-pow.json" || restore_rc=1
+        rpc listtransactions '*' 1000000 0 true | jq -S '[.[].txid] | unique | sort' \
+            >"${EVIDENCE}/restored-cold-transaction-txids.json" || restore_rc=1
+        jq -e '.private_keys_enabled == true and .unlocked_until == 0' \
+            "${EVIDENCE}/restored-cold-wallet.json" >/dev/null || restore_rc=1
+        legacy_cold_pow_is_exact "${EVIDENCE}/restored-cold-pow.json" \
+            "$LEGACY_BASELINE_QUARANTINED_CLAIMS" || restore_rc=1
+        transaction_sets_match_exactly "${EVIDENCE}/prelaunch-transaction-txids.json" \
+            "${EVIDENCE}/restored-cold-transaction-txids.json" || restore_rc=1
     fi
     if (( restore_rc == 0 )); then
         run_helper "$NORMAL_UNLOCK_HELPER" "$NORMAL_UNLOCK_HELPER_SHA" || restore_rc=1
@@ -1261,7 +1893,7 @@ failed_maintenance_is_fail_closed()
         validate_canary_maintenance_marker
         return
     fi
-    (( maintenance_marker_activated == 0 )) || [[ "$maintenance_marker_released" == true ]]
+    (( maintenance_marker_activated == 0 ))
 }
 
 on_exit()
@@ -1276,6 +1908,7 @@ on_exit()
         restore_guard_starts || rc=1
     fi
     if [[ "$result" != passed ]]; then
+        rc=1
         if [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
             if failed_maintenance_is_fail_closed; then
                 echo "Crash-safe maintenance remains active for recovery: $ROLLOUT_MAINTENANCE_MARKER" >&2
@@ -1360,8 +1993,21 @@ verify_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA" ||
         "$(stat -Lc '%u:%g:%a' -- "$POW_START_HELPER")"
 } > "${EVIDENCE}/runtime-helper-identities.tsv"
 
-exec 5>/run/blackcoin-endpoint-guard.lock
-flock -w 1800 5 || fail 'endpoint guard did not drain within 30 minutes; no state was changed'
+if [[ "${INHERITED_ENDPOINT_LOCK_FD+x}" == x ]]; then
+    [[ "$INHERITED_ENDPOINT_LOCK_FD" == 20 ]] ||
+        fail 'INHERITED_ENDPOINT_LOCK_FD must be unset or the literal descriptor 20'
+    [[ "$(realpath -e -- "/proc/$$/fd/20" 2>/dev/null || true)" == \
+       /run/blackcoin-endpoint-guard.lock ]] ||
+        fail 'inherited descriptor 20 is not the exact endpoint-guard lock file'
+    exec 5>&20
+    [[ "$(realpath -e -- "/proc/$$/fd/5" 2>/dev/null || true)" == \
+       /run/blackcoin-endpoint-guard.lock ]] ||
+        fail 'could not retain inherited endpoint-guard lock on descriptor 5'
+    flock -n 5 || fail 'inherited endpoint-guard descriptor is not lockable by this transaction'
+else
+    exec 5>/run/blackcoin-endpoint-guard.lock
+    flock -w 1800 5 || fail 'endpoint guard did not drain within 30 minutes; no state was changed'
+fi
 exec 9>/var/run/blackcoin-node-cutover.lock
 flock -w 1800 9 || fail 'fleet cutover lock did not drain within 30 minutes; no state was changed'
 exec 8>/run/blackcoin-pow-quarantine-cycle.lock
@@ -1442,16 +2088,25 @@ for sample in $(seq 1 12); do
 done
 (( baseline_staking_ok == 1 )) || fail 'baseline staking is not active'
 jq -e '.unlocked_until > now' "${EVIDENCE}/baseline-wallet.json" >/dev/null || fail 'baseline wallet is not normally unlocked'
-LEGACY_BASELINE_POW_MODE=$(legacy_pow_snapshot_mode "${EVIDENCE}/baseline-pow.json") ||
-    fail 'baseline PoW is neither clean one-thread hashing nor the expected single disabled legacy quarantine'
+LEGACY_OBSERVED_POW_MODE=$(legacy_pow_observed_mode "${EVIDENCE}/baseline-pow.json") ||
+    fail 'observed PoW is not exact clean hashing, disabled q1, or stalled enabled/hash0 q1'
+case "$LEGACY_OBSERVED_POW_MODE" in
+    clean-hashing) LEGACY_BASELINE_POW_MODE='clean-hashing' ;;
+    quarantined-disabled|quarantined-stalled)
+        LEGACY_BASELINE_POW_MODE='quarantined-disabled'
+        ;;
+    *) fail 'unsupported observed legacy PoW mode' ;;
+esac
 LEGACY_BASELINE_LIVE_CLAIMS=$(jq -er \
     '.live_claims | select(type == "number" and floor == . and . == 0)' \
     "${EVIDENCE}/baseline-pow.json") || fail 'baseline live-claim count is invalid'
 LEGACY_BASELINE_QUARANTINED_CLAIMS=$(jq -er \
     '.quarantined_claims | select(type == "number" and floor == . and . >= 0)' \
     "${EVIDENCE}/baseline-pow.json") || fail 'baseline quarantined-claim count is invalid'
-legacy_pow_state_matches_baseline "${EVIDENCE}/baseline-pow.json" ||
-    fail 'baseline PoW mode and claim counters are inconsistent'
+if [[ "$LEGACY_OBSERVED_POW_MODE" != quarantined-stalled ]]; then
+    legacy_pow_state_matches_baseline "${EVIDENCE}/baseline-pow.json" ||
+        fail 'observed PoW mode and claim counters are inconsistent'
+fi
 
 # Validate that the exact published binaries can execute without network or
 # wallet/data access before touching the live container.
@@ -1487,10 +2142,34 @@ if [[ "$LEGACY_BASELINE_POW_MODE" == clean-hashing ]]; then
         fail 'original node could not reach a no-spend claim-clean stop boundary'
     fi
 else
-    rpc getpowmininginfo >"${EVIDENCE}/legacy-prelaunch-pow.json"
-    legacy_pow_state_matches_baseline "${EVIDENCE}/legacy-prelaunch-pow.json" ||
-        fail 'disabled legacy quarantine changed before candidate launch'
+    rpc setpowmining false 1 1 false >"${EVIDENCE}/legacy-prelaunch-pow-stop.json" ||
+        fail 'could not explicitly stop the inherited legacy q1 miner'
 fi
+rpc staking false >"${EVIDENCE}/legacy-prelaunch-staking-stop.json" ||
+    fail 'could not disable legacy staking before the cold boundary'
+rpc walletlock >"${EVIDENCE}/legacy-prelaunch-wallet-lock.json" ||
+    fail 'could not lock the legacy wallet before the cold boundary'
+legacy_cold_ready=false
+for attempt in $(seq 1 120); do
+    rpc getwalletinfo >"${EVIDENCE}/legacy-prelaunch-wallet-${attempt}.json" ||
+        fail 'legacy wallet status failed during cold normalization'
+    rpc getpowmininginfo >"${EVIDENCE}/legacy-prelaunch-pow-${attempt}.json" ||
+        fail 'legacy PoW status failed during cold normalization'
+    if jq -e '.private_keys_enabled == true and .unlocked_until == 0' \
+        "${EVIDENCE}/legacy-prelaunch-wallet-${attempt}.json" >/dev/null &&
+       legacy_cold_pow_is_exact "${EVIDENCE}/legacy-prelaunch-pow-${attempt}.json" \
+           "$LEGACY_BASELINE_QUARANTINED_CLAIMS"; then
+        install -m 600 -o root -g root "${EVIDENCE}/legacy-prelaunch-wallet-${attempt}.json" \
+            "${EVIDENCE}/legacy-prelaunch-wallet.json"
+        install -m 600 -o root -g root "${EVIDENCE}/legacy-prelaunch-pow-${attempt}.json" \
+            "${EVIDENCE}/legacy-prelaunch-pow.json"
+        legacy_cold_ready=true
+        break
+    fi
+    sleep 2
+done
+[[ "$legacy_cold_ready" == true ]] ||
+    fail 'legacy node did not reach the exact locked disabled/hash0/live0 cold baseline'
 rpc listtransactions '*' 1000000 0 true | jq -S '[.[].txid] | unique | sort' \
     >"${EVIDENCE}/prelaunch-transaction-txids.json"
 transaction_sets_match_exactly "${EVIDENCE}/prelaunch-transaction-txids.json" \
@@ -1554,11 +2233,10 @@ docker inspect "$CONTAINER" | jq -S '.[0] | {path:.Path,args:.Args,
 cmp -s "${EVIDENCE}/baseline-invocation.json" "${EVIDENCE}/candidate-invocation.json" ||
     fail 'candidate effective entrypoint or command differs from the fleet invocation'
 
-# Establish the immutable no-spend counter before granting the candidate any
-# wallet signing authority.  The fresh process must still be locked, PoW is
-# explicitly drained, every automatic wallet feature is default-off, and both
-# manual and automatic managed-resolution queues are empty.  This prevents a
-# startup-created fee from being absorbed into the canary's baseline.
+# Establish the immutable no-spend counter and, for the exact inherited q1
+# exception, verify Core's full historical inventory is authoritatively
+# reclassified to q0 without a payment. The wallet
+# remains locked and staking/PoW remain disabled throughout this transition.
 rpc getwalletinfo >"${EVIDENCE}/candidate-preactivation-wallet-initial.json"
 rpc getstakinginfo >"${EVIDENCE}/candidate-preactivation-staking-initial.json"
 rpc getpowmininginfo >"${EVIDENCE}/candidate-preactivation-pow-initial.json"
@@ -1579,50 +2257,33 @@ automatic_wallet_features_are_off \
     "${EVIDENCE}/candidate-preactivation-staking-initial.json" \
     "${EVIDENCE}/candidate-preactivation-pow-initial.json" ||
     fail 'candidate automatic wallet features were enabled before activation'
-stop_and_drain_candidate_pow ||
-    fail 'candidate could not reach a locked, claim-clean pre-activation boundary'
-
-BASELINE_RECOVERY_FEE=''
-for attempt in $(seq 1 240); do
-    candidate_recovery_file="${EVIDENCE}/candidate-preactivation-recovery-${attempt}.json"
-    candidate_wallet_file="${EVIDENCE}/candidate-preactivation-wallet-${attempt}.json"
-    candidate_staking_file="${EVIDENCE}/candidate-preactivation-staking-${attempt}.json"
-    candidate_pow_file="${EVIDENCE}/candidate-preactivation-pow-${attempt}.json"
-    if ! rpc getpowclaimrecoveryinfo true >"$candidate_recovery_file" 2>/dev/null ||
-       ! rpc getwalletinfo >"$candidate_wallet_file" 2>/dev/null; then
-        sleep 5
-        continue
-    fi
-    jq -e '.private_keys_enabled == true and
-        (.unlocked_until | type == "number" and . == 0)' \
-        "$candidate_wallet_file" >/dev/null ||
-        fail 'candidate wallet gained signing authority before the no-spend baseline'
-    jq -e '.policy_authoritative == true and .policy.automatic_authorized == false and
-        .database_outcome_ambiguous == false' "$candidate_recovery_file" >/dev/null ||
-        fail 'candidate recovery policy is ambiguous or authorizes automatic fee payments'
-    if jq -e '.chain_ready == true and .wallet_tip_matches == true' \
-        "$candidate_recovery_file" >/dev/null; then
-        rpc getstakinginfo >"$candidate_staking_file"
-        rpc getpowmininginfo >"$candidate_pow_file"
-        locked_recovery_counter_is_safe "$candidate_wallet_file" \
-            "$candidate_recovery_file" "$candidate_staking_file" "$candidate_pow_file" ||
-            fail 'candidate locked no-spend counter baseline is not clean and default-off'
-        BASELINE_RECOVERY_FEE=$(jq -er '.confirmed_resolution_fees' "$candidate_recovery_file")
-        install -m 600 -o root -g root "$candidate_wallet_file" \
-            "${EVIDENCE}/candidate-recovery-baseline-wallet-locked.json"
-        install -m 600 -o root -g root "$candidate_recovery_file" \
-            "${EVIDENCE}/candidate-recovery-fee-baseline.json"
-        install -m 600 -o root -g root "$candidate_staking_file" \
-            "${EVIDENCE}/candidate-recovery-baseline-staking-defaults.json"
-        install -m 600 -o root -g root "$candidate_pow_file" \
-            "${EVIDENCE}/candidate-recovery-baseline-pow-defaults.json"
-        break
-    fi
-    sleep 5
-done
-[[ -n "$BASELINE_RECOVERY_FEE" ]] ||
-    fail 'locked candidate recovery baseline did not become ready within 20 minutes'
-
+candidate_staking_is_strictly_stopped \
+    "${EVIDENCE}/candidate-preactivation-staking-initial.json" ||
+    fail 'candidate staking was not disabled before inherited-claim normalization'
+normalize_inherited_candidate_claim ||
+    fail 'candidate did not reclassify the inherited legacy q1 state to exact q0 without payment'
+rpc getwalletinfo >"${EVIDENCE}/candidate-recovery-baseline-wallet-locked.json"
+rpc getstakinginfo >"${EVIDENCE}/candidate-recovery-baseline-staking-defaults.json"
+rpc getpowmininginfo >"${EVIDENCE}/candidate-recovery-baseline-pow-defaults.json"
+rpc getpowclaimrecoveryinfo true >"${EVIDENCE}/candidate-recovery-fee-baseline.json"
+locked_recovery_counter_is_safe \
+    "${EVIDENCE}/candidate-recovery-baseline-wallet-locked.json" \
+    "${EVIDENCE}/candidate-recovery-fee-baseline.json" \
+    "${EVIDENCE}/candidate-recovery-baseline-staking-defaults.json" \
+    "${EVIDENCE}/candidate-recovery-baseline-pow-defaults.json" ||
+    fail 'normalized candidate baseline is not locked, default-off, and q0'
+candidate_staking_is_strictly_stopped \
+    "${EVIDENCE}/candidate-recovery-baseline-staking-defaults.json" ||
+    fail 'normalized candidate staking baseline is not disabled'
+candidate_pow_is_strictly_stopped \
+    "${EVIDENCE}/candidate-recovery-baseline-pow-defaults.json" ||
+    fail 'normalized candidate PoW baseline is not strict disabled/hash0/q0'
+[[ "$(jq -er '.confirmed_resolution_fees' \
+    "${EVIDENCE}/candidate-recovery-fee-baseline.json")" == "$BASELINE_RECOVERY_FEE" ]] ||
+    fail 'normalized candidate fee counter differs from the first locked authoritative sample'
+publish_candidate_activation_marker 1 first-unlock ||
+    fail 'could not durably mark first candidate signing activation before unlock'
+phase='candidate_activation_1_attempted'
 run_helper "$NORMAL_UNLOCK_HELPER" "$NORMAL_UNLOCK_HELPER_SHA" || fail 'candidate wallet unlock/staking activation failed'
 require_claim_recovery_clean candidate-first || fail 'candidate recovery state is not clean without payment'
 run_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA" || fail 'candidate PoW activation failed'
@@ -1648,6 +2309,11 @@ rpc listtransactions '*' 100000 0 true | jq -S '[.[].txid] | unique | sort' \
 jq -S '[.wallet_scripts[].address] | unique | sort' \
     "${EVIDENCE}/candidate-goldrush-1.json" >"${EVIDENCE}/candidate-legacy-addresses.json"
 docker logs --since "$CANARY_STARTED" "$CONTAINER" >"${EVIDENCE}/candidate-startup-1.log" 2>&1
+
+jq -e '.private_keys_enabled == true and .unlocked_staking_only == false and
+    (.unlocked_until | type == "number" and . > now)' \
+    "${EVIDENCE}/candidate-wallet-1.json" >/dev/null ||
+    fail 'candidate wallet is not normally unlocked for active PoS/PoW validation'
 
 candidate_network_is_ready "${EVIDENCE}/candidate-network-1.json" ||
     fail 'candidate network is not active with at least three outbound peers'
@@ -1711,10 +2377,12 @@ done
 pow_ok=0
 for sample in $(seq 1 20); do
     rpc getpowmininginfo >"${EVIDENCE}/candidate-pow-sample-${sample}.json"
-    if jq -e '.enabled == true and
+    if jq -e '.enabled == true and .autostart == false and
+        (.state == "ready" or .state == "hashing") and
         (.threads | type == "number" and floor == . and . == 1) and
         (.cpu_percent | type == "number" and . == 1) and
         (.hashrate | type == "number" and . > 0) and
+        (.unresolved_claims | type == "number" and floor == . and . == 0) and
         (.live_claims | type == "number" and floor == . and . == 0) and
         (.quarantined_claims | type == "number" and floor == . and . == 0) and
         (.blocking_quarantined_claims | type == "number" and floor == . and . == 0) and
@@ -1732,11 +2400,14 @@ for sample in $(seq 1 20); do
 done
 (( pow_ok == 1 )) || fail 'candidate PoW did not reach a clean hashing state'
 
-# Stop the canary miner and drain any proof it found before restart so a
-# legitimate live single-flight claim cannot be mistaken for a startup fault.
-stop_and_drain_candidate_pow || fail 'candidate PoW did not reach a clean restart boundary'
-require_claim_recovery_clean candidate-pre-restart ||
-    fail 'candidate recovery fees or claim state changed before restart'
+# Revoke both signing paths, lock the wallet, and seal two fresh exact q0
+# samples before restart. The next activation marker is written before the
+# restart itself because startup is part of the second activation epoch.
+quiesce_candidate_and_publish_safe 1 pre_restart ||
+    fail 'candidate did not reach a durable locked safe boundary before restart'
+publish_candidate_activation_marker 2 second-start-and-unlock ||
+    fail 'could not durably mark second candidate activation before restart'
+phase='candidate_activation_2_attempted'
 
 # A second start proves an already-upgraded 30.x datadir is not repeatedly
 # rewound or reindexed. This remains the same exact candidate and data.
@@ -1750,6 +2421,7 @@ require_claim_recovery_clean candidate-second ||
 run_helper "$POW_START_HELPER" "$POW_START_HELPER_SHA" || fail 'second-start PoW activation failed'
 rpc getblockchaininfo >"${EVIDENCE}/candidate-blockchain-2.json"
 rpc getnetworkinfo >"${EVIDENCE}/candidate-network-2.json"
+rpc getwalletinfo >"${EVIDENCE}/candidate-wallet-2.json"
 rpc getstakinginfo >"${EVIDENCE}/candidate-staking-2.json"
 rpc getpowmininginfo >"${EVIDENCE}/candidate-pow-2.json"
 rpc getgoldrushinfo >"${EVIDENCE}/candidate-goldrush-2.json"
@@ -1767,6 +2439,10 @@ jq -e '.chain == "main" and .initialblockdownload == false and .headers >= .bloc
     "${EVIDENCE}/candidate-blockchain-2.json" >/dev/null || fail 'second-start chain is not synced'
 candidate_network_is_ready "${EVIDENCE}/candidate-network-2.json" ||
     fail 'second-start network is not active with at least three outbound peers'
+jq -e '.private_keys_enabled == true and .unlocked_staking_only == false and
+    (.unlocked_until | type == "number" and . > now)' \
+    "${EVIDENCE}/candidate-wallet-2.json" >/dev/null ||
+    fail 'second-start candidate wallet is not normally unlocked'
 replay_state_matches_chain "${EVIDENCE}/candidate-blockchain-2.json" \
     "${EVIDENCE}/candidate-goldrush-state-2.json" ||
     fail 'second-start schema-12 replay marker is absent, invalid, or not exact for the active tip'
@@ -1798,10 +2474,12 @@ done
 second_pow_ok=0
 for sample in $(seq 1 20); do
     rpc getpowmininginfo >"${EVIDENCE}/candidate-pow-2-sample-${sample}.json"
-    if jq -e '.enabled == true and
+    if jq -e '.enabled == true and .autostart == false and
+        (.state == "ready" or .state == "hashing") and
         (.threads | type == "number" and floor == . and . == 1) and
         (.cpu_percent | type == "number" and . == 1) and
         (.hashrate | type == "number" and . > 0) and
+        (.unresolved_claims | type == "number" and floor == . and . == 0) and
         (.live_claims | type == "number" and floor == . and . == 0) and
         (.quarantined_claims | type == "number" and floor == . and . == 0) and
         (.blocking_quarantined_claims | type == "number" and floor == . and . == 0) and
@@ -1819,11 +2497,10 @@ for sample in $(seq 1 20); do
 done
 (( second_pow_ok == 1 )) || fail 'second start PoW did not reach a clean hashing state'
 
-# Prove a claim-clean boundary before crossing back to v30.1.3.  The rollback
-# helper repeats this check defensively if a later step fails.
-stop_and_drain_candidate_pow || fail 'second-start PoW did not drain before rollback'
-require_claim_recovery_clean candidate-pre-rollback ||
-    fail 'candidate recovery fees or claim state changed before rollback'
+# Revoke staking and PoW, lock the wallet, and seal the exact q0/transaction/
+# fee boundary before any candidate stop or ZFS rollback is permitted.
+quiesce_candidate_and_publish_safe 2 pre_rollback ||
+    fail 'second-start candidate did not reach a durable safe rollback boundary'
 
 restore_original || fail 'candidate passed but rollback to the original node failed'
 phase='restored'
@@ -1838,12 +2515,12 @@ release_snapshot_holds || fail 'could not release all transaction-specific ZFS h
 restore_guard_starts || fail 'could not restore automatic-start authority after verified rollback'
 [[ "$candidate_launch_attempted" == 1 && "$snapshot_holds_released" == true &&
    "$start_authority_suspended" == 0 ]] || fail 'canary completion state is incomplete'
-release_canary_maintenance_marker ||
-    fail 'could not durably release canary maintenance after verified restoration'
-[[ "$maintenance_marker_released" == true &&
-   ! -e "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" &&
-   "$(cat "$CANARY_STATE")" == complete ]] ||
-    fail 'canary maintenance release proof is incomplete'
+publish_maintenance_handoff_ready ||
+    fail 'could not seal active canary maintenance for authenticated fleet handoff'
+[[ "$maintenance_handoff_ready" == true &&
+   -f "$ROLLOUT_MAINTENANCE_MARKER" && ! -L "$ROLLOUT_MAINTENANCE_MARKER" &&
+   "$(cat "$CANARY_STATE")" == active ]] ||
+    fail 'active canary maintenance handoff proof is incomplete'
 [[ "$RESTORED_LEGACY_LIVE_CLAIMS" == "$LEGACY_BASELINE_LIVE_CLAIMS" &&
    "$RESTORED_LEGACY_QUARANTINED_CLAIMS" == "$LEGACY_BASELINE_QUARANTINED_CLAIMS" ]] ||
     fail 'restored legacy PoW claim counts differ from the pre-upgrade baseline'
@@ -1867,16 +2544,22 @@ jq -n \
     --arg launch_marker_sha "$CANDIDATE_LAUNCH_MARKER_SHA" \
     --arg prelaunch_transaction_set_sha "$PRELAUNCH_TRANSACTION_SET_SHA" \
     --arg locked_candidate_transaction_set_sha "$LOCKED_CANDIDATE_TRANSACTION_SET_SHA" \
+    --arg legacy_observed_pow_mode "$LEGACY_OBSERVED_POW_MODE" \
     --arg legacy_baseline_pow_mode "$LEGACY_BASELINE_POW_MODE" \
+    --arg inherited_claim_inventory_sha "$INHERITED_CLAIM_INVENTORY_SHA" \
+    --arg inherited_claim_transition_sha "$INHERITED_CLAIM_TRANSITION_SHA" \
     --arg maintenance_marker "$ROLLOUT_MAINTENANCE_MARKER" \
     --arg maintenance_run_dir "$OPS" \
     --arg maintenance_nonce_sha "$MAINTENANCE_NONCE_SHA" \
     --arg maintenance_activation_sha "$MAINTENANCE_MARKER_ACTIVATION_SHA" \
-    --arg maintenance_release_sha "$MAINTENANCE_MARKER_RELEASE_SHA" \
     --arg recovery_procedure_sha "$RECOVERY_PROCEDURE_SHA" \
     --arg maintenance_active_state_sha "$MAINTENANCE_ACTIVE_STATE_SHA" \
-    --arg maintenance_complete_state_sha "$MAINTENANCE_COMPLETE_STATE_SHA" \
     --arg guard_identities_sha "$GUARD_IDENTITIES_SHA" \
+    --arg candidate_activation_1_sha "$CANDIDATE_ACTIVATION_MARKER_1_SHA" \
+    --arg candidate_activation_2_sha "$CANDIDATE_ACTIVATION_MARKER_2_SHA" \
+    --arg candidate_safe_1_sha "$CANDIDATE_SAFE_MARKER_1_SHA" \
+    --arg candidate_safe_2_sha "$CANDIDATE_SAFE_MARKER_2_SHA" \
+    --arg maintenance_handoff_ready_sha "$MAINTENANCE_HANDOFF_READY_SHA" \
     --arg wallet_runtime_guard_sha "$WALLET_RUNTIME_GUARD_SHA" \
     --arg endpoint_guard_sha "$ENDPOINT_GUARD_SHA" \
     --arg hold_tag "$ZFS_HOLD_TAG" \
@@ -1909,6 +2592,7 @@ jq -n \
       fee_payments_authorized:false,claim_recovery_fee_unchanged:true,
       claim_recovery_fee_baseline:$claim_recovery_fee_baseline,
       claim_recovery_fee_final:$claim_recovery_fee_final,
+      legacy_observed_pow_mode:$legacy_observed_pow_mode,
       legacy_baseline_pow_mode:$legacy_baseline_pow_mode,
       legacy_baseline_live_claims:$legacy_baseline_live_claims,
       legacy_baseline_quarantined_claims:$legacy_baseline_quarantined_claims,
@@ -1917,32 +2601,42 @@ jq -n \
       legacy_quarantined_claim_count_preserved:true,
       legacy_quarantined_claim_resolution_attempted:false,
       legacy_quarantined_claim_fee_paid:false,
+      inherited_claim_inventory_evidence:"candidate-inherited-claim-inventory.json",
+      inherited_claim_inventory_sha256:$inherited_claim_inventory_sha,
+      inherited_claim_transition_evidence:"candidate-inherited-claim-transition.json",
+      inherited_claim_transition_sha256:$inherited_claim_transition_sha,
+      legacy_q1_candidate_q0_no_payment_reclassification_verified:true,
       candidate_pow_clean_hashing_verified:true,
       recovery_fee_baseline_established_while_wallet_locked:true,
       locked_candidate_transaction_set_unchanged:true,
       prelaunch_transaction_set_sha256:$prelaunch_transaction_set_sha,
       locked_candidate_transaction_set_sha256:$locked_candidate_transaction_set_sha,
       maintenance:{schema:1,transaction:"v30.1.4-node27-canary",
-        marker:$maintenance_marker,run_dir:$maintenance_run_dir,state:"complete",
+        marker:$maintenance_marker,run_dir:$maintenance_run_dir,state:"active",
         run_nonce_sha256:$maintenance_nonce_sha,
         marker_activation_evidence:"maintenance-marker-activated.json",
         marker_activation_sha256:$maintenance_activation_sha,
         active_state_evidence:"maintenance-state-active.txt",
         active_state_evidence_sha256:$maintenance_active_state_sha,
-        marker_release_evidence:"maintenance-marker-released.json",
-        marker_release_sha256:$maintenance_release_sha,
-        complete_state_evidence:"maintenance-state-complete.txt",
-        complete_state_evidence_sha256:$maintenance_complete_state_sha,
         crash_recovery_procedure:"crash-recovery-procedure.json",
         crash_recovery_procedure_sha256:$recovery_procedure_sha,
         guard_identity_evidence:"maintenance-compatible-guard-identities.tsv",
         guard_identity_evidence_sha256:$guard_identities_sha,
+        candidate_activation_markers:[
+          {sequence:1,file:"candidate-activation-attempted-01.json",sha256:$candidate_activation_1_sha},
+          {sequence:2,file:"candidate-activation-attempted-02.json",sha256:$candidate_activation_2_sha}],
+        candidate_safe_markers:[
+          {sequence:1,purpose:"pre_restart",file:"candidate-safe-boundary-01.json",sha256:$candidate_safe_1_sha},
+          {sequence:2,purpose:"pre_rollback",file:"candidate-safe-boundary-02.json",sha256:$candidate_safe_2_sha}],
+        handoff_ready_evidence:"maintenance-handoff-ready.json",
+        handoff_ready_sha256:$maintenance_handoff_ready_sha,
         executable_recovery:false,recovery_mode:"manual-audited-only",
         wallet_runtime_guard_sha256:$wallet_runtime_guard_sha,
         endpoint_guard_sha256:$endpoint_guard_sha,
         activated_before_node_mutation:true,retained_on_failure:true,
-        released_after_old_runtime_and_start_authority:true,
-        live_marker_absent:true},
+        marker_released:false,live_marker_active:true,
+        automatic_start_authority_restored:true,
+        maintenance_handoff_ready:true},
       automatic_wallet_features_default_off_verified:true,
       candidate_network_ready_verified:true,replay_marker_exact_tip_verified:true,
       wallet_identity_unchanged:true,configuration_identity_unchanged:true,
@@ -1951,11 +2645,16 @@ jq -n \
       snapshot_identity_verified:true,snapshot_zero_diff_verified:true,
       candidate_launch_attempted:true,zfs_snapshot_holds_released:true,
       automatic_start_authority_restored:true,
-      maintenance_marker_activated:true,maintenance_marker_released:true,
+      maintenance_marker_activated:true,maintenance_marker_released:false,
+      live_marker_active:true,maintenance_handoff_ready:true,
       crash_safe_supervisor_inhibition_verified:true,
       rollback_verified:true}' \
     >"${EVIDENCE}/RESULT.json"
 
+validate_canary_maintenance_marker ||
+    fail 'active maintenance marker changed before final evidence sealing'
+[[ "$(cat "$CANARY_STATE")" == active ]] ||
+    fail 'canary STATE changed before final evidence sealing'
 chmod 600 "${EVIDENCE}"/*
 chown root:root "${EVIDENCE}"/*
 manifest_tmp=$(mktemp "${OPS}/.canary-evidence-sha256.XXXXXX")
@@ -1970,6 +2669,10 @@ mv -fT -- "$manifest_tmp" "${EVIDENCE}/SHA256SUMS"
     fail 'canary evidence checksum verification failed'
 sync -f "${EVIDENCE}/SHA256SUMS"
 sync -f "$EVIDENCE"
+validate_canary_maintenance_marker ||
+    fail 'active maintenance marker changed during final evidence sealing'
+[[ "$(cat "$CANARY_STATE")" == active && "$maintenance_handoff_ready" == true ]] ||
+    fail 'active handoff state changed during final evidence sealing'
 
 result='passed'
-echo "CANARY_PASS source=${SOURCE_SHA} evidence=${EVIDENCE}"
+echo "CANARY_PASS_HANDOFF_READY source=${SOURCE_SHA} evidence=${EVIDENCE} marker=${ROLLOUT_MAINTENANCE_MARKER}"

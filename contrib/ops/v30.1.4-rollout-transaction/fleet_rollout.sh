@@ -726,11 +726,23 @@ activate_maintenance_marker()
        "$reactivation_mode" == post-handoff-reactivation ]] ||
         die 'invalid maintenance-marker activation mode'
     if [[ -e "$ROLLOUT_MAINTENANCE_MARKER" || -L "$ROLLOUT_MAINTENANCE_MARKER" ]]; then
-        if [[ -f "$(canary_predecessor_path)" && ! -L "$(canary_predecessor_path)" ]]; then
+        if verify_maintenance_marker; then
+            if [[ -e "$RUN_DIR/CANARY-FLEET-HANDOFF.json" ||
+                  -L "$RUN_DIR/CANARY-FLEET-HANDOFF.json" ]]; then
+                verify_canary_fleet_handoff 0 ||
+                    die 'active fleet maintenance marker has changed handoff evidence'
+            elif [[ -f "$(canary_predecessor_path)" &&
+                    ! -L "$(canary_predecessor_path)" ]]; then
+                [[ "$WAVE_LOCKS_HELD" -eq 1 && "$FREE_CLAIM_LOCK_HELD" -eq 1 ]] ||
+                    die 'unsealed fleet maintenance handoff requires wave and Free Claim locks'
+                publish_canary_fleet_handoff ||
+                    die 'active fleet maintenance marker handoff could not be sealed'
+            fi
+        elif [[ -f "$(canary_predecessor_path)" && ! -L "$(canary_predecessor_path)" ]]; then
             adopt_canary_maintenance_marker ||
                 die 'active canary marker could not be atomically adopted by the fleet transaction'
         else
-            verify_maintenance_marker || die 'foreign or malformed rollout maintenance marker exists'
+            die 'foreign or malformed rollout maintenance marker exists'
         fi
         return 0
     fi
@@ -6995,6 +7007,18 @@ rollback_run()
        "$rollback_state" == rolled-back ]] || die 'run state is not rollback-eligible'
     exec 19>/var/run/blackcoin-v30.1.4-fleet-rollout.lock
     flock -n 19 || die 'another rollout transaction is active'
+    if [[ "$rollback_state" == complete ]] &&
+       [[ -e "$(terminal_receipt_dir)" || -L "$(terminal_receipt_dir)" ]]; then
+        verify_terminal_receipt complete 0 ||
+            die 'completed terminal receipt is present but changed; rollback is prohibited'
+        die 'terminal-finalized rollout cannot reuse destroyed snapshot authority for rollback'
+    fi
+    if [[ "$rollback_state" == complete ]] &&
+       [[ -e "$RUN_DIR/snapshot-cleanup" || -L "$RUN_DIR/snapshot-cleanup" ]]; then
+        verify_snapshot_cleanup_resume_prefix ||
+            die 'completed rollout snapshot-cleanup prefix is present but changed; rollback is prohibited'
+        die 'snapshot cleanup has begun; resume finalization instead of rollback'
+    fi
     trap on_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -7030,8 +7054,15 @@ rollback_run()
        'state=installed-and-paused cycle=v30.1.4-no-spend free_claim=paused' ]] ||
         die 'exact transaction inhibitor state did not verify before rollback'
     verify_free_claim_pause || die 'Free Claim pause did not verify before rollback'
+    # A prepared-run crash can still have the live canary marker. Hold the same
+    # locks as fresh apply while either adopting that marker or recognizing the
+    # already-sealed fleet marker; a rollback must support both prefixes.
+    CURRENT_WAVE_NODES=(30)
+    acquire_wave_locks
     activate_maintenance_marker post-handoff-reactivation
     verify_maintenance_marker || die 'rollback maintenance marker did not verify'
+    release_wave_locks
+    CURRENT_WAVE_NODES=()
 
     while IFS= read -r wave; do
         wave_name=${wave##*/}

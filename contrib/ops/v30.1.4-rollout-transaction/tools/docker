@@ -47,10 +47,10 @@ validate_rewrite_authority()
 
 rewrite_legacy_stopped_create()
 {
-    local -n command=$1
-    command=(
-        compose --project-directory "${command[2]}" -f "${command[4]}"
-        up --no-start --no-deps --no-recreate --no-build --pull never "${command[10]}"
+    local -n rewritten=$1
+    rewritten=(
+        compose --project-directory "${rewritten[2]}" -f "${rewritten[4]}"
+        up --no-start --no-deps --no-recreate --no-build --pull never "${rewritten[10]}"
     )
 }
 

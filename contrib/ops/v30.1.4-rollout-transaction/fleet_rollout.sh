@@ -3134,10 +3134,182 @@ rollback_old_image_authority_sha()
     printf '%s\n' "$sha"
 }
 
+rollback_compose_path_for_image()
+{
+    local node="$1" config_image="$2" image_id="$3" old_ref old_id
+    old_ref=$(rollback_old_config_image_for "$node") || return 1
+    old_id=$(rollback_old_image_id_for "$node") || return 1
+    if [[ "$config_image" == "$old_ref" && "$image_id" == "$old_id" ]]; then
+        printf '%s\n' "$CURRENT_WAVE_DIR/docker-compose.before.yml"
+    elif [[ "$config_image" == "$CANDIDATE_IMAGE_REF" &&
+            "$image_id" == "$CANDIDATE_IMAGE_ID" ]]; then
+        printf '%s\n' "$CURRENT_WAVE_DIR/docker-compose.candidate.yml"
+    else
+        return 1
+    fi
+}
+
+rollback_compose_service_hash()
+{
+    local compose_path="$1" service="$2" output output_service hash extra
+    data_rollback_protected_file "$compose_path" 600 || return 1
+    output=$(docker compose --project-directory "${COMPOSE_FILE%/*}" \
+        -f "$compose_path" config --hash "$service") || return 1
+    [[ -n "$output" && "$output" != *$'\n'* ]] || return 1
+    read -r output_service hash extra <<< "$output" || return 1
+    [[ "$output_service" == "$service" && "$hash" =~ ^[0-9a-f]{64}$ && -z "$extra" ]] ||
+        return 1
+    printf '%s\n' "$hash"
+}
+
+verify_rollback_container_compose_contract()
+{
+    local node="$1" inspect="$2" compose_path="$3" expected_ref="$4" expected_id="$5"
+    local service expected_hash image_inspect ref_inspect
+    service=$(service_for "$node") || return 1
+    expected_hash=$(rollback_compose_service_hash "$compose_path" "$service") || return 1
+    image_inspect=$(docker image inspect "$expected_id") || return 1
+    jq -e --arg id "$expected_id" '
+        length == 1 and .[0].Id == $id
+    ' >/dev/null <<< "$image_inspect" || return 1
+    ref_inspect=$(docker image inspect "$expected_ref") || return 1
+    jq -e --arg id "$expected_id" '
+        length == 1 and .[0].Id == $id
+    ' >/dev/null <<< "$ref_inspect" || return 1
+    jq -e --arg ref "$expected_ref" --arg id "$expected_id" \
+        --arg service "$service" --arg hash "$expected_hash" '
+        length == 1 and .[0].Config.Image == $ref and .[0].Image == $id and
+        .[0].State.Paused == false and
+        .[0].Config.Labels["com.docker.compose.service"] == $service and
+        .[0].Config.Labels["com.docker.compose.config-hash"] == $hash
+    ' >/dev/null <<< "$inspect"
+}
+
+verify_rollback_vpn_generation()
+{
+    local node="$1" source_generation="$2" container_id container_started vpn_id vpn_started
+    local vpn inspect second_inspect
+    data_rollback_validate_stopped_generation "$source_generation" || return 1
+    IFS='|' read -r container_id container_started vpn_id vpn_started <<< "$source_generation" ||
+        return 1
+    [[ "$container_id" =~ ^[0-9a-f]{64}$ && -n "$container_started" &&
+       "$vpn_id" =~ ^[0-9a-f]{64}$ && -n "$vpn_started" ]] || return 1
+    vpn=$(vpn_for "$node") || return 1
+    inspect=$(docker inspect "$vpn") || return 1
+    jq -e --arg id "$vpn_id" --arg started "$vpn_started" '
+        length == 1 and .[0].Id == $id and .[0].State.StartedAt == $started and
+        .[0].State.Running == true and .[0].State.Paused == false and
+        .[0].State.Restarting == false and .[0].State.Health.Status == "healthy"
+    ' >/dev/null <<< "$inspect" || return 1
+    second_inspect=$(docker inspect "$vpn") || return 1
+    jq -e --arg id "$vpn_id" --arg started "$vpn_started" '
+        length == 1 and .[0].Id == $id and .[0].State.StartedAt == $started and
+        .[0].State.Running == true and .[0].State.Paused == false and
+        .[0].State.Restarting == false and .[0].State.Health.Status == "healthy"
+    ' >/dev/null <<< "$second_inspect"
+}
+
+verify_rollback_present_old_exclusive()
+{
+    local node="$1" authority_sha="$2" expected_generation="$3" expected_running="$4"
+    local marker source_generation source_id baseline_id current_id container service vpn
+    local vpn_id vpn_started vpn_pid vpn_netns ids inventory process process_comm exe
+    local process_netns cgroup target_processes=0 inspect ignored data blocks cmdline cwd fd link
+    [[ "$expected_running" == true || "$expected_running" == false ]] || return 1
+    verify_rollback_old_image_attempt_marker "$node" "$authority_sha" || return 1
+    marker=$(rollback_node_old_image_attempt_path "$node") || return 1
+    source_generation=$(jq -er '.source_generation' "$marker") || return 1
+    verify_rollback_vpn_generation "$node" "$source_generation" || return 1
+    IFS='|' read -r source_id ignored vpn_id vpn_started <<< "$source_generation" || return 1
+    [[ "$source_id" =~ ^[0-9a-f]{64}$ && "$vpn_id" =~ ^[0-9a-f]{64}$ &&
+       -n "$vpn_started" ]] || return 1
+    baseline_id=$(expected_old_container_id "$node") || return 1
+    [[ "$baseline_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+    container=$(container_for "$node") || return 1
+    service=$(service_for "$node") || return 1
+    vpn=$(vpn_for "$node") || return 1
+    data=$(host_datadir_for "$node") || return 1
+    blocks=$(host_blocks_for "$node") || return 1
+    inspect=$(docker inspect "$container") || return 1
+    current_id=$(jq -er '.[0].Id | select(test("^[0-9a-f]{64}$"))' <<< "$inspect") || return 1
+    [[ "$current_id" != "$source_id" && "$current_id" != "$baseline_id" &&
+       "$(container_generation_for "$node")" == "$expected_generation" ]] || return 1
+    ids=$(docker ps -aq --no-trunc) || return 1
+    if [[ -n "$ids" ]]; then
+        # shellcheck disable=SC2086
+        inventory=$(docker inspect $ids) || return 1
+    else
+        inventory='[]'
+    fi
+    jq -e --arg current_id "$current_id" --arg source_id "$source_id" \
+        --arg baseline_id "$baseline_id" --arg name "/$container" --arg service "$service" \
+        --arg data "$data" --arg blocks "$blocks" '
+        type == "array" and
+        ([.[] | select(.Id == $current_id)] | length) == 1 and
+        all(.[];
+          if .Id == $current_id then true
+          else .Id != $source_id and .Id != $baseline_id and .Name != $name and
+            ((.Config.Labels["com.docker.compose.service"] // "") != $service) and
+            ([.Mounts[]? | select(.Source == $data or .Source == $blocks)] | length) == 0
+          end)
+    ' >/dev/null <<< "$inventory" || return 1
+    vpn_pid=$(docker inspect -f '{{.State.Pid}}' "$vpn") || return 1
+    [[ "$vpn_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    vpn_netns=$(readlink "/proc/$vpn_pid/ns/net") || return 1
+    [[ -n "$vpn_netns" ]] || return 1
+    for process in /proc/[0-9]*; do
+        [[ -d "$process" ]] || continue
+        cgroup="$process/cgroup"
+        if [[ -r "$cgroup" ]]; then
+            ! grep -Fq -- "$source_id" "$cgroup" || return 1
+            ! grep -Fq -- "$baseline_id" "$cgroup" || return 1
+        fi
+        process_comm=$(cat "$process/comm" 2>/dev/null || true)
+        exe=$(readlink "$process/exe" 2>/dev/null || true)
+        case "$process_comm|${exe##*/}" in
+            blackcoind\|*|blackcoin-qt\|*|*\|blackcoind|*\|blackcoin-qt|\
+            *\|blackcoind\ \(deleted\)|*\|blackcoin-qt\ \(deleted\))
+                process_netns=$(readlink "$process/ns/net" 2>/dev/null || true)
+                [[ -n "$process_netns" && -r "$cgroup" ]] || return 1
+                if grep -Fq -- "$current_id" "$cgroup"; then
+                    [[ "$process_netns" == "$vpn_netns" ]] || return 1
+                    target_processes=$((target_processes + 1))
+                elif [[ "$process_netns" == "$vpn_netns" ]]; then
+                    return 1
+                else
+                    cmdline=$(tr '\0' '\n' < "$process/cmdline" 2>/dev/null || true)
+                    cwd=$(readlink "$process/cwd" 2>/dev/null || true)
+                    if [[ "$cmdline" == *"$data"* || "$cmdline" == *"$blocks"* ||
+                          "$cwd" == "$data" || "$cwd" == "$data"/* ||
+                          "$cwd" == "$blocks" || "$cwd" == "$blocks"/* ]]; then
+                        return 1
+                    fi
+                    for fd in "$process"/fd/*; do
+                        [[ -e "$fd" || -L "$fd" ]] || continue
+                        link=$(readlink "$fd" 2>/dev/null || true)
+                        if [[ "$link" == "$data" || "$link" == "$data"/* ||
+                              "$link" == "$blocks" || "$link" == "$blocks"/* ]]; then
+                            return 1
+                        fi
+                    done
+                fi
+                ;;
+        esac
+    done
+    if [[ "$expected_running" == true ]]; then
+        ((target_processes == 1)) || return 1
+    else
+        ((target_processes == 0)) || return 1
+    fi
+    verify_rollback_vpn_generation "$node" "$source_generation" || return 1
+    [[ "$(container_generation_for "$node")" == "$expected_generation" ]]
+}
+
 verify_rollback_authority_source_node_from_file()
 {
     local node="$1" authority="$2" source_generation source_config_image source_image_id
-    local container vpn vpn_id inspect generation service
+    local container vpn vpn_id inspect generation service compose_path
+    local source_container_id source_container_started source_vpn_started
     data_rollback_protected_file "$authority" 600 || return 1
     source_generation=$(jq -er --argjson node "$node" \
         '.nodes[] | select(.node == $node) | .source_generation' "$authority") || return 1
@@ -3148,17 +3320,24 @@ verify_rollback_authority_source_node_from_file()
     container=$(container_for "$node") || return 1
     service=$(service_for "$node") || return 1
     vpn=$(vpn_for "$node") || return 1
-    vpn_id=$(docker inspect -f '{{.Id}}' "$vpn") || return 1
+    verify_rollback_vpn_generation "$node" "$source_generation" || return 1
+    IFS='|' read -r source_container_id source_container_started vpn_id source_vpn_started \
+        <<< "$source_generation" || return 1
     generation=$(container_generation_for "$node") || return 1
     [[ "$generation" == "$source_generation" ]] || return 1
     inspect=$(docker inspect "$container") || return 1
+    compose_path=$(rollback_compose_path_for_image \
+        "$node" "$source_config_image" "$source_image_id") || return 1
+    verify_rollback_container_compose_contract "$node" "$inspect" "$compose_path" \
+        "$source_config_image" "$source_image_id" || return 1
     jq -e --arg image "$source_config_image" --arg image_id "$source_image_id" \
         --arg service "$service" --arg node_label "$(node_padded "$node")" \
         --arg vpn "$vpn" --arg mode "container:$vpn_id" \
         --arg data "$(host_datadir_for "$node")" --arg blocks "$(host_blocks_for "$node")" '
         length == 1 and .[0].Config.Image == $image and .[0].Image == $image_id and
         .[0].State.Running == false and .[0].State.Pid == 0 and
-        .[0].State.Restarting == false and .[0].HostConfig.RestartPolicy.Name == "no" and
+        .[0].State.Restarting == false and .[0].State.Paused == false and
+        .[0].HostConfig.RestartPolicy.Name == "no" and
         .[0].Config.Labels["com.docker.compose.service"] == $service and
         .[0].Config.Labels["blackcoin.node"] == $node_label and
         .[0].Config.Labels["blackcoin.vpn"] == $vpn and
@@ -3441,12 +3620,14 @@ rollback_absent_target_state_safe()
 {
     local node="$1" authority_sha="$2" path source_generation source_id old_id
     local container service vpn ids inventory vpn_pid vpn_netns process process_comm exe
-    local process_netns cgroup
+    local process_netns cgroup source_started vpn_id vpn_started
     verify_rollback_old_image_attempt_marker "$node" "$authority_sha" || return 1
     path=$(rollback_node_old_image_attempt_path "$node") || return 1
     source_generation=$(jq -er '.source_generation' "$path") || return 1
-    source_id=${source_generation%%|*}
-    [[ "$source_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+    verify_rollback_vpn_generation "$node" "$source_generation" || return 1
+    IFS='|' read -r source_id source_started vpn_id vpn_started <<< "$source_generation" ||
+        return 1
+    [[ "$source_id" =~ ^[0-9a-f]{64}$ && "$vpn_id" =~ ^[0-9a-f]{64}$ ]] || return 1
     old_id=$(expected_old_container_id "$node") || return 1
     container=$(container_for "$node") || return 1
     service=$(service_for "$node") || return 1
@@ -3493,7 +3674,7 @@ rollback_absent_target_state_safe()
 classify_rollback_old_image_node()
 {
     local node="$1" authority_sha="$2" marker container service vpn vpn_id inspect generation
-    local source_generation source_config_image source_image_id old_ref old_id
+    local source_generation source_config_image source_image_id old_ref old_id compose_path
     verify_rollback_old_image_attempt_marker "$node" "$authority_sha" || return 1
     marker=$(rollback_node_old_image_attempt_path "$node") || return 1
     container=$(container_for "$node") || return 1
@@ -3511,6 +3692,7 @@ classify_rollback_old_image_node()
     source_image_id=$(jq -er '.source_image_id' "$marker") || return 1
     old_ref=$(rollback_old_config_image_for "$node") || return 1
     old_id=$(rollback_old_image_id_for "$node") || return 1
+    verify_rollback_vpn_generation "$node" "$source_generation" || return 1
     jq -e --arg service "$service" --arg node_label "$(node_padded "$node")" \
         --arg vpn "$vpn" --arg mode "container:$vpn_id" \
         --arg data "$(host_datadir_for "$node")" --arg blocks "$(host_blocks_for "$node")" '
@@ -3526,24 +3708,37 @@ classify_rollback_old_image_node()
           .Source == $blocks and .RW == true)] | length) == 1
     ' >/dev/null <<< "$inspect" || return 1
     [[ "$(container_generation_for "$node")" == "$generation" ]] || return 1
+    compose_path=$(rollback_compose_path_for_image \
+        "$node" "$source_config_image" "$source_image_id") || return 1
     if [[ "$generation" == "$source_generation" ]] &&
        jq -e --arg image "$source_config_image" --arg image_id "$source_image_id" '
           .[0].Config.Image == $image and .[0].Image == $image_id and
           .[0].State.Running == false and .[0].State.Pid == 0 and
           .[0].State.Restarting == false and .[0].HostConfig.RestartPolicy.Name == "no"
        ' >/dev/null <<< "$inspect"; then
+        verify_rollback_container_compose_contract "$node" "$inspect" "$compose_path" \
+            "$source_config_image" "$source_image_id" || return 1
         printf '%s\n' authority-source-stopped
         return 0
     fi
+    cmp -s "$COMPOSE_FILE" "$CURRENT_WAVE_DIR/docker-compose.before.yml" || return 1
+    verify_rollback_container_compose_contract "$node" "$inspect" \
+        "$CURRENT_WAVE_DIR/docker-compose.before.yml" "$old_ref" "$old_id" || return 1
     jq -e --arg image "$old_ref" --arg image_id "$old_id" '
         .[0].Config.Image == $image and .[0].Image == $image_id and
         .[0].HostConfig.RestartPolicy.Name == "on-failure" and
         .[0].HostConfig.RestartPolicy.MaximumRetryCount == 3 and
-        .[0].State.Restarting == false
+        .[0].State.Restarting == false and .[0].State.Paused == false
     ' >/dev/null <<< "$inspect" || return 1
     if jq -e '.[0].State.Running == true and .[0].State.Pid > 0' >/dev/null <<< "$inspect"; then
+        verify_rollback_present_old_exclusive "$node" "$authority_sha" "$generation" true ||
+            return 1
+        [[ "$(container_generation_for "$node")" == "$generation" ]] || return 1
         printf '%s\n' old-running
     elif jq -e '.[0].State.Running == false and .[0].State.Pid == 0' >/dev/null <<< "$inspect"; then
+        verify_rollback_present_old_exclusive "$node" "$authority_sha" "$generation" false ||
+            return 1
+        [[ "$(container_generation_for "$node")" == "$generation" ]] || return 1
         printf '%s\n' old-stopped
     else
         return 1
@@ -3552,7 +3747,7 @@ classify_rollback_old_image_node()
 
 ensure_rollback_old_image_node()
 {
-    local node="$1" authority_sha="$2" path state service
+    local node="$1" authority_sha="$2" path state service deadline
     data_rollback_require_mutation_fences || return 1
     verify_rollback_old_image_authority || return 1
     path=$(rollback_node_old_image_attempt_path "$node") || return 1
@@ -3563,8 +3758,12 @@ ensure_rollback_old_image_node()
     service=$(service_for "$node") || return 1
     case "$state" in
         authority-source-stopped|absent-after-authorized-recreate)
-            docker compose -f "$COMPOSE_FILE" create --no-deps --force-recreate --pull never \
-                "$service" || return 1
+            data_rollback_require_mutation_fences || return 1
+            verify_rollback_old_image_attempt_marker "$node" "$authority_sha" || return 1
+            cmp -s "$COMPOSE_FILE" "$CURRENT_WAVE_DIR/docker-compose.before.yml" || return 1
+            docker compose --project-directory "${COMPOSE_FILE%/*}" \
+                -f "$CURRENT_WAVE_DIR/docker-compose.before.yml" create --no-deps \
+                --force-recreate --pull never "$service" || return 1
             state=$(classify_rollback_old_image_node "$node" "$authority_sha") || return 1
             [[ "$state" == old-stopped ]] || return 1
             ;;
@@ -3572,15 +3771,238 @@ ensure_rollback_old_image_node()
         *) return 1 ;;
     esac
     if [[ "$state" == old-stopped ]]; then
-        docker compose -f "$COMPOSE_FILE" start "$service" || return 1
+        data_rollback_require_mutation_fences || return 1
+        verify_rollback_old_image_attempt_marker "$node" "$authority_sha" || return 1
+        cmp -s "$COMPOSE_FILE" "$CURRENT_WAVE_DIR/docker-compose.before.yml" || return 1
+        docker compose --project-directory "${COMPOSE_FILE%/*}" \
+            -f "$CURRENT_WAVE_DIR/docker-compose.before.yml" start "$service" || return 1
     fi
-    [[ "$(classify_rollback_old_image_node "$node" "$authority_sha")" == old-running ]]
+    deadline=$((SECONDS + 120))
+    while ((SECONDS < deadline)); do
+        state=$(classify_rollback_old_image_node "$node" "$authority_sha" 2>/dev/null || true)
+        case "$state" in
+            old-running) return 0 ;;
+            old-stopped|'') ;;
+            *) return 1 ;;
+        esac
+        sleep 1
+    done
+    return 1
+}
+
+rollback_resume_phase()
+{
+    local restore_authority receipt sidecar restore_manifest old_authority old_authority_sha
+    local restore_authority_sha data_state path
+    restore_authority=$(data_rollback_authority_path) || return 1
+    receipt="$CURRENT_WAVE_DIR/DATA-RESTORED.json"
+    sidecar="$CURRENT_WAVE_DIR/DATA-RESTORED.json.sha256"
+    restore_manifest="$CURRENT_WAVE_DIR/DATA-RESTORE-EVIDENCE.sha256"
+    old_authority=$(rollback_old_image_authority_dir) || return 1
+    if rollback_old_image_evidence_present; then
+        old_authority_sha=$(rollback_old_image_authority_sha) || return 1
+        data_state=$(jq -er '.preupgrade_data_state' "$(rollback_old_image_authority_path)") ||
+            return 1
+        if [[ "$data_state" == restored ]]; then
+            restore_authority_sha=$(rollback_restore_authority_sha) || return 1
+            rollback_data_restored_receipt_sha "$restore_authority_sha" >/dev/null || return 1
+        elif [[ "$data_state" == unchanged-no-candidate-launch ]]; then
+            restore_authority_sha=-
+        else
+            return 1
+        fi
+        printf 'old-image-authorized|%s|%s\n' "$restore_authority_sha" "$old_authority_sha"
+        return 0
+    fi
+    [[ ! -e "$old_authority" && ! -L "$old_authority" ]] || return 1
+    if [[ -e "$restore_authority" || -L "$restore_authority" ]]; then
+        restore_authority_sha=$(rollback_restore_authority_sha) || return 1
+        cmp -s "$COMPOSE_FILE" "$CURRENT_WAVE_DIR/docker-compose.candidate.yml" || return 1
+        cmp -s "$IMAGE_POLICY" "$CURRENT_WAVE_DIR/fleet-image-policy.candidate.json" || return 1
+        cmp -s "$ENDPOINT_GUARD" "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.candidate.sh" ||
+            return 1
+        if [[ -e "$sidecar" || -L "$sidecar" ]]; then
+            [[ -e "$receipt" && ! -L "$receipt" ]] || return 1
+            rollback_data_restored_receipt_sha "$restore_authority_sha" >/dev/null || return 1
+            data_rollback_verify_authority_live "$restore_authority_sha" || return 1
+            printf 'data-restored|%s|-\n' "$restore_authority_sha"
+        elif [[ -e "$receipt" || -L "$receipt" ]]; then
+            [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+            data_rollback_verify_data_restored_receipt_body "$restore_authority_sha" || return 1
+            data_rollback_verify_authority_live "$restore_authority_sha" || return 1
+            printf 'restore-authority-live|%s|-\n' "$restore_authority_sha"
+        else
+            data_rollback_verify_authority_live "$restore_authority_sha" || return 1
+            printf 'restore-authority-live|%s|-\n' "$restore_authority_sha"
+        fi
+        return 0
+    fi
+    for path in "$receipt" "$sidecar" "$restore_manifest"; do
+        [[ ! -e "$path" && ! -L "$path" ]] || return 1
+    done
+    printf '%s\n' 'pre-restore|-|-'
+}
+
+verify_data_restore_authority_source_node()
+{
+    local node="$1" authority_sha="$2" authority generation launch_state inspect
+    local config_image image_id old_ref old_id container service vpn vpn_id compose_path
+    authority=$(data_rollback_authority_path) || return 1
+    data_rollback_verify_authority_sealed "$authority_sha" || return 1
+    generation=$(jq -er --argjson node "$node" \
+        '.nodes[] | select(.node == $node) | .stopped_generation' "$authority") || return 1
+    launch_state=$(data_rollback_authority_node_launch_state "$authority_sha" "$node") || return 1
+    [[ "$(container_generation_for "$node")" == "$generation" ]] || return 1
+    verify_rollback_vpn_generation "$node" "$generation" || return 1
+    container=$(container_for "$node") || return 1
+    service=$(service_for "$node") || return 1
+    vpn=$(vpn_for "$node") || return 1
+    vpn_id=$(docker inspect -f '{{.Id}}' "$vpn") || return 1
+    inspect=$(docker inspect "$container") || return 1
+    config_image=$(jq -er '.[0].Config.Image | select(type == "string" and length > 0)' \
+        <<< "$inspect") || return 1
+    image_id=$(jq -er '.[0].Image | select(test("^sha256:[0-9a-f]{64}$"))' \
+        <<< "$inspect") || return 1
+    old_ref=$(rollback_old_config_image_for "$node") || return 1
+    old_id=$(rollback_old_image_id_for "$node") || return 1
+    if [[ "$launch_state" == candidate-attempted ]]; then
+        [[ "$config_image" == "$CANDIDATE_IMAGE_REF" &&
+           "$image_id" == "$CANDIDATE_IMAGE_ID" ]] || return 1
+    elif [[ "$launch_state" == not-attempted ]]; then
+        if [[ "$config_image" == "$old_ref" && "$image_id" == "$old_id" ]]; then
+            :
+        elif [[ "$config_image" == "$CANDIDATE_IMAGE_REF" &&
+                "$image_id" == "$CANDIDATE_IMAGE_ID" ]]; then
+            jq -e '.[0].State.StartedAt == "0001-01-01T00:00:00Z"' \
+                >/dev/null <<< "$inspect" || return 1
+        else
+            return 1
+        fi
+    else
+        return 1
+    fi
+    compose_path=$(rollback_compose_path_for_image "$node" "$config_image" "$image_id") ||
+        return 1
+    verify_rollback_container_compose_contract "$node" "$inspect" "$compose_path" \
+        "$config_image" "$image_id" || return 1
+    jq -e --arg service "$service" --arg node_label "$(node_padded "$node")" \
+        --arg vpn "$vpn" --arg mode "container:$vpn_id" \
+        --arg data "$(host_datadir_for "$node")" --arg blocks "$(host_blocks_for "$node")" '
+        length == 1 and .[0].State.Running == false and .[0].State.Pid == 0 and
+        .[0].State.Restarting == false and .[0].State.Paused == false and
+        .[0].HostConfig.RestartPolicy.Name == "no" and
+        .[0].Config.Labels["com.docker.compose.service"] == $service and
+        .[0].Config.Labels["blackcoin.node"] == $node_label and
+        .[0].Config.Labels["blackcoin.vpn"] == $vpn and
+        .[0].Config.Labels["blackcoin.storage"] == "pulsar" and
+        .[0].HostConfig.NetworkMode == $mode and .[0].HostConfig.Privileged == false and
+        .[0].HostConfig.AutoRemove == false and
+        ([.[0].Mounts[] | select(.Destination == "/home/blackcoin/.blackcoin" and
+          .Source == $data and .RW == true)] | length) == 1 and
+        ([.[0].Mounts[] | select(.Destination == "/home/blackcoin/blocks_storage" and
+          .Source == $blocks and .RW == true)] | length) == 1
+    ' >/dev/null <<< "$inspect" || return 1
+    verify_rollback_vpn_generation "$node" "$generation" || return 1
+    [[ "$(container_generation_for "$node")" == "$generation" ]]
+}
+
+verify_rollback_old_node_quiescent()
+{
+    local node="$1" authority_sha="$2" expected_generation="$3"
+    local wallet_info staking mining txids_tmp
+    [[ "$(classify_rollback_old_image_node "$node" "$authority_sha")" == old-running ]] ||
+        return 1
+    [[ "$(container_generation_for "$node")" == "$expected_generation" ]] || return 1
+    wallet_info=$(wallet_rpc_for "$node" getwalletinfo) || return 1
+    staking=$(wallet_rpc_for "$node" getstakinginfo) || return 1
+    mining=$(wallet_rpc_for "$node" getpowmininginfo) || return 1
+    jq -e '.unlocked_until == 0' >/dev/null <<< "$wallet_info" || return 1
+    jq -e '.enabled == false and .staking == false and
+        ((has("worker_running") | not) or .worker_running == false) and
+        .automatic_qqsignal == false and .automatic_demurrage_attestation == false and
+        .automatic_redelegation == false and .allow_automatic_quantum_key_creation == false' \
+        >/dev/null <<< "$staking" || return 1
+    jq -e '.enabled == false and .live_claims == 0' >/dev/null <<< "$mining" || return 1
+    txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.old-quiescent-txids.XXXXXX") || return 1
+    if ! capture_wallet_txid_set "$node" "$txids_tmp" ||
+       ! cmp -s "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json" \
+           "$txids_tmp"; then
+        rm -f -- "$txids_tmp"
+        return 1
+    fi
+    rm -f -- "$txids_tmp"
+    [[ "$(container_generation_for "$node")" == "$expected_generation" ]]
+}
+
+quiesce_rollback_old_node()
+{
+    local node="$1" authority_sha="$2" generation deadline
+    [[ "$(classify_rollback_old_image_node "$node" "$authority_sha")" == old-running ]] ||
+        return 1
+    generation=$(container_generation_for "$node") || return 1
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        [[ "$(container_generation_for "$node" 2>/dev/null || true)" == "$generation" ]] ||
+            return 1
+        if [[ "$node" -ne "$FREE_CLAIM_NODE" ]]; then
+            wallet_rpc_for "$node" setpowmining false 1 1 >/dev/null 2>&1 || true
+        fi
+        wallet_rpc_for "$node" staking false >/dev/null 2>&1 || true
+        wallet_rpc_for "$node" walletlock >/dev/null 2>&1 || true
+        if verify_rollback_old_node_quiescent \
+            "$node" "$authority_sha" "$generation" 2>/dev/null; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+quiesce_rollback_old_wave()
+{
+    local authority_sha="$1" node deadline unresolved
+    local -A generations=() pending=()
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        [[ "$(classify_rollback_old_image_node "$node" "$authority_sha")" == old-running ]] ||
+            return 1
+        generations[$node]=$(container_generation_for "$node") || return 1
+        pending[$node]=1
+    done
+    deadline=$((SECONDS + 1200))
+    while ((SECONDS < deadline)); do
+        unresolved=0
+        for node in "${CURRENT_WAVE_NODES[@]}"; do
+            [[ -n "${pending[$node]:-}" ]] || continue
+            [[ "$(container_generation_for "$node" 2>/dev/null || true)" == \
+               "${generations[$node]}" ]] || return 1
+            if [[ "$node" -ne "$FREE_CLAIM_NODE" ]]; then
+                wallet_rpc_for "$node" setpowmining false 1 1 >/dev/null 2>&1 || true
+            fi
+            wallet_rpc_for "$node" staking false >/dev/null 2>&1 || true
+            wallet_rpc_for "$node" walletlock >/dev/null 2>&1 || true
+            if verify_rollback_old_node_quiescent \
+                "$node" "$authority_sha" "${generations[$node]}" 2>/dev/null; then
+                unset 'pending[$node]'
+            else
+                unresolved=$((unresolved + 1))
+            fi
+        done
+        ((unresolved == 0)) && break
+        sleep 2
+    done
+    ((unresolved == 0)) || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        verify_rollback_old_node_quiescent "$node" "$authority_sha" "${generations[$node]}" ||
+            return 1
+    done
 }
 
 verify_interrupted_target_container()
 {
     local node="$1" padded before_class candidate_class before_ref before_id candidate_ref candidate_id
-    local container vpn vpn_id inspect
+    local container vpn vpn_id inspect generation config_image image_id compose_path service
+    local container_id container_started vpn_started
+    local rollback_state="$CURRENT_WAVE_DIR/ROLLBACK_STATE" stop_authorized=false
     padded=$(node_padded "$node") || return 1
     before_class=$(jq -er --arg node "$padded" '.nodes[$node]' \
         "$CURRENT_WAVE_DIR/fleet-image-policy.before.json") || return 1
@@ -3595,33 +4017,71 @@ verify_interrupted_target_container()
     candidate_id=$(jq -er --arg class "$candidate_class" '.images[$class].image_id' \
         "$CURRENT_WAVE_DIR/fleet-image-policy.candidate.json") || return 1
     container=$(container_for "$node")
+    service=$(service_for "$node") || return 1
     vpn=$(vpn_for "$node")
-    vpn_id=$(docker inspect -f '{{.Id}}' "$vpn") || return 1
+    if [[ -e "$rollback_state" || -L "$rollback_state" ]]; then
+        assert_marker_state "$rollback_state" rollback-started || return 1
+        stop_authorized=true
+    fi
     if ! inspect=$(docker inspect "$container" 2>/dev/null); then
         absent_target_state_safe "$node"
         return
     fi
+    generation=$(container_generation_for "$node") || return 1
+    verify_rollback_vpn_generation "$node" "$generation" || return 1
+    IFS='|' read -r container_id container_started vpn_id vpn_started <<< "$generation" ||
+        return 1
+    [[ "$vpn_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+    config_image=$(jq -er '.[0].Config.Image | select(type == "string" and length > 0)' \
+        <<< "$inspect") || return 1
+    image_id=$(jq -er '.[0].Image | select(test("^sha256:[0-9a-f]{64}$"))' \
+        <<< "$inspect") || return 1
+    compose_path=$(rollback_compose_path_for_image "$node" "$config_image" "$image_id") ||
+        return 1
+    verify_rollback_container_compose_contract "$node" "$inspect" "$compose_path" \
+        "$config_image" "$image_id" || return 1
     jq -e --arg before_ref "$before_ref" --arg before_id "$before_id" \
         --arg candidate_ref "$candidate_ref" --arg candidate_id "$candidate_id" \
-        --arg mode "container:$vpn_id" --arg data "$(host_datadir_for "$node")" \
-        --arg blocks "$(host_blocks_for "$node")" '
-        length == 1 and
+        --arg container_id "$container_id" --arg container_started "$container_started" \
+        --arg service "$service" --arg node_label "$(node_padded "$node")" \
+        --arg vpn "$vpn" --arg mode "container:$vpn_id" \
+        --arg data "$(host_datadir_for "$node")" --arg blocks "$(host_blocks_for "$node")" \
+        --argjson stop_authorized "$stop_authorized" '
+        length == 1 and .[0].Id == $container_id and
+        .[0].State.StartedAt == $container_started and
         ((.[0].Config.Image == $before_ref and .[0].Image == $before_id) or
          (.[0].Config.Image == $candidate_ref and .[0].Image == $candidate_id)) and
+        .[0].State.Paused == false and .[0].State.Restarting == false and
+        ((.[0].State.Running == true and .[0].State.Pid > 0) or
+         (.[0].State.Running == false and .[0].State.Pid == 0)) and
         .[0].HostConfig.NetworkMode == $mode and
-        .[0].HostConfig.RestartPolicy.Name == "on-failure" and
-        .[0].HostConfig.RestartPolicy.MaximumRetryCount == 3 and
+        (if $stop_authorized then
+           ((.[0].HostConfig.RestartPolicy.Name == "on-failure" and
+             .[0].HostConfig.RestartPolicy.MaximumRetryCount == 3) or
+            (.[0].HostConfig.RestartPolicy.Name == "no" and
+             .[0].HostConfig.RestartPolicy.MaximumRetryCount == 0))
+         else
+           .[0].HostConfig.RestartPolicy.Name == "on-failure" and
+           .[0].HostConfig.RestartPolicy.MaximumRetryCount == 3
+         end) and
         .[0].HostConfig.Privileged == false and .[0].HostConfig.AutoRemove == false and
+        .[0].Config.Labels["com.docker.compose.service"] == $service and
+        .[0].Config.Labels["blackcoin.node"] == $node_label and
+        .[0].Config.Labels["blackcoin.vpn"] == $vpn and
+        .[0].Config.Labels["blackcoin.storage"] == "pulsar" and
         ([.[0].Mounts[] | select(.Destination == "/home/blackcoin/.blackcoin" and
             .Source == $data and .RW == true)] | length) == 1 and
         ([.[0].Mounts[] | select(.Destination == "/home/blackcoin/blocks_storage" and
             .Source == $blocks and .RW == true)] | length) == 1
-    ' >/dev/null <<< "$inspect"
+    ' >/dev/null <<< "$inspect" || return 1
+    verify_rollback_vpn_generation "$node" "$generation" || return 1
+    [[ "$(container_generation_for "$node")" == "$generation" ]]
 }
 
 resume_interrupted_wave_before_live_preflight()
 {
     local interrupted="$1" wave_name wave_index node temporary containment_pending=0
+    local phase_record rollback_phase restore_authority_sha old_authority_sha attempt state
     require_host_tools
     [[ "$(id -u)" -eq 0 ]] || die 'root is required on the Unraid host'
     verify_package_integrity "$PACKAGE_ROOT" || die 'resume package bytes changed'
@@ -3651,6 +4111,18 @@ resume_interrupted_wave_before_live_preflight()
         log 'interrupted wave has containment evidence; rollback recovery will resume containment'
         containment_pending=1
     fi
+    rollback_phase=pre-restore
+    restore_authority_sha=-
+    old_authority_sha=-
+    if [[ "$containment_pending" -eq 0 ]]; then
+        phase_record=$(rollback_resume_phase) ||
+            die 'interrupted rollback phase evidence is absent, changed, or contradictory'
+        IFS='|' read -r rollback_phase restore_authority_sha old_authority_sha <<< "$phase_record"
+        case "$rollback_phase" in
+            pre-restore|restore-authority-live|data-restored|old-image-authorized) ;;
+            *) die 'interrupted rollback phase classification is invalid' ;;
+        esac
+    fi
     live_file_matches_wave_generation "$COMPOSE_FILE" \
         "$CURRENT_WAVE_DIR/docker-compose.before.yml" \
         "$CURRENT_WAVE_DIR/docker-compose.candidate.yml" ||
@@ -3673,8 +4145,33 @@ resume_interrupted_wave_before_live_preflight()
     rm -f -- "$temporary"
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         if [[ "$containment_pending" -eq 0 ]]; then
-            verify_interrupted_target_container "$node" ||
-                die "interrupted target topology/image is outside the rollback boundary: node $node"
+            case "$rollback_phase" in
+                pre-restore)
+                    verify_interrupted_target_container "$node" ||
+                        die "interrupted target topology/image is outside the rollback boundary: node $node"
+                    ;;
+                restore-authority-live|data-restored)
+                    verify_data_restore_authority_source_node "$node" "$restore_authority_sha" ||
+                        die "data-restore authority source changed before old-image authorization: node $node"
+                    ;;
+                old-image-authorized)
+                    attempt=$(rollback_node_old_image_attempt_path "$node") ||
+                        die "old-image attempt path is invalid: node $node"
+                    if [[ -e "$attempt" || -L "$attempt" ]]; then
+                        state=$(classify_rollback_old_image_node "$node" "$old_authority_sha") ||
+                            die "authorized old-image node state is ambiguous: node $node"
+                        case "$state" in
+                            authority-source-stopped|absent-after-authorized-recreate|\
+                            old-stopped|old-running) ;;
+                            *) die "authorized old-image node classification is invalid: node $node" ;;
+                        esac
+                    else
+                        verify_rollback_authority_source_node_from_file "$node" \
+                            "$(rollback_old_image_authority_path)" ||
+                            die "old-image source changed before its node attempt: node $node"
+                    fi
+                    ;;
+            esac
         fi
         verify_vpn_pair "$node" || die "interrupted target VPN proof changed: node $node"
     done
@@ -5851,8 +6348,9 @@ verify_stopped_candidate_safe_boundaries()
 
 rollback_current_wave()
 {
-    local node services=() all_ready deadline plan action wallet_info txids_tmp restored_pow
-    local authority_sha containment_pending=0
+    local node all_ready deadline plan action txids_tmp restored_pow phase_record rollback_phase
+    local attempt state
+    local authority_sha=- old_authority_sha=- containment_pending=0
     if [[ "$CURRENT_WAVE_CONTAINED" -ne 0 ]] || containment_evidence_present; then
         containment_pending=1
     fi
@@ -5890,29 +6388,57 @@ rollback_current_wave()
         log 'rollback refused because the immutable post-drain authority is absent or changed'
         return 1
     }
-    stop_wave_for_rollback || return 1
-    if [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 1 ]]; then
-        verify_stopped_candidate_safe_boundaries || {
-            contain_wave_without_rollback stopped-generation-or-safe-boundary-ambiguous || true
-            return 1
-        }
-        authority_sha=$(data_rollback_prepare_restore_authority) || {
-            contain_wave_without_rollback rollback-authority-publication-or-verification-failed || true
-            return 1
-        }
-        restore_wave_preupgrade_data "$authority_sha" || {
-            log 'pre-upgrade dataset restoration failed; old binary will not be started'
-            return 1
-        }
-        jq -e '.pre_upgrade_data_restored == true and
-            .snapshot_identity_verified == true and .snapshot_zero_diff_verified == true and
-            (.fileset_restore_proofs | type) == "number" and .fileset_restore_proofs >= 0 and
-            (.zfs_rollback_proofs | type) == "number" and .zfs_rollback_proofs >= 1' \
-            "$CURRENT_WAVE_DIR/DATA-RESTORED.json" >/dev/null || return 1
-    fi
-    for node in "${CURRENT_WAVE_NODES[@]}"; do
-        services+=("$(service_for "$node")")
-    done
+    phase_record=$(rollback_resume_phase) || {
+        log 'rollback phase evidence is absent, changed, or contradictory'
+        return 1
+    }
+    IFS='|' read -r rollback_phase authority_sha old_authority_sha <<< "$phase_record"
+    case "$rollback_phase" in
+        pre-restore)
+            stop_wave_for_rollback || return 1
+            if [[ "$CURRENT_WAVE_LAUNCH_ATTEMPTED" -eq 1 ]]; then
+                verify_stopped_candidate_safe_boundaries || {
+                    contain_wave_without_rollback stopped-generation-or-safe-boundary-ambiguous || true
+                    return 1
+                }
+                authority_sha=$(data_rollback_prepare_restore_authority) || {
+                    contain_wave_without_rollback \
+                        rollback-authority-publication-or-verification-failed || true
+                    return 1
+                }
+                restore_wave_preupgrade_data "$authority_sha" || {
+                    log 'pre-upgrade dataset restoration failed; old binary will not be started'
+                    return 1
+                }
+                rollback_data_restored_receipt_sha "$authority_sha" >/dev/null || return 1
+                old_authority_sha=$(publish_rollback_old_image_authority \
+                    restored "$authority_sha") || return 1
+            else
+                old_authority_sha=$(publish_rollback_old_image_authority \
+                    unchanged-no-candidate-launch) || return 1
+            fi
+            ;;
+        restore-authority-live)
+            restore_wave_preupgrade_data "$authority_sha" || {
+                log 'pre-upgrade dataset restoration resume failed; old binary will not be started'
+                return 1
+            }
+            rollback_data_restored_receipt_sha "$authority_sha" >/dev/null || return 1
+            old_authority_sha=$(publish_rollback_old_image_authority restored "$authority_sha") ||
+                return 1
+            ;;
+        data-restored)
+            rollback_data_restored_receipt_sha "$authority_sha" >/dev/null || return 1
+            old_authority_sha=$(publish_rollback_old_image_authority restored "$authority_sha") ||
+                return 1
+            ;;
+        old-image-authorized)
+            verify_rollback_old_image_authority || return 1
+            [[ "$(rollback_old_image_authority_sha)" == "$old_authority_sha" ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    publish_state_token "$CURRENT_WAVE_DIR/ROLLBACK_STATE" old-image-authorized || return 1
     install_triplet "$CURRENT_WAVE_DIR/docker-compose.before.yml" \
         "$CURRENT_WAVE_DIR/fleet-image-policy.before.json" \
         "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.before.sh" || return 1
@@ -5922,29 +6448,21 @@ rollback_current_wave()
        "$(sha256sum "$CURRENT_WAVE_DIR/fleet-image-policy.before.json" | awk '{print $1}')" ]] || return 1
     [[ "$(sha256sum "$ENDPOINT_GUARD" | awk '{print $1}')" == \
        "$(sha256sum "$CURRENT_WAVE_DIR/blackcoin_endpoint_guard.before.sh" | awk '{print $1}')" ]] || return 1
-    docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate --pull never "${services[@]}" || return 1
-    deadline=$((SECONDS + 1200))
-    while ((SECONDS < deadline)); do
-        all_ready=1
-        for node in "${CURRENT_WAVE_NODES[@]}"; do
-            wallet_info=$(wallet_rpc_for "$node" getwalletinfo 2>/dev/null || true)
-            jq -e '.unlocked_until == 0' >/dev/null 2>&1 <<< "$wallet_info" || {
-                all_ready=0
-                continue
-            }
-            txids_tmp=$(mktemp "$CURRENT_WAVE_DIR/.old-locked-txids.XXXXXX") || return 1
-            if ! capture_wallet_txid_set "$node" "$txids_tmp" ||
-               ! cmp -s "$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json" \
-                   "$txids_tmp"; then
-                rm -f -- "$txids_tmp"
-                return 1
-            fi
-            rm -f -- "$txids_tmp"
-        done
-        ((all_ready == 1)) && break
-        sleep 5
+    # A prior invocation may already have started part of the old wave. Quiesce
+    # every authenticated running member before creating or starting another.
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        attempt=$(rollback_node_old_image_attempt_path "$node") || return 1
+        [[ -e "$attempt" || -L "$attempt" ]] || continue
+        state=$(classify_rollback_old_image_node "$node" "$old_authority_sha") || return 1
+        if [[ "$state" == old-running ]]; then
+            quiesce_rollback_old_node "$node" "$old_authority_sha" || return 1
+        fi
     done
-    ((all_ready == 1)) || return 1
+    for node in "${CURRENT_WAVE_NODES[@]}"; do
+        ensure_rollback_old_image_node "$node" "$old_authority_sha" || return 1
+        quiesce_rollback_old_node "$node" "$old_authority_sha" || return 1
+    done
+    quiesce_rollback_old_wave "$old_authority_sha" || return 1
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         run_activation_helper "$NORMAL_UNLOCK_HELPER" "$NORMAL_UNLOCK_HELPER_SHA256" "$node" \
             >/dev/null 2>&1 || return 1
@@ -5987,9 +6505,9 @@ rollback_current_wave()
         done
         verify_node30_free_claim_service || return 1
     fi
-    CURRENT_WAVE_ROLLED_BACK=1
-    publish_state_token "$CURRENT_WAVE_DIR/RESULT" rolled-back || return 1
     publish_state_token "$CURRENT_WAVE_DIR/ROLLBACK_STATE" rollback-passed || return 1
+    publish_state_token "$CURRENT_WAVE_DIR/RESULT" rolled-back || return 1
+    CURRENT_WAVE_ROLLED_BACK=1
 }
 
 on_exit()

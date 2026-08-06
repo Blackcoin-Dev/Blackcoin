@@ -416,23 +416,105 @@ assert_order "$TMP/restore-zfs-boundary" \
     [[ "$FENCE_CALLS" -eq 2 && "$LIVE_AUTHORITY_CALLS" -eq 1 && "$GENERATION_CALLS" -eq 1 ]]
 )
 
-for function_name in data_rollback_canonical_single_object_json \
+for function_name in data_rollback_authority_path data_rollback_canonical_single_object_json \
+    data_rollback_authority_node_launch_state data_rollback_restore_expected_counts \
+    restore_filesets_from_inventory restore_zfs_from_inventory \
     data_rollback_restore_evidence_files data_rollback_verify_restore_evidence_manifest \
     data_rollback_verify_data_restored_receipt_body data_rollback_verify_data_restored_receipt \
     data_rollback_publish_data_restored_receipt restore_wave_preupgrade_data; do
     function_body "$function_name" "$ROOT/lib/data_rollback.sh"
 done > "$TMP/rollback-resume-functions"
 (
+    # The mixed authority may mutate only node 28. Node 29 deliberately has no
+    # live directory, so reaching its primitive checks would fail the fixture.
+    # shellcheck disable=SC1090
+    source "$TMP/rollback-resume-functions"
+    RUN_DIR="$TMP/rollback-authority-filter-run"
+    CURRENT_WAVE_DIR="$RUN_DIR/mixed"
+    mkdir -p "$CURRENT_WAVE_DIR" "$RUN_DIR/node-28-live" "$RUN_DIR/node-28-snapshot"
+    jq -S -n '{nodes:[{node:28,launch_state:"candidate-attempted"},
+      {node:29,launch_state:"not-attempted"}]}' \
+        > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    AUTHORITY_SHA=$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')
+    printf '%s\n' \
+        "FILESET|28|raw|pool|$RUN_DIR/node-28-live|pool@preupgrade|10|20|hold|$RUN_DIR/node-28-snapshot" \
+        "FILESET|29|raw|pool|$RUN_DIR/node-29-missing|pool@preupgrade|11|21|hold|$RUN_DIR/node-29-snapshot-missing" \
+        'ZFS|29|data|pool/node29|/missing|pool/node29@preupgrade|12|22|hold|/missing' \
+        > "$CURRENT_WAVE_DIR/data-snapshots.tsv"
+
+    valid_sha256_hex() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+    valid_node() { [[ "$1" -ge 1 && "$1" -le 32 ]]; }
+    data_rollback_protected_file() { [[ -f "$1" && ! -L "$1" ]]; }
+    data_rollback_verify_authority_sealed()
+    {
+        [[ "$1" == "$AUTHORITY_SHA" &&
+           "$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')" == "$1" ]]
+    }
+    realpath()
+    {
+        [[ "$1" == -e ]] && shift
+        [[ "$1" == -- ]] && shift
+        printf '%s\n' "$1"
+    }
+    MUTATION_NODES=''
+    RSYNC_CALLS=0
+    data_rollback_require_fileset_mutation_boundary()
+    {
+        MUTATION_NODES="${MUTATION_NODES}${MUTATION_NODES:+ }$2"
+    }
+    rsync() { RSYNC_CALLS=$((RSYNC_CALLS + 1)); }
+    chown() { return 0; }
+
+    [[ "$(data_rollback_authority_node_launch_state "$AUTHORITY_SHA" 28)" == candidate-attempted ]]
+    [[ "$(data_rollback_authority_node_launch_state "$AUTHORITY_SHA" 29)" == not-attempted ]]
+    [[ "$(data_rollback_restore_expected_counts "$AUTHORITY_SHA")" == '1 0' ]]
+    restore_filesets_from_inventory "$AUTHORITY_SHA"
+    [[ "$MUTATION_NODES" == 28 && "$RSYNC_CALLS" -eq 2 ]]
+    [[ -f "$CURRENT_WAVE_DIR/fileset-restore-node-28-raw.diff" &&
+       ! -e "$CURRENT_WAVE_DIR/fileset-restore-node-29-raw.diff" ]]
+
+    CURRENT_WAVE_DIR="$RUN_DIR/all-not-attempted"
+    mkdir -p "$CURRENT_WAVE_DIR"
+    jq -S -n '{nodes:[{node:28,launch_state:"not-attempted"},
+      {node:29,launch_state:"not-attempted"}]}' \
+        > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    AUTHORITY_SHA=$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')
+    printf '%s\n' \
+        'FILESET|28|raw|pool|/missing|pool@preupgrade|10|20|hold|/missing' \
+        'ZFS|29|data|pool/node29|/missing|pool/node29@preupgrade|12|22|hold|/missing' \
+        > "$CURRENT_WAVE_DIR/data-snapshots.tsv"
+    MUTATION_CALLS=0
+    ARTIFACT_CALLS=0
+    data_rollback_verify_authority_live() { MUTATION_CALLS=$((MUTATION_CALLS + 1)); }
+    verify_wave_snapshot_inventory() { MUTATION_CALLS=$((MUTATION_CALLS + 1)); }
+    restore_filesets_from_inventory() { MUTATION_CALLS=$((MUTATION_CALLS + 1)); }
+    restore_zfs_from_inventory() { MUTATION_CALLS=$((MUTATION_CALLS + 1)); }
+    data_rollback_publish_restore_evidence_manifest() { ARTIFACT_CALLS=$((ARTIFACT_CALLS + 1)); }
+    data_rollback_publish_data_restored_receipt() { ARTIFACT_CALLS=$((ARTIFACT_CALLS + 1)); }
+
+    ! restore_wave_preupgrade_data "$AUTHORITY_SHA"
+    [[ "$MUTATION_CALLS" -eq 0 && "$ARTIFACT_CALLS" -eq 0 ]]
+    [[ ! -e "$CURRENT_WAVE_DIR/DATA-RESTORE-EVIDENCE.sha256" &&
+       ! -e "$CURRENT_WAVE_DIR/DATA-RESTORED.json" &&
+       ! -e "$CURRENT_WAVE_DIR/DATA-RESTORED.json.sha256" ]]
+)
+pass attempted-only-data-rollback-filtering
+(
     # Test both authenticated crash-publication prefixes. Any invocation of a
     # live restore primitive is a hard fixture failure.
     # shellcheck disable=SC1090
     source "$TMP/rollback-resume-functions"
     RUN_DIR="$TMP/rollback-resume-run"
-    CURRENT_WAVE_DIR="$RUN_DIR/wave-01-nodes-28"
+    CURRENT_WAVE_DIR="$RUN_DIR/wave-01-nodes-28-29"
     mkdir -p "$CURRENT_WAVE_DIR"
-    printf '%s\n' authority > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
+    jq -S -n '{nodes:[{node:28,launch_state:"candidate-attempted"},
+      {node:29,launch_state:"not-attempted"}]}' \
+        > "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json"
     AUTHORITY_SHA=$(sha256sum "$CURRENT_WAVE_DIR/ROLLBACK-AUTHORITY.json" | awk '{print $1}')
-    printf '%s\n' 'FILESET|28|raw|pool|/mnt/pool/node-28/blocks|pool@preupgrade|10|20|hold|/mnt/pool/.zfs/snapshot/preupgrade/node-28/blocks' \
+    printf '%s\n' \
+        'FILESET|28|raw|pool|/mnt/pool/node-28/blocks|pool@preupgrade|10|20|hold|/mnt/pool/.zfs/snapshot/preupgrade/node-28/blocks' \
+        'FILESET|29|raw|pool|/mnt/pool/node-29/blocks|pool@preupgrade|11|21|hold|/mnt/pool/.zfs/snapshot/preupgrade/node-29/blocks' \
+        'ZFS|29|data|pool/node29|/mnt/pool/node-29|pool/node29@preupgrade|12|22|hold|/mnt/pool/node-29/.zfs/snapshot/preupgrade' \
         > "$CURRENT_WAVE_DIR/data-snapshots.tsv"
     : > "$CURRENT_WAVE_DIR/fileset-restore-node-28-raw.diff"
     (cd "$CURRENT_WAVE_DIR" && sha256sum fileset-restore-node-28-raw.diff \
@@ -443,7 +525,9 @@ done > "$TMP/rollback-resume-functions"
     LIVE_AUTHORITY_CALLS=0
     SNAPSHOT_INVENTORY_CALLS=0
     MANIFEST_PUBLISH_CALLS=0
+    ZFS_PRIMITIVE_CALLS=0
     valid_sha256_hex() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+    valid_node() { [[ "$1" -ge 1 && "$1" -le 32 ]]; }
     data_rollback_protected_file() { [[ -f "$1" && ! -L "$1" ]]; }
     data_rollback_verify_authority_sealed()
     {
@@ -452,6 +536,14 @@ done > "$TMP/rollback-resume-functions"
     }
     chown() { return 0; }
     sync() { return 0; }
+    zfs() { ZFS_PRIMITIVE_CALLS=$((ZFS_PRIMITIVE_CALLS + 1)); return 1; }
+
+    data_rollback_restore_evidence_files "$AUTHORITY_SHA" "$TMP/mixed-restore-evidence-files"
+    [[ "$(cat "$TMP/mixed-restore-evidence-files")" == \
+       fileset-restore-node-28-raw.diff ]]
+    restore_zfs_from_inventory "$AUTHORITY_SHA"
+    [[ "$ZFS_PRIMITIVE_CALLS" -eq 0 ]]
+
     data_rollback_verify_authority_live()
     {
         LIVE_AUTHORITY_CALLS=$((LIVE_AUTHORITY_CALLS + 1))
@@ -482,6 +574,12 @@ done > "$TMP/rollback-resume-functions"
     data_rollback_verify_data_restored_receipt "$AUTHORITY_SHA"
     [[ -f "$CURRENT_WAVE_DIR/DATA-RESTORED.json" &&
        -f "$CURRENT_WAVE_DIR/DATA-RESTORED.json.sha256" ]]
+    [[ "$(wc -l < "$CURRENT_WAVE_DIR/DATA-RESTORE-EVIDENCE.sha256")" -eq 1 ]]
+    ! grep -Fq 'node-29' "$CURRENT_WAVE_DIR/DATA-RESTORE-EVIDENCE.sha256"
+    jq -e '.fileset_restore_expected == 1 and .fileset_restore_completed == 1 and
+      .fileset_restore_proofs == 1 and .zfs_restore_expected == 0 and
+      .zfs_restore_completed == 0 and .zfs_rollback_proofs == 0' \
+        "$CURRENT_WAVE_DIR/DATA-RESTORED.json" >/dev/null
     [[ "$RESTORE_FILESET_CALLS" -eq 0 && "$RESTORE_ZFS_CALLS" -eq 0 &&
        "$LIVE_AUTHORITY_CALLS" -eq 0 && "$SNAPSHOT_INVENTORY_CALLS" -eq 0 &&
        "$MANIFEST_PUBLISH_CALLS" -eq 0 ]]

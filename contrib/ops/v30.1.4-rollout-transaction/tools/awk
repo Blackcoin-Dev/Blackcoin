@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C TZ=UTC
+
+# Compatibility adapter for the interrupted transaction whose sealed renderer
+# accepts node1..node9 while the sealed fleet script emits node01..node09. Only
+# that exact renderer invocation is redirected to the corrected sealed copy.
+# Every other awk invocation is passed to the root-owned system awk unchanged.
+readonly REAL_AWK=/usr/bin/awk
+readonly REAL_AWK_TARGET=/bin/gawk-5.4.0
+readonly REAL_AWK_SHA256=de83fb353fcd41fba42ded0a070eb8d50bf51c35e8fd5bc8a12ce11210b087ba
+readonly OLD_PACKAGE_ROOT=/mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-packages/rollout-express-c15d60a/seal-root/v30.1.4-rollout-transaction
+readonly CORRECTED_PACKAGE_ROOT=/mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-packages/rollout-express-compose-up-20260806T1007Z/seal-root/v30.1.4-rollout-transaction
+readonly OLD_RENDERER="$OLD_PACKAGE_ROOT/render_compose_images.awk"
+readonly CORRECTED_RENDERER="$CORRECTED_PACKAGE_ROOT/render_compose_images.awk"
+readonly OLD_RENDERER_SHA256=a9bfe1153471b0bc1698aadd1d9b9cc44e4981417d3db6a912b39e65921b0670
+readonly CORRECTED_RENDERER_SHA256=ed9048264138fe85147c076d77122d39dac4d5fea6463f065b7e4eb50050b5b5
+readonly COMPOSE_FILE=/boot/config/plugins/compose.manager/projects/blackcoin30/docker-compose.yml
+readonly CANDIDATE_IMAGE=qqblackcoin/blackcoin-v4-gui@sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2
+
+root_owned_system_awk()
+{
+    local owner mode actual_sha ignored
+    [[ -x "$REAL_AWK" && -L "$REAL_AWK" &&
+       "$(stat -c '%u:%g' "$REAL_AWK")" == 0:0 &&
+       "$(realpath -e -- "$REAL_AWK")" == "$REAL_AWK_TARGET" &&
+       -x "$REAL_AWK_TARGET" && ! -L "$REAL_AWK_TARGET" ]] || return 1
+    owner=$(stat -c '%u:%g' "$REAL_AWK_TARGET") || return 1
+    mode=$(stat -c '%a' "$REAL_AWK_TARGET") || return 1
+    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ && $((8#$mode & 0022)) -eq 0 ]] ||
+        return 1
+    read -r actual_sha ignored < <(sha256sum "$REAL_AWK_TARGET") || return 1
+    [[ "$actual_sha" == "$REAL_AWK_SHA256" ]]
+}
+
+root_owned_0600_file()
+{
+    local path=$1
+    [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+       "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]]
+}
+
+sealed_package_is_valid()
+{
+    local root renderer expected_sha manifest owner mode
+    root=$1
+    renderer=$2
+    expected_sha=$3
+    manifest="$root/SHA256SUMS"
+    [[ -d "$root" && ! -L "$root" && "$(realpath -e -- "$root")" == "$root" ]] || return 1
+    owner=$(stat -c '%u:%g' "$root") || return 1
+    mode=$(stat -c '%a' "$root") || return 1
+    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ && $((8#$mode & 0022)) -eq 0 ]] ||
+        return 1
+    root_owned_0600_file "$renderer" || return 1
+    root_owned_0600_file "$manifest" || return 1
+    [[ "$(sha256sum "$renderer" | "$REAL_AWK" '{print $1}')" == "$expected_sha" ]] || return 1
+    [[ "$("$REAL_AWK" -v expected="$expected_sha" '
+        NF == 2 {
+            name=$2
+            sub(/^\\*/, "", name)
+            if (name == "./render_compose_images.awk" || name == "render_compose_images.awk") {
+                count++
+                if ($1 == expected) matched++
+            }
+        }
+        END {print count ":" matched}
+    ' "$manifest")" == 1:1 ]] || return 1
+    [[ -z "$(find "$root" -type l -print -quit)" &&
+       -z "$(find "$root" ! -type d ! -type f -print -quit)" ]] || return 1
+    cmp -s \
+        <(cd "$root" && find . -type f ! -path './SHA256SUMS' -print | sort) \
+        <("$REAL_AWK" 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ {
+            name=$2
+            sub(/^\\*/, "", name)
+            sub(/^[.]\//, "", name)
+            print "./" name
+        }' "$manifest" | sort) || return 1
+    (cd "$root" && sha256sum --strict -c SHA256SUMS >/dev/null)
+}
+
+sealed_fleet_renderer_shape()
+{
+    local -n candidate=$1
+    local targets service seen='' suffix
+    [[ "${#candidate[@]}" -eq 7 &&
+       "${candidate[0]}" == -v &&
+       "${candidate[1]}" == targets=* &&
+       "${candidate[2]}" == -v &&
+       "${candidate[3]}" == "image=$CANDIDATE_IMAGE" &&
+       "${candidate[4]}" == -f &&
+       "${candidate[5]}" == "$OLD_RENDERER" &&
+       "${candidate[6]}" == "$COMPOSE_FILE" ]] || return 1
+    targets=${candidate[1]#targets=}
+    [[ -n "$targets" ]] || return 1
+    while :; do
+        service=${targets%%,*}
+        [[ "$service" =~ ^node(0[1-9]|[12][0-9]|3[0-2])$ ]] || return 1
+        case ",$seen," in
+            *",$service,"*) return 1 ;;
+        esac
+        seen+="${seen:+,}$service"
+        [[ "$targets" == *,* ]] || break
+        suffix=${targets#*,}
+        [[ "$suffix" != "$targets" && -n "$suffix" ]] || return 1
+        targets=$suffix
+    done
+}
+
+validate_renderer_authority()
+{
+    [[ "$(id -u)" -eq 0 ]] || return 1
+    root_owned_system_awk || return 1
+    sealed_package_is_valid "$OLD_PACKAGE_ROOT" "$OLD_RENDERER" "$OLD_RENDERER_SHA256" ||
+        return 1
+    sealed_package_is_valid "$CORRECTED_PACKAGE_ROOT" "$CORRECTED_RENDERER" \
+        "$CORRECTED_RENDERER_SHA256"
+}
+
+rewrite_sealed_fleet_renderer()
+{
+    local -n rewritten=$1
+    rewritten[5]=$CORRECTED_RENDERER
+}
+
+main()
+{
+    local -a command=("$@")
+    root_owned_system_awk || {
+        printf '%s\n' 'FATAL: system awk compatibility authority is unsafe' >&2
+        return 1
+    }
+    if sealed_fleet_renderer_shape command; then
+        validate_renderer_authority || {
+            printf '%s\n' 'FATAL: sealed renderer compatibility authority is unsafe' >&2
+            return 1
+        }
+        printf '%s\n' 'compat: redirecting authenticated sealed Compose renderer' >&2
+        rewrite_sealed_fleet_renderer command
+    fi
+    exec "$REAL_AWK" "${command[@]}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

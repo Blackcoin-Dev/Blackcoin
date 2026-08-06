@@ -6,7 +6,7 @@ BEGIN {
     n = split(targets, requested, ",")
     if (n < 1 || image !~ /^[A-Za-z0-9._\/-]+@sha256:[0-9a-f]+$/) exit 64
     for (i = 1; i <= n; i++) {
-        if (requested[i] !~ /^node([12][0-9]|3[0-2]|[1-9])$/ || (requested[i] in wanted)) exit 64
+        if (requested[i] !~ /^node(0[1-9]|[12][0-9]|3[0-2])$/ || (requested[i] in wanted)) exit 64
         wanted[requested[i]] = 1
     }
     current = ""
@@ -19,7 +19,7 @@ BEGIN {
     next
 }
 
-in_services && /^  node([12][0-9]|3[0-2]|[1-9]):[[:space:]]*$/ {
+in_services && /^  node(0[1-9]|[12][0-9]|3[0-2]):[[:space:]]*$/ {
     current = $1
     sub(/:$/, "", current)
     seen_service[current]++
@@ -32,7 +32,7 @@ in_services && /^[^[:space:]]/ && $0 !~ /^services:[[:space:]]*$/ {
     in_services = 0
 }
 
-in_services && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ && $0 !~ /^  node([12][0-9]|3[0-2]|[1-9]):/ {
+in_services && /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ && $0 !~ /^  node(0[1-9]|[12][0-9]|3[0-2]):/ {
     current = ""
 }
 

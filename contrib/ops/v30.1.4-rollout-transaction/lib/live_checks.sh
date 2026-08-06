@@ -1931,7 +1931,7 @@ candidate_safe_rollback_state_is_clean()
 verify_claim_recovery_clean()
 {
     local node="$1" old_fee="${2:-}" recovery current_fee
-    [[ "$old_fee" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    jq -en --argjson fee "$old_fee" '$fee | type == "number" and . >= 0' >/dev/null || return 1
     recovery=$(wallet_rpc_for "$node" getpowclaimrecoveryinfo) || return 1
     jq -e '.policy_authoritative == true and .policy.automatic_authorized == false and
         .database_outcome_ambiguous == false and .chain_ready == true and
@@ -1942,7 +1942,8 @@ verify_claim_recovery_clean()
         >/dev/null <<< "$recovery" || return 1
     current_fee=$(jq -er '.confirmed_resolution_fees |
         select(type == "number")' <<< "$recovery") || return 1
-    [[ "$current_fee" == "$old_fee" ]]
+    jq -en --argjson current "$current_fee" --argjson expected "$old_fee" \
+        '$current == $expected' >/dev/null
 }
 
 verify_standard_pow()
@@ -1958,7 +1959,7 @@ verify_standard_pow()
 verify_node30_core_role()
 {
     local mining recovery old_fee="${1:-}" current_fee
-    [[ "$old_fee" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    jq -en --argjson fee "$old_fee" '$fee | type == "number" and . >= 0' >/dev/null || return 1
     mining=$(wallet_rpc_for "$FREE_CLAIM_NODE" getpowmininginfo) || return 1
     mining=$(jq -ceS 'select(type == "object")' <<< "$mining") || return 1
     _candidate_pow_json_is_valid "$mining" node30-off || return 1
@@ -1970,7 +1971,8 @@ verify_node30_core_role()
         .pending_manual_resolutions == 0 and .pending_automatic_resolutions == 0' \
         >/dev/null <<< "$recovery" || return 1
     current_fee=$(jq -er '.confirmed_resolution_fees' <<< "$recovery") || return 1
-    [[ "$current_fee" == "$old_fee" ]] || return 1
+    jq -en --argjson current "$current_fee" --argjson expected "$old_fee" \
+        '$current == $expected' >/dev/null || return 1
 }
 
 verify_node30_free_claim_service()

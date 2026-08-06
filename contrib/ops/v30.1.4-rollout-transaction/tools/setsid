@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C TZ=UTC
+
+# Compatibility adapter for the activation worker in the already-sealed fleet
+# transaction. The worker can briefly outlive its final command while Bash's
+# process-substitution tee drains. Keep the worker process-group leader alive
+# until that transient member is gone, without hiding persistent descendants
+# from the transaction's existing process-group residue check.
+#
+# These two functions intentionally duplicate the sealed worker definitions.
+# `declare -f` renders both copies in the same Bash process, allowing the
+# adapter to authenticate the complete serialized worker source rather than a
+# loose command prefix.
+verify_activation_helper()
+{
+    local path="$1" expected_sha="$2"
+    [[ -f "$path" && ! -L "$path" && "$(realpath -e -- "$path")" == "$path" &&
+       "$(stat -c '%u:%g:%a' "$path")" == 0:0:600 ]] || return 1
+    [[ "$(sha256sum "$path" | awk '{print $1}')" == "$expected_sha" ]]
+}
+
+activate_one_node_phase()
+{
+    local phase="$1" node="$2" path="${3:-}" sha="${4:-}" deadline helper_pid='' attempt_rc
+    cleanup_activation_child()
+    {
+        local tick
+        [[ -n "$helper_pid" ]] || return 0
+        kill -TERM -- "-$helper_pid" 2>/dev/null || kill -TERM "$helper_pid" 2>/dev/null || true
+        for ((tick = 0; tick < 50; tick++)); do
+            kill -0 "$helper_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL -- "-$helper_pid" 2>/dev/null || kill -KILL "$helper_pid" 2>/dev/null || true
+        wait "$helper_pid" 2>/dev/null || true
+        helper_pid=''
+    }
+    trap 'cleanup_activation_child; exit 129' HUP
+    trap 'cleanup_activation_child; exit 143' TERM
+    trap 'cleanup_activation_child; exit 130' INT
+    if [[ -z "$path" || -z "$sha" ]]; then
+        if [[ "$phase" == staking ]]; then
+            path=${NORMAL_UNLOCK_HELPER:-}
+            sha=${NORMAL_UNLOCK_HELPER_SHA256:-}
+        else
+            [[ "$phase" == pow && "$node" -ne "${FREE_CLAIM_NODE:-30}" ]] || return 1
+            path=${POW_START_HELPER:-}
+            sha=${POW_START_HELPER_SHA256:-}
+        fi
+    fi
+    [[ -n "$path" && -n "$sha" && ( "$phase" == staking || "$phase" == pow ) ]] || return 1
+    deadline=$((SECONDS + 300))
+    while ((SECONDS < deadline)); do
+        verify_activation_helper "$path" "$sha" || {
+            trap - HUP INT TERM
+            return 1
+        }
+        timeout --foreground --signal=TERM --kill-after=15 120 /bin/bash "$path" "$node" &
+        helper_pid=$!
+        if wait "$helper_pid"; then
+            helper_pid=''
+            trap - HUP INT TERM
+            return 0
+        else
+            attempt_rc=$?
+        fi
+        helper_pid=''
+        [[ "$attempt_rc" -ne 130 && "$attempt_rc" -ne 143 ]] || {
+            trap - HUP INT TERM
+            return "$attempt_rc"
+        }
+        sleep 5
+    done
+    cleanup_activation_child
+    trap - HUP INT TERM
+    return 1
+}
+
+readonly REAL_SETSID=/usr/bin/setsid
+readonly NORMAL_UNLOCK_HELPER=/boot/config/plugins/blackcoin-quantum-nodes/blackcoin_node_normal_unlock.sh
+readonly POW_START_HELPER=/boot/config/plugins/blackcoin-quantum-nodes/blackcoin_pow_start_only.sh
+readonly NORMAL_UNLOCK_HELPER_SHA256=acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1
+readonly POW_START_HELPER_SHA256=21808f232ca3961e180a4c2dd3853e4aef93c2dfdf4821b5d63ca5106c5676ea
+readonly ACTIVATION_DRAIN_SECONDS=15
+
+legacy_activation_worker_shape()
+{
+    local -n candidate=$1
+    local expected_source phase node
+    [[ "${#candidate[@]}" -eq 8 &&
+       "${candidate[0]}" == /bin/bash &&
+       "${candidate[1]}" == -c &&
+       "${candidate[3]}" == activation-worker ]] || return 1
+    expected_source=$(declare -f verify_activation_helper activate_one_node_phase) || return 1
+    expected_source+=$'\n''activate_one_node_phase "$1" "$2" "$3" "$4"'
+    [[ "${candidate[2]}" == "$expected_source" ]] || return 1
+    phase=${candidate[4]}
+    node=${candidate[5]}
+    [[ "$node" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || return 1
+    if [[ "$phase" == staking ]]; then
+        [[ "${candidate[6]}" == "$NORMAL_UNLOCK_HELPER" &&
+           "${candidate[7]}" == "$NORMAL_UNLOCK_HELPER_SHA256" ]]
+    elif [[ "$phase" == pow && "$node" -ne 30 ]]; then
+        [[ "${candidate[6]}" == "$POW_START_HELPER" &&
+           "${candidate[7]}" == "$POW_START_HELPER_SHA256" ]]
+    else
+        return 1
+    fi
+}
+
+validate_supervisor_authority()
+{
+    local owner mode
+    [[ "$(id -u)" -eq 0 && -x "$REAL_SETSID" && ! -L "$REAL_SETSID" &&
+       "$(realpath -e -- "$REAL_SETSID")" == "$REAL_SETSID" ]] || return 1
+    owner=$(stat -c '%u:%g' "$REAL_SETSID") || return 1
+    mode=$(stat -c '%a' "$REAL_SETSID") || return 1
+    [[ "$owner" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ &&
+       $((8#$mode & 0022)) -eq 0 ]]
+}
+
+compat_process_identity()
+{
+    local pid=$1 stat_line tail
+    local -a fields=()
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    stat_line=$(< "/proc/$pid/stat") || return 1
+    tail=${stat_line##*) }
+    [[ "$tail" != "$stat_line" ]] || return 1
+    read -r -a fields <<< "$tail"
+    ((${#fields[@]} >= 20)) || return 1
+    [[ "${fields[0]}" =~ ^.$ && "${fields[2]}" =~ ^[1-9][0-9]*$ &&
+       "${fields[19]}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s %s %s\n' "${fields[2]}" "${fields[19]}" "${fields[0]}"
+}
+
+compat_group_contains_only_leader()
+{
+    local leader=$1 expected_start=$2 identity pgid starttime state
+    local stat_file pid found_leader=0
+    local -a stat_files=(/proc/[1-9]*/stat)
+    identity=$(compat_process_identity "$leader") || return 2
+    read -r pgid starttime state <<< "$identity"
+    [[ "$pgid" == "$leader" && "$starttime" == "$expected_start" &&
+       "$state" != Z && "$state" != X && "$state" != x ]] || return 2
+    for stat_file in "${stat_files[@]}"; do
+        [[ -e "$stat_file" ]] || continue
+        pid=${stat_file#/proc/}
+        pid=${pid%/stat}
+        identity=''
+        if ! identity=$(compat_process_identity "$pid"); then
+            [[ ! -e "/proc/$pid" ]] || return 2
+            continue
+        fi
+        read -r pgid starttime state <<< "$identity"
+        [[ "$pgid" == "$leader" ]] || continue
+        if [[ "$pid" == "$leader" ]]; then
+            [[ "$starttime" == "$expected_start" &&
+               "$state" != Z && "$state" != X && "$state" != x ]] || return 2
+            found_leader=1
+        else
+            return 1
+        fi
+    done
+    ((found_leader == 1)) || return 2
+    return 0
+}
+
+activation_worker_supervisor()
+{
+    local drain_seconds=$1 leader identity pgid starttime state worker_pid worker_rc
+    local deadline group_state
+    shift
+    [[ "$drain_seconds" =~ ^([1-9]|1[0-5])$ && "$#" -gt 0 ]] || return 125
+    leader=$BASHPID
+    identity=$(compat_process_identity "$leader") || return 125
+    read -r pgid starttime state <<< "$identity"
+    [[ "$pgid" == "$leader" && "$state" != Z && "$state" != X && "$state" != x ]] ||
+        return 125
+    "$@" &
+    worker_pid=$!
+    if wait "$worker_pid"; then worker_rc=0; else worker_rc=$?; fi
+    deadline=$((SECONDS + drain_seconds))
+    while :; do
+        if compat_group_contains_only_leader "$leader" "$starttime"; then
+            return "$worker_rc"
+        else
+            group_state=$?
+        fi
+        ((group_state == 1)) || {
+            printf '%s\n' 'FATAL: activation process-group identity became ambiguous' >&2
+            return 125
+        }
+        ((SECONDS < deadline)) || {
+            printf 'compat: activation process group %s retained a descendant after %ss\n' \
+                "$leader" "$drain_seconds" >&2
+            return "$worker_rc"
+        }
+        sleep 0.05
+    done
+}
+
+main()
+{
+    local supervisor_source
+    local -a command=("$@")
+    if legacy_activation_worker_shape command; then
+        validate_supervisor_authority || {
+            printf '%s\n' 'FATAL: activation setsid compatibility authority is unsafe' >&2
+            return 1
+        }
+        supervisor_source=$(declare -f compat_process_identity \
+            compat_group_contains_only_leader activation_worker_supervisor) || return 1
+        supervisor_source+=$'\n''activation_worker_supervisor "$@"'
+        exec "$REAL_SETSID" /bin/bash -c "$supervisor_source" \
+            activation-worker-supervisor "$ACTIVATION_DRAIN_SECONDS" "${command[@]}"
+    fi
+    exec "$REAL_SETSID" "$@"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

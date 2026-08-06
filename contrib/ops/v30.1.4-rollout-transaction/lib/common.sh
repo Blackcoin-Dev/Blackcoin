@@ -177,7 +177,7 @@ rpc_for()
 {
     local node="$1"
     shift
-    timeout --kill-after=2 45 docker exec "$(container_for "$node")" \
+    timeout --foreground --kill-after=2 45 docker exec "$(container_for "$node")" \
         "$CLI_PATH" -datadir="$DATADIR" "$@"
 }
 
@@ -194,7 +194,7 @@ wallet_rpc_for()
     local node="$1" wallet
     shift
     wallet=$(single_wallet_for "$node") || return 1
-    timeout --kill-after=2 45 docker exec "$(container_for "$node")" \
+    timeout --foreground --kill-after=2 45 docker exec "$(container_for "$node")" \
         "$CLI_PATH" -datadir="$DATADIR" -rpcwallet="$wallet" "$@"
 }
 
@@ -203,8 +203,8 @@ live_netns_matches()
     local node="$1" container vpn container_pid vpn_pid container_ns vpn_ns
     container=$(container_for "$node")
     vpn=$(vpn_for "$node")
-    container_pid=$(timeout -k 2 10 docker inspect -f '{{.State.Pid}}' "$container" 2>/dev/null) || return 1
-    vpn_pid=$(timeout -k 2 10 docker inspect -f '{{.State.Pid}}' "$vpn" 2>/dev/null) || return 1
+    container_pid=$(timeout --foreground -k 2 10 docker inspect -f '{{.State.Pid}}' "$container" 2>/dev/null) || return 1
+    vpn_pid=$(timeout --foreground -k 2 10 docker inspect -f '{{.State.Pid}}' "$vpn" 2>/dev/null) || return 1
     [[ "$container_pid" =~ ^[1-9][0-9]*$ && "$vpn_pid" =~ ^[1-9][0-9]*$ ]] || return 1
     container_ns=$(readlink "/proc/$container_pid/ns/net" 2>/dev/null) || return 1
     vpn_ns=$(readlink "/proc/$vpn_pid/ns/net" 2>/dev/null) || return 1
@@ -215,7 +215,7 @@ read_vpn_proof()
 {
     local node="$1" vpn proof ip port
     vpn=$(vpn_for "$node")
-    proof=$(timeout -k 2 20 docker exec "$vpn" sh -c \
+    proof=$(timeout --foreground -k 2 20 docker exec "$vpn" sh -c \
         'ip=$(tr -d "\r\n" </tmp/gluetun/ip) || exit 1
          port=$(tr -d "\r\n" </tmp/gluetun/forwarded_port) || exit 1
          printf "%s|%s\n" "$ip" "$port"' 2>/dev/null) || return 1

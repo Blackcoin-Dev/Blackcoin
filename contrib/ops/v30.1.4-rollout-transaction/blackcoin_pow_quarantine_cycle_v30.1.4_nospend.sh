@@ -59,7 +59,7 @@ rpc_for()
 {
     local node="$1"
     shift
-    timeout --kill-after=2 30 docker exec "$(container_for "$node")" \
+    timeout --foreground --kill-after=2 30 docker exec "$(container_for "$node")" \
         "$CLI" -datadir="$DATADIR" "$@"
 }
 
@@ -71,7 +71,7 @@ wallet_rpc_for()
     wallet=$(jq -er 'select(type == "array" and length == 1) |
         .[0] | select(type == "string" and length <= 128)' \
         <<< "$wallets") || return 1
-    timeout --kill-after=2 30 docker exec "$(container_for "$node")" \
+    timeout --foreground --kill-after=2 30 docker exec "$(container_for "$node")" \
         "$CLI" -datadir="$DATADIR" -rpcwallet="$wallet" "$@"
 }
 

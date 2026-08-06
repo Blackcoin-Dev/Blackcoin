@@ -566,6 +566,7 @@ establish_wave_recovery_baselines()
     # Monitor mode gives every asynchronous function a process group whose
     # PGID is its recorded leader PID. Rollback can then kill the worker and
     # any timeout/docker RPC descendants before it reads or mutates evidence.
+    trap 'launch_signal=129' HUP
     trap 'launch_signal=130' INT
     trap 'launch_signal=143' TERM
     ((monitor_was_enabled == 1)) || set -m
@@ -612,6 +613,7 @@ establish_wave_recovery_baselines()
         remaining=$((remaining - 1))
     done
     terminate_and_join_candidate_baseline_helpers || failed=1
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     ((launch_signal == 0)) || exit "$launch_signal"
@@ -2009,8 +2011,9 @@ write_terminal_receipt()
     chmod 600 "$sha_tmp" && chown root:root "$sha_tmp" && sync -f "$sha_tmp" || return 1
     sync -f "$staging" || return 1
     verify_terminal_receipt "$outcome" 0 "$staging" || return 1
-    trap '' INT TERM
+    trap '' HUP INT TERM
     if ! mv -T -- "$staging" "$receipt_dir"; then
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         return 1
@@ -2023,10 +2026,12 @@ write_terminal_receipt()
     TERMINAL_COMMIT_ACTIVE=0
     FINALIZATION_ACTIVE=0
     if ! sync -f "$RUN_DIR"; then
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         return 1
     fi
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     verify_terminal_receipt "$outcome" 0 || return 1
@@ -2117,14 +2122,16 @@ finalize_completed_rollout()
     [[ -f "$RUN_DIR/STATE" && ! -L "$RUN_DIR/STATE" && "$(cat "$RUN_DIR/STATE")" == complete ]] ||
         return 1
     if [[ -e "$(terminal_receipt_dir)" || -L "$(terminal_receipt_dir)" ]]; then
-        trap '' INT TERM
+        trap '' HUP INT TERM
         if ! verify_terminal_receipt complete 0; then
+            trap 'exit 129' HUP
             trap 'exit 130' INT
             trap 'exit 143' TERM
             return 1
         fi
         TERMINAL_FINALIZED=1
         FINALIZATION_ACTIVE=0
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         verify_terminal_receipt complete 1 || return 1
@@ -2601,14 +2608,16 @@ finalize_rolled_back_run()
     local inhibitor_state ready="$RUN_DIR/ROLLBACK-FINALIZATION-READY.json" release_required=0
     local resume_finalization_state
     if [[ -e "$(terminal_receipt_dir)" || -L "$(terminal_receipt_dir)" ]]; then
-        trap '' INT TERM
+        trap '' HUP INT TERM
         if ! verify_terminal_receipt rolled-back 0; then
+            trap 'exit 129' HUP
             trap 'exit 130' INT
             trap 'exit 143' TERM
             return 1
         fi
         TERMINAL_FINALIZED=1
         FINALIZATION_ACTIVE=0
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         verify_terminal_receipt rolled-back 1 || return 1
@@ -5271,11 +5280,11 @@ capture_fleet_identity()
         vpn=$(vpn_for "$node")
         wallets=$(rpc_for "$node" listwallets | jq -cS .) || return 1
         wallet=$(jq -er 'select(type == "array" and length == 1) | .[0]' <<< "$wallets") || return 1
-        qaddr=$(timeout -k 2 45 docker exec "$container" "$CLI_PATH" -datadir="$DATADIR" \
+        qaddr=$(timeout --foreground -k 2 45 docker exec "$container" "$CLI_PATH" -datadir="$DATADIR" \
             -rpcwallet="$wallet" listquantumaddresses | jq -cS . | sha256sum | awk '{print $1}') || return 1
-        qinv=$(timeout -k 2 45 docker exec "$container" "$CLI_PATH" -datadir="$DATADIR" \
+        qinv=$(timeout --foreground -k 2 45 docker exec "$container" "$CLI_PATH" -datadir="$DATADIR" \
             -rpcwallet="$wallet" getquantumkeyinventory | jq -cS . | sha256sum | awk '{print $1}') || return 1
-        legacy=$(timeout -k 2 45 docker exec "$container" "$CLI_PATH" -datadir="$DATADIR" \
+        legacy=$(timeout --foreground -k 2 45 docker exec "$container" "$CLI_PATH" -datadir="$DATADIR" \
             -rpcwallet="$wallet" getgoldrushinfo | jq -cS \
             '[.wallet_scripts[].address] | unique | sort | select(length > 0)' | \
             sha256sum | awk '{print $1}') || return 1
@@ -6291,7 +6300,7 @@ stop_wave_cleanly()
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         container=$(container_for "$node")
         if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == true ]]; then
-            timeout --kill-after=30 660 docker stop -t 600 "$container" >/dev/null
+            timeout --foreground --kill-after=30 660 docker stop -t 600 "$container" >/dev/null
         fi
         [[ "$(docker inspect -f '{{.State.Running}}' "$container")" == false ]] ||
             die "node $node did not stop cleanly"
@@ -6736,6 +6745,7 @@ activate_wave_phase()
     worker_source=$(declare -f verify_activation_helper activate_one_node_phase) ||
         die 'activation worker functions could not be serialized'
     [[ $- == *m* ]] && monitor_was_enabled=1
+    trap 'launch_signal=129' HUP
     trap 'launch_signal=130' INT
     trap 'launch_signal=143' TERM
     ((monitor_was_enabled == 0)) || set +m
@@ -6785,6 +6795,7 @@ activate_wave_phase()
     done
     terminate_and_join_activation_helpers || failed=1
     ((monitor_was_enabled == 0)) || set -m
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     ((launch_signal == 0)) || exit "$launch_signal"
@@ -6807,6 +6818,7 @@ activate_one_node_phase()
         wait "$helper_pid" 2>/dev/null || true
         helper_pid=''
     }
+    trap 'cleanup_activation_child; exit 129' HUP
     trap 'cleanup_activation_child; exit 143' TERM
     trap 'cleanup_activation_child; exit 130' INT
     if [[ -z "$path" || -z "$sha" ]]; then
@@ -6823,27 +6835,27 @@ activate_one_node_phase()
     deadline=$((SECONDS + 300))
     while ((SECONDS < deadline)); do
         verify_activation_helper "$path" "$sha" || {
-            trap - INT TERM
+            trap - HUP INT TERM
             return 1
         }
-        timeout --signal=TERM --kill-after=15 120 /bin/bash "$path" "$node" &
+        timeout --foreground --signal=TERM --kill-after=15 120 /bin/bash "$path" "$node" &
         helper_pid=$!
         if wait "$helper_pid"; then
             helper_pid=''
-            trap - INT TERM
+            trap - HUP INT TERM
             return 0
         else
             attempt_rc=$?
         fi
         helper_pid=''
         [[ "$attempt_rc" -ne 130 && "$attempt_rc" -ne 143 ]] || {
-            trap - INT TERM
+            trap - HUP INT TERM
             return "$attempt_rc"
         }
         sleep 5
     done
     cleanup_activation_child
-    trap - INT TERM
+    trap - HUP INT TERM
     return 1
 }
 
@@ -7237,7 +7249,7 @@ contain_node_without_rollback()
             wallet_rpc_for "$node" staking false >/dev/null 2>&1 || true
             wallet_rpc_for "$node" walletlock >/dev/null 2>&1 || true
             rpc_for "$node" stop >/dev/null 2>&1 || true
-            timeout --kill-after=10 45 docker stop -t 30 "$container" >/dev/null 2>&1 ||
+            timeout --foreground --kill-after=10 45 docker stop -t 30 "$container" >/dev/null 2>&1 ||
                 docker kill "$container" >/dev/null 2>&1 || return 1
         fi
         verify_node_containment_marker "$node" 0 || return 1
@@ -7265,7 +7277,7 @@ contain_node_without_rollback()
         wallet_attempted=true
         rpc_for "$node" stop >/dev/null 2>&1 || true
         if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == true ]]; then
-            timeout --kill-after=10 45 docker stop -t 30 "$container" >/dev/null 2>&1 ||
+            timeout --foreground --kill-after=10 45 docker stop -t 30 "$container" >/dev/null 2>&1 ||
                 docker kill "$container" >/dev/null 2>&1 || return 1
         fi
     fi
@@ -7409,21 +7421,24 @@ terminate_and_join_containment_helpers()
 contain_wave_without_rollback()
 {
     local reason="$1" node pid failed=0 index monitor_was_enabled=0 signal_received=0
-    local int_trap term_trap trap_mode remaining completed_pid wait_rc found
+    local hup_trap int_trap term_trap trap_mode remaining completed_pid wait_rc found
     local -a active_pids=()
     terminate_and_join_containment_helpers || return 1
     terminate_and_join_activation_helpers || return 1
+    hup_trap=$(trap -p HUP)
     int_trap=$(trap -p INT)
     term_trap=$(trap -p TERM)
-    if [[ -z "$int_trap" && -z "$term_trap" ]]; then
+    if [[ -z "$hup_trap" && -z "$int_trap" && -z "$term_trap" ]]; then
         trap_mode=default
-    elif [[ "$int_trap" == "trap -- 'exit 130' SIGINT" &&
+    elif [[ "$hup_trap" == "trap -- 'exit 129' SIGHUP" &&
+            "$int_trap" == "trap -- 'exit 130' SIGINT" &&
             "$term_trap" == "trap -- 'exit 143' SIGTERM" ]]; then
         trap_mode=rollout
     else
         return 1
     fi
     [[ $- == *m* ]] && monitor_was_enabled=1
+    trap 'signal_received=129' HUP
     trap 'signal_received=130' INT
     trap 'signal_received=143' TERM
     ((monitor_was_enabled == 1)) || set -m
@@ -7470,10 +7485,11 @@ contain_wave_without_rollback()
     done
     terminate_and_join_containment_helpers || failed=1
     if [[ "$trap_mode" == rollout ]]; then
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
     else
-        trap - INT TERM
+        trap - HUP INT TERM
     fi
     ((signal_received == 0)) || exit "$signal_received"
     ((failed == 0)) || return 1
@@ -7648,7 +7664,7 @@ stop_wave_for_rollback()
     for node in "${CURRENT_WAVE_NODES[@]}"; do
         container=$(container_for "$node")
         if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == true ]]; then
-            timeout --kill-after=30 660 docker stop -t 600 "$container" >/dev/null || return 1
+            timeout --foreground --kill-after=30 660 docker stop -t 600 "$container" >/dev/null || return 1
         fi
         if assert_node_cleanly_stopped "$node"; then
             continue
@@ -7913,14 +7929,16 @@ rollback_current_wave()
         done
         verify_node30_free_claim_service || return 1
     fi
-    trap '' INT TERM
+    trap '' HUP INT TERM
     if ! publish_state_token "$CURRENT_WAVE_DIR/ROLLBACK_STATE" rollback-passed ||
        ! publish_state_token "$CURRENT_WAVE_DIR/RESULT" rolled-back; then
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         return 1
     fi
     CURRENT_WAVE_ROLLED_BACK=1
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
 }
@@ -7928,7 +7946,7 @@ rollback_current_wave()
 on_exit()
 {
     local rc=$? containment_proven=0 containment_prefix_ready=0 inhibitor_state=''
-    trap - EXIT INT TERM
+    trap - EXIT HUP INT TERM
     terminate_and_join_containment_helpers || true
     terminate_and_join_candidate_baseline_helpers || true
     terminate_and_join_activation_helpers || true
@@ -8118,13 +8136,15 @@ run_one_wave()
     # as an interrupted attempt. Mask termination across publication and the
     # in-memory boundary so on_exit cannot observe RESULT=passed while the
     # rollback flag still describes an in-progress wave.
-    trap '' INT TERM
+    trap '' HUP INT TERM
     if ! publish_state_token "$CURRENT_WAVE_DIR/RESULT" passed; then
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         die 'passed wave result could not be durably published'
     fi
     CURRENT_WAVE_COMMITTED=0
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     release_wave_locks
@@ -8158,6 +8178,7 @@ apply_rollout()
                 acquire_wave_locks
                 resume_interrupted_wave_before_live_preflight "$interrupted"
                 trap on_exit EXIT
+                trap 'exit 129' HUP
                 trap 'exit 130' INT
                 trap 'exit 143' TERM
                 CURRENT_WAVE_COMMITTED=1
@@ -8168,7 +8189,7 @@ apply_rollout()
                 rollback_current_wave || die 'interrupted wave could not be restored before live preflight'
                 release_wave_locks
                 CURRENT_WAVE_COMMITTED=0
-                trap - EXIT INT TERM
+                trap - EXIT HUP INT TERM
                 CURRENT_WAVE_DIR=
                 CURRENT_WAVE_NODES=()
             fi
@@ -8210,6 +8231,7 @@ apply_rollout()
         fi
     fi
     trap on_exit EXIT
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     release_wave_locks
@@ -8220,7 +8242,7 @@ apply_rollout()
         FINALIZATION_ACTIVE=1
         finalize_completed_rollout || die 'completed rollout finalization could not be proven'
         FINALIZATION_ACTIVE=0
-        trap - EXIT INT TERM
+        trap - EXIT HUP INT TERM
         log "v30.1.4 rollout finalization complete: $RUN_DIR"
         return 0
     fi
@@ -8247,7 +8269,7 @@ apply_rollout()
     FINALIZATION_ACTIVE=1
     finalize_completed_rollout || die 'successful rollout could not safely release transaction inhibitors'
     FINALIZATION_ACTIVE=0
-    trap - EXIT INT TERM
+    trap - EXIT HUP INT TERM
     log "v30.1.4 rollout and exact-32 soak complete: $RUN_DIR"
 }
 
@@ -8284,6 +8306,7 @@ rollback_run()
         die 'snapshot cleanup has begun; resume finalization instead of rollback'
     fi
     trap on_exit EXIT
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     if [[ "$rollback_state" == complete || "$rollback_state" == rolled-back ]]; then
@@ -8294,7 +8317,7 @@ rollback_run()
         FINALIZATION_ACTIVE=1
         finalize_rolled_back_run || die 'rolled-back run finalization could not be proven'
         FINALIZATION_ACTIVE=0
-        trap - EXIT INT TERM
+        trap - EXIT HUP INT TERM
         log "full fleet rollback finalization complete: $RUN_DIR"
         return 0
     fi
@@ -8387,7 +8410,7 @@ rollback_run()
     FINALIZATION_ACTIVE=1
     finalize_rolled_back_run || die 'rollback finalization could not be proven'
     FINALIZATION_ACTIVE=0
-    trap - EXIT INT TERM
+    trap - EXIT HUP INT TERM
     log "full fleet configuration/image rollback completed: $RUN_DIR"
 }
 

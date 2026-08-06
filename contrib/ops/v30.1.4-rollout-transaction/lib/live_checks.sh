@@ -1479,7 +1479,7 @@ verify_core_operational()
     [[ -n "$network" ]] || network=$(rpc_for "$node" getnetworkinfo) || return 1
     chain=$(rpc_for "$node" getblockchaininfo) || return 1
     wallet=$(single_wallet_for "$node") || return 1
-    wallet_info=$(timeout --kill-after=2 45 docker exec "$(container_for "$node")" \
+    wallet_info=$(timeout --foreground --kill-after=2 45 docker exec "$(container_for "$node")" \
         "$CLI_PATH" -datadir="$DATADIR" -rpcwallet="$wallet" getwalletinfo) || return 1
     jq -e '.networkactive == true and .connections_out >= 3' >/dev/null <<< "$network" || return 1
     jq -e '.chain == "main" and .initialblockdownload == false and
@@ -2051,7 +2051,7 @@ verify_no_reindex_log()
     local node="$1" container started logs
     container=$(container_for "$node")
     started=$(docker inspect -f '{{.State.StartedAt}}' "$container") || return 1
-    logs=$(timeout --kill-after=2 45 docker logs --since "$started" "$container" 2>&1) || return 1
+    logs=$(timeout --foreground --kill-after=2 45 docker logs --since "$started" "$container" 2>&1) || return 1
     ! grep -Eiq '(^|[^a-z])(reindexing|reindex-chainstate|reindex started|replay rebuild started|gold rush rewind)' \
         <<< "$logs"
 }

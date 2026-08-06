@@ -244,7 +244,7 @@ contain_on_failure()
                 sleep 1
             done
             if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" == true ]]; then
-                timeout --kill-after=30 660 docker stop -t 600 "$CONTAINER" >/dev/null 2>&1 || failed=1
+                timeout --foreground --kill-after=30 660 docker stop -t 600 "$CONTAINER" >/dev/null 2>&1 || failed=1
             fi
             assert_target_cleanly_stopped || failed=1
         else

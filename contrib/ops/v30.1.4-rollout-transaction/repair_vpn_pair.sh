@@ -275,7 +275,7 @@ stop_repair_target_cleanly()
             sleep 1
         done
         if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" == true ]]; then
-            timeout --kill-after=30 660 docker stop -t 600 "$CONTAINER" >/dev/null 2>&1 || return 1
+            timeout --foreground --kill-after=30 660 docker stop -t 600 "$CONTAINER" >/dev/null 2>&1 || return 1
         fi
     fi
     docker inspect "$CONTAINER" | jq -e 'length == 1 and .[0].State.Running == false and
@@ -372,7 +372,7 @@ apply_repair()
     MUTATION_STARTED=1
     for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
         log "node=$NODE restarting only VPN=$VPN attempt=$attempt"
-        if ! timeout --kill-after=30 180 docker restart -t 120 "$VPN" >/dev/null; then
+        if ! timeout --foreground --kill-after=30 180 docker restart -t 120 "$VPN" >/dev/null; then
             log "node=$NODE VPN restart command failed attempt=$attempt"
             continue
         fi

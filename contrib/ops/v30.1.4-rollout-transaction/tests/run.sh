@@ -66,7 +66,7 @@ pass shellcheck-actionable
 awk '
   /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
   {waves++; if (NF < 1 || NF > 4) exit 1; for (i=1;i<=NF;i++) {
-    if ($i !~ /^([1-9]|[12][0-9]|3[0-2])$/ || seen[$i]++) exit 1; nodes++
+    if ($i !~ /^([12][0-9]|3[0-2]|[1-9])$/ || seen[$i]++) exit 1; nodes++
   }}
   END {exit !(waves >= 8 && nodes == 32 && seen[30] && seen[31] && seen[32])}
 ' "$ROOT/waves.txt"
@@ -747,7 +747,7 @@ assert_order "$TMP/cleanup-transaction-snapshots" \
 function_body write_terminal_receipt "$ROOT/fleet_rollout.sh" > "$TMP/terminal-writer"
 assert_order "$TMP/terminal-writer" 'mktemp -d "$RUN_DIR/.terminal-finalization.' \
     'sha256sum ./RESULT.json' 'verify_terminal_receipt "$outcome" 0 "$staging"' \
-    "trap '' INT TERM" 'mv -T -- "$staging" "$receipt_dir"' \
+    "trap '' HUP INT TERM" 'mv -T -- "$staging" "$receipt_dir"' \
     'TERMINAL_FINALIZED=1' 'FINALIZATION_ACTIVE=0' 'sync -f "$RUN_DIR"' \
     'verify_terminal_receipt "$outcome" 0' 'verify_terminal_receipt "$outcome" 1'
 for required in 'terminal_evidence_manifest' 'hour_manifest_sha256' \
@@ -1338,10 +1338,10 @@ done
 grep -Fq '"$INHIBITOR_RELEASER" verify-release' "$ROOT/lib/data_rollback.sh"
 grep -Fq 'if [[ ! -s "$newer_before" ]]' "$ROOT/lib/data_rollback.sh"
 grep -Fq 'rsync -aHAXx --numeric-ids --delete' "$ROOT/lib/data_rollback.sh"
-function_body verify_published_canary "$ROOT/lib/live_checks.sh" > "$TMP/canary-consumer"
+function_body verify_published_canary_handoff_ready "$ROOT/lib/live_checks.sh" > "$TMP/canary-consumer"
 for required in maintenance-marker-activated.json crash-recovery-procedure.json \
     maintenance-compatible-guard-identities.tsv CANDIDATE-LAUNCH-ATTEMPTED.json \
-    maintenance-marker-released.json maintenance-state-complete.txt; do
+    maintenance-handoff-ready.json maintenance-state-active.txt; do
     grep -Fq -- "$required" "$TMP/canary-consumer"
 done
 for required in legacy_baseline_pow_mode legacy_baseline_quarantined_claims \
@@ -1536,7 +1536,7 @@ assert_order "$TMP/canary-restore-original" \
     'if [[ "$LEGACY_BASELINE_POW_MODE" == clean-hashing ]]' \
     'run_helper "$POW_START_HELPER"' \
     'elif [[ "$LEGACY_BASELINE_POW_MODE" != quarantined-disabled ]]'
-grep -Fq 'legacy_pow_state_matches_baseline "${EVIDENCE}/legacy-prelaunch-pow.json"' "$CANARY"
+grep -Fq 'legacy_pow_state_matches_baseline "${EVIDENCE}/baseline-pow.json"' "$CANARY"
 grep -Fq 'legacy_quarantined_claim_resolution_attempted:false' "$CANARY"
 grep -Fq 'clean_q0_candidate_q0_no_payment_transition_verified:' "$CANARY"
 grep -Fq 'candidate_pow_clean_hashing_verified:true' "$CANARY"

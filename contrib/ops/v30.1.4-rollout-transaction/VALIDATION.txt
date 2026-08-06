@@ -1,4 +1,4 @@
-validated_at=2026-08-05T23:05:02Z
+validated_at=2026-08-06T08:34:58Z
 scope=local-static-targeted-fixture-only
 live_unraid_mutation=false
 docker_invoked=false
@@ -14,14 +14,21 @@ PASS package-integrity-positive-negative-and-entrypoints
 PASS zero-broadcast-normal-install-and-purpose-bound-emergency-containment
 PASS triplet-commit-and-byte-exact-internal-restoration
 PASS claim-safe-and-clean-stop-boundaries
+PASS attempted-only-data-rollback-filtering
+PASS authenticated-data-rollback-boundaries-and-resume
 PASS fresh-final-fleet-and-efficient-soak-resume
 PASS crash-safe-supervisor-fresh-finalization-and-rollback-release-order
 PASS vpn-commit-rollback-and-final-uniqueness
 PASS fee-baseline-no-automatic-recovery-and-full-runtime-gates
+PASS exact-id-no-force-container-replacement-and-absence-proof
+PASS sealed-source-drain-triplet-and-rollback-authority-recovery
+PASS crash-resumable-candidate-recovery-baseline-publication
+PASS joined-process-group-workers-hup-and-nested-timeout-containment
+PASS offline-canary-handoff-and-transaction-identity-pinning
 PASS identity-wave-evidence-and-precommit-publication
 PASS forbidden-operation-and-build-invariants
 PASS build-base-schema-and-package-path-negative-fixtures
-PASS canary-legacy-quarantine-preservation-and-candidate-pow-gates
+PASS canary-clean-and-legacy-quarantine-preservation-and-candidate-pow-gates
 PASS canary-consumer-and-snapshot-retention-gates
 PASS package-manifest-generation
 RESULT=passed

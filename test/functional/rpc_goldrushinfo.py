@@ -2,6 +2,8 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license
 
+from decimal import Decimal
+
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
@@ -11,6 +13,7 @@ MIGRATION_END_HEIGHT = 700
 QQP3_LATE_ORIGIN_WINDOW = 64
 QQSPROOF_MEMPOOL_TTL_SECONDS = 60 * 60
 POW_WALLET_PASSPHRASE = "goldrush-pow-state-test"
+ZERO_HASH = "0" * 64
 
 class GoldRushInfoTest(BitcoinTestFramework):
     def add_options(self, parser):
@@ -57,6 +60,14 @@ class GoldRushInfoTest(BitcoinTestFramework):
                 claims.append(txid)
         return claims
 
+    @staticmethod
+    def _wallet_pow_claims(wallet):
+        return {
+            entry["txid"]
+            for entry in wallet.listtransactions("*", 1000, 0, True)
+            if entry.get("comment") == "PoW Claim"
+        }
+
     def _assert_qqp3_recovery_age(
         self, wallet, claim_txid, origin_age, *, expect_in_mempool=True
     ):
@@ -101,71 +112,250 @@ class GoldRushInfoTest(BitcoinTestFramework):
             expect_in_mempool,
         )
 
+    def _assert_lineaged_origin_expired_family(
+        self,
+        wallet,
+        claim_txid,
+        anchor,
+        target_address,
+        *,
+        expected_snapshot=None,
+    ):
+        """Assert that an expired authored family keeps its exact anchor reserved."""
+        node = self.nodes[0]
+        recovery = wallet.getpowclaimrecoveryinfo(True)
+        component = next(
+            item
+            for item in recovery["component_details"]
+            if claim_txid in item["claim_txids"]
+        )
+        claim_node = next(
+            item for item in component["nodes"] if item["txid"] == claim_txid
+        )
+        record = wallet.gettransaction(claim_txid)
+        transactions = wallet.listtransactions("*", 1000, 0, True)
+
+        assert_equal(component["classification"], "terminal_on_pinned_tip")
+        assert_equal(
+            {
+                "txid": component["anchor"]["txid"],
+                "vout": component["anchor"]["vout"],
+            },
+            anchor,
+        )
+        assert_equal(component["anchor_authenticated"], True)
+        assert_equal(component["anchor_unspent"], True)
+        assert_equal(component["claim_txids"], [claim_txid])
+        assert_equal(component["root_claim_txids"], [claim_txid])
+        assert_equal(component["resolution_txids"], [])
+        assert_equal(component["ordinary_or_mixed_txids"], [])
+        assert_equal(component["all_claims_zero_payment_retirable"], False)
+        assert_equal(component["all_claims_expired_locally_retired"], False)
+        assert_equal(len(component["generation_fingerprint"]), 64)
+        assert component["generation_fingerprint"] != ZERO_HASH
+
+        assert_equal(claim_node["disposition"], "origin_expired")
+        assert_equal(claim_node["in_mempool"], False)
+        assert_equal(claim_node["quarantined"], True)
+        assert_equal(claim_node["abandoned"], False)
+        assert_equal(claim_node["expired_locally_retired"], False)
+        assert_equal(claim_node["lineage_metadata_present"], True)
+        assert_equal(claim_node["lineage_metadata_valid"], True)
+        assert_equal(claim_node["lineage_root_txid"], claim_txid)
+        assert_equal(claim_node["lineage_parent_txid"], ZERO_HASH)
+        assert_equal(claim_node["lineage_ordinal"], 0)
+        assert_equal(
+            claim_node["lineage_family_fingerprint"],
+            component["generation_fingerprint"],
+        )
+
+        assert_equal(record["qq_shadow_pow_quarantine"], "1")
+        assert_equal(record["qq_shadow_pow_lineage_schema"], "1")
+        assert_equal(record["qq_shadow_pow_lineage_root"], claim_txid)
+        assert "qq_shadow_pow_lineage_parent" not in record
+        assert_equal(record["qq_shadow_pow_lineage_ordinal"], "0")
+        assert_equal(
+            record["qq_shadow_pow_lineage_family"],
+            component["generation_fingerprint"],
+        )
+        assert "qq_shadow_pow_expired_retired" not in record
+        assert "qq_shadow_pow_expired_retired_height" not in record
+        assert "qq_shadow_pow_expired_retired_tip" not in record
+
+        assert_equal(recovery["retired_claim_objects"], 0)
+        assert_equal(recovery["retired_components"], 0)
+        assert_equal(recovery["blocking_components"], 1)
+        assert_equal(recovery["pending_manual_resolutions"], 0)
+        assert_equal(recovery["pending_automatic_resolutions"], 0)
+        assert_equal(recovery["confirmed_manual_resolutions"], 0)
+        assert_equal(recovery["confirmed_automatic_resolutions"], 0)
+        assert_equal(recovery["automatic_fee_exposure_in_window"], Decimal("0"))
+        assert_equal(recovery["confirmed_resolution_fees"], Decimal("0"))
+        assert_equal(recovery["policy"]["mode"], "unset")
+        assert_equal(recovery["policy"]["automatic_authorized"], False)
+        assert not any(
+            entry.get("qq_shadow_pow_cleanup_for") == claim_txid
+            for entry in transactions
+        )
+
+        assert node.gettxout(anchor["txid"], anchor["vout"], False) is not None
+        assert all(
+            {"txid": utxo["txid"], "vout": utxo["vout"]} != anchor
+            for utxo in wallet.listunspent(1, 9999999, [target_address])
+        )
+
+        gate = wallet.getpowmininginfo()
+        assert_equal(gate["claim_inventory_tip"], node.getbestblockhash())
+        assert_equal(gate["claim_inventory_wallet_tip_matches"], True)
+        assert_equal(gate["mining_gate_coherent"], True)
+        assert_equal(gate["mining_gate_database_ambiguous"], False)
+        assert_equal(gate["mining_gate_unsafe_claims"], 0)
+        assert_equal(gate["mining_gate_unsafe_components"], 0)
+        assert_equal(gate["mining_gate_action"], "refresh_same_anchor")
+        assert_equal(gate["mining_gate_can_submit"], True)
+        assert_equal(gate["mining_gate_family_claims"], 1)
+        assert_equal(gate["mining_gate_live_claims"], 0)
+        assert_equal(gate["mining_gate_eligible_claims"], 0)
+        assert_equal(gate["mining_gate_lineage_head_txid"], claim_txid)
+        assert_equal(len(gate["mining_gate_candidate_state_fingerprint"]), 64)
+        assert gate["mining_gate_candidate_state_fingerprint"] != ZERO_HASH
+
+        snapshot = {
+            "anchor": {
+                "txid": component["anchor"]["txid"],
+                "vout": component["anchor"]["vout"],
+            },
+            "generation_fingerprint": component["generation_fingerprint"],
+            "lineage_family_fingerprint": claim_node[
+                "lineage_family_fingerprint"
+            ],
+            "claim_txids": component["claim_txids"],
+            "wallet_txcount": wallet.getwalletinfo()["txcount"],
+            "wallet_claims": self._wallet_pow_claims(wallet),
+        }
+        if expected_snapshot is not None:
+            assert_equal(snapshot, expected_snapshot)
+        return snapshot
+
     def _assert_builtin_pow_miner_lifecycle(self):
         node = self.nodes[0]
         wallet_name = "goldrush_pow_builtin"
-        node.createwallet(wallet_name=wallet_name)
+        strict_wallet_name = "goldrush_pow_interactive_strict"
+
+        # Interactive starts remain strict independently of the retained
+        # startup worker exercised below. SetPowMining stops an existing worker
+        # before validating a fresh interactive request, so this deliberately
+        # uses a separate wallet/lifecycle phase.
+        node.createwallet(wallet_name=strict_wallet_name, load_on_startup=False)
+        strict_wallet = node.get_wallet_rpc(strict_wallet_name)
+        strict_wallet.getnewquantumaddress("PoW - Quantum Claim Address")
+        strict_wallet.encryptwallet(POW_WALLET_PASSPHRASE)
+        assert_raises_rpc_error(
+            -4,
+            "requires an unlocked wallet",
+            strict_wallet.setpowmining,
+            True,
+            1,
+            1,
+        )
+        strict_wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, True)
+        assert_raises_rpc_error(
+            -4,
+            "normal wallet unlock",
+            strict_wallet.setpowmining,
+            True,
+            1,
+            1,
+        )
+        strict_wallet.walletlock()
+        node.unloadwallet(strict_wallet_name, False)
+
+        node.createwallet(wallet_name=wallet_name, load_on_startup=True)
         wallet = node.get_wallet_rpc(wallet_name)
         target = wallet.getnewaddress()
 
         self._generate_with_peer_offline(node, 101, target)
         self._sync_mocktime_to_tip()
-
-        if not self.is_cli_compiled():
-            self.log.info("Skipping built-in PoW miner CLI lifecycle test: CLI not compiled")
-            return
-
-        self.log.info("Starting the built-in PoW miner via CLI and checking worker telemetry")
-        cli_wallet = node.cli(f"-rpcwallet={wallet_name}")
-        legacy_payout = wallet.getnewquantumaddress("goldrush-pow")["address"]
-        assert_equal(wallet.getaddressinfo(legacy_payout)["labels"], ["goldrush-pow"])
-        assert_equal(wallet.getpowmininginfo()["state"], "disabled")
+        payout = wallet.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
+        assert_equal(
+            wallet.getaddressinfo(payout)["labels"],
+            ["PoW - Quantum Claim Address"],
+        )
+        quantum_addresses_before = {
+            entry["address"] for entry in wallet.listquantumaddresses()
+        }
+        assert_equal(quantum_addresses_before, {payout})
+        wallet_txcount_before = wallet.getwalletinfo()["txcount"]
+        wallet_claims_before = self._wallet_pow_claims(wallet)
         wallet.encryptwallet(POW_WALLET_PASSPHRASE)
-        wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
-        # Use real clock time while the worker runs. The hashrate meter is wall-clock based,
-        # while epoch activity is derived from the already-connected chain tip.
-        node.setmocktime(0)
-        payout = ""
+
+        # The process-wide startup option applies to every loaded private-key
+        # wallet. Persist only this target for the restart so an unrelated
+        # wallet cannot silently satisfy the worker assertions.
+        originally_loaded = [name for name in node.listwallets() if name != wallet_name]
+        for name in originally_loaded:
+            node.unloadwallet(name, False)
+        assert_equal(node.listwallets(), [wallet_name])
+
         try:
-            started = cli_wallet.setpowmining(True, 1, 100)
-            assert_equal(started["enabled"], True)
-            assert_equal(started["created_payout_key"], False)
-            assert_equal(started["threads"], 1)
-            assert_equal(started["cpu_percent"], 100)
-            payout = started["payout_address"]
-            assert_equal(payout, legacy_payout)
-            assert "warning" not in started
-            assert_equal(wallet.getaddressinfo(payout)["labels"], ["PoW - Quantum Claim Address"])
-            assert_equal(node.validateaddress(payout)["isvalid"], True)
-            assert_equal(wallet.getpowmininginfo()["payout_address"], payout)
+            self.restart_node(
+                0,
+                extra_args=[
+                    *self.extra_args[0],
+                    "-powmining=1",
+                    "-powminingthreads=1",
+                    "-powminingcpu=1",
+                    "-autostartstaking=0",
+                    f"-qqpowpayoutaddress={payout}",
+                ],
+            )
+            node = self.nodes[0]
+            self.connect_nodes(0, 1)
+            assert_equal(node.listwallets(), [wallet_name])
+            wallet = node.get_wallet_rpc(wallet_name)
+            node.setmocktime(0)
 
             self.wait_until(
-                lambda: (
-                    wallet.getpowmininginfo()["hashrate"] > 0
-                    and wallet.getpowmininginfo()["state"] in ("ready", "hashing", "claim_in_flight")
-                ),
-                timeout=60,
+                lambda: wallet.getpowmininginfo()["state"]
+                == "wallet_locked_or_staking_only",
+                timeout=20,
             )
-            info = cli_wallet.getpowmininginfo()
-            assert_equal(info["enabled"], True)
-            assert_equal(info["threads"], 1)
-            assert_equal(info["cpu_percent"], 100)
-            assert_equal(info["epoch_active"], True)
-            assert_equal(info["payout_address"], payout)
-            assert info["hashrate"] > 0
+            locked = wallet.getpowmininginfo()
+            assert_equal(locked["enabled"], True)
+            assert_equal(locked["autostart"], True)
+            assert_equal(locked["threads"], 1)
+            assert_equal(locked["cpu_percent"], 1)
+            assert_equal(locked["state"], "wallet_locked_or_staking_only")
+            assert_equal(locked["hashrate"], 0)
+            assert locked["payout_address"] in ("", payout)
+            assert_equal(wallet.getwalletinfo()["unlocked_until"], 0)
+            assert_equal(
+                {entry["address"] for entry in wallet.listquantumaddresses()},
+                quantum_addresses_before,
+            )
+            assert_equal(wallet.getwalletinfo()["txcount"], wallet_txcount_before)
+            assert_equal(self._wallet_pow_claims(wallet), wallet_claims_before)
 
-            self.log.info("Locking an enabled miner reports a fail-soft waiting state")
-            wallet.walletlock()
-            self._generate_with_peer_offline(node, 1, node.get_deterministic_priv_key().address)
+            self.log.info("A staking-only unlock keeps the retained startup worker paused")
+            wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, True)
             self.wait_until(
                 lambda: wallet.getpowmininginfo()["state"] == "wallet_locked_or_staking_only",
                 timeout=10,
             )
-            locked = wallet.getpowmininginfo()
-            assert_equal(locked["enabled"], True)
-            assert_equal(locked["state"], "wallet_locked_or_staking_only")
-            assert_equal(locked["hashrate"], 0)
+            staking_only = wallet.getpowmininginfo()
+            assert_equal(staking_only["enabled"], True)
+            assert_equal(staking_only["threads"], 1)
+            assert_equal(staking_only["cpu_percent"], 1)
+            assert_equal(staking_only["state"], "wallet_locked_or_staking_only")
+            assert_equal(staking_only["hashrate"], 0)
+            assert_equal(
+                {entry["address"] for entry in wallet.listquantumaddresses()},
+                quantum_addresses_before,
+            )
+            assert_equal(wallet.getwalletinfo()["txcount"], wallet_txcount_before)
+            assert_equal(self._wallet_pow_claims(wallet), wallet_claims_before)
 
+            self.log.info("A normal unlock resumes hashing without setpowmining")
             wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
             self.wait_until(
                 lambda: (
@@ -174,18 +364,78 @@ class GoldRushInfoTest(BitcoinTestFramework):
                 ),
                 timeout=60,
             )
+            running = wallet.getpowmininginfo()
+            assert_equal(running["enabled"], True)
+            assert_equal(running["threads"], 1)
+            assert_equal(running["cpu_percent"], 1)
+            assert_equal(running["payout_address"], payout)
+            assert_equal(
+                {entry["address"] for entry in wallet.listquantumaddresses()},
+                quantum_addresses_before,
+            )
+
+            self.log.info("Relock and a second normal unlock retain one configured worker")
+            wallet.walletlock()
+            self.wait_until(
+                lambda: wallet.getpowmininginfo()["state"]
+                == "wallet_locked_or_staking_only",
+                timeout=10,
+            )
+            relocked = wallet.getpowmininginfo()
+            assert_equal(relocked["enabled"], True)
+            assert_equal(relocked["threads"], 1)
+            assert_equal(relocked["cpu_percent"], 1)
+            assert_equal(relocked["hashrate"], 0)
+            assert_equal(relocked["payout_address"], payout)
+
+            wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
+            self.wait_until(
+                lambda: (
+                    wallet.getpowmininginfo()["hashrate"] > 0
+                    and wallet.getpowmininginfo()["state"]
+                    in ("ready", "hashing", "claim_in_flight")
+                ),
+                timeout=60,
+            )
+            resumed = wallet.getpowmininginfo()
+            assert_equal(resumed["enabled"], True)
+            assert_equal(resumed["threads"], 1)
+            assert_equal(resumed["cpu_percent"], 1)
+            assert_equal(resumed["payout_address"], payout)
+            assert_equal(
+                {entry["address"] for entry in wallet.listquantumaddresses()},
+                quantum_addresses_before,
+            )
+
+            self.log.info("An explicit runtime stop remains authoritative after later unlocks")
+            stopped_result = wallet.setpowmining(False)
+            assert_equal(stopped_result["enabled"], False)
+            wallet.walletlock()
+            wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
+            stopped = wallet.getpowmininginfo()
+            assert_equal(stopped["enabled"], False)
+            assert_equal(stopped["state"], "disabled")
+            assert_equal(stopped["hashrate"], 0)
+            assert_equal(stopped["payout_address"], payout)
+            assert_equal(
+                {entry["address"] for entry in wallet.listquantumaddresses()},
+                quantum_addresses_before,
+            )
         finally:
             try:
-                cli_wallet.setpowmining(False)
+                if wallet_name in node.listwallets():
+                    wallet = node.get_wallet_rpc(wallet_name)
+                    if wallet.getpowmininginfo()["enabled"]:
+                        wallet.setpowmining(False)
+                    node.unloadwallet(wallet_name, False)
             finally:
+                self.restart_node(0, extra_args=self.extra_args[0])
+                node = self.nodes[0]
+                self.connect_nodes(0, 1)
+                for name in originally_loaded:
+                    if name not in node.listwallets():
+                        node.loadwallet(name, False)
                 self._sync_mocktime_to_tip()
-
-        stopped = wallet.getpowmininginfo()
-        assert_equal(stopped["enabled"], False)
-        assert_equal(stopped["state"], "disabled")
-        assert_equal(stopped["hashrate"], 0)
-        if payout:
-            assert_equal(stopped["payout_address"], payout)
 
     def _assert_pow_claim_from_non_whitelisted_address(self):
         if not self.is_wallet_compiled():
@@ -263,15 +513,19 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_raises_rpc_error(-4, "cpu_percent must be between 1 and 100", wallet.setpowmining, True, 1, 101)
         assert_equal(wallet.getpowmininginfo()["enabled"], False)
 
+        # Exercise the real startup path while the Gold Rush epoch is active.
+        # The lifecycle restarts node 0, so reacquire every process-bound RPC
+        # proxy before continuing this wallet's claim scenario.
         self._assert_builtin_pow_miner_lifecycle()
+        node = self.nodes[0]
+        wallet = node.get_wallet_rpc(wallet_name)
+        cli_rpc_wallet = node.get_wallet_rpc(cli_wallet_name)
 
-        # The built-in worker can win while its lifecycle telemetry is sampled.
-        # QQP3 claims target the height after the current tip and remain
-        # eligible through origin_age == QQP3_LATE_ORIGIN_WINDOW. Advance one
-        # additional block so the next mempool evaluation is strictly beyond
-        # that inclusive window before beginning the manual claim checks.
+        # A fast test worker may find a claim while lifecycle telemetry is
+        # sampled. Move past its inclusive origin window before constructing
+        # the independent manual family below.
         if self._mempool_pow_claims(node):
-            self.log.info("Advancing the tip to expire a claim found by the built-in PoW miner")
+            self.log.info("Advancing the tip past a claim found by the lifecycle worker")
             self._generate_with_peer_offline(
                 node,
                 QQP3_LATE_ORIGIN_WINDOW + 1,
@@ -293,18 +547,37 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert stale_claim["proof"].startswith(QQSPROOF_HEX)
         assert stale_claim["txid"] in node.getrawmempool()
         rpc_decoded = node.decoderawtransaction(stale_claim["hex"])
+        assert_equal(len(rpc_decoded["vin"]), 1)
+        stale_anchor = {
+            "txid": rpc_decoded["vin"][0]["txid"],
+            "vout": rpc_decoded["vin"][0]["vout"],
+        }
         assert any(QQSPROOF_HEX in vout["scriptPubKey"]["hex"] for vout in rpc_decoded["vout"])
         assert all(vout["scriptPubKey"].get("address") != rpc_quantum for vout in rpc_decoded["vout"] if "scriptPubKey" in vout)
         proof_mismatch_error = "proof does not match the current tip, target address, quantum payout address, and PoW channel"
-        assert_raises_rpc_error(-8, proof_mismatch_error, wallet.sendshadowpowclaim, rpc_target, rpc_quantum, 1, None, QQSPROOF_HEX + "00")
+        # The typed gate correctly refuses any second construction in the
+        # wallet that already owns the live claim. Exercise malformed external
+        # proofs through the separately funded claim-free CLI wallet so the
+        # parser assertions remain independent of that stronger gate.
+        validation_quantum = cli_rpc_wallet.getnewquantumaddress()["address"]
+        assert_raises_rpc_error(
+            -8,
+            proof_mismatch_error,
+            cli_rpc_wallet.sendshadowpowclaim,
+            cli_target,
+            validation_quantum,
+            1,
+            None,
+            QQSPROOF_HEX + "00",
+        )
         pos_proof = bytearray.fromhex(stale_claim["proof"])
         pos_proof[len(bytes.fromhex(QQSPROOF_HEX)) + 4] = 1
         assert_raises_rpc_error(
             -8,
             "proof encodes PoS mode; fee-paying QQSPROOF claims require PoW mode byte 0",
-            wallet.sendshadowpowclaim,
-            rpc_target,
-            rpc_quantum,
+            cli_rpc_wallet.sendshadowpowclaim,
+            cli_target,
+            validation_quantum,
             1,
             None,
             pos_proof.hex(),
@@ -314,19 +587,28 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_raises_rpc_error(
             -8,
             "proof encodes an unknown mode; fee-paying QQSPROOF claims require PoW mode byte 0",
-            wallet.sendshadowpowclaim,
-            rpc_target,
-            rpc_quantum,
+            cli_rpc_wallet.sendshadowpowclaim,
+            cli_target,
+            validation_quantum,
             1,
             None,
             unknown_proof.hex(),
         )
-        stolen_quantum = wallet.getnewquantumaddress()["address"]
-        assert_raises_rpc_error(-8, proof_mismatch_error, wallet.sendshadowpowclaim, rpc_target, stolen_quantum, 1, None, stale_claim["proof"])
-        self.log.info("Rejecting a second fee-paying carrier for the same logical QQP3 proof")
+        stolen_quantum = cli_rpc_wallet.getnewquantumaddress()["address"]
         assert_raises_rpc_error(
-            -26,
-            "shadow-proof-mempool-duplicate",
+            -8,
+            proof_mismatch_error,
+            cli_rpc_wallet.sendshadowpowclaim,
+            cli_target,
+            stolen_quantum,
+            1,
+            None,
+            stale_claim["proof"],
+        )
+        self.log.info("The typed gate rejects a second fee-paying carrier for the live QQP3 family")
+        assert_raises_rpc_error(
+            -4,
+            "waiting for an existing live claim",
             wallet.sendshadowpowclaim,
             rpc_target,
             rpc_quantum,
@@ -403,7 +685,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
                 expect_in_mempool=False,
             )
 
-        self.log.info("Making QQP3 recovery eligible only at expired origin age 65")
+        self.log.info("Expiring the lineaged QQP3 origin while preserving its family anchor")
         assert_equal(
             node.getblockcount(),
             claim_origin_height + QQP3_LATE_ORIGIN_WINDOW - 1,
@@ -434,47 +716,36 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(expired_node["in_mempool"], False)
         assert_equal(expired_node["quarantined"], True)
         assert_equal(expired_component["classification"], "terminal_on_pinned_tip")
-        txcount_before_retirement = wallet.getwalletinfo()["txcount"]
-        node.mockscheduler(60)
-        self.wait_until(
-            lambda: wallet.getpowclaimrecoveryinfo(True)["retired_components"] == 1,
-            timeout=10,
+        preserved_snapshot = self._assert_lineaged_origin_expired_family(
+            wallet,
+            stale_claim["txid"],
+            stale_anchor,
+            rpc_target,
         )
-        assert_equal(wallet.getwalletinfo()["txcount"], txcount_before_retirement)
-        retired_info = wallet.getpowclaimrecoveryinfo(True)
-        retired_component = next(
-            component
-            for component in retired_info["component_details"]
-            if stale_claim["txid"] in component["claim_txids"]
-        )
-        retired_node = next(
-            graph_node
-            for graph_node in retired_component["nodes"]
-            if graph_node["txid"] == stale_claim["txid"]
-        )
-        assert_equal(retired_component["classification"], "retired_on_active_branch")
-        assert_equal(retired_component["all_claims_expired_locally_retired"], True)
-        assert_equal(retired_node["expired_locally_retired"], True)
-        assert_equal(retired_info["retired_claim_objects"], 1)
-        assert_equal(retired_info["blocking_components"], 0)
-        retired_preview = wallet.resolveallshadowpowclaims()
-        assert_equal(retired_preview["actionable_components"], 0)
-        assert_equal(retired_preview["refused_components"], 1)
-        assert_equal(
-            retired_preview["refused"][0]["reason_code"],
-            "claim-expired-locally-retired",
-        )
-        assert_equal(retired_preview["total_fee"], 0)
 
-        self.log.info("Zero-payment retirement persists across wallet reload")
+        self.log.info("The wallet scheduler does not retire an authenticated lineage family")
+        node.mockscheduler(60)
+        node.syncwithvalidationinterfacequeue()
+        self._assert_lineaged_origin_expired_family(
+            wallet,
+            stale_claim["txid"],
+            stale_anchor,
+            rpc_target,
+            expected_snapshot=preserved_snapshot,
+        )
+
+        self.log.info("Same-anchor preservation and the typed refresh decision survive reload")
         node.unloadwallet(wallet_name)
         node.loadwallet(wallet_name)
         wallet = node.get_wallet_rpc(wallet_name)
         node.syncwithvalidationinterfacequeue()
-        persisted_retirement = wallet.getpowclaimrecoveryinfo(True)
-        assert_equal(persisted_retirement["retired_claim_objects"], 1)
-        assert_equal(persisted_retirement["retired_components"], 1)
-        assert_equal(persisted_retirement["blocking_components"], 0)
+        self._assert_lineaged_origin_expired_family(
+            wallet,
+            stale_claim["txid"],
+            stale_anchor,
+            rpc_target,
+            expected_snapshot=preserved_snapshot,
+        )
 
         if self.is_cli_compiled():
             self.log.info("Checking miner work and broadcasting non-whitelisted PoW claim via CLI")

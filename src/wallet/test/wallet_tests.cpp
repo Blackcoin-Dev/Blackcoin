@@ -1947,6 +1947,65 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_miner_lifecycle_creates_quantum_payout)
     m_wallet.StopPowMining();
 }
 
+BOOST_AUTO_TEST_CASE(goldrush_pow_autostart_waits_for_normal_unlock)
+{
+    ScopedArgsSettings args_guard;
+    args_guard.Force("-qqallowautokeycreation", "0");
+
+    bilingual_str error;
+    bool created_payout_key{false};
+    BOOST_REQUIRE(m_wallet.EnsurePowPayoutAddress(
+        error, &created_payout_key, /*allow_new_key=*/true));
+    BOOST_REQUIRE(created_payout_key);
+    const std::string payout = WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.m_pow_payout_quantum);
+
+    const SecureString passphrase{"pow-autostart-test"};
+    BOOST_REQUIRE(m_wallet.EncryptWallet(passphrase));
+    BOOST_REQUIRE(m_wallet.IsLocked());
+
+    // Interactive RPC/GUI starts remain strict while the wallet is locked.
+    error.clear();
+    BOOST_CHECK(!m_wallet.SetPowMining(
+        /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/1, error));
+    BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK(error.original.find("requires an unlocked wallet") !=
+                std::string::npos);
+
+    // Only explicit startup consent may create a waiting worker. Exercise the
+    // real post-init route so this covers the encrypted clean-install order,
+    // not merely the internal SetPowMining mode.
+    args_guard.Force("-powmining", "1");
+    args_guard.Force("-powminingthreads", "1");
+    args_guard.Force("-powminingcpu", "1");
+    args_guard.Force("-autostartstaking", "0");
+    m_wallet.postInitProcess();
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_threads.load(), 1);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_cpu_percent.load(), 1);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup
+                             ? m_wallet.threadPowMinerGroup->size()
+                             : 0U),
+        1U);
+
+    m_wallet.m_wallet_unlock_staking_only = true;
+    BOOST_REQUIRE(m_wallet.Unlock(passphrase));
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+                          m_wallet.cs_wallet,
+                          return m_wallet.m_pow_payout_quantum),
+                      payout);
+
+    // The same worker remains alive when the operator expands the unlock to
+    // normal signing authority; it can resume without another start command.
+    m_wallet.m_wallet_unlock_staking_only = false;
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    m_wallet.StopPowMining();
+    BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
+}
+
 BOOST_FIXTURE_TEST_CASE(lifecycle_balance_requires_matching_wallet_and_chain_tips, TestChain100Setup)
 {
     std::shared_ptr<CWallet> wallet{CreateSyncedWallet(

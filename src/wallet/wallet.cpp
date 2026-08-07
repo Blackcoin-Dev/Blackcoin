@@ -2457,6 +2457,10 @@ void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
     if (it != mapWallet.end()) {
         RefreshMempoolStatus(it->second);
         UpdatePendingShadowSignalIndex(it->second);
+        // Validation-interface delivery can lag a later eviction/removal.
+        // Clear the atomic QQSPROOF reservation only while the refreshed
+        // wallet record is authoritatively present in the mempool.
+        if (!it->second.InMempool()) return;
         UpdateShadowPowClaimRecoveryRecordDurably(
             tx->GetHash(),
             [](CWalletTx& persisted) {
@@ -5166,6 +5170,15 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
         return false;
     }
 
+    // A locally committed QQSPROOF reserves its authenticated input from the
+    // same database write that first publishes the wallet transaction. The
+    // validation-interface mempool callback durably clears this marker after
+    // authoritative admission; no-broadcast and exceptional relay paths keep
+    // the exact persisted bytes quarantined without a second-write window.
+    if (TransactionHasShadowProof(*tx)) {
+        mapValue[SHADOW_POW_QUARANTINE_KEY] = "1";
+    }
+
     {
         LOCK(cs_wallet);
         WalletLogPrintf("CommitTransaction:\n%s", tx->ToString()); // NOLINT(bitcoin-unterminated-logprintf)
@@ -5218,6 +5231,11 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
 
         // wtx can only be null if the db write failed.
         if (!wtx) {
+            if (TransactionHasShadowProof(*tx)) {
+                m_shadow_pow_claim_recovery_db_ambiguous = true;
+                WalletLogPrintf(
+                    "Gold Rush PoW claim wallet write failed after an in-memory record may have been installed; mining and recovery remain fail-closed until wallet reload\n");
+            }
             throw std::runtime_error(std::string(__func__) + ": Wallet db error, transaction commit failed");
         }
 
@@ -10909,45 +10927,68 @@ ShadowPowClaimSubmitResult CWallet::SubmitShadowPowClaim(
             map_value[SHADOW_POW_CLAIM_LINEAGE_PARENT_KEY] =
                 selected_input.lineage_parent_txid.GetHex();
         }
+        const auto has_durable_claim_reservation = [&] {
+            return WITH_LOCK(
+                cs_wallet,
+                return GetWalletTx(tx->GetHash()) != nullptr &&
+                    !m_shadow_pow_claim_recovery_db_ambiguous &&
+                    IsQuarantinedShadowPowClaim(tx->GetHash()));
+        };
         try {
             std::string broadcast_error;
+            const bool broadcast_enabled = GetBroadcastTransactions();
             WalletCommitStatus commit_status{
                 WalletCommitStatus::REJECTED_NOT_ADDED};
             if (!CommitTransaction(tx, std::move(map_value), {},
                                    &broadcast_error, &commit_status)) {
                 error = strprintf(_("Broadcasting Gold Rush PoW claim failed: %s"), broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error);
-                const bool added_to_wallet = WITH_LOCK(cs_wallet, return GetWalletTx(tx->GetHash()) != nullptr);
-                if (added_to_wallet) {
-                    QuarantineShadowPowClaim(tx->GetHash());
+                const bool retained = has_durable_claim_reservation();
+                if (retained) {
                     WalletLogPrintf("Quarantined Gold Rush PoW claim %s after broadcast failure; its input remains reserved\n",
                                     tx->GetHash().ToString());
                 }
-                return added_to_wallet ||
+                return retained &&
                                commit_status ==
                                    WalletCommitStatus::PERSISTED_PENDING
                     ? ShadowPowClaimSubmitResult::PERSISTED_PENDING
                     : ShadowPowClaimSubmitResult::FAILED;
             }
+            const bool claim_in_mempool = WITH_LOCK(
+                cs_wallet,
+                const CWalletTx* committed = GetWalletTx(tx->GetHash());
+                return committed && committed->InMempool());
+            if (!claim_in_mempool) {
+                const bool retained = has_durable_claim_reservation();
+                if (!retained) {
+                    error = _("Gold Rush PoW claim persistence or input-reservation state is ambiguous; mining remains fail-closed until the wallet is reloaded.");
+                    return ShadowPowClaimSubmitResult::FAILED;
+                }
+                error = !broadcast_enabled
+                    ? _("Gold Rush PoW claim was persisted without relay; its input remains reserved while the typed family gate determines the next action.")
+                    : _("Gold Rush PoW claim was persisted but is not present in the mempool; its input remains reserved while the typed family gate determines the next action.");
+                WalletLogPrintf(
+                    "Gold Rush PoW claim retained pending mempool admission: txid=%s fee=%s\n",
+                    tx->GetHash().ToString(), FormatMoney(fee));
+                return ShadowPowClaimSubmitResult::PERSISTED_PENDING;
+            }
         } catch (const std::exception& e) {
             error = strprintf(_("Broadcasting Gold Rush PoW claim failed: %s"), e.what());
-            const bool added_to_wallet = WITH_LOCK(cs_wallet, return GetWalletTx(tx->GetHash()) != nullptr);
-            if (added_to_wallet) {
-                QuarantineShadowPowClaim(tx->GetHash());
+            const bool retained = has_durable_claim_reservation();
+            if (retained) {
                 WalletLogPrintf("Quarantined Gold Rush PoW claim %s after broadcast exception; its input remains reserved\n",
                                 tx->GetHash().ToString());
             }
-            return added_to_wallet
+            return retained
                 ? ShadowPowClaimSubmitResult::PERSISTED_PENDING
                 : ShadowPowClaimSubmitResult::FAILED;
         } catch (...) {
             error = _("Broadcasting Gold Rush PoW claim failed with an unknown exception.");
-            const bool added_to_wallet = WITH_LOCK(cs_wallet, return GetWalletTx(tx->GetHash()) != nullptr);
-            if (added_to_wallet) {
-                QuarantineShadowPowClaim(tx->GetHash());
+            const bool retained = has_durable_claim_reservation();
+            if (retained) {
                 WalletLogPrintf("Quarantined Gold Rush PoW claim %s after unknown broadcast exception; its input remains reserved\n",
                                 tx->GetHash().ToString());
             }
-            return added_to_wallet
+            return retained
                 ? ShadowPowClaimSubmitResult::PERSISTED_PENDING
                 : ShadowPowClaimSubmitResult::FAILED;
         }

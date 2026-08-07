@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Atomically align the persistent Compose, image-policy, and endpoint-guard
 # desired state after the direct all-32 v30.1.4 service restoration.
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 readonly PKG=/mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-packages/rollout-express-readoption-20260806T1323Z/seal-root/v30.1.4-rollout-transaction
 readonly ENV_FILE=/mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-packages/rollout-express-c15d60a/rollout.env

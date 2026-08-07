@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Byte-pinned, crash-recoverable compatibility update for the wallet-runtime
 # guard and its endpoint-guard hash pin. The default probe performs no writes.
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 readonly PACKAGE_ROOT=${BASH_SOURCE[0]%/*}
 readonly ACTION=${1:-probe}

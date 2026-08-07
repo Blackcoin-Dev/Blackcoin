@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C
 
 [[ $# -eq 3 ]] || {
     printf 'usage: %s INPUT_GUARD OUTPUT_GUARD POLICY_SHA256\n' "$0" >&2

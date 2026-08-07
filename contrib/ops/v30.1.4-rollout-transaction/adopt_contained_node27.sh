@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # One-time, append-only recovery for the authenticated node-27 containment
 # produced by rollout-20260806T094713Z. The original activation and containment
@@ -8,7 +9,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 readonly ADOPTION_ACTION=${1:-plan}
 ADOPTION_PACKAGE_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) ||
@@ -596,6 +597,8 @@ verify_readoption_failed_containment_record()
     started_generation=$(jq -er '.started_container_generation' "$started") || return 1
     readoption_generation_has_original_lineage "$generation" || return 1
     IFS='|' read -r id started_at vpn vpn_started <<< "$generation" || return 1
+    # The timestamp field is parsed to preserve the authenticated generation tuple layout.
+    # shellcheck disable=SC2034
     IFS='|' read -r recorded_id recorded_started recorded_vpn recorded_vpn_started \
         <<< "$started_generation" || return 1
     [[ "$id" == "$recorded_id" && "$vpn" == "$recorded_vpn" &&
@@ -1127,6 +1130,8 @@ run_readoption_phase()
         "$READOPTION_ATTEMPT")-${phase}-activation.$$.partial"
     [[ ! -e "$partial" && ! -L "$partial" ]] || return 1
     worker_source=$(declare -f verify_activation_helper activate_one_node_phase) || return 1
+    # The positional parameters in this literal fragment expand only in the child shell.
+    # shellcheck disable=SC2016
     "$ADOPTION_PACKAGE_ROOT/tools/setsid" /bin/bash -c \
         "$worker_source"$'\n''activate_one_node_phase "$1" "$2" "$3" "$4"' \
         activation-worker "$phase" "$TARGET_NODE" "$path" "$sha" > "$partial" 2>&1 &
@@ -1696,6 +1701,8 @@ adoption_preflight()
     fi
     ADOPTION_REENTRY_STATE=$(verify_adoption_reentry_state) ||
         die 'node27 append-only readoption state or fleet invariant changed'
+    # The temporary compatibility allowance must not escape the completed preflight.
+    # shellcheck disable=SC2034
     ALLOW_PENDING_RESUME_COMPATIBILITY=0
     log "node27 append-only readoption preflight passed state=$ADOPTION_REENTRY_STATE; no live mutation performed"
 }

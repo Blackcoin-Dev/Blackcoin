@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Resume the original sealed v30.1.4 transaction with the independently
 # checksum-sealed compatibility implementation authorized by
@@ -7,7 +8,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 readonly RESUME_ACTION=${1:-preflight}
 RESUME_PACKAGE_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) ||

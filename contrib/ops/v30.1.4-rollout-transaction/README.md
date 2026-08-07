@@ -6,11 +6,28 @@ release at commit `13262151077cce3f72d07d17dc7725b2b6a8e1ab`. Its default action
 read-only plans. It never starts with reindex flags, parks chainstate, generates
 an address, creates a wallet, or authorizes a fee-paying claim resolution.
 
+The typed-gate changes in this package target a **post-release v30.1.4 hotfix
+candidate**, not the immutable `v30.1.4` tag. The example environment retains
+the immutable release pins as historical evidence only. It is not candidate
+rollout authority and must not be edited until CI has produced and attested one
+exact candidate source commit, binary hash, image ID, and registry digest. A
+candidate starts only when all typed fields are present; a partial typed schema
+fails closed and never falls back to the immutable-release predicates.
+
 ## Acceptance target
 
 - 32/32 containers healthy, synchronized on mainnet, P2P active, one expected loaded wallet, normally unlocked, and legacy PoS actively searching with positive weight.
-- Nodes 1-29 and 31-32: built-in PoW enabled at exactly one thread and one percent, positive hashrate, zero live/blocking/quarantined claims, coherent stake reserve, and no automatic quantum-key creation.
-- Node 30: regular PoW remains disabled because it is the Free Claim wallet; its separate API must be healthy, no `.broadcast` marker may remain older than one hour, and confirmed recovery-fee totals may not increase during rollout.
+- Nodes 1-29 and 31-32: built-in PoW enabled at exactly one thread and one
+  percent, coherent stake reserve, no automatic quantum-key creation, and a
+  complete safe typed mining gate. The gate requires coherent tips, no mining
+  or recovery database ambiguity, zero unsafe claims/components, and one of
+  `create_new_anchor`, `wait_for_live`, `wait_for_next_tip`,
+  `relay_existing`, or `refresh_same_anchor`. Zero instantaneous hashrate is
+  valid for a wait or relay.
+- Node 30: regular PoW remains disabled with zero hashrate and a safe typed gate
+  because it is the Free Claim wallet; its separate API must be healthy, no
+  `.broadcast` marker may remain older than one hour, and confirmed
+  recovery-fee totals may not increase during rollout.
 - Nodes 31 and 32: wallet-specific Quantum Quasar signal is confirmed, active, unexpired, and recent-solver-qualified in addition to legacy staking.
 - All 32 VPN proofs have a valid forwarded port and a unique public IPv4 address. Node and VPN topology, mounts, restart policy, wallet/legacy/quantum identity, configuration, and role manifests remain pinned.
 - The final fleet shares one mainnet height, best-block hash, and chainwork, and a fresh supervisor report proves all 32 nodes operational.
@@ -25,7 +42,7 @@ an address, creates a wallet, or authorizes a fee-paying claim resolution.
 6. If read-only preflight finds a stopped node with a failed VPN proof, repair only that stopped node/VPN pair with `repair_vpn_pair.sh`. Each repair proves the other 31 generations unchanged. `recover_clean_guard_stop.sh` remains a manually authorized break-glass path, not a second cron job.
 7. Copy `rollout.env.example` to a root-only operator file and fill only the build, canary, and same-lock live-preflight values that are necessarily dynamic. Run `fleet_rollout.sh preflight`; never refresh a pin merely to make a failed preflight pass.
 8. Set `CONFIRM_APPLY=v30.1.4-exact-32` and run `fleet_rollout.sh apply`. Waves are `27`, `16`, groups of at most four, node 30 alone, then nodes 31/32 together. Every wave drains claims, cleanly stops, takes cold wallet/config backups and held ZFS snapshots, commits the Compose/policy/guard triplet transactionally, recreates only selected nodes with `--pull never`, reactivates the existing wallet, and gates runtime before continuing.
-9. The exact-32 soak takes at least four samples across one hour while both supervisors and Free Claim broadcasts remain durably inhibited. Static checks are reused only for unchanged generations. After the hour passes, the transaction removes maintenance under endpoint → cutover → PoW-cycle → wallet locks, requires a new exact-32 supervisor observation within five minutes, and only then releases Free Claim last. A post-release audit rechecks all 32 nodes and node 30's API/stale-broadcast gate.
+9. The exact-32 soak takes at least four samples across one hour while both supervisors and Free Claim broadcasts remain durably inhibited. Static checks are reused only for unchanged generations. The first and final samples bind each node's tip, typed action, candidate-state fingerprint, and hashrate. Lack of tip/action/fingerprint/hashrate progress, or a `wait_for_next_tip` action that remains across observed tip progress with no fingerprint/hashrate change, is a separate non-gating warning; it never weakens the typed safety gate or authorizes restart/unlock/spending. After the hour passes, the transaction removes maintenance under endpoint → cutover → PoW-cycle → wallet locks, requires a new exact-32 supervisor observation within five minutes, and only then releases Free Claim last. A post-release audit rechecks all 32 nodes and node 30's API/stale-broadcast gate.
 10. After post-release validation, the cleanup transaction releases and destroys only the exact held rollout snapshots. Newer or unrelated snapshots are preserved; rollback falls back to exact-mountpoint `rsync` instead of recursive ZFS rollback whenever newer snapshots exist. Only then may roadmap issues be closed with links to the release, image digest, canary, rollout, soak, finalization, and cleanup evidence.
 
 ## Resume and rollback
@@ -39,8 +56,23 @@ Full rollback requires `CONFIRM_ROLLBACK=v30.1.4-rollback` and the original run 
 - Docker `on-failure:3` is retained for node containers. Changing it to `unless-stopped` would let a clean endpoint-guard stop bypass the VPN/config proof. The existing endpoint guard is the automatic proof-gated recovery path; `recover_clean_guard_stop.sh` is manual break-glass tooling only.
 - The node-30 Free Claim lock is held for stop/recreate/Core validation, then released before the separate service/stale-broadcast gate so the worker can make progress.
 - The PoW quarantine-cycle lock is wave-scoped, not held during the one-hour soak. No automatic resolution or fee budget is invoked by this package.
+- Unresolved, live, quarantined, blocking, family, and recovery counts are
+  retained as evidence. They may be nonzero for a safe same-anchor family and
+  are never compared numerically between immutable v30.1.4 and the candidate.
+  Prelaunch and first-candidate locked-phase wallet transaction sets must match
+  exactly. After activation, permitted PoS and authenticated PoW claims may add
+  protocol transactions; confirmed recovery fees and the prohibited recovery
+  payment set remain pinned. `mining_gate_can_submit` is always the fresh
+  inventory decision;
+  only `mining_gate_action` may report an exact cached `wait_for_next_tip`.
 - Cold backups and snapshots are rollback evidence, not authority to generate keys, change payout addresses, split coins, spend funds, or replace wallets.
 
 ## Local validation
 
-Run `tests/run.sh`. It performs Bash syntax, actionable ShellCheck, exact wave-plan and renderer fixtures, package-tamper rejection, transaction/rollback/claim-drain/resume invariants, and forbidden-operation assertions only. It does not contact Docker, GitHub, Unraid, wallets, or the network. `VALIDATION.txt` and `SHA256SUMS` are generated only after the targeted checks pass.
+Run `tests/run.sh`. It performs Bash syntax, actionable ShellCheck, exact
+wave-plan and renderer fixtures, historical schema-2 preservation, candidate
+schema-3 typed-action/fail-closed fixtures, non-gating staleness fixtures,
+package-tamper rejection, transaction/rollback/claim-drain/resume invariants,
+and forbidden-operation assertions only. It does not contact Docker, GitHub,
+Unraid, wallets, or the network. `VALIDATION.txt` and `SHA256SUMS` are generated
+only after the targeted checks pass.

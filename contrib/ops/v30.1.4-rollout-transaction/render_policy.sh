@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C
 
 [[ $# -ge 4 ]] || {
     printf 'usage: %s INPUT_POLICY OUTPUT_POLICY IMAGE_REF IMAGE_ID NODE...\n' "$0" >&2

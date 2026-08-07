@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Build adapter for the published v30.1.4 linux/amd64 package. It performs no
 # download or pull, refuses target-tag overwrite, derives all binary pins only
@@ -7,7 +8,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 PACKAGE_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P) || exit 1
 readonly PACKAGE_ROOT

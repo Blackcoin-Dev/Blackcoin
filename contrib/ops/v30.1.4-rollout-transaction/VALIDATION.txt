@@ -1,4 +1,4 @@
-validated_at=2026-08-06T13:30:28Z
+validated_at=2026-08-07T10:01:33Z
 scope=local-static-targeted-fixture-only
 live_unraid_mutation=false
 docker_invoked=false
@@ -33,7 +33,8 @@ PASS authenticated-data-rollback-boundaries-and-resume
 PASS fresh-final-fleet-and-efficient-soak-resume
 PASS crash-safe-supervisor-fresh-finalization-and-rollback-release-order
 PASS vpn-commit-rollback-and-final-uniqueness
-PASS soak-schema2-prelaunch-recovery-baseline-and-json-numeric-zero
+PASS soak-schema2-preservation-schema3-typed-gate-and-no-spend
+PASS typed-pow-staleness-warning-is-evidence-not-availability-gate
 PASS fee-baseline-no-automatic-recovery-and-full-runtime-gates
 PASS exact-id-no-force-container-replacement-and-absence-proof
 PASS sealed-source-drain-triplet-and-rollback-authority-recovery
@@ -45,6 +46,7 @@ PASS identity-wave-evidence-and-precommit-publication
 PASS forbidden-operation-and-build-invariants
 PASS build-base-schema-and-package-path-negative-fixtures
 PASS canary-clean-and-legacy-quarantine-preservation-and-candidate-pow-gates
+PASS candidate-typed-gate-safe-actions-identity-roles-and-fail-closed
 PASS canary-consumer-and-snapshot-retention-gates
 PASS package-manifest-generation
 RESULT=passed

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # One-time recovery for explicitly pinned v30.1.3 QQP2 claims that cannot use
 # v30.1.4 zero-payment retirement because their wallets lack authenticated
@@ -7,7 +8,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 if ((BASH_VERSINFO[0] < 4)); then
     printf '%s FATAL: Bash 4 or newer is required\n' "$(date -u +%FT%TZ)" >&2

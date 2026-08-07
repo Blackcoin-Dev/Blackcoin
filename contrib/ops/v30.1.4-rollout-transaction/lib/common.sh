@@ -1,11 +1,14 @@
-#!/usr/bin/env bash
+# shellcheck shell=bash
+# Constants in this sourced library are intentionally consumed by different caller subsets.
+# shellcheck disable=SC2034
+export LC_ALL=C
 
 # Shared, side-effect-free helpers for the v30.1.4 fleet transaction.
 # Callers choose when mutations are authorized; this file never performs one.
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 readonly NODE_COUNT=32
 readonly FREE_CLAIM_NODE=30
@@ -215,6 +218,8 @@ read_vpn_proof()
 {
     local node="$1" vpn proof ip port
     vpn=$(vpn_for "$node")
+    # This remote-shell program must expand its variables inside the VPN container.
+    # shellcheck disable=SC2016
     proof=$(timeout --foreground -k 2 20 docker exec "$vpn" sh -c \
         'ip=$(tr -d "\r\n" </tmp/gluetun/ip) || exit 1
          port=$(tr -d "\r\n" </tmp/gluetun/forwarded_port) || exit 1

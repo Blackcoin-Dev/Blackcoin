@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Installs the permanent no-spend quarantine cycle and the durable Free Claim
 # pause wrapper. Default `probe` is read-only; `install` is explicit and gated.
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 PACKAGE_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
 readonly PACKAGE_ROOT

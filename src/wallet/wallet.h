@@ -1877,6 +1877,14 @@ public:
     ShadowPowClaimMiningGate GetShadowPowClaimMiningGateFromInventoryLocked(
         const ShadowPowClaimRecoveryInventory& inventory) const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    /** Return the action reported by getpowmininginfo while retaining every
+     * safety field and can-submit decision from fresh_gate. Lock ordering is
+     * cs_main + cs_wallet before the worker cache mutex. */
+    ShadowPowClaimMiningGateAction
+    GetShadowPowClaimMiningGateTelemetryActionLocked(
+        const ShadowPowClaimMiningGate& fresh_gate, bool& miner_enabled,
+        interfaces::WalletPowMiningState& miner_state)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     /** Record a deterministic full-mempool-policy rejection only if the
      * supplied relay intent still exactly matches a fresh authoritative gate. */
     bool RecordShadowPowClaimRelayPolicyRejection(

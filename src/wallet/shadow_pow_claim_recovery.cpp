@@ -1532,6 +1532,45 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGate(
     return BuildShadowPowClaimMiningGateImpl(inventory);
 }
 
+ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
+    const ShadowPowClaimMiningGate& fresh_gate,
+    const ShadowPowClaimMiningGate& cached_gate, bool miner_enabled,
+    bool claim_in_flight)
+{
+    if (!miner_enabled || !claim_in_flight ||
+        cached_gate.action !=
+            ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP ||
+        cached_gate.active_tip.IsNull() || !fresh_gate.coherent ||
+        fresh_gate.recovery_database_ambiguous ||
+        fresh_gate.HasUnsafeClaims() || cached_gate.HasUnsafeClaims() ||
+        cached_gate.coherent != fresh_gate.coherent ||
+        cached_gate.recovery_database_ambiguous !=
+            fresh_gate.recovery_database_ambiguous ||
+        cached_gate.active_tip != fresh_gate.active_tip ||
+        cached_gate.active_height != fresh_gate.active_height ||
+        cached_gate.wallet_generation != fresh_gate.wallet_generation ||
+        cached_gate.candidate_state_fingerprint.IsNull() ||
+        cached_gate.candidate_state_fingerprint !=
+            fresh_gate.candidate_state_fingerprint ||
+        cached_gate.anchor.IsNull() ||
+        cached_gate.anchor != fresh_gate.anchor ||
+        cached_gate.anchor_amount != fresh_gate.anchor_amount ||
+        cached_gate.target != fresh_gate.target ||
+        cached_gate.payout_script != fresh_gate.payout_script ||
+        cached_gate.generation_fingerprint.IsNull() ||
+        cached_gate.generation_fingerprint !=
+            fresh_gate.generation_fingerprint ||
+        cached_gate.lineage_root_txid.IsNull() ||
+        cached_gate.lineage_root_txid != fresh_gate.lineage_root_txid ||
+        cached_gate.lineage_head_txid.IsNull() ||
+        cached_gate.lineage_head_txid != fresh_gate.lineage_head_txid ||
+        cached_gate.next_lineage_ordinal !=
+            fresh_gate.next_lineage_ordinal) {
+        return fresh_gate.action;
+    }
+    return ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP;
+}
+
 ShadowPowClaimMiningGate CWallet::GetShadowPowClaimMiningGate() const
 {
     if (!HaveChain() || !chain().isReadyToBroadcast()) {
@@ -1575,6 +1614,22 @@ CWallet::GetShadowPowClaimMiningGateFromInventoryLocked(
         gate.relay_expiry_time = 0;
     }
     return gate;
+}
+
+ShadowPowClaimMiningGateAction
+CWallet::GetShadowPowClaimMiningGateTelemetryActionLocked(
+    const ShadowPowClaimMiningGate& fresh_gate, bool& miner_enabled,
+    interfaces::WalletPowMiningState& miner_state)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_wallet);
+    LOCK(m_pow_miner_mutex);
+    miner_enabled = m_pow_mining_enabled.load();
+    miner_state = m_pow_state.load();
+    return GetShadowPowClaimMiningGateTelemetryAction(
+        fresh_gate, m_pow_mining_gate, miner_enabled,
+        miner_state ==
+            interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT);
 }
 
 bool CWallet::RecordShadowPowClaimRelayPolicyRejection(

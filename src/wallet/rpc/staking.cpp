@@ -3819,9 +3819,9 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             {RPCResult::Type::NUM, "raw_claim_objects", "All wallet-known unconfirmed claim objects in the typed inventory."},
             {RPCResult::Type::NUM, "live_claim_objects", "Claim objects currently in the local mempool."},
             {RPCResult::Type::NUM, "quarantined_claim_objects", "Claim objects marked quarantined for audit and reorg safety."},
-            {RPCResult::Type::NUM, "blocking_components", "Typed components that currently gate new mining claims."},
-            {RPCResult::Type::NUM, "retired_claim_objects", "Origin-expired, locally-authored claim objects durably retired on the active branch without a recovery transaction."},
-            {RPCResult::Type::NUM, "retired_components", "Typed components retired on the active branch without a recovery transaction or recovery fee."},
+            {RPCResult::Type::NUM, "blocking_components", "Legacy recovery classification count retained for audit compatibility. Candidate claim creation is controlled by the complete typed mining gate."},
+            {RPCResult::Type::NUM, "retired_claim_objects", "Narrow legacy claim objects durably retired on the active branch without a recovery transaction. Schema-lineage and strict exact locally-authored carriers are reclassified instead."},
+            {RPCResult::Type::NUM, "retired_components", "Narrow legacy components retired on the active branch without a recovery transaction or recovery fee."},
             {RPCResult::Type::NUM, "resolved_components", "Typed components resolved on the active chain."},
             {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual resolutions."},
             {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic resolutions."},
@@ -3927,7 +3927,7 @@ static RPCHelpMan setpowclaimrecovery()
     return RPCHelpMan{
         "setpowclaimrecovery",
         "\nPersist this wallet's Gold Rush PoW claim-recovery choice.\n"
-        "Newly authored origin-bound claims retire without a second transaction or recovery fee after their full block-height eligibility window. automatic is explicit standing consent to create fee-paying on-chain conflicts only for remaining components after the component engine classifies the complete graph as conflict-resolvable on one pinned active-chain tip. This may include a disclosed unbound QQP2 proof that is invalid now but may become valid on a descendant. Generic retryable and indeterminate states remain refused. All six positive limits are required when enabling it. pause_and_ask keeps conflict recovery manual. unset removes standing consent. This call never starts mining and never creates, signs, or broadcasts a transaction.\n",
+        "The built-in miner's normal path for a strict exact wallet-authored QQP2/QQP3/QQP4 family is exact relay or same-anchor continuation; the family is not retired merely because an original policy window expires. Separately, automatic is explicit, default-off standing consent to create fee-paying on-chain conflicts that the component engine finds conflict-resolvable on one pinned active-chain tip, including a disclosed legacy QQP2 proof that is invalid now but may validate on a descendant. Generic retryable and indeterminate states remain refused. All six positive limits are required when enabling it. pause_and_ask keeps conflict recovery manual. unset removes standing consent. This call never starts mining and never creates, signs, or broadcasts a transaction.\n",
         {
             {"mode", RPCArg::Type::STR, RPCArg::Optional::NO, "automatic, pause_and_ask, or unset."},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Wallet-scoped spending and staleness limits.", {
@@ -4115,9 +4115,9 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "claims_submitted", "Claims submitted by this miner since it started."},
             {RPCResult::Type::NUM, "unresolved_claims", "Unconfirmed wallet QQSPROOF transactions, whether live or quarantined."},
             {RPCResult::Type::NUM, "live_claims", "Unconfirmed wallet QQSPROOF transactions currently in the local mempool."},
-            {RPCResult::Type::NUM, "quarantined_claims", "Backward-compatible count of quarantined claim objects that currently gate claim creation (same as blocking_quarantined_claims)."},
+            {RPCResult::Type::NUM, "quarantined_claims", "Backward-compatible legacy count (same as blocking_quarantined_claims). It is audit evidence, not the candidate mining predicate; a safe typed family may relay or refresh while this count is nonzero."},
             {RPCResult::Type::NUM, "raw_quarantined_claims", "All wallet-authored unconfirmed QQSPROOF objects absent from the local mempool, including history already resolved on the active chain."},
-            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Quarantined claim objects that currently gate claim creation (actionable plus indeterminate)."},
+            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Legacy actionable-plus-indeterminate compatibility count. Candidate claim creation is controlled by the complete typed mining gate instead."},
             {RPCResult::Type::NUM, "actionable_quarantined_claims", "Quarantined objects whose confirmed anchor remains unspent on the active chain."},
             {RPCResult::Type::NUM, "resolved_on_active_chain_claims", "Historical quarantined objects whose confirmed anchor is already spent on the active chain; retained for reorg safety but not miner-gating."},
             {RPCResult::Type::NUM, "indeterminate_quarantined_claims", "Quarantined objects with incomplete ancestry or an incoherent wallet/chain snapshot; these fail closed and gate mining."},
@@ -4125,8 +4125,8 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::STR_HEX, "claim_inventory_tip", "Active tip to which component classification is bound, or all-zero when unavailable."},
             {RPCResult::Type::BOOL, "claim_inventory_wallet_tip_matches", "Whether the wallet-processed tip exactly matched the classified active tip."},
             {RPCResult::Type::BOOL, "mining_gate_coherent", "Whether the typed mining gate is bound to one matching active-chain and wallet tip."},
-            {RPCResult::Type::STR, "mining_gate_action", "Typed wallet action: create_new_anchor, wait_for_live, wait_for_next_tip, relay_existing, refresh_same_anchor, or unsafe."},
-            {RPCResult::Type::BOOL, "mining_gate_can_submit", "Whether the gate permits creation of one additional claim without mutating recovery state."},
+            {RPCResult::Type::STR, "mining_gate_action", "Fresh inventory action, except that an enabled claim-in-flight worker may report the optional transient wait_for_next_tip from one exact matching cached snapshot: create_new_anchor, wait_for_live, wait_for_next_tip, relay_existing, refresh_same_anchor, or unsafe."},
+            {RPCResult::Type::BOOL, "mining_gate_can_submit", "Fresh inventory authorization to create one additional claim without mutating recovery state. It may be true while mining_gate_action reports a bounded wait_for_next_tip worker override, but does not authorize bypassing that wait."},
             {RPCResult::Type::BOOL, "mining_gate_database_ambiguous", "Whether an ambiguous recovery database outcome forces the gate closed until wallet reload."},
             {RPCResult::Type::NUM, "mining_gate_unresolved_components", "Unresolved wallet claim components in the typed snapshot."},
             {RPCResult::Type::NUM, "mining_gate_live_claims", "Same-anchor family members currently in the local mempool."},
@@ -4134,7 +4134,7 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "mining_gate_family_claims", "Historical members of the one authenticated same-anchor claim family."},
             {RPCResult::Type::NUM, "mining_gate_unsafe_claims", "Unresolved claim objects that fail the strict same-anchor family rules."},
             {RPCResult::Type::NUM, "mining_gate_unsafe_components", "Unresolved components that fail the strict same-anchor family rules."},
-            {RPCResult::Type::STR_HEX, "mining_gate_relay_txid", "Eligible under-TTL claim selected for immediate relay, or all-zero otherwise."},
+            {RPCResult::Type::STR_HEX, "mining_gate_relay_txid", "Fresh-inventory eligible under-TTL relay claim, or all-zero otherwise. It may remain nonzero while mining_gate_action reports a matching bounded wait_for_next_tip worker override."},
             {RPCResult::Type::STR_HEX, "mining_gate_lineage_head_txid", "Current durable same-anchor lineage head, or all-zero when no family is active."},
             {RPCResult::Type::STR_HEX, "mining_gate_candidate_state_fingerprint", "Cheap in-memory wallet-claim state key used with tip and database generation to invalidate the cached gate."},
             {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual claim resolutions."},
@@ -4162,14 +4162,6 @@ static RPCHelpMan getpowmininginfo()
     if (!pwallet) return NullUniValue;
 
     UniValue obj(UniValue::VOBJ);
-    obj.pushKV("enabled", pwallet->m_pow_mining_enabled.load());
-    obj.pushKV("autostart", gArgs.GetBoolArg("-powmining", false));
-    obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
-    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pwallet->m_pow_state.load())));
-    obj.pushKV("threads", pwallet->m_pow_threads.load());
-    obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
-    obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());
-    obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
     ShadowPowClaimInventory claim_inventory;
     ShadowPowClaimRecoveryInventory recovery_inventory;
     ShadowPowClaimMiningGate mining_gate;
@@ -4181,6 +4173,11 @@ static RPCHelpMan getpowmininginfo()
     ShadowPowClaimRecoveryPolicyMutationResult recovery_policy_state;
     bool recovery_database_ambiguous{false};
     ShadowPowClaimStakeReserveInfo stake_reserve;
+    ShadowPowClaimMiningGateAction mining_gate_telemetry_action{
+        ShadowPowClaimMiningGateAction::UNSAFE};
+    bool pow_mining_enabled{false};
+    interfaces::WalletPowMiningState pow_mining_state{
+        interfaces::WalletPowMiningState::DISABLED};
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
         recovery_inventory =
@@ -4190,6 +4187,9 @@ static RPCHelpMan getpowmininginfo()
         mining_gate =
             pwallet->GetShadowPowClaimMiningGateFromInventoryLocked(
                 recovery_inventory);
+        mining_gate_telemetry_action =
+            pwallet->GetShadowPowClaimMiningGateTelemetryActionLocked(
+                mining_gate, pow_mining_enabled, pow_mining_state);
         for (const ShadowPowClaimRecoveryComponent& component :
              recovery_inventory.components) {
             for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
@@ -4215,6 +4215,14 @@ static RPCHelpMan getpowmininginfo()
                 recovery_policy.rolling_fee_window_seconds);
         stake_reserve = pwallet->GetShadowPowClaimStakeReserveInfoLocked();
     }
+    obj.pushKV("enabled", pow_mining_enabled);
+    obj.pushKV("autostart", gArgs.GetBoolArg("-powmining", false));
+    obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
+    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pow_mining_state)));
+    obj.pushKV("threads", pwallet->m_pow_threads.load());
+    obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
+    obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());
+    obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
     obj.pushKV("unresolved_claims",
                static_cast<uint64_t>(unresolved_claims));
     obj.pushKV("live_claims", static_cast<uint64_t>(live_claims));
@@ -4229,7 +4237,8 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("claim_inventory_wallet_tip_matches", claim_inventory.wallet_tip_matches);
     obj.pushKV("mining_gate_coherent", mining_gate.coherent);
     obj.pushKV("mining_gate_action",
-               ShadowPowMiningGateActionName(mining_gate.action));
+               ShadowPowMiningGateActionName(
+                   mining_gate_telemetry_action));
     obj.pushKV("mining_gate_can_submit", mining_gate.MayCreateClaim());
     obj.pushKV("mining_gate_database_ambiguous",
                mining_gate.recovery_database_ambiguous);

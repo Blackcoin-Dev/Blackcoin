@@ -799,6 +799,144 @@ BOOST_FIXTURE_TEST_CASE(
     BOOST_CHECK(after_tip_public.relay_txid == after_tip_pure.relay_txid);
 }
 
+BOOST_AUTO_TEST_CASE(mining_gate_wait_for_next_tip_telemetry_requires_an_exact_worker_snapshot)
+{
+    ShadowPowClaimMiningGate fresh;
+    fresh.action = ShadowPowClaimMiningGateAction::RELAY_EXISTING;
+    fresh.active_tip = uint256S("01");
+    fresh.active_height = 101;
+    fresh.wallet_generation = 7;
+    fresh.candidate_state_fingerprint = uint256S("02");
+    fresh.coherent = true;
+    fresh.unresolved_components = 1;
+    fresh.eligible_claims = 1;
+    fresh.family_claims = 2;
+    fresh.anchor = COutPoint{uint256S("03"), 1};
+    fresh.anchor_amount = 100000;
+    fresh.target = CScript() << OP_TRUE;
+    fresh.payout_script = CScript() << OP_0;
+    fresh.generation_fingerprint = uint256S("04");
+    fresh.lineage_root_txid = uint256S("05");
+    fresh.lineage_head_txid = uint256S("06");
+    fresh.next_lineage_ordinal = 2;
+    fresh.relay_txid = fresh.lineage_head_txid;
+
+    ShadowPowClaimMiningGate cached = fresh;
+    cached.action = ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP;
+    cached.relay_txid.SetNull();
+    cached.relay_expiry_time = 0;
+
+    const auto reported = [&](const ShadowPowClaimMiningGate& current,
+                              const ShadowPowClaimMiningGate& worker,
+                              bool enabled = true,
+                              bool claim_in_flight = true) {
+        return GetShadowPowClaimMiningGateTelemetryAction(
+            current, worker, enabled, claim_in_flight);
+    };
+
+    BOOST_CHECK(reported(fresh, cached) ==
+                ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP);
+    BOOST_CHECK(!fresh.MayCreateClaim());
+    BOOST_CHECK(reported(fresh, cached, /*enabled=*/false) == fresh.action);
+    BOOST_CHECK(reported(fresh, cached, /*enabled=*/true,
+                         /*claim_in_flight=*/false) == fresh.action);
+
+    ShadowPowClaimMiningGate mismatch = cached;
+    mismatch.active_tip = uint256S("07");
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    ++mismatch.active_height;
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    ++mismatch.wallet_generation;
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.candidate_state_fingerprint = uint256S("08");
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.candidate_state_fingerprint.SetNull();
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.generation_fingerprint = uint256S("09");
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.generation_fingerprint.SetNull();
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.lineage_root_txid = uint256S("0a");
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.lineage_root_txid.SetNull();
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.lineage_head_txid = uint256S("0b");
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.lineage_head_txid.SetNull();
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.anchor = COutPoint{uint256S("0d"), 1};
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    ++mismatch.anchor_amount;
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.target = CScript() << OP_FALSE;
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.payout_script = CScript() << OP_TRUE;
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    ++mismatch.next_lineage_ordinal;
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.action = ShadowPowClaimMiningGateAction::RELAY_EXISTING;
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.recovery_database_ambiguous = true;
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+    mismatch = cached;
+    mismatch.coherent = false;
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+
+    // PERSISTED_PENDING deliberately publishes a null-tip sentinel so the
+    // worker immediately rebuilds the typed gate instead of reporting a wait.
+    mismatch = cached;
+    mismatch.active_tip.SetNull();
+    BOOST_CHECK(reported(fresh, mismatch) == fresh.action);
+
+    ShadowPowClaimMiningGate unsafe_component = fresh;
+    unsafe_component.unsafe_components = 1;
+    BOOST_CHECK(reported(unsafe_component, cached) ==
+                unsafe_component.action);
+    ShadowPowClaimMiningGate unsafe_action = fresh;
+    unsafe_action.action = ShadowPowClaimMiningGateAction::UNSAFE;
+    BOOST_CHECK(reported(unsafe_action, cached) == unsafe_action.action);
+    ShadowPowClaimMiningGate cached_unsafe = cached;
+    cached_unsafe.unsafe_components = 1;
+    BOOST_CHECK(reported(fresh, cached_unsafe) == fresh.action);
+    ShadowPowClaimMiningGate ambiguous = fresh;
+    ambiguous.recovery_database_ambiguous = true;
+    BOOST_CHECK(reported(ambiguous, cached) == ambiguous.action);
+    ShadowPowClaimMiningGate incoherent = fresh;
+    incoherent.coherent = false;
+    BOOST_CHECK(reported(incoherent, cached) == incoherent.action);
+
+    // A next-tip inventory snapshot exits the override immediately.
+    ShadowPowClaimMiningGate next_tip = fresh;
+    next_tip.active_tip = uint256S("0c");
+    ++next_tip.active_height;
+    BOOST_CHECK(reported(next_tip, cached) == next_tip.action);
+
+    // Can-submit remains the fresh inventory decision even while the worker's
+    // exact matching snapshot truthfully reports a bounded wait.
+    ShadowPowClaimMiningGate refresh = fresh;
+    refresh.action = ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR;
+    BOOST_REQUIRE(refresh.MayCreateClaim());
+    BOOST_CHECK(reported(refresh, cached) ==
+                ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP);
+}
+
 BOOST_AUTO_TEST_CASE(mining_gate_fails_closed_for_ambiguous_or_nonfamily_graphs)
 {
     RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,

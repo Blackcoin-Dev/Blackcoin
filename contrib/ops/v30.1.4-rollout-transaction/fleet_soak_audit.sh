@@ -128,6 +128,7 @@ validate_recovery_baseline()
     local node="$1" expected_sha="${2:-}" expected_fee="${3:-}"
     local padded path metadata actual_sha metadata_sha fee wave transaction_set
     local transaction_prelaunch transaction_first prelaunch_sha first_sha
+    local schema mining recovery
     padded=$(node_padded "$node") || return 1
     wave=$(passed_wave_for_node "$node") || return 1
     path="$wave/candidate-recovery-node-${padded}.json"
@@ -154,44 +155,90 @@ validate_recovery_baseline()
     prelaunch_sha=$(sha256sum "$transaction_prelaunch" | awk '{print $1}') || return 1
     first_sha=$(sha256sum "$transaction_first" | awk '{print $1}') || return 1
     [[ "$prelaunch_sha" == "$first_sha" ]] || return 1
-    jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
-        --arg source "$SOURCE_COMMIT" --argjson node "$node" \
-        --arg prelaunch_sha "$prelaunch_sha" --arg first_sha "$first_sha" \
-        --arg wave_dir "$wave" '
-        .schema == 2 and .node == $node and .candidate_image == $image and
-        .candidate_image_id == $image_id and .source_commit == $source and
-        .wave_dir == $wave_dir and
-        (.captured_at | type) == "string" and
-        (.container_generation | type) == "string" and
-        .wallet_locked_throughout == true and .wallet_final.unlocked_until == 0 and
-        .staking_final.enabled == false and .staking_final.staking == false and
-        .staking_final.worker_running == false and
-        .staking_final.allow_automatic_quantum_key_creation == false and
-        .mining_final.enabled == false and .mining_final.autostart == false and
-        .mining_final.state == "disabled" and .mining_final.hashrate == 0 and
-        .mining_final.live_claims == 0 and .mining_final.quarantined_claims == 0 and
-        .mining_final.blocking_quarantined_claims == 0 and
-        .mining_final.allow_automatic_quantum_key_creation == false and
-        .recovery_initial.policy_authoritative == true and
-        .recovery_initial.policy.automatic_authorized == false and
-        .recovery_initial.database_outcome_ambiguous == false and
-        .recovery_final.policy_authoritative == true and
-        .recovery_final.policy.automatic_authorized == false and
-        .recovery_final.database_outcome_ambiguous == false and
-        .recovery_final.chain_ready == true and .recovery_final.wallet_tip_matches == true and
-        .recovery_final.blocking_quarantined_claims == 0 and
-        .recovery_final.blocking_components == 0 and
-        .recovery_final.indeterminate_quarantined_claims == 0 and
-        .recovery_final.pending_manual_resolutions == 0 and
-        .recovery_final.pending_automatic_resolutions == 0 and
-        (.recovery_initial.confirmed_resolution_fees | type) == "number" and
-        .recovery_initial.confirmed_resolution_fees >= 0 and
-        .recovery_final.confirmed_resolution_fees ==
-          .recovery_initial.confirmed_resolution_fees and
-        .wallet_transaction_guard.prelaunch_sha256 == $prelaunch_sha and
-        .wallet_transaction_guard.first_v3014_sha256 == $first_sha and
-        .wallet_transaction_guard.exactly_unchanged == true
-    ' "$path" >/dev/null || return 1
+    schema=$(jq -er '.schema | select(. == 2 or . == 3)' "$path") || return 1
+    case "$schema" in
+        2)
+            # Do not reinterpret sealed schema-2 evidence. Its Q0 predicates
+            # remain byte-for-byte historical resume authority.
+            jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+                --arg source "$SOURCE_COMMIT" --argjson node "$node" \
+                --arg prelaunch_sha "$prelaunch_sha" --arg first_sha "$first_sha" \
+                --arg wave_dir "$wave" '
+                .schema == 2 and .node == $node and .candidate_image == $image and
+                .candidate_image_id == $image_id and .source_commit == $source and
+                .wave_dir == $wave_dir and
+                (.captured_at | type) == "string" and
+                (.container_generation | type) == "string" and
+                .wallet_locked_throughout == true and .wallet_final.unlocked_until == 0 and
+                .staking_final.enabled == false and .staking_final.staking == false and
+                .staking_final.worker_running == false and
+                .staking_final.allow_automatic_quantum_key_creation == false and
+                .mining_final.enabled == false and .mining_final.autostart == false and
+                .mining_final.state == "disabled" and .mining_final.hashrate == 0 and
+                .mining_final.live_claims == 0 and .mining_final.quarantined_claims == 0 and
+                .mining_final.blocking_quarantined_claims == 0 and
+                .mining_final.allow_automatic_quantum_key_creation == false and
+                .recovery_initial.policy_authoritative == true and
+                .recovery_initial.policy.automatic_authorized == false and
+                .recovery_initial.database_outcome_ambiguous == false and
+                .recovery_final.policy_authoritative == true and
+                .recovery_final.policy.automatic_authorized == false and
+                .recovery_final.database_outcome_ambiguous == false and
+                .recovery_final.chain_ready == true and
+                .recovery_final.wallet_tip_matches == true and
+                .recovery_final.blocking_quarantined_claims == 0 and
+                .recovery_final.blocking_components == 0 and
+                .recovery_final.indeterminate_quarantined_claims == 0 and
+                .recovery_final.pending_manual_resolutions == 0 and
+                .recovery_final.pending_automatic_resolutions == 0 and
+                (.recovery_initial.confirmed_resolution_fees | type) == "number" and
+                .recovery_initial.confirmed_resolution_fees >= 0 and
+                .recovery_final.confirmed_resolution_fees ==
+                  .recovery_initial.confirmed_resolution_fees and
+                .wallet_transaction_guard.prelaunch_sha256 == $prelaunch_sha and
+                .wallet_transaction_guard.first_v3014_sha256 == $first_sha and
+                .wallet_transaction_guard.exactly_unchanged == true
+            ' "$path" >/dev/null || return 1
+            ;;
+        3)
+            jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+                --arg source "$SOURCE_COMMIT" --argjson node "$node" \
+                --arg prelaunch_sha "$prelaunch_sha" --arg first_sha "$first_sha" \
+                --arg wave_dir "$wave" '
+                .schema == 3 and .typed_mining_gate_contract == true and
+                .node == $node and .candidate_image == $image and
+                .candidate_image_id == $image_id and .source_commit == $source and
+                .wave_dir == $wave_dir and
+                (.captured_at | type) == "string" and
+                (.container_generation | type) == "string" and
+                .wallet_locked_throughout == true and .wallet_final.unlocked_until == 0 and
+                .staking_final.enabled == false and .staking_final.staking == false and
+                .staking_final.worker_running == false and
+                .staking_final.allow_automatic_quantum_key_creation == false and
+                .recovery_initial.policy_authoritative == true and
+                .recovery_initial.policy.automatic_authorized == false and
+                .recovery_initial.database_outcome_ambiguous == false and
+                .recovery_final.policy_authoritative == true and
+                .recovery_final.policy.automatic_authorized == false and
+                .recovery_final.database_outcome_ambiguous == false and
+                .recovery_final.chain_ready == true and
+                .recovery_final.wallet_tip_matches == true and
+                (.recovery_initial.confirmed_resolution_fees | type) == "number" and
+                .recovery_initial.confirmed_resolution_fees >= 0 and
+                .recovery_final.confirmed_resolution_fees ==
+                  .recovery_initial.confirmed_resolution_fees and
+                .wallet_transaction_guard.prelaunch_sha256 == $prelaunch_sha and
+                .wallet_transaction_guard.first_v3014_sha256 == $first_sha and
+                .wallet_transaction_guard.exactly_unchanged == true
+            ' "$path" >/dev/null || return 1
+            mining=$(jq -ceS '.mining_final | select(type == "object")' "$path") || return 1
+            _candidate_pow_json_is_valid "$mining" drained || return 1
+            recovery=$(jq -ceS '.recovery_final | select(type == "object")' "$path") || return 1
+            fee=$(jq -er '.recovery_initial.confirmed_resolution_fees |
+                select(type == "number" and . >= 0)' "$path") || return 1
+            _candidate_recovery_json_is_valid "$recovery" "$fee" || return 1
+            ;;
+    esac
     fee=$(jq -er '.recovery_initial.confirmed_resolution_fees |
         select(type == "number" and . >= 0)' \
         "$path") || return 1
@@ -685,6 +732,208 @@ verify_dynamic_node()
     fi
     if [[ "$node" -eq 31 || "$node" -eq 32 ]]; then
         verify_quantum_special "$node" || return 1
+    fi
+}
+
+capture_pow_gate_telemetry_snapshot()
+{
+    local phase="$1" output="$2" parts temporary observed_at observed_epoch
+    local node pid failed=0 mining chain role
+    local -a pids=()
+    [[ "$phase" == first || "$phase" == final ]] || return 1
+    [[ ! -e "$output" && ! -L "$output" ]] || return 1
+    observed_at=$(date -u +%FT%TZ) || return 1
+    observed_epoch=$(date +%s) || return 1
+    [[ "$observed_epoch" =~ ^[1-9][0-9]*$ ]] || return 1
+    parts=$(mktemp -d "${output%/*}/.pow-gate-telemetry-parts.XXXXXX") || return 1
+    chmod 700 "$parts" || { rm -rf -- "$parts"; return 1; }
+    chown root:root "$parts" || { rm -rf -- "$parts"; return 1; }
+    for node in $(seq 1 "$NODE_COUNT"); do
+        (
+            chain=$(rpc_for "$node" getblockchaininfo) || exit 1
+            mining=$(wallet_rpc_for "$node" getpowmininginfo) || exit 1
+            chain=$(jq -ceS 'select(type == "object")' <<< "$chain") || exit 1
+            mining=$(jq -ceS 'select(type == "object")' <<< "$mining") || exit 1
+            jq -e '.chain == "main" and .initialblockdownload == false and
+                (.blocks | type == "number" and floor == . and . >= 0) and
+                (.bestblockhash | type == "string" and
+                  test("^[0-9a-f]{64}$"))' >/dev/null <<< "$chain" || exit 1
+            if [[ "$node" -eq "$FREE_CLAIM_NODE" ]]; then
+                role='free-claim'
+                _candidate_pow_json_is_valid "$mining" node30-off || exit 1
+            else
+                role='regular-pow'
+                _candidate_pow_json_is_valid "$mining" hashing || exit 1
+            fi
+            jq -cn --argjson node "$node" --arg role "$role" \
+                --argjson chain "$chain" --argjson mining "$mining" '
+                {node:$node,role:$role,tip_height:$chain.blocks,
+                 tip_hash:$chain.bestblockhash,enabled:$mining.enabled,
+                 state:$mining.state,hashrate:$mining.hashrate,
+                 mining_gate_action:$mining.mining_gate_action,
+                 mining_gate_candidate_state_fingerprint:
+                   $mining.mining_gate_candidate_state_fingerprint}' \
+                > "$parts/node-$(node_padded "$node").json"
+        ) &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do
+        if ! wait "$pid"; then
+            failed=1
+        fi
+    done
+    if [[ "$failed" -ne 0 ||
+          "$(find "$parts" -mindepth 1 -maxdepth 1 -type f -name 'node-*.json' |
+              wc -l)" -ne "$NODE_COUNT" ]]; then
+        rm -rf -- "$parts"
+        return 1
+    fi
+    temporary=$(mktemp "${output%/*}/.pow-gate-telemetry.XXXXXX") || {
+        rm -rf -- "$parts"
+        return 1
+    }
+    jq -n --arg phase "$phase" --arg observed_at "$observed_at" \
+        --argjson observed_epoch "$observed_epoch" \
+        --slurpfile nodes <(jq -s 'sort_by(.node)' "$parts"/node-*.json) '
+        {schema:3,kind:"typed-pow-mining-gate-telemetry",phase:$phase,
+         observed_at:$observed_at,observed_at_epoch:$observed_epoch,
+         nodes:$nodes[0]}' > "$temporary" || {
+        rm -rf -- "$parts" "$temporary"
+        return 1
+    }
+    jq -e --arg phase "$phase" '
+        .schema == 3 and .kind == "typed-pow-mining-gate-telemetry" and
+        .phase == $phase and
+        (.observed_at | type) == "string" and
+        (.observed_at_epoch | type == "number" and floor == . and . > 0) and
+        (.nodes | length) == 32 and [.nodes[].node] == [range(1;33)] and
+        all(.nodes[];
+          (.role == "regular-pow" or .role == "free-claim") and
+          (.tip_height | type == "number" and floor == . and . >= 0) and
+          (.tip_hash | type == "string" and test("^[0-9a-f]{64}$")) and
+          (.enabled | type) == "boolean" and (.state | type) == "string" and
+          (.hashrate | type == "number" and . >= 0) and
+          (.mining_gate_action == "create_new_anchor" or
+            .mining_gate_action == "wait_for_live" or
+            .mining_gate_action == "wait_for_next_tip" or
+            .mining_gate_action == "relay_existing" or
+            .mining_gate_action == "refresh_same_anchor") and
+          (.mining_gate_candidate_state_fingerprint | type == "string" and
+            test("^[0-9a-f]{64}$"))) and
+        (.nodes[29].node == 30 and .nodes[29].role == "free-claim" and
+          .nodes[29].enabled == false and .nodes[29].hashrate == 0) and
+        all((.nodes[:29] + .nodes[30:])[];
+          .role == "regular-pow" and .enabled == true)
+    ' "$temporary" >/dev/null || {
+        rm -rf -- "$parts" "$temporary"
+        return 1
+    }
+    if ! chmod 600 "$temporary" || ! chown root:root "$temporary" ||
+       ! sync -f "$temporary" || ! mv -fT -- "$temporary" "$output" ||
+       ! sync -f "${output%/*}"; then
+        rm -rf -- "$parts" "$temporary"
+        return 1
+    fi
+    rm -rf -- "$parts"
+}
+
+write_pow_gate_staleness_report()
+{
+    local first="$1" final="$2" output="$3" temporary warnings next_tip_warnings
+    protected_regular_file "$first" 600 && protected_regular_file "$final" 600 || return 1
+    [[ ! -e "$output" && ! -L "$output" ]] || return 1
+    temporary=$(mktemp "${output%/*}/.pow-gate-staleness.XXXXXX") || return 1
+    jq -n --slurpfile first "$first" --slurpfile final "$final" '
+        ($first[0]) as $a | ($final[0]) as $b |
+        [range(0;32) as $i |
+          ($a.nodes[$i]) as $x | ($b.nodes[$i]) as $y |
+          (($y.tip_height > $x.tip_height) or
+            ($y.tip_hash != $x.tip_hash)) as $tip_progressed |
+          ($y.mining_gate_action != $x.mining_gate_action) as $action_changed |
+          ($y.mining_gate_candidate_state_fingerprint !=
+            $x.mining_gate_candidate_state_fingerprint) as $fingerprint_changed |
+          (($x.hashrate > 0) or ($y.hashrate > 0)) as $positive_hashrate_observed |
+          {node:$x.node,role:$x.role,
+           first:{tip_height:$x.tip_height,tip_hash:$x.tip_hash,
+             action:$x.mining_gate_action,
+             candidate_state_fingerprint:$x.mining_gate_candidate_state_fingerprint,
+             hashrate:$x.hashrate},
+           final:{tip_height:$y.tip_height,tip_hash:$y.tip_hash,
+             action:$y.mining_gate_action,
+             candidate_state_fingerprint:$y.mining_gate_candidate_state_fingerprint,
+             hashrate:$y.hashrate},
+           tip_progressed:$tip_progressed,action_changed:$action_changed,
+           candidate_state_fingerprint_changed:$fingerprint_changed,
+           positive_hashrate_observed:$positive_hashrate_observed,
+           tip_progress_warning:($x.role == "regular-pow" and
+             ($tip_progressed | not)),
+           fully_stale_warning:($x.role == "regular-pow" and
+             ($tip_progressed | not) and ($action_changed | not) and
+             ($fingerprint_changed | not) and ($positive_hashrate_observed | not)),
+           next_tip_exit_warning:($x.role == "regular-pow" and
+             $x.mining_gate_action == "wait_for_next_tip" and
+             $y.mining_gate_action == "wait_for_next_tip" and
+             $tip_progressed and ($fingerprint_changed | not) and
+             ($positive_hashrate_observed | not))}]
+          as $nodes |
+        {schema:3,kind:"typed-pow-mining-gate-staleness-report",
+         first_observed_at:$a.observed_at,final_observed_at:$b.observed_at,
+         bounded_interval_seconds:($b.observed_at_epoch - $a.observed_at_epoch),
+         warning_is_availability_gate:false,
+         warning_nodes:[$nodes[] | select(.tip_progress_warning == true) | .node],
+         warning_count:([$nodes[] | select(.tip_progress_warning == true)] | length),
+         fully_stale_warning_nodes:
+           [$nodes[] | select(.fully_stale_warning == true) | .node],
+         fully_stale_warning_count:
+           ([$nodes[] | select(.fully_stale_warning == true)] | length),
+         next_tip_exit_warning_nodes:
+           [$nodes[] | select(.next_tip_exit_warning == true) | .node],
+         next_tip_exit_warning_count:
+           ([$nodes[] | select(.next_tip_exit_warning == true)] | length),
+         tip_progress_nodes:([$nodes[] | select(.tip_progressed == true)] | length),
+         action_change_nodes:([$nodes[] | select(.action_changed == true)] | length),
+         fingerprint_change_nodes:
+           ([$nodes[] | select(.candidate_state_fingerprint_changed == true)] | length),
+         positive_hashrate_observed_nodes:
+           ([$nodes[] | select(.positive_hashrate_observed == true)] | length),
+         nodes:$nodes}
+    ' > "$temporary" || { rm -f -- "$temporary"; return 1; }
+    jq -e '
+        .schema == 3 and .kind == "typed-pow-mining-gate-staleness-report" and
+        (.bounded_interval_seconds | type == "number" and floor == . and . >= 0) and
+        .warning_is_availability_gate == false and
+        (.warning_nodes | type) == "array" and
+        (.warning_count | type == "number" and floor == . and . >= 0 and . <= 31) and
+        .warning_count == (.warning_nodes | length) and
+        (.fully_stale_warning_nodes | type) == "array" and
+        (.fully_stale_warning_count | type == "number" and floor == . and . >= 0) and
+        .fully_stale_warning_count <= .warning_count and
+        .fully_stale_warning_count == (.fully_stale_warning_nodes | length) and
+        (.next_tip_exit_warning_nodes | type) == "array" and
+        (.next_tip_exit_warning_count | type == "number" and floor == . and
+          . >= 0 and . <= 31) and
+        .next_tip_exit_warning_count ==
+          (.next_tip_exit_warning_nodes | length) and
+        (.nodes | length) == 32 and [.nodes[].node] == [range(1;33)] and
+        .nodes[29].role == "free-claim" and
+        .nodes[29].tip_progress_warning == false and
+        .nodes[29].fully_stale_warning == false and
+        .nodes[29].next_tip_exit_warning == false
+    ' "$temporary" >/dev/null || { rm -f -- "$temporary"; return 1; }
+    if ! chmod 600 "$temporary" || ! chown root:root "$temporary" ||
+       ! sync -f "$temporary" || ! mv -fT -- "$temporary" "$output" ||
+       ! sync -f "${output%/*}"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    warnings=$(jq -er '.warning_count | select(type == "number")' "$output") || return 1
+    if [[ "$warnings" -gt 0 ]]; then
+        log "WARNING: typed PoW telemetry found $warnings non-gating regular-node tip-progress warning(s); see $output"
+    fi
+    next_tip_warnings=$(jq -er '.next_tip_exit_warning_count |
+        select(type == "number")' "$output") || return 1
+    if [[ "$next_tip_warnings" -gt 0 ]]; then
+        log "WARNING: typed PoW telemetry found $next_tip_warnings non-gating wait_for_next_tip exit warning(s); see $output"
     fi
 }
 
@@ -1546,6 +1795,11 @@ start_epoch=$(date +%s)
 sample=0
 interval=$((DURATION_SECONDS / (REQUIRED_SAMPLES - 1)))
 ((interval >= 60)) || interval=60
+pow_gate_telemetry_first="$ATTEMPT_DIR/POW-GATE-TELEMETRY-FIRST.json"
+pow_gate_telemetry_final="$ATTEMPT_DIR/POW-GATE-TELEMETRY-FINAL.json"
+pow_gate_staleness_report="$ATTEMPT_DIR/POW-GATE-STALENESS-WARNINGS.json"
+capture_pow_gate_telemetry_snapshot first "$pow_gate_telemetry_first" ||
+    die 'initial exact-32 typed PoW gate telemetry could not be captured'
 
 while :; do
     sample=$((sample + 1))
@@ -1636,6 +1890,11 @@ verify_active_fleet_maintenance_marker ||
     die 'durable fleet maintenance marker was lost before final dynamic gate'
 verify_final_dynamic_all_nodes ||
     die 'final concurrent dynamic/generation gate did not pass for all 32 nodes'
+capture_pow_gate_telemetry_snapshot final "$pow_gate_telemetry_final" ||
+    die 'final exact-32 typed PoW gate telemetry could not be captured'
+write_pow_gate_staleness_report "$pow_gate_telemetry_first" \
+    "$pow_gate_telemetry_final" "$pow_gate_staleness_report" ||
+    die 'typed PoW staleness evidence could not be produced'
 assert_unique_vpn_proofs || die 'VPN proof uniqueness changed during the final dynamic gate'
 verify_final_policy_assets || die 'image policy/guard pin changed during the final dynamic gate'
 verify_active_fleet_maintenance_marker ||
@@ -1644,12 +1903,47 @@ verify_free_claim_pause || die 'Free Claim pause was lost before soak evidence p
 verify_recovery_baselines_unchanged ||
     die 'candidate recovery baseline changed before soak evidence publication'
 
+pow_gate_telemetry_first_sha=$(sha256sum "$pow_gate_telemetry_first" | awk '{print $1}') ||
+    die 'initial typed PoW gate telemetry could not be hashed'
+pow_gate_telemetry_final_sha=$(sha256sum "$pow_gate_telemetry_final" | awk '{print $1}') ||
+    die 'final typed PoW gate telemetry could not be hashed'
+pow_gate_staleness_report_sha=$(sha256sum "$pow_gate_staleness_report" | awk '{print $1}') ||
+    die 'typed PoW staleness report could not be hashed'
+for telemetry_sha in "$pow_gate_telemetry_first_sha" "$pow_gate_telemetry_final_sha" \
+    "$pow_gate_staleness_report_sha"; do
+    valid_sha256_hex "$telemetry_sha" || die 'typed PoW telemetry hash is malformed'
+done
+pow_gate_staleness_warning_count=$(jq -er '.warning_count |
+    select(type == "number" and floor == . and . >= 0)' "$pow_gate_staleness_report") ||
+    die 'typed PoW staleness warning count is malformed'
+pow_gate_observation_seconds=$(jq -er '.bounded_interval_seconds |
+    select(type == "number" and floor == . and . >= 0)' "$pow_gate_staleness_report") ||
+    die 'typed PoW staleness observation interval is malformed'
+((pow_gate_observation_seconds >= DURATION_SECONDS - 300 &&
+  pow_gate_observation_seconds <= MAX_SECONDS + 1800)) ||
+    die 'typed PoW staleness observation interval is outside the bounded soak window'
+pow_gate_tip_progress_nodes=$(jq -er '.tip_progress_nodes |
+    select(type == "number" and floor == . and . >= 0 and . <= 32)' \
+    "$pow_gate_staleness_report") || die 'typed PoW tip-progress count is malformed'
+pow_gate_telemetry_first_rel=${pow_gate_telemetry_first#"$AUDIT_DIR/"}
+pow_gate_telemetry_final_rel=${pow_gate_telemetry_final#"$AUDIT_DIR/"}
+pow_gate_staleness_report_rel=${pow_gate_staleness_report#"$AUDIT_DIR/"}
+
 result_tmp=$(mktemp "$AUDIT_DIR/.RESULT.XXXXXX")
 jq -n --arg result passed --arg started "$(date -u -d "@$start_epoch" +%FT%TZ)" \
     --arg completed "$(date -u +%FT%TZ)" --arg image "$CANDIDATE_IMAGE_REF" \
     --arg image_id "$CANDIDATE_IMAGE_ID" --arg source "$SOURCE_COMMIT" \
     --argjson recovery_baselines "$RECOVERY_BASELINE_SHA_JSON" \
     --arg recovery_baseline_set_sha "$RECOVERY_BASELINE_SET_SHA256" \
+    --arg telemetry_first "$pow_gate_telemetry_first_rel" \
+    --arg telemetry_first_sha "$pow_gate_telemetry_first_sha" \
+    --arg telemetry_final "$pow_gate_telemetry_final_rel" \
+    --arg telemetry_final_sha "$pow_gate_telemetry_final_sha" \
+    --arg staleness_report "$pow_gate_staleness_report_rel" \
+    --arg staleness_report_sha "$pow_gate_staleness_report_sha" \
+    --argjson staleness_warning_count "$pow_gate_staleness_warning_count" \
+    --argjson staleness_observation_seconds "$pow_gate_observation_seconds" \
+    --argjson tip_progress_nodes "$pow_gate_tip_progress_nodes" \
     --argjson samples "$sample" --argjson duration "$(( $(date +%s) - start_epoch ))" \
     '{schema:1,result:$result,started_at:$started,completed_at:$completed,
       image:$image,image_id:$image_id,source_commit:$source,
@@ -1666,6 +1960,20 @@ jq -n --arg result passed --arg started "$(date -u -d "@$start_epoch" +%FT%TZ)" 
       replay_state_valid_nodes:32,donation_defaults_off_nodes:32,
       activation_wallet_transaction_sets_unchanged:true,
       wallet_transaction_guard_unchanged_nodes:32,
+      typed_pow_gate_telemetry_schema:3,
+      typed_pow_gate_first_evidence:$telemetry_first,
+      typed_pow_gate_first_sha256:$telemetry_first_sha,
+      typed_pow_gate_final_evidence:$telemetry_final,
+      typed_pow_gate_final_sha256:$telemetry_final_sha,
+      typed_pow_gate_staleness_evidence:$staleness_report,
+      typed_pow_gate_staleness_sha256:$staleness_report_sha,
+      typed_pow_gate_staleness_warning_non_gating:true,
+      typed_pow_gate_staleness_warning_count:$staleness_warning_count,
+      typed_pow_gate_staleness_observation_seconds:$staleness_observation_seconds,
+      typed_pow_gate_tip_progress_nodes:$tip_progress_nodes,
+      typed_pow_gate_safe_nodes:32,
+      instantaneous_positive_hashrate_required:false,
+      raw_claim_and_recovery_counts_are_availability_gates:false,
       claim_recovery_baseline_sha256s:$recovery_baselines,
       claim_recovery_baseline_set_sha256:$recovery_baseline_set_sha}' \
     > "$result_tmp"

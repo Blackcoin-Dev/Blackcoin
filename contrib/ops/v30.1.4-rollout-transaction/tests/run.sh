@@ -1866,6 +1866,10 @@ pass vpn-commit-rollback-and-final-uniqueness
 
 function_body validate_recovery_baseline "$ROOT/fleet_soak_audit.sh" \
     > "$TMP/validate-soak-recovery-baseline"
+function_body _candidate_pow_json_is_valid "$ROOT/lib/live_checks.sh" \
+    >> "$TMP/validate-soak-recovery-baseline"
+function_body _candidate_recovery_json_is_valid "$ROOT/lib/live_checks.sh" \
+    >> "$TMP/validate-soak-recovery-baseline"
 for required in 'wallet-txids.prelaunch.json' 'wallet-txids.first-v3014.json' \
     '.schema == 2' '.recovery_initial.policy_authoritative == true' \
     '.recovery_final.policy_authoritative == true' \
@@ -1941,13 +1945,140 @@ done
         "$WAVE/node-01-wallet-txids.prelaunch.json"
 
     cp "$WAVE/candidate-recovery-node-01.json" "$TMP/soak-recovery-schema2.valid"
+    zero=$(printf '%064d' 0)
+    head=$(printf '%064x' 2)
+    fingerprint=$(printf '%064x' 3)
+    jq --arg zero "$zero" --arg head "$head" --arg fingerprint "$fingerprint" '
+        .schema=3 | .typed_mining_gate_contract=true |
+        .mining_final={
+          enabled:false,autostart:false,state:"disabled",threads:1,
+          cpu_percent:1,hashrate:0,unresolved_claims:76,live_claims:0,
+          quarantined_claims:1,blocking_quarantined_claims:1,
+          raw_quarantined_claims:76,
+          claim_recovery_database_outcome_ambiguous:false,
+          allow_automatic_quantum_key_creation:false,
+          mining_gate_coherent:true,
+          mining_gate_action:"refresh_same_anchor",
+          mining_gate_can_submit:true,
+          mining_gate_database_ambiguous:false,
+          mining_gate_unresolved_components:1,mining_gate_live_claims:0,
+          mining_gate_eligible_claims:0,mining_gate_family_claims:76,
+          mining_gate_unsafe_claims:0,mining_gate_unsafe_components:0,
+          mining_gate_relay_txid:$zero,
+          mining_gate_lineage_head_txid:$head,
+          mining_gate_candidate_state_fingerprint:$fingerprint} |
+        .recovery_final.blocking_quarantined_claims=9 |
+        .recovery_final.blocking_components=2 |
+        .recovery_final.indeterminate_quarantined_claims=1 |
+        .recovery_final.pending_manual_resolutions=3 |
+        .recovery_final.pending_automatic_resolutions=4
+    ' "$TMP/soak-recovery-schema2.valid" \
+        > "$WAVE/candidate-recovery-node-01.json"
+    chmod 600 "$WAVE/candidate-recovery-node-01.json"
+    baseline_sha=$(sha256sum "$WAVE/candidate-recovery-node-01.json" | awk '{print $1}')
+    printf '%s\n' "$baseline_sha" > "$WAVE/candidate-recovery-node-01.json.sha256"
+    chmod 600 "$WAVE/candidate-recovery-node-01.json.sha256"
+    info=$(validate_recovery_baseline 1 '' 0)
+    IFS='|' read -r returned_sha returned_fee <<< "$info"
+    [[ "$returned_sha" == "$baseline_sha" ]]
+    jq -e -n --argjson fee "$returned_fee" '$fee == 0' >/dev/null
+
+    cp "$WAVE/candidate-recovery-node-01.json" "$TMP/soak-recovery-schema3.valid"
+    jq '.mining_final.mining_gate_unsafe_components=1' \
+        "$TMP/soak-recovery-schema3.valid" \
+        > "$WAVE/candidate-recovery-node-01.json"
+    sha256sum "$WAVE/candidate-recovery-node-01.json" | awk '{print $1}' \
+        > "$WAVE/candidate-recovery-node-01.json.sha256"
+    ! validate_recovery_baseline 1 '' 0 >/dev/null
+
+    cp "$TMP/soak-recovery-schema3.valid" \
+        "$WAVE/candidate-recovery-node-01.json"
+    sha256sum "$WAVE/candidate-recovery-node-01.json" | awk '{print $1}' \
+        > "$WAVE/candidate-recovery-node-01.json.sha256"
+    jq --arg txid bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+        '. + [$txid] | unique | sort' \
+        "$WAVE/node-01-wallet-txids.first-v3014.json" \
+        > "$TMP/soak-recovery-extra-txid.json"
+    mv "$TMP/soak-recovery-extra-txid.json" \
+        "$WAVE/node-01-wallet-txids.first-v3014.json"
+    chmod 600 "$WAVE/node-01-wallet-txids.first-v3014.json"
+    ! validate_recovery_baseline 1 '' 0 >/dev/null
+    cp "$WAVE/node-01-wallet-txids.prelaunch.json" \
+        "$WAVE/node-01-wallet-txids.first-v3014.json"
+
     jq '.schema=1' "$TMP/soak-recovery-schema2.valid" \
         > "$WAVE/candidate-recovery-node-01.json"
     sha256sum "$WAVE/candidate-recovery-node-01.json" | awk '{print $1}' \
         > "$WAVE/candidate-recovery-node-01.json.sha256"
     ! validate_recovery_baseline 1 '' 0 >/dev/null
 )
-pass soak-schema2-prelaunch-recovery-baseline-and-json-numeric-zero
+pass soak-schema2-preservation-schema3-typed-gate-and-no-spend
+
+function_body write_pow_gate_staleness_report "$ROOT/fleet_soak_audit.sh" \
+    > "$TMP/pow-gate-staleness-function"
+(
+    # shellcheck disable=SC1090
+    source "$TMP/pow-gate-staleness-function"
+    protected_regular_file()
+    {
+        [[ -f "$1" && ! -L "$1" ]]
+    }
+    chown() { :; }
+    sync() { :; }
+    mv()
+    {
+        command mv -f -- "${@: -2:1}" "${@: -1}"
+    }
+    log() { printf '%s\n' "$*" >> "$TMP/staleness-warnings.log"; }
+
+    hash_a=$(printf '%064x' 10)
+    hash_b=$(printf '%064x' 11)
+    fingerprint=$(printf '%064x' 12)
+    jq -n --arg hash "$hash_a" --arg fingerprint "$fingerprint" '
+        {schema:3,kind:"typed-pow-mining-gate-telemetry",phase:"first",
+         observed_at:"2026-08-07T00:00:00Z",observed_at_epoch:1000,
+         nodes:[range(1;33) as $node |
+           {node:$node,role:(if $node == 30 then "free-claim" else "regular-pow" end),
+            tip_height:100,tip_hash:$hash,enabled:($node != 30),
+            state:(if $node == 30 then "disabled" else "claim_in_flight" end),
+            hashrate:0,mining_gate_action:"wait_for_next_tip",
+            mining_gate_candidate_state_fingerprint:$fingerprint}]}
+    ' > "$TMP/pow-gate-first.json"
+    jq --arg hash "$hash_b" '
+        .phase="final" | .observed_at="2026-08-07T00:10:00Z" |
+        .observed_at_epoch=1600 |
+        .nodes |= map(if .node == 30 then . else
+          .tip_height=101 | .tip_hash=$hash end)
+    ' "$TMP/pow-gate-first.json" > "$TMP/pow-gate-final.json"
+    chmod 600 "$TMP/pow-gate-first.json" "$TMP/pow-gate-final.json"
+    write_pow_gate_staleness_report "$TMP/pow-gate-first.json" \
+        "$TMP/pow-gate-final.json" "$TMP/pow-gate-progress.json"
+    jq -e '.warning_is_availability_gate == false and .warning_count == 0 and
+        .fully_stale_warning_count == 0 and
+        .next_tip_exit_warning_count == 31 and
+        .next_tip_exit_warning_nodes == ([range(1;30)] + [range(31;33)]) and
+        .tip_progress_nodes == 31 and .nodes[29].node == 30 and
+        .nodes[29].tip_progress_warning == false and
+        .nodes[29].next_tip_exit_warning == false' \
+        "$TMP/pow-gate-progress.json" >/dev/null
+
+    jq --slurpfile first "$TMP/pow-gate-first.json" '
+        .nodes[0]=$first[0].nodes[0]' "$TMP/pow-gate-final.json" \
+        > "$TMP/pow-gate-final-stale.json"
+    chmod 600 "$TMP/pow-gate-final-stale.json"
+    write_pow_gate_staleness_report "$TMP/pow-gate-first.json" \
+        "$TMP/pow-gate-final-stale.json" "$TMP/pow-gate-stale.json"
+    jq -e '.warning_is_availability_gate == false and .warning_count == 1 and
+        .warning_nodes == [1] and .fully_stale_warning_nodes == [1] and
+        .next_tip_exit_warning_count == 30 and
+        .next_tip_exit_warning_nodes == ([range(2;30)] + [range(31;33)]) and
+        .tip_progress_nodes == 30' "$TMP/pow-gate-stale.json" >/dev/null
+    grep -Fq 'non-gating regular-node tip-progress warning' \
+        "$TMP/staleness-warnings.log"
+    grep -Fq 'non-gating wait_for_next_tip exit warning' \
+        "$TMP/staleness-warnings.log"
+)
+pass typed-pow-staleness-warning-is-evidence-not-availability-gate
 
 [[ "$(grep -Fc '.policy.automatic_authorized == false' "$ROOT/lib/live_checks.sh")" -ge 2 ]]
 grep -Fq 'verify_candidate_recovery_baseline "$node"' "$ROOT/fleet_rollout.sh"
@@ -2649,6 +2780,208 @@ grep -Fq 'legacy_quarantined_claim_resolution_attempted:false' "$CANARY"
 grep -Fq 'clean_q0_candidate_q0_no_payment_transition_verified:' "$CANARY"
 grep -Fq 'candidate_pow_clean_hashing_verified:true' "$CANARY"
 pass canary-clean-and-legacy-quarantine-preservation-and-candidate-pow-gates
+
+function_body _candidate_pow_json_is_valid "$ROOT/lib/live_checks.sh" \
+    > "$TMP/typed-gate-functions"
+function_body _candidate_recovery_json_is_valid "$ROOT/lib/live_checks.sh" \
+    >> "$TMP/typed-gate-functions"
+function_body pow_contract_identity_for \
+    "$ROOT/blackcoin_pow_quarantine_cycle_v30.1.4_nospend.sh" \
+    >> "$TMP/typed-gate-functions"
+function_body pow_contract_for \
+    "$ROOT/blackcoin_pow_quarantine_cycle_v30.1.4_nospend.sh" \
+    >> "$TMP/typed-gate-functions"
+function_body candidate_pow_role_common_ready \
+    "$ROOT/blackcoin_pow_quarantine_cycle_v30.1.4_nospend.sh" \
+    >> "$TMP/typed-gate-functions"
+function_body candidate_regular_pow_reserve_ready \
+    "$ROOT/blackcoin_pow_quarantine_cycle_v30.1.4_nospend.sh" \
+    >> "$TMP/typed-gate-functions"
+function_body regular_pow_ready \
+    "$ROOT/blackcoin_pow_quarantine_cycle_v30.1.4_nospend.sh" \
+    >> "$TMP/typed-gate-functions"
+function_body free_claim_pow_ready \
+    "$ROOT/blackcoin_pow_quarantine_cycle_v30.1.4_nospend.sh" \
+    >> "$TMP/typed-gate-functions"
+(
+    # shellcheck disable=SC1091
+    source "$TMP/typed-gate-functions"
+    IMAGE_POLICY="$TMP/typed-image-policy.json"
+    SOURCE_LABEL_KEY=org.blackcoin.source.commit
+    IMMUTABLE_V3014_SOURCE_COMMIT=13262151077cce3f72d07d17dc7725b2b6a8e1ab
+    policy_image_id="sha256:$(printf '%064x' 10)"
+    MOCK_IMAGE_ID="$policy_image_id"
+    MOCK_SOURCE_COMMIT="$IMMUTABLE_V3014_SOURCE_COMMIT"
+    jq -n --arg id "$policy_image_id" '
+        {schema:1,images:{final3014:{config_image:"fixture",image_id:$id}},
+         nodes:(reduce range(1;33) as $node ({};
+           .[(if $node < 10 then "0" + ($node | tostring)
+              else ($node | tostring) end)] = "final3014"))}
+    ' > "$IMAGE_POLICY"
+    protected_regular_file() { [[ "$1" == "$IMAGE_POLICY" && -f "$1" ]]; }
+    container_for() { printf 'node-%s\n' "$1"; }
+    docker()
+    {
+        [[ "$1" == inspect && "$2" == node-1 ]] || return 1
+        jq -cn --arg id "$MOCK_IMAGE_ID" --arg key "$SOURCE_LABEL_KEY" \
+            --arg source "$MOCK_SOURCE_COMMIT" \
+            '[{Image:$id,Config:{Labels:{($key):$source}}}]'
+    }
+    zero=$(printf '%064d' 0)
+    relay=$(printf '%064x' 1)
+    head=$(printf '%064x' 2)
+    fingerprint=$(printf '%064x' 3)
+    base=$(jq -cn --arg zero "$zero" --arg head "$head" \
+        --arg fingerprint "$fingerprint" '
+        {
+          enabled:true,autostart:false,
+          allow_automatic_quantum_key_creation:false,
+          state:"claim_in_flight",threads:1,cpu_percent:1,hashrate:0,
+          unresolved_claims:76,live_claims:0,quarantined_claims:1,
+          blocking_quarantined_claims:1,raw_quarantined_claims:76,
+          claim_recovery_database_outcome_ambiguous:false,
+          stake_reserve_snapshot_available:true,
+          configured_stake_reserve_coins:1,
+          mature_stakeable_legacy_coins:2,reserved_stake_coins:1,
+          claim_coins_after_stake_reserve:1,
+          mature_stakeable_legacy_weight:2,reserved_stake_weight:1,
+          last_stake_coin_guard:false,
+          mining_gate_coherent:true,mining_gate_action:"wait_for_live",
+          mining_gate_can_submit:false,
+          mining_gate_database_ambiguous:false,
+          mining_gate_unresolved_components:1,mining_gate_live_claims:0,
+          mining_gate_eligible_claims:1,mining_gate_family_claims:76,
+          mining_gate_unsafe_claims:0,mining_gate_unsafe_components:0,
+          mining_gate_relay_txid:$zero,
+          mining_gate_lineage_head_txid:$head,
+          mining_gate_candidate_state_fingerprint:$fingerprint
+        }')
+
+    for action in create_new_anchor wait_for_live wait_for_next_tip \
+        relay_existing refresh_same_anchor; do
+        can_submit=false
+        state=claim_in_flight
+        relay_txid=$zero
+        case "$action" in
+            create_new_anchor|refresh_same_anchor)
+                can_submit=true
+                state=ready
+                ;;
+            relay_existing)
+                relay_txid=$relay
+                ;;
+            wait_for_next_tip)
+                # The action alone is the cached worker override. Fresh relay
+                # identity remains visible in the rest of the RPC snapshot.
+                relay_txid=$relay
+                ;;
+        esac
+        sample=$(jq -c --arg action "$action" --arg state "$state" \
+            --arg relay "$relay_txid" --argjson can "$can_submit" \
+            '.mining_gate_action=$action | .state=$state |
+             .mining_gate_relay_txid=$relay |
+             .mining_gate_can_submit=$can' <<< "$base")
+        _candidate_pow_json_is_valid "$sample" hashing
+    done
+
+    # A fresh REFRESH_SAME_ANCHOR authorization may become visible while the
+    # exact matching worker remains bounded to the old tip. Only action is
+    # overridden; can_submit remains the fresh inventory value.
+    wait_can_submit=$(jq -c --arg zero "$zero" '
+        .mining_gate_action="wait_for_next_tip" |
+        .mining_gate_can_submit=true |
+        .mining_gate_relay_txid=$zero' <<< "$base")
+    _candidate_pow_json_is_valid "$wait_can_submit" hashing
+
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c '.mining_gate_coherent=false' <<< "$base")" hashing
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c '.mining_gate_database_ambiguous=true' <<< "$base")" hashing
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c '.claim_recovery_database_outcome_ambiguous=true' <<< "$base")" hashing
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c '.mining_gate_unsafe_claims=1' <<< "$base")" hashing
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c '.mining_gate_unsafe_components=1' <<< "$base")" hashing
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c '.mining_gate_action="unsafe"' <<< "$base")" hashing
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c 'del(.mining_gate_candidate_state_fingerprint)' <<< "$base")" hashing
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c '.mining_gate_action="create_new_anchor" |
+                  .mining_gate_can_submit=false' <<< "$base")" hashing
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c --arg zero "$zero" '
+            .mining_gate_action="relay_existing" |
+            .mining_gate_relay_txid=$zero' <<< "$base")" hashing
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c '.hashrate=10 | .mining_gate_unsafe_claims=1' <<< "$base")" hashing
+
+    node30=$(jq -c '
+        .enabled=false | .state="disabled" | .hashrate=0' <<< "$base")
+    _candidate_pow_json_is_valid "$node30" node30-off
+    ! _candidate_pow_json_is_valid \
+        "$(jq -c '.enabled=true' <<< "$node30")" node30-off
+
+    recovery=$(jq -cn '
+        {policy:{automatic_authorized:false},policy_authoritative:true,
+         database_outcome_ambiguous:false,chain_ready:true,
+         wallet_tip_matches:true,blocking_quarantined_claims:9,
+         blocking_components:2,indeterminate_quarantined_claims:1,
+         pending_manual_resolutions:3,pending_automatic_resolutions:4,
+         confirmed_resolution_fees:1.25}')
+    _candidate_recovery_json_is_valid "$recovery" 1.25
+    ! _candidate_recovery_json_is_valid \
+        "$(jq -c '.database_outcome_ambiguous=true' <<< "$recovery")" 1.25
+    ! _candidate_recovery_json_is_valid "$recovery" 1.26
+
+    immutable=$(jq -c 'del(.mining_gate_coherent,
+        .mining_gate_action,.mining_gate_can_submit,
+        .mining_gate_database_ambiguous,.mining_gate_unresolved_components,
+        .mining_gate_live_claims,.mining_gate_eligible_claims,
+        .mining_gate_family_claims,.mining_gate_unsafe_claims,
+        .mining_gate_unsafe_components,.mining_gate_relay_txid,
+        .mining_gate_lineage_head_txid,
+        .mining_gate_candidate_state_fingerprint)' <<< "$base")
+    [[ "$(pow_contract_for 1 "$immutable")" == immutable-v30.1.4 ]]
+    ! pow_contract_for 1 "$base"
+    MOCK_SOURCE_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    [[ "$(pow_contract_for 1 "$base")" == typed-hotfix-candidate ]]
+    ! pow_contract_for 1 "$immutable"
+    ! pow_contract_for 1 "$(jq -c 'del(.mining_gate_action)' <<< "$base")"
+    MOCK_IMAGE_ID="sha256:$(printf '%064x' 11)"
+    ! pow_contract_for 1 "$base"
+    MOCK_IMAGE_ID="$policy_image_id"
+
+    regular_pow_ready 1 300104 "$base"
+    ! regular_pow_ready 1 300104 \
+        "$(jq -c '.reserved_stake_coins=0' <<< "$base")"
+    ! regular_pow_ready 1 300104 \
+        "$(jq -c '.unresolved_claims=-1' <<< "$base")"
+    ! regular_pow_ready 1 300104 \
+        "$(jq -c '.state="no_spendable_legacy_fee_utxo"' <<< "$base")"
+    ! regular_pow_ready 1 300104 \
+        "$(jq -c '.autostart=true' <<< "$base")"
+    ! regular_pow_ready 1 300104 \
+        "$(jq -c '.threads=2' <<< "$base")"
+    node30=$(jq -c '.enabled=false | .state="disabled" | .hashrate=0' \
+        <<< "$base")
+    free_claim_pow_ready 1 300104 "$node30"
+    node30_without_reserve=$(jq -c 'del(.stake_reserve_snapshot_available,
+        .configured_stake_reserve_coins,.mature_stakeable_legacy_coins,
+        .reserved_stake_coins,.claim_coins_after_stake_reserve,
+        .mature_stakeable_legacy_weight,.reserved_stake_weight,
+        .last_stake_coin_guard)' <<< "$node30")
+    free_claim_pow_ready 1 300104 "$node30_without_reserve"
+    ! free_claim_pow_ready 1 300104 \
+        "$(jq -c '.unresolved_claims=-1' <<< "$node30_without_reserve")"
+    ! free_claim_pow_ready 1 300104 \
+        "$(jq -c '.autostart=true' <<< "$node30")"
+    ! free_claim_pow_ready 1 300104 \
+        "$(jq -c '.cpu_percent=100' <<< "$node30")"
+)
+pass candidate-typed-gate-safe-actions-identity-roles-and-fail-closed
+
 grep -Fq -- \
     'export PUBLISHED_CANARY_RESULT="/mnt/pulsar/Blackcoin_Blocks/operations/releases/v30.1.4-${SOURCE_COMMIT}/node27-canary-__CANARY_TIMESTAMP_YYYYMMDDTHHMMSSZ__/evidence/RESULT.json"' \
     "$ROOT/rollout.env.example"

@@ -10,6 +10,7 @@ umask 077
 export TZ=UTC
 
 readonly STATE_DIR=/boot/config/plugins/blackcoin-quantum-nodes
+readonly IMAGE_POLICY="$STATE_DIR/fleet-image-policy.json"
 readonly CYCLE_LOCK=/run/blackcoin-pow-quarantine-cycle.lock
 readonly MAINTENANCE_MARKER="$STATE_DIR/V30_1_4_ROLLOUT_MAINTENANCE.json"
 readonly NORMAL_UNLOCK_HELPER="$STATE_DIR/blackcoin_node_normal_unlock.sh"
@@ -21,6 +22,8 @@ readonly CLI=/usr/local/bin/blackcoin-cli
 readonly DATADIR=/home/blackcoin/.blackcoin
 readonly NODE_COUNT=32
 readonly FREE_CLAIM_NODE=30
+readonly SOURCE_LABEL_KEY=org.blackcoin.source.commit
+readonly IMMUTABLE_V3014_SOURCE_COMMIT=13262151077cce3f72d07d17dc7725b2b6a8e1ab
 
 WORK_DIR=
 NORMAL_UNLOCK_SNAPSHOT=
@@ -140,7 +143,7 @@ legacy_claim_state_clean()
     ' >/dev/null <<< "$1"
 }
 
-current_claim_state_clean()
+immutable_v3014_claim_state_clean()
 {
     local mining="$1" recovery="$2"
     jq -e '
@@ -158,16 +161,223 @@ current_claim_state_clean()
         ' >/dev/null <<< "$recovery"
 }
 
+pow_contract_identity_for()
+{
+    local node="$1" padded container inspect actual_id source expected_id
+    [[ "$node" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || return 1
+    padded=$(printf '%02d' "$node") || return 1
+    container=$(container_for "$node") || return 1
+    protected_regular_file "$IMAGE_POLICY" '^600$' || return 1
+    inspect=$(docker inspect "$container") || return 1
+    actual_id=$(jq -er '
+        select(type == "array" and length == 1) |
+        .[0].Image | select(type == "string" and
+          test("^sha256:[0-9a-f]{64}$"))
+    ' <<< "$inspect") || return 1
+    source=$(jq -er --arg key "$SOURCE_LABEL_KEY" '
+        select(type == "array" and length == 1) |
+        .[0].Config.Labels[$key] |
+        select(type == "string" and test("^[0-9a-f]{40}$"))
+    ' <<< "$inspect") || return 1
+    expected_id=$(jq -er --arg node "$padded" '
+        select(.schema == 1 and (.images | type) == "object" and
+          (.nodes | type) == "object" and (.nodes | length) == 32) as $policy |
+        $policy.nodes[$node] as $class |
+        select($class | type == "string") |
+        $policy.images[$class].image_id |
+        select(type == "string" and test("^sha256:[0-9a-f]{64}$"))
+    ' "$IMAGE_POLICY") || return 1
+    [[ "$actual_id" == "$expected_id" ]] || return 1
+    if [[ "$source" == "$IMMUTABLE_V3014_SOURCE_COMMIT" ]]; then
+        printf '%s\n' immutable-v30.1.4
+    else
+        printf '%s\n' typed-hotfix-candidate
+    fi
+}
+
+pow_contract_for()
+{
+    local node="$1" mining="$2" present identity
+    present=$(jq -er '
+        select(type == "object") as $object |
+        [
+            "mining_gate_coherent",
+            "mining_gate_action",
+            "mining_gate_can_submit",
+            "mining_gate_database_ambiguous",
+            "mining_gate_unresolved_components",
+            "mining_gate_live_claims",
+            "mining_gate_eligible_claims",
+            "mining_gate_family_claims",
+            "mining_gate_unsafe_claims",
+            "mining_gate_unsafe_components",
+            "mining_gate_relay_txid",
+            "mining_gate_lineage_head_txid",
+            "mining_gate_candidate_state_fingerprint"
+        ] as $fields |
+        [$fields[] as $field | $object | has($field)] |
+        map(select(. == true)) | length
+    ' <<< "$mining") || return 1
+    identity=$(pow_contract_identity_for "$node") || return 1
+    case "$identity:$present" in
+        immutable-v30.1.4:0)
+            printf '%s\n' immutable-v30.1.4
+            ;;
+        typed-hotfix-candidate:13)
+            printf '%s\n' typed-hotfix-candidate
+            ;;
+        *)
+            # Exact immutable identity permits zero typed fields. Every other
+            # policy-pinned v30.1.4 image requires the complete candidate
+            # schema; zero or partial visibility fails closed.
+            return 1
+            ;;
+    esac
+}
+
+candidate_claim_state_clean()
+{
+    local mining="$1" recovery="$2"
+    jq -e '
+        type == "object" and
+        (.mining_gate_coherent | type) == "boolean" and
+        .mining_gate_coherent == true and
+        (.mining_gate_action | type) == "string" and
+        (.mining_gate_action as $action |
+            ["create_new_anchor", "wait_for_live", "wait_for_next_tip",
+             "relay_existing", "refresh_same_anchor"] | index($action)) != null and
+        (.mining_gate_can_submit | type) == "boolean" and
+        (if (.mining_gate_action == "create_new_anchor" or
+             .mining_gate_action == "refresh_same_anchor")
+         then .mining_gate_can_submit == true
+         elif .mining_gate_action == "wait_for_next_tip"
+         then true
+         else .mining_gate_can_submit == false end) and
+        (.mining_gate_database_ambiguous | type) == "boolean" and
+        .mining_gate_database_ambiguous == false and
+        (.claim_recovery_database_outcome_ambiguous | type) == "boolean" and
+        .claim_recovery_database_outcome_ambiguous == false and
+        ([.unresolved_claims,
+          .live_claims,
+          .quarantined_claims,
+          .blocking_quarantined_claims,
+          .raw_quarantined_claims] |
+            all(type == "number" and . >= 0 and floor == .)) and
+        ([.mining_gate_unresolved_components,
+          .mining_gate_live_claims,
+          .mining_gate_eligible_claims,
+          .mining_gate_family_claims,
+          .mining_gate_unsafe_claims,
+          .mining_gate_unsafe_components] |
+            all(type == "number" and . >= 0 and floor == .)) and
+        .mining_gate_unsafe_claims == 0 and
+        .mining_gate_unsafe_components == 0 and
+        (.mining_gate_relay_txid | type) == "string" and
+        (.mining_gate_relay_txid | test("^[0-9a-f]{64}$")) and
+        (if .mining_gate_action == "relay_existing"
+         then .mining_gate_relay_txid !=
+          "0000000000000000000000000000000000000000000000000000000000000000"
+         elif .mining_gate_action == "wait_for_next_tip"
+         then true
+         else .mining_gate_relay_txid ==
+          "0000000000000000000000000000000000000000000000000000000000000000"
+         end) and
+        (.mining_gate_lineage_head_txid | type) == "string" and
+        (.mining_gate_lineage_head_txid | test("^[0-9a-f]{64}$")) and
+        (.mining_gate_candidate_state_fingerprint | type) == "string" and
+        (.mining_gate_candidate_state_fingerprint | test("^[0-9a-f]{64}$"))
+    ' >/dev/null <<< "$mining" &&
+        jq -e '
+            type == "object" and
+            (.policy | type) == "object" and
+            (.policy.version | type) == "number" and
+            (.policy.version | floor) == .policy.version and .policy.version >= 0 and
+            (.policy.mode | type) == "string" and
+            (.policy.choice_recorded | type) == "boolean" and
+            (.policy.automatic_enabled | type) == "boolean" and
+            (.policy_authoritative | type) == "boolean" and
+            .policy_authoritative == true and
+            (.policy.automatic_authorized | type) == "boolean" and
+            .policy.automatic_authorized == false and
+            ([.policy.max_fee_per_resolution,
+              .policy.aggregate_batch_fee_cap,
+              .policy.rolling_fee_budget] |
+                all(type == "number" and . >= 0)) and
+            ([.policy.rolling_fee_window_seconds,
+              .policy.max_actions_per_window,
+              .policy.minimum_stale_blocks] |
+                all(type == "number" and . >= 0 and floor == .)) and
+            (.policy_state_status | type) == "string" and
+            (.policy_state_detail | type) == "string" and
+            (.chain_ready | type) == "boolean" and .chain_ready == true and
+            (.database_outcome_ambiguous | type) == "boolean" and
+            .database_outcome_ambiguous == false and
+            (.active_tip | type) == "string" and
+            (.active_tip | test("^[0-9a-f]{64}$")) and
+            (.active_height | type) == "number" and
+            (.active_height | floor) == .active_height and .active_height >= -1 and
+            (.wallet_processed_tip | type) == "string" and
+            (.wallet_processed_tip | test("^[0-9a-f]{64}$")) and
+            (.wallet_processed_height | type) == "number" and
+            (.wallet_processed_height | floor) == .wallet_processed_height and
+            (.wallet_generation | type) == "number" and
+            (.wallet_generation | floor) == .wallet_generation and
+            .wallet_generation >= 0 and
+            (.wallet_tip_matches | type) == "boolean" and
+            .wallet_tip_matches == true and
+            ([.raw_quarantined_claims,
+              .blocking_quarantined_claims,
+              .actionable_quarantined_claims,
+              .resolved_on_active_chain_claims,
+              .indeterminate_quarantined_claims,
+              .components,
+              .raw_claim_objects,
+              .live_claim_objects,
+              .quarantined_claim_objects,
+              .blocking_components,
+              .retired_claim_objects,
+              .retired_components,
+              .resolved_components,
+              .confirmed_manual_resolutions,
+              .confirmed_automatic_resolutions,
+              .automatic_actions_in_window,
+              .reconciled_descendant_claims,
+              .claims_recycled] |
+                all(type == "number" and . >= 0 and floor == .)) and
+            (.pending_manual_resolutions | type) == "number" and
+            (.pending_manual_resolutions | floor) == .pending_manual_resolutions and
+            .pending_manual_resolutions >= 0 and
+            (.pending_automatic_resolutions | type) == "number" and
+            (.pending_automatic_resolutions | floor) == .pending_automatic_resolutions and
+            .pending_automatic_resolutions >= 0 and
+            (.confirmed_resolution_fees | type) == "number" and
+            .confirmed_resolution_fees >= 0 and
+            (.automatic_fee_exposure_in_window | type) == "number" and
+            .automatic_fee_exposure_in_window >= 0
+        ' >/dev/null <<< "$recovery"
+}
+
 node_claim_state_clean()
 {
-    local node="$1" version="$2" mining="$3" recovery
+    local node="$1" version="$2" mining="$3" recovery contract
     case "$version" in
         300103)
             legacy_claim_state_clean "$mining"
             ;;
         300104)
             recovery=$(wallet_rpc_for "$node" getpowclaimrecoveryinfo 2>/dev/null) || return 1
-            current_claim_state_clean "$mining" "$recovery"
+            contract=$(pow_contract_for "$node" "$mining") || return 1
+            case "$contract" in
+                immutable-v30.1.4)
+                    immutable_v3014_claim_state_clean "$mining" "$recovery"
+                    ;;
+                typed-hotfix-candidate)
+                    candidate_claim_state_clean "$mining" "$recovery"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
             ;;
         *)
             return 1
@@ -244,18 +454,114 @@ pow_prestart_safe()
     jq -e '.allow_automatic_quantum_key_creation == false' >/dev/null <<< "$1"
 }
 
+candidate_pow_role_common_ready()
+{
+    jq -e '
+        type == "object" and
+        (.enabled | type) == "boolean" and
+        (.autostart | type) == "boolean" and .autostart == false and
+        (.state | type) == "string" and
+        (.threads | type) == "number" and (.threads | floor) == .threads and
+        .threads == 1 and
+        (.cpu_percent | type) == "number" and .cpu_percent == 1 and
+        (.hashrate | type) == "number" and .hashrate >= 0 and
+        ([.unresolved_claims,
+          .live_claims,
+          .quarantined_claims,
+          .blocking_quarantined_claims,
+          .raw_quarantined_claims] |
+            all(type == "number" and . >= 0 and floor == .)) and
+        (.claim_recovery_database_outcome_ambiguous | type) == "boolean" and
+        .claim_recovery_database_outcome_ambiguous == false and
+        .allow_automatic_quantum_key_creation == false and
+        (.allow_automatic_quantum_key_creation | type) == "boolean"
+    ' >/dev/null <<< "$1"
+}
+
+candidate_regular_pow_reserve_ready()
+{
+    jq -e '
+        type == "object" and
+        (.stake_reserve_snapshot_available | type) == "boolean" and
+        .stake_reserve_snapshot_available == true and
+        (.reserved_stake_coins | type) == "number" and
+        (.reserved_stake_coins | floor) == .reserved_stake_coins and
+        .reserved_stake_coins >= 1 and
+        (.last_stake_coin_guard | type) == "boolean"
+    ' >/dev/null <<< "$1"
+}
+
 regular_pow_ready()
 {
-    jq -e '.enabled == true and .threads == 1 and .cpu_percent == 1 and
-        .hashrate > 0 and (.live_claims | type) == "number" and
-        .live_claims >= 0 and .live_claims <= 64 and
-        .allow_automatic_quantum_key_creation == false' >/dev/null <<< "$1"
+    local node="$1" version="$2" mining="$3" contract
+    case "$version" in
+        300103)
+            jq -e '.enabled == true and .threads == 1 and .cpu_percent == 1 and
+                .hashrate > 0 and (.live_claims | type) == "number" and
+                .live_claims >= 0 and .live_claims <= 64 and
+                .allow_automatic_quantum_key_creation == false' \
+                >/dev/null <<< "$mining"
+            ;;
+        300104)
+            contract=$(pow_contract_for "$node" "$mining") || return 1
+            case "$contract" in
+                immutable-v30.1.4)
+                    jq -e '.enabled == true and .threads == 1 and .cpu_percent == 1 and
+                        .hashrate > 0 and (.live_claims | type) == "number" and
+                        .live_claims >= 0 and .live_claims <= 64 and
+                        .allow_automatic_quantum_key_creation == false' \
+                        >/dev/null <<< "$mining"
+                    ;;
+                typed-hotfix-candidate)
+                    candidate_pow_role_common_ready "$mining" &&
+                        candidate_regular_pow_reserve_ready "$mining" &&
+                        jq -e '.enabled == true and
+                            (.state == "ready" or .state == "hashing" or
+                             .state == "claim_in_flight")' \
+                            >/dev/null <<< "$mining"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 free_claim_pow_ready()
 {
-    jq -e '.enabled == false and .hashrate == 0 and .live_claims == 0 and
-        .allow_automatic_quantum_key_creation == false' >/dev/null <<< "$1"
+    local node="$1" version="$2" mining="$3" contract
+    case "$version" in
+        300103)
+            jq -e '.enabled == false and .hashrate == 0 and .live_claims == 0 and
+                .allow_automatic_quantum_key_creation == false' \
+                >/dev/null <<< "$mining"
+            ;;
+        300104)
+            contract=$(pow_contract_for "$node" "$mining") || return 1
+            case "$contract" in
+                immutable-v30.1.4)
+                    jq -e '.enabled == false and .hashrate == 0 and .live_claims == 0 and
+                        .allow_automatic_quantum_key_creation == false' \
+                        >/dev/null <<< "$mining"
+                    ;;
+                typed-hotfix-candidate)
+                    candidate_pow_role_common_ready "$mining" &&
+                        jq -e '.enabled == false and .state == "disabled" and
+                            .hashrate == 0' >/dev/null <<< "$mining"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 write_node_status()
@@ -313,7 +619,7 @@ process_node()
             return 1
         fi
     fi
-    if [[ "$node" -ne "$FREE_CLAIM_NODE" ]] && ! regular_pow_ready "$mining"; then
+    if [[ "$node" -ne "$FREE_CLAIM_NODE" ]] && ! regular_pow_ready "$node" "$version" "$mining"; then
         if /bin/bash "$POW_START_SNAPSHOT" "$node" >/dev/null 2>&1; then
             pow_action=restored
         else
@@ -327,8 +633,8 @@ process_node()
         mining=$(wallet_rpc_for "$node" getpowmininginfo 2>/dev/null || true)
         if staking_ready "$version" "$wallet_info" "$staking" &&
            donation_defaults_off "$node" "$version" &&
-           { { [[ "$node" -eq "$FREE_CLAIM_NODE" ]] && free_claim_pow_ready "$mining"; } ||
-             { [[ "$node" -ne "$FREE_CLAIM_NODE" ]] && regular_pow_ready "$mining"; }; } &&
+           { { [[ "$node" -eq "$FREE_CLAIM_NODE" ]] && free_claim_pow_ready "$node" "$version" "$mining"; } ||
+             { [[ "$node" -ne "$FREE_CLAIM_NODE" ]] && regular_pow_ready "$node" "$version" "$mining"; }; } &&
            node_claim_state_clean "$node" "$version" "$mining"; then
             write_node_status "$node" "$version" healthy "$staking_action" "$pow_action"
             return 0

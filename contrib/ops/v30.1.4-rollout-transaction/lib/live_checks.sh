@@ -1826,8 +1826,49 @@ _candidate_pow_json_is_valid()
     jq -e -n --arg phase "$phase" --argjson mining "$mining" '
         def integer:
           type == "number" and floor == .;
+        def hex64:
+          type == "string" and test("^[0-9a-f]{64}$");
+        def typed_gate:
+          (.mining_gate_coherent | type == "boolean") and
+          .mining_gate_coherent == true and
+          (.mining_gate_action | type == "string") and
+          (.mining_gate_action == "create_new_anchor" or
+            .mining_gate_action == "wait_for_live" or
+            .mining_gate_action == "wait_for_next_tip" or
+            .mining_gate_action == "relay_existing" or
+            .mining_gate_action == "refresh_same_anchor") and
+          (.mining_gate_can_submit | type == "boolean") and
+          (if (.mining_gate_action == "create_new_anchor" or
+               .mining_gate_action == "refresh_same_anchor")
+           then .mining_gate_can_submit == true
+           elif .mining_gate_action == "wait_for_next_tip"
+           then true
+           else .mining_gate_can_submit == false
+           end) and
+          (.mining_gate_database_ambiguous | type == "boolean") and
+          .mining_gate_database_ambiguous == false and
+          (.mining_gate_unresolved_components | integer and . >= 0) and
+          (.mining_gate_live_claims | integer and . >= 0) and
+          (.mining_gate_eligible_claims | integer and . >= 0) and
+          (.mining_gate_family_claims | integer and . >= 0) and
+          (.mining_gate_unsafe_claims | integer and . == 0) and
+          (.mining_gate_unsafe_components | integer and . == 0) and
+          (.mining_gate_relay_txid | hex64) and
+          (.mining_gate_lineage_head_txid | hex64) and
+          (.mining_gate_candidate_state_fingerprint | hex64) and
+          (if .mining_gate_action == "relay_existing"
+           then .mining_gate_relay_txid !=
+             "0000000000000000000000000000000000000000000000000000000000000000"
+           elif .mining_gate_action == "wait_for_next_tip"
+           then true
+           else .mining_gate_relay_txid ==
+             "0000000000000000000000000000000000000000000000000000000000000000"
+           end);
         def common:
-          type == "object" and .autostart == false and
+          type == "object" and
+          (.enabled | type == "boolean") and
+          (.autostart | type == "boolean") and .autostart == false and
+          (.state | type == "string") and
           (.threads | integer and . == 1) and
           (.cpu_percent | type == "number" and . == 1) and
           (.hashrate | type == "number" and . >= 0) and
@@ -1836,21 +1877,22 @@ _candidate_pow_json_is_valid()
           (.quarantined_claims | integer and . >= 0) and
           (.blocking_quarantined_claims | integer and . >= 0) and
           (.raw_quarantined_claims | integer and . >= 0) and
+          (.claim_recovery_database_outcome_ambiguous | type == "boolean") and
           .claim_recovery_database_outcome_ambiguous == false and
-          .allow_automatic_quantum_key_creation == false;
+          (.allow_automatic_quantum_key_creation | type == "boolean") and
+          .allow_automatic_quantum_key_creation == false and
+          typed_gate;
         def off:
           common and .enabled == false and .state == "disabled" and
-          .hashrate == 0 and .live_claims == 0 and
-          .quarantined_claims == 0 and .blocking_quarantined_claims == 0;
-        def clean_hashing:
+          .hashrate == 0;
+        def regular_active:
           common and .enabled == true and
-          (.state == "ready" or .state == "hashing") and
-          .hashrate > 0 and .live_claims == 0 and
-          .quarantined_claims == 0 and .blocking_quarantined_claims == 0 and
+          (.state == "ready" or .state == "hashing" or
+            .state == "claim_in_flight") and
           .stake_reserve_snapshot_available == true and
           (.reserved_stake_coins | integer and . >= 1) and
           (.last_stake_coin_guard | type) == "boolean";
-        $mining | if $phase == "hashing" then clean_hashing else off end
+        $mining | if $phase == "hashing" then regular_active else off end
     ' >/dev/null
 }
 
@@ -1887,20 +1929,50 @@ candidate_node30_pow_is_off()
     _candidate_pow_file_is_valid "$1" node30-off
 }
 
+_candidate_recovery_json_is_valid()
+{
+    local recovery="$1" expected_fee="$2"
+    jq -e -n --argjson recovery "$recovery" --argjson fee "$expected_fee" '
+        def integer:
+          type == "number" and floor == .;
+        ($fee | type == "number" and . >= 0) and
+        ($recovery | type == "object") and
+        ($recovery.policy | type == "object") and
+        ($recovery.policy_authoritative | type == "boolean") and
+        $recovery.policy_authoritative == true and
+        ($recovery.policy.automatic_authorized | type == "boolean") and
+        $recovery.policy.automatic_authorized == false and
+        ($recovery.database_outcome_ambiguous | type == "boolean") and
+        $recovery.database_outcome_ambiguous == false and
+        ($recovery.chain_ready | type == "boolean") and
+        $recovery.chain_ready == true and
+        ($recovery.wallet_tip_matches | type == "boolean") and
+        $recovery.wallet_tip_matches == true and
+        ($recovery.blocking_quarantined_claims | integer and . >= 0) and
+        ($recovery.blocking_components | integer and . >= 0) and
+        ($recovery.indeterminate_quarantined_claims | integer and . >= 0) and
+        ($recovery.pending_manual_resolutions | integer and . >= 0) and
+        ($recovery.pending_automatic_resolutions | integer and . >= 0) and
+        ($recovery.confirmed_resolution_fees | type == "number") and
+        $recovery.confirmed_resolution_fees == $fee
+    ' >/dev/null
+}
+
 candidate_safe_rollback_state_is_clean()
 {
     local wallet_file="$1" staking_file="$2" mining_file="$3" recovery_file="$4"
-    local fee="$5" state_file
+    local fee="$5" recovery state_file
     [[ "$fee" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
     for state_file in "$wallet_file" "$staking_file" "$mining_file" "$recovery_file"; do
         [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
         jq -e 'type == "object"' "$state_file" >/dev/null || return 1
     done
     candidate_drained_pow_is_clean "$mining_file" || return 1
+    recovery=$(jq -ceS 'select(type == "object")' "$recovery_file") || return 1
+    _candidate_recovery_json_is_valid "$recovery" "$fee" || return 1
     jq -e -n --argjson fee "$fee" --slurpfile wallet "$wallet_file" \
-        --slurpfile staking "$staking_file" --slurpfile recovery "$recovery_file" '
+        --slurpfile staking "$staking_file" '
         ($wallet | length) == 1 and ($staking | length) == 1 and
-        ($recovery | length) == 1 and
         ($wallet[0] | type) == "object" and
         $wallet[0].private_keys_enabled == true and
         ($wallet[0].unlocked_until | type) == "number" and
@@ -1913,38 +1985,17 @@ candidate_safe_rollback_state_is_clean()
         $staking[0].automatic_qqsignal == false and
         $staking[0].automatic_demurrage_attestation == false and
         $staking[0].automatic_redelegation == false and
-        $staking[0].allow_automatic_quantum_key_creation == false and
-        ($recovery[0] | type) == "object" and
-        $recovery[0].policy_authoritative == true and
-        $recovery[0].policy.automatic_authorized == false and
-        $recovery[0].database_outcome_ambiguous == false and
-        $recovery[0].chain_ready == true and $recovery[0].wallet_tip_matches == true and
-        $recovery[0].blocking_quarantined_claims == 0 and
-        $recovery[0].blocking_components == 0 and
-        $recovery[0].indeterminate_quarantined_claims == 0 and
-        $recovery[0].pending_manual_resolutions == 0 and
-        $recovery[0].pending_automatic_resolutions == 0 and
-        ($recovery[0].confirmed_resolution_fees | type) == "number" and
-        $recovery[0].confirmed_resolution_fees == $fee
+        $staking[0].allow_automatic_quantum_key_creation == false
     ' >/dev/null
 }
 
 verify_claim_recovery_clean()
 {
-    local node="$1" old_fee="${2:-}" recovery current_fee
+    local node="$1" old_fee="${2:-}" recovery
     jq -en --argjson fee "$old_fee" '$fee | type == "number" and . >= 0' >/dev/null || return 1
     recovery=$(wallet_rpc_for "$node" getpowclaimrecoveryinfo) || return 1
-    jq -e '.policy_authoritative == true and .policy.automatic_authorized == false and
-        .database_outcome_ambiguous == false and .chain_ready == true and
-        .wallet_tip_matches == true and
-        .blocking_quarantined_claims == 0 and .blocking_components == 0 and
-        .indeterminate_quarantined_claims == 0 and
-        .pending_manual_resolutions == 0 and .pending_automatic_resolutions == 0' \
-        >/dev/null <<< "$recovery" || return 1
-    current_fee=$(jq -er '.confirmed_resolution_fees |
-        select(type == "number")' <<< "$recovery") || return 1
-    jq -en --argjson current "$current_fee" --argjson expected "$old_fee" \
-        '$current == $expected' >/dev/null
+    recovery=$(jq -ceS 'select(type == "object")' <<< "$recovery") || return 1
+    _candidate_recovery_json_is_valid "$recovery" "$old_fee"
 }
 
 verify_standard_pow()
@@ -1959,21 +2010,14 @@ verify_standard_pow()
 
 verify_node30_core_role()
 {
-    local mining recovery old_fee="${1:-}" current_fee
+    local mining recovery old_fee="${1:-}"
     jq -en --argjson fee "$old_fee" '$fee | type == "number" and . >= 0' >/dev/null || return 1
     mining=$(wallet_rpc_for "$FREE_CLAIM_NODE" getpowmininginfo) || return 1
     mining=$(jq -ceS 'select(type == "object")' <<< "$mining") || return 1
     _candidate_pow_json_is_valid "$mining" node30-off || return 1
     recovery=$(wallet_rpc_for "$FREE_CLAIM_NODE" getpowclaimrecoveryinfo) || return 1
-    jq -e '.policy_authoritative == true and .policy.automatic_authorized == false and
-        .database_outcome_ambiguous == false and .chain_ready == true and
-        .wallet_tip_matches == true and .blocking_quarantined_claims == 0 and
-        .blocking_components == 0 and .indeterminate_quarantined_claims == 0 and
-        .pending_manual_resolutions == 0 and .pending_automatic_resolutions == 0' \
-        >/dev/null <<< "$recovery" || return 1
-    current_fee=$(jq -er '.confirmed_resolution_fees' <<< "$recovery") || return 1
-    jq -en --argjson current "$current_fee" --argjson expected "$old_fee" \
-        '$current == $expected' >/dev/null || return 1
+    recovery=$(jq -ceS 'select(type == "object")' <<< "$recovery") || return 1
+    _candidate_recovery_json_is_valid "$recovery" "$old_fee" || return 1
 }
 
 verify_node30_free_claim_service()

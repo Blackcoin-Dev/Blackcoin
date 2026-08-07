@@ -187,55 +187,110 @@ candidate_recovery_baseline_path()
 
 verify_candidate_recovery_baseline_payload()
 {
-    local node="$1" path prelaunch prelaunch_sha
+    local node="$1" path prelaunch prelaunch_sha schema mining recovery fee
     valid_node "$node" || return 1
     path=$(candidate_recovery_baseline_path "$node")
     prelaunch="$CURRENT_WAVE_DIR/node-$(node_padded "$node")-wallet-txids.prelaunch.json"
     data_rollback_protected_file "$path" 600 || return 1
     data_rollback_protected_file "$prelaunch" 600 || return 1
     prelaunch_sha=$(sha256sum "$prelaunch" | awk '{print $1}') || return 1
-    jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
-        --arg source "$SOURCE_COMMIT" --argjson node "$node" \
-        --arg prelaunch_sha "$prelaunch_sha" \
-        --arg wave_dir "$CURRENT_WAVE_DIR" '
-        .schema == 2 and .node == $node and .candidate_image == $image and
-        .candidate_image_id == $image_id and .source_commit == $source and
-        .wave_dir == $wave_dir and
-        (.captured_at | type) == "string" and
-        (.container_generation | type) == "string" and (.container_generation | length) > 0 and
-        .wallet_locked_throughout == true and
-        .wallet_final.unlocked_until == 0 and
-        .staking_final.enabled == false and .staking_final.staking == false and
-        .staking_final.worker_running == false and
-        .staking_final.automatic_qqsignal == false and
-        .staking_final.automatic_demurrage_attestation == false and
-        .staking_final.automatic_redelegation == false and
-        .staking_final.allow_automatic_quantum_key_creation == false and
-        .mining_final.enabled == false and .mining_final.autostart == false and
-        .mining_final.state == "disabled" and .mining_final.hashrate == 0 and
-        .mining_final.live_claims == 0 and .mining_final.quarantined_claims == 0 and
-        .mining_final.blocking_quarantined_claims == 0 and
-        .mining_final.claim_recovery_database_outcome_ambiguous == false and
-        .mining_final.allow_automatic_quantum_key_creation == false and
-        .recovery_initial.policy_authoritative == true and
-        .recovery_initial.policy.automatic_authorized == false and
-        .recovery_initial.database_outcome_ambiguous == false and
-        .recovery_final.policy_authoritative == true and
-        .recovery_final.policy.automatic_authorized == false and
-        .recovery_final.database_outcome_ambiguous == false and
-        .recovery_final.chain_ready == true and .recovery_final.wallet_tip_matches == true and
-        .recovery_final.blocking_quarantined_claims == 0 and
-        .recovery_final.blocking_components == 0 and
-        .recovery_final.indeterminate_quarantined_claims == 0 and
-        .recovery_final.pending_manual_resolutions == 0 and
-        .recovery_final.pending_automatic_resolutions == 0 and
-        (.recovery_initial.confirmed_resolution_fees | type) == "number" and
-        .recovery_final.confirmed_resolution_fees ==
-          .recovery_initial.confirmed_resolution_fees and
-        .wallet_transaction_guard.prelaunch_sha256 == $prelaunch_sha and
-        .wallet_transaction_guard.first_v3014_sha256 == $prelaunch_sha and
-        .wallet_transaction_guard.exactly_unchanged == true
-    ' "$path" >/dev/null
+    schema=$(jq -er '.schema | select(. == 2 or . == 3)' "$path") || return 1
+    case "$schema" in
+        2)
+            # Schema 2 is immutable historical evidence. Keep its original Q0
+            # contract so already-sealed transactions remain resumable without
+            # reinterpreting their bytes.
+            jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+                --arg source "$SOURCE_COMMIT" --argjson node "$node" \
+                --arg prelaunch_sha "$prelaunch_sha" \
+                --arg wave_dir "$CURRENT_WAVE_DIR" '
+                .schema == 2 and .node == $node and .candidate_image == $image and
+                .candidate_image_id == $image_id and .source_commit == $source and
+                .wave_dir == $wave_dir and
+                (.captured_at | type) == "string" and
+                (.container_generation | type) == "string" and
+                (.container_generation | length) > 0 and
+                .wallet_locked_throughout == true and
+                .wallet_final.unlocked_until == 0 and
+                .staking_final.enabled == false and .staking_final.staking == false and
+                .staking_final.worker_running == false and
+                .staking_final.automatic_qqsignal == false and
+                .staking_final.automatic_demurrage_attestation == false and
+                .staking_final.automatic_redelegation == false and
+                .staking_final.allow_automatic_quantum_key_creation == false and
+                .mining_final.enabled == false and .mining_final.autostart == false and
+                .mining_final.state == "disabled" and .mining_final.hashrate == 0 and
+                .mining_final.live_claims == 0 and .mining_final.quarantined_claims == 0 and
+                .mining_final.blocking_quarantined_claims == 0 and
+                .mining_final.claim_recovery_database_outcome_ambiguous == false and
+                .mining_final.allow_automatic_quantum_key_creation == false and
+                .recovery_initial.policy_authoritative == true and
+                .recovery_initial.policy.automatic_authorized == false and
+                .recovery_initial.database_outcome_ambiguous == false and
+                .recovery_final.policy_authoritative == true and
+                .recovery_final.policy.automatic_authorized == false and
+                .recovery_final.database_outcome_ambiguous == false and
+                .recovery_final.chain_ready == true and
+                .recovery_final.wallet_tip_matches == true and
+                .recovery_final.blocking_quarantined_claims == 0 and
+                .recovery_final.blocking_components == 0 and
+                .recovery_final.indeterminate_quarantined_claims == 0 and
+                .recovery_final.pending_manual_resolutions == 0 and
+                .recovery_final.pending_automatic_resolutions == 0 and
+                (.recovery_initial.confirmed_resolution_fees | type) == "number" and
+                .recovery_final.confirmed_resolution_fees ==
+                  .recovery_initial.confirmed_resolution_fees and
+                .wallet_transaction_guard.prelaunch_sha256 == $prelaunch_sha and
+                .wallet_transaction_guard.first_v3014_sha256 == $prelaunch_sha and
+                .wallet_transaction_guard.exactly_unchanged == true
+            ' "$path" >/dev/null
+            ;;
+        3)
+            # Schema 3 records the complete typed mining gate. Safe same-anchor
+            # families may have nonzero raw inventory and recovery counters;
+            # those counters are evidence, not availability predicates.
+            jq -e --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+                --arg source "$SOURCE_COMMIT" --argjson node "$node" \
+                --arg prelaunch_sha "$prelaunch_sha" \
+                --arg wave_dir "$CURRENT_WAVE_DIR" '
+                .schema == 3 and .typed_mining_gate_contract == true and
+                .node == $node and .candidate_image == $image and
+                .candidate_image_id == $image_id and .source_commit == $source and
+                .wave_dir == $wave_dir and
+                (.captured_at | type) == "string" and
+                (.container_generation | type) == "string" and
+                (.container_generation | length) > 0 and
+                .wallet_locked_throughout == true and
+                .wallet_final.unlocked_until == 0 and
+                .staking_final.enabled == false and .staking_final.staking == false and
+                .staking_final.worker_running == false and
+                .staking_final.automatic_qqsignal == false and
+                .staking_final.automatic_demurrage_attestation == false and
+                .staking_final.automatic_redelegation == false and
+                .staking_final.allow_automatic_quantum_key_creation == false and
+                .recovery_initial.policy_authoritative == true and
+                .recovery_initial.policy.automatic_authorized == false and
+                .recovery_initial.database_outcome_ambiguous == false and
+                .recovery_final.policy_authoritative == true and
+                .recovery_final.policy.automatic_authorized == false and
+                .recovery_final.database_outcome_ambiguous == false and
+                .recovery_final.chain_ready == true and
+                .recovery_final.wallet_tip_matches == true and
+                (.recovery_initial.confirmed_resolution_fees | type) == "number" and
+                .recovery_final.confirmed_resolution_fees ==
+                  .recovery_initial.confirmed_resolution_fees and
+                .wallet_transaction_guard.prelaunch_sha256 == $prelaunch_sha and
+                .wallet_transaction_guard.first_v3014_sha256 == $prelaunch_sha and
+                .wallet_transaction_guard.exactly_unchanged == true
+            ' "$path" >/dev/null || return 1
+            mining=$(jq -ceS '.mining_final | select(type == "object")' "$path") || return 1
+            _candidate_pow_json_is_valid "$mining" drained || return 1
+            recovery=$(jq -ceS '.recovery_final | select(type == "object")' "$path") || return 1
+            fee=$(jq -er '.recovery_initial.confirmed_resolution_fees |
+                select(type == "number" and . >= 0)' "$path") || return 1
+            _candidate_recovery_json_is_valid "$recovery" "$fee"
+            ;;
+    esac
 }
 
 verify_candidate_recovery_baseline_digest()
@@ -286,6 +341,7 @@ reprove_candidate_recovery_baseline_live_state()
 {
     local node="$1" txids_output="$2" path attempt stopped_generation generation expected_id
     local recovery mining staking wallet_info current_fee expected_fee prelaunch expected_txids_sha
+    local schema
     verify_candidate_recovery_baseline_payload "$node" || return 1
     path=$(candidate_recovery_baseline_path "$node") || return 1
     attempt=$(wave_node_launch_attempt_path "$node") || return 1
@@ -302,24 +358,35 @@ reprove_candidate_recovery_baseline_live_state()
     staking=$(wallet_rpc_for "$node" getstakinginfo) || return 1
     wallet_info=$(wallet_rpc_for "$node" getwalletinfo) || return 1
     jq -e '.unlocked_until == 0' >/dev/null <<< "$wallet_info" || return 1
-    jq -e '.enabled == false and .autostart == false and .state == "disabled" and
-        .hashrate == 0 and .live_claims == 0 and .quarantined_claims == 0 and
-        .blocking_quarantined_claims == 0 and
-        .claim_recovery_database_outcome_ambiguous == false and
-        .allow_automatic_quantum_key_creation == false' >/dev/null <<< "$mining" || return 1
+    schema=$(jq -er '.schema | select(. == 2 or . == 3)' "$path") || return 1
+    expected_fee=$(jq -c '.recovery_initial.confirmed_resolution_fees' "$path") || return 1
+    if [[ "$schema" -eq 2 ]]; then
+        jq -e '.enabled == false and .autostart == false and .state == "disabled" and
+            .hashrate == 0 and .live_claims == 0 and .quarantined_claims == 0 and
+            .blocking_quarantined_claims == 0 and
+            .claim_recovery_database_outcome_ambiguous == false and
+            .allow_automatic_quantum_key_creation == false' \
+            >/dev/null <<< "$mining" || return 1
+    else
+        _candidate_pow_json_is_valid "$mining" drained || return 1
+    fi
     jq -e '.enabled == false and .staking == false and .worker_running == false and
         .automatic_qqsignal == false and .automatic_demurrage_attestation == false and
         .automatic_redelegation == false and
         .allow_automatic_quantum_key_creation == false' >/dev/null <<< "$staking" || return 1
     verify_donation_defaults_off "$node" || return 1
-    jq -e '.policy_authoritative == true and .policy.automatic_authorized == false and
-        .database_outcome_ambiguous == false and .chain_ready == true and
-        .wallet_tip_matches == true and .blocking_quarantined_claims == 0 and
-        .blocking_components == 0 and .indeterminate_quarantined_claims == 0 and
-        .pending_manual_resolutions == 0 and .pending_automatic_resolutions == 0 and
-        (.confirmed_resolution_fees | type) == "number"' >/dev/null <<< "$recovery" || return 1
+    if [[ "$schema" -eq 2 ]]; then
+        jq -e '.policy_authoritative == true and .policy.automatic_authorized == false and
+            .database_outcome_ambiguous == false and .chain_ready == true and
+            .wallet_tip_matches == true and .blocking_quarantined_claims == 0 and
+            .blocking_components == 0 and .indeterminate_quarantined_claims == 0 and
+            .pending_manual_resolutions == 0 and .pending_automatic_resolutions == 0 and
+            (.confirmed_resolution_fees | type) == "number"' \
+            >/dev/null <<< "$recovery" || return 1
+    else
+        _candidate_recovery_json_is_valid "$recovery" "$expected_fee" || return 1
+    fi
     current_fee=$(jq -c '.confirmed_resolution_fees' <<< "$recovery") || return 1
-    expected_fee=$(jq -c '.recovery_initial.confirmed_resolution_fees' "$path") || return 1
     [[ "$current_fee" == "$expected_fee" ]] || return 1
     jq -e --argjson fee "$current_fee" '
         .recovery_initial.confirmed_resolution_fees == $fee and
@@ -425,11 +492,7 @@ establish_candidate_recovery_baseline()
         jq -e '.unlocked_until == 0' >/dev/null 2>&1 <<< "$wallet_info" || {
             rm -f -- "$txids_tmp"; return 1;
         }
-        jq -e '.enabled == false and .autostart == false and .state == "disabled" and
-            .hashrate == 0 and .live_claims == 0 and
-            (.quarantined_claims == 0 or .quarantined_claims == 1) and
-            .claim_recovery_database_outcome_ambiguous == false and
-            .allow_automatic_quantum_key_creation == false' >/dev/null 2>&1 <<< "$mining" ||
+        _candidate_pow_json_is_valid "$mining" drained >/dev/null 2>&1 ||
             { rm -f -- "$txids_tmp"; return 1; }
         jq -e '.enabled == false and .staking == false and .worker_running == false and
             .automatic_qqsignal == false and .automatic_demurrage_attestation == false and
@@ -452,15 +515,8 @@ establish_candidate_recovery_baseline()
         fi
         capture_wallet_txid_set "$node" "$txids_tmp" || { rm -f -- "$txids_tmp"; return 1; }
         cmp -s "$txids_before" "$txids_tmp" || { rm -f -- "$txids_tmp"; return 1; }
-        if jq -e '.chain_ready == true and .wallet_tip_matches == true and
-                .blocking_quarantined_claims == 0 and .blocking_components == 0 and
-                .indeterminate_quarantined_claims == 0 and .pending_manual_resolutions == 0 and
-                .pending_automatic_resolutions == 0' >/dev/null <<< "$recovery" &&
-           jq -e '.enabled == false and .autostart == false and .state == "disabled" and
-               .hashrate == 0 and .live_claims == 0 and .quarantined_claims == 0 and
-               .blocking_quarantined_claims == 0 and
-               .claim_recovery_database_outcome_ambiguous == false and
-               .allow_automatic_quantum_key_creation == false' >/dev/null <<< "$mining"; then
+        if _candidate_recovery_json_is_valid "$recovery" "$initial_fee" &&
+           _candidate_pow_json_is_valid "$mining" drained; then
             ready=1
             break
         fi
@@ -493,7 +549,8 @@ establish_candidate_recovery_baseline()
         --argjson staking_final "$staking" --argjson mining_final "$mining" \
         --arg prelaunch_sha "$prelaunch_sha" --arg first_sha "$first_sha" \
         --arg wave_dir "$CURRENT_WAVE_DIR" --arg generation "$generation" \
-        '{schema:2,node:$node,candidate_image:$image,candidate_image_id:$image_id,
+        '{schema:3,typed_mining_gate_contract:true,
+          node:$node,candidate_image:$image,candidate_image_id:$image_id,
           source_commit:$source,wave_dir:$wave_dir,captured_at:$captured_at,
           container_generation:$generation,wallet_locked_throughout:true,
           wallet_final:$wallet_final,staking_final:$staking_final,mining_final:$mining_final,

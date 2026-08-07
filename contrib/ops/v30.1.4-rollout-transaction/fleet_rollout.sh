@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Fail-closed, resumable v30.1.4 fleet rollout. The default action is `plan`,
 # which performs no live operation. `apply` requires an explicit confirmation.
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 PACKAGE_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
 readonly PACKAGE_ROOT

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # One-time attempt-3 launcher for the sealed node-27 adoption package. It
 # changes only the wallet audit transport: large listtransactions JSON is fed
@@ -8,7 +9,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 readonly SEALED_ROOT=/mnt/pulsar/Blackcoin_Blocks/operations/v30.1.4-packages/rollout-express-readoption-20260806T1323Z/seal-root/v30.1.4-rollout-transaction
 readonly SEALED_MANIFEST_SHA256=dadcca0cd0b9f742021cb92f7287afd7db61b9f359a9b78dfe01e89d5ccb49bd

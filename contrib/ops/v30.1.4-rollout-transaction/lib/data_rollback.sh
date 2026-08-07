@@ -1,4 +1,5 @@
-#!/usr/bin/env bash
+# shellcheck shell=bash
+export LC_ALL=C
 
 # Reversible data boundary for the v30.1.4 fleet transaction. Callers must
 # stop every target container cleanly before snapshot or restore.
@@ -632,7 +633,7 @@ data_rollback_verify_authority_sealed()
         if [[ -e "$launch_marker" || -L "$launch_marker" ]]; then
             data_rollback_protected_file "$launch_marker" 600 || return 1
             verify_candidate_launch_attempt_marker "$node" 0 || return 1
-            launch_state=candidate-attempted
+            launch_state='candidate-attempted'
             launch_sha=$(sha256sum "$launch_marker" | awk '{print $1}') || return 1
             data_rollback_protected_file "$safe" 600 || return 1
             data_rollback_verify_safe_boundary_sealed "$node" "$stopped_generation" || return 1
@@ -887,7 +888,7 @@ data_rollback_publish_authority()
                 rm -f -- "$temporary" "$nodes_tmp"
                 return 1
             fi
-            launch_state=candidate-attempted
+            launch_state='candidate-attempted'
             launch_sha=$(sha256sum "$launch_marker" | awk '{print $1}') || {
                 rm -f -- "$temporary" "$nodes_tmp"; return 1;
             }

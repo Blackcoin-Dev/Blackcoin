@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Cron-safe fleet liveness cycle for the v30.1.4 transition. This program has
 # no transaction-construction or transaction-broadcast path. Its only mutation
@@ -6,7 +7,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 readonly STATE_DIR=/boot/config/plugins/blackcoin-quantum-nodes
 readonly CYCLE_LOCK=/run/blackcoin-pow-quarantine-cycle.lock

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Targeted recovery for a clean (exit-code 0) guard stop. Docker's on-failure
 # policy intentionally does not restart that generation. This script starts
@@ -8,7 +9,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 PACKAGE_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
 readonly PACKAGE_ROOT

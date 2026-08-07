@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 ROOT=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)
 CANARY=$(realpath "$ROOT/../v30.1.4-canary/node27-v30.1.4-canary.no-spend.sh")

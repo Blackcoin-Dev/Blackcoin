@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Durable pause interlock for the node-30 Free Claim worker. The wrapper emits
 # no payout and performs no queue operation. The original daemon remains pinned
@@ -6,7 +7,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 readonly FREE_CLAIM_ROOT=/mnt/pulsar/Blackcoin_Blocks/operations/free-claim-pool
 readonly FREE_CLAIM_LOCK=/var/run/blackcoin-free-claim-pool.lock

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Releases only the Free Claim pause after canonical success evidence. The old
 # quarantine cycle remains disabled permanently; this script has no restore path
@@ -6,7 +7,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 PACKAGE_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
 readonly PACKAGE_ROOT

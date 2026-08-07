@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export LC_ALL=C
 
 # Exact-32, stateful soak. Static checks run once. Later samples rerun only
 # dynamic liveness checks, and nodes leave the work set after enough consecutive
@@ -6,7 +7,7 @@
 
 set -Eeuo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export TZ=UTC
 
 # The bootstrap verification intentionally precedes every sourced package byte.
 # A caller therefore cannot replace a helper and rely on that helper to attest

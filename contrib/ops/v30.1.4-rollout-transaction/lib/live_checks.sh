@@ -1,4 +1,5 @@
-#!/usr/bin/env bash
+# shellcheck shell=bash
+export LC_ALL=C
 
 # Runtime assertions used by the rollout and the independent soak audit.
 # This file contains no mutation commands.

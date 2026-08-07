@@ -51,13 +51,14 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             "-staking=0",
             "-txindex=1",
             "-shadowwhitelistheight=1",
-            "-shadowgoldrushblocks=500",
+            "-shadowgoldrushblocks=600",
             # Keep this focused on historical QQP2 single-flight behavior,
             # but use a reachable boundary inside the compressed Gold Rush.
             # Post-boundary QQP4 behavior is exercised by the contention and
-            # index-boundary tests.
+            # index-boundary tests. This test crosses only the deployed
+            # QQP2-to-QQP3 boundary so it exercises the production failure
+            # mode without enabling the separately scheduled QQP4 fork.
             "-shadowcompetingclaimsheight=501",
-            "-shadowqqp4height=501",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
         ]
         self.extra_args = [[
@@ -293,21 +294,11 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         policy_lock_inputs = self._fund_live_fee_inputs(default_wallet, policy_lock, policy_lock_address, funding_address)
         builtin_race_inputs = self._fund_live_fee_inputs(default_wallet, builtin_race, builtin_race_address, funding_address)
 
-        self.log.info("Manual claims choose the smallest sufficient same-script input")
         policy_payout = policy.getnewquantumaddress("policy-payout")["address"]
-        policy_claim = policy.sendshadowpowclaim(policy_address, policy_payout, 500000)
-        assert_equal(self._claim_input(policy_claim["txid"]), policy_inputs[LIVE_FEE_VALUES[0]])
-        # The live claim creates an unconfirmed same-script change output. It
-        # must never become the next claim's fee input: claim chains can be
-        # invalidated with their parent and bypass the confirmed-input rule.
-        assert any(
-            utxo["txid"] == policy_claim["txid"] and utxo["vout"] == 0
-            for utxo in policy.listunspent(0, 9999999, [policy_address])
-        )
-
-        self.log.info("A selected input locked at the test barrier cannot fall back to a larger coin")
+        self.log.info("A fresh selected input locked at the test barrier cannot fall back to a larger coin")
         policy_before_race = self._claim_txids(policy)
-        expected_policy_race_input = policy_inputs[LIVE_FEE_VALUES[1]]
+        assert_equal(policy_before_race, set())
+        expected_policy_race_input = policy_inputs[LIVE_FEE_VALUES[0]]
         policy_race_errors = []
 
         def submit_policy_race():
@@ -321,7 +312,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         policy_race_thread = Thread(target=submit_policy_race, name="policy-input-race", daemon=True)
         with node.wait_for_debug_log([b"Gold Rush PoW claim submission test barrier reached"], timeout=20):
             policy_race_thread.start()
-        assert_equal(policy.lockunspent(False, [policy_inputs[LIVE_FEE_VALUES[1]]]), True)
+        assert_equal(policy.lockunspent(False, [policy_inputs[LIVE_FEE_VALUES[0]]]), True)
         policy_race_thread.join(timeout=300)
         assert not policy_race_thread.is_alive(), "policy input race caller did not finish"
         assert_equal(len(policy_race_errors), 1)
@@ -332,7 +323,19 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert "changed while grinding" in policy_race_errors[0]
         assert_equal(self._claim_txids(policy), policy_before_race)
-        assert_equal(policy.lockunspent(True, [policy_inputs[LIVE_FEE_VALUES[1]]]), True)
+        assert_equal(policy.lockunspent(True, [policy_inputs[LIVE_FEE_VALUES[0]]]), True)
+
+        self.log.info("Manual claims choose the smallest sufficient same-script input")
+        policy_claim = policy.sendshadowpowclaim(policy_address, policy_payout, 500000)
+        assert_equal(self._claim_input(policy_claim["txid"]), policy_inputs[LIVE_FEE_VALUES[0]])
+        # The live claim creates an unconfirmed same-script change output. It
+        # must never become a second fee anchor while the first claim remains
+        # live; same-anchor refresh is authorized only after the head leaves
+        # the mempool.
+        assert any(
+            utxo["txid"] == policy_claim["txid"] and utxo["vout"] == 0
+            for utxo in policy.listunspent(0, 9999999, [policy_address])
+        )
 
         # Historical QQP2 policy permits one live proof in the global mempool.
         # Clear that slot explicitly before exercising the independent
@@ -461,9 +464,11 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(automatic_info["pending_automatic_resolutions"], 0)
         assert_equal(automatic_info["confirmed_automatic_resolutions"], 1)
         automatic_component = automatic_info["component_details"][0]
-        assert_equal(automatic_component["has_revalidating_unbound_proof"], True)
-        assert any(
-            graph_node["proof_may_revalidate_on_descendant"]
+        assert_equal(automatic_component["classification"], "resolved_on_active_chain")
+        assert_equal(automatic_component["anchor_unspent"], False)
+        assert_equal(automatic_component["has_revalidating_unbound_proof"], False)
+        assert all(
+            graph_node["proof_evaluation_skipped_resolved_anchor"]
             for graph_node in automatic_component["nodes"]
             if graph_node["kind"] == "claim"
         )
@@ -838,7 +843,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert manual.gettransaction(second_claim_txid)["confirmations"] < 0
         assert manual.gettransaction(second_resolution_txid)["confirmations"] > 0
         resolution_info = manual.getpowmininginfo()
-        assert_equal(resolution_info["unresolved_claims"], 0)
+        # `unresolved_claims` is the raw count of wallet-authored,
+        # non-confirmed QQSPROOF history, including a conflicted claim whose
+        # anchor generation is conclusively resolved. It is not the mining
+        # blocker count exposed by the typed inventory and gate.
+        assert_equal(resolution_info["unresolved_claims"], 1)
+        assert_equal(resolution_info["live_claims"], 0)
+        assert_equal(resolution_info["mining_gate_action"], "create_new_anchor")
         self._assert_claim_inventory(
             manual, raw=1, actionable=0, resolved=1, indeterminate=0, components=1
         )
@@ -918,16 +929,32 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(len(fault.listunspent(1, 9999999, [fault_address])), 0)
         self._assert_generic_abandon_rejected(fault, first_fault_txid)
 
-        self.log.info("The built-in miner uses the same guard and exception cleanup")
-        before_builtin_fault = self._quarantined_claim_txids(builtin)
+        self.log.info("The built-in miner exact-relays its persisted claim after a broadcast exception")
+        before_builtin_fault = self._claim_txids(builtin)
         started = builtin.setpowmining(True, 1, 100, True)
         assert started["created_payout_key"]
         try:
-            builtin_fault_txid = self._wait_for_new_quarantined_claim(builtin, before_builtin_fault)
+            self.wait_until(
+                lambda: len(self._claim_txids(builtin) - before_builtin_fault) == 1,
+                timeout=180,
+            )
+            builtin_fault_txid = next(
+                iter(self._claim_txids(builtin) - before_builtin_fault)
+            )
+            self.wait_until(
+                lambda: builtin_fault_txid in node.getrawmempool(), timeout=20
+            )
         finally:
             builtin.setpowmining(False)
+        # The first relay throws after the exact bytes are persisted. The
+        # worker re-enters the typed gate and relays those same bytes; it must
+        # not grind a second proof or consume another fee input.
         assert_equal(builtin.getpowmininginfo()["claims_submitted"], 0)
-        assert builtin_fault_txid not in node.getrawmempool()
+        assert builtin_fault_txid in node.getrawmempool()
+        assert_equal(
+            self._claim_txids(builtin) - before_builtin_fault,
+            {builtin_fault_txid},
+        )
         assert_equal(self._is_abandoned(builtin, builtin_fault_txid), False)
         assert_equal(len(builtin.listunspent(1, 9999999, [builtin_address])), 0)
         self._assert_generic_abandon_rejected(builtin, builtin_fault_txid)
@@ -1013,7 +1040,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
         assert_equal(fault.getpowclaimrecoveryinfo()["pending_manual_resolutions"], 1)
 
-        self.log.info("A pre-boundary QQP2 claim crosses into QQP4 policy without releasing its input")
+        self.log.info("A stale QQP2 claim refreshes on the same anchor across the QQP3 boundary")
         activation_height = 501
         pre_boundary_tip = activation_height - 2
         assert node.getblockcount() < pre_boundary_tip
@@ -1024,7 +1051,11 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(node.getshadowpowwork()["proof_version"], 2)
 
         boundary = self._load_wallet(BOUNDARY_WALLET)
-        assert_equal(len(boundary.listunspent(1, 9999999, [boundary_address])), 2)
+        boundary_inputs = [
+            {"txid": utxo["txid"], "vout": utxo["vout"]}
+            for utxo in boundary.listunspent(1, 9999999, [boundary_address])
+        ]
+        assert_equal(len(boundary_inputs), 2)
         boundary_payout = boundary.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
         boundary_claim = boundary.sendshadowpowclaim(
             boundary_address, boundary_payout, 500_000
@@ -1038,24 +1069,63 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             for output in boundary_decoded["vout"]
         )
         assert boundary_claim_txid in node.getrawmempool()
+        untouched_boundary_input = next(
+            outpoint for outpoint in boundary_inputs if outpoint != boundary_claim_input
+        )
 
-        # Deliberately omit the last QQP2 claim at its intended height. At the
-        # resulting tip, the next-block policy is QQP4-only and the old
-        # transaction is terminal. Its fee input remains unavailable. The
-        # other confirmed UTXO stays visible, but the quarantine gate must
-        # prevent it from funding another claim while the old proof resolves.
-        self.generateblock(node, output=funding_address, transactions=[])
-        assert_equal(node.getblockcount(), activation_height - 1)
-        assert_equal(node.getshadowpowwork()["height"], activation_height)
-        assert_equal(node.getshadowpowwork()["proof_version"], 4)
-        rejected = node.testmempoolaccept([boundary_raw])[0]
-        assert_equal(rejected["allowed"], False)
-        assert_equal(rejected["reject-reason"], "shadow-proof-version")
-        assert_equal(len(boundary.listunspent(1, 9999999, [boundary_address])), 1)
+        # Deliberately omit the last QQP2 claim at its intended height. QQP3
+        # still recognizes QQP2 carriers, so advance only until this proof's
+        # work is ineligible on the current tip. This forces the production
+        # failure mode without relying on a proof-version rejection.
+        rejected = None
+        for _ in range(32):
+            self.generateblock(node, output=funding_address, transactions=[])
+            node.syncwithvalidationinterfacequeue()
+            if boundary_claim_txid not in node.getrawmempool():
+                candidate = node.testmempoolaccept([boundary_raw])[0]
+                if (
+                    not candidate["allowed"]
+                    and candidate["reject-reason"] == "shadow-proof-invalid"
+                ):
+                    rejected = candidate
+                    break
+        assert rejected is not None, "QQP2 proof remained eligible across 32 descendant tips"
+        assert node.getblockcount() >= activation_height - 1
+        assert_equal(node.getshadowpowwork()["proof_version"], 3)
+        assert_equal(
+            [
+                {"txid": utxo["txid"], "vout": utxo["vout"]}
+                for utxo in boundary.listunspent(
+                    1, 9999999, [boundary_address]
+                )
+            ],
+            [untouched_boundary_input],
+        )
+        stale_recovery = boundary.getpowclaimrecoveryinfo(True)
+        stale_component = next(
+            component
+            for component in stale_recovery["component_details"]
+            if boundary_claim_txid in component["claim_txids"]
+        )
+        stale_node = next(
+            graph_node
+            for graph_node in stale_component["nodes"]
+            if graph_node["txid"] == boundary_claim_txid
+        )
+        assert_equal(stale_component["classification"], "current_branch_ineligible")
+        assert_equal(stale_node["disposition"], "unbound_proof_may_revalidate")
+        assert_equal(stale_node["proof_version"], 2)
+        assert_equal(stale_node["authored_tip_active_branch_bound"], True)
+        boundary_recovery_before = boundary.getpowclaimrecoveryinfo()
+        assert_equal(boundary_recovery_before["pending_manual_resolutions"], 0)
+        assert_equal(boundary_recovery_before["pending_automatic_resolutions"], 0)
+        assert_equal(boundary_recovery_before["confirmed_manual_resolutions"], 0)
+        assert_equal(boundary_recovery_before["confirmed_automatic_resolutions"], 0)
+        assert_equal(boundary_recovery_before["confirmed_resolution_fees"], Decimal("0"))
 
-        # Startup repair must retain the obsolete proof and its input. A
-        # second confirmed fee UTXO exists, but neither RPC nor the built-in
-        # miner may consume it while the first claim remains quarantined.
+        # Startup repair must retain the old proof and exact anchor. The other
+        # confirmed UTXO remains visible, but the miner must refresh the proof
+        # by conflicting on the same anchor instead of paying from that coin.
         self.restart_node(0, extra_args=[*self.base_args, f"-mocktime={self.mock_time}"])
         node = self.nodes[0]
         node.setmocktime(self.mock_time)
@@ -1064,41 +1134,324 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         remaining_boundary_inputs = boundary.listunspent(1, 9999999, [boundary_address])
         assert_equal(len(remaining_boundary_inputs), 1)
         assert_equal(
-            {"txid": remaining_boundary_inputs[0]["txid"], "vout": remaining_boundary_inputs[0]["vout"]}
-            != boundary_claim_input,
-            True,
+            {"txid": remaining_boundary_inputs[0]["txid"], "vout": remaining_boundary_inputs[0]["vout"]},
+            untouched_boundary_input,
         )
-        before_second_claim = self._claim_txids(boundary)
-        assert_raises_rpc_error(
-            -4,
-            "wallet will not create a second fee-input claim",
-            boundary.sendshadowpowclaim,
-            boundary_address,
-            boundary_payout,
-            500_000,
-        )
-        assert_equal(self._claim_txids(boundary), before_second_claim)
+        before_refresh = self._claim_txids(boundary)
+        assert_equal(before_refresh, {boundary_claim_txid})
 
         started = boundary.setpowmining(True, 1, 100)
         assert_equal(started["created_payout_key"], False)
         assert_equal(started["payout_address"], boundary_payout)
         try:
             self.wait_until(
-                lambda: boundary.getpowmininginfo()["state"] == "claim_quarantined",
-                timeout=20,
+                lambda: len(self._claim_txids(boundary) - before_refresh) == 1,
+                timeout=180,
             )
+            refreshed_claim_txid = next(iter(self._claim_txids(boundary) - before_refresh))
             info = boundary.getpowmininginfo()
-            assert_equal(info["claims_submitted"], 0)
-            self._assert_claim_inventory(
-                boundary, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
-            )
-            assert_equal(self._claim_txids(boundary), before_second_claim)
+            assert_equal(info["claims_submitted"], 1)
+            assert_equal(info["mining_gate_action"], "wait_for_live")
+            assert_equal(info["mining_gate_family_claims"], 2)
+            assert_equal(info["mining_gate_live_claims"], 1)
             assert_equal(len(boundary.listunspent(1, 9999999, [boundary_address])), 1)
         finally:
             boundary.setpowmining(False)
-        assert not any(
-            entry.get("qq_shadow_pow_cleanup_for") == boundary_claim_txid
+        refreshed_raw = node.getrawtransaction(refreshed_claim_txid)
+        refreshed_decoded = node.decoderawtransaction(refreshed_raw)
+        assert_equal(self._claim_input(refreshed_claim_txid), boundary_claim_input)
+        assert any(
+            "51515033" in output["scriptPubKey"]["hex"]
+            for output in refreshed_decoded["vout"]
+        )
+        assert refreshed_claim_txid in node.getrawmempool()
+        assert boundary_claim_txid not in node.getrawmempool()
+        assert_equal(
+            [
+                {"txid": utxo["txid"], "vout": utxo["vout"]}
+                for utxo in boundary.listunspent(1, 9999999, [boundary_address])
+            ],
+            [untouched_boundary_input],
+        )
+
+        refresh_record = next(
+            entry
             for entry in boundary.listtransactions("*", 1000, 0, True)
+            if entry["txid"] == refreshed_claim_txid
+        )
+        assert_equal(refresh_record["qq_shadow_pow_lineage_schema"], "1")
+        assert_equal(refresh_record["qq_shadow_pow_lineage_root"], boundary_claim_txid)
+        assert_equal(refresh_record["qq_shadow_pow_lineage_parent"], boundary_claim_txid)
+        assert_equal(refresh_record["qq_shadow_pow_lineage_ordinal"], "1")
+        assert_equal(len(refresh_record["qq_shadow_pow_lineage_family"]), 64)
+        refreshed_recovery = boundary.getpowclaimrecoveryinfo(True)
+        refreshed_component = next(
+            component
+            for component in refreshed_recovery["component_details"]
+            if refreshed_claim_txid in component["claim_txids"]
+        )
+        assert_equal(
+            set(refreshed_component["claim_txids"]),
+            {boundary_claim_txid, refreshed_claim_txid},
+        )
+        assert_equal(refreshed_component["descendant_claims"], 0)
+        assert_equal(refreshed_component["ordinary_or_mixed_txids"], [])
+        assert_equal(refreshed_component["resolution_txids"], [])
+        assert_equal(
+            boundary.getpowclaimrecoveryinfo()["confirmed_resolution_fees"],
+            Decimal("0"),
+        )
+        assert not any(
+            entry.get("qq_shadow_pow_cleanup_for")
+            in {boundary_claim_txid, refreshed_claim_txid}
+            for entry in boundary.listtransactions("*", 1000, 0, True)
+        )
+
+        self.log.info("The miner promptly relays an eligible absent head on the same tip")
+        self.restart_node(
+            0,
+            extra_args=[
+                *self.base_args,
+                "-mempoolexpiry=0",
+                f"-mocktime={self.mock_time}",
+            ],
+        )
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        boundary = self._load_wallet(BOUNDARY_WALLET)
+        default_wallet = node.get_wallet_rpc(self.default_wallet_name)
+        self.wait_until(lambda: refreshed_claim_txid in node.getrawmempool(), timeout=30)
+        self._bump_mocktime(2)
+        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
+        node.syncwithvalidationinterfacequeue()
+        self.wait_until(
+            lambda: refreshed_claim_txid not in node.getrawmempool(), timeout=20
+        )
+        relay_gate = boundary.getpowmininginfo()
+        assert_equal(relay_gate["mining_gate_action"], "relay_existing")
+        assert_equal(relay_gate["mining_gate_relay_txid"], refreshed_claim_txid)
+        assert_equal(relay_gate["mining_gate_unsafe_claims"], 0)
+        assert_equal(relay_gate["mining_gate_unsafe_components"], 0)
+        absent_recovery = boundary.getpowclaimrecoveryinfo(True)
+        absent_head = next(
+            graph_node
+            for component in absent_recovery["component_details"]
+            for graph_node in component["nodes"]
+            if graph_node["txid"] == refreshed_claim_txid
+        )
+        assert_equal(absent_head["in_mempool"], False)
+        assert_equal(absent_head["quarantined"], True)
+
+        claims_before_restart_mining = self._claim_txids(boundary)
+        boundary.setpowmining(True, 1, 100)
+        try:
+            self.wait_until(
+                lambda: refreshed_claim_txid in node.getrawmempool(), timeout=20
+            )
+            self.wait_until(
+                lambda: boundary.getpowmininginfo()["state"] == "claim_in_flight",
+                timeout=20,
+            )
+            assert_equal(
+                boundary.getpowmininginfo()["mining_gate_action"],
+                "wait_for_live",
+            )
+
+            # Removing the just-relayed head without changing the chain tip
+            # must invalidate the cached WAIT state. The running worker loops
+            # back through RELAY_EXISTING and submits the same bytes again.
+            same_tip = node.getbestblockhash()
+            self._bump_mocktime(2)
+            with node.wait_for_debug_log(
+                [b"Relayed existing eligible Gold Rush PoW claim"], timeout=20
+            ):
+                default_wallet.sendtoaddress(
+                    funding_address, Decimal("0.10000000")
+                )
+            self.wait_until(
+                lambda: refreshed_claim_txid in node.getrawmempool(), timeout=20
+            )
+            assert_equal(node.getbestblockhash(), same_tip)
+            assert_equal(self._claim_txids(boundary), claims_before_restart_mining)
+            assert_equal(boundary.getpowmininginfo()["claims_submitted"], 0)
+        finally:
+            boundary.setpowmining(False)
+
+        self.log.info("RPC truthfully reports a bounded next-tip relay wait")
+        self._bump_mocktime(2)
+        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
+        node.syncwithvalidationinterfacequeue()
+        self.wait_until(
+            lambda: refreshed_claim_txid not in node.getrawmempool(), timeout=20
+        )
+        self.restart_node(
+            0,
+            extra_args=[
+                *self.base_args,
+                "-mempoolexpiry=0",
+                "-walletbroadcast=0",
+                f"-mocktime={self.mock_time}",
+            ],
+        )
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        boundary = self._load_wallet(BOUNDARY_WALLET)
+        assert refreshed_claim_txid not in node.getrawmempool()
+        assert_equal(
+            boundary.getpowmininginfo()["mining_gate_action"],
+            "relay_existing",
+        )
+
+        boundary.setpowmining(True, 1, 100)
+        try:
+            self.wait_until(
+                lambda: boundary.getpowmininginfo()["mining_gate_action"]
+                == "wait_for_next_tip",
+                timeout=20,
+            )
+            wait_info = boundary.getpowmininginfo()
+            assert_equal(
+                wait_info["mining_gate_action"], "wait_for_next_tip"
+            )
+            assert_equal(wait_info["state"], "claim_in_flight")
+            assert_equal(wait_info["mining_gate_can_submit"], False)
+            # Every safety field remains fresh-inventory-derived. The cached
+            # override changes only the action, so the eligible relay txid is
+            # still visible and auditable during the bounded wait.
+            assert_equal(
+                wait_info["mining_gate_relay_txid"], refreshed_claim_txid
+            )
+            assert_equal(wait_info["mining_gate_unsafe_claims"], 0)
+            assert_equal(wait_info["mining_gate_unsafe_components"], 0)
+            waiting_tip = node.getbestblockhash()
+        finally:
+            boundary.setpowmining(False)
+
+        # Disabling the worker immediately falls back to the fresh inventory
+        # action. Advancing the tip then invalidates the old cached snapshot;
+        # neither transition can leave WAIT_FOR_NEXT_TIP latched in RPC.
+        assert_equal(
+            boundary.getpowmininginfo()["mining_gate_action"],
+            "relay_existing",
+        )
+        self.generateblock(node, output=funding_address, transactions=[])
+        node.syncwithvalidationinterfacequeue()
+        assert node.getbestblockhash() != waiting_tip
+        assert boundary.getpowmininginfo()["mining_gate_action"] != (
+            "wait_for_next_tip"
+        )
+
+        self.log.info("Restart retains the live head without creating a third sibling")
+        self.restart_node(0, extra_args=[*self.base_args, f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        boundary = self._load_wallet(BOUNDARY_WALLET)
+        self.wait_until(lambda: refreshed_claim_txid in node.getrawmempool(), timeout=30)
+        restarted_head = next(
+            graph_node
+            for component in boundary.getpowclaimrecoveryinfo(True)[
+                "component_details"
+            ]
+            for graph_node in component["nodes"]
+            if graph_node["txid"] == refreshed_claim_txid
+        )
+        assert_equal(restarted_head["in_mempool"], True)
+        assert_equal(restarted_head["quarantined"], False)
+        assert_equal(
+            boundary.getpowmininginfo()["mining_gate_action"], "wait_for_live"
+        )
+        boundary.setpowmining(True, 1, 100)
+        try:
+            self.wait_until(
+                lambda: boundary.getpowmininginfo()["state"] == "claim_in_flight",
+                timeout=20,
+            )
+            time.sleep(2)
+            assert_equal(self._claim_txids(boundary), claims_before_restart_mining)
+        finally:
+            boundary.setpowmining(False)
+
+        self.log.info("One confirmation resolves exactly one sibling and preserves the other UTXO")
+        refreshed_block = self.generateblock(
+            node, output=funding_address, transactions=[refreshed_claim_txid]
+        )["hash"]
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(boundary.gettransaction(refreshed_claim_txid)["confirmations"], 1)
+        assert boundary.gettransaction(boundary_claim_txid)["confirmations"] < 0
+        confirmed_boundary_outpoints = {
+            (utxo["txid"], utxo["vout"])
+            for utxo in boundary.listunspent(1, 9999999, [boundary_address])
+        }
+        assert_equal(
+            confirmed_boundary_outpoints,
+            {
+                (untouched_boundary_input["txid"], untouched_boundary_input["vout"]),
+                (refreshed_claim_txid, 0),
+            },
+        )
+        self._assert_claim_inventory(
+            boundary, raw=1, actionable=0, resolved=1, indeterminate=0, components=1
+        )
+        boundary_recovery_confirmed = boundary.getpowclaimrecoveryinfo()
+        for field in (
+            "pending_manual_resolutions",
+            "pending_automatic_resolutions",
+            "confirmed_manual_resolutions",
+            "confirmed_automatic_resolutions",
+            "confirmed_resolution_fees",
+            "automatic_fee_exposure_in_window",
+        ):
+            assert_equal(
+                boundary_recovery_confirmed[field], boundary_recovery_before[field]
+            )
+
+        self.log.info("A one-block reorg reopens only the same-anchor live head across restart")
+        node.invalidateblock(refreshed_block)
+        self.wait_until(lambda: node.getbestblockhash() != refreshed_block, timeout=20)
+        node.syncwithvalidationinterfacequeue()
+        self.wait_until(lambda: refreshed_claim_txid in node.getrawmempool(), timeout=30)
+        assert_equal(
+            [
+                {"txid": utxo["txid"], "vout": utxo["vout"]}
+                for utxo in boundary.listunspent(1, 9999999, [boundary_address])
+            ],
+            [untouched_boundary_input],
+        )
+        claims_before_reorg_restart = self._claim_txids(boundary)
+        self.restart_node(0, extra_args=[*self.base_args, f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        boundary = self._load_wallet(BOUNDARY_WALLET)
+        self.wait_until(lambda: refreshed_claim_txid in node.getrawmempool(), timeout=30)
+        boundary.setpowmining(True, 1, 100)
+        try:
+            self.wait_until(
+                lambda: boundary.getpowmininginfo()["state"] == "claim_in_flight",
+                timeout=20,
+            )
+            time.sleep(2)
+            assert_equal(self._claim_txids(boundary), claims_before_reorg_restart)
+        finally:
+            boundary.setpowmining(False)
+
+        node.reconsiderblock(refreshed_block)
+        self.wait_until(lambda: node.getbestblockhash() == refreshed_block, timeout=20)
+        node.syncwithvalidationinterfacequeue()
+        assert boundary.gettransaction(refreshed_claim_txid)["confirmations"] > 0
+        assert boundary.gettransaction(boundary_claim_txid)["confirmations"] < 0
+        assert_equal(
+            {
+                (utxo["txid"], utxo["vout"])
+                for utxo in boundary.listunspent(1, 9999999, [boundary_address])
+            },
+            {
+                (untouched_boundary_input["txid"], untouched_boundary_input["vout"]),
+                (refreshed_claim_txid, 0),
+            },
+        )
+        assert_equal(
+            boundary.getpowclaimrecoveryinfo()["confirmed_resolution_fees"],
+            Decimal("0"),
         )
 
         self.log.info("Recovery policy, exact bytes, graph, and metrics survive rescan and reindex")

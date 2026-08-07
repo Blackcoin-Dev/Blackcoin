@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Single-quoted jq/awk programs are intentionally literal, and several values
+# are consumed by sourced transaction helpers that ShellCheck cannot follow.
+# shellcheck disable=SC2016,SC2034
+
 export LC_ALL=C
 
 # Fail-closed, resumable v30.1.4 fleet rollout. The default action is `plan`,

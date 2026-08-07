@@ -1,4 +1,8 @@
 # shellcheck shell=bash
+# This sourced library is evaluated from several package roots that ShellCheck
+# cannot resolve statically.
+# shellcheck disable=SC1091
+
 export LC_ALL=C
 
 # Runtime assertions used by the rollout and the independent soak audit.
@@ -1258,7 +1262,7 @@ verify_published_canary_handoff_ready()
         select(type == "number" and . >= 0)' "$PUBLISHED_CANARY_RESULT") || return 1
     for sequence in 1 2; do
         if [[ "$sequence" == 1 ]]; then
-            purpose=first-unlock
+            purpose='first-unlock'
             boundary_marker=$activation_one_file
         else
             purpose=second-start-and-unlock

@@ -87,7 +87,6 @@
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/fees.h>
 #include <wallet/scriptpubkeyman.h>
-#include <wallet/shadow_pow_claim_recovery.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
@@ -124,6 +123,10 @@ using interfaces::FoundBlock;
 using interfaces::WalletPowMiningState;
 
 namespace wallet {
+
+uint256 ComputeShadowPowClaimLineageFamilyFingerprint(
+    const COutPoint& anchor, CAmount anchor_amount,
+    const CScript& anchor_script);
 
 static std::vector<unsigned char> QuantumWalletProgramForPubkey(const std::vector<unsigned char>& public_key)
 {
@@ -10140,11 +10143,13 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         LOCK(m_pow_miner_mutex);
         threadPowMinerGroup = std::move(group);
     }
-    WalletLogPrintf(
-        payout_resolution_deferred
-            ? "Gold Rush PoW miner started with %d worker(s) at %d%% CPU target; waiting for a normal wallet unlock before payout resolution and hashing\n"
-            : "Gold Rush PoW miner started with %d worker(s) at %d%% CPU target\n",
-        threads, cpu_percent);
+    if (payout_resolution_deferred) {
+        WalletLogPrintf("Gold Rush PoW miner started with %d worker(s) at %d%% CPU target; waiting for a normal wallet unlock before payout resolution and hashing\n",
+                        threads, cpu_percent);
+    } else {
+        WalletLogPrintf("Gold Rush PoW miner started with %d worker(s) at %d%% CPU target\n",
+                        threads, cpu_percent);
+    }
     return true;
 }
 

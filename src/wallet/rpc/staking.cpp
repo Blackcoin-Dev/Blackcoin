@@ -3793,7 +3793,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     return RPCHelpMan{
         "getpowclaimrecoveryinfo",
         "\nReturn this wallet's persisted Gold Rush PoW claim-recovery consent and current component gate.\n"
-        "This RPC never creates, signs, or broadcasts a transaction. Recovery is disabled unless mode is explicitly set to automatic with bounded spending limits. Set verbose=true to inspect the complete typed component graph and provenance.\n",
+        "This RPC never creates, signs, or broadcasts a transaction. Automatic recovery is disabled unless mode is explicitly set to automatic with bounded spending limits; exact-plan manual recovery remains separately authorized per request. Set verbose=true to inspect the complete typed component graph and provenance.\n",
         {
             {"verbose", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include complete component, node, provenance, and refusal-classification details."},
         },
@@ -3811,7 +3811,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             {RPCResult::Type::NUM, "wallet_generation", "Wallet database generation used by exact-plan stale-state protection."},
             {RPCResult::Type::BOOL, "wallet_tip_matches", "Whether the wallet-processed tip matches the classified active tip."},
             {RPCResult::Type::NUM, "raw_quarantined_claims", "Wallet-known quarantined claim objects retained for audit and reorg safety."},
-            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Actionable plus indeterminate claim objects that currently pause new claim creation."},
+            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Legacy actionable-plus-indeterminate compatibility count. Candidate claim creation is controlled by the complete typed mining gate instead."},
             {RPCResult::Type::NUM, "actionable_quarantined_claims", "Claim objects whose confirmed anchor is currently unspent."},
             {RPCResult::Type::NUM, "resolved_on_active_chain_claims", "Historical objects whose confirmed anchor is spent on the active chain."},
             {RPCResult::Type::NUM, "indeterminate_quarantined_claims", "Objects that fail closed because classification is incomplete."},

@@ -1,16 +1,20 @@
 # Gold Rush PoW claim lifecycle and recovery
 
-This document describes the wallet behavior developed for Issue #37. It is a
-later wallet and operator-safety change, not a change to the Gold Rush consensus
-rules shipped in v30.1.1 through v30.1.3. Historical release notes retain the
+This document describes the wallet behavior developed for Issue #37 and the
+post-release v30.1.4 hotfix candidate. The same-anchor continuation and typed
+mining gate below are not part of the immutable `v30.1.4` tag. They are later
+wallet and operator-safety changes, not changes to the Gold Rush consensus
+rules shipped in v30.1.1 through v30.1.4. Historical release notes retain the
 behavior of those releases and link here for the later recovery model.
 
 ## Claims, quarantine, and components
 
-A wallet may have more than one unresolved `QQSPROOF`. It may submit up to 64
-independent claims that are still live in its local mempool. The limit matches
-the bounded per-block proof-evaluation set; it does not promise that any claim
-will be included or credited.
+A wallet may have more than one historical unresolved `QQSPROOF`, and consensus
+can evaluate a bounded set of up to 64 claims in one block. The post-release
+hotfix candidate does not treat that protocol bound as permission to spend
+additional fee anchors: while an authenticated family member is live, its
+mining gate waits. The limit does not promise that any claim will be included
+or credited.
 
 A live claim and a quarantined claim are different states:
 
@@ -33,38 +37,101 @@ or indeterminate components, current anchors, and pending or confirmed
 resolutions. Resolved descendants remain in wallet history for audit and reorg
 safety, but do not independently create another recovery action.
 
-For compatibility with existing mining supervisors, `getpowmininginfo` keeps
-`quarantined_claims` as the count that blocks claim creation. The complete
-audit count is reported separately as `raw_quarantined_claims`; resolved
-active-chain history can make that raw count nonzero without pausing PoW.
+For compatibility, `getpowmininginfo.quarantined_claims` retains the legacy
+count that blocks claim creation in immutable v30.1.4. The complete audit count
+is reported separately as `raw_quarantined_claims`. The post-release candidate
+does not use either raw count as its mining decision: an authenticated family
+may remain quarantined while the typed action relays or refreshes it. Unsafe or
+indeterminate families still fail closed. Recovery never enables mining itself.
 
-The built-in miner pauses while a quarantined component is actionable or cannot
-be classified safely. It does not consume another fee input merely because a
-different input is available. When all blocking components resolve, a miner
-that was already enabled may resume. Recovery never enables mining itself.
+## Same-anchor continuation for QQP2, QQP3, and QQP4 claims
 
-## Zero-payment retirement for origin-bound claims
+The post-release hotfix candidate's normal lifecycle for an exact
+wallet-authored QQP2, QQP3, or QQP4 claim keeps one confirmed fee anchor
+reserved until a member of that claim family confirms or the anchor is
+otherwise spent on the active chain. A live member pauses new claim creation.
+If an eligible member has left the local mempool but is still inside its
+dedicated one-hour relay lifetime, Core first relays those exact bytes.
 
-The normal v30.1.4 lifecycle for a newly wallet-authored QQP3 or QQP4 claim does
-not create a conflicting recovery transaction. While the claim is eligible on
-the active branch, the wallet retains the exact transaction and reserves its
-input even after the one-hour mempool residence limit removes it from local
-relay. Startup, import, periodic resend, and reorg retry do not grant an
-over-age claim a new local relay lifetime.
+When no family member is live or eligible for that exact relay, the typed
+mining gate may authorize one new current-tip, current-policy sibling that
+spends the same confirmed anchor and preserves the same legacy target and
+quantum payout. Every sibling carries durable root, parent, family, and ordinal
+metadata. The siblings conflict, so at most one can confirm and charge its
+ordinary claim fee. This does not consume another wallet coin, create a chain
+of recovery payments, or release the anchor for an unrelated claim.
+Same-anchor siblings remain `QQSPROOF` claims; the candidate does not change
+existing claim reward, winner, loser, late-claim, or reimbursement consensus
+rules.
 
-After the authenticated origin plus the inclusive 64-block late window has
-expired on one pinned active branch, Core may durably mark the exact locally
-authored, single-input claim component retired on that branch. This transition
-creates, signs, and broadcasts no transaction, pays no recovery fee, and
-releases the local reservation. The marker records the observation height and
-block hash. A reorg that removes that observation reopens and reclassifies the
-claim before the input can be reused inconsistently.
+The refresh path is deliberately narrow. The complete component must be an
+unforked, gap-free family of exact single-input wallet-authored carriers with
+authenticated creation metadata and one unchanged anchor, target, and payout.
+Adopted or foreign history, malformed or mixed graphs, ordinary descendants,
+ambiguous database state, future proof formats, and inconsistent lineage fail
+closed. A deterministic relay-policy rejection authorizes a sibling only when
+a fresh full mempool test reproduces the exact low-fee rejection on the same
+tip and wallet snapshot.
 
-This path is deliberately narrow. QQP2, adopted or foreign history, a future
-origin or version, malformed or mixed graphs, ordinary descendants, active
-mempool claims, and indeterminate local state remain reserved. Fee-paying
-conflict recovery is an optional, default-off last resort for those separately
-reviewed components; it is not the ordinary PoW liveness loop.
+Zero-payment local retirement remains only for narrow pre-lineage legacy
+records that cannot be authenticated as a refreshable exact carrier.
+Schema-lineage claims, strict locally authored unbound QQP2 singletons, and
+exact locally authored origin-bound QQP3/QQP4 carriers are never retired merely
+because an original policy window expires. A historical retirement marker on
+such a record is reclassified from current chain and wallet facts before the
+anchor can be reused. Fee-paying conflict recovery remains a separate,
+explicit, default-off path under exact manual consent or bounded automatic
+standing consent. The existing recovery engine can authorize that path for a
+component it classifies as conflict-resolvable, including
+`unbound_proof_may_revalidate`, even when the built-in miner's normal path can
+continue the authenticated same-anchor family. Mining alone never invokes that
+fee path, and same-anchor continuation does not require it.
+
+## Typed mining-gate telemetry
+
+The post-release candidate adds one complete, tip-pinned gate to
+`getpowmininginfo`. Candidate-aware automation must require all of these fields
+together; a partial set is invalid and fails closed:
+
+- `mining_gate_coherent`, `mining_gate_action`,
+  `mining_gate_can_submit`, and `mining_gate_database_ambiguous`;
+- `mining_gate_unresolved_components`, `mining_gate_live_claims`,
+  `mining_gate_eligible_claims`, and `mining_gate_family_claims`;
+- `mining_gate_unsafe_claims` and `mining_gate_unsafe_components`; and
+- `mining_gate_relay_txid`, `mining_gate_lineage_head_txid`, and
+  `mining_gate_candidate_state_fingerprint`.
+
+The safe action family is `create_new_anchor`, `wait_for_live`,
+`wait_for_next_tip`, `relay_existing`, and `refresh_same_anchor`. Without a
+worker override, `mining_gate_can_submit` is true only for
+`create_new_anchor` and `refresh_same_anchor`; it is false for
+`wait_for_live`, `relay_existing`, and `unsafe`. `wait_for_next_tip` is an
+optional transient action override, so `mining_gate_can_submit` retains the
+fresh inventory value and may be true or false. A true value does not authorize
+bypassing the reported wait. Supervisors must accept a proven next-tip wait but
+must never require observing it for liveness. `relay_existing` requires a
+nonzero 64-character hexadecimal txid; a next-tip wait may retain that fresh
+inventory relay txid. `unsafe`, an
+incoherent snapshot, either database ambiguity flag, or a nonzero unsafe
+claim/component count fails closed.
+`getpowclaimrecoveryinfo.database_outcome_ambiguous` and
+`getpowmininginfo.claim_recovery_database_outcome_ambiguous` must also remain
+false before any wallet action.
+
+Zero instantaneous hashrate is expected while the action waits or relays.
+Likewise, unresolved, live, quarantined, blocking, family, and recovery counts
+can remain nonzero for a safe authenticated family. Those raw counts are audit
+evidence, not standalone health predicates, and must not be compared
+numerically between immutable v30.1.4 and the candidate. Monitor active-tip
+progress, action/fingerprint age, and hashrate as a separate bounded staleness
+alert. Do not restart, unlock, spend, or rotate a payout key solely because that
+alert fires.
+
+After version and image identity independently verify immutable v30.1.4,
+absence of every typed field identifies its legacy telemetry. Field absence
+alone does not identify a binary. Once a candidate starts, automation must
+never silently fall back to legacy quarantine-count or positive-hashrate
+predicates.
 
 ## QQP2 and QQP3 eligibility
 
@@ -83,14 +150,16 @@ descendant context without changing its transaction bytes. Its typed
 permanently dead or terminal. The classifier reports it separately from both
 terminal and generic retryable failures.
 
-Resolving such a QQP2 component is a deliberate on-chain conflict, not an
-abandonment of a dead transaction. It is available only through an exact manual
-plan with explicit fee-and-conflict acknowledgement, or through the wallet's
-explicit bounded automatic standing policy after the configured stale-depth,
-rate, and fee gates pass. Either the unchanged QQP2 claim or the conflicting
-resolution may confirm. Generic transient or indeterminate conditions, local
-state errors, future-origin proofs, and future-version proofs remain fail-closed
-and cannot authorize recovery.
+For a strict wallet-authored singleton with an authenticated confirmed anchor,
+the candidate first relays eligible exact QQP2 bytes and otherwise appends one
+current-policy sibling spending that same anchor. The old and new claim cannot
+both confirm, and no second fee input is consumed. A separately fee-paying
+resolution remains available only through exact manual conflict consent or an
+explicit bounded automatic policy. That separately authorized engine can act
+on an `unbound_proof_may_revalidate` component even though same-anchor
+continuation is the normal built-in-miner path. Generic transient or
+indeterminate conditions, local state errors, future-origin proofs, and
+future-version proofs remain fail-closed and cannot authorize recovery.
 
 ## One shared recovery engine
 
@@ -180,9 +249,9 @@ treated as age zero when their stored time is ahead of the current chain clock,
 without moving the window past other recent actions. Their transaction
 timestamp provides a floor when old metadata is behind it.
 
-Once the wallet has explicitly committed exact resolution bytes for a component
-that cannot use zero-payment retirement, safe retries
-may continue across restart without creating a new spend. Disabling automatic
+Once the wallet has explicitly committed exact resolution bytes for a
+component, safe retries may continue across restart without creating a new
+spend. Disabling automatic
 recovery prevents new automatic actions; it cannot recall a transaction that
 was already propagated. Disabling the built-in PoW miner and committing a
 recovery action are serialized per wallet: whichever operation starts first
@@ -205,13 +274,13 @@ confirms pays its base-chain fee.
   a new frontier after the claim output is confirmed and spendable. A later
   frontier is a new plan; one call cannot promise to finish every future branch.
 
-The wallet releases no reservation merely because a claim left the mempool or
-exceeded one hour of relay residence. It releases only after an active-chain
-confirmation resolves the conflict or after the narrow, branch-scoped
-origin-expiry retirement above. If the controlling block is disconnected, the
-wallet reopens and reclassifies the component on the new pinned tip and restores
-any required quarantine. A transaction already seen by peers cannot be
-withdrawn.
+The wallet releases no reservation merely because a claim left the mempool,
+exceeded one hour of relay residence, or exhausted its original
+origin-plus-64 window. It releases only after an active-chain confirmation
+spends the anchor or after the narrow legacy-only retirement described above.
+If the controlling block is disconnected, the wallet reopens and reclassifies
+the component on the new pinned tip and restores any required quarantine. A
+transaction already seen by peers cannot be withdrawn.
 
 ## Operator checks
 

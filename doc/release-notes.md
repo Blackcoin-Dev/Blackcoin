@@ -1,11 +1,18 @@
 30.1.4 Maintenance Release Notes
 ================================
 
-Blackcoin Core v30.1.4 removes the recurring fee-paying operator stopgap that
-was required when a wallet-authored, origin-bound Gold Rush PoW claim left the
-local mempool. It also protects mature legacy stake capacity, publishes
-coherent PoS worker state, makes claim-recovery review atomic, and exposes
-wallet-specific QQSIGNAL lifecycle evidence.
+> **Release identity:** `v30.1.4` is immutable. Same-anchor claim
+> continuation, typed mining-gate telemetry, and locked-wallet PoW worker
+> resumption described below are a **post-release v30.1.4 hotfix candidate**,
+> not behavior shipped by the `v30.1.4` tag.
+
+Blackcoin Core v30.1.4 introduced fail-closed Gold Rush claim recovery, mature
+legacy stake protection, coherent PoS worker state, atomic claim-recovery
+review, and wallet-specific QQSIGNAL lifecycle evidence. The immutable release
+does not restore built-in PoW for a strict wallet-authored QQP2 singleton that
+has become current-branch-ineligible outside the mempool. The post-release
+hotfix candidate addresses that production liveness defect with authenticated
+same-anchor continuation, without authorizing another independent fee input.
 
 It also permanently disables the legacy development-fund recipient and old
 payment controls. A separate Quantum Quasar development donation is available
@@ -24,10 +31,17 @@ The production defaults are fail-closed:
 
 - wallet-authored QQP3/QQP4 carriers have a one-hour local mempool residence
   limit, while ordinary transactions retain the existing mempool policy;
-- after the complete origin-plus-64 window expires, an exact eligible local
-  claim reservation is retired durably without another transaction or fee;
-- fee-paying conflict recovery remains an explicit, default-off fallback for
-  components that cannot use zero-payment retirement;
+- in the post-release hotfix candidate, after exact relay is no longer
+  available, a strictly authenticated claim
+  family continues with a current-policy sibling spending the same confirmed
+  anchor, so no second wallet coin or independent recovery payment is needed;
+- in the post-release hotfix candidate, fee-paying conflict recovery remains
+  a separate, explicit, default-off path under the existing exact manual or
+  bounded automatic consent gates; the built-in miner does not require or
+  invoke that path for same-anchor continuation;
+- in the post-release hotfix candidate, explicit `-powmining=1` starts a
+  locked encrypted wallet in a waiting state
+  and resumes its configured worker after a normal, non-staking-only unlock;
 - while staking is enabled, PoW claim selection protects one mature,
   stakeable legacy coin by default (`-powclaimreservestakecoins=1`);
 - `getstakinginfo` reports a coherent worker snapshot and no longer treats a
@@ -55,28 +69,73 @@ of historical v30.1.1 through v30.1.3 binaries. Sections below that describe a
 single unresolved claim, a one-claim compatibility RPC, or a debug-console-only
 manual path are retained as release history for those binaries.
 
-The later recovery model permits up to 64 independent live wallet claims,
+The later recovery inventory can represent up to 64 live wallet claims,
 classifies non-mempool siblings and descendants as current-anchor components,
 and separates exact preview, signed-draft persistence, and explicit
-commit-and-broadcast authority. Manual GUI and headless paths share that engine.
+commit-and-broadcast authority. That protocol bound does not authorize the
+candidate miner to select independent fee anchors while an unresolved family
+exists. Manual GUI and headless paths share the recovery engine.
 Wallet-scoped automatic recovery is a seventh optional automation, is off by
 default, requires explicit positive fee/rate/staleness bounds, and never unlocks
 the wallet or enables mining.
 
-Newly authored origin-bound QQP3/QQP4 carriers have a dedicated one-hour local
-mempool residence limit. Eviction does not release their inputs while the proof
-remains height-eligible. After the complete origin-plus-64 window expires on a
-pinned active branch, Core retires an authenticated local claim reservation
-without creating, signing, or broadcasting another transaction and without a
-recovery fee. That durable retirement is reversed and reclassified if its
-observation block leaves the active chain. Fee-paying conflict recovery remains
-an explicit, default-off fallback for components that cannot use this path.
+### Post-release v30.1.4 hotfix candidate
 
-`getpowmininginfo.quarantined_claims` retains its legacy miner-gating meaning
-so existing supervisors continue to start PoW when all historical components
-are resolved. The new `raw_quarantined_claims` field exposes retained audit and
-reorg history separately; a nonzero raw count alone never authorizes a fee or
-pauses mining.
+The paragraphs in this subsection describe the candidate, not the immutable
+`v30.1.4` release. Exact wallet-authored QQP2/QQP3/QQP4 carriers have a
+dedicated one-hour local mempool residence limit. Eviction does not release
+their confirmed fee anchor.
+The enabled built-in miner first attempts exact relay while the carrier remains eligible and inside
+that relay lifetime. Otherwise, a strict typed gate may append one current-tip,
+current-policy sibling that spends the same anchor and preserves the legacy
+target and quantum payout. Each newly authored carrier stores schema, family,
+root, and ordinal metadata; every non-root refresh also stores its direct
+parent. This makes the lineage auditable and prevents a second root. Because the siblings
+conflict, at most one can confirm and charge its ordinary claim fee.
+Same-anchor siblings remain `QQSPROOF` claims, and the candidate does not change
+existing claim reward or reimbursement consensus rules.
+
+Schema-lineage claims, strict locally authored unbound QQP2 singletons, and
+exact locally authored origin-bound QQP3/QQP4 carriers are not retired merely
+because an original policy window expires. Zero-payment retirement remains
+narrow and legacy-only. Separately, explicit,
+default-off fee-paying conflict recovery remains available under the existing
+confirmed fee, txid, and conflict-risk gates, including for a classified
+`unbound_proof_may_revalidate` component. The built-in miner's authenticated
+same-anchor path does not invoke that authority. For that mining path,
+malformed, mixed, adopted, forked, or ambiguous components remain reserved and
+fail closed.
+
+An explicit `-powmining=1` now survives the normal encrypted-wallet startup
+sequence: Core starts the configured worker in a waiting state and it resumes
+after a normal wallet unlock. It retains `-powminingthreads`,
+`-powminingcpu`, and the configured or previously stored payout key. A
+staking-only unlock cannot authorize claim signing, and an explicit stop still
+stops and joins the worker.
+
+The candidate adds a complete typed gate to `getpowmininginfo`. The safe action
+family is `create_new_anchor`, `wait_for_live`, `wait_for_next_tip`,
+`relay_existing`, and `refresh_same_anchor`; `unsafe` fails closed. Without a
+worker override, `mining_gate_can_submit` is true only for create/refresh and
+false for wait-for-live, relay, and unsafe. A next-tip wait is an optional
+transient action override, so `mining_gate_can_submit` keeps the fresh
+inventory value and may be true or false; true never bypasses the wait.
+Supervisors accept the action when present but never require it for liveness.
+Candidate
+automation requires the complete `mining_gate_*` schema, coherent matching
+tips, no database ambiguity, and zero unsafe claims/components. The fresh
+`mining_gate_can_submit` value remains authoritative when the worker reports a
+bounded next-tip wait. Zero hashrate and nonzero unresolved, quarantined,
+family, or recovery counts can be expected for a safe waiting or relay action.
+Those raw counts are audit evidence, not cross-build health predicates.
+Tip/action/fingerprint age and hashrate belong in a separate bounded staleness
+alert.
+
+`getpowmininginfo.quarantined_claims` retains its immutable-v30.1.4
+compatibility meaning. Candidate-aware supervisors use the complete typed gate,
+not this legacy count; a safe authenticated family may relay or refresh while
+the count remains nonzero. `raw_quarantined_claims` remains audit and reorg
+history and never authorizes a fee.
 
 A chainstate that already carries the authenticated Quantum Quasar schema-12
 replay marker for its exact active tip starts normally on v30.1.4. Upgrading
@@ -95,16 +154,19 @@ re-enable a miner or acquire authority after an earlier disable.
 
 Either the original claim or the resolution may confirm. Only the confirming
 transaction pays a fee; a confirmed resolution fee is not shadow-reimbursed.
+This managed-resolution rule is separate from same-anchor QQSPROOF continuation,
+whose existing reimbursement consensus is unchanged.
 Broadcast is not a confirmation promise, and reorg or original-claim
 confirmation can require a fresh frontier plan. See
 `doc/gold-rush-pow-claim-recovery.md` for the complete Issue #37 behavior.
 
-The later classifier gives legacy unbound QQP2 proofs a distinct typed result:
-a proof invalid on the pinned tip may validate on a normal descendant and is
-never represented as permanently dead or terminal. A real conflict therefore
-requires exact-plan manual fee/conflict consent, or explicit bounded automatic
-standing consent after the configured stale-depth, rate, and fee gates pass.
-Either transaction may confirm. Generic transient or local-state failures,
+The candidate gives legacy unbound QQP2 proofs a distinct typed result: a proof
+invalid on the pinned tip may validate on a normal descendant and is never
+represented as permanently dead or terminal. A strict locally authored
+singleton normally uses exact relay or same-anchor continuation in the built-in
+miner. Exact-plan manual fee/conflict consent, or explicit bounded automatic
+standing consent, remains a separate default-off authority and can cover
+`unbound_proof_may_revalidate`. Generic transient or local-state failures,
 future-origin proofs, and future-version proofs remain fail-closed.
 
 30.1.3 Signed Corrective Release Notes

@@ -1,0 +1,446 @@
+name: v30.1.4 Linux x86_64 post-release hotfix candidate
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/v30.1.4-hotfix-candidate-linux.yml
+      - ci/release/generate_hotfix_candidate_metadata.py
+      - ci/release/test_hotfix_candidate_metadata.py
+      - contrib/ops/v30.1.4-hotfix-candidate-package/**
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact approved Blackcoin-Dev-signed Core source commit
+        required: true
+        type: string
+      core_ci_run_id:
+        description: Completed successful pull-request safety-gate run for source_sha
+        required: true
+        type: string
+      confirmation:
+        description: Exact explicit candidate-build confirmation
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: v30.1.4-hotfix-candidate-linux-${{ github.event_name }}-${{ inputs.source_sha || github.sha }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_SOURCE: 8a3a5aa1c01caf57acc694b836398c5acba969d0
+  EXPECTED_RELEASE_ANCESTOR: 13262151077cce3f72d07d17dc7725b2b6a8e1ab
+  EXPECTED_IDENTITY_ANCESTOR: 19baffef25af36e177db2975780e0641b59753aa
+  EXPECTED_FINGERPRINT: SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
+  EXPECTED_CORE_CI_EVENT: pull_request
+  EXPECTED_CORE_CI_PR: 49
+  EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256: 24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869
+  POLICY: contrib/ops/v30.1.4-hotfix-candidate-package/policy.json
+  PACKAGE_ROOT: contrib/ops/v30.1.4-hotfix-candidate-package
+  HOST: x86_64-pc-linux-gnu
+  MAKEJOBS: 4
+
+jobs:
+  adapter-self-test:
+    name: Static packaging adapter and fixture gates
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact review tooling
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact review checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Install static test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Run metadata and package fixture gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ci/release/test_hotfix_candidate_metadata.py
+          bash "$PACKAGE_ROOT/tests/run.sh"
+
+  authorize-source:
+    name: Authorize signed source, tooling, and exact successful Core CI
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs:
+      - adapter-self-test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    outputs:
+      source_sha: ${{ steps.authorize.outputs.source_sha }}
+      source_date_epoch: ${{ steps.source-gate.outputs.source_date_epoch }}
+      tooling_sha: ${{ steps.authorize.outputs.tooling_sha }}
+      short_source: ${{ steps.authorize.outputs.short_source }}
+    steps:
+      - name: Checkout exact workflow tooling
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+
+      - id: authorize
+        name: Verify tooling signature before candidate authorization
+        shell: bash
+        env:
+          REQUESTED_SOURCE: ${{ inputs.source_sha }}
+          CORE_CI_RUN_ID: ${{ inputs.core_ci_run_id }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          TOOLING_SHA: ${{ github.workflow_sha }}
+          EVENT_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTOR" = Blackcoin-Dev
+          test "$GITHUB_TRIGGERING_ACTOR" = Blackcoin-Dev
+          [[ "$TOOLING_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$TOOLING_SHA" = "$EVENT_SHA"
+          test "$(git rev-parse HEAD)" = "$TOOLING_SHA"
+          test "$CONFIRMATION" = BUILD_V30_1_4_HOTFIX_CANDIDATE_LINUX_X86_64
+          [[ "$CORE_CI_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          python3 ci/release/verify_source_identity.py \
+            --base "$EXPECTED_IDENTITY_ANCESTOR" \
+            --head "$TOOLING_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --require-actor \
+            --actor "$GITHUB_ACTOR" \
+            --require-signatures \
+            --signing-fingerprint "$EXPECTED_FINGERPRINT"
+          python3 ci/release/generate_hotfix_candidate_metadata.py validate-policy \
+            --policy "$POLICY"
+          POLICY_SOURCE=$(jq -er '.source.commit' "$POLICY")
+          test "$REQUESTED_SOURCE" = "$EXPECTED_SOURCE"
+          test "$REQUESTED_SOURCE" = "$POLICY_SOURCE"
+          {
+            echo "source_sha=$REQUESTED_SOURCE"
+            echo "short_source=${REQUESTED_SOURCE:0:12}"
+            echo "tooling_sha=$TOOLING_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact candidate source separately
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          path: candidate-source
+
+      - id: source-gate
+        name: Verify signed candidate source and successful Core CI
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CORE_CI_RUN_ID: ${{ inputs.core_ci_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_SHA" = "$EXPECTED_SOURCE"
+          test "$(git -C candidate-source rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C candidate-source merge-base --is-ancestor "$EXPECTED_RELEASE_ANCESTOR" "$SOURCE_SHA"
+          test "$(git -C candidate-source merge-base "$EXPECTED_IDENTITY_ANCESTOR" "$SOURCE_SHA")" = \
+            "$EXPECTED_IDENTITY_ANCESTOR"
+          test "$(git -C candidate-source show "$SOURCE_SHA:.github/workflows/pr-gate.yml" | sha256sum | awk '{print $1}')" = \
+            "$EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256"
+          test "$(git -C candidate-source show "$EXPECTED_IDENTITY_ANCESTOR:.github/workflows/pr-gate.yml" | sha256sum | awk '{print $1}')" = \
+            "$EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256"
+          (
+            cd candidate-source
+            python3 "$GITHUB_WORKSPACE/ci/release/verify_source_identity.py" \
+              --base "$EXPECTED_IDENTITY_ANCESTOR" \
+              --head "$SOURCE_SHA" \
+              --repository "$GITHUB_REPOSITORY" \
+              --require-actor \
+              --actor "$GITHUB_ACTOR" \
+              --require-signatures \
+              --signing-fingerprint "$EXPECTED_FINGERPRINT"
+          )
+          test "$(sed -n 's/^define(_CLIENT_VERSION_MAJOR, \([0-9]*\))$/\1/p' candidate-source/configure.ac)" = 30
+          test "$(sed -n 's/^define(_CLIENT_VERSION_MINOR, \([0-9]*\))$/\1/p' candidate-source/configure.ac)" = 1
+          test "$(sed -n 's/^define(_CLIENT_VERSION_BUILD, \([0-9]*\))$/\1/p' candidate-source/configure.ac)" = 4
+          test "$(sed -n 's/^define(_CLIENT_VERSION_RC, \([0-9]*\))$/\1/p' candidate-source/configure.ac)" = 0
+          test "$(sed -n 's/^define(_CLIENT_VERSION_IS_RELEASE, \(.*\))$/\1/p' candidate-source/configure.ac)" = true
+
+          gh api "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_SHA" > source-verification.json
+          jq -e --arg source "$SOURCE_SHA" '
+            .sha == $source and .verification.verified == true and
+            .verification.reason == "valid"
+          ' source-verification.json >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CORE_CI_RUN_ID" > core-ci-run.json
+          jq -e --arg source "$SOURCE_SHA" --arg base "$EXPECTED_IDENTITY_ANCESTOR" \
+            --arg repository "$GITHUB_REPOSITORY" --arg event "$EXPECTED_CORE_CI_EVENT" \
+            --argjson pr "$EXPECTED_CORE_CI_PR" --argjson run "$CORE_CI_RUN_ID" '
+            .id == $run and .path == ".github/workflows/pr-gate.yml" and
+            .name == "pull-request safety gate" and .head_sha == $source and
+            .event == $event and .repository.full_name == $repository and
+            .head_repository.full_name == $repository and
+            (.pull_requests | type == "array" and length == 1) and
+            .pull_requests[0].number == $pr and
+            .pull_requests[0].head.sha == $source and
+            .pull_requests[0].base.sha == $base and
+            .status == "completed" and .conclusion == "success"
+          ' core-ci-run.json >/dev/null
+
+          mkdir preflight-evidence
+          jq -n --arg commit "$SOURCE_SHA" --arg repository "$GITHUB_REPOSITORY" \
+            --arg fingerprint "$EXPECTED_FINGERPRINT" --arg actor "$GITHUB_ACTOR" \
+            --arg triggering_actor "$GITHUB_TRIGGERING_ACTOR" '
+            {schema:1,commit:$commit,repository:$repository,signer:"Blackcoin-Dev",
+             format:"ssh",fingerprint:$fingerprint,local_git_verified:true,
+             github_verified:true,github_verification_reason:"valid",
+             workflow_actor:$actor,workflow_triggering_actor:$triggering_actor}
+          ' > preflight-evidence/source-signature.json
+          jq -n --argjson run "$CORE_CI_RUN_ID" --argjson pr "$EXPECTED_CORE_CI_PR" \
+            --arg source "$SOURCE_SHA" --arg base "$EXPECTED_IDENTITY_ANCESTOR" \
+            --arg repository "$GITHUB_REPOSITORY" --arg event "$EXPECTED_CORE_CI_EVENT" \
+            --arg workflow_blob "$EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256" '
+            {schema:1,workflow_path:".github/workflows/pr-gate.yml",
+             workflow_name:"pull-request safety gate",workflow_blob_sha256:$workflow_blob,
+             event:$event,repository:$repository,head_repository:$repository,
+             pull_request_number:$pr,pull_request_head_sha:$source,
+             pull_request_base_sha:$base,run_id:$run,head_sha:$source,
+             status:"completed",conclusion:"success"}
+          ' > preflight-evidence/core-ci.json
+          SOURCE_DATE_EPOCH=$(git -C candidate-source show -s --format=%ct "$SOURCE_SHA")
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[1-9][0-9]*$ ]]
+          echo "source_date_epoch=$SOURCE_DATE_EPOCH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact authorization evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hotfix-candidate-authorization-${{ inputs.source_sha }}-attempt-${{ github.run_attempt }}
+          path: preflight-evidence/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux:
+    name: Linux x86_64 exact-source build (${{ matrix.builder }})
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs:
+      - adapter-self-test
+      - authorize-source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        builder:
+          - primary
+          - verifier
+    env:
+      SOURCE_SHA: ${{ needs.authorize-source.outputs.source_sha }}
+      SOURCE_DATE_EPOCH: ${{ needs.authorize-source.outputs.source_date_epoch }}
+      SHORT_SOURCE: ${{ needs.authorize-source.outputs.short_source }}
+      WORKFLOW_RUN_ID: ${{ github.run_id }}
+      WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+    steps:
+      - name: Independently authorize this build attempt
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTOR" = Blackcoin-Dev
+          test "$GITHUB_TRIGGERING_ACTOR" = Blackcoin-Dev
+          [[ "$WORKFLOW_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$WORKFLOW_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+
+      - name: Install exact build packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            make automake cmake curl g++ libtool gperf binutils-gold bsdmainutils \
+            pkg-config python3 patch bison lbzip2 xz-utils libxml2-utils gettext \
+            xutils-dev file xvfb
+          if command -v pkg-config >/dev/null && ! command -v "$HOST-pkg-config" >/dev/null; then
+            sudo ln -s "$(command -v pkg-config)" "/usr/local/bin/$HOST-pkg-config"
+          fi
+
+      - name: Checkout immutable candidate source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ needs.authorize-source.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Build exact six deployable binaries without shared depends cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          make -j "$MAKEJOBS" -C depends HOST="$HOST"
+          ./autogen.sh
+          ./configure --prefix="$PWD/depends/$HOST" --enable-sse2 \
+            --enable-glibc-back-compat LDFLAGS=-static-libstdc++ --enable-reduce-exports || {
+              cat config.log
+              exit 1
+            }
+          grep -q 'define USE_BDB 1' src/config/bitcoin-config.h
+          grep -q 'define USE_SQLITE 1' src/config/bitcoin-config.h
+          make -j "$MAKEJOBS" install || make install V=1
+          test -s src/obj/build.h
+          grep -Fx '#define BUILD_SOURCE_COMMIT "'"$SOURCE_SHA"'"' src/obj/build.h
+          grep -Fx '#define BUILD_SOURCE_DIRTY 0' src/obj/build.h
+          git diff --quiet --exit-code --
+          git diff --cached --quiet --exit-code --
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Verify clean embedded source identity and package exact binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="Blackcoin-30.1.4-hotfix-candidate-$SHORT_SOURCE"
+          output="$GITHUB_WORKSPACE/raw-candidate"
+          binary_root="depends/$HOST/bin"
+          binaries=(blackcoin-cli blackcoin-qt blackcoin-tx blackcoin-util blackcoin-wallet blackcoind)
+          mkdir "$output"
+          : > "$output/$prefix-VERSIONS.txt"
+          for binary in "${binaries[@]}"; do
+            test -x "$binary_root/$binary" && test ! -L "$binary_root/$binary"
+            file "$binary_root/$binary" | grep -Fq 'ELF 64-bit LSB pie executable, x86-64'
+            if [[ "$binary" == blackcoin-qt ]]; then
+              version_output=$(xvfb-run -a "$binary_root/$binary" -version 2>&1)
+            else
+              version_output=$("$binary_root/$binary" -version 2>&1)
+            fi
+            normalized=$(printf '%s\n' "$version_output" | tr -d '\r')
+            test "$(printf '%s\n' "$normalized" | grep -Fxc "Source commit: $SOURCE_SHA")" = 1
+            if grep -Fq '(dirty)' <<< "$normalized"; then
+              exit 1
+            fi
+            printf 'binary=%s\n%s\n' "$binary" "$normalized" >> "$output/$prefix-VERSIONS.txt"
+          done
+          (
+            cd "$binary_root"
+            sha256sum "${binaries[@]}"
+          ) > "$output/$prefix-BINARY_SHA256SUMS.txt"
+          tar -C "$binary_root" --sort=name --mtime="@$SOURCE_DATE_EPOCH" \
+            --owner=0 --group=0 --numeric-owner --format=posix \
+            --pax-option=delete=atime,delete=ctime -cf - "${binaries[@]}" |
+            gzip -n -9 > "$output/$prefix-Linux-x86_64.tar.gz"
+          printf '%s\n' "$SOURCE_SHA" > "$output/$prefix-SOURCE_COMMIT.txt"
+
+          mapfile -d '' -t depends_tracked_files < <(git ls-files -z -- depends | LC_ALL=C sort -z)
+          ((${#depends_tracked_files[@]} > 0))
+          # Hash exact sorted path<NUL>sha256(file bytes)<NUL> records. This
+          # covers every tracked depends input and excludes ignored build output.
+          depends_tracked_source_tree_sha=$(
+            for path in "${depends_tracked_files[@]}"; do
+              [[ "$path" == depends/* && -f "$path" && ! -L "$path" ]]
+              digest=$(sha256sum -- "$path" | awk '{print $1}')
+              [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+              printf '%s\0%s\0' "$path" "$digest"
+            done | sha256sum | awk '{print $1}'
+          )
+          [[ "$depends_tracked_source_tree_sha" =~ ^[0-9a-f]{64}$ ]]
+          packages=$(
+            dpkg-query -W -f='${Package}=${Version}\n' \
+              automake binutils-gold bison bsdmainutils cmake curl file g++ gettext \
+              gperf lbzip2 libtool libxml2-utils make patch pkg-config python3 xvfb \
+              xutils-dev xz-utils | sort | paste -sd, -
+          )
+          {
+            printf 'source_commit=%s\n' "$SOURCE_SHA"
+            printf 'workflow_run_id=%s\n' "$WORKFLOW_RUN_ID"
+            printf 'workflow_run_attempt=%s\n' "$WORKFLOW_RUN_ATTEMPT"
+            printf 'runner_image=ubuntu-22.04\n'
+            printf 'host=%s\n' "$HOST"
+            printf 'build_matrix=primary,verifier\n'
+            printf 'depends_cache_reused=false\n'
+            printf 'compiler=%s\n' "$(g++ --version | head -n 1)"
+            printf 'binutils=%s\n' "$(ld --version | head -n 1)"
+            printf 'make=%s\n' "$(make --version | head -n 1)"
+            printf 'packages=%s\n' "$packages"
+            printf 'depends_tracked_source_tree_sha256=%s\n' "$depends_tracked_source_tree_sha"
+          } > "$output/$prefix-TOOLCHAIN.txt"
+
+      - name: Upload isolated exact-source build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hotfix-candidate-raw-${{ matrix.builder }}-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          path: raw-candidate/*
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble-candidate:
+    name: Seal unpublished binary and OCI candidate bundle
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs:
+      - adapter-self-test
+      - authorize-source
+      - build-linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Independently authorize this assembly attempt
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTOR" = Blackcoin-Dev
+          test "$GITHUB_TRIGGERING_ACTOR" = Blackcoin-Dev
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+
+      - name: Checkout exact workflow tooling
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ needs.authorize-source.outputs.tooling_sha }}
+          fetch-depth: 0
+
+      - name: Install isolated image assembly tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends file jq skopeo xvfb
+
+      - name: Download primary build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: hotfix-candidate-raw-primary-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          path: primary
+
+      - name: Download verifier build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: hotfix-candidate-raw-verifier-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          path: verifier
+
+      - name: Download exact source and Core-CI authorization
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: hotfix-candidate-authorization-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          path: authorization
+
+      - name: Build, probe, convert, and seal without publication
+        shell: bash
+        env:
+          TOOLING_COMMIT: ${{ needs.authorize-source.outputs.tooling_sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_DATE_EPOCH: ${{ needs.authorize-source.outputs.source_date_epoch }}
+          CONFIRM_CANDIDATE_BUILD: BUILD_V30_1_4_HOTFIX_CANDIDATE_LINUX_X86_64
+          ALLOW_IMMUTABLE_BASE_PULL: 1
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TOOLING_COMMIT"
+          "$PACKAGE_ROOT/build_candidate_bundle.sh" "$GITHUB_WORKSPACE/$POLICY" \
+            "$GITHUB_WORKSPACE/primary" "$GITHUB_WORKSPACE/verifier" \
+            "$GITHUB_WORKSPACE/authorization/source-signature.json" \
+            "$GITHUB_WORKSPACE/authorization/core-ci.json" \
+            "$GITHUB_WORKSPACE/candidate-bundle"
+
+      - name: Upload reviewable unpublished hotfix candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hotfix-candidate-30.1.4-linux-x86_64-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          path: candidate-bundle/*
+          if-no-files-found: error
+          retention-days: 7

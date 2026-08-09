@@ -1,7 +1,7 @@
 # Gold Rush PoW claim lifecycle and recovery
 
 This document describes the wallet behavior developed for Issue #37 and the
-post-release v30.1.4 hotfix candidate. The same-anchor continuation and typed
+v30.1.5 candidate. The same-anchor continuation and typed
 mining gate below are not part of the immutable `v30.1.4` tag. They are later
 wallet and operator-safety changes, not changes to the Gold Rush consensus
 rules shipped in v30.1.1 through v30.1.4. Historical release notes retain the
@@ -39,14 +39,14 @@ safety, but do not independently create another recovery action.
 
 For compatibility, `getpowmininginfo.quarantined_claims` retains the legacy
 count that blocks claim creation in immutable v30.1.4. The complete audit count
-is reported separately as `raw_quarantined_claims`. The post-release candidate
+is reported separately as `raw_quarantined_claims`. The v30.1.5 candidate
 does not use either raw count as its mining decision: an authenticated family
 may remain quarantined while the typed action relays or refreshes it. Unsafe or
 indeterminate families still fail closed. Recovery never enables mining itself.
 
 ## Same-anchor continuation for QQP2, QQP3, and QQP4 claims
 
-The post-release hotfix candidate's normal lifecycle for an exact
+The v30.1.5 candidate's normal lifecycle for an exact
 wallet-authored QQP2, QQP3, or QQP4 claim keeps one confirmed fee anchor
 reserved until a member of that claim family confirms or the anchor is
 otherwise spent on the active chain. A live member pauses new claim creation.
@@ -89,7 +89,7 @@ fee path, and same-anchor continuation does not require it.
 
 ## Typed mining-gate telemetry
 
-The post-release candidate adds one complete, tip-pinned gate to
+The v30.1.5 candidate adds one complete, tip-pinned gate to
 `getpowmininginfo`. Candidate-aware automation must require all of these fields
 together; a partial set is invalid and fails closed:
 

@@ -1,17 +1,41 @@
+30.1.5 Maintenance Release Notes
+================================
+
+Blackcoin Core v30.1.5 is the corrective successor to immutable v30.1.4.
+The source is not a public release until the exact Blackcoin-Dev-signed commit
+and tag complete the mandatory release gate and the resulting artifacts are
+published. Until then, v30.1.4 remains the latest public release.
+
+v30.1.5 restores built-in Gold Rush PoW progress for strictly authenticated
+same-anchor claim families, retains explicit `-powmining=1` intent across
+encrypted-wallet startup, and makes wallet locking and staking-only scope
+authoritative across every PoW worker. Lock, timed relock, and staking-only
+transitions synchronously publish zero hashrate and prevent stale work that is
+not already inside the persistence/commit path from entering claim submission.
+A later normal unlock resumes the configured worker group without silently
+expanding a staking-only unlock or creating duplicate payout keys.
+
+These changes are wallet policy, lifecycle, telemetry, GUI, and test-fixture
+corrections. They do not change block, transaction, proof, reward,
+reimbursement, Gold Rush, migration, Final Lockout, demurrage, or chain
+serialization consensus. See
+`doc/release-notes/release-notes-30.1.5.md` for the canonical scope, operator
+warnings, and validation boundary.
+
 30.1.4 Maintenance Release Notes
 ================================
 
 > **Release identity:** `v30.1.4` is immutable. Same-anchor claim
 > continuation, typed mining-gate telemetry, and locked-wallet PoW worker
-> resumption described below are a **post-release v30.1.4 hotfix candidate**,
+> resumption described below belong to the **v30.1.5 candidate**,
 > not behavior shipped by the `v30.1.4` tag.
 
 Blackcoin Core v30.1.4 introduced fail-closed Gold Rush claim recovery, mature
 legacy stake protection, coherent PoS worker state, atomic claim-recovery
 review, and wallet-specific QQSIGNAL lifecycle evidence. The immutable release
 does not restore built-in PoW for a strict wallet-authored QQP2 singleton that
-has become current-branch-ineligible outside the mempool. The post-release
-hotfix candidate addresses that production liveness defect with authenticated
+has become current-branch-ineligible outside the mempool. The v30.1.5
+candidate addresses that production liveness defect with authenticated
 same-anchor continuation, without authorizing another independent fee input.
 
 It also permanently disables the legacy development-fund recipient and old
@@ -31,15 +55,15 @@ The production defaults are fail-closed:
 
 - wallet-authored QQP3/QQP4 carriers have a one-hour local mempool residence
   limit, while ordinary transactions retain the existing mempool policy;
-- in the post-release hotfix candidate, after exact relay is no longer
+- in the v30.1.5 candidate, after exact relay is no longer
   available, a strictly authenticated claim
   family continues with a current-policy sibling spending the same confirmed
   anchor, so no second wallet coin or independent recovery payment is needed;
-- in the post-release hotfix candidate, fee-paying conflict recovery remains
+- in the v30.1.5 candidate, fee-paying conflict recovery remains
   a separate, explicit, default-off path under the existing exact manual or
   bounded automatic consent gates; the built-in miner does not require or
   invoke that path for same-anchor continuation;
-- in the post-release hotfix candidate, explicit `-powmining=1` starts a
+- in the v30.1.5 candidate, explicit `-powmining=1` starts a
   locked encrypted wallet in a waiting state
   and resumes its configured worker after a normal, non-staking-only unlock;
 - while staking is enabled, PoW claim selection protects one mature,
@@ -79,7 +103,7 @@ Wallet-scoped automatic recovery is a seventh optional automation, is off by
 default, requires explicit positive fee/rate/staleness bounds, and never unlocks
 the wallet or enables mining.
 
-### Post-release v30.1.4 hotfix candidate
+### v30.1.5 candidate
 
 The paragraphs in this subsection describe the candidate, not the immutable
 `v30.1.4` release. Exact wallet-authored QQP2/QQP3/QQP4 carriers have a

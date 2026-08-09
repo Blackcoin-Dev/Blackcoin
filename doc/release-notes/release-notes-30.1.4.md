@@ -6,8 +6,8 @@ lifecycle rules, or wallet ownership.
 
 > **Post-release addendum:** the same-anchor continuation, typed mining gate,
 > and locked-wallet PoW worker resumption described in the marked subsection
-> below are a post-release v30.1.4 hotfix candidate. They are not part of the
-> immutable `v30.1.4` tag.
+> below belong to the v30.1.5 candidate. They are not part of the immutable
+> `v30.1.4` tag.
 
 ## Development-fund retirement and quantum replacement
 
@@ -25,7 +25,7 @@ startup, RPC, GUI, lifecycle, and fail-closed details are in
 
 ## Gold Rush PoW claim lifecycle
 
-### Post-release v30.1.4 hotfix candidate
+### v30.1.5 candidate
 
 The candidate handles exact wallet-authored QQP2/QQP3/QQP4 claim carriers as
 follows. Their confirmed fee anchor remains reserved until a member of the

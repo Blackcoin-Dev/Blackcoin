@@ -39,9 +39,14 @@ The v30.1.5 execution order is:
 1. Create the exact final source commit with the release-team identity and the
    allowlisted SSH key. Push it to the review branch without creating the final
    tag.
-2. Require the complete current-SHA pull-request gate. Download its native
-   Linux x86-64 candidate only from that run and verify the embedded source
-   identity.
+2. Require the complete current-SHA pull-request gate. Treat its native
+   Linux x86-64 output as test evidence only: that gate builds debug, no-Qt
+   binaries and does not produce the deployable canary package. After the gate
+   succeeds, run the separately reviewed v30.1.5 candidate-packaging workflow
+   bound to the same signed source SHA and successful gate run. Require two
+   isolated byte-identical builds, the sealed candidate manifest, the separate
+   packaging-tooling SHA, and the embedded source identity before installing
+   that package on the canary.
 3. Back up one canary wallet and its complete datadir. Stop that canary
    cleanly, install the exact candidate, and prove wallet names, existing
    legacy and quantum keys, transaction history, configuration, block paths,

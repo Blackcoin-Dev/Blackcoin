@@ -30,6 +30,7 @@ BUILTIN_WALLET = "pow_claim_builtin"
 POLICY_WALLET = "pow_claim_policy"
 POLICY_LOCK_WALLET = "pow_claim_policy_lock"
 BUILTIN_RACE_WALLET = "pow_claim_builtin_race"
+LOCK_BARRIER_WALLET = "pow_claim_lock_barrier"
 TIE_WALLET = "pow_claim_tie"
 FAULT_WALLET = "pow_claim_fault"
 BOUNDARY_WALLET = "pow_claim_boundary"
@@ -284,6 +285,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.createwallet(wallet_name=POLICY_WALLET)
         node.createwallet(wallet_name=POLICY_LOCK_WALLET)
         node.createwallet(wallet_name=BUILTIN_RACE_WALLET)
+        node.createwallet(wallet_name=LOCK_BARRIER_WALLET)
         node.createwallet(wallet_name=TIE_WALLET)
         node.createwallet(wallet_name=FAULT_WALLET)
         node.createwallet(wallet_name=BOUNDARY_WALLET)
@@ -293,6 +295,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         policy = node.get_wallet_rpc(POLICY_WALLET)
         policy_lock = node.get_wallet_rpc(POLICY_LOCK_WALLET)
         builtin_race = node.get_wallet_rpc(BUILTIN_RACE_WALLET)
+        lock_barrier = node.get_wallet_rpc(LOCK_BARRIER_WALLET)
         tie_wallet = node.get_wallet_rpc(TIE_WALLET)
         fault = node.get_wallet_rpc(FAULT_WALLET)
         boundary = node.get_wallet_rpc(BOUNDARY_WALLET)
@@ -305,6 +308,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             policy,
             policy_lock,
             builtin_race,
+            lock_barrier,
             tie_wallet,
             fault,
             boundary,
@@ -317,6 +321,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         policy_address = policy.getnewaddress("claim-input", "legacy")
         policy_lock_address = policy_lock.getnewaddress("claim-input", "legacy")
         builtin_race_address = builtin_race.getnewaddress("claim-input", "legacy")
+        lock_barrier_address = lock_barrier.getnewaddress(
+            "claim-input", "legacy"
+        )
         tie_address = tie_wallet.getnewaddress("claim-input", "legacy")
         fault_address = fault.getnewaddress("claim-input", "legacy")
         boundary_address = boundary.getnewaddress("claim-input", "legacy")
@@ -329,6 +336,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self.generatetoaddress(node, 1, manual_address, sync_fun=self.no_op)
         self.generatetoaddress(node, 1, descendant_blocker_address, sync_fun=self.no_op)
         self.generatetoaddress(node, 1, builtin_address, sync_fun=self.no_op)
+        self.generatetoaddress(
+            node, 1, lock_barrier_address, sync_fun=self.no_op
+        )
         self.generatetoaddress(node, 1, fault_address, sync_fun=self.no_op)
         self.generatetoaddress(node, 1, boundary_address, sync_fun=self.no_op)
         self.generatetoaddress(
@@ -561,6 +571,61 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self.generateblock(node, output=funding_address, transactions=[])
         self.wait_until(lambda: tie_claim["txid"] not in node.getrawmempool(), timeout=20)
         self._assert_generic_abandon_rejected(tie_wallet, tie_claim["txid"])
+
+        self.log.info("Wallet lock at the miner submission barrier cancels the pending claim")
+        lock_barrier_passphrase = "pow-claim-lock-barrier-passphrase"
+        lock_barrier.encryptwallet(lock_barrier_passphrase)
+        lock_barrier.walletpassphrase(
+            lock_barrier_passphrase, 600, False
+        )
+        lock_barrier_before = self._claim_txids(lock_barrier)
+        with node.wait_for_debug_log(
+            [b"Gold Rush PoW claim submission test barrier reached"],
+            timeout=180,
+        ):
+            lock_started = lock_barrier.setpowmining(True, 1, 100, True)
+            assert lock_started["created_payout_key"]
+        lock_barrier.walletlock()
+        locked_info = lock_barrier.getpowmininginfo()
+        assert_equal(locked_info["enabled"], True)
+        assert_equal(locked_info["state"], "wallet_locked_or_staking_only")
+        assert_equal(locked_info["hashrate"], 0)
+        time.sleep(2)
+        assert_equal(self._claim_txids(lock_barrier), lock_barrier_before)
+        assert_equal(lock_barrier.getpowmininginfo()["claims_submitted"], 0)
+
+        try:
+            # A second barrier after the normal unlock is direct evidence that
+            # the retained worker resumed, ground a fresh proof, and reached
+            # the pre-submit authority check again. Lock during that barrier a
+            # second time so neither stale proof can enter the commit path.
+            with node.wait_for_debug_log(
+                [b"Gold Rush PoW claim submission test barrier reached"],
+                timeout=180,
+            ):
+                lock_barrier.walletpassphrase(
+                    lock_barrier_passphrase, 600, False
+                )
+            # Lock is deliberately the first RPC after observing the barrier;
+            # extra telemetry calls here would let a slow sanitizer consume the
+            # 1.5-second test delay and enter claim persistence first.
+            lock_barrier.walletlock()
+            second_locked_info = lock_barrier.getpowmininginfo()
+            assert_equal(second_locked_info["enabled"], True)
+            assert_equal(second_locked_info["threads"], 1)
+            assert_equal(second_locked_info["cpu_percent"], 100)
+            assert_equal(
+                second_locked_info["state"], "wallet_locked_or_staking_only"
+            )
+            assert_equal(second_locked_info["hashrate"], 0)
+            assert_equal(
+                lock_barrier.getwalletinfo()["unlocked_staking_only"], False
+            )
+            time.sleep(2)
+            assert_equal(self._claim_txids(lock_barrier), lock_barrier_before)
+            assert_equal(lock_barrier.getpowmininginfo()["claims_submitted"], 0)
+        finally:
+            lock_barrier.setpowmining(False)
 
         self.log.info("The built-in miner waits for a new tip after its exact input becomes unavailable")
         builtin_race_before = self._claim_txids(builtin_race)

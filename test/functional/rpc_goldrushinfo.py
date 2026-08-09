@@ -3,6 +3,7 @@
 # Distributed under the MIT software license
 
 from decimal import Decimal
+import time
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
@@ -315,6 +316,67 @@ class GoldRushInfoTest(BitcoinTestFramework):
             wallet = node.get_wallet_rpc(wallet_name)
             node.setmocktime(0)
 
+            submit_gate_actions = {
+                "create_new_anchor",
+                "refresh_same_anchor",
+            }
+            wait_gate_actions = {
+                "wait_for_live",
+                "wait_for_next_tip",
+                "relay_existing",
+            }
+            null_txid = "0" * 64
+
+            def gate_is_safe(info):
+                return (
+                    info["mining_gate_coherent"]
+                    and not info["mining_gate_database_ambiguous"]
+                    and info["mining_gate_unsafe_claims"] == 0
+                    and info["mining_gate_unsafe_components"] == 0
+                )
+
+            def is_genuine_safe_wait(info):
+                action = info["mining_gate_action"]
+                if (
+                    action not in wait_gate_actions
+                    or info["state"] != "claim_in_flight"
+                    or info["hashrate"] != 0
+                    or info["mining_gate_family_claims"] == 0
+                    or info["mining_gate_lineage_head_txid"] == null_txid
+                ):
+                    return False
+                if action == "wait_for_live":
+                    return info["mining_gate_live_claims"] > 0
+                if action == "relay_existing":
+                    return info["mining_gate_relay_txid"] != null_txid
+                return True
+
+            def worker_resumed_or_safely_waiting():
+                info = wallet.getpowmininginfo()
+                if (
+                    not info["enabled"]
+                    or info["state"] == "wallet_locked_or_staking_only"
+                    or not gate_is_safe(info)
+                ):
+                    return False
+                return (
+                    info["hashrate"] > 0
+                    and info["state"] in ("ready", "hashing", "claim_in_flight")
+                    and info["mining_gate_action"] in submit_gate_actions
+                    and info["mining_gate_can_submit"]
+                ) or is_genuine_safe_wait(info)
+
+            def assert_worker_resumed_or_safely_waiting(info):
+                assert_equal(info["enabled"], True)
+                assert info["state"] != "wallet_locked_or_staking_only"
+                assert_equal(gate_is_safe(info), True)
+                if info["hashrate"] == 0:
+                    assert_equal(is_genuine_safe_wait(info), True)
+                else:
+                    assert info["state"] in ("ready", "hashing", "claim_in_flight")
+                    assert info["mining_gate_action"] in submit_gate_actions
+                    assert_equal(info["mining_gate_can_submit"], True)
+
             self.wait_until(
                 lambda: wallet.getpowmininginfo()["state"]
                 == "wallet_locked_or_staking_only",
@@ -355,17 +417,33 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(wallet.getwalletinfo()["txcount"], wallet_txcount_before)
             assert_equal(self._wallet_pow_claims(wallet), wallet_claims_before)
 
-            self.log.info("A normal unlock resumes hashing without setpowmining")
-            wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
-            self.wait_until(
-                lambda: (
-                    wallet.getpowmininginfo()["hashrate"] > 0
-                    and wallet.getpowmininginfo()["state"] in ("ready", "hashing", "claim_in_flight")
-                ),
-                timeout=60,
+            self.log.info("A failed RPC scope expansion leaves staking-only authority intact")
+            assert_raises_rpc_error(
+                -14,
+                "passphrase",
+                wallet.walletpassphrase,
+                "wrong-goldrush-pow-passphrase",
+                600,
+                False,
             )
+            failed_scope_change = wallet.getpowmininginfo()
+            assert_equal(
+                wallet.getwalletinfo()["unlocked_staking_only"], True
+            )
+            assert_equal(failed_scope_change["enabled"], True)
+            assert_equal(
+                failed_scope_change["state"],
+                "wallet_locked_or_staking_only",
+            )
+            assert_equal(failed_scope_change["hashrate"], 0)
+
+            self.log.info(
+                "A normal unlock resumes the worker without setpowmining"
+            )
+            wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
+            self.wait_until(worker_resumed_or_safely_waiting, timeout=60)
             running = wallet.getpowmininginfo()
-            assert_equal(running["enabled"], True)
+            assert_worker_resumed_or_safely_waiting(running)
             assert_equal(running["threads"], 1)
             assert_equal(running["cpu_percent"], 1)
             assert_equal(running["payout_address"], payout)
@@ -376,29 +454,27 @@ class GoldRushInfoTest(BitcoinTestFramework):
 
             self.log.info("Relock and a second normal unlock retain one configured worker")
             wallet.walletlock()
-            self.wait_until(
-                lambda: wallet.getpowmininginfo()["state"]
-                == "wallet_locked_or_staking_only",
-                timeout=10,
-            )
             relocked = wallet.getpowmininginfo()
+            assert_equal(wallet.getwalletinfo()["unlocked_until"], 0)
             assert_equal(relocked["enabled"], True)
             assert_equal(relocked["threads"], 1)
             assert_equal(relocked["cpu_percent"], 1)
+            assert_equal(relocked["state"], "wallet_locked_or_staking_only")
             assert_equal(relocked["hashrate"], 0)
             assert_equal(relocked["payout_address"], payout)
+            time.sleep(0.25)
+            relocked_stable = wallet.getpowmininginfo()
+            assert_equal(relocked_stable["enabled"], True)
+            assert_equal(
+                relocked_stable["state"], "wallet_locked_or_staking_only"
+            )
+            assert_equal(relocked_stable["hashrate"], 0)
+            assert_equal(relocked_stable["payout_address"], payout)
 
             wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
-            self.wait_until(
-                lambda: (
-                    wallet.getpowmininginfo()["hashrate"] > 0
-                    and wallet.getpowmininginfo()["state"]
-                    in ("ready", "hashing", "claim_in_flight")
-                ),
-                timeout=60,
-            )
+            self.wait_until(worker_resumed_or_safely_waiting, timeout=60)
             resumed = wallet.getpowmininginfo()
-            assert_equal(resumed["enabled"], True)
+            assert_worker_resumed_or_safely_waiting(resumed)
             assert_equal(resumed["threads"], 1)
             assert_equal(resumed["cpu_percent"], 1)
             assert_equal(resumed["payout_address"], payout)
@@ -406,6 +482,37 @@ class GoldRushInfoTest(BitcoinTestFramework):
                 {entry["address"] for entry in wallet.listquantumaddresses()},
                 quantum_addresses_before,
             )
+
+            self.log.info("Timed relock publishes the same synchronous paused state")
+            wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 1, False)
+            self.wait_until(
+                lambda: wallet.getwalletinfo()["unlocked_until"] == 0,
+                timeout=10,
+            )
+            timed_relock = wallet.getpowmininginfo()
+            assert_equal(timed_relock["enabled"], True)
+            assert_equal(timed_relock["threads"], 1)
+            assert_equal(timed_relock["cpu_percent"], 1)
+            assert_equal(
+                timed_relock["state"], "wallet_locked_or_staking_only"
+            )
+            assert_equal(timed_relock["hashrate"], 0)
+            assert_equal(timed_relock["payout_address"], payout)
+            time.sleep(0.25)
+            timed_relock_stable = wallet.getpowmininginfo()
+            assert_equal(
+                timed_relock_stable["state"],
+                "wallet_locked_or_staking_only",
+            )
+            assert_equal(timed_relock_stable["hashrate"], 0)
+
+            wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
+            self.wait_until(worker_resumed_or_safely_waiting, timeout=60)
+            timed_relock_resumed = wallet.getpowmininginfo()
+            assert_worker_resumed_or_safely_waiting(timed_relock_resumed)
+            assert_equal(timed_relock_resumed["threads"], 1)
+            assert_equal(timed_relock_resumed["cpu_percent"], 1)
+            assert_equal(timed_relock_resumed["payout_address"], payout)
 
             self.log.info("An explicit runtime stop remains authoritative after later unlocks")
             stopped_result = wallet.setpowmining(False)

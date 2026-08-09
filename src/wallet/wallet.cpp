@@ -1368,7 +1368,8 @@ void CWallet::UpgradeDescriptorCache()
     SetWalletFlag(WALLET_FLAG_LAST_HARDENED_XPUB_CACHED);
 }
 
-bool CWallet::Unlock(const SecureString& strWalletPassphrase, bool accept_no_keys)
+bool CWallet::Unlock(const SecureString& strWalletPassphrase, bool accept_no_keys,
+                     std::optional<bool> staking_only)
 {
     CCrypter crypter;
     CKeyingMaterial _vMasterKey;
@@ -1381,7 +1382,7 @@ bool CWallet::Unlock(const SecureString& strWalletPassphrase, bool accept_no_key
                 return false;
             if (!crypter.Decrypt(pMasterKey.second.vchCryptedKey, _vMasterKey))
                 continue; // try another master key
-            if (Unlock(_vMasterKey, accept_no_keys)) {
+            if (Unlock(_vMasterKey, accept_no_keys, staking_only)) {
                 // Now that we've unlocked, upgrade the key metadata
                 UpgradeKeyMetadata();
                 // Now that we've unlocked, upgrade the descriptor cache
@@ -8516,13 +8517,15 @@ bool CWallet::Lock()
             memory_cleanse(vMasterKey.data(), vMasterKey.size() * sizeof(decltype(vMasterKey)::value_type));
             vMasterKey.clear();
         }
+        PublishPowMiningWalletAuthorityLocked();
     }
 
     NotifyStatusChanged(this);
     return true;
 }
 
-bool CWallet::Unlock(const CKeyingMaterial& vMasterKeyIn, bool accept_no_keys)
+bool CWallet::Unlock(const CKeyingMaterial& vMasterKeyIn, bool accept_no_keys,
+                     std::optional<bool> staking_only)
 {
     {
         LOCK(cs_wallet);
@@ -8535,6 +8538,10 @@ bool CWallet::Unlock(const CKeyingMaterial& vMasterKeyIn, bool accept_no_keys)
             return false;
         }
         vMasterKey = vMasterKeyIn;
+        if (staking_only) {
+            m_wallet_unlock_staking_only = *staking_only;
+        }
+        PublishPowMiningWalletAuthorityLocked();
     }
     NotifyStatusChanged(this);
     return true;
@@ -9585,17 +9592,66 @@ StakingTelemetrySnapshot CWallet::GetStakingTelemetrySnapshot() const
 namespace {
 static constexpr uint64_t POW_MINER_BATCH_TRIES = 128;
 
-bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration)
+bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
+                   bool allow_locked_wait = false)
 {
+    const uint64_t authority_generation =
+        wallet.m_pow_wallet_authority_generation.load(std::memory_order_acquire);
+    if (!allow_locked_wait &&
+        wallet.m_pow_state.load(std::memory_order_acquire) ==
+            WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
+        return false;
+    }
     const auto step = std::chrono::milliseconds{100};
     auto slept = std::chrono::milliseconds{0};
     while (slept < duration) {
         if (wallet.IsPowMiningClosing() || !wallet.m_pow_mining_enabled.load()) return false;
+        if (wallet.m_pow_wallet_authority_generation.load(
+                std::memory_order_acquire) != authority_generation) {
+            return false;
+        }
         const auto pause = std::min(step, duration - slept);
         std::this_thread::sleep_for(pause);
         slept += pause;
     }
     return true;
+}
+
+bool GrindShadowPowWorkInterruptibly(
+    CWallet& wallet, const ShadowPowWork& work, uint64_t start_nonce,
+    uint64_t nonce_step, uint64_t max_tries, uint64_t authority_generation,
+    std::vector<unsigned char>& data_out, uint64_t* tries_done)
+{
+    data_out.clear();
+    if (tries_done) *tries_done = 0;
+    if (nonce_step == 0 || max_tries == 0) return false;
+
+    uint64_t nonce = start_nonce;
+    for (uint64_t tries = 0; tries < max_tries; ++tries) {
+        if (wallet.IsPowMiningClosing() ||
+            !wallet.m_pow_mining_enabled.load(std::memory_order_acquire) ||
+            wallet.m_pow_wallet_authority_generation.load(
+                std::memory_order_acquire) != authority_generation ||
+            wallet.m_pow_state.load(std::memory_order_acquire) ==
+                WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
+            return false;
+        }
+
+        std::vector<unsigned char> candidate;
+        uint64_t candidate_tries{0};
+        const ShadowPowGrindResult result = GrindShadowPowWorkDetailed(
+            work, nonce, nonce_step, /*max_tries=*/1, candidate,
+            &candidate_tries);
+        if (tries_done) *tries_done += candidate_tries;
+        if (result == ShadowPowGrindResult::FOUND) {
+            data_out = std::move(candidate);
+            return true;
+        }
+        if (result != ShadowPowGrindResult::EXHAUSTED) return false;
+        if (std::numeric_limits<uint64_t>::max() - nonce < nonce_step) break;
+        nonce += nonce_step;
+    }
+    return false;
 }
 
 bool IsShadowPowMiningTarget(const CScript& script)
@@ -10057,6 +10113,9 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
                            bool wait_for_normal_unlock)
 {
     if (created_payout) *created_payout = false;
+    bool created_payout_local{false};
+    bool* const created_payout_result = created_payout
+        ? created_payout : &created_payout_local;
     if (enabled) {
         if (threads < 1 || threads > 256) {
             error = _("Gold Rush PoW mining threads must be between 1 and 256.");
@@ -10101,7 +10160,7 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
     }
 
     if (!payout_resolution_deferred &&
-        !EnsurePowPayoutAddress(error, created_payout,
+        !EnsurePowPayoutAddress(error, created_payout_result,
                                 allow_new_payout_key)) {
         return false;
     }
@@ -10115,7 +10174,6 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
     m_pow_claims_submitted = 0;
     const ShadowPowClaimMiningGate mining_gate =
         GetShadowPowClaimMiningGate();
-    m_pow_state = WalletPowMiningState::STARTING;
     m_stop_pow_mining_thread = false;
     {
         LOCK(m_pow_miner_mutex);
@@ -10124,9 +10182,34 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         m_pow_mining_gate = mining_gate;
     }
 
+    // Recheck signing authority after payout resolution and gate construction.
+    // Publishing enabled+state under cs_wallet closes the final check/start
+    // race: any subsequent lock or scope restriction sees an enabled miner and
+    // installs the sticky locked sentinel before a worker can submit a claim.
+    {
+        LOCK(cs_wallet);
+        const bool normal_authority =
+            HasNormalPowMiningWalletAuthorityLocked();
+        if (!normal_authority && !wait_for_normal_unlock) {
+            error = IsCrypted() && vMasterKey.empty()
+                ? _("Gold Rush PoW mining requires an unlocked wallet.")
+                : _("Gold Rush PoW mining requires a normal wallet unlock, not staking-only unlock.");
+            if (*created_payout_result) {
+                error += _(" A new non-HD ML-DSA payout key was already created and remains in this wallet. Back up the wallet now; an older backup cannot recover it.");
+            }
+            return false;
+        }
+        payout_resolution_deferred = !normal_authority;
+        m_pow_state.store(
+            payout_resolution_deferred
+                ? WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY
+                : WalletPowMiningState::STARTING,
+            std::memory_order_release);
+        m_pow_mining_enabled.store(true, std::memory_order_release);
+    }
+
     auto group = std::make_unique<std::vector<std::thread>>();
     group->reserve(threads);
-    m_pow_mining_enabled = true;
     try {
         for (int i = 0; i < threads; ++i) {
             group->emplace_back(&CWallet::ThreadShadowPoWMiner, this, i);
@@ -10143,6 +10226,9 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         m_stop_pow_mining_thread = false;
         error = strprintf(_("Gold Rush PoW miner could not create its worker threads: %s"),
                           exception.what());
+        if (*created_payout_result) {
+            error += _(" A new non-HD ML-DSA payout key was already created and remains in this wallet. Back up the wallet now; an older backup cannot recover it.");
+        }
         return false;
     } catch (...) {
         m_pow_mining_enabled = false;
@@ -10155,6 +10241,9 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         m_pow_state = WalletPowMiningState::DISABLED;
         m_stop_pow_mining_thread = false;
         error = _("Gold Rush PoW miner could not create its worker threads.");
+        if (*created_payout_result) {
+            error += _(" A new non-HD ML-DSA payout key was already created and remains in this wallet. Back up the wallet now; an older backup cannot recover it.");
+        }
         return false;
     }
     {
@@ -10201,6 +10290,118 @@ void CWallet::StopPowMiningLocked()
 bool CWallet::IsPowMiningClosing() const
 {
     return (HaveChain() && chain().shutdownRequested()) || m_stop_pow_mining_thread.load();
+}
+
+bool CWallet::HasNormalPowMiningWalletAuthorityLocked() const
+{
+    AssertLockHeld(cs_wallet);
+    return (!IsCrypted() || !vMasterKey.empty()) &&
+           !m_wallet_unlock_staking_only.load(std::memory_order_acquire);
+}
+
+bool CWallet::HasNormalPowMiningWalletAuthority() const
+{
+    LOCK(cs_wallet);
+    return HasNormalPowMiningWalletAuthorityLocked();
+}
+
+bool CWallet::HasNormalPowMiningWalletAuthority(
+    uint64_t expected_generation) const
+{
+    LOCK(cs_wallet);
+    return m_pow_mining_enabled.load(std::memory_order_acquire) &&
+           m_pow_wallet_authority_generation.load(
+               std::memory_order_acquire) == expected_generation &&
+           HasNormalPowMiningWalletAuthorityLocked();
+}
+
+void CWallet::PublishPowMiningWalletAuthorityLocked()
+{
+    AssertLockHeld(cs_wallet);
+    m_pow_wallet_authority_generation.fetch_add(1, std::memory_order_acq_rel);
+    if (m_pow_mining_enabled.load(std::memory_order_acquire) &&
+        !HasNormalPowMiningWalletAuthorityLocked()) {
+        m_pow_hashrate.store(0.0, std::memory_order_release);
+        m_pow_state.store(
+            WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY,
+            std::memory_order_release);
+    }
+}
+
+void CWallet::SetWalletUnlockStakingOnly(bool staking_only)
+{
+    LOCK(cs_wallet);
+    if (!staking_only &&
+        m_wallet_unlock_staking_only.load(std::memory_order_acquire) &&
+        IsCrypted() && !vMasterKey.empty()) {
+        // Expanding an installed staking-only key into normal transaction/PoW
+        // authority must require a credential-verified Unlock(..., false).
+        // GUI staging code is allowed to clear this marker only while locked;
+        // this guard also closes a concurrent walletpassphrase race between a
+        // lock check and that staging call.
+        WalletLogPrintf(
+            "Refused to expand an installed staking-only wallet key without a credential-verified normal unlock\n");
+        return;
+    }
+    const bool previous = m_wallet_unlock_staking_only.exchange(
+        staking_only, std::memory_order_acq_rel);
+    if (previous != staking_only) PublishPowMiningWalletAuthorityLocked();
+}
+
+bool CWallet::PublishPowMiningWorkerState(
+    WalletPowMiningState state,
+    std::optional<uint64_t> expected_generation)
+{
+    LOCK(cs_wallet);
+    const bool enabled = m_pow_mining_enabled.load(std::memory_order_acquire);
+    if (expected_generation &&
+        m_pow_wallet_authority_generation.load(std::memory_order_acquire) !=
+            *expected_generation) {
+        if (enabled && !HasNormalPowMiningWalletAuthorityLocked()) {
+            m_pow_hashrate.store(0.0, std::memory_order_release);
+            m_pow_state.store(
+                WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY,
+                std::memory_order_release);
+        }
+        return false;
+    }
+    if (state == WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
+        if (enabled && HasNormalPowMiningWalletAuthorityLocked()) return false;
+        m_pow_hashrate.store(0.0, std::memory_order_release);
+    }
+    if (!enabled) {
+        m_pow_hashrate.store(0.0, std::memory_order_release);
+        if (state != WalletPowMiningState::RUNTIME_ERROR &&
+            state != WalletPowMiningState::DISABLED) {
+            return false;
+        }
+    } else if (!HasNormalPowMiningWalletAuthorityLocked() &&
+               state !=
+                   WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
+        m_pow_hashrate.store(0.0, std::memory_order_release);
+        m_pow_state.store(
+            WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY,
+            std::memory_order_release);
+        return false;
+    }
+    m_pow_state.store(state, std::memory_order_release);
+    return true;
+}
+
+bool CWallet::PublishPowMiningHashrate(
+    double hashrate, std::optional<uint64_t> expected_generation)
+{
+    LOCK(cs_wallet);
+    if ((expected_generation &&
+         m_pow_wallet_authority_generation.load(std::memory_order_acquire) !=
+             *expected_generation) ||
+        !m_pow_mining_enabled.load(std::memory_order_acquire) ||
+        !HasNormalPowMiningWalletAuthorityLocked()) {
+        m_pow_hashrate.store(0.0, std::memory_order_release);
+        return false;
+    }
+    m_pow_hashrate.store(hashrate, std::memory_order_release);
+    return true;
 }
 
 QuantumAddressBindingResult CWallet::ResolveConfiguredQuantumAddress(
@@ -11002,9 +11203,28 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
     WalletLogPrintf("Gold Rush PoW worker %d started\n", worker_id);
     while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
         bilingual_str error;
+        const uint64_t loop_authority_generation =
+            m_pow_wallet_authority_generation.load(std::memory_order_acquire);
+        const bool normal_wallet_authority =
+            HasNormalPowMiningWalletAuthority();
+        if (!normal_wallet_authority ||
+            m_pow_wallet_authority_generation.load(
+                std::memory_order_acquire) != loop_authority_generation) {
+            if (!normal_wallet_authority) {
+                PublishPowMiningWorkerState(
+                    WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+            }
+            SleepPowMiner(*this,
+                          normal_wallet_authority
+                              ? std::chrono::milliseconds{100}
+                              : std::chrono::seconds{2},
+                          /*allow_locked_wait=*/true);
+            continue;
+        }
         if (!HaveChain() || !chain().isReadyToBroadcast()) {
-            m_pow_hashrate = 0.0;
-            m_pow_state = WalletPowMiningState::CHAIN_UNAVAILABLE;
+            PublishPowMiningHashrate(0.0);
+            PublishPowMiningWorkerState(
+                WalletPowMiningState::CHAIN_UNAVAILABLE);
             SleepPowMiner(*this, std::chrono::seconds{1});
             continue;
         }
@@ -11056,9 +11276,14 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             mining_gate = m_pow_mining_gate;
         }
         if (mining_gate.ShouldRelayExisting()) {
-            m_pow_hashrate = 0.0;
-            m_pow_state = WalletPowMiningState::CLAIM_IN_FLIGHT;
+            PublishPowMiningHashrate(0.0);
+            PublishPowMiningWorkerState(
+                WalletPowMiningState::CLAIM_IN_FLIGHT);
             if (worker_id == 0) {
+                if (!HasNormalPowMiningWalletAuthority(
+                        loop_authority_generation)) {
+                    continue;
+                }
                 std::string relay_error;
                 bool relayed{false};
                 try {
@@ -11118,15 +11343,17 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE ||
             mining_gate.action ==
                 ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP) {
-            m_pow_hashrate = 0.0;
-            m_pow_state = WalletPowMiningState::CLAIM_IN_FLIGHT;
+            PublishPowMiningHashrate(0.0);
+            PublishPowMiningWorkerState(
+                WalletPowMiningState::CLAIM_IN_FLIGHT);
             SleepPowMiner(*this, std::chrono::seconds{1});
             continue;
         }
         if (!mining_gate.MayCreateClaim()) {
-            m_pow_hashrate = 0.0;
-            const WalletPowMiningState prior_state =
-                m_pow_state.exchange(WalletPowMiningState::CLAIM_QUARANTINED);
+            PublishPowMiningHashrate(0.0);
+            const WalletPowMiningState prior_state = m_pow_state.load();
+            PublishPowMiningWorkerState(
+                WalletPowMiningState::CLAIM_QUARANTINED);
             if (prior_state != WalletPowMiningState::CLAIM_QUARANTINED) {
                 WalletLogPrintf("Gold Rush PoW worker %d paused: coherent=%d database_ambiguous=%d unsafe_claims=%u unsafe_components=%u\n",
                                 worker_id, mining_gate.coherent,
@@ -11137,23 +11364,37 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             SleepPowMiner(*this, std::chrono::seconds{1});
             continue;
         }
-        // If the wallet is locked (or staking-only) we cannot sign claims; pause instead of
-        // grinding pointlessly and spamming claim-failure logs until it is unlocked again.
-        bool cannot_claim{false};
-        {
-            LOCK(cs_wallet);
-            cannot_claim = IsLocked() || m_wallet_unlock_staking_only;
-        }
-        if (cannot_claim) {
-            m_pow_hashrate = 0.0;
-            m_pow_state = WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY;
-            SleepPowMiner(*this, std::chrono::seconds{2});
-            continue;
-        }
         if (!EnsurePowPayoutAddress(error)) {
+            bool retry_after_authority_change{false};
+            bool authority_lost{false};
+            {
+                LOCK(cs_wallet);
+                authority_lost = !HasNormalPowMiningWalletAuthorityLocked();
+                retry_after_authority_change = authority_lost ||
+                    m_pow_wallet_authority_generation.load(
+                        std::memory_order_acquire) !=
+                        loop_authority_generation;
+                if (authority_lost) {
+                    m_pow_hashrate.store(0.0, std::memory_order_release);
+                    m_pow_state.store(
+                        WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY,
+                        std::memory_order_release);
+                } else if (!retry_after_authority_change) {
+                    m_pow_mining_enabled.store(false,
+                                               std::memory_order_release);
+                    m_pow_hashrate.store(0.0, std::memory_order_release);
+                    m_pow_state.store(WalletPowMiningState::RUNTIME_ERROR,
+                                      std::memory_order_release);
+                }
+            }
+            if (retry_after_authority_change) {
+                SleepPowMiner(*this,
+                              authority_lost ? std::chrono::seconds{2}
+                                             : std::chrono::milliseconds{100},
+                              /*allow_locked_wait=*/true);
+                continue;
+            }
             WalletLogPrintf("Gold Rush PoW worker %d stopped: %s\n", worker_id, error.original);
-            m_pow_state = WalletPowMiningState::RUNTIME_ERROR;
-            m_pow_mining_enabled = false;
             break;
         }
 
@@ -11165,8 +11406,8 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         const CTxDestination quantum_dest = DecodeDestination(quantum_address);
         if (!IsValidDestination(quantum_dest) || !IsQuantumMigrationDestination(quantum_dest)) {
             WalletLogPrintf("Gold Rush PoW worker %d stopped: invalid payout address\n", worker_id);
-            m_pow_state = WalletPowMiningState::RUNTIME_ERROR;
-            m_pow_mining_enabled = false;
+            m_pow_mining_enabled.store(false, std::memory_order_release);
+            PublishPowMiningWorkerState(WalletPowMiningState::RUNTIME_ERROR);
             break;
         }
         const CScript quantum_payout_script = GetScriptForDestination(quantum_dest);
@@ -11189,7 +11430,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 &mining_gate);
         }
         if (selection_result != ShadowPowClaimInputSelectionResult::SELECTED) {
-            m_pow_hashrate = 0.0;
+            PublishPowMiningHashrate(0.0);
             const bool claim_inflight = WITH_LOCK(m_pow_miner_mutex, return m_pow_claim_inflight);
             const WalletPowMiningState next_state = claim_inflight
                 ? WalletPowMiningState::CLAIM_IN_FLIGHT
@@ -11197,8 +11438,8 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                           ShadowPowClaimInputSelectionResult::STAKE_RESERVE_PROTECTED
                       ? WalletPowMiningState::STAKE_RESERVE_PROTECTED
                       : WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO;
-            const WalletPowMiningState prior_state =
-                m_pow_state.exchange(next_state);
+            const WalletPowMiningState prior_state = m_pow_state.load();
+            PublishPowMiningWorkerState(next_state);
             if (next_state == WalletPowMiningState::STAKE_RESERVE_PROTECTED &&
                 prior_state != next_state) {
                 WalletLogPrintf(
@@ -11223,19 +11464,21 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             LOCK(cs_main);
             const CBlockIndex* tip = chainman.ActiveChain().Tip();
             if (!tip) {
-                m_pow_hashrate = 0.0;
-                m_pow_state = WalletPowMiningState::CHAIN_UNAVAILABLE;
+                PublishPowMiningHashrate(0.0);
+                PublishPowMiningWorkerState(
+                    WalletPowMiningState::CHAIN_UNAVAILABLE);
                 loop_sleep = std::chrono::seconds{1};
             } else {
                 const Consensus::Params& consensus = Params().GetConsensus();
                 const int next_height = tip->nHeight + 1;
                 const bool active = IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), next_height);
                 if (!active) {
-                    m_pow_hashrate = 0.0;
-                    m_pow_state = WalletPowMiningState::EPOCH_INACTIVE;
+                    PublishPowMiningHashrate(0.0);
+                    PublishPowMiningWorkerState(
+                        WalletPowMiningState::EPOCH_INACTIVE);
                     loop_sleep = std::chrono::seconds{2};
                 } else {
-                    m_pow_state = WalletPowMiningState::READY;
+                    PublishPowMiningWorkerState(WalletPowMiningState::READY);
                     tip_hash = tip->GetBlockHash();
                     bool claim_inflight{false};
                     {
@@ -11248,7 +11491,8 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                         claim_inflight = m_pow_claim_inflight;
                     }
                     if (claim_inflight) {
-                        m_pow_state = WalletPowMiningState::CLAIM_IN_FLIGHT;
+                        PublishPowMiningWorkerState(
+                            WalletPowMiningState::CLAIM_IN_FLIGHT);
                         loop_sleep = std::chrono::seconds{1};
                     } else {
                         // Snapshot the PoW work (the only coins-view read) under cs_main, then grind
@@ -11261,8 +11505,9 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                             chainman.ActiveChainstate().CoinsTip());
                         should_grind = work.valid;
                         if (!should_grind) {
-                            m_pow_hashrate = 0.0;
-                            m_pow_state = WalletPowMiningState::CHAIN_UNAVAILABLE;
+                            PublishPowMiningHashrate(0.0);
+                            PublishPowMiningWorkerState(
+                                WalletPowMiningState::CHAIN_UNAVAILABLE);
                             loop_sleep = std::chrono::seconds{2};
                         }
                     }
@@ -11274,11 +11519,24 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             continue;
         }
         if (should_grind) {
-            m_pow_state = WalletPowMiningState::HASHING;
+            if (!PublishPowMiningWorkerState(
+                    WalletPowMiningState::HASHING,
+                    loop_authority_generation)) {
+                continue;
+            }
             const auto batch_start = std::chrono::steady_clock::now();
-            proof_found = GrindShadowPowWork(work, nonce_start, 1, POW_MINER_BATCH_TRIES, proof, &tries_done);
+            proof_found = GrindShadowPowWorkInterruptibly(
+                *this, work, nonce_start, 1, POW_MINER_BATCH_TRIES,
+                loop_authority_generation, proof, &tries_done);
             batch_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - batch_start);
-            m_pow_state = WalletPowMiningState::READY;
+            PublishPowMiningWorkerState(WalletPowMiningState::READY,
+                                        loop_authority_generation);
+        }
+
+        if (!HasNormalPowMiningWalletAuthority(
+                loop_authority_generation)) {
+            PublishPowMiningHashrate(0.0);
+            continue;
         }
 
         if (tries_done > 0) {
@@ -11286,7 +11544,10 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             const int64_t now_ms = GetTime<std::chrono::milliseconds>().count();
             const int64_t start_ms = m_pow_hashrate_start_ms.load();
             if (start_ms > 0 && now_ms > start_ms) {
-                m_pow_hashrate = (static_cast<double>(total_tries) * 1000.0) / static_cast<double>(now_ms - start_ms);
+                PublishPowMiningHashrate(
+                    (static_cast<double>(total_tries) * 1000.0) /
+                        static_cast<double>(now_ms - start_ms),
+                    loop_authority_generation);
             }
         }
 
@@ -11310,7 +11571,9 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             // submission must not create a new wallet transaction. The stop
             // path joins this worker, so clearing the single-flight marker here
             // leaves the wallet disabled without an unrequested fee spend.
-            if (IsPowMiningClosing() || !m_pow_mining_enabled.load()) {
+            if (IsPowMiningClosing() ||
+                !HasNormalPowMiningWalletAuthority(
+                    loop_authority_generation)) {
                 LOCK(m_pow_miner_mutex);
                 m_pow_claim_inflight = false;
                 continue;
@@ -11326,7 +11589,8 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                         "Gold Rush PoW worker %d retained a claim after relay failure; re-entering the typed family gate: %s\n",
                         worker_id, error.original);
                 }
-                m_pow_state = WalletPowMiningState::CLAIM_IN_FLIGHT;
+                PublishPowMiningWorkerState(
+                    WalletPowMiningState::CLAIM_IN_FLIGHT);
                 {
                     LOCK(m_pow_miner_mutex);
                     // Re-enter the typed gate immediately. While the claim is
@@ -11343,7 +11607,9 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 WalletLogPrintf("Gold Rush PoW worker %d could not submit claim: %s\n", worker_id, error.original);
                 const bool wait_for_next_tip = conflict || submit_result == ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE;
                 if (wait_for_next_tip) {
-                    m_pow_state = conflict ? WalletPowMiningState::CLAIM_IN_FLIGHT : WalletPowMiningState::READY;
+                    PublishPowMiningWorkerState(
+                        conflict ? WalletPowMiningState::CLAIM_IN_FLIGHT
+                                 : WalletPowMiningState::READY);
                     while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
                         bool tip_changed = false;
                         {

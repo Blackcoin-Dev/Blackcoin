@@ -71,17 +71,14 @@ RPCHelpMan walletpassphrase()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "passphrase can not be empty");
         }
 
-        // Used to restore m_wallet_unlock_staking_only value in case of unlock failure
-        bool tmpStakingOnly = pwallet->m_wallet_unlock_staking_only;
+        // Apply the requested signing scope only after the passphrase has been
+        // verified, in the same wallet lock section that installs the master
+        // key. A failed passphrase must not transiently expand PoW authority.
+        const bool staking_only = request.params.size() > 2
+            ? request.params[2].get_bool() : false;
 
-        // ppcoin: if user OS account compromised prevent trivial sendmoney commands
-        if (request.params.size() > 2)
-            pwallet->m_wallet_unlock_staking_only = request.params[2].get_bool();
-        else
-            pwallet->m_wallet_unlock_staking_only = false;
-
-        if (!pwallet->Unlock(strWalletPass)) {
-            pwallet->m_wallet_unlock_staking_only = tmpStakingOnly;
+        if (!pwallet->Unlock(strWalletPass, /*accept_no_keys=*/false,
+                             staking_only)) {
             // Check if the passphrase has a null character (see #27067 for details)
             if (strWalletPass.find('\0') == std::string::npos) {
                 throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered was incorrect.");

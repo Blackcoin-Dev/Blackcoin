@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -245,7 +246,8 @@ public:
     // Wallet encryption
     bool setWalletEncrypted(const SecureString& passphrase);
     // Passphrase only needed when unlocking
-    bool setWalletLocked(bool locked, const SecureString &passPhrase=SecureString());
+    bool setWalletLocked(bool locked, const SecureString &passPhrase=SecureString(),
+                         std::optional<bool> staking_only = std::nullopt);
     bool changePassphrase(const SecureString &oldPass, const SecureString &newPass);
     bool getWalletUnlockStakingOnly();
     void setWalletUnlockStakingOnly(bool unlock);
@@ -254,7 +256,9 @@ public:
     class UnlockContext
     {
     public:
-        UnlockContext(WalletModel *wallet, bool valid, bool relock);
+        UnlockContext(
+            WalletModel *wallet, bool valid, bool relock,
+            std::optional<bool> restore_staking_only = std::nullopt);
         ~UnlockContext();
 
         bool isValid() const { return valid; }
@@ -269,7 +273,7 @@ public:
         WalletModel *wallet;
         const bool valid;
         const bool relock;
-        bool stakingOnly;
+        const std::optional<bool> restoreStakingOnly;
     };
 
     UnlockContext requestUnlock();

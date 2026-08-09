@@ -2867,10 +2867,15 @@ void StakingMiningPage::onUnlockStakingOnlyToggled(bool enabled)
             return;
         }
     } else if (m_wallet_model->getWalletUnlockStakingOnly()) {
-        m_wallet_model->setWalletUnlockStakingOnly(false);
         if (m_wallet_model->getEncryptionStatus() == WalletModel::Unlocked) {
-            m_wallet_model->setWalletLocked(true);
+            if (!m_wallet_model->setWalletLocked(true) ||
+                m_wallet_model->getEncryptionStatus() != WalletModel::Locked) {
+                m_wallet_model->updateStatus();
+                updateStatus();
+                return;
+            }
         }
+        m_wallet_model->setWalletUnlockStakingOnly(false);
         m_wallet_model->updateStatus();
     }
 
@@ -2972,10 +2977,15 @@ void StakingMiningPage::onPowUnlockWalletToggled(bool enabled)
             std::string ignored_error;
             m_wallet_model->wallet().setPowMining(false, m_pow_cores->value(), m_pow_percent->value(), ignored_error);
         }
-        m_wallet_model->setWalletUnlockStakingOnly(false);
         if (m_wallet_model->getEncryptionStatus() == WalletModel::Unlocked) {
-            m_wallet_model->setWalletLocked(true);
+            if (!m_wallet_model->setWalletLocked(true) ||
+                m_wallet_model->getEncryptionStatus() != WalletModel::Locked) {
+                m_wallet_model->updateStatus();
+                updateStatus();
+                return;
+            }
         }
+        m_wallet_model->setWalletUnlockStakingOnly(false);
         m_wallet_model->updateStatus();
     }
 
@@ -4060,11 +4070,16 @@ void StakingMiningPage::updateStatus()
     // construction and signing may legitimately own the wallet mutex for a
     // bounded interval; waiting here would stop the entire Qt event loop.
     const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getCachedEncryptionStatus();
+    const bool staking_only_unlocked = encryption_status == WalletModel::Unlocked &&
+                                       w.getWalletUnlockStakingOnly();
     const bool normal_unlocked = encryption_status == WalletModel::Unlocked &&
                                  !w.getWalletUnlockStakingOnly();
     const bool normal_signing_available = encryption_status == WalletModel::Unencrypted || normal_unlocked;
     m_staking_enable->setChecked(staking);
-    m_unlock_staking_only->setChecked(w.getWalletUnlockStakingOnly());
+    // The Core marker is also the staged preference used for the next unlock.
+    // It is not proof that an encrypted wallet currently holds a staking-only
+    // key, so never present a locked wallet as unlocked from the marker alone.
+    m_unlock_staking_only->setChecked(staking_only_unlocked);
     m_unlock_quantum_legacy_staking->setChecked(normal_unlocked);
     const bool actively_searching = staking_info.enabled &&
         staking_info.worker_running && staking_info.eligible &&
@@ -4198,6 +4213,8 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     const interfaces::WalletBalances balances = m_wallet_model->getCachedBalance();
     const bool staking = w.getStakingInfo().enabled;
     const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getCachedEncryptionStatus();
+    const bool staking_only_unlocked = encryption_status == WalletModel::Unlocked &&
+                                       w.getWalletUnlockStakingOnly();
     const bool normal_unlocked = encryption_status == WalletModel::Unlocked &&
                                  !w.getWalletUnlockStakingOnly();
     const bool normal_signing_available = encryption_status == WalletModel::Unencrypted || normal_unlocked;
@@ -4300,7 +4317,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         unlock_mode = tr("unencrypted wallet");
     } else if (normal_unlocked) {
         unlock_mode = tr("normal unlock: quantum actions available");
-    } else if (w.getWalletUnlockStakingOnly()) {
+    } else if (staking_only_unlocked) {
         unlock_mode = tr("legacy staking-only unlock: Gold Rush signals and quantum actions blocked");
     } else {
         unlock_mode = tr("locked");
@@ -5180,10 +5197,17 @@ bool StakingMiningPage::requestNormalUnlock()
     }
 
     if (m_wallet_model->getWalletUnlockStakingOnly()) {
-        m_wallet_model->setWalletUnlockStakingOnly(false);
         if (encryption_status == WalletModel::Unlocked) {
-            m_wallet_model->setWalletLocked(true);
+            // Revoke the staking-only key first. Clearing the scope marker
+            // while the key is still installed would briefly grant normal
+            // PoW/transaction signing authority before the passphrase prompt.
+            if (!m_wallet_model->setWalletLocked(true) ||
+                m_wallet_model->getEncryptionStatus() != WalletModel::Locked) {
+                m_wallet_model->updateStatus();
+                return false;
+            }
         }
+        m_wallet_model->setWalletUnlockStakingOnly(false);
         m_wallet_model->updateStatus();
     }
 
@@ -5200,8 +5224,14 @@ bool StakingMiningPage::requestNormalUnlock()
     }
 
     if (m_wallet_model->getWalletUnlockStakingOnly()) {
-        m_wallet_model->setWalletUnlockStakingOnly(false);
+        // Accepted must mean the dialog performed an atomic normal unlock. If
+        // an unexpected handler left staking-only scope installed, fail closed
+        // by locking; never expand authority after the prompt has returned.
+        if (m_wallet_model->getEncryptionStatus() == WalletModel::Unlocked) {
+            m_wallet_model->setWalletLocked(true);
+        }
         m_wallet_model->updateStatus();
+        return false;
     }
     return true;
 }

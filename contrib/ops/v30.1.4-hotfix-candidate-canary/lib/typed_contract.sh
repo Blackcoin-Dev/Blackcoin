@@ -418,6 +418,252 @@ hotfix_candidate_recovery_json_is_valid()
     ' >/dev/null
 }
 
+# Bind one typed gate observation to the authoritative recovery family and the
+# raw verbose mempool snapshot captured in the same stable cut. This uses only
+# fields already exposed by getpowmininginfo, getpowclaimrecoveryinfo true, and
+# getrawmempool true.
+hotfix_pow_observation_json_is_valid()
+{
+    local pow="$1" recovery="$2" mempool="$3" tip="$4" height="$5" observed="$6"
+    jq -e -n --arg zero "$HOTFIX_ZERO_TXID" --arg tip "$tip" \
+        --argjson height "$height" --argjson observed "$observed" \
+        --argjson pow "$pow" --argjson recovery "$recovery" \
+        --argjson mempool "$mempool" '
+        def integer: type == "number" and floor == .;
+        def uint: integer and . >= 0;
+        def hex64: type == "string" and test("^[0-9a-f]{64}$");
+        def claim_nodes($component):
+          $component.nodes | map(select(.kind == "claim")) |
+          sort_by(.lineage_ordinal);
+        ($height | uint) and ($observed | integer and . > 0) and
+        ($tip | hex64) and $tip != $zero and
+        ($mempool | type) == "object" and
+        $pow.claim_inventory_tip == $tip and $pow.current_height == $height and
+        $recovery.active_tip == $tip and $recovery.wallet_processed_tip == $tip and
+        $recovery.active_height == $height and
+        $recovery.wallet_processed_height == $height and
+        ($pow.mining_gate_lineage_head_txid) as $head |
+        if $head == $zero then
+          $pow.mining_gate_action == "create_new_anchor"
+        else
+          ([ $recovery.component_details[] as $component |
+             select(any($component.nodes[];
+               .kind == "claim" and .txid == $head)) | $component ]) as $matches |
+          ($matches | length) == 1 and
+          ($matches[0]) as $component |
+          (claim_nodes($component)) as $claims |
+          ($claims | length) >= 1 and
+          ($claims | length) == $pow.mining_gate_family_claims and
+          $component.anchor_authenticated == true and
+          $component.anchor_unspent == true and
+          ($component.generation_fingerprint | hex64) and
+          $component.generation_fingerprint != $zero and
+          ($claims | map(.lineage_ordinal)) ==
+            [range(0; ($claims | length))] and
+          $claims[-1].txid == $head and
+          $claims[0].lineage_ordinal == 0 and
+          (if $claims[0].lineage_metadata_present then
+             $claims[0].lineage_metadata_valid == true and
+             $claims[0].lineage_root_txid == $claims[0].txid and
+             $claims[0].lineage_family_fingerprint ==
+               $component.generation_fingerprint
+           else true end) and
+          all(range(1; ($claims | length));
+            $claims[.].lineage_metadata_present == true and
+            $claims[.].lineage_metadata_valid == true and
+            $claims[.].lineage_family_fingerprint ==
+              $component.generation_fingerprint and
+            $claims[.].lineage_root_txid == $claims[0].txid and
+            $claims[.].lineage_parent_txid == $claims[.-1].txid) and
+          all($claims[];
+            .active_chain_confirmed == false and .abandoned == false and
+            .expired_locally_retired == false and .expected_shape == true and
+            .wallet_authored == true and .wallet_from_me == true and
+            .authored_metadata_valid == true and
+            .claim_descriptor_valid == true and
+            .exact_authored_carrier_shape == true and
+            .provenance == "explicit_authored" and
+            (.txid as $txid |
+              .in_mempool == ($mempool | has($txid))) and
+            (if .in_mempool then
+               (.txid as $txid | $mempool[$txid] | type) == "object" and
+               (.txid as $txid | $mempool[$txid].time | integer and . > 0 and
+                 . <= $observed) and
+               (.txid as $txid | $mempool[$txid].height | uint and
+                 . <= $height)
+             else true end)) and
+          $pow.mining_gate_live_claims ==
+            ([$claims[] | select(.in_mempool)] | length) and
+          (if $pow.mining_gate_action == "wait_for_live" then
+             ($pow.mining_gate_live_claims >= 1) and
+             all($claims[] | select(.in_mempool);
+               (.txid as $txid |
+                 ($height - $mempool[$txid].height) >= 0 and
+                 ($height - $mempool[$txid].height) <= 1))
+           elif $pow.mining_gate_action == "relay_existing" then
+             ($pow.mining_gate_relay_txid) as $relay |
+             ([ $claims[] | select(.txid == $relay) ] | length) == 1 and
+             ($claims[] | select(.txid == $relay) |
+               .in_mempool == false and .relay_ttl_expired == false and
+               (.relay_expiry_time | integer and . > $observed) and
+               .disposition == "eligible")
+           elif $pow.mining_gate_action == "wait_for_next_tip" and
+                $pow.mining_gate_relay_txid != $zero then
+             ($pow.mining_gate_relay_txid) as $relay |
+             ([ $claims[] | select(.txid == $relay) ] | length) == 1 and
+             ($claims[] | select(.txid == $relay) |
+               .in_mempool == false and .relay_ttl_expired == false and
+               (.relay_expiry_time | integer and . > $observed) and
+               .disposition == "eligible")
+           else true end)
+        end
+    ' >/dev/null
+}
+
+# A fingerprint/action/relay change is not progress: each can change while the
+# same durable family toggles between local mempool and relay views. Across an
+# advancing-tip series, every enabled zero-hash action may span at most one tip
+# without a new authenticated family/head, a first observed authoritative live
+# transition for an authenticated family member, an increased worker submission
+# counter, or positive hashing under a submit-capable create/refresh action.
+hotfix_pow_observation_series_json_is_valid()
+{
+    local series="$1" observation row
+    local sample tip height enabled zero_hash hash_progress claims key head ordinal
+    local generation claim_txids inventory_keys live_txids inventory_key live_txid live_progress
+    local previous_sample=0 previous_tip='' previous_height=-1 previous_claims=0
+    local previous_key='' previous_head='' previous_ordinal=-1 stale_transitions=0
+    local previous_generation='-' previous_claim_txids='-'
+    local seen_selected_keys='|' seen_inventory_keys='|' seen_live_txids='|' progress
+    jq -e -n --argjson series "$series" '
+      def integer: type == "number" and floor == .;
+      $series | type == "array" and length >= 3 and
+      all(.[];
+        type == "object" and
+        (keys | sort) == (["height","mempool_verbose","observed_epoch",
+          "pow","recovery","sample","tip"] | sort) and
+        (.sample | integer and . > 0) and (.height | integer and . >= 0) and
+        (.observed_epoch | integer and . > 0))
+    ' >/dev/null || return 1
+    while IFS= read -r observation; do
+        hotfix_pow_observation_json_is_valid \
+            "$(jq -ce '.pow' <<<"$observation")" \
+            "$(jq -ce '.recovery' <<<"$observation")" \
+            "$(jq -ce '.mempool_verbose' <<<"$observation")" \
+            "$(jq -er '.tip' <<<"$observation")" \
+            "$(jq -er '.height' <<<"$observation")" \
+            "$(jq -er '.observed_epoch' <<<"$observation")" || return 1
+        row=$(jq -er --arg zero "$HOTFIX_ZERO_TXID" '
+          .pow.mining_gate_lineage_head_txid as $head |
+          (if $head == $zero then null
+           else ([.recovery.component_details[] as $component |
+             select(any($component.nodes[];
+               .kind == "claim" and .txid == $head)) | $component][0]) end) as $component |
+          (if $component == null then []
+           else ($component.nodes | map(select(.kind == "claim")) |
+             sort_by(.lineage_ordinal)) end) as $claims |
+          ([.recovery.component_details[] |
+            select(.anchor_authenticated == true and .anchor_unspent == true) |
+            (.nodes | map(select(.kind == "claim")) |
+              sort_by(.lineage_ordinal)) as $component_claims |
+            select(($component_claims | length) > 0) |
+            ([.anchor.txid,(.anchor.vout|tostring),$component_claims[0].txid] |
+              join(":"))] | unique | sort) as $inventory_keys |
+          [ .sample,.tip,.height,.pow.enabled,(.pow.hashrate == 0),
+            (.pow.mining_gate_can_submit and
+             (.pow.mining_gate_action == "create_new_anchor" or
+              .pow.mining_gate_action == "refresh_same_anchor") and
+             .pow.hashrate > 0),.pow.claims_submitted,
+            (if $component == null then "-"
+             else ([$component.anchor.txid,($component.anchor.vout|tostring),
+               $claims[0].txid] | join(":")) end),
+            (if $component == null then "-" else $component.generation_fingerprint end),
+            $head,(if ($claims|length) == 0 then -1 else $claims[-1].lineage_ordinal end),
+            (if ($claims|length) == 0 then "-"
+             else ($claims | map(.txid) | join(",")) end),
+            (if ($inventory_keys|length) == 0 then "-"
+             else ($inventory_keys | join(",")) end),
+            ([$claims[] | select(.in_mempool) | .txid] as $live |
+              if ($live|length) == 0 then "-" else ($live | join(",")) end) ] | @tsv
+        ' <<<"$observation") || return 1
+        IFS=$'\t' read -r sample tip height enabled zero_hash hash_progress claims \
+            key generation head ordinal claim_txids inventory_keys live_txids <<<"$row"
+        if (( previous_sample != 0 )); then
+            (( sample > previous_sample && height > previous_height )) || return 1
+            [[ "$tip" != "$previous_tip" ]] || return 1
+            (( claims >= previous_claims )) || return 1
+            progress=false
+            if (( claims > previous_claims )) || [[ "$hash_progress" == true ]]; then
+                progress=true
+            fi
+            if [[ "$key" != - ]]; then
+                if [[ "$key" == "$previous_key" ]]; then
+                    [[ "$generation" == "$previous_generation" ]] || return 1
+                    (( ordinal >= previous_ordinal )) || return 1
+                    if (( ordinal == previous_ordinal )); then
+                        [[ "$head" == "$previous_head" &&
+                           "$claim_txids" == "$previous_claim_txids" ]] || return 1
+                    else
+                        [[ "$claim_txids" == "${previous_claim_txids},"* ]] || return 1
+                        progress=true
+                    fi
+                else
+                    [[ "$seen_selected_keys" != *"|${key}|"* ]] || return 1
+                    seen_selected_keys+="${key}|"
+                    if [[ "$seen_inventory_keys" != *"|${key}|"* ]]; then
+                        progress=true
+                    fi
+                fi
+            fi
+            if [[ "$key" != - && "$key" == "$previous_key" &&
+                  "$live_txids" != - ]]; then
+                live_progress=false
+                while IFS= read -r live_txid; do
+                    if [[ -n "$live_txid" &&
+                          "$seen_live_txids" != *"|${live_txid}|"* ]]; then
+                        live_progress=true
+                    fi
+                done < <(tr ',' '\n' <<<"$live_txids")
+                [[ "$live_progress" == false ]] || progress=true
+            fi
+            if [[ "$progress" == true ]]; then
+                stale_transitions=0
+            else
+                stale_transitions=$((stale_transitions + 1))
+            fi
+            if [[ "$enabled" == true && "$zero_hash" == true &&
+                  $stale_transitions -gt 1 ]]; then
+                return 1
+            fi
+        elif [[ "$key" != - ]]; then
+            seen_selected_keys+="${key}|"
+        fi
+        if [[ "$inventory_keys" != - ]]; then
+            while IFS= read -r inventory_key; do
+                [[ -n "$inventory_key" ]] &&
+                    seen_inventory_keys+="${inventory_key}|"
+            done < <(tr ',' '\n' <<<"$inventory_keys")
+        fi
+        if [[ "$live_txids" != - ]]; then
+            while IFS= read -r live_txid; do
+                if [[ -n "$live_txid" &&
+                      "$seen_live_txids" != *"|${live_txid}|"* ]]; then
+                    seen_live_txids+="${live_txid}|"
+                fi
+            done < <(tr ',' '\n' <<<"$live_txids")
+        fi
+        previous_sample=$sample
+        previous_tip=$tip
+        previous_height=$height
+        previous_claims=$claims
+        previous_key=$key
+        previous_generation=$generation
+        previous_head=$head
+        previous_ordinal=$ordinal
+        previous_claim_txids=$claim_txids
+    done < <(jq -ce '.[]' <<<"$series")
+}
+
 hotfix_phase_a_staking_json_is_disabled()
 {
     jq -e -n --argjson staking "$1" '
@@ -508,7 +754,7 @@ hotfix_phase_b_staking_json_is_active()
 
 hotfix_phase_b_progress_file_is_valid()
 {
-    local file="$1" expected_nonce="$2" pow_mode="$3" sample fee
+    local file="$1" expected_nonce="$2" pow_mode="$3" sample fee series
     [[ -f "$file" && ! -L "$file" && ( "$pow_mode" == active || "$pow_mode" == off ) ]] ||
         return 1
     jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" --arg nonce "$expected_nonce" '
@@ -517,15 +763,16 @@ hotfix_phase_b_progress_file_is_valid()
         type == "object" and
         (keys | sort) == (["candidate_source_sha","p2p_ready_continuously","phase",
           "pos_active_continuously","promotion_nonce","samples","schema","tip_changes",
-          "wallet_chain_synchronized_continuously"] | sort) and
-        (.schema | integer and . == 1) and .phase == "B" and
+          "wallet_chain_synchronized_continuously",
+          "zero_hash_max_no_progress_tip_transitions"] | sort) and
+        (.schema | integer and . == 2) and .phase == "B" and
         .candidate_source_sha == $source and .promotion_nonce == $nonce and
         ($nonce | test("^[0-9a-f]{32}$")) and
         (.samples | type == "array" and length == 4) and
         ([.samples[].sample] == [1,2,3,4]) and
         all(.samples[];
-          (keys | sort) == (["chain","network","observed_epoch","pow","recovery",
-            "sample","staking","wallet"] | sort) and
+          (keys | sort) == (["chain","mempool_verbose","network","observed_epoch",
+            "pow","recovery","sample","staking","wallet"] | sort) and
           (.sample | integer and . >= 1 and . <= 4) and
           (.observed_epoch | integer and . > 0) and
           (.chain | type) == "object" and .chain.chain == "main" and
@@ -571,6 +818,7 @@ hotfix_phase_b_progress_file_is_valid()
         ([.samples[].observed_epoch] as $o |
           all(range(1;($o|length)); $o[.] >= $o[.-1])) and
         (.tip_changes | integer and . == 3) and
+        (.zero_hash_max_no_progress_tip_transitions | integer and . == 1) and
         (.wallet_chain_synchronized_continuously | type) == "boolean" and
         .wallet_chain_synchronized_continuously == true and
         (.pos_active_continuously | type) == "boolean" and
@@ -585,6 +833,10 @@ hotfix_phase_b_progress_file_is_valid()
         hotfix_phase_b_staking_json_is_active "$(jq -c '.staking' <<<"$sample")" || return 1
         hotfix_candidate_pow_json_is_valid "$(jq -c '.pow' <<<"$sample")" "$pow_mode" || return 1
     done < <(jq -ce '.samples[]' "$file")
+    series=$(jq -ce '[.samples[] | {sample,observed_epoch,
+      tip:.chain.bestblockhash,height:.chain.blocks,pow,recovery,mempool_verbose}]' \
+        "$file") || return 1
+    hotfix_pow_observation_series_json_is_valid "$series"
 }
 
 hotfix_unlock_helper_audit_file_is_valid()
@@ -834,6 +1086,7 @@ hotfix_invocation_file_is_valid()
 hotfix_phase_a_envelope_json_is_valid()
 {
     local envelope="$1" fee mining_before mining_after recovery_before recovery_after staking
+    local mempool tip height observed
     jq -e -n --argjson envelope "$envelope" '
         def integer: type == "number" and floor == .;
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
@@ -841,14 +1094,20 @@ hotfix_phase_a_envelope_json_is_valid()
           confirmed_manual_resolutions,confirmed_automatic_resolutions,
           confirmed_resolution_fees,automatic_actions_in_window,
           automatic_fee_exposure_in_window,reconciled_descendant_claims,claims_recycled};
+        def gate_tuple: {mining_gate_action,mining_gate_can_submit,
+          mining_gate_database_ambiguous,mining_gate_unresolved_components,
+          mining_gate_live_claims,mining_gate_eligible_claims,mining_gate_family_claims,
+          mining_gate_unsafe_claims,mining_gate_unsafe_components,mining_gate_relay_txid,
+          mining_gate_lineage_head_txid,mining_gate_candidate_state_fingerprint,
+          claims_submitted};
         $envelope | type == "object" and
         (keys | sort) == (["chain_after","chain_before","expected_pending_automatic",
           "expected_pending_manual","expected_recovery_fee","expected_recovery_metrics",
           "expected_recovery_metrics_sha256","isolation_continuously_valid","isolation_sha256",
-          "mining_after","mining_before","network","observed_epoch","observer_status",
+          "mempool_verbose","mining_after","mining_before","network","observed_epoch","observer_status",
           "phase","recovery_after","recovery_before","restart_epoch","sample","schema",
           "staking","wallet","wallets"] | sort) and
-        (.schema | integer and . == 2) and .phase == "A" and
+        (.schema | integer and . == 3) and .phase == "A" and
         (.sample | integer and . >= 1 and . <= 4) and
         (.observed_epoch | integer and . > 0) and
         (.restart_epoch | integer and (. == 1 or . == 2)) and
@@ -886,8 +1145,10 @@ hotfix_phase_a_envelope_json_is_valid()
         .mining_after.claim_inventory_tip == .chain_before.bestblockhash and
         .mining_after.mining_gate_candidate_state_fingerprint ==
           .mining_before.mining_gate_candidate_state_fingerprint and
+        (.mining_after | gate_tuple) == (.mining_before | gate_tuple) and
         .mining_before.claims_submitted == 0 and .mining_after.claims_submitted == 0 and
         (.isolation_sha256 | hex64) and
+        (.mempool_verbose | type) == "object" and
         (.wallet | type) == "object" and .wallet.walletname == "" and
         .wallet.private_keys_enabled == true and .wallet.scanning == false and
         .wallet.unlocked_staking_only == false and
@@ -947,16 +1208,24 @@ hotfix_phase_a_envelope_json_is_valid()
     recovery_before=$(jq -ce '.recovery_before' <<<"$envelope") || return 1
     recovery_after=$(jq -ce '.recovery_after' <<<"$envelope") || return 1
     staking=$(jq -ce '.staking' <<<"$envelope") || return 1
+    mempool=$(jq -ce '.mempool_verbose' <<<"$envelope") || return 1
+    tip=$(jq -er '.chain_before.bestblockhash' <<<"$envelope") || return 1
+    height=$(jq -er '.chain_before.blocks' <<<"$envelope") || return 1
+    observed=$(jq -er '.observed_epoch' <<<"$envelope") || return 1
     hotfix_candidate_pow_json_is_valid "$mining_before" active &&
         hotfix_candidate_pow_json_is_valid "$mining_after" active &&
         hotfix_candidate_recovery_json_is_valid "$recovery_before" "$fee" &&
         hotfix_candidate_recovery_json_is_valid "$recovery_after" "$fee" &&
-        hotfix_phase_a_staking_json_is_disabled "$staking"
+        hotfix_phase_a_staking_json_is_disabled "$staking" &&
+        hotfix_pow_observation_json_is_valid "$mining_before" "$recovery_before" \
+            "$mempool" "$tip" "$height" "$observed" &&
+        hotfix_pow_observation_json_is_valid "$mining_after" "$recovery_after" \
+            "$mempool" "$tip" "$height" "$observed"
 }
 
 hotfix_phase_a_progress_file_is_valid()
 {
-    local file="$1" envelope
+    local file="$1" envelope series
     [[ -f "$file" && ! -L "$file" ]] || return 1
     jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" '
         def integer: type == "number" and floor == .;
@@ -968,8 +1237,8 @@ hotfix_phase_a_progress_file_is_valid()
           "pos_disabled_continuous","run_nonce","schema",
           "single_positive_hash_sample_required","tip_changes",
           "visibility_sample_sha256s","wait_for_next_tip_required_for_liveness",
-          "worker_only_pow"] | sort) and
-        (.schema | integer and . == 2) and .phase == "A" and
+          "worker_only_pow","zero_hash_max_no_progress_tip_transitions"] | sort) and
+        (.schema | integer and . == 3) and .phase == "A" and
         (.run_nonce | type == "string" and test("^[0-9a-f]{32}$")) and
         .candidate_source_sha == $source and
         (.envelopes | type == "array" and length == 4) and
@@ -987,6 +1256,7 @@ hotfix_phase_a_progress_file_is_valid()
         all(.envelopes[1:][]; .restart_epoch == 2) and
         ([.envelopes[].expected_recovery_metrics_sha256] | unique | length) == 1 and
         (.tip_changes | integer and . == 3) and
+        (.zero_hash_max_no_progress_tip_transitions | integer and . == 1) and
         .hard_flags_continuous == true and .pos_disabled_continuous == true and
         .nonpublication_continuous == true and
         .interactive_surfaces_stopped_continuously == true and .worker_only_pow == true and
@@ -1004,6 +1274,10 @@ hotfix_phase_a_progress_file_is_valid()
     while IFS= read -r envelope; do
         hotfix_phase_a_envelope_json_is_valid "$envelope" || return 1
     done < <(jq -ce '.envelopes[]' "$file")
+    series=$(jq -ce '[.envelopes[] | {sample,observed_epoch,
+      tip:.chain_before.bestblockhash,height:.chain_before.blocks,
+      pow:.mining_after,recovery:.recovery_after,mempool_verbose}]' "$file") || return 1
+    hotfix_pow_observation_series_json_is_valid "$series"
 }
 
 hotfix_phase_a_claim_proof_file_is_valid()

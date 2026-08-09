@@ -1433,6 +1433,7 @@ collect_stable_envelope()
         rpc getwalletinfo >"${tmp}.wallet"
         rpc getnetworkinfo >"${tmp}.network"
         rpc listwallets >"${tmp}.wallets"
+        rpc getrawmempool true >"${tmp}.mempool"
         rpc getpowmininginfo >"${tmp}.mining2"
         rpc getpowclaimrecoveryinfo true >"${tmp}.recovery2"
         rpc getblockchaininfo >"${tmp}.chain2"
@@ -1451,12 +1452,14 @@ collect_stable_envelope()
             --slurpfile recovery1 "${tmp}.recovery1" --slurpfile recovery2 "${tmp}.recovery2" \
             --slurpfile mining1 "${tmp}.mining1" --slurpfile mining2 "${tmp}.mining2" \
             --slurpfile staking "${tmp}.staking" --slurpfile wallet "${tmp}.wallet" \
-            --slurpfile network "${tmp}.network" --slurpfile wallets "${tmp}.wallets" '
-            {schema:2,phase:"A",sample:$sample,observed_epoch:$observed,
+            --slurpfile network "${tmp}.network" --slurpfile wallets "${tmp}.wallets" \
+            --slurpfile mempool "${tmp}.mempool" '
+            {schema:3,phase:"A",sample:$sample,observed_epoch:$observed,
              restart_epoch:$epoch,
              chain_before:$chain1[0],chain_after:$chain2[0],
              recovery_before:$recovery1[0],recovery_after:$recovery2[0],
              mining_before:$mining1[0],mining_after:$mining2[0],
+             mempool_verbose:$mempool[0],
              staking:$staking[0],wallet:$wallet[0],network:$network[0],
              wallets:$wallets[0],expected_recovery_fee:$fee,
              isolation_continuously_valid:true,observer_status:"observed_absent",
@@ -1571,7 +1574,7 @@ collect_progress_across_restart()
         --slurpfile e2 "${EVIDENCE}/candidate-envelope-2.json" \
         --slurpfile e3 "${EVIDENCE}/candidate-envelope-3.json" \
         --slurpfile e4 "${EVIDENCE}/candidate-envelope-4.json" '
-        {schema:2,phase:"A",run_nonce:$nonce,candidate_source_sha:$source,
+        {schema:3,phase:"A",run_nonce:$nonce,candidate_source_sha:$source,
          envelopes:[$e1[0],$e2[0],$e3[0],$e4[0]],tip_changes:3,
          hard_flags_continuous:true,pos_disabled_continuous:true,
          nonpublication_continuous:true,interactive_surfaces_stopped_continuously:true,
@@ -1583,7 +1586,8 @@ collect_progress_across_restart()
              all(.mining_before.claims_submitted == 0 and
                .mining_after.claims_submitted == 0)),
          bounded_worker_tip_progress:true,single_positive_hash_sample_required:false,
-         wait_for_next_tip_required_for_liveness:false}
+         wait_for_next_tip_required_for_liveness:false,
+         zero_hash_max_no_progress_tip_transitions:1}
     ' >"$progress_tmp"
     jq -e '.per_epoch_claims_submitted_zero == true and
       (.isolation_sample_sha256s | length == 4 and

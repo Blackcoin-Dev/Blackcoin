@@ -367,24 +367,52 @@ make_nonpublication()
 make_envelope()
 {
     local sample="$1" epoch="$2" tip="$3" work="$4" isolation_sha="$5" file="$6"
-    local mining recovery staking recovery_metrics recovery_metrics_sha
+    local mining recovery staking recovery_metrics recovery_metrics_sha height head
+    height=$((100 + sample))
     mining=$(mining_json refresh_same_anchor)
     recovery=$(recovery_json "$tip" 9)
+    case "$sample" in
+        1) head=$CLAIM1 ;;
+        2) head=$CLAIM2 ;;
+        3) head=$CLAIM3 ;;
+        4) head=$CLAIM4 ;;
+        *) return 1 ;;
+    esac
+    mining=$(jq --arg tip "$tip" --arg head "$head" --argjson height "$height" \
+      --argjson count "$sample" '
+      .claim_inventory_tip=$tip | .current_height=$height |
+      .mining_gate_lineage_head_txid=$head | .mining_gate_family_claims=$count |
+      .actionable_quarantined_claims=$count |
+      .blocking_quarantined_claims=$count | .quarantined_claims=$count |
+      .raw_quarantined_claims=$count | .unresolved_claims=$count
+      ' <<<"$mining")
+    recovery=$(jq --argjson height "$height" --argjson count "$sample" \
+      --arg c1 "$CLAIM1" --arg c2 "$CLAIM2" --arg c3 "$CLAIM3" --arg c4 "$CLAIM4" '
+      ([$c1,$c2,$c3,$c4][0:$count]) as $claims |
+      .active_height=$height | .wallet_processed_height=$height |
+      .actionable_quarantined_claims=$count |
+      .blocking_quarantined_claims=$count |
+      .quarantined_claim_objects=$count | .raw_claim_objects=$count |
+      .raw_quarantined_claims=$count |
+      .component_details[0].claim_txids=$claims |
+      .component_details[0].nodes |= map(select(.txid as $txid |
+        $claims | index($txid)))
+      ' <<<"$recovery")
     recovery_metrics=$(recovery_metrics_json_value "$recovery")
     recovery_metrics_sha=$(recovery_metrics_sha_value "$recovery")
     staking=$(staking_disabled)
-    mining=$(jq --arg tip "$tip" '.claim_inventory_tip=$tip' <<<"$mining")
     jq -S -n --argjson sample "$sample" --argjson epoch "$epoch" \
         --argjson observed 2000000000 --arg tip "$tip" \
         --arg work "$work" --argjson mining "$mining" --argjson recovery "$recovery" \
         --argjson staking "$staking" --argjson recovery_metrics "$recovery_metrics" \
         --arg recovery_metrics_sha "$recovery_metrics_sha" --arg isolation "$isolation_sha" '
-      {schema:2,phase:"A",sample:$sample,observed_epoch:$observed,restart_epoch:$epoch,
+      {schema:3,phase:"A",sample:$sample,observed_epoch:$observed,restart_epoch:$epoch,
        chain_before:{chain:"main",initialblockdownload:false,blocks:(100+$sample),headers:(100+$sample),
          bestblockhash:$tip,chainwork:$work},
        chain_after:{chain:"main",initialblockdownload:false,blocks:(100+$sample),headers:(100+$sample),
          bestblockhash:$tip,chainwork:$work},recovery_before:$recovery,recovery_after:$recovery,
        mining_before:$mining,mining_after:$mining,staking:$staking,
+       mempool_verbose:{},
        wallet:{walletname:"",private_keys_enabled:true,scanning:false,unlocked_staking_only:false,
          unlocked_until:4102444800},network:{networkactive:true,localrelay:false,connections_out:4},
        wallets:[""],expected_recovery_fee:0,expected_pending_manual:0,
@@ -423,14 +451,15 @@ make_progress()
       --argjson isolation "$isolation_json" --argjson visibility "$visibility_json" \
       --slurpfile e1 "$e1" \
       --slurpfile e2 "$e2" --slurpfile e3 "$e3" --slurpfile e4 "$e4" '
-      {schema:2,phase:"A",run_nonce:$nonce,candidate_source_sha:$source,
+      {schema:3,phase:"A",run_nonce:$nonce,candidate_source_sha:$source,
        envelopes:[$e1[0],$e2[0],$e3[0],$e4[0]],tip_changes:3,
        hard_flags_continuous:true,pos_disabled_continuous:true,
        nonpublication_continuous:true,interactive_surfaces_stopped_continuously:true,
        worker_only_pow:true,lineage_continuation_tips:3,per_epoch_claims_submitted_zero:true,
        isolation_sample_sha256s:$isolation,visibility_sample_sha256s:$visibility,
        bounded_worker_tip_progress:true,
-       single_positive_hash_sample_required:false,wait_for_next_tip_required_for_liveness:false}
+       single_positive_hash_sample_required:false,wait_for_next_tip_required_for_liveness:false,
+       zero_hash_max_no_progress_tip_transitions:1}
     ' >"$output"
 }
 
@@ -1600,8 +1629,11 @@ make_phase_b_progress()
             4) tip=$TIP4; height=104 ;;
         esac
         mining=$(mining_json refresh_same_anchor | jq --arg tip "$tip" \
-          '.claim_inventory_tip=$tip')
-        recovery=$(recovery_json "$tip" 9)
+          --argjson height "$height" '
+          .claim_inventory_tip=$tip | .current_height=$height |
+          .hashrate=5 | .state="hashing"')
+        recovery=$(recovery_json "$tip" 9 | jq --argjson height "$height" \
+          '.active_height=$height | .wallet_processed_height=$height')
         staking=$(staking_active "$height")
         wallet=$(jq -cn '{walletname:"",private_keys_enabled:true,scanning:false,
           unlocked_staking_only:false,unlocked_until:4102444800}')
@@ -1614,15 +1646,139 @@ make_phase_b_progress()
           --argjson staking "$staking" --argjson pow "$mining" \
           --argjson recovery "$recovery" '
           $existing+[{sample:$sample,observed_epoch:2000000000,chain:$chain,network:$network,
-            wallet:$wallet,staking:$staking,pow:$pow,recovery:$recovery}]
+            wallet:$wallet,staking:$staking,pow:$pow,recovery:$recovery,mempool_verbose:{}}]
         ')
     done
     jq -S -n --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" \
       --arg nonce 'fedcba9876543210fedcba9876543210' --argjson samples "$samples" '
-      {schema:1,phase:"B",candidate_source_sha:$source,promotion_nonce:$nonce,
+      {schema:2,phase:"B",candidate_source_sha:$source,promotion_nonce:$nonce,
        samples:$samples,tip_changes:3,wallet_chain_synchronized_continuously:true,
-       pos_active_continuously:true,p2p_ready_continuously:true}
+       pos_active_continuously:true,p2p_ready_continuously:true,
+       zero_hash_max_no_progress_tip_transitions:1}
     ' >"$output"
+}
+
+set_phase_b_sample_action()
+{
+    local file="$1" index="$2" action="$3" fingerprint="$4" hashrate="${5:-0}"
+    local temporary="${file}.action"
+    jq -S --argjson index "$index" --arg action "$action" --arg fp "$fingerprint" \
+      --arg head "$CLAIM4" --arg zero "$HOTFIX_ZERO_TXID" --argjson hash "$hashrate" '
+      .samples[$index] |= (
+        .observed_epoch as $observed | .chain.blocks as $height |
+        .pow.mining_gate_action=$action |
+        .pow.mining_gate_candidate_state_fingerprint=$fp |
+        .pow.hashrate=$hash |
+        .pow.state=(if ($action == "wait_for_live" or
+          $action == "wait_for_next_tip" or $action == "relay_existing")
+          then "claim_in_flight" elif $hash > 0 then "hashing" else "ready" end) |
+        .pow.mining_gate_can_submit=
+          ($action == "create_new_anchor" or $action == "refresh_same_anchor" or
+           $action == "wait_for_next_tip") |
+        .pow.mining_gate_relay_txid=
+          (if $action == "relay_existing" then $head else $zero end) |
+        .pow.mining_gate_live_claims=
+          (if $action == "wait_for_live" then 1 else 0 end) |
+        .pow.live_claims=.pow.mining_gate_live_claims |
+        .pow.mining_gate_eligible_claims=
+          (if $action == "relay_existing" then 1 else 0 end) |
+        .recovery.component_details[0].nodes |= map(
+          .in_mempool=false | .relay_ttl_expired=false | .relay_expiry_time=0 |
+          if .txid == $head then
+            .in_mempool=($action == "wait_for_live") |
+            .disposition=(if $action == "relay_existing" then "eligible"
+              else "origin-expired" end) |
+            .relay_expiry_time=(if $action == "relay_existing"
+              then ($observed + 600) else 0 end)
+          else . end) |
+        .recovery.live_claim_objects=
+          (if $action == "wait_for_live" then 1 else 0 end) |
+        .recovery.component_details[0].classification=
+          (if $action == "wait_for_live" then "live"
+           else "current_branch_ineligible" end) |
+        .mempool_verbose=(if $action == "wait_for_live" then
+          {($head):{time:($observed - 10),height:$height}} else {} end) |
+        if $action == "create_new_anchor" then
+          .pow.mining_gate_lineage_head_txid=$zero |
+          .pow.mining_gate_family_claims=0 |
+          .pow.mining_gate_unresolved_components=0 |
+          .pow.actionable_quarantined_claims=0 |
+          .pow.blocking_quarantined_claims=0 |
+          .pow.quarantined_claims=0 | .pow.raw_quarantined_claims=0 |
+          .pow.unresolved_claims=0 | .pow.claim_components=0 |
+          .recovery.actionable_quarantined_claims=0 |
+          .recovery.blocking_quarantined_claims=0 |
+          .recovery.quarantined_claim_objects=0 |
+          .recovery.raw_claim_objects=0 | .recovery.raw_quarantined_claims=0 |
+          .recovery.blocking_components=0 | .recovery.components=0 |
+          .recovery.component_details=[]
+        else . end
+      )
+    ' "$file" >"$temporary" || return 1
+    mv -f -- "$temporary" "$file"
+}
+
+set_phase_b_sample_relay_member()
+{
+    local file="$1" index="$2" txid="$3" temporary
+    temporary="${file}.relay-member"
+    jq -S --argjson index "$index" --arg txid "$txid" '
+      .samples[$index] |= (
+        .observed_epoch as $observed |
+        .pow.mining_gate_relay_txid=$txid |
+        .recovery.component_details[0].nodes |= map(
+          .in_mempool=false | .relay_ttl_expired=false |
+          if .txid == $txid then
+            .disposition="eligible" | .relay_expiry_time=($observed + 600)
+          else .disposition="origin-expired" | .relay_expiry_time=0 end) |
+        .mempool_verbose={}
+      )
+    ' "$file" >"$temporary" || return 1
+    mv -f -- "$temporary" "$file"
+}
+
+set_phase_b_sample_live_member()
+{
+    local file="$1" index="$2" txid="$3" temporary
+    temporary="${file}.live-member"
+    jq -S --argjson index "$index" --arg txid "$txid" '
+      .samples[$index] |= (
+        .observed_epoch as $observed | .chain.blocks as $height |
+        .recovery.component_details[0].nodes |= map(
+          .in_mempool=(.txid == $txid) | .relay_ttl_expired=false |
+          .relay_expiry_time=0 | .disposition="origin-expired") |
+        .mempool_verbose={($txid):{time:($observed - 10),height:$height}}
+      )
+    ' "$file" >"$temporary" || return 1
+    mv -f -- "$temporary" "$file"
+}
+
+truncate_phase_b_sample_family()
+{
+    local file="$1" index="$2" count="$3" temporary
+    temporary="${file}.family"
+    jq -S --argjson index "$index" --argjson count "$count" \
+      --arg c1 "$CLAIM1" --arg c2 "$CLAIM2" --arg c3 "$CLAIM3" --arg c4 "$CLAIM4" '
+      ([$c1,$c2,$c3,$c4][0:$count]) as $claims |
+      .samples[$index] |= (
+        .pow.mining_gate_lineage_head_txid=$claims[-1] |
+        .pow.mining_gate_family_claims=$count |
+        .pow.actionable_quarantined_claims=$count |
+        .pow.blocking_quarantined_claims=$count |
+        .pow.quarantined_claims=$count |
+        .pow.raw_quarantined_claims=$count |
+        .pow.unresolved_claims=$count |
+        .recovery.component_details[0].nodes |= map(select(.txid as $txid |
+          $claims | index($txid))) |
+        .recovery.component_details[0].claim_txids=$claims |
+        .recovery.actionable_quarantined_claims=$count |
+        .recovery.blocking_quarantined_claims=$count |
+        .recovery.quarantined_claim_objects=$count |
+        .recovery.raw_claim_objects=$count |
+        .recovery.raw_quarantined_claims=$count
+      )
+    ' "$file" >"$temporary" || return 1
+    mv -f -- "$temporary" "$file"
 }
 
 make_phase_b_wallet_delta()
@@ -1999,6 +2155,25 @@ INV_B="$TMP/inv-b.json"
 HELPER="$TMP/helper.json"
 ISOLATION="$TMP/isolation.json"
 PROGRESS="$TMP/progress.json"
+PROGRESS_B_SHORT="$TMP/progress-b-short.json"
+PROGRESS_B_NEXT="$TMP/progress-b-next.json"
+PROGRESS_B_STALE_LIVE="$TMP/progress-b-stale-live.json"
+PROGRESS_B_STALE_RELAY="$TMP/progress-b-stale-relay.json"
+PROGRESS_B_STALE_NEXT="$TMP/progress-b-stale-next.json"
+PROGRESS_B_ALTERNATING="$TMP/progress-b-alternating.json"
+PROGRESS_B_REPLAY="$TMP/progress-b-replay.json"
+PROGRESS_B_STALE_REFRESH="$TMP/progress-b-stale-refresh.json"
+PROGRESS_B_STALE_CREATE="$TMP/progress-b-stale-create.json"
+PROGRESS_B_LIVE_PROGRESS="$TMP/progress-b-live-progress.json"
+PROGRESS_B_OLDER_LIVE_PROGRESS="$TMP/progress-b-older-live-progress.json"
+PROGRESS_B_LIVE_REPLAY="$TMP/progress-b-live-replay.json"
+PROGRESS_B_LIVE_SIBLING_TOGGLE="$TMP/progress-b-live-sibling-toggle.json"
+PROGRESS_B_NEW_SIBLING_LIVE="$TMP/progress-b-new-sibling-live.json"
+PROGRESS_B_SEEN_DURING_PROGRESS="$TMP/progress-b-seen-during-progress.json"
+PROGRESS_B_COUNTER_PROGRESS="$TMP/progress-b-counter-progress.json"
+PROGRESS_B_CREATE_SHORT="$TMP/progress-b-create-short.json"
+PROGRESS_B_MIDDLE_REPLAY="$TMP/progress-b-middle-replay.json"
+PROGRESS_B_GENERATION_CHURN="$TMP/progress-b-generation-churn.json"
 CLAIM="$TMP/claim.json"
 SNAPSHOTS="$TMP/snapshots.json"
 CERT="$TMP/cert.json"
@@ -2019,6 +2194,168 @@ make_invocation B "$INV_B"
 make_helper "$HELPER"
 make_nonpublication "$ISOLATION"
 make_progress "$PROGRESS"
+make_phase_b_progress "$PROGRESS_B_SHORT"
+set_phase_b_sample_action "$PROGRESS_B_SHORT" 0 refresh_same_anchor "$FINGERPRINT" 5
+set_phase_b_sample_action "$PROGRESS_B_SHORT" 1 wait_for_live "$FINGERPRINT"
+set_phase_b_sample_action "$PROGRESS_B_SHORT" 2 refresh_same_anchor "$FINGERPRINT" 5
+set_phase_b_sample_action "$PROGRESS_B_SHORT" 3 relay_existing "$FINGERPRINT"
+make_phase_b_progress "$PROGRESS_B_NEXT"
+set_phase_b_sample_action "$PROGRESS_B_NEXT" 0 refresh_same_anchor "$FINGERPRINT" 5
+set_phase_b_sample_action "$PROGRESS_B_NEXT" 1 wait_for_next_tip "$FINGERPRINT"
+set_phase_b_sample_action "$PROGRESS_B_NEXT" 2 refresh_same_anchor "$FINGERPRINT" 5
+set_phase_b_sample_action "$PROGRESS_B_NEXT" 3 wait_for_next_tip "$FINGERPRINT"
+make_phase_b_progress "$PROGRESS_B_STALE_LIVE"
+make_phase_b_progress "$PROGRESS_B_STALE_RELAY"
+make_phase_b_progress "$PROGRESS_B_STALE_NEXT"
+make_phase_b_progress "$PROGRESS_B_ALTERNATING"
+make_phase_b_progress "$PROGRESS_B_STALE_REFRESH"
+make_phase_b_progress "$PROGRESS_B_STALE_CREATE"
+make_phase_b_progress "$PROGRESS_B_LIVE_PROGRESS"
+make_phase_b_progress "$PROGRESS_B_OLDER_LIVE_PROGRESS"
+make_phase_b_progress "$PROGRESS_B_LIVE_REPLAY"
+make_phase_b_progress "$PROGRESS_B_LIVE_SIBLING_TOGGLE"
+make_phase_b_progress "$PROGRESS_B_NEW_SIBLING_LIVE"
+make_phase_b_progress "$PROGRESS_B_SEEN_DURING_PROGRESS"
+make_phase_b_progress "$PROGRESS_B_COUNTER_PROGRESS"
+make_phase_b_progress "$PROGRESS_B_CREATE_SHORT"
+make_phase_b_progress "$PROGRESS_B_MIDDLE_REPLAY"
+make_phase_b_progress "$PROGRESS_B_GENERATION_CHURN"
+for index in 0 1 2 3; do
+    set_phase_b_sample_action "$PROGRESS_B_STALE_LIVE" "$index" wait_for_live \
+        "$FINGERPRINT"
+    set_phase_b_sample_action "$PROGRESS_B_STALE_RELAY" "$index" relay_existing \
+        "$FINGERPRINT"
+    set_phase_b_sample_action "$PROGRESS_B_STALE_NEXT" "$index" wait_for_next_tip \
+        "$FINGERPRINT"
+    set_phase_b_sample_action "$PROGRESS_B_STALE_REFRESH" "$index" \
+        refresh_same_anchor "$(hex64 $((20 + index)))"
+    set_phase_b_sample_action "$PROGRESS_B_STALE_CREATE" "$index" \
+        create_new_anchor "$(hex64 $((30 + index)))"
+    set_phase_b_sample_action "$PROGRESS_B_COUNTER_PROGRESS" "$index" \
+        refresh_same_anchor "$FINGERPRINT"
+    set_phase_b_sample_action "$PROGRESS_B_CREATE_SHORT" "$index" \
+        create_new_anchor "$FINGERPRINT"
+    set_phase_b_sample_action "$PROGRESS_B_MIDDLE_REPLAY" "$index" \
+        refresh_same_anchor "$FINGERPRINT" 5
+    set_phase_b_sample_action "$PROGRESS_B_GENERATION_CHURN" "$index" \
+        refresh_same_anchor "$(hex64 $((70 + index)))"
+done
+set_phase_b_sample_action "$PROGRESS_B_ALTERNATING" 0 wait_for_live "$(hex64 5)"
+set_phase_b_sample_action "$PROGRESS_B_ALTERNATING" 1 relay_existing "$(hex64 6)"
+set_phase_b_sample_action "$PROGRESS_B_ALTERNATING" 2 wait_for_live "$(hex64 7)"
+set_phase_b_sample_action "$PROGRESS_B_ALTERNATING" 3 relay_existing "$(hex64 8)"
+set_phase_b_sample_action "$PROGRESS_B_LIVE_PROGRESS" 0 relay_existing "$FINGERPRINT"
+set_phase_b_sample_action "$PROGRESS_B_LIVE_PROGRESS" 1 wait_for_live "$FINGERPRINT"
+set_phase_b_sample_action "$PROGRESS_B_LIVE_PROGRESS" 2 wait_for_next_tip "$FINGERPRINT"
+set_phase_b_sample_action "$PROGRESS_B_LIVE_PROGRESS" 3 refresh_same_anchor \
+    "$FINGERPRINT" 5
+set_phase_b_sample_action "$PROGRESS_B_OLDER_LIVE_PROGRESS" 0 relay_existing \
+    "$FINGERPRINT"
+set_phase_b_sample_relay_member "$PROGRESS_B_OLDER_LIVE_PROGRESS" 0 "$CLAIM3"
+set_phase_b_sample_action "$PROGRESS_B_OLDER_LIVE_PROGRESS" 1 wait_for_live \
+    "$FINGERPRINT"
+set_phase_b_sample_live_member "$PROGRESS_B_OLDER_LIVE_PROGRESS" 1 "$CLAIM3"
+set_phase_b_sample_action "$PROGRESS_B_OLDER_LIVE_PROGRESS" 2 wait_for_next_tip \
+    "$FINGERPRINT"
+set_phase_b_sample_action "$PROGRESS_B_OLDER_LIVE_PROGRESS" 3 refresh_same_anchor \
+    "$FINGERPRINT" 5
+set_phase_b_sample_action "$PROGRESS_B_LIVE_REPLAY" 0 relay_existing "$(hex64 40)"
+set_phase_b_sample_action "$PROGRESS_B_LIVE_REPLAY" 1 wait_for_live "$(hex64 41)"
+set_phase_b_sample_action "$PROGRESS_B_LIVE_REPLAY" 2 relay_existing "$(hex64 42)"
+set_phase_b_sample_action "$PROGRESS_B_LIVE_REPLAY" 3 wait_for_live "$(hex64 43)"
+for index in 0 1 2 3; do
+    set_phase_b_sample_action "$PROGRESS_B_LIVE_SIBLING_TOGGLE" "$index" \
+        wait_for_live "$(hex64 $((50 + index)))"
+done
+set_phase_b_sample_live_member "$PROGRESS_B_LIVE_SIBLING_TOGGLE" 0 "$CLAIM3"
+set_phase_b_sample_live_member "$PROGRESS_B_LIVE_SIBLING_TOGGLE" 1 "$CLAIM4"
+set_phase_b_sample_live_member "$PROGRESS_B_LIVE_SIBLING_TOGGLE" 2 "$CLAIM3"
+set_phase_b_sample_live_member "$PROGRESS_B_LIVE_SIBLING_TOGGLE" 3 "$CLAIM4"
+set_phase_b_sample_action "$PROGRESS_B_NEW_SIBLING_LIVE" 0 wait_for_live \
+    "$FINGERPRINT"
+set_phase_b_sample_live_member "$PROGRESS_B_NEW_SIBLING_LIVE" 0 "$CLAIM3"
+set_phase_b_sample_action "$PROGRESS_B_NEW_SIBLING_LIVE" 1 wait_for_live \
+    "$FINGERPRINT"
+mutate "$PROGRESS_B_NEW_SIBLING_LIVE" "${PROGRESS_B_NEW_SIBLING_LIVE}.growth" '
+  .samples[1] |= (
+    .pow.mining_gate_live_claims=2 | .pow.live_claims=2 |
+    .recovery.live_claim_objects=2 |
+    .recovery.component_details[0].nodes |= map(
+      .in_mempool=(.txid == "'"$CLAIM3"'" or .txid == "'"$CLAIM4"'") |
+      .relay_ttl_expired=false | .relay_expiry_time=0 |
+      .disposition="origin-expired") |
+    .mempool_verbose={
+      ("'"$CLAIM3"'"):{time:(.observed_epoch - 10),height:.chain.blocks},
+      ("'"$CLAIM4"'"):{time:(.observed_epoch - 10),height:.chain.blocks}})'
+mv -f -- "${PROGRESS_B_NEW_SIBLING_LIVE}.growth" \
+    "$PROGRESS_B_NEW_SIBLING_LIVE"
+set_phase_b_sample_action "$PROGRESS_B_NEW_SIBLING_LIVE" 2 wait_for_live \
+    "$FINGERPRINT"
+set_phase_b_sample_live_member "$PROGRESS_B_NEW_SIBLING_LIVE" 2 "$CLAIM3"
+set_phase_b_sample_action "$PROGRESS_B_NEW_SIBLING_LIVE" 3 refresh_same_anchor \
+    "$FINGERPRINT" 5
+set_phase_b_sample_action "$PROGRESS_B_SEEN_DURING_PROGRESS" 0 wait_for_live \
+    "$FINGERPRINT"
+set_phase_b_sample_live_member "$PROGRESS_B_SEEN_DURING_PROGRESS" 0 "$CLAIM3"
+set_phase_b_sample_action "$PROGRESS_B_SEEN_DURING_PROGRESS" 1 wait_for_live \
+    "$FINGERPRINT"
+set_phase_b_sample_action "$PROGRESS_B_SEEN_DURING_PROGRESS" 2 relay_existing \
+    "$FINGERPRINT"
+set_phase_b_sample_action "$PROGRESS_B_SEEN_DURING_PROGRESS" 3 wait_for_live \
+    "$FINGERPRINT"
+set_phase_b_sample_live_member "$PROGRESS_B_SEEN_DURING_PROGRESS" 3 "$CLAIM4"
+mutate "$PROGRESS_B_SEEN_DURING_PROGRESS" \
+    "${PROGRESS_B_SEEN_DURING_PROGRESS}.seen" '
+  .samples[1] |= (
+    .pow.claims_submitted=1 | .pow.mining_gate_live_claims=2 | .pow.live_claims=2 |
+    .recovery.live_claim_objects=2 |
+    .recovery.component_details[0].nodes |= map(
+      .in_mempool=(.txid == "'"$CLAIM3"'" or .txid == "'"$CLAIM4"'") |
+      .relay_ttl_expired=false | .relay_expiry_time=0 |
+      .disposition="origin-expired") |
+    .mempool_verbose={
+      ("'"$CLAIM3"'"):{time:(.observed_epoch - 10),height:.chain.blocks},
+      ("'"$CLAIM4"'"):{time:(.observed_epoch - 10),height:.chain.blocks}}) |
+  .samples[2].pow.claims_submitted=1 |
+  .samples[3].pow.claims_submitted=1'
+mv -f -- "${PROGRESS_B_SEEN_DURING_PROGRESS}.seen" \
+    "$PROGRESS_B_SEEN_DURING_PROGRESS"
+mutate "$PROGRESS_B_CREATE_SHORT" "${PROGRESS_B_CREATE_SHORT}.hash" \
+    '.samples[2].pow.hashrate=5 | .samples[2].pow.state="hashing"'
+mv -f -- "${PROGRESS_B_CREATE_SHORT}.hash" "$PROGRESS_B_CREATE_SHORT"
+mutate "$PROGRESS_B_COUNTER_PROGRESS" "${PROGRESS_B_COUNTER_PROGRESS}.counts" '
+  .samples[1].pow.claims_submitted=1 |
+  .samples[2].pow.claims_submitted=1 |
+  .samples[3].pow.claims_submitted=2'
+mv -f -- "${PROGRESS_B_COUNTER_PROGRESS}.counts" "$PROGRESS_B_COUNTER_PROGRESS"
+mutate "$PROGRESS_B_MIDDLE_REPLAY" "${PROGRESS_B_MIDDLE_REPLAY}.middle" '
+  .samples[2].recovery.component_details[0] |= (
+    .claim_txids |= map(if . == "'"$CLAIM3"'" then "'"$(hex64 60)"'" else . end) |
+    .nodes |= map(
+      if .txid == "'"$CLAIM3"'" then .txid="'"$(hex64 60)"'"
+      elif .txid == "'"$CLAIM4"'" then
+        .lineage_parent_txid="'"$(hex64 60)"'"
+      else . end))'
+mv -f -- "${PROGRESS_B_MIDDLE_REPLAY}.middle" "$PROGRESS_B_MIDDLE_REPLAY"
+for index in 0 1 2 3; do
+    mutate "$PROGRESS_B_GENERATION_CHURN" \
+        "${PROGRESS_B_GENERATION_CHURN}.generation" \
+        '.samples['"$index"'].recovery.component_details[0] |= (
+          .generation_fingerprint="'"$(hex64 $((80 + index)))"'" |
+          .nodes |= map(.lineage_family_fingerprint=
+            "'"$(hex64 $((80 + index)))"'"))'
+    mv -f -- "${PROGRESS_B_GENERATION_CHURN}.generation" \
+        "$PROGRESS_B_GENERATION_CHURN"
+done
+make_phase_b_progress "$PROGRESS_B_REPLAY"
+for index in 0 1 2 3; do
+    set_phase_b_sample_action "$PROGRESS_B_REPLAY" "$index" refresh_same_anchor \
+        "$FINGERPRINT" 5
+done
+truncate_phase_b_sample_family "$PROGRESS_B_REPLAY" 0 3
+truncate_phase_b_sample_family "$PROGRESS_B_REPLAY" 1 4
+truncate_phase_b_sample_family "$PROGRESS_B_REPLAY" 2 3
+truncate_phase_b_sample_family "$PROGRESS_B_REPLAY" 3 4
 make_claim "$CLAIM"
 make_snapshot_set "$SNAPSHOTS"
 make_rewind_safe "$CERT"
@@ -2137,7 +2474,8 @@ ok 'hard-disabled Phase-A staking accepted' hotfix_phase_a_staking_json_is_disab
 reject 'active PoS rejected during Phase A' hotfix_phase_a_staking_json_is_disabled "$(staking_active)"
 ok 'active PoS accepted during Phase B' hotfix_phase_b_staking_json_is_active "$(staking_active)"
 
-ok 'three-tip Phase-A progress accepted' hotfix_phase_a_progress_file_is_valid "$PROGRESS"
+ok 'three-tip Phase-A authenticated same-family lineage progress accepted' \
+    hotfix_phase_a_progress_file_is_valid "$PROGRESS"
 for filter in '.tip_changes=2' '.pos_disabled_continuous=false' \
     '.nonpublication_continuous=false' '.envelopes[2].staking.enabled=true' \
     '.envelopes[3].chain_before.chainwork=.envelopes[2].chain_before.chainwork' \
@@ -2151,6 +2489,89 @@ for filter in '.tip_changes=2' '.pos_disabled_continuous=false' \
     mutate "$PROGRESS" "$TMP/m.json" "$filter"
     reject "progress hostile mutation ${filter}" hotfix_phase_a_progress_file_is_valid "$TMP/m.json"
 done
+mutate "$PROGRESS" "$TMP/m.json" '.zero_hash_max_no_progress_tip_transitions=2'
+reject 'Phase-A cannot relax the one-transition zero-hash no-progress bound' \
+    hotfix_phase_a_progress_file_is_valid "$TMP/m.json"
+
+ok 'one-tip live/relay waits accept unchanged fingerprint around real hashing progress' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_SHORT" \
+        fedcba9876543210fedcba9876543210 active
+ok 'one-tip wait_for_next_tip accepts unchanged fingerprint around real hashing progress' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_NEXT" \
+        fedcba9876543210fedcba9876543210 active
+ok 'first authoritative relay-to-live transition resets the bounded wait once' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_LIVE_PROGRESS" \
+        fedcba9876543210fedcba9876543210 active
+ok 'an older authenticated relay member becoming live resets the bounded wait once' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_OLDER_LIVE_PROGRESS" \
+        fedcba9876543210fedcba9876543210 active
+ok 'live-set growth resets once while an already-seen sibling remains live' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_NEW_SIBLING_LIVE" \
+        fedcba9876543210fedcba9876543210 active
+ok 'increased worker submission counter resets a bounded zero-hash interval' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_COUNTER_PROGRESS" \
+        fedcba9876543210fedcba9876543210 active
+ok 'empty-family create sentinel survives parsing and one bounded zero-hash transition' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_CREATE_SHORT" \
+        fedcba9876543210fedcba9876543210 active
+reject 'wait_for_live cannot remain zero-progress across two advancing-tip transitions' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_STALE_LIVE" \
+        fedcba9876543210fedcba9876543210 active
+reject 'relay_existing cannot remain zero-progress across two advancing-tip transitions' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_STALE_RELAY" \
+        fedcba9876543210fedcba9876543210 active
+reject 'wait_for_next_tip cannot replay one cached family across two tip transitions' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_STALE_NEXT" \
+        fedcba9876543210fedcba9876543210 active
+reject 'first-sample live replay plus action/fingerprint churn cannot reset staleness' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_ALTERNATING" \
+        fedcba9876543210fedcba9876543210 active
+reject 'a second absent-to-live transition for the same member cannot reset staleness' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_LIVE_REPLAY" \
+        fedcba9876543210fedcba9876543210 active
+reject 'switching live siblings without a family-absent cut cannot reset staleness' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_LIVE_SIBLING_TOGGLE" \
+        fedcba9876543210fedcba9876543210 active
+reject 'a live sibling seen during other progress cannot later reset staleness' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_SEEN_DURING_PROGRESS" \
+        fedcba9876543210fedcba9876543210 active
+reject 'zero-hash refresh cannot remain unchanged across two tip transitions' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_STALE_REFRESH" \
+        fedcba9876543210fedcba9876543210 active
+reject 'zero-hash create cannot remain unchanged across two tip transitions' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_STALE_CREATE" \
+        fedcba9876543210fedcba9876543210 active
+reject 'lineage head regression after an observed descendant is replay, not progress' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_REPLAY" \
+        fedcba9876543210fedcba9876543210 active
+reject 'same head and ordinal cannot conceal a rewritten middle lineage member' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_MIDDLE_REPLAY" \
+        fedcba9876543210fedcba9876543210 active
+reject 'generation-fingerprint churn cannot redefine one stable family as progress' \
+    hotfix_phase_b_progress_file_is_valid "$PROGRESS_B_GENERATION_CHURN" \
+        fedcba9876543210fedcba9876543210 active
+mutate "$PROGRESS_B_SHORT" "$TMP/m.json" \
+    '.samples[1].mempool_verbose[.samples[1].pow.mining_gate_lineage_head_txid].height =
+      (.samples[1].chain.blocks - 2)'
+reject 'wait_for_live rejects a verbose mempool entry older than one tip transition' \
+    hotfix_phase_b_progress_file_is_valid "$TMP/m.json" \
+        fedcba9876543210fedcba9876543210 active
+mutate "$PROGRESS_B_SHORT" "$TMP/m.json" \
+    'del(.samples[1].mempool_verbose[.samples[1].pow.mining_gate_lineage_head_txid])'
+reject 'wait_for_live rejects missing raw mempool-entry evidence' \
+    hotfix_phase_b_progress_file_is_valid "$TMP/m.json" \
+        fedcba9876543210fedcba9876543210 active
+mutate "$PROGRESS_B_SHORT" "$TMP/m.json" \
+    '.samples[3].recovery.component_details[0].nodes |= map(
+      if .txid == "'"$CLAIM4"'" then .relay_expiry_time=2000000000 else . end)'
+reject 'relay_existing rejects a relay TTL that is not future-bound to observation time' \
+    hotfix_phase_b_progress_file_is_valid "$TMP/m.json" \
+        fedcba9876543210fedcba9876543210 active
+mutate "$PROGRESS_B_SHORT" "$TMP/m.json" \
+    '.zero_hash_max_no_progress_tip_transitions=2'
+reject 'Phase-B cannot relax the one-transition zero-hash no-progress bound' \
+    hotfix_phase_b_progress_file_is_valid "$TMP/m.json" \
+        fedcba9876543210fedcba9876543210 active
 
 ok 'same-anchor persisted-pending claim proof accepted' hotfix_phase_a_claim_proof_file_is_valid "$CLAIM"
 for filter in '.candidate_created_qqsproof_txids=[]' \
@@ -2268,6 +2689,14 @@ ok 'Phase-A hard flags appear in exact source order' /bin/bash -c '
   expected="-walletbroadcast=0 -blocksonly=1 -staking=0 -autostartstaking=0 -powmining=0 -qqautoshadowsignal=0 -qqautodemurrageattest=0"
   [[ "$got" == "$expected" ]]
 ' _ "$PHASE_A"
+# shellcheck disable=SC2016 # The phase paths are passed to the isolated child shell.
+ok 'both phase producers bind verbose mempool cuts and the exact liveness bound' \
+    /bin/bash -c '
+      for file in "$1" "$2"; do
+        grep -Fq "getrawmempool true" "$file" &&
+          grep -Fq "zero_hash_max_no_progress_tip_transitions:1" "$file" || exit 1
+      done
+    ' _ "$PHASE_A" "$PHASE_B"
 # shellcheck disable=SC2016 # Intentional child-shell fixture; $1 expands there.
 ok 'Phase-A trap has no destructive data or old-image start call' /bin/bash -c '
   body=$(sed -n "/^on_exit()/,/^main()/p" "$1")

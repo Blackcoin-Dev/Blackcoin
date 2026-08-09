@@ -1155,7 +1155,7 @@ capture_final_envelope()
 collect_phase_b_progress()
 {
     local sample deadline previous_height=-1 previous_tip='' previous_work='' row rows='[]'
-    local chain recovery wallet staking pow network mode
+    local chain recovery wallet staking pow network mempool mode observed
     mode=$([[ "$baseline_pow_enabled" == true ]] && printf active || printf off)
     deadline=$((SECONDS + 2700))
     for sample in 1 2 3 4; do
@@ -1166,6 +1166,8 @@ collect_phase_b_progress()
             staking=$(rpc getstakinginfo) || return 1
             pow=$(rpc getpowmininginfo) || return 1
             network=$(rpc getnetworkinfo) || return 1
+            mempool=$(rpc getrawmempool true) || return 1
+            observed=$(date +%s) || return 1
             if [[ "$(jq -er '.blocks' <<<"$chain")" -gt "$previous_height" &&
                "$(jq -er '.bestblockhash' <<<"$chain")" != "$previous_tip" &&
                "$(jq -er '.chainwork' <<<"$chain")" > "$previous_work" ]] &&
@@ -1186,13 +1188,18 @@ collect_phase_b_progress()
                jq -e '.networkactive == true and .connections_out >= 3' \
                  <<<"$network" >/dev/null &&
                hotfix_phase_b_staking_json_is_active "$staking" &&
-               hotfix_candidate_pow_json_is_valid "$pow" "$mode"; then
-                row=$(jq -cn --argjson sample "$sample" --argjson observed "$(date +%s)" \
+               hotfix_candidate_pow_json_is_valid "$pow" "$mode" &&
+               hotfix_pow_observation_json_is_valid "$pow" "$recovery" "$mempool" \
+                 "$(jq -er '.bestblockhash' <<<"$chain")" \
+                 "$(jq -er '.blocks' <<<"$chain")" "$observed"; then
+                row=$(jq -cn --argjson sample "$sample" --argjson observed "$observed" \
                     --argjson chain "$chain" --argjson recovery "$recovery" \
                     --argjson wallet "$wallet" --argjson staking "$staking" \
-                    --argjson pow "$pow" --argjson network "$network" '
+                    --argjson pow "$pow" --argjson network "$network" \
+                    --argjson mempool "$mempool" '
                     {sample:$sample,observed_epoch:$observed,chain:$chain,recovery:$recovery,
-                     wallet:$wallet,staking:$staking,pow:$pow,network:$network}
+                     wallet:$wallet,staking:$staking,pow:$pow,network:$network,
+                     mempool_verbose:$mempool}
                 ') || return 1
                 rows=$(jq -cn --argjson rows "$rows" --argjson row "$row" '$rows + [$row]') ||
                     return 1
@@ -1207,9 +1214,10 @@ collect_phase_b_progress()
     done
     jq -S -n --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" --arg nonce "$promotion_nonce" \
         --argjson rows "$rows" '
-        {schema:1,phase:"B",candidate_source_sha:$source,promotion_nonce:$nonce,
+        {schema:2,phase:"B",candidate_source_sha:$source,promotion_nonce:$nonce,
          samples:$rows,tip_changes:3,wallet_chain_synchronized_continuously:true,
-         pos_active_continuously:true,p2p_ready_continuously:true}
+         pos_active_continuously:true,p2p_ready_continuously:true,
+         zero_hash_max_no_progress_tip_transitions:1}
     ' >"${EVIDENCE}/phase-b-progress.json" || return 1
     hotfix_phase_b_progress_file_is_valid "${EVIDENCE}/phase-b-progress.json" \
         "$promotion_nonce" "$mode"

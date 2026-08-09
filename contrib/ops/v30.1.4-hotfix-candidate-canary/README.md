@@ -164,6 +164,48 @@ absent from the local mempool/active chain, and absent from two independent
 observer mempools. Any observer failure is unclassifiable and prohibits the
 data operation.
 
+### Bounded zero-hash liveness
+
+Every Phase-A envelope and Phase-B progress sample includes a verbose raw
+mempool snapshot from the same stable cut as the typed PoW gate and recovery
+inventory. The common validator binds the chain tip and height across those
+objects and permits at most one advancing-tip transition while an enabled PoW
+worker remains at zero hashrate without a witnessed state advance. The bound
+applies to all five typed actions: `create_new_anchor`, `refresh_same_anchor`,
+`wait_for_live`, `wait_for_next_tip`, and `relay_existing`.
+
+Only these observations reset the bound:
+
+- positive hashrate under a submit-capable create or refresh action;
+- an increase in Core's `claims_submitted` counter;
+- a newly observed authenticated family or an exact append-only lineage
+  extension under the stable anchor-outpoint/root identity; or
+- growth of the exact authoritative live-txid set for that authenticated
+  component.
+
+The component generation fingerprint must remain stable for one
+anchor-outpoint/root identity. A lineage at the same ordinal must be
+byte-for-byte the same txid sequence; an extension must contain the prior
+sequence as an exact prefix. Every live txid is recorded when first observed,
+including the first sample and samples whose progress came from another
+witness, so a later mempool replay cannot become progress. A genuinely new
+live sibling may count once.
+
+For `wait_for_live`, every recovery member marked live must have an exact entry
+in the captured verbose mempool, with entry time no later than the observation
+and entry height at most one block behind the current height. For
+`relay_existing`, the exact relay txid must resolve to an eligible,
+not-in-mempool recovery member whose relay TTL is unexpired and whose expiry is
+later than the observation. `wait_for_next_tip` remains bound to the sampled
+current tip and to the same series-level budget.
+
+An action change, relay-txid change, candidate-state-fingerprint change,
+generation-fingerprint churn, or live/relay replay is not progress. Alternating
+otherwise safe actions therefore cannot reset the bound. One no-progress tip
+transition remains permitted so legitimate short waits and an unchanged
+candidate-state fingerprint across fresh tips are accepted; a second such
+transition fails closed.
+
 Authenticated lineaged origin-bound claims are deliberately retained on their
 confirmed anchor. Their normal lifecycle is exact-byte relay or an
 authenticated `refresh_same_anchor` continuation, without a recovery

@@ -47,12 +47,26 @@ PASS  Alternate 40-hex source, immutable v30.1.4 source, and nonexact release
       overrides fail the shared exact-identity predicate.
 PASS  Phase A and the offline verifier both bind exact R, PR base, and
       pr-gate.yml bytes.
+PASS  Phase A and Phase B capture same-cut `getrawmempool true` evidence and
+      enforce the exact one-transition zero-hash no-progress budget across all
+      five typed actions.
+PASS  Stable anchor/root identity, immutable generation fingerprint, exact
+      lineage prefix growth, and component-wide first-seen live-txid set
+      growth are bound to recovery and raw mempool evidence.
 
 Offline hostile fixture suite
 -----------------------------
-PASS  261/261 assertions on the frozen provisional-repin bytes.
-PASS  Independent hostile replay: 261/261 assertions, exit 0; exact package
-      hashes were unchanged before and after the replay.
+PASS  286/286 assertions on the frozen zero-hash-liveness bytes, exit 0.
+PASS  Hostile coverage rejects indefinite wait_for_live, wait_for_next_tip,
+      relay_existing, zero-hash create/refresh, alternating action/fingerprint
+      replay, live-txid replay, rewritten lineage, and family-generation churn.
+PASS  Positive coverage accepts a one-tip short wait, exact empty-family create
+      accounting, real hash/submission/lineage progress, older-member
+      relay-to-live progress, and first-seen live-set growth while a sibling
+      remains live.
+PASS  Independent read-only hostile review found no remaining series-contract
+      blocker. Its frozen-byte executable replay also passed 286/286, exit 0;
+      payload mtimes remained unchanged throughout that replay.
 
 Required positive modes remain Phase-A pre-rewind, Phase-A final, and Phase-B
 final with independent raw wallet-delta recomputation. New hostile evidence
@@ -64,8 +78,7 @@ Seal status
 PASS  SHA256SUMS binds the exact paths and bytes of all eight non-seal
       payloads. Strict checksum verification, the eight-payload/nine-file
       topology, and the no-symlink/special-object boundary pass. The final
-      validation bytes were resealed and replayed locally before commit; the
-      independent executable review is complete.
+      validation bytes were resealed and replayed locally before handoff.
 
 Not executed or claimed
 -----------------------

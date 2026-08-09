@@ -234,13 +234,18 @@ class GoldRushQQP3DuplicateClaimsTest(BitcoinTestFramework):
         node.createwallet(wallet_name="qqp3_claimants", load_on_startup=True)
         claimant = node.get_wallet_rpc("qqp3_claimants")
         claimant.staking(False)
+        node.createwallet(wallet_name="qqp3_claimants_b", load_on_startup=True)
+        claimant_b = node.get_wallet_rpc("qqp3_claimants_b")
+        claimant_b.staking(False)
 
         staking_address = node.get_deterministic_priv_key().address
         target_address = claimant.getnewaddress("qqp3-target", "legacy")
+        target_address_b = claimant_b.getnewaddress("qqp3-target-b", "legacy")
         self.log.info("Creating independent mature staking and claim inputs")
         self.generatetoaddress(node, 1, staking_address)
         self.generatetoaddress(node, COINBASE_MATURITY + 2, staking_address)
         self.generatetoaddress(node, COINBASE_MATURITY + 8, target_address)
+        self.generatetoaddress(node, COINBASE_MATURITY + 8, target_address_b)
         self._sync_mocktime_to_tip()
         self._wait_shadowindex()
         assert_equal(node.getquantumquasarinfo()["phase"], "gold_rush")
@@ -249,15 +254,22 @@ class GoldRushQQP3DuplicateClaimsTest(BitcoinTestFramework):
         assert_equal(state["qqp4_active_next_block"], False)
 
         payout_a = claimant.getnewquantumaddress()["address"]
-        payout_b = claimant.getnewquantumaddress()["address"]
+        payout_b = claimant_b.getnewquantumaddress()["address"]
         claim_a = claimant.sendshadowpowclaim(
             target_address, payout_a, 500_000
         )
-        claim_b = claimant.sendshadowpowclaim(
-            target_address, payout_b, 500_000
+        claim_b = claimant_b.sendshadowpowclaim(
+            target_address_b, payout_b, 500_000
         )
         raw_a = node.getrawtransaction(claim_a["txid"])
         raw_b = node.getrawtransaction(claim_b["txid"])
+        decoded_a = node.decoderawtransaction(raw_a)
+        decoded_b = node.decoderawtransaction(raw_b)
+        assert (
+            decoded_a["vin"][0]["txid"], decoded_a["vin"][0]["vout"]
+        ) != (
+            decoded_b["vin"][0]["txid"], decoded_b["vin"][0]["vout"]
+        )
 
         duplicate_fee = Decimal("0.005")
         duplicate_txid, duplicate_raw = self._raw_carrier(

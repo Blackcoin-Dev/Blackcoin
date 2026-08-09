@@ -5,26 +5,31 @@ source. It does not alter the immutable v30.1.4 rollout transaction and does not
 source any v30.1.4 operations library. It is currently **offline-only and
 nondeployable**.
 
-The release identity is presently unresolved and fail-closed:
+The signed source identity and provisional exact-SHA CI run are pinned, but
+the release remains fail-closed:
 
-- source commit: pending replacement final signed `H`
-- source tree: pending tree bound to `H`
+- source commit: `a0695f22740e111d0487a194fb46f1bae05952c5`
+- source tree: `86df040ae5eb8e819e940dd08364bcc177a72195`
 - signer fingerprint: `SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70`
 - network version: `300105`
 - subversion: `/Blackcoin:30.1.5/`
-- exact-SHA CI run: pending replacement successful run `R` bound to `H`
+- exact-SHA CI run: `31336502539`, attempt 1, `pull_request`, base
+  `19baffef25af36e177db2975780e0641b59753aa`, head-matched and still
+  `in_progress` with no successful conclusion recorded
 
-`rollout.env.example` deliberately contains unresolved CI, bundle, OCI,
+`rollout.env.example` deliberately contains an unresolved successful-CI
+conclusion plus unresolved bundle, OCI,
 binary, tooling, completed-Phase-B, package-seal, Compose, image-policy,
 post-reconcile proof, handoff-receipt, guard, node30 probe, and
 execution-authority values. Any one unresolved value prevents preflight.
 The candidate image must use the canonical immutable
 `qqblackcoin/blackcoin-v4-gui@sha256:...` reference; the historical
 `hotfix-candidate` naming convention is not rollout authority.
-`SHA256SUMS` seals the exact fourteen non-manifest files in this reviewed
-identity-neutral package. That byte seal is package-integrity evidence only;
-it is not rollout authority. The later H/R/bundle/OCI/Phase-B/handoff repin is
-a separate change and must regenerate both `VALIDATION.txt` and `SHA256SUMS`.
+`SHA256SUMS` seals the exact fourteen non-manifest files in this provisionally
+source/CI-bound package. That byte seal is package-integrity evidence only; it
+is not rollout authority. Recording a successful R conclusion and later
+bundle/OCI/Phase-B/handoff identities is a separate change and must regenerate
+both `VALIDATION.txt` and `SHA256SUMS`.
 
 ## Acceptance contract
 
@@ -200,8 +205,9 @@ fresh exact collision/live authority is recorded.
 No Core RPC/schema change is requested by this package. Before live clearance,
 the following external facts remain mandatory:
 
-1. final Blackcoin-Dev-signed source `H` and successful exact-SHA Core CI run
-   `R` (superseded checkpoints/runs are not authority);
+1. successful completion of exact-H Core CI run `31336502539`, or a separately
+   reviewed superseding signed H/R pair (superseded checkpoints are not
+   authority);
 2. sealed Linux x86_64 bundle, OCI, image ID/digest, tooling, and executable
    identities for the signed source;
 3. a complete verified Phase-A/Phase-B nine-path canary with Phase B promoted

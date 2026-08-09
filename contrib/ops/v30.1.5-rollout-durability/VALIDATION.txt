@@ -1,19 +1,26 @@
-IDENTITY-NEUTRAL OFFLINE VALIDATION RECORD — NOT ROLLOUT AUTHORITY
+PROVISIONAL SOURCE/CI-BOUND OFFLINE VALIDATION — NOT ROLLOUT AUTHORITY
 
 Source identity:
-  final signed commit H intentionally not embedded in this commit
-  exact tree bound to H intentionally not embedded in this commit
+  signed commit H a0695f22740e111d0487a194fb46f1bae05952c5
+  exact tree 86df040ae5eb8e819e940dd08364bcc177a72195
   required signer SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
+  GitHub signature verification: valid
   version 300105 / /Blackcoin:30.1.5/
 
 Exact-SHA Core CI:
-  successful run R bound to H intentionally not embedded in this commit
+  provisional run R 31336502539
+  head a0695f22740e111d0487a194fb46f1bae05952c5
+  workflow .github/workflows/pr-gate.yml / pull-request safety gate
+  event pull_request; attempt 1
+  base 19baffef25af36e177db2975780e0641b59753aa
+  status in_progress; GitHub conclusion is not populated
+  checked-in conclusion sentinel __PENDING_EXACT_SHA_CI_SUCCESS__
 
 Current offline package checks:
   Bash syntax: PASS
   ShellCheck -x, including the .sh.inc guard: PASS
-  exact sealed-byte hostile fixture suite: 151/151 PASS
-  independent exact sealed-byte hostile replay: 151/151 PASS
+  exact sealed-byte hostile fixture suite: 152/152 PASS
+  independent exact sealed-byte hostile replay: 152/152 PASS
   exact package inventory: 15/15 PASS
   SHA256SUMS exact 14-payload seal: PASS
   symlink, mode, whitespace, stale-pin, mutator/RPC scans: PASS
@@ -42,10 +49,10 @@ path), and missing/extra/tampered evidence.
 The suite accepts only the exact irreversible, snapshot-absent, no-rewind
 Phase-B marker/result schemas with shared Phase-A, package, tooling, script,
 verifier, and typed-contract identities. Mixed runs, packages, keys, tooling,
-data rewind, and unresolved CI fail closed.
+data rewind, and a non-successful CI conclusion fail closed.
 
 UNRESOLVED AND FAIL-CLOSED:
-  - final signed H/tree and successful exact-H CI run R identity repin
+  - successful conclusion of exact-H CI run 31336502539
   - sealed candidate bundle/OCI/image/binary/tooling identities
   - completed Phase-B RESULT and PROMOTED_NO_REWIND marker
   - nine-path canary seal
@@ -56,8 +63,9 @@ UNRESOLVED AND FAIL-CLOSED:
   - final identity-repinned package seal and its external manifest hash
   - nonce-bound live authority
 
-The current SHA256SUMS seals the reviewed identity-neutral package bytes. Any
-later identity, artifact, Phase-B, handoff, or authority repin invalidates this
-seal and requires a new validation record and manifest in the separate repin
-commit. Do not cite this record as canary, rollout, release, or fleet
+The current SHA256SUMS seals the provisional H/R package bytes. The pending
+success-conclusion sentinel and every remaining unresolved identity keep
+preflight fail-closed. Any superseding source/run, artifact, Phase-B, handoff,
+or authority repin invalidates this seal and requires a new validation record
+and manifest. Do not cite this record as canary, rollout, release, or fleet
 acceptance evidence.

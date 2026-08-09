@@ -1210,7 +1210,9 @@ cp "$env_file" "$placeholder_env"
 printf "CORE_CI_CONCLUSION='__PENDING__'\n" >>"$placeholder_env"
 expect_fail 'pending exact-SHA CI fails closed' bash -c \
   "source '$package_dir/lib/common.sh'; source '$placeholder_env'; v3015_validate_release_env"
-expect_fail 'unresolved final H/R template fails closed' bash -c \
+expect_pass 'template pins the provisional signed H, tree, run, and workflow' bash -c \
+  "source '$package_dir/rollout.env.example'; [[ \"\$SOURCE_SHA\" == a0695f22740e111d0487a194fb46f1bae05952c5 && \"\$SOURCE_TREE\" == 86df040ae5eb8e819e940dd08364bcc177a72195 && \"\$SOURCE_SIGNATURE_VERIFIED\" == 1 && \"\$CORE_CI_RUN_ID\" == 31336502539 && \"\$CORE_CI_HEAD_SHA\" == \"\$SOURCE_SHA\" && \"\$CORE_CI_CONCLUSION\" == __PENDING_EXACT_SHA_CI_SUCCESS__ && \"\$CORE_CI_WORKFLOW\" == .github/workflows/pr-gate.yml ]]"
+expect_fail 'provisional exact-H CI run remains fail-closed while in progress' bash -c \
   "source '$package_dir/lib/common.sh'; source '$package_dir/rollout.env.example'; v3015_validate_release_env"
 mixed_probe_env="$tmp/mixed-probe-tool.env"
 cp "$env_file" "$mixed_probe_env"
@@ -1269,7 +1271,7 @@ expect_pass 'runtime invocation binds actual container image identity' bash -c \
   "grep -Fq '.[0].Image == \$image_id' '$package_dir/native_restart_durability.sh' && grep -Fq '.[0].Image == \$image_id' '$package_dir/fleet_rollout.sh' && grep -Fq \"docker inspect -f '{{.Image}}'\" '$package_dir/fleet_rollout.sh'"
 # The single-quoted body is intentionally evaluated by the child Bash.
 # shellcheck disable=SC2016
-expect_pass 'identity-neutral package seal covers the exact fourteen payloads' bash -c '
+expect_pass 'provisional source/CI-bound seal covers the exact fourteen payloads' bash -c '
   set -euo pipefail
   package_dir=$1
   actual=$(cd "$package_dir" && find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort)

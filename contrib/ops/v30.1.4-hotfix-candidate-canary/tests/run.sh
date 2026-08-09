@@ -4,9 +4,9 @@ set -Eeuo pipefail
 
 ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P) || exit 1
 readonly ROOT
-# Production defaults are deliberately unresolved. Tests inject one synthetic,
-# internally coherent identity before sourcing the shared readonly contract.
-export HOTFIX_CANDIDATE_SOURCE_SHA='0123456789abcdef0123456789abcdef01234567'
+# Tests exercise the exact provisional Core pin while keeping the independent
+# candidate packaging run and artifact identities synthetic and unresolved.
+export HOTFIX_CANDIDATE_SOURCE_SHA='a0695f22740e111d0487a194fb46f1bae05952c5'
 export HOTFIX_CANDIDATE_RELEASE_VERSION='30.1.5'
 # shellcheck source=lib/typed_contract.sh
 # shellcheck source-path=SCRIPTDIR/..
@@ -956,14 +956,16 @@ make_candidate_identity_bundle()
        github_verification_reason:"valid",workflow_actor:"Blackcoin-Dev",
        workflow_triggering_actor:"Blackcoin-Dev"}
     ' >"$root/candidate-source-signature.json"
-    jq -S -n --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" '
+    jq -S -n --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" \
+      --arg base "$HOTFIX_EXPECTED_CORE_CI_PULL_REQUEST_BASE_SHA" \
+      --arg workflow_blob "$HOTFIX_EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256" \
+      --argjson run "$HOTFIX_EXPECTED_CORE_CI_RUN_ID" '
       {schema:1,workflow_path:".github/workflows/pr-gate.yml",
        workflow_name:"pull-request safety gate",event:"pull_request",
        repository:"Blackcoin-Dev/Blackcoin",head_repository:"Blackcoin-Dev/Blackcoin",
        pull_request_number:49,pull_request_head_sha:$source,
-       pull_request_base_sha:"1234567890123456789012345678901234567890",
-       workflow_blob_sha256:("6"*64),head_sha:$source,status:"completed",
-       conclusion:"success",run_id:1}
+       pull_request_base_sha:$base,workflow_blob_sha256:$workflow_blob,
+       head_sha:$source,status:"completed",conclusion:"success",run_id:$run}
     ' >"$root/candidate-core-ci.json"
     jq -S -n --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" \
       --arg base "$IMMUTABLE_V3014_IMAGE_DIGEST" --arg base_id "$IMMUTABLE_V3014_IMAGE_ID" \
@@ -1964,6 +1966,17 @@ mutate_json_in_place()
     mv "$temporary" "$file"
 }
 
+mutate_core_ci_fixture()
+{
+    local root="$1" filter="$2"
+    mutate_json_in_place "$root/candidate-core-ci.json" "$filter"
+    jq -S --slurpfile core "$root/candidate-core-ci.json" '
+      .core_ci=$core[0] | .authorization.core_ci_run_id=$core[0].run_id
+    ' "$root/candidate-bundle-manifest.json" >"$root/mutation.tmp"
+    mv "$root/mutation.tmp" "$root/candidate-bundle-manifest.json"
+    reseal_phase_a_pre_fixture "$root"
+}
+
 reseal_phase_a_pre_fixture()
 {
     local root="$1"
@@ -2022,16 +2035,52 @@ RESULT_A_SHA=$(sha256sum "$RESULT_A" | awk '{print $1}')
 make_marker "$RESULT_A_SHA" "$MARKER"
 make_phase_b_result "$RESULT_A_SHA" "$RESULT_B"
 
-ok 'synthetic candidate source/release identity is coherent' hotfix_candidate_identity_is_resolved
+ok 'provisional candidate source/release identity is exact' hotfix_candidate_identity_is_resolved
+ok 'provisional candidate prefix is exact' test "$HOTFIX_CANDIDATE_PREFIX" = \
+    'Blackcoin-30.1.5-candidate-a0695f22740e'
+ok 'provisional candidate archive name is exact' test "$HOTFIX_CANDIDATE_OCI_ARCHIVE_NAME" = \
+    'blackcoin-v4-gui-30.1.5-candidate-a0695f22740e.oci.tar'
+ok 'provisional candidate image tag is exact' test "$HOTFIX_CANDIDATE_IMAGE_TAG" = \
+    '30.1.5-candidate-a0695f22740e-ci1'
 ok 'candidate artifact name is exact and workflow-attempt-bound' test \
     "$(hotfix_candidate_artifact_name 7)" = \
     "v${HOTFIX_CANDIDATE_RELEASE_VERSION}-candidate-linux-x86_64-${HOTFIX_CANDIDATE_SOURCE_SHA}-attempt-7"
 reject 'zero workflow attempt cannot derive a candidate artifact' hotfix_candidate_artifact_name 0
-# shellcheck disable=SC2016 # The contract path is passed to the isolated child shell.
-reject 'unresolved committed candidate defaults remain nondeployable' \
+# shellcheck disable=SC2016 # The contract path is passed to isolated child shells.
+ok 'committed provisional defaults resolve only to the exact H and release' \
     /usr/bin/env -u HOTFIX_CANDIDATE_SOURCE_SHA -u HOTFIX_CANDIDATE_RELEASE_VERSION \
+        /bin/bash -c 'source "$1"; hotfix_candidate_identity_is_resolved &&
+          [[ "$HOTFIX_CANDIDATE_SOURCE_SHA" == a0695f22740e111d0487a194fb46f1bae05952c5 &&
+             "$HOTFIX_CANDIDATE_RELEASE_VERSION" == 30.1.5 ]]' \
+        _ "$ROOT/lib/typed_contract.sh"
+# shellcheck disable=SC2016 # The contract path is passed to isolated child shells.
+reject 'alternate valid candidate source override is rejected' \
+    /usr/bin/env HOTFIX_CANDIDATE_SOURCE_SHA=0123456789abcdef0123456789abcdef01234567 \
+        HOTFIX_CANDIDATE_RELEASE_VERSION=30.1.5 \
         /bin/bash -c 'source "$1"; hotfix_candidate_identity_is_resolved' \
         _ "$ROOT/lib/typed_contract.sh"
+# shellcheck disable=SC2016 # The contract path is passed to isolated child shells.
+reject 'immutable v30.1.4 source override is rejected' \
+    /usr/bin/env HOTFIX_CANDIDATE_SOURCE_SHA="$IMMUTABLE_V3014_SOURCE_SHA" \
+        HOTFIX_CANDIDATE_RELEASE_VERSION=30.1.5 \
+        /bin/bash -c 'source "$1"; hotfix_candidate_identity_is_resolved' \
+        _ "$ROOT/lib/typed_contract.sh"
+# shellcheck disable=SC2016 # The contract path is passed to isolated child shells.
+reject 'nonexact release override is rejected' \
+    /usr/bin/env HOTFIX_CANDIDATE_SOURCE_SHA="$HOTFIX_EXPECTED_CANDIDATE_SOURCE_SHA" \
+        HOTFIX_CANDIDATE_RELEASE_VERSION=30.1.4 \
+        /bin/bash -c 'source "$1"; hotfix_candidate_identity_is_resolved' \
+        _ "$ROOT/lib/typed_contract.sh"
+# shellcheck disable=SC2016 # The file paths are passed to the isolated child shell.
+ok 'Phase-A and offline verifier both bind exact Core run, base, and workflow bytes' \
+    /bin/bash -c '
+      for file in "$1" "$2"; do
+        grep -Fq HOTFIX_EXPECTED_CORE_CI_RUN_ID "$file" &&
+          grep -Fq HOTFIX_EXPECTED_CORE_CI_PULL_REQUEST_BASE_SHA "$file" &&
+          grep -Fq HOTFIX_EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256 "$file" || exit 1
+      done
+    ' _ "$ROOT/node27-v30.1.4-hotfix-candidate.no-recovery-spend.sh" \
+        "$ROOT/verify-evidence.sh"
 
 ok 'Phase-A exact invocation accepted' hotfix_invocation_file_is_valid "$INV_A" A "$IMAGE_ID" "$NONCE"
 ok 'Phase-B exact invocation accepted' hotfix_invocation_file_is_valid "$INV_B" B "$IMAGE_ID" "$NONCE"
@@ -2479,6 +2528,51 @@ EVIDENCE_B_FINAL="$TMP/evidence-phase-b-final"
 build_phase_a_pre_fixture "$EVIDENCE_A_PRE"
 ok 'full Phase-A pre-rewind evidence verifies' \
     run_fixture_verifier phase-a-pre-rewind "$EVIDENCE_A_PRE"
+
+HOSTILE_CORE_RUN="$TMP/evidence-hostile-core-run"
+clone_fixture_tree "$EVIDENCE_A_PRE" "$HOSTILE_CORE_RUN"
+mutate_core_ci_fixture "$HOSTILE_CORE_RUN" '.run_id=31336502538'
+reject 'resealed Core-CI evidence rejects a different successful run' \
+    run_fixture_verifier phase-a-pre-rewind "$HOSTILE_CORE_RUN"
+
+HOSTILE_CORE_PENDING="$TMP/evidence-hostile-core-pending"
+clone_fixture_tree "$EVIDENCE_A_PRE" "$HOSTILE_CORE_PENDING"
+mutate_core_ci_fixture "$HOSTILE_CORE_PENDING" '.status="in_progress" | .conclusion=null'
+reject 'resealed provisional Core-CI evidence cannot authorize while pending' \
+    run_fixture_verifier phase-a-pre-rewind "$HOSTILE_CORE_PENDING"
+
+HOSTILE_CORE_FAILURE="$TMP/evidence-hostile-core-failure"
+clone_fixture_tree "$EVIDENCE_A_PRE" "$HOSTILE_CORE_FAILURE"
+mutate_core_ci_fixture "$HOSTILE_CORE_FAILURE" '.status="completed" | .conclusion="failure"'
+reject 'resealed completed Core-CI failure cannot authorize' \
+    run_fixture_verifier phase-a-pre-rewind "$HOSTILE_CORE_FAILURE"
+
+HOSTILE_CORE_BASE="$TMP/evidence-hostile-core-base"
+clone_fixture_tree "$EVIDENCE_A_PRE" "$HOSTILE_CORE_BASE"
+mutate_core_ci_fixture "$HOSTILE_CORE_BASE" \
+    '.pull_request_base_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+reject 'resealed Core-CI evidence rejects a different pull-request base' \
+    run_fixture_verifier phase-a-pre-rewind "$HOSTILE_CORE_BASE"
+
+HOSTILE_CORE_WORKFLOW="$TMP/evidence-hostile-core-workflow"
+clone_fixture_tree "$EVIDENCE_A_PRE" "$HOSTILE_CORE_WORKFLOW"
+mutate_core_ci_fixture "$HOSTILE_CORE_WORKFLOW" \
+    '.workflow_blob_sha256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
+reject 'resealed Core-CI evidence rejects different pr-gate bytes' \
+    run_fixture_verifier phase-a-pre-rewind "$HOSTILE_CORE_WORKFLOW"
+
+HOSTILE_CORE_HEAD="$TMP/evidence-hostile-core-head"
+clone_fixture_tree "$EVIDENCE_A_PRE" "$HOSTILE_CORE_HEAD"
+mutate_core_ci_fixture "$HOSTILE_CORE_HEAD" \
+    '.head_sha="cccccccccccccccccccccccccccccccccccccccc" | .pull_request_head_sha=.head_sha'
+reject 'resealed Core-CI evidence rejects a different head' \
+    run_fixture_verifier phase-a-pre-rewind "$HOSTILE_CORE_HEAD"
+
+HOSTILE_CORE_EVENT="$TMP/evidence-hostile-core-event"
+clone_fixture_tree "$EVIDENCE_A_PRE" "$HOSTILE_CORE_EVENT"
+mutate_core_ci_fixture "$HOSTILE_CORE_EVENT" '.event="workflow_dispatch"'
+reject 'resealed Core-CI evidence rejects a non-PR event' \
+    run_fixture_verifier phase-a-pre-rewind "$HOSTILE_CORE_EVENT"
 
 TOOLING_BAD_HASH=$(printf 'a%.0s' {1..64})
 for field in package_sha256sums_sha256 phase_a_script_sha256 phase_b_script_sha256 \

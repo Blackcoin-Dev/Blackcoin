@@ -238,30 +238,38 @@ verify_candidate_identity()
         .workflow_actor == "Blackcoin-Dev" and
         .workflow_triggering_actor == "Blackcoin-Dev"
     ' "$signature" >/dev/null || die 'candidate signature identity failed'
-    jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" '
+    jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" \
+        --argjson expected_core_run "$HOTFIX_EXPECTED_CORE_CI_RUN_ID" \
+        --arg expected_core_base "$HOTFIX_EXPECTED_CORE_CI_PULL_REQUEST_BASE_SHA" \
+        --arg expected_workflow_blob "$HOTFIX_EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256" '
         .schema == 1 and .workflow_path == ".github/workflows/pr-gate.yml" and
         .workflow_name == "pull-request safety gate" and
         .event == "pull_request" and .repository == "Blackcoin-Dev/Blackcoin" and
         .head_repository == "Blackcoin-Dev/Blackcoin" and .pull_request_number == 49 and
         .pull_request_head_sha == $source and .head_sha == $source and
-        (.pull_request_base_sha | type == "string" and test("^[0-9a-f]{40}$")) and
-        (.workflow_blob_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+        .pull_request_base_sha == $expected_core_base and
+        .workflow_blob_sha256 == $expected_workflow_blob and
         .status == "completed" and .conclusion == "success" and
-        (.run_id | type == "number" and floor == . and . > 0)
+        .run_id == $expected_core_run
     ' "$core_ci" >/dev/null || die 'Core CI identity failed'
     jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" \
         --arg classification "$HOTFIX_CANDIDATE_CLASSIFICATION" \
         --arg prefix "$HOTFIX_CANDIDATE_PREFIX" \
         --arg release "$HOTFIX_CANDIDATE_RELEASE_VERSION" \
         --arg workflow_path "$HOTFIX_CANDIDATE_WORKFLOW_PATH" \
-        --argjson core_run "$(jq -er '.run_id' "$core_ci")" '
+        --argjson expected_core_run "$HOTFIX_EXPECTED_CORE_CI_RUN_ID" \
+        --arg expected_core_base "$HOTFIX_EXPECTED_CORE_CI_PULL_REQUEST_BASE_SHA" \
+        --arg expected_workflow_blob "$HOTFIX_EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256" '
         .schema == 1 and .classification == $classification and
         .package == {name:$prefix,version:$release,platform:"linux/amd64"} and
         .source.commit == $source and .source.signature.commit == $source and
-        .core_ci.head_sha == $source and .core_ci.run_id == $core_run and
-        .core_ci.conclusion == "success" and
+        .core_ci.head_sha == $source and .core_ci.run_id == $expected_core_run and
+        .core_ci.status == "completed" and .core_ci.conclusion == "success" and
+        .core_ci.pull_request_base_sha == $expected_core_base and
+        .core_ci.workflow_blob_sha256 == $expected_workflow_blob and
         .authorization == {state:"authorized_exact_signed_source_and_green_ci",
-          dispatch_enabled:true,temporary_source_pin:false,core_ci_run_id:$core_run} and
+          dispatch_enabled:true,temporary_source_pin:false,
+          core_ci_run_id:$expected_core_run} and
         .build.workflow_path == $workflow_path and
         .build.workflow_definition_commit == .build.tooling_commit and
         (.build.workflow_run_id | type == "number" and floor == . and . > 0) and

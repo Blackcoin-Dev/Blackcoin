@@ -1,81 +1,76 @@
-IDENTITY-NEUTRAL OFFLINE CHECKPOINT — NOT EXECUTION AUTHORITY
-=============================================================
+PROVISIONAL SOURCE/RUN-BOUND CHECKPOINT — NOT EXECUTION AUTHORITY
+================================================================
 
 NONDEPLOYABLE CHECKPOINT
 ------------------------
-These nine-path two-phase canary bytes deliberately contain no mutable Core
-candidate identity. The only candidate identity inputs are:
+These nine-path two-phase canary bytes provisionally bind:
 
-  HOTFIX_CANDIDATE_SOURCE_SHA=__40_HEX_CANDIDATE_SOURCE_SHA__
-  HOTFIX_CANDIDATE_RELEASE_VERSION=__CANDIDATE_RELEASE_SEMVER__
+  Candidate Core source:
+    a0695f22740e111d0487a194fb46f1bae05952c5
+  Candidate source tree:
+    86df040ae5eb8e819e940dd08364bcc177a72195
+  Candidate release:
+    30.1.5
+  Expected Core PR safety run:
+    31336502539 — PENDING, NOT AUTHORIZATION
+  Expected PR base:
+    19baffef25af36e177db2975780e0641b59753aa
+  Expected pr-gate.yml SHA-256:
+    24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869
 
-Phase A, Phase B, and verify-evidence.sh reject the committed unresolved values.
-The release input is accepted only as exact v30.1.5. Candidate paths,
-confirmations, bundle names, OCI archive name, manifest package version, OCI
-version label, and the ci1 local image tag are derived from and checked against
-the injected source/release inputs. The GitHub artifact name is additionally
-bound to the mandatory workflow run attempt. These derivations match the
-current reviewed v30.1.5 adapter profile; its final signed tooling/workflow
-commit is still unresolved and is not authority. Candidate run, workflow,
-bundle, image, and payload identities remain explicit fail-closed placeholders
-in candidate.env.example.
+GitHub verifies H with the Blackcoin-Dev SSH signature and fingerprint
+SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70. Phase A and the offline
+verifier require exact R to report status completed and conclusion success.
+Pending, failed, cancelled, superseded-run, wrong-head, wrong-base,
+wrong-workflow, and non-pull-request evidence fails closed.
 
-Scope
------
-Candidate Core source: UNRESOLVED
-Candidate release version: UNRESOLVED
-Candidate Core CI run: UNRESOLVED
-Candidate adapter tooling/workflow commit: UNRESOLVED
-Candidate bundle/OCI/binary identities: UNRESOLVED
-Immutable rollback source: 13262151077cce3f72d07d17dc7725b2b6a8e1ab
-Immutable rollback manifest: sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2
-Immutable rollback config: sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909
+Run 31336502539 is the Core qualification run, not the candidate packaging
+workflow run. Candidate packaging workflow commit/run/attempt, adapter tooling
+commit, bundle, OCI graph, image, provenance, and all six binary identities
+remain unresolved. Phase-A/Phase-B evidence, live Compose/guard identities,
+and both operator confirmations also remain unresolved. No live phase can pass
+preflight.
 
 The historical Phase-A/Phase-B filenames, v30.1.4 snapshot names, deployed
 guard-compatible transaction names, immutable rollback image identities, and
 immutable final-canary byte pins are intentionally unchanged.
 
-Current identity-neutral gates
-------------------------------
+Offline gates
+-------------
 PASS  Bash syntax for both phase scripts, typed_contract.sh,
       verify-evidence.sh, and candidate.env.example.
 PASS  ShellCheck -x for the same shell inputs, with no findings.
-PASS  Diff whitespace check for the identity-neutral file boundary.
-PASS  Exact stale-candidate-pin search outside excluded tests/run.sh and
-      SHA256SUMS: no stale candidate source pin remains.
-PASS  Unresolved committed identity is rejected by the shared identity
-      predicate.
-PASS  Synthetic injected source/release identities produce coherent derived
-      prefix, artifact, archive, image-version, and Phase confirmation values
-      under the reviewed v30.1.5 adapter profile without changing committed
-      source.
+PASS  Diff whitespace check for the provisional repin boundary.
+PASS  Exact H/release identity and derived prefix, attempt-bound artifact,
+      archive, ci1 image tag, and Phase confirmations.
+PASS  Alternate 40-hex source, immutable v30.1.4 source, and nonexact release
+      overrides fail the shared exact-identity predicate.
+PASS  Phase A and the offline verifier both bind exact R, PR base, and
+      pr-gate.yml bytes.
 
 Offline hostile fixture suite
 -----------------------------
-PASS  247/247 assertions in 114 seconds (run 20260809T202245Z).
-PASS  Phase-A pre-rewind, Phase-A final, and Phase-B final positive evidence
-      directories, including independent raw wallet-delta recomputation.
-PASS  Synthetic source 0123456789abcdef0123456789abcdef01234567,
-      release 30.1.5, and workflow attempt 7 produce the exact reviewed
-      adapter classification, prefix, artifact, archive, ci1 image tag,
-      workflow path, and OCI labels; unresolved defaults reject.
-PASS  Phase A, Phase B, typed contract, verifier, and tests/run.sh SHA-256
-      identities were captured before the run and were byte-identical after it.
-PASS  Post-run Bash syntax, ShellCheck 0.11.0 -x, and diff checks.
+PASS  261/261 assertions on the frozen provisional-repin bytes.
+PASS  Independent hostile replay: 261/261 assertions, exit 0; exact package
+      hashes were unchanged before and after the replay.
+
+Required positive modes remain Phase-A pre-rewind, Phase-A final, and Phase-B
+final with independent raw wallet-delta recomputation. New hostile evidence
+must reject a different successful run, pending/null conclusion, completed
+failure, wrong PR base, wrong workflow bytes, wrong head, and non-PR event.
 
 Seal status
 -----------
-PASS  SHA256SUMS binds the exact relative paths and bytes of all eight non-seal
-      payloads; checksum verification and the exact nine-path inventory pass.
-      Unresolved candidate inputs still fail closed under this current seal.
-      The later final identity-repin commit must bind the approved signed
-      candidate source, successful exact-SHA Core CI run, signed adapter,
-      sealed artifact/OCI/binary identities, and all nine package paths, then
-      regenerate and revalidate the seal again before live use.
+PASS  SHA256SUMS binds the exact paths and bytes of all eight non-seal
+      payloads. Strict checksum verification, the eight-payload/nine-file
+      topology, and the no-symlink/special-object boundary pass. The final
+      validation bytes were resealed and replayed locally before commit; the
+      independent executable review is complete.
 
 Not executed or claimed
 -----------------------
-No Docker command, network request, GitHub mutation, workflow dispatch, artifact
-build/download/load, wallet RPC, container change, ZFS operation, live canary,
-or fleet action was performed. No final candidate source, CI run, package,
-artifact, image, or release identity is claimed by this checkpoint.
+No Docker command, network mutation, GitHub mutation, workflow dispatch,
+artifact build/download/load, wallet RPC, container change, ZFS operation,
+live canary, or fleet action was performed. No successful Core-CI result,
+candidate package, artifact, image, or release authority is claimed by this
+checkpoint.

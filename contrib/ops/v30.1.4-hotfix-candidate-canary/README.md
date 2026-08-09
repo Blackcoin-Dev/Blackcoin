@@ -4,16 +4,22 @@ This directory contains a candidate-only, two-phase node 27 transaction for a
 post-v30.1.4 correction candidate for v30.1.5. It is not an alteration of the
 immutable v30.1.4 release or final canary.
 
-The current tooling bytes are deliberately candidate-identity-neutral and
-nondeployable. No mutable candidate source, Core-CI run, adapter tooling
-commit, artifact run, or image digest is committed. A reviewed environment must inject
-`HOTFIX_CANDIDATE_SOURCE_SHA` and `HOTFIX_CANDIDATE_RELEASE_VERSION`; every
-derived name and every sealed bundle identity must then agree with those two
-values. The release input is accepted only when it is exactly `30.1.5`.
-Unresolved placeholders fail Phase A, Phase B, and evidence-verifier preflight.
-A later, separate repin must bind the final Blackcoin-Dev-signed source commit,
-successful exact-SHA Core CI run, signed adapter tooling/workflow commit, and
-sealed candidate artifact identities before either live phase may run.
+The current tooling bytes are provisionally pinned to Blackcoin-Dev-signed
+source `a0695f22740e111d0487a194fb46f1bae05952c5` (tree
+`86df040ae5eb8e819e940dd08364bcc177a72195`) and expected Core safety run
+`31336502539`. That run remains pending and is not execution authority. The
+exact PR base `19baffef25af36e177db2975780e0641b59753aa` and unchanged
+`.github/workflows/pr-gate.yml` SHA-256
+`24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869`
+are also pinned. Phase A and the offline verifier require the exact run to be
+`completed` with conclusion `success`; queued, in-progress, failed,
+superseded-run, wrong-base, or wrong-workflow evidence fails closed.
+
+Run `31336502539` qualifies Core only. It is not the later candidate packaging
+run. The signed adapter tooling/workflow commit, candidate workflow run and
+attempt, bundle, OCI graph, image ID, provenance, and six-binary ledger remain
+unresolved. Their placeholders fail Phase A, Phase B, and evidence-verifier
+preflight. The release input is accepted only when it is exactly `30.1.5`.
 
 The naming and metadata predicates match the current reviewed v30.1.5 adapter
 profile: `Blackcoin-30.1.5-candidate-<source12>`, GitHub artifact
@@ -63,12 +69,12 @@ Phase A never invokes Phase B.
 9. `SHA256SUMS`.
 
 The current `SHA256SUMS` binds the exact paths and bytes of all eight non-seal
-identity-neutral payloads. The frozen offline hostile suite passed 247/247
-assertions in 114 seconds with all tested package hashes unchanged. Unresolved
-candidate identity inputs remain independently fail closed under that seal, so
-it is not execution authority. The later final signed v30.1.5
-source/CI/adapter/bundle repin is a separate commit and must regenerate and
-revalidate the seal again. Live preflight treats `SHA256SUMS` as the ninth
+provisionally source/run-bound payloads. The frozen offline hostile suite binds
+the exact source, Core run, PR base, and workflow bytes and rejects pending or
+non-success Core-CI evidence. Unresolved packaging and live identities remain
+independently fail closed under that seal, so it is not execution authority.
+Recording the terminal successful run and the later adapter/bundle identities
+must regenerate and revalidate the seal. Live preflight treats `SHA256SUMS` as the ninth
 required regular file and rejects extra or non-regular objects, symlinks,
 unsafe ownership or modes, and multiply linked files.
 

@@ -4,13 +4,17 @@
 
 export LC_ALL=C
 
-# Candidate identity is injected by the reviewed environment. Committed defaults
-# are deliberately unresolved so these bytes cannot authorize a stale candidate.
-: "${HOTFIX_CANDIDATE_SOURCE_SHA:=__40_HEX_CANDIDATE_SOURCE_SHA__}"
-: "${HOTFIX_CANDIDATE_RELEASE_VERSION:=__CANDIDATE_RELEASE_SEMVER__}"
+readonly HOTFIX_EXPECTED_RELEASE_VERSION='30.1.5'
+readonly HOTFIX_EXPECTED_CANDIDATE_SOURCE_SHA='a0695f22740e111d0487a194fb46f1bae05952c5'
+readonly HOTFIX_EXPECTED_CORE_CI_RUN_ID='31336502539'
+readonly HOTFIX_EXPECTED_CORE_CI_PULL_REQUEST_BASE_SHA='19baffef25af36e177db2975780e0641b59753aa'
+readonly HOTFIX_EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256='24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869'
+# Candidate source/release may be supplied by a reviewed environment, but the
+# exact equality predicate below prevents overriding this sealed provisional pin.
+: "${HOTFIX_CANDIDATE_SOURCE_SHA:=$HOTFIX_EXPECTED_CANDIDATE_SOURCE_SHA}"
+: "${HOTFIX_CANDIDATE_RELEASE_VERSION:=$HOTFIX_EXPECTED_RELEASE_VERSION}"
 readonly HOTFIX_CANDIDATE_SOURCE_SHA HOTFIX_CANDIDATE_RELEASE_VERSION
 readonly HOTFIX_CANDIDATE_SHORT_SHA="${HOTFIX_CANDIDATE_SOURCE_SHA:0:12}"
-readonly HOTFIX_EXPECTED_RELEASE_VERSION='30.1.5'
 readonly HOTFIX_CANDIDATE_CLASSIFICATION='V30_1_5_CANDIDATE_CANARY_ONLY'
 readonly HOTFIX_CANDIDATE_WORKFLOW_PATH='.github/workflows/v30.1.5-candidate-linux.yml'
 readonly IMMUTABLE_V3014_SOURCE_SHA='13262151077cce3f72d07d17dc7725b2b6a8e1ab'
@@ -55,6 +59,7 @@ hotfix_valid_nonce()
 hotfix_candidate_identity_is_resolved()
 {
     hotfix_valid_git_sha "$HOTFIX_CANDIDATE_SOURCE_SHA" &&
+        [[ "$HOTFIX_CANDIDATE_SOURCE_SHA" == "$HOTFIX_EXPECTED_CANDIDATE_SOURCE_SHA" ]] &&
         [[ "$HOTFIX_CANDIDATE_SOURCE_SHA" != "$IMMUTABLE_V3014_SOURCE_SHA" ]] &&
         [[ "$HOTFIX_CANDIDATE_RELEASE_VERSION" == "$HOTFIX_EXPECTED_RELEASE_VERSION" ]] &&
         [[ "$HOTFIX_CANDIDATE_PREFIX" == \

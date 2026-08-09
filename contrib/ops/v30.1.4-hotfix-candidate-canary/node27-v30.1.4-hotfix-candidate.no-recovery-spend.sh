@@ -498,9 +498,11 @@ verify_bundle_identity()
         --arg fingerprint "$HOTFIX_SIGNING_FINGERPRINT" \
         --arg tooling "$CANDIDATE_TOOLING_COMMIT" \
         --arg workflow_commit "$CANDIDATE_WORKFLOW_DEFINITION_COMMIT" \
+        --argjson expected_core_run "$HOTFIX_EXPECTED_CORE_CI_RUN_ID" \
+        --arg expected_core_base "$HOTFIX_EXPECTED_CORE_CI_PULL_REQUEST_BASE_SHA" \
+        --arg expected_workflow_blob "$HOTFIX_EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256" \
         --argjson run_id "$CANDIDATE_GITHUB_RUN_ID" \
         --argjson run_attempt "$CANDIDATE_GITHUB_RUN_ATTEMPT" \
-        --argjson core_run_id "$(jq -er '.run_id' "$CANDIDATE_CORE_CI")" \
         --arg toolchain "${CANDIDATE_TOOLCHAIN##*/}" \
         --arg toolchain_sha "$CANDIDATE_TOOLCHAIN_SHA256" \
         --arg base_manifest "$IMMUTABLE_V3014_IMAGE_DIGEST" \
@@ -522,7 +524,7 @@ verify_bundle_identity()
         .source.signature.workflow_actor == "Blackcoin-Dev" and
         .source.signature.workflow_triggering_actor == "Blackcoin-Dev" and
         .core_ci.head_sha == $source and .core_ci.status == "completed" and
-        .core_ci.conclusion == "success" and .core_ci.run_id == $core_run_id and
+        .core_ci.conclusion == "success" and .core_ci.run_id == $expected_core_run and
         .core_ci.workflow_path == ".github/workflows/pr-gate.yml" and
         .core_ci.workflow_name == "pull-request safety gate" and
         .core_ci.event == "pull_request" and
@@ -530,11 +532,11 @@ verify_bundle_identity()
         .core_ci.head_repository == "Blackcoin-Dev/Blackcoin" and
         .core_ci.pull_request_number == 49 and
         .core_ci.pull_request_head_sha == $source and
-        (.core_ci.pull_request_base_sha | type == "string" and test("^[0-9a-f]{40}$")) and
-        (.core_ci.workflow_blob_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
-        (.core_ci.run_id | type == "number" and floor == . and . > 0) and
+        .core_ci.pull_request_base_sha == $expected_core_base and
+        .core_ci.workflow_blob_sha256 == $expected_workflow_blob and
         .authorization == {state:"authorized_exact_signed_source_and_green_ci",
-          dispatch_enabled:true,temporary_source_pin:false,core_ci_run_id:$core_run_id} and
+          dispatch_enabled:true,temporary_source_pin:false,
+          core_ci_run_id:$expected_core_run} and
         .build.tooling_commit == $tooling and
         .build.workflow_definition_commit == $workflow_commit and
         .build.workflow_path == $workflow_path and
@@ -598,16 +600,19 @@ verify_bundle_identity()
         .workflow_actor == "Blackcoin-Dev" and
         .workflow_triggering_actor == "Blackcoin-Dev"
     ' "$CANDIDATE_SOURCE_SIGNATURE" >/dev/null || return 1
-    jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" '
+    jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" \
+        --argjson expected_core_run "$HOTFIX_EXPECTED_CORE_CI_RUN_ID" \
+        --arg expected_core_base "$HOTFIX_EXPECTED_CORE_CI_PULL_REQUEST_BASE_SHA" \
+        --arg expected_workflow_blob "$HOTFIX_EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256" '
         .schema == 1 and .workflow_path == ".github/workflows/pr-gate.yml" and
         .workflow_name == "pull-request safety gate" and
         .event == "pull_request" and .repository == "Blackcoin-Dev/Blackcoin" and
         .head_repository == "Blackcoin-Dev/Blackcoin" and .pull_request_number == 49 and
         .pull_request_head_sha == $source and .head_sha == $source and
-        (.pull_request_base_sha | type == "string" and test("^[0-9a-f]{40}$")) and
-        (.workflow_blob_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+        .pull_request_base_sha == $expected_core_base and
+        .workflow_blob_sha256 == $expected_workflow_blob and
         .status == "completed" and .conclusion == "success" and
-        (.run_id | type == "number" and floor == . and . > 0)
+        .run_id == $expected_core_run
     ' "$CANDIDATE_CORE_CI" >/dev/null || return 1
     jq -e --arg archive "${CANDIDATE_OCI_ARCHIVE##*/}" \
         --arg sha "$CANDIDATE_OCI_ARCHIVE_SHA256" '

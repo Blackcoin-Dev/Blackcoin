@@ -2454,6 +2454,138 @@ BOOST_AUTO_TEST_CASE(component_adoption_has_typed_atomic_outcomes)
     BOOST_CHECK(!unsafe_abandoned.durable_state_changed);
 }
 
+BOOST_AUTO_TEST_CASE(recovery_signing_authority_modes_fail_closed_without_mutation)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    BOOST_REQUIRE(tip->pprev);
+
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        anchor, anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.at(0).scriptPubKey);
+    AddRecoveryTestClaim(*wallet, claim, tip->pprev->nHeight,
+                         tip->pprev->GetBlockHash(), tip->pprev->nHeight,
+                         tip->pprev->GetBlockHash());
+
+    wallet->SetBroadcastTransactions(/*broadcast=*/true);
+    wallet->m_pow_mining_enabled.store(true);
+    ShadowPowClaimRecoveryPolicy policy =
+        DefaultShadowPowClaimRecoveryPolicy();
+    policy.choice_recorded = 1;
+    policy.automatic_enabled = 1;
+    policy.minimum_stale_blocks = 1;
+    bilingual_str policy_error;
+    BOOST_REQUIRE(wallet->SetShadowPowClaimRecoveryPolicy(policy,
+                                                          policy_error));
+
+    ShadowPowClaimRecoveryRequest request;
+    request.origin = ShadowPowClaimRecoveryOrigin::AUTOMATIC;
+    request.selectors = {claim->GetHash()};
+    const ShadowPowClaimRecoveryPlan available =
+        wallet->PlanShadowPowClaimRecovery(request);
+    BOOST_REQUIRE(available.complete);
+    BOOST_CHECK(available.refused.empty());
+    BOOST_REQUIRE_EQUAL(available.actions.size(), 1U);
+
+    const size_t wallet_records_before = WITH_LOCK(
+        wallet->cs_wallet, return wallet->mapWallet.size());
+    const unsigned long mempool_size_before = Assert(m_node.mempool)->size();
+    const ShadowPowClaimRecoveryUsage usage_before =
+        wallet->GetShadowPowClaimRecoveryUsage(
+            policy.rolling_fee_window_seconds);
+
+    const auto assert_signing_unavailable = [&]() {
+        const ShadowPowClaimRecoveryPlan refused =
+            wallet->PlanShadowPowClaimRecovery(request);
+        BOOST_REQUIRE(refused.complete);
+        BOOST_CHECK(refused.actions.empty());
+        BOOST_REQUIRE_EQUAL(refused.refused.size(), 1U);
+        BOOST_CHECK_EQUAL(refused.refused.front().reason_code,
+                          "wallet-signing-unavailable");
+
+        const ShadowPowClaimRecoveryInventory inventory =
+            wallet->GetShadowPowClaimRecoveryInventory();
+        const auto& component = FindRecoveryComponent(inventory, anchor);
+        const ShadowPowClaimRecoveryAdoptionResult adoption =
+            wallet->AdoptShadowPowClaimRecoveryComponent(
+                claim->GetHash(), inventory.active_tip,
+                component.fingerprint);
+        BOOST_CHECK(adoption.status ==
+                    ShadowPowClaimRecoveryAdoptionStatus::SIGNING_UNAVAILABLE);
+        BOOST_CHECK(!adoption.IsSuccess());
+        BOOST_CHECK(!adoption.adopted);
+        BOOST_CHECK(!adoption.durable_state_changed);
+        BOOST_CHECK(!adoption.durable_state_ambiguous);
+
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,
+                                    return wallet->mapWallet.size()),
+                          wallet_records_before);
+        BOOST_CHECK_EQUAL(Assert(m_node.mempool)->size(),
+                          mempool_size_before);
+        const ShadowPowClaimRecoveryUsage usage_after =
+            wallet->GetShadowPowClaimRecoveryUsage(
+                policy.rolling_fee_window_seconds);
+        BOOST_CHECK_EQUAL(usage_after.pending_manual,
+                          usage_before.pending_manual);
+        BOOST_CHECK_EQUAL(usage_after.pending_automatic,
+                          usage_before.pending_automatic);
+        BOOST_CHECK_EQUAL(usage_after.confirmed_manual,
+                          usage_before.confirmed_manual);
+        BOOST_CHECK_EQUAL(usage_after.confirmed_automatic,
+                          usage_before.confirmed_automatic);
+        BOOST_CHECK_EQUAL(usage_after.confirmed_resolution_fees,
+                          usage_before.confirmed_resolution_fees);
+        BOOST_CHECK_EQUAL(usage_after.automatic_actions_in_window,
+                          usage_before.automatic_actions_in_window);
+        BOOST_CHECK_EQUAL(usage_after.automatic_fee_exposure_in_window,
+                          usage_before.automatic_fee_exposure_in_window);
+    };
+
+    // Canonical watch-only wallets use DISABLE_PRIVATE_KEYS. Exercise that
+    // exact recovery-signing gate on a wallet with pre-existing claim history,
+    // as can occur after import or migration.
+    wallet->SetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+    BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));
+    BOOST_CHECK(!wallet->HasPrivateKeys());
+    assert_signing_unavailable();
+
+    // A production external-signer wallet necessarily has private keys
+    // disabled. It must produce the same typed refusal and no wallet mutation.
+    wallet->SetWalletFlag(WALLET_FLAG_EXTERNAL_SIGNER);
+    BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
+    BOOST_CHECK(!wallet->HasPrivateKeys());
+    assert_signing_unavailable();
+
+    // Also exercise the explicit external-signer disjunct independently. The
+    // wallet factory rejects this flag combination, but a malformed or migrated
+    // record must still fail closed rather than reach signing.
+    wallet->UnsetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+    BOOST_CHECK(wallet->HasPrivateKeys());
+    BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
+    assert_signing_unavailable();
+
+    wallet->UnsetWalletFlag(WALLET_FLAG_EXTERNAL_SIGNER);
+    const ShadowPowClaimRecoveryPlan restored =
+        wallet->PlanShadowPowClaimRecovery(request);
+    BOOST_REQUIRE(restored.complete);
+    BOOST_CHECK(restored.refused.empty());
+    BOOST_REQUIRE_EQUAL(restored.actions.size(), 1U);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,
+                                return wallet->mapWallet.size()),
+                      wallet_records_before);
+}
+
 BOOST_AUTO_TEST_CASE(component_adoption_fails_closed_for_unsafe_and_ambiguous_state)
 {
     RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,

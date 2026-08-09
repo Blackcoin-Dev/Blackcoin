@@ -704,7 +704,8 @@ class CWallet final : public WalletStorage, public interfaces::Chain::Notificati
 private:
     CKeyingMaterial vMasterKey GUARDED_BY(cs_wallet);
 
-    bool Unlock(const CKeyingMaterial& vMasterKeyIn, bool accept_no_keys = false);
+    bool Unlock(const CKeyingMaterial& vMasterKeyIn, bool accept_no_keys = false,
+                std::optional<bool> staking_only = std::nullopt);
 
     struct QuantumKeyRecord
     {
@@ -1150,7 +1151,8 @@ public:
     // Used to prevent deleting the passphrase from memory when it is still in use.
     RecursiveMutex m_relock_mutex;
 
-    bool Unlock(const SecureString& strWalletPassphrase, bool accept_no_keys = false);
+    bool Unlock(const SecureString& strWalletPassphrase, bool accept_no_keys = false,
+                std::optional<bool> staking_only = std::nullopt);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
     bool EncryptWallet(const SecureString& strWalletPassphrase);
 
@@ -1363,6 +1365,10 @@ public:
     std::atomic<uint64_t> m_pow_next_nonce{0};
     std::atomic<uint64_t> m_pow_total_tries{0};
     std::atomic<int64_t> m_pow_hashrate_start_ms{0};
+    // Monotonic wallet-signing-authority generation. PoW workers sample this
+    // before hashing and must discard work after any lock/unlock-scope change,
+    // including a lock+unlock pulse that occurs between worker polls.
+    std::atomic<uint64_t> m_pow_wallet_authority_generation{0};
     // Payout discovery normally happens before workers start. The one
     // exception is explicit startup autostart for an encrypted wallet: those
     // workers wait for a normal unlock and resolve the payout afterwards.
@@ -1815,6 +1821,20 @@ public:
     void StopPowMiningLocked()
         EXCLUSIVE_LOCKS_REQUIRED(m_pow_recovery_authority_mutex);
     bool IsPowMiningClosing() const;
+    bool HasNormalPowMiningWalletAuthority() const;
+    bool HasNormalPowMiningWalletAuthority(
+        uint64_t expected_generation) const;
+    bool HasNormalPowMiningWalletAuthorityLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void PublishPowMiningWalletAuthorityLocked()
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetWalletUnlockStakingOnly(bool staking_only);
+    bool PublishPowMiningWorkerState(
+        interfaces::WalletPowMiningState state,
+        std::optional<uint64_t> expected_generation = std::nullopt);
+    bool PublishPowMiningHashrate(
+        double hashrate,
+        std::optional<uint64_t> expected_generation = std::nullopt);
     void ThreadShadowPoWMiner(int worker_id);
     QuantumAddressBindingResult ResolveConfiguredQuantumAddress(
         const std::string& option,

@@ -2388,29 +2388,37 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_autostart_waits_for_normal_unlock)
     // real post-init route so this covers the encrypted clean-install order,
     // not merely the internal SetPowMining mode.
     args_guard.Force("-powmining", "1");
-    args_guard.Force("-powminingthreads", "1");
+    args_guard.Force("-powminingthreads", "2");
     args_guard.Force("-powminingcpu", "1");
     args_guard.Force("-autostartstaking", "0");
     m_wallet.postInitProcess();
     BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
-    BOOST_CHECK_EQUAL(m_wallet.m_pow_threads.load(), 1);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_threads.load(), 2);
     BOOST_CHECK_EQUAL(m_wallet.m_pow_cpu_percent.load(), 1);
     BOOST_CHECK_EQUAL(
         WITH_LOCK(m_wallet.m_pow_miner_mutex,
                   return m_wallet.threadPowMinerGroup
                              ? m_wallet.threadPowMinerGroup->size()
                              : 0U),
-        1U);
+        2U);
     auto* const startup_worker_group = WITH_LOCK(
         m_wallet.m_pow_miner_mutex,
         return m_wallet.threadPowMinerGroup.get());
     BOOST_REQUIRE(startup_worker_group);
     BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
 
-    m_wallet.m_wallet_unlock_staking_only = true;
-    BOOST_REQUIRE(m_wallet.Unlock(passphrase));
+    BOOST_REQUIRE(m_wallet.Unlock(passphrase, /*accept_no_keys=*/false,
+                                  /*staking_only=*/true));
     BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
     BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
     BOOST_CHECK_EQUAL(
         WITH_LOCK(m_wallet.m_pow_miner_mutex,
                   return m_wallet.threadPowMinerGroup.get()),
@@ -2420,23 +2428,80 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_autostart_waits_for_normal_unlock)
                           return m_wallet.m_pow_payout_quantum),
                       payout);
 
+    // A marker-only GUI transition may narrow an installed key, but it cannot
+    // expand staking-only authority. Normal signing authority must come from a
+    // successful credential-verified Unlock(..., false), which also closes a
+    // concurrent walletpassphrase race against GUI lock-then-stage paths.
+    m_wallet.SetWalletUnlockStakingOnly(false);
+    BOOST_CHECK(m_wallet.m_wallet_unlock_staking_only.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+
+    // A failed request to expand staking-only authority is atomic: it cannot
+    // wake either worker or change the retained unlock scope.
+    const SecureString wrong_passphrase{"pow-autostart-wrong"};
+    BOOST_CHECK(!m_wallet.Unlock(wrong_passphrase,
+                                 /*accept_no_keys=*/false,
+                                 /*staking_only=*/false));
+    BOOST_CHECK(m_wallet.m_wallet_unlock_staking_only.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+
     // The same worker remains alive when the operator expands the unlock to
     // normal signing authority; it can resume without another start command.
-    m_wallet.m_wallet_unlock_staking_only = false;
+    BOOST_REQUIRE(m_wallet.Unlock(passphrase, /*accept_no_keys=*/false,
+                                  /*staking_only=*/false));
     BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
     BOOST_CHECK_EQUAL(
         WITH_LOCK(m_wallet.m_pow_miner_mutex,
                   return m_wallet.threadPowMinerGroup.get()),
         startup_worker_group);
 
+    m_wallet.m_pow_hashrate.store(42.0);
     BOOST_REQUIRE(m_wallet.Lock());
     BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
-    BOOST_REQUIRE(m_wallet.Unlock(passphrase));
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+    BOOST_REQUIRE(m_wallet.Unlock(passphrase, /*accept_no_keys=*/false,
+                                  /*staking_only=*/false));
     BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
     BOOST_CHECK_EQUAL(
         WITH_LOCK(m_wallet.m_pow_miner_mutex,
                   return m_wallet.threadPowMinerGroup.get()),
         startup_worker_group);
+
+    // A terminal failure from either worker is authoritative. Late state or
+    // hashrate publication from the other configured worker cannot overwrite
+    // enabled=false/error before the lifecycle owner joins the group.
+    m_wallet.m_pow_hashrate.store(42.0);
+    m_wallet.m_pow_mining_enabled.store(false);
+    BOOST_REQUIRE(m_wallet.PublishPowMiningWorkerState(
+        interfaces::WalletPowMiningState::RUNTIME_ERROR));
+    bool late_state_rejected{false};
+    bool late_hash_rejected{false};
+    std::thread late_state([&] {
+        late_state_rejected = !m_wallet.PublishPowMiningWorkerState(
+            interfaces::WalletPowMiningState::READY);
+    });
+    std::thread late_hash([&] {
+        late_hash_rejected = !m_wallet.PublishPowMiningHashrate(42.0);
+    });
+    late_state.join();
+    late_hash.join();
+    BOOST_CHECK(late_state_rejected);
+    BOOST_CHECK(late_hash_rejected);
+    std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::RUNTIME_ERROR);
 
     m_wallet.StopPowMining();
     BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
@@ -2450,7 +2515,8 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_autostart_waits_for_normal_unlock)
     // An explicit runtime stop is authoritative. A later lock/unlock cycle
     // cannot recreate the startup worker group in this process.
     BOOST_REQUIRE(m_wallet.Lock());
-    BOOST_REQUIRE(m_wallet.Unlock(passphrase));
+    BOOST_REQUIRE(m_wallet.Unlock(passphrase, /*accept_no_keys=*/false,
+                                  /*staking_only=*/false));
     BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
     BOOST_CHECK_EQUAL(
         WITH_LOCK(m_wallet.m_pow_miner_mutex,

@@ -1491,6 +1491,66 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     const SecureString passphrase{"qt-claim-recovery-passphrase"};
     QVERIFY(wallet->EncryptWallet(passphrase));
 
+    // Generic signing requests must revoke an existing staking-only key before
+    // asking for a normal unlock. The hidden-scope Unlock dialog receives a
+    // locked wallet with the normal scope staged, and the context restores the
+    // original unlocked staking-only scope only after the operation ends.
+    QVERIFY(model.setWalletLocked(false, passphrase,
+                                  /*staking_only=*/true));
+    bool generic_normal_prompted{false};
+    QMetaObject::Connection generic_unlock = QObject::connect(
+        &model, &WalletModel::requireUnlock, &model, [&] {
+            generic_normal_prompted = true;
+            QCOMPARE(model.getEncryptionStatus(), WalletModel::Locked);
+            QVERIFY(!model.getWalletUnlockStakingOnly());
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
+        });
+    {
+        auto context = model.requestUnlock();
+        QVERIFY(context.isValid());
+        QVERIFY(generic_normal_prompted);
+        QCOMPARE(model.getEncryptionStatus(), WalletModel::Unlocked);
+        QVERIFY(!model.getWalletUnlockStakingOnly());
+    }
+    QCOMPARE(model.getEncryptionStatus(), WalletModel::Unlocked);
+    QVERIFY(model.getWalletUnlockStakingOnly());
+    QObject::disconnect(generic_unlock);
+
+    // A cancelled normal-unlock request cannot clear staking-only scope on an
+    // installed key. It leaves the wallet locked and restores the prior scope
+    // marker without granting normal authority.
+    {
+        auto context = model.requestUnlock();
+        QVERIFY(!context.isValid());
+    }
+    QCOMPARE(model.getEncryptionStatus(), WalletModel::Locked);
+    QVERIFY(model.getWalletUnlockStakingOnly());
+
+    // The retained marker is only the staged preference for the next unlock.
+    // A locked wallet must not be presented as actively staking-only unlocked.
+    {
+        StakingMiningPage scope_page(platform_style);
+        scope_page.setClientModel(mini_gui.clientModel.get());
+        scope_page.setWalletModel(&model);
+        scope_page.show();
+        auto* scope_refresh =
+            scope_page.findChild<QPushButton*>("stakingMiningRefresh");
+        auto* scope_checkbox =
+            scope_page.findChild<QCheckBox*>("unlockStakingOnly");
+        auto* scope_summary =
+            scope_page.findChild<QLabel*>("stakingSummary");
+        QVERIFY(scope_refresh);
+        QVERIFY(scope_checkbox);
+        QVERIFY(scope_summary);
+        scope_refresh->click();
+        QTRY_VERIFY_WITH_TIMEOUT(!scope_checkbox->isChecked(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            scope_summary->text().contains(QStringLiteral("Unlock mode: locked")),
+            5000);
+    }
+    model.setWalletUnlockStakingOnly(false);
+
     interfaces::WalletPowClaimRecoveryRequest preview_request;
     const auto preview =
         model.wallet().getPowClaimRecoveryReview(preview_request);
@@ -1530,8 +1590,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     QMetaObject::Connection unlock = QObject::connect(
         &model, &WalletModel::requireUnlock, &model, [&] {
             full_unlock_requested = true;
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
         });
     uint64_t request_id =
         model.requestPowClaimRecoveryOperation(make_execution());
@@ -1543,8 +1603,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     QObject::disconnect(unlock);
 
     // normal unlocked -> normal unlocked, with no unlock prompt.
-    QVERIFY(model.setWalletLocked(false, passphrase));
-    model.setWalletUnlockStakingOnly(false);
+    QVERIFY(model.setWalletLocked(false, passphrase,
+                                  /*staking_only=*/false));
     QSignalSpy normal_prompt(&model, &WalletModel::requireUnlock);
     request_id = model.requestPowClaimRecoveryOperation(make_execution());
     QTRY_VERIFY_WITH_TIMEOUT(results.count(request_id) == 1, 5000);
@@ -1560,8 +1620,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     unlock = QObject::connect(
         &model, &WalletModel::requireUnlock, &model, [&] {
             full_unlock_requested = true;
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
         });
     request_id = model.requestPowClaimRecoveryOperation(make_execution());
     QTRY_VERIFY_WITH_TIMEOUT(results.count(request_id) == 1, 5000);
@@ -1586,12 +1646,12 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     // Entering the passphrase but selecting staking-only still cannot
     // authorize a recovery spend. It restores the original unlocked
     // staking-only state without briefly retaining a normal unlock context.
-    QVERIFY(model.setWalletLocked(false, passphrase));
-    model.setWalletUnlockStakingOnly(true);
+    QVERIFY(model.setWalletLocked(false, passphrase,
+                                  /*staking_only=*/true));
     const QMetaObject::Connection staking_scope_unlock = QObject::connect(
         &model, &WalletModel::requireUnlock, &model, [&] {
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(true);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/true));
         });
     request_id = model.requestPowClaimRecoveryOperation(make_execution());
     QTRY_VERIFY_WITH_TIMEOUT(results.count(request_id) == 1, 5000);
@@ -1613,8 +1673,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         &model, &WalletModel::requireUnlock, &model, [&] {
             obsolete_prompt_seen = true;
             obsolete_view->store(false, std::memory_order_release);
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
             // This callback runs inside the nested unlock prompt. The model
             // must observe the obsolete view and restore staking-only scope
             // without dispatching the cancelled request to Core.
@@ -1651,8 +1711,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         &model, &WalletModel::requireUnlock, &model, [&] {
             nested_cancel_seen = true;
             model.cancelPowClaimRecoveryOperation(request_id);
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
             QTimer::singleShot(0, &model, [&] {
                 nested_cancel_scope_restored_without_core_entry =
                     model.getEncryptionStatus() == WalletModel::Unlocked &&
@@ -1688,8 +1748,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
                 overlapping_id =
                     model.requestPowClaimRecoveryOperation(make_execution());
             }
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
         });
     const uint64_t first_id =
         model.requestPowClaimRecoveryOperation(make_execution());
@@ -1730,8 +1790,8 @@ void TestPowClaimRecoveryJoinCancelsQueuedMutation(
     SyncRecoveryReviewWalletTip(wallet, node);
     const SecureString passphrase{"qt-claim-recovery-join-passphrase"};
     QVERIFY(wallet->EncryptWallet(passphrase));
-    QVERIFY(model.setWalletLocked(false, passphrase));
-    model.setWalletUnlockStakingOnly(true);
+    QVERIFY(model.setWalletLocked(false, passphrase,
+                                  /*staking_only=*/true));
 
     interfaces::WalletPowClaimRecoveryRequest preview_request;
     const auto preview =
@@ -1813,8 +1873,8 @@ void TestPowClaimRecoveryModelDestructionRestoresStakingScope(
     const SecureString passphrase{
         "qt-claim-recovery-prompt-destruction-passphrase"};
     QVERIFY(wallet->EncryptWallet(passphrase));
-    QVERIFY(model->setWalletLocked(false, passphrase));
-    model->setWalletUnlockStakingOnly(true);
+    QVERIFY(model->setWalletLocked(false, passphrase,
+                                   /*staking_only=*/true));
 
     WalletContext& context = *node.walletLoader().context();
     auto observer = interfaces::MakeWallet(context, wallet);

@@ -191,11 +191,22 @@ void WaitForModal(const QString& description, std::function<bool()> action)
 }
 
 //! Press a standard button in a modal message box.
-void ConfirmMessageBox(QMessageBox::StandardButton confirm_type)
+void ConfirmMessageBox(QMessageBox::StandardButton confirm_type,
+                       const QString& expected_text = {})
 {
-    WaitForModal(QStringLiteral("message box"), [confirm_type]() {
+    WaitForModal(QStringLiteral("message box"), [confirm_type, expected_text]() {
         for (QWidget* widget : QApplication::topLevelWidgets()) {
             if (auto* dialog = qobject_cast<QMessageBox*>(widget)) {
+                if (!expected_text.isEmpty() &&
+                    !dialog->text().contains(expected_text)) {
+                    QTest::qFail(
+                        QStringLiteral("Message box omitted required disclosure: %1; actual: %2")
+                            .arg(expected_text, dialog->text())
+                            .toUtf8().constData(),
+                        __FILE__, __LINE__);
+                    dialog->reject();
+                    return true;
+                }
                 if (QAbstractButton* button = dialog->button(confirm_type)) {
                     button->click();
                     return true;
@@ -238,6 +249,14 @@ void AnswerPowClaimRecoveryConsent(bool enable, bool use_escape = false,
                 return true;
             }
             if (!explanation ||
+                !explanation->text().contains(
+                    QStringLiteral("waits while a member is live")) ||
+                !explanation->text().contains(
+                    QStringLiteral("same confirmed anchor")) ||
+                !explanation->text().contains(
+                    QStringLiteral("ordinary claim fee")) ||
+                !explanation->text().contains(
+                    QStringLiteral("miner could continue")) ||
                 !explanation->text().contains(
                     QStringLiteral("may become eligible again at a later height")) ||
                 !explanation->text().contains(
@@ -326,6 +345,14 @@ void AnswerInitialPowClaimRecoveryChoice(InitialPowClaimRecoveryChoice choice)
                 return true;
             }
             if (!explanation ||
+                !explanation->text().contains(
+                    QStringLiteral("waits while a member is live")) ||
+                !explanation->text().contains(
+                    QStringLiteral("same anchor")) ||
+                !explanation->text().contains(
+                    QStringLiteral("ordinary claim fee")) ||
+                !explanation->text().contains(
+                    QStringLiteral("optional fee-paying alternative")) ||
                 !explanation->text().contains(
                     QStringLiteral("may become eligible again at a later height")) ||
                 !explanation->text().contains(
@@ -710,6 +737,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(!automation_demurrage->isChecked());
     QVERIFY(!automation_redelegate->isChecked());
     QVERIFY(!automation_new_keys->isChecked());
+
     QVERIFY(refresh_details);
     QVERIFY(refresh_hint);
     QVERIFY(migration_phase);
@@ -765,6 +793,17 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     refresh_details->click();
     QTRY_VERIFY_WITH_TIMEOUT(refresh_hint->text().contains(QString("Detail panels updated")), 10000);
+
+    // The completed detail snapshot has released the page's update guard.
+    // Persistent PoW consent must describe retained locked-wallet intent,
+    // rather than the superseded claim that a locked startup discards it.
+    QTRY_VERIFY_WITH_TIMEOUT(automation_autostart_pow->isEnabled(), 5000);
+    ConfirmMessageBox(
+        QMessageBox::No,
+        QStringLiteral("keeps the configured worker enabled at zero hashrate and waits for a normal unlock"));
+    automation_autostart_pow->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!automation_autostart_pow->isChecked(), 3000);
+
     QCOMPARE(staking_enable->isChecked(), false);
     QCOMPARE(unlock_staking_only->isChecked(), false);
     QVERIFY(!unlock_staking_only->isEnabled());
@@ -1049,8 +1088,13 @@ void TestPowClaimRecoveryPolicyControls(
     QVERIFY(status);
     QVERIFY(refresh);
     QCOMPARE(recovery->text(), QStringLiteral(
-        "Permit automatic fee-paying conflict recovery when zero-payment "
-        "claim retirement is unavailable"));
+        "Permit bounded automatic fee-paying conflict recovery as an "
+        "alternative to waiting"));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("same confirmed anchor")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("waits while a member is live")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("no recovery transaction")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("ordinary claim fee")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("miner could otherwise continue")));
     QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
     QVERIFY(!recovery->isChecked());
     QVERIFY(status->text().contains(QStringLiteral("6 process-wide")));
@@ -1345,6 +1389,14 @@ void TestPowClaimRecoveryManualDialog(
     QVERIFY(explanation);
     QVERIFY(acknowledge);
     QVERIFY(wait->isDefault());
+    QVERIFY(explanation->text().contains(
+        QStringLiteral("same confirmed anchor")));
+    QVERIFY(explanation->text().contains(
+        QStringLiteral("waits while a member is live")));
+    QVERIFY(explanation->text().contains(
+        QStringLiteral("ordinary claim fee")));
+    QVERIFY(explanation->text().contains(
+        QStringLiteral("miner could continue")));
     QVERIFY(explanation->text().contains(
         QStringLiteral("may become eligible again at a later height")));
     QVERIFY(explanation->text().contains(

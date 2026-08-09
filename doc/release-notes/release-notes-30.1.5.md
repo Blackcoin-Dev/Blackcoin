@@ -70,6 +70,28 @@ preference while the encrypted wallet is locked is not displayed as an active
 unlock. Scope-revocation paths lock first and fail closed if the wallet state
 changes concurrently.
 
+The GUI's **Review claim recovery...** flow, `blackcoin-cli` and other RPC
+clients, and `blackcoind` all use the same active-tip-pinned Core recovery
+inventory, plan identifier, fee calculation, and final revalidation. Manual
+recovery signing or commit requires the exact reviewed plan plus explicit fee
+and conflict-risk acknowledgement. Automatic fee-paying recovery remains off
+by default and requires an explicit maximum fee per resolution, aggregate batch
+fee cap, rolling fee budget, rolling fee/action window, maximum actions per
+window, and minimum stale-block depth before the wallet records standing
+authority.
+
+GUI mining and recovery prompts distinguish the normal authenticated
+same-anchor path from optional fee-paying conflict recovery. A coherent safe
+family waits while a member is live, relays an eligible absent member, or is
+continued on its confirmed anchor without a recovery transaction; the
+fee-paying option is shown separately and requires an exact recoverable plan.
+That optional authority may apply even when the miner could continue an
+authenticated `unbound_proof_may_revalidate` family, so the prompts disclose
+the alternative and its conflict risk rather than presenting it as required
+for mining. Persistent PoW consent also states that a locked or staking-only
+wallet retains the configured worker at zero hashrate until a normal unlock
+rather than silently discarding the operator's request.
+
 ## Validation and upgrade boundary
 
 The v30.1.5 candidate includes focused unit and functional coverage for

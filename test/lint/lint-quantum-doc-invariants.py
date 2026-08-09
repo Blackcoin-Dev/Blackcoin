@@ -53,6 +53,8 @@ CURRENT_FINAL_OPERATOR_DOCUMENTS = (
 )
 
 BETA2_RELEASE_CANDIDATE = 2
+FINAL_RELEASE_IDENTITY = (30, 1, 5, 0, True)
+BETA2_RELEASE_IDENTITY = (30, 1, 1, BETA2_RELEASE_CANDIDATE, False)
 
 
 def read_text(root, relative):
@@ -66,19 +68,24 @@ def normalized(text):
 
 
 def configured_release_identity(configure):
-    rc_match = re.search(
-        r"^define\(_CLIENT_VERSION_RC, ([0-9]+)\)$",
-        configure,
-        re.MULTILINE,
-    )
+    components = []
+    for name in ("MAJOR", "MINOR", "BUILD", "RC"):
+        match = re.search(
+            rf"^define\(_CLIENT_VERSION_{name}, ([0-9]+)\)$",
+            configure,
+            re.MULTILINE,
+        )
+        if match is None:
+            raise ValueError("configure.ac has malformed Blackcoin Core release identity")
+        components.append(int(match.group(1)))
     release_match = re.search(
         r"^define\(_CLIENT_VERSION_IS_RELEASE, (true|false)\)$",
         configure,
         re.MULTILINE,
     )
-    if rc_match is None or release_match is None:
-        raise ValueError("configure.ac has malformed v30.1.1 release identity")
-    return int(rc_match.group(1)), release_match.group(1) == "true"
+    if release_match is None:
+        raise ValueError("configure.ac has malformed Blackcoin Core release identity")
+    return (*components, release_match.group(1) == "true")
 
 
 def formatted_height(value):
@@ -650,6 +657,9 @@ def check_release_status(root, failures):
 def check_final_release_identity(root, failures):
     configure = read_text(root, "configure.ac")
     for fragment in (
+        "define(_CLIENT_VERSION_MAJOR, 30)",
+        "define(_CLIENT_VERSION_MINOR, 1)",
+        "define(_CLIENT_VERSION_BUILD, 5)",
         "define(_CLIENT_VERSION_RC, 0)",
         "define(_CLIENT_VERSION_IS_RELEASE, true)",
     ):
@@ -658,7 +668,7 @@ def check_final_release_identity(root, failures):
             "configure.ac",
             configure,
             fragment,
-            "final v30.1.1 source metadata",
+            "final v30.1.5 source metadata",
         )
 
     stale_channel_patterns = (
@@ -677,6 +687,9 @@ def check_final_release_identity(root, failures):
 
     release_notes = read_text(root, "doc/release-notes.md")
     for fragment in (
+        "30.1.5 Maintenance Release Notes",
+        "Blackcoin Core v30.1.5 is the corrective successor to immutable v30.1.4.",
+        "`doc/release-notes/release-notes-30.1.5.md` for the canonical scope",
         "Production release identity",
         "Only the annotated unsigned `v30.1.1` tag enters the production path.",
         "I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES",
@@ -709,15 +722,16 @@ def check_final_release_identity(root, failures):
         "final Windows recovery warning",
     )
 
-    final_notes_relative = "doc/release-notes/release-notes-30.1.1.md"
+    final_notes_relative = "doc/release-notes/release-notes-30.1.5.md"
     final_notes = read_text(root, final_notes_relative)
     for fragment in (
-        "# Blackcoin Core 30.1.1",
-        "Gold Rush is already active from",
-        "createshadowpowclaimresolution",
-        "getshadowresourceinfo",
-        "connected-tip mainnet witness inventory",
-        "optional post-release qualification",
+        "# Blackcoin Core 30.1.5",
+        "source commit and annotated tag are SSH-signed by Blackcoin-Dev",
+        "This release does not change consensus",
+        "same-anchor lifecycle",
+        "`getpowmininginfo` exposes the coherent typed mining-gate snapshot",
+        "`SubmitShadowPowClaim` enters its persistence and commit path",
+        "Release publication still requires the exact-SHA",
     ):
         require_fragment(
             failures,
@@ -728,6 +742,27 @@ def check_final_release_identity(root, failures):
         )
     if "RELEASE_NOTES_NOT_FINAL" in final_notes:
         failures.append(f"{final_notes_relative}: final release marker remains")
+
+    release_process_relative = "doc/release-process.md"
+    release_process = read_text(root, release_process_relative)
+    for fragment in (
+        "release runbook for Blackcoin Core v30.1.5",
+        "annotated `v30.1.5` tag must both be SSH-signed by",
+        "`production-release` acknowledgement is exactly `V30.1.5`",
+        "`doc/release-notes/release-notes-30.1.5.md`",
+        "packages remain without Authenticode signatures",
+        "identity-free ad-hoc signatures and are not Developer-ID signed or notarized",
+        "It therefore cannot inherit v30.1.4 release evidence or use the",
+        "corrective fast path. The exact v30.1.5 source must pass the complete",
+        "exact reviewed Blackcoin-Dev-signed source commit",
+    ):
+        require_fragment(
+            failures,
+            release_process_relative,
+            release_process,
+            fragment,
+            "v30.1.5 signed full-gate release policy",
+        )
 
     beta2_notes_relative = "doc/release-notes/release-notes-30.1.1-beta2.md"
     beta2_notes = read_text(root, beta2_notes_relative)
@@ -818,16 +853,16 @@ def check_beta2_release_identity(root, failures):
 
 def check_release_identity(root, failures):
     identity = configured_release_identity(read_text(root, "configure.ac"))
-    if identity == (0, True):
+    if identity == FINAL_RELEASE_IDENTITY:
         check_final_release_identity(root, failures)
-    elif identity == (BETA2_RELEASE_CANDIDATE, False):
+    elif identity == BETA2_RELEASE_IDENTITY:
         check_beta2_release_identity(root, failures)
     else:
-        rc, is_release = identity
+        major, minor, build, rc, is_release = identity
         failures.append(
-            "configure.ac release identity must be final RC0/true or replacement "
-            f"Beta 2 RC{BETA2_RELEASE_CANDIDATE}/false; found "
-            f"RC{rc}/{'true' if is_release else 'false'}"
+            "configure.ac release identity must be final 30.1.5 RC0/true or "
+            f"replacement Beta 2 30.1.1 RC{BETA2_RELEASE_CANDIDATE}/false; found "
+            f"{major}.{minor}.{build} RC{rc}/{'true' if is_release else 'false'}"
         )
 
 

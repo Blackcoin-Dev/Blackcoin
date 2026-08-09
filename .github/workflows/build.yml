@@ -1,4 +1,4 @@
-name: v30.1.4 signed maintenance release build
+name: v30.1.5 signed maintenance release build
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       package_label:
         description: Explicit unpublished prerelease label (must match source RC)
         required: true
-        default: 30.1.4-alpha1
+        default: 30.1.5-alpha1
         type: string
       target:
         description: Build target to run (manual runs never publish)
@@ -27,13 +27,13 @@ on:
           - macos-arm-64-bit
   push:
     tags:
-      - 'v30.1.4'
+      - 'v30.1.5'
 
 permissions:
   contents: read
 
 concurrency:
-  group: v30.1.4-release-${{ github.ref }}
+  group: v30.1.5-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -79,8 +79,8 @@ jobs:
           RC=$(sed -n "s/^define(_CLIENT_VERSION_RC, \([0-9]*\))$/\1/p" configure.ac)
           IS_RELEASE=$(sed -n "s/^define(_CLIENT_VERSION_IS_RELEASE, \(.*\))$/\1/p" configure.ac)
           BASE_VERSION="$MAJOR.$MINOR.$BUILD"
-          test "$BASE_VERSION" = "30.1.4" || {
-            echo "::error::This workflow is locked to the v30.1.4 source line"
+          test "$BASE_VERSION" = "30.1.5" || {
+            echo "::error::This workflow is locked to the v30.1.5 source line"
             exit 1
           }
           [[ "$RC" =~ ^[0-9]+$ ]]
@@ -227,7 +227,7 @@ jobs:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
       # Alpha artifacts wait for the core gate. A beta adds native-platform,
       # sanitizer, pinned-fuzz, and complete extended functional evidence.
-      # v30.1.4 changes runtime and wallet behavior, so every exact-SHA
+      # v30.1.5 changes runtime and wallet behavior, so every exact-SHA
       # production gate runs against this source. No inherited corrective
       # evidence or fast path is permitted.
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
@@ -1104,7 +1104,7 @@ jobs:
           retention-days: 7
 
   signed-final-preflight:
-    name: Require explicit v30.1.4 signed-source publication acknowledgement
+    name: Require explicit v30.1.5 signed-source publication acknowledgement
     needs:
       - resolve-target
       - safety-gate
@@ -1118,9 +1118,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected='V30.1.4'
+          expected='V30.1.5'
           test "$UNSIGNED_FINAL_ACK" = "$expected" || {
-            echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this v30.1.4 release'
+            echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this v30.1.5 release'
             exit 1
           }
 
@@ -1178,7 +1178,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          expected_ack='V30.1.4'
+          expected_ack='V30.1.5'
           test "$UNSIGNED_FINAL_ACK" = "$expected_ack"
           mkdir -p dist
           shopt -s nullglob

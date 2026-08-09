@@ -1,25 +1,31 @@
 # Blackcoin Core release process
 
-This is the release runbook for Blackcoin Core v30.1.4. A successful local
+This is the release runbook for Blackcoin Core v30.1.5. A successful local
 build is not release authorization. Production publication is allowed only for
 the exact commit that satisfies the mandatory safety gate and the controls
 below.
 
-## v30.1.4 signed maintenance release
+## v30.1.5 signed maintenance release
 
-v30.1.4 changes wallet, staking, mining-policy, telemetry, GUI, RPC, and test
-code. It therefore cannot inherit the v30.1.3 corrective-release evidence or
-use the corrective fast path. The exact v30.1.4 source must pass the complete
+v30.1.5 changes wallet, staking, mining-policy, telemetry, GUI, RPC, and test
+code. It therefore cannot inherit v30.1.4 release evidence or use the
+corrective fast path. The exact v30.1.5 source must pass the complete
 current-SHA unit, lint, functional, extended, sanitizer, fuzz,
 interoperability, native-platform, resource, package, and two-builder
 reproducibility gates before publication.
 
-The exact source commit and annotated `v30.1.4` tag must both be SSH-signed by
+The exact source commit and annotated `v30.1.5` tag must both be SSH-signed by
 Blackcoin-Dev with the allowlisted key and verified by GitHub. The protected
-`production-release` acknowledgement is exactly `V30.1.4`. The signatures
+`production-release` acknowledgement is exactly `V30.1.5`. The signatures
 authenticate the Git objects; they do not code-sign the packages. Windows
 packages remain without Authenticode signatures. macOS applications retain
 identity-free ad-hoc signatures and are not Developer-ID signed or notarized.
+
+The configured source version must be exactly `30.1.5`, release candidate zero,
+and release status true. The canonical tracked notes are
+`doc/release-notes/release-notes-30.1.5.md`; the workflow rejects a missing,
+empty, or non-final canonical file. No tracked runbook, notes file, or workflow
+may guess the final source SHA before the signed source commit is frozen.
 
 Publication begins only when the release commit is reviewed, every required
 check is green, the protected environment value has been updated, immutable
@@ -28,7 +34,7 @@ workflow builds two isolated copies of every platform package, requires
 byte-for-byte equality, assembles checksums, SBOM and provenance, creates GitHub
 attestations, and publishes one immutable release.
 
-The v30.1.4 execution order is:
+The v30.1.5 execution order is:
 
 1. Create the exact final source commit with the release-team identity and the
    allowlisted SSH key. Push it to the review branch without creating the final
@@ -41,19 +47,21 @@ The v30.1.4 execution order is:
    legacy and quantum keys, transaction history, configuration, block paths,
    active tip, P2P, PoS, PoW, clean restart, and rollback preservation. Do not
    create a replacement wallet, address, key, or payout destination.
-4. Fast-forward the default branch to the same reviewed, signed commit. Do not
-   recreate or squash the commit, because the final tag and canary must remain
-   bound to the same Git object.
+4. Merge without rewriting the reviewed, signed source commit, then prove that
+   exact object is reachable from the default branch. Do not squash or rebase
+   it. If the hosting platform creates a merge commit, never use that generated
+   object as the release source: the final tag and canary remain bound to the
+   exact reviewed Blackcoin-Dev-signed source commit.
 5. Confirm repository immutable releases, tag protection, and the exact
-   protected `V30.1.4` acknowledgement. Create and verify the annotated,
-   SSH-signed `v30.1.4` tag, then push it once.
+   protected `V30.1.5` acknowledgement. Create and verify the annotated,
+   SSH-signed `v30.1.5` tag, then push it once.
 6. Treat any failed production job as a release blocker. Publication is
    complete only after every exact-tag gate, both builders, reproducibility,
    package verification, attestations, and immutable release publication
    succeed and the published checksums verify.
 
 The remaining version-specific sections are historical controls. They do not
-authorize v30.1.4 to inherit tests, use unsigned source objects, or skip the
+authorize v30.1.5 to inherit tests, use unsigned source objects, or skip the
 canary and duplicate-build requirements above.
 
 ## v30.1.3 signed corrective history

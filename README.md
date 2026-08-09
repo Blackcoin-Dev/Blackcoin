@@ -92,7 +92,7 @@ and its fee input stays reserved because another peer can retain and later
 confirm it. Generic `abandontransaction` does not release that reservation.
 Immutable v30.1.4 pauses on actionable or indeterminate quarantined
 components, not merely on the raw number of historical claim objects. The
-post-release candidate instead follows the complete typed gate and may safely
+v30.1.5 candidate instead follows the complete typed gate and may safely
 relay or refresh one authenticated family while those legacy counts remain
 nonzero.
 
@@ -107,8 +107,8 @@ Rate and fee windows use active-chain median time, and recovery-authorizing
 metadata is published only after durable wallet-database commit. An
 indeterminate database outcome fails closed until wallet reload.
 
-The following behavior belongs to the **post-release v30.1.4 hotfix
-candidate**; it is not part of the immutable `v30.1.4` tag. For exact
+The following behavior belongs to the **v30.1.5 candidate**; it is not part of
+the immutable `v30.1.4` tag. For exact
 wallet-authored claims—including a strict unbound QQP2 singleton and
 origin-bound QQP3/QQP4 carriers—the candidate mining path first
 relays eligible bytes and then, when necessary, appends a current-policy sibling

@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Run pinned historical releases and the v30.1.4 candidate together.
+"""Run pinned historical releases and the v30.1.5 candidate together.
 
 The exact v26.2.0 reference and candidate remain the normative pair for
 adversarial legacy-valid blocks and two-way reorganizations. The exact pinned
@@ -58,7 +58,7 @@ from test_framework.wallet_util import bytes_to_wif
 
 
 VERSIONS = [260200, 280400, 300100, None]
-EXPECTED_RPC_VERSIONS = [260200, 280400, 300100, 300104]
+EXPECTED_RPC_VERSIONS = [260200, 280400, 300100, 300105]
 REFERENCE = 0
 V30_1_0 = 2
 CANDIDATE = 3

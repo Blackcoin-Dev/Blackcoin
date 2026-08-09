@@ -1526,6 +1526,11 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     }
     QCOMPARE(model.getEncryptionStatus(), WalletModel::Locked);
     QVERIFY(model.getWalletUnlockStakingOnly());
+    // Lock notifications update WalletModel's display cache asynchronously.
+    // Establish that presentation precondition before constructing the page;
+    // the assertions below test locked-marker rendering, not timer latency.
+    QTRY_COMPARE_WITH_TIMEOUT(
+        model.getCachedEncryptionStatus(), WalletModel::Locked, 1000);
 
     // The retained marker is only the staged preference for the next unlock.
     // A locked wallet must not be presented as actively staking-only unlocked.

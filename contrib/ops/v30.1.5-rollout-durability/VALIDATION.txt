@@ -1,0 +1,63 @@
+IDENTITY-NEUTRAL OFFLINE VALIDATION RECORD — NOT ROLLOUT AUTHORITY
+
+Source identity:
+  final signed commit H intentionally not embedded in this commit
+  exact tree bound to H intentionally not embedded in this commit
+  required signer SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
+  version 300105 / /Blackcoin:30.1.5/
+
+Exact-SHA Core CI:
+  successful run R bound to H intentionally not embedded in this commit
+
+Current offline package checks:
+  Bash syntax: PASS
+  ShellCheck -x, including the .sh.inc guard: PASS
+  exact sealed-byte hostile fixture suite: 151/151 PASS
+  independent exact sealed-byte hostile replay: 151/151 PASS
+  exact package inventory: 15/15 PASS
+  SHA256SUMS exact 14-payload seal: PASS
+  symlink, mode, whitespace, stale-pin, mutator/RPC scans: PASS
+  pre/post behavior-byte equality: PASS
+  existing-path mutation check: PASS (new directory only)
+  live Docker/wallet/network/GitHub action: NONE
+
+The fixture suite covers all five typed mining actions, zero-hash safe waits,
+per-interval create/refresh progress, partial/extra/unsafe/ambiguous schema
+rejection, three tip changes, stale wait-for-next-tip fingerprint or wallet-tip
+rejection, active PoS, locked worker intent with claims_submitted=0, and
+normal-unlock-only evidence. It verifies complete wallet txid inventories,
+exact recovery schema/policy/metrics/resolution inventories, authenticated
+unspent same-anchor origin/input-bound lineage with independently checked
+family/root/parent/ordinal relationships, typed summary/detail counter
+consistency, per-transaction abandonment, one allowed transaction class, and
+key/payout/fee invariants. It proves the node30 probe's root-owned 0700 secure
+path, pinned-copy TOCTOU check, distinct tool/output identities, fresh terminal
+probe, post-probe Core resample, and independent wallet/probe cross-binding.
+It also covers filename swaps, duplicate or
+missing nodes, node30 role leakage, a fresh terminal 32-node census, exact
+handoff receipts and post-Compose identity proof, authority no-clobber/race/
+partial-fsync/removal ownership (including the VFAT marker's hard-link-free
+path), and missing/extra/tampered evidence.
+
+The suite accepts only the exact irreversible, snapshot-absent, no-rewind
+Phase-B marker/result schemas with shared Phase-A, package, tooling, script,
+verifier, and typed-contract identities. Mixed runs, packages, keys, tooling,
+data rewind, and unresolved CI fail closed.
+
+UNRESOLVED AND FAIL-CLOSED:
+  - final signed H/tree and successful exact-H CI run R identity repin
+  - sealed candidate bundle/OCI/image/binary/tooling identities
+  - completed Phase-B RESULT and PROMOTED_NO_REWIND marker
+  - nine-path canary seal
+  - read-only node30 Free Claim probe identity
+  - locked live Compose and reviewed runtime guard identities
+  - exact persistent Compose/image-policy receipts, post-reconcile identity
+    proof, and 300105 runtime-guard handoff
+  - final identity-repinned package seal and its external manifest hash
+  - nonce-bound live authority
+
+The current SHA256SUMS seals the reviewed identity-neutral package bytes. Any
+later identity, artifact, Phase-B, handoff, or authority repin invalidates this
+seal and requires a new validation record and manifest in the separate repin
+commit. Do not cite this record as canary, rollout, release, or fleet
+acceptance evidence.

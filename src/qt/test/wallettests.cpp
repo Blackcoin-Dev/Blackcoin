@@ -18,6 +18,7 @@
 #include <qt/optionsmodel.h>
 #include <qt/overviewpage.h>
 #include <qt/platformstyle.h>
+#include <qt/quantumguides.h>
 #include <qt/qvalidatedlineedit.h>
 #include <qt/receivecoinsdialog.h>
 #include <qt/receiverequestdialog.h>
@@ -996,6 +997,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
         walletModel.wallet().getPowClaimRecoveryPolicy().mode,
         interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK, 5000);
     QTRY_VERIFY_WITH_TIMEOUT(pow_status->text().contains(QString("enabled")), 5000);
+    QVERIFY(pow_status->text().contains(QString("configured new-anchor payout")));
     QCOMPARE(walletModel.getEncryptionStatus(), encryption_before_policy);
     QCOMPARE(walletModel.getWalletUnlockStakingOnly(), staking_only_before_policy);
 
@@ -1024,7 +1026,19 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     pow_copy->click();
     QCOMPARE(QApplication::clipboard()->text(), pow_payout->text());
     QVERIFY(pow_warning->text().contains(QString("Back up this wallet")));
+    QVERIFY(pow_warning->text().contains(QString("authenticated quantum payout carried by its claim")));
+    QVERIFY(pow_warning->text().contains(QString("configures only future new-anchor claims")));
     QVERIFY(pow_warning->text().contains(QString("locked until Gold Rush ends")));
+    const QString pow_guide = QuantumGuides::DetailedAppendixForTitle(
+        QStringLiteral("PoW payout"));
+    QVERIFY(pow_guide.contains(QStringLiteral(
+        "retained claim family preserves its already-authenticated payout")));
+    QVERIFY(pow_guide.contains(QStringLiteral(
+        "same-anchor refresh does not allocate an unrelated future-new-anchor key")));
+    QVERIFY(pow_guide.contains(QStringLiteral(
+        "authenticated quantum payout carried by that claim")));
+    QVERIFY(pow_guide.contains(QStringLiteral(
+        "does not alter a retained family's authenticated payout")));
 
     pow_enable->click();
     qApp->processEvents();
@@ -2225,6 +2239,72 @@ void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, co
     QVERIFY(pow_status->text().contains(QString("Load a wallet")));
 }
 
+void TestStakingMiningPayoutClearsAcrossWalletIdentity(
+    interfaces::Node& node,
+    const std::shared_ptr<CWallet>& wallet_a,
+    const PlatformStyle* platform_style)
+{
+    auto wallet_b = std::make_shared<CWallet>(
+        node.context()->chain.get(), "qt-staking-payout-wallet-b",
+        CreateMockableWalletDatabase());
+    QCOMPARE(wallet_b->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    SyncRecoveryReviewWalletTip(wallet_b, node);
+
+    MiniGUI mini_gui_a(node, platform_style);
+    mini_gui_a.initModelForWallet(node, wallet_a, platform_style);
+    MiniGUI mini_gui_b(node, platform_style);
+    mini_gui_b.initModelForWallet(node, wallet_b, platform_style);
+    QVERIFY(mini_gui_b.walletModel->wallet()
+                .getPowMiningInfo()
+                .payout_address.empty());
+
+    StakingMiningPage page(platform_style);
+    page.setClientModel(mini_gui_a.clientModel.get());
+    page.setWalletModel(mini_gui_a.walletModel.get());
+    page.show();
+    qApp->processEvents();
+
+    auto* pow_payout = page.findChild<QLineEdit*>(
+        QStringLiteral("powPayout"));
+    auto* pow_copy = page.findChild<QPushButton*>(
+        QStringLiteral("powCopy"));
+    auto* refresh = page.findChild<QPushButton*>(
+        QStringLiteral("stakingMiningRefresh"));
+    auto* refresh_hint = page.findChild<QLabel*>(
+        QStringLiteral("stakingMiningRefreshHint"));
+    QVERIFY(pow_payout);
+    QVERIFY(pow_copy);
+    QVERIFY(refresh);
+    QVERIFY(refresh_hint);
+
+    pow_payout->setText(QStringLiteral("wallet-a-payout"));
+    QVERIFY(QMetaObject::invokeMethod(
+        &page, "updateStatus", Qt::DirectConnection));
+    QVERIFY(pow_copy->isEnabled());
+
+    // A direct A -> B switch must revoke display and copy authority before an
+    // event-loop turn or background detail refresh can expose wallet B.
+    page.setWalletModel(mini_gui_b.walletModel.get());
+    QVERIFY(pow_payout->text().isEmpty());
+    QVERIFY(!pow_copy->isEnabled());
+
+    // An accepted empty snapshot is equally authoritative. Seed obsolete UI
+    // text after the switch so this assertion also detects a conditional
+    // snapshot assignment that would preserve a previous value.
+    pow_payout->setText(QStringLiteral("obsolete-wallet-b-payout"));
+    QVERIFY(QMetaObject::invokeMethod(
+        &page, "updateStatus", Qt::DirectConnection));
+    QVERIFY(pow_copy->isEnabled());
+    refresh->click();
+    QTRY_VERIFY_WITH_TIMEOUT(
+        refresh_hint->text().contains(QStringLiteral("Detail panels updated")),
+        20000);
+    QVERIFY(pow_payout->text().isEmpty());
+    QVERIFY(!pow_copy->isEnabled());
+
+    page.setWalletModel(nullptr);
+}
+
 void TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(interfaces::Node& node, const PlatformStyle* platformStyle)
 {
     auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-staking-heartbeat", CreateMockableWalletDatabase());
@@ -2483,6 +2563,8 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     TestPowClaimRecoveryAmbiguousDatabaseDisablesActions(node, platformStyle.get());
     TestWalletPagesScale(mini_gui, platformStyle.get());
     TestStakingMiningPageSurvivesWalletModelDeletion(node, wallet, platformStyle.get());
+    TestStakingMiningPayoutClearsAcrossWalletIdentity(
+        node, wallet, platformStyle.get());
     TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(node, platformStyle.get());
     TestStakingMiningAsyncRefreshLifecycle(node, platformStyle.get());
 

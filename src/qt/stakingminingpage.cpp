@@ -764,8 +764,8 @@ void StakingMiningPage::setupUi()
     m_pow_payout->setObjectName(QStringLiteral("powPayout"));
     configureLineEdit(m_pow_payout);
     m_pow_payout->setReadOnly(true);
-    m_pow_payout->setToolTip(tr("The quantum (ML-DSA) address that receives your Gold Rush PoW shadow-ledger credits. "
-                                "Created automatically when PoW mining is first enabled."));
+    m_pow_payout->setToolTip(tr("The configured quantum (ML-DSA) payout for future new-anchor claims. "
+                                "A retained claim family preserves its own authenticated payout, which may differ or remain usable while this field is empty."));
     m_pow_copy = new QPushButton(tr("Copy"), powBox);
     m_pow_copy->setObjectName(QStringLiteral("powCopy"));
     m_pow_apply = new QPushButton(tr("Apply"), powBox);
@@ -786,8 +786,9 @@ void StakingMiningPage::setupUi()
     m_pow_warning->setObjectName(QStringLiteral("powWarning"));
     m_pow_warning->setWordWrap(true);
     m_pow_warning->setTextFormat(Qt::RichText);
-    m_pow_warning->setText(tr("<b>Important:</b> Gold Rush PoW rewards are paid to the quantum address above. "
-                              "Back up this wallet after the address is created. Rewards remain locked until Gold Rush ends, "
+    m_pow_warning->setText(tr("<b>Important:</b> Each Gold Rush PoW reward is paid to the authenticated quantum payout carried by its claim. "
+                              "The address above configures only future new-anchor claims; a retained family preserves its own payout, which may differ or remain usable while this field is empty. "
+                              "Back up this wallet after any new non-HD payout key is created. Rewards remain locked until Gold Rush ends, "
                               "then become ordinary direct quantum funds after normal maturity."));
     GUIUtil::ConfigureThemedLabelPanel(m_pow_warning, QPalette::Highlight, QPalette::HighlightedText, 6);
     auto* powHelp = makeHelpButton(
@@ -800,7 +801,7 @@ void StakingMiningPage::setupUi()
            "<li>The miner finds a valid QQSPROOF.</li>"
            "<li>The wallet signs and broadcasts a claim transaction that spends a small legacy UTXO and includes the proof.</li>"
            "<li>A staker includes that claim in a PoS block.</li>"
-           "<li>Upgraded nodes credit the reward to the quantum payout address shown here.</li>"
+           "<li>Upgraded nodes credit the reward to the claim's authenticated quantum payout. New-anchor claims use the configured address shown here; retained families preserve their own payout.</li>"
            "</ol>"
            "<h3>CPU controls</h3>"
            "<p>The default is intentionally conservative: 1 core at 1 percent. Increase cores or percent only if you want this computer to spend more CPU time mining claims.</p>"
@@ -810,8 +811,8 @@ void StakingMiningPage::setupUi()
     auto* payoutHelp = makeHelpButton(
         tr("Payout"),
         tr("PoW payout address and reward movement"),
-        tr("<h3>Payout address</h3>"
-           "<p>The payout address is a wallet-backed quantum address. Back up the wallet after it is created.</p>"
+        tr("<h3>Configured new-anchor payout</h3>"
+           "<p>This field is the wallet-backed quantum address for future new-anchor claims. Back up the wallet after it is created. A retained claim family keeps its own authenticated payout and does not allocate an unrelated key merely to wait, relay, or refresh.</p>"
            "<h3>Using mined rewards</h3>"
            "<p>Gold Rush rewards remain phase-locked until Gold Rush ends. After maturity and the boundary, the original wallet-backed quantum outputs are ordinary direct quantum funds. A fresh-address consolidation is optional, not a spendability requirement.</p>"
            "<h3>Why the control transaction has a fee</h3>"
@@ -826,7 +827,7 @@ void StakingMiningPage::setupUi()
     pgrid->addWidget(m_pow_cores, r++, 1);
     pgrid->addWidget(new QLabel(tr("CPU usage:"), powBox), r, 0);
     pgrid->addWidget(m_pow_percent, r++, 1);
-    pgrid->addWidget(new QLabel(tr("Payout address:"), powBox), r, 0);
+    pgrid->addWidget(new QLabel(tr("New-anchor payout:"), powBox), r, 0);
     pgrid->addWidget(m_pow_payout, r, 1);
     pgrid->addWidget(m_pow_copy, r++, 2);
     pgrid->addWidget(new QLabel(tr("Status:"), powBox), r, 0);
@@ -2768,6 +2769,11 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
 
     ++m_wallet_generation;
     m_wallet_model = walletModel;
+    // Wallet-scoped payout text and copy authority must not survive an
+    // identity change. A later accepted snapshot repopulates this field from
+    // the newly selected wallet, including an authoritative empty value.
+    m_pow_payout->clear();
+    m_pow_copy->setEnabled(false);
     m_updating = false;
     m_detail_refresh_in_flight = false;
     m_detail_refresh_pending = false;
@@ -3053,7 +3059,7 @@ void StakingMiningPage::applyPowWithCurrentRecoveryPolicy()
         QString body = tr("This will start the built-in Gold Rush PoW miner with %1 CPU core(s) at %2% target duty cycle.\n\n"
                                 "The wallet must be normally unlocked so it can sign QQSPROOF claim transactions. "
                                 "The miner also needs a confirmed, spendable legacy BLK UTXO to authenticate and pay the fee for each claim. "
-                                "If no existing payout key is available, approving this dialog is one-time consent to create one new non-HD quantum key. "
+                                "If no configured future-new-anchor payout is available, approving this dialog is one-time consent to bind or create one non-HD quantum key for that future work, even while a retained family is being serviced. "
                                 "That key is not recoverable from the wallet seed; back up this wallet immediately if one is created.\n\n"
                                 "Start mining now?")
                                  .arg(cores)
@@ -3101,7 +3107,7 @@ void StakingMiningPage::applyPowWithCurrentRecoveryPolicy()
     }
     m_pow_settings_dirty = false;
     m_pow_status->setText(enabled
-        ? tr("Gold Rush PoW mining is enabled with %1 core(s) at %2% target duty cycle. Press Refresh details for the payout address and live statistics.")
+        ? tr("Gold Rush PoW mining is enabled with %1 core(s) at %2% target duty cycle. Press Refresh details for the configured new-anchor payout and live statistics.")
               .arg(cores)
               .arg(percent)
         : tr("Gold Rush PoW mining is off."));
@@ -4267,9 +4273,11 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
             if (!m_pow_percent->hasFocus()) m_pow_percent->setValue(display_percent);
         }
     }
-    if (info.payout_address_available || !info.payout_address.empty()) {
-        m_pow_payout->setText(QString::fromStdString(info.payout_address));
-    }
+    // An accepted immutable snapshot is authoritative even when the selected
+    // wallet has no configured future-new-anchor payout. Never retain text or
+    // copy authority from an older snapshot or wallet identity.
+    m_pow_payout->setText(QString::fromStdString(info.payout_address));
+    m_pow_copy->setEnabled(!m_pow_payout->text().isEmpty());
 
     m_goldrush_badge->setText(info.epoch_active
         ? tr("Gold Rush shadow ledger: ACTIVE at height %1 (next reward height %2; %3 blocks remaining)")
@@ -4408,7 +4416,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         "<b>PoW Gold Rush</b><br>"
         "%1<br>"
         "Next claim: %2<br>"
-        "Payout: %3<br>"
+        "Configured new-anchor payout: %3<br>"
         "Autostart: %4")
         .arg(pow_runtime_summary)
         .arg(formatBLK(info.next_claim_payout))

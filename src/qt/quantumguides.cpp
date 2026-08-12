@@ -90,12 +90,13 @@ QString PowGuide()
 <h2>Detailed PoW Gold Rush example</h2>
 <p>Gold Rush PoW is not a separate block chain. It creates claim transactions that are included in ordinary PoS blocks. This gives smaller holders a way to compete for part of the Gold Rush reward schedule without needing 10,000 BLK at the PoS whitelist snapshot.</p>
 <ol>
-<li>The wallet reuses an existing wallet-backed quantum payout address. If none exists, the GUI asks before creating one; RPC callers must pass explicit one-call key-creation consent.</li>
+<li>When mining starts or prepares future new-anchor work, the wallet binds or reuses a wallet-backed quantum payout address. If none exists, the GUI asks before creating a non-HD key; RPC callers must pass explicit one-call key-creation consent.</li>
+<li>A retained claim family preserves its already-authenticated payout. Waiting, relaying, or same-anchor refresh does not allocate an unrelated future-new-anchor key.</li>
 <li>The built-in miner searches for an Argon2id proof that meets the current target.</li>
 <li>When it finds a proof, the wallet creates a QQSPROOF transaction.</li>
 <li>The QQSPROOF transaction pays a normal small legacy-chain fee.</li>
 <li>A staker includes the claim in a PoS block.</li>
-<li>Upgraded nodes credit the PoW Gold Rush reward to the quantum payout address.</li>
+<li>Upgraded nodes credit the PoW Gold Rush reward to the authenticated quantum payout carried by that claim.</li>
 </ol>
 <p><b>CPU example:</b> 1 core at 1 percent is deliberately gentle and should keep the wallet responsive. 4 cores at 50 percent is much more aggressive. The higher setting may find more proofs but will use more battery, heat, and fan.</p>
 <p><b>Fee example:</b> if the control transaction is small and the network minimum fee is low, the visible legacy fee can be tiny compared with the quantum reward. The user still needs a small legacy UTXO available so the wallet can anchor the claim.</p>
@@ -107,7 +108,7 @@ QString PowGuide()
 
 <h3>Why the payout must be a quantum address</h3>
 <p>PoW Gold Rush is intended to pull users onto quantum-resistant keys. Paying the reward to a legacy address would defeat the transition goal. The wallet therefore uses a quantum payout address and asks users to back up the wallet after that address exists.</p>
-<p>Quantum payout keys are non-HD. The miner never creates one silently: reject the prompt or omit the RPC consent flag and mining fails without creating a key. If a new payout key is created, back up the wallet immediately.</p>
+<p>New-anchor payout keys are non-HD. The miner never creates one without explicit consent. Rejecting the prompt or omitting the RPC consent flag causes that start or new-anchor allocation to fail without creating a key; it does not alter a retained family's authenticated payout. If a new payout key is created, back up the wallet immediately.</p>
 
 <h3>When PoW rewards become spendable</h3>
 <p>A Gold Rush reward remains locked until Gold Rush ends and must satisfy normal maturity. It then becomes an ordinary direct quantum output at the original payout address. Moving it to a fresh address is optional consolidation or key rotation, not a prerequisite for sends, cold-stake delegation, or node bonding.</p>

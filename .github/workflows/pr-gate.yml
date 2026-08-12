@@ -786,7 +786,7 @@ jobs:
             feature_shutdown.py
 
   mixed-version:
-    name: real v26.2, v28.4, v30.1, v30.1.4, and candidate interoperability
+    name: real v26.2, v28.4, v30.1, and candidate interoperability
     if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
     needs: [policy-and-lint, native-build-and-unit]
     runs-on: ubuntu-22.04

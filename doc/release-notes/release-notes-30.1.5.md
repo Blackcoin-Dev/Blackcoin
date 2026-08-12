@@ -16,20 +16,31 @@ transaction serialization, or wallet ownership.
 
 ## Gold Rush PoW claim continuation
 
-The built-in miner now treats a strictly authenticated wallet-authored claim
-family as one same-anchor lifecycle. It relays an exact eligible carrier when
-possible and otherwise may append one current-policy sibling that spends the
-same confirmed anchor, preserves the legacy target and quantum payout, and
-records durable family, root, parent, and ordinal metadata. It does not select
-a second independent fee coin for that continuation. Because the siblings
-conflict, at most one can confirm and charge its ordinary claim fee.
+The built-in miner now treats each strictly authenticated wallet-authored claim
+family as one same-anchor lifecycle. Within one family, a live member blocks a
+competing sibling. Across multiple safe families, the wallet first relays any
+exact eligible absent carrier, then refreshes one family that has no live or
+relayable member, and waits only when no independent relay or refresh work
+remains. A refreshed sibling spends that family's confirmed anchor, preserves
+its legacy target and quantum payout, and records durable family, root, parent,
+and ordinal metadata. It does not select a second independent fee coin for
+that continuation. Because same-family siblings conflict, at most one can
+confirm and charge its ordinary claim fee. Waiting, relaying, or refreshing a
+retained family uses its authenticated payout and does not allocate the
+configured future-new-anchor payout key; `getpowmininginfo.payout_address` may
+therefore be empty or different during that work. A caller that explicitly
+grants one-call key-creation consent may proactively bind or create that future
+payout so any non-HD-key backup warning is returned synchronously.
 
 A locally persisted claim that has not entered the local mempool remains a
 durably reserved family member instead of collapsing the typed mining gate
-into an indeterminate permanent stop. Malformed, mixed, foreign, forked, or
-database-ambiguous families still fail closed. Explicit fee-paying conflict
-recovery remains a separate, default-off operator authority and is not invoked
-by the normal same-anchor miner path.
+into an indeterminate permanent stop. A foreign incoming proof remains visible
+as audit history but cannot pause a recipient wallet unless the component also
+contains wallet-authored, from-me, adopted, or otherwise wallet-relevant claim
+state. Malformed, mixed, forked, wallet-relevant foreign, or database-ambiguous
+families still fail closed. Explicit fee-paying conflict recovery remains a
+separate, default-off operator authority and is not invoked by the normal
+same-anchor miner path.
 
 `getpowmininginfo` exposes the coherent typed mining-gate snapshot used by the
 worker. Supervisors must evaluate that typed state; raw unresolved or

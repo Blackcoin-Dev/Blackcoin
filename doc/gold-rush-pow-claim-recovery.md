@@ -49,7 +49,9 @@ indeterminate families still fail closed. Recovery never enables mining itself.
 The v30.1.5 candidate's normal lifecycle for an exact
 wallet-authored QQP2, QQP3, or QQP4 claim keeps one confirmed fee anchor
 reserved until a member of that claim family confirms or the anchor is
-otherwise spent on the active chain. A live member pauses new claim creation.
+otherwise spent on the active chain. A live member pauses another sibling in
+that family; it does not prevent the aggregate wallet gate from servicing an
+independent safe family.
 If an eligible member has left the local mempool but is still inside its
 dedicated one-hour relay lifetime, Core first relays those exact bytes.
 
@@ -60,18 +62,32 @@ quantum payout. Every sibling carries durable root, parent, family, and ordinal
 metadata. The siblings conflict, so at most one can confirm and charge its
 ordinary claim fee. This does not consume another wallet coin, create a chain
 of recovery payments, or release the anchor for an unrelated claim.
+The retained family supplies its own authenticated payout script, so waiting,
+relaying, and refreshing it do not require or allocate the wallet's configured
+future-new-anchor payout key. `getpowmininginfo.payout_address` describes that
+separate configured binding and may therefore be empty or different while a
+retained family is being serviced. Explicit one-call key-creation consent may
+proactively bind or create the future-new-anchor payout so the non-HD-key
+backup warning is delivered before background work continues.
 Same-anchor siblings remain `QQSPROOF` claims; the candidate does not change
 existing claim reward, winner, loser, late-claim, or reimbursement consensus
 rules.
 
-The refresh path is deliberately narrow. The complete component must be an
-unforked, gap-free family of exact single-input wallet-authored carriers with
+The refresh path is deliberately narrow. Each mining-relevant component must be
+an unforked, gap-free family of exact single-input wallet-authored carriers with
 authenticated creation metadata and one unchanged anchor, target, and payout.
-Adopted or foreign history, malformed or mixed graphs, ordinary descendants,
-ambiguous database state, future proof formats, and inconsistent lineage fail
-closed. A deterministic relay-policy rejection authorizes a sibling only when
-a fresh full mempool test reproduces the exact low-fee rejection on the same
-tip and wallet snapshot.
+Multiple safe families are aggregated and one action family is selected
+deterministically. Eligible absent bytes have priority over a paid refresh,
+and a refresh has priority over waiting on an unrelated live or transiently
+deferred family. Any wallet-relevant unsafe component closes the whole gate.
+Purely incoming foreign proofs remain visible as audit history but cannot claim
+mining authority over the recipient wallet. Wholly foreign UNKNOWN/non-authored
+mixed history is likewise audit-only; once an ordinary member spends wallet
+value or is marked from-me, the mixed graph fails closed. Adopted families,
+ambiguous database state, future proof formats, and inconsistent lineage also
+fail closed. A deterministic relay-policy rejection authorizes a
+sibling only when a fresh full mempool test reproduces the exact low-fee
+rejection on the same tip and wallet snapshot.
 
 Zero-payment local retirement remains only for narrow pre-lineage legacy
 records that cannot be authenticated as a refreshable exact carrier.

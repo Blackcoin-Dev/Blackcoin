@@ -92,9 +92,11 @@ and its fee input stays reserved because another peer can retain and later
 confirm it. Generic `abandontransaction` does not release that reservation.
 Immutable v30.1.4 pauses on actionable or indeterminate quarantined
 components, not merely on the raw number of historical claim objects. The
-v30.1.5 candidate instead follows the complete typed gate and may safely
-relay or refresh one authenticated family while those legacy counts remain
-nonzero.
+v30.1.5 candidate instead follows the complete typed gate and may safely wait,
+relay, or refresh one deterministically selected authenticated wallet-owned
+family while those legacy counts remain nonzero. Multiple safe families are
+serviced without selecting another fee anchor, and a purely incoming foreign
+proof remains audit history rather than authority to pause the recipient.
 
 The Issue #37 recovery release groups wallet-known sibling conflicts and
 descendants by their current confirmed anchor. Its shared GUI, CLI/RPC, daemon,
@@ -115,8 +117,13 @@ relays eligible bytes and then, when necessary, appends a current-policy sibling
 that spends the same confirmed fee anchor. The append-only lineage records
 schema, family, root, and ordinal metadata on each carrier plus the direct
 parent on every non-root refresh. It preserves the legacy target and quantum
-payout; conflicting siblings cannot both confirm, so the wallet does not
-consume another coin for each retry. Exact authenticated
+payout without requiring or creating the configured future-new-anchor payout
+key; `getpowmininginfo.payout_address` may therefore be empty or different
+while a retained family is serviced. If the caller explicitly grants one-call
+key-creation consent, the wallet may instead bind or create that future payout
+up front so the non-HD-key backup warning is delivered synchronously.
+Conflicting siblings cannot both confirm,
+so the wallet does not consume another coin for each retry. Exact authenticated
 claims are not retired merely because an original policy window expires.
 
 Same-anchor siblings remain `QQSPROOF` claims; this candidate does not change

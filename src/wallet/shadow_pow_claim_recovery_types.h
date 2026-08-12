@@ -184,6 +184,10 @@ struct ShadowPowClaimRecoveryComponent
     std::vector<uint256> resolution_txids;
     bool anchor_authenticated{false};
     bool anchor_unspent{false};
+    // A user coin lock is a restriction-only hold on this retained family.
+    // It suppresses relay and refresh, but must not make the family unsafe or
+    // prevent independent families from progressing.
+    bool anchor_user_locked{false};
     bool all_claims_quarantined{false};
     bool all_claims_explicitly_provenanced{false};
     bool has_live_claim{false};
@@ -232,10 +236,10 @@ enum class ShadowPowClaimMiningGateAction : uint8_t {
     UNSAFE,
 };
 
-/** Read-only, active-tip-pinned wallet action for QQSPROOF production. A
- * refresh never selects a second fee UTXO: it spends the same authenticated
- * confirmed anchor as every older member of one strictly linear, authenticated
- * QQP2/QQP3/QQP4 family. */
+/** Read-only, active-tip-pinned wallet action for QQSPROOF production. Counters
+ * aggregate every safe authenticated wallet-owned family; the action payload
+ * identifies one deterministically selected family. A refresh never selects a
+ * second fee UTXO: it spends that family's authenticated confirmed anchor. */
 struct ShadowPowClaimMiningGate
 {
     ShadowPowClaimMiningGateAction action{
@@ -295,6 +299,29 @@ struct ShadowPowClaimMiningGate
                !relay_txid.IsNull();
     }
 };
+
+/** Derive the aggregate mining decision from one already-built recovery
+ * inventory so callers can reuse proof-validation work for telemetry and
+ * payout decisions. */
+ShadowPowClaimMiningGate BuildShadowPowClaimMiningGate(
+    const ShadowPowClaimRecoveryInventory& inventory);
+
+/** True when an unresolved component can affect this wallet's mining
+ * authority. Pure incoming UNKNOWN/non-authored/non-from-me records are
+ * retained for audit but do not count. */
+bool HasMiningRelevantUnresolvedShadowPowClaimComponent(
+    const ShadowPowClaimRecoveryInventory& inventory);
+
+/**
+ * Return true only when two gates authorize the same exact historical relay
+ * on the same active-chain and wallet snapshot. Callers use this immediately
+ * before handing retained bytes to the mempool so a concurrent tip, wallet,
+ * family, safety-counter, or relay-expiry change cannot be mistaken for the
+ * previously reviewed intent.
+ */
+bool ShadowPowClaimRelayIntentMatches(
+    const ShadowPowClaimMiningGate& expected,
+    const ShadowPowClaimMiningGate& current);
 
 /**
  * Recovery has three deliberately distinct side-effect levels. PREVIEW is

@@ -11,6 +11,7 @@
 #include <rpc/util.h>
 #include <script/script.h>
 #include <util/moneystr.h>
+#include <validation.h>
 #include <wallet/coincontrol.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
@@ -19,6 +20,7 @@
 
 #include <univalue.h>
 
+#include <set>
 
 namespace wallet {
 static UniValue WalletLifecycleAmountsToJSON(const WalletLifecycleAmounts& amounts)
@@ -282,6 +284,7 @@ RPCHelpMan lockunspent()
                 "Locks are stored in memory only, unless persistent=true, in which case they will be written to the\n"
                 "wallet database and loaded on node start. Unwritten (persistent=false) locks are always cleared\n"
                 "(by virtue of process exit) when a node stops or fails. Unlocking will clear both persistent and not.\n"
+                "A confirmed chain-unspent anchor reserved only by exact, durably quarantined Gold Rush QQSPROOF claims may also be locked. This adds a user hold to that retained family and never releases its existing claim reservation.\n"
                 "Also see the listunspent call\n",
                 {
                     {"unlock", RPCArg::Type::BOOL, RPCArg::Optional::NO, "Whether to unlock (true) or lock (false) the specified transactions"},
@@ -323,26 +326,29 @@ RPCHelpMan lockunspent()
     // the user could have gotten from another RPC command prior to now
     pwallet->BlockUntilSyncedToCurrentChain();
 
-    LOCK(pwallet->cs_wallet);
-
-    bool fUnlock = request.params[0].get_bool();
-
+    const bool fUnlock{request.params[0].get_bool()};
     const bool persistent{request.params[2].isNull() ? false : request.params[2].get_bool()};
 
     if (request.params[1].isNull()) {
         if (fUnlock) {
-            if (!pwallet->UnlockAllCoins())
-                throw JSONRPCError(RPC_WALLET_ERROR, "Unlocking coins failed");
+            LOCK(pwallet->cs_wallet);
+            std::string error;
+            if (!pwallet->UnlockAllCoins(&error)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, error);
+            }
         }
         return true;
     }
 
     const UniValue& output_params = request.params[1].get_array();
 
-    // Create and validate the COutPoints first.
+    // Parse the caller-controlled array before taking either wallet or chain
+    // locks.  State-dependent validation below still uses the authoritative
+    // cs_main -> cs_wallet lock order.
 
     std::vector<COutPoint> outputs;
     outputs.reserve(output_params.size());
+    std::set<COutPoint> seen_outputs;
 
     for (unsigned int idx = 0; idx < output_params.size(); idx++) {
         const UniValue& o = output_params[idx].get_obj();
@@ -359,47 +365,82 @@ RPCHelpMan lockunspent()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, vout cannot be negative");
         }
 
-        const COutPoint outpt(txid, nOutput);
-
-        const auto it = pwallet->mapWallet.find(outpt.hash);
-        if (it == pwallet->mapWallet.end()) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, unknown transaction");
+        const COutPoint outpoint{txid, static_cast<uint32_t>(nOutput)};
+        if (seen_outputs.insert(outpoint).second) {
+            outputs.push_back(outpoint);
         }
-
-        const CWalletTx& trans = it->second;
-
-        if (outpt.n >= trans.tx->vout.size()) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, vout index out of bounds");
-        }
-
-        if (pwallet->IsSpent(outpt)) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, expected unspent output");
-        }
-
-        const bool is_locked = pwallet->IsLockedCoin(outpt);
-
-        if (fUnlock && !is_locked) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, expected locked output");
-        }
-
-        if (!fUnlock && is_locked && !persistent) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, output already locked");
-        }
-
-        outputs.push_back(outpt);
     }
 
-    std::unique_ptr<WalletBatch> batch = nullptr;
-    // Unlock is always persistent
-    if (fUnlock || persistent) batch = std::make_unique<WalletBatch>(pwallet->GetDatabase());
+    const auto validate_common = [&]() {
+        for (const COutPoint& outpt : outputs) {
+            const auto it = pwallet->mapWallet.find(outpt.hash);
+            if (it == pwallet->mapWallet.end()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, unknown transaction");
+            }
 
-    // Atomically set (un)locked status for the outputs.
-    for (const COutPoint& outpt : outputs) {
-        if (fUnlock) {
-            if (!pwallet->UnlockCoin(outpt, batch.get())) throw JSONRPCError(RPC_WALLET_ERROR, "Unlocking coin failed");
-        } else {
-            if (!pwallet->LockCoin(outpt, batch.get())) throw JSONRPCError(RPC_WALLET_ERROR, "Locking coin failed");
+            const CWalletTx& trans = it->second;
+            if (outpt.n >= trans.tx->vout.size()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, vout index out of bounds");
+            }
+
+            const bool is_locked = pwallet->IsLockedCoin(outpt);
+            if (fUnlock) {
+                if (!is_locked) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, expected locked output");
+                }
+            } else if (is_locked && !persistent) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, output already locked");
+            }
         }
+    };
+
+    if (fUnlock) {
+        LOCK(pwallet->cs_wallet);
+        validate_common();
+        std::string error;
+        if (!pwallet->UpdateLockedCoins(outputs, /*lock=*/false,
+                                        /*persistent=*/true, &error)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, error);
+        }
+        return true;
+    }
+
+    bool requires_chain_exception{false};
+    {
+        LOCK(pwallet->cs_wallet);
+        validate_common();
+        for (const COutPoint& outpt : outputs) {
+            if (pwallet->IsSpent(outpt)) {
+                requires_chain_exception = true;
+                break;
+            }
+        }
+        if (!requires_chain_exception) {
+            std::string error;
+            if (!pwallet->UpdateLockedCoins(outputs, /*lock=*/true,
+                                            persistent, &error)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, error);
+            }
+            return true;
+        }
+    }
+
+    // A spent output needs the narrow, restriction-only QQSPROOF exception.
+    // Revalidate the entire request after acquiring the canonical chain then
+    // wallet lock order; no preliminary decision is trusted across the gap.
+    LOCK2(::cs_main, pwallet->cs_wallet);
+    validate_common();
+    for (const COutPoint& outpt : outputs) {
+        if (pwallet->IsSpent(outpt) &&
+            !pwallet->CanLockQuarantinedShadowPowClaimAnchor(outpt)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "Invalid parameter, expected unspent output");
+        }
+    }
+    std::string error;
+    if (!pwallet->UpdateLockedCoins(outputs, /*lock=*/true,
+                                    persistent, &error)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, error);
     }
 
     return true;

@@ -47,6 +47,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 using node::BlockAssembler;
@@ -81,6 +82,20 @@ static bool ShadowPowClaimRelayMustWaitForNextTip(
            error.find("wallet-broadcast-in-flight") != std::string::npos;
 }
 
+static bool ShadowPowClaimRelayRequiresFreshGate(const std::string& error)
+{
+    return error == "recovery-wallet-generation-changed" ||
+           error == "recovery-database-outcome-ambiguous" ||
+           error == "recovery-candidate-state-changed" ||
+           error == "recovery-normal-wallet-unlock-ended" ||
+           error == "recovery-automatic-authority-changed" ||
+           error == "recovery-pow-miner-disabled" ||
+           error == "recovery-pow-miner-authority-changed" ||
+           error == "shadow-proof-relay-ttl-expired";
+}
+
+static constexpr size_t MAX_SHADOW_POW_RPC_RELAY_ATTEMPTS{256};
+
 static std::string DurableQuantumKeyFailureMessage(
     const CTxDestination& created_destination,
     const std::string& action,
@@ -111,12 +126,16 @@ static void CommitWalletTransactionOrThrow(
     const CTransactionRef& tx,
     mapValue_t map_value,
     const std::string& action,
-    const std::optional<CTxDestination>& created_destination = std::nullopt)
+    const std::optional<CTxDestination>& created_destination = std::nullopt,
+    const std::optional<ShadowPowClaimCommitAuthority>&
+        shadow_pow_authority = std::nullopt)
 {
     std::string broadcast_error;
     bool committed{false};
     try {
-        committed = wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error);
+        committed = wallet.CommitTransaction(
+            tx, std::move(map_value), {}, &broadcast_error,
+            /*commit_status=*/nullptr, shadow_pow_authority);
     } catch (const std::exception& e) {
         if (created_destination) {
             ThrowQuantumActionError(
@@ -1798,7 +1817,7 @@ static RPCHelpMan sendshadowpowclaim()
                 "If proof is omitted, grinding is memory-hard (Argon2id, ~1 MiB per try) and synchronous; tune max_tries accordingly.\n"
                 "If proof is supplied, it must be the hex QQSPROOF payload for the current tip, target address, and quantum payout address.\n"
                 "The active proof format is reported by getshadowpowwork. QQP2/QQP3 do not bind an exact fee input; QQP4 does so only after its separately scheduled activation. Never reuse one externally supplied proof for multiple claim transactions.\n"
-                "Only valid during the Gold Rush reward window. An unconfirmed QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it. Mining may continue only around an isolated, explicitly-authored legacy QQP2 claim that the typed, active-tip-pinned gate can safely defer; all other unresolved components fail closed.\n" +
+                "Only valid during the Gold Rush reward window. An unconfirmed wallet-authored QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it. The typed, active-tip-pinned gate validates each wallet-owned same-anchor family. Within one family a live member blocks a competing sibling; across independent safe families Core relays eligible absent bytes first, then refreshes one family, and waits only when no independent relay or refresh work remains. Audit-only incoming proofs do not gain mining authority; any wallet-owned unsafe component still fails closed.\n" +
                 HELP_REQUIRING_PASSPHRASE,
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet legacy address that owns the UTXO authenticating this PoW claim. It does not need to be whitelisted."},
@@ -1841,73 +1860,19 @@ static RPCHelpMan sendshadowpowclaim()
     if (pwallet->m_wallet_unlock_staking_only) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to create claim transaction");
     }
+    const uint64_t expected_wallet_authority_generation = WITH_LOCK(
+        pwallet->cs_wallet,
+        if (!pwallet->HasNormalPowMiningWalletAuthorityLocked()) {
+            throw JSONRPCError(
+                RPC_WALLET_UNLOCK_NEEDED,
+                "Error: Wallet requires a normal unlock to create a claim transaction");
+        }
+        return pwallet->m_pow_wallet_authority_generation.load(
+            std::memory_order_acquire));
     if (!pwallet->chain().isReadyToBroadcast()) {
         throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
                            "Gold Rush PoW claims are paused while the node is reindexing, importing blocks, or in initial block download");
     }
-    ShadowPowClaimMiningGate initial_gate =
-        pwallet->GetShadowPowClaimMiningGate();
-    if (initial_gate.ShouldRelayExisting()) {
-        std::string relay_error;
-        bool relayed{false};
-        try {
-            relayed = pwallet->SubmitTxMemoryPoolAndRelay(
-                initial_gate.relay_txid, relay_error, /*relay=*/true,
-                /*recovery_guard=*/nullptr,
-                /*max_tx_fee_override=*/CENT);
-        } catch (const std::exception& exception) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                strprintf("Existing Gold Rush PoW claim relay encountered a local exception; no sibling was authorized: %s",
-                          exception.what()));
-        } catch (...) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                "Existing Gold Rush PoW claim relay encountered an unknown local exception; no sibling was authorized");
-        }
-        if (relayed) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                strprintf("An existing eligible Gold Rush PoW claim %s was relayed; no additional fee transaction was created",
-                          initial_gate.relay_txid.GetHex()));
-        }
-        if (relay_error.empty() ||
-            ShadowPowClaimRelayMustWaitForNextTip(relay_error)) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                strprintf("An existing eligible Gold Rush PoW claim %s must resolve before another claim is created; relay failed: %s",
-                          initial_gate.relay_txid.GetHex(),
-                          relay_error.empty() ? "local relay unavailable"
-                                              : relay_error));
-        }
-        // Full mempool test-accept rejected the historical bytes for a
-        // deterministic policy reason. The coherent snapshot may authorize a
-        // current-policy sibling that spends the same anchor; it may not pick
-        // another fee UTXO.
-        if (!pwallet->RecordShadowPowClaimRelayPolicyRejection(
-                initial_gate)) {
-            throw JSONRPCError(
-                RPC_VERIFY_REJECTED,
-                "Relay failure was not a reproducible deterministic mempool-policy rejection; no same-anchor sibling was authorized");
-        }
-        initial_gate = pwallet->GetShadowPowClaimMiningGate();
-        if (!initial_gate.MayRefreshSameAnchor()) {
-            throw JSONRPCError(
-                RPC_VERIFY_REJECTED,
-                "The rejected claim family is no longer authorized for same-anchor refresh");
-        }
-    }
-    if (!initial_gate.MayCreateClaim()) {
-        throw JSONRPCError(RPC_WALLET_ERROR,
-                           "Gold Rush PoW claim creation is waiting for an existing live claim or is blocked by an incoherent or unsafe claim family");
-    }
-
-    ShadowPowClaimSubmissionGuard submission_guard(*pwallet);
-    if (!submission_guard) {
-        throw JSONRPCError(RPC_WALLET_ERROR,
-                           "Another Gold Rush PoW claim submission is already in progress for this wallet");
-    }
-
     const std::string address = request.params[0].get_str();
     const CTxDestination dest = DecodeDestination(address);
     if (!IsValidDestination(dest)) {
@@ -1960,6 +1925,134 @@ static RPCHelpMan sendshadowpowclaim()
         coin_control.fOverrideFeeRate = true;
     }
 
+    // Validate every caller-supplied argument before any historical relay
+    // side effect, then reserve the wallet's complete claim/recovery submit
+    // path for both retained-byte relay and any subsequent new claim.
+    ShadowPowClaimSubmissionGuard submission_guard(*pwallet);
+    if (!submission_guard) {
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           "Another Gold Rush PoW claim submission is already in progress for this wallet");
+    }
+
+    ShadowPowClaimMiningGate initial_gate =
+        pwallet->GetShadowPowClaimMiningGate();
+    std::set<uint256> relay_attempts;
+    size_t relay_iterations{0};
+    while (initial_gate.ShouldRelayExisting()) {
+        if (++relay_iterations > MAX_SHADOW_POW_RPC_RELAY_ATTEMPTS) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Existing Gold Rush PoW relay selection did not converge within the bounded per-call snapshot limit; no new fee transaction was created");
+        }
+        const ShadowPowClaimMiningGate current_gate =
+            pwallet->GetShadowPowClaimMiningGate();
+        if (!ShadowPowClaimRelayIntentMatches(
+                initial_gate, current_gate) ||
+            current_gate.relay_expiry_time <= 0 ||
+            GetTime() >= current_gate.relay_expiry_time) {
+            initial_gate = current_gate;
+            continue;
+        }
+        if (!relay_attempts.insert(current_gate.relay_txid).second) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Existing Gold Rush PoW relay selection did not converge within the bounded per-call attempt limit; no new fee transaction was created");
+        }
+        const ShadowPowClaimMiningGate relay_gate = current_gate;
+        std::string relay_error;
+        bool relayed{false};
+        ShadowPowClaimRecoveryBroadcastGuard broadcast_guard;
+        broadcast_guard.expected_wallet_generation =
+            relay_gate.wallet_generation;
+        broadcast_guard.expected_wallet_tip = relay_gate.active_tip;
+        broadcast_guard.expected_candidate_state_fingerprint =
+            relay_gate.candidate_state_fingerprint;
+        broadcast_guard.require_normal_unlock = true;
+        try {
+            relayed = pwallet->SubmitTxMemoryPoolAndRelay(
+                relay_gate.relay_txid, relay_error, /*relay=*/true,
+                &broadcast_guard,
+                /*max_tx_fee_override=*/CENT);
+        } catch (const std::exception& exception) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                strprintf("Existing Gold Rush PoW claim relay encountered a local exception; no sibling was authorized: %s",
+                          exception.what()));
+        } catch (...) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Existing Gold Rush PoW claim relay encountered an unknown local exception; no sibling was authorized");
+        }
+        if (relayed) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                strprintf("An existing eligible Gold Rush PoW claim %s was relayed; no additional fee transaction was created",
+                          relay_gate.relay_txid.GetHex()));
+        }
+        if (ShadowPowClaimRelayRequiresFreshGate(relay_error)) {
+            initial_gate = pwallet->GetShadowPowClaimMiningGate();
+            continue;
+        }
+        const bool wait_for_snapshot_change = relay_error.empty() ||
+            ShadowPowClaimRelayMustWaitForNextTip(relay_error);
+        ShadowPowClaimMiningGate recorded_reselection;
+        const bool recorded = !wait_for_snapshot_change &&
+            pwallet->RecordShadowPowClaimRelayPolicyRejection(
+                relay_gate, &recorded_reselection);
+        initial_gate = recorded
+            ? recorded_reselection
+            : pwallet->DeferShadowPowClaimFamilyForSnapshot(
+                  relay_gate);
+        if (initial_gate.ShouldRelayExisting()) {
+            continue;
+        }
+        if (initial_gate.MayRefreshSameAnchor()) {
+            break;
+        }
+        if (wait_for_snapshot_change) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                strprintf("Existing Gold Rush PoW claim family %s must wait for a wallet or tip state change; no independent relay or refresh work remains: %s",
+                          relay_gate.relay_txid.GetHex(),
+                          relay_error.empty() ? "local relay unavailable"
+                                              : relay_error));
+        }
+        if (!recorded) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Relay failure was not a reproducible deterministic mempool-policy rejection and no independent relay or refresh work remains; no new fee transaction was authorized");
+        }
+        throw JSONRPCError(
+            RPC_VERIFY_REJECTED,
+            "Every bounded historical relay candidate was rejected and the typed gate did not authorize a same-anchor refresh");
+    }
+    if (!initial_gate.MayCreateClaim()) {
+        switch (initial_gate.action) {
+        case ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is waiting for an existing live claim family member; no competing fee transaction was created");
+        case ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is waiting for a wallet or active-tip state change; no fee transaction was created");
+        case ShadowPowClaimMiningGateAction::RELAY_EXISTING:
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Gold Rush PoW claim creation still has bounded historical relay work; no sibling fee transaction was authorized");
+        case ShadowPowClaimMiningGateAction::UNSAFE:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is blocked by an incoherent, ambiguous, or unsafe wallet-owned claim component");
+        case ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR:
+        case ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR:
+            break;
+        }
+        throw JSONRPCError(
+            RPC_WALLET_ERROR,
+            "Gold Rush PoW claim creation is not authorized by the current typed mining-gate snapshot");
+    }
+
     ShadowPowClaimInput selected_input;
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
@@ -1986,6 +2079,13 @@ static RPCHelpMan sendshadowpowclaim()
             throw JSONRPCError(RPC_WALLET_ERROR, selection_error.original);
         }
         if (selection_result != ShadowPowClaimInputSelectionResult::SELECTED) {
+            if (mining_gate.MayRefreshSameAnchor()) {
+                throw JSONRPCError(
+                    RPC_WALLET_ERROR,
+                    selection_error.original.empty()
+                        ? "The selected retained Gold Rush PoW claim family is not currently serviceable"
+                        : selection_error.original);
+            }
             throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable non-dust UTXO found for the target address");
         }
     }
@@ -2053,6 +2153,14 @@ static RPCHelpMan sendshadowpowclaim()
     int64_t vsize{-1};
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
+        if (pwallet->m_pow_wallet_authority_generation.load(
+                std::memory_order_acquire) !=
+                expected_wallet_authority_generation ||
+            !pwallet->HasNormalPowMiningWalletAuthorityLocked()) {
+            throw JSONRPCError(
+                RPC_WALLET_UNLOCK_NEEDED,
+                "Wallet signing authority changed while grinding; retry after a normal unlock");
+        }
         const ShadowPowClaimMiningGate mining_gate =
             pwallet->GetShadowPowClaimMiningGateLocked();
         if (!mining_gate.MayCreateClaim() ||
@@ -2174,6 +2282,8 @@ static RPCHelpMan sendshadowpowclaim()
 
     CTransactionRef tx = MakeTransactionRef(std::move(claim_tx));
     const std::string hex = EncodeHexTx(*tx);
+    pwallet->MaybeDelayShadowPowClaimCommitForTest(
+        selected_input.outpoint);
     {
         ChainstateManager& chainman = pwallet->chain().chainman();
         LOCK(cs_main);
@@ -2182,17 +2292,18 @@ static RPCHelpMan sendshadowpowclaim()
             tip->nHeight + 1 != pow_work.height) {
             throw JSONRPCError(RPC_VERIFY_REJECTED, "Active chain tip changed before the PoW claim could be committed; retry on the new tip");
         }
+        ShadowPowClaimMiningGate final_mining_gate;
         {
             LOCK(pwallet->cs_wallet);
-            const ShadowPowClaimMiningGate mining_gate =
+            final_mining_gate =
                 pwallet->GetShadowPowClaimMiningGateLocked();
             Coin selected_coin;
             bilingual_str refresh_error;
             const bool gate_matches = selected_input.same_anchor_refresh
                 ? pwallet->GetShadowPowClaimRefreshCoinLocked(
-                      selected_input, mining_gate, selected_coin,
+                      selected_input, final_mining_gate, selected_coin,
                       refresh_error)
-                : mining_gate.MayCreateNewAnchorClaim() &&
+                : final_mining_gate.MayCreateNewAnchorClaim() &&
                       chainman.ActiveChainstate().CoinsTip().GetCoin(
                           selected_input.outpoint, selected_coin) &&
                       !selected_coin.IsSpent() &&
@@ -2237,7 +2348,16 @@ static RPCHelpMan sendshadowpowclaim()
             map_value[SHADOW_POW_CLAIM_LINEAGE_PARENT_KEY] =
                 selected_input.lineage_parent_txid.GetHex();
         }
-        CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "PoW Claim");
+        CommitWalletTransactionOrThrow(
+            *pwallet, tx, std::move(map_value), "PoW Claim",
+            /*created_destination=*/std::nullopt,
+            ShadowPowClaimCommitAuthority{
+                expected_wallet_authority_generation,
+                /*require_pow_mining_enabled=*/false,
+                selected_input.coin_lock_generation,
+                selected_input.outpoint,
+                final_mining_gate.wallet_generation,
+                final_mining_gate.candidate_state_fingerprint});
     }
 
     UniValue result(UniValue::VOBJ);
@@ -2677,6 +2797,7 @@ static UniValue ShadowPowRecoveryComponentToJSON(const ShadowPowClaimRecoveryCom
     result.pushKV("stale_depth_known", component.stale_depth_known);
     result.pushKV("anchor_authenticated", component.anchor_authenticated);
     result.pushKV("anchor_unspent", component.anchor_unspent);
+    result.pushKV("anchor_user_locked", component.anchor_user_locked);
     result.pushKV("all_claims_quarantined", component.all_claims_quarantined);
     result.pushKV("all_claims_explicitly_provenanced", component.all_claims_explicitly_provenanced);
     result.pushKV("all_claims_zero_payment_retirable",
@@ -4033,7 +4154,7 @@ static RPCHelpMan setpowmining()
         "\nStart, stop, or reconfigure the built-in (in-process) Gold Rush Proof-of-Work miner.\n"
         "No external miner is required. Mining only produces claims during the Gold Rush reward window,\n"
         "requires an unlocked wallet with private keys, and credits valid claims to a wallet-owned quantum address in the upgraded shadow ledger.\n"
-        "By default the miner reuses -qqpowpayoutaddress or a previously stored wallet payout and creates no key. If neither exists, the call fails without changing the wallet unless allow_new_payout_key=true gives one-call consent, or startup already supplied -qqallowautokeycreation=1. Every newly created payout key is non-HD and requires an immediate wallet backup.\n"
+        "A new-anchor claim reuses -qqpowpayoutaddress or a previously stored wallet payout and creates no key by default. If neither exists, new-anchor mining fails without changing the wallet unless allow_new_payout_key=true gives one-call consent, or startup already supplied -qqallowautokeycreation=1. A safe retained family needs no configured payout to wait, relay, or refresh: Core preserves that family's authenticated payout script and allocates no unrelated key. If explicit key-creation consent is supplied while servicing a retained family, Core binds the future new-anchor payout during this call so the backup warning is returned synchronously. Every newly created payout key is non-HD and requires an immediate wallet backup.\n"
         "Claim submission is not whitelist-gated, but it does require a spendable non-dust legacy UTXO to authenticate the QQSPROOF transaction and pay the minimal network fee.\n",
         {
             {"enabled", RPCArg::Type::BOOL, RPCArg::Optional::NO, "true to start mining, false to stop."},
@@ -4045,7 +4166,7 @@ static RPCHelpMan setpowmining()
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is now enabled."},
             {RPCResult::Type::NUM, "threads", "Configured worker threads."},
             {RPCResult::Type::NUM, "cpu_percent", "Configured per-core CPU duty cycle."},
-            {RPCResult::Type::STR, "payout_address", "The configured, restored, or newly created wallet-owned quantum payout address."},
+            {RPCResult::Type::STR, "payout_address", "The configured, restored, or newly created wallet-owned payout for future new-anchor claims. It may be empty or differ while a retained family preserves its own authenticated payout."},
             {RPCResult::Type::BOOL, "created_payout_key", "Whether this call created a new non-HD ML-DSA payout key."},
             {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup reminder when a wallet-backed quantum payout key was created."},
         }},
@@ -4108,7 +4229,7 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "shadow_reward_end_height", "Last Gold Rush shadow-ledger reward height."},
             {RPCResult::Type::BOOL, "epoch_active", "Whether the Gold Rush reward window is currently open."},
             {RPCResult::Type::NUM, "blocks_remaining", "Blocks left in the Gold Rush reward window."},
-            {RPCResult::Type::STR, "payout_address", "Quantum payout address (empty until created)."},
+            {RPCResult::Type::STR, "payout_address", "Configured wallet payout for future new-anchor claims (empty until bound). A retained-family refresh instead preserves that selected family's authenticated payout."},
             {RPCResult::Type::STR_AMOUNT, "accrued_jackpot", "PoW jackpot accrued in the pool."},
             {RPCResult::Type::STR_AMOUNT, "next_claim_payout", "Estimated payout for a valid PoW claim in the next block."},
             {RPCResult::Type::NUM, "next_claim_amount", "Estimated payout for a valid PoW claim in the next block, in satoshis."},
@@ -4127,14 +4248,14 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::BOOL, "mining_gate_coherent", "Whether the typed mining gate is bound to one matching active-chain and wallet tip."},
             {RPCResult::Type::STR, "mining_gate_action", "Fresh inventory action, except that an enabled claim-in-flight worker may report the optional transient wait_for_next_tip from one exact matching cached snapshot: create_new_anchor, wait_for_live, wait_for_next_tip, relay_existing, refresh_same_anchor, or unsafe."},
             {RPCResult::Type::BOOL, "mining_gate_can_submit", "Fresh inventory authorization to create one additional claim without mutating recovery state. It may be true while mining_gate_action reports a bounded wait_for_next_tip worker override, but does not authorize bypassing that wait."},
-            {RPCResult::Type::BOOL, "mining_gate_database_ambiguous", "Whether an ambiguous recovery database outcome forces the gate closed until wallet reload."},
-            {RPCResult::Type::NUM, "mining_gate_unresolved_components", "Unresolved wallet claim components in the typed snapshot."},
-            {RPCResult::Type::NUM, "mining_gate_live_claims", "Same-anchor family members currently in the local mempool."},
-            {RPCResult::Type::NUM, "mining_gate_eligible_claims", "Same-anchor family members valid for the pinned tip, whether live or absent."},
-            {RPCResult::Type::NUM, "mining_gate_family_claims", "Historical members of the one authenticated same-anchor claim family."},
-            {RPCResult::Type::NUM, "mining_gate_unsafe_claims", "Unresolved claim objects that fail the strict same-anchor family rules."},
-            {RPCResult::Type::NUM, "mining_gate_unsafe_components", "Unresolved components that fail the strict same-anchor family rules."},
-            {RPCResult::Type::STR_HEX, "mining_gate_relay_txid", "Fresh-inventory eligible under-TTL relay claim, or all-zero otherwise. It may remain nonzero while mining_gate_action reports a matching bounded wait_for_next_tip worker override."},
+            {RPCResult::Type::BOOL, "mining_gate_database_ambiguous", "Whether an ambiguous claim-recovery or user coin-lock database outcome forces the gate closed until wallet reload."},
+            {RPCResult::Type::NUM, "mining_gate_unresolved_components", "Unresolved mining-relevant wallet claim components in the typed snapshot. Audit-only incoming proof records remain visible in recovery inventory but do not count here."},
+            {RPCResult::Type::NUM, "mining_gate_live_claims", "Members currently in the local mempool across every safe authenticated wallet-owned family."},
+            {RPCResult::Type::NUM, "mining_gate_eligible_claims", "Members valid for the pinned tip across every safe authenticated wallet-owned family, whether live or absent."},
+            {RPCResult::Type::NUM, "mining_gate_family_claims", "Historical members across every safe authenticated wallet-owned same-anchor family."},
+            {RPCResult::Type::NUM, "mining_gate_unsafe_claims", "Claim objects in mining-relevant unresolved components that fail the strict same-anchor family rules."},
+            {RPCResult::Type::NUM, "mining_gate_unsafe_components", "Mining-relevant unresolved components that fail the strict same-anchor family rules."},
+            {RPCResult::Type::STR_HEX, "mining_gate_relay_txid", "Eligible under-TTL relay claim for the reported gate snapshot, or all-zero when no relay is currently actionable, including while that family is deferred until the next tip."},
             {RPCResult::Type::STR_HEX, "mining_gate_lineage_head_txid", "Current durable same-anchor lineage head, or all-zero when no family is active."},
             {RPCResult::Type::STR_HEX, "mining_gate_candidate_state_fingerprint", "Cheap in-memory wallet-claim state key used with tip and database generation to invalidate the cached gate."},
             {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual claim resolutions."},

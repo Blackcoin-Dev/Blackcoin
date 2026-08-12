@@ -37,6 +37,7 @@ BOUNDARY_WALLET = "pow_claim_boundary"
 CROSS_BOUNDARY_WALLET = "pow_claim_cross_boundary"
 LIVE_FEE_VALUES = (Decimal("0.991"), Decimal("501.747137"), Decimal("969.818832"))
 ZERO_HASH = "0" * 64
+QQSPROOF = b"QQSPROOF"
 
 
 class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
@@ -66,6 +67,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self.extra_args = [[
             *self.base_args,
             "-qqshadowpowclaimsubmissiondelaymillis=1500",
+            "-qqshadowpowclaimcommitdelaymillis=1500",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -112,6 +114,44 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         decoded = self.nodes[0].decoderawtransaction(self.nodes[0].getrawtransaction(txid))
         assert_equal(len(decoded["vin"]), 1)
         return {"txid": decoded["vin"][0]["txid"], "vout": decoded["vin"][0]["vout"]}
+
+    def _claim_scripts(self, wallet, txid):
+        """Return the proof magic plus target and payout scripts for a claim."""
+        decoded = self.nodes[0].decoderawtransaction(
+            wallet.gettransaction(txid)["hex"]
+        )
+        payloads = []
+        for output in decoded["vout"]:
+            script = bytes.fromhex(output["scriptPubKey"]["hex"])
+            offset = script.find(QQSPROOF)
+            if offset >= 0:
+                payloads.append(script[offset:])
+        assert_equal(len(payloads), 1)
+
+        proof = payloads[0][len(QQSPROOF):]
+        magic = proof[:4]
+        context_size = {
+            b"QQP2": 0,
+            b"QQP3": 36,
+            b"QQP4": 72,
+        }.get(magic)
+        assert context_size is not None, f"unexpected proof version {magic!r}"
+        script_header = 13 + context_size
+        assert len(proof) >= script_header + 4
+        target_size = int.from_bytes(
+            proof[script_header:script_header + 2], "little"
+        )
+        cursor = script_header + 2
+        target = proof[cursor:cursor + target_size]
+        cursor += target_size
+        assert_equal(len(target), target_size)
+        payout_size = int.from_bytes(proof[cursor:cursor + 2], "little")
+        cursor += 2
+        payout = proof[cursor:cursor + payout_size]
+        cursor += payout_size
+        assert_equal(len(payout), payout_size)
+        assert_equal(cursor, len(proof))
+        return magic, target.hex(), payout.hex()
 
     def _fund_live_fee_inputs(self, source_wallet, target_wallet, target_address, funding_address):
         for amount in LIVE_FEE_VALUES:
@@ -352,6 +392,14 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             1,
         )
         assert_equal(len(builtin.listunspent(1, 9999999, [builtin_address])), 1)
+        lock_barrier_inputs = lock_barrier.listunspent(
+            1, 9999999, [lock_barrier_address]
+        )
+        assert_equal(len(lock_barrier_inputs), 1)
+        lock_barrier_input = {
+            "txid": lock_barrier_inputs[0]["txid"],
+            "vout": lock_barrier_inputs[0]["vout"],
+        }
 
         self.log.info("Funding a second confirmed boundary-wallet fee input for quarantine-gate coverage")
         default_wallet.sendtoaddress(boundary_address, Decimal("1.25000000"))
@@ -433,18 +481,48 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(policy_lock.lockunspent(True, [policy_lock_inputs[LIVE_FEE_VALUES[0]]]), True)
 
         self.log.info("Automatic claim recovery is wallet-scoped, default-off, bounded, and zero-touch")
-        policy_initial_info = policy.getpowclaimrecoveryinfo()
+        # Establish the branch-relative observation while automatic recovery
+        # is still disabled. Slow sanitizer builds can otherwise let the
+        # periodic scheduler record this observation before an intervening
+        # test block, making a hard-coded zero depth timing-dependent.
+        automatic_claim_txids_before = self._claim_txids(policy)
+        node.syncwithvalidationinterfacequeue()
+        node.mockscheduler(61)
+        node.syncwithvalidationinterfacequeue()
+        self.wait_until(
+            lambda: (
+                policy.getpowclaimrecoveryinfo(True)["wallet_tip_matches"]
+                and policy.getpowclaimrecoveryinfo(True)["component_details"][0]["stale_depth_known"]
+            ),
+            timeout=20,
+        )
+        automatic_baseline_info = policy.getpowclaimrecoveryinfo(True)
+        assert_equal(automatic_baseline_info["wallet_tip_matches"], True)
+        assert_equal(automatic_baseline_info["active_tip"], node.getbestblockhash())
+        assert_equal(
+            automatic_baseline_info["wallet_processed_tip"],
+            automatic_baseline_info["active_tip"],
+        )
+        assert_equal(
+            automatic_baseline_info["pending_automatic_resolutions"],
+            0,
+        )
+        assert_equal(self._claim_txids(policy), automatic_claim_txids_before)
+        policy_initial_info = automatic_baseline_info
         assert_equal(policy_initial_info["policy"]["mode"], "unset")
         assert_equal(policy_initial_info["policy_authoritative"], True)
         assert_equal(policy_initial_info["policy_state_status"], "success")
         assert_equal(policy_lock.getpowclaimrecoveryinfo()["policy"]["mode"], "unset")
+        automatic_initial_stale_depth = automatic_baseline_info[
+            "component_details"
+        ][0]["minimum_stale_depth"]
         automatic_limits = {
             "max_fee_per_resolution": Decimal("0.01"),
             "aggregate_batch_fee_cap": Decimal("0.05"),
             "rolling_fee_budget": Decimal("0.10"),
             "rolling_fee_window_seconds": 86400,
             "max_actions_per_window": 5,
-            "minimum_stale_blocks": 1,
+            "minimum_stale_blocks": automatic_initial_stale_depth + 1,
         }
         automatic_policy = policy.setpowclaimrecovery("automatic", automatic_limits)
         assert_equal(automatic_policy["status"], "success")
@@ -456,25 +534,34 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(automatic_policy["policy"]["automatic_authorized"], True)
         assert_equal(policy_lock.getpowclaimrecoveryinfo()["policy"]["mode"], "unset")
 
-        automatic_claim_txids_before = self._claim_txids(policy)
         automatic_resolution_txid = None
         automatic_running_state = None
         started = policy.setpowmining(True, 1, 1, True)
         assert_equal(started["enabled"], True)
         try:
-            # The first scheduler pass performs a typed, pinned-tip conflict
-            # classification and durably records the branch-relative
-            # quarantine observation. It must not spend on that same
-            # observation.
+            # The first automatic scheduler pass rechecks the typed,
+            # branch-relative observation at the same pinned tip. It must not
+            # spend before another block satisfies the configured delay.
             node.mockscheduler(61)
             self.wait_until(
                 lambda: policy.getpowclaimrecoveryinfo(True)["component_details"][0]["stale_depth_known"],
                 timeout=20,
             )
+            same_tip_automatic_info = policy.getpowclaimrecoveryinfo(True)
+            assert_equal(same_tip_automatic_info["wallet_tip_matches"], True)
             assert_equal(
-                policy.getpowclaimrecoveryinfo(True)["component_details"][0]["minimum_stale_depth"],
+                same_tip_automatic_info["active_tip"],
+                automatic_baseline_info["active_tip"],
+            )
+            assert_equal(
+                same_tip_automatic_info["component_details"][0]["minimum_stale_depth"],
+                automatic_initial_stale_depth,
+            )
+            assert_equal(
+                same_tip_automatic_info["pending_automatic_resolutions"],
                 0,
             )
+            assert_equal(self._claim_txids(policy), automatic_claim_txids_before)
 
             # Mature the persisted observation by the configured number of
             # active-branch blocks, then let the next scheduler pass create,
@@ -627,27 +714,82 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         finally:
             lock_barrier.setpowmining(False)
 
-        self.log.info("The built-in miner waits for a new tip after its exact input becomes unavailable")
+        self.log.info(
+            "A lock/unlock pulse after signing but before final wallet publication cancels the stale claim"
+        )
+        lock_barrier.walletpassphrase(
+            lock_barrier_passphrase, 600, False
+        )
+        with node.wait_for_debug_log(
+            [b"Gold Rush PoW claim final-commit authority test barrier reached"],
+            timeout=180,
+        ):
+            final_commit_started = lock_barrier.setpowmining(
+                True, 1, 100, True
+            )
+            assert_equal(final_commit_started["created_payout_key"], False)
+        # Reserve the selected input without changing wallet unlock scope.
+        # The final publication guard must observe this user-authority pulse
+        # even after signing and reject the stale candidate atomically.
+        assert_equal(
+            lock_barrier.lockunspent(False, [lock_barrier_input]), True
+        )
+        try:
+            time.sleep(2)
+            assert_equal(self._claim_txids(lock_barrier), lock_barrier_before)
+            assert_equal(
+                lock_barrier.getpowmininginfo()["claims_submitted"], 0
+            )
+        finally:
+            lock_barrier.setpowmining(False)
+            assert_equal(
+                lock_barrier.lockunspent(True, [lock_barrier_input]), True
+            )
+
+        self.log.info("The complete worker group waits for a new tip after its exact input becomes unavailable")
         builtin_race_before = self._claim_txids(builtin_race)
         with node.wait_for_debug_log([b"Gold Rush PoW claim submission test barrier reached"], timeout=180):
-            started = builtin_race.setpowmining(True, 1, 100, True)
+            started = builtin_race.setpowmining(True, 2, 100, True)
             assert started["created_payout_key"]
         with node.wait_for_debug_log([b"is no longer spendable; retry after the next tip"], timeout=20):
             assert_equal(builtin_race.lockunspent(False, [builtin_race_inputs[LIVE_FEE_VALUES[0]]]), True)
         try:
-            self.wait_until(lambda: builtin_race.getpowmininginfo()["state"] == "ready", timeout=10)
+            def worker_group_waits_for_next_tip():
+                info = builtin_race.getpowmininginfo()
+                return (
+                    info["state"] == "claim_in_flight"
+                    and info["mining_gate_action"] == "wait_for_next_tip"
+                )
+
+            self.wait_until(worker_group_waits_for_next_tip, timeout=10)
+            waiting_info = builtin_race.getpowmininginfo()
+            assert_equal(waiting_info["threads"], 2)
+            assert_equal(waiting_info["hashrate"], 0)
             time.sleep(2)
             assert_equal(self._claim_txids(builtin_race), builtin_race_before)
             assert_equal(builtin_race.getpowmininginfo()["claims_submitted"], 0)
-        finally:
-            builtin_race.setpowmining(False)
-        assert_equal(builtin_race.lockunspent(True, [builtin_race_inputs[LIVE_FEE_VALUES[0]]]), True)
-
-        self.generateblock(node, output=funding_address, transactions=[])
-        builtin_race.setpowmining(True, 1, 100)
-        try:
-            self.wait_until(lambda: len(self._claim_txids(builtin_race) - builtin_race_before) == 1, timeout=180)
-            builtin_race_claim = sorted(self._claim_txids(builtin_race) - builtin_race_before)[0]
+            assert_equal(
+                builtin_race.lockunspent(
+                    True, [builtin_race_inputs[LIVE_FEE_VALUES[0]]]
+                ),
+                True,
+            )
+            # Unlocking the selected fee input on the same tip must not let a
+            # sibling worker steal the wallet-wide slot and retry early.
+            time.sleep(2)
+            assert_equal(self._claim_txids(builtin_race), builtin_race_before)
+            assert_equal(builtin_race.getpowmininginfo()["claims_submitted"], 0)
+            self.generateblock(node, output=funding_address, transactions=[])
+            self.wait_until(
+                lambda: len(
+                    self._claim_txids(builtin_race) - builtin_race_before
+                )
+                == 1,
+                timeout=180,
+            )
+            builtin_race_claim = sorted(
+                self._claim_txids(builtin_race) - builtin_race_before
+            )[0]
         finally:
             builtin_race.setpowmining(False)
         assert_equal(self._claim_input(builtin_race_claim), builtin_race_inputs[LIVE_FEE_VALUES[0]])
@@ -1291,10 +1433,24 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         before_refresh = self._claim_txids(boundary)
         assert_equal(before_refresh, {boundary_claim_txid})
+        boundary_quantum_inventory = boundary.getquantumkeyinventory()
+        boundary_quantum_addresses = boundary.listquantumaddresses()
+        boundary_root_magic, boundary_target_script, boundary_payout_script = (
+            self._claim_scripts(boundary, boundary_claim_txid)
+        )
+        assert_equal(boundary_root_magic, b"QQP2")
+        assert_equal(
+            boundary_target_script,
+            node.validateaddress(boundary_address)["scriptPubKey"],
+        )
+        assert_equal(
+            boundary_payout_script,
+            node.validateaddress(boundary_payout)["scriptPubKey"],
+        )
 
         started = boundary.setpowmining(True, 1, 100)
         assert_equal(started["created_payout_key"], False)
-        assert_equal(started["payout_address"], boundary_payout)
+        assert_equal(started["payout_address"], "")
         try:
             self.wait_until(
                 lambda: len(self._claim_txids(boundary) - before_refresh) == 1,
@@ -1312,6 +1468,14 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         refreshed_raw = node.getrawtransaction(refreshed_claim_txid)
         refreshed_decoded = node.decoderawtransaction(refreshed_raw)
         assert_equal(self._claim_input(refreshed_claim_txid), boundary_claim_input)
+        refreshed_magic, refreshed_target_script, refreshed_payout_script = (
+            self._claim_scripts(boundary, refreshed_claim_txid)
+        )
+        assert_equal(refreshed_magic, b"QQP2")
+        assert_equal(refreshed_target_script, boundary_target_script)
+        assert_equal(refreshed_payout_script, boundary_payout_script)
+        assert_equal(boundary.getquantumkeyinventory(), boundary_quantum_inventory)
+        assert_equal(boundary.listquantumaddresses(), boundary_quantum_addresses)
         assert any(
             "51515032" in output["scriptPubKey"]["hex"]
             for output in refreshed_decoded["vout"]
@@ -1501,7 +1665,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             claims_at_barrier = self._claim_txids(boundary)
             restarted = boundary.setpowmining(True, 1, 100)
             assert_equal(restarted["created_payout_key"], False)
-            assert_equal(restarted["payout_address"], boundary_payout)
+            assert_equal(restarted["payout_address"], "")
 
             def fresh_worker_waits_for_live():
                 info = boundary.getpowmininginfo()
@@ -1520,6 +1684,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             assert_equal(node.getbestblockhash(), same_tip_barrier)
             assert_equal(self._claim_txids(boundary), claims_at_barrier)
             assert_equal(stopped_barrier["claims_submitted"], 0)
+            assert_equal(
+                boundary.getquantumkeyinventory(), boundary_quantum_inventory
+            )
+            assert_equal(
+                boundary.listquantumaddresses(), boundary_quantum_addresses
+            )
         finally:
             boundary.setpowmining(False)
 
@@ -1687,12 +1857,10 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             assert_equal(wait_info["mining_gate_can_submit"], False)
             assert_equal(wait_info["mining_gate_coherent"], True)
             assert_equal(wait_info["mining_gate_database_ambiguous"], False)
-            # Every safety field remains fresh-inventory-derived. The cached
-            # override changes only the action, so the eligible relay txid is
-            # still visible and auditable during the bounded wait.
-            assert_equal(
-                wait_info["mining_gate_relay_txid"], refreshed_claim_txid
-            )
+            # Every safety field remains snapshot-derived. Deferring the exact
+            # family clears its actionable relay identity for this snapshot;
+            # the durable lineage head and recovery inventory remain auditable.
+            assert_equal(wait_info["mining_gate_relay_txid"], ZERO_HASH)
             assert_equal(wait_info["mining_gate_unsafe_claims"], 0)
             assert_equal(wait_info["mining_gate_unsafe_components"], 0)
             waiting_tip = node.getbestblockhash()
@@ -1808,15 +1976,14 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         finally:
             boundary.setpowmining(False)
 
-        # Disabling the worker immediately falls back to fresh inventory on the
-        # already-advanced tip; no cached wait remains authoritative.
-        assert_equal(
-            boundary.getpowmininginfo()["mining_gate_action"],
-            "relay_existing",
-        )
-        assert_equal(
-            boundary.getpowmininginfo()["claim_inventory_tip"], advanced_tip
-        )
+        # Disabling removes worker telemetry but does not erase the wallet's
+        # exact-snapshot relay defer. Repeated stop/start must not bypass the
+        # bounded backoff while tip, wallet generation, and candidate state
+        # remain unchanged.
+        stopped_wait = boundary.getpowmininginfo()
+        assert_equal(stopped_wait["mining_gate_action"], "wait_for_next_tip")
+        assert_equal(stopped_wait["mining_gate_relay_txid"], ZERO_HASH)
+        assert_equal(stopped_wait["claim_inventory_tip"], advanced_tip)
 
         self.log.info("Restart retains the exact current family head without creating another sibling")
         self.restart_node(0, extra_args=[*self.base_args, f"-mocktime={self.mock_time}"])
@@ -2070,9 +2237,23 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
 
         cross_before_refresh = self._claim_txids(cross_boundary)
+        cross_quantum_inventory = cross_boundary.getquantumkeyinventory()
+        cross_quantum_addresses = cross_boundary.listquantumaddresses()
+        cross_root_magic, cross_target_script, cross_payout_script = (
+            self._claim_scripts(cross_boundary, cross_root_txid)
+        )
+        assert_equal(cross_root_magic, b"QQP2")
+        assert_equal(
+            cross_target_script,
+            node.validateaddress(cross_boundary_address)["scriptPubKey"],
+        )
+        assert_equal(
+            cross_payout_script,
+            node.validateaddress(cross_payout)["scriptPubKey"],
+        )
         started = cross_boundary.setpowmining(True, 1, 100)
         assert_equal(started["created_payout_key"], False)
-        assert_equal(started["payout_address"], cross_payout)
+        assert_equal(started["payout_address"], "")
         try:
             self.wait_until(
                 lambda: len(
@@ -2096,6 +2277,18 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
         assert_equal(self._claim_input(cross_head_txid), cross_anchor)
         cross_head_raw = node.getrawtransaction(cross_head_txid)
+        cross_head_magic, cross_head_target_script, cross_head_payout_script = (
+            self._claim_scripts(cross_boundary, cross_head_txid)
+        )
+        assert_equal(cross_head_magic, b"QQP3")
+        assert_equal(cross_head_target_script, cross_target_script)
+        assert_equal(cross_head_payout_script, cross_payout_script)
+        assert_equal(
+            cross_boundary.getquantumkeyinventory(), cross_quantum_inventory
+        )
+        assert_equal(
+            cross_boundary.listquantumaddresses(), cross_quantum_addresses
+        )
         assert any(
             "51515033" in output["scriptPubKey"]["hex"]
             for output in node.decoderawtransaction(cross_head_raw)["vout"]

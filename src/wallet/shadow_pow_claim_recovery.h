@@ -14,19 +14,14 @@ uint256 ComputeShadowPowClaimLineageFamilyFingerprint(
     const COutPoint& anchor, CAmount anchor_amount,
     const CScript& anchor_script);
 
-/** Derive the mining decision from an already-built coherent recovery
- * inventory. Callers that also need telemetry should share this snapshot so
- * QQ proof validation is not repeated. */
-ShadowPowClaimMiningGate BuildShadowPowClaimMiningGate(
-    const ShadowPowClaimRecoveryInventory& inventory);
-
 /** Select the existing RPC action string without replacing any safety field in
- * the fresh inventory-derived gate. WAIT_FOR_NEXT_TIP is reportable only for
- * one still-current worker snapshot; every mismatch returns the fresh action. */
+ * the fresh inventory-derived gate. A wallet-wide new-anchor submission wait
+ * remains tip-bound even when a user lock changes the otherwise-safe wallet
+ * snapshot; family-local waits remain exact-snapshot-bound. */
 ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
     const ShadowPowClaimMiningGate& fresh_gate,
     const ShadowPowClaimMiningGate& cached_gate, bool miner_enabled,
-    bool claim_in_flight);
+    bool claim_in_flight, bool wallet_wide_tip_wait = false);
 
 const char* ShadowPowClaimRecoveryAdoptionStatusName(
     ShadowPowClaimRecoveryAdoptionStatus status);

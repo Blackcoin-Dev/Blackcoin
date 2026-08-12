@@ -242,6 +242,7 @@ uint256 FingerprintComponent(const uint256& active_tip,
     hasher << static_cast<uint8_t>(component.state);
     hasher << component.anchor_authenticated;
     hasher << component.anchor_unspent;
+    hasher << component.anchor_user_locked;
     hasher << component.all_claims_quarantined;
     hasher << component.all_claims_explicitly_provenanced;
     hasher << component.has_live_claim;
@@ -435,7 +436,8 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventory() co
         ShadowPowClaimRecoveryInventory inventory;
         LOCK(cs_wallet);
         inventory.recovery_database_ambiguous =
-            m_shadow_pow_claim_recovery_db_ambiguous;
+            m_shadow_pow_claim_recovery_db_ambiguous ||
+            m_locked_coins_db_ambiguous;
         inventory.wallet_processed_tip = m_last_block_processed;
         inventory.wallet_processed_height = m_last_block_processed_height;
         inventory.wallet_generation = GetDatabase().nUpdateCounter.load();
@@ -490,7 +492,13 @@ uint256 CWallet::GetShadowPowClaimCandidateStateFingerprintLocked() const
     AssertLockHeld(::cs_main);
     AssertLockHeld(cs_wallet);
     HashWriter hasher{};
-    hasher << uint8_t{1};
+    // Relay eligibility changes at a wall-clock boundary without mutating the
+    // wallet. Hash that derived phase so snapshot-local family suppression and
+    // worker WAIT caches expire into a same-anchor refresh on a stalled tip.
+    const int64_t now = GetTime();
+    hasher << uint8_t{2};
+    hasher << m_coin_lock_generation;
+    hasher << m_locked_coins_db_ambiguous;
     size_t candidates{0};
     for (const auto& [txid, wtx] : mapWallet) {
         if (!wtx.tx || GetTxDepthInMainChain(wtx) > 0 ||
@@ -504,6 +512,9 @@ uint256 CWallet::GetShadowPowClaimCandidateStateFingerprintLocked() const
         hasher << wtx.isAbandoned();
         hasher << wtx.fFromMe;
         hasher << wtx.nTimeReceived;
+        hasher << (wtx.nTimeReceived <= 0 ||
+                   wtx.nTimeReceived <=
+                       now - SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS);
         hasher << wtx.mapValue;
     }
     hasher << static_cast<uint64_t>(candidates);
@@ -529,7 +540,8 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
     inventory.candidate_state_fingerprint =
         GetShadowPowClaimCandidateStateFingerprintLocked();
     inventory.recovery_database_ambiguous =
-        m_shadow_pow_claim_recovery_db_ambiguous;
+        m_shadow_pow_claim_recovery_db_ambiguous ||
+        m_locked_coins_db_ambiguous;
     inventory.wallet_tip_matches = tip &&
                                    m_last_block_processed == inventory.active_tip;
 
@@ -653,6 +665,7 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         component.anchor_amount = first_path.amount;
         component.anchor_script = first_path.script;
         component.anchor_authenticated = true;
+        component.anchor_user_locked = IsLockedCoin(anchor);
 
         Coin anchor_coin;
         if (coins_tip.GetCoin(anchor, anchor_coin) && !anchor_coin.IsSpent()) {
@@ -723,6 +736,8 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
             node.active_chain_confirmed = GetTxDepthInMainChain(wtx) > 0;
             node.in_mempool = wtx.InMempool();
             node.abandoned = wtx.isAbandoned();
+            node.wallet_authored = GetDebit(tx, ISMINE_SPENDABLE) > 0;
+            node.wallet_from_me = wtx.fFromMe;
 
             if (TransactionHasShadowProof(tx)) {
                 node.kind = ShadowPowClaimRecoveryNodeKind::CLAIM;
@@ -739,8 +754,6 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                         created_parent &&
                         created_parent->GetBlockHash() == node.created_tip;
                 }
-                node.wallet_authored = GetDebit(tx, ISMINE_SPENDABLE) > 0;
-                node.wallet_from_me = wtx.fFromMe;
                 node.quarantined = MetadataFlag(
                     wtx.mapValue, SHADOW_POW_QUARANTINE_MARKER_KEY);
                 node.expired_locally_retired = node.abandoned &&
@@ -1161,15 +1174,15 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
             node.txid = txid;
             node.active_chain_confirmed = false;
             node.in_mempool = wtx.InMempool();
+            node.wallet_authored =
+                GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0;
+            node.wallet_from_me = wtx.fFromMe;
 
             if (TransactionHasShadowProof(*wtx.tx)) {
                 node.kind = ShadowPowClaimRecoveryNodeKind::CLAIM;
                 node.provenance = ClaimProvenance(wtx, node);
                 node.quarantined = MetadataFlag(
                     wtx.mapValue, SHADOW_POW_QUARANTINE_MARKER_KEY);
-                node.wallet_authored =
-                    GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0;
-                node.wallet_from_me = wtx.fFromMe;
                 node.expected_shape = wtx.tx->vin.size() == 1 &&
                                       !wtx.tx->vin.front().prevout.IsNull() &&
                                       !wtx.tx->IsCoinBase() &&
@@ -1256,8 +1269,38 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
 
 namespace {
 
-ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
-    const ShadowPowClaimRecoveryInventory& inventory)
+struct ShadowPowClaimRelaySuppression
+{
+    uint256 active_tip;
+    uint64_t wallet_generation{0};
+    uint256 candidate_state_fingerprint;
+    const std::set<uint256>* relay_txids{nullptr};
+    const std::set<uint256>* deferred_family_roots{nullptr};
+};
+
+bool IsAuditOnlyForeignShadowPowClaimComponent(
+    const ShadowPowClaimRecoveryComponent& component)
+{
+    if (component.anchor_authenticated) return false;
+
+    bool saw_claim{false};
+    for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
+        if (node.wallet_authored || node.wallet_from_me ||
+            node.provenance !=
+                ShadowPowClaimRecoveryProvenance::UNKNOWN) {
+            return false;
+        }
+        if (node.kind == ShadowPowClaimRecoveryNodeKind::CLAIM) {
+            saw_claim = true;
+        }
+    }
+    return saw_claim;
+}
+
+ShadowPowClaimMiningGate EvaluateShadowPowClaimMiningFamily(
+    const ShadowPowClaimRecoveryInventory& inventory,
+    const ShadowPowClaimRecoveryComponent& component,
+    const ShadowPowClaimRelaySuppression* suppression)
 {
     ShadowPowClaimMiningGate gate;
     gate.active_tip = inventory.active_tip;
@@ -1270,40 +1313,7 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
     gate.coherent = inventory.wallet_tip_matches &&
                     !inventory.active_tip.IsNull() &&
                     inventory.active_height >= 0;
-    if (!gate.coherent || gate.recovery_database_ambiguous) return gate;
 
-    const ShadowPowClaimRecoveryComponent* unresolved{nullptr};
-    for (const ShadowPowClaimRecoveryComponent& component :
-         inventory.components) {
-        if (component.state ==
-                ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN ||
-            component.state ==
-                ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH) {
-            continue;
-        }
-        ++gate.unresolved_components;
-        if (!unresolved) unresolved = &component;
-    }
-    if (gate.unresolved_components == 0) {
-        gate.action =
-            ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR;
-        return gate;
-    }
-    if (gate.unresolved_components != 1 || !unresolved) {
-        gate.unsafe_components = gate.unresolved_components;
-        for (const ShadowPowClaimRecoveryComponent& component :
-             inventory.components) {
-            if (component.state !=
-                    ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN &&
-                component.state !=
-                    ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH) {
-                gate.unsafe_claims += component.claim_txids.size();
-            }
-        }
-        return gate;
-    }
-
-    const ShadowPowClaimRecoveryComponent& component = *unresolved;
     const bool pure_component_shape =
         component.anchor_authenticated && component.anchor_unspent &&
         !component.anchor.IsNull() && component.anchor_amount > 0 &&
@@ -1471,24 +1481,46 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
                        ShadowPowClaimMempoolDisposition::UNSUPPORTED_VERSION;
         };
 
+    size_t live_claims{0};
+    size_t eligible_claims{0};
     const ShadowPowClaimRecoveryNode* relay_candidate{nullptr};
+    const bool suppression_has_state = suppression &&
+        ((suppression->relay_txids &&
+          !suppression->relay_txids->empty()) ||
+         (suppression->deferred_family_roots &&
+          !suppression->deferred_family_roots->empty()));
+    const bool suppression_matches_snapshot = suppression_has_state &&
+        inventory.active_tip == suppression->active_tip &&
+        inventory.wallet_generation == suppression->wallet_generation &&
+        inventory.candidate_state_fingerprint ==
+            suppression->candidate_state_fingerprint;
     for (const auto& [ordinal, node] : by_ordinal) {
         if (!disposition_is_family_safe(*node)) {
             family_safe = false;
             break;
         }
-        if (node->in_mempool) ++gate.live_claims;
+        if (node->in_mempool) ++live_claims;
         if (node->disposition ==
             ShadowPowClaimMempoolDisposition::ELIGIBLE) {
-            ++gate.eligible_claims;
-            if (!node->in_mempool && !node->relay_ttl_expired) {
+            ++eligible_claims;
+            if (!node->in_mempool && !node->relay_ttl_expired &&
+                (!suppression_matches_snapshot ||
+                 !suppression->relay_txids ||
+                 suppression->relay_txids->count(node->txid) == 0)) {
                 relay_candidate = node;
             }
         }
     }
     if (!family_safe) {
-        gate.live_claims = 0;
-        gate.eligible_claims = 0;
+        gate.unsafe_components = 1;
+        gate.unsafe_claims = claims.size();
+        return gate;
+    }
+    if (live_claims > 1) {
+        // Same-anchor siblings conflict on the authenticated input and cannot
+        // coexist in the authoritative mempool. Multiple live members inside
+        // one family therefore indicate stale or incoherent wallet state,
+        // even though independent families may each have one live member.
         gate.unsafe_components = 1;
         gate.unsafe_claims = claims.size();
         return gate;
@@ -1496,6 +1528,14 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
 
     const ShadowPowClaimRecoveryNode& head =
         *by_ordinal.rbegin()->second;
+    if (head.lineage_ordinal == std::numeric_limits<uint32_t>::max()) {
+        gate.unsafe_components = 1;
+        gate.unsafe_claims = claims.size();
+        return gate;
+    }
+
+    gate.live_claims = live_claims;
+    gate.eligible_claims = eligible_claims;
     gate.family_claims = claims.size();
     gate.anchor = component.anchor;
     gate.anchor_amount = component.anchor_amount;
@@ -1504,14 +1544,23 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
     gate.generation_fingerprint = component.generation_fingerprint;
     gate.lineage_root_txid = root.txid;
     gate.lineage_head_txid = head.txid;
-    if (head.lineage_ordinal == std::numeric_limits<uint32_t>::max()) {
-        gate.unsafe_components = 1;
-        gate.unsafe_claims = claims.size();
-        return gate;
-    }
     gate.next_lineage_ordinal = head.lineage_ordinal + 1;
 
-    if (gate.live_claims != 0) {
+    const bool defer_family_until_snapshot_changes =
+        suppression_matches_snapshot &&
+        suppression->deferred_family_roots &&
+        suppression->deferred_family_roots->count(
+            gate.lineage_root_txid) != 0;
+    if (defer_family_until_snapshot_changes) {
+        gate.action =
+            ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP;
+        return gate;
+    }
+
+    if (component.anchor_user_locked) {
+        gate.action =
+            ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP;
+    } else if (gate.live_claims != 0) {
         gate.action = ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE;
     } else if (relay_candidate) {
         gate.action = ShadowPowClaimMiningGateAction::RELAY_EXISTING;
@@ -1524,6 +1573,189 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
     return gate;
 }
 
+int ShadowPowClaimMiningActionPriority(
+    ShadowPowClaimMiningGateAction action)
+{
+    switch (action) {
+    case ShadowPowClaimMiningGateAction::RELAY_EXISTING:
+        return 0;
+    case ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR:
+        return 1;
+    case ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP:
+        return 2;
+    case ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE:
+        return 3;
+    default:
+        return 4;
+    }
+}
+
+bool PreferShadowPowClaimMiningFamily(
+    const ShadowPowClaimMiningGate& candidate,
+    const ShadowPowClaimMiningGate& selected)
+{
+    const int candidate_priority =
+        ShadowPowClaimMiningActionPriority(candidate.action);
+    const int selected_priority =
+        ShadowPowClaimMiningActionPriority(selected.action);
+    if (candidate_priority != selected_priority) {
+        return candidate_priority < selected_priority;
+    }
+    if (candidate.anchor != selected.anchor) {
+        return candidate.anchor < selected.anchor;
+    }
+    if (candidate.generation_fingerprint !=
+        selected.generation_fingerprint) {
+        return candidate.generation_fingerprint <
+               selected.generation_fingerprint;
+    }
+    if (candidate.lineage_root_txid != selected.lineage_root_txid) {
+        return candidate.lineage_root_txid < selected.lineage_root_txid;
+    }
+    if (candidate.lineage_head_txid != selected.lineage_head_txid) {
+        return candidate.lineage_head_txid < selected.lineage_head_txid;
+    }
+    return candidate.relay_txid < selected.relay_txid;
+}
+
+void CopyShadowPowClaimMiningFamilySelection(
+    ShadowPowClaimMiningGate& aggregate,
+    const ShadowPowClaimMiningGate& selected)
+{
+    aggregate.action = selected.action;
+    aggregate.anchor = selected.anchor;
+    aggregate.anchor_amount = selected.anchor_amount;
+    aggregate.target = selected.target;
+    aggregate.payout_script = selected.payout_script;
+    aggregate.generation_fingerprint = selected.generation_fingerprint;
+    aggregate.lineage_root_txid = selected.lineage_root_txid;
+    aggregate.lineage_head_txid = selected.lineage_head_txid;
+    aggregate.next_lineage_ordinal = selected.next_lineage_ordinal;
+    aggregate.relay_txid = selected.relay_txid;
+    aggregate.relay_expiry_time = selected.relay_expiry_time;
+}
+
+bool ShadowPowClaimMiningGateSnapshotMatches(
+    const ShadowPowClaimMiningGate& expected,
+    const ShadowPowClaimMiningGate& current)
+{
+    return expected.action == current.action &&
+           expected.active_tip == current.active_tip &&
+           expected.active_height == current.active_height &&
+           expected.wallet_generation == current.wallet_generation &&
+           expected.candidate_state_fingerprint ==
+               current.candidate_state_fingerprint &&
+           expected.coherent == current.coherent &&
+           expected.recovery_database_ambiguous ==
+               current.recovery_database_ambiguous &&
+           expected.unresolved_components ==
+               current.unresolved_components &&
+           expected.live_claims == current.live_claims &&
+           expected.eligible_claims == current.eligible_claims &&
+           expected.family_claims == current.family_claims &&
+           expected.unsafe_claims == current.unsafe_claims &&
+           expected.unsafe_components == current.unsafe_components &&
+           expected.anchor == current.anchor &&
+           expected.anchor_amount == current.anchor_amount &&
+           expected.target == current.target &&
+           expected.payout_script == current.payout_script &&
+           expected.generation_fingerprint ==
+               current.generation_fingerprint &&
+           expected.lineage_root_txid == current.lineage_root_txid &&
+           expected.lineage_head_txid == current.lineage_head_txid &&
+           expected.next_lineage_ordinal ==
+               current.next_lineage_ordinal &&
+           expected.relay_txid == current.relay_txid &&
+           expected.relay_expiry_time == current.relay_expiry_time;
+}
+
+bool ShadowPowClaimCachedRelayStateExpired(
+    const ShadowPowClaimRecoveryInventory& inventory, int64_t now)
+{
+    for (const ShadowPowClaimRecoveryComponent& component :
+         inventory.components) {
+        for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
+            if (node.kind == ShadowPowClaimRecoveryNodeKind::CLAIM &&
+                !node.in_mempool &&
+                node.disposition ==
+                    ShadowPowClaimMempoolDisposition::ELIGIBLE &&
+                !node.relay_ttl_expired && node.relay_expiry_time > 0 &&
+                now >= node.relay_expiry_time) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool ShadowPowClaimDeferrableFamilyIntentMatches(
+    const ShadowPowClaimMiningGate& expected,
+    const ShadowPowClaimMiningGate& current)
+{
+    const bool deferrable = expected.ShouldRelayExisting() ||
+        expected.MayRefreshSameAnchor();
+    return deferrable && ShadowPowClaimMiningGateSnapshotMatches(
+        expected, current);
+}
+
+ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
+    const ShadowPowClaimRecoveryInventory& inventory,
+    const ShadowPowClaimRelaySuppression* suppression = nullptr)
+{
+    ShadowPowClaimMiningGate gate;
+    gate.active_tip = inventory.active_tip;
+    gate.active_height = inventory.active_height;
+    gate.wallet_generation = inventory.wallet_generation;
+    gate.candidate_state_fingerprint =
+        inventory.candidate_state_fingerprint;
+    gate.recovery_database_ambiguous =
+        inventory.recovery_database_ambiguous;
+    gate.coherent = inventory.wallet_tip_matches &&
+                    !inventory.active_tip.IsNull() &&
+                    inventory.active_height >= 0;
+    if (!gate.coherent || gate.recovery_database_ambiguous) return gate;
+
+    std::optional<ShadowPowClaimMiningGate> selected;
+    for (const ShadowPowClaimRecoveryComponent& component :
+         inventory.components) {
+        if (component.state ==
+                ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN ||
+            component.state ==
+                ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH) {
+            continue;
+        }
+        if (IsAuditOnlyForeignShadowPowClaimComponent(component)) {
+            continue;
+        }
+        ++gate.unresolved_components;
+        ShadowPowClaimMiningGate family =
+            EvaluateShadowPowClaimMiningFamily(
+                inventory, component, suppression);
+        gate.live_claims += family.live_claims;
+        gate.eligible_claims += family.eligible_claims;
+        gate.family_claims += family.family_claims;
+        gate.unsafe_claims += family.unsafe_claims;
+        gate.unsafe_components += family.unsafe_components;
+        if (family.action == ShadowPowClaimMiningGateAction::UNSAFE) {
+            continue;
+        }
+        if (!selected ||
+            PreferShadowPowClaimMiningFamily(family, *selected)) {
+            selected = std::move(family);
+        }
+    }
+    if (gate.unsafe_components != 0) return gate;
+    if (gate.unresolved_components == 0) {
+        gate.action =
+            ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR;
+        return gate;
+    }
+    if (selected) {
+        CopyShadowPowClaimMiningFamilySelection(gate, *selected);
+    }
+    return gate;
+}
+
 } // namespace
 
 ShadowPowClaimMiningGate BuildShadowPowClaimMiningGate(
@@ -1532,37 +1764,80 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGate(
     return BuildShadowPowClaimMiningGateImpl(inventory);
 }
 
+bool HasMiningRelevantUnresolvedShadowPowClaimComponent(
+    const ShadowPowClaimRecoveryInventory& inventory)
+{
+    return std::any_of(
+        inventory.components.begin(), inventory.components.end(),
+        [](const ShadowPowClaimRecoveryComponent& component) {
+            if (component.state ==
+                    ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN ||
+                component.state ==
+                    ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH) {
+                return false;
+            }
+            return !IsAuditOnlyForeignShadowPowClaimComponent(component);
+        });
+}
+
+bool ShadowPowClaimRelayIntentMatches(
+    const ShadowPowClaimMiningGate& expected,
+    const ShadowPowClaimMiningGate& current)
+{
+    return expected.ShouldRelayExisting() &&
+           current.ShouldRelayExisting() &&
+           ShadowPowClaimMiningGateSnapshotMatches(expected, current);
+}
+
 ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
     const ShadowPowClaimMiningGate& fresh_gate,
     const ShadowPowClaimMiningGate& cached_gate, bool miner_enabled,
-    bool claim_in_flight)
+    bool claim_in_flight, bool wallet_wide_tip_wait)
 {
-    if (!miner_enabled || !claim_in_flight ||
+    if (!miner_enabled || cached_gate.active_tip.IsNull() ||
+        !fresh_gate.coherent ||
+        fresh_gate.recovery_database_ambiguous ||
+        fresh_gate.HasUnsafeClaims() ||
+        cached_gate.active_tip != fresh_gate.active_tip ||
+        cached_gate.active_height != fresh_gate.active_height) {
+        return fresh_gate.action;
+    }
+    // A new-anchor INPUT_UNAVAILABLE/conflict outcome owns the wallet-wide
+    // submission reservation until this exact tip changes. A user may unlock
+    // the failed input (or otherwise change a safe wallet snapshot) while the
+    // reservation remains active; that must not let a sibling worker grind or
+    // submit on the same tip. Safety transitions above still win immediately.
+    if (wallet_wide_tip_wait) {
+        return ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP;
+    }
+    if (!claim_in_flight ||
         cached_gate.action !=
             ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP ||
-        cached_gate.active_tip.IsNull() || !fresh_gate.coherent ||
-        fresh_gate.recovery_database_ambiguous ||
-        fresh_gate.HasUnsafeClaims() || cached_gate.HasUnsafeClaims() ||
+        cached_gate.HasUnsafeClaims() ||
         cached_gate.coherent != fresh_gate.coherent ||
         cached_gate.recovery_database_ambiguous !=
-            fresh_gate.recovery_database_ambiguous ||
-        cached_gate.active_tip != fresh_gate.active_tip ||
-        cached_gate.active_height != fresh_gate.active_height ||
+            fresh_gate.recovery_database_ambiguous) {
+        return fresh_gate.action;
+    }
+    if (
         cached_gate.wallet_generation != fresh_gate.wallet_generation ||
         cached_gate.candidate_state_fingerprint.IsNull() ||
         cached_gate.candidate_state_fingerprint !=
             fresh_gate.candidate_state_fingerprint ||
-        cached_gate.anchor.IsNull() ||
+        cached_gate.unresolved_components !=
+            fresh_gate.unresolved_components ||
+        cached_gate.live_claims != fresh_gate.live_claims ||
+        cached_gate.eligible_claims != fresh_gate.eligible_claims ||
+        cached_gate.family_claims != fresh_gate.family_claims ||
+        cached_gate.unsafe_claims != fresh_gate.unsafe_claims ||
+        cached_gate.unsafe_components != fresh_gate.unsafe_components ||
         cached_gate.anchor != fresh_gate.anchor ||
         cached_gate.anchor_amount != fresh_gate.anchor_amount ||
         cached_gate.target != fresh_gate.target ||
         cached_gate.payout_script != fresh_gate.payout_script ||
-        cached_gate.generation_fingerprint.IsNull() ||
         cached_gate.generation_fingerprint !=
             fresh_gate.generation_fingerprint ||
-        cached_gate.lineage_root_txid.IsNull() ||
         cached_gate.lineage_root_txid != fresh_gate.lineage_root_txid ||
-        cached_gate.lineage_head_txid.IsNull() ||
         cached_gate.lineage_head_txid != fresh_gate.lineage_head_txid ||
         cached_gate.next_lineage_ordinal !=
             fresh_gate.next_lineage_ordinal) {
@@ -1595,25 +1870,16 @@ CWallet::GetShadowPowClaimMiningGateFromInventoryLocked(
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(cs_wallet);
-    ShadowPowClaimMiningGate gate =
-        BuildShadowPowClaimMiningGate(inventory);
-    if (gate.ShouldRelayExisting() &&
-        gate.active_tip == m_shadow_pow_relay_reject_tip &&
-        gate.wallet_generation ==
-            m_shadow_pow_relay_reject_wallet_generation &&
-        gate.relay_txid == m_shadow_pow_relay_reject_txid &&
-        gate.candidate_state_fingerprint ==
-            m_shadow_pow_relay_reject_candidate_state &&
-        gate.generation_fingerprint ==
-            m_shadow_pow_relay_reject_family &&
-        gate.lineage_root_txid == m_shadow_pow_relay_reject_root &&
-        gate.lineage_head_txid == m_shadow_pow_relay_reject_head) {
-        gate.action =
-            ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR;
-        gate.relay_txid.SetNull();
-        gate.relay_expiry_time = 0;
-    }
-    return gate;
+    ShadowPowClaimRelaySuppression suppression;
+    suppression.active_tip = m_shadow_pow_relay_reject_tip;
+    suppression.wallet_generation =
+        m_shadow_pow_relay_reject_wallet_generation;
+    suppression.candidate_state_fingerprint =
+        m_shadow_pow_relay_reject_candidate_state;
+    suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
+    suppression.deferred_family_roots =
+        &m_shadow_pow_relay_wait_roots;
+    return BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
 }
 
 ShadowPowClaimMiningGateAction
@@ -1629,18 +1895,59 @@ CWallet::GetShadowPowClaimMiningGateTelemetryActionLocked(
     return GetShadowPowClaimMiningGateTelemetryAction(
         fresh_gate, m_pow_mining_gate, miner_enabled,
         miner_state ==
-            interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT);
+            interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT,
+        m_pow_wallet_wide_tip_wait);
 }
 
 bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
-    const ShadowPowClaimMiningGate& rejected_gate)
+    const ShadowPowClaimMiningGate& rejected_gate,
+    ShadowPowClaimMiningGate* reselected_gate)
 {
     LOCK2(::cs_main, cs_wallet);
-    const ShadowPowClaimMiningGate current =
-        BuildShadowPowClaimMiningGate(
-            GetShadowPowClaimRecoveryInventoryLocked());
     if (!rejected_gate.ShouldRelayExisting() ||
-        !current.ShouldRelayExisting() ||
+        rejected_gate.recovery_database_ambiguous ||
+        !rejected_gate.coherent) {
+        return false;
+    }
+    const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
+    const uint256 active_tip = tip ? tip->GetBlockHash() : uint256{};
+    const uint64_t wallet_generation =
+        GetDatabase().nUpdateCounter.load();
+    const uint256 candidate_state =
+        GetShadowPowClaimCandidateStateFingerprintLocked();
+    if (!tip || m_last_block_processed != active_tip ||
+        m_shadow_pow_claim_recovery_db_ambiguous ||
+        active_tip != rejected_gate.active_tip ||
+        wallet_generation != rejected_gate.wallet_generation ||
+        candidate_state != rejected_gate.candidate_state_fingerprint) {
+        m_shadow_pow_relay_reject_inventory.reset();
+        return false;
+    }
+    if (!m_shadow_pow_relay_reject_inventory ||
+        m_shadow_pow_relay_reject_inventory->active_tip != active_tip ||
+        m_shadow_pow_relay_reject_inventory->wallet_generation !=
+            wallet_generation ||
+        m_shadow_pow_relay_reject_inventory
+                ->candidate_state_fingerprint != candidate_state ||
+        ShadowPowClaimCachedRelayStateExpired(
+            *m_shadow_pow_relay_reject_inventory, GetTime())) {
+        m_shadow_pow_relay_reject_inventory =
+            GetShadowPowClaimRecoveryInventoryLocked();
+    }
+    const ShadowPowClaimRecoveryInventory& inventory =
+        *m_shadow_pow_relay_reject_inventory;
+    ShadowPowClaimRelaySuppression suppression;
+    suppression.active_tip = m_shadow_pow_relay_reject_tip;
+    suppression.wallet_generation =
+        m_shadow_pow_relay_reject_wallet_generation;
+    suppression.candidate_state_fingerprint =
+        m_shadow_pow_relay_reject_candidate_state;
+    suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
+    suppression.deferred_family_roots =
+        &m_shadow_pow_relay_wait_roots;
+    const ShadowPowClaimMiningGate current =
+        BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+    if (!current.ShouldRelayExisting() ||
         current.active_tip != rejected_gate.active_tip ||
         current.wallet_generation != rejected_gate.wallet_generation ||
         current.candidate_state_fingerprint !=
@@ -1669,17 +1976,110 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
         // sibling. Only a reproducible deterministic policy rejection does.
         return false;
     }
-    m_shadow_pow_relay_reject_tip = current.active_tip;
-    m_shadow_pow_relay_reject_wallet_generation =
-        current.wallet_generation;
-    m_shadow_pow_relay_reject_txid = current.relay_txid;
-    m_shadow_pow_relay_reject_candidate_state =
-        current.candidate_state_fingerprint;
-    m_shadow_pow_relay_reject_family =
-        current.generation_fingerprint;
-    m_shadow_pow_relay_reject_root = current.lineage_root_txid;
-    m_shadow_pow_relay_reject_head = current.lineage_head_txid;
+    if (m_shadow_pow_relay_reject_tip != current.active_tip ||
+        m_shadow_pow_relay_reject_wallet_generation !=
+            current.wallet_generation ||
+        m_shadow_pow_relay_reject_candidate_state !=
+            current.candidate_state_fingerprint) {
+        m_shadow_pow_relay_reject_txids.clear();
+        m_shadow_pow_relay_wait_roots.clear();
+        m_shadow_pow_relay_reject_tip = current.active_tip;
+        m_shadow_pow_relay_reject_wallet_generation =
+            current.wallet_generation;
+        m_shadow_pow_relay_reject_candidate_state =
+            current.candidate_state_fingerprint;
+    }
+    m_shadow_pow_relay_reject_txids.insert(current.relay_txid);
+    if (reselected_gate) {
+        suppression.active_tip = current.active_tip;
+        suppression.wallet_generation = current.wallet_generation;
+        suppression.candidate_state_fingerprint =
+            current.candidate_state_fingerprint;
+        *reselected_gate =
+            BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+    }
     return true;
+}
+
+ShadowPowClaimMiningGate
+CWallet::DeferShadowPowClaimFamilyForSnapshot(
+    const ShadowPowClaimMiningGate& deferred_gate)
+{
+    LOCK2(::cs_main, cs_wallet);
+    return DeferShadowPowClaimFamilyForSnapshotLocked(deferred_gate);
+}
+
+ShadowPowClaimMiningGate
+CWallet::DeferShadowPowClaimFamilyForSnapshotLocked(
+    const ShadowPowClaimMiningGate& deferred_gate)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_wallet);
+    const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
+    const uint256 active_tip = tip ? tip->GetBlockHash() : uint256{};
+    const uint64_t wallet_generation =
+        GetDatabase().nUpdateCounter.load();
+    const uint256 candidate_state =
+        GetShadowPowClaimCandidateStateFingerprintLocked();
+    if ((!deferred_gate.ShouldRelayExisting() &&
+         !deferred_gate.MayRefreshSameAnchor()) ||
+        !tip ||
+        m_last_block_processed != active_tip ||
+        m_shadow_pow_claim_recovery_db_ambiguous ||
+        active_tip != deferred_gate.active_tip ||
+        wallet_generation != deferred_gate.wallet_generation ||
+        candidate_state != deferred_gate.candidate_state_fingerprint) {
+        m_shadow_pow_relay_reject_inventory.reset();
+        return GetShadowPowClaimMiningGateLocked();
+    }
+    if (!m_shadow_pow_relay_reject_inventory ||
+        m_shadow_pow_relay_reject_inventory->active_tip != active_tip ||
+        m_shadow_pow_relay_reject_inventory->wallet_generation !=
+            wallet_generation ||
+        m_shadow_pow_relay_reject_inventory
+                ->candidate_state_fingerprint != candidate_state ||
+        ShadowPowClaimCachedRelayStateExpired(
+            *m_shadow_pow_relay_reject_inventory, GetTime())) {
+        m_shadow_pow_relay_reject_inventory =
+            GetShadowPowClaimRecoveryInventoryLocked();
+    }
+    const ShadowPowClaimRecoveryInventory& inventory =
+        *m_shadow_pow_relay_reject_inventory;
+    ShadowPowClaimRelaySuppression suppression;
+    suppression.active_tip = m_shadow_pow_relay_reject_tip;
+    suppression.wallet_generation =
+        m_shadow_pow_relay_reject_wallet_generation;
+    suppression.candidate_state_fingerprint =
+        m_shadow_pow_relay_reject_candidate_state;
+    suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
+    suppression.deferred_family_roots =
+        &m_shadow_pow_relay_wait_roots;
+    const ShadowPowClaimMiningGate current =
+        BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+    if (!ShadowPowClaimDeferrableFamilyIntentMatches(
+            deferred_gate, current)) {
+        return current;
+    }
+    if (m_shadow_pow_relay_reject_tip != current.active_tip ||
+        m_shadow_pow_relay_reject_wallet_generation !=
+            current.wallet_generation ||
+        m_shadow_pow_relay_reject_candidate_state !=
+            current.candidate_state_fingerprint) {
+        m_shadow_pow_relay_reject_txids.clear();
+        m_shadow_pow_relay_wait_roots.clear();
+        m_shadow_pow_relay_reject_tip = current.active_tip;
+        m_shadow_pow_relay_reject_wallet_generation =
+            current.wallet_generation;
+        m_shadow_pow_relay_reject_candidate_state =
+            current.candidate_state_fingerprint;
+    }
+    m_shadow_pow_relay_wait_roots.insert(
+        current.lineage_root_txid);
+    suppression.active_tip = current.active_tip;
+    suppression.wallet_generation = current.wallet_generation;
+    suppression.candidate_state_fingerprint =
+        current.candidate_state_fingerprint;
+    return BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
 }
 
 uint256 ComputeShadowPowClaimRecoveryPlanId(
@@ -1991,10 +2391,10 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
     plan.active_height = inventory.active_height;
     plan.wallet_generation = inventory.wallet_generation;
     plan.wallet_tip_matches = inventory.wallet_tip_matches;
-    if (wallet.IsShadowPowClaimRecoveryDatabaseAmbiguous()) {
+    if (inventory.recovery_database_ambiguous) {
         ShadowPowClaimRecoveryAction refused;
         refused.reason_code = "database-outcome-ambiguous";
-        refused.detail = "wallet recovery database outcome is ambiguous; reload and inspect exact records before any new plan";
+        refused.detail = "wallet recovery or coin-lock database outcome is ambiguous; reload and inspect exact records before any new plan";
         plan.refused.push_back(std::move(refused));
         plan.complete = false;
         plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
@@ -2100,6 +2500,14 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
         action.component_state = component.state;
         action.conflicts_with_revalidating_unbound_proof =
             component.has_revalidating_unbound_proof;
+
+        if (component.anchor_user_locked) {
+            action.reason_code = "anchor-user-locked";
+            action.detail =
+                "the confirmed recovery anchor is user-locked; explicitly unlock this outpoint before previewing a fee-paying recovery";
+            plan.refused.push_back(std::move(action));
+            continue;
+        }
 
         std::string refusal_code;
         std::string refusal;
@@ -2713,6 +3121,7 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
 
     std::vector<uint256> relay_txids;
     std::map<uint256, size_t> relay_action_indices;
+    std::map<uint256, COutPoint> relay_anchors;
     std::set<uint256> relay_requires_unlock;
     uint64_t post_persist_generation{0};
     {
@@ -2727,9 +3136,10 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
             effective.aggregate_batch_fee_cap =
                 automatic_policy->aggregate_batch_fee_cap;
         }
-        if (m_shadow_pow_claim_recovery_db_ambiguous) {
+        if (m_shadow_pow_claim_recovery_db_ambiguous ||
+            m_locked_coins_db_ambiguous) {
             result.durable_state_ambiguous = true;
-            result.error = "a prior recovery database commit had an ambiguous outcome; reload the wallet before any further recovery action";
+            result.error = "a prior recovery or coin-lock database commit had an ambiguous outcome; reload the wallet before any further recovery action";
             return result;
         }
         result.plan = BuildRecoveryPlanLocked(
@@ -2948,6 +3358,8 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
                 relay_txids.push_back(item.transaction->GetHash());
                 relay_action_indices.emplace(
                     item.transaction->GetHash(), item.action_index);
+                relay_anchors.emplace(
+                    item.transaction->GetHash(), action.anchor);
                 if (item.newly_signed || !item.managed ||
                     !item.relay_authorized) {
                     relay_requires_unlock.insert(
@@ -2974,16 +3386,26 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
         bool already_in_mempool{false};
         {
             LOCK(cs_wallet);
+            const auto anchor_it = relay_anchors.find(txid);
+            if (anchor_it == relay_anchors.end()) {
+                result.error = "recovery relay lost its exact anchor binding";
+                return result;
+            }
+            if (m_shadow_pow_claim_recovery_db_ambiguous ||
+                m_locked_coins_db_ambiguous) {
+                result.durable_state_ambiguous = true;
+                result.error = "recovery or coin-lock database outcome became ambiguous before relay; reload the wallet";
+                return result;
+            }
+            if (IsLockedCoin(anchor_it->second)) {
+                result.error = "recovery anchor was user-locked before relay; exact authorized bytes remain persisted";
+                return result;
+            }
             if (m_last_block_processed != result.plan.active_tip ||
                 GetDatabase().nUpdateCounter.load() !=
                     post_persist_generation) {
                 result.stale_plan = true;
                 result.error = "wallet generation changed after persistence; signed bytes remain safely stored";
-                return result;
-            }
-            if (m_shadow_pow_claim_recovery_db_ambiguous) {
-                result.durable_state_ambiguous = true;
-                result.error = "recovery database outcome became ambiguous before relay; reload the wallet";
                 return result;
             }
             const auto it = mapWallet.find(txid);
@@ -3038,6 +3460,8 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
         broadcast_guard.expected_wallet_generation =
             post_persist_generation;
         broadcast_guard.expected_wallet_tip = result.plan.active_tip;
+        broadcast_guard.expected_unlocked_input =
+            relay_anchors.at(txid);
         broadcast_guard.require_normal_unlock =
             relay_requires_unlock.count(txid) != 0;
         if (effective.origin ==

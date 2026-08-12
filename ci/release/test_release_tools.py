@@ -1604,6 +1604,710 @@ class ReleaseToolTests(unittest.TestCase):
                     cwd=root,
                 )
 
+    def test_mixed_version_manifest_requires_explicit_safe_identity_contracts(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        manifest_path = MIXED_VERSION_TOOLS / "sources.json"
+        manifest = builder.load_manifest(manifest_path)
+        contracts = {
+            source["version"]: source["identity_contract"]
+            for source in manifest["sources"]
+        }
+        self.assertEqual(
+            contracts["v30.1.4"], builder.CLEAN_SOURCE_COMMIT_CONTRACT
+        )
+
+        def rejected(mutator, message):
+            document = copy.deepcopy(manifest)
+            mutator(document)
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "sources.json"
+                path.write_text(json.dumps(document), encoding="utf8")
+                with self.assertRaisesRegex(ValueError, message):
+                    builder.load_manifest(path)
+
+        rejected(
+            lambda document: document["sources"][0].pop("identity_contract"),
+            "missing.*identity_contract",
+        )
+        rejected(
+            lambda document: document["sources"][0].update(
+                identity_contract="trust-me-v1"
+            ),
+            "unsupported identity contract",
+        )
+        rejected(
+            lambda document: document["sources"][1].update(
+                install_dir=document["sources"][0]["install_dir"]
+            ),
+            "duplicate install directory",
+        )
+        rejected(
+            lambda document: document["sources"][0].update(source_daemon="."),
+            "unsafe source_daemon",
+        )
+        rejected(
+            lambda document: document["sources"][0].update(install_dir="../escape"),
+            "unsafe install directory",
+        )
+        rejected(
+            lambda document: document["sources"][0].update(commit=[]),
+            "non-string field",
+        )
+        rejected(
+            lambda document: document.update(sources=["not-an-object"]),
+            "entries must be objects",
+        )
+
+    def test_mixed_version_source_selection_is_exact_unique_and_manifest_ordered(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        manifest = builder.load_manifest(MIXED_VERSION_TOOLS / "sources.json")
+        all_versions = [source["version"] for source in manifest["sources"]]
+
+        contract, requested, selected = builder.select_manifest_sources(
+            manifest["sources"]
+        )
+        self.assertEqual(contract, builder.COMPLETE_SELECTION_CONTRACT)
+        self.assertEqual(requested, all_versions)
+        self.assertEqual([source["version"] for source in selected], all_versions)
+
+        contract, requested, selected = builder.select_manifest_sources(
+            manifest["sources"], ["v30.1.4", "v26.2.0"]
+        )
+        self.assertEqual(contract, builder.SUBSET_SELECTION_CONTRACT)
+        self.assertEqual(requested, ["v26.2.0", "v30.1.4"])
+        self.assertEqual([source["version"] for source in selected], requested)
+
+        for hostile, message in (
+            (["v30.1.4", "v30.1.4"], "duplicate versions"),
+            (["v30.1.5"], "unknown mixed-version"),
+            ([], "non-empty version list"),
+        ):
+            with self.subTest(hostile=hostile), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                builder.select_manifest_sources(manifest["sources"], hostile)
+
+    def test_mixed_version_builder_defaults_to_all_and_limits_explicit_subset(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        manifest = builder.load_manifest(MIXED_VERSION_TOOLS / "sources.json")
+        all_versions = [source["version"] for source in manifest["sources"]]
+
+        def built_item(source, *, host, **_kwargs):
+            return {
+                **builder.provenance_source_metadata(source),
+                "host": host,
+                "origin": "source-build",
+                "identity_verified": True,
+                "source_checkout_clean": True,
+                "binaries": {},
+                "reported_versions": {},
+            }
+
+        cases = (
+            ([], builder.COMPLETE_SELECTION_CONTRACT, all_versions),
+            (
+                ["--version", "v30.1.4"],
+                builder.SUBSET_SELECTION_CONTRACT,
+                ["v30.1.4"],
+            ),
+        )
+        for arguments, expected_contract, expected_versions in cases:
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                output = root / "output"
+                build_root = root / "build"
+                argv = [
+                    "build_previous_releases.py",
+                    "--output", str(output),
+                    "--build-root", str(build_root),
+                    "--host", "test-host",
+                    *arguments,
+                ]
+                observed = []
+                with mock.patch.object(sys, "argv", argv), \
+                     mock.patch.object(
+                         builder, "remote_objects",
+                         side_effect=lambda source: observed.append(source["version"]),
+                     ), \
+                     mock.patch.object(
+                         builder, "cached_provenance_is_reusable", return_value=False,
+                     ), \
+                     mock.patch.object(
+                         builder, "download_exact_release", side_effect=built_item,
+                     ), \
+                     mock.patch("builtins.print"):
+                    self.assertEqual(builder.main(), 0)
+                document = json.loads(
+                    (output / "provenance.json").read_text(encoding="utf8")
+                )
+                self.assertEqual(observed, expected_versions)
+                self.assertEqual(document["selection_contract"], expected_contract)
+                self.assertEqual(document["requested_versions"], expected_versions)
+                self.assertEqual(document["built_versions"], expected_versions)
+                self.assertEqual(
+                    [item["version"] for item in document["sources"]],
+                    expected_versions,
+                )
+                self.assertEqual(
+                    document["manifest_sha256"],
+                    builder.file_sha256(MIXED_VERSION_TOOLS / "sources.json"),
+                )
+
+    def test_mixed_version_subset_provenance_is_exact_and_complete_is_shareable(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            scratch = root / "scratch"
+            scratch.mkdir()
+            sources = []
+            items = {}
+            for ordinal, version in enumerate(("v30.1.0", "v30.1.4"), start=1):
+                install_dir = version
+                source = {
+                    "version": version,
+                    "product": "Blackcoin",
+                    "install_dir": install_dir,
+                    "repository": "https://example.invalid/Blackcoin.git",
+                    "source_ref": f"refs/tags/{version}",
+                    "ref_object": str(ordinal) * 40,
+                    "commit": str(ordinal) * 40,
+                    "tag_kind": "lightweight",
+                    "source_daemon": "blackcoind",
+                    "source_cli": "blackcoin-cli",
+                    "identity_contract": builder.VERSION_BANNER_CONTRACT,
+                }
+                sources.append(source)
+                bin_dir = output / install_dir / "bin"
+                bin_dir.mkdir(parents=True)
+                normalized = version.removeprefix("v")
+                banners = {
+                    "blackcoind": f"Blackcoin version v{normalized}",
+                    "blackcoin-cli": f"Blackcoin RPC client version v{normalized}",
+                }
+                for binary, banner in banners.items():
+                    path = bin_dir / binary
+                    path.write_text(
+                        "#!/bin/sh\nprintf '%s\\n' " + repr(banner) + "\n",
+                        encoding="utf8",
+                    )
+                    path.chmod(0o755)
+                items[version] = {
+                    **builder.provenance_source_metadata(source),
+                    "host": "test-host",
+                    "origin": "source-build",
+                    "identity_verified": True,
+                    "source_checkout_clean": True,
+                    "binaries": {
+                        binary: builder.file_sha256(bin_dir / binary)
+                        for binary in builder.BINARIES
+                    },
+                    "reported_versions": banners,
+                }
+
+            manifest_digest = "5" * 64
+
+            def provenance(contract, versions):
+                return {
+                    "schema": 1,
+                    "contract": builder.PROVENANCE_CONTRACT,
+                    "host": "test-host",
+                    "manifest_sha256": manifest_digest,
+                    "selection_contract": contract,
+                    "requested_versions": list(versions),
+                    "built_versions": list(versions),
+                    "sources": [copy.deepcopy(items[version]) for version in versions],
+                }
+
+            def validate(document, required):
+                (output / "provenance.json").write_text(
+                    json.dumps(document), encoding="utf8"
+                )
+                return builder.cached_provenance_is_valid(
+                    output_dir=output,
+                    manifest_digest=manifest_digest,
+                    sources=sources,
+                    required_versions=required,
+                    host="test-host",
+                    scratch_root=scratch,
+                )
+
+            subset = provenance(
+                builder.SUBSET_SELECTION_CONTRACT, ["v30.1.4"]
+            )
+            self.assertTrue(validate(subset, ["v30.1.4"]))
+            self.assertFalse(validate(subset, ["v30.1.0"]))
+
+            complete = provenance(
+                builder.COMPLETE_SELECTION_CONTRACT,
+                ["v30.1.0", "v30.1.4"],
+            )
+            self.assertTrue(validate(complete, ["v30.1.4"]))
+
+            hostile_documents = []
+            hostile = copy.deepcopy(subset)
+            hostile["built_versions"] = []
+            hostile_documents.append(hostile)
+            hostile = copy.deepcopy(subset)
+            hostile["requested_versions"].append("v30.1.4")
+            hostile_documents.append(hostile)
+            hostile = copy.deepcopy(subset)
+            hostile["sources"].append(copy.deepcopy(items["v30.1.0"]))
+            hostile_documents.append(hostile)
+            hostile = copy.deepcopy(subset)
+            hostile["sources"][0]["commit"] = "9" * 40
+            hostile_documents.append(hostile)
+            hostile = copy.deepcopy(complete)
+            hostile["sources"].pop()
+            hostile_documents.append(hostile)
+            hostile = copy.deepcopy(complete)
+            hostile["selection_contract"] = builder.SUBSET_SELECTION_CONTRACT
+            hostile_documents.append(hostile)
+            for index, hostile in enumerate(hostile_documents):
+                with self.subTest(index=index):
+                    self.assertFalse(validate(hostile, ["v30.1.4"]))
+
+    def test_mixed_version_clean_source_contract_rejects_dirty_or_ambiguous_output(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        source_commit = "1" * 40
+        cases = (
+            ("Source commit: " + source_commit, True),
+            ("Source commit: " + source_commit + " (dirty)", False),
+            ("Source commit: " + "2" * 40, False),
+            ("", False),
+            (
+                "Source commit: " + source_commit + "\nSource commit: " + source_commit,
+                False,
+            ),
+        )
+        for role, banner in (
+            ("blackcoind", "Blackcoin version v30.1.4"),
+            ("blackcoin-cli", "Blackcoin RPC client version v30.1.4"),
+        ):
+            for source_line, accepted in cases:
+                with self.subTest(role=role, source_line=source_line), \
+                     tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    binary = root / role
+                    lines = banner + ("\n" + source_line if source_line else "")
+                    binary.write_text(
+                        "#!/usr/bin/env python3\nprint(" + repr(lines) + ")\n",
+                        encoding="utf8",
+                    )
+                    binary.chmod(0o755)
+                    call = lambda: builder.verified_reported_version(
+                        binary,
+                        "v30.1.4",
+                        expected_product="Blackcoin",
+                        scratch_root=root,
+                        identity_contract=builder.CLEAN_SOURCE_COMMIT_CONTRACT,
+                        expected_source_commit=source_commit,
+                    )
+                    if accepted:
+                        self.assertEqual(call(), banner)
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "unexpected source identity"
+                        ):
+                            call()
+
+    def test_mixed_version_clone_is_atomic_clean_and_requires_absent_destination(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _working, remote, pinned, _descendant = self.make_mixed_version_remote(root)
+            destination = root / "build" / "v28.4"
+            source = {"repository": str(remote), "commit": pinned}
+            builder.clone_exact_source(source, destination)
+            self.assertTrue(destination.is_dir())
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "-C", destination, "rev-parse", "HEAD"], text=True
+                ).strip(),
+                pinned,
+            )
+            builder.verify_source_checkout(
+                destination, pinned, require_untracked_clean=True
+            )
+            marker = destination / "must-survive"
+            marker.write_text("preserve\n", encoding="utf8")
+            with self.assertRaisesRegex(RuntimeError, "existing path"):
+                builder.clone_exact_source(source, destination)
+            self.assertEqual(marker.read_text(encoding="utf8"), "preserve\n")
+            with self.assertRaisesRegex(RuntimeError, "not clean"):
+                builder.verify_source_checkout(
+                    destination, pinned, require_untracked_clean=True
+                )
+
+    def test_mixed_version_frozen_header_is_bound_to_clean_exact_commit(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "source"
+            (root / "share").mkdir(parents=True)
+            shutil_script = TOOLS.parent.parent / "share" / "genbuild.sh"
+            (root / "share" / "genbuild.sh").write_bytes(shutil_script.read_bytes())
+            (root / "share" / "genbuild.sh").chmod(0o755)
+            (root / "tracked.txt").write_text("clean\n", encoding="utf8")
+            subprocess.run(["git", "init", "-q", root], check=True)
+            subprocess.run(
+                ["git", "-C", root, "config", "user.name", "Blackcoin-Dev"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", root, "config", "user.email", "dev@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", root, "add", "share/genbuild.sh", "tracked.txt"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", root, "commit", "-q", "-m", "source"], check=True
+            )
+            commit = subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"], text=True
+            ).strip()
+            source = {
+                "commit": commit,
+                "identity_contract": builder.CLEAN_SOURCE_COMMIT_CONTRACT,
+            }
+            environment = builder.frozen_build_environment(source, root)
+            self.assertEqual(
+                environment["BITCOIN_GENBUILD_FROZEN_SOURCE_COMMIT"], commit
+            )
+            header = (root / "src" / "obj" / "build.h").read_text(encoding="utf8")
+            self.assertIn(f'#define BUILD_SOURCE_COMMIT "{commit}"', header)
+            self.assertIn("#define BUILD_SOURCE_DIRTY 0", header)
+
+            (root / "tracked.txt").write_text("dirty\n", encoding="utf8")
+            with self.assertRaisesRegex(RuntimeError, "not clean|exact clean source"):
+                builder.frozen_build_environment(source, root)
+
+    def test_mixed_version_cache_revalidates_host_contract_cleanliness_and_runtime(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            scratch = root / "scratch"
+            bin_dir = output / "v30.1.4" / "bin"
+            bin_dir.mkdir(parents=True)
+            scratch.mkdir()
+            commit = "3" * 40
+            source = {
+                "version": "v30.1.4",
+                "product": "Blackcoin",
+                "install_dir": "v30.1.4",
+                "repository": "https://example.invalid/Blackcoin.git",
+                "source_ref": "refs/tags/v30.1.4",
+                "ref_object": "4" * 40,
+                "commit": commit,
+                "tag_kind": "annotated",
+                "source_daemon": "blackcoind",
+                "source_cli": "blackcoin-cli",
+                "identity_contract": builder.CLEAN_SOURCE_COMMIT_CONTRACT,
+            }
+            banners = {
+                "blackcoind": "Blackcoin version v30.1.4",
+                "blackcoin-cli": "Blackcoin RPC client version v30.1.4",
+            }
+
+            def write_binary(name, source_line):
+                path = bin_dir / name
+                path.write_text(
+                    "#!/bin/sh\nprintf '%s\\n' "
+                    + repr(banners[name])
+                    + " "
+                    + repr(source_line)
+                    + "\n",
+                    encoding="utf8",
+                )
+                path.chmod(0o755)
+
+            exact_line = f"Source commit: {commit}"
+            for name in builder.BINARIES:
+                write_binary(name, exact_line)
+            manifest_digest = "5" * 64
+
+            def provenance():
+                return {
+                    "schema": 1,
+                    "contract": builder.PROVENANCE_CONTRACT,
+                    "host": "test-host",
+                    "manifest_sha256": manifest_digest,
+                    "selection_contract": builder.COMPLETE_SELECTION_CONTRACT,
+                    "requested_versions": [source["version"]],
+                    "built_versions": [source["version"]],
+                    "sources": [{
+                        **{
+                            key: source[key]
+                            for key in (
+                                "version", "product", "install_dir", "repository",
+                                "source_ref", "ref_object", "commit", "tag_kind",
+                                "source_daemon", "source_cli", "identity_contract",
+                            )
+                        },
+                        "host": "test-host",
+                        "origin": "source-build",
+                        "identity_verified": True,
+                        "source_checkout_clean": True,
+                        "binaries": {
+                            name: builder.file_sha256(bin_dir / name)
+                            for name in builder.BINARIES
+                        },
+                        "reported_versions": banners,
+                    }],
+                }
+
+            def write_provenance(document):
+                (output / "provenance.json").write_text(
+                    json.dumps(document), encoding="utf8"
+                )
+
+            valid = provenance()
+            write_provenance(valid)
+            arguments = dict(
+                output_dir=output,
+                manifest_digest=manifest_digest,
+                sources=[source],
+                host="test-host",
+                scratch_root=scratch,
+            )
+            self.assertTrue(builder.cached_provenance_is_valid(**arguments))
+
+            for field, value in (
+                ("host", "wrong-host"),
+                ("contract", "weak-contract"),
+            ):
+                hostile = copy.deepcopy(valid)
+                hostile[field] = value
+                write_provenance(hostile)
+                self.assertFalse(builder.cached_provenance_is_valid(**arguments))
+
+            hostile = copy.deepcopy(valid)
+            hostile["sources"][0]["source_checkout_clean"] = False
+            write_provenance(hostile)
+            self.assertFalse(builder.cached_provenance_is_valid(**arguments))
+
+            for malformed in ([], {"schema": 1, "sources": [{"version": []}]}):
+                write_provenance(malformed)
+                self.assertFalse(builder.cached_provenance_is_valid(**arguments))
+
+            write_binary("blackcoind", exact_line + " (dirty)")
+            hostile = provenance()
+            write_provenance(hostile)
+            self.assertFalse(builder.cached_provenance_is_valid(**arguments))
+
+            outside = root / "outside-blackcoind"
+            write_binary("blackcoind", exact_line)
+            (bin_dir / "blackcoind").replace(outside)
+            (bin_dir / "blackcoind").symlink_to(outside)
+            hostile = provenance()
+            hostile["sources"][0]["binaries"]["blackcoind"] = (
+                builder.file_sha256(outside)
+            )
+            write_provenance(hostile)
+            self.assertFalse(builder.cached_provenance_is_valid(**arguments))
+
+    def test_mixed_version_release_asset_cache_requires_pinned_member_hashes(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            scratch = root / "scratch"
+            bin_dir = output / "v26.2" / "bin"
+            bin_dir.mkdir(parents=True)
+            scratch.mkdir()
+            banners = {
+                "blackcoind": "Blackcoin More version v26.2.0",
+                "blackcoin-cli": "Blackcoin More RPC client version v26.2.0",
+            }
+            for binary, banner in banners.items():
+                path = bin_dir / binary
+                path.write_text(
+                    "#!/bin/sh\nprintf '%s\\n' " + repr(banner) + "\n",
+                    encoding="utf8",
+                )
+                path.chmod(0o755)
+            actual_hashes = {
+                binary: builder.file_sha256(bin_dir / binary)
+                for binary in builder.BINARIES
+            }
+            source = {
+                "version": "v26.2.0",
+                "product": "Blackcoin More",
+                "install_dir": "v26.2",
+                "repository": "https://example.invalid/blackcoin-more.git",
+                "source_ref": "refs/tags/v26.2.0",
+                "ref_object": "1" * 40,
+                "commit": "1" * 40,
+                "tag_kind": "lightweight",
+                "source_daemon": "blackmored",
+                "source_cli": "blackmore-cli",
+                "identity_contract": builder.VERSION_BANNER_CONTRACT,
+                "release_asset": {
+                    "host": "test-host",
+                    "url": "https://example.invalid/v26.2.0.tar.gz",
+                    "sha256": "2" * 64,
+                    "daemon_member": "release/blackmored",
+                    "daemon_sha256": "3" * 64,
+                    "cli_member": "release/blackmore-cli",
+                    "cli_sha256": "4" * 64,
+                },
+            }
+            manifest_digest = "5" * 64
+            provenance = {
+                "schema": 1,
+                "contract": builder.PROVENANCE_CONTRACT,
+                "host": "test-host",
+                "manifest_sha256": manifest_digest,
+                "selection_contract": builder.COMPLETE_SELECTION_CONTRACT,
+                "requested_versions": [source["version"]],
+                "built_versions": [source["version"]],
+                "sources": [{
+                    **{
+                        key: source[key]
+                        for key in (
+                            "version", "product", "install_dir", "repository",
+                            "source_ref", "ref_object", "commit", "tag_kind",
+                            "source_daemon", "source_cli", "identity_contract",
+                        )
+                    },
+                    "host": "test-host",
+                    "origin": "digest-pinned-release-asset",
+                    "release_asset_url": source["release_asset"]["url"],
+                    "release_asset_sha256": source["release_asset"]["sha256"],
+                    "identity_verified": True,
+                    "binaries": actual_hashes,
+                    "reported_versions": banners,
+                }],
+            }
+            (output / "provenance.json").write_text(
+                json.dumps(provenance), encoding="utf8"
+            )
+            self.assertFalse(builder.cached_provenance_is_valid(
+                output_dir=output,
+                manifest_digest=manifest_digest,
+                sources=[source],
+                host="test-host",
+                scratch_root=scratch,
+            ))
+
+            source["release_asset"]["daemon_sha256"] = actual_hashes["blackcoind"]
+            source["release_asset"]["cli_sha256"] = actual_hashes["blackcoin-cli"]
+            validation_arguments = dict(
+                output_dir=output,
+                manifest_digest=manifest_digest,
+                sources=[source],
+                host="test-host",
+                scratch_root=scratch,
+            )
+            self.assertTrue(builder.cached_provenance_is_valid(
+                **validation_arguments
+            ))
+            self.assertTrue(builder.cached_provenance_is_reusable(
+                **validation_arguments
+            ))
+
+            downgraded = copy.deepcopy(provenance)
+            downgraded["sources"][0]["origin"] = "source-build"
+            downgraded["sources"][0]["source_checkout_clean"] = True
+            downgraded["sources"][0].pop("release_asset_url")
+            downgraded["sources"][0].pop("release_asset_sha256")
+            (output / "provenance.json").write_text(
+                json.dumps(downgraded), encoding="utf8"
+            )
+            self.assertFalse(builder.cached_provenance_is_valid(
+                output_dir=output,
+                manifest_digest=manifest_digest,
+                sources=[source],
+                host="test-host",
+                scratch_root=scratch,
+            ))
+
+    def test_mixed_version_source_build_cache_is_rejected_before_execution(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        source = {
+            "version": "v30.1.4",
+            "product": "Blackcoin",
+            "install_dir": "v30.1.4",
+            "repository": "https://example.invalid/Blackcoin.git",
+            "source_ref": "refs/tags/v30.1.4",
+            "ref_object": "4" * 40,
+            "commit": "3" * 40,
+            "tag_kind": "annotated",
+            "identity_contract": builder.CLEAN_SOURCE_COMMIT_CONTRACT,
+        }
+        with mock.patch.object(
+            builder,
+            "cached_provenance_is_valid",
+            side_effect=AssertionError("cached binary validation executed"),
+        ):
+            self.assertFalse(builder.cached_provenance_is_reusable(
+                Path("/untrusted/cache"),
+                "5" * 64,
+                [source],
+                host="test-host",
+                scratch_root=Path("/unused/scratch"),
+            ))
+
+    def test_mixed_version_safe_child_rejects_escape_and_symlink_escape(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            outside = Path(temporary) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "outside workspace"):
+                builder.safe_child(root, "../outside/payload")
+            (root / "link").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "outside workspace"):
+                builder.safe_child(root, "link/payload")
+
+    def test_mixed_version_cleanup_roots_cannot_cover_tracked_or_git_content(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        repository = TOOLS.parent.parent
+        with self.assertRaisesRegex(RuntimeError, "tracked repository files"):
+            builder.reject_tracked_destructive_root(repository / "src", repository)
+        with self.assertRaisesRegex(RuntimeError, "repository metadata"):
+            builder.reject_tracked_destructive_root(repository / ".git", repository)
+        builder.reject_tracked_destructive_root(
+            repository / ".ci" / "previous-releases", repository
+        )
+
+        # APFS commonly resolves these alternate-case spellings to the same
+        # objects while pathlib preserves the caller's case. The guards must
+        # remain safe on both case-insensitive and case-sensitive hosts, and
+        # this test never invokes recursive cleanup.
+        alternate_home = Path(str(Path.home()).swapcase())
+        self.assertIsNotNone(
+            builder.filesystem_relative_path(Path.home(), alternate_home)
+        )
+        alternate_repository = repository.with_name(repository.name.swapcase())
+        self.assertIsNotNone(
+            builder.filesystem_relative_path(repository, alternate_repository)
+        )
+        with self.assertRaisesRegex(RuntimeError, "tracked repository files"):
+            builder.reject_tracked_destructive_root(
+                alternate_repository / "SRC", repository
+            )
+        with self.assertRaisesRegex(RuntimeError, "repository metadata"):
+            builder.reject_tracked_destructive_root(
+                alternate_repository / ".GIT", repository
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(temporary)
+                with self.assertRaisesRegex(
+                    RuntimeError, "tracked repository files"
+                ):
+                    builder.reject_tracked_destructive_root(
+                        repository / "src", repository
+                    )
+            finally:
+                os.chdir(previous_cwd)
+
     def make_mixed_version_remote(self, directory):
         working = directory / "working"
         remote = directory / "remote.git"

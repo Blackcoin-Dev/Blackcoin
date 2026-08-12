@@ -785,9 +785,9 @@ jobs:
             feature_shutdown.py
 
   mixed-version:
-    name: real v26.2, v28.4, v30.1, and candidate interoperability
+    name: real v26.2, v28.4, v30.1, v30.1.4, and candidate interoperability
     if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
-    needs: native-build-and-unit
+    needs: [policy-and-lint, native-build-and-unit]
     runs-on: ubuntu-22.04
     timeout-minutes: 300
     steps:
@@ -813,13 +813,6 @@ jobs:
             automake bison build-essential cmake gettext gperf libtool \
             pkg-config python3 python3-zmq
 
-      - name: Restore pull-request historical-binary cache
-        if: ${{ inputs.release_mode != true }}
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: .ci/previous-releases
-          key: mixed-version-${{ runner.os }}-${{ hashFiles('ci/mixed-version/sources.json', 'ci/mixed-version/build_previous_releases.py') }}
-
       - name: Build and verify historical binaries
         run: |
           python3 ci/mixed-version/build_previous_releases.py \
@@ -828,13 +821,17 @@ jobs:
             --host "$HOST" \
             --jobs "$MAKEJOBS"
 
-      - name: Run mixed-version relay and reorg test
+      - name: Run mixed-version relay, reorg, and wallet-upgrade tests
         env:
           PREVIOUS_RELEASES_DIR: ${{ github.workspace }}/.ci/previous-releases
+          PREVIOUS_RELEASES_HOST: ${{ env.HOST }}
         run: |
           python3 test/functional/test_runner.py \
             --ci --jobs=1 --failfast --combinedlogslen=2000 \
             feature_goldrush_mixed_version.py --previous-releases --legacy-wallet
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=2000 \
+            feature_goldrush_v3014_wallet_upgrade.py --previous-releases --descriptors
 
       - name: Upload historical binary provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -870,7 +867,7 @@ jobs:
         run: |
           python3 test/functional/test_runner.py \
             --ci --extended --jobs=4 --combinedlogslen=2000 \
-            --exclude=feature_goldrush_mixed_version.py
+            --exclude=feature_goldrush_mixed_version.py,feature_goldrush_v3014_wallet_upgrade.py
 
   sanitizer-gates:
     name: ${{ matrix.name }} consensus and liveness gate

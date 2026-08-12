@@ -81,7 +81,23 @@ elif [ "$RUN_UNIT_TESTS" = "true" ] || [ "$RUN_UNIT_TESTS_SEQUENTIAL" = "true" ]
   "${BASE_ROOT_DIR}/ci/test/prepare_script_assets.sh"
 fi
 
-mkdir -p "${BASE_SCRATCH_DIR}/sanitizer-output/"
+emit_sanitizer_reports_on_exit() {
+  local source_status="$1"
+  local collector_status
+  trap - EXIT
+  set +e
+  python3 "${BASE_ROOT_DIR}/ci/test/emit_sanitizer_reports.py" "$source_status"
+  collector_status=$?
+  if [[ "$source_status" -ne 0 ]]; then
+    exit "$source_status"
+  fi
+  exit "$collector_status"
+}
+
+# Preparation is descriptor-relative and refuses symlinks, nested entries, and
+# unsafe metadata. It never recursively traverses a preexisting path.
+python3 "${BASE_ROOT_DIR}/ci/test/emit_sanitizer_reports.py" --prepare
+trap 'emit_sanitizer_reports_on_exit "$?"' EXIT
 
 if [ "$USE_BUSY_BOX" = "true" ]; then
   echo "Setup to use BusyBox utils"

@@ -146,13 +146,26 @@ The v30.1.5 candidate includes focused unit and functional coverage for
 same-anchor continuation, persisted-but-unrelayed claims, normal and
 staking-only unlock, manual and timed relock, active-work cancellation,
 multi-worker terminal telemetry, restart, reorg, reindex, and independent
-competing-claim fixtures. Release publication still requires the exact-SHA
-repository gate, reproducible candidate packaging, and a data-preserving
-canary before fleet rollout.
+competing-claim fixtures. Exact pinned-v30.1.4 coverage also opens one wallet
+and datadir in the sequence v30.1.4, candidate, v30.1.4, candidate after the
+candidate has written QQP2-to-QQP3 family metadata. The old daemon preserves
+the unknown metadata through a normal wallet write, and the second candidate
+open reconstructs the same authenticated family and anchor. A concurrent
+two-version test sends candidate-authored same-anchor bytes through v30.1.4's
+P2P admission path, includes them in a v30.1.4 PoS block, restarts both
+versions, and checks removal and later reinclusion across a competing-branch
+reorganization. Release publication still requires the exact-SHA repository
+gate, reproducible candidate packaging, and a data-preserving canary before
+fleet rollout.
 
 Back up each wallet and take a cold datadir copy before replacing binaries.
 Stop the existing process cleanly. Do not run two versions against one datadir.
 An exact-active-tip authenticated schema-12 datadir produced by v30.1.4 does
 not require an automatic rewind or reindex merely because the client version
 changes. Any rollback must follow the reviewed canary or release procedure and
-preserve wallet and chain state created after the upgrade.
+preserve wallet and chain state created after the upgrade. This tested rollback
+boundary is data-compatible, not feature-equivalent: v30.1.4 does not
+interpret the candidate's typed same-anchor family policy and may again report
+`claim_quarantined` with zero PoW hashrate for a family the candidate can safely
+relay or continue. Rollback therefore must not be represented as preserving
+the candidate's regular-PoW liveness behavior.

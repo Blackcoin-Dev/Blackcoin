@@ -15,6 +15,8 @@ readonly TEST_ROOT PACKAGE_ROOT REPO_ROOT
 readonly WORKFLOW="$REPO_ROOT/.github/workflows/v30.1.5-candidate-linux.yml"
 readonly METADATA="$REPO_ROOT/ci/release/generate_v30_1_5_candidate_metadata.py"
 readonly METADATA_TEST="$REPO_ROOT/ci/release/test_v30_1_5_candidate_metadata.py"
+readonly CORE_CI_VERIFIER="$REPO_ROOT/ci/release/verify_v30_1_5_core_ci.py"
+readonly CORE_CI_TEST="$REPO_ROOT/ci/release/test_v30_1_5_core_ci.py"
 readonly POLICY="$PACKAGE_ROOT/policy.json"
 readonly BUILD="$PACKAGE_ROOT/build_candidate_bundle.sh"
 readonly VERIFY="$PACKAGE_ROOT/verify_candidate_bundle.sh"
@@ -34,7 +36,8 @@ expected_directories=$(printf '.\n./tests\n' | sort)
 [[ "$actual_directories" == "$expected_directories" ]] ||
     fail 'candidate package directory inventory changed'
 
-for path in "$WORKFLOW" "$METADATA" "$METADATA_TEST" "$POLICY" "$BUILD" "$VERIFY" "$SUMS"; do
+for path in "$WORKFLOW" "$METADATA" "$METADATA_TEST" "$CORE_CI_VERIFIER" "$CORE_CI_TEST" \
+    "$POLICY" "$BUILD" "$VERIFY" "$SUMS"; do
     [[ -f "$path" && ! -L "$path" ]] || fail "required package path is absent or unsafe: $path"
 done
 
@@ -43,6 +46,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     shellcheck "$BUILD" "$VERIFY" "$TEST_ROOT/run.sh"
 fi
 python3 "$METADATA_TEST"
+python3 "$CORE_CI_TEST"
 
 python3 - "$WORKFLOW" <<'PY'
 import re
@@ -176,6 +180,8 @@ assert policy["authorization"] == {
     "dispatch_enabled": False,
     "temporary_source_pin": True,
     "core_ci_run_id": None,
+    "core_ci_run_attempt": None,
+    "thread_sanitizer_artifact": None,
 }
 assert policy["source"]["commit"] == "a0695f22740e111d0487a194fb46f1bae05952c5"
 assert policy["source"]["tree"] == "86df040ae5eb8e819e940dd08364bcc177a72195"
@@ -194,6 +200,25 @@ assert policy["core_ci"] == {
     "workflow_name": "pull-request safety gate",
     "base_workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869",
     "source_workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869",
+    "required_checks_app_id": 15368,
+    "required_checks": [
+        "source identity, workflow syntax, and lint",
+        "pinned independent quantum crypto provenance",
+        "pinned native build and unit tests",
+        "measured worst-case quantum crypto resources (Linux x86_64)",
+        "Linux ARM64 native cryptographic vectors and resources",
+        "Linux ARM64 native UBSan block-harness gate",
+        "Build pinned Windows x86_64 vector binaries",
+        "Windows x86_64 native cryptographic vectors and resources",
+        "macOS Intel native cryptographic vectors",
+        "macOS Apple Silicon native cryptographic vectors",
+        "critical Gold Rush, lifecycle, wallet, and recovery tests",
+        "real v26.2, v28.4, v30.1, and candidate interoperability",
+        "complete extended functional suite",
+        "address-undefined-sanitizer consensus and liveness gate",
+        "thread-sanitizer consensus and liveness gate",
+        "source-pinned sanitizer regression smoke",
+    ],
 }
 assert policy["base_image"]["manifest_digest"] == "sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2"
 assert policy["base_image"]["config_digest"] == "sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909"
@@ -219,6 +244,7 @@ PY
 grep -Fq 'permissions:' "$WORKFLOW"
 grep -Fq '  contents: read' "$WORKFLOW"
 grep -Fq '  actions: read' "$WORKFLOW"
+grep -Fq '  checks: read' "$WORKFLOW"
 grep -Fq "if: \${{ github.event_name == 'workflow_dispatch' }}" "$WORKFLOW"
 test "$(grep -Fc "test \"\$GITHUB_ACTOR\" = Blackcoin-Dev" "$WORKFLOW")" = 3
 test "$(grep -Fc "test \"\$GITHUB_TRIGGERING_ACTOR\" = Blackcoin-Dev" "$WORKFLOW")" = 3
@@ -234,12 +260,9 @@ grep -Fq 'EXPECTED_CORE_CI_BASE_WORKFLOW_BLOB_SHA256: 24c14f2fe4bd7b25de38e71a80
 grep -Fq 'EXPECTED_CORE_CI_SOURCE_WORKFLOW_BLOB_SHA256: 24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869' "$WORKFLOW"
 grep -Fq "\"\$EXPECTED_CORE_CI_BASE_WORKFLOW_BLOB_SHA256\"" "$WORKFLOW"
 grep -Fq "\"\$EXPECTED_CORE_CI_SOURCE_WORKFLOW_BLOB_SHA256\"" "$WORKFLOW"
-grep -Fq "base_workflow_blob_sha256:\$base_workflow_blob" "$WORKFLOW"
-grep -Fq "source_workflow_blob_sha256:\$source_workflow_blob" "$WORKFLOW"
-grep -Fq "pull_request_base_sha:\$base,base_tree:\$base_tree" "$WORKFLOW"
-grep -Fq '{schema:2,workflow_path:' "$WORKFLOW"
 grep -Fq "{schema:2,commit:\$commit,tree:\$tree" "$WORKFLOW"
 grep -Fq '.status == "completed" and .conclusion == "success"' "$WORKFLOW"
+grep -Fq ".run_attempt == \$attempt" "$WORKFLOW"
 grep -Fq ".head_sha == \$source" "$WORKFLOW"
 grep -Fq ".head_commit.id == \$source and .head_commit.tree_id == \$tree" "$WORKFLOW"
 grep -Fq ".sha == \$source and .tree.sha == \$tree" "$WORKFLOW"
@@ -254,6 +277,21 @@ grep -Fq "test \"\$POLICY_DISPATCH_ENABLED\" = true" "$WORKFLOW"
 grep -Fq "test \"\$POLICY_TEMPORARY_SOURCE\" = false" "$WORKFLOW"
 grep -Fq "test \"\$POLICY_CORE_CI_RUN_ID\" = \"\$EXPECTED_CORE_CI_RUN_ID\"" "$WORKFLOW"
 grep -Fq "test \"\$CORE_CI_RUN_ID\" = \"\$EXPECTED_CORE_CI_RUN_ID\"" "$WORKFLOW"
+grep -Fq "POLICY_CORE_CI_RUN_ATTEMPT=\$(jq -r" "$WORKFLOW"
+grep -Fq "POLICY_TSAN_ARTIFACT_ID=\$(jq -r" "$WORKFLOW"
+grep -Fq "actions/runs/\$CORE_CI_RUN_ID/attempts/\$CORE_CI_RUN_ATTEMPT/jobs?per_page=100" "$WORKFLOW"
+grep -Fq "actions/runs/\$CORE_CI_RUN_ID/artifacts?per_page=100" "$WORKFLOW"
+grep -Fq "actions/workflows/pr-gate.yml/runs?event=pull_request&head_sha=\$SOURCE_SHA&per_page=100" "$WORKFLOW"
+grep -Fq "commits/\$SOURCE_SHA/check-runs?per_page=100" "$WORKFLOW"
+grep -Fq "actions/artifacts/\$TSAN_ARTIFACT_ID/zip" "$WORKFLOW"
+grep -Fq "repos/\$GITHUB_REPOSITORY/git/ref/heads/main" "$WORKFLOW"
+grep -Fq "repos/\$GITHUB_REPOSITORY/pulls/\$EXPECTED_CORE_CI_PR" "$WORKFLOW"
+grep -Fq 'python3 ci/release/verify_v30_1_5_core_ci.py' "$WORKFLOW"
+grep -Fq -- '--artifact-zip thread-sanitizer-artifact.zip' "$WORKFLOW"
+grep -Fq -- '--main-ref-json core-main-ref.json' "$WORKFLOW"
+grep -Fq -- '--pull-request-json core-pull-request.json' "$WORKFLOW"
+grep -Fq -- '--workflow-runs-json core-ci-exact-head-runs.json' "$WORKFLOW"
+grep -Fq -- '--check-runs-json core-ci-check-runs.json' "$WORKFLOW"
 grep -Fq "\"\$GITHUB_WORKSPACE/\$POLICY\"" "$WORKFLOW"
 grep -Fq "\"\$GITHUB_WORKSPACE/primary\" \"\$GITHUB_WORKSPACE/verifier\"" "$WORKFLOW"
 grep -Fq "\"\$GITHUB_WORKSPACE/candidate-bundle\"" "$WORKFLOW"

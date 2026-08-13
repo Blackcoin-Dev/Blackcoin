@@ -35,6 +35,25 @@ EXPECTED_CORE_CI_BASE = "19baffef25af36e177db2975780e0641b59753aa"
 EXPECTED_CORE_CI_BASE_TREE = "f897d758aee1849f02126f0ee3b7a4be9bd3be8c"
 EXPECTED_BASE_WORKFLOW_BLOB_SHA256 = "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869"
 EXPECTED_SOURCE_WORKFLOW_BLOB_SHA256 = "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869"
+EXPECTED_REQUIRED_CHECKS_APP_ID = 15368
+EXPECTED_REQUIRED_CHECKS = (
+    "source identity, workflow syntax, and lint",
+    "pinned independent quantum crypto provenance",
+    "pinned native build and unit tests",
+    "measured worst-case quantum crypto resources (Linux x86_64)",
+    "Linux ARM64 native cryptographic vectors and resources",
+    "Linux ARM64 native UBSan block-harness gate",
+    "Build pinned Windows x86_64 vector binaries",
+    "Windows x86_64 native cryptographic vectors and resources",
+    "macOS Intel native cryptographic vectors",
+    "macOS Apple Silicon native cryptographic vectors",
+    "critical Gold Rush, lifecycle, wallet, and recovery tests",
+    "real v26.2, v28.4, v30.1, and candidate interoperability",
+    "complete extended functional suite",
+    "address-undefined-sanitizer consensus and liveness gate",
+    "thread-sanitizer consensus and liveness gate",
+    "source-pinned sanitizer regression smoke",
+)
 EXPECTED_BINARIES = (
     "blackcoin-cli",
     "blackcoin-qt",
@@ -138,19 +157,48 @@ def validate_policy(policy_path):
     authorization = policy["authorization"]
     require_exact_keys(
         authorization,
-        {"state", "dispatch_enabled", "temporary_source_pin", "core_ci_run_id"},
+        {
+            "state", "dispatch_enabled", "temporary_source_pin", "core_ci_run_id",
+            "core_ci_run_attempt", "thread_sanitizer_artifact",
+        },
         "candidate authorization policy",
     )
     if authorization["state"] == BLOCKED_AUTHORIZATION_STATE:
         require(authorization["dispatch_enabled"] is False, "blocked candidate cannot be dispatchable")
         require(authorization["temporary_source_pin"] is True, "blocked candidate must identify its temporary source pin")
         require(authorization["core_ci_run_id"] is None, "blocked candidate cannot pin a Core CI run")
+        require(authorization["core_ci_run_attempt"] is None, "blocked candidate cannot pin a Core CI run attempt")
+        require(authorization["thread_sanitizer_artifact"] is None, "blocked candidate cannot pin a sanitizer artifact")
     elif authorization["state"] == READY_AUTHORIZATION_STATE:
         require(authorization["dispatch_enabled"] is True, "authorized candidate must be dispatchable")
         require(authorization["temporary_source_pin"] is False, "authorized candidate cannot retain a temporary source pin")
         require(
-            isinstance(authorization["core_ci_run_id"], int) and authorization["core_ci_run_id"] > 0,
+            type(authorization["core_ci_run_id"]) is int and authorization["core_ci_run_id"] > 0,
             "authorized candidate must pin a positive Core CI run ID",
+        )
+        require(
+            type(authorization["core_ci_run_attempt"]) is int and authorization["core_ci_run_attempt"] > 0,
+            "authorized candidate must pin a positive Core CI run attempt",
+        )
+        sanitizer = authorization["thread_sanitizer_artifact"]
+        require_exact_keys(
+            sanitizer,
+            {"id", "name", "zip_sha256", "reports_sha256"},
+            "authorized ThreadSanitizer artifact",
+        )
+        require(type(sanitizer["id"]) is int and sanitizer["id"] > 0, "sanitizer artifact ID is malformed")
+        expected_artifact_name = (
+            f"sanitizer-reports-thread-sanitizer-{EXPECTED_SOURCE_COMMIT}-attempt-"
+            f"{authorization['core_ci_run_attempt']}"
+        )
+        require(sanitizer["name"] == expected_artifact_name, "sanitizer artifact name changed")
+        require(
+            isinstance(sanitizer["zip_sha256"], str) and HEX_SHA256_RE.fullmatch(sanitizer["zip_sha256"]),
+            "sanitizer artifact ZIP digest is malformed",
+        )
+        require(
+            isinstance(sanitizer["reports_sha256"], str) and HEX_SHA256_RE.fullmatch(sanitizer["reports_sha256"]),
+            "sanitizer reports digest is malformed",
         )
     else:
         raise RuntimeError("candidate authorization state is not supported")
@@ -182,6 +230,7 @@ def validate_policy(policy_path):
             "event", "pull_request_number", "head_sha", "head_tree", "base_sha", "base_tree", "repository",
             "head_repository", "workflow_path", "workflow_name",
             "base_workflow_blob_sha256", "source_workflow_blob_sha256",
+            "required_checks_app_id", "required_checks",
         },
         "Core CI policy",
     )
@@ -202,6 +251,15 @@ def validate_policy(policy_path):
     require(
         core_ci["source_workflow_blob_sha256"] == EXPECTED_SOURCE_WORKFLOW_BLOB_SHA256,
         "Core CI source workflow blob changed",
+    )
+    require(
+        core_ci["required_checks"] == list(EXPECTED_REQUIRED_CHECKS),
+        "Core CI required check set changed",
+    )
+    require(
+        type(core_ci["required_checks_app_id"]) is int
+        and core_ci["required_checks_app_id"] == EXPECTED_REQUIRED_CHECKS_APP_ID,
+        "Core CI required-check app ID changed",
     )
 
     base = policy["base_image"]
@@ -351,7 +409,12 @@ def validate_core_ci(path, policy):
             "schema", "workflow_path", "workflow_name", "base_workflow_blob_sha256",
             "source_workflow_blob_sha256", "event",
             "repository", "head_repository", "pull_request_number", "pull_request_head_sha",
-            "pull_request_base_sha", "base_tree", "run_id", "head_sha", "head_tree", "status", "conclusion",
+            "pull_request_base_sha", "base_tree", "run_id", "run_attempt", "head_sha", "head_tree",
+            "status", "conclusion", "workflow_actor", "workflow_triggering_actor",
+            "base_branch", "base_branch_head_sha", "strict_base_fresh",
+            "pull_request_state", "pull_request_draft", "pull_request_mergeable",
+            "pull_request_mergeable_state", "exact_head_run_count",
+            "required_checks", "thread_sanitizer_artifact",
         },
         "Core CI evidence",
     )
@@ -385,16 +448,99 @@ def validate_core_ci(path, policy):
         "Core CI pull request base changed",
     )
     require(value["base_tree"] == policy["core_ci"]["base_tree"], "Core CI base tree changed")
-    require(isinstance(value["run_id"], int) and value["run_id"] > 0, "Core CI run ID is malformed")
+    require(type(value["run_id"]) is int and value["run_id"] > 0, "Core CI run ID is malformed")
     if policy["authorization"]["state"] == READY_AUTHORIZATION_STATE:
         require(
             value["run_id"] == policy["authorization"]["core_ci_run_id"],
             "Core CI evidence does not match the authorized exact run",
         )
+        require(
+            value["run_attempt"] == policy["authorization"]["core_ci_run_attempt"],
+            "Core CI evidence does not match the authorized exact run attempt",
+        )
+    require(type(value["run_attempt"]) is int and value["run_attempt"] > 0, "Core CI run attempt is malformed")
     require(value["head_sha"] == policy["core_ci"]["head_sha"], "Core CI ran against another source")
     require(value["head_tree"] == policy["core_ci"]["head_tree"], "Core CI ran against another source tree")
     require(value["status"] == "completed", "Core CI did not complete")
     require(value["conclusion"] == "success", "Core CI did not pass")
+    require(value["workflow_actor"] == EXPECTED_ACTOR, "Core CI actor changed")
+    require(value["workflow_triggering_actor"] == EXPECTED_ACTOR, "Core CI triggering actor changed")
+    require(value["base_branch"] == "main", "Core CI base branch changed")
+    require(value["base_branch_head_sha"] == policy["core_ci"]["base_sha"], "strict Core base is stale")
+    require(value["strict_base_fresh"] is True, "strict Core base freshness is not proven")
+    require(value["pull_request_state"] == "open", "Core pull request is not open")
+    require(value["pull_request_draft"] is False, "Core pull request is draft")
+    require(value["pull_request_mergeable"] is True, "Core pull request is not mergeable")
+    require(
+        value["pull_request_mergeable_state"] == "clean",
+        "Core pull request does not satisfy current protection",
+    )
+    require(
+        type(value["exact_head_run_count"]) is int and value["exact_head_run_count"] == 1,
+        "Core CI exact-head pull-request run is not unique",
+    )
+    checks = value["required_checks"]
+    require(isinstance(checks, list) and len(checks) == len(EXPECTED_REQUIRED_CHECKS), "Core CI check count changed")
+    check_names = []
+    check_ids = set()
+    for check in checks:
+        require_exact_keys(check, {"id", "name", "app_id", "status", "conclusion"}, "Core CI required check")
+        require(type(check["id"]) is int and check["id"] > 0, "Core CI check ID is malformed")
+        require(check["id"] not in check_ids, "Core CI check ID is duplicated")
+        check_ids.add(check["id"])
+        require(
+            type(check["app_id"]) is int and check["app_id"] == EXPECTED_REQUIRED_CHECKS_APP_ID,
+            "Core CI required-check app changed",
+        )
+        require(check["status"] == "completed", "Core CI required check did not complete")
+        require(check["conclusion"] == "success", "Core CI required check did not pass")
+        check_names.append(check["name"])
+    require(check_names == list(EXPECTED_REQUIRED_CHECKS), "Core CI protected check set changed")
+
+    sanitizer = value["thread_sanitizer_artifact"]
+    require_exact_keys(
+        sanitizer,
+        {
+            "id", "name", "size_in_bytes", "expired", "api_digest", "zip_sha256",
+            "reports_sha256", "report",
+        },
+        "ThreadSanitizer artifact evidence",
+    )
+    require(type(sanitizer["id"]) is int and sanitizer["id"] > 0, "sanitizer artifact ID is malformed")
+    require(type(sanitizer["size_in_bytes"]) is int and sanitizer["size_in_bytes"] > 0, "sanitizer artifact is empty")
+    require(sanitizer["expired"] is False, "sanitizer artifact expired")
+    require(
+        isinstance(sanitizer["zip_sha256"], str) and HEX_SHA256_RE.fullmatch(sanitizer["zip_sha256"]),
+        "sanitizer artifact ZIP digest is malformed",
+    )
+    require(sanitizer["api_digest"] == f"sha256:{sanitizer['zip_sha256']}", "sanitizer API digest changed")
+    require(
+        isinstance(sanitizer["reports_sha256"], str) and HEX_SHA256_RE.fullmatch(sanitizer["reports_sha256"]),
+        "sanitizer reports digest is malformed",
+    )
+    if policy["authorization"]["state"] == READY_AUTHORIZATION_STATE:
+        authorized_sanitizer = policy["authorization"]["thread_sanitizer_artifact"]
+        for field in ("id", "name", "zip_sha256", "reports_sha256"):
+            require(sanitizer[field] == authorized_sanitizer[field], f"authorized sanitizer {field} changed")
+    report = sanitizer["report"]
+    require_exact_keys(
+        report,
+        {
+            "target_sha", "sanitizer", "report_count", "report_bytes", "framing_error_count",
+            "collector_error_count", "artifact_error", "capture_complete",
+        },
+        "ThreadSanitizer report evidence",
+    )
+    require(report["target_sha"] == policy["source"]["commit"], "sanitizer report target changed")
+    require(report["sanitizer"] == "thread-sanitizer", "sanitizer report kind changed")
+    for field in (
+        "report_count", "report_bytes", "framing_error_count", "collector_error_count", "artifact_error",
+    ):
+        require(type(report[field]) is int and report[field] == 0, f"sanitizer report is not clean: {field}")
+    require(
+        type(report["capture_complete"]) is int and report["capture_complete"] == 1,
+        "sanitizer report capture is incomplete",
+    )
     return value
 
 

@@ -1,21 +1,23 @@
 # Blackcoin v30.1.5 rollout and native restart durability
 
-This directory is a new, self-contained consumer for the signed v30.1.5 Core
-source. It does not alter the immutable v30.1.4 rollout transaction and does not
-source any v30.1.4 operations library. It is currently **offline-only and
-nondeployable**.
+This directory is a new, self-contained, identity-neutral offline consumer for
+the eventual signed v30.1.5 Core release. It does not alter the immutable
+v30.1.4 rollout transaction and does not source any v30.1.4 operations library.
+It is currently **offline-only and nondeployable**.
 
-The signed source identity and provisional exact-SHA CI run are pinned, but
-the release remains fail-closed:
+The final signed source identity and its pending exact-SHA CI run are recorded
+for audit continuity, but are not current rollout authority. The release
+remains fail-closed until that exact-H run and all artifact/handoff gates are
+complete:
 
-- source commit: `a0695f22740e111d0487a194fb46f1bae05952c5`
-- source tree: `86df040ae5eb8e819e940dd08364bcc177a72195`
+- source commit: `309731e3340f380e48cb67f94a243725465420fb`
+- source tree: `1517a277e1ab6355db0a14ed40d21e4e5e1dc846`
 - signer fingerprint: `SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70`
 - network version: `300105`
 - subversion: `/Blackcoin:30.1.5/`
-- exact-SHA CI run: `31336502539`, attempt 1, `pull_request`, base
-  `19baffef25af36e177db2975780e0641b59753aa`, head-matched and still
-  `in_progress` with no successful conclusion recorded
+- exact-SHA CI run: `31560485480`, head-bound to the source commit above;
+  no successful release-authorizing conclusion is recorded while the run is
+  pending
 
 `rollout.env.example` deliberately contains an unresolved successful-CI
 conclusion plus unresolved bundle, OCI,
@@ -25,11 +27,21 @@ execution-authority values. Any one unresolved value prevents preflight.
 The candidate image must use the canonical immutable
 `qqblackcoin/blackcoin-v4-gui@sha256:...` reference; the historical
 `hotfix-candidate` naming convention is not rollout authority.
-`SHA256SUMS` seals the exact fourteen non-manifest files in this provisionally
-source/CI-bound package. That byte seal is package-integrity evidence only; it
-is not rollout authority. Recording a successful R conclusion and later
-bundle/OCI/Phase-B/handoff identities is a separate change and must regenerate
-both `VALIDATION.txt` and `SHA256SUMS`.
+The checked-in `SHA256SUMS` is the prior exact fourteen-payload tooling seal. It
+is intentionally stale while this frozen-Core semantic reconciliation awaits
+independent review. The previous frozen local preseal replay reported 571/572,
+with all 571 behavioral/static fixtures passing and only the old manifest
+assertion failing. The exact-H reconciliation adds source/run pins and
+retained-family carrier-continuity coverage. Its current-byte authoritative
+preseal replay reports 580/581, with all 580 non-seal behavioral/static
+assertions passing and only the intentionally stale manifest assertion failing.
+No current-byte seal or independent review closure is claimed yet. A later reviewed
+tooling-integrity seal will prove only exact offline package-byte closure; it
+will not validate Core product behavior, authorize a source/run or ordinary-user
+artifact, execute a canary, or establish rollout, live-fleet, or release
+acceptance evidence. Recording a successful R conclusion and later
+bundle/OCI/Phase-B/handoff identities remains a separate change and must
+regenerate both `VALIDATION.txt` and `SHA256SUMS`.
 
 ## Acceptance contract
 
@@ -42,20 +54,173 @@ The final fleet result is one contract with two distinct roles:
 
 Regular PoW does not require all 31 wallets to show positive hashrate in one
 sample. `create_new_anchor` and `refresh_same_anchor` require `can_submit=true`.
-Every sampled interval touching either action must contain positive hashrate at
-an endpoint or a strict `claims_submitted` increase; one earlier positive
-sample cannot satisfy a later idle interval.
+They normally show positive hashrate or a strict `claims_submitted` increase.
+Zero-work transitions remain valid intermediate polling, but cannot complete
+the rollout without a bounded active-chain or action/family work witness and
+cannot remain unwitnessed beyond the ten-minute no-progress window.
 `wait_for_live`, `wait_for_next_tip`, and `relay_existing` may report
-`claim_in_flight` and zero hashrate only when the complete typed schema is
+zero or transiently positive hashrate with any operational worker state (`ready`, `hashing`, or
+`claim_in_flight`) only when the complete typed schema is
 present, the gate is coherent, both ambiguity flags are false, unsafe
 claim/component counts are zero, and authenticated lineage/relay fields are
-consistent with the action. Four samples must span at least three strictly
-advancing tips. An unchanged `wait_for_next_tip` fingerprint across a tip
-change fails liveness.
+consistent with the action. Each selected-family zero-hash observation is independently bound
+to its tip, lineage head, relay txid, candidate-state fingerprint, sample time,
+complete verbose recovery component, ordered claim descriptors, and the same
+cut's verbose raw mempool. A selected gate-safe component must be one authenticated,
+unspent, unresolved family with no resolution/ordinary nodes, and every counted
+claim must have explicit authored provenance and the exact Core-reported carrier
+shape. For the selected operational family, Core requires the raw
+transaction-graph root set to equal the exact claim set and requires
+`descendant_claims=0`; a same-family live count above one is unsafe. Generic
+recovery and wallet-delta auditing still accepts internally coherent
+nonselected inventory such as four claims, two graph roots, and two graph
+descendants. That audit inventory is not liveness authority. Independently, the
+ordered typed lineage has exactly one canonical explicit schema root or one
+permitted implicit legacy QQP2/QQP3/QQP4 root. Later lineage members must use
+valid metadata with one immutable generation/root, contiguous ordinals, and
+exact parents.
+
+Each operational sample also captures the signed-Core `getgoldrushstate`
+QQP4 schedule projection inside the stable chain bracket. Its height and best
+block must equal the sample cut; disabled schedules require height zero and
+both active flags false; enabled schedules must derive both active flags
+exactly from the invariant activation height. An implicit QQP2 or QQP3
+`unsupported_version` disposition is accepted only when that authenticated
+receipt says QQP4 is active for the next block. Mainnet's disabled schedule
+therefore remains fail-closed while an explicitly scheduled test chain can
+exercise Core's post-boundary compatibility rule.
+
+Positive hash observed while Core reports a non-submit wait/relay action is
+accepted as bounded convergence telemetry only. It is never credited as
+operational progress; only submit-capable create/refresh hash work can reset
+the no-progress budget.
+
+`wait_for_live` records the complete authenticated component-wide live set,
+binds every member to its exact same-cut verbose mempool entry and entry time
+without treating absolute age as a health veto, and deterministically selects
+the highest-ordinal live member even when the
+lineage head itself is absent. `relay_existing`, and `wait_for_next_tip` with a
+nonzero relay txid, must select an exact eligible member of the selected
+component that is absent from the raw mempool, under its TTL, and has a future
+relay expiry. The tooling does not guess Core's hidden per-tx suppression set
+or reselect a family: an older eligible member may be selected after a newer
+member was deterministically suppressed. Aggregate live, eligible, and family
+counters cover every safe wallet-owned family and therefore need not equal the
+selected component's counts. A zero-relay `wait_for_next_tip` instead binds the
+absent lineage head; it may coexist with an eligible recovery candidate because
+Core's snapshot-bound wallet-facing relay-rejection suppression clears the
+relay field before publishing the cached wait action. A selected component
+whose anchor is user-locked is accepted only as a fresh non-submit
+`wait_for_next_tip` with a zero relay txid; it cannot authorize relay or
+refresh. Aggregate live claims may exceed one only across independent safe
+families.
+
+Core may also publish one exact familyless `wait_for_next_tip` transition while
+fresh new-anchor work is being established: `can_submit=true`, zero authoritative
+unresolved/family/live/eligible counts, and null lineage-head and relay txids.
+That shape has no selected component to look up, so its freshness payload is
+null. Any partial family, nonzero authoritative component count, selected txid,
+or attached component evidence fails closed. Repeating this transition does not
+itself establish progress.
+
+Across the complete series, every enabled zero-hash action is bounded by a
+ten-minute no-progress window, and the full series is limited to 30 minutes.
+An unchanged coherent wait is valid intermediate polling, but never a completed
+rollout result. Progress means an advancing active-chain tip with strictly
+greater fixed-width chainwork and nondecreasing height, current positive
+create/refresh hash work,
+a strict `claims_submitted` increase, a strict ordered lineage extension after
+an authenticated prior observation of the same exact anchor/generation/root,
+or the first live observation of a member previously authenticated absent in
+that same family. Merely observing family A, B, C, or D for the first time is
+selection, not progress. For a previously observed anchor outpoint, the full
+anchor object, generation, and canonical root are immutable; the latest prior
+observation of that outpoint must be an exact descriptor prefix of an extension,
+or exactly equal when the head is unchanged. This remains true across
+interleaved families. Head regression, middle rewrites,
+generation/root/anchor churn, repeated live txids, action/relay churn, and
+alternation among previously seen or newly selected safe states do not reset
+the budget. Candidate-state fingerprint changes alone are not progress and
+are also not distinct operational cuts because audit-only foreign inventory
+contributes to that cache fingerprint.
+
+Consecutive observations with the exact same operational-authority projection
+are collapsed before transition-budget accounting. The projection includes the
+stable tip/height/chainwork cut, processed wallet tip, the typed gate and
+worker work/submission fields, and the complete selected-family freshness
+evidence other than host time, candidate-state fingerprint, and unrelated raw
+mempool entries. Audit-only wallet-generation/fingerprint churn and legacy or
+raw recovery counters are excluded from this projection. This permits several
+unchanged five-second polls and unrelated foreign/ordinary mempool changes
+without inventing transitions. Any same-tip action, selected family, relay,
+work, component, or selected live-set change remains a distinct observation
+and receives no progress credit merely for changing. The raw timestamps remain
+in evidence: an unchanged series spanning more than ten minutes fails, and the
+whole series remains limited to 30 minutes.
+
+The sampler continues beyond its minimum four observations until the complete
+contract has a liveness witness, with a ten-minute no-progress deadline and a
+30-minute evidence bound; it does not exhaust a raw sample-count cap while a
+coherent wait is being polled. Adjacent observations
+may share one tip only when height and chainwork are identical, allowing
+same-cut authority or work changes to remain visible. A changed tip must have
+strictly greater fixed-width chainwork and nondecreasing height, and a compressed sequence of distinct tips may never
+revisit an earlier tip. The candidate-state fingerprint must be a valid nonzero
+64-hex value and internally match each observation; it is a cache-key
+constituent, so neither it nor an action, relay, family, or sample switch is
+progress. Fingerprint-only churn is collapsed for the bounded operational
+budget, while action/relay/family changes remain visible and non-crediting.
+
+Core does not expose when a gate action first began before the restart. The
+package therefore proves bounded, freshly sampled current state from existing
+recovery, mempool-time, relay-expiry, and host sample-time evidence. It does
+not claim a longer historical action-age guarantee that Core does not report.
 
 The inventory-derived typed gate remains authoritative. This package never
-compares unresolved or quarantine counts with v30.1.4 and never treats positive
-hashrate alone as safety evidence.
+compares unresolved, quarantine, retained-history, pending, confirmed, or
+rolling-fee counters with v30.1.4. Nonzero coherent telemetry is not a health
+veto. Legacy unresolved/quarantine counter arithmetic is type-checked but is
+not used to infer typed-gate safety. The authoritative
+`mining_gate_unresolved_components` field is different: `create_new_anchor` and
+the exact familyless next-tip transition require it to be zero, while a
+selected-family action requires at least one authoritative component. Positive
+hashrate alone is never safety evidence.
+
+The RPC `payout_address` field is the process-local configured future-payout
+setting, not the persisted payout of a selected retained family, and it may be
+empty while Core safely waits, relays, or refreshes retained work. The
+migration and candidate-native audits permit it to remain empty or resolve
+only to an already-present owned quantum key without key/address inventory
+growth. They permit only the known same-address legacy-to-canonical label
+normalization and do not present this field as selected-family payout
+evidence. The selected action and family come only from the exact Core gate and
+authenticated recovery component; the host never reconstructs or overrides
+Core's wallet-wide RELAY > REFRESH > WAIT_FOR_NEXT_TIP > WAIT_FOR_LIVE
+selection. When the wallet audit classifies a candidate-authored claim that is
+confirmed and no longer present in recovery, it decodes the exact persisted
+raw carrier and binds its target and payout to every authenticated predecessor's
+preserved before-state carrier, including an exact candidate-before v30.1.4
+implicit root. Thus payout continuity is proved from wallet-local transaction
+evidence rather than from the process-local future-payout setting.
+
+Verbose recovery may retain an audit-only foreign component with either the
+default null outpoint or one common nonnull foreign prevout; both carry zero
+amount and an empty script because they provide no wallet anchor authority. The
+validator requires unauthenticated, unspent-false, user-lock-false state, at
+least one claim, and only `unknown`, not-wallet-authored, not-from-me nodes,
+including any mixed ordinary siblings. Every such claim is bound to the exact
+`unanchored_claim_txids` inventory. It cannot be the selected mining family or
+liveness progress. A newly arriving ordinary or claim-shaped external credit is
+safe when exact `gettransaction` evidence proves positive receive-only rows, no
+wallet fee/debit or control metadata, and (when confirmed) exact active-chain
+block membership. Watch-only receive rows are permitted. Recovery may contain
+no matching node, or one unique matching audit-only foreign component; any
+wallet-relevant or ambiguous match fails closed. An active-chain synthetic Gold
+Rush payout is separately bound to `getshadowtransaction`, the exact source
+transaction bytes and proof tuple, the active source block, and the payout
+amount/address/script. Its source need not have been authored by the recipient
+wallet. Both portable locked migration and the candidate-native audit enforce
+the external-receive class.
 
 ## Native restart proof
 
@@ -67,24 +232,47 @@ For each regular-PoW node, `native_restart_durability.sh`:
 2. recreates the service with the immutable v30.1.5 image and exact Core-native
    settings `-walletbroadcast=1`, `-autostartstaking=1`, `-powmining=1`, `-powminingthreads=1`, and
    `-powminingcpu=1`;
-3. establishes candidate operation with the pinned normal-unlock-only helper;
+3. proves a portable locked pre-unlock migration guard over wallet name,
+   singleton loaded-wallet identity, transaction inventory, keys, and payout,
+   without interpreting v30.1.4 recovery classifications; the candidate capture
+   uses verbose recovery and permits only the exact safe external-receive
+   class described above, then establishes operation with the pinned
+   normal-unlock-only helper;
 4. performs a controlled restart;
-5. proves the restarted process is locked, retains both worker intents, shows
+5. bounded-polls recognized transient startup states, then proves the restarted
+   process is locked, retains both worker intents, shows
    zero locked-wallet hashrate and `claims_submitted=0`, and has not been
    repaired by an enable RPC;
 6. invokes only the same normal-unlock helper, then proves PoS and action-aware
-   PoW liveness across at least three tip changes; and
-7. proves complete before/after transaction inventories, exact added/removed
-   txids, exact recovery schema/policy/metrics/resolution inventories, and one
-   allowed class per new transaction; authenticated claims must retain an
-   unspent authenticated anchor plus origin/input-bound lineage whose
-   family/root/parent/ordinal relationships independently match the typed
-   component; recovery summary counters must exactly match typed node and
-   component details; and
-8. fails closed on any unclassified or abandoned wallet transaction, new
-   key/address, payout change, database ambiguity, cleanup/resolution activity,
-   recovery fee/counter change, stale wallet-generation/tip state, or
+   PoW liveness across at least four stable observations, retaining
+   authority/work changes sampled on an identical tip cut; and
+7. proves a candidate-native locked-baseline-to-final audit with verbose recovery,
+   complete transaction inventories, no removed txids, and one allowed class per new
+   transaction. No added transaction may be cleanup, recovery, or resolution;
+   a newly reported component resolution/ordinary ID must already belong to the
+   locked-baseline wallet inventory. Rolling recovery counters are not
+   authority. Authenticated claims must retain authenticated anchor provenance
+   plus the exact Core-reported QQP2/QQP3/QQP4
+   carrier/binding tuple; one canonical explicit or permitted implicit root;
+   and lineage family/root/parent/ordinal relationships that independently
+   match the typed component; each candidate recovery cut must remain internally
+   coherent with its typed node and component details. A candidate-authored
+   claim remains an authenticated class if it later confirms, resolves, or is
+   exactly expired-retired; an abandoned row is permitted only for that exact
+   expired-retired authenticated node; and
+8. fails closed on any unclassified or unauthorized abandoned wallet transaction,
+   new key/address inventory, unowned/non-quantum future payout, database ambiguity,
+   cleanup/resolution activity,
+   a new fee-bearing recovery/resolution transaction record, automatic recovery
+   authority, stale wallet-generation/tip state, or
    incomplete transaction inventory.
+
+Before the first Compose mutation, the proof captures one and only one loaded
+wallet name. Empty and named wallets (including `default_wallet`) are both
+supported. Candidate pre-unlock, locked-restart, every liveness sample, final
+wallet audit, and terminal census must all retain that exact name and the exact
+singleton `listwallets` result. A missing, additional, or coherently renamed
+wallet fails rather than silently switching RPC scope.
 
 There is no wallet, chain, or dataset rewind path. A post-launch failure invokes
 containment only: automatic restart is disabled, the affected candidate
@@ -103,13 +291,23 @@ Node30 is never included in a regular-PoW wave. Its Compose overlay pins
 root-owned `0700`, single-linked, non-symlink read-only Free Claim probe with
 non-writable ancestry is identity-pinned. Under fleet locks, the probe is
 copied into the root-owned run directory, fsynced, rehashed, and executed only
-from those pinned bytes. The probe must emit
-the exact JSON contract accepted by `v3015_node30_result_is_valid`: node30,
-signed source identity, normal wallet unlock, active legacy PoS, regular PoW
+from those pinned bytes. The probe must implement the challenged schema-2 JSON
+contract accepted by `v3015_node30_probe_output_is_valid`. The rollout passes
+the exact observation kind, rollout nonce, source SHA, immutable image
+reference, image ID, and probe tool SHA. Every probe sample must echo those
+identities and carry contiguous sample indices/times, one exact loaded wallet,
+and contemporaneous Core before/after snapshots of best hash, blocks, headers,
+and IBD state. The Core snapshots must be equal around the service observation
+and must match the sample tip/height and PoS heights. After the external probe
+returns, the rollout queries `getblockheader` for every reported tip, requires
+the returned hash/height and positive confirmations to match, timestamps those
+active-chain rechecks, and only then finishes and validates the envelope.
+Node30 must report normal wallet unlock, active legacy PoS, regular PoW
 disabled, `healthy=true`, `paused=false`, and zero recovery activity/fee.
 It must also bind the candidate recreation and controlled restart, prove locked
 PoS intent and disabled regular-PoW intent before the normal unlock, preserve
-Free Claim intent, and report four healthy samples over at least three tips.
+Free Claim intent, and report four or more healthy samples over globally unique
+advancing tips.
 The probe must not unpause, unlock, broadcast, or mutate the service. Its tool
 hash is distinct from each output hash and is bound through release identity,
 rollout authority, node30 result, terminal census, and fleet result. A second
@@ -117,10 +315,15 @@ fresh terminal probe must again span at least three advancing tips. Every Core
 chain/network/wallet/PoS/PoW surface is resampled after that terminal probe so
 an intervening lock, staking-only unlock, sync/peer loss, PoS loss, or Free
 Claim pause fails acceptance.
+Initial and terminal envelopes must share the same source/image/tool/nonce
+identity, and terminal sampling must begin only after initial completion.
 The rollout itself—not the probe—verifies node30's immutable image, all six
 executables, PID 1, argument vector, network identity, locked PoS intent, and
 disabled regular-PoW intent before the normal unlock. The probe owns only the
 separately protected Free Claim service truth and multi-tip observations.
+This repository does not supply that external root-owned probe. Offline
+fixtures model its schema-2 output, but live preflight must remain blocked until
+reviewed probe bytes implement the exact challenge CLI and contract above.
 
 ## Runtime guard and transaction boundary
 
@@ -170,7 +373,8 @@ single-linked `0600` files. It contains:
 - an exact `SHA256SUMS` inventory.
 
 Each regular result binds its expected filename/node identity, recreated
-container, locked restart, normal unlock only, four or more chain samples,
+container, locked restart, normal unlock only, four or more stable
+same-cut/tip-aware chain samples,
 typed PoS/PoW observations, and the raw before/after wallet audit. The terminal
 census resamples all 32 nodes and derives the 32/32 PoS and 31/31 regular-PoW
 lists and counts. Package-owned result/authority envelopes use exact outer key
@@ -185,7 +389,9 @@ The only currently authorized execution is local and offline:
 
 ```bash
 bash -n contrib/ops/v30.1.5-rollout-durability/*.sh \
-  contrib/ops/v30.1.5-rollout-durability/lib/*.sh
+  contrib/ops/v30.1.5-rollout-durability/lib/*.sh \
+  contrib/ops/v30.1.5-rollout-durability/tests/*.sh \
+  contrib/ops/v30.1.5-rollout-durability/*.sh.inc
 shellcheck -x contrib/ops/v30.1.5-rollout-durability/*.sh \
   contrib/ops/v30.1.5-rollout-durability/lib/*.sh \
   contrib/ops/v30.1.5-rollout-durability/tests/run.sh \
@@ -202,17 +408,19 @@ fresh exact collision/live authority is recorded.
 
 ## Remaining external dependencies
 
-No Core RPC/schema change is requested by this package. Before live clearance,
-the following external facts remain mandatory:
+This package does not substitute host selection or filtering for Core behavior.
+Before live clearance, the following external facts remain mandatory:
 
-1. successful completion of exact-H Core CI run `31336502539`, or a separately
-   reviewed superseding signed H/R pair (superseded checkpoints are not
-   authority);
+1. a successful exact-H CI run `R` for the final signed source identity above,
+   with its exact head, workflow, and successful conclusion recorded; the
+   currently pending run is not authority;
 2. sealed Linux x86_64 bundle, OCI, image ID/digest, tooling, and executable
    identities for the signed source;
-3. a complete verified Phase-A/Phase-B nine-path canary with Phase B promoted
-   and no data rewind;
-4. the exact read-only node30 Free Claim health probe contract and bytes;
+3. a complete verified Phase-A/Phase-B nine-path canary with Phase B promoted,
+   no data rewind, and the exact relaxed candidate-native semantic authority;
+   obsolete cross-version pending/fee/counter equality fields are rejected;
+4. root-owned probe bytes that implement the exact challenged node30 schema-2
+   CLI, identity echo, Core before/after sampling, and read-only service checks;
 5. a locked live Compose hash and reviewed v30.1.5-compatible runtime guard;
 6. independent review and regeneration of the identity-repinned package seal
    and validation record;

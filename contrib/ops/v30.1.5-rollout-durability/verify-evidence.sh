@@ -31,7 +31,7 @@ else
     [[ -d "$evidence" && ! -L "$evidence" ]] || v3015_die 'fixture evidence missing'
 fi
 v3015_validate_release_env
-v3015_require_commands jq sha256sum find sort realpath stat sed wc
+v3015_require_commands jq sha256sum find sort realpath stat sed wc python3
 if ((fixture == 0)); then
     v3015_verify_package_tree "$package_dir" || v3015_die 'sealed package tree is invalid'
 fi
@@ -51,11 +51,13 @@ while IFS= read -r file; do listed+=("$file"); done < <(
 
 v3015_release_identity_is_valid "$evidence/release-identity.json" ||
     v3015_die 'release identity is invalid'
+v3015_rollout_authority_is_valid "$evidence/rollout-authority.json" ||
+    v3015_die 'rollout authority is invalid'
 terminal_census_sha=$(v3015_sha256_file "$evidence/terminal-fleet-census.json")
 terminal_probe_sha=$(v3015_sha256_file \
   "$evidence/node-30-free-claim-terminal-probe.raw.json")
 v3015_fleet_result_is_valid "$evidence/fleet-result.json" "$terminal_census_sha" \
-  "$terminal_probe_sha" ||
+  "$terminal_probe_sha" "$evidence/rollout-authority.json" ||
     v3015_die 'fleet result is invalid'
 
 [[ "$(v3015_sha256_file "$evidence/runtime-policy-handoff-receipt.json")" == \
@@ -65,7 +67,8 @@ v3015_fleet_result_is_valid "$evidence/fleet-result.json" "$terminal_census_sha"
    "$(v3015_sha256_file "$evidence/post-compose-reconcile-identity.json")" == \
    "$POST_COMPOSE_RECONCILE_IDENTITY_SHA256" ]] ||
     v3015_die 'handoff receipt copies do not match reviewed exact bytes'
-v3015_terminal_census_is_valid "$evidence/terminal-fleet-census.json" "$evidence" ||
+v3015_terminal_census_is_valid "$evidence/terminal-fleet-census.json" "$evidence" \
+  "$evidence/rollout-authority.json" ||
     v3015_die 'terminal 32-node census is invalid'
 
 expected_names=(fleet-result.json node-30-free-claim.json
@@ -77,15 +80,14 @@ expected_names=(fleet-result.json node-30-free-claim.json
 for node in $(seq 1 29) 31 32; do
     file=$(printf 'node-%02d.json' "$node")
     expected_names+=("$file")
-    v3015_node_result_is_valid "$evidence/$file" "$node" ||
+    v3015_node_result_is_valid "$evidence/$file" "$node" \
+      "$evidence/rollout-authority.json" ||
         v3015_die "node durability result is invalid: $node"
 done
 v3015_node30_result_is_valid "$evidence/node-30-free-claim.json" \
-  "$evidence/node-30-free-claim-probe.raw.json" ||
+  "$evidence/node-30-free-claim-probe.raw.json" \
+  "$evidence/rollout-authority.json" ||
     v3015_die 'node30 Free Claim result is invalid'
-
-v3015_rollout_authority_is_valid "$evidence/rollout-authority.json" ||
-    v3015_die 'rollout authority is invalid'
 
 expected_sorted=()
 while IFS= read -r file; do expected_sorted+=("$file"); done < <(

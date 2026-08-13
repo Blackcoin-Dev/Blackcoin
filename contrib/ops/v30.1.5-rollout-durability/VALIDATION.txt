@@ -1,61 +1,148 @@
-PROVISIONAL SOURCE/CI-BOUND OFFLINE VALIDATION — NOT ROLLOUT AUTHORITY
+IDENTITY-NEUTRAL OFFLINE TOOLING-INTEGRITY VALIDATION
+NOT CORE, RELEASE, CANARY, ROLLOUT, OR LIVE AUTHORITY
 
-Source identity:
-  signed commit H a0695f22740e111d0487a194fb46f1bae05952c5
-  exact tree 86df040ae5eb8e819e940dd08364bcc177a72195
+Final signed source identity (audit continuity only; not execution authority):
+  signed commit H 309731e3340f380e48cb67f94a243725465420fb
+  exact tree 1517a277e1ab6355db0a14ed40d21e4e5e1dc846
   required signer SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
   GitHub signature verification: valid
   version 300105 / /Blackcoin:30.1.5/
 
-Exact-SHA Core CI:
-  provisional run R 31336502539
-  head a0695f22740e111d0487a194fb46f1bae05952c5
+Pending exact-SHA Core CI (audit continuity only):
+  pending run R 31560485480
+  head 309731e3340f380e48cb67f94a243725465420fb
   workflow .github/workflows/pr-gate.yml / pull-request safety gate
-  event pull_request; attempt 1
-  base 19baffef25af36e177db2975780e0641b59753aa
-  status in_progress; GitHub conclusion is not populated
+  no successful conclusion recorded; not release authority
   checked-in conclusion sentinel __PENDING_EXACT_SHA_CI_SUCCESS__
 
-Current offline package checks:
-  Bash syntax: PASS
-  ShellCheck -x, including the .sh.inc guard: PASS
-  exact sealed-byte hostile fixture suite: 152/152 PASS
-  independent exact sealed-byte hostile replay: 152/152 PASS
-  exact package inventory: 15/15 PASS
-  SHA256SUMS exact 14-payload seal: PASS
-  symlink, mode, whitespace, stale-pin, mutator/RPC scans: PASS
-  pre/post behavior-byte equality: PASS
-  existing-path mutation check: PASS (new directory only)
+Current exact-H semantic reconciliation (preseal):
+  prior frozen hostile fixture replay: 571/572 behavioral/static assertions PASS;
+    only the intentionally stale prior SHA256SUMS assertion failed
+  exact-H source/run pin and retained-family payout-continuity focused checks: PASS
+  current-byte authoritative preseal replay: 580/581 assertions;
+    all 580 non-seal behavioral/static assertions PASS and only the intentionally
+    stale prior SHA256SUMS assertion failed
+  Bash syntax: PASS (all .sh and the standalone .sh.inc guard)
+  ShellCheck -x: PASS (all .sh and the standalone .sh.inc guard)
+  git diff --check: PASS
+  prior exact manifest bytes: PRESERVED as historical audit evidence;
+    no current-byte manifest reseal performed
+  independent current-byte P0/P1 review: PENDING
   live Docker/wallet/network/GitHub action: NONE
 
-The fixture suite covers all five typed mining actions, zero-hash safe waits,
-per-interval create/refresh progress, partial/extra/unsafe/ambiguous schema
-rejection, three tip changes, stale wait-for-next-tip fingerprint or wallet-tip
-rejection, active PoS, locked worker intent with claims_submitted=0, and
-normal-unlock-only evidence. It verifies complete wallet txid inventories,
-exact recovery schema/policy/metrics/resolution inventories, authenticated
-unspent same-anchor origin/input-bound lineage with independently checked
-family/root/parent/ordinal relationships, typed summary/detail counter
-consistency, per-transaction abandonment, one allowed transaction class, and
-key/payout/fee invariants. It proves the node30 probe's root-owned 0700 secure
-path, pinned-copy TOCTOU check, distinct tool/output identities, fresh terminal
-probe, post-probe Core resample, and independent wallet/probe cross-binding.
-It also covers filename swaps, duplicate or
-missing nodes, node30 role leakage, a fresh terminal 32-node census, exact
-handoff receipts and post-Compose identity proof, authority no-clobber/race/
-partial-fsync/removal ownership (including the VFAT marker's hard-link-free
-path), and missing/extra/tampered evidence.
+Historical prior tooling-integrity seal (now superseded for current bytes):
+  exact package inventory: 15 files / 14 manifest payloads
+  strict old SHA256SUMS seal and full 366/366 replay: PASS at the prior boundary
+  the old seal is not authority for this unstaged reconciliation
+
+The current fixture suite covers all five typed mining actions, the exact familyless
+fresh-new-anchor next-tip transition, a ten-minute global zero-hash no-progress
+window, current-interval create/refresh work, monotonic submission
+progress, and partial/extra/unsafe/ambiguous schema rejection. It requires zero
+authoritative unresolved components for create/familyless authority while
+accepting nonzero legacy/raw/quarantine telemetry. It accepts an unchanged valid
+candidate cache fingerprint across progressing observations, but rejects
+action/relay/family/sample churn, malformed or advancing-cut
+repeated familyless waits, alternating waits, old hash work, replayed live
+txids, and every indefinite safe-wait or zero-hash work action. First selection
+of an authenticated family/head is not progress: a head must strictly extend a
+previously authenticated exact anchor/generation/root prefix, and a live member
+must previously have been authenticated absent in that same family. A-to-B-to-
+C-to-D zero-work selection and first-live unseen-family hostiles are covered.
+It binds the complete authenticated recovery component and raw verbose mempool,
+including an older live sibling while the newest head remains absent; new
+component-wide live-set growth; deterministic highest-ordinal live-member
+selection; Core-selected older relay reselection after per-tx suppression; and
+the valid wallet-facing zero-relay suppression state. Same-tip observations
+must retain identical height and chainwork; only a strict same-family prefix/head
+extension or a previously absent same-family member becoming live can establish
+lineage progress on that cut. A changed tip must strictly advance fixed-width
+chainwork without lowering height, and compressed
+nonconsecutive tip replay is rejected. The native sampler no
+longer drops authority/work changes solely because the tip is unchanged.
+Consecutive exact operational-authority duplicates collapse before transition
+accounting, so short unchanged five-second familyless and retained-family polls
+remain valid intermediate polling without manufactured progress; final rollout
+acceptance requires an active-chain or action/family work witness, raw elapsed
+time remains authoritative, and an unchanged series over ten minutes fails.
+
+The lineage hostiles keep raw transaction-graph roots independent from the one
+canonical typed lineage root. Generic recovery/wallet audit accepts a real
+four-claim component with two graph roots and two graph descendants. The
+selected operational-family validator instead mirrors Core's pure safe-family
+shape: `root_claim_txids == claim_txids`, `descendant_claims == 0`, and no more
+than one live member in that family. Aggregate live count above one remains
+valid across independent families. The ordered lineage still requires one
+canonical explicit or exact implicit QQP2/QQP3/QQP4 root, contiguous metadata
+lineage, explicit-authored carrier and binding tuples, exact disposition flags,
+safe unresolved classifications, full anchor immutability, generation/root
+continuity, descriptor-prefix extension, and latest-prior same-outpoint checks
+across interleaved families. User-locked selected anchors accept only the exact
+fresh non-submit, zero-relay next-tip wait.
+
+Operational samples bind the signed-Core QQP4 activation receipt to the exact
+stable tip and height and require one invariant disabled/activation schedule.
+Implicit QQP2/QQP3 `unsupported_version` is accepted only when the internally
+exact receipt reports QQP4 active for the next block; mainnet-disabled and
+forged boundary, tip, height, or schedule-drift variants remain hostile.
+
+Operational duplicate accounting excludes audit-only candidate fingerprint,
+wallet-generation, unrelated raw-mempool, and legacy/raw recovery-counter
+churn. Those changes remain fully typed in each sample but do not consume the
+bounded no-progress budget. Selected action, family, relay, component, live-set,
+worker work/submission, and chain changes remain visible; switching them is not
+progress. Same-tip family-A deferral followed by real positive-hash family-B
+work passes, while action/family/relay churn without work remains hostile.
+
+The suite also verifies active PoS, bounded transient-startup polling followed
+by an exact locked restart retaining native worker
+intent with `claims_submitted=0`, normal-unlock-only recovery, one exact loaded
+wallet identity for both empty and named wallets, complete wallet txid
+inventories, exact recovery schema/policy/metrics/resolution inventories,
+typed summary/detail counter consistency, class-bound abandonment, one allowed
+transaction class, and key/payout/fee invariants. Both regular and node30
+wallet-state producers request verbose recovery; nonverbose candidate locked or
+final shapes fail. Safe external receive evidence permits an ordinary or
+claim-shaped positive receive-only transaction, including watch-only credit,
+with no wallet fee/debit or control metadata. Confirmed rows bind exact active
+block membership; unconfirmed recovery matches may be absent or must identify
+one unique unauthenticated/unspent-false/user-lock-false audit-only component
+whose claim txids are in `unanchored_claim_txids`. Owned, authored, ambiguous,
+sent/debit, zero-amount, fee-present, synthetic-marker, lineage, and recovery
+variants fail. Separately, a synthetic Gold Rush credit binds the active-chain
+shadow record, source transaction bytes/version/input tuple, and exact payout
+amount/address/script without requiring the recipient wallet to have authored
+the source. An authenticated candidate-added claim may later resolve or
+retire without losing identity classification; an abandoned row is permitted
+only when bound to that exact expired-retired claim node. It proves the node30
+schema-2 challenge, exact source/image/tool/nonce echo, contemporaneous stable
+Core brackets, post-probe active-chain rechecks and chronology, root-owned 0700
+secure path, pinned-copy TOCTOU check, distinct tool/output identities, fresh
+terminal probe, post-probe Core resample, and independent wallet/probe
+cross-binding. It also covers filename swaps, duplicate or missing nodes,
+node30 role leakage, node30 safe-external-receive-only additions, a fresh terminal 32-node census, exact handoff receipts and
+post-Compose identity proof, authority no-clobber/race/partial-fsync/removal
+ownership (including the VFAT marker's hard-link-free path), early containment
+ownership for partial Compose failure, and missing/extra/tampered evidence.
 
 The suite accepts only the exact irreversible, snapshot-absent, no-rewind
 Phase-B marker/result schemas with shared Phase-A, package, tooling, script,
-verifier, and typed-contract identities. Mixed runs, packages, keys, tooling,
-data rewind, and a non-successful CI conclusion fail closed.
+verifier, and typed-contract identities. The Phase-B consumer now requires the
+current relaxed candidate-native semantic authorities: automatic recovery stayed
+unauthorized, candidate-native resolution txids did not change, and no new
+fee-bearing recovery wallet transaction appeared. Obsolete numeric pending,
+fee-exposure, cross-version recovery-counter equality, and process-local
+future-payout equality fields are rejected.
+Mixed runs, packages, keys, tooling, data rewind, and a non-successful CI
+conclusion fail closed.
 
 UNRESOLVED AND FAIL-CLOSED:
-  - successful conclusion of exact-H CI run 31336502539
+  - a successful exact-H CI run R for the final signed Core H above
   - sealed candidate bundle/OCI/image/binary/tooling identities
   - completed Phase-B RESULT and PROMOTED_NO_REWIND marker
-  - nine-path canary seal
+  - live Phase-B-bound nine-path result seal and authority receipt; the offline
+    canary tooling package is separately sealed at signed commit 5cb7bf7 but is
+    not live Phase-A/Phase-B evidence and is not pinned into this rollout
   - read-only node30 Free Claim probe identity
   - locked live Compose and reviewed runtime guard identities
   - exact persistent Compose/image-policy receipts, post-reconcile identity
@@ -63,9 +150,14 @@ UNRESOLVED AND FAIL-CLOSED:
   - final identity-repinned package seal and its external manifest hash
   - nonce-bound live authority
 
-The current SHA256SUMS seals the provisional H/R package bytes. The pending
-success-conclusion sentinel and every remaining unresolved identity keep
-preflight fail-closed. Any superseding source/run, artifact, Phase-B, handoff,
-or authority repin invalidates this seal and requires a new validation record
-and manifest. Do not cite this record as canary, rollout, release, or fleet
-acceptance evidence.
+Independent review has not yet cleared the current reconciled bytes. Closure
+remains two-pass: freeze all payloads, obtain a current-byte hostile P0/P1 review,
+then regenerate `SHA256SUMS` and repeat strict topology/manifest, static, full
+raw-exit-zero, and all-15-file stability checks. The resulting seal will prove
+only exact offline package-byte closure; it will not validate Core behavior,
+authorize a source/run or artifact identity, execute a canary, or establish
+rollout or fleet acceptance evidence. The pending-success sentinel and every
+remaining unresolved identity keep preflight fail-closed. Any superseding
+source/run, artifact, Phase-B, handoff, or authority repin requires a separate
+validation update and manifest reseal. Do not cite this record as Core, canary,
+rollout, release, or fleet acceptance evidence.

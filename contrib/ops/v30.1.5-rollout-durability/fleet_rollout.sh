@@ -29,7 +29,7 @@ else
         v3015_load_reviewed_env "$env_file"
     fi
 fi
-v3015_require_commands jq awk sha256sum sort uniq find date install flock docker realpath stat \
+v3015_require_commands jq awk sha256sum sort uniq find date install flock docker realpath stat python3 \
     sed wc tr grep sync ln mv mktemp id
 v3015_validate_release_env
 v3015_verify_package_tree "$package_dir" || v3015_die 'sealed package tree is invalid'
@@ -190,38 +190,205 @@ wait_node30_rpc()
 }
 capture_node30_wallet_state()
 {
-    local wallet wallets recovery transactions quantum pow chain
+    local reference=${1:-null}
+    local wallet wallets recovery transactions quantum pow chain_before chain_after
+    local labels label_json label addresses labeled_addresses='[]'
+    local payout payout_info='null' reference_ids='[]' added_txids txid
+    local transaction shadow_transaction source_transaction
+    local rows blockhash blockheight active_header active_block active_chain_hash
+    local created_height created_tip created_tip_header created_tip_active_chain_hash
+    local source_txid evidence='{}'
+    jq -e . <<<"$reference" >/dev/null || return 1
+    evidence=$(jq -c '.transaction_evidence // {}' <<<"$reference") || return 1
+    chain_before=$(node30_rpc getblockchaininfo)
     wallet=$(node30_rpc getwalletinfo)
     wallets=$(node30_rpc listwallets)
-    recovery=$(node30_rpc getpowclaimrecoveryinfo)
+    recovery=$(node30_rpc getpowclaimrecoveryinfo true)
     transactions=$(node30_rpc listtransactions '*' 2147483647 0 true)
     quantum=$(node30_rpc getquantumkeyinventory)
     pow=$(node30_rpc getpowmininginfo)
-    chain=$(node30_rpc getblockchaininfo)
+    labels=$(node30_rpc listlabels)
+    while IFS= read -r label_json; do
+        label=$(jq -er '.' <<<"$label_json") || return 1
+        addresses=$(node30_rpc getaddressesbylabel "$label") || return 1
+        labeled_addresses=$(jq -cn --argjson old "$labeled_addresses" \
+          --arg label "$label" --argjson addresses "$addresses" '
+          ($old + [$addresses | to_entries[] |
+            {address:.key,label:$label,purpose:.value.purpose}]) |
+          unique_by([.address,.label,.purpose]) | sort_by([.address,.label,.purpose])') || return 1
+    done < <(jq -c '.[]' <<<"$labels")
+    payout=$(jq -er '.payout_address' <<<"$pow") || return 1
+    if [[ -n "$payout" ]]; then
+        payout_info=$(node30_rpc getaddressinfo "$payout") || return 1
+    fi
+    if [[ "$reference" != null ]]; then
+        reference_ids=$(jq -ce '[.transactions[].txid] | unique | sort' \
+          <<<"$reference") || return 1
+    fi
+    added_txids=$(jq -cn --argjson transactions "$transactions" \
+      --argjson reference "$reference_ids" '
+      ([$transactions[].txid] | unique | sort) - $reference') || return 1
+    while IFS= read -r txid; do
+        source_txid=''
+        rows=$(jq -ce --arg txid "$txid" '[.[] | select(.txid == $txid)]' \
+          <<<"$transactions") || return 1
+        if jq -e 'any(.[]; .qq_synthetic_goldrush_payout == "1")' \
+          <<<"$rows" >/dev/null; then
+            shadow_transaction=$(node30_rpc getshadowtransaction "$txid") || return 1
+            blockhash=$(jq -er '.base_anchor.blockhash' <<<"$shadow_transaction") || return 1
+            active_header=$(node30_rpc getblockheader "$blockhash") || return 1
+            blockheight=$(jq -er '.height' <<<"$active_header") || return 1
+            active_chain_hash=$(node30_rpc getblockhash "$blockheight") || return 1
+            active_block=$(node30_rpc getblock "$blockhash" 1) || return 1
+            source_transaction='null'
+            if [[ "$(jq -r '.mode' <<<"$shadow_transaction")" == pow ]]; then
+                source_txid=$(jq -er '.pow_claim_source.txid' <<<"$shadow_transaction") || return 1
+                source_transaction=$(node30_rpc getrawtransaction \
+                  "$source_txid" true "$blockhash") || return 1
+            fi
+            evidence=$(jq -cn --argjson old "$evidence" --arg txid "$txid" \
+              --argjson shadow "$shadow_transaction" --argjson active_header "$active_header" \
+              --argjson active_block "$active_block" --arg active_chain_hash "$active_chain_hash" \
+              --argjson source_transaction "$source_transaction" '
+              $old + {($txid):{kind:"synthetic_payout",shadow_transaction:$shadow,
+                active_header:$active_header,active_block:$active_block,
+                active_chain_hash:$active_chain_hash,
+                source_transaction:$source_transaction}}') || return 1
+        else
+            transaction=$(node30_rpc gettransaction "$txid" true true) || return 1
+            blockhash=$(jq -r '.blockhash // empty' <<<"$transaction") || return 1
+            active_header='null'
+            active_block='null'
+            active_chain_hash=''
+            created_tip_header='null'
+            created_tip_active_chain_hash=''
+            if [[ -n "$blockhash" ]]; then
+                active_header=$(node30_rpc getblockheader "$blockhash") || return 1
+                blockheight=$(jq -er '.height' <<<"$active_header") || return 1
+                active_chain_hash=$(node30_rpc getblockhash "$blockheight") || return 1
+                active_block=$(node30_rpc getblock "$blockhash" 1) || return 1
+                if jq -e '.qq_shadow_pow_authored == "1"' \
+                  <<<"$transaction" >/dev/null; then
+                    created_height=$(jq -er \
+                      '.qq_shadow_pow_created_height | tonumber |
+                       select(floor == . and . > 0)' <<<"$transaction") || return 1
+                    created_tip=$(jq -er \
+                      '.qq_shadow_pow_created_tip |
+                       select(test("^[0-9a-f]{64}$"))' <<<"$transaction") || return 1
+                    created_tip_header=$(node30_rpc getblockheader "$created_tip") || return 1
+                    created_tip_active_chain_hash=$(node30_rpc getblockhash \
+                      "$((created_height - 1))") || return 1
+                fi
+            fi
+            evidence=$(jq -cn --argjson old "$evidence" --arg txid "$txid" \
+              --argjson transaction "$transaction" --argjson active_header "$active_header" \
+              --argjson active_block "$active_block" --arg active_chain_hash "$active_chain_hash" \
+              --argjson created_tip_header "$created_tip_header" \
+              --arg created_tip_active_chain_hash "$created_tip_active_chain_hash" '
+              $old + {($txid):({kind:"base_transaction",transaction:$transaction,
+                active_header:$active_header,active_block:$active_block,
+                active_chain_hash:(if $active_chain_hash == "" then null
+                  else $active_chain_hash end)} +
+                (if $created_tip_header == null then {}
+                 else {created_tip_header:$created_tip_header,
+                   created_tip_active_chain_hash:$created_tip_active_chain_hash}
+                 end))}') || return 1
+        fi
+    done < <(jq -r '.[]' <<<"$added_txids")
+    chain_after=$(node30_rpc getblockchaininfo)
+    jq -e -n --argjson before "$chain_before" --argjson after "$chain_after" '
+      ($before | {bestblockhash,blocks,headers,chainwork,initialblockdownload}) ==
+      ($after | {bestblockhash,blocks,headers,chainwork,initialblockdownload})
+    ' >/dev/null || return 1
     jq -cn --argjson wallet "$wallet" --argjson wallets "$wallets" \
       --argjson recovery "$recovery" --argjson transactions "$transactions" \
-      --argjson quantum "$quantum" --argjson pow "$pow" --argjson chain "$chain" \
+      --argjson quantum "$quantum" --argjson pow "$pow" --argjson chain "$chain_after" \
+      --argjson transaction_evidence "$evidence" \
+      --argjson labeled_addresses "$labeled_addresses" --argjson payout_info "$payout_info" \
       '{wallet:$wallet,loaded_wallets:$wallets,recovery:$recovery,transactions:$transactions,
-        quantum_inventory:$quantum,payout:$pow.payout_address,chain:$chain}'
+        transaction_evidence:$transaction_evidence,quantum_inventory:$quantum,
+        automatic_key_creation_allowed:$pow.allow_automatic_quantum_key_creation,
+        payout:$pow.payout_address,payout_address_info:$payout_info,
+        labeled_addresses:$labeled_addresses,chain:$chain}'
 }
 capture_node30_probe_evidence()
 {
     local output=$1 observation=$2
     local payload="${output}.payload.tmp" envelope="${output}.tmp"
+    local started finished samples payload_json sample_finish rechecks='[]'
+    local index tip header rechecked
     [[ "$observation" == initial || "$observation" == terminal ]] || return 1
     v3015_secure_root_executable "$node30_probe_tool" || return 1
     [[ "$(v3015_sha256_file "$node30_probe_tool")" == \
        "$NODE30_FREE_CLAIM_PROBE_SHA256" ]] || return 1
-    [[ ! -e "$payload" && ! -L "$payload" && ! -e "$envelope" && ! -L "$envelope" ]] ||
+    [[ ! -e "$output" && ! -L "$output" &&
+       ! -e "$payload" && ! -L "$payload" && ! -e "$envelope" && ! -L "$envelope" ]] ||
         return 1
-    "$node30_probe_tool" --node 30 --durability-json >"$payload" || {
+    started=$(date +%s%3N)
+    "$node30_probe_tool" --node 30 --durability-json \
+      --observation "$observation" --rollout-nonce "$nonce" \
+      --expected-source-sha "$SOURCE_SHA" \
+      --expected-image-ref "$CANDIDATE_IMAGE_REF" \
+      --expected-image-id "$CANDIDATE_IMAGE_ID" \
+      --expected-tool-sha256 "$NODE30_FREE_CLAIM_PROBE_SHA256" >"$payload" || {
         rm -f -- "$payload"
         return 1
     }
+    payload_json=$(jq -cse 'if length == 1 then .[0]
+      else error("node30 probe emitted multiple JSON values") end' "$payload") || {
+        rm -f -- "$payload"
+        return 1
+    }
+    jq -e 'type == "object" and (keys | sort) ==
+      ["free_claim_intent_retained","healthy","locked_restart","node","paused",
+       "samples","wallet_normal_unlocked"] and .node == 30 and .healthy == true and
+      .paused == false and .wallet_normal_unlocked == true and
+      .free_claim_intent_retained == true and
+      .locked_restart == {free_claim_intent_retained:true}' \
+      <<<"$payload_json" >/dev/null || { rm -f -- "$payload"; return 1; }
+    samples=$(jq -ce '.samples' <<<"$payload_json") || { rm -f -- "$payload"; return 1; }
+    sample_finish=$(jq -er 'map(.sample_finished_unix_ms) | max' <<<"$samples") || {
+        rm -f -- "$payload"
+        return 1
+    }
+    v3015_node30_probe_samples_are_live "$samples" "$observation" \
+      "$NODE30_FREE_CLAIM_PROBE_SHA256" "$SOURCE_SHA" "$CANDIDATE_IMAGE_REF" \
+      "$CANDIDATE_IMAGE_ID" "$nonce" "$started" "$sample_finish" || {
+        rm -f -- "$payload"
+        return 1
+    }
+    while IFS=$'\t' read -r index tip; do
+        header=$(node30_rpc getblockheader "$tip" true) || {
+            rm -f -- "$payload" "$envelope"
+            return 1
+        }
+        jq -e --arg tip "$tip" '.hash == $tip and
+          (.height | type == "number" and floor == . and . >= 0) and
+          (.confirmations | type == "number" and floor == . and . > 0)' \
+          <<<"$header" >/dev/null || {
+            rm -f -- "$payload" "$envelope"
+            return 1
+        }
+        rechecked=$(date +%s%3N)
+        rechecks=$(jq -cn --argjson old "$rechecks" --argjson index "$index" \
+          --arg tip "$tip" --argjson header "$header" --argjson rechecked "$rechecked" \
+          '$old + [{sample_index:$index,blockhash:$header.hash,height:$header.height,
+            confirmations:$header.confirmations,rechecked_unix_ms:$rechecked}]') || {
+            rm -f -- "$payload" "$envelope"
+            return 1
+        }
+    done < <(jq -r 'to_entries[] | [.key,.value.tip] | @tsv' <<<"$samples")
+    finished=$(date +%s%3N)
     jq -cn --arg tool "$NODE30_FREE_CLAIM_PROBE_SHA256" --arg observation "$observation" \
-      --slurpfile payload "$payload" \
+      --arg source "$SOURCE_SHA" --arg image "$CANDIDATE_IMAGE_REF" \
+      --arg image_id "$CANDIDATE_IMAGE_ID" --arg nonce "$nonce" \
+      --argjson started "$started" --argjson finished "$finished" \
+      --argjson rechecks "$rechecks" --slurpfile payload "$payload" \
       'if ($payload | length) == 1 then
-         {schema:1,observation:$observation,probe_tool_sha256:$tool,payload:$payload[0]}
+         {schema:2,observation:$observation,probe_tool_sha256:$tool,source_sha:$source,
+          candidate_image_ref:$image,candidate_image_id:$image_id,rollout_nonce:$nonce,
+          probe_started_unix_ms:$started,probe_finished_unix_ms:$finished,
+          active_chain_rechecks:$rechecks,payload:$payload[0]}
        else error("node30 probe emitted multiple JSON values") end' >"$envelope" || {
         rm -f -- "$payload" "$envelope"
         return 1
@@ -281,22 +448,31 @@ EOF
 
 capture_terminal_census_row()
 {
-    local census_node=$1 census_container census_rpc chain network wallet staking pow
+    local census_node=$1 census_container census_rpc chain chain_before chain_after
+    local network wallet wallets staking pow
     local role result_file result_sha free_healthy=false free_paused=false probe_sha=null
     local probe_tool_sha=null terminal_probe
     census_container="blackcoin-v4-gui-${census_node}"
     census_rpc=(docker exec "$census_container" /usr/local/bin/blackcoin-cli
       -datadir=/home/blackcoin/.blackcoin)
-    chain=$("${census_rpc[@]}" getblockchaininfo)
+    chain_before=$("${census_rpc[@]}" getblockchaininfo)
     network=$("${census_rpc[@]}" getnetworkinfo)
     wallet=$("${census_rpc[@]}" getwalletinfo)
+    wallets=$("${census_rpc[@]}" listwallets)
     staking=$("${census_rpc[@]}" getstakinginfo)
     pow=$("${census_rpc[@]}" getpowmininginfo)
+    chain_after=$("${census_rpc[@]}" getblockchaininfo)
+    jq -e -n --argjson before "$chain_before" --argjson after "$chain_after" '
+      ($before | {bestblockhash,blocks,headers,chainwork,initialblockdownload}) ==
+      ($after | {bestblockhash,blocks,headers,chainwork,initialblockdownload})
+    ' >/dev/null || return 1
+    chain=$chain_after
     v3015_pos_json_is_active "$staking" || return 1
     if [[ "$census_node" == 30 ]]; then
         role=free_claim
         result_file="$run_dir/node-30-free-claim.json"
-        v3015_node30_result_is_valid "$result_file" "$run_dir/node-30-free-claim-probe.raw.json" ||
+        v3015_node30_result_is_valid "$result_file" \
+          "$run_dir/node-30-free-claim-probe.raw.json" "$run_dir/AUTHORITY" ||
             return 1
         jq -e '.enabled == false and .autostart == false and .hashrate == 0 and
           .state == "disabled"' <<<"$pow" >/dev/null || return 1
@@ -305,11 +481,18 @@ capture_terminal_census_row()
         # The terminal probe spans multiple tips. Resample every Core surface
         # after it returns so an intervening lock, sync, peer, or PoS loss
         # cannot be hidden by the earlier point-in-time snapshot.
-        chain=$("${census_rpc[@]}" getblockchaininfo)
+        chain_before=$("${census_rpc[@]}" getblockchaininfo)
         network=$("${census_rpc[@]}" getnetworkinfo)
         wallet=$("${census_rpc[@]}" getwalletinfo)
+        wallets=$("${census_rpc[@]}" listwallets)
         staking=$("${census_rpc[@]}" getstakinginfo)
         pow=$("${census_rpc[@]}" getpowmininginfo)
+        chain_after=$("${census_rpc[@]}" getblockchaininfo)
+        jq -e -n --argjson before "$chain_before" --argjson after "$chain_after" '
+          ($before | {bestblockhash,blocks,headers,chainwork,initialblockdownload}) ==
+          ($after | {bestblockhash,blocks,headers,chainwork,initialblockdownload})
+        ' >/dev/null || return 1
+        chain=$chain_after
         v3015_pos_json_is_active "$staking" || return 1
         jq -e '.enabled == false and .autostart == false and .hashrate == 0 and
           .state == "disabled"' <<<"$pow" >/dev/null || return 1
@@ -320,20 +503,29 @@ capture_terminal_census_row()
     else
         role=regular
         result_file=$(printf '%s/node-%02d.json' "$run_dir" "$census_node")
-        v3015_node_result_is_valid "$result_file" "$census_node" || return 1
+        v3015_node_result_is_valid "$result_file" "$census_node" "$run_dir/AUTHORITY" || return 1
         v3015_pow_json_is_typed_safe "$pow" || return 1
     fi
     result_sha=$(v3015_sha256_file "$result_file")
     jq -cn --argjson node "$census_node" --arg role "$role" --arg source "$SOURCE_SHA" \
       --arg image "$(docker inspect -f '{{.Config.Image}}' "$census_container")" \
       --arg image_id "$(docker inspect -f '{{.Image}}' "$census_container")" \
-      --argjson chain "$chain" --argjson network "$network" --argjson wallet "$wallet" \
+      --argjson chain "$chain" --argjson chain_before "$chain_before" \
+      --argjson chain_after "$chain_after" --argjson network "$network" \
+      --argjson wallet "$wallet" \
+      --argjson wallets "$wallets" \
       --argjson staking "$staking" --argjson pow "$pow" --arg result_sha "$result_sha" \
       --argjson healthy "$free_healthy" --argjson paused "$free_paused" \
       --arg probe "$probe_sha" --arg probe_tool "$probe_tool_sha" '{
         node:$node,role:$role,source_sha:$source,network_version:$network.version,
         subversion:$network.subversion,container_image_ref:$image,container_image_id:$image_id,
-        chain:$chain,network:$network,wallet:$wallet,staking:$staking,pow:$pow,
+        chain:$chain,
+        core_before:($chain_before | {bestblockhash,blocks,headers,chainwork,
+          initialblockdownload}),
+        core_after:($chain_after | {bestblockhash,blocks,headers,chainwork,
+          initialblockdownload}),
+        network:$network,wallet:$wallet,loaded_wallets:$wallets,
+        staking:$staking,pow:$pow,
         pos_contract_passed:true,pow_contract_passed:($role == "regular"),
         free_claim_healthy:$healthy,free_claim_paused:$paused,
         free_claim_probe_output_sha256:(if $role == "free_claim" then $probe else null end),
@@ -360,6 +552,9 @@ while read -r role nodes; do
         node=30
         node30_before_id=$(docker inspect -f '{{.Id}}' blackcoin-v4-gui-30)
         node30_baseline=$(capture_node30_wallet_state)
+        v3015_wallet_state_has_single_identity "$node30_baseline" ||
+            v3015_die 'node30 baseline does not contain exactly one loaded wallet identity'
+        node30_baseline_walletname=$(jq -er '.wallet.walletname' <<<"$node30_baseline")
         touched+=(30)
         docker compose -f "$COMPOSE_FILE" -f "$overlay" up -d --no-deps \
           --force-recreate --pull never node30 >/dev/null
@@ -369,6 +564,18 @@ while read -r role nodes; do
         node30_after_id=$(docker inspect -f '{{.Id}}' blackcoin-v4-gui-30)
         [[ "$node30_after_id" != "$node30_before_id" ]] ||
             v3015_die 'node30 candidate container was not recreated'
+        node30_candidate_wallet_deadline=$((SECONDS + 180))
+        until node30_candidate_wallet=$(capture_node30_wallet_state "$node30_baseline") &&
+              v3015_wallet_state_has_single_identity "$node30_candidate_wallet" &&
+              [[ "$(jq -r '.wallet.walletname' <<<"$node30_candidate_wallet")" == \
+                 "$node30_baseline_walletname" ]] &&
+              node30_preunlock_migration=$(v3015_make_preunlock_migration_audit \
+                "$node30_baseline" "$node30_candidate_wallet") &&
+              v3015_preunlock_migration_is_safe "$node30_preunlock_migration"; do
+            ((SECONDS < node30_candidate_wallet_deadline)) ||
+                v3015_die 'node30 portable locked pre-unlock migration guard did not converge'
+            sleep 2
+        done
         /bin/bash "$NORMAL_UNLOCK_HELPER" 30 >/dev/null
         node30_initial_deadline=$((SECONDS + 180))
         until node30_staking=$(node30_rpc getstakinginfo) &&
@@ -385,23 +592,57 @@ while read -r role nodes; do
         verify_node30_invocation || v3015_die 'node30 restarted invocation identity mismatch'
         [[ "$node30_argv_sha" == "$node30_first_argv_sha" ]] ||
             v3015_die 'node30 runtime argv changed across restart'
-        node30_locked_wallet=$(node30_rpc getwalletinfo)
-        node30_locked_staking=$(node30_rpc getstakinginfo)
-        node30_locked_pow=$(node30_rpc getpowmininginfo)
-        node30_locked=$(jq -cn --argjson wallet "$node30_locked_wallet" \
-          --argjson staking "$node30_locked_staking" --argjson pow "$node30_locked_pow" '{
-            wallet_locked:(($wallet.unlocked_until // 0) == 0),normal_unlock_called:false,
-            pos_intent_retained:($staking.autostart_staking == true),
-            regular_pow_disabled:($pow.enabled == false and $pow.autostart == false),
-            staking:$staking,regular_pow:$pow}')
-        jq -e '.wallet_locked == true and .normal_unlock_called == false and
-          .pos_intent_retained == true and .regular_pow_disabled == true and
-          .staking.enabled == true and .staking.autostart_staking == true and
-          .staking.worker_running == true and .staking.staking == false and
-          .staking.eligible == false and .staking.staking_state == "locked" and
-          .regular_pow.enabled == false and .regular_pow.hashrate == 0 and
-          .regular_pow.state == "disabled"' <<<"$node30_locked" >/dev/null ||
-            v3015_die 'node30 locked restart intent proof failed'
+        node30_locked_deadline=$((SECONDS + 180))
+        while :; do
+            if node30_locked_wallet=$(node30_rpc getwalletinfo) &&
+               node30_locked_wallets=$(node30_rpc listwallets) &&
+               node30_locked_staking=$(node30_rpc getstakinginfo) &&
+               node30_locked_pow=$(node30_rpc getpowmininginfo); then
+                node30_locked_identity=$(jq -cn --argjson wallet "$node30_locked_wallet" \
+                  --argjson wallets "$node30_locked_wallets" \
+                  '{wallet:$wallet,loaded_wallets:$wallets}')
+                v3015_wallet_state_has_single_identity "$node30_locked_identity" &&
+                  [[ "$(jq -r '.wallet.walletname' <<<"$node30_locked_identity")" == \
+                     "$node30_baseline_walletname" ]] ||
+                    v3015_die 'node30 loaded wallet identity changed across locked restart'
+                node30_locked_observation=$(jq -cn --argjson wallet "$node30_locked_wallet" \
+                  --argjson staking "$node30_locked_staking" \
+                  --argjson pow "$node30_locked_pow" \
+                  '{wallet:$wallet,staking:$staking,pow:$pow}')
+                jq -e '(.wallet.unlocked_until // 0) == 0 and
+                  (.wallet.unlocked_staking_only // false) == false and
+                  .staking.enabled == true and .staking.autostart_staking == true and
+                  .pow.enabled == false and .pow.autostart == false and
+                  .pow.hashrate == 0 and .pow.state == "disabled"' \
+                  <<<"$node30_locked_observation" >/dev/null ||
+                      v3015_die 'node30 locked restart disabled or contradicted role authority'
+                node30_locked_staking_state=$(jq -er '.staking.staking_state' \
+                  <<<"$node30_locked_observation")
+                node30_locked=$(jq -cn --argjson wallet "$node30_locked_wallet" \
+                  --argjson staking "$node30_locked_staking" \
+                  --argjson pow "$node30_locked_pow" '{
+                    wallet_locked:(($wallet.unlocked_until // 0) == 0),
+                    normal_unlock_called:false,
+                    pos_intent_retained:($staking.autostart_staking == true),
+                    regular_pow_disabled:($pow.enabled == false and $pow.autostart == false),
+                    staking:$staking,regular_pow:$pow}')
+                if [[ "$node30_locked_staking_state" == locked ]] && jq -e '
+                  .wallet_locked == true and .normal_unlock_called == false and
+                  .pos_intent_retained == true and .regular_pow_disabled == true and
+                  .staking.enabled == true and .staking.autostart_staking == true and
+                  .staking.worker_running == true and .staking.staking == false and
+                  .staking.eligible == false and .staking.staking_state == "locked" and
+                  .regular_pow.enabled == false and .regular_pow.hashrate == 0 and
+                  .regular_pow.state == "disabled"' \
+                  <<<"$node30_locked" >/dev/null; then break; fi
+                [[ "$node30_locked_staking_state" == starting ||
+                   "$node30_locked_staking_state" == syncing ]] ||
+                    v3015_die 'node30 locked restart PoS worker entered a disabled, stopped, or error state'
+            fi
+            ((SECONDS < node30_locked_deadline)) ||
+                v3015_die 'node30 locked restart worker states did not converge'
+            sleep 2
+        done
         /bin/bash "$NORMAL_UNLOCK_HELPER" 30 >/dev/null
         node30_raw="$run_dir/node-30-free-claim-probe.raw.json"
         v3015_stage_root_executable_copy "$NODE30_FREE_CLAIM_PROBE" \
@@ -409,20 +650,30 @@ while read -r role nodes; do
             v3015_die 'node30 probe could not be pinned under fleet locks'
         capture_node30_probe_evidence "$node30_raw" initial ||
             v3015_die 'initial node30 Free Claim probe failed closed'
-        node30_final=$(capture_node30_wallet_state)
-        node30_wallet_audit=$(v3015_make_wallet_audit "$node30_baseline" "$node30_final")
+        node30_final=$(capture_node30_wallet_state "$node30_candidate_wallet")
+        node30_wallet_audit=$(v3015_make_wallet_audit "$node30_candidate_wallet" "$node30_final")
         v3015_wallet_delta_is_safe "$node30_wallet_audit" ||
             v3015_die 'node30 wallet/recovery/key/payout/policy comparison failed'
-        jq -e '.delta.added_txids == [] and .delta.removed_txids == []' \
+        jq -e '.delta.removed_txids == [] and
+          all(.delta.transactions[];
+            .safe_external_receive == true and
+            .authenticated_same_anchor_claim == false and
+            .normal_coinstake == false and
+            .authenticated_synthetic_payout == false and
+            .cleanup == false and .recovery == false and
+            .resolution == false and .recovery_fee == 0)' \
           <<<"$node30_wallet_audit" >/dev/null ||
-            v3015_die 'node30 transaction inventory changed during restart durability proof'
+            v3015_die 'node30 wallet delta is not an external receive-only change'
         node30_raw_sha=$(v3015_sha256_file "$node30_raw")
         jq --arg source "$SOURCE_SHA" --arg image "$CANDIDATE_IMAGE_REF" \
           --arg image_id "$CANDIDATE_IMAGE_ID" --arg argv "$node30_argv_sha" \
           --arg raw_sha "$node30_raw_sha" --arg probe_tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
+          --arg nonce "$nonce" \
           --argjson locked "$node30_locked" \
+          --argjson migration "$node30_preunlock_migration" \
           --argjson audit "$node30_wallet_audit" '
-          .payload as $probe | {schema:1,node:30,source_sha:$source,network_version:300105,
+          .payload as $probe | {schema:1,node:30,source_sha:$source,rollout_nonce:$nonce,
+            network_version:300105,
             subversion:"/Blackcoin:30.1.5/",role:"free_claim",regular_pow_enabled:false,
             probe_tool_sha256:$probe_tool,raw_probe_sha256:$raw_sha,
             healthy:$probe.healthy,paused:$probe.paused,
@@ -438,14 +689,15 @@ while read -r role nodes; do
               ($probe.locked_restart.free_claim_intent_retained == true)}),
             free_claim_intent_retained:$probe.free_claim_intent_retained,
             samples:$probe.samples,
+            preunlock_migration:$migration,
             wallet_audit:$audit,
             no_recovery_or_resolution_transaction:
-              ($audit.delta.component_resolution_txids_before ==
-               $audit.delta.component_resolution_txids_after),
-            recovery_fee_delta:($audit.after.recovery.confirmed_resolution_fees -
-              $audit.before.recovery.confirmed_resolution_fees)}' "$node30_raw" \
+              all($audit.delta.transactions[];
+                .cleanup == false and .recovery == false and
+                .resolution == false and .recovery_fee == 0)}' "$node30_raw" \
           >"$run_dir/node-30-free-claim.json.tmp"
-        v3015_node30_result_is_valid "$run_dir/node-30-free-claim.json.tmp" "$node30_raw" ||
+        v3015_node30_result_is_valid "$run_dir/node-30-free-claim.json.tmp" "$node30_raw" \
+          "$run_dir/AUTHORITY" ||
           v3015_die 'node30 Free Claim is unhealthy or paused'
         mv -- "$run_dir/node-30-free-claim.json.tmp" "$run_dir/node-30-free-claim.json"
         chmod 600 "$run_dir/node-30-free-claim.json"
@@ -466,9 +718,11 @@ done
 terminal_probe_sha=$(v3015_sha256_file \
   "$run_dir/node-30-free-claim-terminal-probe.raw.json")
 terminal_census=$(jq -cn --arg source "$SOURCE_SHA" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg nonce "$nonce" \
   --arg probe_tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
   --arg terminal_probe "$terminal_probe_sha" \
-  --argjson nodes "$terminal_nodes" '{schema:1,source_sha:$source,captured_utc:$now,nodes:$nodes,
+  --argjson nodes "$terminal_nodes" '{schema:1,source_sha:$source,rollout_nonce:$nonce,
+    captured_utc:$now,nodes:$nodes,
     pos_active_nodes:[$nodes[] | select(.pos_contract_passed == true) | .node],
     pos_active_count:([$nodes[] | select(.pos_contract_passed == true)] | length),
     regular_pow_nodes:[$nodes[] | select(.role == "regular" and
@@ -480,7 +734,8 @@ terminal_census=$(jq -cn --arg source "$SOURCE_SHA" --arg now "$(date -u +%Y-%m-
     node30_free_claim_probe_tool_sha256:$probe_tool,
     node30_terminal_probe_sha256:$terminal_probe}')
 printf '%s\n' "$terminal_census" | v3015_atomic_write "$run_dir/terminal-fleet-census.json"
-v3015_terminal_census_is_valid "$run_dir/terminal-fleet-census.json" "$run_dir" ||
+v3015_terminal_census_is_valid "$run_dir/terminal-fleet-census.json" "$run_dir" \
+  "$run_dir/AUTHORITY" ||
     v3015_die 'terminal 32-node census does not meet v30.1.5 policy'
 v3015_remove_owned_root_executable "$node30_probe_tool" \
   "$NODE30_FREE_CLAIM_PROBE_SHA256" ||
@@ -495,6 +750,7 @@ cp -- "$PERSISTENT_COMPOSE_HANDOFF_RECEIPT" \
 cp -- "$POST_COMPOSE_RECONCILE_IDENTITY_PROOF" \
   "$run_dir/post-compose-reconcile-identity.json"
 jq -cn --arg source "$SOURCE_SHA" --arg census_sha "$terminal_census_sha" \
+  --arg nonce "$nonce" \
   --arg policy_receipt "$RUNTIME_POLICY_HANDOFF_RECEIPT_SHA256" \
   --arg compose_receipt "$PERSISTENT_COMPOSE_HANDOFF_RECEIPT_SHA256" \
   --arg compose_sha "$FINAL_COMPOSE_SHA256" --arg policy_sha "$FINAL_IMAGE_POLICY_SHA256" \
@@ -502,7 +758,7 @@ jq -cn --arg source "$SOURCE_SHA" --arg census_sha "$terminal_census_sha" \
   --arg probe_tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
   --arg terminal_probe "$terminal_probe_sha" \
   --argjson census "$terminal_census" '{schema:1,transaction:"v30.1.5-fleet-rollout",
-  source_sha:$source,status:"PASS",terminal_census_sha256:$census_sha,
+  source_sha:$source,rollout_nonce:$nonce,status:"PASS",terminal_census_sha256:$census_sha,
   pos_active:$census.pos_active_count,
   pos_active_nodes:$census.pos_active_nodes,
   regular_pow_operational:$census.regular_pow_operational_count,
@@ -515,7 +771,6 @@ jq -cn --arg source "$SOURCE_SHA" --arg census_sha "$terminal_census_sha" \
   persistent_compose_handoff_receipt_sha256:$compose_receipt,
   final_compose_sha256:$compose_sha,final_image_policy_sha256:$policy_sha,
   post_compose_reconcile_identity_sha256:$reconcile,
-  recovery_transactions_created:false,recovery_fees_delta:0,
   containment_only_failure_policy:true}' | v3015_atomic_write "$run_dir/fleet-result.json"
 
 v3015_remove_owned_authority "$run_dir/AUTHORITY" "$authority_sha" ||

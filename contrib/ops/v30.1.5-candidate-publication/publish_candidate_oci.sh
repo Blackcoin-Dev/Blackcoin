@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Verify a GitHub Actions candidate artifact offline by default. The live path
 # burns one complete, time-limited authority before any Docker or registry

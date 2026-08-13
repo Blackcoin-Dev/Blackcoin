@@ -1,0 +1,33 @@
+{
+  "artifact": {
+    "api_metadata_path": "/ABSOLUTE/PATH/artifact-api.json",
+    "api_metadata_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "bundle_sha256sums_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "github_zip_path": "/ABSOLUTE/PATH/artifact.zip",
+    "github_zip_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "id": 1,
+    "name": "v30.1.5-candidate-linux-x86_64-0000000000000000000000000000000000000000-attempt-1",
+    "packaging_run_attempt": 1,
+    "packaging_run_id": 1
+  },
+  "execution": {
+    "confirmation": null,
+    "dispatch_enabled": false,
+    "exclusive_tag_writer": false,
+    "execute": false,
+    "nonce": null
+  },
+  "identity": {
+    "core_ci_run_id": 1,
+    "packaging_tooling_commit": "0000000000000000000000000000000000000000",
+    "packaging_tooling_tree": "0000000000000000000000000000000000000000",
+    "repository": "Blackcoin-Dev/Blackcoin",
+    "source_commit": "0000000000000000000000000000000000000000",
+    "source_tree": "0000000000000000000000000000000000000000"
+  },
+  "registry": {
+    "repository": "qqblackcoin/blackcoin-v4-gui",
+    "tag": "30.1.5-candidate-000000000000-gha1-a1-pub1"
+  },
+  "schema": 1
+}

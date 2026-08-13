@@ -421,30 +421,40 @@ static bool ClearShadowPowClaimExpiredRetirement(CWalletTx& wtx)
     return changed;
 }
 
-static bool HasShadowPowClaimRetirementOnActiveBranch(
-    const CWalletTx& wtx, const CChain& active_chain)
-    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+static bool HasShadowPowClaimExpiredRetirementMetadata(const CWalletTx& wtx)
 {
-    const auto marker = wtx.mapValue.find(
-        SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY);
-    const auto height = wtx.mapValue.find(
-        SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY);
-    const auto block = wtx.mapValue.find(
-        SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY);
-    int32_t parsed_height{-1};
-    if (marker == wtx.mapValue.end() || marker->second != "1" ||
-        height == wtx.mapValue.end() || block == wtx.mapValue.end() ||
-        !ParseInt32(height->second, &parsed_height) || parsed_height < 0 ||
-        parsed_height > active_chain.Height() ||
-        block->second.size() != uint256::size() * 2 ||
-        !IsHex(block->second)) {
+    // v30.1.5 release candidates could abandon an origin-expired claim and
+    // mark its input reusable even though the signed transaction remained
+    // valid for direct block inclusion. Treat any complete, partial, or
+    // malformed legacy marker as a reservation until atomic repair clears it.
+    return wtx.mapValue.count(SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY) != 0 ||
+           wtx.mapValue.count(
+               SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY) != 0 ||
+           wtx.mapValue.count(
+               SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY) != 0;
+}
+
+static bool IsShadowPowClaimAnchorReservation(
+    const CWallet& wallet, const CWalletTx& wtx,
+    const COutPoint& anchor)
+{
+    // This predicate deliberately does not depend on a quarantine marker.
+    // A user may install a hold while a claim is quarantined and the exact
+    // same wallet transaction may later enter the mempool.  That state change
+    // must not let AddToSpends silently erase the user's restriction.  Old
+    // abandoned retirement records are also reservations until repair clears
+    // every historical marker atomically.
+    if (!wtx.tx || wtx.isConflicted() || wtx.isConfirmed() ||
+        wtx.tx->vin.size() != 1 ||
+        wtx.tx->vin.front().prevout != anchor ||
+        !GetShadowPowProofLogicalId(*wtx.tx) ||
+        wallet.GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0 ||
+        wtx.mapValue.count(SHADOW_POW_RESOLUTION_SCHEMA_KEY) != 0 ||
+        wtx.mapValue.count(SHADOW_POW_LEGACY_CLEANUP_FOR_KEY) != 0) {
         return false;
     }
-    uint256 parsed_block;
-    parsed_block.SetHex(block->second);
-    const CBlockIndex* observed = active_chain[parsed_height];
-    return observed && !parsed_block.IsNull() &&
-           observed->GetBlockHash() == parsed_block;
+    return !wtx.isAbandoned() ||
+           HasShadowPowClaimExpiredRetirementMetadata(wtx);
 }
 
 bool CWallet::UpdateShadowPowClaimRecoveryRecordsDurably(
@@ -1570,7 +1580,12 @@ bool CWallet::IsSpent(const COutPoint& outpoint) const
         const auto mit = mapWallet.find(wtxid);
         if (mit != mapWallet.end()) {
             int depth = GetTxDepthInMainChain(mit->second);
-            if (depth > 0  || (depth == 0 && !mit->second.isAbandoned()))
+            const bool legacy_retirement_hold =
+                mit->second.isAbandoned() &&
+                HasShadowPowClaimExpiredRetirementMetadata(mit->second);
+            if (depth > 0 ||
+                (depth == 0 &&
+                 (!mit->second.isAbandoned() || legacy_retirement_hold)))
                 return true; // Spent
         }
     }
@@ -1599,31 +1614,32 @@ bool CWallet::CanLockQuarantinedShadowPowClaimAnchor(
     }
 
     const auto spends = mapTxSpends.equal_range(outpoint);
-    bool saw_quarantined_claim{false};
+    bool saw_claim_reservation{false};
     for (auto spend = spends.first; spend != spends.second; ++spend) {
         const auto wallet_tx = mapWallet.find(spend->second);
         if (wallet_tx == mapWallet.end()) return false;
         const CWalletTx& wtx = wallet_tx->second;
 
-        // Match IsSpent's reservation boundary.  Abandoned and conflicted
-        // history remains auditable in mapTxSpends but does not reserve the
-        // active-chain coin and therefore cannot make an additional user
-        // hold less safe.
+        // Match IsSpent's reservation boundary. Conflicted history and
+        // ordinary abandoned transactions remain auditable in mapTxSpends
+        // but do not reserve the active-chain coin. Historical abandoned
+        // claim retirements do reserve it until repair clears their markers.
         const int depth = GetTxDepthInMainChain(wtx);
-        if (depth < 0 || wtx.isAbandoned()) continue;
+        if (depth < 0 ||
+            (wtx.isAbandoned() &&
+             !HasShadowPowClaimExpiredRetirementMetadata(wtx))) {
+            continue;
+        }
         if (depth > 0) return false;
 
-        if (!wtx.tx || wtx.tx->vin.size() != 1 ||
-            wtx.tx->vin.front().prevout != outpoint ||
-            !GetShadowPowProofLogicalId(*wtx.tx) ||
-            wtx.mapValue.count(SHADOW_POW_RESOLUTION_SCHEMA_KEY) != 0 ||
-            wtx.mapValue.count(SHADOW_POW_LEGACY_CLEANUP_FOR_KEY) != 0 ||
-            !IsQuarantinedShadowPowClaim(wtx.GetHash())) {
+        if (!IsShadowPowClaimAnchorReservation(*this, wtx, outpoint) ||
+            (!wtx.isAbandoned() &&
+             !IsQuarantinedShadowPowClaim(wtx.GetHash()))) {
             return false;
         }
-        saw_quarantined_claim = true;
+        saw_claim_reservation = true;
     }
-    return saw_quarantined_claim;
+    return saw_claim_reservation;
 }
 
 bool CWallet::IsSpentForStakeIndex(const COutPoint& outpoint) const
@@ -1640,7 +1656,11 @@ bool CWallet::IsSpentForStakeIndex(const COutPoint& outpoint) const
         const auto wallet_tx = mapWallet.find(spend->second);
         if (wallet_tx == mapWallet.end()) continue;
         const CWalletTx& wtx = wallet_tx->second;
-        if (!wtx.isConflicted() && !wtx.isAbandoned()) return true;
+        if (!wtx.isConflicted() &&
+            (!wtx.isAbandoned() ||
+             HasShadowPowClaimExpiredRetirementMetadata(wtx))) {
+            return true;
+        }
     }
     return false;
 }
@@ -1705,15 +1725,42 @@ void CWallet::RefreshMempoolStatus(CWalletTx& wtx)
 
 void CWallet::AddToSpends(const COutPoint& outpoint, const uint256& wtxid, WalletBatch* batch)
 {
+    // A coin lock is normally cleared when its first wallet-known spender is
+    // added because manually selected inputs must not remain locked after the
+    // transaction is created. A spent output can only be locked through the
+    // public wallet API's narrow quarantined-claim-anchor exception, however.
+    // Once such an explicit user hold exists, learning another sibling or
+    // conflicting spender must not silently revoke it. Keep the hold until the
+    // user explicitly unlocks the anchor, even if the new spender makes the
+    // narrow lock-add exception no longer applicable.
+    bool preserve_existing_spent_anchor_hold{false};
+    if (IsLockedCoin(outpoint)) {
+        const auto existing_spends = mapTxSpends.equal_range(outpoint);
+        for (auto spend = existing_spends.first;
+             spend != existing_spends.second; ++spend) {
+            const auto wallet_tx = mapWallet.find(spend->second);
+            if (wallet_tx == mapWallet.end()) continue;
+            const CWalletTx& wtx = wallet_tx->second;
+            if (!IsShadowPowClaimAnchorReservation(
+                    *this, wtx, outpoint)) {
+                continue;
+            }
+            preserve_existing_spent_anchor_hold = true;
+            break;
+        }
+    }
+
     mapTxSpends.insert(std::make_pair(outpoint, wtxid));
 
     RefreshLiveUnspentStakeOutpoint(outpoint);
 
-    if (batch) {
-        UnlockCoin(outpoint, batch);
-    } else {
-        WalletBatch temp_batch(GetDatabase());
-        UnlockCoin(outpoint, &temp_batch);
+    if (!preserve_existing_spent_anchor_hold) {
+        if (batch) {
+            UnlockCoin(outpoint, batch);
+        } else {
+            WalletBatch temp_batch(GetDatabase());
+            UnlockCoin(outpoint, &temp_batch);
+        }
     }
 
     std::pair<TxSpends::iterator, TxSpends::iterator> range;
@@ -4095,20 +4142,6 @@ void CWallet::RepairStaleShadowTransactions(bool force)
                 GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) {
                 continue;
             }
-            // A valid zero-payment retirement remains abandoned across
-            // restart only while its observation block is still on the active
-            // branch and the exact bytes still classify ORIGIN_EXPIRED. Any
-            // reorg, malformed marker, or changed classification reopens the
-            // reservation before this scheduler can retire it again.
-            if (HasShadowPowClaimRetirementOnActiveBranch(
-                    wtx, chainman.ActiveChain())) {
-                const ShadowPowClaimTipPolicy policy =
-                    ClassifyShadowPowClaimAtTip(chainman, *wtx.tx);
-                if (policy.disposition ==
-                    ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED) {
-                    continue;
-                }
-            }
             bool conclusively_spent{false};
             for (const CTxIn& input : wtx.tx->vin) {
                 const auto conflicts = mapTxSpends.equal_range(input.prevout);
@@ -4152,7 +4185,7 @@ void CWallet::RepairStaleShadowTransactions(bool force)
                     },
                     "reopen legacy-abandoned claim", &changed) && changed) {
                 MarkInputsDirty(mapWallet.at(txid).tx);
-                WalletLogPrintf("Reopened and quarantined legacy-abandoned Gold Rush PoW claim %s; its input remains reserved until an on-chain conflict confirms\n",
+                WalletLogPrintf("Reopened and quarantined legacy-abandoned Gold Rush PoW claim %s; its peer-retained bytes can remain block-valid, so the input stays reserved until an on-chain conflict confirms\n",
                                 txid.ToString());
             }
         }
@@ -4339,139 +4372,6 @@ void CWallet::RepairStaleShadowTransactions(bool force)
     }
 }
 
-size_t CWallet::RetireExpiredShadowPowClaims()
-{
-    if (!HaveChain() || !chain().isReadyToBroadcast()) return 0;
-
-    // Serialize this automatic no-payment state transition with both miner
-    // enable/disable and every fee-paying recovery action. The submission
-    // guard also prevents a newly found proof from selecting an input while
-    // the old reservation is being released.
-    LOCK(m_pow_recovery_authority_mutex);
-    ShadowPowClaimSubmissionGuard submission_guard(*this);
-    if (!submission_guard) return 0;
-
-    std::vector<uint256> eligible_claims;
-    size_t eligible_components{0};
-    {
-        LOCK2(::cs_main, cs_wallet);
-        if (m_shadow_pow_claim_recovery_db_ambiguous) return 0;
-
-        const ShadowPowClaimRecoveryInventory inventory =
-            GetShadowPowClaimRecoveryInventoryLocked();
-        if (!inventory.wallet_tip_matches || inventory.active_tip.IsNull() ||
-            inventory.active_height < 0) {
-            return 0;
-        }
-
-        for (const ShadowPowClaimRecoveryComponent& component :
-             inventory.components) {
-            if (component.state !=
-                    ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP ||
-                !component.anchor_authenticated || !component.anchor_unspent ||
-                !component.all_claims_zero_payment_retirable ||
-                component.all_claims_expired_locally_retired ||
-                !component.ordinary_or_mixed_txids.empty() ||
-                !component.resolution_txids.empty() ||
-                component.claim_txids.empty()) {
-                continue;
-            }
-
-            bool safe_component{true};
-            for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
-                if (node.kind != ShadowPowClaimRecoveryNodeKind::CLAIM ||
-                    node.active_chain_confirmed || node.in_mempool ||
-                    !node.quarantined || !node.expected_shape ||
-                    !node.wallet_authored || node.lineage_metadata_present ||
-                    (node.exact_authored_carrier_shape &&
-                     node.proof_origin_bound) ||
-                    node.provenance !=
-                        ShadowPowClaimRecoveryProvenance::EXPLICIT_AUTHORED ||
-                    node.disposition !=
-                        ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED ||
-                    m_inflight_wallet_broadcasts.count(node.txid) != 0) {
-                    safe_component = false;
-                    break;
-                }
-                const auto live = mapWallet.find(node.txid);
-                if (live == mapWallet.end() || !live->second.tx) {
-                    safe_component = false;
-                    break;
-                }
-                const auto manual = live->second.mapValue.find(
-                    MANUAL_SHADOW_ABANDON_KEY);
-                if (manual != live->second.mapValue.end() &&
-                    manual->second == "1") {
-                    safe_component = false;
-                    break;
-                }
-            }
-            if (!safe_component) continue;
-            eligible_claims.insert(eligible_claims.end(),
-                                   component.claim_txids.begin(),
-                                   component.claim_txids.end());
-            ++eligible_components;
-        }
-
-        if (eligible_claims.empty()) return 0;
-        std::sort(eligible_claims.begin(), eligible_claims.end());
-        eligible_claims.erase(
-            std::unique(eligible_claims.begin(), eligible_claims.end()),
-            eligible_claims.end());
-
-        std::vector<uint256> changed;
-        if (!UpdateShadowPowClaimRecoveryRecordsDurably(
-                eligible_claims,
-                [&](CWalletTx& persisted) {
-                    bool changed_record = !persisted.isAbandoned();
-                    persisted.m_state =
-                        TxStateInactive{/*abandoned=*/true};
-                    changed_record |=
-                        persisted.mapValue[AUTO_SHADOW_STALE_KEY] != "1";
-                    persisted.mapValue[AUTO_SHADOW_STALE_KEY] = "1";
-                    changed_record |= persisted.mapValue.erase(
-                        MANUAL_SHADOW_ABANDON_KEY) != 0;
-                    changed_record |= persisted.mapValue[
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY] != "1";
-                    persisted.mapValue[
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY] = "1";
-                    const std::string height = ToString(
-                        inventory.active_height);
-                    const std::string tip = inventory.active_tip.GetHex();
-                    changed_record |= persisted.mapValue[
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY] !=
-                        height;
-                    changed_record |= persisted.mapValue[
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY] != tip;
-                    persisted.mapValue[
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY] = height;
-                    persisted.mapValue[
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY] = tip;
-                    return changed_record;
-                },
-                "retire origin-expired claim without payment", &changed)) {
-            return 0;
-        }
-
-        for (const uint256& txid : changed) {
-            CWalletTx& retired = mapWallet.at(txid);
-            RefreshLiveUnspentStakeOutpoints(retired);
-            RemoveIndexedShadowSolve(txid);
-            UpdatePendingShadowSignalIndex(retired);
-            MarkInputsDirty(retired.tx);
-            NotifyTransactionChanged(txid, CT_UPDATED);
-        }
-        eligible_claims = std::move(changed);
-    }
-
-    WalletLogPrintf(
-        "Retired %u origin-expired Gold Rush PoW claim(s) in %u component(s) "
-        "without creating, signing, broadcasting, or paying for a recovery transaction\n",
-        static_cast<unsigned int>(eligible_claims.size()),
-        static_cast<unsigned int>(eligible_components));
-    return eligible_claims.size();
-}
-
 void CWallet::ResubmitWalletTransactions(bool relay, bool force)
 {
     int submitted_tx_count = 0;
@@ -4479,7 +4379,6 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force)
 
     if (force) {
         RepairStaleShadowTransactions(/*force=*/true);
-        RetireExpiredShadowPowClaims();
     }
 
     std::vector<uint256> to_submit;
@@ -4509,8 +4408,9 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force)
 
             // A claim that aged out of its dedicated relay window must not
             // regain a fresh mempool lifetime through startup, import, reorg,
-            // or periodic wallet rebroadcast. Its input stays reserved until
-            // branch-aware origin expiry permits zero-payment retirement.
+            // or periodic wallet rebroadcast. Relay-policy expiry does not
+            // make signed bytes block-invalid, so its input stays reserved
+            // until confirmed chain state or explicit recovery resolves it.
             if (ShadowPowClaimPastRelayTtl(wtx, now)) {
                 continue;
             }
@@ -4590,7 +4490,6 @@ void MaybeResendWalletTxs(WalletContext& context)
         MaybeAutoShadowSignal(*pwallet);
         MaybeAutoRedelegateQuantumColdStake(*pwallet);
         pwallet->RepairStaleShadowTransactions(/*force=*/false);
-        pwallet->RetireExpiredShadowPowClaims();
         pwallet->MaybeAutoResolveShadowPowClaims();
         if (!pwallet->ShouldResend()) continue;
         pwallet->ResubmitWalletTransactions(/*relay=*/true, /*force=*/false);
@@ -11121,22 +11020,6 @@ size_t CWallet::CountQuarantinedShadowPowClaims() const
             ++blocking;
             continue;
         }
-        const auto authored = wtx.mapValue.find(
-            SHADOW_POW_CLAIM_AUTHORED_KEY);
-        if (wtx.isAbandoned() && wtx.tx->vin.size() == 1 &&
-            authored != wtx.mapValue.end() && authored->second == "1" &&
-            HasValidShadowPowTipObservation(
-                wtx.mapValue, SHADOW_POW_CLAIM_CREATED_HEIGHT_KEY,
-                SHADOW_POW_CLAIM_CREATED_TIP_KEY) &&
-            HasShadowPowClaimRetirementOnActiveBranch(
-                wtx, chainman.ActiveChain())) {
-            // Retirement was classified once under cs_main+cs_wallet and its
-            // observation block is still an ancestor. ORIGIN_EXPIRED is
-            // monotonic on descendants of that branch, so the one-second
-            // miner gate need not re-run proof verification.
-            continue;
-        }
-
         const CWalletTx* current = &wtx;
         std::set<uint256> seen;
         bool classified{false};

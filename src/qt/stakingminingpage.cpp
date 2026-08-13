@@ -124,7 +124,7 @@ QString recoveryStateText(interfaces::WalletPowClaimRecoveryState state)
     case State::INDETERMINATE: return QObject::tr("Indeterminate — no action");
     case State::CURRENT_BRANCH_INELIGIBLE: return QObject::tr("Ineligible on current branch");
     case State::TERMINAL_ON_PINNED_TIP: return QObject::tr("Terminal on reviewed tip");
-    case State::RETIRED_ON_ACTIVE_BRANCH: return QObject::tr("Expired; retired without payment");
+    case State::RETIRED_ON_ACTIVE_BRANCH: return QObject::tr("Historical retirement marker; repair required");
     case State::RESOLUTION_PENDING: return QObject::tr("Resolution pending");
     case State::RESOLVED_ON_ACTIVE_CHAIN: return QObject::tr("Resolved on active chain");
     }
@@ -1893,7 +1893,7 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
         contains_unbound_legacy_proof);
     m_pow_recovery_summary->setText(
         tr("Wallet: %1 | active height: %2 | tip: %3 | plan: %4\n"
-           "%5 claim object(s), %6 live, %7 quarantined; %8 blocking component(s), %9 retired without payment, %10 resolved. "
+           "%5 claim object(s), %6 live, %7 quarantined; %8 blocking component(s), %9 historical retirement marker(s), %10 resolved. "
            "Persisted recovery facts: %11 manual pending, %12 automatic pending, %13 recycled output(s), %14 total confirmed fees. "
            "Snapshot policy: %15; minimum stale depth %16 block(s).")
             .arg(QString::fromStdString(m_wallet_model

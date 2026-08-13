@@ -284,7 +284,7 @@ RPCHelpMan lockunspent()
                 "Locks are stored in memory only, unless persistent=true, in which case they will be written to the\n"
                 "wallet database and loaded on node start. Unwritten (persistent=false) locks are always cleared\n"
                 "(by virtue of process exit) when a node stops or fails. Unlocking will clear both persistent and not.\n"
-                "A confirmed chain-unspent anchor reserved only by exact, durably quarantined Gold Rush QQSPROOF claims may also be locked. This adds a user hold to that retained family and never releases its existing claim reservation.\n"
+                "A confirmed chain-unspent anchor reserved only by exact retained Gold Rush QQSPROOF claims may also be locked. This adds a user hold to that retained family and never releases its existing quarantine or historical-repair reservation.\n"
                 "Also see the listunspent call\n",
                 {
                     {"unlock", RPCArg::Type::BOOL, RPCArg::Optional::NO, "Whether to unlock (true) or lock (false) the specified transactions"},

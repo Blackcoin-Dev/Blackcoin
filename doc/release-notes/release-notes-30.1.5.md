@@ -6,6 +6,14 @@ the exact Blackcoin-Dev-signed source commit and tag pass the release gate and
 the corresponding artifacts are published. Until that publication occurs,
 v30.1.4 remains the latest public release.
 
+Wallet safety is tightened for origin-expired Gold Rush claims. Expiry of the
+claim-specific mempool and reward window does not make already signed
+transaction bytes invalid for direct block inclusion. The wallet therefore
+keeps the confirmed anchor reserved until chain state or an explicit recovery
+spend resolves it. Historical local retirement markers written by earlier
+v30.1.5 release candidates are reopened and cleared without releasing the
+anchor during migration or a failed database update.
+
 The source commit and annotated tag are SSH-signed by Blackcoin-Dev. That
 source identity does not Authenticode-sign Windows packages. macOS applications
 retain identity-free ad-hoc launch signatures and are not notarized.

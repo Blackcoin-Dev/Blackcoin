@@ -722,7 +722,11 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         }
 
         bool all_claims_terminal{true};
-        bool all_claims_zero_payment_retirable{true};
+        // Origin expiry removes shadow-reward eligibility but does not make
+        // the signed base transaction invalid for direct block inclusion.
+        // No unspent claim component may therefore release its anchor merely
+        // because its mempool policy window elapsed.
+        bool all_claims_zero_payment_retirable{false};
         bool all_claims_expired_locally_retired{true};
         bool have_claim{false};
         bool all_stale_depth_known{true};
@@ -945,23 +949,6 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                 const bool typed_terminal =
                     IsShadowPowClaimCurrentBranchTerminal(node.disposition);
                 if (!typed_terminal) all_claims_terminal = false;
-                const bool zero_payment_retirable =
-                    node.provenance ==
-                        ShadowPowClaimRecoveryProvenance::EXPLICIT_AUTHORED &&
-                    node.wallet_authored && node.expected_shape &&
-                    // A schema-authenticated same-anchor family is recovered
-                    // by appending a new sibling. Abandoning any member would
-                    // release the confirmed anchor back to AvailableCoins and
-                    // permit a second root to be authored for that generation.
-                    !node.lineage_metadata_present &&
-                    !(node.exact_authored_carrier_shape &&
-                      node.proof_origin_bound) &&
-                    node.quarantined && !node.in_mempool &&
-                    node.disposition ==
-                        ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED;
-                if (!zero_payment_retirable) {
-                    all_claims_zero_payment_retirable = false;
-                }
                 if (!node.expired_locally_retired) {
                     all_claims_expired_locally_retired = false;
                 }
@@ -2181,12 +2168,12 @@ bool SafeClaimGraphForRecovery(
         ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH) {
         return refuse(
             "claim-expired-locally-retired",
-            "the origin-bound claim is already retired locally without a recovery transaction on this active branch");
+            "the component has an inconsistent deprecated local-retirement classification; reopen and repair its retained claim records before recovery");
     }
     if (component.all_claims_zero_payment_retirable) {
         return refuse(
             "zero-payment-retirement-pending",
-            "the origin-bound claim qualifies for durable local retirement without a recovery transaction; fee-paying recovery is refused while Core retries that zero-payment operation");
+            "the component has an inconsistent deprecated zero-payment-retirement classification; repair its retained claim records before recovery");
     }
     if (!component.anchor_authenticated || component.anchor.IsNull() ||
         component.generation_fingerprint.IsNull()) {

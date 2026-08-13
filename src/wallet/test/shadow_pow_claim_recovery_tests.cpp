@@ -349,6 +349,15 @@ void AddRecoveryTestClaim(CWallet& wallet, const CTransactionRef& claim,
         }));
 }
 
+bool HasRetirementMarker(const CWalletTx& wtx)
+{
+    return wtx.mapValue.count(SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY) != 0 ||
+           wtx.mapValue.count(
+               SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY) != 0 ||
+           wtx.mapValue.count(
+               SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY) != 0;
+}
+
 void SetRecoveryTestClaimLineage(
     CWallet& wallet, const uint256& claim_txid,
     const uint256& family_fingerprint, const uint256& root_txid,
@@ -1954,7 +1963,6 @@ BOOST_FIXTURE_TEST_CASE(
     assert_terminal_schema_root(
         *expired, expired_anchor, expired_root->GetHash(),
         ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED);
-    BOOST_CHECK_EQUAL(expired->RetireExpiredShadowPowClaims(), 0U);
     BOOST_CHECK(WITH_LOCK(expired->cs_wallet,
                           return expired->IsSpent(expired_anchor)));
     assert_terminal_schema_root(
@@ -1991,7 +1999,6 @@ BOOST_FIXTURE_TEST_CASE(
     BOOST_CHECK(implicit_expired_gate.action ==
                 ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR);
     BOOST_CHECK(implicit_expired_gate.MayRefreshSameAnchor());
-    BOOST_CHECK_EQUAL(implicit_expired->RetireExpiredShadowPowClaims(), 0U);
     BOOST_CHECK(WITH_LOCK(implicit_expired->cs_wallet,
                           return implicit_expired->IsSpent(implicit_anchor)));
 
@@ -4900,8 +4907,7 @@ BOOST_AUTO_TEST_CASE(stale_plan_and_unsafe_graph_fail_before_signing)
                          tip->GetBlockHash(), tip->nHeight,
                          tip->GetBlockHash());
     // Canonical QQP2 bytes are unbound and may revalidate on a descendant.
-    // Zero-payment retirement must never release their input.
-    BOOST_CHECK_EQUAL(wallet->RetireExpiredShadowPowClaims(), 0U);
+    // Their peer-retained bytes keep the input reserved.
     BOOST_CHECK(!WITH_LOCK(
         wallet->cs_wallet,
         return wallet->mapWallet.at(claim->GetHash()).isAbandoned()));
@@ -4950,9 +4956,8 @@ BOOST_AUTO_TEST_CASE(stale_plan_and_unsafe_graph_fail_before_signing)
                       "ordinary-conflict");
 }
 
-BOOST_FIXTURE_TEST_CASE(
-    origin_expiry_retires_without_transaction_and_reopens_on_reorg,
-    RecoveryQQP3TestingSetup)
+BOOST_FIXTURE_TEST_CASE(origin_expiry_preserves_block_valid_claim_input,
+                        RecoveryQQP3TestingSetup)
 {
     auto wallet = CreateSyncedWallet(
         *m_node.chain,
@@ -4990,6 +4995,14 @@ BOOST_FIXTURE_TEST_CASE(
         anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
         wallet_script);
     claim_mutable.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const unsigned int script_verify_flags =
+        wallet->GetActiveScriptVerifyFlags();
+    {
+        LOCK(wallet->cs_wallet);
+        std::map<int, bilingual_str> input_errors;
+        BOOST_REQUIRE(wallet->SignTransactionWithScriptVerifyFlags(
+            claim_mutable, input_errors, script_verify_flags));
+    }
     const CTransactionRef claim =
         MakeTransactionRef(std::move(claim_mutable));
     AddRecoveryTestClaim(*wallet, claim, origin_parent->nHeight,
@@ -4999,86 +5012,249 @@ BOOST_FIXTURE_TEST_CASE(
 
     BOOST_CHECK(WITH_LOCK(wallet->cs_wallet,
                           return wallet->IsSpent(anchor)));
-    BOOST_CHECK_EQUAL(wallet->RetireExpiredShadowPowClaims(), 0U);
 
-    CBlock expiry_block;
     for (unsigned int age = 1;
          age <= SHADOW_POW_LATE_ORIGIN_WINDOW + 1; ++age) {
-        expiry_block = CreateAndProcessBlock(
+        CreateAndProcessBlock(
             {}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
         SyncWithValidationInterfaceQueue();
     }
     SyncRecoveryTestWalletTip(*wallet, chainman);
 
-    ShadowPowClaimRecoveryRequest pending_request;
-    pending_request.selectors = {claim->GetHash()};
-    const ShadowPowClaimRecoveryPlan pending_preview =
-        wallet->PlanShadowPowClaimRecovery(pending_request);
-    BOOST_CHECK(pending_preview.actions.empty());
-    BOOST_REQUIRE_EQUAL(pending_preview.refused.size(), 1U);
-    BOOST_CHECK_EQUAL(pending_preview.refused.front().reason_code,
-                      "zero-payment-retirement-pending");
-    BOOST_CHECK_EQUAL(pending_preview.total_fee, 0);
-
-    const size_t transaction_count_before = WITH_LOCK(
-        wallet->cs_wallet, return wallet->mapWallet.size());
-    BOOST_CHECK_EQUAL(wallet->RetireExpiredShadowPowClaims(), 1U);
-    BOOST_CHECK_EQUAL(WITH_LOCK(
-                          wallet->cs_wallet, return wallet->mapWallet.size()),
-                      transaction_count_before);
+    ShadowPowClaimMempoolDisposition disposition{
+        ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR};
+    std::string reject_reason;
+    ShadowProofValidationResult validation;
     {
-        LOCK(wallet->cs_wallet);
-        const CWalletTx& retired = wallet->mapWallet.at(claim->GetHash());
-        BOOST_CHECK(retired.isAbandoned());
-        BOOST_CHECK_EQUAL(
-            retired.mapValue.at(SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY), "1");
-        BOOST_CHECK_EQUAL(
-            retired.mapValue.at(SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY),
-            expiry_block.GetHash().GetHex());
-        BOOST_CHECK(!wallet->IsSpent(anchor));
+        LOCK(::cs_main);
+        validation = CheckShadowPowClaimForMempoolDetailed(
+            *claim, chainman.ActiveChain().Tip(),
+            chainman.ActiveChainstate().CoinsTip(),
+            /*gold_rush_active=*/true, reject_reason, &disposition);
     }
-    BOOST_CHECK_EQUAL(wallet->CountQuarantinedShadowPowClaims(), 0U);
+    BOOST_CHECK(validation == ShadowProofValidationResult::INVALID);
+    BOOST_CHECK(disposition ==
+                ShadowPowClaimMempoolDisposition::ORIGIN_EXPIRED);
+    {
+        LOCK(::cs_main);
+        const MempoolAcceptResult mempool_result =
+            chainman.ProcessTransaction(claim, /*test_accept=*/true);
+        BOOST_CHECK(mempool_result.m_result_type ==
+                    MempoolAcceptResult::ResultType::INVALID);
+        BOOST_CHECK_EQUAL(mempool_result.m_state.GetRejectReason(),
+                          "shadow-proof-origin-expired");
+    }
+    BOOST_CHECK(!m_node.chain->isInMempool(claim->GetHash()));
 
-    const ShadowPowClaimRecoveryInventory retired_inventory =
+    const ShadowPowClaimRecoveryInventory expired_inventory =
         wallet->GetShadowPowClaimRecoveryInventory();
-    const auto& retired_component =
-        FindRecoveryComponent(retired_inventory, anchor);
-    BOOST_CHECK(retired_component.state ==
-                ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH);
-    BOOST_CHECK(retired_component.all_claims_expired_locally_retired);
-    BOOST_CHECK_EQUAL(retired_inventory.retired_claim_objects, 1U);
-    BOOST_CHECK_EQUAL(retired_inventory.retired_components, 1U);
-    BOOST_CHECK_EQUAL(retired_inventory.blocking_components, 0U);
+    const auto& expired_component =
+        FindRecoveryComponent(expired_inventory, anchor);
+    BOOST_CHECK(!expired_component.all_claims_zero_payment_retirable);
+    BOOST_CHECK(!expired_component.all_claims_expired_locally_retired);
+    BOOST_CHECK(expired_component.state ==
+                ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP);
+    BOOST_CHECK_EQUAL(expired_inventory.retired_claim_objects, 0U);
+    BOOST_CHECK_EQUAL(expired_inventory.retired_components, 0U);
 
     ShadowPowClaimRecoveryRequest preview_request;
     preview_request.selectors = {claim->GetHash()};
-    const ShadowPowClaimRecoveryPlan retired_preview =
+    const ShadowPowClaimRecoveryPlan recovery_preview =
         wallet->PlanShadowPowClaimRecovery(preview_request);
-    BOOST_CHECK(retired_preview.actions.empty());
-    BOOST_REQUIRE_EQUAL(retired_preview.refused.size(), 1U);
-    BOOST_CHECK_EQUAL(retired_preview.refused.front().reason_code,
-                      "claim-expired-locally-retired");
-    BOOST_CHECK_EQUAL(retired_preview.total_fee, 0);
+    BOOST_REQUIRE_EQUAL(recovery_preview.actions.size(), 1U);
+    BOOST_CHECK(recovery_preview.refused.empty());
+    BOOST_CHECK(recovery_preview.total_fee > 0);
 
-    CBlockIndex* expiry_index = WITH_LOCK(
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& retained = wallet->mapWallet.at(claim->GetHash());
+        BOOST_CHECK(!retained.isAbandoned());
+        BOOST_CHECK(!HasRetirementMarker(retained));
+        BOOST_CHECK(wallet->IsSpent(anchor));
+    }
+    BOOST_CHECK(wallet->CountQuarantinedShadowPowClaims() > 0);
+
+    // Origin expiry is a mempool/reward-eligibility boundary, not a base
+    // transaction consensus rule. A block producer retaining the signed bytes
+    // can still include them during Gold Rush, so the wallet must not reuse
+    // their confirmed input merely because policy rejects mempool admission.
+    CMutableTransaction block_claim{*claim};
+    CBlock claim_block = CreateBlock(
+        {block_claim}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()),
+        chainman.ActiveChainstate());
+    bool new_block{false};
+    BOOST_REQUIRE(chainman.ProcessNewBlock(
+        std::make_shared<const CBlock>(claim_block),
+        /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+    BOOST_CHECK(new_block);
+    BOOST_CHECK(WITH_LOCK(
         ::cs_main,
-        return chainman.m_blockman.LookupBlockIndex(expiry_block.GetHash()));
-    BOOST_REQUIRE(expiry_index);
-    BlockValidationState state;
-    BOOST_REQUIRE(chainman.ActiveChainstate().InvalidateBlock(
-        state, expiry_index));
+        return chainman.ActiveChain().Tip()->GetBlockHash() ==
+            claim_block.GetHash()));
     SyncWithValidationInterfaceQueue();
     SyncRecoveryTestWalletTip(*wallet, chainman);
 
     {
         LOCK(wallet->cs_wallet);
-        const CWalletTx& reopened = wallet->mapWallet.at(claim->GetHash());
-        BOOST_CHECK(!reopened.isAbandoned());
-        BOOST_CHECK(reopened.mapValue.count(
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY) == 0);
+        BOOST_CHECK(wallet->mapWallet.at(claim->GetHash()).isConfirmed());
         BOOST_CHECK(wallet->IsSpent(anchor));
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(legacy_expired_retirement_reopens_fail_closed,
+                        RecoveryQQP3TestingSetup)
+{
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        anchor, anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.at(0).scriptPubKey);
+    AddRecoveryTestClaim(*wallet, claim, tip->nHeight, tip->GetBlockHash(),
+                         tip->nHeight, tip->GetBlockHash());
+
+    BOOST_REQUIRE(wallet->AddToWallet(
+        claim, TxStateInactive{/*abandoned=*/true},
+        [&](CWalletTx& wtx, bool) {
+            wtx.m_state = TxStateInactive{/*abandoned=*/true};
+            wtx.mapValue[SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY] = "1";
+            wtx.mapValue[SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY] =
+                ToString(tip->nHeight);
+            wtx.mapValue[SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY] =
+                tip->GetBlockHash().GetHex();
+            return true;
+        }));
+    {
+        LOCK(wallet->cs_wallet);
+        CWalletTx& legacy = wallet->mapWallet.at(claim->GetHash());
+        BOOST_CHECK(legacy.isAbandoned());
+        BOOST_CHECK(wallet->IsSpent(anchor));
+
+        // Torn or malformed historical metadata must fail closed too. A
+        // repair transaction clears all three keys atomically; until then,
+        // the presence of any one key keeps peer-retained bytes reserved.
+        const auto complete_metadata = legacy.mapValue;
+        legacy.mapValue.erase(SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY);
+        legacy.mapValue.erase(SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY);
+        BOOST_CHECK(wallet->IsSpent(anchor));
+        legacy.mapValue = complete_metadata;
+        legacy.mapValue[SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY] = "malformed";
+        legacy.mapValue.erase(
+            SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY);
+        legacy.mapValue.erase(SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY);
+        BOOST_CHECK(wallet->IsSpent(anchor));
+        legacy.mapValue = complete_metadata;
+    }
     BOOST_CHECK(wallet->CountQuarantinedShadowPowClaims() > 0);
+    const MockableData legacy_records =
+        GetMockableDatabase(*wallet).m_records;
+
+    auto load_legacy = [&] {
+        auto loaded = std::make_unique<CWallet>(
+            m_node.chain.get(), "",
+            CreateMockableWalletDatabase(legacy_records));
+        BOOST_REQUIRE_EQUAL(loaded->LoadWallet(), DBErrors::LOAD_OK);
+        {
+            LOCK(loaded->cs_wallet);
+            loaded->SetLastBlockProcessed(tip->nHeight,
+                                          tip->GetBlockHash());
+        }
+        return loaded;
+    };
+
+    // A user hold installed on a historical marker-backed reservation must
+    // survive another same-anchor wallet transaction learned before startup
+    // repair. Only an explicit unlock may remove the durable restriction.
+    auto held = load_legacy();
+    {
+        LOCK2(::cs_main, held->cs_wallet);
+        BOOST_REQUIRE(held->CanLockQuarantinedShadowPowClaimAnchor(anchor));
+        std::string lock_error;
+        BOOST_REQUIRE(held->UpdateLockedCoins(
+            {anchor}, /*lock=*/true, /*persistent=*/true, &lock_error));
+        BOOST_CHECK(held->IsLockedCoin(anchor));
+    }
+    CMutableTransaction held_conflict;
+    held_conflict.vin.emplace_back(anchor);
+    held_conflict.vout.emplace_back(
+        anchor_tx->vout.at(0).nValue - 2 * DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.at(0).scriptPubKey);
+    BOOST_REQUIRE(held->AddToWallet(
+        MakeTransactionRef(std::move(held_conflict)), TxStateInactive{}));
+    {
+        LOCK(held->cs_wallet);
+        BOOST_CHECK(held->IsLockedCoin(anchor));
+    }
+    CWallet held_reload(
+        m_node.chain.get(), "", DuplicateMockDatabase(held->GetDatabase()));
+    BOOST_REQUIRE_EQUAL(held_reload.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(held_reload.cs_wallet);
+        BOOST_CHECK(held_reload.IsLockedCoin(anchor));
+        std::string lock_error;
+        BOOST_REQUIRE(held_reload.UpdateLockedCoins(
+            {anchor}, /*lock=*/false, /*persistent=*/true, &lock_error));
+        BOOST_CHECK(!held_reload.IsLockedCoin(anchor));
+    }
+    CWallet held_unlocked_reload(
+        m_node.chain.get(), "",
+        DuplicateMockDatabase(held_reload.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(held_unlocked_reload.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(WITH_LOCK(held_unlocked_reload.cs_wallet,
+                          return !held_unlocked_reload.IsLockedCoin(anchor)));
+
+    auto failed = load_legacy();
+    MockableDatabase& failed_database = GetMockableDatabase(*failed);
+    failed_database.m_fail_write_at = 0;
+    failed->RepairStaleShadowTransactions(/*force=*/true);
+    failed_database.m_fail_write_at.reset();
+    {
+        LOCK(failed->cs_wallet);
+        const CWalletTx& retained = failed->mapWallet.at(claim->GetHash());
+        BOOST_CHECK(retained.isAbandoned());
+        BOOST_CHECK(HasRetirementMarker(retained));
+        BOOST_CHECK(failed->IsSpent(anchor));
+        BOOST_CHECK(!failed->GetLiveUnspentStakeOutpoints().count(anchor));
+    }
+    BOOST_CHECK(failed->IsShadowPowClaimRecoveryDatabaseAmbiguous());
+    BOOST_CHECK(failed->CountQuarantinedShadowPowClaims() > 0);
+
+    auto repaired = load_legacy();
+    repaired->RepairStaleShadowTransactions(/*force=*/true);
+    {
+        LOCK(repaired->cs_wallet);
+        const CWalletTx& reopened = repaired->mapWallet.at(claim->GetHash());
+        BOOST_CHECK(!reopened.isAbandoned());
+        BOOST_CHECK(!HasRetirementMarker(reopened));
+        BOOST_CHECK(repaired->IsQuarantinedShadowPowClaim(
+            claim->GetHash()));
+        BOOST_CHECK(repaired->IsSpent(anchor));
+        BOOST_CHECK(!repaired->GetLiveUnspentStakeOutpoints().count(anchor));
+    }
+
+    CWallet repaired_reload(
+        m_node.chain.get(), "", DuplicateMockDatabase(repaired->GetDatabase()));
+    BOOST_REQUIRE_EQUAL(repaired_reload.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(repaired_reload.cs_wallet);
+        repaired_reload.SetLastBlockProcessed(tip->nHeight,
+                                              tip->GetBlockHash());
+        const CWalletTx& durable =
+            repaired_reload.mapWallet.at(claim->GetHash());
+        BOOST_CHECK(!durable.isAbandoned());
+        BOOST_CHECK(!HasRetirementMarker(durable));
+        BOOST_CHECK(repaired_reload.IsSpent(anchor));
+        BOOST_CHECK(!repaired_reload.GetLiveUnspentStakeOutpoints().count(
+            anchor));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

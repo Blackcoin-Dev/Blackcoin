@@ -119,10 +119,11 @@ conflict, at most one can confirm and charge its ordinary claim fee.
 Same-anchor siblings remain `QQSPROOF` claims, and the candidate does not change
 existing claim reward or reimbursement consensus rules.
 
-Schema-lineage claims, strict locally authored unbound QQP2 singletons, and
-exact locally authored origin-bound QQP3/QQP4 carriers are not retired merely
-because an original policy window expires. Zero-payment retirement remains
-narrow and legacy-only. Separately, explicit,
+No claim input is released merely because its mempool or shadow-reward policy
+window expires: peer-retained signed bytes can remain valid for direct block
+inclusion during Gold Rush. Historical release-candidate retirement markers
+are reopened, quarantined, and cleared atomically unless an active-chain
+conflict conclusively spent the anchor. Separately, explicit,
 default-off fee-paying conflict recovery remains available under the existing
 confirmed fee, txid, and conflict-risk gates, including for a classified
 `unbound_proof_may_revalidate` component. The built-in miner's authenticated

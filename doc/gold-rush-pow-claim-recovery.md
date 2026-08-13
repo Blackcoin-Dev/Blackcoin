@@ -89,13 +89,13 @@ fail closed. A deterministic relay-policy rejection authorizes a
 sibling only when a fresh full mempool test reproduces the exact low-fee
 rejection on the same tip and wallet snapshot.
 
-Zero-payment local retirement remains only for narrow pre-lineage legacy
-records that cannot be authenticated as a refreshable exact carrier.
-Schema-lineage claims, strict locally authored unbound QQP2 singletons, and
-exact locally authored origin-bound QQP3/QQP4 carriers are never retired merely
-because an original policy window expires. A historical retirement marker on
-such a record is reclassified from current chain and wallet facts before the
-anchor can be reused. Fee-paying conflict recovery remains a separate,
+No claim input is released merely because its mempool or shadow-reward
+eligibility window expires. Expired signed claim bytes can still be included
+directly in a block during Gold Rush, so peer-retained bytes remain a live
+base-chain conflict. Historical release-candidate retirement markers are
+fail-closed input holds: wallet repair atomically reopens and quarantines those
+records unless an active-chain conflict conclusively spent the anchor.
+Fee-paying conflict recovery remains a separate,
 explicit, default-off path under exact manual consent or bounded automatic
 standing consent. The existing recovery engine can authorize that path for a
 component it classifies as conflict-resolvable, including
@@ -293,10 +293,9 @@ confirms pays its base-chain fee.
 The wallet releases no reservation merely because a claim left the mempool,
 exceeded one hour of relay residence, or exhausted its original
 origin-plus-64 window. It releases only after an active-chain confirmation
-spends the anchor or after the narrow legacy-only retirement described above.
-If the controlling block is disconnected, the wallet reopens and reclassifies
-the component on the new pinned tip and restores any required quarantine. A
-transaction already seen by peers cannot be withdrawn.
+spends the anchor. If the controlling block is disconnected, the wallet
+reopens and reclassifies the component on the new pinned tip and restores any
+required quarantine. A transaction already seen by peers cannot be withdrawn.
 
 ## Operator checks
 

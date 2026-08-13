@@ -1373,6 +1373,19 @@ BOOST_FIXTURE_TEST_CASE(
             {anchor}, /*lock=*/true, /*persistent=*/true, &lock_error));
     }
 
+    // The hold was validly installed while the claim was quarantined. If the
+    // exact retained bytes later enter the mempool, the quarantine predicate
+    // becomes false but the user's restriction must survive that transition
+    // and any subsequently learned same-anchor spender.
+    BOOST_REQUIRE(wallet->AddToWallet(claim_ref, TxStateInMempool{}));
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->IsLockedCoin(anchor));
+        BOOST_CHECK(!wallet->IsQuarantinedShadowPowClaim(
+            claim_ref->GetHash()));
+        BOOST_CHECK(wallet->IsSpent(anchor));
+    }
+
     // A mixed ordinary wallet spender closes the narrow exception. Unlocking
     // an already installed user lock must nevertheless remain possible after
     // that later reservation appears.
@@ -1385,10 +1398,32 @@ BOOST_FIXTURE_TEST_CASE(
         MakeTransactionRef(std::move(ordinary_spend));
     BOOST_REQUIRE(!TransactionHasShadowProof(*ordinary_ref));
     BOOST_REQUIRE(wallet->AddToWallet(ordinary_ref, TxStateInactive{}));
+
+    CWallet held_reload_wallet(
+        m_node.chain.get(), "", DuplicateMockDatabase(wallet->GetDatabase()));
+    BOOST_REQUIRE_EQUAL(held_reload_wallet.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(held_reload_wallet.cs_wallet);
+        held_reload_wallet.SetLastBlockProcessed(
+            unlocked_inventory.wallet_processed_height,
+            unlocked_inventory.wallet_processed_tip);
+        BOOST_CHECK(held_reload_wallet.IsLockedCoin(anchor));
+    }
     {
         LOCK2(::cs_main, wallet->cs_wallet);
+        // Discovering a later conflict must not silently revoke the explicit
+        // persistent hold. The new ordinary spender closes the narrow lock-add
+        // exception, but only an explicit unlock may remove an existing hold.
+        BOOST_CHECK(wallet->IsLockedCoin(anchor));
         BOOST_CHECK(
             !wallet->CanLockQuarantinedShadowPowClaimAnchor(anchor));
+        const ShadowPowClaimRecoveryInventory held_inventory =
+            wallet->GetShadowPowClaimRecoveryInventoryLocked();
+        const auto held_component = std::find_if(
+            held_inventory.components.begin(), held_inventory.components.end(),
+            [&](const auto& component) { return component.anchor == anchor; });
+        BOOST_REQUIRE(held_component != held_inventory.components.end());
+        BOOST_CHECK(held_component->anchor_user_locked);
         std::string lock_error;
         BOOST_REQUIRE(wallet->UpdateLockedCoins(
             {anchor}, /*lock=*/false, /*persistent=*/true, &lock_error));
@@ -1398,6 +1433,7 @@ BOOST_FIXTURE_TEST_CASE(
     // Historical abandoned or conflicted spends do not reserve the
     // active-chain coin and therefore do not defeat this restriction-only
     // lock exception.  The exact quarantined claim still must be present.
+    BOOST_REQUIRE(wallet->AddToWallet(claim_ref, TxStateInactive{}));
     BOOST_REQUIRE(wallet->AbandonTransaction(ordinary_ref->GetHash()));
     {
         LOCK2(::cs_main, wallet->cs_wallet);

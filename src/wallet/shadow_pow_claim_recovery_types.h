@@ -32,11 +32,11 @@ inline constexpr char SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY[]{"qq_shadow_pow
 // audit provenance and is never used to infer current-branch age.
 inline constexpr char SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY[]{"qq_shadow_pow_branch_quarantine_height"};
 inline constexpr char SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY[]{"qq_shadow_pow_branch_quarantine_tip"};
-// A zero-payment retirement is a reversible, branch-scoped wallet fact. It
-// releases only a locally-authored legacy claim that cannot qualify for the
-// authenticated same-anchor lineage. Recoverable bound/schema claims are
-// never retired. The observation block must remain an ancestor of the active
-// tip; otherwise the wallet reopens and reclassifies the claim.
+// Deprecated release-candidate retirement metadata. Origin expiry removes
+// mempool/reward eligibility but does not make peer-retained claim bytes
+// invalid for direct block inclusion. v30.1.5 therefore treats the presence
+// of any of these keys as a fail-closed input hold, then atomically reopens,
+// quarantines, and clears the historical record during wallet repair.
 inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY[]{"qq_shadow_pow_expired_retired"};
 inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY[]{"qq_shadow_pow_expired_retired_height"};
 inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY[]{"qq_shadow_pow_expired_retired_tip"};

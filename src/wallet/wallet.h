@@ -1141,9 +1141,10 @@ public:
 
     bool IsSpent(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Whether an active-chain-unspent confirmed anchor is reported spent
-     * only because every wallet spender is an exact, durably quarantined
-     * QQSPROOF. Locking such an anchor adds a user restriction; it never
-     * releases or overrides the existing claim reservation. */
+     * only because every wallet spender is an exact retained QQSPROOF with a
+     * durable quarantine or historical retirement-repair reservation.
+     * Locking such an anchor adds a user restriction; it never releases or
+     * overrides the existing claim reservation. */
     bool CanLockQuarantinedShadowPowClaimAnchor(
         const COutPoint& outpoint) const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
@@ -2006,10 +2007,6 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Periodic wallet-scoped automatic execution; never enables the miner. */
     void MaybeAutoResolveShadowPowClaims();
-    /** Durably release only legacy locally-authored claims that are ineligible
-     * for authenticated same-anchor lineage recovery and origin-expired on the
-     * pinned branch. This creates, signs, and broadcasts no transaction. */
-    size_t RetireExpiredShadowPowClaims();
     /** Count quarantined claim objects that currently gate claim creation.
      * This is actionable plus indeterminate objects, not raw wallet history. */
     size_t CountQuarantinedShadowPowClaims() const;

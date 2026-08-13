@@ -5,6 +5,7 @@
 """Generate and verify exact-SHA v30.1.5 candidate metadata."""
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -36,6 +37,12 @@ EXPECTED_CORE_CI_BASE_TREE = "f897d758aee1849f02126f0ee3b7a4be9bd3be8c"
 EXPECTED_BASE_WORKFLOW_BLOB_SHA256 = "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869"
 EXPECTED_SOURCE_WORKFLOW_BLOB_SHA256 = "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869"
 EXPECTED_REQUIRED_CHECKS_APP_ID = 15368
+EXPECTED_MERGE_ACTOR = "Blackcoin-Dev"
+EXPECTED_MERGE_COMMITTER = "web-flow"
+EXPECTED_MERGE_AUTHOR_NAME = "Blackcoin-Dev"
+EXPECTED_MERGE_AUTHOR_EMAIL = "298119138+Blackcoin-Dev@users.noreply.github.com"
+EXPECTED_MERGE_COMMITTER_NAME = "GitHub"
+EXPECTED_MERGE_COMMITTER_EMAIL = "noreply@github.com"
 EXPECTED_REQUIRED_CHECKS = (
     "source identity, workflow syntax, and lint",
     "pinned independent quantum crypto provenance",
@@ -78,6 +85,16 @@ OCI_LAYER_MEDIA_TYPES = {
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def parse_github_timestamp(value, description):
+    require(isinstance(value, str), f"{description} is missing")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise RuntimeError(f"{description} is malformed") from error
+    require(parsed.strftime("%Y-%m-%dT%H:%M:%SZ") == value, f"{description} is not canonical")
+    return parsed
 
 
 def sha256(path):
@@ -231,7 +248,7 @@ def validate_policy(policy_path):
             "event", "pull_request_number", "head_sha", "head_tree", "base_sha", "base_tree", "repository",
             "head_repository", "workflow_path", "workflow_name",
             "base_workflow_blob_sha256", "source_workflow_blob_sha256",
-            "required_checks_app_id", "required_checks",
+            "required_checks_app_id", "required_checks", "authority_state", "merge_commit_sha",
         },
         "Core CI policy",
     )
@@ -264,6 +281,24 @@ def validate_policy(policy_path):
         and core_ci["required_checks_app_id"] == EXPECTED_REQUIRED_CHECKS_APP_ID,
         "Core CI required-check app ID changed",
     )
+    authority_state = core_ci["authority_state"]
+    merge_commit_sha = core_ci["merge_commit_sha"]
+    if authorization["state"] == BLOCKED_AUTHORIZATION_STATE:
+        require(authority_state == "pending_final_pin", "blocked Core CI authority must remain pending")
+        require(merge_commit_sha is None, "blocked Core CI authority cannot pin a merge commit")
+    elif authority_state == "open":
+        require(merge_commit_sha is None, "open Core CI authority cannot pin a merge commit")
+    elif authority_state == "merged":
+        require(
+            isinstance(merge_commit_sha, str) and FULL_SHA_RE.fullmatch(merge_commit_sha),
+            "merged Core CI authority must pin a full merge commit",
+        )
+        require(
+            merge_commit_sha not in (core_ci["base_sha"], core_ci["head_sha"]),
+            "merged Core CI authority must pin a distinct merge commit",
+        )
+    else:
+        raise RuntimeError("authorized Core CI authority state is not supported")
 
     base = policy["base_image"]
     require_exact_keys(
@@ -414,14 +449,16 @@ def validate_core_ci(path, policy):
             "repository", "head_repository", "pull_request_number", "pull_request_head_sha",
             "pull_request_base_sha", "base_tree", "run_id", "run_attempt", "head_sha", "head_tree",
             "status", "conclusion", "workflow_actor", "workflow_triggering_actor",
-            "base_branch", "base_branch_head_sha", "strict_base_fresh",
+            "run_completed_at", "base_branch", "authority_state", "current_main_sha",
+            "current_main_authority_fresh",
             "pull_request_state", "pull_request_draft", "pull_request_mergeable",
-            "pull_request_mergeable_state", "exact_head_run_count",
+            "pull_request_mergeable_state", "pull_request_merged", "pull_request_merged_at",
+            "pull_request_merged_by", "merge_commit", "exact_head_run_count",
             "branch_protection", "required_checks", "thread_sanitizer_artifact",
         },
         "Core CI evidence",
     )
-    require(type(value["schema"]) is int and value["schema"] == 2,
+    require(type(value["schema"]) is int and value["schema"] == 3,
             "Core CI evidence schema is not supported")
     require(value["workflow_path"] == policy["core_ci"]["workflow_path"], "Core CI workflow path changed")
     require(value["workflow_name"] == policy["core_ci"]["workflow_name"], "Core CI workflow name changed")
@@ -470,16 +507,66 @@ def validate_core_ci(path, policy):
     require(value["conclusion"] == "success", "Core CI did not pass")
     require(value["workflow_actor"] == EXPECTED_ACTOR, "Core CI actor changed")
     require(value["workflow_triggering_actor"] == EXPECTED_ACTOR, "Core CI triggering actor changed")
+    run_completed = parse_github_timestamp(value["run_completed_at"], "Core CI completion timestamp")
     require(value["base_branch"] == "main", "Core CI base branch changed")
-    require(value["base_branch_head_sha"] == policy["core_ci"]["base_sha"], "strict Core base is stale")
-    require(value["strict_base_fresh"] is True, "strict Core base freshness is not proven")
-    require(value["pull_request_state"] == "open", "Core pull request is not open")
-    require(value["pull_request_draft"] is False, "Core pull request is draft")
-    require(value["pull_request_mergeable"] is True, "Core pull request is not mergeable")
-    require(
-        value["pull_request_mergeable_state"] == "clean",
-        "Core pull request does not satisfy current protection",
-    )
+    require(value["current_main_authority_fresh"] is True, "current Core main authority is not fresh")
+    authority_state = value["authority_state"]
+    if policy["authorization"]["state"] == READY_AUTHORIZATION_STATE:
+        require(authority_state == policy["core_ci"]["authority_state"], "Core CI authority state changed")
+    else:
+        require(authority_state == "open", "blocked synthetic Core CI evidence must use the open fixture path")
+    if authority_state == "open":
+        require(value["current_main_sha"] == policy["core_ci"]["base_sha"], "strict Core base is stale")
+        require(value["pull_request_state"] == "open", "Core pull request is not open")
+        require(value["pull_request_draft"] is False, "Core pull request is draft")
+        require(value["pull_request_mergeable"] is True, "Core pull request is not mergeable")
+        require(value["pull_request_mergeable_state"] == "clean", "Core pull request does not satisfy current protection")
+        require(value["pull_request_merged"] is False, "open Core pull request unexpectedly merged")
+        require(value["pull_request_merged_at"] is None, "open Core pull request has a merge timestamp")
+        require(value["pull_request_merged_by"] is None, "open Core pull request has a merger")
+        require(value["merge_commit"] is None, "open Core authority contains a merge receipt")
+    elif authority_state == "merged":
+        require(
+            value["current_main_sha"] == policy["core_ci"]["merge_commit_sha"],
+            "current Core main is not the approved merge commit",
+        )
+        require(value["pull_request_state"] == "closed", "merged Core pull request is not closed")
+        require(value["pull_request_draft"] is False, "merged Core pull request was draft")
+        require(value["pull_request_mergeable"] is None, "terminal Core pull request mergeability changed")
+        require(value["pull_request_mergeable_state"] == "unknown", "terminal Core pull request state changed")
+        require(value["pull_request_merged"] is True, "Core pull request is not merged")
+        merged_at = parse_github_timestamp(value["pull_request_merged_at"], "Core PR merge timestamp")
+        require(value["pull_request_merged_by"] == EXPECTED_MERGE_ACTOR, "Core PR merger changed")
+        require(run_completed < merged_at, "Core PR merged before the exact successful run completed")
+        merge_commit = value["merge_commit"]
+        require_exact_keys(
+            merge_commit,
+            {
+                "sha", "tree", "parents", "github_verified", "github_verification_reason",
+                "author_login", "committer_login", "author", "committer",
+            },
+            "Core merge-commit evidence",
+        )
+        require(merge_commit["sha"] == policy["core_ci"]["merge_commit_sha"], "Core merge commit changed")
+        require(merge_commit["tree"] == policy["core_ci"]["head_tree"], "Core merge tree differs from the tested tree")
+        require(
+            merge_commit["parents"] == [policy["core_ci"]["base_sha"], policy["core_ci"]["head_sha"]],
+            "Core merge parent order or identity changed",
+        )
+        require(merge_commit["github_verified"] is True, "Core merge commit is not verified")
+        require(merge_commit["github_verification_reason"] == "valid", "Core merge verification is not valid")
+        require(merge_commit["author_login"] == EXPECTED_MERGE_ACTOR, "Core merge author changed")
+        require(merge_commit["committer_login"] == EXPECTED_MERGE_COMMITTER, "Core merge signer identity changed")
+        require_exact_keys(merge_commit["author"], {"name", "email", "date"}, "Core merge author")
+        require_exact_keys(merge_commit["committer"], {"name", "email", "date"}, "Core merge committer")
+        require(merge_commit["author"]["name"] == EXPECTED_MERGE_AUTHOR_NAME, "Core merge author name changed")
+        require(merge_commit["author"]["email"] == EXPECTED_MERGE_AUTHOR_EMAIL, "Core merge author email changed")
+        require(merge_commit["committer"]["name"] == EXPECTED_MERGE_COMMITTER_NAME, "Core merge committer name changed")
+        require(merge_commit["committer"]["email"] == EXPECTED_MERGE_COMMITTER_EMAIL, "Core merge committer email changed")
+        require(merge_commit["author"]["date"] == value["pull_request_merged_at"], "Core merge author timestamp changed")
+        require(merge_commit["committer"]["date"] == value["pull_request_merged_at"], "Core merge committer timestamp changed")
+    else:
+        raise RuntimeError("Core CI evidence authority state is not supported")
     require(
         type(value["exact_head_run_count"]) is int and value["exact_head_run_count"] == 1,
         "Core CI exact-head pull-request run is not unique",

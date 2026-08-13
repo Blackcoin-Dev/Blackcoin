@@ -37,8 +37,14 @@ Blackcoin-Dev SSH-signed tooling commit and must supply:
   one for the base commit and one for the source commit. Both temporary values
   are `24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869`; and
   status/conclusion `completed`/`success`, uniqueness as the sole
-  `pull_request` workflow run for that exact head, a currently mergeable PR
-  against the exact fresh base, a live `branches/main` receipt proving
+  `pull_request` workflow run for that exact head, and either an open,
+  currently mergeable PR against the exact fresh base or the exact terminal
+  merged state. The merged path requires the policy-pinned merge commit to be
+  the current `main` head and the PR's exact `merge_commit_sha`; a verified
+  GitHub merge authored and merged by `Blackcoin-Dev` and signed by `web-flow`;
+  exactly two parents ordered as pre-merge base then tested head; a merge tree
+  byte-identical to the tested head tree; and a merge timestamp later than the
+  completed run. A live `branches/main` receipt must also prove
   protection is enabled for everyone with the exact sixteen contexts bound to
   GitHub Actions app ID `15368`, and a complete check-run inventory consisting
   of exactly the same sixteen jobs bound to GitHub Actions app ID `15368`, all
@@ -56,8 +62,10 @@ workflow, metadata verifier, assembler, bundle verifier, tests, and this
 document; set `authorization.state` to
 `authorized_exact_signed_source_and_green_ci`; set
 `dispatch_enabled=true` and `temporary_source_pin=false`; and pin the exact
-positive `core_ci_run_id` in both policy and workflow. Any partial update is
-rejected. It must also pin the positive run attempt and the exact sanitizer
+positive `core_ci_run_id` in both policy and workflow. Because PR #49 is now
+merged, the update must also set `core_ci.authority_state=merged` and pin its
+exact merge commit; `pending_final_pin` remains non-dispatchable. Any partial
+update is rejected. It must also pin the positive run attempt and the exact sanitizer
 artifact ID/name/ZIP/report digests; aggregate run success alone is not
 authorization.
 
@@ -69,10 +77,14 @@ rerun cannot consume evidence or binaries from an earlier attempt. The
 authorization evidence records both actors, the source commit and tree, and
 the distinct base/source workflow digests, all sixteen exact protected job
 receipts, and the byte-verified zero-report ThreadSanitizer receipt in Core-CI
-schema `2`. Safe ZIP inspection rejects extra, duplicate, nested, traversing,
+schema `3`. Schema 3 records the conditional open-or-merged authority receipt;
+the merged form includes current main, merger, chronology, ordered parents,
+tested-tree equality, and verified merge-signer identity. Safe ZIP inspection rejects extra, duplicate, nested, traversing,
 encrypted, oversized, and nonregular members. Exact-key validation rejects the
 legacy single-digest field, missing fields, extras, duplicate job IDs,
-non-unique exact-head runs, a stale or currently blocked PR, substituted
+non-unique exact-head runs, a stale or currently blocked open PR, a squash,
+rebase, unrelated-parent, wrong-tree, unsigned, prematurely merged, or
+main-drifted terminal PR, substituted
 live branch protection, substituted check-run apps, and malformed
 boolean-as-integer evidence.
 The workflow records the Core source SHA and the tooling/workflow-definition
@@ -141,7 +153,7 @@ Its exact file set uses prefix
 
 The manifest has schema `2` and classification
 `V30_1_5_CANDIDATE_CANARY_ONLY`. It binds the exact signed source, explicit
-source tree, immutable v30.1.4 ancestor, successful schema-2 Core CI run with
+source tree, immutable v30.1.4 ancestor, successful schema-3 Core CI run with
 independent base/source workflow digests, tooling and workflow SHA,
 workflow run/attempt, toolchain evidence, base manifest/config, binary archive,
 all six binary hashes, OCI archive/manifest/config, and every evidence file.

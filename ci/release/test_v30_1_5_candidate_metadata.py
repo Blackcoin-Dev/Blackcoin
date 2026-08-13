@@ -180,7 +180,7 @@ class V3015CandidateMetadataTest(unittest.TestCase):
         }
         write_json(root / names["source_signature"], signature)
         core_ci = {
-            "schema": 2,
+            "schema": 3,
             "workflow_path": METADATA.EXPECTED_WORKFLOW_PATH,
             "workflow_name": METADATA.EXPECTED_WORKFLOW_NAME,
             "base_workflow_blob_sha256": METADATA.EXPECTED_BASE_WORKFLOW_BLOB_SHA256,
@@ -200,13 +200,19 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             "conclusion": "success",
             "workflow_actor": METADATA.EXPECTED_ACTOR,
             "workflow_triggering_actor": METADATA.EXPECTED_ACTOR,
+            "run_completed_at": "2026-08-13T16:44:16Z",
             "base_branch": "main",
-            "base_branch_head_sha": METADATA.EXPECTED_CORE_CI_BASE,
-            "strict_base_fresh": True,
+            "authority_state": "open",
+            "current_main_sha": METADATA.EXPECTED_CORE_CI_BASE,
+            "current_main_authority_fresh": True,
             "pull_request_state": "open",
             "pull_request_draft": False,
             "pull_request_mergeable": True,
             "pull_request_mergeable_state": "clean",
+            "pull_request_merged": False,
+            "pull_request_merged_at": None,
+            "pull_request_merged_by": None,
+            "merge_commit": None,
             "exact_head_run_count": 1,
             "branch_protection": {
                 "enabled": True,
@@ -408,8 +414,13 @@ class V3015CandidateMetadataTest(unittest.TestCase):
                 policy, names = self.create_fixture(root)
                 path = root / names[kind]
                 text = path.read_text(encoding="utf-8")
+                schema = json.loads(text)["schema"]
                 path.write_text(
-                    text.replace('"schema": 2,', '"schema": 2,\n  "schema": 2,', 1),
+                    text.replace(
+                        f'"schema": {schema},',
+                        f'"schema": {schema},\n  "schema": {schema},',
+                        1,
+                    ),
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(RuntimeError, "duplicate JSON key: schema"):
@@ -531,6 +542,8 @@ class V3015CandidateMetadataTest(unittest.TestCase):
                     "reports_sha256": "b" * 64,
                 },
             }
+            policy["core_ci"]["authority_state"] = "open"
+            policy["core_ci"]["merge_commit_sha"] = None
             path = Path(temporary) / "policy.json"
             write_json(path, policy)
             ready = METADATA.validate_policy(path)
@@ -590,6 +603,8 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             "required_checks_app_id": 1,
             "required_checks_app_id_boolean": True,
             "required_checks": [],
+            "authority_state": "merged",
+            "merge_commit_sha": "e" * 40,
         }
         for field, replacement in substitutions.items():
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:

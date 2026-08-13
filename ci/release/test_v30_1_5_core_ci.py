@@ -78,6 +78,8 @@ class CoreCiReceiptTests(unittest.TestCase):
                 "reports_sha256": reports_sha,
             },
         }
+        policy["core_ci"]["authority_state"] = "open"
+        policy["core_ci"]["merge_commit_sha"] = None
         run = {
             "id": self.RUN_ID,
             "check_suite_id": 246810,
@@ -99,6 +101,7 @@ class CoreCiReceiptTests(unittest.TestCase):
             }],
             "status": "completed",
             "conclusion": "success",
+            "updated_at": "2026-08-13T16:44:16Z",
             "actor": {"login": metadata.EXPECTED_ACTOR},
             "triggering_actor": {"login": metadata.EXPECTED_ACTOR},
         }
@@ -145,6 +148,7 @@ class CoreCiReceiptTests(unittest.TestCase):
             "number": metadata.EXPECTED_CORE_CI_PR,
             "state": "open",
             "draft": False,
+            "merged": False,
             "mergeable": True,
             "mergeable_state": "clean",
             "head": {
@@ -175,10 +179,60 @@ class CoreCiReceiptTests(unittest.TestCase):
         }
         return policy, run, {"total_count": len(jobs), "jobs": jobs}, {
             "total_count": len(artifacts), "artifacts": artifacts,
-        }, main_branch, pull_request, workflow_runs, check_runs, artifact_zip
+        }, main_branch, pull_request, None, workflow_runs, check_runs, artifact_zip
+
+    def merged_fixture(self, directory):
+        values = list(self.fixture(directory))
+        policy, run, _, _, main_branch, pull_request = values[:6]
+        merge_sha = "e" * 40
+        merged_at = "2026-08-13T16:44:18Z"
+        policy["core_ci"]["authority_state"] = "merged"
+        policy["core_ci"]["merge_commit_sha"] = merge_sha
+        run["pull_requests"] = []
+        main_branch["commit"]["sha"] = merge_sha
+        pull_request.update({
+            "state": "closed",
+            "draft": False,
+            "merged": True,
+            "merged_at": merged_at,
+            "closed_at": merged_at,
+            "merged_by": {"login": metadata.EXPECTED_MERGE_ACTOR},
+            "merge_commit_sha": merge_sha,
+            "mergeable": None,
+            "mergeable_state": "unknown",
+        })
+        values[6] = {
+            "sha": merge_sha,
+            "commit": {
+                "tree": {"sha": metadata.EXPECTED_SOURCE_TREE},
+                "author": {
+                    "name": metadata.EXPECTED_MERGE_AUTHOR_NAME,
+                    "email": metadata.EXPECTED_MERGE_AUTHOR_EMAIL,
+                    "date": merged_at,
+                },
+                "committer": {
+                    "name": metadata.EXPECTED_MERGE_COMMITTER_NAME,
+                    "email": metadata.EXPECTED_MERGE_COMMITTER_EMAIL,
+                    "date": merged_at,
+                },
+                "verification": {
+                    "verified": True,
+                    "reason": "valid",
+                    "signature": "signed fixture",
+                    "payload": "exact merge payload fixture",
+                },
+            },
+            "parents": [
+                {"sha": metadata.EXPECTED_CORE_CI_BASE},
+                {"sha": metadata.EXPECTED_SOURCE_COMMIT},
+            ],
+            "author": {"login": metadata.EXPECTED_MERGE_ACTOR},
+            "committer": {"login": metadata.EXPECTED_MERGE_COMMITTER},
+        }
+        return tuple(values)
 
     def validate(
-        self, directory, policy, run, jobs, artifacts, main_branch, pull_request,
+        self, directory, policy, run, jobs, artifacts, main_branch, pull_request, merge_commit,
         workflow_runs, check_runs, artifact_zip,
     ):
         directory = Path(directory)
@@ -187,11 +241,13 @@ class CoreCiReceiptTests(unittest.TestCase):
         checked_policy = metadata.validate_policy(policy_path)
         verifier.validate_run(run, checked_policy)
         verifier.validate_unique_exact_run(workflow_runs, checked_policy)
-        branch_protection = verifier.validate_current_authority(main_branch, pull_request, checked_policy)
+        current_authority = verifier.validate_current_authority(
+            main_branch, pull_request, merge_commit, run, checked_policy,
+        )
         checked_jobs = verifier.validate_jobs(jobs, check_runs, run, checked_policy)
         checked_artifact = verifier.validate_artifact(artifacts, artifact_zip, checked_policy)
         evidence = verifier.build_evidence(
-            checked_policy, checked_jobs, checked_artifact, branch_protection,
+            checked_policy, checked_jobs, checked_artifact, current_authority,
         )
         evidence_path = directory / "core-ci.json"
         verifier.write_canonical_new(evidence_path, evidence)
@@ -208,6 +264,44 @@ class CoreCiReceiptTests(unittest.TestCase):
             )
             self.assertEqual(evidence["thread_sanitizer_artifact"]["report"]["report_count"], 0)
 
+    def test_exact_terminal_merge_authority_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = self.validate(temporary, *self.merged_fixture(temporary))
+            self.assertEqual(evidence["schema"], 3)
+            self.assertEqual(evidence["authority_state"], "merged")
+            self.assertEqual(evidence["current_main_sha"], "e" * 40)
+            self.assertEqual(
+                evidence["merge_commit"]["parents"],
+                [metadata.EXPECTED_CORE_CI_BASE, metadata.EXPECTED_SOURCE_COMMIT],
+            )
+
+    def test_terminal_merge_rejects_nonmerge_drift_identity_and_bad_chronology(self):
+        mutations = {
+            "current-main-drift": lambda values: values[4]["commit"].update({"sha": "0" * 40}),
+            "pr-merge-sha": lambda values: values[5].update({"merge_commit_sha": "0" * 40}),
+            "pr-not-merged": lambda values: values[5].update({"merged": False}),
+            "wrong-merger": lambda values: values[5]["merged_by"].update({"login": "Other"}),
+            "merge-before-run": lambda values: values[1].update({"updated_at": "2026-08-13T16:44:19Z"}),
+            "merge-sha": lambda values: values[6].update({"sha": "0" * 40}),
+            "squash-parent": lambda values: values[6].update({"parents": [values[6]["parents"][1]]}),
+            "unrelated-first-parent": lambda values: values[6]["parents"][0].update({"sha": "0" * 40}),
+            "reversed-parents": lambda values: values[6]["parents"].reverse(),
+            "tree": lambda values: values[6]["commit"]["tree"].update({"sha": "0" * 40}),
+            "unsigned": lambda values: values[6]["commit"]["verification"].update({"verified": False}),
+            "bad-verification": lambda values: values[6]["commit"]["verification"].update({"reason": "unsigned"}),
+            "wrong-author": lambda values: values[6]["author"].update({"login": "Other"}),
+            "wrong-signer": lambda values: values[6]["committer"].update({"login": "Other"}),
+            "wrong-author-email": lambda values: values[6]["commit"]["author"].update({"email": "other@example.com"}),
+            "wrong-merge-time": lambda values: values[6]["commit"]["committer"].update({"date": "2026-08-13T16:44:17Z"}),
+            "nonterminal-run-binding": lambda values: values[1].update({"pull_requests": [{"number": metadata.EXPECTED_CORE_CI_PR}]}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                values = list(self.merged_fixture(temporary))
+                mutate(values)
+                with self.assertRaises(RuntimeError):
+                    self.validate(temporary, *values)
+
     def test_aggregate_success_cannot_hide_missing_extra_duplicate_or_failed_job(self):
         mutations = {
             "missing": lambda jobs: jobs["jobs"].pop(),
@@ -222,12 +316,12 @@ class CoreCiReceiptTests(unittest.TestCase):
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
-                policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+                policy, run, jobs, artifacts, main_branch, pull_request, merge_commit, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
                 mutate(jobs)
                 jobs["total_count"] = len(jobs["jobs"])
                 with self.assertRaises(RuntimeError):
                     self.validate(
-                        temporary, policy, run, jobs, artifacts, main_branch, pull_request,
+                        temporary, policy, run, jobs, artifacts, main_branch, pull_request, merge_commit,
                         workflow_runs, check_runs, artifact_zip,
                     )
 
@@ -249,7 +343,7 @@ class CoreCiReceiptTests(unittest.TestCase):
         for mutate in mutations:
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
                 values = list(self.fixture(temporary))
-                mutate(values[6])
+                mutate(values[7])
                 with self.assertRaises(RuntimeError):
                     self.validate(temporary, *values)
 
@@ -271,7 +365,7 @@ class CoreCiReceiptTests(unittest.TestCase):
         for mutate in mutations:
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
                 values = list(self.fixture(temporary))
-                mutate(values[7])
+                mutate(values[8])
                 with self.assertRaises(RuntimeError):
                     self.validate(temporary, *values)
 
@@ -292,11 +386,11 @@ class CoreCiReceiptTests(unittest.TestCase):
         )
         for mutate in mutations:
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
-                policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+                policy, run, jobs, artifacts, main_branch, pull_request, merge_commit, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
                 mutate(run)
                 with self.assertRaises(RuntimeError):
                     self.validate(
-                        temporary, policy, run, jobs, artifacts, main_branch, pull_request,
+                        temporary, policy, run, jobs, artifacts, main_branch, pull_request, merge_commit,
                         workflow_runs, check_runs, artifact_zip,
                     )
 
@@ -315,11 +409,11 @@ class CoreCiReceiptTests(unittest.TestCase):
         )
         for mutate in mutations:
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
-                policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+                policy, run, jobs, artifacts, main_branch, pull_request, merge_commit, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
                 mutate(artifacts)
                 with self.assertRaises(RuntimeError):
                     self.validate(
-                        temporary, policy, run, jobs, artifacts, main_branch, pull_request,
+                        temporary, policy, run, jobs, artifacts, main_branch, pull_request, merge_commit,
                         workflow_runs, check_runs, artifact_zip,
                     )
 
@@ -339,11 +433,11 @@ class CoreCiReceiptTests(unittest.TestCase):
         )
         for mutate in mutations:
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
-                policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+                policy, run, jobs, artifacts, main_branch, pull_request, merge_commit, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
                 mutate(main_branch, pull_request)
                 with self.assertRaises(RuntimeError):
                     self.validate(
-                        temporary, policy, run, jobs, artifacts, main_branch, pull_request,
+                        temporary, policy, run, jobs, artifacts, main_branch, pull_request, merge_commit,
                         workflow_runs, check_runs, artifact_zip,
                     )
 
@@ -370,12 +464,12 @@ class CoreCiReceiptTests(unittest.TestCase):
 
     def test_duplicate_named_artifact_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
-            policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+            policy, run, jobs, artifacts, main_branch, pull_request, merge_commit, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
             artifacts["artifacts"].append({**artifacts["artifacts"][0], "id": self.ARTIFACT_ID + 1})
             artifacts["total_count"] = 2
             with self.assertRaisesRegex(RuntimeError, "missing or duplicated"):
                 self.validate(
-                    temporary, policy, run, jobs, artifacts, main_branch, pull_request,
+                    temporary, policy, run, jobs, artifacts, main_branch, pull_request, merge_commit,
                     workflow_runs, check_runs, artifact_zip,
                 )
 
@@ -426,7 +520,7 @@ class CoreCiReceiptTests(unittest.TestCase):
 
     def test_blocked_or_partially_ready_policy_cannot_validate_runtime_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
-            policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+            policy, run, jobs, artifacts, main_branch, pull_request, merge_commit, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
             for field in ("core_ci_run_id", "core_ci_run_attempt", "thread_sanitizer_artifact"):
                 changed = copy.deepcopy(policy)
                 changed["authorization"][field] = None

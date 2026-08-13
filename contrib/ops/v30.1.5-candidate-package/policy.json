@@ -23,10 +23,12 @@
     "is_release": true
   },
   "core_ci": {
+    "authority_state": "pending_final_pin",
     "event": "pull_request",
     "pull_request_number": 49,
     "head_sha": "a0695f22740e111d0487a194fb46f1bae05952c5",
     "head_tree": "86df040ae5eb8e819e940dd08364bcc177a72195",
+    "merge_commit_sha": null,
     "base_sha": "19baffef25af36e177db2975780e0641b59753aa",
     "base_tree": "f897d758aee1849f02126f0ee3b7a4be9bd3be8c",
     "repository": "Blackcoin-Dev/Blackcoin",

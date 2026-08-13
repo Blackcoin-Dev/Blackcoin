@@ -188,10 +188,12 @@ assert policy["source"]["tree"] == "86df040ae5eb8e819e940dd08364bcc177a72195"
 assert policy["source"]["immutable_release_ancestor"] == "13262151077cce3f72d07d17dc7725b2b6a8e1ab"
 assert policy["source"]["signing_fingerprint"] == "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70"
 assert policy["core_ci"] == {
+    "authority_state": "pending_final_pin",
     "event": "pull_request",
     "pull_request_number": 49,
     "head_sha": "a0695f22740e111d0487a194fb46f1bae05952c5",
     "head_tree": "86df040ae5eb8e819e940dd08364bcc177a72195",
+    "merge_commit_sha": None,
     "base_sha": "19baffef25af36e177db2975780e0641b59753aa",
     "base_tree": "f897d758aee1849f02126f0ee3b7a4be9bd3be8c",
     "repository": "Blackcoin-Dev/Blackcoin",
@@ -286,10 +288,14 @@ grep -Fq "commits/\$SOURCE_SHA/check-runs?per_page=100" "$WORKFLOW"
 grep -Fq "actions/artifacts/\$TSAN_ARTIFACT_ID/zip" "$WORKFLOW"
 grep -Fq "repos/\$GITHUB_REPOSITORY/branches/main" "$WORKFLOW"
 grep -Fq "repos/\$GITHUB_REPOSITORY/pulls/\$EXPECTED_CORE_CI_PR" "$WORKFLOW"
+grep -Fq "repos/\$GITHUB_REPOSITORY/commits/\$CORE_CI_MERGE_COMMIT_SHA" "$WORKFLOW"
+grep -Fq "CORE_CI_AUTHORITY_STATE=\$(jq -er '.core_ci.authority_state' \"\$POLICY\")" "$WORKFLOW"
+grep -Fq '(.pull_requests | type == "array" and length == 0)' "$WORKFLOW"
 grep -Fq 'python3 ci/release/verify_v30_1_5_core_ci.py' "$WORKFLOW"
 grep -Fq -- '--artifact-zip thread-sanitizer-artifact.zip' "$WORKFLOW"
 grep -Fq -- '--main-branch-json core-main-branch.json' "$WORKFLOW"
 grep -Fq -- '--pull-request-json core-pull-request.json' "$WORKFLOW"
+grep -Fq -- '--merge-commit-json core-merge-commit.json' "$WORKFLOW"
 grep -Fq -- '--workflow-runs-json core-ci-exact-head-runs.json' "$WORKFLOW"
 grep -Fq -- '--check-runs-json core-ci-check-runs.json' "$WORKFLOW"
 grep -Fq "\"\$GITHUB_WORKSPACE/\$POLICY\"" "$WORKFLOW"

@@ -206,9 +206,23 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CORE_CI_RUN_ID" > core-ci-run.json
           CORE_CI_RUN_ATTEMPT=$(jq -er '.authorization.core_ci_run_attempt' "$POLICY")
           TSAN_ARTIFACT_ID=$(jq -er '.authorization.thread_sanitizer_artifact.id' "$POLICY")
+          CORE_CI_AUTHORITY_STATE=$(jq -er '.core_ci.authority_state' "$POLICY")
+          CORE_CI_MERGE_COMMIT_SHA=$(jq -r '.core_ci.merge_commit_sha // empty' "$POLICY")
+          case "$CORE_CI_AUTHORITY_STATE" in
+            open)
+              test -z "$CORE_CI_MERGE_COMMIT_SHA"
+              ;;
+            merged)
+              [[ "$CORE_CI_MERGE_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
           jq -e --arg source "$SOURCE_SHA" --arg tree "$EXPECTED_SOURCE_TREE" \
             --arg base "$EXPECTED_IDENTITY_ANCESTOR" --arg base_tree "$EXPECTED_IDENTITY_ANCESTOR_TREE" \
             --arg repository "$GITHUB_REPOSITORY" --arg event "$EXPECTED_CORE_CI_EVENT" \
+            --arg authority "$CORE_CI_AUTHORITY_STATE" \
             --argjson pr "$EXPECTED_CORE_CI_PR" --argjson run "$CORE_CI_RUN_ID" \
             --argjson attempt "$CORE_CI_RUN_ATTEMPT" '
             .id == $run and .path == ".github/workflows/pr-gate.yml" and
@@ -217,10 +231,17 @@ jobs:
             .head_commit.id == $source and .head_commit.tree_id == $tree and
             .event == $event and .repository.full_name == $repository and
             .head_repository.full_name == $repository and
-            (.pull_requests | type == "array" and length == 1) and
-            .pull_requests[0].number == $pr and
-            .pull_requests[0].head.sha == $source and
-            .pull_requests[0].base.sha == $base and
+            (.updated_at | type == "string") and
+            ((
+              $authority == "open" and
+              (.pull_requests | type == "array" and length == 1) and
+              .pull_requests[0].number == $pr and
+              .pull_requests[0].head.sha == $source and
+              .pull_requests[0].base.sha == $base
+            ) or (
+              $authority == "merged" and
+              (.pull_requests | type == "array" and length == 0)
+            )) and
             .status == "completed" and .conclusion == "success"
           ' core-ci-run.json >/dev/null
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CORE_CI_RUN_ID/attempts/$CORE_CI_RUN_ATTEMPT/jobs?per_page=100" \
@@ -232,15 +253,21 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/check-runs?per_page=100" \
             > core-ci-check-runs.json
           gh api "repos/$GITHUB_REPOSITORY/branches/main" > core-main-branch.json
-          for attempt in $(seq 1 10); do
+          if test "$CORE_CI_AUTHORITY_STATE" = open; then
+            for attempt in $(seq 1 10); do
+              gh api "repos/$GITHUB_REPOSITORY/pulls/$EXPECTED_CORE_CI_PR" > core-pull-request.json
+              if jq -e '.mergeable | type == "boolean"' core-pull-request.json >/dev/null && \
+                 jq -e '.mergeable_state != "unknown"' core-pull-request.json >/dev/null; then
+                break
+              fi
+              test "$attempt" -lt 10
+              sleep 3
+            done
+            printf 'null\n' > core-merge-commit.json
+          else
             gh api "repos/$GITHUB_REPOSITORY/pulls/$EXPECTED_CORE_CI_PR" > core-pull-request.json
-            if jq -e '.mergeable | type == "boolean"' core-pull-request.json >/dev/null && \
-               jq -e '.mergeable_state != "unknown"' core-pull-request.json >/dev/null; then
-              break
-            fi
-            test "$attempt" -lt 10
-            sleep 3
-          done
+            gh api "repos/$GITHUB_REPOSITORY/commits/$CORE_CI_MERGE_COMMIT_SHA" > core-merge-commit.json
+          fi
           gh api -H 'Accept: application/vnd.github+json' \
             "repos/$GITHUB_REPOSITORY/actions/artifacts/$TSAN_ARTIFACT_ID/zip" \
             > thread-sanitizer-artifact.zip
@@ -262,6 +289,7 @@ jobs:
             --artifacts-json core-ci-artifacts.json \
             --main-branch-json core-main-branch.json \
             --pull-request-json core-pull-request.json \
+            --merge-commit-json core-merge-commit.json \
             --workflow-runs-json core-ci-exact-head-runs.json \
             --check-runs-json core-ci-check-runs.json \
             --artifact-zip thread-sanitizer-artifact.zip \

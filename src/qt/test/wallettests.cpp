@@ -1508,6 +1508,40 @@ void TestPowClaimRecoveryManualDialog(
         !page.findChild<QDialog*>(QStringLiteral("powClaimRecoveryDialog")),
         5000);
 
+    uint256 managed_resolution_txid;
+    {
+        LOCK(core_wallet->cs_wallet);
+        for (const auto& [txid, wtx] : core_wallet->mapWallet) {
+            if (wtx.mapValue.count(
+                    wallet::SHADOW_POW_RESOLUTION_SCHEMA_KEY) != 0) {
+                managed_resolution_txid = txid;
+                break;
+            }
+        }
+    }
+    QVERIFY(!managed_resolution_txid.IsNull());
+    const auto revocation =
+        core_wallet->RevokeManagedShadowPowResolutionRelayAuthority(
+            managed_resolution_txid);
+    QVERIFY(revocation.success);
+    const auto revoked_interface_review =
+        wallet_interface.getPowClaimRecoveryReview(interface_preview);
+    QVERIFY(std::any_of(
+        revoked_interface_review.plan.actions.begin(),
+        revoked_interface_review.plan.actions.end(), [](const auto& action) {
+            return action.relay_revoked && !action.relay_authorized;
+        }));
+    QVERIFY(std::any_of(
+        revoked_interface_review.components.begin(),
+        revoked_interface_review.components.end(), [](const auto& component) {
+            return std::any_of(
+                component.nodes.begin(), component.nodes.end(),
+                [](const auto& graph_node) {
+                    return graph_node.resolution_relay_revoked &&
+                           !graph_node.resolution_relay_authorized;
+                });
+        }));
+
     // Inspection preserves a staking-only scope and never grants signing.
     wallet_model.setWalletUnlockStakingOnly(true);
     QTest::mouseClick(review, Qt::LeftButton);
@@ -1517,9 +1551,13 @@ void TestPowClaimRecoveryManualDialog(
     dialog = page.findChild<QDialog*>(QStringLiteral("powClaimRecoveryDialog"));
     result = dialog->findChild<QLabel*>(QStringLiteral("powClaimRecoveryResult"));
     wait = dialog->findChild<QPushButton*>(QStringLiteral("powClaimRecoveryWait"));
+    table = dialog->findChild<QTableWidget*>(QStringLiteral("powClaimRecoveryComponents"));
     QTRY_VERIFY_WITH_TIMEOUT(
         result->text().contains(QStringLiteral("Read-only preview complete")),
         10000);
+    QTRY_COMPARE_WITH_TIMEOUT(table->rowCount(), 1, 10000);
+    QVERIFY(table->item(0, 6)->text().contains(
+        QStringLiteral("local relay revoked")));
     QVERIFY(wallet_model.getWalletUnlockStakingOnly());
     QTest::mouseClick(wait, Qt::LeftButton);
     QTRY_VERIFY_WITH_TIMEOUT(

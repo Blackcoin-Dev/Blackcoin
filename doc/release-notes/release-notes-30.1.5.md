@@ -116,6 +116,18 @@ For legacy label migration, current labels take precedence over older labels;
 multiple different direct addresses at the same highest precedence fail
 closed as ambiguous.
 
+`revokeshadowpowclaimresolution` provides a separate, restriction-only
+lifecycle for exact managed resolution bytes. With explicit acknowledgement
+that signed copies may exist elsewhere, it durably cancels this wallet's
+future scheduler and relay authority without requiring an unlock. It does not
+delete or abandon the transaction, remove mempool or peer copies, release or
+unlock the shared anchor, enable ordinary coin selection, or enable mining.
+The tombstone survives restart. Only a fresh exact-plan commit under a normal
+wallet unlock can clear it; an older plan, a persisted retry, or a generic
+`sendrawtransaction` callback cannot. An in-flight wallet broadcast is refused
+without mutation, and an indeterminate database result closes recovery until
+wallet reload.
+
 GUI mining and recovery prompts distinguish the normal authenticated
 same-anchor path from optional fee-paying conflict recovery. A coherent safe
 family waits while a member is live, relays an eligible absent member, or is

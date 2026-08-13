@@ -177,6 +177,20 @@ database outcome disables recovery until wallet reload. Miner disable/start and
 recovery mutation are serialized per wallet so recovery cannot silently
 re-enable a miner or acquire authority after an earlier disable.
 
+The candidate also separates signed bytes from continuing local relay
+authority. `revokeshadowpowclaimresolution` requires an exact authenticated
+managed-resolution txid and an explicit acknowledgement that disclosed bytes
+may still confirm. It needs no wallet unlock and durably prevents scheduler,
+ordinary wallet-relay, and generic raw-submission callbacks from granting or
+using future local retry authority. It does not delete or abandon the
+transaction, remove mempool or peer copies, release the shared anchor, enable
+normal coin selection, or enable mining. The tombstone survives restart and
+can be cleared only by a fresh exact-plan commit under normal wallet unlock;
+pre-revocation plans and persisted retry authority fail closed. An in-flight
+local wallet broadcast is refused without mutation, and an indeterminate
+database commit closes recovery until reload. See the recovery lifecycle
+document for the complete result fields and operator sequence.
+
 Either the original claim or the resolution may confirm. Only the confirming
 transaction pays a fee; a confirmed resolution fee is not shadow-reimbursed.
 This managed-resolution rule is separate from same-anchor QQSPROOF continuation,

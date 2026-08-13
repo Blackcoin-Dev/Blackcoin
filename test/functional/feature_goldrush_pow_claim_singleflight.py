@@ -236,6 +236,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             "lineage_ordinal",
             "resolution_metadata_valid",
             "resolution_relay_authorized",
+            "resolution_relay_revoked",
         )
         components = []
         for component in info["component_details"]:
@@ -1183,9 +1184,102 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(second_signed["current_plan"]["plan_reusable"], True)
         second_resolution_txid = second_signed["actions"][0]["resolution_txid"]
         assert second_resolution_txid not in node.getrawmempool()
+
+        self.log.info("A signed draft can be durably cancelled while locked and stays cancelled across restart")
+        manual_revoke_passphrase = "manual-recovery-revocation-passphrase"
+        manual.encryptwallet(manual_revoke_passphrase)
+        assert_equal(manual.getwalletinfo()["unlocked_until"], 0)
+        assert_raises_rpc_error(
+            -8,
+            "acknowledge_signed_bytes_may_exist_elsewhere=true is required",
+            manual.revokeshadowpowclaimresolution,
+            second_resolution_txid,
+            False,
+        )
+        pre_revocation_plan_id = second_signed["current_plan"]["plan_id"]
+        revoked_draft = manual.revokeshadowpowclaimresolution(
+            second_resolution_txid,
+            True,
+        )
+        assert_equal(revoked_draft["status"], "success")
+        assert_equal(revoked_draft["success"], True)
+        assert_equal(revoked_draft["resolution_txid"], second_resolution_txid)
+        assert_equal(revoked_draft["relay_authority_was_active"], False)
+        assert_equal(revoked_draft["relay_authority_revoked"], True)
+        assert_equal(revoked_draft["locally_cancelled"], True)
+        assert_equal(revoked_draft["durable_state_changed"], True)
+        assert_equal(revoked_draft["durable_state_ambiguous"], False)
+        assert_equal(revoked_draft["in_mempool"], False)
+        assert_equal(revoked_draft["broadcast_in_flight"], False)
+        assert_equal(revoked_draft["may_still_confirm"], True)
+        assert_equal(revoked_draft["anchor_reserved"], True)
+        assert_equal(revoked_draft["normal_coin_selection_enabled"], False)
+        assert_equal(revoked_draft["mining_gate_action"], "unsafe")
+        assert second_resolution_txid not in node.getrawmempool()
+
+        # blackcoin-cli must JSON-convert the mandatory acknowledgement in
+        # both positional and named forms. Repeating this restriction-only
+        # operation is intentionally idempotent.
+        manual_cli = node.cli(f"-rpcwallet={quote(MANUAL_WALLET)}")
+        revoked_cli_positional = manual_cli.revokeshadowpowclaimresolution(
+            second_resolution_txid,
+            True,
+        )
+        assert_equal(revoked_cli_positional["status"], "already_revoked")
+        assert_equal(revoked_cli_positional["relay_authority_revoked"], True)
+        revoked_cli_named = manual_cli.revokeshadowpowclaimresolution(
+            resolution_txid=second_resolution_txid,
+            acknowledge_signed_bytes_may_exist_elsewhere=True,
+        )
+        assert_equal(revoked_cli_named["status"], "already_revoked")
+        assert_equal(revoked_cli_named["locally_cancelled"], True)
+
+        self.restart_node(
+            0,
+            extra_args=[*self.base_args, f"-mocktime={self.mock_time}"],
+        )
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        manual = self._load_wallet(MANUAL_WALLET)
+        assert second_resolution_txid not in node.getrawmempool()
+        restarted_cancelled = manual.getpowclaimrecoveryinfo(True)
+        restarted_cancelled_node = next(
+            graph_node
+            for component in restarted_cancelled["component_details"]
+            for graph_node in component["nodes"]
+            if graph_node["txid"] == second_resolution_txid
+        )
+        assert_equal(
+            restarted_cancelled_node["resolution_relay_authorized"], False
+        )
+        assert_equal(
+            restarted_cancelled_node["resolution_relay_revoked"], True
+        )
+        node.mockscheduler(61)
+        assert second_resolution_txid not in node.getrawmempool()
+        manual.walletpassphrase(manual_revoke_passphrase, 600, False)
+
+        # Revocation changed the wallet generation and component fingerprint.
+        # Reauthorization therefore consumes a fresh exact plan, never the
+        # plan that described the pre-revocation draft.
+        assert_raises_rpc_error(
+            -26,
+            "stale",
+            manual.resolveallshadowpowclaims,
+            {
+                "action": "commit_and_broadcast",
+                "expected_plan_id": pre_revocation_plan_id,
+                "acknowledge_fee_and_conflict_risk": True,
+            },
+        )
+        second_reauthorization_preview = manual.resolveallshadowpowclaims()
+        assert_equal(
+            second_reauthorization_preview["actions"][0]["relay_revoked"],
+            True,
+        )
         second_committed = manual.resolveallshadowpowclaims({
             "action": "commit_and_broadcast",
-            "expected_plan_id": second_signed["current_plan"]["plan_id"],
+            "expected_plan_id": second_reauthorization_preview["plan_id"],
             "acknowledge_fee_and_conflict_risk": True,
         })
         assert_equal(second_committed["success"], True)
@@ -1193,6 +1287,31 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(second_committed["relay_authority_granted"], 1)
         assert_equal(second_committed["broadcast"] + second_committed["already_in_mempool"], 1)
         assert second_resolution_txid in node.getrawmempool()
+
+        self.log.info("Revocation reports but cannot recall exact bytes already in the mempool")
+        revoked_live = manual.revokeshadowpowclaimresolution(
+            second_resolution_txid,
+            True,
+        )
+        assert_equal(revoked_live["success"], True)
+        assert_equal(revoked_live["relay_authority_was_active"], True)
+        assert_equal(revoked_live["relay_authority_revoked"], True)
+        assert_equal(revoked_live["locally_cancelled"], True)
+        assert_equal(revoked_live["in_mempool"], True)
+        assert_equal(revoked_live["broadcast_in_flight"], False)
+        assert_equal(revoked_live["may_still_confirm"], True)
+        assert_equal(revoked_live["anchor_reserved"], True)
+        assert_equal(revoked_live["normal_coin_selection_enabled"], False)
+        assert second_resolution_txid in node.getrawmempool()
+        live_cancelled_info = manual.getpowclaimrecoveryinfo(True)
+        live_cancelled_node = next(
+            graph_node
+            for component in live_cancelled_info["component_details"]
+            for graph_node in component["nodes"]
+            if graph_node["txid"] == second_resolution_txid
+        )
+        assert_equal(live_cancelled_node["resolution_relay_authorized"], False)
+        assert_equal(live_cancelled_node["resolution_relay_revoked"], True)
         resolution_block = self.generateblock(
             node,
             output=funding_address,
@@ -1374,9 +1493,24 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(retained_resolution["kind"], "managed_resolution")
         assert_equal(retained_resolution["resolution_relay_authorized"], True)
+        assert_equal(retained_resolution["resolution_relay_revoked"], False)
         assert_equal(retained["pending_manual_resolutions"], 1)
 
-        self.log.info("Restart retries the identical commit-authorized resolution bytes")
+        self.log.info("An authorized absent resolution can be cancelled before restart retry")
+        revoked_absent = fault.revokeshadowpowclaimresolution(
+            failed_resolution_txid,
+            True,
+        )
+        assert_equal(revoked_absent["success"], True)
+        assert_equal(revoked_absent["relay_authority_was_active"], True)
+        assert_equal(revoked_absent["relay_authority_revoked"], True)
+        assert_equal(revoked_absent["locally_cancelled"], True)
+        assert_equal(revoked_absent["in_mempool"], False)
+        assert_equal(revoked_absent["may_still_confirm"], True)
+        assert_equal(revoked_absent["anchor_reserved"], True)
+        assert failed_resolution_txid not in node.getrawmempool()
+
+        self.log.info("Restart preserves cancellation until a fresh exact plan reauthorizes the bytes")
         self.restart_node(0, extra_args=[*self.base_args, f"-mocktime={self.mock_time}"])
         node = self.nodes[0]
         node.setmocktime(self.mock_time)
@@ -1390,9 +1524,26 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             if graph_node["txid"] == failed_resolution_txid
         )
         assert_equal(restarted_resolution["kind"], "managed_resolution")
-        assert_equal(restarted_resolution["resolution_relay_authorized"], True)
-        if failed_resolution_txid not in node.getrawmempool():
-            node.mockscheduler(61)
+        assert_equal(restarted_resolution["resolution_relay_authorized"], False)
+        assert_equal(restarted_resolution["resolution_relay_revoked"], True)
+        node.mockscheduler(61)
+        assert failed_resolution_txid not in node.getrawmempool()
+        reauthorize_absent_preview = fault.resolveallshadowpowclaims()
+        assert_equal(
+            reauthorize_absent_preview["actions"][0]["resolution_txid"],
+            failed_resolution_txid,
+        )
+        assert_equal(
+            reauthorize_absent_preview["actions"][0]["relay_revoked"], True
+        )
+        reauthorized_absent = fault.resolveallshadowpowclaims({
+            "action": "commit_and_broadcast",
+            "expected_plan_id": reauthorize_absent_preview["plan_id"],
+            "acknowledge_fee_and_conflict_risk": True,
+        })
+        assert_equal(reauthorized_absent["success"], True)
+        assert_equal(reauthorized_absent["durable_state_changed"], True)
+        assert_equal(reauthorized_absent["relay_authority_granted"], 1)
         self.wait_until(
             lambda: failed_resolution_txid in node.getrawmempool(), timeout=30
         )
@@ -2568,6 +2719,10 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             Decimal("0"),
         )
 
+        # The manual wallet was deliberately encrypted to prove revocation
+        # needs no signing authority. Rescan itself still requires the normal
+        # encrypted-wallet unlock expected by the existing test matrix.
+        manual.walletpassphrase(manual_revoke_passphrase, 600, False)
         for wallet in (manual, policy, fault, boundary, cross_boundary):
             wallet.rescanblockchain(0)
         node.syncwithvalidationinterfacequeue()

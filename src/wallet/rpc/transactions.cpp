@@ -486,6 +486,7 @@ static std::vector<RPCResult> TransactionDescriptionString()
            {RPCResult::Type::STR, "qq_shadow_pow_resolution_created_height", /*optional=*/true, "Active-chain height at which exact managed resolution bytes were persisted."},
            {RPCResult::Type::STR, "qq_shadow_pow_resolution_created_time", /*optional=*/true, "Rollback-resistant wallet action time used for persisted recovery budgets."},
            {RPCResult::Type::STR, "qq_shadow_pow_resolution_relay_authorized", /*optional=*/true, "Set to \"1\" only after explicit commit or bounded automatic policy durably authorizes relay of the exact managed bytes."},
+           {RPCResult::Type::STR, "qq_shadow_pow_resolution_relay_revoked", /*optional=*/true, "Set to \"1\" when local scheduler/relay authority for exact managed resolution bytes was durably revoked without abandoning the transaction or releasing its anchor."},
            {RPCResult::Type::STR, "qq_shadow_pow_legacy_cleanup_quarantine", /*optional=*/true, "Set to \"1\" when a legacy Gold Rush PoW cleanup is retained for its conflict reservation but will never be automatically rebroadcast."},
            {RPCResult::Type::STR, "qq_synthetic_goldrush_payout", /*optional=*/true, "Set to \"1\" for a wallet-recognized synthetic Gold Rush payout transaction."},
            {RPCResult::Type::STR, "qq_synthetic_goldrush_payout_stale", /*optional=*/true, "Set to \"1\" when the stored synthetic payout is not authenticated by its active block's current claim markers."},

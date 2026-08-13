@@ -10,6 +10,7 @@
 #include <script/solver.h>
 #include <shadow.h>
 #include <test/util/setup_common.h>
+#include <txmempool.h>
 #include <util/check.h>
 #include <util/string.h>
 #include <util/time.h>
@@ -4811,6 +4812,458 @@ BOOST_AUTO_TEST_CASE(sign_only_persists_exact_uncommitted_bytes_and_reuses_them)
     BOOST_REQUIRE_MESSAGE(retried.success, retried.error);
     BOOST_CHECK_EQUAL(retried.signed_and_persisted, 0U);
     BOOST_CHECK_EQUAL(retried.broadcast + retried.already_in_mempool, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(managed_resolution_relay_revocation_is_durable_restriction_only)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const CTransactionRef anchor_tx = m_coinbase_txns.at(0);
+    const COutPoint anchor{anchor_tx->GetHash(), 0};
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        anchor, anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.at(0).scriptPubKey);
+    AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                         tip->GetBlockHash(), tip->nHeight,
+                         tip->GetBlockHash());
+
+    ShadowPowClaimRecoveryRequest request;
+    request.selectors = {claim->GetHash()};
+    const ShadowPowClaimRecoveryPlan initial_preview =
+        wallet->PlanShadowPowClaimRecovery(request);
+    BOOST_REQUIRE_EQUAL(initial_preview.actions.size(), 1U);
+    ShadowPowClaimRecoveryRequest sign = request;
+    sign.mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
+    sign.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+    sign.acknowledge_fee_and_conflict_risk = true;
+    sign.expected_plan_id = initial_preview.plan_id;
+    const ShadowPowClaimRecoveryResult signed_result =
+        wallet->ResolveShadowPowClaims(sign);
+    BOOST_REQUIRE_MESSAGE(signed_result.success, signed_result.error);
+    BOOST_REQUIRE_EQUAL(signed_result.plan.actions.size(), 1U);
+    const CTransactionRef exact =
+        signed_result.plan.actions.front().transaction;
+    BOOST_REQUIRE(exact);
+    const uint256 resolution_txid = exact->GetHash();
+
+    const MockableData signed_records =
+        GetMockableDatabase(*wallet).m_records;
+    auto load = [&](const MockableData& records) {
+        auto loaded = std::make_unique<CWallet>(
+            m_node.chain.get(), "", CreateMockableWalletDatabase(records));
+        BOOST_REQUIRE_EQUAL(loaded->LoadWallet(), DBErrors::LOAD_OK);
+        {
+            LOCK(loaded->cs_wallet);
+            loaded->SetLastBlockProcessed(tip->nHeight,
+                                          tip->GetBlockHash());
+        }
+        return loaded;
+    };
+
+    // SIGN_ONLY survives restart as a non-authorized draft. Revocation is
+    // valid while staking-only/otherwise non-signing and changes neither the
+    // exact bytes nor the shared anchor reservation.
+    auto restarted_draft = load(signed_records);
+    const ShadowPowClaimRecoveryPlan pre_revocation_plan =
+        restarted_draft->PlanShadowPowClaimRecovery(request);
+    BOOST_REQUIRE_EQUAL(pre_revocation_plan.actions.size(), 1U);
+    BOOST_CHECK(!pre_revocation_plan.actions.front().relay_authorized);
+    BOOST_CHECK(!pre_revocation_plan.actions.front().relay_revoked);
+
+    const auto missing =
+        restarted_draft->RevokeManagedShadowPowResolutionRelayAuthority(
+            uint256::ONE);
+    BOOST_CHECK(!missing.success);
+    BOOST_CHECK(missing.status ==
+                ShadowPowClaimResolutionRevocationStatus::NOT_FOUND);
+    const auto nonmanaged =
+        restarted_draft->RevokeManagedShadowPowResolutionRelayAuthority(
+            claim->GetHash());
+    BOOST_CHECK(!nonmanaged.success);
+    BOOST_CHECK(nonmanaged.status ==
+                ShadowPowClaimResolutionRevocationStatus::NOT_MANAGED);
+
+    auto malformed = load(signed_records);
+    {
+        LOCK(malformed->cs_wallet);
+        malformed->mapWallet.at(resolution_txid).mapValue[
+            SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY] = "invalid";
+    }
+    const auto malformed_result =
+        malformed->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_CHECK(!malformed_result.success);
+    BOOST_CHECK(malformed_result.status ==
+                ShadowPowClaimResolutionRevocationStatus::INVALID_METADATA);
+
+    auto unreserved = load(signed_records);
+    {
+        LOCK(unreserved->cs_wallet);
+        unreserved->mapWallet.at(claim->GetHash()).m_state =
+            TxStateInactive{/*abandoned=*/true};
+        unreserved->mapWallet.at(resolution_txid).m_state =
+            TxStateInactive{/*abandoned=*/true};
+    }
+    const auto unreserved_result =
+        unreserved->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_CHECK(!unreserved_result.success);
+    BOOST_CHECK(unreserved_result.status ==
+                ShadowPowClaimResolutionRevocationStatus::ANCHOR_NOT_RESERVED);
+    BOOST_CHECK_EQUAL(unreserved_result.anchor_reserved.value(), false);
+    BOOST_CHECK_EQUAL(
+        unreserved_result.normal_coin_selection_enabled.value(), true);
+
+    {
+        LOCK(restarted_draft->cs_wallet);
+        restarted_draft->m_wallet_unlock_staking_only = true;
+    }
+    const ShadowPowClaimResolutionRevocationResult revoked_draft =
+        restarted_draft->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_REQUIRE_MESSAGE(revoked_draft.success, revoked_draft.detail);
+    BOOST_CHECK(revoked_draft.status ==
+                ShadowPowClaimResolutionRevocationStatus::SUCCESS);
+    BOOST_CHECK_EQUAL(revoked_draft.durable_state_changed.value(), true);
+    BOOST_CHECK_EQUAL(
+        revoked_draft.relay_authority_was_active.value(), false);
+    BOOST_CHECK_EQUAL(revoked_draft.relay_authority_revoked.value(), true);
+    BOOST_CHECK_EQUAL(revoked_draft.locally_cancelled.value(), true);
+    BOOST_CHECK_EQUAL(revoked_draft.in_mempool.value(), false);
+    BOOST_CHECK_EQUAL(revoked_draft.broadcast_in_flight.value(), false);
+    BOOST_CHECK_EQUAL(revoked_draft.may_still_confirm.value(), true);
+    BOOST_CHECK(revoked_draft.anchor == anchor);
+    BOOST_CHECK_EQUAL(revoked_draft.anchor_reserved.value(), true);
+    BOOST_CHECK_EQUAL(
+        revoked_draft.normal_coin_selection_enabled.value(), false);
+    {
+        LOCK(restarted_draft->cs_wallet);
+        restarted_draft->m_wallet_unlock_staking_only = false;
+        const CWalletTx& stored =
+            restarted_draft->mapWallet.at(resolution_txid);
+        BOOST_CHECK(stored.tx->GetWitnessHash() == exact->GetWitnessHash());
+        BOOST_CHECK_EQUAL(stored.mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY),
+                          "0");
+        BOOST_CHECK_EQUAL(stored.mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY),
+                          "1");
+        BOOST_CHECK(restarted_draft->IsSpent(anchor));
+    }
+
+    // A chainless/offline wallet can still narrow its own durable relay
+    // authority. It must omit observations that require node chain/mempool
+    // state instead of dereferencing a missing interface or reporting a
+    // fabricated default.
+    auto chainless = std::make_unique<CWallet>(
+        /*chain=*/nullptr, "", CreateMockableWalletDatabase(signed_records));
+    BOOST_REQUIRE_EQUAL(chainless->LoadWallet(), DBErrors::LOAD_OK);
+    const ShadowPowClaimResolutionRevocationResult chainless_revoked =
+        chainless->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_REQUIRE_MESSAGE(chainless_revoked.success,
+                          chainless_revoked.detail);
+    BOOST_CHECK(chainless_revoked.status ==
+                ShadowPowClaimResolutionRevocationStatus::SUCCESS);
+    BOOST_CHECK_EQUAL(chainless_revoked.relay_authority_revoked.value(), true);
+    BOOST_CHECK_EQUAL(chainless_revoked.anchor_reserved.value(), true);
+    BOOST_CHECK(!chainless_revoked.in_mempool.has_value());
+    BOOST_CHECK(!chainless_revoked.mining_gate_available);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        chainless->cs_wallet,
+        return chainless->mapWallet.at(resolution_txid).mapValue.at(
+            SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY)), "1");
+
+    // The tombstone is restart durable, remains authenticated inventory, and
+    // blocks both scheduler retry and generic local-submit promotion.
+    auto cancelled = load(GetMockableDatabase(*restarted_draft).m_records);
+    const ShadowPowClaimRecoveryInventory cancelled_inventory =
+        cancelled->GetShadowPowClaimRecoveryInventory();
+    const ShadowPowClaimRecoveryComponent& cancelled_component =
+        FindRecoveryComponent(cancelled_inventory, anchor);
+    const auto cancelled_node = std::find_if(
+        cancelled_component.nodes.begin(), cancelled_component.nodes.end(),
+        [&](const ShadowPowClaimRecoveryNode& node) {
+            return node.txid == resolution_txid;
+        });
+    BOOST_REQUIRE(cancelled_node != cancelled_component.nodes.end());
+    BOOST_CHECK(cancelled_node->resolution_metadata_valid);
+    BOOST_CHECK(!cancelled_node->resolution_relay_authorized);
+    BOOST_CHECK(cancelled_node->resolution_relay_revoked);
+    cancelled->SetBroadcastTransactions(/*broadcast=*/true);
+    cancelled->MaybeAutoResolveShadowPowClaims();
+    BOOST_CHECK(!m_node.chain->isInMempool(resolution_txid));
+    cancelled->transactionSubmittedByRpc(exact);
+    {
+        LOCK(cancelled->cs_wallet);
+        BOOST_CHECK_EQUAL(cancelled->mapWallet.at(resolution_txid).mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY),
+                          "0");
+        BOOST_CHECK_EQUAL(cancelled->mapWallet.at(resolution_txid).mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY),
+                          "1");
+    }
+    std::string relay_error;
+    BOOST_CHECK(!cancelled->SubmitTxMemoryPoolAndRelay(
+        resolution_txid, relay_error, /*relay=*/true));
+    BOOST_CHECK_EQUAL(relay_error, "recovery-relay-authority-revoked");
+
+    // Revocation consumes the prior wallet snapshot. Reauthorization with
+    // that old exact plan fails closed; a fresh plan plus explicit manual
+    // consent clears both flags atomically. Wallet broadcasting is disabled
+    // so this test can inspect authorized-but-absent bytes deterministically.
+    ShadowPowClaimRecoveryRequest stale_commit = request;
+    stale_commit.mode =
+        ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+    stale_commit.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
+    stale_commit.acknowledge_fee_and_conflict_risk = true;
+    stale_commit.expected_plan_id = pre_revocation_plan.plan_id;
+    const ShadowPowClaimRecoveryResult stale =
+        cancelled->ResolveShadowPowClaims(stale_commit);
+    BOOST_CHECK(!stale.success);
+    BOOST_CHECK(stale.stale_plan);
+    {
+        LOCK(cancelled->cs_wallet);
+        BOOST_CHECK_EQUAL(cancelled->mapWallet.at(resolution_txid).mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY),
+                          "1");
+    }
+
+    const ShadowPowClaimRecoveryPlan fresh =
+        cancelled->PlanShadowPowClaimRecovery(request);
+    BOOST_REQUIRE_EQUAL(fresh.actions.size(), 1U);
+    BOOST_CHECK(fresh.actions.front().relay_revoked);
+    ShadowPowClaimRecoveryRequest reauthorize = stale_commit;
+    reauthorize.expected_plan_id = fresh.plan_id;
+    cancelled->SetBroadcastTransactions(/*broadcast=*/false);
+    const ShadowPowClaimRecoveryResult reauthorized =
+        cancelled->ResolveShadowPowClaims(reauthorize);
+    BOOST_CHECK(!reauthorized.success);
+    BOOST_CHECK(reauthorized.durable_state_changed);
+    BOOST_CHECK_EQUAL(reauthorized.relay_authority_granted, 1U);
+    {
+        LOCK(cancelled->cs_wallet);
+        BOOST_CHECK_EQUAL(cancelled->mapWallet.at(resolution_txid).mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY),
+                          "1");
+        BOOST_CHECK_EQUAL(cancelled->mapWallet.at(resolution_txid).mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY),
+                          "0");
+        BOOST_CHECK(cancelled->IsSpent(anchor));
+    }
+
+    // Revocation cannot remove bytes already in the local mempool. Its
+    // receipt says so, but still cancels every later wallet-controlled retry.
+    {
+        LOCK2(::cs_main, m_node.mempool->cs);
+        LockPoints lock_points;
+        m_node.mempool->addUnchecked(CTxMemPoolEntry(
+            exact, signed_result.plan.actions.front().fee,
+            /*time=*/0, /*entry_height=*/tip->nHeight,
+            /*entry_sequence=*/0, /*spends_coinbase=*/false,
+            /*sigops_cost=*/4, lock_points));
+    }
+    const ShadowPowClaimResolutionRevocationResult revoked_live =
+        cancelled->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_REQUIRE_MESSAGE(revoked_live.success, revoked_live.detail);
+    BOOST_CHECK_EQUAL(
+        revoked_live.relay_authority_was_active.value(), true);
+    BOOST_CHECK_EQUAL(revoked_live.in_mempool.value(), true);
+    BOOST_CHECK_EQUAL(revoked_live.may_still_confirm.value(), true);
+    BOOST_CHECK(!WITH_LOCK(cancelled->cs_wallet,
+                           return cancelled->mapWallet.at(
+                               resolution_txid).InMempool()));
+    cancelled->transactionAddedToMempool(exact);
+    BOOST_CHECK(WITH_LOCK(cancelled->cs_wallet,
+                          return cancelled->mapWallet.at(
+                              resolution_txid).InMempool()));
+    cancelled->transactionSubmittedByRpc(exact);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        cancelled->cs_wallet,
+        return cancelled->mapWallet.at(resolution_txid).mapValue.at(
+            SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY)), "0");
+    WITH_LOCK(
+        m_node.mempool->cs,
+        m_node.mempool->removeRecursive(
+            *exact, MemPoolRemovalReason::EXPIRY));
+    cancelled->transactionRemovedFromMempool(
+        exact, MemPoolRemovalReason::EXPIRY);
+    const ShadowPowClaimResolutionRevocationResult idempotent =
+        cancelled->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_CHECK(idempotent.success);
+    BOOST_CHECK(idempotent.status ==
+                ShadowPowClaimResolutionRevocationStatus::ALREADY_REVOKED);
+    BOOST_CHECK_EQUAL(idempotent.durable_state_changed.value(), false);
+
+    // Reauthorize once more and snapshot that state for race and database
+    // fault paths.
+    const ShadowPowClaimRecoveryPlan fresh_again =
+        cancelled->PlanShadowPowClaimRecovery(request);
+    reauthorize.expected_plan_id = fresh_again.plan_id;
+    const ShadowPowClaimRecoveryResult reauthorized_again =
+        cancelled->ResolveShadowPowClaims(reauthorize);
+    BOOST_CHECK(!reauthorized_again.success);
+    BOOST_CHECK(reauthorized_again.durable_state_changed);
+    const ShadowPowClaimMiningGateAction pre_in_flight_gate =
+        cancelled->GetShadowPowClaimMiningGate().action;
+    {
+        LOCK(cancelled->cs_wallet);
+        cancelled->m_inflight_wallet_broadcasts.insert(resolution_txid);
+    }
+    const ShadowPowClaimResolutionRevocationResult in_flight =
+        cancelled->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_CHECK(!in_flight.success);
+    BOOST_CHECK(in_flight.status ==
+                ShadowPowClaimResolutionRevocationStatus::BROADCAST_IN_FLIGHT);
+    BOOST_CHECK_EQUAL(in_flight.broadcast_in_flight.value(), true);
+    BOOST_CHECK_EQUAL(in_flight.durable_state_changed.value(), false);
+    BOOST_CHECK(in_flight.mining_gate_action == pre_in_flight_gate);
+    {
+        LOCK(cancelled->cs_wallet);
+        cancelled->m_inflight_wallet_broadcasts.erase(resolution_txid);
+        BOOST_CHECK_EQUAL(cancelled->mapWallet.at(resolution_txid).mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY),
+                          "1");
+        BOOST_CHECK_EQUAL(cancelled->mapWallet.at(resolution_txid).mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY),
+                          "0");
+    }
+    const MockableData authorized_records =
+        GetMockableDatabase(*cancelled).m_records;
+
+    auto coin_lock_ambiguous = load(authorized_records);
+    MockableDatabase& coin_lock_database =
+        GetMockableDatabase(*coin_lock_ambiguous);
+    coin_lock_database.m_fail_commit = true;
+    std::string coin_lock_error;
+    {
+        LOCK(coin_lock_ambiguous->cs_wallet);
+        BOOST_CHECK(!coin_lock_ambiguous->UpdateLockedCoins(
+            {anchor}, /*lock=*/true, /*persistent=*/true,
+            &coin_lock_error));
+        BOOST_CHECK(coin_lock_ambiguous->IsLockedCoinsDatabaseAmbiguous());
+    }
+    coin_lock_database.m_fail_commit = false;
+    const auto coin_lock_ambiguous_result =
+        coin_lock_ambiguous->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_CHECK(!coin_lock_ambiguous_result.success);
+    BOOST_CHECK(coin_lock_ambiguous_result.status ==
+                ShadowPowClaimResolutionRevocationStatus::DATABASE_OUTCOME_AMBIGUOUS);
+    BOOST_CHECK(coin_lock_ambiguous_result.durable_state_ambiguous);
+
+    auto coin_lock_ambiguous_draft = load(signed_records);
+    MockableDatabase& coin_lock_draft_database =
+        GetMockableDatabase(*coin_lock_ambiguous_draft);
+    coin_lock_draft_database.m_fail_commit = true;
+    {
+        LOCK(coin_lock_ambiguous_draft->cs_wallet);
+        BOOST_CHECK(!coin_lock_ambiguous_draft->UpdateLockedCoins(
+            {anchor}, /*lock=*/true, /*persistent=*/true,
+            &coin_lock_error));
+        BOOST_CHECK(
+            coin_lock_ambiguous_draft->IsLockedCoinsDatabaseAmbiguous());
+    }
+    coin_lock_draft_database.m_fail_commit = false;
+    const uint64_t coin_lock_generation =
+        coin_lock_ambiguous_draft->GetDatabase().nUpdateCounter.load();
+    coin_lock_ambiguous_draft->transactionSubmittedByRpc(exact);
+    BOOST_CHECK_EQUAL(
+        coin_lock_ambiguous_draft->GetDatabase().nUpdateCounter.load(),
+        coin_lock_generation);
+    {
+        LOCK(coin_lock_ambiguous_draft->cs_wallet);
+        const auto& record =
+            coin_lock_ambiguous_draft->mapWallet.at(resolution_txid);
+        BOOST_CHECK_EQUAL(record.mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY),
+                          "0");
+        BOOST_CHECK_EQUAL(record.mapValue.at(
+                              SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY),
+                          "0");
+    }
+
+    auto begin_failure = load(authorized_records);
+    GetMockableDatabase(*begin_failure).m_fail_begin = true;
+    const auto begin_result =
+        begin_failure->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_CHECK(!begin_result.success);
+    BOOST_CHECK(begin_result.status ==
+                ShadowPowClaimResolutionRevocationStatus::DATABASE_FAILURE);
+    BOOST_CHECK(!begin_result.durable_state_ambiguous);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        begin_failure->cs_wallet,
+        return begin_failure->mapWallet.at(resolution_txid).mapValue.at(
+            SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY)), "1");
+
+    auto write_failure = load(authorized_records);
+    GetMockableDatabase(*write_failure).m_fail_write_at = 0;
+    const auto write_result =
+        write_failure->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_CHECK(!write_result.success);
+    BOOST_CHECK(write_result.status ==
+                ShadowPowClaimResolutionRevocationStatus::DATABASE_FAILURE);
+    BOOST_CHECK(!write_result.durable_state_ambiguous);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        write_failure->cs_wallet,
+        return write_failure->mapWallet.at(resolution_txid).mapValue.at(
+            SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY)), "0");
+
+    auto commit_failure = load(authorized_records);
+    GetMockableDatabase(*commit_failure).m_fail_commit = true;
+    const auto commit_result =
+        commit_failure->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_CHECK(!commit_result.success);
+    BOOST_CHECK(commit_result.status ==
+                ShadowPowClaimResolutionRevocationStatus::DATABASE_OUTCOME_AMBIGUOUS);
+    BOOST_CHECK(commit_result.durable_state_ambiguous);
+    BOOST_CHECK(!commit_result.durable_state_changed.has_value());
+    BOOST_CHECK(commit_result.relay_authority_was_active.has_value());
+    BOOST_CHECK(!commit_result.relay_authority_revoked.has_value());
+    BOOST_CHECK(!commit_result.locally_cancelled.has_value());
+    BOOST_CHECK(commit_failure->IsShadowPowClaimRecoveryDatabaseAmbiguous());
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        commit_failure->cs_wallet,
+        return commit_failure->mapWallet.at(resolution_txid).mapValue.at(
+            SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY)), "1");
+    const auto ambiguity_latched =
+        commit_failure->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    BOOST_CHECK(!ambiguity_latched.success);
+    BOOST_CHECK(ambiguity_latched.status ==
+                ShadowPowClaimResolutionRevocationStatus::DATABASE_OUTCOME_AMBIGUOUS);
+    BOOST_CHECK(ambiguity_latched.durable_state_ambiguous);
+    BOOST_CHECK(!ambiguity_latched.relay_authority_was_active.has_value());
+    BOOST_CHECK(!ambiguity_latched.relay_authority_revoked.has_value());
+    BOOST_CHECK(!ambiguity_latched.locally_cancelled.has_value());
+    BOOST_CHECK(!ambiguity_latched.in_mempool.has_value());
+    BOOST_CHECK(!ambiguity_latched.anchor_reserved.has_value());
+    commit_failure->SetBroadcastTransactions(/*broadcast=*/true);
+    std::string ambiguous_relay_error;
+    BOOST_CHECK(!commit_failure->SubmitTxMemoryPoolAndRelay(
+        resolution_txid, ambiguous_relay_error, /*relay=*/true));
+    BOOST_CHECK_EQUAL(ambiguous_relay_error,
+                      "recovery-database-outcome-ambiguous");
+    BOOST_CHECK(WITH_LOCK(
+        commit_failure->cs_wallet,
+        return commit_failure->m_inflight_wallet_broadcasts.empty()));
 }
 
 BOOST_AUTO_TEST_CASE(manual_scheduler_retries_exact_authorized_fee_above_preview_default)

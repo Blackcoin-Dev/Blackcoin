@@ -845,6 +845,7 @@ struct WalletPowClaimRecoveryNode
     int stale_depth{0};
     bool stale_depth_known{false};
     bool resolution_relay_authorized{false};
+    bool resolution_relay_revoked{false};
 };
 
 //! One transitive claim component rooted at the nearest confirmed wallet UTXO.
@@ -888,6 +889,7 @@ struct WalletPowClaimRecoveryAction
     bool persisted{false};
     bool in_mempool{false};
     bool relay_authorized{false};
+    bool relay_revoked{false};
     bool frontier_may_advance{true};
     bool conflicts_with_revalidating_unbound_proof{false};
     std::string reason_code;

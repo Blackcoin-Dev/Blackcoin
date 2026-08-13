@@ -223,6 +223,7 @@ interfaces::WalletPowClaimRecoveryNode MakeRecoveryNode(
     out.stale_depth = node.stale_depth;
     out.stale_depth_known = node.stale_depth_known;
     out.resolution_relay_authorized = node.resolution_relay_authorized;
+    out.resolution_relay_revoked = node.resolution_relay_revoked;
     return out;
 }
 
@@ -283,6 +284,7 @@ interfaces::WalletPowClaimRecoveryAction MakeRecoveryAction(
     out.persisted = action.persisted;
     out.in_mempool = action.in_mempool;
     out.relay_authorized = action.relay_authorized;
+    out.relay_revoked = action.relay_revoked;
     out.frontier_may_advance = action.frontier_may_advance;
     out.conflicts_with_revalidating_unbound_proof =
         action.conflicts_with_revalidating_unbound_proof;

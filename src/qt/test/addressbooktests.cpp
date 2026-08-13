@@ -182,17 +182,19 @@ void TestAddAddressesToSendBook(interfaces::Node& node)
     search_line->setText(s_label);
     QCOMPARE(table_view->model()->rowCount(), 1);
 
-    search_line->setText("io");
+    // Include separators that cannot occur in an encoded address so these
+    // label-filter assertions cannot pick up a randomly generated address.
+    search_line->setText("io - new");
     QCOMPARE(table_view->model()->rowCount(), 2);
 
     // Check wildcard "?".
-    search_line->setText("io?new");
+    search_line->setText("io ?new");
     QCOMPARE(table_view->model()->rowCount(), 0);
-    search_line->setText("io???new");
+    search_line->setText("io ? new");
     QCOMPARE(table_view->model()->rowCount(), 2);
 
     // Check wildcard "*".
-    search_line->setText("io*new");
+    search_line->setText("io * new");
     QCOMPARE(table_view->model()->rowCount(), 2);
     search_line->setText("*");
     QCOMPARE(table_view->model()->rowCount(), 3);

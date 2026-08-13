@@ -27,6 +27,7 @@ MINER_FUNDING = Decimal("1.0")
 # stale test must advance beyond this consensus window rather than treating a
 # single omitted block as an eviction.
 QQP4_LATE_ORIGIN_WINDOW = 64
+ZERO_HASH = "0" * 64
 
 
 class GoldRushPowMinerE2ETest(BitcoinTestFramework):
@@ -204,20 +205,86 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
             for entry in wallet.listtransactions("*", 1000, 0, True)
         )
 
-    def _assert_zero_payment_retired_claim(self, wallet, txid, address, claim_input):
-        """An origin-expired authored claim releases its input without a new tx."""
+    def _assert_lineaged_origin_expired_claim(self, wallet, txid, address, claim_input):
+        """An origin-expired authored family retains its exact anchor for refresh."""
         node = self.nodes[0]
         self.wait_until(lambda: txid not in node.getrawmempool(), timeout=20)
-        self.wait_until(lambda: self._is_abandoned(wallet, txid), timeout=20)
         record = wallet.gettransaction(txid)
-        assert_equal(record["qq_shadow_pow_expired_retired"], "1")
-        assert int(record["qq_shadow_pow_expired_retired_height"]) > 0
-        assert_equal(len(record["qq_shadow_pow_expired_retired_tip"]), 64)
+        assert_equal(self._is_abandoned(wallet, txid), False)
+        assert_equal(record["qq_shadow_pow_quarantine"], "1")
+        assert_equal(record["qq_shadow_pow_lineage_schema"], "1")
+        assert_equal(record["qq_shadow_pow_lineage_root"], txid)
+        assert "qq_shadow_pow_lineage_parent" not in record
+        assert_equal(record["qq_shadow_pow_lineage_ordinal"], "0")
+        assert_equal(len(record["qq_shadow_pow_lineage_family"]), 64)
+        assert record["qq_shadow_pow_lineage_family"] != ZERO_HASH
+        assert "qq_shadow_pow_expired_retired" not in record
+        assert "qq_shadow_pow_expired_retired_height" not in record
+        assert "qq_shadow_pow_expired_retired_tip" not in record
         self._assert_no_automatic_claim_cleanup(wallet, txid)
-        assert any(
-            {"txid": utxo["txid"], "vout": utxo["vout"]} == claim_input
+        assert node.gettxout(claim_input["txid"], claim_input["vout"], False) is not None
+        assert all(
+            {"txid": utxo["txid"], "vout": utxo["vout"]} != claim_input
             for utxo in wallet.listunspent(1, 9999999, [address])
         )
+
+        recovery = wallet.getpowclaimrecoveryinfo(True)
+        component = next(
+            item for item in recovery["component_details"] if txid in item["claim_txids"]
+        )
+        claim_node = next(item for item in component["nodes"] if item["txid"] == txid)
+        assert_equal(component["classification"], "terminal_on_pinned_tip")
+        assert_equal(
+            {
+                "txid": component["anchor"]["txid"],
+                "vout": component["anchor"]["vout"],
+            },
+            claim_input,
+        )
+        assert_equal(component["anchor_authenticated"], True)
+        assert_equal(component["anchor_unspent"], True)
+        assert_equal(component["all_claims_zero_payment_retirable"], False)
+        assert_equal(component["all_claims_expired_locally_retired"], False)
+        assert_equal(component["resolution_txids"], [])
+        assert_equal(component["ordinary_or_mixed_txids"], [])
+        assert_equal(
+            component["generation_fingerprint"],
+            record["qq_shadow_pow_lineage_family"],
+        )
+        assert_equal(claim_node["disposition"], "origin_expired")
+        assert_equal(claim_node["quarantined"], True)
+        assert_equal(claim_node["abandoned"], False)
+        assert_equal(claim_node["expired_locally_retired"], False)
+        assert_equal(claim_node["lineage_metadata_present"], True)
+        assert_equal(claim_node["lineage_metadata_valid"], True)
+        assert_equal(claim_node["lineage_root_txid"], txid)
+        assert_equal(claim_node["lineage_parent_txid"], ZERO_HASH)
+        assert_equal(claim_node["lineage_ordinal"], 0)
+        assert_equal(recovery["retired_claim_objects"], 0)
+        assert_equal(recovery["retired_components"], 0)
+        assert_equal(recovery["blocking_components"], 1)
+        assert_equal(recovery["pending_manual_resolutions"], 0)
+        assert_equal(recovery["pending_automatic_resolutions"], 0)
+        assert_equal(recovery["confirmed_manual_resolutions"], 0)
+        assert_equal(recovery["confirmed_automatic_resolutions"], 0)
+        assert_equal(recovery["automatic_fee_exposure_in_window"], Decimal("0"))
+        assert_equal(recovery["confirmed_resolution_fees"], Decimal("0"))
+
+        gate = wallet.getpowmininginfo()
+        assert_equal(gate["claim_inventory_tip"], node.getbestblockhash())
+        assert_equal(gate["claim_inventory_wallet_tip_matches"], True)
+        assert_equal(gate["mining_gate_coherent"], True)
+        assert_equal(gate["mining_gate_database_ambiguous"], False)
+        assert_equal(gate["mining_gate_unsafe_claims"], 0)
+        assert_equal(gate["mining_gate_unsafe_components"], 0)
+        assert_equal(gate["mining_gate_action"], "refresh_same_anchor")
+        assert_equal(gate["mining_gate_can_submit"], True)
+        assert_equal(gate["mining_gate_family_claims"], 1)
+        assert_equal(gate["mining_gate_live_claims"], 0)
+        assert_equal(gate["mining_gate_eligible_claims"], 0)
+        assert_equal(gate["mining_gate_lineage_head_txid"], txid)
+        assert_equal(len(gate["mining_gate_candidate_state_fingerprint"]), 64)
+        assert gate["mining_gate_candidate_state_fingerprint"] != ZERO_HASH
 
     def _assert_confirmed_claim(self, wallet, txid, block_hash):
         record = wallet.gettransaction(txid)
@@ -442,7 +509,7 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         assert age_txid in node.getblock(age_block_hash)["tx"]
         self._assert_confirmed_claim(age_miner, age_txid, age_block_hash)
 
-        self.log.info("Repairing an already-stale v30.1.0-style claim when its wallet is loaded")
+        self.log.info("Preparing a lineaged claim that will expire while its wallet is unloaded")
         repair_txid, _ = self._start_miner_until_claim(repair_miner)
         assert repair_txid in node.getrawmempool()
         repair_input = self._claim_input(repair_txid)
@@ -456,7 +523,7 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
             self.generateblock(node, output=staker_address, transactions=[])
         self.wait_until(lambda: repair_txid not in node.getrawmempool(), timeout=10)
 
-        self.log.info("Restarting before wallet load exercises zero-payment stale-claim retirement")
+        self.log.info("Restarting before wallet load preserves the lineaged same-anchor family")
         self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={self.mock_time}"])
         node = self.nodes[0]
         node.setmocktime(self.mock_time)
@@ -467,7 +534,7 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         self._assert_confirmed_claim(age_miner, age_txid, age_block_hash)
 
         repair_miner = self._load_wallet("goldrush_pow_repair")
-        self._assert_zero_payment_retired_claim(
+        self._assert_lineaged_origin_expired_claim(
             repair_miner, repair_txid, repair_address, repair_input
         )
         self._sync_mocktime_to_tip()

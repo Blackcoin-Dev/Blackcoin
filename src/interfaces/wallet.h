@@ -112,7 +112,8 @@ public:
     virtual bool lock() = 0;
 
     //! Unlock wallet.
-    virtual bool unlock(const SecureString& wallet_passphrase) = 0;
+    virtual bool unlock(const SecureString& wallet_passphrase,
+                        std::optional<bool> staking_only = std::nullopt) = 0;
 
     //! Return whether wallet is locked.
     virtual bool isLocked() = 0;

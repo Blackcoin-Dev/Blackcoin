@@ -140,6 +140,7 @@ jobs:
       - name: Test script corpus precondition tooling
         run: |
           python3 ci/test/test_verify_script_assets.py
+          python3 ci/test/test_sanitizer_report_capture.py
           python3 test/fuzz/test_runner_tests.py
 
       - name: Run repository linters
@@ -787,7 +788,7 @@ jobs:
   mixed-version:
     name: real v26.2, v28.4, v30.1, and candidate interoperability
     if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
-    needs: native-build-and-unit
+    needs: [policy-and-lint, native-build-and-unit]
     runs-on: ubuntu-22.04
     timeout-minutes: 300
     steps:
@@ -813,13 +814,6 @@ jobs:
             automake bison build-essential cmake gettext gperf libtool \
             pkg-config python3 python3-zmq
 
-      - name: Restore pull-request historical-binary cache
-        if: ${{ inputs.release_mode != true }}
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: .ci/previous-releases
-          key: mixed-version-${{ runner.os }}-${{ hashFiles('ci/mixed-version/sources.json', 'ci/mixed-version/build_previous_releases.py') }}
-
       - name: Build and verify historical binaries
         run: |
           python3 ci/mixed-version/build_previous_releases.py \
@@ -828,13 +822,17 @@ jobs:
             --host "$HOST" \
             --jobs "$MAKEJOBS"
 
-      - name: Run mixed-version relay and reorg test
+      - name: Run mixed-version relay, reorg, and wallet-upgrade tests
         env:
           PREVIOUS_RELEASES_DIR: ${{ github.workspace }}/.ci/previous-releases
+          PREVIOUS_RELEASES_HOST: ${{ env.HOST }}
         run: |
           python3 test/functional/test_runner.py \
             --ci --jobs=1 --failfast --combinedlogslen=2000 \
             feature_goldrush_mixed_version.py --previous-releases --legacy-wallet
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=2000 \
+            feature_goldrush_v3014_wallet_upgrade.py --previous-releases --descriptors
 
       - name: Upload historical binary provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -870,7 +868,7 @@ jobs:
         run: |
           python3 test/functional/test_runner.py \
             --ci --extended --jobs=4 --combinedlogslen=2000 \
-            --exclude=feature_goldrush_mixed_version.py
+            --exclude=feature_goldrush_mixed_version.py,feature_goldrush_v3014_wallet_upgrade.py
 
   sanitizer-gates:
     name: ${{ matrix.name }} consensus and liveness gate
@@ -904,21 +902,69 @@ jobs:
               feature_shutdown.py
     steps:
       - name: Checkout immutable candidate
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Verify exact checkout
         run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
 
       - name: Run sanitizer gate with pinned consensus dependencies
+        id: sanitizer-gate
         env:
           CI_OS_NAME: linux
           FILE_ENV: ${{ matrix.environment }}
           MAKEJOBS: -j2
           TEST_RUNNER_EXTRA: ${{ matrix.functional_tests }}
-        run: ./ci/test_run_all.sh
+        shell: bash
+        run: |
+          capture_dir=$(mktemp -d \
+            "$RUNNER_TEMP/blackcoin-sanitizer-${{ matrix.name }}.XXXXXX")
+          chmod 0700 "$capture_dir"
+          report_log="$capture_dir/reports.log"
+          [[ ! -e "$report_log" && ! -L "$report_log" ]]
+          printf 'report_log=%s\n' "$report_log" >> "$GITHUB_OUTPUT"
+          set +e
+          ./ci/test_run_all.sh 2>&1 |
+            python3 ci/test/extract_sanitizer_reports.py \
+              --output "$report_log" \
+              --target-sha "$TARGET_SHA" \
+              --sanitizer '${{ matrix.name }}'
+          pipeline_status=("${PIPESTATUS[@]}")
+          test_status="${pipeline_status[0]}"
+          extractor_status="${pipeline_status[1]}"
+          report_ready=false
+          if [[ "$extractor_status" -eq 0 || "$extractor_status" -eq 74 ]] &&
+             [[ -f "$report_log" && ! -L "$report_log" && -O "$report_log" ]] &&
+             [[ "$(stat -c '%a' "$report_log")" = 600 ]] &&
+             grep -Fxq "target_sha=$TARGET_SHA" "$report_log" &&
+             grep -Fxq "sanitizer=${{ matrix.name }}" "$report_log" &&
+             grep -Eq '^framing_error_count=[0-9]+$' "$report_log" &&
+             grep -Eq '^collector_error_count=[0-9]+$' "$report_log" &&
+             grep -Fxq 'artifact_error=0' "$report_log" &&
+             grep -Fxq 'capture_complete=1' "$report_log"; then
+            report_ready=true
+          fi
+          printf 'report_ready=%s\n' "$report_ready" >> "$GITHUB_OUTPUT"
+          set -e
+          if [[ "$test_status" -ne 0 ]]; then
+            exit "$test_status"
+          fi
+          if [[ "$extractor_status" -ne 0 ]]; then
+            exit "$extractor_status"
+          fi
+          [[ "$report_ready" = true ]]
+
+      - name: Upload exact-source ThreadSanitizer reports
+        if: ${{ always() && matrix.name == 'thread-sanitizer' && steps.sanitizer-gate.outputs.report_ready == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sanitizer-reports-${{ matrix.name }}-${{ env.TARGET_SHA }}-attempt-${{ github.run_attempt }}
+          path: ${{ steps.sanitizer-gate.outputs.report_log }}
+          if-no-files-found: error
+          retention-days: 30
 
   fuzz-smoke:
     name: source-pinned sanitizer regression smoke

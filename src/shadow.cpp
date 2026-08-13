@@ -5935,6 +5935,40 @@ std::optional<uint256> GetShadowPowProofLogicalId(const CTransaction& tx)
     return logical_proof_id;
 }
 
+std::optional<ShadowPowClaimDescriptor>
+GetShadowPowClaimDescriptor(const CTransaction& tx)
+{
+    std::optional<ShadowPowClaimDescriptor> descriptor;
+    for (size_t output_index = 0; output_index < tx.vout.size();
+         ++output_index) {
+        const std::optional<valtype> proof =
+            ExtractProofPayload(tx.vout[output_index].scriptPubKey);
+        if (!proof) continue;
+        if (descriptor) return std::nullopt;
+
+        ShadowProof decoded;
+        if (!DecodeProof(*proof, decoded)) return std::nullopt;
+
+        ShadowPowClaimDescriptor candidate;
+        candidate.version = decoded.version;
+        candidate.mode = decoded.mode == ShadowProofMode::POW
+            ? ShadowProofPayloadMode::POW
+            : ShadowProofPayloadMode::POS;
+        candidate.origin_bound = decoded.origin_bound;
+        candidate.origin_height = decoded.origin_height;
+        candidate.origin_previous_block_hash =
+            decoded.origin_previous_block_hash;
+        candidate.input_bound = decoded.input_bound;
+        candidate.claim_outpoint = decoded.claim_outpoint;
+        candidate.target = decoded.target;
+        candidate.payout_script = decoded.payout_script;
+        candidate.proof_output_index =
+            static_cast<uint32_t>(output_index);
+        descriptor = std::move(candidate);
+    }
+    return descriptor;
+}
+
 std::optional<COutPoint> GetShadowPowProofBoundOutpoint(
     const CTransaction& tx)
 {

@@ -9,6 +9,20 @@
 
 namespace wallet {
 
+/** Stable identity of one confirmed wallet anchor generation. */
+uint256 ComputeShadowPowClaimLineageFamilyFingerprint(
+    const COutPoint& anchor, CAmount anchor_amount,
+    const CScript& anchor_script);
+
+/** Select the existing RPC action string without replacing any safety field in
+ * the fresh inventory-derived gate. A wallet-wide new-anchor submission wait
+ * remains tip-bound even when a user lock changes the otherwise-safe wallet
+ * snapshot; family-local waits remain exact-snapshot-bound. */
+ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
+    const ShadowPowClaimMiningGate& fresh_gate,
+    const ShadowPowClaimMiningGate& cached_gate, bool miner_enabled,
+    bool claim_in_flight, bool wallet_wide_tip_wait = false);
+
 const char* ShadowPowClaimRecoveryAdoptionStatusName(
     ShadowPowClaimRecoveryAdoptionStatus status);
 

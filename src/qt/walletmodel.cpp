@@ -1137,7 +1137,8 @@ bool WalletModel::setWalletEncrypted(const SecureString& passphrase)
     return m_wallet->encryptWallet(passphrase);
 }
 
-bool WalletModel::setWalletLocked(bool locked, const SecureString &passPhrase)
+bool WalletModel::setWalletLocked(bool locked, const SecureString &passPhrase,
+                                  std::optional<bool> staking_only)
 {
     if(locked)
     {
@@ -1147,7 +1148,7 @@ bool WalletModel::setWalletLocked(bool locked, const SecureString &passPhrase)
     else
     {
         // Unlock
-        return m_wallet->unlock(passPhrase);
+        return m_wallet->unlock(passPhrase, staking_only);
     }
 }
 
@@ -1246,38 +1247,56 @@ void WalletModel::unsubscribeFromCoreSignals()
 // WalletModel::UnlockContext implementation
 WalletModel::UnlockContext WalletModel::requestUnlock()
 {
-    bool was_locked = getEncryptionStatus() == Locked;
+    const bool initially_locked = getEncryptionStatus() == Locked;
+    const bool initially_staking_only = getWalletUnlockStakingOnly();
+    bool prompt_required = initially_locked;
 
-    if ((!was_locked) && getWalletUnlockStakingOnly())
-    {
-        setWalletLocked(true);
-        was_locked = getEncryptionStatus() == Locked;
-
+    if (!initially_locked && initially_staking_only) {
+        // Revoke the installed staking-only key before preparing a normal
+        // unlock. Clearing the marker first would transiently grant ordinary
+        // transaction and PoW signing authority without a passphrase prompt.
+        if (!setWalletLocked(true) || getEncryptionStatus() != Locked) {
+            return UnlockContext(this, /*valid=*/false, /*relock=*/false);
+        }
+        prompt_required = true;
     }
 
-    if(was_locked)
-    {
+    if (prompt_required && getWalletUnlockStakingOnly()) {
+        // Mode::Unlock has no visible scope selector. Stage the normal scope
+        // only while the wallet is locked so a successful prompt installs the
+        // key and requested authority atomically.
+        setWalletUnlockStakingOnly(false);
+    }
+
+    if (prompt_required) {
         // Request UI to unlock wallet
         Q_EMIT requireUnlock();
     }
-    // If wallet is still locked, unlock was failed or cancelled, mark context as invalid
-    bool valid = getEncryptionStatus() != Locked;
 
-    return UnlockContext(this, valid, was_locked && !getWalletUnlockStakingOnly());
+    // A generic signing request requires normal authority. An unexpected
+    // staking-only unlock is not enough and must not be expanded after the
+    // prompt by merely clearing the scope marker.
+    const bool valid = getEncryptionStatus() != Locked &&
+                       !getWalletUnlockStakingOnly();
+    if (!valid) {
+        if (getEncryptionStatus() == Unlocked) setWalletLocked(true);
+        if (initially_staking_only) setWalletUnlockStakingOnly(true);
+        return UnlockContext(this, /*valid=*/false, /*relock=*/false);
+    }
+
+    return UnlockContext(
+        this, /*valid=*/true, /*relock=*/initially_locked,
+        initially_staking_only ? std::optional<bool>{true} : std::nullopt);
 }
 
-WalletModel::UnlockContext::UnlockContext(WalletModel *_wallet, bool _valid, bool _relock):
+WalletModel::UnlockContext::UnlockContext(
+    WalletModel *_wallet, bool _valid, bool _relock,
+    std::optional<bool> restore_staking_only):
         wallet(_wallet),
         valid(_valid),
         relock(_relock),
-        stakingOnly(false)
-{
-    if(!relock)
-    {
-        stakingOnly = wallet->getWalletUnlockStakingOnly();
-        wallet->setWalletUnlockStakingOnly(false);
-    }
-}
+        restoreStakingOnly(restore_staking_only)
+{}
 
 WalletModel::UnlockContext::~UnlockContext()
 {
@@ -1286,9 +1305,8 @@ WalletModel::UnlockContext::~UnlockContext()
         wallet->setWalletLocked(true);
     }
 
-    if(!relock)
-    {
-        wallet->setWalletUnlockStakingOnly(stakingOnly);
+    if (restoreStakingOnly) {
+        wallet->setWalletUnlockStakingOnly(*restoreStakingOnly);
         wallet->updateStatus();
     }
 }

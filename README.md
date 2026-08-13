@@ -85,12 +85,18 @@ transition and replay path before it is scheduled.
 
 ### Gold Rush PoW claim safety
 
-The wallet may have up to 64 independent live `QQSPROOF` claims in its local
-mempool. A claim that leaves the mempool is different: it remains quarantined
+Consensus and inventory can represent a bounded set of up to 64 live
+`QQSPROOF` claims. That bound is not candidate permission to select independent
+fee anchors. A claim that leaves the mempool is different: it remains quarantined
 and its fee input stays reserved because another peer can retain and later
 confirm it. Generic `abandontransaction` does not release that reservation.
-The built-in miner pauses on actionable or indeterminate quarantined
-components, not merely on the raw number of historical claim objects.
+Immutable v30.1.4 pauses on actionable or indeterminate quarantined
+components, not merely on the raw number of historical claim objects. The
+v30.1.5 candidate instead follows the complete typed gate and may safely wait,
+relay, or refresh one deterministically selected authenticated wallet-owned
+family while those legacy counts remain nonzero. Multiple safe families are
+serviced without selecting another fee anchor, and a purely incoming foreign
+proof remains audit history rather than authority to pause the recipient.
 
 The Issue #37 recovery release groups wallet-known sibling conflicts and
 descendants by their current confirmed anchor. Its shared GUI, CLI/RPC, daemon,
@@ -103,11 +109,29 @@ Rate and fee windows use active-chain median time, and recovery-authorizing
 metadata is published only after durable wallet-database commit. An
 indeterminate database outcome fails closed until wallet reload.
 
-Either the original claim or the resolution may confirm. Only the confirming
-transaction pays a fee; a confirmed resolution's ordinary base-chain fee is
-not shadow-reimbursed. Broadcast does not guarantee confirmation, and an
-original-claim confirmation can advance the component to a later frontier that
-requires a fresh plan. See the
+The following behavior belongs to the **v30.1.5 candidate**; it is not part of
+the immutable `v30.1.4` tag. For exact
+wallet-authored claims—including a strict unbound QQP2 singleton and
+origin-bound QQP3/QQP4 carriers—the candidate mining path first
+relays eligible bytes and then, when necessary, appends a current-policy sibling
+that spends the same confirmed fee anchor. The append-only lineage records
+schema, family, root, and ordinal metadata on each carrier plus the direct
+parent on every non-root refresh. It preserves the legacy target and quantum
+payout without requiring or creating the configured future-new-anchor payout
+key; `getpowmininginfo.payout_address` may therefore be empty or different
+while a retained family is serviced. If the caller explicitly grants one-call
+key-creation consent, the wallet may instead bind or create that future payout
+up front so the non-HD-key backup warning is delivered synchronously.
+Conflicting siblings cannot both confirm,
+so the wallet does not consume another coin for each retry. Exact authenticated
+claims are not retired merely because an original policy window expires.
+
+Same-anchor siblings remain `QQSPROOF` claims; this candidate does not change
+their winner, loser, late-claim, reward, or reimbursement consensus rules.
+Separately, for explicit fee-paying conflict recovery, either the original
+claim or the managed resolution may confirm. A confirmed managed-resolution
+fee is not shadow-reimbursed. Broadcast does not guarantee confirmation. See
+the
 [Gold Rush PoW claim lifecycle and recovery guide](doc/gold-rush-pow-claim-recovery.md)
 for the manual and optional automatic flows, QQP3 origin-plus-64 eligibility,
 confirmation outcomes, restart behavior, and reorg rules.

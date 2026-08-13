@@ -66,9 +66,15 @@ AskPassphraseDialog::AskPassphraseDialog(Mode _mode, QWidget *parent, SecureStri
             ui->stakingCheckBox->setChecked(true);
             ui->stakingCheckBox->show();
             ui->quantumStakingCheckBox->show();
-            [[fallthrough]];
+            ui->warningLabel->setText(tr("Enter the wallet passphrase and choose whether to grant legacy staking-only access or normal signing access."));
+            ui->passLabel2->hide();
+            ui->passEdit2->hide();
+            ui->passLabel3->hide();
+            ui->passEdit3->hide();
+            setWindowTitle(tr("Unlock wallet"));
+            break;
         case Unlock: // Ask passphrase
-            ui->warningLabel->setText(tr("This operation needs your wallet passphrase to unlock the wallet."));
+            ui->warningLabel->setText(tr("This operation requires normal wallet signing authority. Entering the passphrase temporarily enables spending, quantum actions, and Gold Rush PoW claim signing; this is not a legacy staking-only unlock."));
             ui->passLabel2->hide();
             ui->passEdit2->hide();
             ui->passLabel3->hide();
@@ -99,7 +105,10 @@ void AskPassphraseDialog::setModel(WalletModel *_model)
 {
     this->model = _model;
     if (model) {
-        const bool legacy_only = model->getWalletUnlockStakingOnly() || mode == UnlockStaking;
+        // Unlock has no visible scope controls and always means normal signing
+        // authority. Only the explicit UnlockStaking mode may preselect the
+        // legacy-staking-only scope.
+        const bool legacy_only = mode == UnlockStaking;
         ui->stakingCheckBox->setChecked(legacy_only);
         ui->quantumStakingCheckBox->setChecked(!legacy_only);
     }
@@ -187,7 +196,8 @@ void AskPassphraseDialog::accept()
     case UnlockStaking:
     case Unlock:
         try {
-            if (!model->setWalletLocked(false, oldpass)) {
+            const bool staking_only = ui->stakingCheckBox->isChecked();
+            if (!model->setWalletLocked(false, oldpass, staking_only)) {
                 // Check if the passphrase has a null character (see #27067 for details)
                 if (oldpass.find('\0') == std::string::npos) {
                     QMessageBox::critical(this, tr("Wallet unlock failed"),
@@ -202,7 +212,6 @@ void AskPassphraseDialog::accept()
                                              "passphrase to avoid this issue in the future."));
                 }
             } else {
-                model->setWalletUnlockStakingOnly(ui->stakingCheckBox->isChecked());
                 if (UnlockStaking == mode) {
                     // Start the staking if enabled on the machine
                     bool staking = node::CanStake();

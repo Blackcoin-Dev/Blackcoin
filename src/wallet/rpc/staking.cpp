@@ -47,6 +47,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 using node::BlockAssembler;
@@ -70,6 +71,30 @@ static CFeeRate FeeRateFromSatVbValue(const UniValue& value)
 {
     return CFeeRate{AmountFromValue(value, /*decimals=*/3)};
 }
+
+static bool ShadowPowClaimRelayMustWaitForNextTip(
+    const std::string& error)
+{
+    return error.find("txn-mempool-conflict") != std::string::npos ||
+           error.find("shadow-proof-mempool-limit") != std::string::npos ||
+           error.find("txn-already-in-mempool") != std::string::npos ||
+           error.find("txn-already-known") != std::string::npos ||
+           error.find("wallet-broadcast-in-flight") != std::string::npos;
+}
+
+static bool ShadowPowClaimRelayRequiresFreshGate(const std::string& error)
+{
+    return error == "recovery-wallet-generation-changed" ||
+           error == "recovery-database-outcome-ambiguous" ||
+           error == "recovery-candidate-state-changed" ||
+           error == "recovery-normal-wallet-unlock-ended" ||
+           error == "recovery-automatic-authority-changed" ||
+           error == "recovery-pow-miner-disabled" ||
+           error == "recovery-pow-miner-authority-changed" ||
+           error == "shadow-proof-relay-ttl-expired";
+}
+
+static constexpr size_t MAX_SHADOW_POW_RPC_RELAY_ATTEMPTS{256};
 
 static std::string DurableQuantumKeyFailureMessage(
     const CTxDestination& created_destination,
@@ -101,12 +126,16 @@ static void CommitWalletTransactionOrThrow(
     const CTransactionRef& tx,
     mapValue_t map_value,
     const std::string& action,
-    const std::optional<CTxDestination>& created_destination = std::nullopt)
+    const std::optional<CTxDestination>& created_destination = std::nullopt,
+    const std::optional<ShadowPowClaimCommitAuthority>&
+        shadow_pow_authority = std::nullopt)
 {
     std::string broadcast_error;
     bool committed{false};
     try {
-        committed = wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error);
+        committed = wallet.CommitTransaction(
+            tx, std::move(map_value), {}, &broadcast_error,
+            /*commit_status=*/nullptr, shadow_pow_authority);
     } catch (const std::exception& e) {
         if (created_destination) {
             ThrowQuantumActionError(
@@ -1788,7 +1817,7 @@ static RPCHelpMan sendshadowpowclaim()
                 "If proof is omitted, grinding is memory-hard (Argon2id, ~1 MiB per try) and synchronous; tune max_tries accordingly.\n"
                 "If proof is supplied, it must be the hex QQSPROOF payload for the current tip, target address, and quantum payout address.\n"
                 "The active proof format is reported by getshadowpowwork. QQP2/QQP3 do not bind an exact fee input; QQP4 does so only after its separately scheduled activation. Never reuse one externally supplied proof for multiple claim transactions.\n"
-                "Only valid during the Gold Rush reward window. An unconfirmed QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it; this wallet will not create another fee-input claim until it resolves on chain.\n" +
+                "Only valid during the Gold Rush reward window. An unconfirmed wallet-authored QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it. The typed, active-tip-pinned gate validates each wallet-owned same-anchor family. Within one family a live member blocks a competing sibling; across independent safe families Core relays eligible absent bytes first, then refreshes one family, and waits only when no independent relay or refresh work remains. Audit-only incoming proofs do not gain mining authority; any wallet-owned unsafe component still fails closed.\n" +
                 HELP_REQUIRING_PASSPHRASE,
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet legacy address that owns the UTXO authenticating this PoW claim. It does not need to be whitelisted."},
@@ -1831,25 +1860,19 @@ static RPCHelpMan sendshadowpowclaim()
     if (pwallet->m_wallet_unlock_staking_only) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to create claim transaction");
     }
+    const uint64_t expected_wallet_authority_generation = WITH_LOCK(
+        pwallet->cs_wallet,
+        if (!pwallet->HasNormalPowMiningWalletAuthorityLocked()) {
+            throw JSONRPCError(
+                RPC_WALLET_UNLOCK_NEEDED,
+                "Error: Wallet requires a normal unlock to create a claim transaction");
+        }
+        return pwallet->m_pow_wallet_authority_generation.load(
+            std::memory_order_acquire));
     if (!pwallet->chain().isReadyToBroadcast()) {
         throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
                            "Gold Rush PoW claims are paused while the node is reindexing, importing blocks, or in initial block download");
     }
-    if (pwallet->CountQuarantinedShadowPowClaims() != 0) {
-        throw JSONRPCError(RPC_WALLET_ERROR,
-                           "Gold Rush PoW claim creation is paused because a prior claim remains quarantined outside the local mempool. Its fee input remains reserved until on-chain resolution; the wallet will not create a second fee-input claim");
-    }
-    if (pwallet->CountLiveShadowPowClaims() >= MAX_SHADOW_POW_EVALS_PER_BLOCK) {
-        throw JSONRPCError(RPC_WALLET_ERROR,
-                           strprintf("The wallet already has the maximum %u relayable Gold Rush PoW claims", MAX_SHADOW_POW_EVALS_PER_BLOCK));
-    }
-
-    ShadowPowClaimSubmissionGuard submission_guard(*pwallet);
-    if (!submission_guard) {
-        throw JSONRPCError(RPC_WALLET_ERROR,
-                           "Another Gold Rush PoW claim submission is already in progress for this wallet");
-    }
-
     const std::string address = request.params[0].get_str();
     const CTxDestination dest = DecodeDestination(address);
     if (!IsValidDestination(dest)) {
@@ -1902,13 +1925,142 @@ static RPCHelpMan sendshadowpowclaim()
         coin_control.fOverrideFeeRate = true;
     }
 
+    // Validate every caller-supplied argument before any historical relay
+    // side effect, then reserve the wallet's complete claim/recovery submit
+    // path for both retained-byte relay and any subsequent new claim.
+    ShadowPowClaimSubmissionGuard submission_guard(*pwallet);
+    if (!submission_guard) {
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           "Another Gold Rush PoW claim submission is already in progress for this wallet");
+    }
+
+    ShadowPowClaimMiningGate initial_gate =
+        pwallet->GetShadowPowClaimMiningGate();
+    std::set<uint256> relay_attempts;
+    size_t relay_iterations{0};
+    while (initial_gate.ShouldRelayExisting()) {
+        if (++relay_iterations > MAX_SHADOW_POW_RPC_RELAY_ATTEMPTS) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Existing Gold Rush PoW relay selection did not converge within the bounded per-call snapshot limit; no new fee transaction was created");
+        }
+        const ShadowPowClaimMiningGate current_gate =
+            pwallet->GetShadowPowClaimMiningGate();
+        if (!ShadowPowClaimRelayIntentMatches(
+                initial_gate, current_gate) ||
+            current_gate.relay_expiry_time <= 0 ||
+            GetTime() >= current_gate.relay_expiry_time) {
+            initial_gate = current_gate;
+            continue;
+        }
+        if (!relay_attempts.insert(current_gate.relay_txid).second) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Existing Gold Rush PoW relay selection did not converge within the bounded per-call attempt limit; no new fee transaction was created");
+        }
+        const ShadowPowClaimMiningGate relay_gate = current_gate;
+        std::string relay_error;
+        bool relayed{false};
+        ShadowPowClaimRecoveryBroadcastGuard broadcast_guard;
+        broadcast_guard.expected_wallet_generation =
+            relay_gate.wallet_generation;
+        broadcast_guard.expected_wallet_tip = relay_gate.active_tip;
+        broadcast_guard.expected_candidate_state_fingerprint =
+            relay_gate.candidate_state_fingerprint;
+        broadcast_guard.require_normal_unlock = true;
+        try {
+            relayed = pwallet->SubmitTxMemoryPoolAndRelay(
+                relay_gate.relay_txid, relay_error, /*relay=*/true,
+                &broadcast_guard,
+                /*max_tx_fee_override=*/CENT);
+        } catch (const std::exception& exception) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                strprintf("Existing Gold Rush PoW claim relay encountered a local exception; no sibling was authorized: %s",
+                          exception.what()));
+        } catch (...) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Existing Gold Rush PoW claim relay encountered an unknown local exception; no sibling was authorized");
+        }
+        if (relayed) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                strprintf("An existing eligible Gold Rush PoW claim %s was relayed; no additional fee transaction was created",
+                          relay_gate.relay_txid.GetHex()));
+        }
+        if (ShadowPowClaimRelayRequiresFreshGate(relay_error)) {
+            initial_gate = pwallet->GetShadowPowClaimMiningGate();
+            continue;
+        }
+        const bool wait_for_snapshot_change = relay_error.empty() ||
+            ShadowPowClaimRelayMustWaitForNextTip(relay_error);
+        ShadowPowClaimMiningGate recorded_reselection;
+        const bool recorded = !wait_for_snapshot_change &&
+            pwallet->RecordShadowPowClaimRelayPolicyRejection(
+                relay_gate, &recorded_reselection);
+        initial_gate = recorded
+            ? recorded_reselection
+            : pwallet->DeferShadowPowClaimFamilyForSnapshot(
+                  relay_gate);
+        if (initial_gate.ShouldRelayExisting()) {
+            continue;
+        }
+        if (initial_gate.MayRefreshSameAnchor()) {
+            break;
+        }
+        if (wait_for_snapshot_change) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                strprintf("Existing Gold Rush PoW claim family %s must wait for a wallet or tip state change; no independent relay or refresh work remains: %s",
+                          relay_gate.relay_txid.GetHex(),
+                          relay_error.empty() ? "local relay unavailable"
+                                              : relay_error));
+        }
+        if (!recorded) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Relay failure was not a reproducible deterministic mempool-policy rejection and no independent relay or refresh work remains; no new fee transaction was authorized");
+        }
+        throw JSONRPCError(
+            RPC_VERIFY_REJECTED,
+            "Every bounded historical relay candidate was rejected and the typed gate did not authorize a same-anchor refresh");
+    }
+    if (!initial_gate.MayCreateClaim()) {
+        switch (initial_gate.action) {
+        case ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is waiting for an existing live claim family member; no competing fee transaction was created");
+        case ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is waiting for a wallet or active-tip state change; no fee transaction was created");
+        case ShadowPowClaimMiningGateAction::RELAY_EXISTING:
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Gold Rush PoW claim creation still has bounded historical relay work; no sibling fee transaction was authorized");
+        case ShadowPowClaimMiningGateAction::UNSAFE:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is blocked by an incoherent, ambiguous, or unsafe wallet-owned claim component");
+        case ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR:
+        case ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR:
+            break;
+        }
+        throw JSONRPCError(
+            RPC_WALLET_ERROR,
+            "Gold Rush PoW claim creation is not authorized by the current typed mining-gate snapshot");
+    }
+
     ShadowPowClaimInput selected_input;
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
-        const ShadowPowClaimInventory claim_inventory = pwallet->GetShadowPowClaimInventoryLocked();
-        if (claim_inventory.BlockingClaims() != 0) {
+        ShadowPowClaimMiningGate mining_gate =
+            pwallet->GetShadowPowClaimMiningGateLocked();
+        if (!mining_gate.MayCreateClaim()) {
             throw JSONRPCError(RPC_WALLET_ERROR,
-                "Gold Rush PoW claim creation is paused because an actionable or indeterminate quarantined claim component remains unresolved");
+                "Gold Rush PoW claim creation is paused because the typed mining gate is unsafe, incoherent, or at capacity");
         }
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, GetAdjustedTimeSeconds());
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
@@ -1921,11 +2073,19 @@ static RPCHelpMan sendshadowpowclaim()
             supplied_proof ? &*supplied_proof : nullptr,
             coin_control,
             selected_input,
-            selection_error);
+            selection_error,
+            &mining_gate);
         if (selection_result == ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX) {
             throw JSONRPCError(RPC_WALLET_ERROR, selection_error.original);
         }
         if (selection_result != ShadowPowClaimInputSelectionResult::SELECTED) {
+            if (mining_gate.MayRefreshSameAnchor()) {
+                throw JSONRPCError(
+                    RPC_WALLET_ERROR,
+                    selection_error.original.empty()
+                        ? "The selected retained Gold Rush PoW claim family is not currently serviceable"
+                        : selection_error.original);
+            }
             throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable non-dust UTXO found for the target address");
         }
     }
@@ -1945,7 +2105,8 @@ static RPCHelpMan sendshadowpowclaim()
         }
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
         pow_work = PrepareShadowPowWork(
-            target, quantum_payout_script, selected_input.outpoint, tip, view);
+            selected_input.target, selected_input.quantum_payout_script,
+            selected_input.outpoint, tip, view);
         if (!pow_work.valid) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Failed to prepare shadow PoW work (outside the reward window or invalid payout script/input)");
         }
@@ -1992,30 +2153,50 @@ static RPCHelpMan sendshadowpowclaim()
     int64_t vsize{-1};
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
+        if (pwallet->m_pow_wallet_authority_generation.load(
+                std::memory_order_acquire) !=
+                expected_wallet_authority_generation ||
+            !pwallet->HasNormalPowMiningWalletAuthorityLocked()) {
+            throw JSONRPCError(
+                RPC_WALLET_UNLOCK_NEEDED,
+                "Wallet signing authority changed while grinding; retry after a normal unlock");
+        }
+        const ShadowPowClaimMiningGate mining_gate =
+            pwallet->GetShadowPowClaimMiningGateLocked();
+        if (!mining_gate.MayCreateClaim() ||
+            selected_input.same_anchor_refresh !=
+                mining_gate.MayRefreshSameAnchor()) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Wallet claim action changed while grinding; retry the PoW claim");
+        }
         const int64_t current_time = GetAdjustedTimeSeconds();
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
         }
-        for (const COutput& output : AvailableCoins(*pwallet, &coin_control).All()) {
-            if (output.outpoint != selected_input.outpoint) continue;
-            if (output.depth <= 0) continue;
-            if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != selected_input.target) continue;
-
+        std::map<COutPoint, Coin> coins;
+        const auto build_candidate = [&](const COutPoint& outpoint,
+                                         const CTxOut& output,
+                                         const Coin& input_coin) {
             CMutableTransaction candidate;
             candidate.nVersion = CTransaction::CURRENT_VERSION;
             candidate.nTime = current_time;
             static constexpr uint32_t SEQUENCE_REPLACEABLE = 0xfffffffd;
-            candidate.vin.emplace_back(output.outpoint, CScript(), SEQUENCE_REPLACEABLE);
-            candidate.vout.emplace_back(output.txout.nValue, selected_input.target);
+            candidate.vin.emplace_back(
+                outpoint, CScript(), SEQUENCE_REPLACEABLE);
+            candidate.vout.emplace_back(output.nValue, selected_input.target);
             candidate.vout.emplace_back(0, CScript() << OP_RETURN << proof);
 
             const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(candidate), pwallet.get(), &coin_control);
-            if (tx_size.vsize <= 0) continue;
+            if (tx_size.vsize <= 0) return false;
             const CAmount candidate_fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
-            const CAmount candidate_change = output.txout.nValue - candidate_fee;
+            const CAmount candidate_change = output.nValue - candidate_fee;
             CTxOut change_out(candidate_change, selected_input.target);
-            if (!MoneyRange(candidate_change) || candidate_change <= 0 || IsDust(change_out, pwallet->chain().relayDustFee())) continue;
+            if (!MoneyRange(candidate_change) || candidate_change <= 0 ||
+                IsDust(change_out, pwallet->chain().relayDustFee())) {
+                return false;
+            }
             if (candidate_fee > pwallet->m_default_max_tx_fee) {
                 throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
             }
@@ -2025,19 +2206,71 @@ static RPCHelpMan sendshadowpowclaim()
             }
 
             candidate.vout[0].nValue = candidate_change;
+            coins.emplace(outpoint, input_coin);
+            claim_tx = std::move(candidate);
+            fee = candidate_fee;
+            change = candidate_change;
+            vsize = tx_size.vsize;
+            return true;
+        };
+
+        if (selected_input.same_anchor_refresh) {
+            Coin anchor_coin;
+            bilingual_str refresh_error;
+            if (!pwallet->GetShadowPowClaimRefreshCoinLocked(
+                    selected_input, mining_gate, anchor_coin,
+                    refresh_error) ||
+                !build_candidate(selected_input.outpoint, anchor_coin.out,
+                                 anchor_coin)) {
+                throw JSONRPCError(
+                    RPC_VERIFY_REJECTED,
+                    refresh_error.original.empty()
+                        ? "The same-anchor Gold Rush PoW refresh became unavailable while grinding"
+                        : refresh_error.original);
+            }
+        } else {
+            if (!mining_gate.MayCreateNewAnchorClaim()) {
+                throw JSONRPCError(
+                    RPC_VERIFY_REJECTED,
+                    "The current wallet action no longer permits a new Gold Rush PoW fee anchor");
+            }
+            for (const COutput& output :
+                 AvailableCoins(*pwallet, &coin_control).All()) {
+                if (output.outpoint != selected_input.outpoint) continue;
+                if (output.depth <= 0) continue;
+                if (CanonicalizeLegacyStakeScript(
+                        output.txout.scriptPubKey) != selected_input.target) {
+                    continue;
+                }
+                if (ComputeShadowPowClaimLineageFamilyFingerprint(
+                        output.outpoint, output.txout.nValue,
+                        output.txout.scriptPubKey) !=
+                    selected_input.lineage_family_fingerprint) {
+                    continue;
+                }
+                Coin input_coin;
+                if (!pwallet->chain().chainman().ActiveChainstate()
+                         .CoinsTip()
+                         .GetCoin(output.outpoint, input_coin) ||
+                    input_coin.IsSpent()) {
+                    continue;
+                }
+                if (build_candidate(
+                        output.outpoint, output.txout, input_coin)) {
+                    break;
+                }
+            }
+        }
+
+        if (!claim_tx.vin.empty()) {
             std::map<int, bilingual_str> input_errors;
-            if (!pwallet->SignTransaction(candidate, input_errors)) {
+            if (!pwallet->SignTransaction(
+                    claim_tx, coins, SIGHASH_DEFAULT, input_errors)) {
                 if (!input_errors.empty()) {
                     throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Signing claim transaction failed: %s", input_errors.begin()->second.original));
                 }
                 throw JSONRPCError(RPC_WALLET_ERROR, "Signing claim transaction failed");
             }
-
-            claim_tx = std::move(candidate);
-            fee = candidate_fee;
-            change = candidate_change;
-            vsize = tx_size.vsize;
-            break;
         }
     }
 
@@ -2049,6 +2282,8 @@ static RPCHelpMan sendshadowpowclaim()
 
     CTransactionRef tx = MakeTransactionRef(std::move(claim_tx));
     const std::string hex = EncodeHexTx(*tx);
+    pwallet->MaybeDelayShadowPowClaimCommitForTest(
+        selected_input.outpoint);
     {
         ChainstateManager& chainman = pwallet->chain().chainman();
         LOCK(cs_main);
@@ -2057,16 +2292,29 @@ static RPCHelpMan sendshadowpowclaim()
             tip->nHeight + 1 != pow_work.height) {
             throw JSONRPCError(RPC_VERIFY_REJECTED, "Active chain tip changed before the PoW claim could be committed; retry on the new tip");
         }
+        ShadowPowClaimMiningGate final_mining_gate;
         {
             LOCK(pwallet->cs_wallet);
-            const ShadowPowClaimInventory claim_inventory = pwallet->GetShadowPowClaimInventoryLocked();
+            final_mining_gate =
+                pwallet->GetShadowPowClaimMiningGateLocked();
             Coin selected_coin;
-            if (claim_inventory.BlockingClaims() != 0 ||
-                !claim_inventory.wallet_tip_matches ||
-                !chainman.ActiveChainstate().CoinsTip().GetCoin(selected_input.outpoint, selected_coin) ||
-                selected_coin.IsSpent()) {
+            bilingual_str refresh_error;
+            const bool gate_matches = selected_input.same_anchor_refresh
+                ? pwallet->GetShadowPowClaimRefreshCoinLocked(
+                      selected_input, final_mining_gate, selected_coin,
+                      refresh_error)
+                : final_mining_gate.MayCreateNewAnchorClaim() &&
+                      chainman.ActiveChainstate().CoinsTip().GetCoin(
+                          selected_input.outpoint, selected_coin) &&
+                      !selected_coin.IsSpent() &&
+                      ComputeShadowPowClaimLineageFamilyFingerprint(
+                          selected_input.outpoint,
+                          selected_coin.out.nValue,
+                          selected_coin.out.scriptPubKey) ==
+                          selected_input.lineage_family_fingerprint;
+            if (!gate_matches) {
                 throw JSONRPCError(RPC_VERIFY_REJECTED,
-                    "Wallet claim-component state or selected confirmed input changed before commit; retry the PoW claim");
+                    "Wallet mining-gate state or selected confirmed input changed before commit; retry the PoW claim");
             }
         }
         const MempoolAcceptResult accept = chainman.ProcessTransaction(tx, /*test_accept=*/true);
@@ -2083,7 +2331,33 @@ static RPCHelpMan sendshadowpowclaim()
             strprintf("%d", pow_work.height);
         map_value[SHADOW_POW_CLAIM_CREATED_TIP_KEY] =
             pow_work.prev_hash.GetHex();
-        CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "PoW Claim");
+        map_value[SHADOW_POW_CLAIM_LINEAGE_SCHEMA_KEY] =
+            SHADOW_POW_CLAIM_LINEAGE_SCHEMA_VERSION;
+        map_value[SHADOW_POW_CLAIM_LINEAGE_FAMILY_KEY] =
+            selected_input.lineage_family_fingerprint.GetHex();
+        map_value[SHADOW_POW_CLAIM_LINEAGE_ROOT_KEY] =
+            (selected_input.same_anchor_refresh
+                 ? selected_input.lineage_root_txid
+                 : tx->GetHash().ToUint256())
+                .GetHex();
+        map_value[SHADOW_POW_CLAIM_LINEAGE_ORDINAL_KEY] =
+            strprintf("%u", selected_input.same_anchor_refresh
+                               ? selected_input.lineage_ordinal
+                               : uint32_t{0});
+        if (selected_input.same_anchor_refresh) {
+            map_value[SHADOW_POW_CLAIM_LINEAGE_PARENT_KEY] =
+                selected_input.lineage_parent_txid.GetHex();
+        }
+        CommitWalletTransactionOrThrow(
+            *pwallet, tx, std::move(map_value), "PoW Claim",
+            /*created_destination=*/std::nullopt,
+            ShadowPowClaimCommitAuthority{
+                expected_wallet_authority_generation,
+                /*require_pow_mining_enabled=*/false,
+                selected_input.coin_lock_generation,
+                selected_input.outpoint,
+                final_mining_gate.wallet_generation,
+                final_mining_gate.candidate_state_fingerprint});
     }
 
     UniValue result(UniValue::VOBJ);
@@ -2116,6 +2390,26 @@ static const char* ShadowPowRecoveryStateName(ShadowPowClaimRecoveryState state)
     case ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN: return "resolved_on_active_chain";
     }
     return "unknown";
+}
+
+static const char* ShadowPowMiningGateActionName(
+    ShadowPowClaimMiningGateAction action)
+{
+    switch (action) {
+    case ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR:
+        return "create_new_anchor";
+    case ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE:
+        return "wait_for_live";
+    case ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP:
+        return "wait_for_next_tip";
+    case ShadowPowClaimMiningGateAction::RELAY_EXISTING:
+        return "relay_existing";
+    case ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR:
+        return "refresh_same_anchor";
+    case ShadowPowClaimMiningGateAction::UNSAFE:
+        return "unsafe";
+    }
+    return "unsafe";
 }
 
 static const char* ShadowPowRecoveryProvenanceName(ShadowPowClaimRecoveryProvenance provenance)
@@ -2437,6 +2731,42 @@ static UniValue ShadowPowRecoveryNodeToJSON(const ShadowPowClaimRecoveryNode& no
     result.pushKV("quarantined", node.quarantined);
     result.pushKV("expected_shape", node.expected_shape);
     result.pushKV("wallet_authored", node.wallet_authored);
+    result.pushKV("wallet_from_me", node.wallet_from_me);
+    result.pushKV("authored_metadata_valid", node.authored_metadata_valid);
+    result.pushKV("authored_tip_active_branch_bound",
+                  node.authored_tip_active_branch_bound);
+    result.pushKV("claim_descriptor_valid", node.claim_descriptor_valid);
+    result.pushKV("proof_evaluation_skipped_resolved_anchor",
+                  node.proof_evaluation_skipped_resolved_anchor);
+    result.pushKV("proof_version",
+                  static_cast<uint64_t>(node.proof_version));
+    result.pushKV("proof_mode",
+                  node.proof_mode == ShadowProofPayloadMode::POW
+                      ? "pow"
+                      : node.proof_mode == ShadowProofPayloadMode::POS
+                          ? "pos"
+                          : node.proof_mode ==
+                                    ShadowProofPayloadMode::UNKNOWN
+                              ? "unknown"
+                              : "malformed");
+    result.pushKV("proof_origin_bound", node.proof_origin_bound);
+    result.pushKV("proof_origin_height", node.proof_origin_height);
+    result.pushKV("proof_origin_previous_block_hash",
+                  node.proof_origin_previous_block_hash.GetHex());
+    result.pushKV("proof_input_bound", node.proof_input_bound);
+    result.pushKV("exact_authored_carrier_shape",
+                  node.exact_authored_carrier_shape);
+    result.pushKV("relay_ttl_expired", node.relay_ttl_expired);
+    result.pushKV("relay_expiry_time", node.relay_expiry_time);
+    result.pushKV("lineage_metadata_present",
+                  node.lineage_metadata_present);
+    result.pushKV("lineage_metadata_valid", node.lineage_metadata_valid);
+    result.pushKV("lineage_family_fingerprint",
+                  node.lineage_family_fingerprint.GetHex());
+    result.pushKV("lineage_root_txid", node.lineage_root_txid.GetHex());
+    result.pushKV("lineage_parent_txid",
+                  node.lineage_parent_txid.GetHex());
+    result.pushKV("lineage_ordinal", node.lineage_ordinal);
     result.pushKV("abandoned", node.abandoned);
     result.pushKV("expired_locally_retired", node.expired_locally_retired);
     result.pushKV("stale_depth", node.stale_depth);
@@ -2467,6 +2797,7 @@ static UniValue ShadowPowRecoveryComponentToJSON(const ShadowPowClaimRecoveryCom
     result.pushKV("stale_depth_known", component.stale_depth_known);
     result.pushKV("anchor_authenticated", component.anchor_authenticated);
     result.pushKV("anchor_unspent", component.anchor_unspent);
+    result.pushKV("anchor_user_locked", component.anchor_user_locked);
     result.pushKV("all_claims_quarantined", component.all_claims_quarantined);
     result.pushKV("all_claims_explicitly_provenanced", component.all_claims_explicitly_provenanced);
     result.pushKV("all_claims_zero_payment_retirable",
@@ -3583,7 +3914,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     return RPCHelpMan{
         "getpowclaimrecoveryinfo",
         "\nReturn this wallet's persisted Gold Rush PoW claim-recovery consent and current component gate.\n"
-        "This RPC never creates, signs, or broadcasts a transaction. Recovery is disabled unless mode is explicitly set to automatic with bounded spending limits. Set verbose=true to inspect the complete typed component graph and provenance.\n",
+        "This RPC never creates, signs, or broadcasts a transaction. Automatic recovery is disabled unless mode is explicitly set to automatic with bounded spending limits; exact-plan manual recovery remains separately authorized per request. Set verbose=true to inspect the complete typed component graph and provenance.\n",
         {
             {"verbose", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include complete component, node, provenance, and refusal-classification details."},
         },
@@ -3601,7 +3932,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             {RPCResult::Type::NUM, "wallet_generation", "Wallet database generation used by exact-plan stale-state protection."},
             {RPCResult::Type::BOOL, "wallet_tip_matches", "Whether the wallet-processed tip matches the classified active tip."},
             {RPCResult::Type::NUM, "raw_quarantined_claims", "Wallet-known quarantined claim objects retained for audit and reorg safety."},
-            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Actionable plus indeterminate claim objects that currently pause new claim creation."},
+            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Legacy actionable-plus-indeterminate compatibility count. Candidate claim creation is controlled by the complete typed mining gate instead."},
             {RPCResult::Type::NUM, "actionable_quarantined_claims", "Claim objects whose confirmed anchor is currently unspent."},
             {RPCResult::Type::NUM, "resolved_on_active_chain_claims", "Historical objects whose confirmed anchor is spent on the active chain."},
             {RPCResult::Type::NUM, "indeterminate_quarantined_claims", "Objects that fail closed because classification is incomplete."},
@@ -3609,9 +3940,9 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             {RPCResult::Type::NUM, "raw_claim_objects", "All wallet-known unconfirmed claim objects in the typed inventory."},
             {RPCResult::Type::NUM, "live_claim_objects", "Claim objects currently in the local mempool."},
             {RPCResult::Type::NUM, "quarantined_claim_objects", "Claim objects marked quarantined for audit and reorg safety."},
-            {RPCResult::Type::NUM, "blocking_components", "Typed components that currently gate new mining claims."},
-            {RPCResult::Type::NUM, "retired_claim_objects", "Origin-expired, locally-authored claim objects durably retired on the active branch without a recovery transaction."},
-            {RPCResult::Type::NUM, "retired_components", "Typed components retired on the active branch without a recovery transaction or recovery fee."},
+            {RPCResult::Type::NUM, "blocking_components", "Legacy recovery classification count retained for audit compatibility. Candidate claim creation is controlled by the complete typed mining gate."},
+            {RPCResult::Type::NUM, "retired_claim_objects", "Narrow legacy claim objects durably retired on the active branch without a recovery transaction. Schema-lineage and strict exact locally-authored carriers are reclassified instead."},
+            {RPCResult::Type::NUM, "retired_components", "Narrow legacy components retired on the active branch without a recovery transaction or recovery fee."},
             {RPCResult::Type::NUM, "resolved_components", "Typed components resolved on the active chain."},
             {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual resolutions."},
             {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic resolutions."},
@@ -3717,7 +4048,7 @@ static RPCHelpMan setpowclaimrecovery()
     return RPCHelpMan{
         "setpowclaimrecovery",
         "\nPersist this wallet's Gold Rush PoW claim-recovery choice.\n"
-        "Newly authored origin-bound claims retire without a second transaction or recovery fee after their full block-height eligibility window. automatic is explicit standing consent to create fee-paying on-chain conflicts only for remaining components after the component engine classifies the complete graph as conflict-resolvable on one pinned active-chain tip. This may include a disclosed unbound QQP2 proof that is invalid now but may become valid on a descendant. Generic retryable and indeterminate states remain refused. All six positive limits are required when enabling it. pause_and_ask keeps conflict recovery manual. unset removes standing consent. This call never starts mining and never creates, signs, or broadcasts a transaction.\n",
+        "The built-in miner's normal path for a strict exact wallet-authored QQP2/QQP3/QQP4 family is exact relay or same-anchor continuation; the family is not retired merely because an original policy window expires. Separately, automatic is explicit, default-off standing consent to create fee-paying on-chain conflicts that the component engine finds conflict-resolvable on one pinned active-chain tip, including a disclosed legacy QQP2 proof that is invalid now but may validate on a descendant. Generic retryable and indeterminate states remain refused. All six positive limits are required when enabling it. pause_and_ask keeps conflict recovery manual. unset removes standing consent. This call never starts mining and never creates, signs, or broadcasts a transaction.\n",
         {
             {"mode", RPCArg::Type::STR, RPCArg::Optional::NO, "automatic, pause_and_ask, or unset."},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Wallet-scoped spending and staleness limits.", {
@@ -3823,7 +4154,7 @@ static RPCHelpMan setpowmining()
         "\nStart, stop, or reconfigure the built-in (in-process) Gold Rush Proof-of-Work miner.\n"
         "No external miner is required. Mining only produces claims during the Gold Rush reward window,\n"
         "requires an unlocked wallet with private keys, and credits valid claims to a wallet-owned quantum address in the upgraded shadow ledger.\n"
-        "By default the miner reuses -qqpowpayoutaddress or a previously stored wallet payout and creates no key. If neither exists, the call fails without changing the wallet unless allow_new_payout_key=true gives one-call consent, or startup already supplied -qqallowautokeycreation=1. Every newly created payout key is non-HD and requires an immediate wallet backup.\n"
+        "A new-anchor claim reuses -qqpowpayoutaddress or a previously stored wallet payout and creates no key by default. If neither exists, new-anchor mining fails without changing the wallet unless allow_new_payout_key=true gives one-call consent, or startup already supplied -qqallowautokeycreation=1. A safe retained family needs no configured payout to wait, relay, or refresh: Core preserves that family's authenticated payout script and allocates no unrelated key. If explicit key-creation consent is supplied while servicing a retained family, Core binds the future new-anchor payout during this call so the backup warning is returned synchronously. Every newly created payout key is non-HD and requires an immediate wallet backup.\n"
         "Claim submission is not whitelist-gated, but it does require a spendable non-dust legacy UTXO to authenticate the QQSPROOF transaction and pay the minimal network fee.\n",
         {
             {"enabled", RPCArg::Type::BOOL, RPCArg::Optional::NO, "true to start mining, false to stop."},
@@ -3835,7 +4166,7 @@ static RPCHelpMan setpowmining()
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is now enabled."},
             {RPCResult::Type::NUM, "threads", "Configured worker threads."},
             {RPCResult::Type::NUM, "cpu_percent", "Configured per-core CPU duty cycle."},
-            {RPCResult::Type::STR, "payout_address", "The configured, restored, or newly created wallet-owned quantum payout address."},
+            {RPCResult::Type::STR, "payout_address", "The configured, restored, or newly created wallet-owned payout for future new-anchor claims. It may be empty or differ while a retained family preserves its own authenticated payout."},
             {RPCResult::Type::BOOL, "created_payout_key", "Whether this call created a new non-HD ML-DSA payout key."},
             {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup reminder when a wallet-backed quantum payout key was created."},
         }},
@@ -3898,22 +4229,35 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "shadow_reward_end_height", "Last Gold Rush shadow-ledger reward height."},
             {RPCResult::Type::BOOL, "epoch_active", "Whether the Gold Rush reward window is currently open."},
             {RPCResult::Type::NUM, "blocks_remaining", "Blocks left in the Gold Rush reward window."},
-            {RPCResult::Type::STR, "payout_address", "Quantum payout address (empty until created)."},
+            {RPCResult::Type::STR, "payout_address", "Configured wallet payout for future new-anchor claims (empty until bound). A retained-family refresh instead preserves that selected family's authenticated payout."},
             {RPCResult::Type::STR_AMOUNT, "accrued_jackpot", "PoW jackpot accrued in the pool."},
             {RPCResult::Type::STR_AMOUNT, "next_claim_payout", "Estimated payout for a valid PoW claim in the next block."},
             {RPCResult::Type::NUM, "next_claim_amount", "Estimated payout for a valid PoW claim in the next block, in satoshis."},
             {RPCResult::Type::NUM, "claims_submitted", "Claims submitted by this miner since it started."},
             {RPCResult::Type::NUM, "unresolved_claims", "Unconfirmed wallet QQSPROOF transactions, whether live or quarantined."},
             {RPCResult::Type::NUM, "live_claims", "Unconfirmed wallet QQSPROOF transactions currently in the local mempool."},
-            {RPCResult::Type::NUM, "quarantined_claims", "Backward-compatible count of quarantined claim objects that currently gate claim creation (same as blocking_quarantined_claims)."},
+            {RPCResult::Type::NUM, "quarantined_claims", "Backward-compatible legacy count (same as blocking_quarantined_claims). It is audit evidence, not the candidate mining predicate; a safe typed family may relay or refresh while this count is nonzero."},
             {RPCResult::Type::NUM, "raw_quarantined_claims", "All wallet-authored unconfirmed QQSPROOF objects absent from the local mempool, including history already resolved on the active chain."},
-            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Quarantined claim objects that currently gate claim creation (actionable plus indeterminate)."},
+            {RPCResult::Type::NUM, "blocking_quarantined_claims", "Legacy actionable-plus-indeterminate compatibility count. Candidate claim creation is controlled by the complete typed mining gate instead."},
             {RPCResult::Type::NUM, "actionable_quarantined_claims", "Quarantined objects whose confirmed anchor remains unspent on the active chain."},
             {RPCResult::Type::NUM, "resolved_on_active_chain_claims", "Historical quarantined objects whose confirmed anchor is already spent on the active chain; retained for reorg safety but not miner-gating."},
             {RPCResult::Type::NUM, "indeterminate_quarantined_claims", "Quarantined objects with incomplete ancestry or an incoherent wallet/chain snapshot; these fail closed and gate mining."},
             {RPCResult::Type::NUM, "claim_components", "Wallet-known quarantined claim components in the current snapshot."},
             {RPCResult::Type::STR_HEX, "claim_inventory_tip", "Active tip to which component classification is bound, or all-zero when unavailable."},
             {RPCResult::Type::BOOL, "claim_inventory_wallet_tip_matches", "Whether the wallet-processed tip exactly matched the classified active tip."},
+            {RPCResult::Type::BOOL, "mining_gate_coherent", "Whether the typed mining gate is bound to one matching active-chain and wallet tip."},
+            {RPCResult::Type::STR, "mining_gate_action", "Fresh inventory action, except that an enabled claim-in-flight worker may report the optional transient wait_for_next_tip from one exact matching cached snapshot: create_new_anchor, wait_for_live, wait_for_next_tip, relay_existing, refresh_same_anchor, or unsafe."},
+            {RPCResult::Type::BOOL, "mining_gate_can_submit", "Fresh inventory authorization to create one additional claim without mutating recovery state. It may be true while mining_gate_action reports a bounded wait_for_next_tip worker override, but does not authorize bypassing that wait."},
+            {RPCResult::Type::BOOL, "mining_gate_database_ambiguous", "Whether an ambiguous claim-recovery or user coin-lock database outcome forces the gate closed until wallet reload."},
+            {RPCResult::Type::NUM, "mining_gate_unresolved_components", "Unresolved mining-relevant wallet claim components in the typed snapshot. Audit-only incoming proof records remain visible in recovery inventory but do not count here."},
+            {RPCResult::Type::NUM, "mining_gate_live_claims", "Members currently in the local mempool across every safe authenticated wallet-owned family."},
+            {RPCResult::Type::NUM, "mining_gate_eligible_claims", "Members valid for the pinned tip across every safe authenticated wallet-owned family, whether live or absent."},
+            {RPCResult::Type::NUM, "mining_gate_family_claims", "Historical members across every safe authenticated wallet-owned same-anchor family."},
+            {RPCResult::Type::NUM, "mining_gate_unsafe_claims", "Claim objects in mining-relevant unresolved components that fail the strict same-anchor family rules."},
+            {RPCResult::Type::NUM, "mining_gate_unsafe_components", "Mining-relevant unresolved components that fail the strict same-anchor family rules."},
+            {RPCResult::Type::STR_HEX, "mining_gate_relay_txid", "Eligible under-TTL relay claim for the reported gate snapshot, or all-zero when no relay is currently actionable, including while that family is deferred until the next tip."},
+            {RPCResult::Type::STR_HEX, "mining_gate_lineage_head_txid", "Current durable same-anchor lineage head, or all-zero when no family is active."},
+            {RPCResult::Type::STR_HEX, "mining_gate_candidate_state_fingerprint", "Cheap in-memory wallet-claim state key used with tip and database generation to invalidate the cached gate."},
             {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual claim resolutions."},
             {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic claim resolutions."},
             {RPCResult::Type::NUM, "claims_auto_resolved", "Confirmed automatic claim resolutions."},
@@ -3939,26 +4283,45 @@ static RPCHelpMan getpowmininginfo()
     if (!pwallet) return NullUniValue;
 
     UniValue obj(UniValue::VOBJ);
-    obj.pushKV("enabled", pwallet->m_pow_mining_enabled.load());
-    obj.pushKV("autostart", gArgs.GetBoolArg("-powmining", false));
-    obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
-    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pwallet->m_pow_state.load())));
-    obj.pushKV("threads", pwallet->m_pow_threads.load());
-    obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
-    obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());
-    obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
-    obj.pushKV("unresolved_claims", static_cast<uint64_t>(pwallet->CountUnresolvedShadowPowClaims()));
-    obj.pushKV("live_claims", static_cast<uint64_t>(pwallet->CountLiveShadowPowClaims()));
     ShadowPowClaimInventory claim_inventory;
+    ShadowPowClaimRecoveryInventory recovery_inventory;
+    ShadowPowClaimMiningGate mining_gate;
+    size_t unresolved_claims{0};
+    size_t live_claims{0};
     ShadowPowClaimRecoveryPolicy recovery_policy =
         DefaultShadowPowClaimRecoveryPolicy();
     ShadowPowClaimRecoveryUsage recovery_usage;
     ShadowPowClaimRecoveryPolicyMutationResult recovery_policy_state;
     bool recovery_database_ambiguous{false};
     ShadowPowClaimStakeReserveInfo stake_reserve;
+    ShadowPowClaimMiningGateAction mining_gate_telemetry_action{
+        ShadowPowClaimMiningGateAction::UNSAFE};
+    bool pow_mining_enabled{false};
+    interfaces::WalletPowMiningState pow_mining_state{
+        interfaces::WalletPowMiningState::DISABLED};
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
-        claim_inventory = pwallet->GetShadowPowClaimInventoryLocked();
+        recovery_inventory =
+            pwallet->GetShadowPowClaimRecoveryInventoryLocked();
+        claim_inventory = BuildShadowPowClaimCompatibilityInventory(
+            recovery_inventory);
+        mining_gate =
+            pwallet->GetShadowPowClaimMiningGateFromInventoryLocked(
+                recovery_inventory);
+        mining_gate_telemetry_action =
+            pwallet->GetShadowPowClaimMiningGateTelemetryActionLocked(
+                mining_gate, pow_mining_enabled, pow_mining_state);
+        for (const ShadowPowClaimRecoveryComponent& component :
+             recovery_inventory.components) {
+            for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
+                if (node.kind != ShadowPowClaimRecoveryNodeKind::CLAIM ||
+                    node.active_chain_confirmed || !node.wallet_authored) {
+                    continue;
+                }
+                ++unresolved_claims;
+                if (node.in_mempool) ++live_claims;
+            }
+        }
         recovery_policy_state =
             pwallet->GetShadowPowClaimRecoveryPolicyState();
         recovery_database_ambiguous =
@@ -3967,10 +4330,23 @@ static RPCHelpMan getpowmininginfo()
             recovery_policy =
                 recovery_policy_state.authoritative_policy;
         }
-        recovery_usage = pwallet->GetShadowPowClaimRecoveryUsage(
-            recovery_policy.rolling_fee_window_seconds);
+        recovery_usage =
+            pwallet->GetShadowPowClaimRecoveryUsageFromInventoryLocked(
+                recovery_inventory,
+                recovery_policy.rolling_fee_window_seconds);
         stake_reserve = pwallet->GetShadowPowClaimStakeReserveInfoLocked();
     }
+    obj.pushKV("enabled", pow_mining_enabled);
+    obj.pushKV("autostart", gArgs.GetBoolArg("-powmining", false));
+    obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
+    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pow_mining_state)));
+    obj.pushKV("threads", pwallet->m_pow_threads.load());
+    obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
+    obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());
+    obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
+    obj.pushKV("unresolved_claims",
+               static_cast<uint64_t>(unresolved_claims));
+    obj.pushKV("live_claims", static_cast<uint64_t>(live_claims));
     obj.pushKV("quarantined_claims", static_cast<uint64_t>(claim_inventory.BlockingClaims()));
     obj.pushKV("raw_quarantined_claims", static_cast<uint64_t>(claim_inventory.raw_quarantined_claims));
     obj.pushKV("blocking_quarantined_claims", static_cast<uint64_t>(claim_inventory.BlockingClaims()));
@@ -3980,6 +4356,25 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("claim_components", static_cast<uint64_t>(claim_inventory.components.size()));
     obj.pushKV("claim_inventory_tip", claim_inventory.active_tip.GetHex());
     obj.pushKV("claim_inventory_wallet_tip_matches", claim_inventory.wallet_tip_matches);
+    obj.pushKV("mining_gate_coherent", mining_gate.coherent);
+    obj.pushKV("mining_gate_action",
+               ShadowPowMiningGateActionName(
+                   mining_gate_telemetry_action));
+    obj.pushKV("mining_gate_can_submit", mining_gate.MayCreateClaim());
+    obj.pushKV("mining_gate_database_ambiguous",
+               mining_gate.recovery_database_ambiguous);
+    obj.pushKV("mining_gate_unresolved_components",
+               static_cast<uint64_t>(mining_gate.unresolved_components));
+    obj.pushKV("mining_gate_live_claims", static_cast<uint64_t>(mining_gate.live_claims));
+    obj.pushKV("mining_gate_eligible_claims", static_cast<uint64_t>(mining_gate.eligible_claims));
+    obj.pushKV("mining_gate_family_claims", static_cast<uint64_t>(mining_gate.family_claims));
+    obj.pushKV("mining_gate_unsafe_claims", static_cast<uint64_t>(mining_gate.unsafe_claims));
+    obj.pushKV("mining_gate_unsafe_components", static_cast<uint64_t>(mining_gate.unsafe_components));
+    obj.pushKV("mining_gate_relay_txid", mining_gate.relay_txid.GetHex());
+    obj.pushKV("mining_gate_lineage_head_txid",
+               mining_gate.lineage_head_txid.GetHex());
+    obj.pushKV("mining_gate_candidate_state_fingerprint",
+               mining_gate.candidate_state_fingerprint.GetHex());
     obj.pushKV("pending_manual_resolutions", static_cast<uint64_t>(recovery_usage.pending_manual));
     obj.pushKV("pending_automatic_resolutions", static_cast<uint64_t>(recovery_usage.pending_automatic));
     obj.pushKV("claims_auto_resolved", static_cast<uint64_t>(recovery_usage.confirmed_automatic));

@@ -18,6 +18,7 @@
 #include <qt/optionsmodel.h>
 #include <qt/overviewpage.h>
 #include <qt/platformstyle.h>
+#include <qt/quantumguides.h>
 #include <qt/qvalidatedlineedit.h>
 #include <qt/receivecoinsdialog.h>
 #include <qt/receiverequestdialog.h>
@@ -191,11 +192,22 @@ void WaitForModal(const QString& description, std::function<bool()> action)
 }
 
 //! Press a standard button in a modal message box.
-void ConfirmMessageBox(QMessageBox::StandardButton confirm_type)
+void ConfirmMessageBox(QMessageBox::StandardButton confirm_type,
+                       const QString& expected_text = {})
 {
-    WaitForModal(QStringLiteral("message box"), [confirm_type]() {
+    WaitForModal(QStringLiteral("message box"), [confirm_type, expected_text]() {
         for (QWidget* widget : QApplication::topLevelWidgets()) {
             if (auto* dialog = qobject_cast<QMessageBox*>(widget)) {
+                if (!expected_text.isEmpty() &&
+                    !dialog->text().contains(expected_text)) {
+                    QTest::qFail(
+                        QStringLiteral("Message box omitted required disclosure: %1; actual: %2")
+                            .arg(expected_text, dialog->text())
+                            .toUtf8().constData(),
+                        __FILE__, __LINE__);
+                    dialog->reject();
+                    return true;
+                }
                 if (QAbstractButton* button = dialog->button(confirm_type)) {
                     button->click();
                     return true;
@@ -238,6 +250,14 @@ void AnswerPowClaimRecoveryConsent(bool enable, bool use_escape = false,
                 return true;
             }
             if (!explanation ||
+                !explanation->text().contains(
+                    QStringLiteral("waits while a member is live")) ||
+                !explanation->text().contains(
+                    QStringLiteral("same confirmed anchor")) ||
+                !explanation->text().contains(
+                    QStringLiteral("ordinary claim fee")) ||
+                !explanation->text().contains(
+                    QStringLiteral("miner could continue")) ||
                 !explanation->text().contains(
                     QStringLiteral("may become eligible again at a later height")) ||
                 !explanation->text().contains(
@@ -326,6 +346,14 @@ void AnswerInitialPowClaimRecoveryChoice(InitialPowClaimRecoveryChoice choice)
                 return true;
             }
             if (!explanation ||
+                !explanation->text().contains(
+                    QStringLiteral("waits while a member is live")) ||
+                !explanation->text().contains(
+                    QStringLiteral("same anchor")) ||
+                !explanation->text().contains(
+                    QStringLiteral("ordinary claim fee")) ||
+                !explanation->text().contains(
+                    QStringLiteral("optional fee-paying alternative")) ||
                 !explanation->text().contains(
                     QStringLiteral("may become eligible again at a later height")) ||
                 !explanation->text().contains(
@@ -710,6 +738,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(!automation_demurrage->isChecked());
     QVERIFY(!automation_redelegate->isChecked());
     QVERIFY(!automation_new_keys->isChecked());
+
     QVERIFY(refresh_details);
     QVERIFY(refresh_hint);
     QVERIFY(migration_phase);
@@ -765,6 +794,17 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     refresh_details->click();
     QTRY_VERIFY_WITH_TIMEOUT(refresh_hint->text().contains(QString("Detail panels updated")), 10000);
+
+    // The completed detail snapshot has released the page's update guard.
+    // Persistent PoW consent must describe retained locked-wallet intent,
+    // rather than the superseded claim that a locked startup discards it.
+    QTRY_VERIFY_WITH_TIMEOUT(automation_autostart_pow->isEnabled(), 5000);
+    ConfirmMessageBox(
+        QMessageBox::No,
+        QStringLiteral("keeps the configured worker enabled at zero hashrate and waits for a normal unlock"));
+    automation_autostart_pow->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!automation_autostart_pow->isChecked(), 3000);
+
     QCOMPARE(staking_enable->isChecked(), false);
     QCOMPARE(unlock_staking_only->isChecked(), false);
     QVERIFY(!unlock_staking_only->isEnabled());
@@ -957,6 +997,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
         walletModel.wallet().getPowClaimRecoveryPolicy().mode,
         interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK, 5000);
     QTRY_VERIFY_WITH_TIMEOUT(pow_status->text().contains(QString("enabled")), 5000);
+    QVERIFY(pow_status->text().contains(QString("configured new-anchor payout")));
     QCOMPARE(walletModel.getEncryptionStatus(), encryption_before_policy);
     QCOMPARE(walletModel.getWalletUnlockStakingOnly(), staking_only_before_policy);
 
@@ -985,7 +1026,19 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     pow_copy->click();
     QCOMPARE(QApplication::clipboard()->text(), pow_payout->text());
     QVERIFY(pow_warning->text().contains(QString("Back up this wallet")));
+    QVERIFY(pow_warning->text().contains(QString("authenticated quantum payout carried by its claim")));
+    QVERIFY(pow_warning->text().contains(QString("configures only future new-anchor claims")));
     QVERIFY(pow_warning->text().contains(QString("locked until Gold Rush ends")));
+    const QString pow_guide = QuantumGuides::DetailedAppendixForTitle(
+        QStringLiteral("PoW payout"));
+    QVERIFY(pow_guide.contains(QStringLiteral(
+        "retained claim family preserves its already-authenticated payout")));
+    QVERIFY(pow_guide.contains(QStringLiteral(
+        "same-anchor refresh does not allocate an unrelated future-new-anchor key")));
+    QVERIFY(pow_guide.contains(QStringLiteral(
+        "authenticated quantum payout carried by that claim")));
+    QVERIFY(pow_guide.contains(QStringLiteral(
+        "does not alter a retained family's authenticated payout")));
 
     pow_enable->click();
     qApp->processEvents();
@@ -1049,8 +1102,13 @@ void TestPowClaimRecoveryPolicyControls(
     QVERIFY(status);
     QVERIFY(refresh);
     QCOMPARE(recovery->text(), QStringLiteral(
-        "Permit automatic fee-paying conflict recovery when zero-payment "
-        "claim retirement is unavailable"));
+        "Permit bounded automatic fee-paying conflict recovery as an "
+        "alternative to waiting"));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("same confirmed anchor")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("waits while a member is live")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("no recovery transaction")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("ordinary claim fee")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("miner could otherwise continue")));
     QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
     QVERIFY(!recovery->isChecked());
     QVERIFY(status->text().contains(QStringLiteral("6 process-wide")));
@@ -1346,6 +1404,14 @@ void TestPowClaimRecoveryManualDialog(
     QVERIFY(acknowledge);
     QVERIFY(wait->isDefault());
     QVERIFY(explanation->text().contains(
+        QStringLiteral("same confirmed anchor")));
+    QVERIFY(explanation->text().contains(
+        QStringLiteral("waits while a member is live")));
+    QVERIFY(explanation->text().contains(
+        QStringLiteral("ordinary claim fee")));
+    QVERIFY(explanation->text().contains(
+        QStringLiteral("miner could continue")));
+    QVERIFY(explanation->text().contains(
         QStringLiteral("may become eligible again at a later height")));
     QVERIFY(explanation->text().contains(
         QStringLiteral("either the original claim or the conflicting recovery may confirm")));
@@ -1491,6 +1557,71 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     const SecureString passphrase{"qt-claim-recovery-passphrase"};
     QVERIFY(wallet->EncryptWallet(passphrase));
 
+    // Generic signing requests must revoke an existing staking-only key before
+    // asking for a normal unlock. The hidden-scope Unlock dialog receives a
+    // locked wallet with the normal scope staged, and the context restores the
+    // original unlocked staking-only scope only after the operation ends.
+    QVERIFY(model.setWalletLocked(false, passphrase,
+                                  /*staking_only=*/true));
+    bool generic_normal_prompted{false};
+    QMetaObject::Connection generic_unlock = QObject::connect(
+        &model, &WalletModel::requireUnlock, &model, [&] {
+            generic_normal_prompted = true;
+            QCOMPARE(model.getEncryptionStatus(), WalletModel::Locked);
+            QVERIFY(!model.getWalletUnlockStakingOnly());
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
+        });
+    {
+        auto context = model.requestUnlock();
+        QVERIFY(context.isValid());
+        QVERIFY(generic_normal_prompted);
+        QCOMPARE(model.getEncryptionStatus(), WalletModel::Unlocked);
+        QVERIFY(!model.getWalletUnlockStakingOnly());
+    }
+    QCOMPARE(model.getEncryptionStatus(), WalletModel::Unlocked);
+    QVERIFY(model.getWalletUnlockStakingOnly());
+    QObject::disconnect(generic_unlock);
+
+    // A cancelled normal-unlock request cannot clear staking-only scope on an
+    // installed key. It leaves the wallet locked and restores the prior scope
+    // marker without granting normal authority.
+    {
+        auto context = model.requestUnlock();
+        QVERIFY(!context.isValid());
+    }
+    QCOMPARE(model.getEncryptionStatus(), WalletModel::Locked);
+    QVERIFY(model.getWalletUnlockStakingOnly());
+    // Lock notifications update WalletModel's display cache asynchronously.
+    // Establish that presentation precondition before constructing the page;
+    // the assertions below test locked-marker rendering, not timer latency.
+    QTRY_COMPARE_WITH_TIMEOUT(
+        model.getCachedEncryptionStatus(), WalletModel::Locked, 1000);
+
+    // The retained marker is only the staged preference for the next unlock.
+    // A locked wallet must not be presented as actively staking-only unlocked.
+    {
+        StakingMiningPage scope_page(platform_style);
+        scope_page.setClientModel(mini_gui.clientModel.get());
+        scope_page.setWalletModel(&model);
+        scope_page.show();
+        auto* scope_refresh =
+            scope_page.findChild<QPushButton*>("stakingMiningRefresh");
+        auto* scope_checkbox =
+            scope_page.findChild<QCheckBox*>("unlockStakingOnly");
+        auto* scope_summary =
+            scope_page.findChild<QLabel*>("stakingSummary");
+        QVERIFY(scope_refresh);
+        QVERIFY(scope_checkbox);
+        QVERIFY(scope_summary);
+        scope_refresh->click();
+        QTRY_VERIFY_WITH_TIMEOUT(!scope_checkbox->isChecked(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            scope_summary->text().contains(QStringLiteral("Unlock mode: locked")),
+            5000);
+    }
+    model.setWalletUnlockStakingOnly(false);
+
     interfaces::WalletPowClaimRecoveryRequest preview_request;
     const auto preview =
         model.wallet().getPowClaimRecoveryReview(preview_request);
@@ -1530,8 +1661,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     QMetaObject::Connection unlock = QObject::connect(
         &model, &WalletModel::requireUnlock, &model, [&] {
             full_unlock_requested = true;
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
         });
     uint64_t request_id =
         model.requestPowClaimRecoveryOperation(make_execution());
@@ -1543,8 +1674,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     QObject::disconnect(unlock);
 
     // normal unlocked -> normal unlocked, with no unlock prompt.
-    QVERIFY(model.setWalletLocked(false, passphrase));
-    model.setWalletUnlockStakingOnly(false);
+    QVERIFY(model.setWalletLocked(false, passphrase,
+                                  /*staking_only=*/false));
     QSignalSpy normal_prompt(&model, &WalletModel::requireUnlock);
     request_id = model.requestPowClaimRecoveryOperation(make_execution());
     QTRY_VERIFY_WITH_TIMEOUT(results.count(request_id) == 1, 5000);
@@ -1560,8 +1691,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     unlock = QObject::connect(
         &model, &WalletModel::requireUnlock, &model, [&] {
             full_unlock_requested = true;
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
         });
     request_id = model.requestPowClaimRecoveryOperation(make_execution());
     QTRY_VERIFY_WITH_TIMEOUT(results.count(request_id) == 1, 5000);
@@ -1586,12 +1717,12 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     // Entering the passphrase but selecting staking-only still cannot
     // authorize a recovery spend. It restores the original unlocked
     // staking-only state without briefly retaining a normal unlock context.
-    QVERIFY(model.setWalletLocked(false, passphrase));
-    model.setWalletUnlockStakingOnly(true);
+    QVERIFY(model.setWalletLocked(false, passphrase,
+                                  /*staking_only=*/true));
     const QMetaObject::Connection staking_scope_unlock = QObject::connect(
         &model, &WalletModel::requireUnlock, &model, [&] {
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(true);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/true));
         });
     request_id = model.requestPowClaimRecoveryOperation(make_execution());
     QTRY_VERIFY_WITH_TIMEOUT(results.count(request_id) == 1, 5000);
@@ -1613,8 +1744,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         &model, &WalletModel::requireUnlock, &model, [&] {
             obsolete_prompt_seen = true;
             obsolete_view->store(false, std::memory_order_release);
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
             // This callback runs inside the nested unlock prompt. The model
             // must observe the obsolete view and restore staking-only scope
             // without dispatching the cancelled request to Core.
@@ -1651,8 +1782,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         &model, &WalletModel::requireUnlock, &model, [&] {
             nested_cancel_seen = true;
             model.cancelPowClaimRecoveryOperation(request_id);
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
             QTimer::singleShot(0, &model, [&] {
                 nested_cancel_scope_restored_without_core_entry =
                     model.getEncryptionStatus() == WalletModel::Unlocked &&
@@ -1688,8 +1819,8 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
                 overlapping_id =
                     model.requestPowClaimRecoveryOperation(make_execution());
             }
-            QVERIFY(model.setWalletLocked(false, passphrase));
-            model.setWalletUnlockStakingOnly(false);
+            QVERIFY(model.setWalletLocked(false, passphrase,
+                                          /*staking_only=*/false));
         });
     const uint64_t first_id =
         model.requestPowClaimRecoveryOperation(make_execution());
@@ -1730,8 +1861,8 @@ void TestPowClaimRecoveryJoinCancelsQueuedMutation(
     SyncRecoveryReviewWalletTip(wallet, node);
     const SecureString passphrase{"qt-claim-recovery-join-passphrase"};
     QVERIFY(wallet->EncryptWallet(passphrase));
-    QVERIFY(model.setWalletLocked(false, passphrase));
-    model.setWalletUnlockStakingOnly(true);
+    QVERIFY(model.setWalletLocked(false, passphrase,
+                                  /*staking_only=*/true));
 
     interfaces::WalletPowClaimRecoveryRequest preview_request;
     const auto preview =
@@ -1813,8 +1944,8 @@ void TestPowClaimRecoveryModelDestructionRestoresStakingScope(
     const SecureString passphrase{
         "qt-claim-recovery-prompt-destruction-passphrase"};
     QVERIFY(wallet->EncryptWallet(passphrase));
-    QVERIFY(model->setWalletLocked(false, passphrase));
-    model->setWalletUnlockStakingOnly(true);
+    QVERIFY(model->setWalletLocked(false, passphrase,
+                                   /*staking_only=*/true));
 
     WalletContext& context = *node.walletLoader().context();
     auto observer = interfaces::MakeWallet(context, wallet);
@@ -2108,6 +2239,72 @@ void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, co
     QVERIFY(pow_status->text().contains(QString("Load a wallet")));
 }
 
+void TestStakingMiningPayoutClearsAcrossWalletIdentity(
+    interfaces::Node& node,
+    const std::shared_ptr<CWallet>& wallet_a,
+    const PlatformStyle* platform_style)
+{
+    auto wallet_b = std::make_shared<CWallet>(
+        node.context()->chain.get(), "qt-staking-payout-wallet-b",
+        CreateMockableWalletDatabase());
+    QCOMPARE(wallet_b->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    SyncRecoveryReviewWalletTip(wallet_b, node);
+
+    MiniGUI mini_gui_a(node, platform_style);
+    mini_gui_a.initModelForWallet(node, wallet_a, platform_style);
+    MiniGUI mini_gui_b(node, platform_style);
+    mini_gui_b.initModelForWallet(node, wallet_b, platform_style);
+    QVERIFY(mini_gui_b.walletModel->wallet()
+                .getPowMiningInfo()
+                .payout_address.empty());
+
+    StakingMiningPage page(platform_style);
+    page.setClientModel(mini_gui_a.clientModel.get());
+    page.setWalletModel(mini_gui_a.walletModel.get());
+    page.show();
+    qApp->processEvents();
+
+    auto* pow_payout = page.findChild<QLineEdit*>(
+        QStringLiteral("powPayout"));
+    auto* pow_copy = page.findChild<QPushButton*>(
+        QStringLiteral("powCopy"));
+    auto* refresh = page.findChild<QPushButton*>(
+        QStringLiteral("stakingMiningRefresh"));
+    auto* refresh_hint = page.findChild<QLabel*>(
+        QStringLiteral("stakingMiningRefreshHint"));
+    QVERIFY(pow_payout);
+    QVERIFY(pow_copy);
+    QVERIFY(refresh);
+    QVERIFY(refresh_hint);
+
+    pow_payout->setText(QStringLiteral("wallet-a-payout"));
+    QVERIFY(QMetaObject::invokeMethod(
+        &page, "updateStatus", Qt::DirectConnection));
+    QVERIFY(pow_copy->isEnabled());
+
+    // A direct A -> B switch must revoke display and copy authority before an
+    // event-loop turn or background detail refresh can expose wallet B.
+    page.setWalletModel(mini_gui_b.walletModel.get());
+    QVERIFY(pow_payout->text().isEmpty());
+    QVERIFY(!pow_copy->isEnabled());
+
+    // An accepted empty snapshot is equally authoritative. Seed obsolete UI
+    // text after the switch so this assertion also detects a conditional
+    // snapshot assignment that would preserve a previous value.
+    pow_payout->setText(QStringLiteral("obsolete-wallet-b-payout"));
+    QVERIFY(QMetaObject::invokeMethod(
+        &page, "updateStatus", Qt::DirectConnection));
+    QVERIFY(pow_copy->isEnabled());
+    refresh->click();
+    QTRY_VERIFY_WITH_TIMEOUT(
+        refresh_hint->text().contains(QStringLiteral("Detail panels updated")),
+        20000);
+    QVERIFY(pow_payout->text().isEmpty());
+    QVERIFY(!pow_copy->isEnabled());
+
+    page.setWalletModel(nullptr);
+}
+
 void TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(interfaces::Node& node, const PlatformStyle* platformStyle)
 {
     auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-staking-heartbeat", CreateMockableWalletDatabase());
@@ -2366,6 +2563,8 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     TestPowClaimRecoveryAmbiguousDatabaseDisablesActions(node, platformStyle.get());
     TestWalletPagesScale(mini_gui, platformStyle.get());
     TestStakingMiningPageSurvivesWalletModelDeletion(node, wallet, platformStyle.get());
+    TestStakingMiningPayoutClearsAcrossWalletIdentity(
+        node, wallet, platformStyle.get());
     TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(node, platformStyle.get());
     TestStakingMiningAsyncRefreshLifecycle(node, platformStyle.get());
 

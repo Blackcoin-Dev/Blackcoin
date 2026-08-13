@@ -1,0 +1,33 @@
+OFFLINE NODE27 INSTALLED-V30.1.4 RECOVERY-CANARY TOOLING VALIDATION
+NOT FINANCIAL, RELAY, FLEET, CORE, BUILD, DEPLOYMENT, OR ROLLOUT AUTHORITY
+
+Base durability authority:
+  commit 2af2621d318a18365da9f9da0d5510dfbe6ee722
+
+Scope:
+  exact node 27 / node27 / blackcoin-v4-gui-27 only
+  installed source 13262151077cce3f72d07d17dc7725b2b6a8e1ab
+  network version 300104 / /Blackcoin:30.1.4/
+  one retained claim and one authenticated anchor
+  one 191-vbyte resolution
+  fee / per-resolution cap / total cap 0.00019100 BLK
+
+Current-byte checks (2026-08-13 UTC):
+  Bash syntax for operator, mock, and hostile runner: PASS
+  ShellCheck -x for operator, mock, and hostile runner: PASS
+  hostile two-phase recovery-canary suite: 188/188 assertions PASS
+  hostile-suite log SHA256:
+    40ec9782386d5e7aa19b195f078772a71a7d1c8503f5a7f2b2d09c3c1468d0c5
+  git diff --check: PASS
+  live Docker/wallet/network contact: NONE
+  wallet signing or relay: NONE
+  candidate build/deploy or Compose mutation: NONE
+
+The suite proves the tooling's fail-closed mechanics against the checked-in
+mock only. It does not prove that the live subject remains unchanged and does
+not include the two required external financial-authority receipts. A live
+operator must first produce a fresh audit receipt. Sign-only and exact-txid
+relay require separate later authorization receipts. Final acceptance requires
+six active-chain confirmations plus positive PoS, positive PoW hashrate, and a
+strict claims_submitted increase. Do not cite this record as live mining,
+staking, payout, claim, fleet, or chain evidence.

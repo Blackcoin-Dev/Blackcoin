@@ -33,8 +33,14 @@ both the reviewed environment and the release-identity document.
 `SHA256SUMS` is a provisional current-byte preseal over the exact fifteen
 non-manifest files. The integrated hostile suite reports 605/605 assertions
 passing, including the topology and independent image/OCI-manifest
-cross-bindings. Independent current-byte review remains pending. This preseal
-proves only exact offline package-byte closure; it does not validate Core
+cross-bindings. Independent hostile review of signed parent commit
+`3b8fa9b092caed5f915489dc6195386bd14d07ca` and tree
+`a3e31e3d941622aa05e65b3598d5bf3850245875` found no P0, P1, or P2 issue.
+That review independently repeated all 605 assertions, strict manifest and
+topology checks, Bash and ShellCheck gates, image/OCI cross-binding hostiles,
+and remote/signature verification. This follow-up changes only this review
+record, `VALIDATION.txt`, and the corresponding `SHA256SUMS` entries. The
+preseal proves only exact offline package-byte closure; it does not validate Core
 product behavior, authorize a source/run or ordinary-user artifact, execute a
 canary, or establish rollout, live-fleet, or release acceptance evidence.
 Recording a successful R conclusion and later bundle/OCI/Phase-B/handoff

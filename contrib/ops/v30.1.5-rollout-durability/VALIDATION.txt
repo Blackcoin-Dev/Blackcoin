@@ -26,7 +26,9 @@ Current recorded-H semantic/topology reconciliation (provisional preseal):
   git diff --check: PASS
   exact package inventory: 16 files / 15 manifest payloads
   provisional SHA256SUMS current-byte preseal: PASS
-  independent current-byte P0/P1 review: PENDING
+  independent hostile review of signed parent commit 3b8fa9b0...: PASS
+  independent review verdict: no P0, P1, or P2 issue
+  independently repeated hostile fixture suite: 605/605 assertions PASS
   live Docker/wallet/network/GitHub action: NONE
 
 This provisional preseal proves package-byte integrity only. It is not final
@@ -161,14 +163,20 @@ UNRESOLVED AND FAIL-CLOSED:
   - final identity-repinned package seal and its external manifest hash
   - nonce-bound live authority
 
-Independent review has not yet cleared the current reconciled bytes. Closure
-requires a current-byte hostile P0/P1 review, then a final regeneration of
-`SHA256SUMS` and repetition of strict topology/manifest, static, full
-raw-exit-zero, and all-16-file stability checks. The resulting seal will prove
-only exact offline package-byte closure; it will not validate Core behavior,
-authorize a source/run or artifact identity, execute a canary, or establish
-rollout or fleet acceptance evidence. The pending-success sentinel and every
-remaining unresolved identity keep preflight fail-closed. Any superseding
-source/run, artifact, Phase-B, handoff, or authority repin requires a separate
-validation update and manifest reseal. Do not cite this record as Core, canary,
-rollout, release, or fleet acceptance evidence.
+Independent hostile review cleared signed parent commit
+3b8fa9b092caed5f915489dc6195386bd14d07ca, exact tree
+a3e31e3d941622aa05e65b3598d5bf3850245875, with no P0, P1, or P2 issue.
+The reviewer independently repeated the full 605-assertion suite, strict
+topology and manifest checks, Bash and ShellCheck gates, remote/signature
+verification, and image-reference/OCI-manifest mismatch hostiles. The reviewed
+suite log SHA256 is
+5190338cb2d0e2f1a7d400912c4351eaec84f049c4f6b2176269ac9b77ae7995.
+This closure follow-up changes only README.md, this validation record, and their
+`SHA256SUMS` entries. The resulting seal proves only exact offline package-byte
+closure; it does not validate Core behavior, authorize a source/run or artifact
+identity, execute a canary, or establish rollout or fleet acceptance evidence.
+The pending-success sentinel and every remaining unresolved identity keep
+preflight fail-closed. Any superseding source/run, artifact, Phase-B, handoff,
+or authority repin requires a separate validation update and manifest reseal.
+Do not cite this record as Core, canary, rollout, release, or fleet acceptance
+evidence.

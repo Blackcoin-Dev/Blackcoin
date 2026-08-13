@@ -38,7 +38,9 @@ Blackcoin-Dev SSH-signed tooling commit and must supply:
   are `24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869`; and
   status/conclusion `completed`/`success`, uniqueness as the sole
   `pull_request` workflow run for that exact head, a currently mergeable PR
-  against the exact fresh base, and a complete check-run inventory consisting
+  against the exact fresh base, a live `branches/main` receipt proving
+  protection is enabled for everyone with the exact sixteen contexts bound to
+  GitHub Actions app ID `15368`, and a complete check-run inventory consisting
   of exactly the same sixteen jobs bound to GitHub Actions app ID `15368`, all
   independently
   `completed`/`success`, and the exact attempt-scoped
@@ -71,7 +73,7 @@ schema `2`. Safe ZIP inspection rejects extra, duplicate, nested, traversing,
 encrypted, oversized, and nonregular members. Exact-key validation rejects the
 legacy single-digest field, missing fields, extras, duplicate job IDs,
 non-unique exact-head runs, a stale or currently blocked PR, substituted
-check-run apps, and malformed
+live branch protection, substituted check-run apps, and malformed
 boolean-as-integer evidence.
 The workflow records the Core source SHA and the tooling/workflow-definition
 SHA separately. Candidate source cannot affect authorization until the tooling

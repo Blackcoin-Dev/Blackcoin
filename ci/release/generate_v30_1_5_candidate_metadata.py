@@ -414,7 +414,7 @@ def validate_core_ci(path, policy):
             "base_branch", "base_branch_head_sha", "strict_base_fresh",
             "pull_request_state", "pull_request_draft", "pull_request_mergeable",
             "pull_request_mergeable_state", "exact_head_run_count",
-            "required_checks", "thread_sanitizer_artifact",
+            "branch_protection", "required_checks", "thread_sanitizer_artifact",
         },
         "Core CI evidence",
     )
@@ -479,6 +479,27 @@ def validate_core_ci(path, policy):
         type(value["exact_head_run_count"]) is int and value["exact_head_run_count"] == 1,
         "Core CI exact-head pull-request run is not unique",
     )
+    protection = value["branch_protection"]
+    require_exact_keys(
+        protection,
+        {"enabled", "enforcement_level", "contexts", "checks"},
+        "Core branch-protection evidence",
+    )
+    require(protection["enabled"] is True, "Core main protection is not enabled")
+    require(protection["enforcement_level"] == "everyone", "Core protection enforcement level changed")
+    require(protection["contexts"] == list(EXPECTED_REQUIRED_CHECKS), "Core protected context set changed")
+    protected_checks = protection["checks"]
+    require(
+        isinstance(protected_checks, list) and len(protected_checks) == len(EXPECTED_REQUIRED_CHECKS),
+        "Core protected check set changed",
+    )
+    for name, check in zip(EXPECTED_REQUIRED_CHECKS, protected_checks):
+        require_exact_keys(check, {"context", "app_id"}, "Core protected check")
+        require(check["context"] == name, "Core protected check order or name changed")
+        require(
+            type(check["app_id"]) is int and check["app_id"] == EXPECTED_REQUIRED_CHECKS_APP_ID,
+            "Core protected check app changed",
+        )
     checks = value["required_checks"]
     require(isinstance(checks, list) and len(checks) == len(EXPECTED_REQUIRED_CHECKS), "Core CI check count changed")
     check_names = []

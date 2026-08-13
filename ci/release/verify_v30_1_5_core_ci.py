@@ -189,11 +189,29 @@ def validate_unique_exact_run(workflow_runs_document, policy):
     require(run.get("name") == core["workflow_name"], "unique Core CI workflow name changed")
 
 
-def validate_current_authority(main_ref, pull_request, policy):
+def validate_current_authority(main_branch, pull_request, policy):
     core = policy["core_ci"]
-    require(main_ref.get("ref") == "refs/heads/main", "Core base branch ref changed")
-    require(main_ref.get("object", {}).get("type") == "commit", "Core base branch object changed")
-    require(main_ref.get("object", {}).get("sha") == core["base_sha"], "strict Core base is no longer fresh")
+    require(main_branch.get("name") == "main", "Core base branch changed")
+    require(main_branch.get("commit", {}).get("sha") == core["base_sha"], "strict Core base is no longer fresh")
+    require(main_branch.get("protected") is True, "Core main branch is not protected")
+    protection = main_branch.get("protection")
+    require(isinstance(protection, dict) and protection.get("enabled") is True, "Core main protection is not enabled")
+    status_checks = protection.get("required_status_checks")
+    require(isinstance(status_checks, dict), "Core main required-status-check protection is missing")
+    require(status_checks.get("enforcement_level") == "everyone", "Core protection enforcement level changed")
+    expected_names = core["required_checks"]
+    require(status_checks.get("contexts") == expected_names, "Core protected context set changed")
+    checks = status_checks.get("checks")
+    require(isinstance(checks, list) and len(checks) == len(expected_names), "Core protected check set changed")
+    protected_checks = []
+    for name, check in zip(expected_names, checks):
+        require(isinstance(check, dict) and set(check) == {"context", "app_id"}, "Core protected check is malformed")
+        require(check.get("context") == name, "Core protected check order or name changed")
+        require(
+            type(check.get("app_id")) is int and check["app_id"] == core["required_checks_app_id"],
+            "Core protected check app changed",
+        )
+        protected_checks.append({"context": name, "app_id": check["app_id"]})
     require(pull_request.get("number") == core["pull_request_number"], "current pull request changed")
     require(pull_request.get("state") == "open", "current pull request is not open")
     require(pull_request.get("draft") is False, "current pull request is draft")
@@ -204,6 +222,12 @@ def validate_current_authority(main_ref, pull_request, policy):
     require(pull_request.get("base", {}).get("ref") == "main", "current pull request base branch changed")
     require(pull_request.get("base", {}).get("sha") == core["base_sha"], "current pull request base changed")
     require(pull_request.get("base", {}).get("repo", {}).get("full_name") == core["repository"], "current PR base repository changed")
+    return {
+        "enabled": True,
+        "enforcement_level": "everyone",
+        "contexts": list(expected_names),
+        "checks": protected_checks,
+    }
 
 
 def validate_reports(data, expected_source):
@@ -317,7 +341,7 @@ def validate_artifact(artifacts_document, artifact_zip, policy):
     }
 
 
-def build_evidence(policy, required_checks, sanitizer_artifact):
+def build_evidence(policy, required_checks, sanitizer_artifact, branch_protection):
     core = policy["core_ci"]
     authorization = policy["authorization"]
     return {
@@ -349,6 +373,7 @@ def build_evidence(policy, required_checks, sanitizer_artifact):
         "pull_request_mergeable": True,
         "pull_request_mergeable_state": "clean",
         "exact_head_run_count": 1,
+        "branch_protection": branch_protection,
         "required_checks": required_checks,
         "thread_sanitizer_artifact": sanitizer_artifact,
     }
@@ -375,7 +400,7 @@ def main():
     parser.add_argument("--run-json", type=Path, required=True)
     parser.add_argument("--jobs-json", type=Path, required=True)
     parser.add_argument("--artifacts-json", type=Path, required=True)
-    parser.add_argument("--main-ref-json", type=Path, required=True)
+    parser.add_argument("--main-branch-json", type=Path, required=True)
     parser.add_argument("--pull-request-json", type=Path, required=True)
     parser.add_argument("--workflow-runs-json", type=Path, required=True)
     parser.add_argument("--check-runs-json", type=Path, required=True)
@@ -391,16 +416,16 @@ def main():
     run = load_api_json(args.run_json, "Core CI run response")
     jobs = load_api_json(args.jobs_json, "Core CI jobs response")
     artifacts = load_api_json(args.artifacts_json, "Core CI artifacts response")
-    main_ref = load_api_json(args.main_ref_json, "Core main ref response")
+    main_branch = load_api_json(args.main_branch_json, "Core main branch response")
     pull_request = load_api_json(args.pull_request_json, "Core pull request response")
     workflow_runs = load_api_json(args.workflow_runs_json, "Core exact-head workflow-runs response")
     check_runs = load_api_json(args.check_runs_json, "Core check-runs response")
     validate_run(run, policy)
     validate_unique_exact_run(workflow_runs, policy)
-    validate_current_authority(main_ref, pull_request, policy)
+    branch_protection = validate_current_authority(main_branch, pull_request, policy)
     required_checks = validate_jobs(jobs, check_runs, run, policy)
     sanitizer_artifact = validate_artifact(artifacts, args.artifact_zip, policy)
-    evidence = build_evidence(policy, required_checks, sanitizer_artifact)
+    evidence = build_evidence(policy, required_checks, sanitizer_artifact, branch_protection)
     write_canonical_new(args.output, evidence)
 
 

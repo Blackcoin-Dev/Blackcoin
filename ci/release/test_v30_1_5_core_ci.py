@@ -125,9 +125,21 @@ class CoreCiReceiptTests(unittest.TestCase):
                 "head_sha": metadata.EXPECTED_SOURCE_COMMIT,
             },
         }]
-        main_ref = {
-            "ref": "refs/heads/main",
-            "object": {"type": "commit", "sha": metadata.EXPECTED_CORE_CI_BASE},
+        main_branch = {
+            "name": "main",
+            "commit": {"sha": metadata.EXPECTED_CORE_CI_BASE},
+            "protected": True,
+            "protection": {
+                "enabled": True,
+                "required_status_checks": {
+                    "enforcement_level": "everyone",
+                    "contexts": list(metadata.EXPECTED_REQUIRED_CHECKS),
+                    "checks": [
+                        {"context": name, "app_id": metadata.EXPECTED_REQUIRED_CHECKS_APP_ID}
+                        for name in metadata.EXPECTED_REQUIRED_CHECKS
+                    ],
+                },
+            },
         }
         pull_request = {
             "number": metadata.EXPECTED_CORE_CI_PR,
@@ -163,10 +175,10 @@ class CoreCiReceiptTests(unittest.TestCase):
         }
         return policy, run, {"total_count": len(jobs), "jobs": jobs}, {
             "total_count": len(artifacts), "artifacts": artifacts,
-        }, main_ref, pull_request, workflow_runs, check_runs, artifact_zip
+        }, main_branch, pull_request, workflow_runs, check_runs, artifact_zip
 
     def validate(
-        self, directory, policy, run, jobs, artifacts, main_ref, pull_request,
+        self, directory, policy, run, jobs, artifacts, main_branch, pull_request,
         workflow_runs, check_runs, artifact_zip,
     ):
         directory = Path(directory)
@@ -175,10 +187,12 @@ class CoreCiReceiptTests(unittest.TestCase):
         checked_policy = metadata.validate_policy(policy_path)
         verifier.validate_run(run, checked_policy)
         verifier.validate_unique_exact_run(workflow_runs, checked_policy)
-        verifier.validate_current_authority(main_ref, pull_request, checked_policy)
+        branch_protection = verifier.validate_current_authority(main_branch, pull_request, checked_policy)
         checked_jobs = verifier.validate_jobs(jobs, check_runs, run, checked_policy)
         checked_artifact = verifier.validate_artifact(artifacts, artifact_zip, checked_policy)
-        evidence = verifier.build_evidence(checked_policy, checked_jobs, checked_artifact)
+        evidence = verifier.build_evidence(
+            checked_policy, checked_jobs, checked_artifact, branch_protection,
+        )
         evidence_path = directory / "core-ci.json"
         verifier.write_canonical_new(evidence_path, evidence)
         self.assertEqual(metadata.validate_core_ci(evidence_path, checked_policy), evidence)
@@ -208,12 +222,12 @@ class CoreCiReceiptTests(unittest.TestCase):
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
-                policy, run, jobs, artifacts, main_ref, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+                policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
                 mutate(jobs)
                 jobs["total_count"] = len(jobs["jobs"])
                 with self.assertRaises(RuntimeError):
                     self.validate(
-                        temporary, policy, run, jobs, artifacts, main_ref, pull_request,
+                        temporary, policy, run, jobs, artifacts, main_branch, pull_request,
                         workflow_runs, check_runs, artifact_zip,
                     )
 
@@ -276,11 +290,11 @@ class CoreCiReceiptTests(unittest.TestCase):
         )
         for mutate in mutations:
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
-                policy, run, jobs, artifacts, main_ref, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+                policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
                 mutate(run)
                 with self.assertRaises(RuntimeError):
                     self.validate(
-                        temporary, policy, run, jobs, artifacts, main_ref, pull_request,
+                        temporary, policy, run, jobs, artifacts, main_branch, pull_request,
                         workflow_runs, check_runs, artifact_zip,
                     )
 
@@ -299,45 +313,66 @@ class CoreCiReceiptTests(unittest.TestCase):
         )
         for mutate in mutations:
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
-                policy, run, jobs, artifacts, main_ref, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+                policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
                 mutate(artifacts)
                 with self.assertRaises(RuntimeError):
                     self.validate(
-                        temporary, policy, run, jobs, artifacts, main_ref, pull_request,
+                        temporary, policy, run, jobs, artifacts, main_branch, pull_request,
                         workflow_runs, check_runs, artifact_zip,
                     )
 
     def test_current_strict_main_and_pull_request_freshness_are_required(self):
         mutations = (
-            lambda main_ref, pull: main_ref["object"].update({"sha": "0" * 40}),
-            lambda main_ref, pull: main_ref.update({"ref": "refs/heads/other"}),
-            lambda main_ref, pull: pull.update({"state": "closed"}),
-            lambda main_ref, pull: pull.update({"draft": True}),
-            lambda main_ref, pull: pull.update({"mergeable": False}),
-            lambda main_ref, pull: pull.update({"mergeable_state": "blocked"}),
-            lambda main_ref, pull: pull["head"].update({"sha": "0" * 40}),
-            lambda main_ref, pull: pull["head"]["repo"].update({"full_name": "other/repo"}),
-            lambda main_ref, pull: pull["base"].update({"ref": "other"}),
-            lambda main_ref, pull: pull["base"].update({"sha": "0" * 40}),
+            lambda main, pull: main["commit"].update({"sha": "0" * 40}),
+            lambda main, pull: main.update({"name": "other"}),
+            lambda main, pull: pull.update({"state": "closed"}),
+            lambda main, pull: pull.update({"draft": True}),
+            lambda main, pull: pull.update({"mergeable": False}),
+            lambda main, pull: pull.update({"mergeable_state": "blocked"}),
+            lambda main, pull: pull["head"].update({"sha": "0" * 40}),
+            lambda main, pull: pull["head"]["repo"].update({"full_name": "other/repo"}),
+            lambda main, pull: pull["base"].update({"ref": "other"}),
+            lambda main, pull: pull["base"].update({"sha": "0" * 40}),
         )
         for mutate in mutations:
             with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
-                policy, run, jobs, artifacts, main_ref, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
-                mutate(main_ref, pull_request)
+                policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+                mutate(main_branch, pull_request)
                 with self.assertRaises(RuntimeError):
                     self.validate(
-                        temporary, policy, run, jobs, artifacts, main_ref, pull_request,
+                        temporary, policy, run, jobs, artifacts, main_branch, pull_request,
                         workflow_runs, check_runs, artifact_zip,
                     )
 
+    def test_live_main_protection_requires_exact_contexts_and_actions_app(self):
+        mutations = (
+            lambda main: main.update({"protected": False}),
+            lambda main: main["protection"].update({"enabled": False}),
+            lambda main: main["protection"].pop("required_status_checks"),
+            lambda main: main["protection"]["required_status_checks"].update({"enforcement_level": "non_admins"}),
+            lambda main: main["protection"]["required_status_checks"]["contexts"].pop(),
+            lambda main: main["protection"]["required_status_checks"]["contexts"].reverse(),
+            lambda main: main["protection"]["required_status_checks"]["checks"].pop(),
+            lambda main: main["protection"]["required_status_checks"]["checks"][0].update({"context": "other"}),
+            lambda main: main["protection"]["required_status_checks"]["checks"][0].update({"app_id": 1}),
+            lambda main: main["protection"]["required_status_checks"]["checks"][0].update({"app_id": True}),
+            lambda main: main["protection"]["required_status_checks"]["checks"][0].update({"unexpected": True}),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
+                values = list(self.fixture(temporary))
+                mutate(values[4])
+                with self.assertRaises(RuntimeError):
+                    self.validate(temporary, *values)
+
     def test_duplicate_named_artifact_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
-            policy, run, jobs, artifacts, main_ref, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+            policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
             artifacts["artifacts"].append({**artifacts["artifacts"][0], "id": self.ARTIFACT_ID + 1})
             artifacts["total_count"] = 2
             with self.assertRaisesRegex(RuntimeError, "missing or duplicated"):
                 self.validate(
-                    temporary, policy, run, jobs, artifacts, main_ref, pull_request,
+                    temporary, policy, run, jobs, artifacts, main_branch, pull_request,
                     workflow_runs, check_runs, artifact_zip,
                 )
 
@@ -388,7 +423,7 @@ class CoreCiReceiptTests(unittest.TestCase):
 
     def test_blocked_or_partially_ready_policy_cannot_validate_runtime_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
-            policy, run, jobs, artifacts, main_ref, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
+            policy, run, jobs, artifacts, main_branch, pull_request, workflow_runs, check_runs, artifact_zip = self.fixture(temporary)
             for field in ("core_ci_run_id", "core_ci_run_attempt", "thread_sanitizer_artifact"):
                 changed = copy.deepcopy(policy)
                 changed["authorization"][field] = None

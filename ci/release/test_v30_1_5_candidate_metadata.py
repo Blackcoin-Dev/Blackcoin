@@ -208,6 +208,15 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             "pull_request_mergeable": True,
             "pull_request_mergeable_state": "clean",
             "exact_head_run_count": 1,
+            "branch_protection": {
+                "enabled": True,
+                "enforcement_level": "everyone",
+                "contexts": list(METADATA.EXPECTED_REQUIRED_CHECKS),
+                "checks": [
+                    {"context": name, "app_id": METADATA.EXPECTED_REQUIRED_CHECKS_APP_ID}
+                    for name in METADATA.EXPECTED_REQUIRED_CHECKS
+                ],
+            },
             "required_checks": [
                 {
                     "id": 1000 + index,
@@ -684,6 +693,29 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             lambda value: value.update({"pull_request_mergeable_state": "blocked"}),
             lambda value: value["required_checks"][0].update({"app_id": 1}),
             lambda value: value["required_checks"][0].update({"app_id": True}),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                policy, names = self.create_fixture(root)
+                path = root / names["core_ci"]
+                value = json.loads(path.read_text(encoding="utf-8"))
+                mutation(value)
+                write_json(path, value)
+                with self.assertRaises(RuntimeError):
+                    METADATA.validate_core_ci(path, policy)
+
+    def test_core_ci_requires_exact_live_branch_protection_receipt(self):
+        mutations = (
+            lambda value: value["branch_protection"].update({"enabled": False}),
+            lambda value: value["branch_protection"].update({"enforcement_level": "non_admins"}),
+            lambda value: value["branch_protection"]["contexts"].pop(),
+            lambda value: value["branch_protection"]["contexts"].reverse(),
+            lambda value: value["branch_protection"]["checks"].pop(),
+            lambda value: value["branch_protection"]["checks"][0].update({"context": "other"}),
+            lambda value: value["branch_protection"]["checks"][0].update({"app_id": 1}),
+            lambda value: value["branch_protection"]["checks"][0].update({"app_id": True}),
+            lambda value: value["branch_protection"]["checks"][0].update({"unexpected": True}),
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:

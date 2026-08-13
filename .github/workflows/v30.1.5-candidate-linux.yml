@@ -231,7 +231,7 @@ jobs:
             > core-ci-exact-head-runs.json
           gh api "repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/check-runs?per_page=100" \
             > core-ci-check-runs.json
-          gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" > core-main-ref.json
+          gh api "repos/$GITHUB_REPOSITORY/branches/main" > core-main-branch.json
           for attempt in $(seq 1 10); do
             gh api "repos/$GITHUB_REPOSITORY/pulls/$EXPECTED_CORE_CI_PR" > core-pull-request.json
             if jq -e '.mergeable | type == "boolean"' core-pull-request.json >/dev/null && \
@@ -260,7 +260,7 @@ jobs:
             --run-json core-ci-run.json \
             --jobs-json core-ci-jobs.json \
             --artifacts-json core-ci-artifacts.json \
-            --main-ref-json core-main-ref.json \
+            --main-branch-json core-main-branch.json \
             --pull-request-json core-pull-request.json \
             --workflow-runs-json core-ci-exact-head-runs.json \
             --check-runs-json core-ci-check-runs.json \

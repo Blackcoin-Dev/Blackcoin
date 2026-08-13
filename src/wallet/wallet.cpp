@@ -1034,6 +1034,27 @@ void UnloadWallet(std::shared_ptr<CWallet>&& wallet)
 }
 
 namespace {
+void PublishRuntimeWallet(
+    WalletContext& context, const std::shared_ptr<CWallet>& wallet)
+{
+    // AttachChainUnpublished subscribes before rescanning so it cannot miss
+    // validation events produced while the wallet is attaching. Drain those
+    // events before making a runtime-loaded or newly created wallet visible or
+    // starting its background workers. No wallet, chain, or context lock is
+    // held here, and the wallet is still absent from WalletContext and
+    // load-notification callbacks.
+    //
+    // Startup uses LoadWallets/StartWallets instead. During shutdown, the GUI
+    // joins its wallet-controller activity thread before requesting core
+    // shutdown, and StopHTTPServer joins in-flight RPC workers before the
+    // validation scheduler is stopped and later unregistered.
+    SyncWithValidationInterfaceQueue();
+
+    NotifyWalletLoaded(context, wallet);
+    AddWallet(context, wallet);
+    wallet->postInitProcess();
+}
+
 std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
 {
     try {
@@ -1067,9 +1088,7 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
             warnings.push_back(_("Wallet loaded successfully. The legacy wallet type is being deprecated and support for creating and opening legacy wallets will be removed in the future. Legacy wallets can be migrated to a descriptor wallet with migratewallet."));
         }
 
-        NotifyWalletLoaded(context, wallet);
-        AddWallet(context, wallet);
-        wallet->postInitProcess();
+        PublishRuntimeWallet(context, wallet);
 
         // Write the wallet setting
         UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -1256,9 +1275,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
         return nullptr;
     }
 
-    NotifyWalletLoaded(context, wallet);
-    AddWallet(context, wallet);
-    wallet->postInitProcess();
+    PublishRuntimeWallet(context, wallet);
 
     // Write the wallet settings
     UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -7929,7 +7946,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
     }
     if (time_first_key) walletInstance->MaybeUpdateBirthTime(*time_first_key);
 
-    if (chain && !AttachChain(walletInstance, *chain, rescan_required, error, warnings)) {
+    if (chain && !AttachChainUnpublished(walletInstance, *chain, rescan_required, error, warnings)) {
         return nullptr;
     }
 
@@ -7944,7 +7961,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
     return walletInstance;
 }
 
-bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings)
+bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInstance, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings)
 {
     LOCK(walletInstance->cs_wallet);
     // allow setting the chain if it hasn't been set already but prevent changing it
@@ -8065,12 +8082,13 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
     }
     walletInstance->m_attaching_chain = false;
 
-    // AttachChain inherits Bitcoin Core's startup-only wallet -> chain lock
-    // order and completes before this wallet is published to RPC or staking
-    // threads. Registered notifications cannot acquire cs_wallet until this
-    // scope releases it. Reset that unreachable startup lock history here so
-    // DEBUG_LOCKORDER begins the published wallet lifecycle with the runtime
-    // chain -> wallet order. DeleteLock is a no-op outside DEBUG_LOCKORDER.
+    // AttachChainUnpublished inherits Bitcoin Core's wallet -> chain lock order
+    // and completes before this wallet is published to RPC or background
+    // workers. Registered notifications cannot acquire cs_wallet until this
+    // scope releases it. Reset that unreachable attachment-phase lock history
+    // here so DEBUG_LOCKORDER begins the published wallet lifecycle with the
+    // runtime chain -> wallet order. DeleteLock is a no-op outside
+    // DEBUG_LOCKORDER.
     DeleteLock(&walletInstance->cs_wallet);
     return true;
 }

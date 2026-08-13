@@ -997,7 +997,7 @@ private:
      * block locator and m_last_block_processed, and registering for
      * notifications about new blocks and transactions.
      */
-    static bool AttachChain(const std::shared_ptr<CWallet>& wallet, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings);
+    static bool AttachChainUnpublished(const std::shared_ptr<CWallet>& wallet, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings);
 
     static NodeClock::time_point GetDefaultNextResend();
 

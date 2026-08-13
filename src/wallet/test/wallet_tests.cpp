@@ -8,33 +8,37 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <future>
 #include <iterator>
 #include <memory>
-#include <stdint.h>
 #include <stdexcept>
+#include <stdint.h>
 #include <string_view>
 #include <thread>
 #include <vector>
 
 #include <addresstype.h>
 #include <chain.h>
+#include <coins.h>
 #include <common/args.h>
 #include <common/settings.h>
 #include <consensus/demurrage.h>
-#include <coins.h>
 #include <crypto/mldsa.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
+#include <logging.h>
 #include <node/blockstorage.h>
 #include <policy/policy.h>
+#include <rpc/protocol.h>
+#include <rpc/request.h>
 #include <rpc/server.h>
 #include <script/solver.h>
 #include <shadow.h>
-#include <support/cleanse.h>
 #include <streams.h>
+#include <support/cleanse.h>
 #include <test/util/logging.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
@@ -47,8 +51,10 @@
 #include <validationinterface.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/load.h>
 #include <wallet/quantum_stake_ops.h>
 #include <wallet/receive.h>
+#include <wallet/rpc/util.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
@@ -125,6 +131,32 @@ public:
 
 private:
     common::Settings m_saved;
+};
+
+class ValidationQueueBarrier
+{
+public:
+    ValidationQueueBarrier()
+        : m_release{m_release_promise.get_future().share()}
+    {
+        CallFunctionInValidationInterfaceQueue(
+            [release = m_release] { release.wait(); });
+    }
+
+    ValidationQueueBarrier(const ValidationQueueBarrier&) = delete;
+    ValidationQueueBarrier& operator=(const ValidationQueueBarrier&) = delete;
+
+    ~ValidationQueueBarrier() { Release(); }
+
+    void Release()
+    {
+        if (!m_released.exchange(true)) m_release_promise.set_value();
+    }
+
+private:
+    std::promise<void> m_release_promise;
+    std::shared_future<void> m_release;
+    std::atomic<bool> m_released{false};
 };
 
 // Blackcoin
@@ -5955,6 +5987,457 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
 
 
     TestUnloadWallet(std::move(wallet));
+}
+
+// Exercise the exact AttachChainUnpublished phase which requires the narrow
+// ThreadSanitizer deadlock suppression. A real block notification is held in
+// the validation queue while a named wallet rescans the same block. The wallet
+// must remain absent from WalletContext and wallet RPC routing until both the
+// rescan and queued callback finish; only then may postInitProcess start the
+// configured real PoW worker.
+BOOST_FIXTURE_TEST_CASE(runtime_loadwallet_attachchain_lifecycle, TestChain100Setup)
+{
+    ScopedArgsSettings args_guard;
+    args_guard.Force("-unsafesqlitesync", "1");
+    args_guard.Force("-autostartstaking", "0");
+    args_guard.Force("-powmining", "0");
+    args_guard.Force("-powminingthreads", "1");
+    args_guard.Force("-powminingcpu", "1");
+    fs::create_directories(gArgs.GetDataDirNet() / "wallets");
+
+    WalletContext context;
+    context.args = &gArgs;
+    context.chain = m_node.chain.get();
+
+    const std::string wallet_name{"attachchain-lifecycle"};
+    DatabaseOptions create_options;
+    ReadDatabaseArgs(gArgs, create_options);
+    create_options.require_create = true;
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    create_options.create_passphrase = SecureString{"attachchain-passphrase"};
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    std::shared_ptr<CWallet> wallet = wallet::CreateWallet(
+        context, wallet_name, /*load_on_start=*/std::nullopt, create_options,
+        status, error, warnings);
+    BOOST_REQUIRE_MESSAGE(wallet, error.original);
+    BOOST_REQUIRE(wallet->IsLocked());
+    const CScript receive_script = GetScriptForDestination(
+        getNewDestination(*wallet, OutputType::BECH32));
+
+    SyncWithValidationInterfaceQueue();
+    BOOST_REQUIRE(RemoveWallet(
+        context, wallet, /*load_on_start=*/std::nullopt));
+    UnloadWallet(std::move(wallet));
+    BOOST_REQUIRE(GetWallets(context).empty());
+
+    // Hold all validation delivery, then produce a real BlockConnected event
+    // for a block which pays the unloaded wallet. AttachChainUnpublished will
+    // subscribe before rescanning it, so releasing this queue later must
+    // deliver a duplicate, harmless AddToWallet update before publication.
+    ValidationQueueBarrier attach_queue;
+
+    const CMutableTransaction block_tx = TestSimpleSpend(
+        *m_coinbase_txns[0], 0, coinbaseKey, receive_script);
+    const CMutableTransaction post_unload_tx = TestSimpleSpend(
+        *m_coinbase_txns[1], 0, coinbaseKey, receive_script);
+    CreateAndProcessBlock(
+        {block_tx}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+
+    std::atomic<bool> validation_caught_up{false};
+    CallFunctionInValidationInterfaceQueue(
+        [&validation_caught_up] { validation_caught_up.store(true); });
+
+    std::promise<void> rescan_release_promise;
+    std::shared_future<void> rescan_release{
+        rescan_release_promise.get_future().share()};
+    std::atomic<bool> rescan_released{false};
+    std::promise<void> rescan_entered_promise;
+    std::future<void> rescan_entered{rescan_entered_promise.get_future()};
+    std::atomic<bool> rescan_entered_signaled{false};
+    std::promise<void> rescan_completed_promise;
+    std::future<void> rescan_completed{rescan_completed_promise.get_future()};
+    std::atomic<bool> rescan_completed_signaled{false};
+    std::promise<void> worker_started_promise;
+    std::future<void> worker_started{worker_started_promise.get_future()};
+    std::atomic<bool> worker_started_signaled{false};
+    std::promise<void> worker_stopped_promise;
+    std::future<void> worker_stopped{worker_stopped_promise.get_future()};
+    std::atomic<bool> worker_stopped_signaled{false};
+    std::atomic<int> block_add_count{0};
+    std::atomic<int> post_unload_add_count{0};
+
+    std::future<std::shared_ptr<CWallet>> load_future;
+    std::atomic<bool> load_notified{false};
+    std::atomic<bool> notified_after_validation{false};
+    std::atomic<bool> notified_after_duplicate{false};
+    std::atomic<bool> notified_before_worker{false};
+    auto load_handler = HandleLoadWallet(
+        context, [&](std::unique_ptr<interfaces::Wallet>) {
+            notified_after_validation.store(validation_caught_up.load());
+            notified_after_duplicate.store(block_add_count.load() >= 2);
+            notified_before_worker.store(!worker_started_signaled.load());
+            load_notified.store(true);
+        });
+
+    const auto signal_once = [](
+                                 std::atomic<bool>& signaled,
+                                 std::promise<void>& promise) {
+        if (!signaled.exchange(true)) promise.set_value();
+    };
+    const std::string wallet_log_prefix{"[" + wallet_name + "] "};
+    const std::string block_add_pattern{
+        wallet_log_prefix + "AddToWallet " + block_tx.GetHash().ToString()};
+    const std::string post_unload_add_pattern{
+        wallet_log_prefix + "AddToWallet " +
+        post_unload_tx.GetHash().ToString()};
+    auto log_connection = LogInstance().PushBackCallback(
+        [&](const std::string& line) {
+            if (line.find(wallet_log_prefix + "Rescan started from block") !=
+                std::string::npos) {
+                signal_once(rescan_entered_signaled, rescan_entered_promise);
+                rescan_release.wait();
+            }
+            if (line.find(wallet_log_prefix + "Rescan completed") !=
+                std::string::npos) {
+                signal_once(
+                    rescan_completed_signaled, rescan_completed_promise);
+            }
+            if (line.find(block_add_pattern) != std::string::npos) {
+                ++block_add_count;
+            }
+            if (line.find(post_unload_add_pattern) != std::string::npos) {
+                ++post_unload_add_count;
+            }
+            if (line.find(
+                    wallet_log_prefix +
+                    "Gold Rush PoW worker 0 started") != std::string::npos) {
+                signal_once(worker_started_signaled, worker_started_promise);
+            }
+            if (line.find(
+                    wallet_log_prefix +
+                    "Gold Rush PoW worker 0 stopped") != std::string::npos) {
+                signal_once(worker_stopped_signaled, worker_stopped_promise);
+            }
+        });
+    auto log_cleanup = interfaces::MakeCleanupHandler(
+        [log_connection] { LogInstance().DeleteCallback(log_connection); });
+
+    const auto release_rescan = [&] {
+        if (!rescan_released.exchange(true)) rescan_release_promise.set_value();
+    };
+    // This guard is declared after the log cleanup and async future so an
+    // assertion cannot strand either callback behind a held logging mutex or
+    // leave the validation scheduler blocked during stack unwinding.
+    auto gate_cleanup = interfaces::MakeCleanupHandler([&] {
+        release_rescan();
+        attach_queue.Release();
+    });
+
+    args_guard.Force("-powmining", "1");
+    DatabaseOptions load_options;
+    ReadDatabaseArgs(gArgs, load_options);
+    load_options.require_existing = true;
+    warnings.clear();
+    error.clear();
+    load_future = std::async(std::launch::async, [&] {
+        return LoadWallet(
+            context, wallet_name, /*load_on_start=*/std::nullopt,
+            load_options, status, error, warnings);
+    });
+
+    // The log callback pauses inside ScanForWalletTransactions while
+    // AttachChainUnpublished still owns this private wallet's cs_wallet. No
+    // WalletContext lookup or default wallet RPC may route to it in this phase.
+    const bool entered_rescan =
+        rescan_entered.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready;
+    const bool attach_still_pending =
+        load_future.wait_for(std::chrono::milliseconds{50}) ==
+        std::future_status::timeout;
+    const bool named_wallet_unroutable =
+        GetWallet(context, wallet_name) == nullptr;
+    const bool no_default_wallet = GetWallets(context).empty();
+    JSONRPCRequest request;
+    request.context = &context;
+    int rpc_error_code{0};
+    try {
+        (void)GetWalletForJSONRPCRequest(request);
+    } catch (const UniValue& rpc_error) {
+        if (rpc_error["code"].isNum()) {
+            rpc_error_code = rpc_error["code"].getInt<int>();
+        }
+    }
+    release_rescan();
+
+    BOOST_CHECK(entered_rescan);
+    BOOST_CHECK(attach_still_pending);
+    BOOST_CHECK(named_wallet_unroutable);
+    BOOST_CHECK(no_default_wallet);
+    BOOST_CHECK_EQUAL(rpc_error_code, RPC_WALLET_NOT_FOUND);
+
+    // AttachChainUnpublished may now finish, but the production runtime-load
+    // boundary must wait for the queued BlockConnected callback before
+    // NotifyWalletLoaded, AddWallet, or postInitProcess can publish or start.
+    const bool completed_rescan =
+        rescan_completed.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready;
+    const bool catchup_still_pending =
+        load_future.wait_for(std::chrono::milliseconds{50}) ==
+        std::future_status::timeout;
+    const bool still_unpublished =
+        GetWallet(context, wallet_name) == nullptr;
+    const bool not_notified_early = !load_notified.load();
+
+    BOOST_CHECK(completed_rescan);
+    BOOST_CHECK(!validation_caught_up.load());
+    BOOST_CHECK(catchup_still_pending);
+    BOOST_CHECK(still_unpublished);
+    BOOST_CHECK(not_notified_early);
+
+    attach_queue.Release();
+    BOOST_REQUIRE(
+        load_future.wait_for(std::chrono::seconds{10}) ==
+        std::future_status::ready);
+    wallet = load_future.get();
+    BOOST_REQUIRE_MESSAGE(wallet, error.original);
+    BOOST_CHECK(
+        worker_started.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+
+    BOOST_CHECK(validation_caught_up.load());
+    BOOST_CHECK(load_notified.load());
+    BOOST_CHECK(notified_after_validation.load());
+    BOOST_CHECK(notified_after_duplicate.load());
+    BOOST_CHECK(notified_before_worker.load());
+    BOOST_CHECK_GE(block_add_count.load(), 2);
+    BOOST_CHECK(GetWallet(context, wallet_name) == wallet);
+    const std::optional<int> height = context.chain->getHeight();
+    BOOST_REQUIRE(height);
+    const uint256 active_tip = context.chain->getBlockHash(*height);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(wallet->mapWallet.count(block_tx.GetHash()), 1U);
+        BOOST_CHECK_EQUAL(wallet->GetLastBlockHash(), active_tip);
+    }
+    BOOST_CHECK(wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK(
+        wallet->m_pow_state.load() ==
+        interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(wallet->m_pow_miner_mutex,
+                  return wallet->threadPowMinerGroup ? wallet->threadPowMinerGroup->size() : 0U),
+        1U);
+
+    wallet->StopPowMining();
+    BOOST_CHECK(
+        worker_stopped.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(wallet->m_pow_miner_mutex,
+                  return wallet->threadPowMinerGroup ? wallet->threadPowMinerGroup->size() : 0U),
+        0U);
+
+    // A blocked validation queue cannot keep an unpublished or unloading
+    // wallet alive. Unregister the handler while a second real BlockConnected
+    // event is queued, and require synchronous unload to finish before that
+    // queue is released. The later event must not call the removed wallet.
+    std::future<bool> unload_future;
+    ValidationQueueBarrier unload_queue;
+    CreateAndProcessBlock(
+        {post_unload_tx}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    std::atomic<bool> post_unload_event_processed{false};
+    CallFunctionInValidationInterfaceQueue([&post_unload_event_processed] {
+        post_unload_event_processed.store(true);
+    });
+    load_handler.reset();
+    unload_future = std::async(
+        std::launch::async,
+        [&, unload_wallet = std::move(wallet)]() mutable {
+            const bool removed = RemoveWallet(
+                context, unload_wallet, /*load_on_start=*/std::nullopt);
+            if (removed) UnloadWallet(std::move(unload_wallet));
+            return removed;
+        });
+    const bool unloaded_while_queue_blocked =
+        unload_future.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready;
+    if (!unloaded_while_queue_blocked) unload_queue.Release();
+    BOOST_REQUIRE(
+        unload_future.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    BOOST_CHECK(unload_future.get());
+    BOOST_CHECK(unloaded_while_queue_blocked);
+    BOOST_CHECK(GetWallets(context).empty());
+    unload_queue.Release();
+    SyncWithValidationInterfaceQueue();
+    BOOST_CHECK(post_unload_event_processed.load());
+    BOOST_CHECK_EQUAL(post_unload_add_count.load(), 0);
+
+    // Startup uses the separate LoadWallets/StartWallets lifecycle. Holding
+    // the validation queue while LoadWallets reopens and rescans this wallet
+    // proves that the new runtime-only catch-up barrier does not widen startup
+    // blocking or start post-init workers early.
+    common::SettingsValue startup_wallets(common::SettingsValue::VARR);
+    startup_wallets.push_back(wallet_name);
+    BOOST_REQUIRE(context.chain->updateRwSetting(
+        "wallet", startup_wallets, /*write=*/false));
+    std::future<bool> startup_load_future;
+    ValidationQueueBarrier startup_queue;
+    startup_load_future = std::async(
+        std::launch::async, [&] { return LoadWallets(context); });
+    const bool startup_load_unblocked =
+        startup_load_future.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready;
+    if (!startup_load_unblocked) startup_queue.Release();
+    BOOST_REQUIRE(
+        startup_load_future.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    BOOST_CHECK(startup_load_future.get());
+    BOOST_CHECK(startup_load_unblocked);
+    wallet = GetWallet(context, wallet_name);
+    BOOST_REQUIRE(wallet);
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(post_unload_add_count.load(), 1);
+    startup_queue.Release();
+    SyncWithValidationInterfaceQueue();
+    BOOST_REQUIRE(RemoveWallet(
+        context, wallet, /*load_on_start=*/std::nullopt));
+    UnloadWallet(std::move(wallet));
+    common::SettingsValue no_startup_wallets(common::SettingsValue::VARR);
+    BOOST_REQUIRE(context.chain->updateRwSetting(
+        "wallet", no_startup_wallets, /*write=*/false));
+
+    // Runtime creation shares the subscribe-to-publication interval even when
+    // a new wallet has no historical range to rescan. Queue a real block-tip
+    // notification before CreateWallet subscribes; notification delivery
+    // resolves subscribers when it executes, so the new wallet receives it.
+    // The explicit sentinel which follows that event must run before the load
+    // callback and configured post-init worker.
+    const std::string created_wallet_name{
+        "attachchain-created-lifecycle"};
+    std::atomic<bool> create_validation_caught_up{false};
+    std::atomic<bool> create_load_notified{false};
+    std::atomic<bool> create_notified_after_validation{false};
+    std::atomic<bool> create_notified_before_worker{false};
+    std::promise<void> create_worker_started_promise;
+    std::future<void> create_worker_started{
+        create_worker_started_promise.get_future()};
+    std::atomic<bool> create_worker_started_signaled{false};
+    std::promise<void> create_worker_stopped_promise;
+    std::future<void> create_worker_stopped{
+        create_worker_stopped_promise.get_future()};
+    std::atomic<bool> create_worker_stopped_signaled{false};
+    auto create_load_handler = HandleLoadWallet(
+        context, [&](std::unique_ptr<interfaces::Wallet>) {
+            create_notified_after_validation.store(
+                create_validation_caught_up.load());
+            create_notified_before_worker.store(
+                !create_worker_started_signaled.load());
+            create_load_notified.store(true);
+        });
+    const std::string created_log_prefix{
+        "[" + created_wallet_name + "] "};
+    auto create_log_connection = LogInstance().PushBackCallback(
+        [&](const std::string& line) {
+            if (line.find(
+                    created_log_prefix +
+                    "Gold Rush PoW worker 0 started") != std::string::npos) {
+                signal_once(
+                    create_worker_started_signaled,
+                    create_worker_started_promise);
+            }
+            if (line.find(
+                    created_log_prefix +
+                    "Gold Rush PoW worker 0 stopped") != std::string::npos) {
+                signal_once(
+                    create_worker_stopped_signaled,
+                    create_worker_stopped_promise);
+            }
+        });
+    auto create_log_cleanup = interfaces::MakeCleanupHandler(
+        [create_log_connection] {
+            LogInstance().DeleteCallback(create_log_connection);
+        });
+
+    std::future<std::shared_ptr<CWallet>> create_future;
+    ValidationQueueBarrier create_queue;
+    CreateAndProcessBlock(
+        {}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    CallFunctionInValidationInterfaceQueue(
+        [&create_validation_caught_up] {
+            create_validation_caught_up.store(true);
+        });
+    const size_t callbacks_before_create_sync =
+        GetMainSignals().CallbacksPending();
+
+    DatabaseOptions runtime_create_options;
+    ReadDatabaseArgs(gArgs, runtime_create_options);
+    runtime_create_options.require_create = true;
+    runtime_create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    runtime_create_options.create_passphrase =
+        SecureString{"attachchain-created-passphrase"};
+    DatabaseStatus create_status;
+    bilingual_str create_error;
+    std::vector<bilingual_str> create_warnings;
+    create_future = std::async(std::launch::async, [&] {
+        return wallet::CreateWallet(
+            context, created_wallet_name, /*load_on_start=*/std::nullopt,
+            runtime_create_options, create_status, create_error,
+            create_warnings);
+    });
+
+    const auto create_sync_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (GetMainSignals().CallbacksPending() <=
+               callbacks_before_create_sync &&
+           create_future.wait_for(std::chrono::milliseconds{0}) !=
+               std::future_status::ready &&
+           std::chrono::steady_clock::now() < create_sync_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    const bool create_waiting_for_catchup =
+        GetMainSignals().CallbacksPending() > callbacks_before_create_sync;
+    const bool create_still_pending =
+        create_future.wait_for(std::chrono::milliseconds{50}) ==
+        std::future_status::timeout;
+    BOOST_CHECK(create_waiting_for_catchup);
+    BOOST_CHECK(create_still_pending);
+    BOOST_CHECK(!create_validation_caught_up.load());
+    BOOST_CHECK(!create_load_notified.load());
+    BOOST_CHECK(!create_worker_started_signaled.load());
+    BOOST_CHECK(GetWallet(context, created_wallet_name) == nullptr);
+
+    create_queue.Release();
+    BOOST_REQUIRE(
+        create_future.wait_for(std::chrono::seconds{10}) ==
+        std::future_status::ready);
+    wallet = create_future.get();
+    BOOST_REQUIRE_MESSAGE(wallet, create_error.original);
+    BOOST_CHECK(
+        create_worker_started.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    BOOST_CHECK(create_validation_caught_up.load());
+    BOOST_CHECK(create_load_notified.load());
+    BOOST_CHECK(create_notified_after_validation.load());
+    BOOST_CHECK(create_notified_before_worker.load());
+    BOOST_CHECK(GetWallet(context, created_wallet_name) == wallet);
+    BOOST_CHECK(wallet->m_pow_mining_enabled.load());
+
+    wallet->StopPowMining();
+    BOOST_CHECK(
+        create_worker_stopped.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    create_load_handler.reset();
+    BOOST_REQUIRE(RemoveWallet(
+        context, wallet, /*load_on_start=*/std::nullopt));
+    UnloadWallet(std::move(wallet));
+    create_log_cleanup.reset();
+
+    gate_cleanup.reset();
+    log_cleanup.reset();
 }
 
 BOOST_FIXTURE_TEST_CASE(CreateWalletWithoutChain, BasicTestingSetup)

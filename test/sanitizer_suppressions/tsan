@@ -13,10 +13,14 @@ race:zmq::*
 race:bitcoin-qt
 
 # deadlock (TODO fix)
-# AttachChain holds an unpublished wallet's cs_wallet across its startup
-# rescan, then resets DEBUG_LOCKORDER before publication. TSan otherwise
-# retains that phase-disjoint edge and pairs it with runtime lock ordering.
-deadlock:wallet::CWallet::AttachChain
+# wallet_tests/runtime_loadwallet_attachchain_lifecycle deterministically holds
+# a runtime-loaded wallet inside AttachChainUnpublished while validation
+# notifications queue behind it, then proves catch-up precedes publication and
+# real PoW worker startup. The phase helper holds that private wallet's
+# cs_wallet across its rescan and chain reads. TSan retains this phase-disjoint
+# edge and pairs it with the published miner's runtime cs_main -> cs_wallet
+# order even though the wallet is unroutable until the phase helper returns.
+deadlock:wallet::CWallet::AttachChainUnpublished
 
 # To reproduce, see:
 # https://github.com/bitcoin/bitcoin/issues/19303#issuecomment-1514926359

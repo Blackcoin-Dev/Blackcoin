@@ -32,10 +32,15 @@ done
 bash -n "$PUBLISH" "$TEST_ROOT/run.sh"
 python3 -m py_compile "$VERIFY"
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck "$PUBLISH" "$TEST_ROOT/run.sh"
+    # The publisher begins with a strictly POSIX bootstrap and re-executes a
+    # verified /bin/bash before any Bash syntax. Check both language regions:
+    # the bootstrap as sh and the complete post-reexec program as Bash.
+    sed -n '1,/^# END POSIX BOOTSTRAP$/p' "$PUBLISH" | shellcheck -s sh -
+    shellcheck -s bash "$PUBLISH" "$TEST_ROOT/run.sh"
 fi
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/v3015-publication-tests.XXXXXX")
+TMP=$(CDPATH='' cd -P -- "$TMP" && pwd -P) || fail 'cannot canonicalize test root'
 trap 'rm -rf "$TMP"' EXIT INT TERM
 export V3015_TEST_TMP="$TMP"
 export V3015_TEST_REPO="$REPO_ROOT"
@@ -44,6 +49,7 @@ export V3015_TEST_PUBLICATION_COMMIT="${V3015_TEST_PUBLICATION_COMMIT:-$(git -C 
 
 python3 - <<'PY'
 from datetime import datetime, timedelta, timezone
+import contextlib
 import copy
 import hashlib
 import importlib.util
@@ -53,6 +59,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import warnings
 import zipfile
@@ -93,6 +100,7 @@ publication_tree = subprocess.run(
 ).stdout.strip()
 core_run = 987654
 core_attempt = 1
+core_merge = "e" * 40
 packaging_run = 123456
 packaging_attempt = 2
 uid = os.getuid()
@@ -128,6 +136,8 @@ def make_policy(directory, ready=False):
                 "reports_sha256": "b" * 64,
             },
         }
+        value["core_ci"]["authority_state"] = "merged"
+        value["core_ci"]["merge_commit_sha"] = core_merge
     else:
         value["authorization"] = {
             "state": "blocked_pending_final_signed_source_and_green_ci",
@@ -137,6 +147,8 @@ def make_policy(directory, ready=False):
             "core_ci_run_attempt": None,
             "thread_sanitizer_artifact": None,
         }
+        value["core_ci"]["authority_state"] = "pending_final_pin"
+        value["core_ci"]["merge_commit_sha"] = None
     output = directory / ("ready-policy.json" if ready else "blocked-policy.json")
     write_json(output, value)
     return output
@@ -167,6 +179,40 @@ def make_bundle(directory, ready=False):
         _, names = case.create_fixture(directory)
     finally:
         candidate_tests.POLICY = original_fixture_policy
+    if ready:
+        core_path = directory / names["core_ci"]
+        core = json.loads(core_path.read_text(encoding="utf-8"))
+        merged_at = "2026-08-13T16:44:18Z"
+        core.update({
+            "authority_state": "merged",
+            "current_main_sha": core_merge,
+            "pull_request_state": "closed",
+            "pull_request_mergeable": None,
+            "pull_request_mergeable_state": "unknown",
+            "pull_request_merged": True,
+            "pull_request_merged_at": merged_at,
+            "pull_request_merged_by": metadata.EXPECTED_MERGE_ACTOR,
+            "merge_commit": {
+                "sha": core_merge,
+                "tree": tree,
+                "parents": [metadata.EXPECTED_CORE_CI_BASE, source],
+                "github_verified": True,
+                "github_verification_reason": "valid",
+                "author_login": metadata.EXPECTED_MERGE_ACTOR,
+                "committer_login": metadata.EXPECTED_MERGE_COMMITTER,
+                "author": {
+                    "name": metadata.EXPECTED_MERGE_AUTHOR_NAME,
+                    "email": metadata.EXPECTED_MERGE_AUTHOR_EMAIL,
+                    "date": merged_at,
+                },
+                "committer": {
+                    "name": metadata.EXPECTED_MERGE_COMMITTER_NAME,
+                    "email": metadata.EXPECTED_MERGE_COMMITTER_EMAIL,
+                    "date": merged_at,
+                },
+            },
+        })
+        write_json(core_path, core)
     metadata.generate(
         selected_policy, directory, tooling, str(packaging_run), str(packaging_attempt),
         directory / names["manifest"], directory / names["provenance"],
@@ -427,6 +473,45 @@ ready_value = publication.prepare_artifact(
 )
 assert ready_value["publication_authorized"] is True
 ready_request_value = json.loads(ready_request.read_text(encoding="utf-8"))
+ready_core_evidence = json.loads(
+    (ready_bundle / ready_names["core_ci"]).read_text(encoding="utf-8")
+)
+assert ready_core_evidence["schema"] == 3
+assert ready_core_evidence["authority_state"] == "merged"
+assert ready_core_evidence["merge_commit"]["sha"] == core_merge
+assert ready_value["core_ci_evidence"] == ready_core_evidence
+publication.validate_core_ci_evidence_shape(
+    ready_core_evidence, source=ready_request_value["source"], require_merged=True
+)
+for bad_schema in (2, 1, 3.0, True):
+    changed = copy.deepcopy(ready_core_evidence)
+    changed["schema"] = bad_schema
+    expect_failure(
+        f"core-schema-{bad_schema!r}",
+        lambda changed=changed: publication.validate_core_ci_evidence_shape(
+            changed, source=ready_request_value["source"], require_merged=True
+        ),
+    )
+for label, mutate in (
+    ("core-missing-merged-at", lambda value: value.pop("pull_request_merged_at")),
+    ("core-extra-legacy", lambda value: value.__setitem__("strict_base_fresh", True)),
+    ("core-parent-order", lambda value: value["merge_commit"]["parents"].reverse()),
+    ("core-main-drift", lambda value: value.__setitem__("current_main_sha", "f" * 40)),
+    ("core-merge-before-run", lambda value: value.__setitem__(
+        "pull_request_merged_at", value["run_completed_at"]
+    )),
+    ("core-tsan-dirty", lambda value: value["thread_sanitizer_artifact"]["report"].__setitem__(
+        "report_count", 1
+    )),
+):
+    changed = copy.deepcopy(ready_core_evidence)
+    mutate(changed)
+    expect_failure(
+        label,
+        lambda changed=changed: publication.validate_core_ci_evidence_shape(
+            changed, source=ready_request_value["source"], require_merged=True
+        ),
+    )
 assert ready_value["publication_authority_sha256"] == publication.publication_authority_sha256(
     ready_request_value
 )
@@ -755,7 +840,34 @@ def registry_call(output, outcome="tag-already-exact", paths=None):
     )
 
 
-result_path = root / "RESULT.json"
+registry_dir = ready_prepared / "registry"
+registry_dir.mkdir()
+canonical_registry_files = {
+    "tag_body": (tag_body, registry_dir / "tag-manifest.json"),
+    "tag_headers": (tag_headers, registry_dir / "tag-manifest.headers"),
+    "digest_body": (digest_body, registry_dir / "digest-manifest.json"),
+    "digest_headers": (digest_headers, registry_dir / "digest-manifest.headers"),
+    "config_body": (config_body, registry_dir / "registry-config.json"),
+    "config_headers": (config_headers, registry_dir / "registry-config.headers"),
+    "inspect": (inspect_path, registry_dir / "local-image-inspect.json"),
+    "binaries": (binary_receipt_path, registry_dir / "EXTRACTED_BINARIES.json"),
+    "authfile": (auth_receipt_path, registry_dir / "REGISTRY_AUTHFILE.json"),
+}
+for source_path, destination_path in canonical_registry_files.values():
+    shutil.copy2(source_path, destination_path)
+tag_body = canonical_registry_files["tag_body"][1]
+tag_headers = canonical_registry_files["tag_headers"][1]
+digest_body = canonical_registry_files["digest_body"][1]
+digest_headers = canonical_registry_files["digest_headers"][1]
+config_body = canonical_registry_files["config_body"][1]
+config_headers = canonical_registry_files["config_headers"][1]
+inspect_path = canonical_registry_files["inspect"][1]
+binary_receipt_path = canonical_registry_files["binaries"][1]
+auth_receipt_path = canonical_registry_files["authfile"][1]
+publication.create_output_anchor(
+    ready_prepared, ready_prepared / "OUTPUT_ANCHOR.json", required_uid=uid
+)
+result_path = registry_dir / "RESULT.json"
 result = registry_call(result_path)
 assert result["immutable_image_ref"] == (
     publication.EXPECTED_REGISTRY_REPOSITORY + "@" + manifest_digest
@@ -766,6 +878,11 @@ assert result["candidate_container_started"] is False
 assert result["registry"]["authfile"]["secrets_recorded"] is False
 assert result["handoff"]["source"] == ready_value["source"]
 assert result["handoff"]["core_ci"] == ready_value["core_ci"]
+assert result["core_ci_evidence"] == ready_core_evidence
+assert result["handoff"]["core_ci_evidence"] == ready_core_evidence
+assert result["handoff"]["candidate_core_ci_authority_state"] == "merged"
+assert result["handoff"]["candidate_core_ci_current_main_sha"] == core_merge
+assert result["handoff"]["candidate_core_ci_merge_commit_sha"] == core_merge
 assert result["handoff"]["packaging"] == ready_value["packaging"]
 assert result["handoff"]["publication_tooling"] == ready_value["publication_tooling"]
 assert result["handoff"]["oci"]["layers"] == ready_value["oci"]["layers"]
@@ -779,12 +896,247 @@ assert result["handoff"]["github_artifact_zip_sha256"] != result["handoff"]["can
 assert result["handoff"]["candidate_tooling_sha256"] == result["handoff"]["candidate_packaging_tooling_sha256"]
 assert result["handoff"]["candidate_image_ref"] == result["immutable_image_ref"]
 assert result["handoff"]["binary_sha256s"] == ready_value["binaries"]
+assert result["copy_attempted"] is False
+assert result["copy_exit_success"] is None
+assert result["published_by_this_operation"] is False
+assert result["remote_exact_equality_verified"] is True
 
 ambiguous_path = root / "RESULT-AMBIGUOUS.json"
 ambiguous = registry_call(ambiguous_path, "copy-error-remote-exact")
+assert ambiguous["copy_attempted"] is True
 assert ambiguous["copy_exit_success"] is False
-assert ambiguous["published_now"] is False
+assert ambiguous["published_by_this_operation"] is None
+assert ambiguous["remote_exact_equality_verified"] is True
 assert ambiguous["source_manifest_exact_equality_verified"] is True
+
+successful_path = root / "RESULT-SUCCESSFUL-COPY.json"
+successful = registry_call(successful_path, "copy-succeeded")
+assert successful["copy_attempted"] is True
+assert successful["copy_exit_success"] is True
+assert successful["published_by_this_operation"] is True
+assert successful["remote_exact_equality_verified"] is True
+
+# RESULT is not rollout authority. Only an exact pre-completion manifest plus a
+# durable completion receipt closes the crash-consistency boundary.
+publication_sums = ready_prepared / publication.PUBLICATION_SUMS_NAME
+
+
+def reseal_publication_evidence():
+    publication_sums.write_text(
+        "".join(
+            f"{sha(path)}  ./{path.relative_to(ready_prepared).as_posix()}\n"
+            for path in sorted(
+                ready_prepared.rglob("*"),
+                key=lambda item: item.relative_to(ready_prepared).as_posix(),
+            )
+            if path.is_file() and not path.is_symlink()
+            and path.name not in {
+                publication.PUBLICATION_SUMS_NAME, publication.PUBLICATION_COMPLETE_NAME
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+reseal_publication_evidence()
+publication.fsync_tree(ready_prepared)
+completion_path = ready_prepared / publication.PUBLICATION_COMPLETE_NAME
+completion = publication.create_publication_completion(
+    ready_prepared, result_path, publication_sums, completion_path,
+    required_uid=uid, **callbacks(ready_policy)
+)
+assert completion["status"] == "complete"
+assert completion["core_ci"]["authority_state"] == "merged"
+assert completion["core_ci"]["merge_commit_sha"] == core_merge
+assert completion["publication"] == {
+    "candidate_container_started": False,
+    "copy_attempted": False,
+    "copy_exit_success": None,
+    "digest_refetch_verified": True,
+    "outcome": "tag-already-exact",
+    "published_by_this_operation": False,
+    "remote_config_bytes_verified": True,
+    "remote_exact_equality_verified": True,
+    "same_response_digest_verified": True,
+    "source_manifest_exact_equality_verified": True,
+}
+assert publication.validate_publication_completion(
+    ready_prepared, completion_path, required_uid=uid, **callbacks(ready_policy)
+) == completion
+
+# Project all three exact copy outcomes through completion, not only RESULT.
+canonical_result_bytes = result_path.read_bytes()
+completion_copy_cases = (
+    (
+        ambiguous_path,
+        "copy-error-remote-exact",
+        True,
+        False,
+        None,
+    ),
+    (
+        successful_path,
+        "copy-succeeded",
+        True,
+        True,
+        True,
+    ),
+)
+for copy_result_path, outcome, attempted, exit_success, published in completion_copy_cases:
+    result_path.write_bytes(copy_result_path.read_bytes())
+    reseal_publication_evidence()
+    projected = publication.publication_completion_value(
+        ready_prepared,
+        result_path,
+        publication_sums,
+        completed_utc=completion["completed_utc"],
+        required_uid=uid,
+        **callbacks(ready_policy),
+    )
+    assert projected["publication"] == {
+        "candidate_container_started": False,
+        "copy_attempted": attempted,
+        "copy_exit_success": exit_success,
+        "digest_refetch_verified": True,
+        "outcome": outcome,
+        "published_by_this_operation": published,
+        "remote_config_bytes_verified": True,
+        "remote_exact_equality_verified": True,
+        "same_response_digest_verified": True,
+        "source_manifest_exact_equality_verified": True,
+    }
+result_path.write_bytes(canonical_result_bytes)
+reseal_publication_evidence()
+
+# Exercise the CLI's nested immutable-ref projection. Synthetic callback-bound
+# fixtures cannot be passed through a subprocess, so patch only the producer
+# while retaining the complete evidence replay above.
+cli_stdout = io.StringIO()
+original_create = publication.create_publication_completion
+original_validate = publication.validate_publication_completion
+original_argv = sys.argv
+try:
+    publication.create_publication_completion = lambda *args, **kwargs: completion
+    sys.argv = [
+        os.fspath(verify_path), "complete-publication",
+        "--root", os.fspath(ready_prepared),
+        "--result", os.fspath(result_path),
+        "--manifest", os.fspath(publication_sums),
+        "--output", os.fspath(completion_path) + ".synthetic",
+    ]
+    with contextlib.redirect_stdout(cli_stdout):
+        publication.main()
+    publication.validate_publication_completion = lambda *args, **kwargs: completion
+    sys.argv = [
+        os.fspath(verify_path), "verify-completion",
+        "--root", os.fspath(ready_prepared),
+        "--completion", os.fspath(completion_path),
+    ]
+    with contextlib.redirect_stdout(cli_stdout):
+        publication.main()
+finally:
+    publication.create_publication_completion = original_create
+    publication.validate_publication_completion = original_validate
+    sys.argv = original_argv
+assert cli_stdout.getvalue().count(
+    f"IMMUTABLE_IMAGE_REF={completion['registry']['immutable_image_ref']}"
+) == 2
+
+# Even after an attacker recomputes the public checksum ledger, no hand-edited
+# RESULT/handoff/nonce/copy field can produce a completion receipt: the result
+# must be byte-identical to a fresh replay from original evidence.
+original_result_bytes = result_path.read_bytes()
+result_mutators = {
+    "result-request-sha": lambda value: value.__setitem__("request_sha256", "f" * 64),
+    "result-handoff-source": lambda value: value["handoff"].__setitem__(
+        "candidate_source_commit", "f" * 40
+    ),
+    "result-core-main": lambda value: value["core_ci_evidence"].__setitem__(
+        "current_main_sha", "f" * 40
+    ),
+    "result-nonce": lambda value: value["nonce_consumption"]["record"].__setitem__(
+        "nonce", "8" * 64
+    ),
+    "result-copy-type": lambda value: value.__setitem__("copy_attempted", 0),
+}
+for label, mutate in result_mutators.items():
+    changed_result = json.loads(original_result_bytes)
+    mutate(changed_result)
+    write_json(result_path, changed_result)
+    reseal_publication_evidence()
+    expect_failure(
+        label,
+        lambda: publication.publication_completion_value(
+            ready_prepared,
+            result_path,
+            publication_sums,
+            completed_utc=completion["completed_utc"],
+            required_uid=uid,
+            **callbacks(ready_policy),
+        ),
+    )
+    result_path.write_bytes(original_result_bytes)
+    reseal_publication_evidence()
+
+# The completion ledger is an exact, canonical filesystem inventory. Exercise
+# its line grammar, ordering, duplicate/self exclusions, and bidirectional
+# file-set closure independently of RESULT replay.
+valid_manifest = publication_sums.read_bytes()
+valid_lines = valid_manifest.decode("utf-8").splitlines(keepends=True)
+manifest_mutations = {
+    "manifest-duplicate": lambda: publication_sums.write_text(
+        "".join(valid_lines + [valid_lines[0]]), encoding="utf-8"
+    ),
+    "manifest-unsafe-path": lambda: publication_sums.write_text(
+        "".join(valid_lines) + f"{'f' * 64}  ./../escape\n", encoding="utf-8"
+    ),
+    "manifest-unsorted": lambda: publication_sums.write_text(
+        "".join(reversed(valid_lines)), encoding="utf-8"
+    ),
+    "manifest-missing-entry": lambda: publication_sums.write_text(
+        "".join(valid_lines[1:]), encoding="utf-8"
+    ),
+    "manifest-self-entry": lambda: publication_sums.write_text(
+        "".join(valid_lines)
+        + f"{'f' * 64}  ./{publication.PUBLICATION_SUMS_NAME}\n",
+        encoding="utf-8",
+    ),
+    "manifest-completion-entry": lambda: publication_sums.write_text(
+        "".join(valid_lines)
+        + f"{'f' * 64}  ./{publication.PUBLICATION_COMPLETE_NAME}\n",
+        encoding="utf-8",
+    ),
+}
+for label, mutate in manifest_mutations.items():
+    mutate()
+    expect_failure(
+        label,
+        lambda: publication.publication_manifest_entries(
+            ready_prepared, publication_sums
+        ),
+    )
+    publication_sums.write_bytes(valid_manifest)
+extra_evidence = ready_prepared / "UNLISTED-EVIDENCE"
+extra_evidence.write_bytes(b"unlisted\n")
+expect_failure(
+    "manifest-unlisted-file",
+    lambda: publication.publication_manifest_entries(ready_prepared, publication_sums),
+)
+extra_evidence.unlink()
+assert publication.publication_manifest_entries(
+    ready_prepared, publication_sums
+)
+
+changed_completion = copy.deepcopy(completion)
+changed_completion["result"]["sha256"] = "f" * 64
+write_json(completion_path, changed_completion)
+expect_failure(
+    "completion-result-substitution",
+    lambda: publication.validate_publication_completion(
+        ready_prepared, completion_path, required_uid=uid, **callbacks(ready_policy)
+    ),
+)
+write_json(completion_path, completion)
 
 
 def expect_registry_failure(label, mutate):
@@ -870,6 +1222,17 @@ assert set(auth_probe) == {
     "skopeo_path", "skopeo_uid", "skopeo_mode", "compatibility_probe",
     "secrets_recorded",
 }
+hanging_skopeo = root / "hanging-skopeo"
+hanging_skopeo.write_text("#!/bin/sh\n/bin/sleep 5\n", encoding="utf-8")
+hanging_skopeo.chmod(0o755)
+expect_failure(
+    "authfile-probe-timeout",
+    lambda: publication.verify_registry_authfile(
+        ready_request, hanging_skopeo, root / "HANGING-AUTH-PROBE.json",
+        required_uid=uid, timeout_seconds=0.05,
+    ),
+)
+assert not (root / "HANGING-AUTH-PROBE.json").exists()
 
 print("PASS publication-schema3-authority-and-hostile-fixtures")
 PY
@@ -880,6 +1243,34 @@ PY
 grep -Fqx "OFFLINE_VERIFICATION_ONLY=$TMP/wrapper-prepared/VERIFIED_INPUT.json" \
     "$TMP/wrapper.stdout"
 grep -Fqx 'NO_DOCKER_OR_REGISTRY_OPERATION_PERFORMED=true' "$TMP/wrapper.stdout"
+
+# The publisher never resolves its interpreter from ambient PATH. Direct exec
+# is the only supported entrypoint; any caller-started Bash can source BASH_ENV
+# before the publisher receives control and is therefore forbidden.
+mkdir "$TMP/hostile-path"
+cat >"$TMP/hostile-path/bash" <<EOF
+#!/bin/sh
+printf 'hostile bash executed\n' >'$TMP/hostile-bash-sentinel'
+exit 99
+EOF
+chmod 755 "$TMP/hostile-path/bash"
+mkdir "$TMP/hostile-python"
+cat >"$TMP/hostile-python/sitecustomize.py" <<EOF
+from pathlib import Path
+Path('$TMP/hostile-python-sentinel').write_text('executed')
+EOF
+cat >"$TMP/hostile-bash-env" <<EOF
+printf 'hostile BASH_ENV executed\n' >'$TMP/hostile-bash-env-sentinel'
+EOF
+PATH="$TMP/hostile-path:$PATH" BASH_ENV="$TMP/hostile-bash-env" \
+    PYTHONPATH="$TMP/hostile-python" \
+    "$PUBLISH" "$TMP/blocked/request.json" \
+    "$TMP/wrapper-hostile-direct" >"$TMP/wrapper-hostile-direct.stdout"
+[[ ! -e "$TMP/hostile-bash-sentinel" ]] || fail 'ambient PATH selected the publisher shell'
+[[ ! -e "$TMP/hostile-bash-env-sentinel" ]] || fail 'ambient BASH_ENV crossed bootstrap'
+[[ ! -e "$TMP/hostile-python-sentinel" ]] || fail 'ambient PYTHONPATH crossed bootstrap'
+grep -Fqx 'NO_DOCKER_OR_REGISTRY_OPERATION_PERFORMED=true' \
+    "$TMP/wrapper-hostile-direct.stdout"
 
 python3 - "$EXAMPLE" <<'PY'
 import json
@@ -916,14 +1307,24 @@ PY
 ! grep -Eq '(^|[[:space:]])docker[[:space:]]+run|"\$DOCKER"[[:space:]]+run' "$PUBLISH" ||
     fail 'publisher can execute a candidate container'
 # shellcheck disable=SC2016
-grep -Fq '"$DOCKER" create --pull=never --network none' "$PUBLISH"
+grep -Fq 'run_bounded 300 "$DOCKER" create --pull=never --network none' "$PUBLISH"
 # shellcheck disable=SC2016
-grep -Fq '"$DOCKER" cp' "$PUBLISH"
+grep -Fq 'run_bounded 600 "$DOCKER" cp' "$PUBLISH"
 grep -Fq 'consume-nonce --verified' "$PUBLISH"
 # shellcheck disable=SC2016
 grep -Fq 'copy --authfile "$AUTHFILE" --preserve-digests' "$PUBLISH"
 grep -Fq 'copy-error-remote-exact' "$PUBLISH" "$VERIFY"
+grep -Fq '#!/bin/sh' "$PUBLISH"
+# shellcheck disable=SC2016
+grep -Fq '"$BOOTSTRAP_BASH" --noprofile --norc "$0" "$@"' "$PUBLISH"
 grep -Fq 'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$PUBLISH"
+grep -Fq 'anchor-live-output --root' "$PUBLISH"
+grep -Fq 'complete-publication --root' "$PUBLISH"
+grep -Fq 'verify-completion --root' "$PUBLISH"
+grep -Fq 'PUBLICATION_COMPLETE_SHA256=' "$PUBLISH"
+grep -Fq -- '--connect-timeout 15 --max-time 120' "$PUBLISH"
+# shellcheck disable=SC2016
+grep -Fq 'run_bounded 1800 "$SKOPEO" copy' "$PUBLISH"
 ! grep -Fq 'docker push' "$PUBLISH" || fail 'publisher retains a Docker push path'
 awk '/"\$CURL"/ && $0 !~ /"\$CURL" --disable/ { bad=1 } END { exit bad }' "$PUBLISH" ||
     fail 'a curl invocation can load ambient configuration'
@@ -936,6 +1337,11 @@ assert consume < text.index('image inspect "$LOCAL_REF"')
 assert consume < text.index('"$SKOPEO" copy --authfile')
 assert 'docker run' not in text
 PY
+grep -Fq 'The executable path is the only supported publisher entrypoint.' \
+    "$PACKAGE_ROOT/README.md"
+# shellcheck disable=SC2016
+grep -Fq '`/bin/bash publish_candidate_oci.sh`' \
+    "$PACKAGE_ROOT/README.md"
 
 cmp -s \
     <(cd "$PACKAGE_ROOT" && find . -type f ! -path './SHA256SUMS' -print | sort) \

@@ -20,7 +20,10 @@ partial collection of fields. Its SHA-256 binds all of the following:
 - source repository, `H`, `T`, and the reviewed signing fingerprint;
 - Core-CI workflow, run ID, run attempt, evidence digest, required-check set,
   and the ThreadSanitizer artifact ID, exact name, API digest, ZIP digest, and
-  reports digest;
+  reports digest. The bound schema-3 receipt also preserves the terminal merged
+  PR, current main, exact merge tree and ordered parents, verified identities,
+  run-before-merge timestamps, branch protection, 16 successful checks, and
+  zero-report sanitizer evidence;
 - packaging tooling commit/tree/package seal, workflow identity, terminal run
   ID and attempt, and terminal run-receipt digest;
 - GitHub artifact ID, exact H/attempt name, API-receipt digest, downloaded ZIP
@@ -91,7 +94,16 @@ equality. The receipt is never trusted as an assertion.
 
 ## Durable one-shot execution
 
-Live operation requires root. The original request and exclusive-writer
+Live operation requires a separately staged, full Git clone whose complete
+directory tree, `.git` database, and publication package are root-owned and
+not group/world writable. Linked worktrees and developer-owned checkouts are
+rejected. Stage and independently verify that protected clone before invoking
+any publication code as root; no executable can make a caller-selected,
+user-writable script trustworthy after the interpreter has already opened it.
+The publisher rechecks the complete protected clone and an inode/hash ledger
+of all six publication files before every Python boundary.
+
+The original request and exclusive-writer
 receipt must be root-owned mode 0600. The selected authfile must be an absolute,
 single-linked, root-owned regular file with mode 0600. The script passes that
 file explicitly to `skopeo copy --authfile`; it never relies on Docker's
@@ -111,6 +123,14 @@ the nonce and requires a new authority; it cannot replay the old one.
 
 Nonce consumption occurs under the global publication lock and before any
 Docker or registry read/write. It is not rolled back on failure.
+
+The live evidence root and every ancestor are anchored to root-owned,
+non-group/world-writable directory identities before nonce consumption and
+rechecked before and after completion. The evidence root itself is mode 0700.
+Every network or daemon command is bounded. Registry HTTP calls use a 15-second
+connection and 120-second total deadline; credential probes, Docker commands,
+and Skopeo copies have explicit operation-specific limits. A timeout cannot
+create completion.
 
 ## OCI and registry proof
 
@@ -136,14 +156,28 @@ and every ordered layer media type, digest, and size. A digest refetch must
 return the same bytes. The referenced config bytes must exactly equal the
 sealed source config and reproduce its labels, platform, and binary ledger.
 
-Only then does the adapter emit
+Only then does the adapter construct
 `qqblackcoin/blackcoin-v4-gui@sha256:<manifest>`. The mutable tag is explicitly
 non-authoritative. `registry/RESULT.json` contains the complete authority,
 source/Core/packaging/artifact/publication receipts, exact local and remote OCI
 graphs, nonce-consumption and credential-operational receipts, stopped-
 container binary proof, publication outcome, and a schema-2 structured handoff
-that cross-binds the same identities. `PUBLICATION_SHA256SUMS` seals the
-resulting evidence tree.
+that cross-binds the same identities. `PUBLICATION_SHA256SUMS` seals the exact
+pre-completion evidence tree. The adapter verifies and fsyncs those bytes, then
+exclusively creates mode-0600 `PUBLICATION_COMPLETE.json`. That receipt binds
+the RESULT and evidence-ledger hashes, exact covered-file count, canonical
+handoff hash, Core merge authority, packaging/artifact/publication-tooling
+identity, nonce records, immutable registry identity, and copy-result truth.
+It is reread, revalidated, and fsynced before the immutable reference is
+printed. `RESULT.json` without a valid completion receipt has zero rollout
+authority.
+
+Copy results are deliberately tri-state. An already-exact tag records
+`copy_attempted=false`, `copy_exit_success=null`, and
+`published_by_this_operation=false`. A successful copy records three `true`
+values. A failed copy followed by exact remote proof records `true`, `false`,
+and `null`, because the client cannot know whether that attempt committed the
+bytes. Every path still requires exact remote equality.
 
 ## Operation
 
@@ -169,6 +203,25 @@ Skopeo-compatible authfile, and use a new absent output path. Do not enable the
 request without external coordination granting exclusive authority over the
 exact unique tag.
 
+The executable path is the only supported publisher entrypoint. Do not invoke
+it as `bash publish_candidate_oci.sh` or `/bin/bash publish_candidate_oci.sh`.
+A caller-started shell can resolve an ambient program or source `BASH_ENV`
+before the publisher receives control. Direct execution enters the fixed
+`/bin/sh` bootstrap, which validates and re-enters `/bin/bash` through an empty
+environment before parsing Bash syntax. System tools are then resolved from
+the fixed system PATH to protected root-owned terminal bytes; protected
+distribution symlinks are resolved, while unsafe links, targets, or parent
+directories fail closed. Python runs isolated with no caller `PYTHONPATH` or
+site customization. Git runs with replace objects and ambient system/global
+configuration disabled and verifies against an internally constructed exact
+allowed-signers file.
+
+Downstream rollout tooling must independently hash and bind
+`PUBLICATION_COMPLETE.json` and verify its RESULT, exact checksum ledger, and
+handoff. Manual transcription of selected RESULT fields is not an authority
+transition. The durability package remains blocked until its checked-in bridge
+has verified this completed receipt.
+
 ## Review validation
 
 The local suite is offline:
@@ -178,9 +231,11 @@ bash contrib/ops/v30.1.5-candidate-publication/tests/run.sh
 ```
 
 It builds canonical blocked and ready candidates and attacks the authority
-tuple, confirmation, timestamps, terminal run receipt, ZIP parser and cap,
+tuple, terminal merged Core schema-3 receipt, confirmation, timestamps,
+terminal run receipt, ZIP parser and cap,
 prepared-state receipt, nonce ledger/replay, stopped-container extraction
 receipt, registry headers/refetch/config, exact OCI layer graph, credential
-contract, ambiguous-copy branch, handoff, disabled wrapper, and package seal.
+and timeout contract, all copy-result branches, handoff, crash-safe completion,
+fixed-interpreter bootstrap, disabled wrapper, and package seal.
 It does not contact GitHub or a registry and does not invoke Docker, Skopeo,
 Compose, or any node.

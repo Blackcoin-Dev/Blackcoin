@@ -37,6 +37,17 @@ EXPECTED_PACKAGING_WORKFLOW_NAME = "v30.1.5 Linux x86_64 canary candidate"
 EXPECTED_REGISTRY_HOST = "registry-1.docker.io"
 EXPECTED_CREDENTIAL_HOST = "docker.io"
 EXPECTED_ACTOR = "Blackcoin-Dev"
+EXPECTED_ACTIONS_APP_ID = 15368
+EXPECTED_MERGE_COMMITTER = "web-flow"
+EXPECTED_MERGE_AUTHOR_NAME = "Blackcoin-Dev"
+EXPECTED_MERGE_AUTHOR_EMAIL = "298119138+Blackcoin-Dev@users.noreply.github.com"
+EXPECTED_MERGE_COMMITTER_NAME = "GitHub"
+EXPECTED_MERGE_COMMITTER_EMAIL = "noreply@github.com"
+EXPECTED_SIGNING_PRINCIPAL = "298119138+Blackcoin-Dev@users.noreply.github.com"
+EXPECTED_SIGNING_PUBLIC_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIBPYLwGcJFN4eoPcQ1mX43s6KzIib1t3P3fpMKKQer4h"
+)
 EXPECTED_BINARIES = (
     "blackcoin-cli",
     "blackcoin-qt",
@@ -78,6 +89,20 @@ MAX_AUTHORITY_LIFETIME = timedelta(minutes=30)
 MAX_CLOCK_SKEW = timedelta(seconds=60)
 UTC_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 SAFE_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+CORE_CI_EVIDENCE_KEYS = {
+    "schema", "workflow_path", "workflow_name", "base_workflow_blob_sha256",
+    "source_workflow_blob_sha256", "event", "repository", "head_repository",
+    "pull_request_number", "pull_request_head_sha", "pull_request_base_sha", "base_tree",
+    "run_id", "run_attempt", "head_sha", "head_tree", "status", "conclusion",
+    "workflow_actor", "workflow_triggering_actor", "run_completed_at", "base_branch",
+    "authority_state", "current_main_sha", "current_main_authority_fresh",
+    "pull_request_state", "pull_request_draft", "pull_request_mergeable",
+    "pull_request_mergeable_state", "pull_request_merged", "pull_request_merged_at",
+    "pull_request_merged_by", "merge_commit", "exact_head_run_count",
+    "branch_protection", "required_checks", "thread_sanitizer_artifact",
+}
+PUBLICATION_COMPLETE_NAME = "PUBLICATION_COMPLETE.json"
+PUBLICATION_SUMS_NAME = "PUBLICATION_SHA256SUMS"
 
 
 class VerificationError(RuntimeError):
@@ -213,6 +238,375 @@ def fsync_tree(root):
             os.close(descriptor)
 
 
+def publication_manifest_entries(root, manifest_path):
+    """Verify the pre-completion evidence ledger and return its exact entries."""
+    root = Path(root)
+    manifest_path = Path(manifest_path)
+    require(root.is_absolute() and root.is_dir() and not root.is_symlink(),
+            "publication evidence root is missing, relative, or unsafe")
+    require(manifest_path == root / PUBLICATION_SUMS_NAME,
+            "publication checksum ledger path is not canonical")
+    payload = read_regular_bytes(
+        manifest_path, "publication checksum ledger", MAX_NONCE_LEDGER_BYTES
+    )
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise VerificationError("publication checksum ledger is not UTF-8") from error
+    entries = {}
+    for line in lines:
+        match = re.fullmatch(r"([0-9a-f]{64})  (\./[^\n]+)", line)
+        require(match is not None, "publication checksum ledger has a malformed line")
+        digest, relative_text = match.groups()
+        candidate = PurePosixPath(relative_text[2:])
+        require(not candidate.is_absolute()
+                and all(part not in ("", ".", "..") for part in candidate.parts)
+                and "\\" not in relative_text,
+                "publication checksum ledger contains an unsafe path")
+        relative = candidate.as_posix()
+        require(relative not in entries, "publication checksum ledger contains a duplicate")
+        require(relative not in {PUBLICATION_SUMS_NAME, PUBLICATION_COMPLETE_NAME},
+                "publication checksum ledger contains a self/completion entry")
+        entries[relative] = digest
+    require(list(entries) == sorted(entries),
+            "publication checksum ledger is not sorted")
+    actual = set()
+    for current, names, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        for name in names:
+            path = current_path / name
+            require(path.is_dir() and not path.is_symlink(),
+                    f"publication evidence directory is unsafe: {path}")
+        for name in files:
+            path = current_path / name
+            require(path.is_file() and not path.is_symlink(),
+                    f"publication evidence entry is unsafe: {path}")
+            relative = path.relative_to(root).as_posix()
+            if relative not in {PUBLICATION_SUMS_NAME, PUBLICATION_COMPLETE_NAME}:
+                actual.add(relative)
+    require(set(entries) == actual,
+            "publication checksum ledger does not cover the exact evidence file set")
+    for relative, expected in entries.items():
+        observed, _ = sha256_regular_file(
+            root.joinpath(*PurePosixPath(relative).parts),
+            f"publication evidence {relative}",
+        )
+        require(observed == expected,
+                f"publication evidence checksum mismatch: {relative}")
+    return entries
+
+
+def replay_registry_result(
+    root,
+    result_path,
+    *,
+    required_uid=0,
+    canonical_bundle_check=None,
+    source_identity_check=None,
+    packaging_snapshot_check=None,
+    publication_snapshot_check=None,
+):
+    """Reconstruct RESULT from original evidence and require byte-exact equality."""
+    root = Path(root)
+    result_path = Path(result_path)
+    validate_output_anchor(root, root / "OUTPUT_ANCHOR.json", required_uid=required_uid)
+    observed = load_json(result_path, "publication result")
+    require(isinstance(observed, dict)
+            and observed.get("publication_outcome") in {
+                "tag-already-exact", "copy-succeeded", "copy-error-remote-exact"
+            },
+            "publication result outcome is malformed")
+    registry = root / "registry"
+    with tempfile.TemporaryDirectory(
+        prefix=".publication-result-replay-", dir=root.parent
+    ) as temporary:
+        replay_path = Path(temporary) / "RESULT.json"
+        expected = verify_registry_evidence(
+            root / "VERIFIED_INPUT.json",
+            root / "request.json",
+            registry / "tag-manifest.json",
+            registry / "tag-manifest.headers",
+            registry / "digest-manifest.json",
+            registry / "digest-manifest.headers",
+            registry / "registry-config.json",
+            registry / "registry-config.headers",
+            registry / "local-image-inspect.json",
+            registry / "EXTRACTED_BINARIES.json",
+            root / "NONCE_CONSUMPTION.json",
+            registry / "REGISTRY_AUTHFILE.json",
+            observed["publication_outcome"],
+            replay_path,
+            required_uid=required_uid,
+            canonical_bundle_check=canonical_bundle_check,
+            source_identity_check=source_identity_check,
+            packaging_snapshot_check=packaging_snapshot_check,
+            publication_snapshot_check=publication_snapshot_check,
+        )
+        require(canonical_json_bytes(observed) == canonical_json_bytes(expected)
+                and read_regular_bytes(result_path, "publication result")
+                == read_regular_bytes(replay_path, "replayed publication result"),
+                "publication result differs from a complete evidence replay")
+    return observed
+
+
+def publication_completion_value(
+    root,
+    result_path,
+    manifest_path,
+    *,
+    completed_utc,
+    required_uid=0,
+    canonical_bundle_check=None,
+    source_identity_check=None,
+    packaging_snapshot_check=None,
+    publication_snapshot_check=None,
+):
+    validate_output_anchor(
+        Path(root), Path(root) / "OUTPUT_ANCHOR.json", required_uid=required_uid
+    )
+    entries = publication_manifest_entries(root, manifest_path)
+    result_path = Path(result_path)
+    require(result_path == Path(root) / "registry" / "RESULT.json",
+            "publication result path is not canonical")
+    result = replay_registry_result(
+        root,
+        result_path,
+        required_uid=required_uid,
+        canonical_bundle_check=canonical_bundle_check,
+        source_identity_check=source_identity_check,
+        packaging_snapshot_check=packaging_snapshot_check,
+        publication_snapshot_check=publication_snapshot_check,
+    )
+    require(type(result.get("schema")) is int and result["schema"] == 2
+            and result.get("result") == "passed",
+            "publication result is not terminal-pass")
+    immutable = result.get("immutable_image_ref")
+    manifest_digest = result.get("registry_manifest_digest")
+    require(isinstance(immutable, str)
+            and immutable == f"{EXPECTED_REGISTRY_REPOSITORY}@{manifest_digest}"
+            and is_digest(manifest_digest),
+            "publication result immutable identity is malformed")
+    require(result.get("handoff", {}).get("registry", {}).get("manifest_digest")
+            == manifest_digest,
+            "publication result handoff manifest changed")
+    core = result["core_ci_evidence"]
+    validate_core_ci_evidence_shape(core, source=result["source"], require_merged=True)
+    completed = parse_utc(completed_utc, "publication completion timestamp")
+    consumed = parse_utc(
+        result["nonce_consumption"]["record"]["consumed_utc"],
+        "publication nonce-consumption timestamp",
+    )
+    require(completed >= consumed,
+            "publication completion predates nonce consumption")
+    handoff = result["handoff"]
+    packaging = result["packaging"]
+    artifact = result["artifact"]
+    publication_tooling = result["publication_tooling"]
+    registry = result["registry"]
+    nonce_receipt_path = Path(root) / "NONCE_CONSUMPTION.json"
+    require(nonce_receipt_path.is_file() and not nonce_receipt_path.is_symlink(),
+            "nonce-consumption receipt is absent or unsafe")
+    copy_fields = {
+        "copy_attempted": result["copy_attempted"],
+        "copy_exit_success": result["copy_exit_success"],
+        "published_by_this_operation": result["published_by_this_operation"],
+    }
+    expected_copy_fields = {
+        "tag-already-exact": {
+            "copy_attempted": False,
+            "copy_exit_success": None,
+            "published_by_this_operation": False,
+        },
+        "copy-succeeded": {
+            "copy_attempted": True,
+            "copy_exit_success": True,
+            "published_by_this_operation": True,
+        },
+        "copy-error-remote-exact": {
+            "copy_attempted": True,
+            "copy_exit_success": False,
+            "published_by_this_operation": None,
+        },
+    }
+    expected_copy = expected_copy_fields.get(result["publication_outcome"])
+    require(expected_copy is not None
+            and copy_fields["copy_attempted"] is expected_copy["copy_attempted"]
+            and copy_fields["copy_exit_success"] is expected_copy["copy_exit_success"]
+            and copy_fields["published_by_this_operation"]
+            is expected_copy["published_by_this_operation"],
+            "publication copy-state truth changed")
+    verification_fields = {
+        "digest_refetch_verified": result["digest_refetch_verified"],
+        "remote_config_bytes_verified": result["remote_config_bytes_verified"],
+        "remote_exact_equality_verified": result["remote_exact_equality_verified"],
+        "same_response_digest_verified": result["same_response_digest_verified"],
+        "source_manifest_exact_equality_verified": (
+            result["source_manifest_exact_equality_verified"]
+        ),
+    }
+    require(all(value is True for value in verification_fields.values())
+            and result["candidate_container_started"] is False,
+            "publication verification is incomplete")
+    return {
+        "action": "complete-v30.1.5-candidate-publication",
+        "artifact": {
+            "api_metadata_sha256": artifact["api_metadata_sha256"],
+            "bundle_sha256sums_sha256": result["bundle"]["sha256sums_sha256"],
+            "id": artifact["id"],
+            "name": artifact["name"],
+            "zip_sha256": artifact["zip_sha256"],
+        },
+        "authorization": {
+            "exclusive_writer_authority_sha256": (
+                handoff["authorization"]["exclusive_writer_authority_sha256"]
+            ),
+            "nonce": handoff["authorization"]["nonce"],
+            "nonce_consumption_sha256": sha256_file(nonce_receipt_path),
+            "nonce_ledger_record_sha256": (
+                handoff["authorization"]["nonce_ledger_record_sha256"]
+            ),
+        },
+        "completed_utc": completed_utc,
+        "core_ci": {
+            "authority_state": core["authority_state"],
+            "current_main_sha": core["current_main_sha"],
+            "evidence_sha256": result["core_ci"]["evidence_sha256"],
+            "merge_commit_sha": core["merge_commit"]["sha"],
+            "pull_request_merged_at": core["pull_request_merged_at"],
+            "run_attempt": core["run_attempt"],
+            "run_completed_at": core["run_completed_at"],
+            "run_id": core["run_id"],
+        },
+        "evidence_manifest": {
+            "covered_file_count": len(entries),
+            "path": PUBLICATION_SUMS_NAME,
+            "sha256": sha256_file(manifest_path),
+        },
+        "handoff_sha256": canonical_subset_sha256(handoff),
+        "packaging": {
+            "package_sha256sums_sha256": packaging["package_sha256sums_sha256"],
+            "run_attempt": packaging["run_attempt"],
+            "run_id": packaging["run_id"],
+            "run_metadata_sha256": packaging["run_metadata_sha256"],
+            "tooling_commit": packaging["tooling_commit"],
+            "tooling_tree": packaging["tooling_tree"],
+        },
+        "publication": {
+            "candidate_container_started": False,
+            **copy_fields,
+            **verification_fields,
+            "outcome": result["publication_outcome"],
+        },
+        "publication_authority_sha256": result["publication_authority_sha256"],
+        "publication_tooling": {
+            "commit": publication_tooling["commit"],
+            "package_sha256sums_sha256": (
+                publication_tooling["package_sha256sums_sha256"]
+            ),
+            "tree": publication_tooling["tree"],
+        },
+        "registry": {
+            "config_digest": result["registry_config_digest"],
+            "credential_host": registry["credential_host"],
+            "host": registry["host"],
+            "immutable_image_ref": immutable,
+            "manifest_digest": manifest_digest,
+            "registry_immutable_image_ref": result["registry_immutable_image_ref"],
+            "repository": registry["repository"],
+            "tag": registry["tag"],
+        },
+        "request_sha256": result["request_sha256"],
+        "result": {
+            "path": "registry/RESULT.json",
+            "sha256": sha256_file(result_path),
+        },
+        "schema": 1,
+        "source": {
+            "commit": result["source"]["commit"],
+            "tree": result["source"]["tree"],
+        },
+        "status": "complete",
+    }
+
+
+def create_publication_completion(
+    root,
+    result_path,
+    manifest_path,
+    output,
+    *,
+    required_uid=0,
+    canonical_bundle_check=None,
+    source_identity_check=None,
+    packaging_snapshot_check=None,
+    publication_snapshot_check=None,
+):
+    root = Path(root)
+    output = Path(output)
+    require(output == root / PUBLICATION_COMPLETE_NAME,
+            "publication completion path is not canonical")
+    completed_utc = datetime.now(timezone.utc).replace(microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    value = publication_completion_value(
+        root,
+        result_path,
+        manifest_path,
+        completed_utc=completed_utc,
+        required_uid=required_uid,
+        canonical_bundle_check=canonical_bundle_check,
+        source_identity_check=source_identity_check,
+        packaging_snapshot_check=packaging_snapshot_check,
+        publication_snapshot_check=publication_snapshot_check,
+    )
+    write_new_json_durable(output, value)
+    return value
+
+
+def validate_publication_completion(
+    root,
+    completion_path,
+    *,
+    required_uid=0,
+    canonical_bundle_check=None,
+    source_identity_check=None,
+    packaging_snapshot_check=None,
+    publication_snapshot_check=None,
+):
+    root = Path(root)
+    completion_path = Path(completion_path)
+    require(completion_path == root / PUBLICATION_COMPLETE_NAME,
+            "publication completion path is not canonical")
+    validate_output_anchor(root, root / "OUTPUT_ANCHOR.json", required_uid=required_uid)
+    completion_status = os.lstat(completion_path)
+    require(stat.S_ISREG(completion_status.st_mode)
+            and completion_status.st_uid == required_uid
+            and stat.S_IMODE(completion_status.st_mode) == 0o600
+            and completion_status.st_nlink == 1,
+            "publication completion receipt ownership or mode changed")
+    value = load_json(completion_path, "publication completion receipt")
+    exact_keys(
+        value,
+        {"action", "artifact", "authorization", "completed_utc", "core_ci",
+         "evidence_manifest", "handoff_sha256", "packaging", "publication",
+         "publication_authority_sha256", "publication_tooling", "registry",
+         "request_sha256", "result", "schema", "source", "status"},
+        "publication completion receipt",
+    )
+    expected = publication_completion_value(
+        root, root / "registry" / "RESULT.json", root / PUBLICATION_SUMS_NAME,
+        completed_utc=value["completed_utc"],
+        required_uid=required_uid,
+        canonical_bundle_check=canonical_bundle_check,
+        source_identity_check=source_identity_check,
+        packaging_snapshot_check=packaging_snapshot_check,
+        publication_snapshot_check=publication_snapshot_check,
+    )
+    require(canonical_json_bytes(value) == canonical_json_bytes(expected),
+            "publication completion receipt changed")
+    return value
+
+
 def sha256_bytes(payload):
     return hashlib.sha256(payload).hexdigest()
 
@@ -268,6 +662,157 @@ def exact_keys(value, expected, description):
     require(set(value) == set(expected), f"{description} has unexpected or missing fields")
 
 
+def validate_core_ci_evidence_shape(value, *, source=None, require_merged=False):
+    """Require the exact terminal Core-CI schema before projecting its receipt."""
+    exact_keys(value, CORE_CI_EVIDENCE_KEYS, "Core CI evidence")
+    require(type(value["schema"]) is int and value["schema"] == 3,
+            "Core CI evidence schema is not supported")
+    require(type(value["run_id"]) is int and value["run_id"] > 0
+            and type(value["run_attempt"]) is int and value["run_attempt"] > 0,
+            "Core CI run identity is malformed")
+    require(value["status"] == "completed" and value["conclusion"] == "success",
+            "Core CI evidence is not terminal-success")
+    require(value["event"] == "pull_request"
+            and value["repository"] == EXPECTED_REPOSITORY
+            and value["head_repository"] == EXPECTED_REPOSITORY
+            and value["base_branch"] == "main"
+            and value["workflow_actor"] == EXPECTED_ACTOR
+            and value["workflow_triggering_actor"] == EXPECTED_ACTOR,
+            "Core CI workflow authority changed")
+    if source is not None:
+        require(value["pull_request_head_sha"] == source["commit"]
+                and value["head_sha"] == source["commit"]
+                and value["head_tree"] == source["tree"],
+                "Core CI source H/T changed")
+    require(value["pull_request_head_sha"] == value["head_sha"],
+            "Core CI pull-request head and run head differ")
+    run_completed = parse_utc(value["run_completed_at"], "Core CI completion timestamp")
+    require(value["current_main_authority_fresh"] is True,
+            "Core CI current-main authority is not fresh")
+    require(type(value["exact_head_run_count"]) is int
+            and value["exact_head_run_count"] == 1,
+            "Core CI exact-head run is not unique")
+    require(value["authority_state"] in {"open", "merged"},
+            "Core CI authority state is not supported")
+    if require_merged:
+        require(value["authority_state"] == "merged",
+                "live publication requires terminal merged Core authority")
+    if value["authority_state"] == "open":
+        require(value["pull_request_state"] == "open"
+                and value["pull_request_draft"] is False
+                and value["pull_request_mergeable"] is True
+                and value["pull_request_mergeable_state"] == "clean"
+                and value["pull_request_merged"] is False
+                and value["pull_request_merged_at"] is None
+                and value["pull_request_merged_by"] is None
+                and value["merge_commit"] is None
+                and value["current_main_sha"] == value["pull_request_base_sha"],
+                "open Core CI authority contains terminal merge state")
+    else:
+        merged_at = parse_utc(value["pull_request_merged_at"], "Core PR merge timestamp")
+        require(value["pull_request_state"] == "closed"
+                and value["pull_request_draft"] is False
+                and value["pull_request_mergeable"] is None
+                and value["pull_request_mergeable_state"] == "unknown"
+                and value["pull_request_merged"] is True
+                and value["pull_request_merged_by"] == EXPECTED_ACTOR
+                and isinstance(value["merge_commit"], dict),
+                "merged Core CI authority is incomplete")
+        require(run_completed < merged_at,
+                "Core PR merged before the exact successful run completed")
+        merge = value["merge_commit"]
+        exact_keys(
+            merge,
+            {"sha", "tree", "parents", "github_verified", "github_verification_reason",
+             "author_login", "committer_login", "author", "committer"},
+            "Core merge-commit evidence",
+        )
+        require(is_full_sha(merge["sha"])
+                and value["current_main_sha"] == merge["sha"]
+                and merge["tree"] == value["head_tree"]
+                and merge["parents"] == [value["pull_request_base_sha"], value["head_sha"]],
+                "Core merge identity, tree, or parent order changed")
+        require(merge["github_verified"] is True
+                and merge["github_verification_reason"] == "valid"
+                and merge["author_login"] == EXPECTED_ACTOR
+                and merge["committer_login"] == EXPECTED_MERGE_COMMITTER,
+                "Core merge signature identity changed")
+        exact_keys(merge["author"], {"name", "email", "date"}, "Core merge author")
+        exact_keys(merge["committer"], {"name", "email", "date"}, "Core merge committer")
+        require(merge["author"] == {
+                    "name": EXPECTED_MERGE_AUTHOR_NAME,
+                    "email": EXPECTED_MERGE_AUTHOR_EMAIL,
+                    "date": value["pull_request_merged_at"],
+                }
+                and merge["committer"] == {
+                    "name": EXPECTED_MERGE_COMMITTER_NAME,
+                    "email": EXPECTED_MERGE_COMMITTER_EMAIL,
+                    "date": value["pull_request_merged_at"],
+                },
+                "Core merge author or committer changed")
+    protection = value["branch_protection"]
+    exact_keys(protection, {"enabled", "enforcement_level", "contexts", "checks"},
+               "Core branch-protection evidence")
+    require(protection["enabled"] is True and protection["enforcement_level"] == "everyone",
+            "Core branch protection is not fully enforced")
+    contexts = protection["contexts"]
+    protected = protection["checks"]
+    checks = value["required_checks"]
+    require(isinstance(contexts, list) and len(contexts) == 16
+            and len(contexts) == len(set(contexts))
+            and isinstance(protected, list) and len(protected) == len(contexts)
+            and isinstance(checks, list) and len(checks) == len(contexts),
+            "Core protected check inventory changed")
+    check_ids = set()
+    for name, protected_check, check in zip(contexts, protected, checks):
+        require(isinstance(name, str) and name,
+                "Core protected context name is malformed")
+        exact_keys(protected_check, {"context", "app_id"}, "Core protected check")
+        exact_keys(check, {"id", "name", "app_id", "status", "conclusion"},
+                   "Core required check")
+        require(protected_check == {"context": name, "app_id": EXPECTED_ACTIONS_APP_ID}
+                and check["name"] == name
+                and type(check["id"]) is int and check["id"] > 0
+                and check["id"] not in check_ids
+                and type(check["app_id"]) is int
+                and check["app_id"] == EXPECTED_ACTIONS_APP_ID
+                and check["status"] == "completed" and check["conclusion"] == "success",
+                "Core required/protected check changed")
+        check_ids.add(check["id"])
+    sanitizer = value["thread_sanitizer_artifact"]
+    exact_keys(
+        sanitizer,
+        {"id", "name", "size_in_bytes", "expired", "api_digest", "zip_sha256",
+         "reports_sha256", "report"},
+        "Core ThreadSanitizer artifact",
+    )
+    require(type(sanitizer["id"]) is int and sanitizer["id"] > 0
+            and type(sanitizer["size_in_bytes"]) is int and sanitizer["size_in_bytes"] > 0
+            and sanitizer["expired"] is False
+            and sanitizer["api_digest"] == f"sha256:{sanitizer['zip_sha256']}"
+            and is_hex64(sanitizer["zip_sha256"])
+            and is_hex64(sanitizer["reports_sha256"]),
+            "Core ThreadSanitizer artifact changed")
+    report = sanitizer["report"]
+    exact_keys(
+        report,
+        {"target_sha", "sanitizer", "report_count", "report_bytes",
+         "framing_error_count", "collector_error_count", "artifact_error",
+         "capture_complete"},
+        "Core ThreadSanitizer report",
+    )
+    require(report["target_sha"] == value["head_sha"]
+            and report["sanitizer"] == "thread-sanitizer",
+            "Core ThreadSanitizer report target changed")
+    for field in ("report_count", "report_bytes", "framing_error_count",
+                  "collector_error_count", "artifact_error"):
+        require(type(report[field]) is int and report[field] == 0,
+                f"Core ThreadSanitizer report is not clean: {field}")
+    require(type(report["capture_complete"]) is int and report["capture_complete"] == 1,
+            "Core ThreadSanitizer capture is incomplete")
+    return value
+
+
 def absolute_path(value, description):
     require(isinstance(value, str) and value.startswith("/"), f"{description} must be absolute")
     path = Path(value)
@@ -275,20 +820,119 @@ def absolute_path(value, description):
     return path
 
 
+def secure_subprocess_environment(*, git=False):
+    """Return the complete environment allowed across a subprocess boundary."""
+    environment = {
+        "HOME": "/var/empty",
+        "LC_ALL": "C",
+        "PATH": SAFE_SYSTEM_PATH,
+        "PYTHONNOUSERSITE": "1",
+        "TZ": "UTC",
+        "XDG_CONFIG_HOME": "/var/empty",
+    }
+    if git:
+        environment.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        })
+    return environment
+
+
+def protected_parent_chain(path, required_uid=0, *, final_mode=None):
+    """Bind every real directory from / through one path's parent."""
+    path = Path(path)
+    require(path.is_absolute() and ".." not in path.parts,
+            "protected path is not a safe absolute path")
+    parent = path.parent
+    entries = []
+    current = Path("/")
+    components = [current]
+    for part in parent.parts[1:]:
+        current /= part
+        components.append(current)
+    for index, directory in enumerate(components):
+        try:
+            before = os.lstat(directory)
+            after = os.lstat(directory)
+        except OSError as error:
+            raise VerificationError(
+                f"cannot inspect protected path ancestor: {directory}"
+            ) from error
+        identity = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_ctime_ns")
+        require(all(getattr(before, field) == getattr(after, field) for field in identity),
+                f"protected path ancestor changed: {directory}")
+        require(stat.S_ISDIR(before.st_mode) and not stat.S_ISLNK(before.st_mode),
+                f"protected path ancestor is not a real directory: {directory}")
+        owner_ok = before.st_uid in {0, required_uid}
+        mode_ok = stat.S_IMODE(before.st_mode) & 0o022 == 0
+        # Non-root unit fixtures may live below a root-owned sticky temporary
+        # directory. The production contract uses required_uid=0 and therefore
+        # never takes this fixture-only allowance.
+        if required_uid != 0 and before.st_uid == 0 and before.st_mode & stat.S_ISVTX:
+            mode_ok = True
+        require(owner_ok and mode_ok,
+                f"protected path ancestor is not required-owner/non-writable: {directory}")
+        if final_mode is not None and index == len(components) - 1:
+            require(stat.S_IMODE(before.st_mode) == final_mode,
+                    f"protected path parent mode is not {final_mode:04o}")
+        entries.append((str(directory), before.st_dev, before.st_ino,
+                        before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode)))
+    return tuple(entries)
+
+
 def trusted_system_tool(name, *, required_uid=0):
     """Resolve a system tool to stable root-owned, non-writable bytes."""
     selected = shutil.which(name, path=SAFE_SYSTEM_PATH)
     require(selected is not None and Path(selected).is_absolute(),
             f"required system tool is unavailable: {name}")
+    path = Path(selected)
+    seen = set()
+    for _ in range(32):
+        require(path not in seen, f"system tool symlink loop: {name}")
+        seen.add(path)
+        protected_parent_chain(path, required_uid)
+        try:
+            before = os.lstat(path)
+        except OSError as error:
+            raise VerificationError(f"cannot inspect system tool safely: {name}") from error
+        if not stat.S_ISLNK(before.st_mode):
+            break
+        require(before.st_uid == required_uid,
+                f"system tool symlink is not required-owner: {name}")
+        try:
+            target = os.readlink(path)
+            after = os.lstat(path)
+        except OSError as error:
+            raise VerificationError(f"cannot resolve system tool safely: {name}") from error
+        require(
+            (before.st_dev, before.st_ino, before.st_uid, before.st_gid,
+             before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            == (after.st_dev, after.st_ino, after.st_uid, after.st_gid,
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+            f"system tool symlink changed while resolving: {name}",
+        )
+        path = Path(target) if target.startswith("/") else path.parent / target
+        path = Path(os.path.normpath(path))
+        require(path.is_absolute() and ".." not in path.parts,
+                f"system tool resolved to an unsafe path: {name}")
+    else:
+        raise VerificationError(f"system tool symlink depth exceeded: {name}")
+    require(str(path).startswith(("/bin/", "/sbin/", "/usr/")),
+            f"system tool resolved outside approved roots: {name}")
+    protected_parent_chain(path, required_uid)
     try:
-        resolved = Path(selected).resolve(strict=True)
-        status = os.stat(resolved, follow_symlinks=False)
+        before = os.stat(path, follow_symlinks=False)
+        after = os.stat(path, follow_symlinks=False)
     except OSError as error:
-        raise VerificationError(f"cannot resolve system tool safely: {name}") from error
-    require(stat.S_ISREG(status.st_mode) and status.st_uid == required_uid
-            and stat.S_IMODE(status.st_mode) & 0o022 == 0,
+        raise VerificationError(f"cannot stat system tool safely: {name}") from error
+    stable = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size",
+              "st_mtime_ns", "st_ctime_ns")
+    require(all(getattr(before, field) == getattr(after, field) for field in stable),
+            f"system tool changed while resolving: {name}")
+    require(stat.S_ISREG(before.st_mode) and before.st_uid == required_uid
+            and stat.S_IMODE(before.st_mode) & 0o022 == 0,
             f"system tool is not root-owned immutable regular bytes: {name}")
-    return str(resolved)
+    return str(path)
 
 
 def expected_artifact_name(source, attempt):
@@ -995,28 +1639,90 @@ def inspect_oci_archive(path):
 def verify_git_identity(commit, tree, description):
     git = trusted_system_tool("git")
     ssh_keygen = trusted_system_tool("ssh-keygen")
-    environment = {
-        "HOME": os.environ.get("HOME", "/root"),
-        "LC_ALL": "C",
-        "PATH": SAFE_SYSTEM_PATH,
-        "TZ": "UTC",
-    }
-    try:
-        observed_tree = subprocess.run(
-            [git, "-C", str(REPO_ROOT), "rev-parse", f"{commit}^{{tree}}"],
-            check=True, text=True, capture_output=True, env=environment,
-        ).stdout.strip()
-        signature = subprocess.run(
-            [git, "-c", f"gpg.ssh.program={ssh_keygen}", "-C", str(REPO_ROOT),
-             "verify-commit", commit],
-            check=True, text=True, capture_output=True, env=environment,
+    environment = secure_subprocess_environment(git=True)
+    with tempfile.TemporaryDirectory(prefix="blackcoin-publication-signers-") as temporary:
+        allowed_signers = Path(temporary) / "allowed_signers"
+        allowed_signers.write_text(
+            f'{EXPECTED_SIGNING_PRINCIPAL} namespaces="git" '
+            f"{EXPECTED_SIGNING_PUBLIC_KEY}\n",
+            encoding="utf-8",
         )
-    except subprocess.CalledProcessError as error:
-        raise VerificationError(f"{description} commit or signature is unavailable") from error
+        allowed_signers.chmod(0o600)
+        git_prefix = [
+            git,
+            "--no-replace-objects",
+            "-c", "gpg.format=ssh",
+            "-c", f"gpg.ssh.allowedSignersFile={allowed_signers}",
+            "-c", f"gpg.ssh.program={ssh_keygen}",
+            "-C", str(REPO_ROOT),
+        ]
+        try:
+            observed_tree = subprocess.run(
+                [*git_prefix, "rev-parse", f"{commit}^{{tree}}"],
+                check=True, text=True, capture_output=True, env=environment,
+                timeout=60,
+            ).stdout.strip()
+            signature = subprocess.run(
+                [*git_prefix, "verify-commit", commit],
+                check=True, text=True, capture_output=True, env=environment,
+                timeout=60,
+            )
+            identities = subprocess.run(
+                [*git_prefix, "show", "-s",
+                 "--format=%an%x00%ae%x00%cn%x00%ce", commit],
+                check=True, capture_output=True, env=environment, timeout=60,
+            ).stdout.rstrip(b"\n").split(b"\x00")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            raise VerificationError(
+                f"{description} commit or signature is unavailable"
+            ) from error
     require(observed_tree == tree, f"{description} tree changed")
-    signature_text = signature.stdout + signature.stderr
-    require("Good \"git\" signature" in signature_text and EXPECTED_FINGERPRINT in signature_text,
+    expected_signature = (
+        f'Good "git" signature for {EXPECTED_SIGNING_PRINCIPAL} '
+        f"with ED25519 key {EXPECTED_FINGERPRINT}"
+    )
+    signature_lines = [
+        line.strip() for line in (signature.stdout + signature.stderr).splitlines()
+        if line.strip()
+    ]
+    require(signature_lines.count(expected_signature) == 1
+            and not any(line.startswith('Good "git" signature')
+                        and line != expected_signature for line in signature_lines),
             f"{description} signature fingerprint changed")
+    require(identities == [
+                b"Blackcoin-Dev", EXPECTED_SIGNING_PRINCIPAL.encode("ascii"),
+                b"Blackcoin-Dev", EXPECTED_SIGNING_PRINCIPAL.encode("ascii"),
+            ],
+            f"{description} author or committer identity changed")
+
+
+def git_snapshot_bytes(git, commit, relative):
+    """Read one commit path with replace refs and ambient Git config disabled."""
+    try:
+        return subprocess.run(
+            [git, "--no-replace-objects", "-C", str(REPO_ROOT),
+             "show", f"{commit}:{relative}"],
+            check=True, capture_output=True,
+            env=secure_subprocess_environment(git=True), timeout=60,
+        ).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise VerificationError(
+            f"signed snapshot path is absent from its commit: {relative}"
+        ) from error
+
+
+def git_snapshot_tree_entry(git, commit, relative):
+    try:
+        return subprocess.run(
+            [git, "--no-replace-objects", "-C", str(REPO_ROOT),
+             "ls-tree", commit, "--", relative],
+            check=True, capture_output=True, text=True,
+            env=secure_subprocess_environment(git=True), timeout=60,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise VerificationError(
+            f"signed snapshot tree path is absent: {relative}"
+        ) from error
 
 
 def verify_packaging_snapshot(commit, tree):
@@ -1033,14 +1739,7 @@ def verify_packaging_snapshot(commit, tree):
     for relative in relative_paths:
         current = REPO_ROOT / relative
         require(current.is_file() and not current.is_symlink(), f"packaging tooling path is unsafe: {relative}")
-        try:
-            committed = subprocess.run(
-                [git, "-C", str(REPO_ROOT), "show", f"{commit}:{relative}"],
-                check=True, capture_output=True,
-                env={"LC_ALL": "C", "PATH": SAFE_SYSTEM_PATH},
-            ).stdout
-        except subprocess.CalledProcessError as error:
-            raise VerificationError(f"packaging tooling path is absent from its commit: {relative}") from error
+        committed = git_snapshot_bytes(git, commit, relative)
         require(current.read_bytes() == committed, f"packaging tooling path differs from its commit: {relative}")
     package_sums = CANDIDATE_ROOT / "SHA256SUMS"
     entries = {}
@@ -1112,24 +1811,8 @@ def verify_publication_snapshot(commit, tree):
             "publication tooling package directory set changed")
     for relative in sorted(expected_relative):
         current = REPO_ROOT / relative
-        try:
-            committed = subprocess.run(
-                [git, "-C", str(REPO_ROOT), "show", f"{commit}:{relative}"],
-                check=True,
-                capture_output=True,
-                env={"LC_ALL": "C", "PATH": SAFE_SYSTEM_PATH},
-            ).stdout
-            tree_entry = subprocess.run(
-                [git, "-C", str(REPO_ROOT), "ls-tree", commit, "--", relative],
-                check=True,
-                capture_output=True,
-                text=True,
-                env={"LC_ALL": "C", "PATH": SAFE_SYSTEM_PATH},
-            ).stdout.strip()
-        except subprocess.CalledProcessError as error:
-            raise VerificationError(
-                f"publication tooling path is absent from its commit: {relative}"
-            ) from error
+        committed = git_snapshot_bytes(git, commit, relative)
+        tree_entry = git_snapshot_tree_entry(git, commit, relative)
         require(current.read_bytes() == committed,
                 f"publication tooling path differs from its commit: {relative}")
         match = re.fullmatch(r"(100644|100755) blob [0-9a-f]{40}\t(.+)", tree_entry)
@@ -1170,18 +1853,20 @@ def run_canonical_bundle_verifier(bundle):
     require(CANDIDATE_POLICY.is_file() and not CANDIDATE_POLICY.is_symlink(), "candidate policy is unsafe")
     require(CANDIDATE_VERIFIER.is_file() and not CANDIDATE_VERIFIER.is_symlink(), "candidate verifier is unsafe")
     require(CANDIDATE_METADATA.is_file() and not CANDIDATE_METADATA.is_symlink(), "candidate metadata verifier is unsafe")
-    environment = os.environ.copy()
+    environment = secure_subprocess_environment()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    environment["PATH"] = SAFE_SYSTEM_PATH
     python = trusted_system_tool("python3")
     try:
         subprocess.run(
-            [python, str(CANDIDATE_METADATA), "verify", "--policy", str(CANDIDATE_POLICY),
+            [python, "-I", "-B", str(CANDIDATE_METADATA),
+             "verify", "--policy", str(CANDIDATE_POLICY),
              "--bundle", str(bundle)],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, timeout=300,
         )
-    except subprocess.CalledProcessError as error:
-        message = error.stderr.decode("utf-8", errors="replace").strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        message = getattr(error, "stderr", b"")
+        message = (message or b"").decode("utf-8", errors="replace").strip()
         raise VerificationError(f"canonical candidate bundle verifier failed: {message}") from error
 
 
@@ -1228,8 +1913,11 @@ def validate_manifest_and_oci(bundle, names, request, checksum_entries):
     require(core_ci == core_ci_evidence, "manifest and Core CI evidence differ")
     require(sha256_file(core_ci_file) == core_request["evidence_sha256"],
             "Core CI evidence digest changed")
-    require(core_ci.get("schema") == 2 and core_ci.get("run_id") == core_request["run_id"]
-            and core_ci.get("run_attempt") == core_request["run_attempt"],
+    validate_core_ci_evidence_shape(
+        core_ci, source=source_request, require_merged=request["execution"]["execute"]
+    )
+    require(core_ci["run_id"] == core_request["run_id"]
+            and core_ci["run_attempt"] == core_request["run_attempt"],
             "manifest Core CI run R changed")
     require(core_ci.get("head_sha") == source and core_ci.get("head_tree") == tree,
             "manifest Core CI H/T changed")
@@ -1381,6 +2069,7 @@ def validate_manifest_and_oci(bundle, names, request, checksum_entries):
         "binary_tar_sha256": sha256_file(bundle / names["binary_tar"]),
         "binary_sums_sha256": sha256_file(bundle / names["binary_sums"]),
         "core_ci_evidence_sha256": sha256_file(core_ci_file),
+        "core_ci_evidence": core_ci,
         "required_checks_sha256": canonical_subset_sha256(core_ci["required_checks"]),
     }
 
@@ -1557,6 +2246,7 @@ def build_verified_receipt(root, evaluated, *, create_source_files):
         "publication_authority": authority,
         "source": source,
         "core_ci": core,
+        "core_ci_evidence": detail["core_ci_evidence"],
         "packaging": {
             **{key: item for key, item in packaging.items() if key != "run_metadata_path"},
             "run_metadata_path": "packaging-run.json",
@@ -1805,8 +2495,84 @@ def open_absolute_directory_nofollow(path, description):
         raise VerificationError(f"cannot open {description} safely: {error}") from error
 
 
+def protected_directory_chain(path, required_uid=0):
+    """Return a stable identity ledger for one protected absolute directory chain."""
+    path = Path(path)
+    require(path.is_absolute() and ".." not in path.parts,
+            "protected directory path is not a safe absolute path")
+    entries = []
+    current = Path("/")
+    components = [current]
+    for part in path.parts[1:]:
+        current /= part
+        components.append(current)
+    for index, current in enumerate(components):
+        try:
+            status = os.lstat(current)
+        except OSError as error:
+            raise VerificationError(f"cannot inspect protected directory: {current}") from error
+        require(stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode),
+                f"protected directory component is not a real directory: {current}")
+        owner_ok = status.st_uid in {0, required_uid}
+        mode_ok = stat.S_IMODE(status.st_mode) & 0o022 == 0
+        if required_uid != 0 and status.st_uid == 0 and status.st_mode & stat.S_ISVTX:
+            mode_ok = True
+        require(owner_ok and mode_ok,
+                f"protected directory component is not required-owner/non-writable: {current}")
+        if index == len(components) - 1:
+            require(status.st_uid == required_uid
+                    and stat.S_IMODE(status.st_mode) == 0o700,
+                    "live evidence directory must have mode 0700")
+        entries.append({
+            "path": str(current),
+            "device": status.st_dev,
+            "inode": status.st_ino,
+            "uid": status.st_uid,
+            "gid": status.st_gid,
+            "mode": f"{stat.S_IMODE(status.st_mode):04o}",
+        })
+    require(entries[-1]["path"] == str(path),
+            "protected directory chain did not terminate at the evidence root")
+    return entries
+
+
+def create_output_anchor(root, output, *, required_uid=0):
+    root = Path(root)
+    output = Path(output)
+    require(output == root / "OUTPUT_ANCHOR.json",
+            "live output-anchor path is not canonical")
+    value = {
+        "schema": 1,
+        "status": "anchored",
+        "root": str(root),
+        "required_uid": required_uid,
+        "chain": protected_directory_chain(root, required_uid),
+    }
+    write_new_json_durable(output, value)
+    return value
+
+
+def validate_output_anchor(root, anchor, *, required_uid=0):
+    root = Path(root)
+    anchor = Path(anchor)
+    require(anchor == root / "OUTPUT_ANCHOR.json",
+            "live output-anchor path is not canonical")
+    observed = load_json(anchor, "live output-anchor receipt")
+    expected = {
+        "schema": 1,
+        "status": "anchored",
+        "root": str(root),
+        "required_uid": required_uid,
+        "chain": protected_directory_chain(root, required_uid),
+    }
+    require(canonical_json_bytes(observed) == canonical_json_bytes(expected),
+            "live evidence directory identity changed")
+    return observed
+
+
 def open_ledger_parent(path, required_uid):
     parent = path.parent
+    chain_before = protected_parent_chain(path, required_uid, final_mode=0o700)
     try:
         descriptor = open_absolute_directory_nofollow(parent, "nonce ledger parent")
     except (OSError, VerificationError) as error:
@@ -1816,6 +2582,9 @@ def open_ledger_parent(path, required_uid):
         require(stat.S_ISDIR(status.st_mode) and status.st_uid == required_uid
                 and stat.S_IMODE(status.st_mode) == 0o700,
                 "nonce ledger parent must have the required owner and mode 0700")
+        require(protected_parent_chain(path, required_uid, final_mode=0o700)
+                == chain_before,
+                "nonce ledger directory ancestry changed while opening")
         return descriptor
     except Exception:
         os.close(descriptor)
@@ -2072,12 +2841,17 @@ def validate_extracted_binary_receipt(path, verified):
     return receipt
 
 
-def verify_registry_authfile(request_path, skopeo_path, output, *, required_uid=0):
+def verify_registry_authfile(
+    request_path, skopeo_path, output=None, *, required_uid=0, timeout_seconds=60
+):
     """Prove the selected protected authfile is readable by the selected skopeo."""
     request = load_request(request_path, enforce_time=False)
     require(request["execution"]["execute"] is True,
             "registry authfile verification requires a live request")
     authfile = Path(request["registry"]["authfile_path"])
+    auth_chain_before = protected_parent_chain(
+        authfile, required_uid, final_mode=0o700
+    )
     try:
         auth_parent = open_absolute_directory_nofollow(
             authfile.parent, "registry authfile parent"
@@ -2107,6 +2881,7 @@ def verify_registry_authfile(request_path, skopeo_path, output, *, required_uid=
             skopeo_path = Path(skopeo_path)
             require(skopeo_path.is_absolute() and skopeo_path.is_file()
                     and not skopeo_path.is_symlink(), "skopeo path is unsafe")
+            tool_chain_before = protected_parent_chain(skopeo_path, required_uid)
             tool_status = os.stat(skopeo_path, follow_symlinks=False)
             require(stat.S_ISREG(tool_status.st_mode)
                     and tool_status.st_uid == required_uid
@@ -2120,9 +2895,10 @@ def verify_registry_authfile(request_path, skopeo_path, output, *, required_uid=
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    env={"PATH": SAFE_SYSTEM_PATH, "LC_ALL": "C", "HOME": "/root"},
+                    env=secure_subprocess_environment(),
+                    timeout=timeout_seconds,
                 )
-            except subprocess.CalledProcessError as error:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                 raise VerificationError(
                     "selected authfile is not skopeo-compatible for the credential host"
                 ) from error
@@ -2134,6 +2910,17 @@ def verify_registry_authfile(request_path, skopeo_path, output, *, required_uid=
                     == getattr(after, field) for field in stable_fields),
                 "registry authfile changed during its compatibility probe",
             )
+            require(protected_parent_chain(
+                        authfile, required_uid, final_mode=0o700
+                    ) == auth_chain_before,
+                    "registry authfile ancestry changed during its compatibility probe")
+            require(protected_parent_chain(skopeo_path, required_uid)
+                    == tool_chain_before,
+                    "skopeo path ancestry changed during its compatibility probe")
+            tool_after = os.stat(skopeo_path, follow_symlinks=False)
+            require(all(getattr(tool_status, field) == getattr(tool_after, field)
+                        for field in stable_fields),
+                    "skopeo executable changed during its compatibility probe")
         finally:
             os.close(auth_descriptor)
     finally:
@@ -2155,7 +2942,8 @@ def verify_registry_authfile(request_path, skopeo_path, output, *, required_uid=
         "compatibility_probe": "skopeo-login-get-login-succeeded",
         "secrets_recorded": False,
     }
-    write_new_json_durable(Path(output), receipt)
+    if output is not None:
+        write_new_json_durable(Path(output), receipt)
     return receipt
 
 
@@ -2389,8 +3177,31 @@ def verify_registry_evidence(
     repository = request["registry"]["repository"]
     immutable = f"{repository}@{tag_digest}"
     registry_immutable = f"{request['registry']['host']}/{immutable}"
-    published_now = publication_outcome == "copy-succeeded"
-    copy_exit_success = publication_outcome != "copy-error-remote-exact"
+    copy_state = {
+        "tag-already-exact": {
+            "copy_attempted": False,
+            "copy_exit_success": None,
+            "published_by_this_operation": False,
+        },
+        "copy-succeeded": {
+            "copy_attempted": True,
+            "copy_exit_success": True,
+            "published_by_this_operation": True,
+        },
+        "copy-error-remote-exact": {
+            "copy_attempted": True,
+            "copy_exit_success": False,
+            "published_by_this_operation": None,
+        },
+    }[publication_outcome]
+    core_evidence = verified["core_ci_evidence"]
+    validate_core_ci_evidence_shape(
+        core_evidence, source=verified["source"], require_merged=True
+    )
+    merge_commit_sha = (
+        core_evidence["merge_commit"]["sha"]
+        if core_evidence["merge_commit"] is not None else None
+    )
     handoff = {
         "schema": 2,
         "classification": EXPECTED_CLASSIFICATION,
@@ -2401,6 +3212,11 @@ def verify_registry_evidence(
         "candidate_core_ci_run_id": verified["core_ci"]["run_id"],
         "candidate_core_ci_run_attempt": verified["core_ci"]["run_attempt"],
         "candidate_core_ci_evidence_sha256": verified["core_ci"]["evidence_sha256"],
+        "candidate_core_ci_authority_state": core_evidence["authority_state"],
+        "candidate_core_ci_current_main_sha": core_evidence["current_main_sha"],
+        "candidate_core_ci_merge_commit_sha": merge_commit_sha,
+        "candidate_core_ci_run_completed_at": core_evidence["run_completed_at"],
+        "candidate_core_ci_merged_at": core_evidence["pull_request_merged_at"],
         "candidate_required_checks_sha256": verified["core_ci"]["required_checks_sha256"],
         "candidate_thread_sanitizer_artifact": verified["core_ci"]["thread_sanitizer_artifact"],
         "candidate_packaging_tooling_commit": verified["packaging"]["tooling_commit"],
@@ -2442,6 +3258,7 @@ def verify_registry_evidence(
         "binary_sha256s": verified["binaries"],
         "source": verified["source"],
         "core_ci": verified["core_ci"],
+        "core_ci_evidence": core_evidence,
         "packaging": verified["packaging"],
         "artifact": verified["github_artifact"],
         "publication_tooling": verified["publication_tooling"],
@@ -2484,6 +3301,7 @@ def verify_registry_evidence(
         "publication_authority": verified["publication_authority"],
         "source": verified["source"],
         "core_ci": verified["core_ci"],
+        "core_ci_evidence": core_evidence,
         "packaging": verified["packaging"],
         "publication_tooling": verified["publication_tooling"],
         "artifact": verified["github_artifact"],
@@ -2512,12 +3330,12 @@ def verify_registry_evidence(
         "nonce_consumption": nonce_receipt,
         "exclusive_writer_authority": verified["exclusive_writer_authority"],
         "publication_outcome": publication_outcome,
-        "copy_exit_success": copy_exit_success,
-        "published_now": published_now,
+        **copy_state,
         "same_response_digest_verified": True,
         "digest_refetch_verified": True,
         "source_manifest_exact_equality_verified": True,
         "remote_config_bytes_verified": True,
+        "remote_exact_equality_verified": True,
         "stopped_container_binary_extraction": binary_receipt,
         "candidate_container_started": False,
         "mutable_tag_is_rollout_authority": False,
@@ -2554,6 +3372,21 @@ def verify_registry_evidence(
         "handoff ZIP and internal bundle seals are confused",
     )
     require(
+        result["handoff"]["core_ci_evidence"] == result["core_ci_evidence"]
+        and result["handoff"]["candidate_core_ci_evidence_sha256"]
+        == verified["core_ci"]["evidence_sha256"]
+        and result["handoff"]["candidate_core_ci_authority_state"]
+        == result["core_ci_evidence"]["authority_state"]
+        and result["handoff"]["candidate_core_ci_current_main_sha"]
+        == result["core_ci_evidence"]["current_main_sha"]
+        and result["handoff"]["candidate_core_ci_merge_commit_sha"] == merge_commit_sha
+        and result["handoff"]["candidate_core_ci_run_completed_at"]
+        == result["core_ci_evidence"]["run_completed_at"]
+        and result["handoff"]["candidate_core_ci_merged_at"]
+        == result["core_ci_evidence"]["pull_request_merged_at"],
+        "handoff terminal Core-CI authority changed",
+    )
+    require(
         result["handoff"]["candidate_oci_layers"]
         == result["handoff"]["oci"]["layers"]
         == result["source_oci"]["layers"]
@@ -2584,8 +3417,25 @@ def main():
     authfile.add_argument("--request", required=True, type=Path)
     authfile.add_argument("--skopeo", required=True, type=Path)
     authfile.add_argument("--output", required=True, type=Path)
+    validate_authfile = subparsers.add_parser("validate-authfile")
+    validate_authfile.add_argument("--request", required=True, type=Path)
+    validate_authfile.add_argument("--skopeo", required=True, type=Path)
+    anchor = subparsers.add_parser("anchor-live-output")
+    anchor.add_argument("--root", required=True, type=Path)
+    anchor.add_argument("--output", required=True, type=Path)
+    verify_anchor = subparsers.add_parser("verify-live-output-anchor")
+    verify_anchor.add_argument("--root", required=True, type=Path)
+    verify_anchor.add_argument("--anchor", required=True, type=Path)
     durable = subparsers.add_parser("fsync-tree")
     durable.add_argument("--root", required=True, type=Path)
+    complete = subparsers.add_parser("complete-publication")
+    complete.add_argument("--root", required=True, type=Path)
+    complete.add_argument("--result", required=True, type=Path)
+    complete.add_argument("--manifest", required=True, type=Path)
+    complete.add_argument("--output", required=True, type=Path)
+    verify_complete = subparsers.add_parser("verify-completion")
+    verify_complete.add_argument("--root", required=True, type=Path)
+    verify_complete.add_argument("--completion", required=True, type=Path)
     registry = subparsers.add_parser("verify-registry")
     registry.add_argument("--verified", required=True, type=Path)
     registry.add_argument("--request", required=True, type=Path)
@@ -2623,9 +3473,32 @@ def main():
         elif args.command == "verify-authfile":
             verify_registry_authfile(args.request, args.skopeo, args.output)
             print(f"REGISTRY_AUTHFILE={args.output}")
+        elif args.command == "validate-authfile":
+            verify_registry_authfile(args.request, args.skopeo)
+            print(f"REGISTRY_AUTHFILE_REVALIDATED={args.request}")
+        elif args.command == "anchor-live-output":
+            create_output_anchor(args.root, args.output)
+            print(f"LIVE_OUTPUT_ANCHOR={args.output}")
+        elif args.command == "verify-live-output-anchor":
+            validate_output_anchor(args.root, args.anchor)
+            print(f"LIVE_OUTPUT_ANCHOR_VERIFIED={args.anchor}")
         elif args.command == "fsync-tree":
             fsync_tree(args.root)
             print(f"DURABLE_EVIDENCE_ROOT={args.root}")
+        elif args.command == "complete-publication":
+            value = create_publication_completion(
+                args.root, args.result, args.manifest, args.output
+            )
+            print(
+                f"PUBLICATION_COMPLETE={args.output} "
+                f"IMMUTABLE_IMAGE_REF={value['registry']['immutable_image_ref']}"
+            )
+        elif args.command == "verify-completion":
+            value = validate_publication_completion(args.root, args.completion)
+            print(
+                f"PUBLICATION_COMPLETE_VERIFIED={args.completion} "
+                f"IMMUTABLE_IMAGE_REF={value['registry']['immutable_image_ref']}"
+            )
         else:
             value = verify_registry_evidence(
                 args.verified, args.request, args.tag_manifest, args.tag_headers,

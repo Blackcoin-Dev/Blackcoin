@@ -173,6 +173,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_local_mining_policy.py',
     'feature_goldrush_mixed_version.py',
     'feature_goldrush_v3014_wallet_upgrade.py --descriptors',
+    'feature_goldrush_v3014_qqp2_upgrade.py --descriptors',
     'feature_goldrush_migration_rpc.py',
     'feature_goldrush_coldstake_auto_migration.py',
     'feature_goldrush_coinstatsindex.py',

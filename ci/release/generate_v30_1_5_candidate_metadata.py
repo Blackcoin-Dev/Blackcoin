@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Generate and verify exact-SHA post-release hotfix-candidate metadata."""
+"""Generate and verify exact-SHA v30.1.5 candidate metadata."""
 
 import argparse
 import hashlib
@@ -13,10 +13,13 @@ import sys
 import tarfile
 
 
-EXPECTED_CLASSIFICATION = "POST_RELEASE_HOTFIX_CANDIDATE_CANARY_ONLY"
+EXPECTED_CLASSIFICATION = "V30_1_5_CANDIDATE_CANARY_ONLY"
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
-EXPECTED_SOURCE_COMMIT = "8a3a5aa1c01caf57acc694b836398c5acba969d0"
+EXPECTED_SOURCE_COMMIT = "a0695f22740e111d0487a194fb46f1bae05952c5"
+EXPECTED_SOURCE_TREE = "86df040ae5eb8e819e940dd08364bcc177a72195"
 EXPECTED_RELEASE_ANCESTOR = "13262151077cce3f72d07d17dc7725b2b6a8e1ab"
+BLOCKED_AUTHORIZATION_STATE = "blocked_pending_final_signed_source_and_green_ci"
+READY_AUTHORIZATION_STATE = "authorized_exact_signed_source_and_green_ci"
 EXPECTED_SIGNER = "Blackcoin-Dev"
 EXPECTED_ACTOR = "Blackcoin-Dev"
 EXPECTED_FINGERPRINT = "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70"
@@ -29,7 +32,9 @@ EXPECTED_WORKFLOW_NAME = "pull-request safety gate"
 EXPECTED_CORE_CI_EVENT = "pull_request"
 EXPECTED_CORE_CI_PR = 49
 EXPECTED_CORE_CI_BASE = "19baffef25af36e177db2975780e0641b59753aa"
-EXPECTED_WORKFLOW_BLOB_SHA256 = "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869"
+EXPECTED_CORE_CI_BASE_TREE = "f897d758aee1849f02126f0ee3b7a4be9bd3be8c"
+EXPECTED_BASE_WORKFLOW_BLOB_SHA256 = "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869"
+EXPECTED_SOURCE_WORKFLOW_BLOB_SHA256 = "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869"
 EXPECTED_BINARIES = (
     "blackcoin-cli",
     "blackcoin-qt",
@@ -120,29 +125,53 @@ def validate_policy(policy_path):
     policy = load_json(policy_path, "candidate policy")
     require_exact_keys(
         policy,
-        {"schema", "classification", "version", "source", "core_ci", "base_image", "image", "artifacts", "binaries"},
+        {
+            "schema", "classification", "version", "authorization", "source",
+            "core_ci", "base_image", "image", "artifacts", "binaries",
+        },
         "candidate policy",
     )
-    require(policy["schema"] == 1, "candidate policy schema is not supported")
+    require(policy["schema"] == 2, "candidate policy schema is not supported")
     require(policy["classification"] == EXPECTED_CLASSIFICATION, "candidate classification changed")
-    require(policy["version"] == "30.1.4", "candidate version must be 30.1.4")
+    require(policy["version"] == "30.1.5", "candidate version must be 30.1.5")
+
+    authorization = policy["authorization"]
+    require_exact_keys(
+        authorization,
+        {"state", "dispatch_enabled", "temporary_source_pin", "core_ci_run_id"},
+        "candidate authorization policy",
+    )
+    if authorization["state"] == BLOCKED_AUTHORIZATION_STATE:
+        require(authorization["dispatch_enabled"] is False, "blocked candidate cannot be dispatchable")
+        require(authorization["temporary_source_pin"] is True, "blocked candidate must identify its temporary source pin")
+        require(authorization["core_ci_run_id"] is None, "blocked candidate cannot pin a Core CI run")
+    elif authorization["state"] == READY_AUTHORIZATION_STATE:
+        require(authorization["dispatch_enabled"] is True, "authorized candidate must be dispatchable")
+        require(authorization["temporary_source_pin"] is False, "authorized candidate cannot retain a temporary source pin")
+        require(
+            isinstance(authorization["core_ci_run_id"], int) and authorization["core_ci_run_id"] > 0,
+            "authorized candidate must pin a positive Core CI run ID",
+        )
+    else:
+        raise RuntimeError("candidate authorization state is not supported")
 
     source = policy["source"]
     require_exact_keys(
         source,
         {
-            "repository", "commit", "immutable_release_ancestor", "actor", "signer",
+            "repository", "commit", "tree", "immutable_release_ancestor", "actor", "signer",
             "signing_fingerprint", "configured_version", "release_candidate", "is_release",
         },
         "candidate source policy",
     )
     require(source["repository"] == EXPECTED_REPOSITORY, "source repository changed")
     require(source["commit"] == EXPECTED_SOURCE_COMMIT, "approved candidate source changed")
+    require(source["tree"] == EXPECTED_SOURCE_TREE, "approved candidate source tree changed")
     require(source["immutable_release_ancestor"] == EXPECTED_RELEASE_ANCESTOR, "release ancestor changed")
     require(source["actor"] == EXPECTED_ACTOR, "workflow actor changed")
     require(source["signer"] == EXPECTED_SIGNER, "source signer changed")
     require(source["signing_fingerprint"] == EXPECTED_FINGERPRINT, "source signing key changed")
-    require(source["configured_version"] == "30.1.4", "configured version changed")
+    require(source["configured_version"] == "30.1.5", "configured version changed")
     require(source["release_candidate"] == 0, "source must remain RC0")
     require(source["is_release"] is True, "source must retain CLIENT_VERSION_IS_RELEASE=true")
 
@@ -150,26 +179,41 @@ def validate_policy(policy_path):
     require_exact_keys(
         core_ci,
         {
-            "event", "pull_request_number", "head_sha", "base_sha", "repository",
-            "head_repository", "workflow_path", "workflow_name", "workflow_blob_sha256",
+            "event", "pull_request_number", "head_sha", "head_tree", "base_sha", "base_tree", "repository",
+            "head_repository", "workflow_path", "workflow_name",
+            "base_workflow_blob_sha256", "source_workflow_blob_sha256",
         },
         "Core CI policy",
     )
     require(core_ci["event"] == EXPECTED_CORE_CI_EVENT, "Core CI event changed")
     require(core_ci["pull_request_number"] == EXPECTED_CORE_CI_PR, "Core CI pull request changed")
     require(core_ci["head_sha"] == EXPECTED_SOURCE_COMMIT, "Core CI policy head changed")
+    require(core_ci["head_tree"] == EXPECTED_SOURCE_TREE, "Core CI policy head tree changed")
     require(core_ci["base_sha"] == EXPECTED_CORE_CI_BASE, "Core CI policy base changed")
+    require(core_ci["base_tree"] == EXPECTED_CORE_CI_BASE_TREE, "Core CI policy base tree changed")
     require(core_ci["repository"] == EXPECTED_REPOSITORY, "Core CI repository changed")
     require(core_ci["head_repository"] == EXPECTED_REPOSITORY, "Core CI head repository changed")
     require(core_ci["workflow_path"] == EXPECTED_WORKFLOW_PATH, "Core CI workflow path changed")
     require(core_ci["workflow_name"] == EXPECTED_WORKFLOW_NAME, "Core CI workflow name changed")
     require(
-        core_ci["workflow_blob_sha256"] == EXPECTED_WORKFLOW_BLOB_SHA256,
-        "Core CI workflow blob changed",
+        core_ci["base_workflow_blob_sha256"] == EXPECTED_BASE_WORKFLOW_BLOB_SHA256,
+        "Core CI base workflow blob changed",
+    )
+    require(
+        core_ci["source_workflow_blob_sha256"] == EXPECTED_SOURCE_WORKFLOW_BLOB_SHA256,
+        "Core CI source workflow blob changed",
     )
 
     base = policy["base_image"]
-    require_exact_keys(base, {"repository", "reference", "manifest_digest", "config_digest"}, "base-image policy")
+    require_exact_keys(
+        base,
+        {"role", "repository", "reference", "manifest_digest", "config_digest"},
+        "base-image policy",
+    )
+    require(
+        base["role"] == "immutable-v30.1.4-rootfs-and-rollback-only",
+        "v30.1.4 image must remain only the immutable rootfs and rollback base",
+    )
     require(base["repository"] == EXPECTED_BASE_REPOSITORY, "base repository changed")
     require(base["reference"] == EXPECTED_BASE_REFERENCE, "base reference is not immutable v30.1.4")
     require(base["manifest_digest"] == EXPECTED_BASE_MANIFEST, "base manifest digest changed")
@@ -185,9 +229,9 @@ def validate_policy(policy_path):
         "candidate-image policy",
     )
     require(image["repository"] == EXPECTED_BASE_REPOSITORY, "candidate image repository changed")
-    require(image["tag_template"] == "30.1.4-hotfix-candidate-{source12}-ci1", "candidate tag template changed")
+    require(image["tag_template"] == "30.1.5-candidate-{source12}-ci1", "candidate tag template changed")
     require(
-        image["archive_template"] == "blackcoin-v4-gui-30.1.4-hotfix-candidate-{source12}.oci.tar",
+        image["archive_template"] == "blackcoin-v4-gui-30.1.5-candidate-{source12}.oci.tar",
         "candidate archive template changed",
     )
     require(image["os"] == "linux" and image["architecture"] == "amd64", "candidate platform changed")
@@ -200,12 +244,12 @@ def validate_policy(policy_path):
     artifacts = policy["artifacts"]
     require_exact_keys(artifacts, {"prefix_template", "github_artifact_template"}, "artifact policy")
     require(
-        artifacts["prefix_template"] == "Blackcoin-30.1.4-hotfix-candidate-{source12}",
+        artifacts["prefix_template"] == "Blackcoin-30.1.5-candidate-{source12}",
         "artifact prefix changed",
     )
     require(
         artifacts["github_artifact_template"] ==
-        "hotfix-candidate-30.1.4-linux-x86_64-{source40}-attempt-{attempt}",
+        "v30.1.5-candidate-linux-x86_64-{source40}-attempt-{attempt}",
         "GitHub artifact template changed",
     )
     require(policy["binaries"] == list(EXPECTED_BINARIES), "candidate binary inventory changed")
@@ -222,6 +266,7 @@ def artifact_names(policy):
         "binary_tar": f"{prefix}-Linux-x86_64.tar.gz",
         "binary_sums": f"{prefix}-BINARY_SHA256SUMS.txt",
         "source_commit": f"{prefix}-SOURCE_COMMIT.txt",
+        "source_tree": f"{prefix}-SOURCE_TREE.txt",
         "reproducibility": f"{prefix}-REPRODUCIBILITY.txt",
         "notice": f"{prefix}-UNSIGNED-CANARY.txt",
         "source_signature": f"{prefix}-SOURCE-SIGNATURE.json",
@@ -276,15 +321,16 @@ def validate_source_signature(path, policy):
     require_exact_keys(
         value,
         {
-            "schema", "commit", "repository", "signer", "format", "fingerprint",
+            "schema", "commit", "tree", "repository", "signer", "format", "fingerprint",
             "local_git_verified", "github_verified", "github_verification_reason",
             "workflow_actor", "workflow_triggering_actor",
         },
         "source-signature evidence",
     )
     source = policy["source"]
-    require(value["schema"] == 1, "source-signature schema is not supported")
+    require(value["schema"] == 2, "source-signature schema is not supported")
     require(value["commit"] == source["commit"], "signature evidence is bound to another commit")
+    require(value["tree"] == source["tree"], "signature evidence is bound to another source tree")
     require(value["repository"] == source["repository"], "signature evidence repository changed")
     require(value["signer"] == source["signer"], "signature evidence signer changed")
     require(value["format"] == "ssh", "candidate source must use an SSH signature")
@@ -302,18 +348,23 @@ def validate_core_ci(path, policy):
     require_exact_keys(
         value,
         {
-            "schema", "workflow_path", "workflow_name", "workflow_blob_sha256", "event",
+            "schema", "workflow_path", "workflow_name", "base_workflow_blob_sha256",
+            "source_workflow_blob_sha256", "event",
             "repository", "head_repository", "pull_request_number", "pull_request_head_sha",
-            "pull_request_base_sha", "run_id", "head_sha", "status", "conclusion",
+            "pull_request_base_sha", "base_tree", "run_id", "head_sha", "head_tree", "status", "conclusion",
         },
         "Core CI evidence",
     )
-    require(value["schema"] == 1, "Core CI evidence schema is not supported")
+    require(value["schema"] == 2, "Core CI evidence schema is not supported")
     require(value["workflow_path"] == policy["core_ci"]["workflow_path"], "Core CI workflow path changed")
     require(value["workflow_name"] == policy["core_ci"]["workflow_name"], "Core CI workflow name changed")
     require(
-        value["workflow_blob_sha256"] == policy["core_ci"]["workflow_blob_sha256"],
-        "Core CI workflow blob changed",
+        value["base_workflow_blob_sha256"] == policy["core_ci"]["base_workflow_blob_sha256"],
+        "Core CI base workflow blob changed",
+    )
+    require(
+        value["source_workflow_blob_sha256"] == policy["core_ci"]["source_workflow_blob_sha256"],
+        "Core CI source workflow blob changed",
     )
     require(value["event"] == policy["core_ci"]["event"], "Core CI event changed")
     require(value["repository"] == policy["core_ci"]["repository"], "Core CI repository changed")
@@ -333,8 +384,15 @@ def validate_core_ci(path, policy):
         value["pull_request_base_sha"] == policy["core_ci"]["base_sha"],
         "Core CI pull request base changed",
     )
+    require(value["base_tree"] == policy["core_ci"]["base_tree"], "Core CI base tree changed")
     require(isinstance(value["run_id"], int) and value["run_id"] > 0, "Core CI run ID is malformed")
+    if policy["authorization"]["state"] == READY_AUTHORIZATION_STATE:
+        require(
+            value["run_id"] == policy["authorization"]["core_ci_run_id"],
+            "Core CI evidence does not match the authorized exact run",
+        )
     require(value["head_sha"] == policy["core_ci"]["head_sha"], "Core CI ran against another source")
+    require(value["head_tree"] == policy["core_ci"]["head_tree"], "Core CI ran against another source tree")
     require(value["status"] == "completed", "Core CI did not complete")
     require(value["conclusion"] == "success", "Core CI did not pass")
     return value
@@ -477,20 +535,22 @@ def inspect_oci_archive(path):
 
 def expected_candidate_labels(policy, binary_hashes, artifact_sha256, binary_sums_sha256):
     source = policy["source"]["commit"]
+    source_tree = policy["source"]["tree"]
     labels = {
-        "org.blackcoin.release.channel": "post-release-hotfix-candidate",
+        "org.blackcoin.release.channel": "v30.1.5-candidate",
         "org.blackcoin.release.qualification": "canary-only-not-release",
         "org.blackcoin.release.tag": "none",
-        "org.blackcoin.candidate.kind": "post-release-hotfix-candidate",
+        "org.blackcoin.candidate.kind": "v30.1.5-candidate",
         "org.blackcoin.candidate.published": "false",
         "org.blackcoin.candidate.registry-pushed": "false",
         "org.blackcoin.deployment.scope": "canary-only",
         "org.blackcoin.source.commit": source,
+        "org.blackcoin.source.tree": source_tree,
         "org.blackcoin.source.verification": "blackcoin-dev-ssh-plus-github-verified",
         "org.opencontainers.image.revision": source,
-        "org.opencontainers.image.version": f"30.1.4-hotfix-candidate-{source[:12]}",
-        "org.blackcoin.base.image": policy["base_image"]["reference"],
-        "org.blackcoin.base.image.id": policy["base_image"]["config_digest"],
+        "org.opencontainers.image.version": f"30.1.5-candidate-{source[:12]}",
+        "org.blackcoin.rollback.base.image": policy["base_image"]["reference"],
+        "org.blackcoin.rollback.base.image.id": policy["base_image"]["config_digest"],
         "org.blackcoin.artifact.sha256": artifact_sha256,
         "org.blackcoin.sha256sums.sha256": binary_sums_sha256,
         "org.blackcoin.package.verification": "two-build-reproducible-plus-binary-sha256",
@@ -512,7 +572,7 @@ def validate_oci_identity(
     require_exact_keys(
         value,
         {
-            "schema", "classification", "source_commit", "image_reference", "archive_name",
+            "schema", "classification", "source_commit", "source_tree", "image_reference", "archive_name",
             "archive_sha256", "image_manifest_digest", "image_config_digest", "base_reference",
             "base_manifest_digest", "base_config_digest", "os", "architecture", "user",
             "entrypoint", "cmd", "working_dir", "healthcheck", "rootfs_base_prefix_exact",
@@ -523,9 +583,10 @@ def validate_oci_identity(
     )
     source = policy["source"]["commit"]
     expected_ref = f"{policy['image']['repository']}:{policy['image']['tag_template'].format(source12=source[:12])}"
-    require(value["schema"] == 1, "OCI identity schema is not supported")
+    require(value["schema"] == 2, "OCI identity schema is not supported")
     require(value["classification"] == EXPECTED_CLASSIFICATION, "OCI classification changed")
     require(value["source_commit"] == source, "OCI identity is bound to another source")
+    require(value["source_tree"] == policy["source"]["tree"], "OCI identity is bound to another source tree")
     require(value["image_reference"] == expected_ref, "OCI image reference changed")
     require(value["archive_name"] == archive_path.name, "OCI archive name changed")
     require(HEX_SHA256_RE.fullmatch(value["archive_sha256"] or "") is not None, "OCI archive hash is malformed")
@@ -602,8 +663,11 @@ def parse_exact_key_value_evidence(path, description, expected_keys, header=None
 
 def validate_text_evidence(directory, names, policy):
     source = policy["source"]["commit"]
+    source_tree = policy["source"]["tree"]
     source_marker = (directory / names["source_commit"]).read_text(encoding="utf-8")
     require(source_marker == f"{source}\n", "source marker does not contain the exact approved commit")
+    source_tree_marker = (directory / names["source_tree"]).read_text(encoding="utf-8")
+    require(source_tree_marker == f"{source_tree}\n", "source-tree marker does not contain the exact approved tree")
 
     notice = parse_exact_key_value_evidence(
         directory / names["notice"],
@@ -612,11 +676,11 @@ def validate_text_evidence(directory, names, policy):
             "source_commit", "core_version_self_report", "signed_source",
             "artifact_platform_signed", "tag", "published", "registry_pushed",
         ),
-        header="POST-RELEASE HOTFIX CANDIDATE - CANARY ONLY - NOT A RELEASE",
+        header="V30.1.5 CANDIDATE - CANARY ONLY - NOT A RELEASE",
     )
     expected_notice = {
         "source_commit": source,
-        "core_version_self_report": "30.1.4",
+        "core_version_self_report": "30.1.5",
         "signed_source": "true",
         "artifact_platform_signed": "false",
         "tag": "none",
@@ -657,7 +721,7 @@ def validate_toolchain(path, policy, workflow_run_id, workflow_run_attempt):
         path,
         "toolchain evidence",
         (
-            "source_commit", "workflow_run_id", "workflow_run_attempt",
+            "source_commit", "source_tree", "workflow_run_id", "workflow_run_attempt",
             "runner_image", "host", "build_matrix", "depends_cache_reused",
             "compiler", "binutils", "make", "packages",
             "depends_tracked_source_tree_sha256",
@@ -665,6 +729,7 @@ def validate_toolchain(path, policy, workflow_run_id, workflow_run_attempt):
     )
     expected = {
         "source_commit": policy["source"]["commit"],
+        "source_tree": policy["source"]["tree"],
         "workflow_run_id": str(workflow_run_id),
         "workflow_run_attempt": str(workflow_run_attempt),
         "runner_image": "ubuntu-22.04",
@@ -714,6 +779,7 @@ def build_documents(
         names["binary_tar"],
         names["binary_sums"],
         names["source_commit"],
+        names["source_tree"],
         names["reproducibility"],
         names["notice"],
         names["source_signature"],
@@ -744,24 +810,26 @@ def build_documents(
     )
     source = policy["source"]["commit"]
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "classification": EXPECTED_CLASSIFICATION,
         "package": {
             "name": names["prefix"],
-            "version": "30.1.4",
+            "version": "30.1.5",
             "platform": "linux/amd64",
         },
         "source": {
             "repository": policy["source"]["repository"],
             "commit": source,
+            "tree": policy["source"]["tree"],
             "immutable_release_ancestor": policy["source"]["immutable_release_ancestor"],
             "signature": signature,
         },
+        "authorization": policy["authorization"],
         "core_ci": core_ci,
         "build": {
             "tooling_commit": adapter_sha,
             "workflow_definition_commit": adapter_sha,
-            "workflow_path": ".github/workflows/v30.1.4-hotfix-candidate-linux.yml",
+            "workflow_path": ".github/workflows/v30.1.5-candidate-linux.yml",
             "workflow_run_id": int(workflow_run_id),
             "workflow_run_attempt": int(workflow_run_attempt),
             "toolchain": toolchain,
@@ -780,7 +848,7 @@ def build_documents(
     repository_uri = f"git+https://github.com/{policy['source']['repository']}.git"
     workflow_uri = (
         f"https://github.com/{policy['source']['repository']}/.github/workflows/"
-        f"v30.1.4-hotfix-candidate-linux.yml@{adapter_sha}"
+        f"v30.1.5-candidate-linux.yml@{adapter_sha}"
     )
     run_uri = f"https://github.com/{policy['source']['repository']}/actions/runs/{workflow_run_id}"
     provenance_subjects = [
@@ -799,7 +867,10 @@ def build_documents(
                 "buildType": workflow_uri,
                 "externalParameters": {
                     "classification": EXPECTED_CLASSIFICATION,
-                    "source": {"uri": repository_uri, "digest": {"gitCommit": source}},
+                    "source": {
+                        "uri": repository_uri,
+                        "digest": {"gitCommit": source, "gitTree": policy["source"]["tree"]},
+                    },
                     "baseImage": {
                         "uri": policy["base_image"]["reference"],
                         "digest": {"sha256": policy["base_image"]["manifest_digest"].removeprefix("sha256:")},
@@ -816,7 +887,10 @@ def build_documents(
                     "reproducibilityGate": "two-isolated-builds-byte-identical",
                 },
                 "resolvedDependencies": [
-                    {"uri": repository_uri, "digest": {"gitCommit": source}},
+                    {
+                        "uri": repository_uri,
+                        "digest": {"gitCommit": source, "gitTree": policy["source"]["tree"]},
+                    },
                     {
                         "uri": policy["base_image"]["repository"],
                         "digest": {"sha256": policy["base_image"]["manifest_digest"].removeprefix("sha256:")},
@@ -889,7 +963,7 @@ def verify(policy_path, directory):
     policy = validate_policy(policy_path)
     names = artifact_names(policy)
     final_files = (
-        names["binary_tar"], names["binary_sums"], names["source_commit"],
+        names["binary_tar"], names["binary_sums"], names["source_commit"], names["source_tree"],
         names["reproducibility"], names["notice"],
         names["source_signature"], names["core_ci"], names["toolchain"],
         names["oci_archive"], names["oci_identity"],
@@ -910,7 +984,7 @@ def verify(policy_path, directory):
     require_exact_keys(
         manifest,
         {
-            "schema", "classification", "package", "source", "core_ci", "build",
+            "schema", "classification", "package", "source", "authorization", "core_ci", "build",
             "base_image", "image", "reproducibility", "release", "artifacts",
         },
         "candidate manifest",
@@ -979,13 +1053,13 @@ def main():
             args.policy, args.artifacts, args.adapter_sha, args.workflow_run_id,
             args.workflow_run_attempt, args.manifest, args.provenance,
         )
-        print(f"Wrote hotfix-candidate metadata for {len(manifest['artifacts'])} artifact(s)")
+        print(f"Wrote v30.1.5-candidate metadata for {len(manifest['artifacts'])} artifact(s)")
     elif args.command == "verify":
         manifest = verify(args.policy, args.bundle)
-        print(f"Verified exact hotfix-candidate bundle {manifest['package']['name']}")
+        print(f"Verified exact v30.1.5-candidate bundle {manifest['package']['name']}")
     else:
         policy = validate_policy(args.policy)
-        print(f"Verified hotfix-candidate policy for {policy['source']['commit']}")
+        print(f"Verified v30.1.5-candidate policy for {policy['source']['commit']}")
     return 0
 
 
@@ -993,5 +1067,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except RuntimeError as error:
-        print(f"hotfix-candidate metadata failed: {error}", file=sys.stderr)
+        print(f"v30.1.5-candidate metadata failed: {error}", file=sys.stderr)
         sys.exit(1)

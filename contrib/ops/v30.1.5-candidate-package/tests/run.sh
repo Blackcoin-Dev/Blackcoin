@@ -12,9 +12,9 @@ TEST_ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) ||
 PACKAGE_ROOT=$(CDPATH='' cd -P -- "$TEST_ROOT/.." && pwd -P) || exit 1
 REPO_ROOT=$(CDPATH='' cd -P -- "$PACKAGE_ROOT/../../.." && pwd -P) || exit 1
 readonly TEST_ROOT PACKAGE_ROOT REPO_ROOT
-readonly WORKFLOW="$REPO_ROOT/.github/workflows/v30.1.4-hotfix-candidate-linux.yml"
-readonly METADATA="$REPO_ROOT/ci/release/generate_hotfix_candidate_metadata.py"
-readonly METADATA_TEST="$REPO_ROOT/ci/release/test_hotfix_candidate_metadata.py"
+readonly WORKFLOW="$REPO_ROOT/.github/workflows/v30.1.5-candidate-linux.yml"
+readonly METADATA="$REPO_ROOT/ci/release/generate_v30_1_5_candidate_metadata.py"
+readonly METADATA_TEST="$REPO_ROOT/ci/release/test_v30_1_5_candidate_metadata.py"
 readonly POLICY="$PACKAGE_ROOT/policy.json"
 readonly BUILD="$PACKAGE_ROOT/build_candidate_bundle.sh"
 readonly VERIFY="$PACKAGE_ROOT/verify_candidate_bundle.sh"
@@ -68,16 +68,16 @@ def validate_attempt_contract(text):
         assert body.count('test "$GITHUB_TRIGGERING_ACTOR" = Blackcoin-Dev') == 1
 
     required_names = (
-        "hotfix-candidate-authorization-${{ inputs.source_sha }}-attempt-${{ github.run_attempt }}",
-        "hotfix-candidate-raw-${{ matrix.builder }}-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
-        "hotfix-candidate-raw-primary-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
-        "hotfix-candidate-raw-verifier-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
-        "hotfix-candidate-authorization-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
-        "hotfix-candidate-30.1.4-linux-x86_64-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
+        "v30.1.5-candidate-authorization-${{ inputs.source_sha }}-attempt-${{ github.run_attempt }}",
+        "v30.1.5-candidate-raw-${{ matrix.builder }}-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
+        "v30.1.5-candidate-raw-primary-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
+        "v30.1.5-candidate-raw-verifier-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
+        "v30.1.5-candidate-authorization-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
+        "v30.1.5-candidate-linux-x86_64-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}",
     )
     for name in required_names:
         assert text.count(f"name: {name}") == 1, name
-    assert text.count("name: hotfix-candidate-") == len(required_names)
+    assert text.count("name: v30.1.5-candidate-") == len(required_names)
 
 
 validate_attempt_contract(workflow)
@@ -168,26 +168,47 @@ import json
 import sys
 
 policy = json.load(open(sys.argv[1], encoding="utf-8"))
-assert policy["schema"] == 1
-assert policy["classification"] == "POST_RELEASE_HOTFIX_CANDIDATE_CANARY_ONLY"
-assert policy["source"]["commit"] == "8a3a5aa1c01caf57acc694b836398c5acba969d0"
+assert policy["schema"] == 2
+assert policy["classification"] == "V30_1_5_CANDIDATE_CANARY_ONLY"
+assert policy["version"] == "30.1.5"
+assert policy["authorization"] == {
+    "state": "blocked_pending_final_signed_source_and_green_ci",
+    "dispatch_enabled": False,
+    "temporary_source_pin": True,
+    "core_ci_run_id": None,
+}
+assert policy["source"]["commit"] == "a0695f22740e111d0487a194fb46f1bae05952c5"
+assert policy["source"]["tree"] == "86df040ae5eb8e819e940dd08364bcc177a72195"
 assert policy["source"]["immutable_release_ancestor"] == "13262151077cce3f72d07d17dc7725b2b6a8e1ab"
 assert policy["source"]["signing_fingerprint"] == "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70"
 assert policy["core_ci"] == {
     "event": "pull_request",
     "pull_request_number": 49,
-    "head_sha": "8a3a5aa1c01caf57acc694b836398c5acba969d0",
+    "head_sha": "a0695f22740e111d0487a194fb46f1bae05952c5",
+    "head_tree": "86df040ae5eb8e819e940dd08364bcc177a72195",
     "base_sha": "19baffef25af36e177db2975780e0641b59753aa",
+    "base_tree": "f897d758aee1849f02126f0ee3b7a4be9bd3be8c",
     "repository": "Blackcoin-Dev/Blackcoin",
     "head_repository": "Blackcoin-Dev/Blackcoin",
     "workflow_path": ".github/workflows/pr-gate.yml",
     "workflow_name": "pull-request safety gate",
-    "workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869",
+    "base_workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869",
+    "source_workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869",
 }
 assert policy["base_image"]["manifest_digest"] == "sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2"
 assert policy["base_image"]["config_digest"] == "sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909"
+assert policy["base_image"]["role"] == "immutable-v30.1.4-rootfs-and-rollback-only"
+candidate_identity = json.dumps({
+    "classification": policy["classification"],
+    "version": policy["version"],
+    "configured_version": policy["source"]["configured_version"],
+    "image": policy["image"],
+    "artifacts": policy["artifacts"],
+}, sort_keys=True)
+assert "30.1.4" not in candidate_identity
+assert "30.1.5" in candidate_identity
 assert policy["artifacts"]["github_artifact_template"] == (
-    "hotfix-candidate-30.1.4-linux-x86_64-{source40}-attempt-{attempt}"
+    "v30.1.5-candidate-linux-x86_64-{source40}-attempt-{attempt}"
 )
 assert policy["binaries"] == [
     "blackcoin-cli", "blackcoin-qt", "blackcoin-tx", "blackcoin-util",
@@ -207,22 +228,42 @@ grep -Fq ".pull_requests[0].number == \$pr" "$WORKFLOW"
 grep -Fq ".pull_requests[0].head.sha == \$source" "$WORKFLOW"
 grep -Fq ".pull_requests[0].base.sha == \$base" "$WORKFLOW"
 grep -Fq ".head_repository.full_name == \$repository" "$WORKFLOW"
-grep -Fq 'EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256: 24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869' "$WORKFLOW"
+grep -Fq 'EXPECTED_SOURCE_TREE: 86df040ae5eb8e819e940dd08364bcc177a72195' "$WORKFLOW"
+grep -Fq 'EXPECTED_IDENTITY_ANCESTOR_TREE: f897d758aee1849f02126f0ee3b7a4be9bd3be8c' "$WORKFLOW"
+grep -Fq 'EXPECTED_CORE_CI_BASE_WORKFLOW_BLOB_SHA256: 24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869' "$WORKFLOW"
+grep -Fq 'EXPECTED_CORE_CI_SOURCE_WORKFLOW_BLOB_SHA256: 24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869' "$WORKFLOW"
+grep -Fq "\"\$EXPECTED_CORE_CI_BASE_WORKFLOW_BLOB_SHA256\"" "$WORKFLOW"
+grep -Fq "\"\$EXPECTED_CORE_CI_SOURCE_WORKFLOW_BLOB_SHA256\"" "$WORKFLOW"
+grep -Fq "base_workflow_blob_sha256:\$base_workflow_blob" "$WORKFLOW"
+grep -Fq "source_workflow_blob_sha256:\$source_workflow_blob" "$WORKFLOW"
+grep -Fq "pull_request_base_sha:\$base,base_tree:\$base_tree" "$WORKFLOW"
+grep -Fq '{schema:2,workflow_path:' "$WORKFLOW"
+grep -Fq "{schema:2,commit:\$commit,tree:\$tree" "$WORKFLOW"
 grep -Fq '.status == "completed" and .conclusion == "success"' "$WORKFLOW"
 grep -Fq ".head_sha == \$source" "$WORKFLOW"
+grep -Fq ".head_commit.id == \$source and .head_commit.tree_id == \$tree" "$WORKFLOW"
+grep -Fq ".sha == \$source and .tree.sha == \$tree" "$WORKFLOW"
 grep -Fq -- '--require-signatures' "$WORKFLOW"
 grep -Fq -- "--signing-fingerprint \"\$EXPECTED_FINGERPRINT\"" "$WORKFLOW"
 test "$(grep -Fc -- "--base \"\$EXPECTED_IDENTITY_ANCESTOR\"" "$WORKFLOW")" = 2
 grep -Fq "TOOLING_SHA: \${{ github.workflow_sha }}" "$WORKFLOW"
 grep -Fq "test \"\$TOOLING_SHA\" = \"\$EVENT_SHA\"" "$WORKFLOW"
+grep -Fq 'EXPECTED_CORE_CI_RUN_ID: 0' "$WORKFLOW"
+grep -Fq "test \"\$POLICY_AUTHORIZATION_STATE\" = authorized_exact_signed_source_and_green_ci" "$WORKFLOW"
+grep -Fq "test \"\$POLICY_DISPATCH_ENABLED\" = true" "$WORKFLOW"
+grep -Fq "test \"\$POLICY_TEMPORARY_SOURCE\" = false" "$WORKFLOW"
+grep -Fq "test \"\$POLICY_CORE_CI_RUN_ID\" = \"\$EXPECTED_CORE_CI_RUN_ID\"" "$WORKFLOW"
+grep -Fq "test \"\$CORE_CI_RUN_ID\" = \"\$EXPECTED_CORE_CI_RUN_ID\"" "$WORKFLOW"
 grep -Fq "\"\$GITHUB_WORKSPACE/\$POLICY\"" "$WORKFLOW"
 grep -Fq "\"\$GITHUB_WORKSPACE/primary\" \"\$GITHUB_WORKSPACE/verifier\"" "$WORKFLOW"
 grep -Fq "\"\$GITHUB_WORKSPACE/candidate-bundle\"" "$WORKFLOW"
-grep -Fq "hotfix-candidate-30.1.4-linux-x86_64-\${{ needs.authorize-source.outputs.source_sha }}-attempt-\${{ github.run_attempt }}" "$WORKFLOW"
-grep -Fq "hotfix-candidate-authorization-\${{ inputs.source_sha }}-attempt-\${{ github.run_attempt }}" "$WORKFLOW"
-grep -Fq "hotfix-candidate-raw-\${{ matrix.builder }}-\${{ needs.authorize-source.outputs.source_sha }}-attempt-\${{ github.run_attempt }}" "$WORKFLOW"
+grep -Fq "v30.1.5-candidate-linux-x86_64-\${{ needs.authorize-source.outputs.source_sha }}-attempt-\${{ github.run_attempt }}" "$WORKFLOW"
+grep -Fq "v30.1.5-candidate-authorization-\${{ inputs.source_sha }}-attempt-\${{ github.run_attempt }}" "$WORKFLOW"
+grep -Fq "v30.1.5-candidate-raw-\${{ matrix.builder }}-\${{ needs.authorize-source.outputs.source_sha }}-attempt-\${{ github.run_attempt }}" "$WORKFLOW"
 grep -Fq 'git ls-files -z -- depends | LC_ALL=C sort -z' "$WORKFLOW"
 grep -Fq 'depends_tracked_source_tree_sha256=' "$WORKFLOW"
+grep -Fq "printf '%s\\n' \"\$EXPECTED_SOURCE_TREE\" > \"\$output/\$prefix-SOURCE_TREE.txt\"" "$WORKFLOW"
+grep -Fq "printf 'source_tree=%s\\n' \"\$EXPECTED_SOURCE_TREE\"" "$WORKFLOW"
 grep -Fq "((\${#depends_tracked_files[@]} > 0))" "$WORKFLOW"
 grep -Fq "printf 'workflow_run_id=%s\\n' \"\$WORKFLOW_RUN_ID\"" "$WORKFLOW"
 grep -Fq "printf 'workflow_run_attempt=%s\\n' \"\$WORKFLOW_RUN_ATTEMPT\"" "$WORKFLOW"
@@ -235,21 +276,44 @@ if grep -Eq 'docker[[:space:]]+push|gh[[:space:]]+release|create-release|git[[:s
 fi
 
 grep -Fq 'docker build --pull=false --network=none --no-cache' "$BUILD"
+grep -Fq "readonly EXPECTED_SOURCE_TREE='86df040ae5eb8e819e940dd08364bcc177a72195'" "$BUILD" "$VERIFY"
+grep -Fq "source_tree_marker=\"\$prefix-SOURCE_TREE.txt\"" "$BUILD"
+test "$(grep -Fc 'source-tree marker changed' "$BUILD")" = 2
+grep -Fq "cp \"\$PRIMARY/\$source_tree_marker\" \"\$OUTPUT/\$source_tree_marker\"" "$BUILD"
+grep -Fq 'org.blackcoin.source.tree="%s"' "$BUILD"
+grep -Fq "source_tree:\$source_tree" "$BUILD"
 grep -Fq "skopeo copy --format oci \"docker-daemon:\$candidate_ref\"" "$BUILD"
 grep -Fq "[[ \"\$oci_config\" == \"\$candidate_config\" ]]" "$BUILD"
 grep -Fq "skopeo copy \"oci-archive:\$OUTPUT/\$oci_name\" \"docker-daemon:\$roundtrip_ref\"" "$BUILD"
 grep -Fq -- '--network none --read-only --user blackcoin --cap-drop ALL' "$BUILD"
-grep -Fq 'POST_RELEASE_HOTFIX_CANDIDATE_CANARY_ONLY' "$METADATA"
+grep -Fq 'V30_1_5_CANDIDATE_CANARY_ONLY' "$METADATA"
+grep -Fq 'blocked_pending_final_signed_source_and_green_ci' "$POLICY"
+grep -Fq 'candidate authorization is blocked pending the final signed source and green Core CI' "$BUILD"
+grep -Fq 'v30.1.4 image role changed from rootfs/rollback-only' "$BUILD"
 grep -Fq '"tag": None' "$METADATA"
 grep -Fq '"published": False' "$METADATA"
 grep -Fq '"registry_pushed": False' "$METADATA"
 grep -Fq '"tooling_commit": adapter_sha' "$METADATA"
 grep -Fq '"workflow_definition_commit": adapter_sha' "$METADATA"
 grep -Fq '"org.blackcoin.deployment.scope": "canary-only"' "$METADATA"
+grep -Fq '"org.blackcoin.source.tree": source_tree' "$METADATA"
+grep -Fq '"org.blackcoin.rollback.base.image": policy["base_image"]["reference"]' "$METADATA"
+grep -Fq '"org.blackcoin.rollback.base.image.id": policy["base_image"]["config_digest"]' "$METADATA"
+if grep -Fq 'org.blackcoin.base.image' "$METADATA" "$BUILD" "$VERIFY"; then
+    fail 'candidate still exposes the v30.1.4 image as a candidate base identity'
+fi
 grep -Fq '"oci_roundtrip_verified"' "$METADATA"
 grep -Fq 'parse_exact_key_value_evidence' "$METADATA"
 grep -Fq 'object_pairs_hook=reject_duplicate_json_keys' "$METADATA"
 grep -Fq 'require_canonical=True' "$METADATA"
+grep -Fq '"gitTree": policy["source"]["tree"]' "$METADATA"
+grep -Fq 'names["source_tree"]' "$METADATA"
+if grep -Fq 'EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256' "$WORKFLOW" "$METADATA"; then
+    fail 'legacy single Core-CI workflow digest constant remains'
+fi
+if grep -Fq '"workflow_blob_sha256"' "$POLICY" "$METADATA"; then
+    fail 'legacy single Core-CI workflow digest field remains in policy or verifier'
+fi
 
 if command -v ruby >/dev/null 2>&1; then
     ruby -e 'require "yaml"; YAML.parse_file(ARGV.fetch(0))' "$WORKFLOW"
@@ -274,6 +338,6 @@ else
     fail 'no SHA256 verifier is available'
 fi
 
-printf 'PASS hotfix-candidate-metadata-fixtures\n'
-printf 'PASS hotfix-candidate-workflow-static-contract\n'
-printf 'PASS hotfix-candidate-package-seal\n'
+printf 'PASS v30.1.5-candidate-metadata-fixtures\n'
+printf 'PASS v30.1.5-candidate-workflow-static-contract\n'
+printf 'PASS v30.1.5-candidate-package-seal\n'

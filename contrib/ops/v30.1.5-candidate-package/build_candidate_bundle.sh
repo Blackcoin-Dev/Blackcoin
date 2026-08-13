@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 export LC_ALL=C
 
-# Assemble an unpublished linux/amd64 post-release hotfix-candidate bundle from
+# Assemble an unpublished linux/amd64 v30.1.5 candidate bundle from
 # two byte-identical exact-source builds. This adapter can pull only the pinned
-# immutable v30.1.4 base and has no registry publication path.
+# immutable v30.1.4 rootfs/rollback base and has no publication path.
 
 set -Eeuo pipefail
 umask 077
@@ -27,11 +27,12 @@ readonly OUTPUT=${6:?usage: build_candidate_bundle.sh POLICY PRIMARY VERIFIER SO
 : "${ALLOW_IMMUTABLE_BASE_PULL:?ALLOW_IMMUTABLE_BASE_PULL is required}"
 readonly TOOLING_COMMIT WORKFLOW_RUN_ID WORKFLOW_RUN_ATTEMPT SOURCE_DATE_EPOCH
 readonly CONFIRM_CANDIDATE_BUILD ALLOW_IMMUTABLE_BASE_PULL
-readonly EXPECTED_SOURCE='8a3a5aa1c01caf57acc694b836398c5acba969d0'
+readonly EXPECTED_SOURCE='a0695f22740e111d0487a194fb46f1bae05952c5'
+readonly EXPECTED_SOURCE_TREE='86df040ae5eb8e819e940dd08364bcc177a72195'
 readonly EXPECTED_BASE_MANIFEST='sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2'
 readonly EXPECTED_BASE_CONFIG='sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909'
 readonly EXPECTED_FINGERPRINT='SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70'
-readonly METADATA_TOOL="$REPO_ROOT/ci/release/generate_hotfix_candidate_metadata.py"
+readonly METADATA_TOOL="$REPO_ROOT/ci/release/generate_v30_1_5_candidate_metadata.py"
 readonly REPRO_TOOL="$REPO_ROOT/ci/release/verify_reproducible.py"
 readonly BINARY_NAMES=(blackcoin-cli blackcoin-qt blackcoin-tx blackcoin-util blackcoin-wallet blackcoind)
 
@@ -39,7 +40,7 @@ TEMP_ROOT=
 
 fail()
 {
-    printf 'hotfix-candidate build failed: %s\n' "$*" >&2
+    printf 'v30.1.5-candidate build failed: %s\n' "$*" >&2
     exit 1
 }
 
@@ -55,7 +56,7 @@ for command in awk chmod cmp cp date docker file find grep jq mkdir mktemp paste
     readlink realpath sha256sum skopeo sort stat tar; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is unavailable: $command"
 done
-[[ "$CONFIRM_CANDIDATE_BUILD" == BUILD_V30_1_4_HOTFIX_CANDIDATE_LINUX_X86_64 ]] ||
+[[ "$CONFIRM_CANDIDATE_BUILD" == BUILD_V30_1_5_CANDIDATE_LINUX_X86_64 ]] ||
     fail 'candidate build confirmation is absent'
 [[ "$ALLOW_IMMUTABLE_BASE_PULL" == 1 ]] || fail 'the one exact immutable base pull was not authorized'
 [[ "$TOOLING_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail 'tooling commit is malformed'
@@ -79,27 +80,46 @@ done
 python3 "$METADATA_TOOL" validate-policy --policy "$POLICY" >/dev/null ||
     fail 'candidate policy validation failed'
 source_commit=$(jq -er '.source.commit' "$POLICY")
+source_tree=$(jq -er '.source.tree' "$POLICY")
+authorization_state=$(jq -er '.authorization.state' "$POLICY")
+dispatch_enabled=$(jq -r '.authorization.dispatch_enabled' "$POLICY")
+temporary_source_pin=$(jq -r '.authorization.temporary_source_pin' "$POLICY")
+authorized_core_ci_run_id=$(jq -r '.authorization.core_ci_run_id // 0' "$POLICY")
 base_ref=$(jq -er '.base_image.reference' "$POLICY")
+base_role=$(jq -er '.base_image.role' "$POLICY")
 base_manifest=$(jq -er '.base_image.manifest_digest' "$POLICY")
 base_config=$(jq -er '.base_image.config_digest' "$POLICY")
 signing_fingerprint=$(jq -er '.source.signing_fingerprint' "$POLICY")
 [[ "$source_commit" == "$EXPECTED_SOURCE" ]] || fail 'policy does not pin the approved Core source'
+[[ "$source_tree" == "$EXPECTED_SOURCE_TREE" ]] || fail 'policy does not pin the approved Core source tree'
+[[ "$authorization_state" == authorized_exact_signed_source_and_green_ci &&
+   "$dispatch_enabled" == true && "$temporary_source_pin" == false ]] ||
+    fail 'candidate authorization is blocked pending the final signed source and green Core CI'
+[[ "$(jq -er '.run_id' "$CORE_CI")" == "$authorized_core_ci_run_id" ]] ||
+    fail 'Core CI evidence does not match the exact authorized run'
+[[ "$base_role" == immutable-v30.1.4-rootfs-and-rollback-only ]] ||
+    fail 'v30.1.4 image role changed from rootfs/rollback-only'
 [[ "$base_manifest" == "$EXPECTED_BASE_MANIFEST" && "$base_config" == "$EXPECTED_BASE_CONFIG" ]] ||
     fail 'policy does not pin the immutable v30.1.4 base'
 [[ "$base_ref" == "qqblackcoin/blackcoin-v4-gui@$EXPECTED_BASE_MANIFEST" ]] ||
     fail 'policy base reference is not digest-addressed'
 [[ "$signing_fingerprint" == "$EXPECTED_FINGERPRINT" ]] || fail 'policy signing fingerprint changed'
 short_source=${source_commit:0:12}
-prefix="Blackcoin-30.1.4-hotfix-candidate-$short_source"
+prefix="Blackcoin-30.1.5-candidate-$short_source"
 binary_tar="$prefix-Linux-x86_64.tar.gz"
 source_marker="$prefix-SOURCE_COMMIT.txt"
+source_tree_marker="$prefix-SOURCE_TREE.txt"
 binary_sums="$prefix-BINARY_SHA256SUMS.txt"
 versions="$prefix-VERSIONS.txt"
 toolchain="$prefix-TOOLCHAIN.txt"
-readonly source_commit base_ref base_manifest base_config short_source prefix
-readonly binary_tar source_marker binary_sums versions toolchain
+readonly source_commit source_tree authorization_state dispatch_enabled temporary_source_pin
+readonly authorized_core_ci_run_id base_ref base_role base_manifest base_config short_source prefix
+readonly binary_tar source_marker source_tree_marker binary_sums versions toolchain
 
-expected_raw=$(printf '%s\n' "$binary_tar" "$source_marker" "$binary_sums" "$versions" "$toolchain" | sort)
+expected_raw=$(
+    printf '%s\n' "$binary_tar" "$source_marker" "$source_tree_marker" \
+        "$binary_sums" "$versions" "$toolchain" | sort
+)
 for directory in "$PRIMARY" "$VERIFIER"; do
     actual_raw=$(find "$directory" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
     [[ "$actual_raw" == "$expected_raw" ]] || fail "raw build artifact set changed: $directory"
@@ -108,8 +128,10 @@ python3 "$REPRO_TOOL" --primary "$PRIMARY" --verifier "$VERIFIER" >/dev/null ||
     fail 'primary and verifier builds are not byte-identical'
 [[ "$(<"$PRIMARY/$source_marker")" == "$source_commit" ]] || fail 'primary source marker changed'
 [[ "$(<"$VERIFIER/$source_marker")" == "$source_commit" ]] || fail 'verifier source marker changed'
+[[ "$(<"$PRIMARY/$source_tree_marker")" == "$source_tree" ]] || fail 'primary source-tree marker changed'
+[[ "$(<"$VERIFIER/$source_tree_marker")" == "$source_tree" ]] || fail 'verifier source-tree marker changed'
 
-TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/blackcoin-hotfix-candidate.XXXXXX") ||
+TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/blackcoin-v30.1.5-candidate.XXXXXX") ||
     fail 'could not create temporary build root'
 [[ -d "$TEMP_ROOT" && ! -L "$TEMP_ROOT" ]] || fail 'temporary build root is unsafe'
 readonly BUILD_CONTEXT="$TEMP_ROOT/context"
@@ -160,8 +182,8 @@ jq -e --arg config "$base_config" '
     .[0].Config.Healthcheck == null and .[0].RootFS.Type == "layers" and
     (.[0].RootFS.Layers | length) >= 1
 ' "$BASE_INSPECT" >/dev/null || fail 'immutable base runtime contract changed'
-base_alias="blackcoin-hotfix-base:${base_config#sha256:}"
-candidate_ref="qqblackcoin/blackcoin-v4-gui:30.1.4-hotfix-candidate-$short_source-ci1"
+base_alias="blackcoin-v30.1.4-rollback-base:${base_config#sha256:}"
+candidate_ref="qqblackcoin/blackcoin-v4-gui:30.1.5-candidate-$short_source-ci1"
 readonly base_alias candidate_ref
 docker tag "$base_ref" "$base_alias"
 [[ "$(docker image inspect -f '{{.Id}}' "$base_alias")" == "$base_config" ]] ||
@@ -174,19 +196,20 @@ fi
     printf 'FROM %s\n\n' "$base_alias"
     printf 'USER root\n\n'
     printf 'COPY --chmod=0755 binaries/blackcoin-cli binaries/blackcoin-qt binaries/blackcoin-tx binaries/blackcoin-util binaries/blackcoin-wallet binaries/blackcoind /usr/local/bin/\n\n'
-    printf 'LABEL org.blackcoin.release.channel="post-release-hotfix-candidate" \\\n'
+    printf 'LABEL org.blackcoin.release.channel="v30.1.5-candidate" \\\n'
     printf '      org.blackcoin.release.qualification="canary-only-not-release" \\\n'
     printf '      org.blackcoin.release.tag="none" \\\n'
-    printf '      org.blackcoin.candidate.kind="post-release-hotfix-candidate" \\\n'
+    printf '      org.blackcoin.candidate.kind="v30.1.5-candidate" \\\n'
     printf '      org.blackcoin.candidate.published="false" \\\n'
     printf '      org.blackcoin.candidate.registry-pushed="false" \\\n'
     printf '      org.blackcoin.deployment.scope="canary-only" \\\n'
     printf '      org.blackcoin.source.commit="%s" \\\n' "$source_commit"
+    printf '      org.blackcoin.source.tree="%s" \\\n' "$source_tree"
     printf '      org.blackcoin.source.verification="blackcoin-dev-ssh-plus-github-verified" \\\n'
     printf '      org.opencontainers.image.revision="%s" \\\n' "$source_commit"
-    printf '      org.opencontainers.image.version="30.1.4-hotfix-candidate-%s" \\\n' "$short_source"
-    printf '      org.blackcoin.base.image="%s" \\\n' "$base_ref"
-    printf '      org.blackcoin.base.image.id="%s" \\\n' "$base_config"
+    printf '      org.opencontainers.image.version="30.1.5-candidate-%s" \\\n' "$short_source"
+    printf '      org.blackcoin.rollback.base.image="%s" \\\n' "$base_ref"
+    printf '      org.blackcoin.rollback.base.image.id="%s" \\\n' "$base_config"
     printf '      org.blackcoin.artifact.sha256="%s" \\\n' "$primary_hash"
     printf '      org.blackcoin.sha256sums.sha256="%s" \\\n' "$binary_sums_sha"
     printf '      org.blackcoin.package.verification="two-build-reproducible-plus-binary-sha256" \\\n'
@@ -209,23 +232,25 @@ candidate_config=$(jq -er '.[0].Id | select(test("^sha256:[0-9a-f]{64}$"))' "$IM
 readonly candidate_config
 
 expected_labels=$(jq -n -c \
-    --arg source "$source_commit" --arg short "$short_source" --arg base "$base_ref" \
+    --arg source "$source_commit" --arg source_tree "$source_tree" \
+    --arg short "$short_source" --arg base "$base_ref" \
     --arg base_config "$base_config" --arg artifact "$primary_hash" \
     --arg binary_sums "$binary_sums_sha" --argjson binaries "$binary_hashes" '
     {
-      "org.blackcoin.release.channel":"post-release-hotfix-candidate",
+      "org.blackcoin.release.channel":"v30.1.5-candidate",
       "org.blackcoin.release.qualification":"canary-only-not-release",
       "org.blackcoin.release.tag":"none",
-      "org.blackcoin.candidate.kind":"post-release-hotfix-candidate",
+      "org.blackcoin.candidate.kind":"v30.1.5-candidate",
       "org.blackcoin.candidate.published":"false",
       "org.blackcoin.candidate.registry-pushed":"false",
       "org.blackcoin.deployment.scope":"canary-only",
       "org.blackcoin.source.commit":$source,
+      "org.blackcoin.source.tree":$source_tree,
       "org.blackcoin.source.verification":"blackcoin-dev-ssh-plus-github-verified",
       "org.opencontainers.image.revision":$source,
-      "org.opencontainers.image.version":("30.1.4-hotfix-candidate-" + $short),
-      "org.blackcoin.base.image":$base,
-      "org.blackcoin.base.image.id":$base_config,
+      "org.opencontainers.image.version":("30.1.5-candidate-" + $short),
+      "org.blackcoin.rollback.base.image":$base,
+      "org.blackcoin.rollback.base.image.id":$base_config,
       "org.blackcoin.artifact.sha256":$artifact,
       "org.blackcoin.sha256sums.sha256":$binary_sums,
       "org.blackcoin.package.verification":"two-build-reproducible-plus-binary-sha256"
@@ -318,6 +343,7 @@ mkdir "$OUTPUT"
 cp "$PRIMARY/$binary_tar" "$OUTPUT/$binary_tar"
 cp "$PRIMARY/$binary_sums" "$OUTPUT/$binary_sums"
 cp "$PRIMARY/$source_marker" "$OUTPUT/$source_marker"
+cp "$PRIMARY/$source_tree_marker" "$OUTPUT/$source_tree_marker"
 cp "$PRIMARY/$toolchain" "$OUTPUT/$toolchain"
 signature_name="$prefix-SOURCE-SIGNATURE.json"
 core_ci_name="$prefix-CORE-CI.json"
@@ -334,9 +360,9 @@ verifier_hash=$(sha256sum "$VERIFIER/$binary_tar" | awk '{print $1}')
 } > "$OUTPUT/$repro_name"
 notice_name="$prefix-UNSIGNED-CANARY.txt"
 {
-    printf 'POST-RELEASE HOTFIX CANDIDATE - CANARY ONLY - NOT A RELEASE\n'
+    printf 'V30.1.5 CANDIDATE - CANARY ONLY - NOT A RELEASE\n'
     printf 'source_commit=%s\n' "$source_commit"
-    printf 'core_version_self_report=30.1.4\n'
+    printf 'core_version_self_report=30.1.5\n'
     printf 'signed_source=true\n'
     printf 'artifact_platform_signed=false\n'
     printf 'tag=none\n'
@@ -344,7 +370,7 @@ notice_name="$prefix-UNSIGNED-CANARY.txt"
     printf 'registry_pushed=false\n'
 } > "$OUTPUT/$notice_name"
 
-oci_name="blackcoin-v4-gui-30.1.4-hotfix-candidate-$short_source.oci.tar"
+oci_name="blackcoin-v4-gui-30.1.5-candidate-$short_source.oci.tar"
 skopeo copy --format oci "docker-daemon:$candidate_ref" \
     "oci-archive:$OUTPUT/$oci_name:$candidate_ref" >/dev/null ||
     fail 'could not create the sealed OCI archive'
@@ -365,7 +391,7 @@ jq -e --argjson labels "$expected_labels" '
     $config.config.Healthcheck == null and
     all($labels | to_entries[]; $config.config.Labels[.key] == .value)
 ' "$OCI_CONFIG" >/dev/null || fail 'OCI archive config changed during conversion'
-roundtrip_ref="blackcoin-hotfix-candidate-roundtrip:30.1.4-$short_source"
+roundtrip_ref="blackcoin-v30.1.5-candidate-roundtrip:30.1.5-$short_source"
 readonly roundtrip_ref
 if docker image inspect "$roundtrip_ref" >/dev/null 2>&1; then
     fail 'refusing to overwrite an existing OCI round-trip image reference'
@@ -376,12 +402,14 @@ skopeo copy "oci-archive:$OUTPUT/$oci_name" "docker-daemon:$roundtrip_ref" >/dev
     fail 'OCI archive round-trip changed the candidate config digest'
 
 oci_identity_name="$prefix-OCI-IDENTITY.json"
-jq -n --arg classification POST_RELEASE_HOTFIX_CANDIDATE_CANARY_ONLY \
-    --arg source "$source_commit" --arg image "$candidate_ref" --arg archive "$oci_name" \
+jq -n --arg classification V30_1_5_CANDIDATE_CANARY_ONLY \
+    --arg source "$source_commit" --arg source_tree "$source_tree" \
+    --arg image "$candidate_ref" --arg archive "$oci_name" \
     --arg archive_sha "$archive_sha" --arg manifest "$oci_manifest" --arg config "$oci_config" \
     --arg base_ref "$base_ref" --arg base_manifest "$base_manifest" --arg base_config "$base_config" \
     --argjson labels "$expected_labels" --argjson binaries "$binary_hashes" '
-    {schema:1,classification:$classification,source_commit:$source,image_reference:$image,
+    {schema:2,classification:$classification,source_commit:$source,source_tree:$source_tree,
+     image_reference:$image,
      archive_name:$archive,archive_sha256:$archive_sha,image_manifest_digest:$manifest,
      image_config_digest:$config,base_reference:$base_ref,base_manifest_digest:$base_manifest,
      base_config_digest:$base_config,os:"linux",architecture:"amd64",user:"blackcoin",
@@ -405,5 +433,5 @@ checksums_name="$prefix-SHA256SUMS.txt"
 ) > "$OUTPUT/$checksums_name"
 "$PACKAGE_ROOT/verify_candidate_bundle.sh" "$POLICY" "$OUTPUT" >/dev/null ||
     fail 'final candidate bundle verification failed'
-printf 'CANDIDATE_BUNDLE=%s\nSOURCE_COMMIT=%s\nTOOLING_COMMIT=%s\nOCI_ARCHIVE=%s\n' \
-    "$OUTPUT" "$source_commit" "$TOOLING_COMMIT" "$OUTPUT/$oci_name"
+printf 'CANDIDATE_BUNDLE=%s\nSOURCE_COMMIT=%s\nSOURCE_TREE=%s\nTOOLING_COMMIT=%s\nOCI_ARCHIVE=%s\n' \
+    "$OUTPUT" "$source_commit" "$source_tree" "$TOOLING_COMMIT" "$OUTPUT/$oci_name"

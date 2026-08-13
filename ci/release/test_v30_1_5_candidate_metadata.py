@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Tests for fail-closed post-release hotfix-candidate metadata."""
+"""Tests for fail-closed v30.1.5 candidate metadata."""
 
 import hashlib
 import importlib.util
@@ -16,9 +16,9 @@ import unittest
 
 TOOLS = Path(__file__).resolve().parent
 REPO = TOOLS.parents[1]
-POLICY = REPO / "contrib" / "ops" / "v30.1.4-hotfix-candidate-package" / "policy.json"
-MODULE_PATH = TOOLS / "generate_hotfix_candidate_metadata.py"
-SPEC = importlib.util.spec_from_file_location("hotfix_candidate_metadata", MODULE_PATH)
+POLICY = REPO / "contrib" / "ops" / "v30.1.5-candidate-package" / "policy.json"
+MODULE_PATH = TOOLS / "generate_v30_1_5_candidate_metadata.py"
+SPEC = importlib.util.spec_from_file_location("v30_1_5_candidate_metadata", MODULE_PATH)
 METADATA = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(METADATA)
 
@@ -27,7 +27,7 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-class HotfixCandidateMetadataTest(unittest.TestCase):
+class V3015CandidateMetadataTest(unittest.TestCase):
     adapter_sha = "a" * 40
     workflow_run_id = "123456"
     workflow_run_attempt = "2"
@@ -88,7 +88,7 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
         manifest_payload = encoded(manifest)
         manifest_digest = digest(manifest_payload)
         source = METADATA.EXPECTED_SOURCE_COMMIT
-        reference = f"qqblackcoin/blackcoin-v4-gui:30.1.4-hotfix-candidate-{source[:12]}-ci1"
+        reference = f"qqblackcoin/blackcoin-v4-gui:30.1.5-candidate-{source[:12]}-ci1"
         index = {
             "manifests": [
                 {
@@ -131,6 +131,9 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
         (root / names["source_commit"]).write_text(
             f"{METADATA.EXPECTED_SOURCE_COMMIT}\n", encoding="utf-8"
         )
+        (root / names["source_tree"]).write_text(
+            f"{METADATA.EXPECTED_SOURCE_TREE}\n", encoding="utf-8"
+        )
         artifact_hash = METADATA.sha256(binary_tar)
         (root / names["reproducibility"]).write_text(
             "\n".join(
@@ -148,9 +151,9 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
         (root / names["notice"]).write_text(
             "\n".join(
                 (
-                    "POST-RELEASE HOTFIX CANDIDATE - CANARY ONLY - NOT A RELEASE",
+                    "V30.1.5 CANDIDATE - CANARY ONLY - NOT A RELEASE",
                     f"source_commit={METADATA.EXPECTED_SOURCE_COMMIT}",
-                    "core_version_self_report=30.1.4",
+                    "core_version_self_report=30.1.5",
                     "signed_source=true",
                     "artifact_platform_signed=false",
                     "tag=none",
@@ -162,8 +165,9 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
             encoding="utf-8",
         )
         signature = {
-            "schema": 1,
+            "schema": 2,
             "commit": METADATA.EXPECTED_SOURCE_COMMIT,
+            "tree": METADATA.EXPECTED_SOURCE_TREE,
             "repository": METADATA.EXPECTED_REPOSITORY,
             "signer": METADATA.EXPECTED_SIGNER,
             "format": "ssh",
@@ -176,18 +180,21 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
         }
         write_json(root / names["source_signature"], signature)
         core_ci = {
-            "schema": 1,
+            "schema": 2,
             "workflow_path": METADATA.EXPECTED_WORKFLOW_PATH,
             "workflow_name": METADATA.EXPECTED_WORKFLOW_NAME,
-            "workflow_blob_sha256": METADATA.EXPECTED_WORKFLOW_BLOB_SHA256,
+            "base_workflow_blob_sha256": METADATA.EXPECTED_BASE_WORKFLOW_BLOB_SHA256,
+            "source_workflow_blob_sha256": METADATA.EXPECTED_SOURCE_WORKFLOW_BLOB_SHA256,
             "event": METADATA.EXPECTED_CORE_CI_EVENT,
             "repository": METADATA.EXPECTED_REPOSITORY,
             "head_repository": METADATA.EXPECTED_REPOSITORY,
             "pull_request_number": METADATA.EXPECTED_CORE_CI_PR,
             "pull_request_head_sha": METADATA.EXPECTED_SOURCE_COMMIT,
             "pull_request_base_sha": METADATA.EXPECTED_CORE_CI_BASE,
+            "base_tree": METADATA.EXPECTED_CORE_CI_BASE_TREE,
             "run_id": 987654,
             "head_sha": METADATA.EXPECTED_SOURCE_COMMIT,
+            "head_tree": METADATA.EXPECTED_SOURCE_TREE,
             "status": "completed",
             "conclusion": "success",
         }
@@ -196,6 +203,7 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
             "\n".join(
                 (
                     f"source_commit={METADATA.EXPECTED_SOURCE_COMMIT}",
+                    f"source_tree={METADATA.EXPECTED_SOURCE_TREE}",
                     f"workflow_run_id={self.workflow_run_id}",
                     f"workflow_run_attempt={self.workflow_run_attempt}",
                     "runner_image=ubuntu-22.04",
@@ -222,10 +230,11 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
         )
         manifest_digest, config_digest = self.create_oci_archive(archive, labels)
         identity = {
-            "schema": 1,
+            "schema": 2,
             "classification": METADATA.EXPECTED_CLASSIFICATION,
             "source_commit": source,
-            "image_reference": f"qqblackcoin/blackcoin-v4-gui:30.1.4-hotfix-candidate-{source[:12]}-ci1",
+            "source_tree": METADATA.EXPECTED_SOURCE_TREE,
+            "image_reference": f"qqblackcoin/blackcoin-v4-gui:30.1.5-candidate-{source[:12]}-ci1",
             "archive_name": archive.name,
             "archive_sha256": METADATA.sha256(archive),
             "image_manifest_digest": manifest_digest,
@@ -285,7 +294,16 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
             root = Path(temporary)
             _, names = self.generate_and_seal(root)
             manifest = METADATA.verify(POLICY, root)
+            self.assertEqual(manifest["schema"], 2)
             self.assertEqual(manifest["source"]["commit"], METADATA.EXPECTED_SOURCE_COMMIT)
+            self.assertEqual(manifest["source"]["tree"], METADATA.EXPECTED_SOURCE_TREE)
+            self.assertEqual(
+                manifest["authorization"]["state"],
+                METADATA.BLOCKED_AUTHORIZATION_STATE,
+            )
+            self.assertFalse(manifest["authorization"]["dispatch_enabled"])
+            self.assertTrue(manifest["authorization"]["temporary_source_pin"])
+            self.assertIsNone(manifest["authorization"]["core_ci_run_id"])
             self.assertEqual(manifest["build"]["tooling_commit"], self.adapter_sha)
             self.assertEqual(manifest["build"]["workflow_definition_commit"], self.adapter_sha)
             self.assertEqual(manifest["build"]["workflow_run_id"], int(self.workflow_run_id))
@@ -297,6 +315,15 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
             self.assertFalse(manifest["release"]["published"])
             self.assertFalse(manifest["release"]["registry_pushed"])
             provenance = json.loads((root / names["provenance"]).read_text(encoding="utf-8"))
+            source_digest = provenance["predicate"]["buildDefinition"]["externalParameters"]["source"]["digest"]
+            self.assertEqual(
+                source_digest,
+                {
+                    "gitCommit": METADATA.EXPECTED_SOURCE_COMMIT,
+                    "gitTree": METADATA.EXPECTED_SOURCE_TREE,
+                },
+            )
+            self.assertEqual(len(tuple(root.iterdir())), 14)
             manifest_subject = next(item for item in provenance["subject"] if item["name"] == names["manifest"])
             self.assertEqual(manifest_subject["digest"]["sha256"], METADATA.sha256(root / names["manifest"]))
             internal = provenance["predicate"]["buildDefinition"]["internalParameters"]
@@ -312,7 +339,7 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
             path = Path(temporary) / "policy.json"
             text = POLICY.read_text(encoding="utf-8")
             path.write_text(
-                text.replace('"schema": 1,', '"schema": 1,\n  "schema": 1,', 1),
+                text.replace('"schema": 2,', '"schema": 2,\n  "schema": 2,', 1),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(RuntimeError, "duplicate JSON key: schema"):
@@ -329,7 +356,7 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
                 path = root / names[kind]
                 text = path.read_text(encoding="utf-8")
                 path.write_text(
-                    text.replace('"schema": 1,', '"schema": 1,\n  "schema": 1,', 1),
+                    text.replace('"schema": 2,', '"schema": 2,\n  "schema": 2,', 1),
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(RuntimeError, "duplicate JSON key: schema"):
@@ -337,7 +364,7 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
 
     def test_sealed_manifest_and_provenance_reject_duplicate_keys(self):
         cases = {
-            "manifest": '  "schema": 1,\n',
+            "manifest": '  "schema": 2,\n',
             "provenance": '  "_type": "https://in-toto.io/Statement/v1",\n',
         }
         for kind, duplicate_line in cases.items():
@@ -396,15 +423,74 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "approved candidate source changed"):
                 METADATA.validate_policy(path)
 
+    def test_policy_rejects_candidate_source_tree_substitution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = json.loads(POLICY.read_text(encoding="utf-8"))
+            policy["source"]["tree"] = "0" * 40
+            path = Path(temporary) / "policy.json"
+            write_json(path, policy)
+            with self.assertRaisesRegex(RuntimeError, "approved candidate source tree changed"):
+                METADATA.validate_policy(path)
+
+    def test_policy_rejects_schema1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = json.loads(POLICY.read_text(encoding="utf-8"))
+            policy["schema"] = 1
+            path = Path(temporary) / "policy.json"
+            write_json(path, policy)
+            with self.assertRaisesRegex(RuntimeError, "candidate policy schema"):
+                METADATA.validate_policy(path)
+
+    def test_policy_rejects_partial_or_inconsistent_authorization(self):
+        substitutions = (
+            {"dispatch_enabled": True},
+            {"temporary_source_pin": False},
+            {"core_ci_run_id": 987654},
+            {"state": METADATA.READY_AUTHORIZATION_STATE},
+        )
+        for substitution in substitutions:
+            with self.subTest(substitution=substitution), tempfile.TemporaryDirectory() as temporary:
+                policy = json.loads(POLICY.read_text(encoding="utf-8"))
+                policy["authorization"].update(substitution)
+                path = Path(temporary) / "policy.json"
+                write_json(path, policy)
+                with self.assertRaises(RuntimeError):
+                    METADATA.validate_policy(path)
+
+    def test_ready_authorization_requires_exact_positive_core_ci_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = json.loads(POLICY.read_text(encoding="utf-8"))
+            policy["authorization"] = {
+                "state": METADATA.READY_AUTHORIZATION_STATE,
+                "dispatch_enabled": True,
+                "temporary_source_pin": False,
+                "core_ci_run_id": 987654,
+            }
+            path = Path(temporary) / "policy.json"
+            write_json(path, policy)
+            ready = METADATA.validate_policy(path)
+            root = Path(temporary) / "artifacts"
+            root.mkdir()
+            _, names = self.create_fixture(root)
+            METADATA.validate_core_ci(root / names["core_ci"], ready)
+            evidence = json.loads((root / names["core_ci"]).read_text(encoding="utf-8"))
+            evidence["run_id"] = 987655
+            write_json(root / names["core_ci"], evidence)
+            with self.assertRaisesRegex(RuntimeError, "authorized exact run"):
+                METADATA.validate_core_ci(root / names["core_ci"], ready)
+
     def test_policy_rejects_core_ci_identity_substitution(self):
         substitutions = {
             "event": "workflow_dispatch",
             "pull_request_number": METADATA.EXPECTED_CORE_CI_PR + 1,
             "head_sha": "0" * 40,
+            "head_tree": "0" * 40,
             "base_sha": "0" * 40,
+            "base_tree": "0" * 40,
             "repository": "substituted/Blackcoin",
             "head_repository": "substituted/Blackcoin",
-            "workflow_blob_sha256": "0" * 64,
+            "base_workflow_blob_sha256": "0" * 64,
+            "source_workflow_blob_sha256": "0" * 64,
         }
         for field, replacement in substitutions.items():
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
@@ -436,6 +522,34 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "signature fingerprint changed"):
                 METADATA.validate_source_signature(path, policy)
 
+    def test_source_signature_requires_schema2_exact_source_tree(self):
+        mutations = (
+            lambda value: value.__setitem__("tree", "0" * 40),
+            lambda value: value.pop("tree"),
+            lambda value: value.__setitem__("unexpected", True),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                policy, names = self.create_fixture(root)
+                path = root / names["source_signature"]
+                value = json.loads(path.read_text(encoding="utf-8"))
+                mutation(value)
+                write_json(path, value)
+                with self.assertRaises(RuntimeError):
+                    METADATA.validate_source_signature(path, policy)
+
+    def test_source_signature_rejects_schema1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            policy, names = self.create_fixture(root)
+            path = root / names["source_signature"]
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["schema"] = 1
+            write_json(path, value)
+            with self.assertRaisesRegex(RuntimeError, "source-signature schema"):
+                METADATA.validate_source_signature(path, policy)
+
     def test_source_signature_requires_original_and_triggering_blackcoin_dev_actors(self):
         for field in ("workflow_actor", "workflow_triggering_actor"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
@@ -456,7 +570,11 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
             "pull_request_number": METADATA.EXPECTED_CORE_CI_PR + 1,
             "pull_request_head_sha": "0" * 40,
             "pull_request_base_sha": "0" * 40,
-            "workflow_blob_sha256": "0" * 64,
+            "base_tree": "0" * 40,
+            "head_sha": "0" * 40,
+            "head_tree": "0" * 40,
+            "base_workflow_blob_sha256": "0" * 64,
+            "source_workflow_blob_sha256": "0" * 64,
         }
         for field, replacement in substitutions.items():
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
@@ -468,6 +586,121 @@ class HotfixCandidateMetadataTest(unittest.TestCase):
                 write_json(path, value)
                 with self.assertRaisesRegex(RuntimeError, "Core CI"):
                     METADATA.validate_core_ci(path, policy)
+
+    def test_core_ci_schema2_rejects_legacy_missing_and_extra_digest_fields(self):
+        def legacy_only(value):
+            value.pop("base_workflow_blob_sha256")
+            value.pop("source_workflow_blob_sha256")
+            value["workflow_blob_sha256"] = METADATA.EXPECTED_BASE_WORKFLOW_BLOB_SHA256
+
+        mutations = (
+            legacy_only,
+            lambda value: value.pop("base_workflow_blob_sha256"),
+            lambda value: value.pop("source_workflow_blob_sha256"),
+            lambda value: value.__setitem__(
+                "workflow_blob_sha256",
+                METADATA.EXPECTED_BASE_WORKFLOW_BLOB_SHA256,
+            ),
+            lambda value: value.__setitem__("unexpected", True),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                policy, names = self.create_fixture(root)
+                path = root / names["core_ci"]
+                value = json.loads(path.read_text(encoding="utf-8"))
+                mutation(value)
+                write_json(path, value)
+                with self.assertRaisesRegex(RuntimeError, "unexpected or missing fields"):
+                    METADATA.validate_core_ci(path, policy)
+
+    def test_core_ci_rejects_schema1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            policy, names = self.create_fixture(root)
+            path = root / names["core_ci"]
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["schema"] = 1
+            write_json(path, value)
+            with self.assertRaisesRegex(RuntimeError, "Core CI evidence schema"):
+                METADATA.validate_core_ci(path, policy)
+
+    def test_policy_rejects_legacy_or_extra_core_ci_digest_fields(self):
+        for legacy_only in (True, False):
+            with self.subTest(legacy_only=legacy_only), tempfile.TemporaryDirectory() as temporary:
+                policy = json.loads(POLICY.read_text(encoding="utf-8"))
+                if legacy_only:
+                    policy["core_ci"].pop("base_workflow_blob_sha256")
+                    policy["core_ci"].pop("source_workflow_blob_sha256")
+                policy["core_ci"]["workflow_blob_sha256"] = (
+                    METADATA.EXPECTED_BASE_WORKFLOW_BLOB_SHA256
+                )
+                path = Path(temporary) / "policy.json"
+                write_json(path, policy)
+                with self.assertRaisesRegex(RuntimeError, "unexpected or missing fields"):
+                    METADATA.validate_policy(path)
+
+    def test_distinct_base_and_source_workflow_digests_are_not_interchangeable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "artifacts"
+            root.mkdir()
+            _, names = self.create_fixture(root)
+            evidence_path = root / names["core_ci"]
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            original_base = METADATA.EXPECTED_BASE_WORKFLOW_BLOB_SHA256
+            original_source = METADATA.EXPECTED_SOURCE_WORKFLOW_BLOB_SHA256
+            try:
+                METADATA.EXPECTED_BASE_WORKFLOW_BLOB_SHA256 = "1" * 64
+                METADATA.EXPECTED_SOURCE_WORKFLOW_BLOB_SHA256 = "2" * 64
+                policy_value = json.loads(POLICY.read_text(encoding="utf-8"))
+                policy_value["core_ci"]["base_workflow_blob_sha256"] = "1" * 64
+                policy_value["core_ci"]["source_workflow_blob_sha256"] = "2" * 64
+                policy_path = Path(temporary) / "policy.json"
+                write_json(policy_path, policy_value)
+                policy = METADATA.validate_policy(policy_path)
+
+                evidence["base_workflow_blob_sha256"] = "1" * 64
+                evidence["source_workflow_blob_sha256"] = "2" * 64
+                write_json(evidence_path, evidence)
+                METADATA.validate_core_ci(evidence_path, policy)
+
+                evidence["base_workflow_blob_sha256"] = "2" * 64
+                evidence["source_workflow_blob_sha256"] = "1" * 64
+                write_json(evidence_path, evidence)
+                with self.assertRaisesRegex(RuntimeError, "base workflow blob changed"):
+                    METADATA.validate_core_ci(evidence_path, policy)
+            finally:
+                METADATA.EXPECTED_BASE_WORKFLOW_BLOB_SHA256 = original_base
+                METADATA.EXPECTED_SOURCE_WORKFLOW_BLOB_SHA256 = original_source
+
+    def test_source_tree_marker_is_mandatory_and_exact(self):
+        for mutation in ("missing", "substituted"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                policy, names = self.create_fixture(root)
+                marker = root / names["source_tree"]
+                if mutation == "missing":
+                    marker.unlink()
+                else:
+                    marker.write_text(f"{'0' * 40}\n", encoding="utf-8")
+                with self.assertRaises((RuntimeError, FileNotFoundError)):
+                    METADATA.validate_text_evidence(root, names, policy)
+
+    def test_bundle_exact_inventory_rejects_missing_or_extra_source_tree_member(self):
+        for mutation in ("missing", "extra"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                _, names = self.generate_and_seal(root)
+                if mutation == "missing":
+                    (root / names["source_tree"]).unlink()
+                else:
+                    (root / "unexpected-SOURCE_TREE.txt").write_text(
+                        f"{METADATA.EXPECTED_SOURCE_TREE}\n",
+                        encoding="utf-8",
+                    )
+                self.reseal_checksums(root, names)
+                with self.assertRaisesRegex(RuntimeError, "unexpected or missing file"):
+                    METADATA.verify(POLICY, root)
 
     def validate_fixture_text(self, root, policy, names, kind):
         if kind == "toolchain":

@@ -1,12 +1,12 @@
-name: v30.1.4 Linux x86_64 post-release hotfix candidate
+name: v30.1.5 Linux x86_64 canary candidate
 
 on:
   pull_request:
     paths:
-      - .github/workflows/v30.1.4-hotfix-candidate-linux.yml
-      - ci/release/generate_hotfix_candidate_metadata.py
-      - ci/release/test_hotfix_candidate_metadata.py
-      - contrib/ops/v30.1.4-hotfix-candidate-package/**
+      - .github/workflows/v30.1.5-candidate-linux.yml
+      - ci/release/generate_v30_1_5_candidate_metadata.py
+      - ci/release/test_v30_1_5_candidate_metadata.py
+      - contrib/ops/v30.1.5-candidate-package/**
   workflow_dispatch:
     inputs:
       source_sha:
@@ -27,19 +27,23 @@ permissions:
   actions: read
 
 concurrency:
-  group: v30.1.4-hotfix-candidate-linux-${{ github.event_name }}-${{ inputs.source_sha || github.sha }}
+  group: v30.1.5-candidate-linux-${{ github.event_name }}-${{ inputs.source_sha || github.sha }}
   cancel-in-progress: false
 
 env:
-  EXPECTED_SOURCE: 8a3a5aa1c01caf57acc694b836398c5acba969d0
+  EXPECTED_SOURCE: a0695f22740e111d0487a194fb46f1bae05952c5
+  EXPECTED_SOURCE_TREE: 86df040ae5eb8e819e940dd08364bcc177a72195
   EXPECTED_RELEASE_ANCESTOR: 13262151077cce3f72d07d17dc7725b2b6a8e1ab
   EXPECTED_IDENTITY_ANCESTOR: 19baffef25af36e177db2975780e0641b59753aa
+  EXPECTED_IDENTITY_ANCESTOR_TREE: f897d758aee1849f02126f0ee3b7a4be9bd3be8c
   EXPECTED_FINGERPRINT: SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
   EXPECTED_CORE_CI_EVENT: pull_request
   EXPECTED_CORE_CI_PR: 49
-  EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256: 24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869
-  POLICY: contrib/ops/v30.1.4-hotfix-candidate-package/policy.json
-  PACKAGE_ROOT: contrib/ops/v30.1.4-hotfix-candidate-package
+  EXPECTED_CORE_CI_RUN_ID: 0
+  EXPECTED_CORE_CI_BASE_WORKFLOW_BLOB_SHA256: 24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869
+  EXPECTED_CORE_CI_SOURCE_WORKFLOW_BLOB_SHA256: 24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869
+  POLICY: contrib/ops/v30.1.5-candidate-package/policy.json
+  PACKAGE_ROOT: contrib/ops/v30.1.5-candidate-package
   HOST: x86_64-pc-linux-gnu
   MAKEJOBS: 4
 
@@ -70,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 ci/release/test_hotfix_candidate_metadata.py
+          python3 ci/release/test_v30_1_5_candidate_metadata.py
           bash "$PACKAGE_ROOT/tests/run.sh"
 
   authorize-source:
@@ -109,7 +113,7 @@ jobs:
           [[ "$TOOLING_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$TOOLING_SHA" = "$EVENT_SHA"
           test "$(git rev-parse HEAD)" = "$TOOLING_SHA"
-          test "$CONFIRMATION" = BUILD_V30_1_4_HOTFIX_CANDIDATE_LINUX_X86_64
+          test "$CONFIRMATION" = BUILD_V30_1_5_CANDIDATE_LINUX_X86_64
           [[ "$CORE_CI_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           python3 ci/release/verify_source_identity.py \
             --base "$EXPECTED_IDENTITY_ANCESTOR" \
@@ -119,11 +123,22 @@ jobs:
             --actor "$GITHUB_ACTOR" \
             --require-signatures \
             --signing-fingerprint "$EXPECTED_FINGERPRINT"
-          python3 ci/release/generate_hotfix_candidate_metadata.py validate-policy \
+          python3 ci/release/generate_v30_1_5_candidate_metadata.py validate-policy \
             --policy "$POLICY"
           POLICY_SOURCE=$(jq -er '.source.commit' "$POLICY")
+          POLICY_SOURCE_TREE=$(jq -er '.source.tree' "$POLICY")
+          POLICY_AUTHORIZATION_STATE=$(jq -er '.authorization.state' "$POLICY")
+          POLICY_DISPATCH_ENABLED=$(jq -r '.authorization.dispatch_enabled' "$POLICY")
+          POLICY_TEMPORARY_SOURCE=$(jq -r '.authorization.temporary_source_pin' "$POLICY")
+          POLICY_CORE_CI_RUN_ID=$(jq -r '.authorization.core_ci_run_id // 0' "$POLICY")
+          test "$POLICY_AUTHORIZATION_STATE" = authorized_exact_signed_source_and_green_ci
+          test "$POLICY_DISPATCH_ENABLED" = true
+          test "$POLICY_TEMPORARY_SOURCE" = false
+          test "$POLICY_CORE_CI_RUN_ID" = "$EXPECTED_CORE_CI_RUN_ID"
+          test "$CORE_CI_RUN_ID" = "$EXPECTED_CORE_CI_RUN_ID"
           test "$REQUESTED_SOURCE" = "$EXPECTED_SOURCE"
           test "$REQUESTED_SOURCE" = "$POLICY_SOURCE"
+          test "$POLICY_SOURCE_TREE" = "$EXPECTED_SOURCE_TREE"
           {
             echo "source_sha=$REQUESTED_SOURCE"
             echo "short_source=${REQUESTED_SOURCE:0:12}"
@@ -148,13 +163,16 @@ jobs:
           set -euo pipefail
           test "$SOURCE_SHA" = "$EXPECTED_SOURCE"
           test "$(git -C candidate-source rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C candidate-source rev-parse "$SOURCE_SHA^{tree}")" = "$EXPECTED_SOURCE_TREE"
           git -C candidate-source merge-base --is-ancestor "$EXPECTED_RELEASE_ANCESTOR" "$SOURCE_SHA"
           test "$(git -C candidate-source merge-base "$EXPECTED_IDENTITY_ANCESTOR" "$SOURCE_SHA")" = \
             "$EXPECTED_IDENTITY_ANCESTOR"
+          test "$(git -C candidate-source rev-parse "$EXPECTED_IDENTITY_ANCESTOR^{tree}")" = \
+            "$EXPECTED_IDENTITY_ANCESTOR_TREE"
           test "$(git -C candidate-source show "$SOURCE_SHA:.github/workflows/pr-gate.yml" | sha256sum | awk '{print $1}')" = \
-            "$EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256"
+            "$EXPECTED_CORE_CI_SOURCE_WORKFLOW_BLOB_SHA256"
           test "$(git -C candidate-source show "$EXPECTED_IDENTITY_ANCESTOR:.github/workflows/pr-gate.yml" | sha256sum | awk '{print $1}')" = \
-            "$EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256"
+            "$EXPECTED_CORE_CI_BASE_WORKFLOW_BLOB_SHA256"
           (
             cd candidate-source
             python3 "$GITHUB_WORKSPACE/ci/release/verify_source_identity.py" \
@@ -168,21 +186,23 @@ jobs:
           )
           test "$(sed -n 's/^define(_CLIENT_VERSION_MAJOR, \([0-9]*\))$/\1/p' candidate-source/configure.ac)" = 30
           test "$(sed -n 's/^define(_CLIENT_VERSION_MINOR, \([0-9]*\))$/\1/p' candidate-source/configure.ac)" = 1
-          test "$(sed -n 's/^define(_CLIENT_VERSION_BUILD, \([0-9]*\))$/\1/p' candidate-source/configure.ac)" = 4
+          test "$(sed -n 's/^define(_CLIENT_VERSION_BUILD, \([0-9]*\))$/\1/p' candidate-source/configure.ac)" = 5
           test "$(sed -n 's/^define(_CLIENT_VERSION_RC, \([0-9]*\))$/\1/p' candidate-source/configure.ac)" = 0
           test "$(sed -n 's/^define(_CLIENT_VERSION_IS_RELEASE, \(.*\))$/\1/p' candidate-source/configure.ac)" = true
 
           gh api "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_SHA" > source-verification.json
-          jq -e --arg source "$SOURCE_SHA" '
-            .sha == $source and .verification.verified == true and
+          jq -e --arg source "$SOURCE_SHA" --arg tree "$EXPECTED_SOURCE_TREE" '
+            .sha == $source and .tree.sha == $tree and .verification.verified == true and
             .verification.reason == "valid"
           ' source-verification.json >/dev/null
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CORE_CI_RUN_ID" > core-ci-run.json
-          jq -e --arg source "$SOURCE_SHA" --arg base "$EXPECTED_IDENTITY_ANCESTOR" \
+          jq -e --arg source "$SOURCE_SHA" --arg tree "$EXPECTED_SOURCE_TREE" \
+            --arg base "$EXPECTED_IDENTITY_ANCESTOR" --arg base_tree "$EXPECTED_IDENTITY_ANCESTOR_TREE" \
             --arg repository "$GITHUB_REPOSITORY" --arg event "$EXPECTED_CORE_CI_EVENT" \
             --argjson pr "$EXPECTED_CORE_CI_PR" --argjson run "$CORE_CI_RUN_ID" '
             .id == $run and .path == ".github/workflows/pr-gate.yml" and
             .name == "pull-request safety gate" and .head_sha == $source and
+            .head_commit.id == $source and .head_commit.tree_id == $tree and
             .event == $event and .repository.full_name == $repository and
             .head_repository.full_name == $repository and
             (.pull_requests | type == "array" and length == 1) and
@@ -193,23 +213,30 @@ jobs:
           ' core-ci-run.json >/dev/null
 
           mkdir preflight-evidence
-          jq -n --arg commit "$SOURCE_SHA" --arg repository "$GITHUB_REPOSITORY" \
+          jq -n --arg commit "$SOURCE_SHA" --arg tree "$EXPECTED_SOURCE_TREE" \
+            --arg repository "$GITHUB_REPOSITORY" \
             --arg fingerprint "$EXPECTED_FINGERPRINT" --arg actor "$GITHUB_ACTOR" \
             --arg triggering_actor "$GITHUB_TRIGGERING_ACTOR" '
-            {schema:1,commit:$commit,repository:$repository,signer:"Blackcoin-Dev",
+            {schema:2,commit:$commit,tree:$tree,repository:$repository,signer:"Blackcoin-Dev",
              format:"ssh",fingerprint:$fingerprint,local_git_verified:true,
              github_verified:true,github_verification_reason:"valid",
              workflow_actor:$actor,workflow_triggering_actor:$triggering_actor}
           ' > preflight-evidence/source-signature.json
           jq -n --argjson run "$CORE_CI_RUN_ID" --argjson pr "$EXPECTED_CORE_CI_PR" \
-            --arg source "$SOURCE_SHA" --arg base "$EXPECTED_IDENTITY_ANCESTOR" \
+            --arg source "$SOURCE_SHA" --arg tree "$EXPECTED_SOURCE_TREE" \
+            --arg base "$EXPECTED_IDENTITY_ANCESTOR" \
+            --arg base_tree "$EXPECTED_IDENTITY_ANCESTOR_TREE" \
             --arg repository "$GITHUB_REPOSITORY" --arg event "$EXPECTED_CORE_CI_EVENT" \
-            --arg workflow_blob "$EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256" '
-            {schema:1,workflow_path:".github/workflows/pr-gate.yml",
-             workflow_name:"pull-request safety gate",workflow_blob_sha256:$workflow_blob,
+            --arg base_workflow_blob "$EXPECTED_CORE_CI_BASE_WORKFLOW_BLOB_SHA256" \
+            --arg source_workflow_blob "$EXPECTED_CORE_CI_SOURCE_WORKFLOW_BLOB_SHA256" '
+            {schema:2,workflow_path:".github/workflows/pr-gate.yml",
+             workflow_name:"pull-request safety gate",
+             base_workflow_blob_sha256:$base_workflow_blob,
+             source_workflow_blob_sha256:$source_workflow_blob,
              event:$event,repository:$repository,head_repository:$repository,
              pull_request_number:$pr,pull_request_head_sha:$source,
-             pull_request_base_sha:$base,run_id:$run,head_sha:$source,
+             pull_request_base_sha:$base,base_tree:$base_tree,run_id:$run,head_sha:$source,
+             head_tree:$tree,
              status:"completed",conclusion:"success"}
           ' > preflight-evidence/core-ci.json
           SOURCE_DATE_EPOCH=$(git -C candidate-source show -s --format=%ct "$SOURCE_SHA")
@@ -219,7 +246,7 @@ jobs:
       - name: Upload exact authorization evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: hotfix-candidate-authorization-${{ inputs.source_sha }}-attempt-${{ github.run_attempt }}
+          name: v30.1.5-candidate-authorization-${{ inputs.source_sha }}-attempt-${{ github.run_attempt }}
           path: preflight-evidence/*
           if-no-files-found: error
           retention-days: 7
@@ -276,6 +303,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_SOURCE_TREE"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           make -j "$MAKEJOBS" -C depends HOST="$HOST"
           ./autogen.sh
@@ -298,7 +326,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          prefix="Blackcoin-30.1.4-hotfix-candidate-$SHORT_SOURCE"
+          prefix="Blackcoin-30.1.5-candidate-$SHORT_SOURCE"
           output="$GITHUB_WORKSPACE/raw-candidate"
           binary_root="depends/$HOST/bin"
           binaries=(blackcoin-cli blackcoin-qt blackcoin-tx blackcoin-util blackcoin-wallet blackcoind)
@@ -328,6 +356,7 @@ jobs:
             --pax-option=delete=atime,delete=ctime -cf - "${binaries[@]}" |
             gzip -n -9 > "$output/$prefix-Linux-x86_64.tar.gz"
           printf '%s\n' "$SOURCE_SHA" > "$output/$prefix-SOURCE_COMMIT.txt"
+          printf '%s\n' "$EXPECTED_SOURCE_TREE" > "$output/$prefix-SOURCE_TREE.txt"
 
           mapfile -d '' -t depends_tracked_files < <(git ls-files -z -- depends | LC_ALL=C sort -z)
           ((${#depends_tracked_files[@]} > 0))
@@ -350,6 +379,7 @@ jobs:
           )
           {
             printf 'source_commit=%s\n' "$SOURCE_SHA"
+            printf 'source_tree=%s\n' "$EXPECTED_SOURCE_TREE"
             printf 'workflow_run_id=%s\n' "$WORKFLOW_RUN_ID"
             printf 'workflow_run_attempt=%s\n' "$WORKFLOW_RUN_ATTEMPT"
             printf 'runner_image=ubuntu-22.04\n'
@@ -366,7 +396,7 @@ jobs:
       - name: Upload isolated exact-source build
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: hotfix-candidate-raw-${{ matrix.builder }}-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          name: v30.1.5-candidate-raw-${{ matrix.builder }}-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
           path: raw-candidate/*
           if-no-files-found: error
           retention-days: 7
@@ -404,19 +434,19 @@ jobs:
       - name: Download primary build
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: hotfix-candidate-raw-primary-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          name: v30.1.5-candidate-raw-primary-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
           path: primary
 
       - name: Download verifier build
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: hotfix-candidate-raw-verifier-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          name: v30.1.5-candidate-raw-verifier-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
           path: verifier
 
       - name: Download exact source and Core-CI authorization
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: hotfix-candidate-authorization-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          name: v30.1.5-candidate-authorization-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
           path: authorization
 
       - name: Build, probe, convert, and seal without publication
@@ -426,7 +456,7 @@ jobs:
           WORKFLOW_RUN_ID: ${{ github.run_id }}
           WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
           SOURCE_DATE_EPOCH: ${{ needs.authorize-source.outputs.source_date_epoch }}
-          CONFIRM_CANDIDATE_BUILD: BUILD_V30_1_4_HOTFIX_CANDIDATE_LINUX_X86_64
+          CONFIRM_CANDIDATE_BUILD: BUILD_V30_1_5_CANDIDATE_LINUX_X86_64
           ALLOW_IMMUTABLE_BASE_PULL: 1
         run: |
           set -euo pipefail
@@ -437,10 +467,10 @@ jobs:
             "$GITHUB_WORKSPACE/authorization/core-ci.json" \
             "$GITHUB_WORKSPACE/candidate-bundle"
 
-      - name: Upload reviewable unpublished hotfix candidate
+      - name: Upload reviewable unpublished v30.1.5 candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: hotfix-candidate-30.1.4-linux-x86_64-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
+          name: v30.1.5-candidate-linux-x86_64-${{ needs.authorize-source.outputs.source_sha }}-attempt-${{ github.run_attempt }}
           path: candidate-bundle/*
           if-no-files-found: error
           retention-days: 7

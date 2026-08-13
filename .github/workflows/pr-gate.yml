@@ -833,6 +833,12 @@ jobs:
           python3 test/functional/test_runner.py \
             --ci --jobs=1 --failfast --combinedlogslen=2000 \
             feature_goldrush_v3014_wallet_upgrade.py --previous-releases --descriptors
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=2000 \
+            feature_goldrush_v3014_qqp2_upgrade.py --previous-releases --descriptors
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=2000 \
+            feature_goldrush_v3014_same_anchor_mixed.py --previous-releases --descriptors
 
       - name: Upload historical binary provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -868,7 +874,7 @@ jobs:
         run: |
           python3 test/functional/test_runner.py \
             --ci --extended --jobs=4 --combinedlogslen=2000 \
-            --exclude=feature_goldrush_mixed_version.py,feature_goldrush_v3014_wallet_upgrade.py
+            --exclude=feature_goldrush_mixed_version.py,feature_goldrush_v3014_wallet_upgrade.py,feature_goldrush_v3014_qqp2_upgrade.py,feature_goldrush_v3014_same_anchor_mixed.py
 
   sanitizer-gates:
     name: ${{ matrix.name }} consensus and liveness gate

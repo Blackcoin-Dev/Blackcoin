@@ -4,22 +4,24 @@ This directory contains a candidate-only, two-phase node 27 transaction for a
 post-v30.1.4 correction candidate for v30.1.5. It is not an alteration of the
 immutable v30.1.4 release or final canary.
 
-The current tooling bytes are provisionally pinned to Blackcoin-Dev-signed
-source `a0695f22740e111d0487a194fb46f1bae05952c5` (tree
-`86df040ae5eb8e819e940dd08364bcc177a72195`) and expected Core safety run
-`31336502539`. That run remains pending and is not execution authority. The
-exact PR base `19baffef25af36e177db2975780e0641b59753aa` and unchanged
+The current tooling bytes are deliberately not pinned to a Core candidate.
+`__FINAL_SIGNED_CORE_SHA__` and `__FINAL_EXACT_SHA_CORE_CI_RUN_ID__` are
+invalid sentinels, so production identity preflight fails closed until a later
+reviewed identity-only repin replaces both with one Blackcoin-Dev-signed source
+and its successful exact-SHA Core safety run. The exact PR base
+`19baffef25af36e177db2975780e0641b59753aa` and unchanged
 `.github/workflows/pr-gate.yml` SHA-256
 `24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869`
-are also pinned. Phase A and the offline verifier require the exact run to be
+remain pinned. Phase A and the offline verifier require the repinned run to be
 `completed` with conclusion `success`; queued, in-progress, failed,
 superseded-run, wrong-base, or wrong-workflow evidence fails closed.
 
-Run `31336502539` qualifies Core only. It is not the later candidate packaging
-run. The signed adapter tooling/workflow commit, candidate workflow run and
-attempt, bundle, OCI graph, image ID, provenance, and six-binary ledger remain
-unresolved. Their placeholders fail Phase A, Phase B, and evidence-verifier
-preflight. The release input is accepted only when it is exactly `30.1.5`.
+The exact-SHA Core run will qualify Core only. It is not the later candidate
+packaging run. The signed adapter tooling/workflow commit, candidate workflow
+run and attempt, bundle, OCI graph, image ID, provenance, and six-binary ledger
+also remain unresolved. Their placeholders fail Phase A, Phase B, and
+evidence-verifier preflight. The release input is accepted only when it is
+exactly `30.1.5`.
 
 The naming and metadata predicates match the current reviewed v30.1.5 adapter
 profile: `Blackcoin-30.1.5-candidate-<source12>`, GitHub artifact
@@ -48,8 +50,8 @@ erase local signing/spend records while peers retain the block.
 The safety boundary is consequently irreversible:
 
 1. Phase A disables PoS and every automatic wallet-signing feature, suppresses
-   wallet relay, proves the repaired `PERSISTED_PENDING` PoW-claim path, and is
-   the only phase that may restore a pre-candidate dataset image.
+   wallet relay, proves a coherent no-spend typed PoW path, and is the only phase
+   that may restore a pre-candidate dataset image.
 2. Phase B is a separately confirmed promotion. Before candidate launch it
    durably records `PROMOTED_NO_REWIND`. It takes no snapshot. It preserves all
    live datasets. Failure can only stop and contain the candidate.
@@ -68,15 +70,28 @@ Phase A never invokes Phase B.
 8. `VALIDATION.txt`.
 9. `SHA256SUMS`.
 
-The current `SHA256SUMS` binds the exact paths and bytes of all eight non-seal
-provisionally source/run-bound payloads. The frozen offline hostile suite binds
-the exact source, Core run, PR base, and workflow bytes and rejects pending or
-non-success Core-CI evidence. Unresolved packaging and live identities remain
-independently fail closed under that seal, so it is not execution authority.
-Recording the terminal successful run and the later adapter/bundle identities
-must regenerate and revalidate the seal. Live preflight treats `SHA256SUMS` as the ninth
-required regular file and rejects extra or non-regular objects, symlinks,
-unsafe ownership or modes, and multiply linked files.
+Before narrative closure, the six exact environment, contract, phase,
+test, and verifier payloads passed local and independent 403/403 hostile
+replays without byte drift. The digest of their ordered `sha256sum` list, in
+manifest order with the two narrative files omitted, is
+`cd15e93f006ae83920fc2817e8d0c1bc7e1cad69f5aa783f9751f2aa145637af`.
+`SHA256SUMS` binds those six payloads together with the final `README.md` and
+`VALIDATION.txt`; it is generated mechanically only after both narrative
+files are frozen.
+
+A completed tooling checkpoint additionally requires strict manifest
+verification, exact package topology and static checks, a local full sealed
+403/403 replay with all nine package-file hashes unchanged, and an independent
+post-seal replay recorded in an external commit ledger. This narrative
+intentionally does not attest or predict the status of that external step and
+does not embed a volatile replay path.
+
+A valid checksum seal proves identity-neutral offline tooling integrity only;
+it does not prove Core correctness or grant execution authority. Recording the
+final source/run and adapter/bundle identities remains a separate reviewed
+repin and seal. Live preflight treats `SHA256SUMS` as the ninth required regular
+file and rejects a mismatch, extra or non-regular objects, symlinks, unsafe
+ownership or modes, and multiply linked files.
 
 ## Unlock-helper audit
 
@@ -156,32 +171,99 @@ An unavailable or ambiguous surface is not treated as safe.
 
 The evidence must span at least three distinct advancing tips, advancing
 chainwork, no IBD, current wallet processing, complete identity-bound typed
-gate telemetry, zero unsafe claims/components, and continuously disabled PoS.
-It must contain at least one newly authored `PERSISTED_PENDING` QQSPROOF and a
-real, contiguous same-anchor/same-family/same-root lineage across the tip
-window. Every member must remain quarantined, unconfirmed, non-abandoned,
-absent from the local mempool/active chain, and absent from two independent
-observer mempools. Any observer failure is unclassifiable and prohibits the
-data operation.
+gate telemetry, a coherent and unambiguous database view, zero unsafe
+claims/components, and continuously disabled PoS. Nonzero unresolved,
+quarantined, blocking, raw, retired, or resolved history is telemetry, not a
+health veto. Legacy PoW unresolved/live/quarantine counters and recovery
+blocking/actionable/indeterminate counts are independently type-checked
+telemetry; no arithmetic relationship among them is a health predicate, and
+legacy inventory counters are not required to agree across the two RPC views.
+Candidate recovery-operation same-cut relationships remain structural
+coherence checks, and candidate counters are never required to equal immutable
+v30.1.4 counters. Mining-gate family/live counters are aggregate authority
+telemetry and are not required to equal the claim/live counts in the one
+Core-selected component authenticated by an observation. A
+`create_new_anchor` report nevertheless has no authoritative unresolved
+component or family. The compatibility `.components` count is not required to
+equal the length of the full audit `component_details` inventory. The full
+inventory must nevertheless be a partition: one node txid cannot appear in two
+components.
 
-### Bounded zero-hash liveness
+The product contract permits all five safe typed actions. A bounded
+`wait_for_live`, `relay_existing`, or `wait_for_next_tip` path may legitimately
+create no wallet transaction. Phase-A progress schema 5 therefore accepts any
+sealed series of at least three advancing observations; each per-sample envelope
+and the repeated terminal stable-cut receipt use schema 4. The claim proof accepts
+zero or more exact newly authored claim subsets. Each nonempty subset is mapped once to a complete
+authenticated component, is a contiguous suffix of that component's canonical
+lineage, and carries its own authenticated anchor. Preexisting family members
+remain part of the complete component proof but are not falsely treated as
+claims created or required to remain unpublished by this canary. An empty
+candidate set maps to no component or anchor; vacuous component selection is
+rejected.
+
+The package classifies every new wallet row as an authenticated wallet-authored
+claim, an authenticated synthetic claim payout, a confirmed coinstake, or an
+external receive proven to have no wallet debit. An unconfirmed receive that is
+present in recovery telemetry must match exactly one audit-only foreign
+component; a confirmed receive is bound to its active-chain block. These rows
+remain outside candidate-authored lineage, anchor, nonpublication, and progress
+evidence.
+
+The tooling never chooses a family, action, or relay target for Core. It binds
+Core's reported lineage head to one unambiguous authenticated component and,
+when a relay txid is present, proves that exact txid is an eligible, absent,
+unexpired member of that selected component. It deliberately does not
+recompute a highest-ordinal relay choice: per-tx suppression may make another
+eligible member the correct reselection. Global action priority, the
+all-safe-families-live condition, and per-tx suppression are signed-Core
+product semantics; the host does not reconstruct or override them after Core
+reports a coherent, nonambiguous, zero-unsafe typed gate. Exact selected-family
+persisted payout/target remains an RPC observability limitation supplied by
+signed-Core evidence, not inferred from the process-local payout field.
+The legacy `payout_address` field is configured-future payout, not the selected
+family's persisted payout: it may be empty for retained wait/relay/refresh
+work, and is required nonempty only for `create_new_anchor`.
+
+Each repeated Phase-A terminal cut independently passes the full typed
+observation validator, including selected-component authentication and exact
+raw-mempool binding. Cross-cut equality then binds only the chain/wallet cut,
+recovery-policy authority, and Core's operational mining-gate projection:
+enabled/action/submission authority, authoritative unsafe counts, selected
+lineage head/relay, aggregate family/live/eligible/unresolved counts, and
+inventory-tip coherence. Full audit component details, unanchored and retained
+history, compatibility counters, and candidate-state fingerprint are not
+cross-cut health predicates.
+
+### Bounded worker liveness
 
 Every Phase-A envelope and Phase-B progress sample includes a verbose raw
 mempool snapshot from the same stable cut as the typed PoW gate and recovery
-inventory. The common validator binds the chain tip and height across those
+inventory. Each operational cut also carries the exact six-field
+`getgoldrushstate` projection for QQP4 activation. The receipt is bound to the
+same tip and height; its activation-disabled/height schedule is invariant
+across Phase-A progress and terminal cuts and Phase-B baseline, progress, and
+final cuts. A selected QQP2 or QQP3 `unsupported_version` member is accepted
+only when that cut reports `qqp4_active_next_block=true`; QQP4 never receives
+that legacy exception. Generic retained history without an operational receipt
+is not reinterpreted. The common validator binds the chain tip and height across those
 objects and permits at most one advancing-tip transition while an enabled PoW
-worker remains at zero hashrate without a witnessed state advance. The bound
-applies to all five typed actions: `create_new_anchor`, `refresh_same_anchor`,
-`wait_for_live`, `wait_for_next_tip`, and `relay_existing`.
+worker lacks an action-appropriate progress witness. The bound applies to all
+five typed actions: `create_new_anchor`, `refresh_same_anchor`, `wait_for_live`,
+`wait_for_next_tip`, and `relay_existing`.
 
 Only these observations reset the bound:
 
 - positive hashrate under a submit-capable create or refresh action;
 - an increase in Core's `claims_submitted` counter;
-- a newly observed authenticated family or an exact append-only lineage
-  extension under the stable anchor-outpoint/root identity; or
+- an exact append-only lineage extension to a previously observed authenticated
+  family under its stable anchor-outpoint/root identity; or
 - growth of the exact authoritative live-txid set for that authenticated
   component.
+
+A live/wait/relay action may report transient positive hashrate. Because those
+actions are not submit-capable, that diagnostic alone is never credited as
+progress and cannot reset the series budget.
 
 The component generation fingerprint must remain stable for one
 anchor-outpoint/root identity. A lineage at the same ordinal must be
@@ -189,15 +271,37 @@ byte-for-byte the same txid sequence; an extension must contain the prior
 sequence as an exact prefix. Every live txid is recorded when first observed,
 including the first sample and samples whose progress came from another
 witness, so a later mempool replay cannot become progress. A genuinely new
-live sibling may count once.
+live member may count once after the prior member is absent. Multiple
+authenticated live members are each raw-mempool-bound, but cardinality alone is
+not a host-side health veto: the package relies on Core's coherent,
+database-unambiguous, zero-authoritative-unsafe gate. Switching to another
+authenticated family, or returning to a previously selected family, is neither
+failure nor progress; continuity is checked against the latest prior
+observation of that same family.
 
-For `wait_for_live`, every recovery member marked live must have an exact entry
-in the captured verbose mempool, with entry time no later than the observation
-and entry height at most one block behind the current height. For
-`relay_existing`, the exact relay txid must resolve to an eligible,
-not-in-mempool recovery member whose relay TTL is unexpired and whose expiry is
-later than the observation. `wait_for_next_tip` remains bound to the sampled
-current tip and to the same series-level budget.
+For `wait_for_live`, every selected-component recovery member marked live must
+have an exact entry in the captured verbose mempool, with entry time no later
+than the observation and entry height no later than the current height. No
+absolute mempool age or block-age cutoff substitutes for the separate series
+progress budget. For `relay_existing`, the exact Core-selected relay txid must
+resolve to an eligible, not-in-mempool member of the selected component whose
+relay TTL is unexpired and whose expiry is later than the observation. A
+nonzero `wait_for_next_tip` relay txid has the same membership proof. Both
+actions may coexist with aggregate live claims in other clean wallet-owned
+families. `wait_for_next_tip` remains bound to the sampled current tip and to
+the same series-level budget. With a zero relay txid it may be either a
+submit-capable cached override or a non-submit fresh deferral.
+
+An implicit metadata-absent QQP2/3/4 ordinal-zero root remains an explicitly
+authored wallet claim. Its serialized lineage family, root, and parent remain
+the all-zero defaults; Core derives the canonical root from the node txid.
+QQP2, QQP3, and QQP4 require their exact false/false, true/false, and true/true
+origin/input binding tuples, respectively. The root also binds authored and
+carrier metadata, the exact Core disposition set, the disposition/revalidation
+relation, and proof-evaluation status. A singleton QQP2 root additionally binds
+the active-branch-authored tip and a safe disposition. The absence of lineage
+metadata does not permit a legacy-wallet-authored, adopted, unknown, or forged
+descriptor.
 
 An action change, relay-txid change, candidate-state-fingerprint change,
 generation-fingerprint churn, or live/relay replay is not progress. Alternating
@@ -213,10 +317,20 @@ transaction, distinct UTXO, or recovery fee. Zero-payment retirement remains a
 legacy/non-lineaged-record behavior and is not an expected outcome for the
 family exercised by this canary.
 
-Phase A rejects every new wallet transaction other than that exact claim
-family. It also proves unchanged payout/key inventory, no coinstake, no
-cleanup/resolution/recovery transaction, no unrelated spend, no payout
-rotation, no abandonment, and no recovery-fee/counter/txid change.
+Phase A rejects every new wallet transaction other than the exact claim
+transactions authenticated by its action-specific proof. It also proves
+unchanged payout/key inventory, no coinstake, no cleanup/resolution/recovery
+transaction, no unrelated spend, no payout rotation, and no abandonment.
+Every newly authored txid is bound to its component anchor and remains absent
+from the local raw mempool, both observer mempools, and the active chain. No
+wallet outpoint may be added; any removed outpoint must be one of those exact
+authenticated authored anchors. An existing-family refresh may remove no new
+outpoint because its anchor was already reserved before the canary.
+Existing wallet txids and abandonment authority must be preserved, but
+candidate-native `listtransactions` metadata may be reclassified. Recovery
+counters and fee-exposure aggregates may age; actual transaction identities,
+raw wallet classification, and the RPC journal prove that the canary created no
+fee-bearing recovery action.
 
 The terminal order is fixed:
 
@@ -263,8 +377,10 @@ Its fixed startup flags are:
 ```
 
 The candidate starts locked with both workers off. Phase B synchronizes chain
-and wallet processing, normally unlocks, explicitly enables PoS, then restores
-the observed PoW policy. Success leaves the exact candidate running and keeps
+and wallet processing, normally unlocks, explicitly enables PoS, and explicitly
+enables regular PoW for node 27 even when immutable v30.1.4 reported PoW off.
+The enable RPC is intent, not liveness evidence; success additionally requires
+active-only typed PoW progress and final evidence. Success leaves the exact candidate running and keeps
 the durable marker and maintenance/guard authority in place pending the
 separately reviewed rollout-consumer integration.
 
@@ -276,15 +392,18 @@ exits without changing or stopping the immutable baseline. No failure path
 starts old Core or changes live dataset history.
 
 Phase B also seals the raw evidence used to classify every new wallet
-transaction. The offline verifier independently recomputes the only permitted
-classes—an authenticated Gold Rush claim, a confirmed coinstake, or an
-authenticated synthetic claim payout—and cross-binds that raw file through
-the wallet delta, final envelope, and result. Unknown, conflicting, unrelated,
-or insufficiently authenticated wallet activity contains the candidate.
+transaction. The offline verifier independently recomputes the four permitted
+classes—an authenticated Gold Rush claim, a confirmed coinstake, an
+authenticated synthetic claim payout, or an external no-debit receive—and
+cross-binds that raw file through the wallet delta, final envelope, and result.
+Unknown, conflicting, wallet-debiting, or insufficiently authenticated wallet
+activity contains the candidate.
 
-Phase B proves an explicitly controlled runtime transition. It does not prove
-Core-native restart durability because it intentionally starts with automatic
-staking and PoW disabled and then enables the desired workers explicitly.
+Phase B proves Core-native configured intent. It launches with automatic
+staking and PoW enabled, observes both intents retained while the wallet is
+locked with zero work, invokes only the normal wallet-unlock helper, and then
+requires active PoS plus active hashing/submission or a coherent bounded safe
+PoW wait. It forbids repair `staking true` and `setpowmining true` RPCs.
 
 ## Offline verifier
 
@@ -320,7 +439,9 @@ workers while the encrypted wallet is locked; a normal wallet unlock alone,
 without a repair `staking true` or `setpowmining true` RPC, must resume legacy
 PoS and either active hashing/submission or a coherent safe-wait Gold Rush
 state. No recovery, cleanup, resolution transaction, or recovery-fee counter
-may change. The rollout consumer, its live predicates, the runtime guard, and
+may be created; aggregate counters may change only when raw transaction and
+resolution identity proves no new durability-lane action. The rollout
+consumer, its live predicates, the runtime guard, and
 the transaction tests, documentation, validation, and seal require separate
 path-level clearance for that lane.
 

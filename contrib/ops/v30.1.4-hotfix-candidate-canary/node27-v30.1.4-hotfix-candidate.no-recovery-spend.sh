@@ -33,6 +33,8 @@ readonly IMMUTABLE_CANARY_MANIFEST_SHA='39bcd09b8320e6ae191be53bc7fc064e25dcc7b3
 readonly PROMOTION_ROOT='/mnt/pulsar/Blackcoin_Blocks/operations/promotion-authority'
 readonly PROMOTION_MARKER="${PROMOTION_ROOT}/PROMOTED_NO_REWIND.node27.json"
 readonly VPN_CONTAINER='pia-vpn-26'
+PHASE_A_OBSERVATION_SAMPLES=${PHASE_A_OBSERVATION_SAMPLES:-3}
+readonly PHASE_A_OBSERVATION_SAMPLES
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 readonly STAMP
@@ -46,6 +48,7 @@ readonly SUSPENDED_START_MARKER="${STATE_ROOT}/ENABLE_GUARD_STARTS.hotfix-node27
 readonly RPC_METHODS_LOG="${EVIDENCE}/rpc-methods.log"
 readonly CANDIDATE_PROGRESS="${EVIDENCE}/phase-a-progress.json"
 readonly NO_RECOVERY_SPEND="${EVIDENCE}/phase-a-claim-proof.json"
+readonly EXTERNAL_RECEIVE_EVIDENCE="${EVIDENCE}/candidate-external-receive-evidence.json"
 readonly REWIND_SAFE="${EVIDENCE}/REWIND_SAFE.json"
 readonly BASE_CATCHUP_PROOF="${EVIDENCE}/base-catchup-proof.json"
 readonly SNAPSHOT_ABSENCE_PROOF="${EVIDENCE}/snapshot-absence-proof.json"
@@ -61,13 +64,8 @@ rewind_started=0
 guard_starts_suspended=0
 maintenance_published=0
 baseline_pow_enabled=false
-baseline_recovery_fee=''
-baseline_cumulative_recovery_fee=''
-baseline_pending_manual=''
-baseline_pending_automatic=''
-baseline_recovery_metrics_json=''
-baseline_recovery_metrics_sha=''
 baseline_payout=''
+baseline_wallet_name=''
 baseline_quantum_key_count=''
 baseline_config_sha=''
 baseline_mounts_sha=''
@@ -104,6 +102,15 @@ rpc()
         sync -f "$RPC_METHODS_LOG"
     fi
     timeout -k 2 45 docker exec "$CONTAINER" "$CLI" -datadir="$DATADIR" "$@"
+}
+
+capture_goldrush_state()
+{
+    local output="$1"
+    rpc getgoldrushstate | jq -eS '
+      {bestblock,height,qqp4_activation_disabled,qqp4_activation_height,
+       qqp4_active,qqp4_active_next_block}
+    ' >"$output"
 }
 
 wait_rpc()
@@ -835,21 +842,16 @@ capture_wallet_state()
         >"${destination}/${prefix}-component-resolution-txids.json"
 }
 
-recovery_metrics_json()
+wallet_transaction_authority_is_preserved()
 {
-    jq -cS '{pending_manual_resolutions,pending_automatic_resolutions,
-      confirmed_manual_resolutions,confirmed_automatic_resolutions,
-      confirmed_resolution_fees,automatic_actions_in_window,
-      automatic_fee_exposure_in_window,reconciled_descendant_claims,claims_recycled}' "$1"
-}
-
-recovery_metrics_match_baseline()
-{
-    local current
-    current=$(recovery_metrics_json "$1") || return 1
-    [[ "$current" == "$baseline_recovery_metrics_json" &&
-       "$(printf '%s' "$current" | sha256sum | awk '{print $1}')" == \
-         "$baseline_recovery_metrics_sha" ]]
+    local before="$1" after="$2" allow_new="${3:-false}"
+    jq -e -n --argjson allow_new "$allow_new" --slurpfile before "$before" \
+        --slurpfile after "$after" '
+      ($before[0] | map(.txid) | unique | sort) as $old |
+      ($after[0] | map(.txid) | unique | sort) as $current |
+      (($old - $current) | length) == 0 and
+      ($allow_new or $current == $old)
+    ' >/dev/null
 }
 
 legacy_pow_is_feature_detected()
@@ -864,18 +866,59 @@ legacy_pow_is_feature_detected()
     ' "$file" >/dev/null
 }
 
+payout_transition_is_valid()
+{
+    local after="$1" before_inventory="$2" after_inventory="$3" evidence="$4"
+    if [[ -z "$after" ]]; then
+        printf 'null\n' >"$evidence"
+    else
+        rpc getaddressinfo "$after" | jq -S . >"$evidence" || return 1
+        hotfix_quantum_payout_address_is_valid \
+            "$evidence" "$before_inventory" "$after" || return 1
+        hotfix_quantum_payout_address_is_valid \
+            "$evidence" "$after_inventory" "$after"
+    fi
+}
+
+capture_quantum_payout_label_evidence()
+{
+    local inventory="$1" output="$2" tmp label addresses
+    [[ -f "$inventory" && ! -L "$inventory" ]] || return 1
+    tmp=$(mktemp "${OPS}/.quantum-labels.XXXXXX") || return 1
+    : >"${tmp}.rows" || return 1
+    jq -er '
+      def entries:
+        if type == "array" then .
+        elif (.keys? | type) == "array" then .keys
+        elif (.inventory? | type) == "array" then .inventory
+        else error("unsupported quantum inventory") end;
+      [entries[]? | (.label? // "") |
+        select(IN("PoW - Quantum Claim Address",
+          "Quantum PoW Reward Address","goldrush-pow"))] | unique | sort | .[]
+    ' "$inventory" >"${tmp}.labels" || return 1
+    while IFS= read -r label; do
+        [[ -n "$label" ]] || continue
+        addresses=$(rpc getaddressesbylabel "$label") || return 1
+        jq -e 'type == "object" and
+          all(.[]; type == "object" and (keys | sort) == ["purpose"] and
+            (.purpose | type) == "string")' <<<"$addresses" >/dev/null || return 1
+        jq -cS -n --arg label "$label" --argjson addresses "$addresses" \
+            '{label:$label,addresses:$addresses}' >>"${tmp}.rows" || return 1
+    done <"${tmp}.labels"
+    jq -S -n --slurpfile rows "${tmp}.rows" \
+        '{schema:1,labels:($rows | sort_by(.label))}' >"$tmp" || return 1
+    install -m 600 -o root -g root "$tmp" "$output" || return 1
+    sync -f "$output" && sync -f "$EVIDENCE" || return 1
+    rm -f -- "$tmp" "${tmp}.rows" "${tmp}.labels"
+}
+
 candidate_off_is_safe()
 {
     local mining_file="$1" recovery_file="$2" wallet_file="$3" staking_file="$4"
     hotfix_candidate_pow_json_is_valid "$(<"$mining_file")" off &&
-        hotfix_candidate_recovery_json_is_valid "$(<"$recovery_file")" \
-            "$baseline_recovery_fee" &&
-        jq -e --argjson manual "$baseline_pending_manual" \
-            --argjson automatic "$baseline_pending_automatic" '
-            .pending_manual_resolutions == $manual and
-            .pending_automatic_resolutions == $automatic
-        ' "$recovery_file" >/dev/null &&
-        recovery_metrics_match_baseline "$recovery_file" &&
+        hotfix_candidate_recovery_json_is_valid "$(<"$recovery_file")" &&
+        hotfix_pow_recovery_same_cut_json_is_valid \
+            "$(<"$mining_file")" "$(<"$recovery_file")" &&
         jq -e '.private_keys_enabled == true and .unlocked_until == 0' \
             "$wallet_file" >/dev/null &&
         hotfix_phase_a_staking_json_is_disabled "$(<"$staking_file")"
@@ -1409,8 +1452,12 @@ capture_claim_sample()
     local sample="$1" tip="$2" tmp
     tmp=$(mktemp "${OPS}/.claim-sample.XXXXXX") || return 1
     rpc listtransactions '*' 1000000 0 true | jq -S '
-      [.[] | select(.comment == "PoW Claim" or
-        has("qq_shadow_pow_lineage_schema") or has("qq_shadow_pow_lineage_root"))] |
+      [.[] | select((.comment == "PoW Claim" or
+        has("qq_shadow_pow_lineage_schema") or has("qq_shadow_pow_lineage_root")) and
+        (has("qq_shadow_pow_legacy_cleanup_quarantine") | not) and
+        (has("qq_auto_shadow_stale") | not) and
+        (has("qq_manual_shadow_abandon") | not) and
+        (has("qq_reorg_shadow_resubmit") | not))] |
       unique_by(.txid) | sort_by(.qq_shadow_pow_lineage_ordinal | tonumber)
     ' >"${tmp}.claims" || return 1
     jq -S -n --argjson sample "$sample" --arg tip "$tip" \
@@ -1427,12 +1474,17 @@ collect_stable_envelope()
     isolation="${EVIDENCE}/candidate-isolation-sample-${sample}.json"
     for _ in $(seq 1 120); do
         rpc getblockchaininfo >"${tmp}.chain1"
+        capture_goldrush_state "${tmp}.goldrush"
         rpc getpowclaimrecoveryinfo true >"${tmp}.recovery1"
         rpc getpowmininginfo >"${tmp}.mining1"
         rpc getstakinginfo >"${tmp}.staking"
         rpc getwalletinfo >"${tmp}.wallet"
         rpc getnetworkinfo >"${tmp}.network"
         rpc listwallets >"${tmp}.wallets"
+        jq -e --arg wallet "$baseline_wallet_name" '.walletname==$wallet' \
+            "${tmp}.wallet" >/dev/null || return 1
+        jq -e --arg wallet "$baseline_wallet_name" '.==[$wallet]' \
+            "${tmp}.wallets" >/dev/null || return 1
         rpc getrawmempool true >"${tmp}.mempool"
         rpc getpowmininginfo >"${tmp}.mining2"
         rpc getpowclaimrecoveryinfo true >"${tmp}.recovery2"
@@ -1443,34 +1495,26 @@ collect_stable_envelope()
         jq -S -n --argjson sample "$sample" --argjson epoch "$epoch" \
             --argjson observed "$(date +%s)" \
             --arg isolation_sha "$isolation_sha" \
-            --argjson fee "$baseline_recovery_fee" \
-            --argjson manual "$baseline_pending_manual" \
-            --argjson automatic "$baseline_pending_automatic" \
-            --argjson recovery_metrics "$baseline_recovery_metrics_json" \
-            --arg recovery_metrics_sha "$baseline_recovery_metrics_sha" \
             --slurpfile chain1 "${tmp}.chain1" --slurpfile chain2 "${tmp}.chain2" \
+            --slurpfile goldrush "${tmp}.goldrush" \
             --slurpfile recovery1 "${tmp}.recovery1" --slurpfile recovery2 "${tmp}.recovery2" \
             --slurpfile mining1 "${tmp}.mining1" --slurpfile mining2 "${tmp}.mining2" \
             --slurpfile staking "${tmp}.staking" --slurpfile wallet "${tmp}.wallet" \
             --slurpfile network "${tmp}.network" --slurpfile wallets "${tmp}.wallets" \
             --slurpfile mempool "${tmp}.mempool" '
-            {schema:3,phase:"A",sample:$sample,observed_epoch:$observed,
+            {schema:4,phase:"A",sample:$sample,observed_epoch:$observed,
              restart_epoch:$epoch,
              chain_before:$chain1[0],chain_after:$chain2[0],
+             goldrush_state:$goldrush[0],
              recovery_before:$recovery1[0],recovery_after:$recovery2[0],
              mining_before:$mining1[0],mining_after:$mining2[0],
              mempool_verbose:$mempool[0],
              staking:$staking[0],wallet:$wallet[0],network:$network[0],
-             wallets:$wallets[0],expected_recovery_fee:$fee,
+             wallets:$wallets[0],
              isolation_continuously_valid:true,observer_status:"observed_absent",
-             isolation_sha256:$isolation_sha,
-             expected_pending_manual:$manual,expected_pending_automatic:$automatic}
-             | . + {expected_recovery_metrics:$recovery_metrics,
-               expected_recovery_metrics_sha256:$recovery_metrics_sha}
+             isolation_sha256:$isolation_sha}
         ' >"$tmp"
         if hotfix_phase_a_envelope_json_is_valid "$(<"$tmp")" &&
-           recovery_metrics_match_baseline "${tmp}.recovery1" &&
-           recovery_metrics_match_baseline "${tmp}.recovery2" &&
            jq -e '.mining_before.claims_submitted == 0 and
              .mining_after.claims_submitted == 0 and
              (.isolation_sha256 | test("^[0-9a-f]{64}$"))' "$tmp" >/dev/null &&
@@ -1482,6 +1526,8 @@ collect_stable_envelope()
                rpc getpowmininginfo >"${tmp}.mining3" &&
                rpc getpowclaimrecoveryinfo true >"${tmp}.recovery3" &&
                rpc getblockchaininfo >"${tmp}.chain3" &&
+               hotfix_pow_recovery_same_cut_json_is_valid \
+                 "$(<"${tmp}.mining3")" "$(<"${tmp}.recovery3")" &&
                jq -e -n --slurpfile chain1 "${tmp}.chain1" \
                  --slurpfile chain3 "${tmp}.chain3" \
                  --slurpfile mining3 "${tmp}.mining3" \
@@ -1494,9 +1540,7 @@ collect_stable_envelope()
                    $recovery3[0].active_tip == $chain1[0].bestblockhash
                  ' >/dev/null &&
                hotfix_candidate_pow_json_is_valid "$(<"${tmp}.mining3")" active &&
-               hotfix_candidate_recovery_json_is_valid "$(<"${tmp}.recovery3")" \
-                 "$baseline_recovery_fee" &&
-               recovery_metrics_match_baseline "${tmp}.recovery3"; then
+               hotfix_candidate_recovery_json_is_valid "$(<"${tmp}.recovery3")"; then
                 jq -S --slurpfile chain "${tmp}.chain3" \
                     --slurpfile mining "${tmp}.mining3" \
                     --slurpfile recovery "${tmp}.recovery3" '
@@ -1519,6 +1563,7 @@ collect_stable_envelope()
 collect_progress_across_restart()
 {
     local sample previous_height previous_tip previous_work deadline envelope progress_tmp
+    local isolation_sha visibility_sha
     collect_stable_envelope 1 1 "${EVIDENCE}/candidate-envelope-1.json" || return 1
     rpc setpowmining false 1 1 false >"${EVIDENCE}/candidate-pre-restart-pow-stop.json"
     rpc walletlock >"${EVIDENCE}/candidate-pre-restart-wallet-lock.json"
@@ -1537,7 +1582,7 @@ collect_progress_across_restart()
     previous_tip=$(jq -er '.chain_before.bestblockhash' "${EVIDENCE}/candidate-envelope-1.json")
     previous_work=$(jq -er '.chain_before.chainwork' "${EVIDENCE}/candidate-envelope-1.json")
     deadline=$((SECONDS + 2700))
-    for sample in 2 3 4; do
+    for sample in $(seq 2 "$PHASE_A_OBSERVATION_SAMPLES"); do
         while (( SECONDS < deadline )); do
             envelope="${EVIDENCE}/candidate-envelope-${sample}.json"
             if collect_stable_envelope "$sample" 2 "$envelope" &&
@@ -1555,46 +1600,61 @@ collect_progress_across_restart()
         [[ -f "${EVIDENCE}/candidate-envelope-${sample}.json" ]] || return 1
     done
     : >"${EVIDENCE}/tx-visibility-samples.jsonl"
-    for sample in 1 2 3 4; do
+    for sample in $(seq 1 "$PHASE_A_OBSERVATION_SAMPLES"); do
         cat "${EVIDENCE}/candidate-visibility-sample-${sample}.json" \
             >>"${EVIDENCE}/tx-visibility-samples.jsonl" || return 1
     done
     sync -f "${EVIDENCE}/tx-visibility-samples.jsonl"
     progress_tmp=$(mktemp "${OPS}/.candidate-progress.XXXXXX") || return 1
+    : >"${progress_tmp}.envelopes.jsonl"
+    : >"${progress_tmp}.isolation-sha256s.jsonl"
+    : >"${progress_tmp}.visibility-sha256s.jsonl"
+    for sample in $(seq 1 "$PHASE_A_OBSERVATION_SAMPLES"); do
+        jq -cS . "${EVIDENCE}/candidate-envelope-${sample}.json" \
+            >>"${progress_tmp}.envelopes.jsonl" || return 1
+        isolation_sha=$(sha256sum \
+            "${EVIDENCE}/candidate-isolation-sample-${sample}.json" | awk '{print $1}') ||
+            return 1
+        visibility_sha=$(sha256sum \
+            "${EVIDENCE}/candidate-visibility-sample-${sample}.json" | awk '{print $1}') ||
+            return 1
+        jq -cS -n --arg sha "$isolation_sha" '$sha' \
+            >>"${progress_tmp}.isolation-sha256s.jsonl" || return 1
+        jq -cS -n --arg sha "$visibility_sha" '$sha' \
+            >>"${progress_tmp}.visibility-sha256s.jsonl" || return 1
+    done
     jq -S -n --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" --arg nonce "$run_nonce" \
-        --arg i1 "$(sha256sum "${EVIDENCE}/candidate-isolation-sample-1.json" | awk '{print $1}')" \
-        --arg i2 "$(sha256sum "${EVIDENCE}/candidate-isolation-sample-2.json" | awk '{print $1}')" \
-        --arg i3 "$(sha256sum "${EVIDENCE}/candidate-isolation-sample-3.json" | awk '{print $1}')" \
-        --arg i4 "$(sha256sum "${EVIDENCE}/candidate-isolation-sample-4.json" | awk '{print $1}')" \
-        --arg v1 "$(sha256sum "${EVIDENCE}/candidate-visibility-sample-1.json" | awk '{print $1}')" \
-        --arg v2 "$(sha256sum "${EVIDENCE}/candidate-visibility-sample-2.json" | awk '{print $1}')" \
-        --arg v3 "$(sha256sum "${EVIDENCE}/candidate-visibility-sample-3.json" | awk '{print $1}')" \
-        --arg v4 "$(sha256sum "${EVIDENCE}/candidate-visibility-sample-4.json" | awk '{print $1}')" \
-        --slurpfile e1 "${EVIDENCE}/candidate-envelope-1.json" \
-        --slurpfile e2 "${EVIDENCE}/candidate-envelope-2.json" \
-        --slurpfile e3 "${EVIDENCE}/candidate-envelope-3.json" \
-        --slurpfile e4 "${EVIDENCE}/candidate-envelope-4.json" '
-        {schema:3,phase:"A",run_nonce:$nonce,candidate_source_sha:$source,
-         envelopes:[$e1[0],$e2[0],$e3[0],$e4[0]],tip_changes:3,
+        --argjson sample_count "$PHASE_A_OBSERVATION_SAMPLES" \
+        --slurpfile envelopes "${progress_tmp}.envelopes.jsonl" \
+        --slurpfile isolation_sha256s "${progress_tmp}.isolation-sha256s.jsonl" \
+        --slurpfile visibility_sha256s "${progress_tmp}.visibility-sha256s.jsonl" '
+        {schema:5,phase:"A",run_nonce:$nonce,candidate_source_sha:$source,
+         observation_sample_count:$sample_count,envelopes:$envelopes,
+         tip_changes:($sample_count-1),
          hard_flags_continuous:true,pos_disabled_continuous:true,
          nonpublication_continuous:true,interactive_surfaces_stopped_continuously:true,
-         worker_only_pow:true,lineage_continuation_tips:3,
-         isolation_sample_sha256s:[$i1,$i2,$i3,$i4],
-         visibility_sample_sha256s:[$v1,$v2,$v3,$v4],
-         per_epoch_claims_submitted_zero:
-           ([$e1[0],$e2[0],$e3[0],$e4[0]] |
-             all(.mining_before.claims_submitted == 0 and
-               .mining_after.claims_submitted == 0)),
+         worker_only_pow:true,post_restart_advancing_observations:($sample_count-1),
+         isolation_sample_sha256s:$isolation_sha256s,
+         visibility_sample_sha256s:$visibility_sha256s,
+         per_epoch_claims_submitted_zero:($envelopes | length == $sample_count and
+           all(.mining_before.claims_submitted == 0 and
+             .mining_after.claims_submitted == 0)),
          bounded_worker_tip_progress:true,single_positive_hash_sample_required:false,
          wait_for_next_tip_required_for_liveness:false,
-         zero_hash_max_no_progress_tip_transitions:1}
+         same_tip_or_submit_no_progress_transition_budget:1}
     ' >"$progress_tmp"
-    jq -e '.per_epoch_claims_submitted_zero == true and
-      (.isolation_sample_sha256s | length == 4 and
+    jq -e --argjson sample_count "$PHASE_A_OBSERVATION_SAMPLES" '
+      .per_epoch_claims_submitted_zero == true and
+      .observation_sample_count == $sample_count and
+      (.envelopes | length == $sample_count) and
+      (.isolation_sample_sha256s | length == $sample_count and
        all(.[]; test("^[0-9a-f]{64}$"))) and
-      (.visibility_sample_sha256s | length == 4 and
+      (.visibility_sample_sha256s | length == $sample_count and
        all(.[]; test("^[0-9a-f]{64}$")))' "$progress_tmp" >/dev/null || return 1
     hotfix_phase_a_progress_file_is_valid "$progress_tmp" || return 1
+    rm -f -- "${progress_tmp}.envelopes.jsonl" \
+        "${progress_tmp}.isolation-sha256s.jsonl" \
+        "${progress_tmp}.visibility-sha256s.jsonl"
     mv -fT -- "$progress_tmp" "$CANDIDATE_PROGRESS"
 }
 
@@ -1623,10 +1683,234 @@ observer_chain_covers_terminal()
     fi
 }
 
+build_candidate_anchor_mapping()
+{
+    local recovery_file="$1" txids_file="$2"
+    jq -S -n --slurpfile recovery "$recovery_file" --slurpfile ids "$txids_file" '
+      ($ids[0] | sort) as $candidate |
+      if ($candidate | length) == 0 then []
+      else
+        [$candidate[] as $id |
+          ([$recovery[0].component_details[]? |
+            select(((.claim_txids // []) | index($id)) != null)]) as $matched |
+          if ($matched | length) != 1 then error("candidate txid component mapping is not exact")
+          elif $matched[0].anchor_authenticated != true or $matched[0].anchor_unspent != true
+          then error("candidate txid anchor is not authenticated and unspent")
+          else {txid:$id,anchor_txid:$matched[0].anchor.txid,
+            anchor_vout:$matched[0].anchor.vout}
+          end]
+      end
+    ' >"${EVIDENCE}/candidate-created-txid-anchor-map.json" || return 1
+    jq -S '[.[] | {txid:.anchor_txid,vout:.anchor_vout}] | unique |
+      sort_by(.txid,.vout)' "${EVIDENCE}/candidate-created-txid-anchor-map.json" \
+      >"${EVIDENCE}/candidate-authenticated-anchors.json" || return 1
+    jq -e --slurpfile ids "$txids_file" \
+      --slurpfile anchors "${EVIDENCE}/candidate-authenticated-anchors.json" '
+      ($ids[0] | sort) as $candidate |
+      (map(.txid) | sort) == $candidate and
+      (if ($candidate | length) == 0 then
+         length == 0 and ($anchors[0] | length) == 0
+       else
+         length == ($candidate | length) and
+         (map(.txid) | unique | length) == length and
+         all(.[]; (.txid | test("^[0-9a-f]{64}$")) and
+           (.anchor_txid | test("^[0-9a-f]{64}$")) and
+           (.anchor_vout | type == "number" and floor == . and . >= 0)) and
+         ($anchors[0] | length) >= 1
+       end)
+    ' "${EVIDENCE}/candidate-created-txid-anchor-map.json" >/dev/null || return 1
+}
+
+capture_phase_a_external_receive_evidence()
+{
+    local terminal_chain="$1" tmp txid wallet_tx confirmations blockhash blockheight
+    local block active_blockhash recovery_matches
+    tmp=$(mktemp "${OPS}/.external-receives.XXXXXX") || return 1
+    jq -S -n --slurpfile before "${EVIDENCE}/prelaunch-wallet-transactions.json" \
+        --slurpfile after "${EVIDENCE}/candidate-final-wallet-transactions.json" \
+        --slurpfile authored "${EVIDENCE}/candidate-created-qqsproof-txids.json" '
+        ($before[0] | map(.txid) | unique | sort) as $prelaunch |
+        ($after[0] | map(.txid) | unique | sort) as $final |
+        ($authored[0] | unique | sort) as $candidate_authored |
+        ($final - $prelaunch) as $new |
+        ($new - $candidate_authored) as $external |
+        if (($candidate_authored - $new) | length) != 0 or
+           ((($candidate_authored - $external) | length) != ($candidate_authored | length)) or
+           $new != (($candidate_authored + $external) | unique | sort)
+        then error("wallet differential is not an exact authored/external partition")
+        else
+          {prelaunch_wallet_txids:$prelaunch,final_wallet_txids:$final,
+           new_wallet_txids:$new,candidate_authored_txids:$candidate_authored,
+           external_receive_txids:$external}
+        end
+    ' >"${tmp}.sets" || return 1
+    jq -r '.external_receive_txids[]' "${tmp}.sets" >"${tmp}.external-txids" || return 1
+    : >"${tmp}.records"
+    while IFS= read -r txid; do
+        [[ "$txid" =~ ^[0-9a-f]{64}$ ]] || return 1
+        wallet_tx=$(rpc gettransaction "$txid" true true) || return 1
+        jq -e --arg txid "$txid" '
+          def no_control_metadata:
+            ([keys[] | select(startswith("qq_"))] | length) == 0;
+          .txid == $txid and .decoded.txid == $txid and
+          (.hex | type == "string" and test("^[0-9a-f]+$") and
+            (length > 0 and length % 2 == 0)) and
+          (has("fee") | not) and (.amount | type) == "number" and .amount > 0 and
+          (has("generated") | not) and
+          no_control_metadata and
+          ((.comment? // "") |
+            IN("Quantum Quasar built-in shadow PoW claim",
+               "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim") | not) and
+          (.confirmations | type) == "number" and
+          (.confirmations | floor) == .confirmations and .confirmations >= 0 and
+          (.details | type) == "array" and (.details | length) > 0 and
+          all(.details[];
+            .category == "receive" and (.amount | type) == "number" and .amount > 0 and
+            .abandoned == false and (has("fee") | not) and
+            (has("generated") | not) and
+            no_control_metadata) and
+          ([.details[].amount] | add) == .amount
+        ' <<<"$wallet_tx" >/dev/null || return 1
+        recovery_matches=$(jq -cS --arg txid "$txid" '
+          [.component_details[]? |
+            select(any(.nodes[]?; .txid == $txid))]
+        ' "${EVIDENCE}/candidate-final-recovery-inventory.json") || return 1
+        jq -e -n --arg txid "$txid" --arg zero "$HOTFIX_ZERO_TXID" \
+            --argjson matches "$recovery_matches" '
+          def hex64: type == "string" and test("^[0-9a-f]{64}$");
+          def valid_null_or_real_outpoint:
+            (.anchor.txid == $zero and .anchor.vout == 4294967295) or
+            ((.anchor.txid | hex64) and .anchor.txid != $zero and
+              (.anchor.vout | type) == "number" and
+              (.anchor.vout | floor) == .anchor.vout and
+              .anchor.vout >= 0 and .anchor.vout < 4294967295);
+          def audit_only_component:
+            .anchor_authenticated == false and .anchor_unspent == false and
+            .anchor_user_locked == false and
+            (.anchor.amount | type) == "number" and .anchor.amount == 0 and
+            .anchor.scriptPubKey == "" and valid_null_or_real_outpoint and
+            (.claim_txids | type) == "array" and (.claim_txids | length) >= 1 and
+            (.claim_txids | unique | length) == (.claim_txids | length) and
+            ([.nodes[]? | select(.kind == "claim") | .txid] | unique | sort) ==
+              (.claim_txids | unique | sort) and
+            all(.nodes[]?; .provenance == "unknown" and
+              .wallet_authored == false and .wallet_from_me == false);
+          ($matches | length) <= 1 and all($matches[]; audit_only_component) and
+          all($matches[]; any(.nodes[]?; .txid == $txid))
+        ' >/dev/null || return 1
+        confirmations=$(jq -er '.confirmations' <<<"$wallet_tx") || return 1
+        if (( confirmations > 0 )); then
+            [[ "$recovery_matches" == '[]' ]] || return 1
+            blockhash=$(jq -er '.blockhash | select(test("^[0-9a-f]{64}$"))' \
+                <<<"$wallet_tx") || return 1
+            blockheight=$(jq -er '.blockheight | select(type == "number" and floor == . and . >= 0)' \
+                <<<"$wallet_tx") || return 1
+            block=$(rpc getblock "$blockhash" 1) || return 1
+            active_blockhash=$(rpc getblockhash "$blockheight" | jq -er '.') || return 1
+            jq -e -n --arg txid "$txid" --arg blockhash "$blockhash" \
+                --arg active "$active_blockhash" --argjson height "$blockheight" \
+                --argjson terminal "$terminal_chain" --argjson block "$block" '
+              $terminal.chain == "main" and $terminal.initialblockdownload == false and
+              $terminal.blocks == $terminal.headers and $height <= $terminal.blocks and
+              $active == $blockhash and $block.hash == $blockhash and
+              $block.height == $height and ($block.tx | index($txid)) != null
+            ' >/dev/null || return 1
+            jq -cS -n --arg txid "$txid" --argjson wallet_tx "$wallet_tx" \
+                --argjson matches "$recovery_matches" --argjson block "$block" \
+                --arg active "$active_blockhash" '
+              {txid:$txid,classification:"external_receive",
+               confirmation_state:"confirmed_active_chain",
+               gettransaction_response:$wallet_tx,recovery_matches:$matches,
+               recovery_match_count:($matches|length),getblock_response:$block,
+               getblockhash_response:$active,active_chain_bound:true,
+               unconfirmed_recovery_bound:false}
+            ' >>"${tmp}.records" || return 1
+        else
+            jq -e --arg zero "$HOTFIX_ZERO_TXID" --argjson matches "$recovery_matches" \
+                --slurpfile recovery "${EVIDENCE}/candidate-final-recovery-inventory.json" '
+              def valid_null_or_real_outpoint:
+                (.anchor.txid == $zero and .anchor.vout == 4294967295) or
+                ((.anchor.txid | type) == "string" and
+                  (.anchor.txid | test("^[0-9a-f]{64}$")) and .anchor.txid != $zero and
+                  (.anchor.vout | type) == "number" and
+                  (.anchor.vout | floor) == .anchor.vout and
+                  .anchor.vout >= 0 and .anchor.vout < 4294967295);
+              (has("blockhash") | not) and (has("blockheight") | not) and
+              (has("blockindex") | not) and (has("blocktime") | not) and
+              ($matches | length) <= 1 and
+              all($matches[];
+                .anchor_authenticated == false and .anchor_unspent == false and
+                .anchor_user_locked == false and .anchor.amount == 0 and
+                .anchor.scriptPubKey == "" and valid_null_or_real_outpoint and
+                (.claim_txids | type) == "array" and (.claim_txids | length) >= 1 and
+                all(.claim_txids[]; . as $claim |
+                  ($recovery[0].unanchored_claim_txids | index($claim)) != null))
+            ' <<<"$wallet_tx" >/dev/null || return 1
+            jq -cS -n --arg txid "$txid" --argjson wallet_tx "$wallet_tx" \
+                --argjson matches "$recovery_matches" '
+              {txid:$txid,classification:"external_receive",
+               confirmation_state:"unconfirmed",gettransaction_response:$wallet_tx,
+               recovery_matches:$matches,recovery_match_count:($matches|length),
+               getblock_response:null,getblockhash_response:null,
+               active_chain_bound:false,unconfirmed_recovery_bound:true}
+            ' >>"${tmp}.records" || return 1
+        fi
+    done <"${tmp}.external-txids"
+    jq -S -n --arg nonce "$run_nonce" --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" \
+        --argjson terminal "$terminal_chain" --slurpfile sets "${tmp}.sets" \
+        --slurpfile records "${tmp}.records" '
+      {schema:1,phase:"A",run_nonce:$nonce,candidate_source_sha:$source,
+       terminal_tip:$terminal.bestblockhash,terminal_height:$terminal.blocks,
+       prelaunch_wallet_txids:$sets[0].prelaunch_wallet_txids,
+       final_wallet_txids:$sets[0].final_wallet_txids,
+       new_wallet_txids:$sets[0].new_wallet_txids,
+       candidate_authored_txids:$sets[0].candidate_authored_txids,
+       external_receive_txids:$sets[0].external_receive_txids,
+       records:($records | sort_by(.txid)),sets_disjoint:true,
+       wallet_differential_exhaustive:true}
+    ' >"${tmp}.evidence" || return 1
+    jq -e '
+      .schema == 1 and .phase == "A" and
+      (.run_nonce | type) == "string" and (.run_nonce | length) > 0 and
+      (.candidate_source_sha | test("^[0-9a-f]{40}$")) and
+      (.terminal_tip | test("^[0-9a-f]{64}$")) and
+      (.terminal_height | type) == "number" and
+      (.terminal_height | floor) == .terminal_height and .terminal_height >= 0 and
+      .sets_disjoint == true and .wallet_differential_exhaustive == true and
+      (.candidate_authored_txids - .external_receive_txids | length) ==
+        (.candidate_authored_txids | length) and
+      .new_wallet_txids ==
+        ((.candidate_authored_txids + .external_receive_txids) | unique | sort) and
+      ([.records[].txid] | unique | sort) == .external_receive_txids and
+      all(.records[]; .txid as $txid |
+        .classification == "external_receive" and
+        .gettransaction_response.txid == $txid and
+        .gettransaction_response.decoded.txid == $txid and
+        (.recovery_match_count | type) == "number" and
+        .recovery_match_count == (.recovery_matches | length) and
+        .recovery_match_count <= 1 and
+        (if .confirmation_state == "confirmed_active_chain" then
+           .active_chain_bound == true and .unconfirmed_recovery_bound == false and
+           .recovery_match_count == 0 and
+           (.getblock_response.tx | index($txid)) != null and
+           .getblockhash_response == .gettransaction_response.blockhash
+         elif .confirmation_state == "unconfirmed" then
+           .active_chain_bound == false and .unconfirmed_recovery_bound == true and
+           .getblock_response == null and .getblockhash_response == null
+         else false end))
+    ' "${tmp}.evidence" >/dev/null || return 1
+    install -m 600 -o root -g root "${tmp}.evidence" "$EXTERNAL_RECEIVE_EVIDENCE" ||
+        return 1
+    sync -f "$EXTERNAL_RECEIVE_EVIDENCE" && sync -f "$EVIDENCE" || return 1
+    rm -f -- "$tmp" "${tmp}.sets" "${tmp}.external-txids" \
+        "${tmp}.records" "${tmp}.evidence"
+}
+
 capture_observer_terminal_proof()
 {
-    local terminal_chain="$1" anchor_txid="$2" anchor_vout="$3"
-    local observer chain1 chain2 mempool anchor txid raw_error relation terminal_work observer_work
+    local terminal_chain="$1" anchors_file="$2" mapping_file="$3"
+    local observer chain1 chain2 mempool anchor txid anchor_txid anchor_vout
+    local raw_error relation terminal_work observer_work
     : >"${EVIDENCE}/observer-mempools.jsonl"
     : >"${EVIDENCE}/observer-final-chain.jsonl"
     : >"${EVIDENCE}/observer-anchor-unspent.jsonl"
@@ -1642,11 +1926,20 @@ capture_observer_terminal_proof()
           . as $observer_mempool |
           all($ids[0][]; . as $id | ($observer_mempool | index($id)) == null)
         ' <<<"$mempool" >/dev/null || return 1
-        anchor=$(timeout -k 2 30 docker exec "$observer" "$CLI" -datadir="$DATADIR" \
-            gettxout "$anchor_txid" "$anchor_vout" true) || return 1
-        jq -e 'type == "object" and .confirmations >= 1 and .coinbase == false' \
-            <<<"$anchor" >/dev/null || return 1
-        while IFS= read -r txid; do
+        while IFS=$'\t' read -r anchor_txid anchor_vout; do
+            [[ -n "$anchor_txid" && -n "$anchor_vout" ]] || return 1
+            anchor=$(timeout -k 2 30 docker exec "$observer" "$CLI" -datadir="$DATADIR" \
+                gettxout "$anchor_txid" "$anchor_vout" true) || return 1
+            jq -e 'type == "object" and .confirmations >= 1 and .coinbase == false' \
+                <<<"$anchor" >/dev/null || return 1
+            jq -cS -n --arg observer "$observer" --arg anchor_txid "$anchor_txid" \
+                --argjson anchor_vout "$anchor_vout" --argjson txout "$anchor" '
+                {observer:$observer,anchor:{txid:$anchor_txid,vout:$anchor_vout},
+                 unspent:true,txout:$txout}
+            ' >>"${EVIDENCE}/observer-anchor-unspent.jsonl" || return 1
+        done < <(jq -r '.[] | [.txid,.vout] | @tsv' "$anchors_file")
+        while IFS=$'\t' read -r txid anchor_txid anchor_vout; do
+            [[ -n "$txid" && -n "$anchor_txid" && -n "$anchor_vout" ]] || return 1
             if raw_error=$(timeout -k 2 30 docker exec "$observer" "$CLI" -datadir="$DATADIR" \
                 getrawtransaction "$txid" true 2>&1); then
                 return 1
@@ -1659,7 +1952,7 @@ capture_observer_terminal_proof()
                  active_chain_absence_basis:"authenticated-anchor-unspent",
                  anchor:{txid:$anchor_txid,vout:$anchor_vout,unspent:true}}
             ' >>"${EVIDENCE}/observer-tx-absence.jsonl" || return 1
-        done < <(jq -r '.[]' "${EVIDENCE}/candidate-created-qqsproof-txids.json")
+        done < <(jq -r '.[] | [.txid,.anchor_txid,.anchor_vout] | @tsv' "$mapping_file")
         chain2=$(timeout -k 2 30 docker exec "$observer" "$CLI" -datadir="$DATADIR" \
             getblockchaininfo) || return 1
         jq -e -n --argjson a "$chain1" --argjson b "$chain2" '
@@ -1678,62 +1971,113 @@ capture_observer_terminal_proof()
         ' >>"${EVIDENCE}/observer-final-chain.jsonl" || return 1
         jq -cS -n --arg observer "$observer" --argjson txids "$mempool" \
             '{observer:$observer,txids:$txids}' >>"${EVIDENCE}/observer-mempools.jsonl" || return 1
-        jq -cS -n --arg observer "$observer" --arg anchor_txid "$anchor_txid" \
-            --argjson anchor_vout "$anchor_vout" --argjson txout "$anchor" '
-            {observer:$observer,anchor:{txid:$anchor_txid,vout:$anchor_vout},
-             unspent:true,txout:$txout}
-        ' >>"${EVIDENCE}/observer-anchor-unspent.jsonl" || return 1
     done
 }
 
 capture_final_proof_inputs()
 {
-    local tmp chain1 chain2 pow2 staking2 recovery2 anchor_txid anchor_vout
+    local tmp chain1 chain2 pow2 staking2 recovery2 mempool2 anchor_count
+    local goldrush1 goldrush2 progress_goldrush
+    local observed1 observed2 mempool_verbose_sha mempool_verbose_after_sha
     local expected_absence_rows mempool_rows chain_rows anchor_rows absence_rows final_cut_sha
+    local recovery_authority_sha recovery_after_authority_sha
+    local pow_gate_authority_sha pow_after_gate_authority_sha payout
     tmp=$(mktemp "${OPS}/.candidate-final-cut.XXXXXX") || return 1
     for _ in $(seq 1 60); do
         chain1=$(rpc getblockchaininfo) || return 1
+        goldrush1=$(rpc getgoldrushstate | jq -ceS \
+          '{bestblock,height,qqp4_activation_disabled,qqp4_activation_height,
+            qqp4_active,qqp4_active_next_block}') || return 1
         capture_wallet_state candidate-final || return 1
         rpc getpowmininginfo >"${EVIDENCE}/candidate-final-pow.json" || return 1
         rpc getstakinginfo >"${EVIDENCE}/candidate-final-staking.json" || return 1
         rpc getquantumkeyinventory | jq -S . \
             >"${EVIDENCE}/candidate-final-quantum-inventory.json" || return 1
-        jq -S -n --slurpfile before "${EVIDENCE}/baseline-wallet-transactions.json" \
+        capture_quantum_payout_label_evidence \
+            "${EVIDENCE}/candidate-final-quantum-inventory.json" \
+            "${EVIDENCE}/candidate-final-quantum-labels.json" || return 1
+        payout=$(jq -er '.payout_address | select(type=="string")' \
+            "${EVIDENCE}/candidate-final-pow.json") || return 1
+        if [[ -n "$payout" ]]; then
+            rpc getaddressinfo "$payout" | jq -S . \
+                >"${EVIDENCE}/candidate-final-payout-address.json" || return 1
+            hotfix_quantum_payout_address_is_valid \
+                "${EVIDENCE}/candidate-final-payout-address.json" \
+                "${EVIDENCE}/baseline-quantum-inventory.json" "$payout" || return 1
+            hotfix_quantum_payout_address_is_valid \
+                "${EVIDENCE}/candidate-final-payout-address.json" \
+                "${EVIDENCE}/candidate-final-quantum-inventory.json" "$payout" || return 1
+        else
+            printf 'null\n' >"${EVIDENCE}/candidate-final-payout-address.json" || return 1
+        fi
+        rpc getrawmempool true | jq -S . \
+            >"${EVIDENCE}/candidate-final-mempool-verbose.json" || return 1
+        observed1=$(date +%s) || return 1
+        # Candidate authorship begins at the exact locked prelaunch cut.  The
+        # earlier baseline capture precedes shutdown and may legitimately gain
+        # a final immutable-v30.1.4 wallet record before prelaunch.
+        jq -S -n --slurpfile before "${EVIDENCE}/prelaunch-wallet-transactions.json" \
             --slurpfile after "${EVIDENCE}/candidate-final-wallet-transactions.json" '
             ($before[0] | map(.txid) | unique) as $old |
             [$after[0][] | .txid as $id |
               select(($old | index($id)) == null) |
-              select(.comment == "PoW Claim" or has("qq_shadow_pow_lineage_schema") or
-                has("qq_shadow_pow_lineage_root")) | $id] | unique | sort
+              select((.comment == "PoW Claim" or has("qq_shadow_pow_lineage_schema") or
+                has("qq_shadow_pow_lineage_root")) and
+                (has("qq_shadow_pow_legacy_cleanup_quarantine") | not) and
+                (has("qq_auto_shadow_stale") | not) and
+                (has("qq_manual_shadow_abandon") | not) and
+                (has("qq_reorg_shadow_resubmit") | not)) | $id] | unique | sort
         ' >"${EVIDENCE}/candidate-created-qqsproof-txids.json" || return 1
-        jq -e 'type == "array" and length >= 4 and
+        jq -e 'type == "array" and
           all(.[]; type == "string" and test("^[0-9a-f]{64}$")) and
           (unique | length) == length' \
           "${EVIDENCE}/candidate-created-qqsproof-txids.json" >/dev/null || return 1
-        anchor_txid=$(jq -er --slurpfile ids \
-            "${EVIDENCE}/candidate-created-qqsproof-txids.json" '
-            [.component_details[]? | select(.anchor_authenticated == true and
-              .anchor_unspent == true and
-              ([$ids[0][] as $id | ((.claim_txids // []) | index($id) != null)] | all))] |
-            select(length == 1) | .[0].anchor.txid |
-            select(type == "string" and test("^[0-9a-f]{64}$"))
-        ' "${EVIDENCE}/candidate-final-recovery-inventory.json") || return 1
-        anchor_vout=$(jq -er --slurpfile ids \
-            "${EVIDENCE}/candidate-created-qqsproof-txids.json" '
-            [.component_details[]? | select(.anchor_authenticated == true and
-              .anchor_unspent == true and
-              ([$ids[0][] as $id | ((.claim_txids // []) | index($id) != null)] | all))] |
-            select(length == 1) | .[0].anchor.vout |
-            select(type == "number" and floor == . and . >= 0)
-        ' "${EVIDENCE}/candidate-final-recovery-inventory.json") || return 1
-        capture_observer_terminal_proof "$chain1" "$anchor_txid" "$anchor_vout" || {
+        capture_phase_a_external_receive_evidence "$chain1" || return 1
+        build_candidate_anchor_mapping \
+            "${EVIDENCE}/candidate-final-recovery-inventory.json" \
+            "${EVIDENCE}/candidate-created-qqsproof-txids.json" || return 1
+        capture_observer_terminal_proof "$chain1" \
+            "${EVIDENCE}/candidate-authenticated-anchors.json" \
+            "${EVIDENCE}/candidate-created-txid-anchor-map.json" || {
             sleep 2
             continue
         }
         pow2=$(rpc getpowmininginfo) || return 1
         staking2=$(rpc getstakinginfo) || return 1
         recovery2=$(rpc getpowclaimrecoveryinfo true) || return 1
+        mempool2=$(rpc getrawmempool true) || return 1
+        goldrush2=$(rpc getgoldrushstate | jq -ceS \
+          '{bestblock,height,qqp4_activation_disabled,qqp4_activation_height,
+            qqp4_active,qqp4_active_next_block}') || return 1
+        observed2=$(date +%s) || return 1
         chain2=$(rpc getblockchaininfo) || return 1
+        progress_goldrush=$(jq -ce '.envelopes[0].goldrush_state' \
+            "${EVIDENCE}/phase-a-progress.json") || return 1
+        hotfix_goldrush_state_json_is_valid "$goldrush1" \
+            "$(jq -er '.bestblockhash' <<<"$chain1")" \
+            "$(jq -er '.blocks' <<<"$chain1")" || return 1
+        hotfix_goldrush_state_json_is_valid "$goldrush2" \
+            "$(jq -er '.bestblockhash' <<<"$chain2")" \
+            "$(jq -er '.blocks' <<<"$chain2")" || return 1
+        jq -e -n --argjson first "$goldrush1" --argjson second "$goldrush2" \
+            --argjson progress "$progress_goldrush" '
+          def schedule: {qqp4_activation_disabled,qqp4_activation_height};
+          ($first|schedule)==($second|schedule) and
+          ($first|schedule)==($progress|schedule)
+        ' >/dev/null || return 1
+        recovery_authority_sha=$(hotfix_recovery_authority_json_sha256 \
+            "$(<"${EVIDENCE}/candidate-final-recovery-inventory.json")") || return 1
+        recovery_after_authority_sha=$(hotfix_recovery_authority_json_sha256 \
+            "$recovery2") || return 1
+        pow_gate_authority_sha=$(hotfix_pow_gate_authority_json_sha256 \
+            "$(<"${EVIDENCE}/candidate-final-pow.json")") || return 1
+        pow_after_gate_authority_sha=$(hotfix_pow_gate_authority_json_sha256 \
+            "$pow2") || return 1
+        if [[ "$recovery_authority_sha" != "$recovery_after_authority_sha" ||
+              "$pow_gate_authority_sha" != "$pow_after_gate_authority_sha" ]]; then
+            sleep 2
+            continue
+        fi
         if ! jq -e -n --argjson c1 "$chain1" --argjson c2 "$chain2" \
             --slurpfile recovery1 "${EVIDENCE}/candidate-final-recovery-inventory.json" \
             --argjson recovery2 "$recovery2" \
@@ -1757,18 +2101,22 @@ capture_final_proof_inputs()
             "$(<"${EVIDENCE}/candidate-final-staking.json")" || return 1
         hotfix_phase_a_staking_json_is_disabled "$staking2" || return 1
         hotfix_candidate_recovery_json_is_valid \
+            "$(<"${EVIDENCE}/candidate-final-recovery-inventory.json")" || return 1
+        hotfix_candidate_recovery_json_is_valid "$recovery2" || return 1
+        hotfix_pow_recovery_same_cut_json_is_valid \
+            "$(<"${EVIDENCE}/candidate-final-pow.json")" \
+            "$(<"${EVIDENCE}/candidate-final-recovery-inventory.json")" || return 1
+        hotfix_pow_recovery_same_cut_json_is_valid "$pow2" "$recovery2" || return 1
+        hotfix_pow_observation_json_is_valid \
+            "$(<"${EVIDENCE}/candidate-final-pow.json")" \
             "$(<"${EVIDENCE}/candidate-final-recovery-inventory.json")" \
-            "$baseline_recovery_fee" || return 1
-        hotfix_candidate_recovery_json_is_valid "$recovery2" "$baseline_recovery_fee" || return 1
-        recovery_metrics_match_baseline \
-            "${EVIDENCE}/candidate-final-recovery-inventory.json" || return 1
+            "$(<"${EVIDENCE}/candidate-final-mempool-verbose.json")" \
+            "$(jq -er '.bestblockhash' <<<"$chain1")" \
+            "$(jq -er '.blocks' <<<"$chain1")" "$observed1" "$goldrush1" || return 1
+        hotfix_pow_observation_json_is_valid "$pow2" "$recovery2" "$mempool2" \
+            "$(jq -er '.bestblockhash' <<<"$chain2")" \
+            "$(jq -er '.blocks' <<<"$chain2")" "$observed2" "$goldrush2" || return 1
         printf '%s\n' "$recovery2" >"${tmp}.recovery-final-after" || return 1
-        recovery_metrics_match_baseline "${tmp}.recovery-final-after" || return 1
-        jq -e --argjson manual "$baseline_pending_manual" \
-            --argjson automatic "$baseline_pending_automatic" '
-            .pending_manual_resolutions == $manual and
-            .pending_automatic_resolutions == $automatic
-        ' <<<"$recovery2" >/dev/null || return 1
         printf '%s\n' "$chain1" | jq -S . >"${EVIDENCE}/candidate-final-chain.json" || return 1
         printf '%s\n' "$chain2" | jq -S . >"${EVIDENCE}/candidate-final-chain-after.json" || return 1
         printf '%s\n' "$pow2" | jq -S . >"${EVIDENCE}/candidate-final-pow-after.json" || return 1
@@ -1776,33 +2124,70 @@ capture_final_proof_inputs()
             >"${EVIDENCE}/candidate-final-staking-after.json" || return 1
         printf '%s\n' "$recovery2" | jq -S . \
             >"${EVIDENCE}/candidate-final-recovery-after.json" || return 1
+        printf '%s\n' "$mempool2" | jq -S . \
+            >"${EVIDENCE}/candidate-final-mempool-verbose-after.json" || return 1
+        printf '%s\n' "$goldrush1" | jq -S . \
+            >"${EVIDENCE}/candidate-final-goldrush-state.json" || return 1
+        printf '%s\n' "$goldrush2" | jq -S . \
+            >"${EVIDENCE}/candidate-final-goldrush-state-after.json" || return 1
         rm -f -- "${tmp}.recovery-final-after"
         expected_absence_rows=$((2 * $(jq 'length' \
             "${EVIDENCE}/candidate-created-qqsproof-txids.json")))
+        anchor_count=$(jq -er 'length' \
+            "${EVIDENCE}/candidate-authenticated-anchors.json") || return 1
         mempool_rows=$(wc -l <"${EVIDENCE}/observer-mempools.jsonl" | tr -d ' ')
         chain_rows=$(wc -l <"${EVIDENCE}/observer-final-chain.jsonl" | tr -d ' ')
         anchor_rows=$(wc -l <"${EVIDENCE}/observer-anchor-unspent.jsonl" | tr -d ' ')
         absence_rows=$(wc -l <"${EVIDENCE}/observer-tx-absence.jsonl" | tr -d ' ')
-        [[ "$mempool_rows" == 2 && "$chain_rows" == 2 && "$anchor_rows" == 2 &&
+        [[ "$mempool_rows" == 2 && "$chain_rows" == 2 &&
+           "$anchor_rows" == "$((2 * anchor_count))" &&
            "$absence_rows" == "$expected_absence_rows" ]] || return 1
-        jq -S -n --arg anchor_txid "$anchor_txid" --argjson anchor_vout "$anchor_vout" \
-            --arg terminal_tip "$(jq -er '.bestblockhash' <<<"$chain1")" \
+        jq -S -n --arg terminal_tip "$(jq -er '.bestblockhash' <<<"$chain1")" \
             --arg terminal_work "$(jq -er '.chainwork' <<<"$chain1")" \
+            --slurpfile authenticated_anchors \
+                "${EVIDENCE}/candidate-authenticated-anchors.json" \
+            --slurpfile txid_anchor_map \
+                "${EVIDENCE}/candidate-created-txid-anchor-map.json" \
             --slurpfile chains "${EVIDENCE}/observer-final-chain.jsonl" \
             --slurpfile anchors "${EVIDENCE}/observer-anchor-unspent.jsonl" \
             --slurpfile absence "${EVIDENCE}/observer-tx-absence.jsonl" '
-            {schema:1,terminal_tip:$terminal_tip,terminal_chainwork:$terminal_work,
-             anchor:{txid:$anchor_txid,vout:$anchor_vout},observer_chains:$chains,
+            {schema:2,terminal_tip:$terminal_tip,terminal_chainwork:$terminal_work,
+             authenticated_anchors:$authenticated_anchors[0],
+             candidate_txid_anchor_map:$txid_anchor_map[0],observer_chains:$chains,
              observer_anchors:$anchors,tx_absence:$absence,
              observers_stable_and_cover_terminal:true,
-             authenticated_anchor_unspent_on_all_observers:true}
+             authenticated_anchors_unspent_on_all_observers:true}
         ' >"${EVIDENCE}/observer-terminal-proof.json" || return 1
         final_cut_sha=$(sha256sum "${EVIDENCE}/observer-terminal-proof.json" | awk '{print $1}') || return 1
+        mempool_verbose_sha=$(sha256sum \
+            "${EVIDENCE}/candidate-final-mempool-verbose.json" | awk '{print $1}') || return 1
+        mempool_verbose_after_sha=$(sha256sum \
+            "${EVIDENCE}/candidate-final-mempool-verbose-after.json" | awk '{print $1}') || return 1
         jq -S -n --arg sha "$final_cut_sha" --arg tip "$(jq -er '.bestblockhash' <<<"$chain1")" \
             --arg work "$(jq -er '.chainwork' <<<"$chain1")" \
+            --arg recovery_authority "$recovery_authority_sha" \
+            --arg pow_gate_authority "$pow_gate_authority_sha" \
+            --arg mempool_verbose_sha "$mempool_verbose_sha" \
+            --arg mempool_verbose_after_sha "$mempool_verbose_after_sha" \
+            --arg first_goldrush "$(sha256sum \
+              "${EVIDENCE}/candidate-final-goldrush-state.json" | awk '{print $1}')" \
+            --arg second_goldrush "$(sha256sum \
+              "${EVIDENCE}/candidate-final-goldrush-state-after.json" | awk '{print $1}')" \
+            --argjson schedule "$(jq -ce \
+              '{qqp4_activation_disabled,qqp4_activation_height}' \
+              "${EVIDENCE}/candidate-final-goldrush-state.json")" \
+            --argjson observed1 "$observed1" --argjson observed2 "$observed2" \
             --argjson generation "$(jq -er '.wallet_generation' <<<"$recovery2")" '
-            {schema:1,stable:true,observer_terminal_proof_sha256:$sha,
-             terminal_tip:$tip,terminal_chainwork:$work,wallet_generation:$generation}
+            {schema:4,stable:true,observer_terminal_proof_sha256:$sha,
+             terminal_tip:$tip,terminal_chainwork:$work,wallet_generation:$generation,
+             recovery_authority_sha256:$recovery_authority,
+             pow_gate_authority_sha256:$pow_gate_authority,
+             first_observed_epoch:$observed1,second_observed_epoch:$observed2,
+             first_goldrush_state_sha256:$first_goldrush,
+             second_goldrush_state_sha256:$second_goldrush,
+             qqp4_schedule:$schedule,
+             first_mempool_verbose_sha256:$mempool_verbose_sha,
+             second_mempool_verbose_sha256:$mempool_verbose_after_sha}
         ' >"$tmp" || return 1
         install -m 600 -o root -g root "$tmp" "${EVIDENCE}/candidate-final-stable-cut.json" ||
             return 1
@@ -1816,11 +2201,11 @@ capture_final_proof_inputs()
 build_no_recovery_spend_proof()
 {
     local tmp forbidden rpc_sha payout_after quantum_after quantum_sha_after
-    local fee_after cumulative_after pending_manual_after pending_automatic_after
-    local recovery_metrics_after recovery_metrics_after_sha
     local observer_terminal_sha stable_cut_sha stopped_sha complete_log_sha log_receipt_sha
     local sample expected_visibility_sha actual_visibility_sha
-    payout_after=$(jq -er '.payout_address | select(type == "string" and length > 0)' \
+    local recovery_authority_sha recovery_after_authority_sha
+    local pow_gate_authority_sha pow_after_gate_authority_sha
+    payout_after=$(jq -er '.payout_address | select(type == "string")' \
         "${EVIDENCE}/candidate-final-pow.json") || return 1
     quantum_after=$(jq -er '
         if type == "array" then length
@@ -1830,28 +2215,12 @@ build_no_recovery_spend_proof()
         else error("unsupported quantum inventory") end
     ' "${EVIDENCE}/candidate-final-quantum-inventory.json") || return 1
     quantum_sha_after=$(sha256sum "${EVIDENCE}/candidate-final-quantum-inventory.json" | awk '{print $1}')
-    fee_after=$(jq -er '.confirmed_resolution_fees' \
-        "${EVIDENCE}/candidate-final-recovery-inventory.json") || return 1
-    cumulative_after=$(jq -er '.cumulative_resolution_fees // .confirmed_resolution_fees' \
-        "${EVIDENCE}/candidate-final-recovery-inventory.json") || return 1
-    pending_manual_after=$(jq -er '.pending_manual_resolutions' \
-        "${EVIDENCE}/candidate-final-recovery-inventory.json") || return 1
-    pending_automatic_after=$(jq -er '.pending_automatic_resolutions' \
-        "${EVIDENCE}/candidate-final-recovery-inventory.json") || return 1
-    recovery_metrics_after=$(recovery_metrics_json \
-        "${EVIDENCE}/candidate-final-recovery-inventory.json") || return 1
-    recovery_metrics_after_sha=$(printf '%s' "$recovery_metrics_after" | sha256sum |
-        awk '{print $1}') || return 1
-    [[ "$recovery_metrics_after" == "$baseline_recovery_metrics_json" &&
-       "$recovery_metrics_after_sha" == "$baseline_recovery_metrics_sha" ]] || return 1
-    forbidden=$(grep -Ev '^(getblockchaininfo|getnetworkinfo|getpeerinfo|getpowclaimrecoveryinfo|getpowmininginfo|getquantumkeyinventory|getrawmempool|getstakinginfo|gettxout|getwalletinfo|listquantumaddresses|listtransactions|listunspent|listwallets|setpowmining:(true|false):1:1:false|staking:false|stop|validateaddress|walletlock)$' \
+    forbidden=$(grep -Ev '^(getaddressinfo|getaddressesbylabel|getblock|getblockchaininfo|getblockhash|getgoldrushstate|getnetworkinfo|getpeerinfo|getpowclaimrecoveryinfo|getpowmininginfo|getquantumkeyinventory|getrawmempool|getstakinginfo|gettransaction|gettxout|getwalletinfo|listquantumaddresses|listtransactions|listunspent|listwallets|setpowmining:(true|false):1:1:false|staking:false|stop|walletlock)$' \
         "$RPC_METHODS_LOG" | sort -u || true)
     [[ -z "$forbidden" ]] || return 1
     install -m 600 -o root -g root "$RPC_METHODS_LOG" \
         "${EVIDENCE}/candidate-rpc-methods-through-proof.log" || return 1
     rpc_sha=$(sha256sum "${EVIDENCE}/candidate-rpc-methods-through-proof.log" | awk '{print $1}') || return 1
-    grep -F 'retained a claim after relay failure' "${EVIDENCE}/candidate-complete.log" >/dev/null || return 1
-    grep -F 'persisted without relay' "${EVIDENCE}/candidate-complete.log" >/dev/null || return 1
     jq -e --arg image "$CANDIDATE_IMAGE_ID" '
       .running == false and .exit_code == 0 and .image_id == $image
     ' "${EVIDENCE}/candidate-stopped.json" >/dev/null || return 1
@@ -1863,15 +2232,56 @@ build_no_recovery_spend_proof()
     complete_log_sha=$(sha256sum "${EVIDENCE}/candidate-complete.log" | awk '{print $1}') || return 1
     log_receipt_sha=$(sha256sum "${EVIDENCE}/candidate-post-stop-log-receipt.json" |
         awk '{print $1}') || return 1
+    recovery_authority_sha=$(hotfix_recovery_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-recovery-inventory.json")") || return 1
+    recovery_after_authority_sha=$(hotfix_recovery_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-recovery-after.json")") || return 1
+    pow_gate_authority_sha=$(hotfix_pow_gate_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-pow.json")") || return 1
+    pow_after_gate_authority_sha=$(hotfix_pow_gate_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-pow-after.json")") || return 1
+    [[ "$recovery_authority_sha" == "$recovery_after_authority_sha" &&
+       "$pow_gate_authority_sha" == "$pow_after_gate_authority_sha" ]] || return 1
     jq -e --arg stopped "$stopped_sha" --arg log "$complete_log_sha" '
       .schema == 1 and .candidate_stopped_receipt_sha256 == $stopped and
       .complete_log_sha256 == $log and .captured_after_clean_stop == true
     ' "${EVIDENCE}/candidate-post-stop-log-receipt.json" >/dev/null || return 1
-    jq -e --arg observer_sha "$observer_terminal_sha" '
-      .schema == 1 and .stable == true and
-      .observer_terminal_proof_sha256 == $observer_sha
+    jq -e --arg observer_sha "$observer_terminal_sha" \
+        --arg recovery_authority "$recovery_authority_sha" \
+        --arg pow_gate_authority "$pow_gate_authority_sha" \
+        --arg first_mempool "$(sha256sum \
+          "${EVIDENCE}/candidate-final-mempool-verbose.json" | awk '{print $1}')" \
+        --arg second_mempool "$(sha256sum \
+          "${EVIDENCE}/candidate-final-mempool-verbose-after.json" | awk '{print $1}')" \
+        --arg first_goldrush "$(sha256sum \
+          "${EVIDENCE}/candidate-final-goldrush-state.json" | awk '{print $1}')" \
+        --arg second_goldrush "$(sha256sum \
+          "${EVIDENCE}/candidate-final-goldrush-state-after.json" | awk '{print $1}')" '
+      (keys | sort) == (["first_goldrush_state_sha256",
+        "first_mempool_verbose_sha256","first_observed_epoch",
+        "observer_terminal_proof_sha256","pow_gate_authority_sha256",
+        "qqp4_schedule","recovery_authority_sha256","schema",
+        "second_goldrush_state_sha256","second_mempool_verbose_sha256",
+        "second_observed_epoch","stable","terminal_chainwork","terminal_tip",
+        "wallet_generation"] | sort) and
+      .schema == 4 and .stable == true and
+      .observer_terminal_proof_sha256 == $observer_sha and
+      .recovery_authority_sha256 == $recovery_authority and
+      .pow_gate_authority_sha256 == $pow_gate_authority and
+      (.first_observed_epoch | type) == "number" and
+      (.first_observed_epoch | floor) == .first_observed_epoch and
+      .first_observed_epoch > 0 and
+      (.second_observed_epoch | type) == "number" and
+      (.second_observed_epoch | floor) == .second_observed_epoch and
+      .second_observed_epoch >= .first_observed_epoch and
+      .first_mempool_verbose_sha256 == $first_mempool and
+      .second_mempool_verbose_sha256 == $second_mempool and
+      .first_goldrush_state_sha256 == $first_goldrush and
+      .second_goldrush_state_sha256 == $second_goldrush and
+      (.qqp4_schedule|keys|sort)==
+        ["qqp4_activation_disabled","qqp4_activation_height"]
     ' "${EVIDENCE}/candidate-final-stable-cut.json" >/dev/null || return 1
-    for sample in 1 2 3 4; do
+    for sample in $(seq 1 "$PHASE_A_OBSERVATION_SAMPLES"); do
         expected_visibility_sha=$(jq -er --argjson index "$((sample - 1))" \
             '.visibility_sample_sha256s[$index]' "$CANDIDATE_PROGRESS") || return 1
         actual_visibility_sha=$(sha256sum \
@@ -1879,39 +2289,43 @@ build_no_recovery_spend_proof()
             awk '{print $1}') || return 1
         [[ "$expected_visibility_sha" == "$actual_visibility_sha" ]] || return 1
     done
+    : >"${EVIDENCE}/candidate-claim-samples.jsonl"
+    for sample in $(seq 1 "$PHASE_A_OBSERVATION_SAMPLES"); do
+        jq -cS . "${EVIDENCE}/candidate-claims-sample-${sample}.json" \
+            >>"${EVIDENCE}/candidate-claim-samples.jsonl" || return 1
+    done
+    sync -f "${EVIDENCE}/candidate-claim-samples.jsonl"
     tmp=$(mktemp "${OPS}/.no-recovery-spend.XXXXXX") || return 1
     jq -S -n --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" \
+        --argjson sample_count "$PHASE_A_OBSERVATION_SAMPLES" \
         --arg payout_before "$baseline_payout" --arg payout_after "$payout_after" \
         --argjson quantum_before "$baseline_quantum_key_count" --argjson quantum_after "$quantum_after" \
         --arg quantum_sha_before "$(sha256sum "${EVIDENCE}/baseline-quantum-inventory.json" | awk '{print $1}')" \
         --arg quantum_sha_after "$quantum_sha_after" \
-        --argjson fee_before "$baseline_recovery_fee" --argjson fee_after "$fee_after" \
-        --argjson cumulative_before "$baseline_cumulative_recovery_fee" \
-        --argjson cumulative_after "$cumulative_after" \
-        --argjson pending_manual_before "$baseline_pending_manual" \
-        --argjson pending_manual_after "$pending_manual_after" \
-        --argjson pending_automatic_before "$baseline_pending_automatic" \
-        --argjson pending_automatic_after "$pending_automatic_after" \
-        --arg recovery_metrics_before "$baseline_recovery_metrics_sha" \
-        --arg recovery_metrics_after "$recovery_metrics_after_sha" \
+        --arg quantum_labels_before "$(sha256sum "${EVIDENCE}/baseline-quantum-labels.json" | awk '{print $1}')" \
+        --arg quantum_labels_after "$(sha256sum "${EVIDENCE}/candidate-final-quantum-labels.json" | awk '{print $1}')" \
         --arg rpc_sha "$rpc_sha" --arg nonce "$run_nonce" --arg zero "$HOTFIX_ZERO_TXID" \
         --arg observer_terminal_sha "$observer_terminal_sha" \
         --arg stable_cut_sha "$stable_cut_sha" --arg stopped_sha "$stopped_sha" \
         --arg complete_log_sha "$complete_log_sha" --arg log_receipt_sha "$log_receipt_sha" \
+        --arg external_receive_sha "$(sha256sum "$EXTERNAL_RECEIVE_EVIDENCE" | awk '{print $1}')" \
         --slurpfile before "${EVIDENCE}/prelaunch-wallet-transactions.json" \
         --slurpfile after "${EVIDENCE}/candidate-final-wallet-transactions.json" \
+        --slurpfile external_receives "$EXTERNAL_RECEIVE_EVIDENCE" \
         --slurpfile mempool "${EVIDENCE}/candidate-final-mempool.json" \
         --slurpfile observers "${EVIDENCE}/observer-mempools.jsonl" \
         --slurpfile observer_absence "${EVIDENCE}/observer-tx-absence.jsonl" \
         --slurpfile visibility "${EVIDENCE}/tx-visibility-samples.jsonl" \
-        --slurpfile sample1 "${EVIDENCE}/candidate-claims-sample-1.json" \
-        --slurpfile sample2 "${EVIDENCE}/candidate-claims-sample-2.json" \
-        --slurpfile sample3 "${EVIDENCE}/candidate-claims-sample-3.json" \
-        --slurpfile sample4 "${EVIDENCE}/candidate-claims-sample-4.json" \
+        --slurpfile claim_samples "${EVIDENCE}/candidate-claim-samples.jsonl" \
+        --slurpfile candidate_ids "${EVIDENCE}/candidate-created-qqsproof-txids.json" \
+        --slurpfile candidate_map "${EVIDENCE}/candidate-created-txid-anchor-map.json" \
+        --slurpfile candidate_anchors "${EVIDENCE}/candidate-authenticated-anchors.json" \
+        --slurpfile payout_after_evidence "${EVIDENCE}/candidate-final-payout-address.json" \
         --slurpfile mining "${EVIDENCE}/candidate-final-pow.json" \
         --slurpfile recovery "${EVIDENCE}/candidate-final-recovery-inventory.json" \
         --slurpfile progress "$CANDIDATE_PROGRESS" \
         --slurpfile stable_cut "${EVIDENCE}/candidate-final-stable-cut.json" \
+        --slurpfile final_chain "${EVIDENCE}/candidate-final-chain.json" \
         --slurpfile observer_terminal "${EVIDENCE}/observer-terminal-proof.json" \
         --slurpfile outpoints_before "${EVIDENCE}/prelaunch-wallet-outpoints.json" \
         --slurpfile outpoints_after "${EVIDENCE}/candidate-final-wallet-outpoints.json" \
@@ -1920,28 +2334,62 @@ build_no_recovery_spend_proof()
         --slurpfile component_before "${EVIDENCE}/prelaunch-component-resolution-txids.json" \
         --slurpfile component_after "${EVIDENCE}/candidate-final-component-resolution-txids.json" '
         def qq: (.comment == "PoW Claim" or has("qq_shadow_pow_lineage_schema") or
-          has("qq_shadow_pow_lineage_root"));
+          has("qq_shadow_pow_lineage_root")) and
+          (has("qq_shadow_pow_legacy_cleanup_quarantine") | not) and
+          (has("qq_auto_shadow_stale") | not) and
+          (has("qq_manual_shadow_abandon") | not) and
+          (has("qq_reorg_shadow_resubmit") | not);
+        def exact_proof_tuple($node):
+          ($node.proof_version == 2 and $node.proof_origin_bound == false and
+             $node.proof_input_bound == false) or
+          ($node.proof_version == 3 and $node.proof_origin_bound == true and
+             $node.proof_input_bound == false) or
+          ($node.proof_version == 4 and $node.proof_origin_bound == true and
+             $node.proof_input_bound == true);
+        def authenticated_root($node;$claim_count;$generation):
+          $node.lineage_ordinal == 0 and $node.proof_mode == "pow" and
+          $node.provenance == "explicit_authored" and
+          $node.wallet_authored == true and $node.wallet_from_me == true and
+          $node.authored_metadata_valid == true and $node.expected_shape == true and
+          $node.claim_descriptor_valid == true and
+          $node.exact_authored_carrier_shape == true and exact_proof_tuple($node) and
+          $node.proof_evaluation_skipped_resolved_anchor == false and
+          $node.proof_may_revalidate_on_descendant ==
+            ($node.disposition == "unbound_proof_may_revalidate") and
+          (if $node.lineage_metadata_present then
+             $node.lineage_metadata_valid == true and
+             $node.lineage_root_txid == $node.txid and
+             $node.lineage_parent_txid == $zero and
+             $node.lineage_family_fingerprint == $generation
+           else
+             $node.lineage_metadata_valid == false and
+             $node.lineage_family_fingerprint == $zero and
+             $node.lineage_root_txid == $zero and
+             $node.lineage_parent_txid == $zero and
+             (if $node.proof_version == 2 and $claim_count == 1 then
+                $node.authored_tip_active_branch_bound == true and
+                ($node.disposition | IN("eligible","unbound_proof_may_revalidate"))
+              else true end)
+           end);
         def outpoint_key: [.txid,.vout] | @json;
-        def static_wallet_record:
-          del(.confirmations,.blockhash,.blockheight,.blockindex,.blocktime,
-            .trusted,.walletconflicts);
+        def wallet_authority_records:
+          map(.txid) | unique | sort;
         ($before[0] | map(.txid) | unique) as $old |
-        ($before[0] | map(static_wallet_record) |
-          sort_by([.txid,(.vout // -1),(.category // ""),(.address // ""),
-            (.amount // 0),(.fee // 0)])) as $old_static |
-        ($after[0] | map(. as $row | select($old | index($row.txid)) |
-          static_wallet_record) |
-          sort_by([.txid,(.vout // -1),(.category // ""),(.address // ""),
-            (.amount // 0),(.fee // 0)])) as $existing_after_static |
+        ($before[0] | wallet_authority_records) as $old_authority |
+        ($after[0] | map(. as $row | select($old | index($row.txid))) |
+          wallet_authority_records) as $existing_after_authority |
         ($after[0] | map(. as $row | select(($old | index($row.txid)) == null))) as $new_rows |
-        ($new_rows | map(.txid) | unique) as $new_txids |
-        ($new_rows | map(select(qq)) | unique_by(.txid) |
-          sort_by(.qq_shadow_pow_lineage_ordinal|tonumber)) as $claims |
-        ($claims | map(.txid)) as $txids |
-        ([$sample1[0],$sample2[0],$sample3[0],$sample4[0]]) as $claim_samples |
+        ($new_rows | map(.txid) | unique | sort) as $new_txids |
+        ($candidate_ids[0] | unique | sort) as $txids |
+        ($external_receives[0].external_receive_txids | unique | sort) as
+          $external_receive_txids |
+        ($new_rows | map(select(qq) | .txid as $id |
+          select(($txids | index($id)) != null)) | unique_by(.txid) |
+          sort_by(.txid)) as $claims |
+        $claim_samples as $claim_samples |
         ($progress[0].envelopes | map(.chain_before.bestblockhash)) as $progress_tips |
         ($claim_samples | map(.tip)) as $sample_tips |
-        (($visibility | map(.sample)) == [1,2,3,4] and
+        (([$visibility[].sample] == [range(1;$sample_count+1)]) and
           ($visibility | map(.candidate_tip)) == $progress_tips and
           ($visibility | all(.observer_chains_stable_and_cover_candidate_tip == true and
             .stable_cut_completed == true and
@@ -1960,20 +2408,118 @@ build_no_recovery_spend_proof()
         ([range(1; $sample_new_txid_sets|length) as $i |
           (($sample_new_txid_sets[$i-1] - $sample_new_txid_sets[$i]) | length) == 0] |
           all) as $samples_monotonic |
-        ([range(0; $progress_tips|length) as $i |
-          ([$claims[] | select(.qq_shadow_pow_created_tip == $progress_tips[$i]) |
-            .txid]) as $created |
-          ($created|length) == 1 and
-          (($sample_new_txid_sets[$i] | index($created[0])) != null)] |
-          all) as $progress_lineage_bound |
-        ([$recovery[0].component_details[]? | . as $component |
-          select([$txids[] as $id |
-            (($component.claim_txids // []) | index($id)) != null] | all)]) as $components |
-        ($components[0] // {}) as $component |
-        ($component.nodes // []) as $nodes |
-        ([$txids[] as $id | $nodes[]? | select(.txid == $id)]) as $candidate_nodes |
-        ([$candidate_nodes[] | select(.expired_locally_retired == true) | .txid] |
-          unique | sort) as $candidate_retired_member_txids |
+        ([$recovery[0].component_details[]? as $component |
+          ($component.nodes | map(select(.kind == "claim")) |
+            sort_by(.lineage_ordinal,.txid)) as $ordered_nodes |
+          ($ordered_nodes | map(.txid)) as $full_txids |
+          ([$ordered_nodes[] | . as $node | $node.txid as $id |
+            select(($txids | index($id)) != null)]) as $new_nodes |
+          ($new_nodes | map(.txid)) as $new_component_txids |
+          select(($new_component_txids | length) > 0) |
+          ($new_nodes | map(. as $node | $node.txid as $id |
+            ($claims | map(select(.txid == $id))) as $wallet_rows |
+            {txid:$id,ordinal:$node.lineage_ordinal,parent_txid:$node.lineage_parent_txid,
+             anchor_txid:$component.anchor.txid,anchor_vout:$component.anchor.vout,
+             family:$node.lineage_family_fingerprint,root_txid:$node.lineage_root_txid,
+             created_tip:($wallet_rows[0].qq_shadow_pow_created_tip // null),
+             quarantine_marker:($wallet_rows[0].qq_shadow_pow_quarantine // null),
+             proof_version:$node.proof_version,
+             proof_origin_bound:$node.proof_origin_bound,
+             proof_input_bound:$node.proof_input_bound,
+             expired_locally_retired:$node.expired_locally_retired,
+             confirmations:($wallet_rows[0].confirmations // 0),
+             abandoned:($wallet_rows[0].abandoned // false),
+             in_local_mempool:($mempool[0] | index($id) != null),
+             in_active_chain:$node.active_chain_confirmed,
+             observer_absent:(([$observer_absence[] |
+               select(.txid == $id and .status == "observed_absent" and
+                 .mempool_absent == true and .active_chain_absent == true and
+                 .active_chain_absence_basis == "authenticated-anchor-unspent" and
+                 .anchor.unspent == true and .anchor.txid == $component.anchor.txid and
+                 .anchor.vout == $component.anchor.vout and .rpc_error_code == -5) |
+                 .observer] | unique | length) == 2),
+             first_quarantine_observation_present:
+               (($wallet_rows[0] // {}) | has("qq_shadow_pow_first_quarantine_height")),
+             branch_quarantine_observation_present:
+               (($wallet_rows[0] // {}) | has("qq_shadow_pow_branch_quarantine_height"))})) as
+            $new_members |
+          {authenticated:
+             ($component.anchor_authenticated == true and $component.anchor_unspent == true and
+              ($ordered_nodes | length) > 0 and
+              ($full_txids | unique | length) == ($full_txids | length) and
+              ($full_txids | sort) == (($component.claim_txids // []) | sort) and
+              authenticated_root($ordered_nodes[0];($ordered_nodes|length);
+                $component.generation_fingerprint) and
+              ([range(0;$ordered_nodes|length) as $i |
+                $ordered_nodes[$i].lineage_ordinal == $i] | all) and
+              ([range(1;$ordered_nodes|length) as $i |
+                $ordered_nodes[$i].lineage_parent_txid == $ordered_nodes[$i-1].txid] | all) and
+              ([range(1;$ordered_nodes|length) as $i |
+                $ordered_nodes[$i].lineage_metadata_present == true and
+                $ordered_nodes[$i].lineage_metadata_valid == true and
+                $ordered_nodes[$i].lineage_family_fingerprint ==
+                  $component.generation_fingerprint and
+                $ordered_nodes[$i].lineage_root_txid == $ordered_nodes[0].txid] | all) and
+              ($ordered_nodes | all(.provenance == "explicit_authored" and
+                .wallet_authored == true and .wallet_from_me == true and
+                .authored_metadata_valid == true and .expected_shape == true and
+                .claim_descriptor_valid == true and
+                .exact_authored_carrier_shape == true and exact_proof_tuple(.))) and
+              $new_component_txids ==
+                $full_txids[(($full_txids|length)-($new_component_txids|length)):] and
+              ($new_nodes | all(.wallet_authored == true and
+                .lineage_metadata_present == true and .lineage_metadata_valid == true)) and
+              ([$new_component_txids[] as $id |
+                ($candidate_map[0] | map(select(.txid == $id))) as $mapped |
+                ($mapped | length) == 1 and
+                  $mapped[0].anchor_txid == $component.anchor.txid and
+                  $mapped[0].anchor_vout == $component.anchor.vout] | all) and
+              ($new_members | all(
+                ((.proof_version == 2 and .proof_origin_bound == false and
+                    .proof_input_bound == false) or
+                 (.proof_version == 3 and .proof_origin_bound == true and
+                    .proof_input_bound == false) or
+                 (.proof_version == 4 and .proof_origin_bound == true and
+                    .proof_input_bound == true)) and
+                .in_local_mempool == false and .in_active_chain == false and
+                .observer_absent == true)) and
+              $component.ordinary_or_mixed_txids == [] and $component.resolution_txids == []),
+           anchor_txid:$component.anchor.txid,anchor_vout:$component.anchor.vout,
+           family:$component.generation_fingerprint,
+           root_txid:$ordered_nodes[0].txid,
+           component_claim_txids:$full_txids,
+           full_members:[$ordered_nodes[] |
+             {txid:.txid,ordinal:.lineage_ordinal,parent_txid:.lineage_parent_txid,
+              root_txid:.lineage_root_txid,family:.lineage_family_fingerprint,
+              lineage_metadata_present:.lineage_metadata_present,
+              lineage_metadata_valid:.lineage_metadata_valid,
+              proof_mode:.proof_mode,proof_version:.proof_version,
+              proof_origin_bound:.proof_origin_bound,proof_input_bound:.proof_input_bound,
+              proof_evaluation_skipped_resolved_anchor:
+                .proof_evaluation_skipped_resolved_anchor,
+              proof_may_revalidate_on_descendant:.proof_may_revalidate_on_descendant,
+              provenance:.provenance,wallet_authored:.wallet_authored,
+              wallet_from_me:.wallet_from_me,
+              authored_metadata_valid:.authored_metadata_valid,
+              authored_tip_active_branch_bound:.authored_tip_active_branch_bound,
+              claim_descriptor_valid:.claim_descriptor_valid,
+              exact_authored_carrier_shape:.exact_authored_carrier_shape,
+              disposition:.disposition}],
+           newly_authored_txids:$new_component_txids,
+           newly_authored_members:$new_members,
+           all_claims_zero_payment_retirable:$component.all_claims_zero_payment_retirable,
+           all_claims_expired_locally_retired:$component.all_claims_expired_locally_retired,
+           ordinary_or_mixed_txids:$component.ordinary_or_mixed_txids,
+           resolution_txids:$component.resolution_txids,
+           contiguous_parents:(([range(1;$ordered_nodes|length) as $i |
+             $ordered_nodes[$i].lineage_parent_txid == $ordered_nodes[$i-1].txid] | all)),
+           newly_authored_contiguous_suffix:
+             ($new_component_txids ==
+               $full_txids[(($full_txids|length)-($new_component_txids|length)):])}
+        ] | sort_by(.anchor_txid,.anchor_vout,.family,.root_txid)) as $authored_components |
+        ([$authored_components[] | .newly_authored_members[] |
+          select(.expired_locally_retired == true) | .txid] | unique | sort) as
+          $candidate_retired_member_txids |
         ([$visibility[] | .local_mempool[] as $seen |
           select($txids | index($seen) != null) | $seen] | unique) as $sample_local_hits |
         ([$visibility[] | .observers[].txids[] as $seen |
@@ -1981,21 +2527,25 @@ build_no_recovery_spend_proof()
         ([$txids[] as $id | select($mempool[0] | index($id) != null) | $id]) as $final_local_hits |
         ([$txids[] as $id | select(any($observers[]; .txids | index($id) != null)) | $id])
           as $final_observer_hits |
-        ([$txids[] as $id | select(
-          ([$observer_absence[] | select(.txid == $id and .status == "observed_absent" and
-             .mempool_absent == true and .active_chain_absent == true and
-             .active_chain_absence_basis == "authenticated-anchor-unspent" and
-             .anchor.unspent == true and .anchor.txid == $component.anchor.txid and
-             .anchor.vout == $component.anchor.vout and .rpc_error_code == -5) |
-             .observer] | unique | length) != 2) | $id]) as $unclassifiable |
+        ([$txids[] as $id |
+          ($candidate_map[0] | map(select(.txid == $id))) as $mapped |
+          select(($mapped | length) != 1 or
+            ([$observer_absence[] | select(.txid == $id and .status == "observed_absent" and
+               .mempool_absent == true and .active_chain_absent == true and
+               .active_chain_absence_basis == "authenticated-anchor-unspent" and
+               .anchor.unspent == true and .anchor.txid == $mapped[0].anchor_txid and
+               .anchor.vout == $mapped[0].anchor_vout and .rpc_error_code == -5) |
+               .observer] | unique | length) != 2) | $id]) as $unclassifiable |
         ($outpoints_before[0] | map(outpoint_key) | unique) as $before_outpoint_keys |
         ($outpoints_after[0] | map(outpoint_key) | unique) as $after_outpoint_keys |
         ([$before_outpoint_keys[] as $key |
           select(($after_outpoint_keys | index($key)) == null) | $key]) as $removed_outpoints |
         ([$after_outpoint_keys[] as $key |
           select(($before_outpoint_keys | index($key)) == null) | $key]) as $added_outpoints |
-        ($claims | map(.qq_shadow_pow_created_tip) | unique | length) as $tip_span |
-        {schema:3,phase:"A",run_nonce:$nonce,candidate_source_sha:$source,
+        ($candidate_anchors[0] | map(outpoint_key) | unique) as $authenticated_anchor_keys |
+        ([$authored_components[].newly_authored_txids[]] | sort) as $authored_union |
+        {schema:6,phase:"A",run_nonce:$nonce,candidate_source_sha:$source,
+         observation_sample_count:$sample_count,
          final_order:["tip-proof","pow-stop-joined",
            "wallet-claim-mempool-observer-proof","wallet-locked",
            "candidate-clean-stop","logs-complete-through-stop"],
@@ -2004,6 +2554,7 @@ build_no_recovery_spend_proof()
          candidate_stopped_receipt_sha256:$stopped_sha,
          candidate_complete_log_sha256:$complete_log_sha,
          candidate_post_stop_log_receipt_sha256:$log_receipt_sha,
+         external_receive_evidence_sha256:$external_receive_sha,
          observer_terminal_proof_sha256:$observer_terminal_sha,
          final_stable_cut_sha256:$stable_cut_sha,
          terminal_stable_cut_verified:
@@ -2013,8 +2564,9 @@ build_no_recovery_spend_proof()
             $stable_cut[0].terminal_chainwork == $observer_terminal[0].terminal_chainwork and
             $stable_cut[0].wallet_generation == $recovery[0].wallet_generation and
             $observer_terminal[0].observers_stable_and_cover_terminal == true and
-            $observer_terminal[0].authenticated_anchor_unspent_on_all_observers == true),
-         persisted_pending_worker_log_observed:true,persisted_without_relay_log_observed:true,
+            $observer_terminal[0].authenticated_anchors_unspent_on_all_observers == true and
+            $observer_terminal[0].authenticated_anchors == $candidate_anchors[0] and
+            $observer_terminal[0].candidate_txid_anchor_map == $candidate_map[0]),
          candidate_claims_submitted:$mining[0].claims_submitted,
          candidate_mining_gate_coherent:$mining[0].mining_gate_coherent,
          candidate_mining_gate_database_ambiguous:$mining[0].mining_gate_database_ambiguous,
@@ -2030,136 +2582,148 @@ build_no_recovery_spend_proof()
          shared_namespace_rpc_auth_boundary_continuously_verified:true,
          coinstake_created_txids:[$new_rows[] |
            select((.generated // false) == true or .category == "immature") | .txid] | unique,
-         network_visible_wallet_txids:($sample_observer_hits + $final_observer_hits | unique),
+         network_visible_candidate_authored_txids:
+           ($sample_observer_hits + $final_observer_hits | unique),
          fee_payments_authorized:false,
          automatic_recovery_authorized:false,recovery_rpc_invoked:false,
          sendrawtransaction_invoked:false,abandontransaction_invoked:false,
          payout_rotation_invoked:false,forbidden_rpc_methods:[],rpc_allowlist_enforced:true,
          unexpected_rpc_methods:[],rpc_methods_sha256:$rpc_sha,
          payout_address_before:$payout_before,payout_address_after:$payout_after,
+         payout_address_after_owned:
+           (if ($payout_after|length)==0 then false
+            else $payout_after_evidence[0].address==$payout_after and
+              $payout_after_evidence[0].isvalid==true and
+              $payout_after_evidence[0].ismine==true end),
+         payout_address_transition_valid:
+           (if ($payout_after|length)==0 then true
+            else $payout_after_evidence[0].address==$payout_after and
+              $payout_after_evidence[0].isvalid==true and
+              $payout_after_evidence[0].ismine==true end),
          quantum_key_count_before:$quantum_before,quantum_key_count_after:$quantum_after,
          quantum_inventory_sha256_before:$quantum_sha_before,
          quantum_inventory_sha256_after:$quantum_sha_after,
-         confirmed_resolution_fees_before:$fee_before,confirmed_resolution_fees_after:$fee_after,
-         cumulative_resolution_fees_before:$cumulative_before,
-         cumulative_resolution_fees_after:$cumulative_after,
-         pending_manual_before:$pending_manual_before,pending_manual_after:$pending_manual_after,
-         pending_automatic_before:$pending_automatic_before,
-         pending_automatic_after:$pending_automatic_after,
-         recovery_metrics_sha256_before:$recovery_metrics_before,
-         recovery_metrics_sha256_after:$recovery_metrics_after,
-         recovery_metrics_unchanged:($recovery_metrics_before == $recovery_metrics_after),
+         quantum_label_evidence_sha256_before:$quantum_labels_before,
+         quantum_label_evidence_sha256_after:$quantum_labels_after,
+         quantum_inventory_transition_valid:true,
          resolution_txids_before:$resolution_before[0],resolution_txids_after:$resolution_after[0],
          component_resolution_txids_before:$component_before[0],
          component_resolution_txids_after:$component_after[0],
          candidate_created_qqsproof_txids:$txids,
+         external_receive_txids:$external_receive_txids,
+         external_receive_evidence_bound:
+           ($external_receives[0].schema == 1 and
+            $external_receives[0].phase == "A" and
+            $external_receives[0].run_nonce == $nonce and
+            $external_receives[0].candidate_source_sha == $source and
+            $external_receives[0].terminal_tip == $stable_cut[0].terminal_tip and
+            $external_receives[0].terminal_height == $final_chain[0].blocks and
+            $external_receives[0].new_wallet_txids == $new_txids and
+            $external_receives[0].candidate_authored_txids == $txids and
+            $external_receives[0].external_receive_txids == $external_receive_txids and
+            ($external_receives[0].records | map(.txid) | unique | sort) ==
+              $external_receive_txids and
+            $external_receives[0].sets_disjoint == true and
+            $external_receives[0].wallet_differential_exhaustive == true),
+         authenticated_anchors:$candidate_anchors[0],
+         authored_components:$authored_components,
          candidate_created_qqsproof_mempool_txids:($sample_local_hits + $final_local_hits | unique),
          candidate_created_qqsproof_confirmed_txids:[$claims[] | select((.confirmations // 0) != 0) | .txid],
          candidate_created_qqsproof_observer_txids:($sample_observer_hits + $final_observer_hits | unique),
          candidate_created_qqsproof_unclassifiable_txids:$unclassifiable,
          observer_status:(if ($unclassifiable|length)==0 then "observed_absent" else "unclassifiable" end),
          observer_samples:($visibility|length),continuous_absence_verified:
-           (($visibility|length) == 4 and $visibility_bound and ($sample_local_hits|length)==0 and
+           (($visibility|length) == $sample_count and $visibility_bound and
+            ($sample_local_hits|length)==0 and
             ($sample_observer_hits|length)==0 and ($unclassifiable|length)==0 and
             $observer_terminal[0].observers_stable_and_cover_terminal == true and
-            $observer_terminal[0].authenticated_anchor_unspent_on_all_observers == true),
-         initial_atomic_reservation_verified:([$txids[] as $id |
-           ([$claim_samples[] | .claims[] | select(.txid == $id)]) as $seen |
-           ($seen|length) > 0 and $seen[0].qq_shadow_pow_quarantine == "1" and
-           ($seen[0] | has("qq_shadow_pow_first_quarantine_height") | not) and
-           ($seen[0] | has("qq_shadow_pow_branch_quarantine_height") | not)] | all),
+            $observer_terminal[0].authenticated_anchors_unspent_on_all_observers == true),
+         initial_atomic_reservation_verified:
+           (if ($txids|length) == 0 then ($authored_components|length) == 0
+            else [$txids[] as $id |
+              ([$claim_samples[] | .claims[] | select(.txid == $id)]) as $seen |
+              ($seen|length) > 0 and $seen[0].qq_shadow_pow_quarantine == "1"] | all end),
          new_nonclaim_wallet_transactions:[$new_txids[] as $id |
-           select(($txids | index($id)) == null) | $id],
+           select(($txids | index($id)) == null and
+             ($external_receive_txids | index($id)) == null) | $id],
          abandoned_wallet_txids:[$new_rows[] | select((.abandoned // false) == true) | .txid] | unique,
-         baseline_wallet_records_static_equal:($old_static == $existing_after_static),
-         baseline_wallet_record_mutations:
-           (if $old_static == $existing_after_static then []
-            else [{before:$old_static,after:$existing_after_static}] end),
+         legacy_baseline_wallet_authority_preserved:
+           ($old_authority == $existing_after_authority),
+         legacy_baseline_wallet_authority_mutations:
+           (if $old_authority == $existing_after_authority then []
+            else [{before:$old_authority,after:$existing_after_authority}] end),
          progress_tips:$progress_tips,
          claim_sample_tips:$sample_tips,
          claim_samples_monotonic:$samples_monotonic,
          visibility_samples_bound_to_progress:$visibility_bound,
-         progress_tips_bound_to_lineage:
-           ($sample_tips == $progress_tips and $progress_lineage_bound and
-            ($sample_new_txid_sets[-1] == ($txids|sort)) and
-            ($txids|length) == ($progress_tips|length) and
+         observation_series_bound:
+           (($claim_samples|length) == $sample_count and
+            ($visibility|length) == $sample_count and
+            $sample_tips == $progress_tips and $samples_monotonic and $visibility_bound and
+            $progress[0].observation_sample_count == $sample_count and
             $progress[0].per_epoch_claims_submitted_zero == true),
-         one_lineage_member_per_progress_tip:
-           ($progress_lineage_bound and ($txids|length) == ($progress_tips|length)),
-         final_claim_sample_complete:($sample_new_txid_sets[-1] == ($txids|sort)),
-         distinct_anchor_consumption_observed:
-           (($removed_outpoints|length) != 1 or ($added_outpoints|length) != 0 or
-            $removed_outpoints[0] != ($component.anchor | outpoint_key)),
-         lineage:{authenticated:(($components|length)==1 and
-             $component.anchor_authenticated == true and $component.anchor_unspent == true and
-             $component.all_claims_zero_payment_retirable == false and
-             $component.all_claims_expired_locally_retired == false and
-             $recovery[0].retired_claim_objects == 0 and
-             $recovery[0].retired_components == 0 and
-             $candidate_retired_member_txids == [] and
-             $component.ordinary_or_mixed_txids == [] and $component.resolution_txids == [] and
-             $sample_tips == $progress_tips and $samples_monotonic and $visibility_bound and
-             $progress_lineage_bound and ($sample_new_txid_sets[-1] == ($txids|sort)) and
-             ($txids|length) == ($progress_tips|length) and
-             $progress[0].per_epoch_claims_submitted_zero == true and
-             (($component.claim_txids|sort) == ($txids|sort)) and
-             [$txids[] as $id | ($nodes | map(select(.txid == $id))) as $matched |
-               ($matched|length)==1 and $matched[0].kind == "claim" and
-               $matched[0].wallet_authored == true and
-               $matched[0].lineage_metadata_present == true and
-               $matched[0].lineage_metadata_valid == true and
-               $matched[0].proof_origin_bound == true and
-               $matched[0].proof_input_bound == true and
-               $matched[0].expired_locally_retired == false and
-               $matched[0].quarantined == true and $matched[0].in_mempool == false and
-               $matched[0].active_chain_confirmed == false and
-               $matched[0].abandoned == false] | all),
-           anchor_txid:$component.anchor.txid,anchor_vout:$component.anchor.vout,
-           family:$component.generation_fingerprint,
-           root_txid:$claims[0].qq_shadow_pow_lineage_root,
-           all_claims_zero_payment_retirable:
-             $component.all_claims_zero_payment_retirable,
-           all_claims_expired_locally_retired:
-             $component.all_claims_expired_locally_retired,
-           component_claim_txids:($component.claim_txids // [] | sort),
-           members:[$claims[] | . as $claim | $claim.txid as $id |
-             ($candidate_nodes | map(select(.txid == $id))) as $matched |
-             {txid:$id,ordinal:($claim.qq_shadow_pow_lineage_ordinal|tonumber),
-             parent_txid:(if ($claim.qq_shadow_pow_lineage_ordinal|tonumber)==0 then $zero
-               else $claim.qq_shadow_pow_lineage_parent end),
-             anchor_txid:$component.anchor.txid,anchor_vout:$component.anchor.vout,
-             family:$claim.qq_shadow_pow_lineage_family,
-             root_txid:$claim.qq_shadow_pow_lineage_root,
-             created_tip:$claim.qq_shadow_pow_created_tip,
-             quarantine_marker:$claim.qq_shadow_pow_quarantine,
-             proof_origin_bound:$matched[0].proof_origin_bound,
-             proof_input_bound:$matched[0].proof_input_bound,
-             expired_locally_retired:$matched[0].expired_locally_retired,
-             confirmations:($claim.confirmations // 0),abandoned:($claim.abandoned // false),
-             in_local_mempool:($mempool[0] | index($id) != null),
-             in_active_chain:(($claim.confirmations // 0) > 0),
-             observer_absent:(([$observer_absence[] |
-               select(.txid == $id and .status == "observed_absent") | .observer] |
-               unique | length) == 2),
-             first_quarantine_observation_present:has("qq_shadow_pow_first_quarantine_height"),
-             branch_quarantine_observation_present:has("qq_shadow_pow_branch_quarantine_height")}],
-           contiguous_parents:([range(1;$claims|length) as $i |
-             $claims[$i].qq_shadow_pow_lineage_parent == $claims[$i-1].txid] | all),
-           same_anchor:(($components|length)==1),
-           same_family:($claims | all(.qq_shadow_pow_lineage_family == $component.generation_fingerprint)),
-           same_root:($claims | all(.qq_shadow_pow_lineage_root == $claims[0].txid)),
-           same_tip_duplicates:($claims | group_by(.qq_shadow_pow_created_tip) | any(length > 1)),
-           tip_span:$tip_span},
+         final_claim_sample_complete:
+           (if ($txids|length) == 0 then $sample_new_txid_sets[-1] == []
+            else $sample_new_txid_sets[-1] == $txids end),
+         candidate_authorship_mapped_exactly:
+           (if ($txids|length) == 0 then
+              ($authored_components|length) == 0 and ($candidate_map[0]|length) == 0 and
+              ($candidate_anchors[0]|length) == 0
+            else
+              ($authored_components|length) >= 1 and
+              $authored_union == $txids and
+              ($candidate_map[0] | map(.txid) | sort) == $txids and
+              [$txids[] as $id |
+                ([$authored_components[] |
+                  select((.newly_authored_txids | index($id)) != null)] | length) == 1] | all
+            end),
+         candidate_txids_mapped_once:
+           (if ($txids|length) == 0 then ($candidate_map[0]|length) == 0
+            else ($candidate_map[0]|length) == ($txids|length) and
+              ($candidate_map[0]|map(.txid)|unique|length) == ($txids|length) end),
+         candidate_authored_suffixes_authenticated:
+           (if ($txids|length) == 0 then ($authored_components|length) == 0
+            else ($authored_components|length) >= 1 and
+              ($authored_components | all(.authenticated == true and
+                .newly_authored_contiguous_suffix == true and
+                (.newly_authored_txids|length) > 0)) end),
+         new_wallet_txids_exclusive_to_authenticated_authored_claims_or_external_receives:
+           (($txids - $external_receive_txids | length) == ($txids | length) and
+            $new_txids == (($txids + $external_receive_txids) | unique | sort) and
+            $authored_union == $txids and
+            (if ($txids|length) == 0 then ($authored_components|length) == 0
+             else ($authored_components | all(.authenticated == true)) end)),
+         removed_wallet_outpoints:($removed_outpoints |
+           map(fromjson | {txid:.[0],vout:.[1]})),
+         added_wallet_outpoints:($added_outpoints |
+           map(fromjson | {txid:.[0],vout:.[1]})),
+         removed_outpoints_subset_of_authenticated_anchors:
+           (if ($removed_outpoints|length) == 0 then true
+             else ($removed_outpoints | all(. as $key |
+               ($authenticated_anchor_keys | index($key)) != null)) end),
+         added_outpoints_exclusive_to_external_receives:
+           (if ($added_outpoints|length) == 0 then true
+            else ($added_outpoints | all(fromjson[0] as $txid |
+              ($external_receive_txids | index($txid)) != null)) end),
          txid_differential_classified:
-           (($new_txids|sort) == ($txids|sort) and $old_static == $existing_after_static),
-         mempool_differential_classified:(($visibility|length) >= 4 and
+           (($new_txids|sort) == (($txids + $external_receive_txids) | unique | sort) and
+            $old_authority == $existing_after_authority),
+         mempool_differential_classified:(($visibility|length) == $sample_count and
            $visibility_bound and ($sample_local_hits|length)==0 and
            ($final_local_hits|length)==0),
-         wallet_outpoint_differential_classified:(($removed_outpoints|length)==1 and
-           ($added_outpoints|length)==0 and
-           $removed_outpoints[0] == ($component.anchor | outpoint_key))}
+         wallet_outpoint_differential_classified:
+           ((if ($added_outpoints|length) == 0 then true
+             else ($added_outpoints | all(fromjson[0] as $txid |
+               ($external_receive_txids | index($txid)) != null)) end) and
+            (if ($removed_outpoints|length) == 0 then true
+             else ($removed_outpoints | all(. as $key |
+               ($authenticated_anchor_keys | index($key)) != null)) end))}
     ' >"$tmp" || return 1
     hotfix_phase_a_claim_proof_file_is_valid "$tmp" || return 1
+    jq -S '.authored_components' "$tmp" \
+        >"${EVIDENCE}/candidate-authored-components.json" || return 1
+    chmod 600 "${EVIDENCE}/candidate-authored-components.json" &&
+        sync -f "${EVIDENCE}/candidate-authored-components.json" || return 1
     mv -fT -- "$tmp" "$NO_RECOVERY_SPEND"
 }
 
@@ -2385,15 +2949,15 @@ destroy_snapshot_set_after_catchup()
     hotfix_base_catchup_file_is_valid "$BASE_CATCHUP_PROOF" "$run_nonce" || return 1
     verify_snapshot_set || return 1
     : >"${EVIDENCE}/snapshot-destroy-authority-rechecks.jsonl"
-    verify_base_quarantine_destroy_authority || return 1
+    verify_base_quarantine_destroy_authority initial '' || return 1
     order=$(mktemp "${OPS}/.destroy-order.XXXXXX") || return 1
     jq -r '.snapshots[].snapshot' "${EVIDENCE}/snapshot-set.json" |
         awk '{d=$0; sub(/@[^@]+$/, "", d); depth=gsub(/\//,"/",d); print depth "\t" $0}' |
         sort -t $'\t' -k1,1nr -k2,2 | cut -f2 >"$order" || return 1
     while IFS= read -r snapshot; do
-        verify_base_quarantine_destroy_authority || return 1
+        verify_base_quarantine_destroy_authority before-release "$snapshot" || return 1
         zfs release "$HOLD" "$snapshot" || return 1
-        if ! verify_base_quarantine_destroy_authority; then
+        if ! verify_base_quarantine_destroy_authority before-destroy "$snapshot"; then
             zfs hold "$HOLD" "$snapshot" >/dev/null 2>&1 || true
             return 1
         fi
@@ -2403,7 +2967,7 @@ destroy_snapshot_set_after_catchup()
         }
         zfs destroy "$snapshot" || return 1
     done <"$order"
-    verify_base_quarantine_destroy_authority || return 1
+    verify_base_quarantine_destroy_authority final '' || return 1
     zpool sync "${EXPECTED_DATADIR_DATASET%%/*}"
     while IFS= read -r snapshot; do
         ! zfs list -H -t snapshot "$snapshot" >/dev/null 2>&1 || return 1
@@ -2577,7 +3141,9 @@ seal_pre_rewind_evidence()
 
 issue_rewind_safe_certificate()
 {
-    local tmp terminal_tip terminal_height terminal_work generation txids
+    local tmp terminal_tip terminal_height terminal_work generation txids anchors
+    local authored_components_sha recovery_authority_sha recovery_after_authority_sha
+    local pow_gate_authority_sha pow_after_gate_authority_sha
     [[ "$(state_value)" == PRE_REWIND_VERIFIED && ! -e "$PROMOTION_MARKER" ]] || return 1
     [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" == false ]] || return 1
     hotfix_phase_a_progress_file_is_valid "$CANDIDATE_PROGRESS" || return 1
@@ -2593,7 +3159,22 @@ issue_rewind_safe_certificate()
     generation=$(jq -er '.wallet_generation' \
         "${EVIDENCE}/candidate-final-stable-cut.json") || return 1
     txids=$(jq -c '.candidate_created_qqsproof_txids' "$NO_RECOVERY_SPEND") || return 1
+    anchors=$(jq -c '.authenticated_anchors' "$NO_RECOVERY_SPEND") || return 1
+    authored_components_sha=$(jq -cS '.authored_components' "$NO_RECOVERY_SPEND" |
+        sha256sum | awk '{print $1}') || return 1
+    recovery_authority_sha=$(hotfix_recovery_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-recovery-inventory.json")") || return 1
+    recovery_after_authority_sha=$(hotfix_recovery_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-recovery-after.json")") || return 1
+    pow_gate_authority_sha=$(hotfix_pow_gate_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-pow.json")") || return 1
+    pow_after_gate_authority_sha=$(hotfix_pow_gate_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-pow-after.json")") || return 1
+    [[ "$recovery_authority_sha" == "$recovery_after_authority_sha" &&
+       "$pow_gate_authority_sha" == "$pow_after_gate_authority_sha" ]] || return 1
     jq -e --arg tip "$terminal_tip" --arg work "$terminal_work" \
+        --arg recovery_authority "$recovery_authority_sha" \
+        --arg pow_gate_authority "$pow_gate_authority_sha" \
         --argjson generation "$generation" --argjson txids "$txids" \
         --slurpfile chain "${EVIDENCE}/candidate-final-chain.json" \
         --slurpfile chain_after "${EVIDENCE}/candidate-final-chain-after.json" \
@@ -2602,6 +3183,8 @@ issue_rewind_safe_certificate()
         --slurpfile observer "${EVIDENCE}/observer-terminal-proof.json" '
         .stable == true and .terminal_tip == $tip and .terminal_chainwork == $work and
         .wallet_generation == $generation and
+        .recovery_authority_sha256 == $recovery_authority and
+        .pow_gate_authority_sha256 == $pow_gate_authority and
         $chain[0].bestblockhash == $tip and $chain_after[0].bestblockhash == $tip and
         $chain[0].chainwork == $work and $chain_after[0].chainwork == $work and
         $recovery[0].active_tip == $tip and $recovery_after[0].active_tip == $tip and
@@ -2609,7 +3192,7 @@ issue_rewind_safe_certificate()
         $recovery_after[0].wallet_generation == $generation and
         $observer[0].terminal_tip == $tip and $observer[0].terminal_chainwork == $work and
         $observer[0].observers_stable_and_cover_terminal == true and
-        $observer[0].authenticated_anchor_unspent_on_all_observers == true and
+        $observer[0].authenticated_anchors_unspent_on_all_observers == true and
         ([ $observer[0].tx_absence[].txid ] | unique | sort) == ($txids | sort)
     ' "${EVIDENCE}/candidate-final-stable-cut.json" >/dev/null || return 1
     tmp=$(mktemp "${OPS}/.rewind-safe.XXXXXX") || return 1
@@ -2661,11 +3244,13 @@ issue_rewind_safe_certificate()
         --arg stopped "$(sha256sum "${EVIDENCE}/candidate-stopped.json" | awk '{print $1}')" \
         --arg stop_authority "$(sha256sum "${EVIDENCE}/candidate-stop-authority.json" | awk '{print $1}')" \
         --arg log_receipt "$(sha256sum "${EVIDENCE}/candidate-post-stop-log-receipt.json" | awk '{print $1}')" \
-        --arg recovery_metrics "$baseline_recovery_metrics_sha" \
         --arg tip "$terminal_tip" --arg work "$terminal_work" \
         --argjson height "$terminal_height" --argjson generation "$generation" \
-        --argjson txids "$txids" '
-        {schema:1,result:"REWIND_SAFE",run_nonce:$nonce,candidate_source_sha:$source,
+        --argjson sample_count "$PHASE_A_OBSERVATION_SAMPLES" \
+        --arg authored_components_sha "$authored_components_sha" \
+        --argjson txids "$txids" --argjson anchors "$anchors" '
+        {schema:2,result:"REWIND_SAFE",run_nonce:$nonce,candidate_source_sha:$source,
+         observation_sample_count:$sample_count,
          candidate_image_id:$image_id,candidate_image_ref:$image_ref,
          candidate_manifest_digest:$manifest_digest,candidate_blackcoin_qt_sha256:$qt,
          tooling_commit:$tooling,entrypoint_body_sha256:$body,
@@ -2698,13 +3283,12 @@ issue_rewind_safe_certificate()
          candidate_final_mempool_sha256:$final_mempool,
          observer_terminal_proof_sha256:$observer_terminal,
          observer_final_chain_sha256:$observer_chains,
-         observer_anchor_unspent_sha256:$observer_anchors,
+         observer_anchors_unspent_sha256:$observer_anchors,
          observer_tx_absence_sha256:$observer_absence,
          candidate_final_stable_cut_sha256:$stable_cut,
          candidate_stopped_receipt_sha256:$stopped,
          candidate_stop_authority_sha256:$stop_authority,
          candidate_post_stop_log_receipt_sha256:$log_receipt,
-         recovery_metrics_sha256:$recovery_metrics,
          candidate_stopped:true,candidate_exit_code:0,pow_worker_joined:true,wallet_locked:true,
          complete_log_captured_after_stop:true,terminal_stable_cut_verified:true,
          hard_flags_continuously_verified:true,pos_disabled_continuously:true,
@@ -2712,7 +3296,8 @@ issue_rewind_safe_certificate()
          shared_namespace_rpc_auth_boundary_verified:true,
          nonpublication_verified:true,observer_absence_verified:true,unknown_or_ambiguous:false,
          coinstake_or_wallet_escape_detected:false,candidate_created_qqsproof_txids:$txids,
-         network_visible_wallet_txids:[],confirmed_candidate_txids:[],
+         authenticated_anchors:$anchors,authored_components_sha256:$authored_components_sha,
+         network_visible_candidate_authored_txids:[],confirmed_candidate_txids:[],
          unclassifiable_candidate_txids:[],recovery_spend_or_fee_detected:false,
          unrelated_wallet_delta:false,terminal_tip:$tip,terminal_height:$height,
          terminal_chainwork:$work,wallet_generation:$generation,
@@ -2738,7 +3323,8 @@ certificate_hash_matches()
 
 verify_rewind_safe_bindings()
 {
-    local nonce state
+    local nonce state recovery_authority_sha recovery_after_authority_sha
+    local pow_gate_authority_sha pow_after_gate_authority_sha
     [[ -f "$REWIND_SAFE" && ! -L "$REWIND_SAFE" && ! -e "$PROMOTION_MARKER" ]] || return 1
     nonce=$(jq -er '.run_nonce' "$REWIND_SAFE") || return 1
     [[ "$nonce" == "$run_nonce" ]] || return 1
@@ -2761,11 +3347,10 @@ verify_rewind_safe_bindings()
           "$PACKAGE_ROOT/node27-v30.1.4-hotfix-candidate.promote-no-data-rewind.sh" |
           awk '{print $1}')" \
         --arg verifier "$(sha256sum "$PACKAGE_ROOT/verify-evidence.sh" | awk '{print $1}')" \
-        --arg contract "$(sha256sum "$PACKAGE_ROOT/lib/typed_contract.sh" | awk '{print $1}')" \
-        --arg recovery_metrics "$baseline_recovery_metrics_sha" '
+        --arg contract "$(sha256sum "$PACKAGE_ROOT/lib/typed_contract.sh" | awk '{print $1}')" '
       .package_sha256sums_sha256==$package and .phase_a_script_sha256==$phase_a and
       .phase_b_script_sha256==$phase_b and .verifier_sha256==$verifier and
-      .typed_contract_sha256==$contract and .recovery_metrics_sha256==$recovery_metrics
+      .typed_contract_sha256==$contract
     ' "$REWIND_SAFE" >/dev/null || return 1
     certificate_hash_matches invocation_sha256 \
         "${EVIDENCE}/candidate-invocation-restart.json" || return 1
@@ -2848,7 +3433,7 @@ verify_rewind_safe_bindings()
         "${EVIDENCE}/observer-terminal-proof.json" || return 1
     certificate_hash_matches observer_final_chain_sha256 \
         "${EVIDENCE}/observer-final-chain.jsonl" || return 1
-    certificate_hash_matches observer_anchor_unspent_sha256 \
+    certificate_hash_matches observer_anchors_unspent_sha256 \
         "${EVIDENCE}/observer-anchor-unspent.jsonl" || return 1
     certificate_hash_matches observer_tx_absence_sha256 \
         "${EVIDENCE}/observer-tx-absence.jsonl" || return 1
@@ -2860,7 +3445,20 @@ verify_rewind_safe_bindings()
         "${EVIDENCE}/candidate-stop-authority.json" || return 1
     certificate_hash_matches candidate_post_stop_log_receipt_sha256 \
         "${EVIDENCE}/candidate-post-stop-log-receipt.json" || return 1
-    jq -e --slurpfile cert "$REWIND_SAFE" \
+    recovery_authority_sha=$(hotfix_recovery_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-recovery-inventory.json")") || return 1
+    recovery_after_authority_sha=$(hotfix_recovery_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-recovery-after.json")") || return 1
+    pow_gate_authority_sha=$(hotfix_pow_gate_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-pow.json")") || return 1
+    pow_after_gate_authority_sha=$(hotfix_pow_gate_authority_json_sha256 \
+        "$(<"${EVIDENCE}/candidate-final-pow-after.json")") || return 1
+    [[ "$recovery_authority_sha" == "$recovery_after_authority_sha" &&
+       "$pow_gate_authority_sha" == "$pow_after_gate_authority_sha" ]] || return 1
+    jq -e --arg recovery_authority "$recovery_authority_sha" \
+        --arg pow_gate_authority "$pow_gate_authority_sha" \
+        --arg external_receive_sha "$(sha256sum "$EXTERNAL_RECEIVE_EVIDENCE" | awk '{print $1}')" \
+        --slurpfile cert "$REWIND_SAFE" \
         --slurpfile chain "${EVIDENCE}/candidate-final-chain.json" \
         --slurpfile chain_after "${EVIDENCE}/candidate-final-chain-after.json" \
         --slurpfile recovery "${EVIDENCE}/candidate-final-recovery-inventory.json" \
@@ -2872,6 +3470,8 @@ verify_rewind_safe_bindings()
         .terminal_tip == $cert[0].terminal_tip and
         .terminal_chainwork == $cert[0].terminal_chainwork and
         .wallet_generation == $cert[0].wallet_generation and
+        .recovery_authority_sha256 == $recovery_authority and
+        .pow_gate_authority_sha256 == $pow_gate_authority and
         $chain[0].bestblockhash == .terminal_tip and
         $chain_after[0].bestblockhash == .terminal_tip and
         $chain[0].chainwork == .terminal_chainwork and
@@ -2884,13 +3484,20 @@ verify_rewind_safe_bindings()
         $observer[0].terminal_tip == .terminal_tip and
         $observer[0].terminal_chainwork == .terminal_chainwork and
         $observer[0].observers_stable_and_cover_terminal == true and
-        $observer[0].authenticated_anchor_unspent_on_all_observers == true and
+        $observer[0].authenticated_anchors_unspent_on_all_observers == true and
         ($claim[0].candidate_created_qqsproof_txids | sort) ==
           ($cert[0].candidate_created_qqsproof_txids | sort) and
+        $claim[0].observation_sample_count == $cert[0].observation_sample_count and
+        $claim[0].authenticated_anchors == $cert[0].authenticated_anchors and
         $claim[0].terminal_stable_cut_verified == true and
-        $claim[0].baseline_wallet_records_static_equal == true and
-        $claim[0].progress_tips_bound_to_lineage == true and
-        $claim[0].one_lineage_member_per_progress_tip == true and
+        $claim[0].legacy_baseline_wallet_authority_preserved == true and
+        $claim[0].observation_series_bound == true and
+        $claim[0].candidate_authorship_mapped_exactly == true and
+        $claim[0].candidate_txids_mapped_once == true and
+        $claim[0].candidate_authored_suffixes_authenticated == true and
+        $claim[0].external_receive_evidence_sha256 == $external_receive_sha and
+        $claim[0].external_receive_evidence_bound == true and
+        $claim[0].new_wallet_txids_exclusive_to_authenticated_authored_claims_or_external_receives == true and
         $claim[0].claim_samples_monotonic == true and
         $claim[0].visibility_samples_bound_to_progress == true and
         $claim[0].rpc_allowlist_enforced == true and
@@ -2899,6 +3506,10 @@ verify_rewind_safe_bindings()
         $claim[0].shared_namespace_rpc_auth_boundary_continuously_verified == true and
         $claim[0].final_claim_sample_complete == true
     ' "${EVIDENCE}/candidate-final-stable-cut.json" >/dev/null || return 1
+    [[ "$(jq -er '.authored_components_sha256' "$REWIND_SAFE")" == \
+       "$(jq -cS '.authored_components' "$NO_RECOVERY_SPEND" | sha256sum | awk '{print $1}')" &&
+       "$(jq -er '.observation_sample_count' "$REWIND_SAFE")" == \
+       "$(jq -er '.observation_sample_count' "$CANDIDATE_PROGRESS")" ]] || return 1
     [[ "$(jq -er '.listener_evidence_sha256' \
          "${EVIDENCE}/phase-a-nonpublication-final.json")" == \
        "$(sha256sum "${EVIDENCE}/phase-a-nonpublication-final.listeners.txt" | awk '{print $1}')" &&
@@ -2974,8 +3585,10 @@ start_base_hard_quarantine()
 
 capture_base_observer_cut()
 {
-    local terminal_chain="$1" anchor_txid="$2" anchor_vout="$3" output="$4"
+    local terminal_chain="$1" anchors_file="$2" output="$3"
+    local authority_sequence="${4:-0}" authority_stage="${5:-}" authority_snapshot="${6:-}"
     local tmp observer chain1 chain2 mempool anchor relation terminal_work observer_work
+    local anchor_txid anchor_vout
     tmp=$(mktemp "${OPS}/.base-observer-cut.XXXXXX") || return 1
     terminal_work=$(jq -er '.chainwork' <<<"$terminal_chain") || return 1
     : >"$tmp"
@@ -2990,10 +3603,18 @@ capture_base_observer_cut()
           all($ids[0].candidate_created_qqsproof_txids[]; . as $id |
             ($observer_mempool | index($id)) == null)
         ' <<<"$mempool" >/dev/null || return 1
-        anchor=$(timeout -k 2 30 docker exec "$observer" "$CLI" -datadir="$DATADIR" \
-            gettxout "$anchor_txid" "$anchor_vout" true) || return 1
-        jq -e 'type == "object" and .confirmations >= 1 and .coinbase == false' \
-            <<<"$anchor" >/dev/null || return 1
+        : >"${tmp}.anchors"
+        while IFS=$'\t' read -r anchor_txid anchor_vout; do
+            [[ -n "$anchor_txid" && -n "$anchor_vout" ]] || return 1
+            anchor=$(timeout -k 2 30 docker exec "$observer" "$CLI" -datadir="$DATADIR" \
+                gettxout "$anchor_txid" "$anchor_vout" true) || return 1
+            jq -e 'type == "object" and .confirmations >= 1 and .coinbase == false' \
+                <<<"$anchor" >/dev/null || return 1
+            jq -cS -n --arg txid "$anchor_txid" --argjson vout "$anchor_vout" \
+                --argjson txout "$anchor" \
+                '{txid:$txid,vout:$vout,unspent:true,txout:$txout}' \
+                >>"${tmp}.anchors" || return 1
+        done < <(jq -r '.[] | [.txid,.vout] | @tsv' "$anchors_file")
         chain2=$(timeout -k 2 30 docker exec "$observer" "$CLI" -datadir="$DATADIR" \
             getblockchaininfo) || return 1
         jq -e -n --argjson a "$chain1" --argjson b "$chain2" '
@@ -3008,28 +3629,57 @@ capture_base_observer_cut()
             relation=terminal_superseded_by_greater_work
         fi
         jq -cS -n --arg observer "$observer" --arg relation "$relation" \
-            --arg anchor_txid "$anchor_txid" --argjson anchor_vout "$anchor_vout" \
+            --argjson authority_sequence "$authority_sequence" \
+            --arg authority_stage "$authority_stage" \
+            --arg authority_snapshot "$authority_snapshot" \
             --argjson before "$chain1" --argjson after "$chain2" \
-            --argjson mempool "$mempool" --argjson txout "$anchor" '
+            --argjson mempool "$mempool" --slurpfile anchors "${tmp}.anchors" '
             {observer:$observer,chain_before:$before,chain_after:$after,stable:true,
              terminal_relation:$relation,mempool:$mempool,candidate_txids_absent:true,
-             anchor:{txid:$anchor_txid,vout:$anchor_vout,unspent:true,txout:$txout}}
+             authenticated_anchors:$anchors,authenticated_anchors_unspent:true} +
+            (if $authority_sequence == 0 then {}
+             else {authority_sequence:$authority_sequence,authority_stage:$authority_stage,
+               authority_snapshot:(if $authority_snapshot == "" then null
+                 else $authority_snapshot end)} end)
         ' >>"$tmp" || return 1
     done
     [[ "$(wc -l <"$tmp" | tr -d ' ')" == 2 ]] || return 1
     install -m 600 -o root -g root "$tmp" "$output" || return 1
+    rm -f -- "$tmp" "${tmp}.anchors"
+}
+
+capture_local_anchor_evidence()
+{
+    local anchors_file="$1" output="$2" tmp anchor anchor_txid anchor_vout
+    tmp=$(mktemp "${OPS}/.local-anchors.XXXXXX") || return 1
+    : >"$tmp"
+    while IFS=$'\t' read -r anchor_txid anchor_vout; do
+        [[ -n "$anchor_txid" && -n "$anchor_vout" ]] || return 1
+        anchor=$(rpc gettxout "$anchor_txid" "$anchor_vout" true) || return 1
+        jq -e 'type == "object" and .confirmations >= 1 and .coinbase == false' \
+            <<<"$anchor" >/dev/null || return 1
+        jq -cS -n --arg txid "$anchor_txid" --argjson vout "$anchor_vout" \
+            --argjson txout "$anchor" \
+            '{txid:$txid,vout:$vout,unspent:true,txout:$txout}' >>"$tmp" || return 1
+    done < <(jq -r '.[] | [.txid,.vout] | @tsv' "$anchors_file")
+    jq -sS . "$tmp" >"$output" || return 1
+    jq -e --slurpfile expected "$anchors_file" '
+      (map({txid,vout}) | sort_by(.txid,.vout)) ==
+        ($expected[0] | sort_by(.txid,.vout)) and
+      (if ($expected[0]|length) == 0 then length == 0
+       else all(.[]; .unspent == true and (.txout|type) == "object" and
+         .txout.confirmations >= 1 and .txout.coinbase == false) end)
+    ' "$output" >/dev/null || return 1
     rm -f -- "$tmp"
 }
 
 wait_base_catchup()
 {
     local terminal_tip terminal_work chain1 chain2 recovery wallet staking pow network wallets
-    local wallet_transactions mempool anchor anchor_txid anchor_vout current_tip current_work
+    local wallet_transactions mempool current_tip current_work
     local terminal_active greater tmp invocation_sha nonpublication_sha observer_sha
     terminal_tip=$(jq -er '.terminal_tip' "$REWIND_SAFE") || return 1
     terminal_work=$(jq -er '.terminal_chainwork' "$REWIND_SAFE") || return 1
-    anchor_txid=$(jq -er '.lineage.anchor_txid' "$NO_RECOVERY_SPEND") || return 1
-    anchor_vout=$(jq -er '.lineage.anchor_vout' "$NO_RECOVERY_SPEND") || return 1
     for _ in $(seq 1 1800); do
         terminal_active=false
         greater=false
@@ -3043,12 +3693,15 @@ wait_base_catchup()
         wallet_transactions=$(rpc listtransactions '*' 1000000 0 true | jq -cS \
             'sort_by(.txid,.vout,.category)') || return 1
         mempool=$(rpc getrawmempool | jq -cS 'sort') || return 1
-        anchor=$(rpc gettxout "$anchor_txid" "$anchor_vout" true) || return 1
+        capture_local_anchor_evidence \
+            "${EVIDENCE}/candidate-authenticated-anchors.json" \
+            "${EVIDENCE}/base-catchup-anchors-current.json" || return 1
         capture_invocation A "$IMMUTABLE_V3014_IMAGE_ID" \
             "${EVIDENCE}/base-quarantine-created-stopped.json" \
             "${EVIDENCE}/base-quarantine-invocation-current.json" || return 1
         capture_nonpublication "${EVIDENCE}/base-quarantine-nonpublication-current.json" || return 1
-        capture_base_observer_cut "$chain1" "$anchor_txid" "$anchor_vout" \
+        capture_base_observer_cut "$chain1" \
+            "${EVIDENCE}/candidate-authenticated-anchors.json" \
             "${EVIDENCE}/base-catchup-observer.jsonl" || {
             sleep 2
             continue
@@ -3097,8 +3750,13 @@ wait_base_catchup()
              all($proof.candidate_created_qqsproof_txids[]; . as $id |
                ($base_mempool | index($id)) == null)
            ' <<<"$mempool" >/dev/null &&
-           jq -e 'type == "object" and .confirmations >= 1 and .coinbase == false' \
-             <<<"$anchor" >/dev/null &&
+           jq -e --slurpfile expected "${EVIDENCE}/candidate-authenticated-anchors.json" '
+             (map({txid,vout}) | sort_by(.txid,.vout)) ==
+               ($expected[0] | sort_by(.txid,.vout)) and
+             (if ($expected[0]|length) == 0 then length == 0
+              else all(.[]; .unspent == true and .txout.confirmations >= 1 and
+                .txout.coinbase == false) end)
+           ' "${EVIDENCE}/base-catchup-anchors-current.json" >/dev/null &&
            [[ "$(docker inspect -f '{{.State.Running}} {{.Config.Image}} {{.Image}}' \
              "$CONTAINER")" == "true $IMMUTABLE_V3014_IMAGE_REF $IMMUTABLE_V3014_IMAGE_ID" ]] &&
            [[ "$terminal_active" == true || "$greater" == true ]]; then
@@ -3115,7 +3773,9 @@ wait_base_catchup()
             printf '%s\n' "$wallet_transactions" | jq -S . \
                 >"${EVIDENCE}/base-catchup-wallet-transactions.json" || return 1
             printf '%s\n' "$mempool" | jq -S . >"${EVIDENCE}/base-catchup-mempool.json" || return 1
-            printf '%s\n' "$anchor" | jq -S . >"${EVIDENCE}/base-catchup-anchor.json" || return 1
+            install -m 600 -o root -g root \
+                "${EVIDENCE}/base-catchup-anchors-current.json" \
+                "${EVIDENCE}/base-catchup-anchors.json" || return 1
             invocation_sha=$(sha256sum \
                 "${EVIDENCE}/base-quarantine-invocation-current.json" | awk '{print $1}') || return 1
             nonpublication_sha=$(sha256sum \
@@ -3138,15 +3798,15 @@ wait_base_catchup()
                 --arg wallets_sha "$(sha256sum "${EVIDENCE}/base-catchup-wallets.json" | awk '{print $1}')" \
                 --arg wallet_tx_sha "$(sha256sum "${EVIDENCE}/base-catchup-wallet-transactions.json" | awk '{print $1}')" \
                 --arg mempool_sha "$(sha256sum "${EVIDENCE}/base-catchup-mempool.json" | awk '{print $1}')" \
-                --arg anchor_sha "$(sha256sum "${EVIDENCE}/base-catchup-anchor.json" | awk '{print $1}')" \
-                --arg anchor_txid "$anchor_txid" --argjson anchor_vout "$anchor_vout" \
+                --arg anchors_sha "$(sha256sum "${EVIDENCE}/base-catchup-anchors.json" | awk '{print $1}')" \
                 --argjson chain "$chain1" --argjson chain_after "$chain2" \
                 --argjson wallet "$wallet" \
                 --argjson recovery "$recovery" --argjson staking "$staking" \
                 --argjson pow "$pow" --argjson network "$network" \
-                --argjson wallets "$wallets" --argjson anchor "$anchor" \
+                --argjson wallets "$wallets" \
+                --slurpfile anchors "${EVIDENCE}/base-catchup-anchors.json" \
                 --argjson active "$terminal_active" --argjson greater "$greater" '
-                {schema:1,run_nonce:$nonce,source_sha:$source,image:$image,image_id:$image_id,
+                {schema:2,run_nonce:$nonce,source_sha:$source,image:$image,image_id:$image_id,
                  hard_quarantine_flags_verified:true,wallet_locked:true,pow_enabled:false,
                  pos_enabled:false,walletbroadcast:false,chain:$chain,
                  phase_a_terminal_chainwork:$terminal,phase_a_terminal_tip:$terminal_tip,
@@ -3163,12 +3823,12 @@ wait_base_catchup()
                  pow_evidence_sha256:$pow_sha,network_evidence_sha256:$network_sha,
                  wallets_evidence_sha256:$wallets_sha,
                  wallet_transactions_sha256:$wallet_tx_sha,mempool_sha256:$mempool_sha,
-                 authenticated_anchor_evidence_sha256:$anchor_sha,
+                 authenticated_anchors_evidence_sha256:$anchors_sha,
                  candidate_txids_absent_from_wallet:true,
                  candidate_txids_absent_from_mempool:true,
-                 authenticated_anchor:{txid:$anchor_txid,vout:$anchor_vout,unspent:true,txout:$anchor},
-                 authenticated_anchor_unspent:true,observer_candidate_txids_absent:true,
-                 observer_anchor_unspent:true,candidate_claim_escape_absent:true,
+                 authenticated_anchors:$anchors[0],
+                 authenticated_anchors_unspent:true,observer_candidate_txids_absent:true,
+                 observer_anchors_unspent:true,candidate_claim_escape_absent:true,
                  stable_cut:true}
             ' >"$tmp" || return 1
             hotfix_base_catchup_file_is_valid "$tmp" "$run_nonce" || return 1
@@ -3195,9 +3855,28 @@ base_catchup_hash_matches()
 
 verify_base_quarantine_destroy_authority()
 {
+    local stage="$1" snapshot="${2:-}" sequence suffix prefix
+    local invocation_file nonpublication_file anchors_file observers_file
     local chain1 chain2 recovery wallet staking pow network wallets wallet_transactions
-    local mempool anchor anchor_txid anchor_vout terminal_tip terminal_work current_tip current_work
-    local relation invocation_sha observer_sha nonpublication_sha
+    local mempool terminal_tip terminal_work current_tip current_work
+    local relation invocation_sha observer_sha nonpublication_sha anchors_sha canonical_anchors_sha
+    [[ "$stage" == initial || "$stage" == before-release ||
+       "$stage" == before-destroy || "$stage" == final ]] || return 1
+    if [[ "$stage" == before-release || "$stage" == before-destroy ]]; then
+        [[ -n "$snapshot" ]] || return 1
+    else
+        [[ -z "$snapshot" ]] || return 1
+    fi
+    sequence=$(( $(wc -l <"${EVIDENCE}/snapshot-destroy-authority-rechecks.jsonl") + 1 ))
+    (( sequence >= 1 && sequence <= 10 )) || return 1
+    printf -v suffix '%02d' "$sequence"
+    prefix="${EVIDENCE}/base-destroy-recheck-${suffix}"
+    invocation_file="${prefix}-invocation.json"
+    nonpublication_file="${prefix}-nonpublication.json"
+    anchors_file="${prefix}-anchors.json"
+    observers_file="${prefix}-observers.jsonl"
+    [[ ! -e "$invocation_file" && ! -e "$nonpublication_file" &&
+       ! -e "$anchors_file" && ! -e "$observers_file" ]] || return 1
     [[ "$(state_value)" == BASE_CAUGHT_UP && ! -e "$PROMOTION_MARKER" &&
        -f "$REWIND_SAFE" && ! -L "$REWIND_SAFE" ]] || return 1
     hotfix_rewind_safe_file_is_valid "$REWIND_SAFE" "$run_nonce" || return 1
@@ -3228,8 +3907,8 @@ verify_base_quarantine_destroy_authority()
         "${EVIDENCE}/base-catchup-wallet-transactions.json" || return 1
     base_catchup_hash_matches mempool_sha256 \
         "${EVIDENCE}/base-catchup-mempool.json" || return 1
-    base_catchup_hash_matches authenticated_anchor_evidence_sha256 \
-        "${EVIDENCE}/base-catchup-anchor.json" || return 1
+    base_catchup_hash_matches authenticated_anchors_evidence_sha256 \
+        "${EVIDENCE}/base-catchup-anchors.json" || return 1
     jq -e --slurpfile chain "${EVIDENCE}/base-catchup-chain.json" \
         --slurpfile chain_after "${EVIDENCE}/base-catchup-chain-after.json" \
         --slurpfile recovery "${EVIDENCE}/base-catchup-recovery.json" \
@@ -3237,11 +3916,16 @@ verify_base_quarantine_destroy_authority()
         --slurpfile staking "${EVIDENCE}/base-catchup-staking.json" \
         --slurpfile pow "${EVIDENCE}/base-catchup-pow.json" \
         --slurpfile network "${EVIDENCE}/base-catchup-network.json" \
-        --slurpfile wallets "${EVIDENCE}/base-catchup-wallets.json" '
+        --slurpfile wallets "${EVIDENCE}/base-catchup-wallets.json" \
+        --slurpfile anchors "${EVIDENCE}/base-catchup-anchors.json" \
+        --slurpfile claim "$NO_RECOVERY_SPEND" '
         .chain == $chain[0] and .chain_after == $chain_after[0] and
         .chain == .chain_after and .recovery == $recovery[0] and
         .wallet == $wallet[0] and .staking == $staking[0] and
         .pow == $pow[0] and .network == $network[0] and .wallets == $wallets[0] and
+        .authenticated_anchors == $anchors[0] and
+        (.authenticated_anchors | map({txid,vout})) == $claim[0].authenticated_anchors and
+        .authenticated_anchors_unspent == true and .observer_anchors_unspent == true and
         .stable_cut == true and .candidate_claim_escape_absent == true
     ' "$BASE_CATCHUP_PROOF" >/dev/null || return 1
     (cd "$EVIDENCE" && sha256sum --strict -c PRE_REWIND_SHA256SUMS >/dev/null) || return 1
@@ -3269,19 +3953,13 @@ verify_base_quarantine_destroy_authority()
     ' "$MAINTENANCE_MARKER" >/dev/null || return 1
     capture_invocation A "$IMMUTABLE_V3014_IMAGE_ID" \
         "${EVIDENCE}/base-quarantine-created-stopped.json" \
-        "${EVIDENCE}/base-quarantine-invocation-destroy-current.json" || return 1
-    invocation_sha=$(sha256sum \
-        "${EVIDENCE}/base-quarantine-invocation-destroy-current.json" | awk '{print $1}') || return 1
+        "$invocation_file" || return 1
+    invocation_sha=$(sha256sum "$invocation_file" | awk '{print $1}') || return 1
     [[ "$invocation_sha" == "$(jq -er '.invocation_sha256' "$BASE_CATCHUP_PROOF")" ]] || return 1
-    capture_nonpublication \
-        "${EVIDENCE}/base-quarantine-nonpublication-destroy-current.json" || return 1
-    nonpublication_sha=$(sha256sum \
-        "${EVIDENCE}/base-quarantine-nonpublication-destroy-current.json" |
-        awk '{print $1}') || return 1
+    capture_nonpublication "$nonpublication_file" || return 1
+    nonpublication_sha=$(sha256sum "$nonpublication_file" | awk '{print $1}') || return 1
     terminal_tip=$(jq -er '.terminal_tip' "$REWIND_SAFE") || return 1
     terminal_work=$(jq -er '.terminal_chainwork' "$REWIND_SAFE") || return 1
-    anchor_txid=$(jq -er '.lineage.anchor_txid' "$NO_RECOVERY_SPEND") || return 1
-    anchor_vout=$(jq -er '.lineage.anchor_vout' "$NO_RECOVERY_SPEND") || return 1
     chain1=$(rpc getblockchaininfo) || return 1
     recovery=$(rpc getpowclaimrecoveryinfo true) || return 1
     wallet=$(rpc getwalletinfo) || return 1
@@ -3292,11 +3970,16 @@ verify_base_quarantine_destroy_authority()
     wallet_transactions=$(rpc listtransactions '*' 1000000 0 true | jq -cS \
         'sort_by(.txid,.vout,.category)') || return 1
     mempool=$(rpc getrawmempool | jq -cS 'sort') || return 1
-    anchor=$(rpc gettxout "$anchor_txid" "$anchor_vout" true) || return 1
-    capture_base_observer_cut "$chain1" "$anchor_txid" "$anchor_vout" \
-        "${EVIDENCE}/base-destroy-observer-current.jsonl" || return 1
-    observer_sha=$(sha256sum "${EVIDENCE}/base-destroy-observer-current.jsonl" |
-        awk '{print $1}') || return 1
+    capture_local_anchor_evidence \
+        "${EVIDENCE}/candidate-authenticated-anchors.json" \
+        "$anchors_file" || return 1
+    capture_base_observer_cut "$chain1" \
+        "${EVIDENCE}/candidate-authenticated-anchors.json" \
+        "$observers_file" "$sequence" "$stage" "$snapshot" || return 1
+    observer_sha=$(sha256sum "$observers_file" | awk '{print $1}') || return 1
+    anchors_sha=$(sha256sum "$anchors_file" | awk '{print $1}') || return 1
+    canonical_anchors_sha=$(sha256sum \
+        "${EVIDENCE}/candidate-authenticated-anchors.json" | awk '{print $1}') || return 1
     chain2=$(rpc getblockchaininfo) || return 1
     jq -e -n --argjson a "$chain1" --argjson b "$chain2" '
       $a.bestblockhash == $b.bestblockhash and $a.chainwork == $b.chainwork and
@@ -3337,16 +4020,28 @@ verify_base_quarantine_destroy_authority()
       all($proof.candidate_created_qqsproof_txids[]; . as $id |
         ($base_mempool | index($id)) == null)
     ' <<<"$mempool" >/dev/null || return 1
-    jq -e 'type == "object" and .confirmations >= 1 and .coinbase == false' \
-        <<<"$anchor" >/dev/null || return 1
+    jq -e --slurpfile expected "${EVIDENCE}/candidate-authenticated-anchors.json" '
+      (map({txid,vout}) | sort_by(.txid,.vout)) ==
+        ($expected[0] | sort_by(.txid,.vout)) and
+      (if ($expected[0]|length) == 0 then length == 0
+       else all(.[]; .unspent == true and .txout.confirmations >= 1 and
+         .txout.coinbase == false) end)
+    ' "$anchors_file" >/dev/null || return 1
     jq -cS -n --arg utc "$(date -u +%FT%TZ)" --arg relation "$relation" \
+        --arg stage "$stage" --arg snapshot "$snapshot" --argjson sequence "$sequence" \
         --arg tip "$current_tip" --arg work "$current_work" \
         --arg invocation_sha "$invocation_sha" --arg nonpublication_sha "$nonpublication_sha" \
-        --arg observer_sha "$observer_sha" \
-        '{observed_utc:$utc,authority_valid:true,chain_tip:$tip,chainwork:$work,
+        --arg observer_sha "$observer_sha" --arg anchors_sha "$anchors_sha" \
+        --arg canonical_anchors_sha "$canonical_anchors_sha" \
+        '{schema:2,sequence:$sequence,stage:$stage,
+          snapshot:(if $snapshot == "" then null else $snapshot end),
+          observed_utc:$utc,authority_valid:true,chain_tip:$tip,chainwork:$work,
           terminal_relation:$relation,invocation_sha256:$invocation_sha,
           nonpublication_sha256:$nonpublication_sha,observer_cut_sha256:$observer_sha,
-          candidate_txids_absent:true,authenticated_anchor_unspent:true,
+          canonical_authenticated_anchors_sha256:$canonical_anchors_sha,
+          local_anchor_evidence_sha256:$anchors_sha,
+          candidate_txids_absent:true,observer_candidate_txids_absent:true,
+          authenticated_anchors_unspent:true,observer_anchors_unspent:true,
           wallet_locked:true,pow_disabled:true,pos_disabled:true}' \
         >>"${EVIDENCE}/snapshot-destroy-authority-rechecks.jsonl" || return 1
     sync -f "${EVIDENCE}/snapshot-destroy-authority-rechecks.jsonl"
@@ -3354,7 +4049,7 @@ verify_base_quarantine_destroy_authority()
 
 restore_baseline_after_snapshot_absence()
 {
-    local restored_quantum restored_fee restored_inspect restored_mounts restored_network
+    local restored_quantum restored_inspect restored_mounts restored_network
     local restored_restart
     [[ "$(state_value)" == SNAPSHOTS_ABSENT ]] || return 1
     hotfix_snapshot_absence_file_is_valid "$SNAPSHOT_ABSENCE_PROOF" "$run_nonce" || return 1
@@ -3398,6 +4093,9 @@ restore_baseline_after_snapshot_absence()
     rpc getpowmininginfo >"${EVIDENCE}/baseline-restored-pow-state.json" || return 1
     rpc getpowclaimrecoveryinfo true >"${EVIDENCE}/baseline-restored-recovery.json" || return 1
     rpc getquantumkeyinventory | jq -S . >"${EVIDENCE}/baseline-restored-quantum.json" || return 1
+    capture_quantum_payout_label_evidence \
+        "${EVIDENCE}/baseline-restored-quantum.json" \
+        "${EVIDENCE}/baseline-restored-quantum-labels.json" || return 1
     rpc listwallets | jq -S . >"${EVIDENCE}/baseline-restored-wallets.json" || return 1
     jq -e '.initialblockdownload == false and .blocks == .headers' \
         "${EVIDENCE}/baseline-restored-chain.json" >/dev/null || return 1
@@ -3408,19 +4106,28 @@ restore_baseline_after_snapshot_absence()
     jq -e '.unlocked_until > now and .unlocked_staking_only == false' \
         "${EVIDENCE}/baseline-restored-wallet.json" >/dev/null || return 1
     legacy_pow_is_feature_detected "${EVIDENCE}/baseline-restored-pow-state.json" || return 1
-    [[ "$(jq -er '.payout_address' "${EVIDENCE}/baseline-restored-pow-state.json")" == "$baseline_payout" ]] || return 1
+    jq -e --arg wallet "$baseline_wallet_name" '.walletname==$wallet' \
+        "${EVIDENCE}/baseline-restored-wallet.json" >/dev/null || return 1
+    jq -e --arg wallet "$baseline_wallet_name" '.==[$wallet]' \
+        "${EVIDENCE}/baseline-restored-wallets.json" >/dev/null || return 1
+    payout_transition_is_valid \
+        "$(jq -er '.payout_address | select(type=="string")' \
+          "${EVIDENCE}/baseline-restored-pow-state.json")" \
+        "${EVIDENCE}/baseline-quantum-inventory.json" \
+        "${EVIDENCE}/baseline-restored-quantum.json" \
+        "${EVIDENCE}/baseline-restored-payout-address.json" || return 1
     restored_quantum=$(jq -er 'if type=="array" then length elif (.keys?|type)=="array"
       then (.keys|length) elif (.inventory?|type)=="array" then (.inventory|length)
       elif (.total?|type)=="number" then .total else error("schema") end' \
       "${EVIDENCE}/baseline-restored-quantum.json") || return 1
     [[ "$restored_quantum" == "$baseline_quantum_key_count" ]] || return 1
-    cmp -s <(jq -cS . "${EVIDENCE}/baseline-quantum-inventory.json") \
-        <(jq -cS . "${EVIDENCE}/baseline-restored-quantum.json") || return 1
+    hotfix_quantum_inventory_transition_is_valid \
+        "${EVIDENCE}/baseline-quantum-inventory.json" \
+        "${EVIDENCE}/baseline-restored-quantum.json" \
+        "${EVIDENCE}/baseline-quantum-labels.json" \
+        "${EVIDENCE}/baseline-restored-quantum-labels.json" || return 1
     cmp -s "${EVIDENCE}/baseline-wallets.json" \
         "${EVIDENCE}/baseline-restored-wallets.json" || return 1
-    restored_fee=$(jq -er '.confirmed_resolution_fees' "${EVIDENCE}/baseline-restored-recovery.json") || return 1
-    [[ "$restored_fee" == "$baseline_recovery_fee" ]] || return 1
-    recovery_metrics_match_baseline "${EVIDENCE}/baseline-restored-recovery.json" || return 1
     cmp -s <(jq -cS '{policy,policy_authoritative,automatic_authorized}' \
         "${EVIDENCE}/baseline-recovery.json") \
         <(jq -cS '{policy,policy_authoritative,automatic_authorized}' \
@@ -3506,10 +4213,13 @@ on_exit()
 }
 main()
 {
-    local command ops_dataset rollback_dataset baseline_mode baseline_quantum_sha logs_since
+    local command ops_dataset rollback_dataset baseline_mode logs_since
     local promotion_dataset promotion_fstype
     local post_manifest baseline_inspect
     trap on_exit EXIT ERR INT TERM
+    [[ "$PHASE_A_OBSERVATION_SAMPLES" =~ ^[0-9]+$ &&
+       "$PHASE_A_OBSERVATION_SAMPLES" -ge 3 ]] ||
+        fail 'PHASE_A_OBSERVATION_SAMPLES must be an integer >= 3'
     require_no_placeholders
     verify_package_integrity || fail 'candidate canary package integrity seal failed'
     [[ "$(sha256sum "$PACKAGE_ROOT/../v30.1.4-canary/node27-v30.1.4-canary.no-spend.sh" |
@@ -3662,10 +4372,17 @@ main()
     rpc getpowmininginfo >"${EVIDENCE}/baseline-pow.json"
     rpc getpowclaimrecoveryinfo true >"${EVIDENCE}/baseline-recovery.json"
     rpc getquantumkeyinventory | jq -S . >"${EVIDENCE}/baseline-quantum-inventory.json"
+    capture_quantum_payout_label_evidence \
+        "${EVIDENCE}/baseline-quantum-inventory.json" \
+        "${EVIDENCE}/baseline-quantum-labels.json" ||
+        fail 'could not bind baseline quantum payout-label purposes'
     rpc listquantumaddresses | jq -S . >"${EVIDENCE}/baseline-quantum-addresses.json"
     rpc listwallets | jq -S . >"${EVIDENCE}/baseline-wallets.json"
-    [[ "$(jq -cS . "${EVIDENCE}/baseline-wallets.json")" == '[""]' ]] ||
-        fail 'node27 must have exactly one default wallet loaded'
+    baseline_wallet_name=$(jq -er '.walletname | select(type=="string")' \
+        "${EVIDENCE}/baseline-wallet.json") || fail 'baseline wallet identity is absent'
+    jq -e --arg wallet "$baseline_wallet_name" '.==[$wallet]' \
+        "${EVIDENCE}/baseline-wallets.json" >/dev/null ||
+        fail 'node27 must have exactly one baseline-identical wallet loaded'
     jq -e '.chain == "main" and .initialblockdownload == false and .blocks == .headers' \
         "${EVIDENCE}/baseline-chain.json" >/dev/null || fail 'baseline chain is not ready'
     jq -e '.networkactive == true and .connections_out >= 3' \
@@ -3680,34 +4397,30 @@ main()
     baseline_mode=$(jq -er 'if .enabled then "enabled" else "disabled" end' \
         "${EVIDENCE}/baseline-pow.json")
     [[ "$baseline_mode" == enabled ]] && baseline_pow_enabled=true
-    baseline_payout=$(jq -er '.payout_address | select(type == "string" and length > 0)' \
+    baseline_payout=$(jq -er '.payout_address | select(type == "string")' \
         "${EVIDENCE}/baseline-pow.json") || fail 'baseline payout is absent'
-    rpc validateaddress "$baseline_payout" | jq -e '.isvalid == true' >/dev/null ||
-        fail 'baseline payout address is invalid'
+    if [[ -n "$baseline_payout" ]]; then
+        rpc getaddressinfo "$baseline_payout" | jq -S . \
+            >"${EVIDENCE}/baseline-payout-address.json" ||
+            fail 'baseline payout address evidence is unavailable'
+        hotfix_quantum_payout_address_is_valid \
+            "${EVIDENCE}/baseline-payout-address.json" \
+            "${EVIDENCE}/baseline-quantum-inventory.json" "$baseline_payout" ||
+            fail 'baseline payout is not an inventoried quantum-migration key'
+    else
+        printf 'null\n' >"${EVIDENCE}/baseline-payout-address.json" ||
+            fail 'could not record empty baseline payout evidence'
+    fi
     jq -e '.policy_authoritative == true and .policy.automatic_authorized == false and
         .database_outcome_ambiguous == false and .chain_ready == true and
         .wallet_tip_matches == true' "${EVIDENCE}/baseline-recovery.json" >/dev/null ||
         fail 'baseline recovery policy/database/tip is unsafe'
-    baseline_recovery_fee=$(jq -er '.confirmed_resolution_fees' \
-        "${EVIDENCE}/baseline-recovery.json")
-    baseline_cumulative_recovery_fee=$(jq -er \
-        '.cumulative_resolution_fees // .confirmed_resolution_fees' \
-        "${EVIDENCE}/baseline-recovery.json")
-    baseline_pending_manual=$(jq -er '.pending_manual_resolutions' \
-        "${EVIDENCE}/baseline-recovery.json")
-    baseline_pending_automatic=$(jq -er '.pending_automatic_resolutions' \
-        "${EVIDENCE}/baseline-recovery.json")
-    baseline_recovery_metrics_json=$(recovery_metrics_json \
-        "${EVIDENCE}/baseline-recovery.json") || fail 'baseline recovery metrics are invalid'
-    baseline_recovery_metrics_sha=$(printf '%s' "$baseline_recovery_metrics_json" | sha256sum |
-        awk '{print $1}') || fail 'baseline recovery metrics hash failed'
     baseline_quantum_key_count=$(jq -er '
         if type == "array" then length
         elif (.keys? | type) == "array" then (.keys | length)
         elif (.inventory? | type) == "array" then (.inventory | length)
         elif (.total? | type) == "number" then .total else error("schema") end
     ' "${EVIDENCE}/baseline-quantum-inventory.json")
-    baseline_quantum_sha=$(sha256sum "${EVIDENCE}/baseline-quantum-inventory.json" | awk '{print $1}')
     capture_wallet_state baseline || fail 'could not capture baseline wallet differential'
 
     mutation_started=1
@@ -3767,12 +4480,11 @@ main()
         "${EVIDENCE}/candidate-locked-wallet.json" \
         "${EVIDENCE}/candidate-locked-staking.json" ||
         fail 'candidate startup did not expose the complete safe typed gate while locked/off'
-    [[ "$(jq -er '.payout_address' "${EVIDENCE}/candidate-locked-pow.json")" == "$baseline_payout" ]] ||
-        fail 'candidate payout binding changed'
     capture_wallet_state candidate-locked || fail 'could not capture locked candidate state'
-    cmp -s "${EVIDENCE}/prelaunch-wallet-transactions.json" \
-        "${EVIDENCE}/candidate-locked-wallet-transactions.json" ||
-        fail 'locked candidate changed wallet transactions before authority was granted'
+    wallet_transaction_authority_is_preserved \
+        "${EVIDENCE}/prelaunch-wallet-transactions.json" \
+        "${EVIDENCE}/candidate-locked-wallet-transactions.json" false ||
+        fail 'locked candidate changed wallet transaction authority before unlock'
 
     write_state PHASE_A_RUNNING || fail 'could not record Phase-A running state'
     run_unlock_helper || fail 'candidate normal wallet unlock failed'
@@ -3795,8 +4507,12 @@ main()
     capture_nonpublication "${EVIDENCE}/phase-a-nonpublication-final.json" ||
         fail 'final nonpublication surface proof failed'
     capture_final_proof_inputs || fail 'final wallet/claim/mempool/observer proof capture failed'
-    [[ "$(sha256sum "${EVIDENCE}/candidate-final-quantum-inventory.json" | awk '{print $1}')" == "$baseline_quantum_sha" ]] ||
-        fail 'candidate changed quantum-key inventory'
+    hotfix_quantum_inventory_transition_is_valid \
+        "${EVIDENCE}/baseline-quantum-inventory.json" \
+        "${EVIDENCE}/candidate-final-quantum-inventory.json" \
+        "${EVIDENCE}/baseline-quantum-labels.json" \
+        "${EVIDENCE}/candidate-final-quantum-labels.json" ||
+        fail 'candidate changed quantum keys beyond the permitted payout-label normalization'
     stop_candidate_cleanly || fail 'wallet lock or clean candidate stop failed'
     docker logs --since "$logs_since" "$CONTAINER" >"${EVIDENCE}/candidate-complete.log" 2>&1 ||
         fail 'post-stop complete candidate log capture failed'
@@ -3855,8 +4571,7 @@ main()
         --arg tooling_identity "$phase_a_tooling_identity_sha" \
         --arg package "$phase_a_package_sha" --arg phase_a_script "$phase_a_script_sha" \
         --arg phase_b_script "$phase_b_script_sha" --arg verifier "$phase_a_verifier_sha" \
-        --arg contract "$phase_a_contract_sha" \
-        --arg recovery_metrics "$baseline_recovery_metrics_sha" '
+        --arg contract "$phase_a_contract_sha" '
         {schema:3,phase:"A",node:27,result:"passed",candidate_source_sha:$candidate,
          base_source_sha:$base,run_nonce:$nonce,rewind_safe_certificate_verified:true,
          data_rewind_completed:true,base_hard_quarantine_catchup_verified:true,
@@ -3869,7 +4584,7 @@ main()
          phase_a_tooling_identity_sha256:$tooling_identity,
          package_sha256sums_sha256:$package,phase_a_script_sha256:$phase_a_script,
          phase_b_script_sha256:$phase_b_script,verifier_sha256:$verifier,
-         typed_contract_sha256:$contract,baseline_recovery_metrics_sha256:$recovery_metrics}
+         typed_contract_sha256:$contract}
     ' >"${EVIDENCE}/RESULT.json" || fail 'Phase-A RESULT creation failed'
     hotfix_phase_a_result_file_is_valid "${EVIDENCE}/RESULT.json" || fail 'Phase-A RESULT invalid'
     seal_evidence_best_effort || fail 'evidence integrity seal failed'

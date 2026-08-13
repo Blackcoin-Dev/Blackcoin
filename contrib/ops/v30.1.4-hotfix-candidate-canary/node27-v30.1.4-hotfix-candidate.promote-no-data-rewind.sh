@@ -41,20 +41,12 @@ readonly SUSPENDED_START_MARKER="${STATE_ROOT}/ENABLE_GUARD_STARTS.promote-node2
 result='failed'
 mutation_started=0
 promotion_durable=0
-baseline_pow_enabled=false
 phase_a_result_sha=''
 phase_a_run_nonce=''
 promotion_nonce=''
-baseline_payout=''
+baseline_wallet_name=''
 baseline_quantum_count=''
-baseline_recovery_fee=''
-baseline_resolution_sha=''
-baseline_pending_manual=''
-baseline_pending_automatic=''
-baseline_automatic_fee_exposure=''
-baseline_recovery_policy_sha=''
-baseline_recovery_metrics_sha=''
-baseline_quantum_sha=''
+candidate_locked_resolution_sha=''
 baseline_config_sha=''
 baseline_mounts_sha=''
 baseline_network_sha=''
@@ -97,6 +89,15 @@ rpc()
         sync -f "$RPC_METHODS_LOG"
     fi
     timeout -k 2 45 docker exec "$CONTAINER" "$CLI" -datadir="$DATADIR" "$@"
+}
+
+capture_goldrush_state()
+{
+    local output="$1"
+    rpc getgoldrushstate | jq -eS '
+      {bestblock,height,qqp4_activation_disabled,qqp4_activation_height,
+       qqp4_active,qqp4_active_next_block}
+    ' >"$output"
 }
 
 wait_rpc()
@@ -550,8 +551,10 @@ services:
       - node27-hotfix-candidate
     command:
       - -walletbroadcast=1
-      - -autostartstaking=0
-      - -powmining=0
+      - -autostartstaking=1
+      - -powmining=1
+      - -powminingthreads=1
+      - -powminingcpu=1
 EOF
     chmod 600 "$OVERRIDE" && chown root:root "$OVERRIDE" && sync -f "$OVERRIDE"
 }
@@ -601,6 +604,38 @@ quantum_inventory_count()
       elif (.total?|type)=="number" then .total else error("schema") end' "$1"
 }
 
+capture_quantum_payout_label_evidence()
+{
+    local inventory="$1" output="$2" tmp label addresses
+    [[ -f "$inventory" && ! -L "$inventory" ]] || return 1
+    tmp=$(mktemp "${OPS}/.quantum-labels.XXXXXX") || return 1
+    : >"${tmp}.rows" || return 1
+    jq -er '
+      def entries:
+        if type == "array" then .
+        elif (.keys? | type) == "array" then .keys
+        elif (.inventory? | type) == "array" then .inventory
+        else error("unsupported quantum inventory") end;
+      [entries[]? | (.label? // "") |
+        select(IN("PoW - Quantum Claim Address",
+          "Quantum PoW Reward Address","goldrush-pow"))] | unique | sort | .[]
+    ' "$inventory" >"${tmp}.labels" || return 1
+    while IFS= read -r label; do
+        [[ -n "$label" ]] || continue
+        addresses=$(rpc getaddressesbylabel "$label") || return 1
+        jq -e 'type == "object" and all(.[];
+          type == "object" and (keys | sort) == ["purpose"] and
+          (.purpose | type) == "string")' <<<"$addresses" >/dev/null || return 1
+        jq -cS -n --arg label "$label" --argjson addresses "$addresses" \
+            '{label:$label,addresses:$addresses}' >>"${tmp}.rows" || return 1
+    done <"${tmp}.labels"
+    jq -S -n --slurpfile rows "${tmp}.rows" \
+        '{schema:1,labels:($rows | sort_by(.label))}' >"$tmp" || return 1
+    install -m 600 -o root -g root "$tmp" "$output" || return 1
+    sync -f "$output" && sync -f "$EVIDENCE" || return 1
+    rm -f -- "$tmp" "${tmp}.rows" "${tmp}.labels"
+}
+
 capture_wallet_transactions()
 {
     local output="$1"
@@ -608,38 +643,55 @@ capture_wallet_transactions()
         jq -S 'sort_by(.txid, (.vout // -1), .category)' >"$output"
 }
 
-recovery_metrics_sha()
+capture_resolution_raw_identities()
 {
-    jq -cS '{pending_manual_resolutions,pending_automatic_resolutions,
-      confirmed_manual_resolutions,confirmed_automatic_resolutions,
-      confirmed_resolution_fees,automatic_actions_in_window,
-      automatic_fee_exposure_in_window,reconciled_descendant_claims,claims_recycled}' "$1" |
-        sha256sum | awk '{print $1}'
-}
-
-recovery_policy_sha()
-{
-    jq -cS '{policy_authoritative,policy_state_status,policy}' "$1" |
-        sha256sum | awk '{print $1}'
+    local ids_file="$1" output="$2" txid rows='[]' raw row
+    while IFS= read -r txid; do
+        raw=$(rpc gettransaction "$txid" false true) || return 1
+        row=$(jq -ce --arg txid "$txid" '
+          select(.txid==$txid and (.hex|type)=="string" and
+            (.hex|test("^[0-9a-f]+$")) and ((.hex|length)%2)==0) |
+          {txid:$txid,hex:.hex}
+        ' <<<"$raw") || return 1
+        rows=$(jq -cn --argjson rows "$rows" --argjson row "$row" '$rows+[$row]') ||
+            return 1
+    done < <(jq -r '.[]' "$ids_file")
+    jq -S -n --argjson rows "$rows" '$rows|sort_by(.txid)' >"$output"
 }
 
 capture_baseline_precondition()
 {
-    local observed tip chain_after fee payout quantum_count policy_sha metrics_sha
+    local observed tip chain_after payout payout_owned quantum_count wallet_name
     for _ in $(seq 1 20); do
         observed=$(date +%s)
         rpc getblockchaininfo >"${EVIDENCE}/baseline-chain.json" || return 1
+        capture_goldrush_state "${EVIDENCE}/baseline-goldrush-state.json" || return 1
         rpc getnetworkinfo >"${EVIDENCE}/baseline-network.json" || return 1
         rpc getwalletinfo >"${EVIDENCE}/baseline-wallet.json" || return 1
         rpc getstakinginfo >"${EVIDENCE}/baseline-staking.json" || return 1
         rpc getpowmininginfo >"${EVIDENCE}/baseline-pow.json" || return 1
         rpc getpowclaimrecoveryinfo true >"${EVIDENCE}/baseline-recovery.json" || return 1
         rpc getquantumkeyinventory | jq -S . >"${EVIDENCE}/baseline-quantum.json" || return 1
+        capture_quantum_payout_label_evidence "${EVIDENCE}/baseline-quantum.json" \
+            "${EVIDENCE}/baseline-quantum-labels.json" || return 1
         rpc listwallets | jq -S . >"${EVIDENCE}/baseline-loaded-wallets.json" || return 1
         capture_wallet_transactions "${EVIDENCE}/baseline-wallet-transactions.json" || return 1
+        jq -S '[.[] | select(
+          has("qq_shadow_pow_cleanup_for") or
+          has("qq_shadow_pow_resolution_schema") or
+          has("qq_shadow_pow_resolution_anchor_txid") or
+          has("qq_shadow_pow_resolution_origin")) | .txid] | unique | sort' \
+            "${EVIDENCE}/baseline-wallet-transactions.json" \
+            >"${EVIDENCE}/baseline-wallet-resolution-txids.json" || return 1
+        capture_resolution_raw_identities \
+            "${EVIDENCE}/baseline-wallet-resolution-txids.json" \
+            "${EVIDENCE}/baseline-wallet-resolution-raw.json" || return 1
         rpc getblockchaininfo >"${EVIDENCE}/baseline-chain-after.json" || return 1
         chain_after=$(<"${EVIDENCE}/baseline-chain-after.json")
         tip=$(jq -er '.bestblockhash' "${EVIDENCE}/baseline-chain.json") || return 1
+        hotfix_goldrush_state_json_is_valid \
+            "$(<"${EVIDENCE}/baseline-goldrush-state.json")" "$tip" \
+            "$(jq -er '.blocks' "${EVIDENCE}/baseline-chain.json")" || return 1
         if ! jq -e --argjson after "$chain_after" '
           .chain=="main" and .initialblockdownload==false and .blocks==.headers and
           .bestblockhash==$after.bestblockhash and .chainwork==$after.chainwork and
@@ -651,41 +703,50 @@ capture_baseline_precondition()
         jq -e '.networkactive==true and .connections_out>=3' \
             "${EVIDENCE}/baseline-network.json" >/dev/null || return 1
         jq -e --argjson observed "$observed" '
-          .walletname=="" and .scanning==false and .private_keys_enabled==true and
+          (.walletname|type)=="string" and .scanning==false and .private_keys_enabled==true and
           .unlocked_staking_only==false and .unlocked_until>$observed
         ' "${EVIDENCE}/baseline-wallet.json" >/dev/null || return 1
+        wallet_name=$(jq -er '.walletname | select(type=="string")' \
+            "${EVIDENCE}/baseline-wallet.json") || return 1
         hotfix_phase_b_staking_json_is_active "$(<"${EVIDENCE}/baseline-staking.json")" ||
             return 1
         jq -e '.enabled|type=="boolean"' "${EVIDENCE}/baseline-pow.json" >/dev/null || return 1
-        payout=$(jq -er '.payout_address | select(type=="string" and length>0)' \
+        payout=$(jq -er '.payout_address | select(type=="string")' \
             "${EVIDENCE}/baseline-pow.json") || return 1
-        rpc getaddressinfo "$payout" | jq -S . >"${EVIDENCE}/baseline-payout-address.json" || return 1
-        jq -e --arg payout "$payout" '.address==$payout and .ismine==true' \
-            "${EVIDENCE}/baseline-payout-address.json" >/dev/null || return 1
-        fee=$(jq -er '.confirmed_resolution_fees|select(type=="number" and .>=0)' \
-            "${EVIDENCE}/baseline-recovery.json") || return 1
+        if [[ -n "$payout" ]]; then
+            rpc getaddressinfo "$payout" | jq -S . \
+                >"${EVIDENCE}/baseline-payout-address.json" || return 1
+            hotfix_quantum_payout_address_is_valid \
+                "${EVIDENCE}/baseline-payout-address.json" \
+                "${EVIDENCE}/baseline-quantum.json" "$payout" || return 1
+            payout_owned=true
+        else
+            printf 'null\n' >"${EVIDENCE}/baseline-payout-address.json" || return 1
+            payout_owned=false
+        fi
         hotfix_candidate_recovery_json_is_valid \
-            "$(<"${EVIDENCE}/baseline-recovery.json")" "$fee" || return 1
+            "$(<"${EVIDENCE}/baseline-recovery.json")" || return 1
         jq -e --arg tip "$tip" '
           .active_tip==$tip and .wallet_processed_tip==$tip and
-          .pending_manual_resolutions==0 and .pending_automatic_resolutions==0 and
           .policy_authoritative==true and .policy.automatic_authorized==false
         ' "${EVIDENCE}/baseline-recovery.json" >/dev/null || return 1
-        jq -e '. == [""]' "${EVIDENCE}/baseline-loaded-wallets.json" >/dev/null || return 1
+        jq -e --arg wallet "$wallet_name" '. == [$wallet]' \
+            "${EVIDENCE}/baseline-loaded-wallets.json" >/dev/null || return 1
         quantum_count=$(quantum_inventory_count "${EVIDENCE}/baseline-quantum.json") || return 1
         [[ "$quantum_count" =~ ^[0-9]+$ && "$quantum_count" -gt 0 ]] || return 1
-        policy_sha=$(recovery_policy_sha "${EVIDENCE}/baseline-recovery.json") || return 1
-        metrics_sha=$(recovery_metrics_sha "${EVIDENCE}/baseline-recovery.json") || return 1
         jq -S -n --argjson observed "$observed" --arg tip "$tip" \
-            --arg policy "$policy_sha" --arg metrics "$metrics_sha" \
-            --arg payout "$payout" --argjson quantum_count "$quantum_count" '
-            {schema:1,observed_epoch:$observed,stable_tip:$tip,
+            --arg goldrush_sha "$(sha256sum \
+              "${EVIDENCE}/baseline-goldrush-state.json" | awk '{print $1}')" \
+            --arg payout "$payout" --argjson payout_owned "$payout_owned" \
+            --arg wallet "$wallet_name" \
+            --argjson quantum_count "$quantum_count" '
+            {schema:2,observed_epoch:$observed,stable_tip:$tip,
+             goldrush_state_sha256:$goldrush_sha,
              main_chain_ready:true,p2p_ready:true,wallet_normally_unlocked:true,
-             exact_loaded_wallets:[""],staking_active:true,payout_address:$payout,
-             payout_owned:true,quantum_key_count:$quantum_count,
-             recovery_policy_sha256:$policy,recovery_metrics_sha256:$metrics,
+             exact_loaded_wallets:[$wallet],staking_active:true,payout_address:$payout,
+             payout_owned:$payout_owned,quantum_key_count:$quantum_count,
              recovery_database_unambiguous:true,recovery_policy_nonautomatic:true,
-             pending_recovery_actions_zero:true,irreversible_marker_allowed:true}
+             irreversible_marker_allowed:true}
         ' >"${EVIDENCE}/baseline-precondition.json" || return 1
         return 0
     done
@@ -843,21 +904,44 @@ capture_final_container_identity()
 
 wait_chain_wallet_sync_locked()
 {
-    local chain recovery wallet tip
+    local chain recovery wallet staking pow loaded tip locked
     for _ in $(seq 1 900); do
         chain=$(rpc getblockchaininfo) || return 1
         recovery=$(rpc getpowclaimrecoveryinfo true) || return 1
         wallet=$(rpc getwalletinfo) || return 1
+        staking=$(rpc getstakinginfo) || return 1
+        pow=$(rpc getpowmininginfo) || return 1
+        loaded=$(rpc listwallets) || return 1
         tip=$(jq -er '.bestblockhash' <<<"$chain") || return 1
         if jq -e '.initialblockdownload == false and .blocks == .headers' <<<"$chain" >/dev/null &&
            jq -e --arg tip "$tip" '.chain_ready == true and .wallet_tip_matches == true and
              .active_tip == $tip and .wallet_processed_tip == $tip' <<<"$recovery" >/dev/null &&
-           jq -e '.scanning == false and .unlocked_until == 0' <<<"$wallet" >/dev/null; then
-            jq -S -n --argjson chain "$chain" --argjson recovery "$recovery" \
-                --argjson wallet "$wallet" \
-                '{schema:1,chain:$chain,recovery:$recovery,wallet:$wallet,synchronized:true}' \
-                >"${EVIDENCE}/candidate-chain-wallet-synchronized.json"
-            return
+           jq -e --arg wallet "$baseline_wallet_name" '
+             .walletname==$wallet and .scanning==false and .private_keys_enabled==true and
+             .unlocked_until==0 and .unlocked_staking_only==false' <<<"$wallet" >/dev/null &&
+           jq -e --arg wallet "$baseline_wallet_name" '. == [$wallet]' <<<"$loaded" >/dev/null; then
+            locked=$(jq -S -n --argjson chain "$chain" --argjson recovery "$recovery" \
+                --argjson wallet "$wallet" --argjson staking "$staking" \
+                --argjson pow "$pow" --argjson loaded "$loaded" '
+                {schema:2,chain:$chain,recovery:$recovery,wallet:$wallet,
+                 loaded_wallets:$loaded,staking:$staking,pow:$pow,synchronized:true,
+                 wallet_locked:true,normal_unlock_called:false,
+                 pos_intent_retained:($staking.enabled==true and
+                   $staking.autostart_staking==true),
+                 pow_intent_retained:($pow.enabled==true and $pow.autostart==true and
+                   $pow.threads==1 and $pow.cpu_percent==1),
+                 locked_pos_zero_work:($staking.staking==false and
+                   $staking.eligible==false and $staking.staking_state=="locked"),
+                 locked_pow_zero_work:($pow.hashrate==0 and $pow.claims_submitted==0 and
+                   $pow.state=="wallet_locked_or_staking_only")}
+            ') || return 1
+            printf '%s\n' "$locked" >"${EVIDENCE}/candidate-chain-wallet-synchronized.json" ||
+                return 1
+            if hotfix_phase_b_locked_sync_file_is_valid \
+                "${EVIDENCE}/candidate-chain-wallet-synchronized.json"; then
+                return 0
+            fi
+            rm -f -- "${EVIDENCE}/candidate-chain-wallet-synchronized.json"
         fi
         sleep 2
     done
@@ -867,13 +951,18 @@ wait_chain_wallet_sync_locked()
 classify_phase_b_wallet_delta()
 {
     local baseline="$1" final="$2" recovery="$3" output="$4" raw_output="$5"
+    local baseline_recovery="$6" progress="$7"
     local baseline_txids final_txids new_txids removed_txids txid rows blockhash block shadow
-    local source_txid
-    local recovery_matches classified='[]' raw_records='[]' row raw_row class
-    local baseline_sha final_sha recovery_sha raw_sha
+    local wallet_tx active_blockhash confirmations
+    local source_txid payout_address
+    local recovery_matches prior_recovery_authority classified='[]' raw_records='[]'
+    local row raw_row class
+    local baseline_sha final_sha recovery_sha baseline_recovery_sha progress_sha raw_sha
     baseline_sha=$(sha256sum "$baseline" | awk '{print $1}') || return 1
     final_sha=$(sha256sum "$final" | awk '{print $1}') || return 1
     recovery_sha=$(sha256sum "$recovery" | awk '{print $1}') || return 1
+    baseline_recovery_sha=$(sha256sum "$baseline_recovery" | awk '{print $1}') || return 1
+    progress_sha=$(sha256sum "$progress" | awk '{print $1}') || return 1
     baseline_txids=$(jq -c '[.[].txid] | unique' "$baseline") || return 1
     final_txids=$(jq -c '[.[].txid] | unique' "$final") || return 1
     new_txids=$(jq -cn --argjson baseline "$baseline_txids" --argjson final "$final_txids" \
@@ -889,56 +978,331 @@ classify_phase_b_wallet_delta()
           "$recovery") || return 1
         block='null'
         shadow='null'
+        wallet_tx=$(rpc gettransaction "$txid" true true) || return 1
+        prior_recovery_authority=$(jq -c --arg txid "$txid" \
+          --slurpfile baseline "$baseline_recovery" --slurpfile progress "$progress" '
+          def matches($source;$sample;$observed;$recovery):
+            [$recovery.component_details[] as $component |
+              $component.nodes[] | select(.txid==$txid) |
+              {source:$source,sample:$sample,observed_epoch:$observed,
+               active_tip:$recovery.active_tip,
+               wallet_processed_tip:$recovery.wallet_processed_tip,
+               component:$component,node:.}];
+          (matches("baseline";null;null;$baseline[0]) +
+           [$progress[0].samples[] |
+             matches("phase_b_progress";.sample;.observed_epoch;.recovery)[]]) |
+          sort_by(if .source=="baseline" then 0 else 1 end,
+                  (.sample // 0),.component.component_fingerprint,.node.txid)
+        ') || return 1
+        active_blockhash='null'
         blockhash=''
         source_txid=''
-        if jq -e --arg txid "$txid" '
+        payout_address=''
+        if jq -e --arg txid "$txid" --arg zero "$HOTFIX_ZERO_TXID" \
+          --argjson rows "$rows" --argjson wallet "$wallet_tx" \
+          --argjson prior "$prior_recovery_authority" '
+          def integer: type=="number" and floor==.;
+          def hex64: type=="string" and test("^[0-9a-f]{64}$");
+          def nonzero_hex64: hex64 and . != $zero;
+          def claim_nodes($component):
+            $component.nodes | map(select(.kind=="claim")) | sort_by(.lineage_ordinal);
+          def known_disposition($node):
+            ($node.disposition | IN("eligible","inactive","height_before_window",
+              "height_after_window","invalid_location","malformed","duplicate",
+              "wrong_mode","unknown_mode","unsupported_version",
+              "version_not_yet_active","invalid_proof",
+              "unbound_proof_may_revalidate","origin_not_yet_reached",
+              "origin_mismatch","origin_expired","input_mismatch",
+              "already_accounted","capacity_limit","evaluation_limit",
+              "local_state_error"));
+          def exact_proof_tuple($node):
+            ($node.proof_version==2 and $node.proof_origin_bound==false and
+              $node.proof_input_bound==false) or
+            ($node.proof_version==3 and $node.proof_origin_bound==true and
+              $node.proof_input_bound==false) or
+            ($node.proof_version==4 and $node.proof_origin_bound==true and
+              $node.proof_input_bound==true);
+          def implicit_claim_root($node;$claim_count):
+            known_disposition($node) and
+            $node.lineage_metadata_present==false and
+            $node.lineage_metadata_valid==false and $node.lineage_ordinal==0 and
+            $node.lineage_family_fingerprint==$zero and
+            $node.lineage_root_txid==$zero and $node.lineage_parent_txid==$zero and
+            $node.proof_mode=="pow" and $node.provenance=="explicit_authored" and
+            $node.authored_metadata_valid==true and $node.expected_shape==true and
+            $node.claim_descriptor_valid==true and
+            $node.exact_authored_carrier_shape==true and
+            $node.proof_evaluation_skipped_resolved_anchor==false and
+            $node.proof_may_revalidate_on_descendant==
+              ($node.disposition=="unbound_proof_may_revalidate") and
+            exact_proof_tuple($node) and
+            (if $claim_count==1 and $node.proof_version==2 then
+               $node.authored_tip_active_branch_bound==true
+             else true end);
+          def canonical_component($match):
+            ($match.component) as $component |
+            (claim_nodes($component)) as $claims |
+            ($claims|length)>=1 and $component.anchor_authenticated==true and
+            ($component.generation_fingerprint|hex64) and
+            $component.generation_fingerprint!=$zero and
+            ([$claims[].txid]|sort)==($component.claim_txids|sort) and
+            ($claims|map(.lineage_ordinal))==[range(0;($claims|length))] and
+            (if $claims[0].lineage_metadata_present then
+               $claims[0].lineage_metadata_valid==true and
+               $claims[0].lineage_root_txid==$claims[0].txid and
+               $claims[0].lineage_family_fingerprint==$component.generation_fingerprint and
+               $claims[0].lineage_parent_txid==$zero
+             else implicit_claim_root($claims[0];($claims|length)) end) and
+            all(range(1;($claims|length));
+              $claims[.].lineage_metadata_present==true and
+              $claims[.].lineage_metadata_valid==true and
+              $claims[.].lineage_family_fingerprint==$component.generation_fingerprint and
+              $claims[.].lineage_root_txid==$claims[0].txid and
+              $claims[.].lineage_parent_txid==$claims[.-1].txid) and
+            all($claims[];
+              .expected_shape==true and .wallet_authored==true and
+              .wallet_from_me==true and .authored_metadata_valid==true and
+              .claim_descriptor_valid==true and .exact_authored_carrier_shape==true and
+              .provenance=="explicit_authored" and
+              .proof_evaluation_skipped_resolved_anchor==false and
+              .proof_may_revalidate_on_descendant==
+                (.disposition=="unbound_proof_may_revalidate") and
+              exact_proof_tuple(.));
+          def authenticated_new_claim($match):
+            canonical_component($match) and $match.node.txid==$txid and
+            $match.node.kind=="claim" and
+            $match.node.provenance=="explicit_authored" and
+            $match.node.wallet_authored==true and $match.node.wallet_from_me==true and
+            $match.node.expected_shape==true and
+            $match.node.lineage_metadata_present==true and
+            $match.node.lineage_metadata_valid==true and
+            exact_proof_tuple($match.node) and
+            $match.node.resolution_metadata_valid==false and
+            $match.node.resolution_relay_authorized==false and
+            ($match.component.claim_txids|index($txid))!=null and
+            ($match.component.resolution_txids|index($txid))==null and
+            ($match.component.ordinary_or_mixed_txids|index($txid))==null;
+          def exact_wallet_metadata($object;$match):
+            $object.qq_shadow_pow_authored=="1" and
+            $object.qq_shadow_pow_lineage_schema=="1" and
+            $object.qq_shadow_pow_lineage_family==$match.component.generation_fingerprint and
+            $object.qq_shadow_pow_lineage_root==$match.node.lineage_root_txid and
+            $object.qq_shadow_pow_lineage_parent==$match.node.lineage_parent_txid and
+            $object.qq_shadow_pow_lineage_ordinal==($match.node.lineage_ordinal|tostring) and
+            ($object.qq_shadow_pow_created_tip|hex64) and
+            ($object.qq_shadow_pow_created_height?==null or
+              (($object.qq_shadow_pow_created_height|type)=="string" and
+               ($object.qq_shadow_pow_created_height|test("^[0-9]+$")))) and
+            $object.qq_shadow_pow_anchor_txid==$match.component.anchor.txid and
+            $object.qq_shadow_pow_anchor_vout==($match.component.anchor.vout|tostring) and
+            ($object.qq_shadow_pow_cleanup_for?==null) and
+            ($object.qq_shadow_pow_legacy_cleanup_quarantine?==null) and
+            ($object.qq_auto_shadow_stale?==null) and
+            ($object.qq_manual_shadow_abandon?==null) and
+            ($object.qq_reorg_shadow_resubmit?==null) and
+            ($object.qq_shadow_pow_resolution_schema?==null) and
+            ($object.qq_shadow_pow_resolution_origin?==null) and
+            ($object.qq_shadow_pow_resolution_anchor_txid?==null);
+          def intrinsic_authored_descriptor($object):
+            if ($object|type)=="object" and
+               $object.qq_shadow_pow_authored=="1" and
+               $object.qq_shadow_pow_lineage_schema=="1" and
+               ($object.qq_shadow_pow_lineage_family|nonzero_hex64) and
+               ($object.qq_shadow_pow_lineage_root|nonzero_hex64) and
+               ($object.qq_shadow_pow_lineage_parent|hex64) and
+               ($object.qq_shadow_pow_lineage_ordinal|type)=="string" and
+               ($object.qq_shadow_pow_lineage_ordinal|test("^(0|[1-9][0-9]*)$")) and
+               ($object.qq_shadow_pow_created_tip|nonzero_hex64) and
+               ($object.qq_shadow_pow_created_height?==null or
+                 (($object.qq_shadow_pow_created_height|type)=="string" and
+                  ($object.qq_shadow_pow_created_height|test("^(0|[1-9][0-9]*)$")))) and
+               ($object.qq_shadow_pow_anchor_txid|nonzero_hex64) and
+               ($object.qq_shadow_pow_anchor_vout|type)=="string" and
+               ($object.qq_shadow_pow_anchor_vout|test("^(0|[1-9][0-9]*)$")) and
+               ($object.qq_shadow_pow_anchor_vout|tonumber)<4294967295 and
+               ($object.qq_shadow_pow_cleanup_for?==null) and
+               ($object.qq_shadow_pow_legacy_cleanup_quarantine?==null) and
+               ($object.qq_auto_shadow_stale?==null) and
+               ($object.qq_manual_shadow_abandon?==null) and
+               ($object.qq_reorg_shadow_resubmit?==null) and
+               ($object.qq_shadow_pow_resolution_schema?==null) and
+               ($object.qq_shadow_pow_resolution_origin?==null) and
+               ($object.qq_shadow_pow_resolution_anchor_txid?==null) and
+               $object.qq_shadow_pow_lineage_ordinal=="0" and
+               $object.qq_shadow_pow_lineage_root==$txid and
+               $object.qq_shadow_pow_lineage_parent==$zero
+            then {family:$object.qq_shadow_pow_lineage_family,
+              root:$object.qq_shadow_pow_lineage_root,
+              parent:$object.qq_shadow_pow_lineage_parent,
+              ordinal:$object.qq_shadow_pow_lineage_ordinal,
+              created_tip:$object.qq_shadow_pow_created_tip,
+              created_height:($object.qq_shadow_pow_created_height? // null),
+              anchor_txid:$object.qq_shadow_pow_anchor_txid,
+              anchor_vout:$object.qq_shadow_pow_anchor_vout}
+            else null end;
+          def intrinsic_confirmed_authored_claim:
+            (intrinsic_authored_descriptor($wallet)) as $descriptor |
+            $descriptor!=null and ($rows|length)>=1 and all($rows[];
+              .txid==$txid and .category=="send" and
+              (.comment | IN("Quantum Quasar built-in shadow PoW claim",
+                "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim")) and
+              intrinsic_authored_descriptor(.)==$descriptor);
+          def exact_claim_rows($match):
+            ($rows|length)>=1 and all($rows[];
+              .txid==$txid and .category=="send" and
+              (.comment | IN("Quantum Quasar built-in shadow PoW claim",
+                "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim")) and
+              exact_wallet_metadata(.;$match));
           [.component_details[] as $component |
             $component.nodes[] | select(.txid==$txid) |
-            {component:$component,node:.}] as $matches |
-          ($matches|length)==1 and
-          $matches[0].node.kind=="claim" and
-          $matches[0].node.provenance=="explicit_authored" and
-          $matches[0].node.wallet_authored==true and
-          $matches[0].node.expected_shape==true and
-          $matches[0].node.lineage_metadata_present==true and
-          $matches[0].node.lineage_metadata_valid==true and
-          $matches[0].node.proof_origin_bound==true and
-          $matches[0].node.proof_input_bound==true and
-          $matches[0].node.expired_locally_retired==false and
-          $matches[0].node.abandoned==false and
-          $matches[0].node.resolution_metadata_valid==false and
-          $matches[0].node.resolution_relay_authorized==false and
-          $matches[0].component.anchor_authenticated==true and
-          $matches[0].component.all_claims_explicitly_provenanced==true and
-          $matches[0].component.all_claims_zero_payment_retirable==false and
-          $matches[0].component.all_claims_expired_locally_retired==false and
-          ($matches[0].component.generation_fingerprint |
-            test("^[0-9a-f]{64}$") and
-            . != "0000000000000000000000000000000000000000000000000000000000000000") and
-          ($matches[0].component.claim_txids | index($txid))!=null and
-          ($matches[0].component.resolution_txids | index($txid))==null and
-          ($matches[0].component.ordinary_or_mixed_txids | index($txid))==null
-        ' "$recovery" >/dev/null && jq -e --arg family "$(jq -er --arg txid "$txid" '
-          first(.component_details[] as $component |
-            $component.nodes[] | select(.txid==$txid) | $component.generation_fingerprint)
-        ' "$recovery")" '
-          length>=1 and all(.[];
-            .category=="send" and .qq_shadow_pow_authored=="1" and
-            (.comment=="Quantum Quasar built-in shadow PoW claim" or
-            .comment=="Blackcoin shadow PoW claim" or .comment=="PoW Claim" or
-             .comment=="Quantum PoW Claim") and
-            .qq_shadow_pow_lineage_schema=="1" and
-            .qq_shadow_pow_lineage_family==$family and
-            (.qq_shadow_pow_lineage_root|test("^[0-9a-f]{64}$")) and
-            (.qq_shadow_pow_lineage_ordinal|test("^[0-9]+$")) and
-            (.qq_shadow_pow_created_tip|test("^[0-9a-f]{64}$")) and
-            .abandoned==false and (.qq_shadow_pow_cleanup_for?==null) and
-            (.qq_shadow_pow_resolution_schema?==null) and
-            (.qq_shadow_pow_resolution_origin?==null) and
-            (.qq_shadow_pow_resolution_anchor_txid?==null))
-        ' <<<"$rows" >/dev/null; then
+            {component:$component,node:.}] as $current |
+          [$prior[] | select(
+            .source=="phase_b_progress" and (.sample|integer) and .sample>=1 and
+            (.observed_epoch|integer) and .observed_epoch>0 and
+            (.active_tip|hex64) and .wallet_processed_tip==.active_tip and
+            authenticated_new_claim({component:.component,node:.node}))] as
+            $prior_authenticated |
+          ($wallet|type)=="object" and $wallet.txid==$txid and
+          ($wallet.hex|type)=="string" and ($wallet.hex|test("^[0-9a-f]+$")) and
+          (($wallet.hex|length)%2)==0 and ($wallet.decoded|type)=="object" and
+          $wallet.decoded.txid==$txid and ($wallet.confirmations|integer) and
+          ($wallet.details|type)=="array" and ($wallet.details|length)>=1 and
+          (if $wallet.confirmations==0 then
+             ($wallet.blockhash?==null) and ($current|length)==1 and
+             authenticated_new_claim($current[0]) and
+             exact_wallet_metadata($wallet;$current[0]) and exact_claim_rows($current[0])
+           elif $wallet.confirmations>0 then
+             ($wallet.blockhash|hex64) and
+             (if ($prior_authenticated|length)>=1 then
+                ($prior_authenticated[-1]) as $authority |
+                exact_wallet_metadata($wallet;
+                  {component:$authority.component,node:$authority.node}) and
+                exact_claim_rows({component:$authority.component,node:$authority.node})
+              else intrinsic_confirmed_authored_claim end)
+           else false end)
+        ' "$recovery" >/dev/null; then
+            confirmations=$(jq -er '.confirmations' <<<"$wallet_tx") || return 1
+            blockhash=$(jq -r '.blockhash // ""' <<<"$wallet_tx") || return 1
+            if (( confirmations > 0 )); then
+                hotfix_valid_sha256 "$blockhash" || return 1
+                block=$(rpc getblock "$blockhash" 1) || return 1
+                jq -e --arg txid "$txid" --arg blockhash "$blockhash" '
+                  .hash==$blockhash and .confirmations>0 and
+                  (.height|type)=="number" and (.height|floor)==.height and .height>=0 and
+                  (.tx|type)=="array" and (.tx|index($txid))!=null
+                ' <<<"$block" >/dev/null || return 1
+                active_blockhash=$(rpc getblockhash "$(jq -er '.height' <<<"$block")") ||
+                    return 1
+                [[ "$(jq -r . <<<"$active_blockhash")" == "$blockhash" ]] || return 1
+                jq -e --arg blockhash "$blockhash" '
+                  all(.[]; (.confirmations|type)=="number" and
+                    (.confirmations|floor)==.confirmations and .confirmations>0 and
+                    .blockhash==$blockhash)
+                ' <<<"$rows" >/dev/null || return 1
+            elif (( confirmations == 0 )) && [[ -z "$blockhash" ]]; then
+                block='null'
+                active_blockhash='null'
+                jq -e 'all(.[]; .confirmations==0 and (.blockhash?==null))' \
+                    <<<"$rows" >/dev/null || return 1
+            else
+                return 1
+            fi
             row=$(jq -cn --arg txid "$txid" '{txid:$txid,class:"authenticated_qq_claim"}') ||
                 return 1
+        elif jq -e --arg txid "$txid" '
+          def no_control_metadata:
+            ([keys[] | select(startswith("qq_"))] | length)==0;
+          def clean_receive:
+            (.amount|type)=="number" and .amount>0 and .abandoned==false and
+            (.fee?==null) and (.generated?==null) and
+            .category=="receive" and no_control_metadata and
+            ((.comment? // "") |
+              IN("Quantum Quasar built-in shadow PoW claim",
+                 "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim") | not);
+          .txid==$txid and (.hex|type)=="string" and
+          (.hex|test("^[0-9a-f]+$")) and ((.hex|length)%2)==0 and
+          (.decoded|type)=="object" and .decoded.txid==$txid and
+          (.fee?==null) and (.amount|type)=="number" and .amount>0 and
+          (.generated?==null) and no_control_metadata and
+          (.details|type)=="array" and (.details|length)>=1 and
+          all(.details[]; clean_receive)
+        ' <<<"$wallet_tx" >/dev/null && jq -e --arg txid "$txid" '
+          length>=1 and all(.[];
+            .txid==$txid and .category=="receive" and
+            (.amount|type)=="number" and .amount>0 and .abandoned==false and
+            (.fee?==null) and (.generated?==null) and
+            ([keys[] | select(startswith("qq_"))] | length)==0 and
+            ((.comment? // "") |
+              IN("Quantum Quasar built-in shadow PoW claim",
+                 "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim") | not))
+        ' <<<"$rows" >/dev/null; then
+            confirmations=$(jq -er '.confirmations | select(type=="number" and floor==.)' \
+                <<<"$wallet_tx") || return 1
+            blockhash=$(jq -r '.blockhash // ""' <<<"$wallet_tx") || return 1
+            if (( confirmations > 0 )); then
+                hotfix_valid_sha256 "$blockhash" || return 1
+                block=$(rpc getblock "$blockhash" 1) || return 1
+                jq -e --arg txid "$txid" --arg blockhash "$blockhash" \
+                    '.hash==$blockhash and .confirmations>0 and
+                     (.height|type)=="number" and (.height|floor)==.height and
+                     (.tx|type)=="array" and (.tx|index($txid))!=null' \
+                    <<<"$block" >/dev/null || return 1
+                active_blockhash=$(rpc getblockhash "$(jq -er '.height' <<<"$block")") ||
+                    return 1
+                [[ "$(jq -r . <<<"$active_blockhash")" == "$blockhash" ]] || return 1
+                jq -e 'length==0' <<<"$recovery_matches" >/dev/null || return 1
+                jq -e --arg blockhash "$blockhash" '
+                  all(.[]; (.confirmations|type)=="number" and
+                    (.confirmations|floor)==.confirmations and .confirmations>0 and
+                    .blockhash==$blockhash)
+                ' <<<"$rows" >/dev/null || return 1
+            elif (( confirmations == 0 )) && [[ -z "$blockhash" ]]; then
+                jq -e 'all(.[]; .confirmations==0 and (.blockhash?==null))' \
+                    <<<"$rows" >/dev/null || return 1
+                if ! jq -e 'length==0' <<<"$recovery_matches" >/dev/null; then
+                    jq -e --arg txid "$txid" --arg zero "$HOTFIX_ZERO_TXID" '
+                      def integer: type=="number" and floor==.;
+                      def hex64: type=="string" and test("^[0-9a-f]{64}$");
+                      . as $recovery |
+                      [.component_details[] as $component |
+                        $component.nodes[] | select(.txid==$txid) |
+                        {component:$component,node:.}] as $matches |
+                      ($matches|length)==1 and ($matches[0].component) as $component |
+                      $component.anchor_authenticated==false and
+                      $component.anchor_unspent==false and
+                      $component.anchor_user_locked==false and
+                      $component.anchor.amount==0 and
+                      $component.anchor.scriptPubKey=="" and
+                      (($component.anchor.txid==$zero and
+                         $component.anchor.vout==4294967295) or
+                       (($component.anchor.txid|hex64) and
+                         $component.anchor.txid!=$zero and
+                         ($component.anchor.vout|integer) and
+                         $component.anchor.vout>=0 and
+                         $component.anchor.vout<4294967295)) and
+                      ($component.nodes|type)=="array" and
+                      ($component.claim_txids|type)=="array" and
+                      ($component.claim_txids|length)>=1 and
+                      ([$component.nodes[]|select(.kind=="claim")|.txid]|sort)==
+                        ($component.claim_txids|sort) and
+                      ([$component.nodes[].txid]|sort)==
+                        ([$component.claim_txids[],$component.resolution_txids[],
+                          $component.ordinary_or_mixed_txids[]]|sort) and
+                      ([$component.nodes[].txid]|unique|length)==
+                        ($component.nodes|length) and
+                      all($component.nodes[];
+                        .provenance=="unknown" and .wallet_authored==false and
+                        .wallet_from_me==false) and
+                      all($component.claim_txids[];
+                        . as $claim | ($recovery.unanchored_claim_txids|index($claim))!=null)
+                    ' "$recovery" >/dev/null || return 1
+                fi
+            else
+                return 1
+            fi
+            row=$(jq -cn --arg txid "$txid" --arg blockhash "$blockhash" \
+                '{txid:$txid,class:"external_receive",
+                  blockhash:(if $blockhash=="" then null else $blockhash end)}') || return 1
         elif jq -e '
           length>=1 and all(.[];
             .generated==true and (.category|IN("generate","immature","orphan")) and
@@ -960,9 +1324,9 @@ classify_phase_b_wallet_delta()
                 '{txid:$txid,class:"confirmed_coinstake",blockhash:$blockhash}') || return 1
         elif jq -e '
           length>=1 and all(.[];
-            .qq_synthetic_goldrush_payout=="1" and
-            (.qq_synthetic_goldrush_payout_stale?==null) and .generated==true and
-            (.category|IN("generate","immature")) and .abandoned==false and
+              .qq_synthetic_goldrush_payout=="1" and
+              (.qq_synthetic_goldrush_payout_stale?==null) and .generated==true and
+              (.category|IN("generate","immature")) and
             (.blockhash|type)=="string" and (.blockhash|test("^[0-9a-f]{64}$")) and
             (.qq_shadow_pow_cleanup_for?==null) and
             (.qq_shadow_pow_resolution_schema?==null)) and
@@ -976,45 +1340,98 @@ classify_phase_b_wallet_delta()
               [.component_details[] as $component |
                 $component.nodes[] | select(.txid==$txid) | {component:$component,node:.}]
             ' "$recovery") || return 1
-            jq -e --arg txid "$txid" --arg blockhash "$blockhash" --arg payout "$baseline_payout" '
+            prior_recovery_authority=$(jq -c --arg txid "$source_txid" \
+              --slurpfile baseline "$baseline_recovery" --slurpfile progress "$progress" '
+              def matches($source;$sample;$observed;$recovery):
+                [$recovery.component_details[] as $component |
+                  $component.nodes[] | select(.txid==$txid) |
+                  {source:$source,sample:$sample,observed_epoch:$observed,
+                   active_tip:$recovery.active_tip,
+                   wallet_processed_tip:$recovery.wallet_processed_tip,
+                   component:$component,node:.}];
+              (matches("baseline";null;null;$baseline[0]) +
+               [$progress[0].samples[] |
+                 matches("phase_b_progress";.sample;.observed_epoch;.recovery)[]]) |
+              sort_by(if .source=="baseline" then 0 else 1 end,
+                      (.sample // 0),.component.component_fingerprint,.node.txid)
+            ') || return 1
+            jq -e --arg txid "$txid" --arg blockhash "$blockhash" \
+              --arg source_txid "$source_txid" --argjson rows "$rows" \
+              --argjson wallet "$wallet_tx" '
+              def integer: type=="number" and floor==.;
+              def hex64: type=="string" and test("^[0-9a-f]{64}$");
+              def rawhex: type=="string" and test("^[0-9a-f]+$") and length%2==0;
+              def credited:
+                IN("winner","reimbursed_loser","reimbursed_late");
+              def exact_source($source):
+                ($source.txid|hex64) and $source.txid==$source_txid and
+                ($source.vout|integer) and $source.vout>=0 and $source.vout<4294967295 and
+                ($source.disposition|credited) and
+                (($source.proof_version==2 and $source.origin_bound==false and
+                   $source.input_bound==false and $source.claim_outpoint==null) or
+                 ($source.proof_version==3 and $source.origin_bound==true and
+                   $source.input_bound==false and $source.claim_outpoint==null) or
+                 ($source.proof_version==4 and $source.origin_bound==true and
+                   $source.input_bound==true and
+                   ($source.claim_outpoint|type)=="object" and
+                   ($source.claim_outpoint|keys|sort)==["txid","vout"] and
+                   ($source.claim_outpoint.txid|hex64) and
+                   ($source.claim_outpoint.vout|integer) and
+                   $source.claim_outpoint.vout>=0 and
+                   $source.claim_outpoint.vout<4294967295));
+              def wallet_credit($row;$shadow;$long):
+                ($row.category|IN("generate","immature")) and
+                ($row.amount|type)=="number" and $row.amount>0 and
+                $row.abandoned==false and ($row.fee?==null) and
+                (if $long then
+                   ($row.blockhash|hex64) and $row.blockhash==$blockhash
+                 else true end) and
+                $row.vout==$shadow.vout and
+                (if ($row|has("address")) then
+                   $row.address==$shadow.address else true end);
+              . as $shadow |
               .schema=="blackcoin.shadow.transaction.v1" and .synthetic==true and
               .merkle_included==false and .synthetic_txid==$txid and .mode=="pow" and
-              .base_anchor.blockhash==$blockhash and .address==$payout and .status!="spent" and
-              .pow_claim_source.input_bound==true and
-              (.pow_claim_source.disposition |
-                IN("winner","reimbursed_loser","reimbursed_late"))
+              (.status | IN("immature","gold_rush_locked","demurrage_locked",
+                "unspent","spent")) and
+              (.vout|integer) and .vout>=0 and .vout<4294967295 and
+              (.scriptPubKey|rawhex) and .base_anchor.blockhash==$blockhash and
+              (.base_anchor.height|integer) and .base_anchor.height>=0 and
+              (.base_anchor.claim_index|integer) and .base_anchor.claim_index>=0 and
+              (.address|type)=="string" and (.address|length)>0 and
+              exact_source(.pow_claim_source) and
+              ($wallet|type)=="object" and $wallet.txid==$txid and
+              ($wallet.hex|rawhex) and ($wallet.decoded|type)=="object" and
+              $wallet.decoded.txid==$txid and ($wallet.fee?==null) and
+              ($wallet.amount|type)=="number" and $wallet.amount>0 and
+              ($wallet.confirmations|integer) and $wallet.confirmations>0 and
+              $wallet.blockhash==$blockhash and
+              ($wallet.details|type)=="array" and ($wallet.details|length)>=1 and
+              all($wallet.details[]; wallet_credit(.;$shadow;false)) and
+              ($rows|length)>=1 and all($rows[]; wallet_credit(.;$shadow;true)) and
+              ([ $wallet.decoded.vout[] |
+                 select((.n|integer) and .n==$shadow.vout and
+                   .scriptPubKey.hex==$shadow.scriptPubKey and
+                   (if (.scriptPubKey|has("address")) then
+                      .scriptPubKey.address==$shadow.address else true end)) ] | length)==1
             ' <<<"$shadow" >/dev/null || return 1
-            jq -e --arg txid "$source_txid" '
-              [.component_details[] as $component |
-                $component.nodes[] | select(.txid==$txid) |
-                {component:$component,node:.}] as $matches |
-              ($matches|length)==1 and $matches[0].node.kind=="claim" and
-              $matches[0].node.provenance=="explicit_authored" and
-              $matches[0].node.wallet_authored==true and
-              $matches[0].node.expected_shape==true and
-              $matches[0].node.lineage_metadata_present==true and
-              $matches[0].node.lineage_metadata_valid==true and
-              $matches[0].node.proof_origin_bound==true and
-              $matches[0].node.proof_input_bound==true and
-              $matches[0].node.expired_locally_retired==false and
-              $matches[0].node.abandoned==false and
-              $matches[0].node.resolution_metadata_valid==false and
-              $matches[0].node.resolution_relay_authorized==false and
-              $matches[0].component.anchor_authenticated==true and
-              $matches[0].component.all_claims_explicitly_provenanced==true and
-              $matches[0].component.all_claims_zero_payment_retirable==false and
-              $matches[0].component.all_claims_expired_locally_retired==false and
-              ($matches[0].component.generation_fingerprint |
-                test("^[0-9a-f]{64}$") and
-                . != "0000000000000000000000000000000000000000000000000000000000000000") and
-              ($matches[0].component.claim_txids | index($txid))!=null and
-              ($matches[0].component.resolution_txids | index($txid))==null and
-              ($matches[0].component.ordinary_or_mixed_txids | index($txid))==null
-            ' "$recovery" >/dev/null || return 1
+            block=$(rpc getblock "$blockhash" 1) || return 1
+            jq -e --arg blockhash "$blockhash" --arg source "$source_txid" \
+              --argjson shadow "$shadow" '
+              .hash==$blockhash and .confirmations>0 and
+              (.height|type)=="number" and (.height|floor)==.height and
+              .height==$shadow.base_anchor.height and
+              (.tx|type)=="array" and (.tx|index($source))!=null
+            ' <<<"$block" >/dev/null || return 1
+            active_blockhash=$(rpc getblockhash "$(jq -er '.height' <<<"$block")") ||
+                return 1
+            [[ "$(jq -r . <<<"$active_blockhash")" == "$blockhash" ]] || return 1
+            payout_address=$(jq -er '.address | select(type=="string" and length>0)' \
+                <<<"$shadow") || return 1
             row=$(jq -cn --arg txid "$txid" --arg blockhash "$blockhash" \
-                --arg source "$source_txid" \
+                --arg source "$source_txid" --arg payout "$payout_address" \
                 '{txid:$txid,class:"authenticated_qq_claim_payout",blockhash:$blockhash,
-                  source_claim_txid:$source}') || return 1
+                  source_claim_txid:$source,payout_address:$payout}') || return 1
         else
             return 1
         fi
@@ -1022,11 +1439,15 @@ classify_phase_b_wallet_delta()
         raw_row=$(jq -cn --arg txid "$txid" --arg class "$class" \
             --arg blockhash "$blockhash" --arg source "$source_txid" \
             --argjson rows "$rows" --argjson recovery_matches "$recovery_matches" \
-            --argjson block "$block" --argjson shadow "$shadow" '
+            --argjson prior "$prior_recovery_authority" \
+            --argjson block "$block" --argjson shadow "$shadow" \
+            --argjson wallet_tx "$wallet_tx" --argjson active_blockhash "$active_blockhash" '
             {txid:$txid,class:$class,wallet_rows:$rows,recovery_matches:$recovery_matches,
+             prior_recovery_authority:$prior,
              blockhash:(if $blockhash=="" then null else $blockhash end),
              source_claim_txid:(if $source=="" then null else $source end),
-             getblock_response:$block,getshadowtransaction_response:$shadow}
+             getblock_response:$block,getblockhash_response:$active_blockhash,
+             gettransaction_response:$wallet_tx,getshadowtransaction_response:$shadow}
         ') || return 1
         classified=$(jq -cn --argjson rows "$classified" --argjson row "$row" \
             '$rows+[$row]') || return 1
@@ -1034,45 +1455,60 @@ classify_phase_b_wallet_delta()
             '$rows+[$row]') || return 1
     done < <(jq -r '.[]' <<<"$new_txids")
     jq -S -n --arg baseline "$baseline_sha" --arg final "$final_sha" \
-        --arg recovery "$recovery_sha" --argjson records "$raw_records" '
-        {schema:1,baseline_wallet_transactions_sha256:$baseline,
+        --arg recovery "$recovery_sha" --arg baseline_recovery "$baseline_recovery_sha" \
+        --arg progress "$progress_sha" --argjson records "$raw_records" \
+        --argjson unanchored "$(jq -c '.unanchored_claim_txids' "$recovery")" '
+        {schema:4,baseline_wallet_transactions_sha256:$baseline,
          final_wallet_transactions_sha256:$final,recovery_inventory_sha256:$recovery,
-         records:$records,complete:true}
+         baseline_recovery_sha256:$baseline_recovery,phase_b_progress_sha256:$progress,
+         recovery_unanchored_claim_txids:$unanchored,records:$records,complete:true}
     ' >"$raw_output" || return 1
+    hotfix_phase_b_wallet_delta_raw_file_is_valid "$raw_output" "$baseline_sha" \
+        "$final_sha" "$recovery_sha" "$baseline_recovery_sha" "$progress_sha" || return 1
     raw_sha=$(sha256sum "$raw_output" | awk '{print $1}') || return 1
     jq -S -n --argjson baseline "$baseline_txids" --argjson added "$new_txids" \
         --argjson removed "$removed_txids" \
         --argjson classified "$classified" --arg raw "$raw_sha" '
-        {schema:1,baseline_txids:$baseline,new_txids:$added,removed_txids:$removed,
+        {schema:4,baseline_txids:$baseline,new_txids:$added,removed_txids:$removed,
          classifications:$classified,rejected_txids:[],complete:true,
          raw_evidence_sha256:$raw,
          allowed_classes:["confirmed_coinstake","authenticated_qq_claim",
-           "authenticated_qq_claim_payout"]}
+           "authenticated_qq_claim_payout","external_receive"]}
     ' >"$output" || return 1
+    hotfix_phase_b_wallet_delta_file_is_valid "$output" "$raw_output" || return 1
     [[ "$(jq -r '.new_txids|length' "$output")" == \
        "$(jq -r '.classifications|length' "$output")" ]]
 }
 
 capture_final_envelope()
 {
-    local observed chain_after tip mode current_quantum current_fee policy_sha metrics_sha
-    mode=$([[ "$baseline_pow_enabled" == true ]] && printf active || printf off)
+    local observed chain_after tip mode current_quantum locked_sync_sha final_recovery_sha
+    local current_payout payout_evidence_sha goldrush_state goldrush_sha
+    mode=active
     for _ in $(seq 1 20); do
         observed=$(date +%s)
         rpc getblockchaininfo >"${EVIDENCE}/candidate-final-chain.json" || return 1
+        capture_goldrush_state "${EVIDENCE}/candidate-final-goldrush-state.json" || return 1
         rpc getnetworkinfo >"${EVIDENCE}/candidate-final-network.json" || return 1
         rpc getwalletinfo >"${EVIDENCE}/candidate-final-wallet.json" || return 1
         rpc getstakinginfo >"${EVIDENCE}/candidate-final-staking.json" || return 1
         rpc getpowmininginfo >"${EVIDENCE}/candidate-final-pow.json" || return 1
         rpc getpowclaimrecoveryinfo true >"${EVIDENCE}/candidate-final-recovery.json" || return 1
+        rpc getrawmempool true | jq -S . \
+            >"${EVIDENCE}/candidate-final-mempool-verbose.json" || return 1
         rpc getquantumkeyinventory | jq -S . >"${EVIDENCE}/candidate-final-quantum.json" ||
             return 1
+        capture_quantum_payout_label_evidence "${EVIDENCE}/candidate-final-quantum.json" \
+            "${EVIDENCE}/candidate-final-quantum-labels.json" || return 1
         rpc listwallets | jq -S . >"${EVIDENCE}/candidate-final-loaded-wallets.json" || return 1
         capture_wallet_transactions "${EVIDENCE}/candidate-final-wallet-transactions.json" ||
             return 1
         rpc getblockchaininfo >"${EVIDENCE}/candidate-final-chain-after.json" || return 1
         chain_after=$(<"${EVIDENCE}/candidate-final-chain-after.json")
         tip=$(jq -er '.bestblockhash' "${EVIDENCE}/candidate-final-chain.json") || return 1
+        goldrush_state=$(<"${EVIDENCE}/candidate-final-goldrush-state.json")
+        hotfix_goldrush_state_json_is_valid "$goldrush_state" "$tip" \
+            "$(jq -er '.blocks' "${EVIDENCE}/candidate-final-chain.json")" || return 1
         if ! jq -e --argjson after "$chain_after" '
           .chain=="main" and .initialblockdownload==false and .blocks==.headers and
           .bestblockhash==$after.bestblockhash and .chainwork==$after.chainwork and
@@ -1083,49 +1519,117 @@ capture_final_envelope()
         fi
         jq -e '.networkactive==true and .connections_out>=3' \
             "${EVIDENCE}/candidate-final-network.json" >/dev/null || return 1
-        jq -e --argjson observed "$observed" '
-          .walletname=="" and .scanning==false and .private_keys_enabled==true and
+        jq -e --argjson observed "$observed" --arg wallet "$baseline_wallet_name" '
+          .walletname==$wallet and .scanning==false and .private_keys_enabled==true and
           .unlocked_staking_only==false and .unlocked_until>$observed
         ' "${EVIDENCE}/candidate-final-wallet.json" >/dev/null || return 1
         hotfix_phase_b_staking_json_is_active \
             "$(<"${EVIDENCE}/candidate-final-staking.json")" || return 1
         hotfix_candidate_pow_json_is_valid "$(<"${EVIDENCE}/candidate-final-pow.json")" \
             "$mode" || return 1
+        jq -e '.autostart_staking==true and
+          .autostart_staking_source=="autostartstaking"' \
+            "${EVIDENCE}/candidate-final-staking.json" >/dev/null || return 1
+        jq -e '.autostart==true and .enabled==true and .threads==1 and .cpu_percent==1' \
+            "${EVIDENCE}/candidate-final-pow.json" >/dev/null || return 1
         jq -e --arg tip "$tip" '
           .claim_inventory_wallet_tip_matches==true and .claim_inventory_tip==$tip
         ' "${EVIDENCE}/candidate-final-pow.json" >/dev/null || return 1
-        current_fee=$(jq -er '.confirmed_resolution_fees' \
-            "${EVIDENCE}/candidate-final-recovery.json") || return 1
         hotfix_candidate_recovery_json_is_valid \
-            "$(<"${EVIDENCE}/candidate-final-recovery.json")" "$current_fee" || return 1
+            "$(<"${EVIDENCE}/candidate-final-recovery.json")" || return 1
+        hotfix_pow_recovery_same_cut_json_is_valid \
+            "$(<"${EVIDENCE}/candidate-final-pow.json")" \
+            "$(<"${EVIDENCE}/candidate-final-recovery.json")" || return 1
+        hotfix_pow_observation_json_is_valid \
+            "$(<"${EVIDENCE}/candidate-final-pow.json")" \
+            "$(<"${EVIDENCE}/candidate-final-recovery.json")" \
+            "$(<"${EVIDENCE}/candidate-final-mempool-verbose.json")" "$tip" \
+            "$(jq -er '.blocks' "${EVIDENCE}/candidate-final-chain.json")" \
+            "$observed" "$goldrush_state" || return 1
         jq -e --arg tip "$tip" '
-          .active_tip==$tip and .wallet_processed_tip==$tip and
-          .pending_manual_resolutions==0 and .pending_automatic_resolutions==0
+          .active_tip==$tip and .wallet_processed_tip==$tip
         ' "${EVIDENCE}/candidate-final-recovery.json" >/dev/null || return 1
-        policy_sha=$(recovery_policy_sha "${EVIDENCE}/candidate-final-recovery.json") || return 1
-        metrics_sha=$(recovery_metrics_sha "${EVIDENCE}/candidate-final-recovery.json") || return 1
-        [[ "$policy_sha" == "$baseline_recovery_policy_sha" &&
-           "$metrics_sha" == "$baseline_recovery_metrics_sha" ]] || return 1
-        jq -e '. == [""]' "${EVIDENCE}/candidate-final-loaded-wallets.json" >/dev/null || return 1
-        [[ "$(jq -er '.payout_address' "${EVIDENCE}/candidate-final-pow.json")" == \
-           "$baseline_payout" ]] || return 1
+        jq -e --arg wallet "$baseline_wallet_name" '. == [$wallet]' \
+            "${EVIDENCE}/candidate-final-loaded-wallets.json" >/dev/null || return 1
+        current_payout=$(jq -er '.payout_address | select(type=="string")' \
+            "${EVIDENCE}/candidate-final-pow.json") || return 1
+        if [[ -n "$current_payout" ]]; then
+            rpc getaddressinfo "$current_payout" | jq -S . \
+                >"${EVIDENCE}/candidate-final-payout-address.json" || return 1
+            hotfix_quantum_payout_address_is_valid \
+                "${EVIDENCE}/candidate-final-payout-address.json" \
+                "${EVIDENCE}/baseline-quantum.json" "$current_payout" || return 1
+            hotfix_quantum_payout_address_is_valid \
+                "${EVIDENCE}/candidate-final-payout-address.json" \
+                "${EVIDENCE}/candidate-final-quantum.json" "$current_payout" || return 1
+        else
+            printf 'null\n' >"${EVIDENCE}/candidate-final-payout-address.json" || return 1
+        fi
+        payout_evidence_sha=$(sha256sum \
+            "${EVIDENCE}/candidate-final-payout-address.json" | awk '{print $1}') || return 1
         current_quantum=$(quantum_inventory_count "${EVIDENCE}/candidate-final-quantum.json") ||
             return 1
-        [[ "$current_quantum" == "$baseline_quantum_count" &&
-           "$(sha256sum "${EVIDENCE}/candidate-final-quantum.json" | awk '{print $1}')" == \
-           "$baseline_quantum_sha" ]] || return 1
+        [[ "$current_quantum" == "$baseline_quantum_count" ]] || return 1
+        hotfix_quantum_inventory_transition_is_valid \
+            "${EVIDENCE}/baseline-quantum.json" \
+            "${EVIDENCE}/candidate-final-quantum.json" \
+            "${EVIDENCE}/baseline-quantum-labels.json" \
+            "${EVIDENCE}/candidate-final-quantum-labels.json" || return 1
         classify_phase_b_wallet_delta "${EVIDENCE}/baseline-wallet-transactions.json" \
             "${EVIDENCE}/candidate-final-wallet-transactions.json" \
             "${EVIDENCE}/candidate-final-recovery.json" \
             "${EVIDENCE}/phase-b-wallet-delta.json" \
-            "${EVIDENCE}/phase-b-wallet-delta-raw.json" || return 1
+            "${EVIDENCE}/phase-b-wallet-delta-raw.json" \
+            "${EVIDENCE}/baseline-recovery.json" \
+            "${EVIDENCE}/phase-b-progress.json" || return 1
         jq -S '[.component_details[]?.resolution_txids[]?] | unique | sort' \
             "${EVIDENCE}/candidate-final-recovery.json" \
             >"${EVIDENCE}/candidate-final-resolution-txids.json" || return 1
-        [[ "$(sha256sum "${EVIDENCE}/candidate-final-resolution-txids.json" |
-             awk '{print $1}')" == "$baseline_resolution_sha" ]] || return 1
+        jq -e -n --slurpfile baseline "${EVIDENCE}/baseline-wallet-resolution-txids.json" \
+            --slurpfile current "${EVIDENCE}/candidate-final-resolution-txids.json" '
+          all($current[0][]; . as $txid | ($baseline[0] | index($txid)) != null)
+        ' >/dev/null || return 1
+        capture_resolution_raw_identities \
+            "${EVIDENCE}/candidate-final-resolution-txids.json" \
+            "${EVIDENCE}/candidate-final-resolution-raw.json" || return 1
+        jq -e -n --slurpfile baseline "${EVIDENCE}/baseline-wallet-resolution-raw.json" \
+            --slurpfile current "${EVIDENCE}/candidate-final-resolution-raw.json" '
+          all($current[0][]; . as $row |
+            ([$baseline[0][] | select(.txid==$row.txid and .hex==$row.hex)] | length)==1)
+        ' >/dev/null || return 1
+        locked_sync_sha=$(sha256sum "${EVIDENCE}/candidate-chain-wallet-synchronized.json" |
+            awk '{print $1}') || return 1
+        final_recovery_sha=$(sha256sum "${EVIDENCE}/candidate-final-recovery.json" |
+            awk '{print $1}') || return 1
+        goldrush_sha=$(sha256sum "${EVIDENCE}/candidate-final-goldrush-state.json" |
+            awk '{print $1}') || return 1
+        jq -e -n --argjson final "$goldrush_state" \
+            --slurpfile baseline "${EVIDENCE}/baseline-goldrush-state.json" \
+            --slurpfile progress "${EVIDENCE}/phase-b-progress.json" '
+          def schedule: {qqp4_activation_disabled,qqp4_activation_height};
+          ($final|schedule)==($baseline[0]|schedule) and
+          all($progress[0].samples[]; (.goldrush_state|schedule)==($final|schedule))
+        ' >/dev/null || return 1
         jq -S -n --argjson observed "$observed" --arg tip "$tip" --arg mode "$mode" \
-            --arg policy "$policy_sha" --arg metrics "$metrics_sha" \
+            --arg wallet_name "$baseline_wallet_name" --arg locked_sync "$locked_sync_sha" \
+            --arg locked_resolution "$candidate_locked_resolution_sha" \
+            --arg baseline_resolution "$(sha256sum \
+              "${EVIDENCE}/baseline-wallet-resolution-txids.json" | awk '{print $1}')" \
+            --arg baseline_resolution_raw "$(sha256sum \
+              "${EVIDENCE}/baseline-wallet-resolution-raw.json" | awk '{print $1}')" \
+            --arg locked_resolution_raw "$(sha256sum \
+              "${EVIDENCE}/candidate-locked-resolution-raw.json" | awk '{print $1}')" \
+            --arg final_recovery "$final_recovery_sha" \
+            --arg final_goldrush "$goldrush_sha" \
+            --arg final_payout "$payout_evidence_sha" \
+            --arg quantum_before "$(sha256sum "${EVIDENCE}/baseline-quantum.json" | awk '{print $1}')" \
+            --arg quantum_after "$(sha256sum "${EVIDENCE}/candidate-final-quantum.json" | awk '{print $1}')" \
+            --arg quantum_labels_before "$(sha256sum "${EVIDENCE}/baseline-quantum-labels.json" | awk '{print $1}')" \
+            --arg quantum_labels_after "$(sha256sum "${EVIDENCE}/candidate-final-quantum-labels.json" | awk '{print $1}')" \
+            --arg final_resolution "$(sha256sum \
+              "${EVIDENCE}/candidate-final-resolution-txids.json" | awk '{print $1}')" \
+            --arg final_resolution_raw "$(sha256sum \
+              "${EVIDENCE}/candidate-final-resolution-raw.json" | awk '{print $1}')" \
             --arg delta "$(sha256sum "${EVIDENCE}/phase-b-wallet-delta.json" | awk '{print $1}')" \
             --arg delta_raw "$(sha256sum "${EVIDENCE}/phase-b-wallet-delta-raw.json" | awk '{print $1}')" \
             --slurpfile chain "${EVIDENCE}/candidate-final-chain.json" \
@@ -1135,16 +1639,37 @@ capture_final_envelope()
             --slurpfile staking "${EVIDENCE}/candidate-final-staking.json" \
             --slurpfile pow "${EVIDENCE}/candidate-final-pow.json" \
             --slurpfile recovery "${EVIDENCE}/candidate-final-recovery.json" \
+            --slurpfile goldrush "${EVIDENCE}/candidate-final-goldrush-state.json" \
+            --slurpfile mempool "${EVIDENCE}/candidate-final-mempool-verbose.json" \
             --slurpfile wallets "${EVIDENCE}/candidate-final-loaded-wallets.json" '
-            {schema:1,observed_epoch:$observed,stable_tip:$tip,pow_mode:$mode,
+            {schema:2,observed_epoch:$observed,stable_tip:$tip,pow_mode:$mode,
              chain_before_after_identical:true,chain_recovery_pow_tip_bound:true,
-             wallet_unlock_current:true,exact_loaded_wallets:[""],
-             recovery_policy_sha256:$policy,recovery_metrics_sha256:$metrics,
-             recovery_counters_unchanged:true,recovery_txids_unchanged:true,
+             wallet_unlock_current:true,exact_loaded_wallets:[$wallet_name],
+             automatic_recovery_unauthorized:true,
+             candidate_locked_sync_sha256:$locked_sync,
+             baseline_wallet_resolution_txids_sha256:$baseline_resolution,
+             baseline_wallet_resolution_raw_sha256:$baseline_resolution_raw,
+             candidate_locked_resolution_txids_sha256:$locked_resolution,
+             candidate_locked_resolution_raw_sha256:$locked_resolution_raw,
+             candidate_final_recovery_sha256:$final_recovery,
+             candidate_final_goldrush_state_sha256:$final_goldrush,
+             candidate_final_payout_address_sha256:$final_payout,
+             candidate_configured_payout_transition_valid:true,
+             baseline_quantum_sha256:$quantum_before,
+             candidate_final_quantum_sha256:$quantum_after,
+             baseline_quantum_labels_sha256:$quantum_labels_before,
+             candidate_final_quantum_labels_sha256:$quantum_labels_after,
+             candidate_quantum_inventory_transition_valid:true,
+             candidate_final_resolution_txids_sha256:$final_resolution,
+             candidate_final_resolution_raw_sha256:$final_resolution_raw,
+             candidate_resolution_membership_baseline_bound:true,
+             legacy_baseline_wallet_txids_preserved:true,
+             no_new_fee_bearing_recovery_wallet_transaction:true,
              wallet_delta_sha256:$delta,wallet_delta_fully_classified:true,
              wallet_delta_raw_sha256:$delta_raw,
              chain:$chain[0],chain_after:$chain_after[0],network:$network[0],
              wallet:$wallet[0],staking:$staking[0],pow:$pow[0],recovery:$recovery[0],
+             goldrush_state:$goldrush[0],mempool_verbose:$mempool[0],
              loaded_wallets:$wallets[0]}
         ' >"${EVIDENCE}/phase-b-final-envelope.json" || return 1
         return 0
@@ -1154,31 +1679,40 @@ capture_final_envelope()
 
 collect_phase_b_progress()
 {
-    local sample deadline previous_height=-1 previous_tip='' previous_work='' row rows='[]'
-    local chain recovery wallet staking pow network mempool mode observed
-    mode=$([[ "$baseline_pow_enabled" == true ]] && printf active || printf off)
+    local sample=1 deadline row candidate_rows rows='[]' series tip_changes=0
+    local chain chain_after recovery wallet staking pow network mempool mode observed
+    local goldrush_state
+    mode=active
     deadline=$((SECONDS + 2700))
-    for sample in 1 2 3 4; do
+    while (( SECONDS < deadline && tip_changes < 1 )); do
         while (( SECONDS < deadline )); do
             chain=$(rpc getblockchaininfo) || return 1
+            goldrush_state=$(rpc getgoldrushstate | jq -ceS \
+              '{bestblock,height,qqp4_activation_disabled,qqp4_activation_height,
+                qqp4_active,qqp4_active_next_block}') || return 1
             recovery=$(rpc getpowclaimrecoveryinfo true) || return 1
             wallet=$(rpc getwalletinfo) || return 1
             staking=$(rpc getstakinginfo) || return 1
             pow=$(rpc getpowmininginfo) || return 1
             network=$(rpc getnetworkinfo) || return 1
             mempool=$(rpc getrawmempool true) || return 1
+            chain_after=$(rpc getblockchaininfo) || return 1
             observed=$(date +%s) || return 1
-            if [[ "$(jq -er '.blocks' <<<"$chain")" -gt "$previous_height" &&
-               "$(jq -er '.bestblockhash' <<<"$chain")" != "$previous_tip" &&
-               "$(jq -er '.chainwork' <<<"$chain")" > "$previous_work" ]] &&
-               jq -e '.initialblockdownload == false and .blocks == .headers' \
+            if jq -e '.initialblockdownload == false and .blocks == .headers' \
                    <<<"$chain" >/dev/null &&
+               jq -e -n --argjson before "$chain" --argjson after "$chain_after" '
+                 $before.bestblockhash==$after.bestblockhash and
+                 $before.chainwork==$after.chainwork and $before.blocks==$after.blocks and
+                 $before.headers==$after.headers
+               ' >/dev/null &&
+               hotfix_goldrush_state_json_is_valid "$goldrush_state" \
+                 "$(jq -er '.bestblockhash' <<<"$chain")" \
+                 "$(jq -er '.blocks' <<<"$chain")" &&
                jq -e --arg tip "$(jq -er '.bestblockhash' <<<"$chain")" '
                  .database_outcome_ambiguous == false and .chain_ready == true and
                  .wallet_tip_matches == true and .active_tip == $tip and
                  .wallet_processed_tip == $tip and .policy_authoritative == true and
-                 .policy.automatic_authorized == false and
-                 .pending_manual_resolutions == 0 and .pending_automatic_resolutions == 0
+                 .policy.automatic_authorized == false
                ' <<<"$recovery" >/dev/null &&
                jq -e --arg tip "$(jq -er '.bestblockhash' <<<"$chain")" '
                  .claim_inventory_wallet_tip_matches == true and .claim_inventory_tip == $tip
@@ -1187,37 +1721,54 @@ collect_phase_b_progress()
                  .unlocked_until > now' <<<"$wallet" >/dev/null &&
                jq -e '.networkactive == true and .connections_out >= 3' \
                  <<<"$network" >/dev/null &&
+               jq -e '.autostart_staking==true and
+                 .autostart_staking_source=="autostartstaking"' <<<"$staking" >/dev/null &&
+               jq -e '.autostart==true and .enabled==true and .threads==1 and
+                 .cpu_percent==1' <<<"$pow" >/dev/null &&
                hotfix_phase_b_staking_json_is_active "$staking" &&
                hotfix_candidate_pow_json_is_valid "$pow" "$mode" &&
                hotfix_pow_observation_json_is_valid "$pow" "$recovery" "$mempool" \
                  "$(jq -er '.bestblockhash' <<<"$chain")" \
-                 "$(jq -er '.blocks' <<<"$chain")" "$observed"; then
+                 "$(jq -er '.blocks' <<<"$chain")" "$observed" \
+                 "$goldrush_state"; then
                 row=$(jq -cn --argjson sample "$sample" --argjson observed "$observed" \
                     --argjson chain "$chain" --argjson recovery "$recovery" \
                     --argjson wallet "$wallet" --argjson staking "$staking" \
                     --argjson pow "$pow" --argjson network "$network" \
-                    --argjson mempool "$mempool" '
+                    --argjson mempool "$mempool" --argjson goldrush "$goldrush_state" '
                     {sample:$sample,observed_epoch:$observed,chain:$chain,recovery:$recovery,
                      wallet:$wallet,staking:$staking,pow:$pow,network:$network,
-                     mempool_verbose:$mempool}
+                     mempool_verbose:$mempool,goldrush_state:$goldrush}
                 ') || return 1
-                rows=$(jq -cn --argjson rows "$rows" --argjson row "$row" '$rows + [$row]') ||
-                    return 1
-                previous_height=$(jq -er '.blocks' <<<"$chain")
-                previous_tip=$(jq -er '.bestblockhash' <<<"$chain")
-                previous_work=$(jq -er '.chainwork' <<<"$chain")
-                break
+                candidate_rows=$(jq -cn --argjson rows "$rows" --argjson row "$row" \
+                    '$rows + [$row]') || return 1
+                series=$(jq -ce '[.[] | {sample,observed_epoch,
+                  tip:.chain.bestblockhash,height:.chain.blocks,work:.chain.chainwork,
+                  goldrush_state,pow,recovery,mempool_verbose}]' <<<"$candidate_rows") || return 1
+                if hotfix_pow_observation_series_json_is_valid "$series" 1; then
+                    rows=$candidate_rows
+                    tip_changes=$(jq -er '
+                      [.[] | .chain.bestblockhash] as $tips |
+                      [range(1;($tips|length)) |
+                        select($tips[.] != $tips[.-1])] | length
+                    ' <<<"$rows") || return 1
+                    sample=$((sample + 1))
+                    (( sample <= 64 )) || return 1
+                    break
+                fi
             fi
             sleep 2
         done
-        [[ "$(jq 'length' <<<"$rows")" == "$sample" ]] || return 1
     done
+    (( tip_changes >= 1 )) || return 1
     jq -S -n --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" --arg nonce "$promotion_nonce" \
-        --argjson rows "$rows" '
-        {schema:2,phase:"B",candidate_source_sha:$source,promotion_nonce:$nonce,
-         samples:$rows,tip_changes:3,wallet_chain_synchronized_continuously:true,
+        --argjson rows "$rows" --argjson tip_changes "$tip_changes" '
+        ($rows | length) as $count |
+        {schema:4,phase:"B",candidate_source_sha:$source,promotion_nonce:$nonce,
+         observation_sample_count:$count,samples:$rows,tip_changes:$tip_changes,
+         wallet_chain_synchronized_continuously:true,
          pos_active_continuously:true,p2p_ready_continuously:true,
-         zero_hash_max_no_progress_tip_transitions:1}
+         same_tip_or_submit_no_progress_transition_budget:1}
     ' >"${EVIDENCE}/phase-b-progress.json" || return 1
     hotfix_phase_b_progress_file_is_valid "${EVIDENCE}/phase-b-progress.json" \
         "$promotion_nonce" "$mode"
@@ -1353,7 +1904,7 @@ on_exit()
 
 main()
 {
-    local command ops_dataset dataset baseline_resolution_file
+    local command ops_dataset dataset
     local manifest_sha marker_sha invocation_sha dataset_sha baseline_inspect
     local storage_recheck_sha created_inspect created_mounts_sha created_network_sha
     local created_restart_policy final_container_sha final_envelope_sha wallet_delta_sha
@@ -1451,27 +2002,11 @@ main()
     baseline_dataset_sha=$(sha256sum "${EVIDENCE}/baseline-live-datasets.json" | awk '{print $1}')
     record_tooling_identity || fail 'Phase-B tooling/package identity capture failed'
     capture_baseline_precondition || fail 'immutable baseline health/wallet/recovery gate failed'
+    baseline_wallet_name=$(jq -er '.walletname | select(type=="string")' \
+        "${EVIDENCE}/baseline-wallet.json") || fail 'baseline wallet identity missing'
     jq -e '.enabled|type=="boolean"' "${EVIDENCE}/baseline-pow.json" >/dev/null ||
         fail 'baseline PoW enabled field is not boolean'
-    baseline_pow_enabled=$(jq -r '.enabled' "${EVIDENCE}/baseline-pow.json")
-    [[ "$baseline_pow_enabled" == true || "$baseline_pow_enabled" == false ]] ||
-        fail 'baseline PoW policy is invalid'
-    baseline_payout=$(jq -er '.payout_address' "${EVIDENCE}/baseline-pow.json")
     baseline_quantum_count=$(quantum_inventory_count "${EVIDENCE}/baseline-quantum.json")
-    baseline_quantum_sha=$(sha256sum "${EVIDENCE}/baseline-quantum.json" | awk '{print $1}')
-    baseline_recovery_fee=$(jq -er '.confirmed_resolution_fees' "${EVIDENCE}/baseline-recovery.json")
-    baseline_pending_manual=$(jq -er '.pending_manual_resolutions' \
-        "${EVIDENCE}/baseline-recovery.json")
-    baseline_pending_automatic=$(jq -er '.pending_automatic_resolutions' \
-        "${EVIDENCE}/baseline-recovery.json")
-    baseline_automatic_fee_exposure=$(jq -er '.automatic_fee_exposure_in_window' \
-        "${EVIDENCE}/baseline-recovery.json")
-    baseline_recovery_policy_sha=$(recovery_policy_sha "${EVIDENCE}/baseline-recovery.json")
-    baseline_recovery_metrics_sha=$(recovery_metrics_sha "${EVIDENCE}/baseline-recovery.json")
-    baseline_resolution_file="${EVIDENCE}/baseline-resolution-txids.json"
-    jq -S '[.component_details[]?.resolution_txids[]?] | unique | sort' \
-        "${EVIDENCE}/baseline-recovery.json" >"$baseline_resolution_file"
-    baseline_resolution_sha=$(sha256sum "$baseline_resolution_file" | awk '{print $1}')
     record_storage_absence "${EVIDENCE}/storage-absence-before-marker.json" before-marker ||
         fail 'storage absence immediately before promotion marker is not proven'
 
@@ -1593,17 +2128,29 @@ main()
     capture_invocation "${EVIDENCE}/candidate-created-stopped.json" \
         "${EVIDENCE}/candidate-invocation.json" || fail 'candidate invocation proof failed'
     wait_chain_wallet_sync_locked || fail 'candidate chain/wallet did not synchronize while locked'
+    jq -S '[.recovery.component_details[]?.resolution_txids[]?] | unique | sort' \
+        "${EVIDENCE}/candidate-chain-wallet-synchronized.json" \
+        >"${EVIDENCE}/candidate-locked-resolution-txids.json" ||
+        fail 'candidate-locked resolution identity capture failed'
+    jq -e -n --slurpfile baseline "${EVIDENCE}/baseline-wallet-resolution-txids.json" \
+        --slurpfile current "${EVIDENCE}/candidate-locked-resolution-txids.json" '
+      all($current[0][]; . as $txid | ($baseline[0] | index($txid)) != null)
+    ' >/dev/null || fail 'candidate-locked recovery exposed a nonbaseline resolution txid'
+    capture_resolution_raw_identities \
+        "${EVIDENCE}/candidate-locked-resolution-txids.json" \
+        "${EVIDENCE}/candidate-locked-resolution-raw.json" ||
+        fail 'candidate-locked resolution raw identity capture failed'
+    jq -e -n --slurpfile baseline "${EVIDENCE}/baseline-wallet-resolution-raw.json" \
+        --slurpfile current "${EVIDENCE}/candidate-locked-resolution-raw.json" '
+      all($current[0][]; . as $row |
+        ([$baseline[0][] | select(.txid==$row.txid and .hex==$row.hex)] | length)==1)
+    ' >/dev/null || fail 'candidate-locked resolution raw identity differs from baseline'
+    candidate_locked_resolution_sha=$(sha256sum \
+        "${EVIDENCE}/candidate-locked-resolution-txids.json" | awk '{print $1}') ||
+        fail 'candidate-locked resolution identity hash failed'
     run_unlock_helper || fail 'normal wallet unlock failed'
     rpc getwalletinfo | jq -e '.unlocked_until > now and .unlocked_staking_only == false' \
         >/dev/null || fail 'wallet is not normally unlocked'
-    rpc staking true >"${EVIDENCE}/candidate-staking-start.json" || fail 'explicit PoS start failed'
-    if [[ "$baseline_pow_enabled" == true ]]; then
-        rpc setpowmining true 1 1 false >"${EVIDENCE}/candidate-pow-restore.json" ||
-            fail 'PoW restoration failed'
-    else
-        rpc setpowmining false 1 1 false >"${EVIDENCE}/candidate-pow-restore.json" ||
-            fail 'PoW disabled policy failed'
-    fi
     collect_phase_b_progress || fail 'three-tip Phase-B PoS/P2P/typed-gate proof failed'
     capture_live_dataset_identity "${EVIDENCE}/candidate-final-live-datasets.json" ||
         fail 'final dataset identity capture failed'
@@ -1637,6 +2184,9 @@ main()
     final_envelope_sha=$(sha256sum "${EVIDENCE}/phase-b-final-envelope.json" | awk '{print $1}')
     wallet_delta_sha=$(sha256sum "${EVIDENCE}/phase-b-wallet-delta.json" | awk '{print $1}')
     wallet_delta_raw_sha=$(sha256sum "${EVIDENCE}/phase-b-wallet-delta-raw.json" | awk '{print $1}')
+    if grep -Eq '^(staking:true|setpowmining:true:)' "$RPC_METHODS_LOG"; then
+        fail 'candidate PoS/PoW was enabled by a repair RPC instead of Core-native intent'
+    fi
     (cd "$EVIDENCE" && find . -type f ! -name RESULT.json ! -name SHA256SUMS \
         ! -name PRE_RESULT_SHA256SUMS -print0 | sort -z | xargs -0 sha256sum) \
         >"${EVIDENCE}/PRE_RESULT_SHA256SUMS" || fail 'pre-result manifest failed'
@@ -1658,19 +2208,27 @@ main()
         --arg contract "$phase_b_contract_sha" \
         --arg baseline "$(sha256sum "${EVIDENCE}/baseline-precondition.json" | awk '{print $1}')" \
         --arg cutover "$cutover_sha" \
-        --arg policy "$baseline_recovery_policy_sha" --arg metrics "$baseline_recovery_metrics_sha" \
-        --argjson pending_manual "$baseline_pending_manual" \
-        --argjson pending_automatic "$baseline_pending_automatic" \
-        --argjson automatic_exposure "$baseline_automatic_fee_exposure" \
-        --argjson recovery_fee "$baseline_recovery_fee" '
-        {schema:2,phase:"B",node:27,result:"passed",candidate_source_sha:$source,
+        --arg locked_sync "$(sha256sum \
+          "${EVIDENCE}/candidate-chain-wallet-synchronized.json" | awk '{print $1}')" \
+        --arg locked_resolution "$(sha256sum \
+          "${EVIDENCE}/candidate-locked-resolution-txids.json" | awk '{print $1}')" \
+        --arg final_recovery "$(sha256sum \
+          "${EVIDENCE}/candidate-final-recovery.json" | awk '{print $1}')" \
+        --arg final_resolution "$(sha256sum \
+          "${EVIDENCE}/candidate-final-resolution-txids.json" | awk '{print $1}')" '
+        {schema:4,phase:"B",node:27,result:"passed",candidate_source_sha:$source,
          phase_a_result_sha256:$result_sha,promoted_no_rewind_marker_verified:true,
          snapshots_absent_before_launch:true,datasets_preserved:true,candidate_running:true,
          wallet_chain_synchronized_before_unlock:true,normal_unlock_completed:true,
-         pos_explicitly_enabled:true,pos_active:true,pow_policy_restored:true,p2p_ready:true,
-         typed_gate_safe:true,payout_unchanged:true,quantum_keys_unchanged:true,
-         recovery_fees_unchanged:true,resolution_txids_unchanged:true,
-         recovery_counters_unchanged:true,recovery_policy_unchanged:true,
+         core_native_pos_intent_configured:true,core_native_pow_intent_configured:true,
+         locked_pos_zero_work_observed:true,locked_pow_zero_work_observed:true,
+         normal_unlock_only_resume_observed:true,repair_enable_rpcs_used:false,
+         pos_active:true,p2p_ready:true,
+         typed_gate_safe:true,configured_payout_transition_valid:true,
+         quantum_keys_unchanged:true,
+         automatic_recovery_unauthorized_continuously:true,
+         candidate_resolution_membership_baseline_bound:true,
+         no_new_fee_bearing_recovery_wallet_transaction:true,
          wallet_delta_fully_classified:true,only_allowed_wallet_delta_classes_added:true,
          baseline_health_gate_passed:true,final_container_identity_stable:true,
          failure_policy:"contain-stop-preserve",old_core_autostarted:false,
@@ -1683,11 +2241,10 @@ main()
          tooling_commit:$tooling,phase_b_tooling_identity_sha256:$tooling_identity,
          package_sha256sums_sha256:$package,phase_b_script_sha256:$script,
          verifier_sha256:$verifier,typed_contract_sha256:$contract,
-         baseline_recovery_policy_sha256:$policy,baseline_recovery_metrics_sha256:$metrics,
-         baseline_pending_manual_resolutions:$pending_manual,
-         baseline_pending_automatic_resolutions:$pending_automatic,
-         baseline_automatic_fee_exposure_in_window:$automatic_exposure,
-         baseline_confirmed_resolution_fees:$recovery_fee}
+         candidate_locked_sync_sha256:$locked_sync,
+         candidate_locked_resolution_txids_sha256:$locked_resolution,
+         candidate_final_recovery_sha256:$final_recovery,
+         candidate_final_resolution_txids_sha256:$final_resolution}
     ' >"$result_tmp"; then
         rm -f -- "$result_tmp"
         fail 'Phase-B RESULT construction failed'

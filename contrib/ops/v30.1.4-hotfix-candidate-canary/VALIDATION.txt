@@ -1,89 +1,142 @@
-PROVISIONAL SOURCE/RUN-BOUND CHECKPOINT — NOT EXECUTION AUTHORITY
-================================================================
+IDENTITY-UNRESOLVED OFFLINE TOOLING CHECKPOINT — NOT EXECUTION AUTHORITY
+=====================================================================
 
-NONDEPLOYABLE CHECKPOINT
-------------------------
-These nine-path two-phase canary bytes provisionally bind:
+Fail-closed identity state
+--------------------------
+The production contract and candidate environment contain these invalid
+sentinels:
 
   Candidate Core source:
-    a0695f22740e111d0487a194fb46f1bae05952c5
-  Candidate source tree:
-    86df040ae5eb8e819e940dd08364bcc177a72195
+    __FINAL_SIGNED_CORE_SHA__
+  Exact-SHA Core safety run:
+    __FINAL_EXACT_SHA_CORE_CI_RUN_ID__
   Candidate release:
     30.1.5
-  Expected Core PR safety run:
-    31336502539 — PENDING, NOT AUTHORIZATION
   Expected PR base:
     19baffef25af36e177db2975780e0641b59753aa
   Expected pr-gate.yml SHA-256:
     24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869
 
-GitHub verifies H with the Blackcoin-Dev SSH signature and fingerprint
-SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70. Phase A and the offline
-verifier require exact R to report status completed and conclusion success.
-Pending, failed, cancelled, superseded-run, wrong-head, wrong-base,
-wrong-workflow, and non-pull-request evidence fails closed.
+The sentinels are not valid source/run identities. The shared exact-identity
+predicate rejects them before either live phase can pass preflight. A later,
+separate, reviewed identity-only commit must replace both sentinels with one
+Blackcoin-Dev-signed source H and its completed-success exact-SHA run R, then
+repin the signed adapter, bundle, OCI graph, image, provenance, and six-binary
+identities from the same ordinary-user artifact.
 
-Run 31336502539 is the Core qualification run, not the candidate packaging
-workflow run. Candidate packaging workflow commit/run/attempt, adapter tooling
-commit, bundle, OCI graph, image, provenance, and all six binary identities
-remain unresolved. Phase-A/Phase-B evidence, live Compose/guard identities,
-and both operator confirmations also remain unresolved. No live phase can pass
-preflight.
+The offline suite copies the contract and replaces only those two sentinels
+with deterministic test identities:
 
-The historical Phase-A/Phase-B filenames, v30.1.4 snapshot names, deployed
-guard-compatible transaction names, immutable rollback image identities, and
-immutable final-canary byte pins are intentionally unchanged.
+  Synthetic source H:
+    0123456789abcdef0123456789abcdef01234567
+  Synthetic exact-SHA run R:
+    42424242424
 
-Offline gates
--------------
-PASS  Bash syntax for both phase scripts, typed_contract.sh,
-      verify-evidence.sh, and candidate.env.example.
-PASS  ShellCheck -x for the same shell inputs, with no findings.
-PASS  Diff whitespace check for the provisional repin boundary.
-PASS  Exact H/release identity and derived prefix, attempt-bound artifact,
-      archive, ci1 image tag, and Phase confirmations.
-PASS  Alternate 40-hex source, immutable v30.1.4 source, and nonexact release
-      overrides fail the shared exact-identity predicate.
-PASS  Phase A and the offline verifier both bind exact R, PR base, and
-      pr-gate.yml bytes.
-PASS  Phase A and Phase B capture same-cut `getrawmempool true` evidence and
-      enforce the exact one-transition zero-hash no-progress budget across all
-      five typed actions.
-PASS  Stable anchor/root identity, immutable generation fingerprint, exact
-      lineage prefix growth, and component-wide first-seen live-txid set
-      growth are bound to recovery and raw mempool evidence.
+Every derived test prefix, archive, image tag, artifact name, candidate
+identity record, and Core-CI record is regenerated from that copied contract.
+The production files remain unresolved. The immutable v30.1.4 source,
+manifest, image/config ID, historical snapshot names, rollback paths, and
+final-canary byte pins remain unchanged.
 
-Offline hostile fixture suite
------------------------------
-PASS  286/286 assertions on the frozen zero-hash-liveness bytes, exit 0.
-PASS  Hostile coverage rejects indefinite wait_for_live, wait_for_next_tip,
-      relay_existing, zero-hash create/refresh, alternating action/fingerprint
-      replay, live-txid replay, rewritten lineage, and family-generation churn.
-PASS  Positive coverage accepts a one-tip short wait, exact empty-family create
-      accounting, real hash/submission/lineage progress, older-member
-      relay-to-live progress, and first-seen live-set growth while a sibling
-      remains live.
-PASS  Independent read-only hostile review found no remaining series-contract
-      blocker. Its frozen-byte executable replay also passed 286/286, exit 0;
-      payload mtimes remained unchanged throughout that replay.
+Generic product boundary exercised offline
+-------------------------------------------
+PASS  Nonzero unresolved, retained, quarantine, blocking, raw, retired, and
+      resolved counters are typed telemetry, not enable/health vetoes and not
+      cross-version equality predicates.
+PASS  Coherent, database-unambiguous typed gates accept create_new_anchor,
+      refresh_same_anchor, wait_for_live, wait_for_next_tip, and
+      relay_existing while requiring zero authoritative unsafe claims and
+      components.
+PASS  Recovery compatibility `.components` telemetry may differ from the full
+      audit `component_details` inventory; the full inventory still rejects a
+      txid duplicated across components.
+PASS  Phase-A schema 4 accepts at least three advancing observations, zero or
+      more newly authored claims, multiple authenticated authored components,
+      multiple claims on one sampled tip, and exact plural anchor evidence.
+PASS  Both Phase-A terminal cuts independently pass the full typed observation
+      contract, including selected-component authentication and raw-mempool
+      binding. Cross-cut equality binds the chain/wallet cut, recovery-policy
+      authority, and the explicit operational gate projection only. Full audit
+      component details, unanchored/history counters, and candidate-state
+      fingerprint may drift without becoming host-side health predicates.
+PASS  All ten pre-release/pre-destroy/post-destroy authority rechecks retain
+      immutable invocation, nonpublication, anchor, and observer evidence with
+      exact sequence/stage/snapshot and hash bindings.
+PASS  Bounded liveness permits short zero-hash wait/relay transitions, credits
+      only action-appropriate progress, tracks first-seen authenticated live
+      family txids, and rejects replay, rewritten lineage, family-generation
+      churn, and unbounded no-progress action alternation.
+PASS  Phase B treats immutable v30.1.4 `.enabled` as telemetry. Node 27 is a
+      regular-PoW canary, so candidate PoW intent is explicitly enabled and
+      both progress and final evidence are active-only. The enable RPC alone is
+      not treated as Core liveness evidence.
+PASS  Configured-future payout may be empty for retained wait/relay/refresh
+      work. When it is nonempty, exact equality and wallet ownership remain
+      mandatory. This does not claim selected-family persisted-payout proof.
+PASS  The corrected implicit metadata-absent root contract binds zero lineage
+      defaults, the exact QQP2/3/4 origin/input tuples, authored and carrier
+      metadata, Core disposition/revalidation semantics, unspent-anchor
+      proof-evaluation status, and the singleton-QQP2 authored-tip rule. Exact
+      producer, contract, verifier, and test payload bytes passed both local
+      and independent 403/403 preseal replay.
+PASS  PoS remains explicitly active in Phase B; no recovery/cleanup payment,
+      abandon, raw broadcast, host repair, data rewind, or old-Core restart is
+      permitted after promotion.
 
-Required positive modes remain Phase-A pre-rewind, Phase-A final, and Phase-B
-final with independent raw wallet-delta recomputation. New hostile evidence
-must reject a different successful run, pending/null conclusion, completed
-failure, wrong PR base, wrong workflow bytes, wrong head, and non-PR event.
+Exact offline validation
+------------------------
+PRESEAL-PASS  Local and independent hostile suites each passed 403/403, exit 0,
+              against the same exact six non-narrative payloads: environment,
+              contract, Phase A, Phase B, tests, and verifier. The digest of
+              their ordered sha256sum list, in manifest order with README and
+              VALIDATION omitted, is
+              cd15e93f006ae83920fc2817e8d0c1bc7e1cad69f5aa783f9751f2aa145637af.
+PASS  Bash syntax for every .sh/.sh.inc input and candidate.env.example.
+PASS  Full ShellCheck -x for every package shell input, with no findings.
+PASS  Git diff whitespace validation.
+SEAL-PROCEDURE  SHA256SUMS binds the six reviewed payloads with final README
+                and VALIDATION bytes and is generated mechanically only after
+                both narratives are frozen. A completed checkpoint requires
+                strict verification of that exact eight-payload manifest,
+                exact topology and static gates, a local full sealed 403/403
+                replay with all nine file hashes unchanged, and an independent
+                post-seal replay recorded in the external commit ledger. This
+                file intentionally does not attest or predict the status of
+                that external step and does not embed volatile fixture paths.
 
-Seal status
------------
-PASS  SHA256SUMS binds the exact paths and bytes of all eight non-seal
-      payloads. Strict checksum verification, the eight-payload/nine-file
-      topology, and the no-symlink/special-object boundary pass. The final
-      validation bytes were resealed and replayed locally before handoff.
+The two verifier routing fixtures use the deterministic copied contract and
+therefore reach the named unknown-mode and missing-root branches. A separate
+fixture proves that the unrepinned production contract fails exact identity
+resolution.
+
+Explicit Core/API blockers
+--------------------------
+BLOCKED  A newly wallet-visible receive-only foreign QQSPROOF cannot yet be
+         authenticated as the exact no-debit/from-me-false, non-wallet-anchor
+         audit class. Phase-B wallet-delta classification remains fail closed.
+BLOCKED  A retained family's authenticated synthetic payout may use its
+         persisted family payout rather than the configured-future payout.
+         Exact selected-family persisted-payout evidence is not yet exposed,
+         so the tooling does not guess or host-select it.
+BLOCKED  The final per-family selection schema must expose enough evidence to
+         independently prove global RELAY_EXISTING > REFRESH_SAME_ANCHOR >
+         bounded WAIT priority, WAIT-only-when-all-safe-families-live, and the
+         exact per-tx suppression/reselection decision. The current tooling
+         authenticates Core's selected component but does not reconstruct
+         missing global authority on the host.
+
+Seal and authorization boundary
+-------------------------------
+The checksum manifest is an identity-neutral offline tooling-integrity seal.
+Even when strict verification and the sealed replay pass, it does not prove
+Core correctness or grant execution authority. With unresolved H/R sentinels
+and unresolved candidate artifact identities, Phase A, Phase B, build, canary,
+rollout, and fleet mutation remain impossible by design.
 
 Not executed or claimed
 -----------------------
-No Docker command, network mutation, GitHub mutation, workflow dispatch,
-artifact build/download/load, wallet RPC, container change, ZFS operation,
-live canary, or fleet action was performed. No successful Core-CI result,
-candidate package, artifact, image, or release authority is claimed by this
-checkpoint.
+No Docker or Compose command, network access or mutation, GitHub mutation,
+workflow dispatch, artifact build/download/load, wallet RPC, container change,
+ZFS operation, live canary, or fleet action was performed. No successful Core
+candidate, package, artifact, image, release, PoS fleet count, PoW fleet count,
+or node30 Free Claim health is claimed by this offline checkpoint.

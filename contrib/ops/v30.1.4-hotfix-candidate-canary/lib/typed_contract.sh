@@ -5,12 +5,13 @@
 export LC_ALL=C
 
 readonly HOTFIX_EXPECTED_RELEASE_VERSION='30.1.5'
-readonly HOTFIX_EXPECTED_CANDIDATE_SOURCE_SHA='a0695f22740e111d0487a194fb46f1bae05952c5'
-readonly HOTFIX_EXPECTED_CORE_CI_RUN_ID='31336502539'
+readonly HOTFIX_EXPECTED_CANDIDATE_SOURCE_SHA='__FINAL_SIGNED_CORE_SHA__'
+readonly HOTFIX_EXPECTED_CORE_CI_RUN_ID='__FINAL_EXACT_SHA_CORE_CI_RUN_ID__'
 readonly HOTFIX_EXPECTED_CORE_CI_PULL_REQUEST_BASE_SHA='19baffef25af36e177db2975780e0641b59753aa'
 readonly HOTFIX_EXPECTED_CORE_CI_WORKFLOW_BLOB_SHA256='24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869'
-# Candidate source/release may be supplied by a reviewed environment, but the
-# exact equality predicate below prevents overriding this sealed provisional pin.
+# Candidate source/release may be supplied by a reviewed environment, but these
+# unresolved sentinels deliberately fail the exact identity predicate. A later
+# reviewed identity-only repin must replace both sentinels with exact values.
 : "${HOTFIX_CANDIDATE_SOURCE_SHA:=$HOTFIX_EXPECTED_CANDIDATE_SOURCE_SHA}"
 : "${HOTFIX_CANDIDATE_RELEASE_VERSION:=$HOTFIX_EXPECTED_RELEASE_VERSION}"
 readonly HOTFIX_CANDIDATE_SOURCE_SHA HOTFIX_CANDIDATE_RELEASE_VERSION
@@ -86,6 +87,94 @@ hotfix_sha256_file()
     sha256sum "$1" | awk '{print $1}'
 }
 
+# Compare public quantum-key inventories without treating Core's one permitted
+# legacy payout-label normalization as key creation, deletion, or rotation.
+# The optional label evidence is the exact getaddressesbylabel output captured
+# for the three recognized payout labels; it proves that a relabeled address
+# stayed a receive-purpose address on both sides of the transition.
+hotfix_quantum_inventory_transition_is_valid()
+{
+    local before="$1" after="$2" before_labels="$3" after_labels="$4"
+    [[ -f "$before" && ! -L "$before" && -f "$after" && ! -L "$after" &&
+       -f "$before_labels" && ! -L "$before_labels" &&
+       -f "$after_labels" && ! -L "$after_labels" ]] || return 1
+    jq -e -n --slurpfile before "$before" --slurpfile after "$after" \
+        --slurpfile before_labels "$before_labels" \
+        --slurpfile after_labels "$after_labels" '
+      def entries:
+        if type == "array" then .
+        elif (.keys? | type) == "array" then .keys
+        elif (.inventory? | type) == "array" then .inventory
+        else error("unsupported quantum inventory") end;
+      def aggregate:
+        if type == "array" then null
+        elif (.keys? | type) == "array" then del(.keys)
+        elif (.inventory? | type) == "array" then del(.inventory)
+        else error("unsupported quantum inventory") end;
+      def identity: del(.label) | tojson;
+      def key_label: (.label? // "");
+      def legacy_label:
+        . == "Quantum PoW Reward Address" or . == "goldrush-pow";
+      def label_evidence:
+        type == "object" and (keys | sort) == ["labels","schema"] and
+        .schema == 1 and (.labels | type) == "array" and
+        .labels == (.labels | sort_by(.label)) and
+        ([.labels[].label] | unique | length) == (.labels | length) and
+        all(.labels[];
+          type == "object" and (keys | sort) == ["addresses","label"] and
+          (.label | IN("PoW - Quantum Claim Address",
+            "Quantum PoW Reward Address","goldrush-pow")) and
+          (.addresses | type) == "object" and
+          all(.addresses[]; type == "object" and
+            (keys | sort) == ["purpose"] and (.purpose | type) == "string"));
+      def receive_bound($evidence;$label;$address):
+        any($evidence.labels[];
+          .label == $label and .addresses[$address].purpose == "receive");
+      ($before[0]) as $b | ($after[0]) as $a |
+      ($b | entries | sort_by(identity)) as $bk |
+      ($a | entries | sort_by(identity)) as $ak |
+      ($b | aggregate) == ($a | aggregate) and
+      ($bk | length) == ($ak | length) and
+      ([range(0; $bk | length) as $i |
+        ($bk[$i] | identity) == ($ak[$i] | identity)] | all) and
+      ($before_labels[0] | label_evidence) and
+      ($after_labels[0] | label_evidence) and
+      all(range(0; $bk | length); . as $i |
+        ($bk[$i] | key_label) as $old | ($ak[$i] | key_label) as $new |
+        if $old == $new then true
+        else
+          ($old | legacy_label) and $new == "PoW - Quantum Claim Address" and
+          ($bk[$i].address? | type) == "string" and
+          ($ak[$i].address? == $bk[$i].address) and
+          receive_bound($before_labels[0];$old;$bk[$i].address) and
+          receive_bound($after_labels[0];$new;$ak[$i].address)
+        end)
+    ' >/dev/null
+}
+
+# A nonempty process-local future payout is acceptable only when it resolves to
+# an already inventoried, spendable quantum-migration key.  This does not claim
+# that the address is the payout of any retained claim family.
+hotfix_quantum_payout_address_is_valid()
+{
+    local address_file="$1" inventory_file="$2" expected="$3"
+    [[ -n "$expected" && -f "$address_file" && ! -L "$address_file" &&
+       -f "$inventory_file" && ! -L "$inventory_file" ]] || return 1
+    jq -e --arg expected "$expected" --slurpfile inventory "$inventory_file" '
+      def entries:
+        if type == "array" then .
+        elif (.keys? | type) == "array" then .keys
+        elif (.inventory? | type) == "array" then .inventory
+        else error("unsupported quantum inventory") end;
+      .address == $expected and .ismine == true and .solvable == true and
+      .iswatchonly == false and .isquantummigration == true and
+      .hasquantumkey == true and (.isquantumcoldstake? // false) == false and
+      ([$inventory[0] | entries[] |
+        select(.address == $expected and .tiered == false and
+          .stored_in_wallet == true)] | length) == 1
+    ' "$address_file" >/dev/null
+}
+
 hotfix_exact_phase_a_flags_json()
 {
     jq -ce -n '["-walletbroadcast=0","-blocksonly=1","-staking=0",
@@ -95,13 +184,14 @@ hotfix_exact_phase_a_flags_json()
 
 hotfix_exact_phase_b_flags_json()
 {
-    jq -ce -n '["-walletbroadcast=1","-autostartstaking=0","-powmining=0"]'
+    jq -ce -n '["-walletbroadcast=1","-autostartstaking=1","-powmining=1",
+      "-powminingthreads=1","-powminingcpu=1"]'
 }
 
 hotfix_candidate_pow_json_is_valid()
 {
     local mining="$1" phase="$2"
-    [[ "$phase" == active || "$phase" == off ]] || return 1
+    [[ "$phase" == active || "$phase" == locked || "$phase" == off ]] || return 1
     jq -e -n --arg phase "$phase" --arg zero "$HOTFIX_ZERO_TXID" \
         --argjson mining "$mining" '
         def integer: type == "number" and floor == .;
@@ -161,14 +251,16 @@ hotfix_candidate_pow_json_is_valid()
           (.mining_gate_lineage_head_txid | hex64) and
           (.mining_gate_candidate_state_fingerprint | hex64) and
           .mining_gate_candidate_state_fingerprint != $zero and
-          (if .mining_gate_action == "create_new_anchor" then
+          (if .mining_gate_action == "create_new_anchor" or
+               (.mining_gate_action == "wait_for_next_tip" and
+                .mining_gate_lineage_head_txid == $zero) then
              .mining_gate_lineage_head_txid == $zero and
              .mining_gate_unresolved_components == 0 and
              .mining_gate_live_claims == 0 and .mining_gate_eligible_claims == 0 and
              .mining_gate_family_claims == 0
            else
              .mining_gate_lineage_head_txid != $zero and
-             .mining_gate_unresolved_components == 1 and .mining_gate_family_claims >= 1
+             .mining_gate_unresolved_components >= 1 and .mining_gate_family_claims >= 1
            end) and
           (if .mining_gate_action == "relay_existing"
            then .mining_gate_relay_txid != $zero
@@ -180,20 +272,19 @@ hotfix_candidate_pow_json_is_valid()
           (if .mining_gate_action == "wait_for_live"
            then .mining_gate_live_claims >= 1
            elif .mining_gate_action == "relay_existing"
-           then .mining_gate_live_claims == 0 and .mining_gate_eligible_claims >= 1
+           then .mining_gate_eligible_claims >= 1
            elif .mining_gate_action == "refresh_same_anchor"
-           then .mining_gate_live_claims == 0
+           then true
            elif .mining_gate_action == "wait_for_next_tip"
-           then .mining_gate_live_claims == 0 and
-             (if .mining_gate_relay_txid == $zero
-              then .mining_gate_can_submit == true
+           then (if .mining_gate_relay_txid == $zero
+              then true
               else .mining_gate_can_submit == false and
                 .mining_gate_eligible_claims >= 1 end)
            else true end);
         $mining | type == "object" and
           ((keys | sort) == (pow_keys | sort)) and
           (.enabled | type) == "boolean" and
-          (.autostart | type) == "boolean" and .autostart == false and
+          (.autostart | type) == "boolean" and
           (.allow_automatic_quantum_key_creation | type) == "boolean" and
           .allow_automatic_quantum_key_creation == false and
           (.state | type) == "string" and
@@ -206,21 +297,18 @@ hotfix_candidate_pow_json_is_valid()
           (.shadow_reward_end_height | uint) and
           (.epoch_active | type) == "boolean" and
           (.blocks_remaining | uint) and
-          (.payout_address | type == "string" and length > 0) and
+          (.payout_address | type == "string") and
+          (if .mining_gate_action == "create_new_anchor"
+           then (.payout_address | length) > 0 else true end) and
           (.accrued_jackpot | amount) and (.next_claim_payout | amount) and
           (.next_claim_amount | uint) and (.claims_submitted | uint) and
           (.unresolved_claims | uint) and (.live_claims | uint) and
-          .unresolved_claims >= .live_claims and
           (.quarantined_claims | uint) and (.raw_quarantined_claims | uint) and
           (.blocking_quarantined_claims | uint) and
           (.actionable_quarantined_claims | uint) and
           (.resolved_on_active_chain_claims | uint) and
           (.indeterminate_quarantined_claims | uint) and
           (.claim_components | uint) and
-          .quarantined_claims == .blocking_quarantined_claims and
-          .blocking_quarantined_claims ==
-            (.actionable_quarantined_claims + .indeterminate_quarantined_claims) and
-          .raw_quarantined_claims >= .blocking_quarantined_claims and
           (.pending_manual_resolutions | uint) and
           (.pending_automatic_resolutions | uint) and
           (.claims_auto_resolved | uint) and (.claims_recycled | uint) and
@@ -241,12 +329,11 @@ hotfix_candidate_pow_json_is_valid()
             .enabled == true and
             (.state == "ready" or .state == "hashing" or
              .state == "claim_in_flight") and
-            (if (.mining_gate_action == "wait_for_live" or
-                 .mining_gate_action == "wait_for_next_tip" or
-                 .mining_gate_action == "relay_existing")
-             then .state == "claim_in_flight" and .hashrate == 0
-             else true end) and
             .stake_reserve_snapshot_available == true
+          elif $phase == "locked" then
+            .enabled == true and .autostart == true and .threads == 1 and
+            .cpu_percent == 1 and .hashrate == 0 and .claims_submitted == 0 and
+            .state == "wallet_locked_or_staking_only"
           else
             .enabled == false and .state == "disabled" and .hashrate == 0
           end
@@ -255,8 +342,8 @@ hotfix_candidate_pow_json_is_valid()
 
 hotfix_candidate_recovery_json_is_valid()
 {
-    local recovery="$1" expected_fee="$2"
-    jq -e -n --argjson recovery "$recovery" --argjson fee "$expected_fee" '
+    local recovery="$1"
+    jq -e -n --argjson recovery "$recovery" '
         def integer: type == "number" and floor == .;
         def uint: integer and . >= 0;
         def amount: type == "number" and . >= 0;
@@ -279,7 +366,7 @@ hotfix_candidate_recovery_json_is_valid()
         def component_keys: [
           "all_claims_expired_locally_retired","all_claims_explicitly_provenanced",
           "all_claims_quarantined","all_claims_zero_payment_retirable","anchor",
-          "anchor_authenticated","anchor_unspent","claim_txids","classification",
+          "anchor_authenticated","anchor_unspent","anchor_user_locked","claim_txids","classification",
           "component_fingerprint","descendant_claims","generation_fingerprint",
           "has_revalidating_unbound_proof","minimum_stale_depth","nodes",
           "ordinary_or_mixed_txids","resolution_txids","root_claim_txids",
@@ -296,7 +383,6 @@ hotfix_candidate_recovery_json_is_valid()
           "proof_version","provenance","quarantined","relay_expiry_time",
           "relay_ttl_expired","resolution_metadata_valid","resolution_relay_authorized",
           "stale_depth","stale_depth_known","txid","wallet_authored","wallet_from_me"];
-        ($fee | amount) and
         ($recovery | type) == "object" and
         (($recovery | keys | sort) == (recovery_keys | sort)) and
         ($recovery.policy | type) == "object" and
@@ -349,14 +435,7 @@ hotfix_candidate_recovery_json_is_valid()
              "confirmed_manual_resolutions","confirmed_automatic_resolutions",
              "automatic_actions_in_window","reconciled_descendant_claims",
              "claims_recycled"][]; $recovery[.] | uint) and
-        $recovery.blocking_quarantined_claims ==
-          ($recovery.actionable_quarantined_claims +
-           $recovery.indeterminate_quarantined_claims) and
-        $recovery.raw_quarantined_claims >= $recovery.blocking_quarantined_claims and
-        $recovery.raw_claim_objects >= $recovery.live_claim_objects and
-        $recovery.raw_claim_objects >= $recovery.quarantined_claim_objects and
         ($recovery.confirmed_resolution_fees | amount) and
-        $recovery.confirmed_resolution_fees == $fee and
         ($recovery.automatic_fee_exposure_in_window | amount) and
         ($recovery.component_details | type == "array") and
         all($recovery.component_details[]; . as $component |
@@ -365,7 +444,11 @@ hotfix_candidate_recovery_json_is_valid()
           (.anchor | keys | sort) == ["amount","scriptPubKey","txid","vout"] and
           (.anchor.txid | hex64) and (.anchor.vout | uint) and
           (.anchor.amount | amount) and
-          (.anchor.scriptPubKey | type == "string" and test("^([0-9a-f]{2})+$")) and
+          # Full recovery telemetry can retain audit-only incoming components
+          # that have no authenticated wallet anchor.  Their default anchor
+          # script is empty; mining authority is decided by the typed gate,
+          # not by rejecting that retained telemetry shape here.
+          (.anchor.scriptPubKey | type == "string" and test("^([0-9a-f]{2})*$")) and
           (.generation_fingerprint | hex64) and
           (.component_fingerprint | hex64) and
           (.classification | IN("live","transient","indeterminate",
@@ -378,6 +461,7 @@ hotfix_candidate_recovery_json_is_valid()
           (.stale_depth_known | type) == "boolean" and
           (.anchor_authenticated | type) == "boolean" and
           (.anchor_unspent | type) == "boolean" and
+          (.anchor_user_locked | type) == "boolean" and
           (.all_claims_quarantined | type) == "boolean" and
           (.all_claims_explicitly_provenanced | type) == "boolean" and
           (.all_claims_zero_payment_retirable | type) == "boolean" and
@@ -390,7 +474,14 @@ hotfix_candidate_recovery_json_is_valid()
             (.kind | IN("claim","managed_resolution","legacy_resolution","ordinary")) and
             (.provenance | IN("explicit_authored","explicit_adopted",
               "legacy_wallet_authored","unknown")) and
-            (.disposition | type == "string" and length > 0) and
+            (.disposition | IN("eligible","inactive","height_before_window",
+              "height_after_window","invalid_location","malformed","duplicate",
+              "wrong_mode","unknown_mode","unsupported_version",
+              "version_not_yet_active","invalid_proof",
+              "unbound_proof_may_revalidate","origin_not_yet_reached",
+              "origin_mismatch","origin_expired","input_mismatch",
+              "already_accounted","capacity_limit","evaluation_limit",
+              "local_state_error")) and
             (.proof_mode | IN("pow","pos","unknown","malformed")) and
             (.proof_version | uint) and (.proof_origin_height | integer) and
             (.proof_origin_previous_block_hash | hex64) and
@@ -413,8 +504,100 @@ hotfix_candidate_recovery_json_is_valid()
             (.resolution_txids | sort) and
           ([.nodes[] | select(.kind == "ordinary") | .txid] | sort) ==
             (.ordinary_or_mixed_txids | sort)) and
+        # `components` is compatibility telemetry while verbose
+        # `component_details` is the full audit inventory.  The two views are
+        # intentionally not required to have the same cardinality.
+        ([$recovery.component_details[].nodes[].txid] | length) ==
+          ([$recovery.component_details[].nodes[].txid] | unique | length) and
         ($recovery.unanchored_claim_txids | type == "array" and
-          length == 0 and all(.[]; hex64))
+          all(.[]; hex64) and
+          ($recovery.unanchored_claim_txids | unique | length) ==
+            ($recovery.unanchored_claim_txids | length))
+    ' >/dev/null
+}
+
+# Canonical authority projections for a repeated terminal cut.  Compatibility,
+# retained-history, and verbose audit inventory are deliberately excluded: they
+# are telemetry, not mining authority.  Each cut is validated independently
+# against the complete typed observation contract; equality here binds only the
+# chain/wallet cut, recovery policy authority, and the Core-selected operational
+# gate.  It must never recreate family selection from host-side inventory.
+hotfix_recovery_authority_json_sha256()
+{
+    local recovery="$1"
+    jq -ceS '
+      {active_tip,active_height,wallet_processed_tip,wallet_processed_height,
+       wallet_generation,chain_ready,wallet_tip_matches,database_outcome_ambiguous,
+       policy_authoritative,
+       policy:{automatic_enabled:.policy.automatic_enabled,
+               automatic_authorized:.policy.automatic_authorized}}
+    ' <<<"$recovery" | sha256sum | awk '{print $1}'
+}
+
+hotfix_pow_gate_authority_json_sha256()
+{
+    local pow="$1"
+    jq -ceS '
+      {enabled,claim_inventory_tip,
+       claim_inventory_wallet_tip_matches,
+       mining_gate_action,mining_gate_can_submit,mining_gate_coherent,
+       mining_gate_database_ambiguous,mining_gate_unsafe_claims,
+       mining_gate_unsafe_components,mining_gate_lineage_head_txid,
+       mining_gate_relay_txid,mining_gate_family_claims,
+       mining_gate_live_claims,mining_gate_eligible_claims,
+       mining_gate_unresolved_components}
+    ' <<<"$pow" | sha256sum | awk '{print $1}'
+}
+
+# Bind the two candidate RPC views captured in one observation. These are
+# structural equalities for recovery-operation telemetry within one
+# candidate-native cut. Legacy claim inventory counters are type-only and are
+# deliberately not compared between RPC views.
+hotfix_pow_recovery_same_cut_json_is_valid()
+{
+    local pow="$1" recovery="$2"
+    jq -e -n --argjson pow "$pow" --argjson recovery "$recovery" '
+      $pow.pending_manual_resolutions == $recovery.pending_manual_resolutions and
+      $pow.pending_automatic_resolutions == $recovery.pending_automatic_resolutions and
+      $pow.claims_auto_resolved == $recovery.confirmed_automatic_resolutions and
+      $pow.claims_recycled == $recovery.claims_recycled and
+      $pow.cumulative_resolution_fees == $recovery.confirmed_resolution_fees and
+      $pow.claim_recovery_database_outcome_ambiguous ==
+        $recovery.database_outcome_ambiguous
+    ' >/dev/null
+}
+
+# Bind the exact signed-H getgoldrushstate schedule projection to the active
+# chain cut used by mining authority.  QQP4 activation is a consensus schedule,
+# not a wallet/recovery heuristic: disabled schedules serialize height 0 and
+# can never be active, while enabled schedules derive both active flags solely
+# from the captured height.
+hotfix_goldrush_state_json_is_valid()
+{
+    local state="$1" tip="$2" height="$3"
+    jq -e -n --arg tip "$tip" --argjson height "$height" --argjson state "$state" '
+      def integer: type == "number" and floor == .;
+      def uint: integer and . >= 0;
+      def hex64: type == "string" and test("^[0-9a-f]{64}$");
+      ($tip | hex64) and ($height | uint) and
+      ($state | type) == "object" and
+      ($state | keys | sort) == (["bestblock","height","qqp4_activation_disabled",
+        "qqp4_activation_height","qqp4_active","qqp4_active_next_block"] | sort) and
+      $state.bestblock == $tip and $state.height == $height and
+      ($state.qqp4_activation_disabled | type) == "boolean" and
+      ($state.qqp4_activation_height | uint) and
+      ($state.qqp4_active | type) == "boolean" and
+      ($state.qqp4_active_next_block | type) == "boolean" and
+      if $state.qqp4_activation_disabled then
+        $state.qqp4_activation_height == 0 and
+        $state.qqp4_active == false and
+        $state.qqp4_active_next_block == false
+      else
+        $state.qqp4_activation_height > 0 and
+        $state.qqp4_active == ($height >= $state.qqp4_activation_height) and
+        $state.qqp4_active_next_block ==
+          (($height + 1) >= $state.qqp4_activation_height)
+      end
     ' >/dev/null
 }
 
@@ -425,16 +608,116 @@ hotfix_candidate_recovery_json_is_valid()
 hotfix_pow_observation_json_is_valid()
 {
     local pow="$1" recovery="$2" mempool="$3" tip="$4" height="$5" observed="$6"
+    local goldrush_state="$7"
+    hotfix_pow_recovery_same_cut_json_is_valid "$pow" "$recovery" || return 1
+    hotfix_goldrush_state_json_is_valid "$goldrush_state" "$tip" "$height" || return 1
     jq -e -n --arg zero "$HOTFIX_ZERO_TXID" --arg tip "$tip" \
         --argjson height "$height" --argjson observed "$observed" \
         --argjson pow "$pow" --argjson recovery "$recovery" \
-        --argjson mempool "$mempool" '
+        --argjson mempool "$mempool" --argjson goldrush "$goldrush_state" '
         def integer: type == "number" and floor == .;
         def uint: integer and . >= 0;
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
         def claim_nodes($component):
           $component.nodes | map(select(.kind == "claim")) |
           sort_by(.lineage_ordinal);
+        # ParseClaimLineage deliberately leaves every lineage descriptor at
+        # its zero default for the one permitted metadata-absent root.  Core
+        # derives that root from the node txid; it does not serialize a
+        # self-root or a family fingerprint into the absent schema.  Bind the
+        # exact QQP2/3/4 proof tuple and the same version/disposition relation
+        # used by the typed family gate so forged legacy-looking descriptors
+        # cannot become an authenticated root.
+        def known_disposition($node):
+          ($node.disposition | IN("eligible","inactive","height_before_window",
+            "height_after_window","invalid_location","malformed","duplicate",
+            "wrong_mode","unknown_mode","unsupported_version",
+            "version_not_yet_active","invalid_proof",
+            "unbound_proof_may_revalidate","origin_not_yet_reached",
+            "origin_mismatch","origin_expired","input_mismatch",
+            "already_accounted","capacity_limit","evaluation_limit",
+            "local_state_error"));
+        def exact_proof_tuple($node):
+          ($node.proof_version == 2 and
+             $node.proof_origin_bound == false and $node.proof_input_bound == false) or
+          ($node.proof_version == 3 and
+             $node.proof_origin_bound == true and $node.proof_input_bound == false) or
+          ($node.proof_version == 4 and
+             $node.proof_origin_bound == true and $node.proof_input_bound == true);
+        def implicit_claim_root($node;$claim_count;$qqp4_active_next_block):
+          known_disposition($node) and
+          $node.lineage_metadata_present == false and
+          $node.lineage_metadata_valid == false and
+          $node.lineage_ordinal == 0 and
+          $node.lineage_family_fingerprint == $zero and
+          $node.lineage_root_txid == $zero and
+          $node.lineage_parent_txid == $zero and
+          $node.proof_mode == "pow" and
+          $node.provenance == "explicit_authored" and
+          $node.authored_metadata_valid == true and
+          $node.expected_shape == true and
+          $node.claim_descriptor_valid == true and
+          $node.exact_authored_carrier_shape == true and
+          $node.proof_evaluation_skipped_resolved_anchor == false and
+          $node.proof_may_revalidate_on_descendant ==
+            ($node.disposition == "unbound_proof_may_revalidate") and
+          exact_proof_tuple($node) and
+          (if $node.disposition == "unsupported_version" then
+             $qqp4_active_next_block and
+             ($node.proof_version == 2 or $node.proof_version == 3)
+           else true end) and
+          (if $node.proof_version == 2 then
+             ($node.in_mempool == true or
+               (($node.disposition | IN("eligible",
+                 "unbound_proof_may_revalidate")) or
+                ($qqp4_active_next_block and
+                 $node.disposition == "unsupported_version"))) and
+             (if $claim_count == 1
+              then $node.authored_tip_active_branch_bound == true
+              else true end)
+           elif $node.proof_version == 3 then
+             $node.in_mempool == true or
+               ($node.disposition | IN("eligible","origin_mismatch","origin_expired")) or
+               ($qqp4_active_next_block and
+                $node.disposition == "unsupported_version")
+           elif $node.proof_version == 4 then
+             $node.in_mempool == true or
+               ($node.disposition | IN("eligible","origin_mismatch","origin_expired"))
+           else false end);
+        def selected_claim_safe($node;$qqp4_active_next_block):
+          $node.proof_mode == "pow" and
+          $node.active_chain_confirmed == false and
+          ($node.abandoned == false or $node.expired_locally_retired == true) and
+          ($node.in_mempool == true or $node.quarantined == true) and
+          $node.proof_evaluation_skipped_resolved_anchor == false and
+          $node.proof_may_revalidate_on_descendant ==
+            ($node.disposition == "unbound_proof_may_revalidate") and
+          (if $node.disposition == "unsupported_version" then
+             $qqp4_active_next_block and
+             ($node.proof_version == 2 or $node.proof_version == 3)
+           else true end) and
+          (if $node.proof_version == 2 then
+             $node.proof_origin_bound == false and
+             $node.proof_input_bound == false and
+             ($node.in_mempool == true or
+               (($node.disposition | IN("eligible",
+                 "unbound_proof_may_revalidate")) or
+                ($qqp4_active_next_block and
+                 $node.disposition == "unsupported_version")))
+           elif $node.proof_version == 3 then
+             $node.proof_origin_bound == true and
+             $node.proof_input_bound == false and
+             ($node.in_mempool == true or
+               (($node.disposition | IN("eligible","origin_mismatch",
+                 "origin_expired")) or
+                ($qqp4_active_next_block and
+                 $node.disposition == "unsupported_version")))
+           elif $node.proof_version == 4 then
+             $node.proof_origin_bound == true and
+             $node.proof_input_bound == true and
+             ($node.in_mempool == true or
+               ($node.disposition | IN("eligible","origin_mismatch","origin_expired")))
+           else false end);
         ($height | uint) and ($observed | integer and . > 0) and
         ($tip | hex64) and $tip != $zero and
         ($mempool | type) == "object" and
@@ -444,7 +727,10 @@ hotfix_pow_observation_json_is_valid()
         $recovery.wallet_processed_height == $height and
         ($pow.mining_gate_lineage_head_txid) as $head |
         if $head == $zero then
-          $pow.mining_gate_action == "create_new_anchor"
+          $pow.mining_gate_action == "create_new_anchor" or
+          ($pow.mining_gate_action == "wait_for_next_tip" and
+           $pow.mining_gate_can_submit == true and
+           $pow.mining_gate_relay_txid == $zero)
         else
           ([ $recovery.component_details[] as $component |
              select(any($component.nodes[];
@@ -453,9 +739,22 @@ hotfix_pow_observation_json_is_valid()
           ($matches[0]) as $component |
           (claim_nodes($component)) as $claims |
           ($claims | length) >= 1 and
-          ($claims | length) == $pow.mining_gate_family_claims and
+          ($claims | length) <= $pow.mining_gate_family_claims and
+          ($component.nodes | length) == ($component.claim_txids | length) and
+          ($component.ordinary_or_mixed_txids | length) == 0 and
+          ($component.resolution_txids | length) == 0 and
+          $component.all_claims_explicitly_provenanced == true and
+          ($component.classification |
+            IN("live","current_branch_ineligible","terminal_on_pinned_tip")) and
           $component.anchor_authenticated == true and
           $component.anchor_unspent == true and
+          $component.anchor.txid != $zero and
+          $component.anchor.vout < 4294967295 and
+          $component.anchor.amount > 0 and
+          ($component.anchor.scriptPubKey | length) > 0 and
+          ($component.root_claim_txids | sort) ==
+            ($component.claim_txids | sort) and
+          $component.descendant_claims == 0 and
           ($component.generation_fingerprint | hex64) and
           $component.generation_fingerprint != $zero and
           ($claims | map(.lineage_ordinal)) ==
@@ -465,9 +764,13 @@ hotfix_pow_observation_json_is_valid()
           (if $claims[0].lineage_metadata_present then
              $claims[0].lineage_metadata_valid == true and
              $claims[0].lineage_root_txid == $claims[0].txid and
+             $claims[0].lineage_parent_txid == $zero and
              $claims[0].lineage_family_fingerprint ==
                $component.generation_fingerprint
-           else true end) and
+           else
+             implicit_claim_root($claims[0]; ($claims | length);
+               $goldrush.qqp4_active_next_block)
+           end) and
           all(range(1; ($claims | length));
             $claims[.].lineage_metadata_present == true and
             $claims[.].lineage_metadata_valid == true and
@@ -476,8 +779,8 @@ hotfix_pow_observation_json_is_valid()
             $claims[.].lineage_root_txid == $claims[0].txid and
             $claims[.].lineage_parent_txid == $claims[.-1].txid) and
           all($claims[];
-            .active_chain_confirmed == false and .abandoned == false and
-            .expired_locally_retired == false and .expected_shape == true and
+            selected_claim_safe(.;$goldrush.qqp4_active_next_block) and
+            .expected_shape == true and
             .wallet_authored == true and .wallet_from_me == true and
             .authored_metadata_valid == true and
             .claim_descriptor_valid == true and
@@ -492,29 +795,34 @@ hotfix_pow_observation_json_is_valid()
                (.txid as $txid | $mempool[$txid].height | uint and
                  . <= $height)
              else true end)) and
-          $pow.mining_gate_live_claims ==
-            ([$claims[] | select(.in_mempool)] | length) and
+          ([$claims[] |
+             select(.disposition == "eligible" and .in_mempool == false and
+               .relay_ttl_expired == false)]) as $relay_candidates |
+          ([$claims[] | select(.in_mempool)] | length) as $selected_live |
+          $pow.mining_gate_live_claims >= $selected_live and
+          $selected_live <= 1 and
+          (if $component.anchor_user_locked then
+             $pow.mining_gate_action == "wait_for_next_tip" and
+             $pow.mining_gate_relay_txid == $zero and
+             $pow.mining_gate_can_submit == false
+           else true end) and
           (if $pow.mining_gate_action == "wait_for_live" then
-             ($pow.mining_gate_live_claims >= 1) and
-             all($claims[] | select(.in_mempool);
-               (.txid as $txid |
-                 ($height - $mempool[$txid].height) >= 0 and
-                 ($height - $mempool[$txid].height) <= 1))
+             $selected_live == 1 and ($pow.mining_gate_live_claims >= 1)
            elif $pow.mining_gate_action == "relay_existing" then
+             $selected_live == 0 and
              ($pow.mining_gate_relay_txid) as $relay |
-             ([ $claims[] | select(.txid == $relay) ] | length) == 1 and
-             ($claims[] | select(.txid == $relay) |
-               .in_mempool == false and .relay_ttl_expired == false and
-               (.relay_expiry_time | integer and . > $observed) and
-               .disposition == "eligible")
+             ([$relay_candidates[] | select(.txid == $relay)]) as $selected |
+             ($selected | length) == 1 and
+             ($selected[0].relay_expiry_time | integer and . > $observed)
            elif $pow.mining_gate_action == "wait_for_next_tip" and
                 $pow.mining_gate_relay_txid != $zero then
+             $selected_live == 0 and
              ($pow.mining_gate_relay_txid) as $relay |
-             ([ $claims[] | select(.txid == $relay) ] | length) == 1 and
-             ($claims[] | select(.txid == $relay) |
-               .in_mempool == false and .relay_ttl_expired == false and
-               (.relay_expiry_time | integer and . > $observed) and
-               .disposition == "eligible")
+             ([$relay_candidates[] | select(.txid == $relay)]) as $selected |
+             ($selected | length) == 1 and
+             ($selected[0].relay_expiry_time | integer and . > $observed)
+           elif $pow.mining_gate_action == "refresh_same_anchor" then
+             $selected_live == 0
            else true end)
         end
     ' >/dev/null
@@ -522,27 +830,36 @@ hotfix_pow_observation_json_is_valid()
 
 # A fingerprint/action/relay change is not progress: each can change while the
 # same durable family toggles between local mempool and relay views. Across an
-# advancing-tip series, every enabled zero-hash action may span at most one tip
+# advancing-tip series, every enabled action without an action-appropriate
+# progress witness may span at most one tip
 # without a new authenticated family/head, a first observed authoritative live
 # transition for an authenticated family member, an increased worker submission
 # counter, or positive hashing under a submit-capable create/refresh action.
 hotfix_pow_observation_series_json_is_valid()
 {
-    local series="$1" observation row
-    local sample tip height enabled zero_hash hash_progress claims key head ordinal
-    local generation claim_txids inventory_keys live_txids inventory_key live_txid live_progress
-    local previous_sample=0 previous_tip='' previous_height=-1 previous_claims=0
-    local previous_key='' previous_head='' previous_ordinal=-1 stale_transitions=0
-    local previous_generation='-' previous_claim_txids='-'
-    local seen_selected_keys='|' seen_inventory_keys='|' seen_live_txids='|' progress
-    jq -e -n --argjson series "$series" '
+    local series="$1" minimum_samples="${2:-3}" observation row projection
+    local sample tip height work observed enabled action can_submit hash_progress claims key head ordinal
+    local generation claim_txids live_txids live_txid live_progress family_index i
+    local previous_sample=0 previous_tip='' previous_height=-1 previous_work=''
+    local previous_observed=0 first_observed=0 last_tip_progress_observed=0
+    local previous_claims=0 tip_changes=0
+    local seen_tips='|'
+    local previous_projection=''
+    local stale_transitions=0 seen_live_txids='|' progress same_tip family_seen_before
+    local previous_family_live='-' previous_family_claims='-'
+    local family_keys=() family_generations=() family_heads=() family_ordinals=()
+    local family_claim_txids=() family_live_txids=()
+    [[ "$minimum_samples" =~ ^[1-9][0-9]*$ ]] || return 1
+    jq -e -n --argjson series "$series" --argjson minimum "$minimum_samples" '
       def integer: type == "number" and floor == .;
-      $series | type == "array" and length >= 3 and
+      def hex64: type == "string" and test("^[0-9a-f]{64}$");
+      $series | type == "array" and length >= $minimum and
       all(.[];
         type == "object" and
-        (keys | sort) == (["height","mempool_verbose","observed_epoch",
-          "pow","recovery","sample","tip"] | sort) and
+        (keys | sort) == (["goldrush_state","height","mempool_verbose",
+          "observed_epoch","pow","recovery","sample","tip","work"] | sort) and
         (.sample | integer and . > 0) and (.height | integer and . >= 0) and
+        (.tip | hex64) and (.work | hex64) and
         (.observed_epoch | integer and . > 0))
     ' >/dev/null || return 1
     while IFS= read -r observation; do
@@ -552,7 +869,8 @@ hotfix_pow_observation_series_json_is_valid()
             "$(jq -ce '.mempool_verbose' <<<"$observation")" \
             "$(jq -er '.tip' <<<"$observation")" \
             "$(jq -er '.height' <<<"$observation")" \
-            "$(jq -er '.observed_epoch' <<<"$observation")" || return 1
+            "$(jq -er '.observed_epoch' <<<"$observation")" \
+            "$(jq -ce '.goldrush_state' <<<"$observation")" || return 1
         row=$(jq -er --arg zero "$HOTFIX_ZERO_TXID" '
           .pow.mining_gate_lineage_head_txid as $head |
           (if $head == $zero then null
@@ -562,14 +880,8 @@ hotfix_pow_observation_series_json_is_valid()
           (if $component == null then []
            else ($component.nodes | map(select(.kind == "claim")) |
              sort_by(.lineage_ordinal)) end) as $claims |
-          ([.recovery.component_details[] |
-            select(.anchor_authenticated == true and .anchor_unspent == true) |
-            (.nodes | map(select(.kind == "claim")) |
-              sort_by(.lineage_ordinal)) as $component_claims |
-            select(($component_claims | length) > 0) |
-            ([.anchor.txid,(.anchor.vout|tostring),$component_claims[0].txid] |
-              join(":"))] | unique | sort) as $inventory_keys |
-          [ .sample,.tip,.height,.pow.enabled,(.pow.hashrate == 0),
+            [ .sample,.tip,.height,.work,.observed_epoch,.pow.enabled,
+              .pow.mining_gate_action,.pow.mining_gate_can_submit,
             (.pow.mining_gate_can_submit and
              (.pow.mining_gate_action == "create_new_anchor" or
               .pow.mining_gate_action == "refresh_same_anchor") and
@@ -581,45 +893,128 @@ hotfix_pow_observation_series_json_is_valid()
             $head,(if ($claims|length) == 0 then -1 else $claims[-1].lineage_ordinal end),
             (if ($claims|length) == 0 then "-"
              else ($claims | map(.txid) | join(",")) end),
-            (if ($inventory_keys|length) == 0 then "-"
-             else ($inventory_keys | join(",")) end),
             ([$claims[] | select(.in_mempool) | .txid] as $live |
               if ($live|length) == 0 then "-" else ($live | join(",")) end) ] | @tsv
         ' <<<"$observation") || return 1
-        IFS=$'\t' read -r sample tip height enabled zero_hash hash_progress claims \
-            key generation head ordinal claim_txids inventory_keys live_txids <<<"$row"
+        projection=$(jq -ceS --arg zero "$HOTFIX_ZERO_TXID" '
+          .pow.mining_gate_lineage_head_txid as $head |
+          (if $head == $zero then null else
+             [.recovery.component_details[] as $component |
+               select(any($component.nodes[];
+                 .kind == "claim" and .txid == $head)) | $component][0]
+           end) as $selected |
+          {tip,height,work,
+           qqp4:{activation_disabled:.goldrush_state.qqp4_activation_disabled,
+             activation_height:.goldrush_state.qqp4_activation_height,
+             active:.goldrush_state.qqp4_active,
+             active_next_block:.goldrush_state.qqp4_active_next_block},
+           worker:{enabled:.pow.enabled,state:.pow.state,threads:.pow.threads,
+             cpu_percent:.pow.cpu_percent,hashrate:.pow.hashrate,
+             claims_submitted:.pow.claims_submitted},
+           gate:{coherent:.pow.mining_gate_coherent,
+             action:.pow.mining_gate_action,
+             can_submit:.pow.mining_gate_can_submit,
+             database_ambiguous:.pow.mining_gate_database_ambiguous,
+             unresolved_components:.pow.mining_gate_unresolved_components,
+             live_claims:.pow.mining_gate_live_claims,
+             eligible_claims:.pow.mining_gate_eligible_claims,
+             family_claims:.pow.mining_gate_family_claims,
+             unsafe_claims:.pow.mining_gate_unsafe_claims,
+             unsafe_components:.pow.mining_gate_unsafe_components,
+             relay_txid:.pow.mining_gate_relay_txid,
+             lineage_head_txid:.pow.mining_gate_lineage_head_txid},
+           selected:(if $selected == null then null else
+             {anchor:$selected.anchor,
+              anchor_authenticated:$selected.anchor_authenticated,
+              anchor_unspent:$selected.anchor_unspent,
+              anchor_user_locked:$selected.anchor_user_locked,
+              classification:$selected.classification,
+              generation_fingerprint:$selected.generation_fingerprint,
+              claim_txids:$selected.claim_txids,
+              root_claim_txids:$selected.root_claim_txids,
+              descendant_claims:$selected.descendant_claims,
+              ordinary_or_mixed_txids:$selected.ordinary_or_mixed_txids,
+              resolution_txids:$selected.resolution_txids,
+              nodes:([$selected.nodes[] | select(.kind == "claim") |
+                {txid,in_mempool,quarantined,active_chain_confirmed,abandoned,
+                 expired_locally_retired,disposition,relay_expiry_time,
+                 relay_ttl_expired,proof_mode,proof_version,proof_origin_bound,
+                 proof_input_bound,proof_may_revalidate_on_descendant,
+                 proof_evaluation_skipped_resolved_anchor,
+                 lineage_metadata_present,lineage_metadata_valid,
+                 lineage_family_fingerprint,lineage_root_txid,
+                 lineage_parent_txid,lineage_ordinal}] | sort_by(.txid))}
+             end)}
+        ' <<<"$observation" | sha256sum | awk '{print $1}') || return 1
+        IFS=$'\t' read -r sample tip height work observed enabled action can_submit hash_progress claims \
+            key generation head ordinal claim_txids live_txids <<<"$row"
         if (( previous_sample != 0 )); then
-            (( sample > previous_sample && height > previous_height )) || return 1
-            [[ "$tip" != "$previous_tip" ]] || return 1
+            (( sample > previous_sample && observed > previous_observed )) || return 1
+            (( observed - first_observed <= 2700 )) || return 1
+            # Worker, lineage, submission, and mempool witnesses never replace
+            # active-chain liveness. Every observed period on one tip is capped
+            # at ten minutes, including the interval ending at the next tip.
+            (( observed - last_tip_progress_observed <= 600 )) || return 1
+            same_tip=false
+            if [[ "$tip" == "$previous_tip" ]]; then
+                (( height == previous_height )) && [[ "$work" == "$previous_work" ]] || return 1
+                [[ "$projection" != "$previous_projection" ]] || return 1
+                same_tip=true
+            else
+                [[ "$seen_tips" != *"|${tip}|"* ]] || return 1
+                (( height > previous_height )) && [[ "$work" > "$previous_work" ]] || return 1
+                tip_changes=$((tip_changes + 1))
+                last_tip_progress_observed=$observed
+            fi
             (( claims >= previous_claims )) || return 1
             progress=false
             if (( claims > previous_claims )) || [[ "$hash_progress" == true ]]; then
                 progress=true
             fi
             if [[ "$key" != - ]]; then
-                if [[ "$key" == "$previous_key" ]]; then
-                    [[ "$generation" == "$previous_generation" ]] || return 1
-                    (( ordinal >= previous_ordinal )) || return 1
-                    if (( ordinal == previous_ordinal )); then
-                        [[ "$head" == "$previous_head" &&
-                           "$claim_txids" == "$previous_claim_txids" ]] || return 1
+                family_index=-1
+                family_seen_before=false
+                previous_family_live='-'
+                previous_family_claims='-'
+                for i in "${!family_keys[@]}"; do
+                    if [[ "${family_keys[$i]}" == "$key" ]]; then
+                        family_index=$i
+                        break
+                    fi
+                done
+                if (( family_index >= 0 )); then
+                    family_seen_before=true
+                    previous_family_live=${family_live_txids[$family_index]}
+                    previous_family_claims=${family_claim_txids[$family_index]}
+                    [[ "$generation" == "${family_generations[$family_index]}" ]] || return 1
+                    (( ordinal >= family_ordinals[family_index] )) || return 1
+                    if (( ordinal == family_ordinals[family_index] )); then
+                        [[ "$head" == "${family_heads[$family_index]}" &&
+                           "$claim_txids" == "${family_claim_txids[$family_index]}" ]] || return 1
                     else
-                        [[ "$claim_txids" == "${previous_claim_txids},"* ]] || return 1
+                        [[ "$claim_txids" == "${family_claim_txids[$family_index]},"* ]] || return 1
                         progress=true
                     fi
+                    family_heads[family_index]=$head
+                    family_ordinals[family_index]=$ordinal
+                    family_claim_txids[family_index]=$claim_txids
+                    family_live_txids[family_index]=$live_txids
                 else
-                    [[ "$seen_selected_keys" != *"|${key}|"* ]] || return 1
-                    seen_selected_keys+="${key}|"
-                    if [[ "$seen_inventory_keys" != *"|${key}|"* ]]; then
-                        progress=true
-                    fi
+                    family_keys+=("$key")
+                    family_generations+=("$generation")
+                    family_heads+=("$head")
+                    family_ordinals+=("$ordinal")
+                    family_claim_txids+=("$claim_txids")
+                    family_live_txids+=("$live_txids")
                 fi
             fi
-            if [[ "$key" != - && "$key" == "$previous_key" &&
-                  "$live_txids" != - ]]; then
+            if [[ "$key" != - && "$live_txids" != - &&
+                  "$family_seen_before" == true ]]; then
                 live_progress=false
                 while IFS= read -r live_txid; do
                     if [[ -n "$live_txid" &&
+                          ",${previous_family_claims}," == *",${live_txid},"* &&
+                          ",${previous_family_live}," != *",${live_txid},"* &&
                           "$seen_live_txids" != *"|${live_txid}|"* ]]; then
                         live_progress=true
                     fi
@@ -629,20 +1024,34 @@ hotfix_pow_observation_series_json_is_valid()
             if [[ "$progress" == true ]]; then
                 stale_transitions=0
             else
-                stale_transitions=$((stale_transitions + 1))
+                # A changed same-tip cut, or a submit-capable create/refresh cut
+                # without concrete work, consumes the bounded no-progress
+                # budget. A coherent wait/live/relay cut may instead remain
+                # zero-hash while the active chain advances; selection/action/
+                # fingerprint/relay churn alone is never credited as progress.
+                if [[ "$same_tip" == true ||
+                      ( "$can_submit" == true &&
+                        ( "$action" == create_new_anchor ||
+                          "$action" == refresh_same_anchor ) ) ]]; then
+                    stale_transitions=$((stale_transitions + 1))
+                else
+                    stale_transitions=0
+                fi
             fi
-            if [[ "$enabled" == true && "$zero_hash" == true &&
-                  $stale_transitions -gt 1 ]]; then
+            if [[ "$enabled" == true && $stale_transitions -gt 1 ]]; then
                 return 1
             fi
         elif [[ "$key" != - ]]; then
-            seen_selected_keys+="${key}|"
+            family_keys+=("$key")
+            family_generations+=("$generation")
+            family_heads+=("$head")
+            family_ordinals+=("$ordinal")
+            family_claim_txids+=("$claim_txids")
+            family_live_txids+=("$live_txids")
         fi
-        if [[ "$inventory_keys" != - ]]; then
-            while IFS= read -r inventory_key; do
-                [[ -n "$inventory_key" ]] &&
-                    seen_inventory_keys+="${inventory_key}|"
-            done < <(tr ',' '\n' <<<"$inventory_keys")
+        if (( first_observed == 0 )); then
+            first_observed=$observed
+            last_tip_progress_observed=$observed
         fi
         if [[ "$live_txids" != - ]]; then
             while IFS= read -r live_txid; do
@@ -655,13 +1064,21 @@ hotfix_pow_observation_series_json_is_valid()
         previous_sample=$sample
         previous_tip=$tip
         previous_height=$height
+        previous_work=$work
+        previous_observed=$observed
         previous_claims=$claims
-        previous_key=$key
-        previous_generation=$generation
-        previous_head=$head
-        previous_ordinal=$ordinal
-        previous_claim_txids=$claim_txids
+        previous_projection=$projection
+        if [[ "$seen_tips" != *"|${tip}|"* ]]; then
+            seen_tips+="${tip}|"
+        fi
     done < <(jq -ce '.[]' <<<"$series")
+    # The consensus schedule is process/network identity. It may cross its
+    # activation height, but it cannot change during one acceptance series.
+    jq -e -n --argjson series "$series" '
+      ([$series[].goldrush_state |
+        {qqp4_activation_disabled,qqp4_activation_height}] | unique | length) == 1
+    ' >/dev/null || return 1
+    (( minimum_samples < 2 || tip_changes >= 1 ))
 }
 
 hotfix_phase_a_staking_json_is_disabled()
@@ -752,28 +1169,69 @@ hotfix_phase_b_staking_json_is_active()
     ' >/dev/null
 }
 
+hotfix_phase_b_staking_json_is_locked_with_intent()
+{
+    jq -e -n --argjson staking "$1" '
+        def integer: type == "number" and floor == .;
+        def required: ["active_blocks","allow_automatic_quantum_key_creation",
+          "automatic_demurrage_attestation","automatic_qqsignal","automatic_redelegation",
+          "autostart_staking","autostart_staking_source","blocks","chain","chainstate_cached",
+          "consensus_demurrage_automatic","difficulty","eligible","enabled","expectedtime",
+          "netstakeweight","pooledtx","search-interval","staking","staking_reason",
+          "staking_snapshot_current","staking_snapshot_sequence","staking_state","warnings",
+          "weight","weight_cache_height","weight_cached","worker_running"];
+        $staking | type == "object" and
+        ((required - keys) | length) == 0 and
+        ((keys - (required + ["currentblocktx","currentblockweight"])) | length) == 0 and
+        .enabled == true and .autostart_staking == true and
+        .autostart_staking_source == "autostartstaking" and
+        .worker_running == true and .staking == false and .eligible == false and
+        .staking_state == "locked" and (.staking_reason | type) == "string" and
+        (.staking_snapshot_current | type) == "boolean" and
+        (.staking_snapshot_sequence | integer and . >= 0) and
+        (.active_blocks | integer and . >= 0) and (.blocks | integer and . >= 0) and
+        (.weight | integer and . >= 0) and (.weight_cached | type) == "boolean" and
+        (.weight_cache_height | integer and . >= -1) and
+        .automatic_qqsignal == false and .automatic_demurrage_attestation == false and
+        .automatic_redelegation == false and
+        .allow_automatic_quantum_key_creation == false and
+        .consensus_demurrage_automatic == true and
+        (.pooledtx | integer and . >= 0) and (.difficulty | type) == "number" and
+        ((.currentblocktx? == null) or (.currentblocktx | integer and . >= 0)) and
+        ((.currentblockweight? == null) or (.currentblockweight | integer and . >= 0)) and
+        (."search-interval" | integer and . >= 0) and
+        (.netstakeweight | integer and . >= 0) and (.expectedtime | integer and . >= 0) and
+        (.chainstate_cached | type) == "boolean" and (.chain | type) == "string" and
+        (.warnings | type) == "string"
+    ' >/dev/null
+}
+
 hotfix_phase_b_progress_file_is_valid()
 {
     local file="$1" expected_nonce="$2" pow_mode="$3" sample fee series
-    [[ -f "$file" && ! -L "$file" && ( "$pow_mode" == active || "$pow_mode" == off ) ]] ||
+    [[ -f "$file" && ! -L "$file" && "$pow_mode" == active ]] ||
         return 1
     jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" --arg nonce "$expected_nonce" '
         def integer: type == "number" and floor == .;
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
         type == "object" and
         (keys | sort) == (["candidate_source_sha","p2p_ready_continuously","phase",
-          "pos_active_continuously","promotion_nonce","samples","schema","tip_changes",
+          "pos_active_continuously","promotion_nonce","observation_sample_count",
+          "samples","schema","tip_changes",
           "wallet_chain_synchronized_continuously",
-          "zero_hash_max_no_progress_tip_transitions"] | sort) and
-        (.schema | integer and . == 2) and .phase == "B" and
+          "same_tip_or_submit_no_progress_transition_budget"] | sort) and
+        (.schema | integer and . == 4) and .phase == "B" and
         .candidate_source_sha == $source and .promotion_nonce == $nonce and
         ($nonce | test("^[0-9a-f]{32}$")) and
-        (.samples | type == "array" and length == 4) and
-        ([.samples[].sample] == [1,2,3,4]) and
+        (.observation_sample_count | integer and . >= 2) and
+        (.observation_sample_count as $file_observation_count |
+        (.samples | type == "array" and
+          length == $file_observation_count) and
+        ([.samples[].sample] == [range(1; $file_observation_count + 1)]) and
         all(.samples[];
-          (keys | sort) == (["chain","mempool_verbose","network","observed_epoch",
-            "pow","recovery","sample","staking","wallet"] | sort) and
-          (.sample | integer and . >= 1 and . <= 4) and
+          (keys | sort) == (["chain","goldrush_state","mempool_verbose","network",
+            "observed_epoch","pow","recovery","sample","staking","wallet"] | sort) and
+          (.sample | integer and . >= 1 and . <= $file_observation_count) and
           (.observed_epoch | integer and . > 0) and
           (.chain | type) == "object" and .chain.chain == "main" and
           (.chain.blocks | integer and . >= 0) and
@@ -784,7 +1242,7 @@ hotfix_phase_b_progress_file_is_valid()
           (.network | type) == "object" and
           (.network.networkactive | type) == "boolean" and
           (.network.connections_out | integer and . >= 3) and
-          (.wallet | type) == "object" and .wallet.walletname == "" and
+          (.wallet | type) == "object" and (.wallet.walletname | type) == "string" and
           .wallet.private_keys_enabled == true and .wallet.scanning == false and
           .wallet.unlocked_staking_only == false and
           (.wallet.unlocked_until | integer) and
@@ -793,38 +1251,34 @@ hotfix_phase_b_progress_file_is_valid()
           .recovery.wallet_processed_tip == .chain.bestblockhash and
           .pow.claim_inventory_tip == .chain.bestblockhash and
           .staking.blocks == .chain.blocks and .staking.active_blocks == .chain.blocks and
-          .staking.autostart_staking == false and
+          .staking.autostart_staking == true and
           .staking.autostart_staking_source == "autostartstaking" and
-          .pow.raw_quarantined_claims == .recovery.raw_quarantined_claims and
-          .pow.blocking_quarantined_claims == .recovery.blocking_quarantined_claims and
-          .pow.actionable_quarantined_claims == .recovery.actionable_quarantined_claims and
-          .pow.resolved_on_active_chain_claims == .recovery.resolved_on_active_chain_claims and
-          .pow.indeterminate_quarantined_claims == .recovery.indeterminate_quarantined_claims and
-          .pow.claim_components == .recovery.components and
-          .pow.pending_manual_resolutions == .recovery.pending_manual_resolutions and
-          .pow.pending_automatic_resolutions == .recovery.pending_automatic_resolutions and
-          .pow.claims_auto_resolved == .recovery.confirmed_automatic_resolutions and
-          .pow.claims_recycled == .recovery.claims_recycled and
-          .pow.cumulative_resolution_fees == .recovery.confirmed_resolution_fees and
+          .pow.autostart == true and
           .pow.claim_recovery_database_outcome_ambiguous ==
             .recovery.database_outcome_ambiguous) and
+        ([.samples[].wallet.walletname] | unique | length) == 1 and
         ([.samples[].chain.blocks] as $h |
-          all(range(1;($h|length)); $h[.] > $h[.-1])) and
-        ([.samples[].chain.bestblockhash] as $t |
-          ($t | unique | length) == 4 and
-          all(range(1;($t|length)); $t[.] != $t[.-1])) and
-        ([.samples[].chain.chainwork] as $w |
-          all(range(1;($w|length)); $w[.] > $w[.-1])) and
+         [.samples[].chain.bestblockhash] as $t |
+         [.samples[].chain.chainwork] as $w |
+          all(range(1;($h|length));
+            if $t[.] == $t[.-1] then
+              $h[.] == $h[.-1] and $w[.] == $w[.-1]
+            else
+              $h[.] > $h[.-1] and $w[.] > $w[.-1]
+            end)) and
         ([.samples[].observed_epoch] as $o |
-          all(range(1;($o|length)); $o[.] >= $o[.-1])) and
-        (.tip_changes | integer and . == 3) and
-        (.zero_hash_max_no_progress_tip_transitions | integer and . == 1) and
+          all(range(1;($o|length)); $o[.] > $o[.-1]) and
+          ($o[-1] - $o[0]) <= 2700) and
+        ([.samples[].chain.bestblockhash] as $t |
+          ([range(1;($t|length)) | select($t[.] != $t[.-1])] | length) as $changes |
+          (.tip_changes | integer and . == $changes and . >= 1)) and
+        (.same_tip_or_submit_no_progress_transition_budget | integer and . == 1) and
         (.wallet_chain_synchronized_continuously | type) == "boolean" and
         .wallet_chain_synchronized_continuously == true and
         (.pos_active_continuously | type) == "boolean" and
         .pos_active_continuously == true and
         (.p2p_ready_continuously | type) == "boolean" and
-        .p2p_ready_continuously == true
+        .p2p_ready_continuously == true)
     ' "$file" >/dev/null || return 1
     while IFS= read -r sample; do
         fee=$(jq -ce '.recovery.confirmed_resolution_fees' <<<"$sample") || return 1
@@ -834,9 +1288,44 @@ hotfix_phase_b_progress_file_is_valid()
         hotfix_candidate_pow_json_is_valid "$(jq -c '.pow' <<<"$sample")" "$pow_mode" || return 1
     done < <(jq -ce '.samples[]' "$file")
     series=$(jq -ce '[.samples[] | {sample,observed_epoch,
-      tip:.chain.bestblockhash,height:.chain.blocks,pow,recovery,mempool_verbose}]' \
+      tip:.chain.bestblockhash,height:.chain.blocks,work:.chain.chainwork,
+      goldrush_state,pow,recovery,mempool_verbose}]' \
         "$file") || return 1
-    hotfix_pow_observation_series_json_is_valid "$series"
+    hotfix_pow_observation_series_json_is_valid "$series" 2 || return 1
+    jq -e --arg zero "$HOTFIX_ZERO_TXID" '
+      def selected:
+        . as $sample | $sample.pow.mining_gate_lineage_head_txid as $head |
+        if $head==$zero then null else
+          ([$sample.recovery.component_details[] as $component |
+            select(any($component.nodes[];
+              .kind=="claim" and .txid==$head)) | $component][0]) as $component |
+          ($component.nodes|map(select(.kind=="claim"))|
+            sort_by(.lineage_ordinal)) as $claims |
+          {key:([$component.anchor.txid,($component.anchor.vout|tostring),
+            $claims[0].txid]|join(":")),ordinal:$claims[-1].lineage_ordinal,
+           claim_txids:[$claims[].txid],live_txids:[$claims[]|select(.in_mempool)|.txid]}
+        end;
+      .samples as $samples | ($samples|length) as $n | $samples[-1] as $final |
+      ($final|selected) as $final_family |
+      if ($final.pow.mining_gate_can_submit==true and
+          ($final.pow.mining_gate_action=="create_new_anchor" or
+           $final.pow.mining_gate_action=="refresh_same_anchor")) then
+        $final.pow.hashrate>0 or
+        any(range(1;$n); $samples[.].pow.claims_submitted>
+          $samples[.-1].pow.claims_submitted) or
+        ($final_family!=null and any(range(0;$n-1); (. as $i |
+          ($samples[$i]|selected) as $prior |
+          $prior!=null and $prior.key==$final_family.key and
+          $final_family.ordinal>$prior.ordinal))) or
+        ($final_family!=null and any($final_family.live_txids[]; . as $live |
+          any(range(0;$n-1); (. as $i | ($samples[$i]|selected) as $prior |
+            $prior!=null and $prior.key==$final_family.key and
+            ($prior.claim_txids|index($live))!=null and
+            ($prior.live_txids|index($live))==null)) and
+          all(range(0;$n-1); (. as $i | ($samples[$i]|selected) as $prior |
+            $prior==null or ($prior.live_txids|index($live))==null))))
+      else true end
+    ' "$file" >/dev/null
 }
 
 hotfix_unlock_helper_audit_file_is_valid()
@@ -1085,15 +1574,11 @@ hotfix_invocation_file_is_valid()
 
 hotfix_phase_a_envelope_json_is_valid()
 {
-    local envelope="$1" fee mining_before mining_after recovery_before recovery_after staking
-    local mempool tip height observed
+    local envelope="$1" mining_before mining_after recovery_before recovery_after staking
+    local mempool tip height observed goldrush_state
     jq -e -n --argjson envelope "$envelope" '
         def integer: type == "number" and floor == .;
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
-        def recovery_metrics: {pending_manual_resolutions,pending_automatic_resolutions,
-          confirmed_manual_resolutions,confirmed_automatic_resolutions,
-          confirmed_resolution_fees,automatic_actions_in_window,
-          automatic_fee_exposure_in_window,reconciled_descendant_claims,claims_recycled};
         def gate_tuple: {mining_gate_action,mining_gate_can_submit,
           mining_gate_database_ambiguous,mining_gate_unresolved_components,
           mining_gate_live_claims,mining_gate_eligible_claims,mining_gate_family_claims,
@@ -1101,17 +1586,17 @@ hotfix_phase_a_envelope_json_is_valid()
           mining_gate_lineage_head_txid,mining_gate_candidate_state_fingerprint,
           claims_submitted};
         $envelope | type == "object" and
-        (keys | sort) == (["chain_after","chain_before","expected_pending_automatic",
-          "expected_pending_manual","expected_recovery_fee","expected_recovery_metrics",
-          "expected_recovery_metrics_sha256","isolation_continuously_valid","isolation_sha256",
+        (keys | sort) == (["chain_after","chain_before","goldrush_state",
+          "isolation_continuously_valid","isolation_sha256",
           "mempool_verbose","mining_after","mining_before","network","observed_epoch","observer_status",
           "phase","recovery_after","recovery_before","restart_epoch","sample","schema",
           "staking","wallet","wallets"] | sort) and
-        (.schema | integer and . == 3) and .phase == "A" and
-        (.sample | integer and . >= 1 and . <= 4) and
+        (.schema | integer and . == 4) and .phase == "A" and
+        (.sample | integer and . >= 1) and
         (.observed_epoch | integer and . > 0) and
         (.restart_epoch | integer and (. == 1 or . == 2)) and
-        .wallets == [""] and
+        (.wallet.walletname | type) == "string" and
+        .wallets == [.wallet.walletname] and
         (.chain_before | type) == "object" and (.chain_after | type) == "object" and
         .chain_before.chain == "main" and .chain_after.chain == "main" and
         .chain_before.initialblockdownload == false and
@@ -1128,17 +1613,6 @@ hotfix_phase_a_envelope_json_is_valid()
         .recovery_before.active_tip == .chain_before.bestblockhash and
         .recovery_after.active_tip == .chain_before.bestblockhash and
         .recovery_after.wallet_generation == .recovery_before.wallet_generation and
-        (.recovery_before | recovery_metrics) == (.recovery_after | recovery_metrics) and
-        (.expected_recovery_metrics | type) == "object" and
-        (.expected_recovery_metrics | keys | sort) ==
-          (["automatic_actions_in_window","automatic_fee_exposure_in_window",
-            "claims_recycled","confirmed_automatic_resolutions",
-            "confirmed_manual_resolutions","confirmed_resolution_fees",
-            "pending_automatic_resolutions","pending_manual_resolutions",
-            "reconciled_descendant_claims"] | sort) and
-        (.expected_recovery_metrics_sha256 | hex64) and
-        (.recovery_before | recovery_metrics) == .expected_recovery_metrics and
-        (.recovery_after | recovery_metrics) == .expected_recovery_metrics and
         .recovery_before.policy == .recovery_after.policy and
         .recovery_before.policy_state_status == .recovery_after.policy_state_status and
         .mining_before.claim_inventory_tip == .chain_before.bestblockhash and
@@ -1147,9 +1621,10 @@ hotfix_phase_a_envelope_json_is_valid()
           .mining_before.mining_gate_candidate_state_fingerprint and
         (.mining_after | gate_tuple) == (.mining_before | gate_tuple) and
         .mining_before.claims_submitted == 0 and .mining_after.claims_submitted == 0 and
+        .mining_before.autostart == false and .mining_after.autostart == false and
         (.isolation_sha256 | hex64) and
         (.mempool_verbose | type) == "object" and
-        (.wallet | type) == "object" and .wallet.walletname == "" and
+        (.wallet | type) == "object" and
         .wallet.private_keys_enabled == true and .wallet.scanning == false and
         .wallet.unlocked_staking_only == false and
         (.wallet.unlocked_until | integer) and .wallet.unlocked_until > .observed_epoch and
@@ -1160,49 +1635,11 @@ hotfix_phase_a_envelope_json_is_valid()
         .network.networkactive == true and .network.localrelay == false and
         .network.connections_out >= 3 and
         .isolation_continuously_valid == true and .observer_status == "observed_absent" and
-        (.expected_recovery_fee | type == "number" and . >= 0) and
-        (.expected_pending_manual | integer and . >= 0) and
-        (.expected_pending_automatic | integer and . >= 0) and
-        .recovery_before.pending_manual_resolutions == .expected_pending_manual and
-        .recovery_after.pending_manual_resolutions == .expected_pending_manual and
-        .recovery_before.pending_automatic_resolutions == .expected_pending_automatic and
-        .recovery_after.pending_automatic_resolutions == .expected_pending_automatic and
-        .mining_before.raw_quarantined_claims == .recovery_before.raw_quarantined_claims and
-        .mining_after.raw_quarantined_claims == .recovery_after.raw_quarantined_claims and
-        .mining_before.blocking_quarantined_claims ==
-          .recovery_before.blocking_quarantined_claims and
-        .mining_after.blocking_quarantined_claims ==
-          .recovery_after.blocking_quarantined_claims and
-        .mining_before.actionable_quarantined_claims ==
-          .recovery_before.actionable_quarantined_claims and
-        .mining_after.actionable_quarantined_claims ==
-          .recovery_after.actionable_quarantined_claims and
-        .mining_before.resolved_on_active_chain_claims ==
-          .recovery_before.resolved_on_active_chain_claims and
-        .mining_after.resolved_on_active_chain_claims ==
-          .recovery_after.resolved_on_active_chain_claims and
-        .mining_before.indeterminate_quarantined_claims ==
-          .recovery_before.indeterminate_quarantined_claims and
-        .mining_after.indeterminate_quarantined_claims ==
-          .recovery_after.indeterminate_quarantined_claims and
-        .mining_before.claim_components == .recovery_before.components and
-        .mining_after.claim_components == .recovery_after.components and
         .mining_before.claim_recovery_database_outcome_ambiguous ==
           .recovery_before.database_outcome_ambiguous and
         .mining_after.claim_recovery_database_outcome_ambiguous ==
-          .recovery_after.database_outcome_ambiguous and
-        .mining_before.claims_auto_resolved ==
-          .recovery_before.confirmed_automatic_resolutions and
-        .mining_after.claims_auto_resolved ==
-          .recovery_after.confirmed_automatic_resolutions and
-        .mining_before.claims_recycled == .recovery_before.claims_recycled and
-        .mining_after.claims_recycled == .recovery_after.claims_recycled and
-        .mining_before.cumulative_resolution_fees ==
-          .recovery_before.confirmed_resolution_fees and
-        .mining_after.cumulative_resolution_fees ==
-          .recovery_after.confirmed_resolution_fees
+          .recovery_after.database_outcome_ambiguous
     ' >/dev/null || return 1
-    fee=$(jq -c '.expected_recovery_fee' <<<"$envelope") || return 1
     mining_before=$(jq -ce '.mining_before' <<<"$envelope") || return 1
     mining_after=$(jq -ce '.mining_after' <<<"$envelope") || return 1
     recovery_before=$(jq -ce '.recovery_before' <<<"$envelope") || return 1
@@ -1212,15 +1649,16 @@ hotfix_phase_a_envelope_json_is_valid()
     tip=$(jq -er '.chain_before.bestblockhash' <<<"$envelope") || return 1
     height=$(jq -er '.chain_before.blocks' <<<"$envelope") || return 1
     observed=$(jq -er '.observed_epoch' <<<"$envelope") || return 1
+    goldrush_state=$(jq -ce '.goldrush_state' <<<"$envelope") || return 1
     hotfix_candidate_pow_json_is_valid "$mining_before" active &&
         hotfix_candidate_pow_json_is_valid "$mining_after" active &&
-        hotfix_candidate_recovery_json_is_valid "$recovery_before" "$fee" &&
-        hotfix_candidate_recovery_json_is_valid "$recovery_after" "$fee" &&
+        hotfix_candidate_recovery_json_is_valid "$recovery_before" &&
+        hotfix_candidate_recovery_json_is_valid "$recovery_after" &&
         hotfix_phase_a_staking_json_is_disabled "$staking" &&
         hotfix_pow_observation_json_is_valid "$mining_before" "$recovery_before" \
-            "$mempool" "$tip" "$height" "$observed" &&
+            "$mempool" "$tip" "$height" "$observed" "$goldrush_state" &&
         hotfix_pow_observation_json_is_valid "$mining_after" "$recovery_after" \
-            "$mempool" "$tip" "$height" "$observed"
+            "$mempool" "$tip" "$height" "$observed" "$goldrush_state"
 }
 
 hotfix_phase_a_progress_file_is_valid()
@@ -1229,24 +1667,29 @@ hotfix_phase_a_progress_file_is_valid()
     [[ -f "$file" && ! -L "$file" ]] || return 1
     jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" '
         def integer: type == "number" and floor == .;
+        . as $progress |
+        ($progress.observation_sample_count) as $n |
         type == "object" and
         (keys | sort) == (["bounded_worker_tip_progress","candidate_source_sha","envelopes",
           "hard_flags_continuous","interactive_surfaces_stopped_continuously",
-          "lineage_continuation_tips","nonpublication_continuous",
+          "nonpublication_continuous","observation_sample_count",
+          "post_restart_advancing_observations",
           "isolation_sample_sha256s","per_epoch_claims_submitted_zero","phase",
           "pos_disabled_continuous","run_nonce","schema",
           "single_positive_hash_sample_required","tip_changes",
           "visibility_sample_sha256s","wait_for_next_tip_required_for_liveness",
-          "worker_only_pow","zero_hash_max_no_progress_tip_transitions"] | sort) and
-        (.schema | integer and . == 3) and .phase == "A" and
+          "worker_only_pow","same_tip_or_submit_no_progress_transition_budget"] | sort) and
+        (.schema | integer and . == 5) and .phase == "A" and
         (.run_nonce | type == "string" and test("^[0-9a-f]{32}$")) and
         .candidate_source_sha == $source and
-        (.envelopes | type == "array" and length == 4) and
-        ([.envelopes[].sample] == [1,2,3,4]) and
+        ($n | integer and . >= 3) and
+        (.envelopes | type == "array" and
+          length == $n) and
+        ([.envelopes[].sample] == [range(1; $n + 1)]) and
         ([.envelopes[].chain_before.blocks] as $h |
           all(range(1;$h|length); $h[.] > $h[.-1])) and
         ([.envelopes[].chain_before.bestblockhash] as $t |
-          ($t | unique | length) == 4 and
+          ($t | unique | length) == $n and
           all(range(1;$t|length); $t[.] != $t[.-1])) and
         ([.envelopes[].chain_before.chainwork] as $w |
           all(range(1;$w|length); $w[.] > $w[.-1])) and
@@ -1254,17 +1697,20 @@ hotfix_phase_a_progress_file_is_valid()
           all(range(1;$o|length); $o[.] >= $o[.-1])) and
         .envelopes[0].restart_epoch == 1 and
         all(.envelopes[1:][]; .restart_epoch == 2) and
-        ([.envelopes[].expected_recovery_metrics_sha256] | unique | length) == 1 and
-        (.tip_changes | integer and . == 3) and
-        (.zero_hash_max_no_progress_tip_transitions | integer and . == 1) and
+        (.tip_changes | integer and
+          . == ($n - 1)) and
+        (.same_tip_or_submit_no_progress_transition_budget | integer and . == 1) and
         .hard_flags_continuous == true and .pos_disabled_continuous == true and
         .nonpublication_continuous == true and
         .interactive_surfaces_stopped_continuously == true and .worker_only_pow == true and
-        (.lineage_continuation_tips | integer and . == 3) and
+        (.post_restart_advancing_observations | integer and
+          . == ($n - 1)) and
         .per_epoch_claims_submitted_zero == true and
-        (.isolation_sample_sha256s | type == "array" and length == 4 and
+        (.isolation_sample_sha256s | type == "array" and
+          length == $n and
           all(.[]; type == "string" and test("^[0-9a-f]{64}$"))) and
-        (.visibility_sample_sha256s | type == "array" and length == 4 and
+        (.visibility_sample_sha256s | type == "array" and
+          length == $n and
           all(.[]; type == "string" and test("^[0-9a-f]{64}$"))) and
         ([.envelopes[].isolation_sha256] == .isolation_sample_sha256s) and
         .bounded_worker_tip_progress == true and
@@ -1276,8 +1722,111 @@ hotfix_phase_a_progress_file_is_valid()
     done < <(jq -ce '.envelopes[]' "$file")
     series=$(jq -ce '[.envelopes[] | {sample,observed_epoch,
       tip:.chain_before.bestblockhash,height:.chain_before.blocks,
+      work:.chain_before.chainwork,goldrush_state,
       pow:.mining_after,recovery:.recovery_after,mempool_verbose}]' "$file") || return 1
     hotfix_pow_observation_series_json_is_valid "$series"
+}
+
+hotfix_phase_a_external_receive_evidence_file_is_valid()
+{
+    local file="$1"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" \
+        --arg zero "$HOTFIX_ZERO_TXID" '
+      def integer: type == "number" and floor == .;
+      def hex64: type == "string" and test("^[0-9a-f]{64}$");
+      def txid_set:
+        type == "array" and all(.[]; hex64) and . == (sort | unique);
+      def no_control_metadata:
+        ([keys[] | select(startswith("qq_"))] | length) == 0 and
+        ((.comment? // "") |
+          IN("Quantum Quasar built-in shadow PoW claim",
+             "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim") | not);
+      def clean_receive($txid):
+        .txid == $txid and .category == "receive" and
+        (.amount | type) == "number" and .amount > 0 and
+        .abandoned == false and (has("fee") | not) and
+        (has("generated") | not) and
+        no_control_metadata;
+      def valid_null_or_real_outpoint:
+        (.anchor.txid == $zero and .anchor.vout == 4294967295) or
+        ((.anchor.txid | hex64) and .anchor.txid != $zero and
+          (.anchor.vout | integer and . >= 0 and . < 4294967295));
+      def audit_only_component:
+        .anchor_authenticated == false and .anchor_unspent == false and
+        .anchor_user_locked == false and .anchor.amount == 0 and
+        .anchor.scriptPubKey == "" and valid_null_or_real_outpoint and
+        (.claim_txids | type == "array" and length >= 1 and
+          all(.[]; hex64) and (unique | length) == length) and
+        ([.nodes[]? | select(.kind == "claim") | .txid] | sort | unique) ==
+          (.claim_txids | sort | unique) and
+        all(.nodes[]?; .provenance == "unknown" and
+          .wallet_authored == false and .wallet_from_me == false);
+      . as $e |
+      type == "object" and
+      (keys | sort) == (["candidate_authored_txids","candidate_source_sha",
+        "external_receive_txids","final_wallet_txids","new_wallet_txids","phase",
+        "prelaunch_wallet_txids","records","run_nonce","schema","sets_disjoint",
+        "terminal_height","terminal_tip","wallet_differential_exhaustive"] | sort) and
+      .schema == 1 and .phase == "A" and .candidate_source_sha == $source and
+      (.run_nonce | type == "string" and test("^[0-9a-f]{32}$")) and
+      (.terminal_tip | hex64) and (.terminal_height | integer and . >= 0) and
+      (.prelaunch_wallet_txids | txid_set) and (.final_wallet_txids | txid_set) and
+      (.new_wallet_txids | txid_set) and (.candidate_authored_txids | txid_set) and
+      (.external_receive_txids | txid_set) and
+      .new_wallet_txids == (.final_wallet_txids - .prelaunch_wallet_txids) and
+      (.candidate_authored_txids - .external_receive_txids | length) ==
+        (.candidate_authored_txids | length) and
+      .new_wallet_txids ==
+        ((.candidate_authored_txids + .external_receive_txids) | sort | unique) and
+      .sets_disjoint == true and .wallet_differential_exhaustive == true and
+      (.records | type == "array" and . == (sort_by(.txid))) and
+      ([.records[].txid] | sort | unique) == .external_receive_txids and
+      all(.records[]; . as $record |
+        type == "object" and
+        (keys | sort) == (["active_chain_bound","classification","confirmation_state",
+          "getblock_response","getblockhash_response","gettransaction_response",
+          "recovery_match_count","recovery_matches","txid",
+          "unconfirmed_recovery_bound"] | sort) and
+        (.txid | hex64) and .classification == "external_receive" and
+        (.gettransaction_response) as $tx |
+        ($tx | type) == "object" and $tx.txid == $record.txid and
+        ($tx.decoded | type) == "object" and $tx.decoded.txid == $record.txid and
+        ($tx.hex | type) == "string" and ($tx.hex | test("^[0-9a-f]+$")) and
+        ($tx.hex | length) > 0 and (($tx.hex | length) % 2) == 0 and
+        ($tx | has("fee") | not) and ($tx.amount | type) == "number" and
+        $tx.amount > 0 and ($tx | has("generated") | not) and
+        ($tx | no_control_metadata) and
+        ($tx.confirmations | integer and . >= 0) and
+        ($tx.details | type == "array" and length > 0) and
+        all($tx.details[]; clean_receive($record.txid)) and
+        ([$tx.details[].amount] | add) == $tx.amount and
+        ($record.recovery_matches | type) == "array" and
+        ($record.recovery_match_count | integer and
+          . == ($record.recovery_matches | length) and . <= 1) and
+        (if $record.confirmation_state == "confirmed_active_chain" then
+           $record.active_chain_bound == true and
+           $record.unconfirmed_recovery_bound == false and
+           $record.recovery_matches == [] and $tx.confirmations > 0 and
+           ($tx.blockhash | hex64) and ($tx.blockheight | integer and . >= 0) and
+           ($tx.blockindex | integer and . >= 0) and
+           ($record.getblock_response | type) == "object" and
+           $record.getblock_response.hash == $tx.blockhash and
+           $record.getblock_response.height == $tx.blockheight and
+           ($record.getblock_response.confirmations | integer and . > 0) and
+           ($record.getblock_response.tx | type) == "array" and
+           ($record.getblock_response.tx | index($record.txid)) != null and
+           $record.getblockhash_response == $tx.blockhash and
+           $tx.blockheight <= $e.terminal_height
+         elif $record.confirmation_state == "unconfirmed" then
+           $record.active_chain_bound == false and
+           $record.unconfirmed_recovery_bound == true and
+           $tx.confirmations == 0 and ($tx | has("blockhash") | not) and
+           ($tx | has("blockheight") | not) and ($tx | has("blockindex") | not) and
+           $record.getblock_response == null and $record.getblockhash_response == null and
+           all($record.recovery_matches[]; audit_only_component)
+         else false end))
+    ' "$file" >/dev/null
 }
 
 hotfix_phase_a_claim_proof_file_is_valid()
@@ -1288,10 +1837,131 @@ hotfix_phase_a_claim_proof_file_is_valid()
         --arg zero "$HOTFIX_ZERO_TXID" '
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
         def integer: type == "number" and floor == .;
+        def known_disposition:
+          type == "string" and IN("eligible","inactive","height_before_window",
+            "height_after_window","invalid_location","malformed","duplicate",
+            "wrong_mode","unknown_mode","unsupported_version",
+            "version_not_yet_active","invalid_proof",
+            "unbound_proof_may_revalidate","origin_not_yet_reached",
+            "origin_mismatch","origin_expired","input_mismatch",
+            "already_accounted","capacity_limit","evaluation_limit",
+            "local_state_error");
+        def exact_proof_tuple:
+          (.proof_version == 2 and .proof_origin_bound == false and
+             .proof_input_bound == false) or
+          (.proof_version == 3 and .proof_origin_bound == true and
+             .proof_input_bound == false) or
+          (.proof_version == 4 and .proof_origin_bound == true and
+             .proof_input_bound == true);
+        def anchor_descriptor:
+          type == "object" and (keys | sort) == ["txid","vout"] and
+          (.txid | hex64) and (.vout | integer and . >= 0);
+        def full_member:
+          type == "object" and
+          (keys | sort) == (["authored_metadata_valid",
+            "authored_tip_active_branch_bound","claim_descriptor_valid","disposition",
+            "exact_authored_carrier_shape","family","lineage_metadata_present",
+            "lineage_metadata_valid","ordinal","parent_txid","proof_input_bound",
+            "proof_evaluation_skipped_resolved_anchor",
+            "proof_may_revalidate_on_descendant","proof_mode","proof_origin_bound",
+            "proof_version","provenance","root_txid","txid","wallet_authored",
+            "wallet_from_me"] | sort) and
+          (.txid | hex64) and (.ordinal | integer and . >= 0) and
+          (.parent_txid | hex64) and (.root_txid | hex64) and (.family | hex64) and
+          (.proof_version | integer and IN(2,3,4)) and .proof_mode == "pow" and
+          (.disposition | known_disposition) and .provenance == "explicit_authored" and
+          .wallet_authored == true and .wallet_from_me == true and
+          .authored_metadata_valid == true and .claim_descriptor_valid == true and
+          .exact_authored_carrier_shape == true and
+          (.authored_tip_active_branch_bound | type) == "boolean" and
+          (.lineage_metadata_present | type) == "boolean" and
+          (.lineage_metadata_valid | type) == "boolean" and
+          (.proof_may_revalidate_on_descendant | type) == "boolean" and
+          .proof_evaluation_skipped_resolved_anchor == false and
+          .proof_may_revalidate_on_descendant ==
+            (.disposition == "unbound_proof_may_revalidate") and exact_proof_tuple;
+        def authored_member:
+          type == "object" and
+          (keys | sort) == (["abandoned","anchor_txid","anchor_vout",
+            "branch_quarantine_observation_present","confirmations","created_tip",
+            "expired_locally_retired","family","first_quarantine_observation_present",
+            "in_active_chain","in_local_mempool","observer_absent","ordinal",
+            "parent_txid","proof_input_bound","proof_origin_bound","proof_version","quarantine_marker",
+            "root_txid","txid"] | sort) and
+          (.txid | hex64) and (.ordinal | integer and . >= 0) and
+          (.parent_txid | hex64) and (.root_txid | hex64) and (.family | hex64) and
+          (.anchor_txid | hex64) and (.anchor_vout | integer and . >= 0) and
+          (.created_tip | hex64) and .quarantine_marker == "1" and
+          (.proof_version | integer and IN(2,3,4)) and
+          (if .proof_version == 2 then
+             .proof_origin_bound == false and .proof_input_bound == false
+           elif .proof_version == 3 then
+             .proof_origin_bound == true and .proof_input_bound == false
+           else
+             .proof_origin_bound == true and .proof_input_bound == true
+           end) and
+          (.expired_locally_retired | type) == "boolean" and
+          .confirmations == 0 and (.abandoned | type) == "boolean" and
+          .in_local_mempool == false and .in_active_chain == false and
+          .observer_absent == true and
+          (.first_quarantine_observation_present | type) == "boolean" and
+          (.branch_quarantine_observation_present | type) == "boolean";
+        def claim_keys: [
+          "abandoned_wallet_txids","abandontransaction_invoked",
+          "added_wallet_outpoints","authenticated_anchors","authored_components",
+          "added_outpoints_exclusive_to_external_receives",
+          "automatic_recovery_authorized","candidate_authored_suffixes_authenticated",
+          "candidate_authorship_mapped_exactly","candidate_claims_submitted",
+          "candidate_cleanly_stopped","candidate_complete_log_sha256",
+          "candidate_created_qqsproof_confirmed_txids",
+          "candidate_created_qqsproof_mempool_txids",
+          "candidate_created_qqsproof_observer_txids",
+          "candidate_created_qqsproof_txids",
+          "candidate_created_qqsproof_unclassifiable_txids",
+          "candidate_mining_gate_coherent","candidate_mining_gate_database_ambiguous",
+          "candidate_mining_gate_unsafe_claims","candidate_mining_gate_unsafe_components",
+          "candidate_post_stop_log_receipt_sha256",
+          "candidate_recovery_database_ambiguous","candidate_retired_member_txids",
+          "candidate_source_sha","candidate_stopped_receipt_sha256",
+          "candidate_txids_mapped_once","claim_sample_tips","claim_samples_monotonic",
+          "coinstake_created_txids","component_resolution_txids_after",
+          "component_resolution_txids_before","continuous_absence_verified",
+          "fee_payments_authorized","final_claim_sample_complete","final_order",
+          "final_pow_enabled","final_pow_hashrate","final_stable_cut_sha256",
+          "external_receive_evidence_bound","external_receive_evidence_sha256",
+          "external_receive_txids",
+          "forbidden_rpc_methods","hard_staking_disabled_continuously",
+          "initial_atomic_reservation_verified",
+          "interactive_surfaces_stopped_continuously",
+          "legacy_baseline_wallet_authority_mutations",
+          "legacy_baseline_wallet_authority_preserved","logs_complete_through_stop",
+          "mempool_differential_classified","network_visible_candidate_authored_txids",
+          "new_nonclaim_wallet_transactions",
+          "new_wallet_txids_exclusive_to_authenticated_authored_claims_or_external_receives",
+          "observation_sample_count","observation_series_bound","observer_samples",
+          "observer_status","observer_terminal_proof_sha256","payout_address_after",
+          "payout_address_after_owned","payout_address_before",
+          "payout_address_transition_valid","payout_rotation_invoked","phase","pow_worker_joined",
+          "progress_tips","quantum_inventory_sha256_after",
+          "quantum_inventory_sha256_before","quantum_inventory_transition_valid",
+          "quantum_key_count_after","quantum_key_count_before",
+          "quantum_label_evidence_sha256_after",
+          "quantum_label_evidence_sha256_before","recovery_rpc_invoked",
+          "removed_outpoints_subset_of_authenticated_anchors",
+          "removed_wallet_outpoints","resolution_txids_after","resolution_txids_before",
+          "retired_claim_objects","retired_components","rpc_allowlist_enforced",
+          "rpc_methods_sha256","run_nonce","schema","sendrawtransaction_invoked",
+          "shared_namespace_rpc_auth_boundary_continuously_verified",
+          "terminal_stable_cut_verified","txid_differential_classified",
+          "unexpected_rpc_methods","visibility_samples_bound_to_progress",
+          "wallet_locked","wallet_outpoint_differential_classified"
+        ];
         . as $proof |
-        type == "object" and .schema == 3 and .phase == "A" and
+        type == "object" and .schema == 6 and .phase == "A" and
+        (keys | sort) == (claim_keys | sort) and
         (.run_nonce | test("^[0-9a-f]{32}$")) and
         .candidate_source_sha == $source and
+        (.observation_sample_count | integer and . >= 3) and
         .final_order == ["tip-proof","pow-stop-joined",
           "wallet-claim-mempool-observer-proof","wallet-locked",
           "candidate-clean-stop","logs-complete-through-stop"] and
@@ -1301,96 +1971,185 @@ hotfix_phase_a_claim_proof_file_is_valid()
         (.candidate_stopped_receipt_sha256 | hex64) and
         (.candidate_complete_log_sha256 | hex64) and
         (.candidate_post_stop_log_receipt_sha256 | hex64) and
+        (.external_receive_evidence_sha256 | hex64) and
+        .external_receive_evidence_bound == true and
         (.observer_terminal_proof_sha256 | hex64) and
         (.final_stable_cut_sha256 | hex64) and .terminal_stable_cut_verified == true and
         .interactive_surfaces_stopped_continuously == true and
         .shared_namespace_rpc_auth_boundary_continuously_verified == true and
         .rpc_allowlist_enforced == true and .unexpected_rpc_methods == [] and
-        .persisted_pending_worker_log_observed == true and
-        .persisted_without_relay_log_observed == true and
         (.candidate_claims_submitted | integer and . == 0) and
         .candidate_mining_gate_coherent == true and
         .candidate_mining_gate_database_ambiguous == false and
         .candidate_mining_gate_unsafe_claims == 0 and
         .candidate_mining_gate_unsafe_components == 0 and
         .candidate_recovery_database_ambiguous == false and
-        (.retired_claim_objects | integer and . == 0) and
-        (.retired_components | integer and . == 0) and
-        .candidate_retired_member_txids == [] and
+        (.retired_claim_objects | integer and . >= 0) and
+        (.retired_components | integer and . >= 0) and
+        (.candidate_retired_member_txids | type == "array" and
+          all(.[]; hex64) and . == (sort | unique) and
+          all(.[]; . as $txid |
+            ($proof.candidate_created_qqsproof_txids | index($txid)) != null)) and
         .hard_staking_disabled_continuously == true and
-        .coinstake_created_txids == [] and .network_visible_wallet_txids == [] and
+        .coinstake_created_txids == [] and
+        .network_visible_candidate_authored_txids == [] and
         .fee_payments_authorized == false and .automatic_recovery_authorized == false and
         .recovery_rpc_invoked == false and .sendrawtransaction_invoked == false and
         .abandontransaction_invoked == false and .payout_rotation_invoked == false and
         .forbidden_rpc_methods == [] and (.rpc_methods_sha256 | hex64) and
-        .payout_address_after == .payout_address_before and
+        (.payout_address_before | type) == "string" and
+        (.payout_address_after | type) == "string" and
+        .payout_address_after_owned ==
+          ((.payout_address_after | length) > 0) and
+        .payout_address_transition_valid == true and
         .quantum_key_count_after == .quantum_key_count_before and
-        .quantum_inventory_sha256_after == .quantum_inventory_sha256_before and
-        .confirmed_resolution_fees_after == .confirmed_resolution_fees_before and
-        .cumulative_resolution_fees_after == .cumulative_resolution_fees_before and
-        .pending_manual_after == .pending_manual_before and
-        .pending_automatic_after == .pending_automatic_before and
-        (.recovery_metrics_sha256_before | hex64) and
-        .recovery_metrics_sha256_after == .recovery_metrics_sha256_before and
-        .recovery_metrics_unchanged == true and
+        (.quantum_inventory_sha256_before | hex64) and
+        (.quantum_inventory_sha256_after | hex64) and
+        (.quantum_label_evidence_sha256_before | hex64) and
+        (.quantum_label_evidence_sha256_after | hex64) and
+        .quantum_inventory_transition_valid == true and
         .resolution_txids_after == .resolution_txids_before and
-        .component_resolution_txids_after == .component_resolution_txids_before and
-        (.candidate_created_qqsproof_txids | type == "array" and length == 4 and
-          all(.[]; hex64) and (unique | length) == length) and
+        (.component_resolution_txids_before | type) == "array" and
+        (.component_resolution_txids_after | type) == "array" and
+        all(.component_resolution_txids_after[]; hex64) and
+        .component_resolution_txids_after ==
+          (.component_resolution_txids_after | sort | unique) and
+        all(.component_resolution_txids_after[];
+          . as $txid | ($proof.component_resolution_txids_before | index($txid)) != null) and
+        (.candidate_created_qqsproof_txids | type == "array" and
+          all(.[]; hex64) and
+          . == (sort | unique)) and
+        (.external_receive_txids | type == "array" and
+          all(.[]; hex64) and . == (sort | unique)) and
+        ((.candidate_created_qqsproof_txids - .external_receive_txids) | length) ==
+          (.candidate_created_qqsproof_txids | length) and
         .candidate_created_qqsproof_mempool_txids == [] and
         .candidate_created_qqsproof_confirmed_txids == [] and
         .candidate_created_qqsproof_observer_txids == [] and
         .candidate_created_qqsproof_unclassifiable_txids == [] and
         .observer_status == "observed_absent" and
-        (.observer_samples | integer and . >= 4) and
+        (.observer_samples | integer and . >= $proof.observation_sample_count) and
         .continuous_absence_verified == true and
         .initial_atomic_reservation_verified == true and
         .new_nonclaim_wallet_transactions == [] and
-        .abandoned_wallet_txids == [] and .baseline_wallet_records_static_equal == true and
-        .baseline_wallet_record_mutations == [] and
-        (.progress_tips | type == "array" and length == 4 and all(.[]; hex64) and
+        (.abandoned_wallet_txids | type == "array" and
+          all(.[]; hex64) and . == (sort | unique) and
+          all(.[]; . as $txid |
+            ($proof.candidate_created_qqsproof_txids | index($txid)) != null)) and
+        .legacy_baseline_wallet_authority_preserved == true and
+        .legacy_baseline_wallet_authority_mutations == [] and
+        (.progress_tips | type == "array" and
+          length == $proof.observation_sample_count and all(.[]; hex64) and
           (unique | length) == length) and
         .claim_sample_tips == .progress_tips and .claim_samples_monotonic == true and
         .visibility_samples_bound_to_progress == true and
-        .progress_tips_bound_to_lineage == true and
-        .one_lineage_member_per_progress_tip == true and
+        .observation_series_bound == true and
+        .candidate_authorship_mapped_exactly == true and
+        .candidate_txids_mapped_once == true and
+        .candidate_authored_suffixes_authenticated == true and
+        .new_wallet_txids_exclusive_to_authenticated_authored_claims_or_external_receives == true and
         .final_claim_sample_complete == true and
-        .distinct_anchor_consumption_observed == false and
-        (.lineage | type == "object") and .lineage.authenticated == true and
-        .lineage.all_claims_zero_payment_retirable == false and
-        .lineage.all_claims_expired_locally_retired == false and
-        (.lineage.anchor_txid | hex64) and (.lineage.anchor_vout | integer and . >= 0) and
-        (.lineage.family | hex64) and (.lineage.root_txid | hex64) and
-        (.lineage.members | type == "array" and length == 4) and
-        (.lineage.members | length) == (.candidate_created_qqsproof_txids | length) and
-        ([.lineage.members[].txid] == .candidate_created_qqsproof_txids) and
-        ([.lineage.members[].txid] | unique | length) == (.lineage.members | length) and
-        .lineage.component_claim_txids == (.candidate_created_qqsproof_txids | sort) and
-        ([.lineage.members[].ordinal] == [range(0; .lineage.members|length)]) and
-        .lineage.root_txid == .lineage.members[0].txid and
-        .lineage.members[0].parent_txid == $zero and
-        ([range(1; ($proof.lineage.members|length)) as $i |
-          $proof.lineage.members[$i].parent_txid ==
-            $proof.lineage.members[$i-1].txid] | all) and
-        .lineage.contiguous_parents == true and .lineage.same_anchor == true and
-        .lineage.same_family == true and .lineage.same_root == true and
-        .lineage.same_tip_duplicates == false and
-        .lineage.tip_span == (.progress_tips | length) and
-        all(.lineage.members[];
-          (.txid | hex64) and .quarantine_marker == "1" and
-          (.parent_txid | hex64) and
-          .anchor_txid == $proof.lineage.anchor_txid and
-          .anchor_vout == $proof.lineage.anchor_vout and
-          .family == $proof.lineage.family and
-          .root_txid == $proof.lineage.root_txid and
-          (.created_tip | hex64) and
-          .proof_origin_bound == true and .proof_input_bound == true and
-          .expired_locally_retired == false and
-          .confirmations == 0 and .abandoned == false and
-          .in_local_mempool == false and .in_active_chain == false and
-          .observer_absent == true and
-          (.first_quarantine_observation_present | type) == "boolean" and
-          (.branch_quarantine_observation_present | type) == "boolean") and
+        .removed_outpoints_subset_of_authenticated_anchors == true and
+        (.authored_components | type == "array" and
+          . == (sort_by(.anchor_txid,.anchor_vout,.family,.root_txid))) and
+        ((.candidate_created_qqsproof_txids | length) == 0) ==
+          ((.authored_components | length) == 0) and
+        all(.authored_components[]; . as $component |
+          type == "object" and
+          (keys | sort) == (["all_claims_expired_locally_retired",
+            "all_claims_zero_payment_retirable","anchor_txid","anchor_vout",
+            "authenticated","component_claim_txids","contiguous_parents","family",
+            "full_members","newly_authored_contiguous_suffix",
+            "newly_authored_members","newly_authored_txids",
+            "ordinary_or_mixed_txids","resolution_txids","root_txid"] | sort) and
+          .authenticated == true and
+          (.all_claims_zero_payment_retirable | type) == "boolean" and
+          (.all_claims_expired_locally_retired | type) == "boolean" and
+          .ordinary_or_mixed_txids == [] and .resolution_txids == [] and
+          (.anchor_txid | hex64) and (.anchor_vout | integer and . >= 0) and
+          (.family | hex64) and (.root_txid | hex64) and
+          (.component_claim_txids | type == "array" and length >= 1 and
+            all(.[]; hex64) and (unique | length) == length) and
+          (.full_members | type == "array" and
+            length == ($component.component_claim_txids | length) and
+            all(.[]; full_member)) and
+          ([.full_members[].txid] == .component_claim_txids) and
+          ([.full_members[].ordinal] == [range(0; .full_members | length)]) and
+          .root_txid == .full_members[0].txid and
+          (.full_members[0] as $root |
+            if $root.lineage_metadata_present then
+              $root.lineage_metadata_valid == true and
+              $root.root_txid == $root.txid and $root.parent_txid == $zero and
+              $root.family == $component.family
+            else
+              $root.lineage_metadata_valid == false and
+              $root.family == $zero and $root.root_txid == $zero and
+              $root.parent_txid == $zero and
+              (if $root.proof_version == 2 and ($component.full_members | length) == 1
+               then $root.authored_tip_active_branch_bound == true and
+                 ($root.disposition | IN("eligible","unbound_proof_may_revalidate"))
+               else true end)
+            end) and
+          all(range(1; ($component.full_members | length));
+            $component.full_members[.].lineage_metadata_present == true and
+            $component.full_members[.].lineage_metadata_valid == true and
+            $component.full_members[.].root_txid == $component.root_txid and
+            $component.full_members[.].family == $component.family) and
+          ([range(1; ($component.full_members | length)) as $i |
+            $component.full_members[$i].parent_txid ==
+              $component.full_members[$i - 1].txid] | all) and
+          .contiguous_parents == true and
+          (.newly_authored_txids | type == "array" and length >= 1 and
+            all(.[]; hex64) and (unique | length) == length and
+            length <= ($component.component_claim_txids | length)) and
+          (.newly_authored_txids as $new |
+            .component_claim_txids[(-($new | length)):] == $new) and
+          (.newly_authored_members | type == "array" and
+            length == ($component.newly_authored_txids | length) and
+            all(.[]; authored_member)) and
+          ([.newly_authored_members[].txid] == .newly_authored_txids) and
+          all(.newly_authored_members[]; . as $member |
+            .anchor_txid == $component.anchor_txid and
+            .anchor_vout == $component.anchor_vout and
+            .family == $component.family and .root_txid == $component.root_txid and
+            ($proof.progress_tips | index($member.created_tip)) != null and
+            ([$component.full_members[] |
+              select(.txid == $member.txid and .ordinal == $member.ordinal and
+                .parent_txid == $member.parent_txid and
+                .root_txid == $member.root_txid and .family == $member.family)] |
+              length) == 1) and
+          .newly_authored_contiguous_suffix == true) and
+        .candidate_retired_member_txids ==
+          ([.authored_components[].newly_authored_members[] |
+            select(.expired_locally_retired == true) | .txid] | sort | unique) and
+        .abandoned_wallet_txids ==
+          ([.authored_components[].newly_authored_members[] |
+            select(.abandoned == true) | .txid] | sort | unique) and
+        ([.authored_components[].component_claim_txids[]] as $component_txids |
+          ($component_txids | unique | length) == ($component_txids | length)) and
+        ([.authored_components[] |
+          [.anchor_txid,.anchor_vout,.family,.root_txid] | @json] as $component_keys |
+          ($component_keys | unique | length) == ($component_keys | length)) and
+        ([.authored_components[].newly_authored_txids[]] | sort) ==
+          .candidate_created_qqsproof_txids and
+        (.authenticated_anchors | type == "array" and
+          all(.[]; anchor_descriptor) and
+          . == (sort_by(.txid,.vout) | unique_by(.txid,.vout))) and
+        .authenticated_anchors ==
+          ([.authored_components[] | {txid:.anchor_txid,vout:.anchor_vout}] |
+            sort_by(.txid,.vout) | unique_by(.txid,.vout)) and
+        (.authenticated_anchors | length) == (.authored_components | length) and
+        (.removed_wallet_outpoints | type == "array" and
+          all(.[]; anchor_descriptor) and
+          . == (sort_by(.txid,.vout) | unique_by(.txid,.vout))) and
+        .removed_wallet_outpoints ==
+          ([.removed_wallet_outpoints[]] | sort_by(.txid,.vout)) and
+        (.added_wallet_outpoints | type == "array" and
+          all(.[]; anchor_descriptor) and
+          . == (sort_by(.txid,.vout) | unique_by(.txid,.vout))) and
+        all(.added_wallet_outpoints[]; . as $outpoint |
+          ($proof.external_receive_txids | index($outpoint.txid)) != null) and
+        .added_outpoints_exclusive_to_external_receives == true and
         .txid_differential_classified == true and
         .mempool_differential_classified == true and
         .wallet_outpoint_differential_classified == true
@@ -1483,8 +2242,10 @@ hotfix_rewind_safe_file_is_valid()
         --arg image_ref "$HOTFIX_CANDIDATE_IMAGE_REF" '
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
         def integer: type == "number" and floor == .;
+        . as $certificate |
         type == "object" and
         (keys | sort) == (["baseline_runtime_identity_sha256",
+          "authenticated_anchors","authored_components_sha256",
           "candidate_binary_sha256sums_sha256","candidate_blackcoin_qt_sha256",
           "candidate_bundle_manifest_sha256","candidate_created_qqsproof_txids",
           "candidate_exit_code","candidate_image_id","candidate_image_ref",
@@ -1504,15 +2265,16 @@ hotfix_rewind_safe_file_is_valid()
           "hard_flags_continuously_verified","helper_audit_sha256","invocation_sha256",
           "interactive_surfaces_stopped_continuously",
           "locks_sha256","logs_sha256","maintenance_marker_sha256",
-          "network_visible_wallet_txids","nonpublication_sha256","nonpublication_verified",
-          "observer_absence_verified","observer_anchor_unspent_sha256",
+          "network_visible_candidate_authored_txids","nonpublication_sha256","nonpublication_verified",
+          "observation_sample_count","observer_absence_verified",
+          "observer_anchors_unspent_sha256",
           "observer_final_chain_sha256","observer_terminal_proof_sha256",
           "observer_tx_absence_sha256","offline_verifier_receipt_sha256",
           "package_sha256sums_sha256","phase_a_script_sha256",
           "phase_a_tooling_identity_sha256","phase_b_script_sha256",
           "pos_disabled_continuously","pow_worker_joined","pre_rewind_manifest_sha256",
           "pre_rewind_state_sha256","progress_sha256","promotion_marker_absent",
-          "recovery_metrics_sha256","recovery_spend_or_fee_detected","result",
+          "recovery_spend_or_fee_detected","result",
           "rpc_journal_sha256","run_nonce",
           "rpc_allowlist_enforced",
           "schema","snapshot_set_sha256","snapshots_held","terminal_chainwork",
@@ -1520,9 +2282,10 @@ hotfix_rewind_safe_file_is_valid()
           "terminal_stable_cut_verified","tooling_commit","typed_contract_sha256",
           "unclassifiable_candidate_txids","unknown_or_ambiguous","unrelated_wallet_delta",
           "verifier_sha256","wallet_generation","wallet_locked"] | sort) and
-        (.schema | integer and . == 1) and .result == "REWIND_SAFE" and
+        (.schema | integer and . == 2) and .result == "REWIND_SAFE" and
         .run_nonce == $nonce and .candidate_source_sha == $source and
         ($nonce | test("^[0-9a-f]{32}$")) and
+        (.observation_sample_count | integer and . >= 3) and
         (.candidate_image_id | test("^sha256:[0-9a-f]{64}$")) and
         .candidate_image_ref == $image_ref and
         (.candidate_manifest_digest | test("^sha256:[0-9a-f]{64}$")) and
@@ -1532,12 +2295,12 @@ hotfix_rewind_safe_file_is_valid()
         (.package_sha256sums_sha256 | hex64) and (.phase_a_script_sha256 | hex64) and
         (.phase_b_script_sha256 | hex64) and (.verifier_sha256 | hex64) and
         (.typed_contract_sha256 | hex64) and
-        (.recovery_metrics_sha256 | hex64) and
         .entrypoint_body_sha256 == $body and
         (.invocation_sha256 | hex64) and
         (.helper_audit_sha256 | hex64) and (.nonpublication_sha256 | hex64) and
         (.snapshot_set_sha256 | hex64) and (.progress_sha256 | hex64) and
-        (.claim_proof_sha256 | hex64) and (.logs_sha256 | hex64) and
+        (.claim_proof_sha256 | hex64) and (.authored_components_sha256 | hex64) and
+        (.logs_sha256 | hex64) and
         (.rpc_journal_sha256 | hex64) and (.locks_sha256 | hex64) and
         (.guard_sources_sha256 | hex64) and
         (.pre_rewind_state_sha256 | hex64) and (.maintenance_marker_sha256 | hex64) and
@@ -1555,7 +2318,7 @@ hotfix_rewind_safe_file_is_valid()
              .candidate_final_recovery_sha256,.candidate_final_recovery_after_sha256,
              .candidate_final_wallet_transactions_sha256,.candidate_final_mempool_sha256,
              .observer_terminal_proof_sha256,.observer_final_chain_sha256,
-             .observer_anchor_unspent_sha256,.observer_tx_absence_sha256,
+             .observer_anchors_unspent_sha256,.observer_tx_absence_sha256,
              .candidate_final_stable_cut_sha256,.candidate_stopped_receipt_sha256,
              .candidate_stop_authority_sha256,
              .candidate_post_stop_log_receipt_sha256][]; hex64) and
@@ -1571,9 +2334,18 @@ hotfix_rewind_safe_file_is_valid()
         .terminal_stable_cut_verified == true and .nonpublication_verified == true and
         .observer_absence_verified == true and .unknown_or_ambiguous == false and
         .coinstake_or_wallet_escape_detected == false and
-        (.candidate_created_qqsproof_txids | type == "array" and length == 4 and
-          all(.[]; hex64) and (unique | length) == length) and
-        .network_visible_wallet_txids == [] and .confirmed_candidate_txids == [] and
+        (.candidate_created_qqsproof_txids | type == "array" and
+          all(.[]; hex64) and
+          . == (sort | unique)) and
+        (.authenticated_anchors | type == "array" and
+          all(.[];
+            type == "object" and (keys | sort) == ["txid","vout"] and
+            (.txid | hex64) and (.vout | integer and . >= 0)) and
+          . == (sort_by(.txid,.vout) | unique_by(.txid,.vout)) and
+          length <= ($certificate.candidate_created_qqsproof_txids | length)) and
+        ((.candidate_created_qqsproof_txids | length) == 0) ==
+          ((.authenticated_anchors | length) == 0) and
+        .network_visible_candidate_authored_txids == [] and .confirmed_candidate_txids == [] and
         .unclassifiable_candidate_txids == [] and
         .recovery_spend_or_fee_detected == false and .unrelated_wallet_delta == false and
         (.terminal_tip | hex64) and
@@ -1621,14 +2393,14 @@ hotfix_base_catchup_file_is_valid()
         def integer: type == "number" and floor == .;
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
         type == "object" and
-        (keys | sort) == (["authenticated_anchor","authenticated_anchor_evidence_sha256",
-          "authenticated_anchor_unspent","candidate_claim_escape_absent",
+        (keys | sort) == (["authenticated_anchors","authenticated_anchors_evidence_sha256",
+          "authenticated_anchors_unspent","candidate_claim_escape_absent",
           "candidate_image_not_applied","candidate_txids_absent_from_mempool",
           "candidate_txids_absent_from_wallet","chain","chain_after",
           "chain_after_evidence_sha256","chain_evidence_sha256",
           "chainwork_at_least_phase_a","hard_quarantine_flags_verified","image","image_id",
           "invocation_sha256","mempool_sha256","network","network_evidence_sha256",
-          "nonpublication_sha256","observer_anchor_unspent",
+          "nonpublication_sha256","observer_anchors_unspent",
           "observer_candidate_txids_absent","observer_cut_sha256",
           "phase_a_terminal_chainwork","phase_a_terminal_tip","pos_enabled","pow",
           "pow_enabled","pow_evidence_sha256","recovery","recovery_evidence_sha256",
@@ -1637,7 +2409,7 @@ hotfix_base_catchup_file_is_valid()
           "terminal_tip_superseded_by_greater_work","wallet","wallet_evidence_sha256",
           "wallet_locked","wallet_processed_tip_current","wallet_transactions_sha256",
           "walletbroadcast","wallets","wallets_evidence_sha256"] | sort) and
-        (.schema | integer and . == 1) and .run_nonce == $nonce and
+        (.schema | integer and . == 2) and .run_nonce == $nonce and
         ($nonce | test("^[0-9a-f]{32}$")) and
         .source_sha == $source and .image == $image and .image_id == $image_id and
         .hard_quarantine_flags_verified == true and .wallet_locked == true and
@@ -1663,7 +2435,7 @@ hotfix_base_catchup_file_is_valid()
         (if .terminal_tip_active then .chain.bestblockhash == .phase_a_terminal_tip
          else (.terminal_tip_superseded_by_greater_work == true and
            .chain.chainwork > .phase_a_terminal_chainwork) end) and
-        (.wallet | type) == "object" and .wallet.walletname == "" and
+        (.wallet | type) == "object" and (.wallet.walletname | type) == "string" and
         .wallet.private_keys_enabled == true and .wallet.scanning == false and
         .wallet.unlocked_until == 0 and .wallet.unlocked_staking_only == false and
         (.recovery | type) == "object" and .recovery.chain_ready == true and
@@ -1676,25 +2448,27 @@ hotfix_base_catchup_file_is_valid()
         (.pow | type) == "object" and .pow.enabled == false and .pow.hashrate == 0 and
         (.network | type) == "object" and .network.networkactive == true and
         .network.localrelay == false and (.network.connections_out | integer and . >= 3) and
-        .wallets == [""] and
-        (.authenticated_anchor | type) == "object" and
-        (.authenticated_anchor | keys | sort) == ["txid","txout","unspent","vout"] and
-        (.authenticated_anchor.txid | hex64) and (.authenticated_anchor.vout | integer and . >= 0) and
-        .authenticated_anchor.unspent == true and
-        (.authenticated_anchor.txout | type) == "object" and
-        (.authenticated_anchor.txout.confirmations | integer and . >= 1) and
-        .authenticated_anchor.txout.coinbase == false and
+        .wallets == [.wallet.walletname] and
+        (.authenticated_anchors | type == "array" and
+          . == (sort_by(.txid,.vout) | unique_by(.txid,.vout)) and
+          all(.[];
+            type == "object" and
+            (keys | sort) == ["txid","txout","unspent","vout"] and
+            (.txid | hex64) and (.vout | integer and . >= 0) and
+            .unspent == true and (.txout | type) == "object" and
+            (.txout.confirmations | integer and . >= 1) and
+            .txout.coinbase == false)) and
         all([.invocation_sha256,.nonpublication_sha256,.observer_cut_sha256,
              .chain_evidence_sha256,.chain_after_evidence_sha256,
              .recovery_evidence_sha256,.wallet_evidence_sha256,
              .staking_evidence_sha256,.pow_evidence_sha256,.network_evidence_sha256,
              .wallets_evidence_sha256,.wallet_transactions_sha256,.mempool_sha256,
-             .authenticated_anchor_evidence_sha256][]; hex64) and
+             .authenticated_anchors_evidence_sha256][]; hex64) and
         .wallet_processed_tip_current == true and .candidate_image_not_applied == true and
         .candidate_txids_absent_from_wallet == true and
         .candidate_txids_absent_from_mempool == true and
-        .authenticated_anchor_unspent == true and
-        .observer_candidate_txids_absent == true and .observer_anchor_unspent == true and
+        .authenticated_anchors_unspent == true and
+        .observer_candidate_txids_absent == true and .observer_anchors_unspent == true and
         .candidate_claim_escape_absent == true and .stable_cut == true
     ' "$file" >/dev/null
 }
@@ -1750,7 +2524,7 @@ hotfix_phase_a_result_file_is_valid()
           "base_hard_quarantine_catchup_verified","base_quarantine_stop_authority_sha256",
           "base_source_sha","baseline_restored","baseline_restored_container_sha256",
           "candidate_source_sha","catchup_proof_sha256","data_rewind_completed",
-          "evidence_sha256sums_sha256","baseline_recovery_metrics_sha256",
+          "evidence_sha256sums_sha256",
           "node","phase","phase_b_invoked",
           "package_sha256sums_sha256","phase_a_script_sha256",
           "phase_a_tooling_identity_sha256","phase_b_script_sha256",
@@ -1772,7 +2546,6 @@ hotfix_phase_a_result_file_is_valid()
         (.package_sha256sums_sha256 | hex64) and (.phase_a_script_sha256 | hex64) and
         (.phase_b_script_sha256 | hex64) and (.verifier_sha256 | hex64) and
         (.typed_contract_sha256 | hex64) and
-        (.baseline_recovery_metrics_sha256 | hex64) and
         (.base_quarantine_stop_authority_sha256 | hex64) and
         (.baseline_restored_container_sha256 | hex64) and
         (.rewind_safe_sha256 | hex64) and (.catchup_proof_sha256 | hex64) and
@@ -1914,29 +2687,36 @@ hotfix_phase_b_baseline_precondition_file_is_valid()
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
         type == "object" and
         (keys | sort) == (["exact_loaded_wallets","irreversible_marker_allowed",
-          "main_chain_ready","observed_epoch","p2p_ready","payout_address","payout_owned",
-          "pending_recovery_actions_zero","quantum_key_count","recovery_database_unambiguous",
-          "recovery_metrics_sha256","recovery_policy_nonautomatic","recovery_policy_sha256",
+          "goldrush_state_sha256","main_chain_ready","observed_epoch","p2p_ready",
+          "payout_address","payout_owned",
+          "quantum_key_count","recovery_database_unambiguous",
+          "recovery_policy_nonautomatic",
           "schema","stable_tip","staking_active","wallet_normally_unlocked"] | sort) and
-        .schema == 1 and (.observed_epoch | integer and . > 0) and
+        .schema == 2 and (.observed_epoch | integer and . > 0) and
         (.stable_tip | hex64) and
+        (.goldrush_state_sha256 | hex64) and
         .main_chain_ready == true and .p2p_ready == true and
-        .wallet_normally_unlocked == true and .exact_loaded_wallets == [""] and
-        .staking_active == true and (.payout_address | type == "string" and length > 0) and
-        .payout_owned == true and (.quantum_key_count | integer and . > 0) and
-        (.recovery_policy_sha256 | hex64) and (.recovery_metrics_sha256 | hex64) and
+        .wallet_normally_unlocked == true and
+        (.exact_loaded_wallets | type == "array" and length == 1 and
+          (.[0] | type) == "string") and
+        .staking_active == true and (.payout_address | type == "string") and
+        (.payout_owned | type == "boolean") and
+        (if (.payout_address | length) > 0 then .payout_owned == true
+         else .payout_owned == false end) and
+        (.quantum_key_count | integer and . > 0) and
         .recovery_database_unambiguous == true and .recovery_policy_nonautomatic == true and
-        .pending_recovery_actions_zero == true and .irreversible_marker_allowed == true
+        .irreversible_marker_allowed == true
     ' "$file" >/dev/null
 }
 
 hotfix_phase_b_baseline_bundle_is_valid()
 {
     local root="$1" pre chain chain_after wallet network staking recovery pow loaded payout
-    local observed tip fee policy metrics quantum_count
+    local observed tip height quantum_count goldrush
     for pre in baseline-precondition.json baseline-chain.json baseline-chain-after.json \
         baseline-wallet.json baseline-network.json baseline-staking.json baseline-recovery.json \
         baseline-pow.json baseline-loaded-wallets.json baseline-quantum.json \
+        baseline-goldrush-state.json \
         baseline-payout-address.json; do
         [[ -f "$root/$pre" && ! -L "$root/$pre" ]] || return 1
     done
@@ -1952,6 +2732,11 @@ hotfix_phase_b_baseline_bundle_is_valid()
     loaded="$root/baseline-loaded-wallets.json"
     observed=$(jq -er '.observed_epoch' "$pre") || return 1
     tip=$(jq -er '.stable_tip' "$pre") || return 1
+    height=$(jq -er '.blocks' "$chain") || return 1
+    goldrush="$root/baseline-goldrush-state.json"
+    hotfix_goldrush_state_json_is_valid "$(<"$goldrush")" "$tip" "$height" || return 1
+    [[ "$(hotfix_sha256_file "$goldrush")" == \
+       "$(jq -er '.goldrush_state_sha256' "$pre")" ]] || return 1
     jq -e --arg tip "$tip" --slurpfile after "$chain_after" '
       def integer: type == "number" and floor == .;
       .chain == "main" and .initialblockdownload == false and
@@ -1963,7 +2748,8 @@ hotfix_phase_b_baseline_bundle_is_valid()
     ' "$chain" >/dev/null || return 1
     jq -e --argjson observed "$observed" '
       def integer: type == "number" and floor == .;
-      .walletname == "" and .private_keys_enabled == true and .scanning == false and
+      (.walletname | type) == "string" and
+      .private_keys_enabled == true and .scanning == false and
       .unlocked_staking_only == false and (.unlocked_until | integer) and
       .unlocked_until > $observed
     ' "$wallet" >/dev/null || return 1
@@ -1971,57 +2757,78 @@ hotfix_phase_b_baseline_bundle_is_valid()
       (.connections_out|type)=="number" and (.connections_out|floor)==.connections_out and
       .connections_out>=3' "$network" >/dev/null || return 1
     hotfix_phase_b_staking_json_is_active "$(<"$staking")" || return 1
-    fee=$(jq -ce '.confirmed_resolution_fees' "$recovery") || return 1
-    hotfix_candidate_recovery_json_is_valid "$(<"$recovery")" "$fee" || return 1
-    jq -e --arg tip "$tip" '.active_tip==$tip and .wallet_processed_tip==$tip and
-      .pending_manual_resolutions==0 and .pending_automatic_resolutions==0' \
+    hotfix_candidate_recovery_json_is_valid "$(<"$recovery")" || return 1
+    jq -e --arg tip "$tip" '.active_tip==$tip and .wallet_processed_tip==$tip' \
       "$recovery" >/dev/null || return 1
-    jq -e '(.enabled|type)=="boolean" and (.payout_address|type)=="string" and
-      (.payout_address|length)>0' "$pow" >/dev/null || return 1
+    jq -e '(.enabled|type)=="boolean" and (.payout_address|type)=="string"' \
+      "$pow" >/dev/null || return 1
     payout=$(jq -er '.payout_address' "$pow") || return 1
     [[ "$payout" == "$(jq -er '.payout_address' "$pre")" ]] || return 1
-    jq -e --arg payout "$payout" '.address==$payout and .ismine==true' \
-        "$root/baseline-payout-address.json" >/dev/null || return 1
-    jq -e '. == [""]' "$loaded" >/dev/null || return 1
+    if [[ -n "$payout" ]]; then
+        jq -e --arg payout "$payout" '.address==$payout and .ismine==true' \
+            "$root/baseline-payout-address.json" >/dev/null || return 1
+        [[ "$(jq -er '.payout_owned' "$pre")" == true ]] || return 1
+    else
+        jq -e '. == null' "$root/baseline-payout-address.json" >/dev/null || return 1
+        [[ "$(jq -er '.payout_owned' "$pre")" == false ]] || return 1
+    fi
+    jq -e --slurpfile wallet "$wallet" '
+      type == "array" and length == 1 and .[0] == $wallet[0].walletname
+    ' "$loaded" >/dev/null || return 1
+    jq -e --slurpfile wallet "$wallet" '
+      .exact_loaded_wallets == [$wallet[0].walletname]
+    ' "$pre" >/dev/null || return 1
     quantum_count=$(jq -er 'if type=="array" then length
       elif (.keys?|type)=="array" then (.keys|length)
       elif (.inventory?|type)=="array" then (.inventory|length)
       elif (.total?|type)=="number" and (.total|floor)==.total and .total>=0 then .total
       else error("schema") end' "$root/baseline-quantum.json") || return 1
     [[ "$quantum_count" == "$(jq -er '.quantum_key_count' "$pre")" ]] || return 1
-    policy=$(jq -cS '{policy_authoritative,policy_state_status,policy}' "$recovery" |
-        sha256sum | awk '{print $1}') || return 1
-    metrics=$(jq -cS '{pending_manual_resolutions,pending_automatic_resolutions,
-      confirmed_manual_resolutions,confirmed_automatic_resolutions,confirmed_resolution_fees,
-      automatic_actions_in_window,automatic_fee_exposure_in_window,
-      reconciled_descendant_claims,claims_recycled}' "$recovery" |
-        sha256sum | awk '{print $1}') || return 1
-    [[ "$policy" == "$(jq -er '.recovery_policy_sha256' "$pre")" &&
-       "$metrics" == "$(jq -er '.recovery_metrics_sha256' "$pre")" ]]
+    if [[ -n "$payout" ]]; then
+        hotfix_quantum_payout_address_is_valid \
+            "$root/baseline-payout-address.json" "$root/baseline-quantum.json" \
+            "$payout" || return 1
+    fi
+    jq -e '.database_outcome_ambiguous == false and .policy_authoritative == true and
+      .policy.automatic_authorized == false and .policy.automatic_enabled == false' \
+      "$recovery" >/dev/null
 }
 
 hotfix_phase_b_locked_sync_file_is_valid()
 {
-    local file="$1" fee recovery
+    local file="$1" recovery pow staking
     [[ -f "$file" && ! -L "$file" ]] || return 1
     jq -e '
         def integer: type == "number" and floor == .;
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
-        type == "object" and (keys | sort) == ["chain","recovery","schema","synchronized","wallet"] and
-        .schema == 1 and .synchronized == true and
+        type == "object" and (keys | sort) == (["chain","loaded_wallets",
+          "locked_pos_zero_work","locked_pow_zero_work","normal_unlock_called",
+          "pos_intent_retained","pow","pow_intent_retained","recovery","schema",
+          "staking","synchronized","wallet","wallet_locked"] | sort) and
+        .schema == 2 and .synchronized == true and .wallet_locked == true and
+        .normal_unlock_called == false and .pos_intent_retained == true and
+        .pow_intent_retained == true and .locked_pos_zero_work == true and
+        .locked_pow_zero_work == true and
         (.chain | type) == "object" and .chain.chain == "main" and
         .chain.initialblockdownload == false and
         (.chain.blocks | integer and . >= 0) and .chain.blocks == .chain.headers and
         (.chain.bestblockhash | hex64) and
         .recovery.active_tip == .chain.bestblockhash and
         .recovery.wallet_processed_tip == .chain.bestblockhash and
-        (.wallet | type) == "object" and .wallet.walletname == "" and
+        .pow.claim_inventory_tip == .chain.bestblockhash and
+        .staking.blocks == .chain.blocks and .staking.active_blocks == .chain.blocks and
+        (.wallet | type) == "object" and (.wallet.walletname | type) == "string" and
         .wallet.private_keys_enabled == true and .wallet.scanning == false and
-        .wallet.unlocked_until == 0
+        .wallet.unlocked_until == 0 and .wallet.unlocked_staking_only == false and
+        .loaded_wallets == [.wallet.walletname]
     ' "$file" >/dev/null || return 1
     recovery=$(jq -ce '.recovery' "$file") || return 1
-    fee=$(jq -ce '.recovery.confirmed_resolution_fees' "$file") || return 1
-    hotfix_candidate_recovery_json_is_valid "$recovery" "$fee"
+    pow=$(jq -ce '.pow' "$file") || return 1
+    staking=$(jq -ce '.staking' "$file") || return 1
+    hotfix_candidate_recovery_json_is_valid "$recovery" &&
+        hotfix_candidate_pow_json_is_valid "$pow" locked &&
+        hotfix_phase_b_staking_json_is_locked_with_intent "$staking" &&
+        hotfix_pow_recovery_same_cut_json_is_valid "$pow" "$recovery"
 }
 
 hotfix_phase_b_cutover_stop_file_is_valid()
@@ -2078,12 +2885,12 @@ hotfix_phase_b_wallet_delta_file_is_valid()
         type == "object" and
         (keys | sort) == ["allowed_classes","baseline_txids","classifications","complete",
           "new_txids","raw_evidence_sha256","rejected_txids","removed_txids","schema"] and
-        .schema == 1 and
+        .schema == 4 and
         (.baseline_txids | txids) and (.new_txids | txids) and
         ([.baseline_txids[],.new_txids[]] | unique | length) ==
           ((.baseline_txids | length) + (.new_txids | length)) and
         .allowed_classes == ["confirmed_coinstake","authenticated_qq_claim",
-          "authenticated_qq_claim_payout"] and
+          "authenticated_qq_claim_payout","external_receive"] and
         .removed_txids == [] and .rejected_txids == [] and .complete == true and
         (.raw_evidence_sha256 | hex64) and
         (.classifications | type == "array") and
@@ -2096,8 +2903,12 @@ hotfix_phase_b_wallet_delta_file_is_valid()
           elif .class == "authenticated_qq_claim" then
             (keys | sort) == ["class","txid"]
           elif .class == "authenticated_qq_claim_payout" then
-            (keys | sort) == ["blockhash","class","source_claim_txid","txid"] and
-            (.blockhash | hex64) and (.source_claim_txid | hex64)
+            (keys | sort) == ["blockhash","class","payout_address","source_claim_txid","txid"] and
+            (.blockhash | hex64) and (.source_claim_txid | hex64) and
+            (.payout_address | type == "string" and length > 0)
+          elif .class == "external_receive" then
+            (keys | sort) == ["blockhash","class","txid"] and
+            (.blockhash == null or (.blockhash | hex64))
           else false end)
     ' "$file" >/dev/null || return 1
     if [[ -n "$raw_file" ]]; then
@@ -2115,68 +2926,588 @@ hotfix_phase_b_wallet_delta_file_is_valid()
 hotfix_phase_b_wallet_delta_raw_file_is_valid()
 {
     local file="$1" expected_baseline="${2:-}" expected_final="${3:-}"
-    local expected_recovery="${4:-}"
+    local expected_recovery="${4:-}" expected_baseline_recovery="${5:-}"
+    local expected_progress="${6:-}"
     [[ -f "$file" && ! -L "$file" ]] || return 1
     jq -e --arg baseline "$expected_baseline" --arg final "$expected_final" \
-        --arg recovery "$expected_recovery" '
+        --arg recovery "$expected_recovery" \
+        --arg baseline_recovery "$expected_baseline_recovery" \
+        --arg progress "$expected_progress" --arg zero "$HOTFIX_ZERO_TXID" '
         def integer: type == "number" and floor == .;
+        def uint: integer and . >= 0;
+        def uint32: integer and . >= 0 and . < 4294967295;
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
+        def nonzero_hex64: hex64 and . != $zero;
+        def rawhex: type == "string" and test("^([0-9a-f]{2})+$");
         def matches($expected): $expected == "" or . == $expected;
+        def no_control_metadata:
+          ([keys[] | select(startswith("qq_"))] | length) == 0;
+        def claim_nodes($component):
+          $component.nodes | map(select(.kind == "claim")) | sort_by(.lineage_ordinal);
+        def known_disposition($node):
+          ($node.disposition | IN("eligible","inactive","height_before_window",
+            "height_after_window","invalid_location","malformed","duplicate",
+            "wrong_mode","unknown_mode","unsupported_version",
+            "version_not_yet_active","invalid_proof",
+            "unbound_proof_may_revalidate","origin_not_yet_reached",
+            "origin_mismatch","origin_expired","input_mismatch",
+            "already_accounted","capacity_limit","evaluation_limit",
+            "local_state_error"));
+        def exact_proof_tuple($node):
+          ($node.proof_version == 2 and
+             $node.proof_origin_bound == false and $node.proof_input_bound == false) or
+          ($node.proof_version == 3 and
+             $node.proof_origin_bound == true and $node.proof_input_bound == false) or
+          ($node.proof_version == 4 and
+             $node.proof_origin_bound == true and $node.proof_input_bound == true);
+        def implicit_claim_root($node;$claim_count):
+          known_disposition($node) and
+          $node.lineage_metadata_present == false and
+          $node.lineage_metadata_valid == false and
+          $node.lineage_ordinal == 0 and
+          $node.lineage_family_fingerprint == $zero and
+          $node.lineage_root_txid == $zero and
+          $node.lineage_parent_txid == $zero and
+          $node.proof_mode == "pow" and
+          $node.provenance == "explicit_authored" and
+          $node.authored_metadata_valid == true and
+          $node.expected_shape == true and
+          $node.claim_descriptor_valid == true and
+          $node.exact_authored_carrier_shape == true and
+          $node.proof_evaluation_skipped_resolved_anchor == false and
+          $node.proof_may_revalidate_on_descendant ==
+            ($node.disposition == "unbound_proof_may_revalidate") and
+          exact_proof_tuple($node) and
+          (if $node.proof_version == 2 then
+             ($node.in_mempool == true or
+               ($node.disposition | IN("eligible",
+                 "unbound_proof_may_revalidate"))) and
+             (if $claim_count == 1
+              then $node.authored_tip_active_branch_bound == true
+              else true end)
+           elif $node.proof_version == 3 or $node.proof_version == 4 then
+             $node.in_mempool == true or
+               ($node.disposition | IN("eligible","origin_mismatch","origin_expired"))
+           else false end);
+        def component_node_match($match):
+          ($match | type) == "object" and
+          ($match | keys | sort) == ["component","node"] and
+          ($match.component | type) == "object" and
+          ($match.node | type) == "object" and ($match.node.txid | hex64) and
+          ($match.component.nodes | type) == "array" and
+          ([$match.component.nodes[] |
+             select(.txid == $match.node.txid and . == $match.node)] | length) == 1;
+        def canonical_claim_component($match):
+          component_node_match($match) and
+          ($match.component) as $component |
+          (claim_nodes($component)) as $claims |
+          ($claims | length) >= 1 and
+          $component.anchor_authenticated == true and
+          $component.anchor_unspent == true and
+          $component.anchor_user_locked == false and
+          ($component.anchor.txid | nonzero_hex64) and
+          ($component.anchor.vout | uint32) and
+          ($component.anchor.amount | type) == "number" and
+          $component.anchor.amount > 0 and
+          ($component.anchor.scriptPubKey | rawhex) and
+          ($component.generation_fingerprint | hex64) and
+          $component.generation_fingerprint != $zero and
+          ($component.claim_txids | type) == "array" and
+          ($component.claim_txids | unique | length) ==
+            ($component.claim_txids | length) and
+          ($component.nodes | map(.txid) | unique | length) ==
+            ($component.nodes | length) and
+          ([ $claims[].txid ] | sort) == ($component.claim_txids | sort) and
+          ($claims | map(.lineage_ordinal)) == [range(0; ($claims | length))] and
+          (if $claims[0].lineage_metadata_present then
+             $claims[0].lineage_metadata_valid == true and
+             $claims[0].lineage_root_txid == $claims[0].txid and
+             $claims[0].lineage_parent_txid == $zero and
+             $claims[0].lineage_family_fingerprint == $component.generation_fingerprint
+           else
+             implicit_claim_root($claims[0]; ($claims | length))
+           end) and
+          all(range(1; ($claims | length));
+            $claims[.].lineage_metadata_present == true and
+            $claims[.].lineage_metadata_valid == true and
+            $claims[.].lineage_family_fingerprint == $component.generation_fingerprint and
+            $claims[.].lineage_root_txid == $claims[0].txid and
+            $claims[.].lineage_parent_txid == $claims[.-1].txid) and
+          all($claims[];
+            (.txid | hex64) and .kind == "claim" and
+            .proof_mode == "pow" and .active_chain_confirmed == false and
+            known_disposition(.) and
+            .expected_shape == true and .wallet_authored == true and
+            .wallet_from_me == true and .authored_metadata_valid == true and
+            .claim_descriptor_valid == true and .exact_authored_carrier_shape == true and
+            .proof_evaluation_skipped_resolved_anchor == false and
+            .proof_may_revalidate_on_descendant ==
+              (.disposition == "unbound_proof_may_revalidate") and
+            .provenance == "explicit_authored" and exact_proof_tuple(.));
+        def authenticated_new_claim($match;$txid):
+          canonical_claim_component($match) and
+          $match.node.txid == $txid and $match.node.kind == "claim" and
+          $match.node.provenance == "explicit_authored" and
+          $match.node.wallet_authored == true and $match.node.wallet_from_me == true and
+          $match.node.expected_shape == true and
+          $match.node.lineage_metadata_present == true and
+          $match.node.lineage_metadata_valid == true and
+          exact_proof_tuple($match.node) and
+          $match.node.resolution_metadata_valid == false and
+          $match.node.resolution_relay_authorized == false and
+          ($match.component.claim_txids | index($txid)) != null and
+          ($match.component.resolution_txids | index($txid)) == null and
+          ($match.component.ordinary_or_mixed_txids | index($txid)) == null;
+        def prior_authority($entry):
+          ($entry | type) == "object" and
+          ($entry | keys | sort) == ["active_tip","component","node",
+            "observed_epoch","sample","source","wallet_processed_tip"] and
+          ($entry.active_tip | nonzero_hex64) and
+          $entry.wallet_processed_tip == $entry.active_tip and
+          (if $entry.source == "baseline" then
+             $entry.sample == null and $entry.observed_epoch == null
+           elif $entry.source == "phase_b_progress" then
+             ($entry.sample | integer and . >= 1) and
+             ($entry.observed_epoch | integer and . > 0)
+           else false end) and
+          component_node_match({component:$entry.component,node:$entry.node});
+        def prior_authorities($entries):
+          ($entries | type) == "array" and all($entries[]; prior_authority(.)) and
+          $entries == ($entries | sort_by(
+            if .source == "baseline" then 0 else 1 end,
+            (.sample // 0),.component.component_fingerprint,.node.txid)) and
+          ([$entries[] | [.source,.sample,.node.txid]] | unique | length) ==
+            ($entries | length);
+        def exact_wallet_metadata($object;$match):
+          $object.qq_shadow_pow_authored == "1" and
+          $object.qq_shadow_pow_lineage_schema == "1" and
+          $object.qq_shadow_pow_lineage_family ==
+            $match.component.generation_fingerprint and
+          $object.qq_shadow_pow_lineage_root == $match.node.lineage_root_txid and
+          $object.qq_shadow_pow_lineage_parent == $match.node.lineage_parent_txid and
+          $object.qq_shadow_pow_lineage_ordinal ==
+            ($match.node.lineage_ordinal | tostring) and
+          ($object.qq_shadow_pow_created_tip | hex64) and
+          ($object.qq_shadow_pow_created_height? == null or
+            ($object.qq_shadow_pow_created_height | type == "string" and
+             test("^(0|[1-9][0-9]*)$"))) and
+          $object.qq_shadow_pow_anchor_txid == $match.component.anchor.txid and
+          $object.qq_shadow_pow_anchor_vout == ($match.component.anchor.vout | tostring) and
+          ($object.qq_shadow_pow_cleanup_for? == null) and
+          ($object.qq_shadow_pow_legacy_cleanup_quarantine? == null) and
+          ($object.qq_auto_shadow_stale? == null) and
+          ($object.qq_manual_shadow_abandon? == null) and
+          ($object.qq_reorg_shadow_resubmit? == null) and
+          ($object.qq_shadow_pow_resolution_schema? == null) and
+          ($object.qq_shadow_pow_resolution_origin? == null) and
+          ($object.qq_shadow_pow_resolution_anchor_txid? == null);
+        def intrinsic_authored_descriptor($object;$txid):
+          if ($object | type) == "object" and
+             $object.qq_shadow_pow_authored == "1" and
+             $object.qq_shadow_pow_lineage_schema == "1" and
+             ($object.qq_shadow_pow_lineage_family | nonzero_hex64) and
+             ($object.qq_shadow_pow_lineage_root | nonzero_hex64) and
+             ($object.qq_shadow_pow_lineage_parent | hex64) and
+             ($object.qq_shadow_pow_lineage_ordinal | type) == "string" and
+             ($object.qq_shadow_pow_lineage_ordinal | test("^(0|[1-9][0-9]*)$")) and
+             ($object.qq_shadow_pow_created_tip | nonzero_hex64) and
+             ($object.qq_shadow_pow_created_height? == null or
+               (($object.qq_shadow_pow_created_height | type) == "string" and
+                ($object.qq_shadow_pow_created_height | test("^(0|[1-9][0-9]*)$")))) and
+             ($object.qq_shadow_pow_anchor_txid | nonzero_hex64) and
+             ($object.qq_shadow_pow_anchor_vout | type) == "string" and
+             ($object.qq_shadow_pow_anchor_vout | test("^(0|[1-9][0-9]*)$")) and
+             ($object.qq_shadow_pow_anchor_vout | tonumber) < 4294967295 and
+             ($object.qq_shadow_pow_cleanup_for? == null) and
+             ($object.qq_shadow_pow_legacy_cleanup_quarantine? == null) and
+             ($object.qq_auto_shadow_stale? == null) and
+             ($object.qq_manual_shadow_abandon? == null) and
+             ($object.qq_reorg_shadow_resubmit? == null) and
+             ($object.qq_shadow_pow_resolution_schema? == null) and
+             ($object.qq_shadow_pow_resolution_origin? == null) and
+             ($object.qq_shadow_pow_resolution_anchor_txid? == null) and
+             # With no retained recovery component, the wallet record alone can
+             # authenticate only an ordinal-zero root. Descendants require the
+             # earlier same-run full component authority so their parent chain
+             # is not inferred from self-asserted mapValue metadata.
+             ($object.qq_shadow_pow_lineage_ordinal == "0") and
+             $object.qq_shadow_pow_lineage_root == $txid and
+             $object.qq_shadow_pow_lineage_parent == $zero
+          then {family:$object.qq_shadow_pow_lineage_family,
+            root:$object.qq_shadow_pow_lineage_root,
+            parent:$object.qq_shadow_pow_lineage_parent,
+            ordinal:$object.qq_shadow_pow_lineage_ordinal,
+            created_tip:$object.qq_shadow_pow_created_tip,
+            created_height:($object.qq_shadow_pow_created_height? // null),
+            anchor_txid:$object.qq_shadow_pow_anchor_txid,
+            anchor_vout:$object.qq_shadow_pow_anchor_vout}
+          else null end;
+        def intrinsic_confirmed_authored_claim($record;$tx):
+          (intrinsic_authored_descriptor($tx;$record.txid)) as $descriptor |
+          $descriptor != null and
+          all($record.wallet_rows[];
+            .txid == $record.txid and .category == "send" and
+            (.comment | IN("Quantum Quasar built-in shadow PoW claim",
+              "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim")) and
+            intrinsic_authored_descriptor(.;$record.txid) == $descriptor);
+        def clean_external_receive_detail:
+          .category == "receive" and
+          (.amount | type) == "number" and .amount > 0 and
+          .abandoned == false and (.fee? == null) and (.generated? == null) and
+          no_control_metadata and
+          ((.comment? // "") |
+            IN("Quantum Quasar built-in shadow PoW claim",
+               "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim") | not);
+        def clean_external_receive_row($txid):
+          .txid == $txid and clean_external_receive_detail;
+        def audit_only_component($match;$txid;$unanchored):
+          component_node_match($match) and
+          ($match.component) as $component |
+          $match.node.txid == $txid and $match.node.kind == "claim" and
+          $component.anchor_authenticated == false and
+          $component.anchor_unspent == false and
+          $component.anchor_user_locked == false and
+          $component.anchor.amount == 0 and $component.anchor.scriptPubKey == "" and
+          (($component.anchor.txid == $zero and
+             $component.anchor.vout == 4294967295) or
+           (($component.anchor.txid | nonzero_hex64) and
+             ($component.anchor.vout | uint32))) and
+          ($component.claim_txids | index($txid)) != null and
+          ([ $component.nodes[] | select(.kind == "claim") | .txid ] | sort) ==
+            ($component.claim_txids | sort) and
+          ([ $component.nodes[].txid ] | unique | length) ==
+            ($component.nodes | length) and
+          all($component.nodes[];
+            .provenance == "unknown" and .wallet_authored == false and
+            .wallet_from_me == false) and
+          all($component.claim_txids[];
+            . as $claim | ($unanchored | index($claim)) != null);
+        def external_receive($record;$unanchored):
+          ($record.gettransaction_response) as $tx |
+          $record.source_claim_txid == null and
+          ($tx | type) == "object" and $tx.txid == $record.txid and
+          ($tx.hex | type) == "string" and ($tx.hex | test("^[0-9a-f]+$")) and
+          (($tx.hex | length) % 2) == 0 and
+          ($tx.decoded | type) == "object" and $tx.decoded.txid == $record.txid and
+          ($tx.fee? == null) and ($tx.amount | type) == "number" and $tx.amount > 0 and
+          ($tx.generated? == null) and ($tx | no_control_metadata) and
+          ($tx.confirmations | integer and . >= 0) and
+          ($tx.details | type) == "array" and ($tx.details | length) >= 1 and
+          all($tx.details[]; clean_external_receive_detail) and
+          all($record.wallet_rows[]; clean_external_receive_row($record.txid)) and
+          (if $tx.confirmations > 0 then
+             ($record.blockhash | hex64) and $tx.blockhash == $record.blockhash and
+             $record.recovery_matches == [] and
+             ($record.getblock_response | type) == "object" and
+             $record.getblock_response.hash == $record.blockhash and
+             ($record.getblock_response.confirmations | integer and . > 0) and
+             ($record.getblock_response.height | integer and . >= 0) and
+             ($record.getblock_response.tx | type) == "array" and
+             ($record.getblock_response.tx | index($record.txid)) != null and
+             $record.getblockhash_response == $record.blockhash and
+             all($record.wallet_rows[];
+               (.confirmations | integer and . > 0) and
+               .blockhash == $record.blockhash)
+           else
+             $tx.confirmations == 0 and ($tx.blockhash? == null) and
+             $record.blockhash == null and $record.getblock_response == null and
+             $record.getblockhash_response == null and
+             all($record.wallet_rows[];
+               .confirmations == 0 and (.blockhash? == null)) and
+             (($record.recovery_matches | length) == 0 or
+               (($record.recovery_matches | length) == 1 and
+                audit_only_component(
+                  $record.recovery_matches[0];$record.txid;$unanchored)))
+          end) and
+          $record.getshadowtransaction_response == null;
+        def active_block_member($record;$txid):
+          ($record.blockhash | hex64) and
+          ($record.getblock_response | type) == "object" and
+          $record.getblock_response.hash == $record.blockhash and
+          ($record.getblock_response.confirmations | integer and . > 0) and
+          ($record.getblock_response.height | integer and . >= 0) and
+          ($record.getblock_response.tx | type) == "array" and
+          ($record.getblock_response.tx | index($txid)) != null and
+          $record.getblockhash_response == $record.blockhash;
+        def authenticated_claim($record):
+          ($record.gettransaction_response) as $tx |
+          $record.source_claim_txid == null and
+          $record.getshadowtransaction_response == null and
+          ($tx | type) == "object" and $tx.txid == $record.txid and
+          ($tx.hex | rawhex) and ($tx.decoded | type) == "object" and
+          $tx.decoded.txid == $record.txid and
+          ($tx.confirmations | integer and . >= 0) and
+          ($tx.details | type) == "array" and ($tx.details | length) >= 1 and
+          ([$record.prior_recovery_authority[] |
+             select(.source == "phase_b_progress" and
+               authenticated_new_claim(
+                 {component:.component,node:.node};$record.txid))]) as
+            $prior_authenticated |
+          if $tx.confirmations == 0 then
+            ($tx.blockhash? == null) and $record.blockhash == null and
+            $record.getblock_response == null and $record.getblockhash_response == null and
+            ($record.recovery_matches | length) == 1 and
+            ($record.recovery_matches[0]) as $current |
+            authenticated_new_claim($current;$record.txid) and
+            exact_wallet_metadata($tx;$current) and
+            all($record.wallet_rows[];
+              .txid == $record.txid and .category == "send" and
+              .confirmations == 0 and (.blockhash? == null) and
+              (.comment | IN("Quantum Quasar built-in shadow PoW claim",
+                "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim")) and
+              exact_wallet_metadata(.;$current))
+          elif $tx.confirmations > 0 then
+            active_block_member($record;$record.txid) and
+            $tx.blockhash == $record.blockhash and
+            ($record.recovery_matches | length) <= 1 and
+            all($record.recovery_matches[];
+              .node.txid == $record.txid and .node.kind == "claim") and
+            all($record.wallet_rows[];
+              (.confirmations | integer and . > 0) and
+              .blockhash == $record.blockhash) and
+            (if ($prior_authenticated | length) >= 1 then
+               ($prior_authenticated[-1]) as $authority |
+               exact_wallet_metadata($tx;
+                 {component:$authority.component,node:$authority.node}) and
+               all($record.wallet_rows[];
+                 .txid == $record.txid and .category == "send" and
+                 (.comment | IN("Quantum Quasar built-in shadow PoW claim",
+                   "Blackcoin shadow PoW claim","PoW Claim","Quantum PoW Claim")) and
+                 exact_wallet_metadata(.;
+                   {component:$authority.component,node:$authority.node}))
+             else intrinsic_confirmed_authored_claim($record;$tx) end)
+          else false end;
+        def confirmed_coinstake($record):
+          ($record.gettransaction_response) as $tx |
+          ($record.blockhash | hex64) and $record.source_claim_txid == null and
+          $record.recovery_matches == [] and
+          $record.getshadowtransaction_response == null and
+          $record.getblockhash_response == null and
+          ($record.getblock_response | type) == "object" and
+          $record.getblock_response.hash == $record.blockhash and
+          ($record.getblock_response.confirmations | integer and . > 0) and
+          ($record.getblock_response.tx | type) == "array" and
+          ($record.getblock_response.tx | length) >= 2 and
+          $record.getblock_response.tx[0] != $record.txid and
+          $record.getblock_response.tx[1] == $record.txid and
+          ($tx | type) == "object" and $tx.txid == $record.txid and
+          ($tx.hex | rawhex) and ($tx.decoded | type) == "object" and
+          $tx.decoded.txid == $record.txid and ($tx.fee? == null) and
+          ($tx.confirmations | integer and . > 0) and
+          $tx.blockhash == $record.blockhash and
+          all($record.wallet_rows[];
+            .txid == $record.txid and .generated == true and
+            (.category | IN("generate","immature","orphan")) and
+            .abandoned == false and .blockhash == $record.blockhash and
+            (.fee? == null) and
+            (.qq_shadow_pow_cleanup_for? == null) and
+            (.qq_shadow_pow_resolution_schema? == null) and
+            (.qq_synthetic_goldrush_payout? == null) and
+            (.qq_shadow_pow_authored? == null));
+        def exact_pow_claim_source($source;$height):
+          ($source | type) == "object" and
+          ($source | keys | sort) == ["base_fee","base_fee_known","canonical_rank",
+            "claim_outpoint","disposition","inclusion_height","input_bound",
+            "logical_proof_id","origin_age","origin_bound","origin_height",
+            "origin_previous_block_hash","proof_version","txid","vout"] and
+          ($source.txid | nonzero_hex64) and ($source.vout | uint32) and
+          ($source.logical_proof_id | nonzero_hex64) and
+          ($source.canonical_rank | nonzero_hex64) and
+          $source.base_fee_known == true and
+          ($source.base_fee | type) == "number" and $source.base_fee >= 0 and
+          ($source.disposition |
+            IN("winner","reimbursed_loser","reimbursed_late")) and
+          ($source.origin_height | uint) and
+          ($source.inclusion_height | integer and . > 0) and
+          $source.inclusion_height == $height and ($source.origin_age | uint) and
+          (if $source.proof_version == 2 then
+             $source.origin_bound == false and $source.input_bound == false and
+             $source.claim_outpoint == null and $source.origin_age == 0 and
+             ($source.origin_previous_block_hash == null or
+               ($source.origin_previous_block_hash | hex64))
+           elif $source.proof_version == 3 or $source.proof_version == 4 then
+             $source.origin_bound == true and
+             ($source.origin_previous_block_hash | nonzero_hex64) and
+             $source.origin_height > 0 and
+             $source.inclusion_height >= $source.origin_height and
+             $source.origin_age ==
+               ($source.inclusion_height - $source.origin_height) and
+             (if $source.proof_version == 3 then
+                $source.input_bound == false and $source.claim_outpoint == null
+              else
+                $source.input_bound == true and
+                ($source.claim_outpoint | type) == "object" and
+                ($source.claim_outpoint | keys | sort) == ["txid","vout"] and
+                ($source.claim_outpoint.txid | nonzero_hex64) and
+                ($source.claim_outpoint.vout | uint32)
+              end) and
+             (if $source.disposition == "reimbursed_late" then
+                $source.origin_height < $source.inclusion_height and
+                $source.origin_age > 0
+              else
+                $source.origin_height == $source.inclusion_height and
+                $source.origin_age == 0
+              end)
+           else false end);
+        def exact_shadow_payout($shadow;$record):
+          ($shadow | type) == "object" and
+          ($shadow | keys | sort) == ["address","base_anchor","confirmations",
+            "decayed_amount","demurrage","effective_amount","lifecycle",
+            "lifecycle_category","merkle_included","mode","nominal_amount",
+            "pow_claim_source","schema","scriptPubKey","spend","status",
+            "synthetic","synthetic_txid","units","valuation_status","vout"] and
+          $shadow.schema == "blackcoin.shadow.transaction.v1" and
+          $shadow.synthetic == true and $shadow.merkle_included == false and
+          $shadow.synthetic_txid == $record.txid and $shadow.mode == "pow" and
+          ($shadow.status | IN("immature","gold_rush_locked","demurrage_locked",
+            "unspent","spent")) and
+          ($shadow.lifecycle_category | type) == "string" and
+          ($shadow.nominal_amount | type) == "number" and $shadow.nominal_amount > 0 and
+          ($shadow.effective_amount | type) == "number" and $shadow.effective_amount >= 0 and
+          ($shadow.decayed_amount | type) == "number" and $shadow.decayed_amount >= 0 and
+          ($shadow.valuation_status |
+            IN("recorded_at_spend","current_next_block_consensus")) and
+          (if $shadow.status == "spent" then
+             $shadow.valuation_status == "recorded_at_spend"
+           else $shadow.valuation_status == "current_next_block_consensus" end) and
+          ($shadow.vout | uint32) and ($shadow.scriptPubKey | rawhex) and
+          ($shadow.address | type) == "string" and ($shadow.address | length) > 0 and
+          ($shadow.confirmations | integer and . > 0) and
+          ($shadow.base_anchor | type) == "object" and
+          ($shadow.base_anchor | keys | sort) == ["blockhash","claim_index","height","time"] and
+          $shadow.base_anchor.blockhash == $record.blockhash and
+          ($shadow.base_anchor.height | integer and . >= 0) and
+          ($shadow.base_anchor.time | integer and . > 0) and
+          ($shadow.base_anchor.claim_index | uint) and
+          exact_pow_claim_source($shadow.pow_claim_source;$shadow.base_anchor.height) and
+          ($shadow.lifecycle | type) == "object" and
+          ($shadow.lifecycle | keys | sort) == ["coinbase_maturity",
+            "consensus_spendable_next_block","earliest_spend_height",
+            "earliest_spend_height_exact","earliest_spend_mtp",
+            "gold_rush_phase_locked","mature","maturity_height",
+            "ordinary_spendable_next_block","permanently_locked",
+            "spendable_next_block"] and
+          ($shadow.lifecycle.coinbase_maturity | integer and . > 0) and
+          ($shadow.lifecycle.gold_rush_phase_locked | type) == "boolean" and
+          ($shadow.lifecycle.earliest_spend_height_exact | type) == "boolean" and
+          ($shadow.lifecycle.consensus_spendable_next_block | type) == "boolean" and
+          ($shadow.lifecycle.ordinary_spendable_next_block | type) == "boolean" and
+          ($shadow.lifecycle.spendable_next_block | type) == "boolean" and
+          ($shadow.lifecycle.permanently_locked | type) == "boolean" and
+          ($shadow.lifecycle.maturity_height == null or
+            ($shadow.lifecycle.maturity_height | integer and . >= 0)) and
+          ($shadow.lifecycle.mature == null or
+            ($shadow.lifecycle.mature | type) == "boolean") and
+          ($shadow.lifecycle.earliest_spend_height == null or
+            ($shadow.lifecycle.earliest_spend_height | integer and . >= 0)) and
+          ($shadow.lifecycle.earliest_spend_mtp == null or
+            ($shadow.lifecycle.earliest_spend_mtp | integer and . >= 0)) and
+          ($shadow.demurrage | type) == "object" and
+          (($shadow.demurrage | keys | sort) == ["active","exempt","inactive_blocks",
+             "locked","remaining_ppm","valuation_height"] or
+           ($shadow.demurrage | keys | sort) == ["active","classification","exempt",
+             "inactive_blocks","locked","remaining_ppm","valuation_height"]) and
+          ($shadow.demurrage.valuation_height | integer and . >= 0) and
+          ($shadow.demurrage.active | type) == "boolean" and
+          ($shadow.demurrage.exempt | type) == "boolean" and
+          ($shadow.demurrage.locked | type) == "boolean" and
+          ($shadow.demurrage.inactive_blocks | uint) and
+          ($shadow.demurrage.remaining_ppm | uint) and
+          ($shadow.demurrage.classification? == null or
+            ($shadow.demurrage.classification | type) == "string") and
+          $shadow.units == {display:"BLK",atomic_decimals:8,
+            amount_encoding:
+              "JSON number in BLK; atomic integer amounts are exact internally"} and
+          (if $shadow.status == "spent" then
+             ($shadow.spend | type) == "object" and
+             ($shadow.spend | keys | sort) ==
+               ["blockhash","height","input_index","tx_index","txid"] and
+             ($shadow.spend.height | integer and
+               . > $shadow.base_anchor.height) and
+             ($shadow.spend.blockhash | nonzero_hex64) and
+             ($shadow.spend.txid | nonzero_hex64) and
+             ($shadow.spend.tx_index | uint) and ($shadow.spend.input_index | uint)
+           else $shadow.spend == null end);
+        def payout_credit($row;$shadow;$record;$wallet_row):
+          (if $wallet_row then
+             $row.txid == $record.txid and
+             $row.qq_synthetic_goldrush_payout == "1" and
+             $row.generated == true and
+             $row.confirmations == $shadow.confirmations and
+             $row.blockhash == $record.blockhash
+           else ($row.txid? == null or $row.txid == $record.txid) end) and
+          ($row.qq_synthetic_goldrush_payout_stale? == null) and
+          ($row.category | IN("generate","immature")) and
+          ($row.amount | type) == "number" and $row.amount > 0 and
+          $row.abandoned == false and ($row.fee? == null) and
+          ($row.address | type) == "string" and $row.address == $shadow.address and
+          ($row.vout | uint32) and $row.vout == $shadow.vout and
+          ($row.qq_shadow_pow_cleanup_for? == null) and
+          ($row.qq_shadow_pow_resolution_schema? == null);
+        def authenticated_payout($record):
+          ($record.getshadowtransaction_response) as $shadow |
+          ($record.gettransaction_response) as $tx |
+          ($record.source_claim_txid | nonzero_hex64) and
+          $record.source_claim_txid != $record.txid and
+          exact_shadow_payout($shadow;$record) and
+          $shadow.pow_claim_source.txid == $record.source_claim_txid and
+          active_block_member($record;$record.source_claim_txid) and
+          $record.getblock_response.height == $shadow.base_anchor.height and
+          $record.getblock_response.confirmations == $shadow.confirmations and
+          ($tx | type) == "object" and $tx.txid == $record.txid and
+          ($tx.hex | rawhex) and ($tx.decoded | type) == "object" and
+          $tx.decoded.txid == $record.txid and ($tx.fee? == null) and
+          ($tx.amount | type) == "number" and $tx.amount > 0 and
+          $tx.confirmations == $shadow.confirmations and
+          $tx.blockhash == $record.blockhash and
+          ($tx.details | type) == "array" and ($tx.details | length) >= 1 and
+          all($tx.details[]; payout_credit(.;$shadow;$record;false)) and
+          all($record.wallet_rows[]; payout_credit(.;$shadow;$record;true)) and
+          ($tx.decoded.vout | type) == "array" and
+          ([$tx.decoded.vout[] |
+             select((.n | uint32) and .n == $shadow.vout and
+               .scriptPubKey.hex == $shadow.scriptPubKey and
+               ((.scriptPubKey.address? == $shadow.address) or
+                (.scriptPubKey.addresses? == [$shadow.address])))] | length) == 1;
+        . as $raw |
         type == "object" and
-        (keys | sort) == ["baseline_wallet_transactions_sha256","complete",
-          "final_wallet_transactions_sha256","records","recovery_inventory_sha256","schema"] and
-        .schema == 1 and .complete == true and
+        (keys | sort) == ["baseline_recovery_sha256",
+          "baseline_wallet_transactions_sha256","complete",
+          "final_wallet_transactions_sha256","phase_b_progress_sha256","records",
+          "recovery_inventory_sha256","recovery_unanchored_claim_txids","schema"] and
+        .schema == 4 and .complete == true and
         (.baseline_wallet_transactions_sha256 | hex64 and matches($baseline)) and
         (.final_wallet_transactions_sha256 | hex64 and matches($final)) and
         (.recovery_inventory_sha256 | hex64 and matches($recovery)) and
+        (.baseline_recovery_sha256 | hex64 and matches($baseline_recovery)) and
+        (.phase_b_progress_sha256 | hex64 and matches($progress)) and
+        (.recovery_unanchored_claim_txids | type == "array" and
+          all(.[]; hex64) and (unique | length) == length) and
         (.records | type == "array") and
         ([.records[].txid] | unique | length) == (.records | length) and
         all(.records[]; . as $record |
           (keys | sort) == ["blockhash","class","getblock_response",
-            "getshadowtransaction_response","recovery_matches","source_claim_txid",
-            "txid","wallet_rows"] and
+            "getblockhash_response","getshadowtransaction_response",
+            "gettransaction_response","prior_recovery_authority","recovery_matches",
+            "source_claim_txid","txid","wallet_rows"] and
           (.txid | hex64) and (.wallet_rows | type == "array" and length >= 1) and
           all(.wallet_rows[]; type == "object" and .txid == $record.txid) and
           (.recovery_matches | type == "array") and
+          all(.recovery_matches[]; component_node_match(.)) and
+          prior_authorities(.prior_recovery_authority) and
+          (.gettransaction_response | type) == "object" and
+          .gettransaction_response.txid == .txid and
+          (.gettransaction_response.hex | type) == "string" and
+          (.gettransaction_response.hex | test("^[0-9a-f]+$")) and
+          ((.gettransaction_response.hex | length) % 2) == 0 and
           if .class == "authenticated_qq_claim" then
-            .blockhash == null and .source_claim_txid == null and
-            .getblock_response == null and .getshadowtransaction_response == null and
-            (.recovery_matches | length) == 1 and
-            (.recovery_matches[0] as $match |
-              $match.node.txid == $record.txid and
-              $match.node.proof_origin_bound == true and
-              $match.node.proof_input_bound == true and
-              $match.node.expired_locally_retired == false and
-              $match.component.all_claims_zero_payment_retirable == false and
-              $match.component.all_claims_expired_locally_retired == false)
+            authenticated_claim($record)
           elif .class == "confirmed_coinstake" then
-            (.blockhash | hex64) and .source_claim_txid == null and
-            .recovery_matches == [] and
-            (.getblock_response | type == "object") and
-            (.getblock_response.confirmations | integer and . > 0) and
-            (.getblock_response.tx | type == "array" and length >= 2) and
-            .getblock_response.tx[0] != .txid and .getblock_response.tx[1] == .txid and
-            .getshadowtransaction_response == null
+            confirmed_coinstake($record)
           elif .class == "authenticated_qq_claim_payout" then
-            (.blockhash | hex64) and (.source_claim_txid | hex64) and
-            .getblock_response == null and
-            (.getshadowtransaction_response | type == "object") and
-            .getshadowtransaction_response.schema == "blackcoin.shadow.transaction.v1" and
-            .getshadowtransaction_response.synthetic == true and
-            .getshadowtransaction_response.merkle_included == false and
-            .getshadowtransaction_response.synthetic_txid == .txid and
-            .getshadowtransaction_response.mode == "pow" and
-            .getshadowtransaction_response.base_anchor.blockhash == .blockhash and
-            .getshadowtransaction_response.pow_claim_source.txid == .source_claim_txid and
-            .getshadowtransaction_response.pow_claim_source.input_bound == true and
-            (.recovery_matches | length) == 1 and
-            (.recovery_matches[0] as $match |
-              $match.node.txid == $record.source_claim_txid and
-              $match.node.proof_origin_bound == true and
-              $match.node.proof_input_bound == true and
-              $match.node.expired_locally_retired == false and
-              $match.component.all_claims_zero_payment_retirable == false and
-              $match.component.all_claims_expired_locally_retired == false)
+            authenticated_payout($record)
+          elif .class == "external_receive" then
+            external_receive($record;$raw.recovery_unanchored_claim_txids)
           else false end)
     ' "$file" >/dev/null
 }
@@ -2215,7 +3546,8 @@ hotfix_phase_b_final_container_file_is_valid()
         .start_gui_sha256 == $start and .entrypoint_body_sha256 == $body and
         .runtime_argv == ["/usr/local/bin/blackcoin-qt",
           "-datadir=/home/blackcoin/.blackcoin","-walletbroadcast=1",
-          "-autostartstaking=0","-powmining=0"] and
+          "-autostartstaking=1","-powmining=1","-powminingthreads=1",
+          "-powminingcpu=1"] and
         (.runtime_argv_sha256 | hex64) and (.config_sha256 | hex64 and matches($config)) and
         (.mounts_sha256 | hex64 and matches($mounts)) and
         (.network_sha256 | hex64 and matches($network)) and
@@ -2233,27 +3565,64 @@ hotfix_phase_b_final_container_file_is_valid()
 hotfix_phase_b_final_envelope_file_is_valid()
 {
     local file="$1" pow_mode="$2" wallet_delta_file="${3:-}"
-    local expected_policy="${4:-}" expected_metrics="${5:-}"
-    local wallet_delta_raw_file="${6:-}" fee recovery policy metrics
-    [[ -f "$file" && ! -L "$file" && ( "$pow_mode" == active || "$pow_mode" == off ) ]] ||
+    local wallet_delta_raw_file="${4:-}" locked_sync_file="${5:-}"
+    local locked_resolution_file="${6:-}" final_recovery_file="${7:-}"
+    local final_resolution_file="${8:-}" baseline_resolution_file="${9:-}"
+    local baseline_resolution_raw_file="${10:-}" locked_resolution_raw_file="${11:-}"
+    local final_resolution_raw_file="${12:-}" final_payout_file="${13:-}"
+    local baseline_quantum_file="${14:-}" final_quantum_file="${15:-}"
+    local recovery pow payout goldrush_state mempool
+    [[ -f "$file" && ! -L "$file" && "$pow_mode" == active ]] ||
         return 1
     jq -e --arg mode "$pow_mode" '
         def integer: type == "number" and floor == .;
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
         type == "object" and
         (keys | sort) == (["chain","chain_after","chain_before_after_identical",
-          "chain_recovery_pow_tip_bound","exact_loaded_wallets","loaded_wallets","network",
-          "observed_epoch","pow","pow_mode","recovery","recovery_counters_unchanged",
-          "recovery_metrics_sha256","recovery_policy_sha256","recovery_txids_unchanged",
-          "schema","stable_tip","staking","wallet","wallet_delta_fully_classified",
+          "chain_recovery_pow_tip_bound","automatic_recovery_unauthorized",
+          "baseline_wallet_resolution_raw_sha256",
+          "baseline_wallet_resolution_txids_sha256",
+          "baseline_quantum_labels_sha256","baseline_quantum_sha256",
+          "candidate_configured_payout_transition_valid",
+          "candidate_final_goldrush_state_sha256","candidate_final_recovery_sha256",
+          "candidate_final_resolution_txids_sha256",
+          "candidate_final_resolution_raw_sha256",
+          "candidate_final_payout_address_sha256",
+          "candidate_final_quantum_labels_sha256","candidate_final_quantum_sha256",
+          "candidate_locked_resolution_raw_sha256","candidate_locked_resolution_txids_sha256",
+          "candidate_locked_sync_sha256","candidate_resolution_membership_baseline_bound",
+          "candidate_quantum_inventory_transition_valid",
+          "exact_loaded_wallets","goldrush_state",
+          "legacy_baseline_wallet_txids_preserved","loaded_wallets","mempool_verbose","network",
+          "no_new_fee_bearing_recovery_wallet_transaction","observed_epoch","pow","pow_mode",
+          "recovery","schema","stable_tip","staking","wallet","wallet_delta_fully_classified",
           "wallet_delta_raw_sha256","wallet_delta_sha256","wallet_unlock_current"] | sort) and
-        .schema == 1 and .pow_mode == $mode and
+        .schema == 2 and .pow_mode == $mode and
         (.observed_epoch | integer and . > 0) and (.stable_tip | hex64) and
         .chain_before_after_identical == true and .chain_recovery_pow_tip_bound == true and
-        .wallet_unlock_current == true and .exact_loaded_wallets == [""] and
-        .loaded_wallets == [""] and
-        (.recovery_policy_sha256 | hex64) and (.recovery_metrics_sha256 | hex64) and
-        .recovery_counters_unchanged == true and .recovery_txids_unchanged == true and
+        .wallet_unlock_current == true and
+        .exact_loaded_wallets == [.wallet.walletname] and
+        .loaded_wallets == [.wallet.walletname] and
+        .automatic_recovery_unauthorized == true and
+        .candidate_configured_payout_transition_valid == true and
+        .candidate_quantum_inventory_transition_valid == true and
+        .candidate_resolution_membership_baseline_bound == true and
+        .legacy_baseline_wallet_txids_preserved == true and
+        .no_new_fee_bearing_recovery_wallet_transaction == true and
+        (.candidate_locked_sync_sha256 | hex64) and
+        (.baseline_wallet_resolution_txids_sha256 | hex64) and
+        (.baseline_wallet_resolution_raw_sha256 | hex64) and
+        (.baseline_quantum_sha256 | hex64) and
+        (.candidate_final_quantum_sha256 | hex64) and
+        (.baseline_quantum_labels_sha256 | hex64) and
+        (.candidate_final_quantum_labels_sha256 | hex64) and
+        (.candidate_locked_resolution_txids_sha256 | hex64) and
+        (.candidate_locked_resolution_raw_sha256 | hex64) and
+        (.candidate_final_goldrush_state_sha256 | hex64) and
+        (.candidate_final_recovery_sha256 | hex64) and
+        (.candidate_final_payout_address_sha256 | hex64) and
+        (.candidate_final_resolution_txids_sha256 | hex64) and
+        (.candidate_final_resolution_raw_sha256 | hex64) and
         (.wallet_delta_sha256 | hex64) and (.wallet_delta_raw_sha256 | hex64) and
         .wallet_delta_fully_classified == true and
         .chain.chain == "main" and .chain.initialblockdownload == false and
@@ -2264,43 +3633,31 @@ hotfix_phase_b_final_envelope_file_is_valid()
         .chain_after.blocks == .chain.blocks and .chain_after.headers == .chain.headers and
         .chain_after.bestblockhash == .stable_tip and .chain_after.chainwork == .chain.chainwork and
         .network.networkactive == true and (.network.connections_out | integer and . >= 3) and
-        .wallet.walletname == "" and .wallet.private_keys_enabled == true and
+        (.wallet.walletname | type) == "string" and
+        .wallet.private_keys_enabled == true and
         .wallet.scanning == false and .wallet.unlocked_staking_only == false and
         (.wallet.unlocked_until | integer) and .wallet.unlocked_until > .observed_epoch and
         .recovery.active_tip == .stable_tip and .recovery.wallet_processed_tip == .stable_tip and
         .pow.claim_inventory_tip == .stable_tip and
         .staking.blocks == .chain.blocks and .staking.active_blocks == .chain.blocks and
-        .staking.autostart_staking == false and
+        .staking.autostart_staking == true and
         .staking.autostart_staking_source == "autostartstaking" and
-        .pow.raw_quarantined_claims == .recovery.raw_quarantined_claims and
-        .pow.blocking_quarantined_claims == .recovery.blocking_quarantined_claims and
-        .pow.actionable_quarantined_claims == .recovery.actionable_quarantined_claims and
-        .pow.resolved_on_active_chain_claims == .recovery.resolved_on_active_chain_claims and
-        .pow.indeterminate_quarantined_claims == .recovery.indeterminate_quarantined_claims and
-        .pow.claim_components == .recovery.components and
-        .pow.pending_manual_resolutions == .recovery.pending_manual_resolutions and
-        .pow.pending_automatic_resolutions == .recovery.pending_automatic_resolutions and
-        .pow.claims_auto_resolved == .recovery.confirmed_automatic_resolutions and
-        .pow.claims_recycled == .recovery.claims_recycled and
-        .pow.cumulative_resolution_fees == .recovery.confirmed_resolution_fees and
+        .pow.autostart == true and
         .pow.claim_recovery_database_outcome_ambiguous == .recovery.database_outcome_ambiguous
     ' "$file" >/dev/null || return 1
     recovery=$(jq -ce '.recovery' "$file") || return 1
-    fee=$(jq -ce '.recovery.confirmed_resolution_fees' "$file") || return 1
-    hotfix_candidate_recovery_json_is_valid "$recovery" "$fee" || return 1
+    pow=$(jq -ce '.pow' "$file") || return 1
+    goldrush_state=$(jq -ce '.goldrush_state' "$file") || return 1
+    mempool=$(jq -ce '.mempool_verbose' "$file") || return 1
+    hotfix_goldrush_state_json_is_valid "$goldrush_state" \
+        "$(jq -er '.stable_tip' "$file")" "$(jq -er '.chain.blocks' "$file")" || return 1
+    hotfix_candidate_recovery_json_is_valid "$recovery" || return 1
     hotfix_phase_b_staking_json_is_active "$(jq -ce '.staking' "$file")" || return 1
-    hotfix_candidate_pow_json_is_valid "$(jq -ce '.pow' "$file")" "$pow_mode" || return 1
-    policy=$(jq -cS '.recovery | {policy_authoritative,policy_state_status,policy}' "$file" |
-        sha256sum | awk '{print $1}') || return 1
-    metrics=$(jq -cS '.recovery | {pending_manual_resolutions,pending_automatic_resolutions,
-      confirmed_manual_resolutions,confirmed_automatic_resolutions,confirmed_resolution_fees,
-      automatic_actions_in_window,automatic_fee_exposure_in_window,
-      reconciled_descendant_claims,claims_recycled}' "$file" | sha256sum | awk '{print $1}') ||
-        return 1
-    [[ "$policy" == "$(jq -er '.recovery_policy_sha256' "$file")" &&
-       "$metrics" == "$(jq -er '.recovery_metrics_sha256' "$file")" ]] || return 1
-    [[ -z "$expected_policy" || "$policy" == "$expected_policy" ]] || return 1
-    [[ -z "$expected_metrics" || "$metrics" == "$expected_metrics" ]] || return 1
+    hotfix_candidate_pow_json_is_valid "$pow" "$pow_mode" || return 1
+    hotfix_pow_recovery_same_cut_json_is_valid "$pow" "$recovery" || return 1
+    hotfix_pow_observation_json_is_valid "$pow" "$recovery" "$mempool" \
+        "$(jq -er '.stable_tip' "$file")" "$(jq -er '.chain.blocks' "$file")" \
+        "$(jq -er '.observed_epoch' "$file")" "$goldrush_state" || return 1
     if [[ -n "$wallet_delta_file" ]]; then
         hotfix_phase_b_wallet_delta_file_is_valid "$wallet_delta_file" "$wallet_delta_raw_file" &&
             [[ "$(hotfix_sha256_file "$wallet_delta_file")" == \
@@ -2311,6 +3668,69 @@ hotfix_phase_b_final_envelope_file_is_valid()
     if [[ -n "$wallet_delta_raw_file" ]]; then
         [[ "$(hotfix_sha256_file "$wallet_delta_raw_file")" == \
            "$(jq -er '.wallet_delta_raw_sha256' "$file")" ]] || return 1
+    fi
+    if [[ -n "$locked_sync_file" ]]; then
+        hotfix_phase_b_locked_sync_file_is_valid "$locked_sync_file" &&
+            [[ "$(hotfix_sha256_file "$locked_sync_file")" == \
+               "$(jq -er '.candidate_locked_sync_sha256' "$file")" ]] || return 1
+    fi
+    if [[ -n "$final_recovery_file" ]]; then
+        [[ "$(hotfix_sha256_file "$final_recovery_file")" == \
+           "$(jq -er '.candidate_final_recovery_sha256' "$file")" ]] &&
+            jq -e -n --argjson embedded "$recovery" --slurpfile raw "$final_recovery_file" \
+              '$embedded == $raw[0]' >/dev/null || return 1
+    fi
+    if [[ -n "$locked_resolution_file" && -n "$final_resolution_file" ]]; then
+        jq -e 'type == "array" and all(.[]; type == "string" and
+          test("^[0-9a-f]{64}$")) and (unique | length) == length' \
+          "$locked_resolution_file" "$final_resolution_file" >/dev/null &&
+            [[ "$(hotfix_sha256_file "$locked_resolution_file")" == \
+               "$(jq -er '.candidate_locked_resolution_txids_sha256' "$file")" ]] &&
+            [[ "$(hotfix_sha256_file "$final_resolution_file")" == \
+               "$(jq -er '.candidate_final_resolution_txids_sha256' "$file")" ]] || return 1
+    fi
+    if [[ -n "$baseline_resolution_file" && -n "$baseline_resolution_raw_file" &&
+          -n "$locked_resolution_raw_file" && -n "$final_resolution_raw_file" ]]; then
+        jq -e -n --slurpfile ids "$baseline_resolution_file" \
+            --slurpfile baseline "$baseline_resolution_raw_file" \
+            --slurpfile locked_ids "$locked_resolution_file" \
+            --slurpfile locked "$locked_resolution_raw_file" \
+            --slurpfile final_ids "$final_resolution_file" \
+            --slurpfile final "$final_resolution_raw_file" '
+          def rows: type=="array" and .==(sort_by(.txid)) and
+            ([.[].txid]|unique|length)==length and
+            all(.[]; (keys|sort)==["hex","txid"] and
+              (.txid|test("^[0-9a-f]{64}$")) and
+              (.hex|test("^[0-9a-f]+$")) and ((.hex|length)%2)==0);
+          ($ids[0]|type)=="array" and $ids[0]==($ids[0]|sort|unique) and
+          ($baseline[0]|rows) and [$baseline[0][].txid]==$ids[0] and
+          ($locked[0]|rows) and [$locked[0][].txid]==$locked_ids[0] and
+          ($final[0]|rows) and [$final[0][].txid]==$final_ids[0] and
+          all(($locked[0]+$final[0])[]; . as $row |
+            ([$baseline[0][] | select(.txid==$row.txid and .hex==$row.hex)]|length)==1)
+        ' >/dev/null &&
+            [[ "$(hotfix_sha256_file "$baseline_resolution_file")" == \
+               "$(jq -er '.baseline_wallet_resolution_txids_sha256' "$file")" ]] &&
+            [[ "$(hotfix_sha256_file "$baseline_resolution_raw_file")" == \
+               "$(jq -er '.baseline_wallet_resolution_raw_sha256' "$file")" ]] &&
+            [[ "$(hotfix_sha256_file "$locked_resolution_raw_file")" == \
+               "$(jq -er '.candidate_locked_resolution_raw_sha256' "$file")" ]] &&
+            [[ "$(hotfix_sha256_file "$final_resolution_raw_file")" == \
+               "$(jq -er '.candidate_final_resolution_raw_sha256' "$file")" ]] || return 1
+    fi
+    if [[ -n "$final_payout_file" ]]; then
+        [[ "$(hotfix_sha256_file "$final_payout_file")" == \
+           "$(jq -er '.candidate_final_payout_address_sha256' "$file")" ]] || return 1
+        payout=$(jq -er '.pow.payout_address | select(type=="string")' "$file") || return 1
+        if [[ -n "$payout" ]]; then
+            [[ -n "$baseline_quantum_file" && -n "$final_quantum_file" ]] || return 1
+            hotfix_quantum_payout_address_is_valid \
+                "$final_payout_file" "$baseline_quantum_file" "$payout" || return 1
+            hotfix_quantum_payout_address_is_valid \
+                "$final_payout_file" "$final_quantum_file" "$payout" || return 1
+        else
+            jq -e '. == null' "$final_payout_file" >/dev/null || return 1
+        fi
     fi
 }
 
@@ -2400,30 +3820,31 @@ hotfix_phase_b_result_file_is_valid()
     jq -e --arg source "$HOTFIX_CANDIDATE_SOURCE_SHA" --arg result_sha "$phase_a_result_sha" '
         def hex64: type == "string" and test("^[0-9a-f]{64}$");
         def integer: type == "number" and floor == .;
-        def amount: type == "number" and . >= 0;
         type == "object" and
-        (keys | sort) == (["baseline_automatic_fee_exposure_in_window",
-          "baseline_confirmed_resolution_fees","baseline_health_gate_passed",
-          "baseline_pending_automatic_resolutions","baseline_pending_manual_resolutions",
-          "baseline_precondition_sha256","baseline_cutover_stop_sha256",
-          "baseline_recovery_metrics_sha256",
-          "baseline_recovery_policy_sha256","candidate_running","candidate_source_sha",
+        (keys | sort) == (["automatic_recovery_unauthorized_continuously",
+          "baseline_health_gate_passed","baseline_precondition_sha256",
+          "baseline_cutover_stop_sha256","candidate_final_recovery_sha256",
+          "candidate_final_resolution_txids_sha256","candidate_locked_resolution_txids_sha256",
+          "candidate_locked_sync_sha256","candidate_resolution_membership_baseline_bound",
+          "candidate_running","candidate_source_sha","core_native_pos_intent_configured",
+          "core_native_pow_intent_configured",
           "data_rewind_performed","datasets_preserved","failure_policy",
           "final_container_identity_stable","final_container_sha256","final_envelope_sha256",
           "invocation_sha256","live_dataset_identity_sha256","marker_sha256","node",
-          "normal_unlock_completed","old_core_autostarted",
+          "locked_pos_zero_work_observed","locked_pow_zero_work_observed",
+          "normal_unlock_completed","normal_unlock_only_resume_observed","old_core_autostarted",
           "only_allowed_wallet_delta_classes_added","p2p_ready","package_sha256sums_sha256",
           "phase","phase_a_result_sha256","phase_b_progress_sha256",
           "phase_b_script_sha256","phase_b_tooling_identity_sha256","pos_active",
-          "pos_explicitly_enabled","pow_policy_restored","pre_result_manifest_sha256",
+          "pre_result_manifest_sha256","repair_enable_rpcs_used",
           "promoted_no_rewind_marker_verified","quantum_keys_unchanged",
-          "recovery_counters_unchanged","recovery_fees_unchanged","recovery_policy_unchanged",
-          "resolution_txids_unchanged","result","schema","snapshots_absent_before_launch",
+          "no_new_fee_bearing_recovery_wallet_transaction","result","schema",
+          "snapshots_absent_before_launch",
           "storage_absence_recheck_sha256","tooling_commit","typed_contract_sha256",
           "typed_gate_safe","verifier_sha256","wallet_chain_synchronized_before_unlock",
           "wallet_delta_fully_classified","wallet_delta_raw_sha256","wallet_delta_sha256",
-          "payout_unchanged"] | sort) and
-        (.schema | integer and . == 2) and .phase == "B" and
+          "configured_payout_transition_valid"] | sort) and
+        (.schema | integer and . == 4) and .phase == "B" and
         (.node | integer and . == 27) and
         .result == "passed" and .candidate_source_sha == $source and
         .phase_a_result_sha256 == $result_sha and
@@ -2431,12 +3852,16 @@ hotfix_phase_b_result_file_is_valid()
         .promoted_no_rewind_marker_verified == true and
         .snapshots_absent_before_launch == true and .datasets_preserved == true and
         .candidate_running == true and .wallet_chain_synchronized_before_unlock == true and
-        .normal_unlock_completed == true and .pos_explicitly_enabled == true and
-        .pos_active == true and .pow_policy_restored == true and
+        .normal_unlock_completed == true and .core_native_pos_intent_configured == true and
+        .core_native_pow_intent_configured == true and
+        .locked_pos_zero_work_observed == true and .locked_pow_zero_work_observed == true and
+        .normal_unlock_only_resume_observed == true and .repair_enable_rpcs_used == false and
+        .pos_active == true and
         .p2p_ready == true and .typed_gate_safe == true and
-        .payout_unchanged == true and .quantum_keys_unchanged == true and
-        .recovery_fees_unchanged == true and .resolution_txids_unchanged == true and
-        .recovery_counters_unchanged == true and .recovery_policy_unchanged == true and
+        .configured_payout_transition_valid == true and .quantum_keys_unchanged == true and
+        .automatic_recovery_unauthorized_continuously == true and
+        .candidate_resolution_membership_baseline_bound == true and
+        .no_new_fee_bearing_recovery_wallet_transaction == true and
         .wallet_delta_fully_classified == true and
         .only_allowed_wallet_delta_classes_added == true and
         .baseline_health_gate_passed == true and .final_container_identity_stable == true and
@@ -2455,11 +3880,9 @@ hotfix_phase_b_result_file_is_valid()
         (.phase_b_tooling_identity_sha256 | hex64) and
         (.package_sha256sums_sha256 | hex64) and (.phase_b_script_sha256 | hex64) and
         (.verifier_sha256 | hex64) and (.typed_contract_sha256 | hex64) and
-        (.baseline_recovery_policy_sha256 | hex64) and
-        (.baseline_recovery_metrics_sha256 | hex64) and
-        (.baseline_pending_manual_resolutions | integer and . >= 0) and
-        (.baseline_pending_automatic_resolutions | integer and . >= 0) and
-        (.baseline_automatic_fee_exposure_in_window | amount) and
-        (.baseline_confirmed_resolution_fees | amount)
+        (.candidate_locked_sync_sha256 | hex64) and
+        (.candidate_locked_resolution_txids_sha256 | hex64) and
+        (.candidate_final_recovery_sha256 | hex64) and
+        (.candidate_final_resolution_txids_sha256 | hex64)
     ' "$file" >/dev/null
 }

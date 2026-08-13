@@ -49,6 +49,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tarfile
 import unittest
@@ -71,8 +72,14 @@ candidate_tests = load_module("candidate_tests", repo / "ci/release/test_v30_1_5
 policy_path = repo / "contrib/ops/v30.1.5-candidate-package/policy.json"
 source = metadata.EXPECTED_SOURCE_COMMIT
 tree = metadata.EXPECTED_SOURCE_TREE
-tooling = "bad55a3a321d33ac5294cfcbc230b9ae7e5b1594"
-tooling_tree = "27b3d3c0bfd966433595239f8dbd36a0a143ef55"
+tooling = subprocess.run(
+    ["git", "-C", str(repo), "rev-parse", "HEAD"],
+    check=True, capture_output=True, text=True,
+).stdout.strip()
+tooling_tree = subprocess.run(
+    ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+    check=True, capture_output=True, text=True,
+).stdout.strip()
 core_run = 987654
 packaging_run = 123456
 attempt = 2
@@ -91,6 +98,13 @@ def make_policy(directory, ready=False):
             "dispatch_enabled": True,
             "temporary_source_pin": False,
             "core_ci_run_id": core_run,
+            "core_ci_run_attempt": 1,
+            "thread_sanitizer_artifact": {
+                "id": 765432,
+                "name": f"sanitizer-reports-thread-sanitizer-{source}-attempt-1",
+                "zip_sha256": "a" * 64,
+                "reports_sha256": "b" * 64,
+            },
         }
     output = directory / ("ready-policy.json" if ready else "blocked-policy.json")
     write_json(output, value)
@@ -148,7 +162,7 @@ def make_request(case_root, ready=False, live=False):
     write_json(api_path, api)
     nonce = "9" * 64 if live else None
     request = {
-        "schema": 1,
+        "schema": 2,
         "identity": {
             "repository": "Blackcoin-Dev/Blackcoin",
             "source_commit": source,
@@ -177,9 +191,11 @@ def make_request(case_root, ready=False, live=False):
             "dispatch_enabled": live,
             "exclusive_tag_writer": live,
             "nonce": nonce,
-            "confirmation": f"PUBLISH_V30_1_5_CANDIDATE:{source}:{nonce}" if live else None,
+            "confirmation": None,
         },
     }
+    if live:
+        request["execution"]["confirmation"] = publication.expected_live_confirmation(request, nonce)
     request_path = case_root / "request.json"
     write_json(request_path, request)
     return request_path, bundle, names, selected_policy
@@ -259,7 +275,7 @@ def arm_blocked_request(request):
         "dispatch_enabled": True,
         "exclusive_tag_writer": True,
         "nonce": nonce,
-        "confirmation": f"PUBLISH_V30_1_5_CANDIDATE:{source}:{nonce}",
+        "confirmation": publication.expected_live_confirmation(request, nonce),
     }
 
 expect_request_failure("blocked-live", arm_blocked_request)
@@ -355,6 +371,43 @@ ready_value = publication.prepare_artifact(
     canonical_bundle_check=lambda bundle: metadata.verify(ready_policy, bundle),
 )
 assert ready_value["publication_authorized"] is True
+assert ready_value["publication_intent_sha256"] == publication.publication_intent_sha256(
+    json.loads(ready_request.read_text(encoding="utf-8"))
+)
+
+live_request_value = json.loads(ready_request.read_text(encoding="utf-8"))
+original_confirmation = live_request_value["execution"]["confirmation"]
+
+def expect_confirmation_replay_failure(label, mutate):
+    value = json.loads(json.dumps(live_request_value))
+    mutate(value)
+    assert value["execution"]["confirmation"] == original_confirmation
+    try:
+        publication.validate_request_value(value)
+    except publication.VerificationError:
+        return
+    raise AssertionError(f"live confirmation replay passed after {label}")
+
+expect_confirmation_replay_failure(
+    "artifact ID change", lambda value: value["artifact"].__setitem__("id", value["artifact"]["id"] + 1)
+)
+
+def change_packaging_run(value):
+    value["artifact"]["packaging_run_id"] += 1
+    value["registry"]["tag"] = publication.expected_registry_tag(
+        value["identity"]["source_commit"],
+        value["artifact"]["packaging_run_id"],
+        value["artifact"]["packaging_run_attempt"],
+    )
+
+expect_confirmation_replay_failure("packaging run and registry tag change", change_packaging_run)
+expect_confirmation_replay_failure(
+    "artifact ZIP digest change",
+    lambda value: value["artifact"].__setitem__("github_zip_sha256", "f" * 64),
+)
+expect_confirmation_replay_failure(
+    "source tree change", lambda value: value["identity"].__setitem__("source_tree", "f" * 40)
+)
 source_manifest = ready_prepared / ready_value["oci"]["source_manifest_path"]
 source_config = ready_prepared / ready_value["oci"]["source_config_path"]
 manifest_digest = "sha256:" + sha(source_manifest)
@@ -452,6 +505,18 @@ def wrong_config_size(paths):
         )
 
 expect_registry_failure("config-size", wrong_config_size)
+
+def substitute_manifest(paths):
+    value = json.loads(paths["tag_body"].read_text(encoding="utf-8"))
+    value["layers"][0]["size"] += 1
+    for body_key, headers_key in (("tag_body", "tag_headers"), ("digest_body", "digest_headers")):
+        write_json(paths[body_key], value)
+        changed_digest = "sha256:" + sha(paths[body_key])
+        paths[headers_key].write_text(
+            headers.replace(manifest_digest, changed_digest), encoding="ascii"
+        )
+
+expect_registry_failure("substituted-manifest", substitute_manifest)
 
 print("PASS publication-python-offline-and-hostile-fixtures")
 PY

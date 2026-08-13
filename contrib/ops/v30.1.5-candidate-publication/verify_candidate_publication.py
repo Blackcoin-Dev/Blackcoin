@@ -172,9 +172,40 @@ def expected_registry_tag(source, run_id, attempt):
     return f"30.1.5-candidate-{source[:12]}-gha{run_id}-a{attempt}-pub1"
 
 
+def publication_intent_value(value):
+    """Return the path-independent identity that an operator authorizes."""
+    identity = value["identity"]
+    artifact = value["artifact"]
+    return {
+        "schema": value["schema"],
+        "identity": identity,
+        "artifact": {
+            "id": artifact["id"],
+            "name": artifact["name"],
+            "packaging_run_id": artifact["packaging_run_id"],
+            "packaging_run_attempt": artifact["packaging_run_attempt"],
+            "api_metadata_sha256": artifact["api_metadata_sha256"],
+            "github_zip_sha256": artifact["github_zip_sha256"],
+            "bundle_sha256sums_sha256": artifact["bundle_sha256sums_sha256"],
+        },
+        "registry": value["registry"],
+    }
+
+
+def publication_intent_sha256(value):
+    return sha256_bytes(canonical_json_bytes(publication_intent_value(value)))
+
+
+def expected_live_confirmation(value, nonce):
+    return (
+        f"PUBLISH_V30_1_5_CANDIDATE:{value['identity']['source_commit']}:"
+        f"{publication_intent_sha256(value)}:{nonce}"
+    )
+
+
 def validate_request_value(value):
     exact_keys(value, {"schema", "identity", "artifact", "registry", "execution"}, "request")
-    require(value["schema"] == 1, "request schema is not supported")
+    require(value["schema"] == 2, "request schema is not supported")
     identity = value["identity"]
     exact_keys(
         identity,
@@ -254,9 +285,7 @@ def validate_request_value(value):
         require(execution["exclusive_tag_writer"] is True, "exclusive tag-writer authority is absent")
         nonce = execution["nonce"]
         require(NONCE_RE.fullmatch(nonce or "") is not None, "live execution nonce is not 32-byte hex")
-        expected_confirmation = (
-            f"PUBLISH_V30_1_5_CANDIDATE:{identity['source_commit']}:{nonce}"
-        )
+        expected_confirmation = expected_live_confirmation(value, nonce)
         require(execution["confirmation"] == expected_confirmation, "live confirmation is not exact")
     else:
         require(execution == {
@@ -726,16 +755,41 @@ def validate_manifest_and_oci(bundle, names, request, checksum_entries):
         "dispatch_enabled": False,
         "temporary_source_pin": True,
         "core_ci_run_id": None,
+        "core_ci_run_attempt": None,
+        "thread_sanitizer_artifact": None,
     }
-    ready = {
-        "state": "authorized_exact_signed_source_and_green_ci",
-        "dispatch_enabled": True,
-        "temporary_source_pin": False,
-        "core_ci_run_id": identity["core_ci_run_id"],
-    }
-    require(authorization in (blocked, ready), "candidate authorization tuple is inconsistent")
+    authorization_ready = authorization.get("state") == "authorized_exact_signed_source_and_green_ci"
+    if authorization_ready:
+        exact_keys(
+            authorization,
+            {
+                "state", "dispatch_enabled", "temporary_source_pin", "core_ci_run_id",
+                "core_ci_run_attempt", "thread_sanitizer_artifact",
+            },
+            "candidate authorization",
+        )
+        require(authorization["dispatch_enabled"] is True
+                and authorization["temporary_source_pin"] is False
+                and authorization["core_ci_run_id"] == identity["core_ci_run_id"],
+                "ready candidate authorization tuple is inconsistent")
+        core_attempt = authorization["core_ci_run_attempt"]
+        require(type(core_attempt) is int and core_attempt > 0,
+                "authorized Core CI run attempt is malformed")
+        sanitizer = authorization["thread_sanitizer_artifact"]
+        exact_keys(sanitizer, {"id", "name", "zip_sha256", "reports_sha256"},
+                   "authorized ThreadSanitizer artifact")
+        require(type(sanitizer["id"]) is int and sanitizer["id"] > 0,
+                "authorized ThreadSanitizer artifact ID is malformed")
+        require(sanitizer["name"] == (
+            f"sanitizer-reports-thread-sanitizer-{source}-attempt-{core_attempt}"
+        ), "authorized ThreadSanitizer artifact name changed")
+        require(HEX64_RE.fullmatch(sanitizer["zip_sha256"] or "") is not None
+                and HEX64_RE.fullmatch(sanitizer["reports_sha256"] or "") is not None,
+                "authorized ThreadSanitizer artifact digest is malformed")
+    else:
+        require(authorization == blocked, "candidate authorization tuple is inconsistent")
     if request["execution"]["execute"]:
-        require(authorization == ready, "live publication cannot use a blocked candidate")
+        require(authorization_ready, "live publication cannot use a blocked candidate")
     require(manifest["release"] == {
         "tag": None, "published": False, "registry_pushed": False, "canary_only": True
     }, "candidate pre-publication state changed")
@@ -802,7 +856,7 @@ def validate_manifest_and_oci(bundle, names, request, checksum_entries):
                 f"manifest artifact digest differs from bundle seal: {artifact_name}")
     return {
         "manifest": manifest,
-        "authorization_ready": authorization == ready,
+        "authorization_ready": authorization_ready,
         "binary_hashes": binary_hashes,
         "oci": oci,
         "manifest_sha256": sha256_file(bundle / names["manifest"]),
@@ -886,6 +940,7 @@ def prepare_artifact(
             "schema": 1,
             "status": "verified",
             "request_sha256": request_sha,
+            "publication_intent_sha256": publication_intent_sha256(request),
             "identity": request["identity"],
             "github_artifact": {
                 "id": artifact["id"],
@@ -1053,6 +1108,15 @@ def verify_registry_evidence(
             and verified.get("candidate_authorization_ready") is True,
             "verified artifact receipt does not authorize publication")
     expected_config = verified["oci"]["source_config_digest"]
+    source_manifest_path = resolve_evidence_path(
+        root, verified["oci"]["source_manifest_path"], "source OCI manifest"
+    )
+    source_manifest = read_regular_bytes(
+        source_manifest_path, "source OCI manifest", MAX_JSON_BYTES
+    )
+    expected_manifest = verified["oci"]["source_manifest_digest"]
+    require(expected_manifest == f"sha256:{sha256_bytes(source_manifest)}",
+            "source OCI manifest digest changed")
     tag_digest, tag_value, tag_bytes = verify_manifest_response(
         Path(tag_manifest), Path(tag_headers), "tag manifest response", expected_config
     )
@@ -1061,6 +1125,8 @@ def verify_registry_evidence(
     )
     require(tag_digest == digest_value and tag_bytes == digest_bytes and tag_value == digest_json,
             "tag manifest and digest refetch differ")
+    require(tag_digest == expected_manifest and tag_bytes == source_manifest,
+            "registry manifest differs from the sealed source OCI manifest")
     require(len(tag_value["layers"]) == verified["oci"]["layer_count"],
             "registry manifest layer count differs from the source OCI config")
     config_path = Path(config_body)

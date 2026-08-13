@@ -20,7 +20,6 @@ readonly MAX_REGISTRY_RESPONSE_BYTES=33554432
 LOCAL_REF=
 TARGET_REF=
 CREATED_LOCAL=0
-CREATED_TARGET=0
 
 fail()
 {
@@ -33,9 +32,6 @@ cleanup()
     local status=$?
     trap - EXIT INT TERM
     if ((status != 0)); then
-        if ((CREATED_TARGET == 1)) && [[ -n "$TARGET_REF" ]]; then
-            docker image rm "$TARGET_REF" >/dev/null 2>&1 || true
-        fi
         if ((CREATED_LOCAL == 1)) && [[ -n "$LOCAL_REF" ]]; then
             docker image rm "$LOCAL_REF" >/dev/null 2>&1 || true
         fi
@@ -122,14 +118,6 @@ docker run --rm --pull=never --network none --read-only --user blackcoin --cap-d
     > "$REGISTRY_EVIDENCE/embedded-binary-sha256.txt" ||
     fail 'imported six-executable verification failed'
 
-if docker image inspect "$TARGET_REF" >/dev/null 2>&1; then
-    [[ "$(docker image inspect -f '{{.Id}}' "$TARGET_REF")" == "$CONFIG" ]] ||
-        fail 'local target tag already names another config'
-else
-    docker tag "$LOCAL_REF" "$TARGET_REF" || fail 'could not create exact local target tag'
-    CREATED_TARGET=1
-fi
-
 registry_token()
 {
     curl --proto '=https' --tlsv1.2 -fsS --get \
@@ -170,7 +158,8 @@ else
         rc=$?
         [[ "$rc" -eq 44 ]] || fail 'registry second tag preflight failed'
         rm -f -- "$TAG_BODY" "$TAG_HEADERS"
-        docker push "$TARGET_REF" || fail 'candidate registry push failed'
+        skopeo copy --preserve-digests "oci-archive:$OCI_ARCHIVE" "docker://$TARGET_REF" >/dev/null ||
+            fail 'digest-preserving candidate registry publication failed'
         PUBLISHED_NOW=true
         TOKEN=$(registry_token) || fail 'could not refresh token after publication'
         fetch_manifest "$TOKEN" "$TAG" "$TAG_BODY" "$TAG_HEADERS" ||

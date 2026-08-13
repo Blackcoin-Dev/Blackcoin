@@ -13,7 +13,11 @@ does not invoke Docker, Skopeo, curl, a registry, Compose, or a node. There is
 no workflow-dispatch file in this package. A live request must atomically set
 `execute`, `dispatch_enabled`, and `exclusive_tag_writer` to `true`, provide a
 fresh 32-byte lowercase-hex nonce, and use the exact confirmation
-`PUBLISH_V30_1_5_CANDIDATE:<H>:<nonce>`. Partial arming is rejected.
+`PUBLISH_V30_1_5_CANDIDATE:<H>:<intent-sha256>:<nonce>`. The intent digest is
+the canonical SHA-256 of schema 2 plus the complete source/tree/Core-run,
+packaging-tooling/run/attempt, artifact ID/name/digest, and registry
+repository/tag authority tuple. Changing any authorized identity requires a
+new confirmation. Partial arming and schema-1 confirmations are rejected.
 
 ## Distinct artifact digests
 
@@ -56,13 +60,16 @@ requires the imported config ID, and hashes all six `/usr/local/bin`
 executables in a no-network, read-only container. It preflights the unique
 H/run/attempt registry tag under explicit exclusive-writer authority. An
 already-existing tag is accepted only if the later registry proof shows the
-exact expected config. A missing tag is pushed through the operator's existing
-Docker credential context.
+exact sealed source manifest and config. A missing tag is copied directly from
+the sealed OCI archive with digest preservation through the operator's
+existing registry credential context.
 
-The tag GET must return a `Docker-Content-Digest` equal to the SHA-256 of that
-same response body. The adapter refetches by that digest and requires identical
-bytes, then fetches the referenced config blob and requires byte identity with
-the sealed OCI config. Only after those checks does it emit
+The tag GET must return a `Docker-Content-Digest` equal to both the SHA-256 of
+that same response body and the sealed source OCI manifest digest. The response
+body must be byte-identical to the sealed source manifest. The adapter
+refetches by that digest and again requires identical bytes, then fetches the
+referenced config blob and requires byte identity with the sealed OCI config.
+Only after those checks does it emit
 `qqblackcoin/blackcoin-v4-gui@sha256:<manifest>`. The mutable tag is explicitly
 recorded as non-authoritative.
 

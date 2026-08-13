@@ -182,6 +182,23 @@ enum class ShadowProofPayloadMode : uint8_t {
     MALFORMED,
 };
 
+/** Wallet-safe structural decode of the one QQSPROOF carrier in a
+ * transaction. This reports payload facts only; it does not imply that the
+ * proof is valid at any chain tip or that the transaction is admissible to
+ * the mempool. */
+struct ShadowPowClaimDescriptor {
+    uint8_t version{0};
+    ShadowProofPayloadMode mode{ShadowProofPayloadMode::MALFORMED};
+    bool origin_bound{false};
+    uint32_t origin_height{0};
+    uint256 origin_previous_block_hash;
+    bool input_bound{false};
+    COutPoint claim_outpoint;
+    CScript target;
+    CScript payout_script;
+    uint32_t proof_output_index{0};
+};
+
 /** Explorer-facing classification of an on-chain QQSPROOF note. */
 struct ShadowProofObservation {
     uint256 source_txid;
@@ -615,6 +632,10 @@ std::optional<COutPoint> GetShadowPowProofBoundOutpoint(const CTransaction& tx);
 /** Return the carrier-independent identity of the transaction's one exact
  * QQSPROOF payload. Structural multi-proof transactions return null. */
 std::optional<uint256> GetShadowPowProofLogicalId(const CTransaction& tx);
+/** Decode exactly one structurally valid QQSPROOF payload from a transaction.
+ * Zero or multiple carriers, or malformed payload bytes, return null. */
+std::optional<ShadowPowClaimDescriptor>
+GetShadowPowClaimDescriptor(const CTransaction& tx);
 
 /** Test-only, process-local fault injection for one or more Argon2id calls.
  *  No configuration, RPC, or network path can arm this hook. */

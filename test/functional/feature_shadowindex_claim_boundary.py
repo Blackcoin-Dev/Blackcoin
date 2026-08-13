@@ -393,10 +393,14 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
         node.createwallet(wallet_name="claim_boundary", load_on_startup=True)
         wallet = node.get_wallet_rpc("claim_boundary")
         wallet.staking(False)
+        node.createwallet(wallet_name="claim_boundary_current", load_on_startup=True)
+        current_wallet = node.get_wallet_rpc("claim_boundary_current")
+        current_wallet.staking(False)
 
         staking_address = wallet.getnewaddress("stake", "legacy")
         historical_claim_address = wallet.getnewaddress("historical", "legacy")
         canonical_claim_address = wallet.getnewaddress("canonical", "legacy")
+        current_claim_address = current_wallet.getnewaddress("current", "legacy")
 
         self.generatetoaddress(node, 1, staking_address)
         self.generatetoaddress(node, COINBASE_MATURITY + 2, staking_address)
@@ -452,6 +456,7 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
         )
 
         self.log.info("Crossing the QQP3 boundary with both valid QQP2 and QQP3 carriers")
+        self.generatetoaddress(node, 1, current_claim_address)
         blocks_to_activation_parent = CLAIM_ACTIVATION_HEIGHT - 1 - node.getblockcount()
         assert blocks_to_activation_parent >= COINBASE_MATURITY
         self.generatetoaddress(
@@ -459,6 +464,9 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
         )
         self._sync_mocktime_to_tip()
         self._wait_index_synced()
+        assert current_wallet.listunspent(
+            1, 9_999_999, [current_claim_address]
+        )
         assert_equal(node.getblockcount(), CLAIM_ACTIVATION_HEIGHT - 1)
         assert_equal(
             node.getgoldrushstate()["competing_claim_rule_active_next_block"],
@@ -506,9 +514,9 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
         )
         assert_equal(node.getgoldrushstate()["qqp4_active_next_block"], False)
 
-        current_payout_address = wallet.getnewquantumaddress()["address"]
-        current_claim = wallet.sendshadowpowclaim(
-            canonical_claim_address, current_payout_address, 500_000
+        current_payout_address = current_wallet.getnewquantumaddress()["address"]
+        current_claim = current_wallet.sendshadowpowclaim(
+            current_claim_address, current_payout_address, 500_000
         )
         assert_equal(
             set(node.getrawmempool()),

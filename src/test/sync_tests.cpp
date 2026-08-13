@@ -7,11 +7,13 @@
 
 #include <sync.h>
 #include <test/util/setup_common.h>
+#include <util/threadnames.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 template <typename MutexType>
@@ -116,6 +118,25 @@ BOOST_AUTO_TEST_CASE(double_lock_mutex)
 BOOST_AUTO_TEST_CASE(double_lock_recursive_mutex)
 {
     TestDoubleLock<RecursiveMutex>(/*should_throw=*/false);
+}
+
+BOOST_AUTO_TEST_CASE(lock_order_history_owns_short_lived_thread_name)
+{
+    RecursiveMutex first;
+    RecursiveMutex second;
+    std::thread worker([&] {
+        util::ThreadRename("short-lived-lock-owner");
+        LOCK2(first, second);
+    });
+    worker.join();
+
+    const bool previous_abort = g_debug_lockorder_abort;
+    g_debug_lockorder_abort = false;
+    BOOST_CHECK_EXCEPTION(
+        ([&] { LOCK2(second, first); }()), std::logic_error,
+        HasReason("potential deadlock detected"));
+    BOOST_CHECK(LockStackEmpty());
+    g_debug_lockorder_abort = previous_abort;
 }
 #endif /* DEBUG_LOCKORDER */
 

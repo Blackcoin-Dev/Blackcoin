@@ -55,6 +55,14 @@ PINNED_IDENTITY_EXCEPTIONS = {
         (EXPECTED_NAME, EXPECTED_EMAIL),
         ("GitHub", "noreply@github.com"),
     ),
+    # Exact GitHub-verified merge of PR #45. This merge introduced the
+    # preceding pinned identity exceptions and is itself on the production
+    # release ancestry. Pin the object; do not trust GitHub merge identities
+    # as a class.
+    "19baffef25af36e177db2975780e0641b59753aa": (
+        (EXPECTED_NAME, EXPECTED_EMAIL),
+        ("GitHub", "noreply@github.com"),
+    ),
 }
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ATTRIBUTION_TRAILER_RE = re.compile(r"^(?:co-authored-by|co-developed-by):", re.IGNORECASE)

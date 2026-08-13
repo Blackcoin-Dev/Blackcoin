@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Run pinned historical releases and the v30.1.4 candidate together.
+"""Run pinned historical releases and the v30.1.5 candidate together.
 
 The exact v26.2.0 reference and candidate remain the normative pair for
 adversarial legacy-valid blocks and two-way reorganizations. The exact pinned
@@ -13,9 +13,10 @@ diagnostic build because v26/v28 already diverge on known consensus paths.
 """
 
 from decimal import Decimal
-import hashlib
-import json
+import importlib.util
+import os
 from pathlib import Path
+import tempfile
 
 from test_framework.address import address_to_scriptpubkey, key_to_p2pkh
 from test_framework.blocktools import (
@@ -58,12 +59,11 @@ from test_framework.wallet_util import bytes_to_wif
 
 
 VERSIONS = [260200, 280400, 300100, None]
-EXPECTED_RPC_VERSIONS = [260200, 280400, 300100, 300104]
+EXPECTED_RPC_VERSIONS = [260200, 280400, 300100, 300105]
+REQUIRED_HISTORICAL_VERSIONS = ["v26.2.0", "v28.4.0", "v30.1.0"]
 REFERENCE = 0
 V30_1_0 = 2
 CANDIDATE = 3
-V30_1_0_COMMIT = "f647dc75c9479c03e81414f145a8d233b60959c7"
-V30_1_0_REF_OBJECT = "1d16eba95983fb2bf41246de6250d7762a450c50"
 GOLD_RUSH_ARGS = [
     "-shadowwhitelistheight=1",
     "-shadowgoldrushstartheight=2",
@@ -172,47 +172,41 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
     def v30_bridge_nodes(self):
         return [self.nodes[V30_1_0], self.nodes[CANDIDATE]]
 
-    @staticmethod
-    def file_sha256(path):
-        digest = hashlib.sha256()
-        with path.open("rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-
     def assert_v30_1_0_provenance(self):
-        """Fail closed if the v30.1.0 fixture is not the pinned release build."""
+        """Validate exactly the historical versions exercised by this test."""
         releases = Path(self.options.previous_releases_path)
-        provenance_path = releases / "provenance.json"
-        if not provenance_path.is_file():
+        if releases.is_symlink():
+            raise AssertionError("mixed-version fixture root must not be a symbolic link")
+        expected_host = os.getenv("PREVIOUS_RELEASES_HOST")
+        if not expected_host:
             raise AssertionError(
-                "mixed-version provenance.json is missing; build fixtures with "
-                "ci/mixed-version/build_previous_releases.py"
+                "PREVIOUS_RELEASES_HOST is required for independent fixture validation"
             )
-        try:
-            provenance = json.loads(provenance_path.read_text(encoding="utf8"))
-        except (OSError, ValueError) as error:
-            raise AssertionError(f"cannot read mixed-version provenance: {error}") from error
-        if provenance.get("schema") != 1:
-            raise AssertionError("unsupported mixed-version provenance schema")
-        sources = [
-            source for source in provenance.get("sources", [])
-            if source.get("version") == "v30.1.0"
-        ]
-        if len(sources) != 1:
-            raise AssertionError("mixed-version provenance must contain exactly one v30.1.0 source")
-        source = sources[0]
-        assert_equal(source.get("commit"), V30_1_0_COMMIT)
-        assert_equal(source.get("ref_object"), V30_1_0_REF_OBJECT)
-        assert_equal(source.get("tag_kind"), "annotated")
-        assert_equal(source.get("install_dir"), "v30.1")
-        for binary in ("blackcoind", "blackcoin-cli"):
-            binary_path = releases / "v30.1" / "bin" / binary
-            if not binary_path.is_file():
-                raise AssertionError(f"pinned v30.1.0 fixture is missing {binary_path}")
-            assert_equal(
-                self.file_sha256(binary_path),
-                source.get("binaries", {}).get(binary),
+        repository_root = Path(__file__).resolve().parents[2]
+        builder_path = repository_root / "ci/mixed-version/build_previous_releases.py"
+        manifest_path = builder_path.with_name("sources.json")
+        spec = importlib.util.spec_from_file_location(
+            "blackcoin_mixed_version_builder", builder_path
+        )
+        if spec is None or spec.loader is None:
+            raise AssertionError("cannot load mixed-version provenance validator")
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        manifest = builder.load_manifest(manifest_path)
+        with tempfile.TemporaryDirectory(
+            prefix="mixed-version-provenance-"
+        ) as scratch:
+            valid = builder.cached_provenance_is_valid(
+                output_dir=releases,
+                manifest_digest=builder.file_sha256(manifest_path),
+                sources=manifest["sources"],
+                required_versions=REQUIRED_HISTORICAL_VERSIONS,
+                host=expected_host,
+                scratch_root=Path(scratch),
+            )
+        if not valid:
+            raise AssertionError(
+                "mixed-version binaries do not match the required checked-in provenance contract"
             )
 
     def assert_normative_tip(self):

@@ -14,16 +14,42 @@ their best known block header time is more than -maxtipage in the past.
 import time
 
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 DEFAULT_MAX_TIP_AGE = 24 * 60 * 60
+RECOVERY_IBD_ERROR = (
+    "Gold Rush PoW claim recovery is unavailable while the node is "
+    "reindexing, importing blocks, or in initial block download"
+)
+RECOVERY_WALLET = "ibd_recovery"
 
 
 class MaxTipAgeTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 2
+
+    def assert_recovery_fails_closed_during_ibd(self, node):
+        wallet = node.get_wallet_rpc(RECOVERY_WALLET)
+        node.syncwithvalidationinterfacequeue()
+
+        transactions_before = wallet.listtransactions("*", 1000, 0, True)
+        recovery_before = wallet.getpowclaimrecoveryinfo(True)
+        assert_equal(transactions_before, [])
+        assert_equal(recovery_before["chain_ready"], False)
+
+        assert_raises_rpc_error(
+            -10,
+            RECOVERY_IBD_ERROR,
+            wallet.resolveallshadowpowclaims,
+        )
+
+        assert_equal(wallet.listtransactions("*", 1000, 0, True), transactions_before)
+        assert_equal(wallet.getpowclaimrecoveryinfo(True), recovery_before)
 
     def test_maxtipage(self, maxtipage, set_parameter=True, test_deltas=True):
         node_miner = self.nodes[0]
@@ -40,13 +66,24 @@ class MaxTipAgeTest(BitcoinTestFramework):
                 node_miner.setmocktime(cur_time - maxtipage - delta)
                 self.generate(node_miner, 1)
                 assert_equal(node_ibd.getblockchaininfo()['initialblockdownload'], True)
+                self.assert_recovery_fails_closed_during_ibd(node_ibd)
 
         # tip within maximum age -> leave IBD
         node_miner.setmocktime(max(cur_time - maxtipage, 0))
         self.generate(node_miner, 1)
         assert_equal(node_ibd.getblockchaininfo()['initialblockdownload'], False)
+        node_ibd.syncwithvalidationinterfacequeue()
+        recovery_wallet = node_ibd.get_wallet_rpc(RECOVERY_WALLET)
+        assert_equal(recovery_wallet.getpowclaimrecoveryinfo()["chain_ready"], True)
+        assert_equal(recovery_wallet.listtransactions("*", 1000, 0, True), [])
 
     def run_test(self):
+        self.nodes[1].createwallet(
+            wallet_name=RECOVERY_WALLET,
+            blank=True,
+            load_on_startup=True,
+        )
+
         self.log.info("Test IBD with maximum tip age of 24 hours (default).")
         self.test_maxtipage(DEFAULT_MAX_TIP_AGE, set_parameter=False)
 

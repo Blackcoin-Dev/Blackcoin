@@ -4,6 +4,11 @@ Blackcoin Core v30.1.4 is a wallet-safety and observability maintenance
 release. It does not change consensus, rewards, Gold Rush eligibility, quantum
 lifecycle rules, or wallet ownership.
 
+> **Post-release addendum:** the same-anchor continuation, typed mining gate,
+> and locked-wallet PoW worker resumption described in the marked subsection
+> below belong to the v30.1.5 candidate. They are not part of the immutable
+> `v30.1.4` tag.
+
 ## Development-fund retirement and quantum replacement
 
 The legacy development-fund address and coinstake payment path are removed.
@@ -20,28 +25,62 @@ startup, RPC, GUI, lifecycle, and fail-closed details are in
 
 ## Gold Rush PoW claim lifecycle
 
-New wallet-authored QQP3/QQP4 claim carriers are removed from the local
-mempool after one hour. Their inputs remain reserved while the proof can still
-be valid on the active branch. Once the authenticated origin-plus-64 window has
-expired, Core can retire the exact local reservation without constructing,
-signing, or broadcasting a second transaction and without paying a recovery
-fee. A reorganization that removes the retirement observation reopens the
-reservation.
+### v30.1.5 candidate
 
-Fee-paying conflict recovery remains available only as an explicit,
-default-off fallback for components that cannot safely use zero-payment
-retirement. Preview, persistence, and broadcast authority remain separate and
-all execution paths revalidate the exact plan.
+The candidate handles exact wallet-authored QQP2/QQP3/QQP4 claim carriers as
+follows. Their confirmed fee anchor remains reserved until a member of the
+authenticated family confirms or that anchor is otherwise spent. The enabled
+built-in miner first relays exact still-eligible bytes. Once that exact relay is no longer
+available, the typed gate may author a current-tip, current-policy sibling that
+spends the same anchor and preserves the target and quantum payout. The
+conflicting siblings cannot both confirm, so this continuation consumes no
+second wallet coin and charges at most the one ordinary fee of the member that
+confirms.
 
-`getpowmininginfo.quarantined_claims` retains its legacy miner-gating meaning,
-so existing supervisors do not stall on history already resolved on the active
-chain. `raw_quarantined_claims` separately reports the complete retained audit
-and reorg history. A nonzero raw count alone neither pauses mining nor
-authorizes a recovery fee.
+Each newly authored carrier stores schema, family, root, and ordinal metadata;
+every non-root refresh also stores its direct parent. The same-anchor mining
+path fails closed on malformed, adopted, mixed, forked, or ambiguous history.
+Strict locally authored unbound QQP2 singletons and exact locally authored
+origin-bound QQP3/QQP4 carriers are not retired merely because an original
+policy window expires. Zero-payment retirement remains narrow and legacy-only.
+Separately, fee-paying conflict recovery remains an explicit, default-off path
+under the existing exact manual or bounded automatic consent gates, including
+for `unbound_proof_may_revalidate`; the built-in miner does not invoke that
+authority for authenticated same-anchor continuation.
+Preview, persistence, and broadcast authority remain separate and all
+execution paths revalidate the exact plan.
+Same-anchor siblings remain `QQSPROOF` claims, and the candidate does not
+change existing claim reward or reimbursement consensus rules.
+
+`getpowmininginfo.quarantined_claims` retains its immutable-v30.1.4
+compatibility meaning. Candidate-aware supervisors use the complete typed gate,
+so an authenticated family can relay or refresh with that count nonzero.
+`raw_quarantined_claims` separately reports retained audit and reorg history;
+neither legacy count authorizes a recovery fee.
+
+The candidate exposes the complete `mining_gate_*` snapshot in
+`getpowmininginfo`. Safe actions are `create_new_anchor`, `wait_for_live`,
+`wait_for_next_tip`, `relay_existing`, and `refresh_same_anchor`; `unsafe`
+fails closed. Without a worker override, `mining_gate_can_submit` is true only
+for create/refresh and false for wait-for-live, relay, and unsafe. A next-tip
+wait is an optional transient action override, so can-submit retains the fresh
+inventory value and may be true or false; true never bypasses the wait.
+Supervisors accept the action when present but never require observing it for
+liveness. They require coherent tips, no database ambiguity, and zero unsafe
+claims/components, but must not require positive instantaneous hashrate or
+zero unresolved/quarantined/family counts for a waiting or relay action, and
+must not compare those raw counts across the immutable release and candidate.
 
 Disabling the built-in PoW miner now cancels a proof that has been found but
 has not yet entered claim submission. The stop operation therefore cannot
 create a new fee-paying wallet transaction from that pending proof.
+
+Explicit `-powmining=1` now starts an encrypted wallet's configured worker in a
+waiting state during daemon/wallet startup or restart. The same worker resumes after a
+normal wallet unlock, using the configured thread and per-core CPU limits and
+the configured or previously stored payout key. A staking-only unlock never
+authorizes PoW claim signing, and direct interactive start requests remain
+strict while locked.
 
 ## PoS and PoW coexistence
 

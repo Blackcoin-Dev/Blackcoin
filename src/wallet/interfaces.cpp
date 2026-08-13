@@ -2391,7 +2391,12 @@ public:
     bool hasPrivateKeys() override { return m_wallet->HasPrivateKeys(); }
     bool isCrypted() override { return m_wallet->IsCrypted(); }
     bool lock() override { return m_wallet->Lock(); }
-    bool unlock(const SecureString& wallet_passphrase) override { return m_wallet->Unlock(wallet_passphrase); }
+    bool unlock(const SecureString& wallet_passphrase,
+                std::optional<bool> staking_only) override
+    {
+        return m_wallet->Unlock(wallet_passphrase, /*accept_no_keys=*/false,
+                                staking_only);
+    }
     bool isLocked() override { return m_wallet->IsLocked(); }
     bool tryGetEncryptionStatus(interfaces::WalletEncryptionStatus& status) override
     {
@@ -2880,7 +2885,7 @@ public:
     }
     void setWalletUnlockStakingOnly(bool unlock) override
     {
-        m_wallet->m_wallet_unlock_staking_only = unlock;
+        m_wallet->SetWalletUnlockStakingOnly(unlock);
     }
     void setEnabledStaking(bool enabled) override
     {

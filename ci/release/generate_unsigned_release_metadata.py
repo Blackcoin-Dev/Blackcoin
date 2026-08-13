@@ -13,7 +13,8 @@ import sys
 
 
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
-EXPECTED_ACKNOWLEDGEMENT = "V30.1.4"
+EXPECTED_VERSION = "30.1.5"
+EXPECTED_ACKNOWLEDGEMENT = f"V{EXPECTED_VERSION}"
 EXPECTED_SSH_SIGNING_FINGERPRINT = (
     "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70"
 )
@@ -69,6 +70,8 @@ def generate_metadata(
     _require(artifacts.is_dir(), "artifact directory does not exist")
     _require(VERSION_RE.fullmatch(version) is not None,
              "version must have major.minor.patch form")
+    _require(version == EXPECTED_VERSION,
+             f"version must match the authorized release: {EXPECTED_VERSION}")
     _require(FULL_SHA_RE.fullmatch(source_sha) is not None,
              "source-sha must be a full lowercase commit identifier")
     _require(tag == f"v{version}", "tag and version do not match")

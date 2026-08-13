@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Upgrade an exact v30.1.4 wallet containing one pre-QQP3 claim.
+"""Round-trip an exact v30.1.4 wallet containing one pre-QQP3 claim.
 
 The historical daemon authors an ordinary QQP2 claim below the QQP3
 activation height. The candidate then opens the unchanged datadir, advances
@@ -15,7 +15,15 @@ A persistent user lock on that reserved anchor must survive restart and defer
 the singleton family. Removing the lock must restore same-anchor refresh on
 the unchanged tip. The built-in worker must then grind and publish one
 current-policy sibling, and a final restart must reconstruct the same safe
-lineage without a recovery transaction or payout-key mutation.
+lineage without a recovery transaction or payout-key mutation.  The exact
+same datadir then returns to v30.1.4 and to the candidate again.  The older
+daemon must open and write the wallet without corrupting the candidate's
+lineage or quarantine metadata. The test framework's strict RPC-documentation
+check is expected to diagnose the future keys; the same old daemon with that
+diagnostic disabled must expose them unchanged, matching release behavior. Its
+legacy miner is expected to remain blocked by the quarantined root; only the
+candidate interprets the complete family as safe same-anchor continuation
+state.
 """
 
 from decimal import Decimal
@@ -27,7 +35,7 @@ import time
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 V30_1_4_VERSION = 300104
@@ -106,6 +114,8 @@ class GoldRushV3014QQP2UpgradeTest(BitcoinTestFramework):
             extra_args=self.extra_args,
             versions=[V30_1_4_VERSION],
         )
+        self.v3014_binary = self.nodes[0].binary
+        self.v3014_cli = self.nodes[0].cli.binary
         self.start_nodes()
         self.import_deterministic_coinbase_privkeys()
 
@@ -241,6 +251,22 @@ class GoldRushV3014QQP2UpgradeTest(BitcoinTestFramework):
         self.start_node(0, extra_args=candidate_args)
         node.setmocktime(self.mock_time)
 
+    def _switch_to_v3014(self, extra_args=None):
+        node = self.nodes[0]
+        self.stop_node(0)
+        node.binary = self.v3014_binary
+        node.args[0] = self.v3014_binary
+        node.cli.binary = self.v3014_cli
+        node.version = V30_1_4_VERSION
+        args = [*self.base_args, f"-mocktime={self.mock_time}"]
+        if extra_args:
+            args.extend(extra_args)
+        self.start_node(
+            0,
+            extra_args=args,
+        )
+        node.setmocktime(self.mock_time)
+
     def _restart_candidate(self, submission_delay=False):
         args = [*self.base_args, f"-mocktime={self.mock_time}"]
         if submission_delay:
@@ -346,6 +372,7 @@ class GoldRushV3014QQP2UpgradeTest(BitcoinTestFramework):
         self._assert_extra_inputs_unchanged(
             claimant, claim_address, untouched_inputs
         )
+
         historical_quantum_inventory = claimant.getquantumkeyinventory()
         historical_quantum_addresses = claimant.listquantumaddresses()
 
@@ -590,6 +617,186 @@ class GoldRushV3014QQP2UpgradeTest(BitcoinTestFramework):
         assert_equal(claimant.listquantumaddresses(), historical_quantum_addresses)
         self._assert_extra_inputs_unchanged(
             claimant, claim_address, untouched_inputs
+        )
+
+        self.log.info("Downgrading the candidate-written datadir to exact v30.1.4")
+        round_trip_tip = node.getbestblockhash()
+        round_trip_label = "v30.1.4 metadata round-trip witness"
+        candidate_root_record = claimant.gettransaction(root_txid)
+        candidate_sibling_record = claimant.gettransaction(sibling_txid)
+        candidate_metadata = {
+            "root_quarantine": candidate_root_record["qq_shadow_pow_quarantine"],
+            "sibling_authored": candidate_sibling_record["qq_shadow_pow_authored"],
+            "sibling_schema": candidate_sibling_record["qq_shadow_pow_lineage_schema"],
+            "sibling_family": candidate_sibling_record["qq_shadow_pow_lineage_family"],
+            "sibling_root": candidate_sibling_record["qq_shadow_pow_lineage_root"],
+            "sibling_parent": candidate_sibling_record["qq_shadow_pow_lineage_parent"],
+            "sibling_ordinal": candidate_sibling_record["qq_shadow_pow_lineage_ordinal"],
+        }
+        candidate_fingerprint = final_component["generation_fingerprint"]
+
+        self._switch_to_v3014(
+            [f"-qqpowpayoutaddress={payout_address}"]
+        )
+        node = self.nodes[0]
+        assert_equal(node.getnetworkinfo()["version"], V30_1_4_VERSION)
+        assert_equal(node.getbestblockhash(), round_trip_tip)
+        claimant = self._load_wallet()
+        claimant.staking(False)
+        self.wait_until(lambda: sibling_txid in node.getrawmempool(), timeout=30)
+        assert root_txid not in node.getrawmempool()
+        assert_equal(claimant.gettransaction(root_txid)["hex"], root_raw)
+        assert_equal(node.getrawtransaction(sibling_txid), sibling_raw)
+
+        # The functional framework forces runtime RPC documentation checking.
+        # v30.1.4 does not document future candidate map-value keys, so that
+        # diagnostic must catch the decorated result. It is not a wallet-load
+        # or database-corruption result, and release builds default it off.
+        old_root_record = claimant.gettransaction(root_txid)
+        assert_equal(
+            old_root_record["qq_shadow_pow_quarantine"],
+            candidate_metadata["root_quarantine"],
+        )
+        assert_raises_rpc_error(
+            -1,
+            "key returned that was not in doc",
+            claimant.gettransaction,
+            sibling_txid,
+        )
+        metadata_keys = {
+            "qq_shadow_pow_authored": "sibling_authored",
+            "qq_shadow_pow_lineage_schema": "sibling_schema",
+            "qq_shadow_pow_lineage_family": "sibling_family",
+            "qq_shadow_pow_lineage_root": "sibling_root",
+            "qq_shadow_pow_lineage_parent": "sibling_parent",
+            "qq_shadow_pow_lineage_ordinal": "sibling_ordinal",
+        }
+
+        self.log.info("Disabling only the old debug RPC schema check")
+        self.restart_node(
+            0,
+            extra_args=[
+                *self.base_args,
+                f"-mocktime={self.mock_time}",
+                f"-qqpowpayoutaddress={payout_address}",
+                "-rpcdoccheck=0",
+            ],
+        )
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        assert_equal(node.getnetworkinfo()["version"], V30_1_4_VERSION)
+        assert_equal(node.getbestblockhash(), round_trip_tip)
+        claimant = self._load_wallet()
+        claimant.staking(False)
+        self.wait_until(lambda: sibling_txid in node.getrawmempool(), timeout=30)
+        assert_equal(claimant.gettransaction(root_txid)["hex"], root_raw)
+        old_sibling_record = claimant.gettransaction(sibling_txid)
+        assert_equal(old_sibling_record["hex"], sibling_raw)
+        for record_key, expected_key in metadata_keys.items():
+            assert_equal(
+                old_sibling_record[record_key],
+                candidate_metadata[expected_key],
+            )
+
+        # Make a normal release-like historical-version address-book write, so
+        # this is stronger than a read-only open-and-close compatibility check.
+        claimant.setlabel(claim_address, round_trip_label)
+        assert_equal(
+            claimant.getaddressinfo(claim_address)["labels"][0],
+            round_trip_label,
+        )
+
+        old_recovery = claimant.getpowclaimrecoveryinfo(True)
+        assert_equal(old_recovery["database_outcome_ambiguous"], False)
+        assert_equal(old_recovery["raw_claim_objects"], 2)
+        assert old_recovery["blocking_quarantined_claims"] > 0
+        old_gate = claimant.getpowmininginfo()
+        assert old_gate["blocking_quarantined_claims"] > 0
+        old_claim_objects = old_recovery["raw_claim_objects"]
+        old_start = claimant.setpowmining(True, 1, 100)
+        assert_equal(old_start["enabled"], True)
+        assert_equal(old_start["created_payout_key"], False)
+        try:
+            self.wait_until(
+                lambda: claimant.getpowmininginfo()["state"]
+                == "claim_quarantined",
+                timeout=30,
+            )
+            old_worker = claimant.getpowmininginfo()
+            assert_equal(old_worker["enabled"], True)
+            assert_equal(old_worker["hashrate"], 0)
+            assert_equal(old_worker["claims_submitted"], 0)
+            assert_equal(
+                claimant.getpowclaimrecoveryinfo(True)["raw_claim_objects"],
+                old_claim_objects,
+            )
+        finally:
+            claimant.setpowmining(False)
+        self._assert_extra_inputs_unchanged(
+            claimant, claim_address, untouched_inputs
+        )
+        assert_equal(
+            claimant.getquantumkeyinventory(), historical_quantum_inventory
+        )
+        assert_equal(
+            claimant.listquantumaddresses(), historical_quantum_addresses
+        )
+
+        self.log.info("Re-upgrading proves v30.1.4 preserved candidate metadata verbatim")
+        self._switch_to_candidate()
+        node = self.nodes[0]
+        assert_equal(node.getnetworkinfo()["version"], CANDIDATE_VERSION)
+        assert_equal(node.getbestblockhash(), round_trip_tip)
+        claimant = self._load_wallet()
+        claimant.staking(False)
+        self.wait_until(lambda: sibling_txid in node.getrawmempool(), timeout=30)
+        assert root_txid not in node.getrawmempool()
+        assert_equal(claimant.gettransaction(root_txid)["hex"], root_raw)
+        assert_equal(claimant.gettransaction(sibling_txid)["hex"], sibling_raw)
+        assert_equal(
+            claimant.getaddressinfo(claim_address)["labels"][0],
+            round_trip_label,
+        )
+
+        round_trip_root = claimant.gettransaction(root_txid)
+        round_trip_sibling = claimant.gettransaction(sibling_txid)
+        assert_equal(
+            round_trip_root["qq_shadow_pow_quarantine"],
+            candidate_metadata["root_quarantine"],
+        )
+        for record_key, expected_key in metadata_keys.items():
+            assert_equal(
+                round_trip_sibling[record_key],
+                candidate_metadata[expected_key],
+            )
+        round_trip_recovery = self._assert_no_recovery_spend(claimant)
+        round_trip_component = self._component_for_claim(
+            round_trip_recovery, root_txid
+        )
+        assert_equal(
+            set(round_trip_component["claim_txids"]),
+            {root_txid, sibling_txid},
+        )
+        assert_equal(
+            round_trip_component["generation_fingerprint"],
+            candidate_fingerprint,
+        )
+        self._assert_component_anchor(round_trip_component, root_anchor)
+        round_trip_gate = claimant.getpowmininginfo()
+        assert_equal(round_trip_gate["mining_gate_coherent"], True)
+        assert_equal(round_trip_gate["mining_gate_database_ambiguous"], False)
+        assert_equal(round_trip_gate["mining_gate_action"], "wait_for_live")
+        assert_equal(round_trip_gate["mining_gate_live_claims"], 1)
+        assert_equal(round_trip_gate["mining_gate_unsafe_claims"], 0)
+        assert_equal(round_trip_gate["mining_gate_unsafe_components"], 0)
+        self._assert_extra_inputs_unchanged(
+            claimant, claim_address, untouched_inputs
+        )
+        assert_equal(
+            claimant.getquantumkeyinventory(), historical_quantum_inventory
+        )
+        assert_equal(
+            claimant.listquantumaddresses(), historical_quantum_addresses
         )
 
 

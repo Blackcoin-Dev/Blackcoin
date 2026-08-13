@@ -177,6 +177,42 @@ continuation is the normal built-in-miner path. Generic transient or
 indeterminate conditions, local state errors, future-origin proofs, and
 future-version proofs remain fail-closed and cannot authorize recovery.
 
+## v30.1.4 compatibility boundary
+
+The regression suite pins the historical daemon and CLI to the checked-in
+v30.1.4 provenance manifest. It exercises an exact wallet and datadir through
+v30.1.4, the candidate, v30.1.4 again, and the candidate again after the
+candidate has written a QQP3 sibling and durable family metadata for a QQP2
+root. The older wallet code can open the database, read both exact transaction
+byte strings, preserve the candidate's unrecognized transaction metadata, and
+perform an ordinary address-book write. Reopening with the candidate restores
+the same family fingerprint, confirmed anchor, target, payout, lineage, and
+zero-recovery-spend result.
+
+The functional harness first leaves its opt-in RPC documentation checker
+enabled and requires v30.1.4 to diagnose the candidate-only response keys.
+It then disables only that diagnostic to model the release default and performs
+the old-version read and write checks. The test never deletes, renames, or
+normalizes the candidate metadata.
+
+That round trip proves wallet-data compatibility; it does not backport the
+typed mining gate. When v30.1.4 sees the quarantined historical member, its
+legacy global quarantine check can keep the built-in PoW worker in
+`claim_quarantined` at zero hashrate even while the candidate recognizes a
+safe live or refreshable member of the same family. Operators must not infer
+candidate PoW liveness from successful rollback startup or wallet readability.
+
+The suite separately runs exact v30.1.4 and the candidate at the same time. A
+candidate-created QQP3 same-anchor carrier is independently accepted and then
+delivered through v30.1.4's transaction P2P path. v30.1.4 includes those exact
+bytes in a PoS block; both versions restart on the byte-identical block. A
+longer competing PoS branch disconnects it, removes the synthetic payout, and
+returns the still-valid carrier for admission before v30.1.4 includes it on
+the winning branch. A final isolated restart reproduces the shared block bytes
+and candidate family state. These assertions cover the protocol-compatible
+transaction, block, restart, and reorganization boundary without claiming that
+v30.1.4 implements candidate-only wallet policy.
+
 ## One shared recovery engine
 
 The Issue #37 release uses one component classifier and one resolver for GUI,

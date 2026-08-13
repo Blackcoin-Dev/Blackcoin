@@ -1,126 +1,186 @@
 # v30.1.5 OCI publication and immutable handoff
 
-This directory closes the boundary between one exact GitHub Actions candidate
-artifact and the immutable registry reference required by the v30.1.5 canary
-and rollout consumers. It is identity-generic across the final source commit
-`H`, source tree `T`, successful Core-CI run `R`, packaging tooling commit/tree,
-and packaging run/attempt. It is deliberately specific to the reviewed
-`Blackcoin-Dev/Blackcoin` source and `qqblackcoin/blackcoin-v4-gui` registry
-repository.
+This package closes the boundary between one exact GitHub Actions candidate
+artifact and the immutable registry reference consumed by the v30.1.5 canary
+and rollout process. It is generic across a final signed source commit `H` and
+tree `T`, a successful Core-CI run and attempt, a successful packaging run and
+attempt, and a signed publication-tooling snapshot. It is deliberately limited
+to `Blackcoin-Dev/Blackcoin`, Docker Hub's `registry-1.docker.io` endpoint, and
+the `qqblackcoin/blackcoin-v4-gui` repository.
 
-The checked-in request is disabled. Offline verification is the default and
-does not invoke Docker, Skopeo, curl, a registry, Compose, or a node. There is
-no workflow-dispatch file in this package. A live request must atomically set
-`execute`, `dispatch_enabled`, and `exclusive_tag_writer` to `true`, provide a
-fresh 32-byte lowercase-hex nonce, and use the exact confirmation
-`PUBLISH_V30_1_5_CANDIDATE:<H>:<intent-sha256>:<nonce>`. The intent digest is
-the canonical SHA-256 of schema 2 plus the complete source/tree/Core-run,
-packaging-tooling/run/attempt, artifact ID/name/digest, and registry
-repository/tag authority tuple. Changing any authorized identity requires a
-new confirmation. Partial arming and schema-1 confirmations are rejected.
+The checked-in request is disabled. That path performs only local reads and
+evidence-directory writes. It does not resolve or invoke Docker, Skopeo, curl,
+a registry, Compose, or a node. There is no workflow-dispatch file here.
 
-## Distinct artifact digests
+## One complete publication authority
 
-The request and receipts never collapse these two values:
+A schema-3 live request authorizes one canonical object, not a mutable tag or a
+partial collection of fields. Its SHA-256 binds all of the following:
 
-- `github_zip_sha256` is the SHA-256 of the GitHub artifact API ZIP. It must
-  equal both the independently pinned request value and the API response's
-  `digest` field. The API artifact ID, exact H/attempt name, size, non-expired
-  state, URL, packaging run, and packaging tooling head must also match.
-- `bundle_sha256sums_sha256` is the SHA-256 of the candidate bundle's internal
-  `Blackcoin-30.1.5-candidate-<H12>-SHA256SUMS.txt`. That file must cover the
-  exact other thirteen flat files and every covered byte.
+- source repository, `H`, `T`, and the reviewed signing fingerprint;
+- Core-CI workflow, run ID, run attempt, evidence digest, required-check set,
+  and the ThreadSanitizer artifact ID, exact name, API digest, ZIP digest, and
+  reports digest;
+- packaging tooling commit/tree/package seal, workflow identity, terminal run
+  ID and attempt, and terminal run-receipt digest;
+- GitHub artifact ID, exact H/attempt name, API-receipt digest, downloaded ZIP
+  digest, and the bundle's internal checksum-ledger digest;
+- publication-tooling commit/tree and this exact six-file package seal;
+- the OCI archive, manifest, config, ordered layer descriptors, ordered rootfs
+  diff IDs, and all six executable hashes;
+- registry host, credential host, repository, unique tag, and the deliberately
+  selected absolute authfile path; and
+- exclusive-writer receipt digest, nonce, issue/expiry times, and absolute
+  durable nonce-ledger path.
 
-The ZIP extractor rejects traversal, nested paths, backslashes, case-folded or
-literal duplicates, symlinks, nonregular entries, encryption, and excessive
-expansion. The canonical candidate verifier is then run against the exact
-checked-in policy and tooling snapshot from the signed packaging commit.
+Paths that merely locate already-digested GitHub or workflow-run receipts are
+not semantic authority. Their bytes are copied and checked against the bound
+digests. Credential and nonce-ledger paths are operational authority and are
+therefore bound.
 
-## Verified graph
+A live request must set `execute`, `dispatch_enabled`, and
+`exclusive_tag_writer` to `true`; supply a fresh 32-byte lowercase-hex nonce;
+use canonical second-resolution UTC timestamps with a maximum 30-minute
+lifetime; and give this exact confirmation:
 
-Before live execution, the adapter independently checks:
+```text
+PUBLISH_V30_1_5_CANDIDATE:<H>:<publication-authority-sha256>:<nonce>
+```
 
-1. signed source `H` and tree `T`, signed packaging commit/tree, successful
-   schema-2 Core-CI run `R`, exact packaging run/attempt, and the GitHub API
-   artifact receipt;
-2. the exact fourteen-file bundle, internal checksum ledger, canonical
-   manifest/provenance, and blocked-or-ready authorization tuple (live mode
-   requires the ready tuple);
-3. the six executable root entries and their binary ledger;
-4. the complete single-image OCI descriptor graph, every blob digest and size,
-   manifest/config digests, Linux/amd64 runtime identity, source labels, and
-   six binary labels; and
-5. the distinction between pre-publication assembly evidence and the later
-   publication receipt. The immutable OCI config truthfully records that the
-   assembly workflow itself did not push. The post-assembly transition is
-   proven by `registry/RESULT.json`; the source config is never rewritten.
+Changing any authority field requires a new confirmation. A disabled request
+must contain the exact all-false/all-null execution object shown in
+`request.example.json`; partial arming is rejected.
 
-Live mode imports that exact OCI archive under a nonce-derived local tag,
-requires the imported config ID, and hashes all six `/usr/local/bin`
-executables in a no-network, read-only container. It preflights the unique
-H/run/attempt registry tag under explicit exclusive-writer authority. An
-already-existing tag is accepted only if the later registry proof shows the
-exact sealed source manifest and config. A missing tag is copied directly from
-the sealed OCI archive with digest preservation through the operator's
-existing registry credential context.
+The separate exclusive-writer JSON receipt is schema 1 and has exactly these
+fields: `schema`, `action`, `repository`, `tag`, `source_commit`,
+`packaging_run_id`, `packaging_run_attempt`, `nonce`, `issued_utc`,
+`expires_utc`, `exclusive`, and `grantor`. The action is
+`exclusive-v30.1.5-candidate-tag-write`, `exclusive` is true, and `grantor` is
+`Blackcoin-Dev`. Every identity and time must equal the request.
 
-The tag GET must return a `Docker-Content-Digest` equal to both the SHA-256 of
-that same response body and the sealed source OCI manifest digest. The response
-body must be byte-identical to the sealed source manifest. The adapter
-refetches by that digest and again requires identical bytes, then fetches the
-referenced config blob and requires byte identity with the sealed OCI config.
-Only after those checks does it emit
+## Terminal and signed evidence
+
+The saved GitHub packaging-run response is a first-class terminal receipt. It
+must prove the exact workflow path/name, `workflow_dispatch` event, run ID,
+run attempt, signed packaging head commit/tree, source and head repository,
+actor and triggering actor, `completed` status, and `success` conclusion. The
+artifact API response must independently identify that same run and packaging
+head.
+
+The verifier checks three signed identities locally: source `H/T`, the
+packaging-tooling commit/tree, and the publication-tooling commit/tree. The
+packaging snapshot must equal the exact checked-in packaging files and seal.
+The publication snapshot must equal this directory's exact six-file inventory
+and seal. A working-tree replacement of either verifier cannot authorize a
+publication.
+
+The GitHub ZIP is capped before it is copied. Extraction rejects traversal,
+nested paths, backslashes, case-folded or literal duplicates, links,
+nonregular entries, encryption, excessive entry counts, and excessive
+expansion. `github_zip_sha256` always means the downloaded ZIP bytes;
+`bundle_sha256sums_sha256` always means the internal candidate checksum file.
+They are never aliases.
+
+Preparation writes `VERIFIED_INPUT.json` plus sealed source OCI manifest and
+config bytes. Immediately before nonce consumption and again before the final
+registry result, the verifier re-hashes all copied receipts and the ZIP,
+re-extracts the ZIP to a scratch directory, byte-compares that extraction with
+the prepared bundle, reruns the canonical candidate verifier, rechecks all
+three signed snapshots, reconstructs `VERIFIED_INPUT.json`, and requires exact
+equality. The receipt is never trusted as an assertion.
+
+## Durable one-shot execution
+
+Live operation requires root. The original request and exclusive-writer
+receipt must be root-owned mode 0600. The selected authfile must be an absolute,
+single-linked, root-owned regular file with mode 0600. The script passes that
+file explicitly to `skopeo copy --authfile`; it never relies on Docker's
+ambient credential context. Before consuming the nonce, the verifier runs
+`skopeo login --get-login` against the bound `docker.io` credential host using
+that exact authfile. The resulting receipt records only path, ownership, mode,
+selected Skopeo metadata, and success of the compatibility probe. It records no
+credential bytes, username, token, or authfile digest.
+
+The nonce-ledger parent must be root-owned mode 0700. The ledger is a
+single-linked regular file, root-owned mode 0600, capped at 16 MiB, locked
+independently, and composed of canonical JSON lines. The verifier rejects a
+repeated nonce or authority digest, appends the complete consumption identity,
+fsyncs the ledger and parent, and then durably creates
+`NONCE_CONSUMPTION.json`. A crash after append but before receipt creation burns
+the nonce and requires a new authority; it cannot replay the old one.
+
+Nonce consumption occurs under the global publication lock and before any
+Docker or registry read/write. It is not rolled back on failure.
+
+## OCI and registry proof
+
+The exact OCI archive is imported under a nonce-scoped local reference with
+digest preservation, and Docker must report the sealed config digest. Candidate
+bytes are never executed. The script creates a container but never starts it,
+requires state `created`, copies the six `/usr/local/bin` files to a protected
+host directory, hashes regular non-symlink bytes on the host, and removes the
+stopped container. The final receipt records `container_started: false`.
+
+The unique H/run/attempt tag is preflighted twice. If absent, Skopeo copies the
+sealed archive with both `--authfile` and `--preserve-digests`. A nonzero copy
+exit is treated as ambiguous because a registry can commit before the client
+observes success. The script does not retry or infer success. It refetches the
+tag and continues only if the ordinary final gate proves exact equality. The
+nonce remains consumed in every branch. No `RESULT.json` or rollout authority
+is emitted unless every final check passes.
+
+The tag response must carry one same-response `Docker-Content-Digest` equal to
+its body hash and the sealed source-manifest digest. The tag bytes must be
+exactly equal to the sealed source manifest, including the config descriptor
+and every ordered layer media type, digest, and size. A digest refetch must
+return the same bytes. The referenced config bytes must exactly equal the
+sealed source config and reproduce its labels, platform, and binary ledger.
+
+Only then does the adapter emit
 `qqblackcoin/blackcoin-v4-gui@sha256:<manifest>`. The mutable tag is explicitly
-recorded as non-authoritative.
+non-authoritative. `registry/RESULT.json` contains the complete authority,
+source/Core/packaging/artifact/publication receipts, exact local and remote OCI
+graphs, nonce-consumption and credential-operational receipts, stopped-
+container binary proof, publication outcome, and a schema-2 structured handoff
+that cross-binds the same identities. `PUBLICATION_SHA256SUMS` seals the
+resulting evidence tree.
 
 ## Operation
 
 Copy `request.example.json` outside the repository and replace every identity,
-path, and digest from reviewed evidence. The GitHub API metadata should be the
-saved response from `GET /repos/Blackcoin-Dev/Blackcoin/actions/artifacts/<id>`;
-the ZIP must be the bytes downloaded from that response's archive URL.
-
-For offline verification:
+path, and digest from reviewed evidence. Save both the artifact API response
+and the terminal packaging workflow-run API response. Keep the execution object
+exactly disabled for offline verification:
 
 ```bash
 contrib/ops/v30.1.5-candidate-publication/publish_candidate_oci.sh \
   /absolute/request.json /absolute/new-evidence-directory
 ```
 
-Keep the execution object exactly disabled. Successful output contains
-`VERIFIED_INPUT.json`, the copied API response and ZIP, the safely extracted
-bundle, and the exact source OCI manifest/config. It emits
-`NO_DOCKER_OR_REGISTRY_OPERATION_PERFORMED=true` and no image authority.
+Successful offline output includes `VERIFIED_INPUT.json`, copied API/run/ZIP
+receipts, the extracted bundle, and exact source OCI manifest/config bytes. It
+prints `NO_DOCKER_OR_REGISTRY_OPERATION_PERFORMED=true` and emits no image
+authority.
 
-For live publication, independently review that offline receipt, create a new
-root-owned mode-0600 request with the live tuple and fresh nonce, and use a new
-absent root-owned evidence path. Root and an existing authenticated Docker
-context are required. The script does not log credentials. Do not execute this
-branch until the exact artifact exists and external release coordination has
-granted exclusive tag-writer authority.
-
-`registry/RESULT.json` provides both the immutable image reference and a
-consumer handoff object. It preserves the API ZIP digest and internal bundle
-seal as different fields and carries the OCI archive/manifest/config,
-manifest/provenance, packaging-tooling seal, and all six executable hashes.
-The handoff's `candidate_bundle_sha256` is the internal bundle SHA256SUMS-file
-digest (also named `candidate_bundle_sha256sums_sha256`); it is never the
-separate `github_artifact_zip_sha256`. `candidate_tooling_sha256` is the
-checked-in packaging package's SHA256SUMS-file digest. These names map directly
-to the durability package's candidate identity inputs without weakening their
-provenance.
-`PUBLICATION_SHA256SUMS` seals the complete evidence tree after success.
+For live execution, independently review the offline evidence, create a fresh
+root-owned mode-0600 request and exclusive-writer receipt, create a protected
+root-owned mode-0700 nonce-ledger directory, select a root-owned mode-0600
+Skopeo-compatible authfile, and use a new absent output path. Do not enable the
+request without external coordination granting exclusive authority over the
+exact unique tag.
 
 ## Review validation
 
-The permitted local suite is offline:
+The local suite is offline:
 
 ```bash
 bash contrib/ops/v30.1.5-candidate-publication/tests/run.sh
 ```
 
-It creates synthetic canonical candidate artifacts and hostile ZIP, H/T/R,
-tooling, checksum, OCI, executable, nonce, header, refetch, and config cases.
-Mock Docker and curl executables prove the disabled shell branch never reaches
-live tools. The tests do not contact GitHub or a registry and do not mutate a
-Docker daemon, Compose, or any node.
+It builds canonical blocked and ready candidates and attacks the authority
+tuple, confirmation, timestamps, terminal run receipt, ZIP parser and cap,
+prepared-state receipt, nonce ledger/replay, stopped-container extraction
+receipt, registry headers/refetch/config, exact OCI layer graph, credential
+contract, ambiguous-copy branch, handoff, disabled wrapper, and package seal.
+It does not contact GitHub or a registry and does not invoke Docker, Skopeo,
+Compose, or any node.

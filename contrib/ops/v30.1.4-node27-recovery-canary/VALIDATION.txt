@@ -1,0 +1,49 @@
+OFFLINE NODE27 INSTALLED-V30.1.4 RECOVERY-CANARY TOOLING VALIDATION
+NOT FINANCIAL, RELAY, FLEET, CORE, BUILD, DEPLOYMENT, OR ROLLOUT AUTHORITY
+
+Base durability authority:
+  commit 2af2621d318a18365da9f9da0d5510dfbe6ee722
+
+Scope:
+  exact node 27 / node27 / blackcoin-v4-gui-27 only
+  installed source 13262151077cce3f72d07d17dc7725b2b6a8e1ab
+  network version 300104 / /Blackcoin:30.1.4/
+  one retained claim and one authenticated anchor
+  one 191-vbyte resolution
+  fee / per-resolution cap / total cap 0.00019100 BLK
+
+Current-byte checks (2026-08-13 UTC):
+  Bash syntax for operator, mock, and hostile runner: PASS
+  ShellCheck -x for operator, mock, and hostile runner: PASS
+  hostile sign-only/observation recovery-canary suite: 208/208 assertions PASS
+  hostile-suite log SHA256:
+    58e68f45e9a5726ba70dc26bcd2f0e444d481f1f07350f2fe162ee37c6e12139
+  git diff --check: PASS
+  live Docker/wallet/network contact: NONE
+  wallet signing or relay: NONE
+  candidate build/deploy or Compose mutation: NONE
+
+The suite proves the tooling's fail-closed mechanics against the checked-in
+mock only. It does not prove that the live subject remains unchanged and does
+not include an external sign-only financial-authority receipt. A live operator
+must first produce a fresh audit receipt. Installed-v30.1.4 relay is
+nondeployable because its commit RPC cannot atomically consume the externally
+reviewed plan/tip/wallet/component/raw-byte tuple. No shell precheck can close
+that interface gap. The relay and final-acceptance command modes therefore fail
+before receipt parsing, locks, transport, or RPC. Do not cite this record as
+live mining, staking, payout, claim, fleet, relay, or chain evidence.
+
+Additional checked predicates:
+  /bin/bash -p, cleared BASH_ENV/ENV/CDPATH, fixed absolute PATH
+  exact production Docker transport and secure ancestry receipt binding
+  single-link mode-0600 receipt inputs opened/inode-pinned and snapshotted
+  owned nonwritable input/output ancestry; hostile swap cannot replace snapshot
+  rollout -> endpoint -> cutover -> PoW -> wallet -> node27 lock order
+  opened lock path/inode identities, ownership, mode, and link count
+  stable main chain including chainwork before sign and read-only observation
+  exact tip/height/wallet generation/component/plan/current-recovery binding
+  exact persisted raw transaction SHA256 and testmempoolaccept binding
+  installed relay hard-ineligible; no commit-result acknowledgement claimed
+  fsynced no-clobber JSON plus SHA256 sidecar publication
+  read-only reconcile-sign; unattributed relay observation; AMBIGUOUS_CONTAINED
+  expired historical context permits observation but never mutation authority

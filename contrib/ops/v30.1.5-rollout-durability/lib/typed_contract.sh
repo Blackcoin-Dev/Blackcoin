@@ -2428,7 +2428,7 @@ v3015_node30_probe_samples_are_live()
         $s.blocks == $s.headers and ($s.peers_out | integer and . >= 1) and
         ($s.walletname | type == "string") and $s.loaded_wallets == [$s.walletname] and
         $s.wallet_normal_unlocked == true and $s.free_claim_healthy == true and
-        $s.free_claim_paused == false and $s.pos.blocks == $s.height and
+        $s.free_claim_paused == true and $s.pos.blocks == $s.height and
         $s.pos.active_blocks == $s.height and
         ($s.regular_pow | type == "object" and (keys | sort) ==
           ["enabled","hashrate","state"]) and $s.regular_pow.enabled == false and
@@ -2477,7 +2477,7 @@ v3015_node30_probe_output_is_valid()
       (.payload.locked_restart | type == "object" and (keys | sort) ==
         ["free_claim_intent_retained"]) and
       .payload.node == 30 and
-      .payload.healthy == true and .payload.paused == false and
+      .payload.healthy == true and .payload.paused == true and
       .payload.wallet_normal_unlocked == true and
       .payload.free_claim_intent_retained == true and
       .payload.locked_restart.free_claim_intent_retained == true and
@@ -2518,18 +2518,19 @@ v3015_node30_result_is_valid()
       --arg probe_tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
       --arg nonce "$expected_nonce" \
       --argjson raw "$(jq -c '.payload' "$raw_probe")" '
-        type == "object" and (keys | sort) == ["container_recreated",
+        type == "object" and (keys | sort) == (["container_recreated",
           "containment_only_on_failure","data_rewind_used","free_claim_intent_retained",
-          "healthy","invocation","locked_restart","network_version","no_recovery_or_resolution_transaction",
+          "deployment_state","healthy","invocation","locked_restart","network_version","no_recovery_or_resolution_transaction",
           "node","normal_unlock_only","paused","preunlock_migration","probe_tool_sha256",
           "raw_probe_sha256","regular_pow_enabled","repair_rpcs",
           "restart_performed","role","rollout_nonce",
           "samples","schema","source_sha","subversion","wallet_audit",
-          "wallet_normal_unlocked"] and
+          "wallet_normal_unlocked"] | sort) and
         .schema == 1 and .node == 30 and .source_sha == $source and
         .rollout_nonce == $nonce and
         .network_version == 300105 and .subversion == "/Blackcoin:30.1.5/" and
         .role == "free_claim" and .regular_pow_enabled == false and
+        .deployment_state == "pause_preserved_pending_separate_release" and
         .probe_tool_sha256 == $probe_tool and .raw_probe_sha256 == $probe_sha and
         .healthy == $raw.healthy and
         .paused == $raw.paused and .wallet_normal_unlocked == $raw.wallet_normal_unlocked and
@@ -2593,7 +2594,7 @@ v3015_node30_result_is_valid()
     while IFS= read -r sample; do
         v3015_pos_json_is_active "$(jq -c '.pos' <<<"$sample")" || return 1
         jq -e '.wallet_normal_unlocked == true and .free_claim_healthy == true and
-          .free_claim_paused == false and .ibd == false and .blocks == .headers and
+          .free_claim_paused == true and .ibd == false and .blocks == .headers and
           .peers_out >= 1 and .regular_pow.enabled == false and
           .regular_pow.hashrate == 0 and .regular_pow.state == "disabled"' \
           <<<"$sample" >/dev/null || return 1
@@ -2643,11 +2644,12 @@ v3015_terminal_census_is_valid()
         ($row.chain | {bestblockhash,blocks,chainwork,headers,initialblockdownload}) ==
           $row.core_after;
       type == "object" and (keys | sort) ==
-        ["captured_utc","node30_free_claim_healthy","node30_free_claim_paused",
+        ["captured_utc","deployment_state","node30_free_claim_healthy","node30_free_claim_paused",
          "node30_free_claim_probe_tool_sha256","node30_terminal_probe_sha256","nodes",
          "pos_active_count","pos_active_nodes","regular_pow_nodes",
          "regular_pow_operational_count","rollout_nonce","schema","source_sha"] and
       .schema == 1 and .source_sha == $source and
+      .deployment_state == "pause_preserved_pending_separate_release" and
       .rollout_nonce == $nonce and
       (.captured_utc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")) and
       (.nodes | type == "array" and length == 32) and
@@ -2661,7 +2663,7 @@ v3015_terminal_census_is_valid()
       .regular_pow_nodes == ([range(1;30)] + [31,32]) and
       .node30_free_claim_healthy == .nodes[29].free_claim_healthy and
       .node30_free_claim_paused == .nodes[29].free_claim_paused and
-      .node30_free_claim_healthy == true and .node30_free_claim_paused == false and
+      .node30_free_claim_healthy == true and .node30_free_claim_paused == true and
       .node30_free_claim_probe_tool_sha256 == $probe_tool and
       .node30_terminal_probe_sha256 == $terminal_probe and
       all(.nodes[]; type == "object" and (keys | sort) ==
@@ -2703,7 +2705,7 @@ v3015_terminal_census_is_valid()
             v3015_pos_json_is_active "$(jq -c '.staking' <<<"$row")" || return 1
             jq -e '.role == "free_claim" and .pos_contract_passed == true and
               .pow_contract_passed == false and .free_claim_healthy == true and
-              .free_claim_paused == false and .pow.enabled == false and
+              .free_claim_paused == true and .pow.enabled == false and
               .pow.autostart == false and .pow.hashrate == 0 and .pow.state == "disabled"' \
               <<<"$row" >/dev/null || return 1
         else
@@ -2740,7 +2742,7 @@ v3015_fleet_result_is_valid()
       --arg probe_tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
       --arg terminal_probe "$terminal_probe_sha" --arg nonce "$expected_nonce" '
       type == "object" and (keys | sort) == (["containment_only_failure_policy",
-        "data_rewind_used","final_compose_sha256","final_image_policy_sha256",
+        "data_rewind_used","deployment_state","final_compose_sha256","final_image_policy_sha256",
         "node30_free_claim_healthy","node30_free_claim_paused",
         "node30_free_claim_probe_tool_sha256","node30_role","node30_terminal_probe_sha256",
         "persistent_compose_handoff_receipt_sha256","pos_active","pos_active_nodes",
@@ -2748,13 +2750,15 @@ v3015_fleet_result_is_valid()
         "rollout_nonce","runtime_policy_handoff_receipt_sha256","schema","source_sha","status",
         "terminal_census_sha256","transaction"] | sort) and
       .schema == 1 and .transaction == "v30.1.5-fleet-rollout" and
-      .source_sha == $source and .rollout_nonce == $nonce and .status == "PASS" and
+      .source_sha == $source and .rollout_nonce == $nonce and
+      .status == "PAUSE_PRESERVED_PENDING_SEPARATE_RELEASE" and
+      .deployment_state == "pause_preserved_pending_separate_release" and
       .terminal_census_sha256 == $census and
       .pos_active == 32 and .regular_pow_operational == 31 and
       .pos_active_nodes == [range(1;33)] and
       .regular_pow_nodes == ([range(1;30)] + [31,32]) and
       .node30_role == "free_claim" and .node30_free_claim_healthy == true and
-      .node30_free_claim_paused == false and .data_rewind_used == false and
+      .node30_free_claim_paused == true and .data_rewind_used == false and
       .node30_free_claim_probe_tool_sha256 == $probe_tool and
       .node30_terminal_probe_sha256 == $terminal_probe and
       .runtime_policy_handoff_receipt_sha256 == $policy_receipt and

@@ -370,7 +370,7 @@ capture_node30_probe_evidence()
     jq -e 'type == "object" and (keys | sort) ==
       ["free_claim_intent_retained","healthy","locked_restart","node","paused",
        "samples","wallet_normal_unlocked"] and .node == 30 and .healthy == true and
-      .paused == false and .wallet_normal_unlocked == true and
+      .paused == true and .wallet_normal_unlocked == true and
       .free_claim_intent_retained == true and
       .locked_restart == {free_claim_intent_retained:true}' \
       <<<"$payload_json" >/dev/null || { rm -f -- "$payload"; return 1; }
@@ -711,6 +711,7 @@ while read -r role nodes; do
           .payload as $probe | {schema:1,node:30,source_sha:$source,rollout_nonce:$nonce,
             network_version:300105,
             subversion:"/Blackcoin:30.1.5/",role:"free_claim",regular_pow_enabled:false,
+            deployment_state:"pause_preserved_pending_separate_release",
             probe_tool_sha256:$probe_tool,raw_probe_sha256:$raw_sha,
             healthy:$probe.healthy,paused:$probe.paused,
             wallet_normal_unlocked:$probe.wallet_normal_unlocked,
@@ -758,6 +759,7 @@ terminal_census=$(jq -cn --arg source "$SOURCE_SHA" --arg now "$(date -u +%Y-%m-
   --arg probe_tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
   --arg terminal_probe "$terminal_probe_sha" \
   --argjson nodes "$terminal_nodes" '{schema:1,source_sha:$source,rollout_nonce:$nonce,
+    deployment_state:"pause_preserved_pending_separate_release",
     captured_utc:$now,nodes:$nodes,
     pos_active_nodes:[$nodes[] | select(.pos_contract_passed == true) | .node],
     pos_active_count:([$nodes[] | select(.pos_contract_passed == true)] | length),
@@ -794,7 +796,9 @@ jq -cn --arg source "$SOURCE_SHA" --arg census_sha "$terminal_census_sha" \
   --arg probe_tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
   --arg terminal_probe "$terminal_probe_sha" \
   --argjson census "$terminal_census" '{schema:1,transaction:"v30.1.5-fleet-rollout",
-  source_sha:$source,rollout_nonce:$nonce,status:"PASS",terminal_census_sha256:$census_sha,
+  source_sha:$source,rollout_nonce:$nonce,
+  status:"PAUSE_PRESERVED_PENDING_SEPARATE_RELEASE",
+  deployment_state:"pause_preserved_pending_separate_release",
   pos_active:$census.pos_active_count,
   pos_active_nodes:$census.pos_active_nodes,
   regular_pow_operational:$census.regular_pow_operational_count,

@@ -3518,8 +3518,8 @@ probe_copy_drift_fails_closed()
 expect_pass 'node30 pinned probe copy rejects TOCTOU byte drift' probe_copy_drift_fails_closed
 
 env_file="$tmp/reviewed.env"
-fixture_source='0123456789abcdef0123456789abcdef01234567'
-fixture_tree='89abcdef0123456789abcdef0123456789abcdef'
+fixture_source='0e62ec0af3daefba30f87382d9b3cc8b00224e62'
+fixture_tree='d460eee11b7c8c6d5fffe6935f2e9a5d58e18aac'
 hex3=$(printf '3%.0s' {1..64}); hex4=$(printf '4%.0s' {1..64}); hex5=$(printf '5%.0s' {1..64})
 hex6=$(printf '6%.0s' {1..64}); hex7=$(printf '7%.0s' {1..64}); hex8=$(printf '8%.0s' {1..64})
 hex9=$(printf '9%.0s' {1..64}); hexa=$(printf 'a%.0s' {1..64}); hexb=$(printf 'b%.0s' {1..64})
@@ -3578,9 +3578,9 @@ compose_receipt_sha=$(sha256sum "$compose_receipt" | awk '{print $1}')
     printf "SOURCE_SIGNING_FINGERPRINT='SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70'\nSOURCE_SIGNATURE_VERIFIED='1'\n"
     printf "CORE_VERSION_NUMERIC='300105'\nCORE_SUBVERSION='/Blackcoin:30.1.5/'\n"
     printf "RUNTIME_ENTRYPOINT_BODY_SHA256='753acc9904b48c411f5514abface930f79d72d00c9d73e91435a6511877d47b4'\n"
-    printf "CORE_CI_RUN_ID='999999'\nCORE_CI_HEAD_SHA='%s'\nCORE_CI_CONCLUSION='success'\n" "$fixture_source"
-    printf "CORE_CI_WORKFLOW='critical-protocol-safety-fixture'\n"
-    printf "CANDIDATE_ARTIFACT_NAME='v3015-linux-x86_64-fixture'\nCANDIDATE_ARTIFACT_RUN_ID='888888'\nCANDIDATE_ARTIFACT_RUN_ATTEMPT='1'\n"
+    printf "CORE_CI_RUN_ID='31710198720'\nCORE_CI_HEAD_SHA='%s'\nCORE_CI_CONCLUSION='success'\n" "$fixture_source"
+    printf "CORE_CI_WORKFLOW='.github/workflows/pr-gate.yml'\n"
+    printf "CANDIDATE_ARTIFACT_NAME='v3015-linux-x86_64-fixture'\nCANDIDATE_ARTIFACT_RUN_ID='31710198720'\nCANDIDATE_ARTIFACT_RUN_ATTEMPT='1'\n"
     printf "CANDIDATE_IMAGE_REF='%s'\nCANDIDATE_IMAGE_ID='%s'\n" "$image" "$image_id"
     printf "CANDIDATE_BUNDLE_SHA256='%s'\nCANDIDATE_OCI_ARCHIVE_SHA256='%s'\n" "$hex3" "$hex4"
     printf "CANDIDATE_OCI_MANIFEST_SHA256='%s'\nCANDIDATE_BLACKCOIND_SHA256='%s'\n" "$image_manifest" "$hex6"
@@ -3642,7 +3642,7 @@ make_node30_samples()
            initialblockdownload:false},
          tip:$s.tip,height:$s.height,blocks:$s.height,headers:$s.height,ibd:false,
          peers_out:8,walletname:$s.walletname,loaded_wallets:$s.loaded_wallets,
-         wallet_normal_unlocked:true,free_claim_healthy:true,free_claim_paused:false,
+         wallet_normal_unlocked:true,free_claim_healthy:true,free_claim_paused:true,
          pos:$s.staking,regular_pow:{enabled:false,hashrate:0,state:"disabled"}})'
 }
 
@@ -3652,7 +3652,7 @@ make_node30_probe()
     samples=$(make_node30_samples "$observation" "$start" "$wallet_name")
     finish=$((start + 9000))
     recheck_start=$((start + 7000))
-    payload=$(jq -cn --argjson samples "$samples" '{node:30,healthy:true,paused:false,
+    payload=$(jq -cn --argjson samples "$samples" '{node:30,healthy:true,paused:true,
       wallet_normal_unlocked:true,free_claim_intent_retained:true,
       locked_restart:{free_claim_intent_retained:true},samples:$samples}')
     jq -cn --arg observation "$observation" --arg tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
@@ -3778,8 +3778,8 @@ jq -cn --arg source "$SOURCE_SHA" --arg tree "$SOURCE_TREE" --arg image "$CANDID
   --arg canary "$NINE_PATH_CANARY_SEAL_SHA256" '{schema:1,release:"v30.1.5",
     source_sha:$source,source_tree:$tree,source_signature_verified:true,
     source_signing_fingerprint:"SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70",
-    core_ci:{run_id:999999,head_sha:$source,conclusion:"success",workflow:"critical-protocol-safety-fixture"},
-    artifact:{name:"v3015-linux-x86_64-fixture",run_id:888888,run_attempt:1},
+    core_ci:{run_id:31710198720,head_sha:$source,conclusion:"success",workflow:".github/workflows/pr-gate.yml"},
+    artifact:{name:"v3015-linux-x86_64-fixture",run_id:31710198720,run_attempt:1},
     network_version:300105,subversion:"/Blackcoin:30.1.5/",
     candidate_image_ref:$image,candidate_image_id:$image_id,
     candidate_bundle_sha256:$bundle,candidate_oci_archive_sha256:$oci,
@@ -3849,7 +3849,8 @@ jq -cn --arg source "$SOURCE_SHA" --arg image "$CANDIDATE_IMAGE_REF" \
   source_sha:$source,rollout_nonce:$nonce,network_version:300105,subversion:"/Blackcoin:30.1.5/",
   role:"free_claim",regular_pow_enabled:false,raw_probe_sha256:$raw_sha,healthy:true,
   probe_tool_sha256:$probe_tool,
-  paused:false,wallet_normal_unlocked:true,container_recreated:true,restart_performed:true,
+  paused:true,wallet_normal_unlocked:true,container_recreated:true,restart_performed:true,
+  deployment_state:"pause_preserved_pending_separate_release",
   normal_unlock_only:true,repair_rpcs:[],data_rewind_used:false,
   containment_only_on_failure:true,
   invocation:{candidate_image_ref:$image,candidate_image_id:$image_id,
@@ -3878,7 +3879,7 @@ for node in $(seq 1 32); do
         result_file="$evidence/node-30-free-claim.json"
         role=free_claim
         terminal_pow=$(jq -cn '{enabled:false,autostart:false,hashrate:0,state:"disabled"}')
-        healthy=true; paused=false; probe_sha=$node30_terminal_probe_sha
+        healthy=true; paused=true; probe_sha=$node30_terminal_probe_sha
         probe_tool=$NODE30_FREE_CLAIM_PROBE_SHA256
         terminal_core=$(jq -cn --arg tip "$terminal_tip" --argjson height "$terminal_height" \
           '{bestblockhash:$tip,blocks:$height,headers:$height,chainwork:("9"*64),
@@ -3918,6 +3919,7 @@ jq -cn --arg source "$SOURCE_SHA" --arg tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
   --arg terminal_probe "$node30_terminal_probe_sha" --arg nonce "$rollout_nonce" \
   --argjson nodes "$terminal_nodes" '{schema:1,
   source_sha:$source,rollout_nonce:$nonce,captured_utc:"2026-08-10T00:00:00Z",nodes:$nodes,
+  deployment_state:"pause_preserved_pending_separate_release",
   pos_active_nodes:[$nodes[]|select(.pos_contract_passed)|.node],
   pos_active_count:([$nodes[]|select(.pos_contract_passed)]|length),
   regular_pow_nodes:[$nodes[]|select(.role=="regular" and .pow_contract_passed)|.node],
@@ -3937,10 +3939,12 @@ jq -cn --arg source "$SOURCE_SHA" --arg census "$terminal_census_sha" \
   --arg tool "$NODE30_FREE_CLAIM_PROBE_SHA256" \
   --arg terminal_probe "$node30_terminal_probe_sha" \
   '{schema:1,transaction:"v30.1.5-fleet-rollout",
-  source_sha:$source,rollout_nonce:$nonce,status:"PASS",terminal_census_sha256:$census,
+  source_sha:$source,rollout_nonce:$nonce,
+  status:"PAUSE_PRESERVED_PENDING_SEPARATE_RELEASE",
+  deployment_state:"pause_preserved_pending_separate_release",terminal_census_sha256:$census,
   pos_active:32,pos_active_nodes:[range(1;33)],regular_pow_operational:31,
   regular_pow_nodes:([range(1;30)] + [31,32]),node30_role:"free_claim",
-  node30_free_claim_healthy:true,node30_free_claim_paused:false,data_rewind_used:false,
+  node30_free_claim_healthy:true,node30_free_claim_paused:true,data_rewind_used:false,
   node30_free_claim_probe_tool_sha256:$tool,node30_terminal_probe_sha256:$terminal_probe,
   runtime_policy_handoff_receipt_sha256:$policy_receipt,
   persistent_compose_handoff_receipt_sha256:$compose_receipt,
@@ -4046,7 +4050,7 @@ mutate_fixture()
         *) return 2 ;;
     esac
 }
-expect_fail 'verifier rejects paused Free Claim' mutate_fixture paused '.paused=true' node-30-free-claim.json
+expect_fail 'verifier rejects premature Free-Claim unpause' mutate_fixture unpaused '.paused=false' node-30-free-claim.json
 expect_fail 'verifier rejects false PoS count' mutate_fixture pos31 '.pos_active=31' fleet-result.json
 expect_fail 'verifier rejects recovery transaction claim' mutate_fixture recovery '.recovery_transactions_created=true' fleet-result.json
 expect_fail 'verifier rejects unsafe node gate' mutate_fixture unsafe '.samples[1].pow.mining_gate_unsafe_components=1' node-01.json
@@ -4139,8 +4143,8 @@ expect_fail 'node30 initial probe is bound to the reviewed tool bytes' mutate_fi
   '.probe_tool_sha256=("f"*64)' node-30-free-claim-probe.raw.json
 expect_fail 'node30 result records the reviewed probe tool separately' mutate_fixture resulttool \
   '.probe_tool_sha256=("f"*64)' node-30-free-claim.json
-expect_fail 'terminal node30 probe is independently healthy and unpaused' mutate_fixture terminalpause \
-  '.payload.paused=true' node-30-free-claim-terminal-probe.raw.json
+expect_fail 'terminal node30 probe independently requires the pause-preserved state' mutate_fixture terminalunpause \
+  '.payload.paused=false' node-30-free-claim-terminal-probe.raw.json
 expect_fail 'terminal node30 probe is bound to the reviewed tool bytes' mutate_fixture terminaltool \
   '.probe_tool_sha256=("f"*64)' node-30-free-claim-terminal-probe.raw.json
 expect_fail 'terminal node30 sample is bound to its observation' mutate_fixture sampleobservation \
@@ -4251,7 +4255,7 @@ expect_fail 'evidence rejects mixed post-Compose identity proof' mutate_fixture 
 
 terminal_drift="$tmp/terminal-drift"
 cp -R "$evidence" "$terminal_drift"
-jq '.payload.paused=true' "$terminal_drift/node-30-free-claim-terminal-probe.raw.json" \
+jq '.payload.paused=false' "$terminal_drift/node-30-free-claim-terminal-probe.raw.json" \
   >"$terminal_drift/change" &&
   mv "$terminal_drift/change" "$terminal_drift/node-30-free-claim-terminal-probe.raw.json"
 make_manifest "$terminal_drift"
@@ -4306,10 +4310,16 @@ cp "$env_file" "$manifest_mismatch_env"
 printf "CANDIDATE_OCI_MANIFEST_SHA256='%064d'\n" 0 >>"$manifest_mismatch_env"
 expect_fail 'reviewed image digest must equal the candidate OCI manifest SHA256' bash -c \
   "source '$package_dir/lib/common.sh'; source '$manifest_mismatch_env'; v3015_validate_release_env"
-expect_pass 'template retains the recorded signed H and tree with its pending run sentinel' bash -c \
-  "source '$package_dir/rollout.env.example'; [[ \"\$SOURCE_SHA\" == 309731e3340f380e48cb67f94a243725465420fb && \"\$SOURCE_TREE\" == 1517a277e1ab6355db0a14ed40d21e4e5e1dc846 && \"\$SOURCE_SIGNATURE_VERIFIED\" == 1 && \"\$CORE_CI_RUN_ID\" == 31560485480 && \"\$CORE_CI_HEAD_SHA\" == \"\$SOURCE_SHA\" && \"\$CORE_CI_CONCLUSION\" == __PENDING_EXACT_SHA_CI_SUCCESS__ && \"\$CORE_CI_WORKFLOW\" == .github/workflows/pr-gate.yml ]]"
+expect_pass 'template binds H0e62 source/tree/run while keeping CI success pending' bash -c \
+  "source '$package_dir/rollout.env.example'; [[ \"\$SOURCE_SHA\" == 0e62ec0af3daefba30f87382d9b3cc8b00224e62 && \"\$SOURCE_TREE\" == d460eee11b7c8c6d5fffe6935f2e9a5d58e18aac && \"\$SOURCE_SIGNATURE_VERIFIED\" == 1 && \"\$CORE_CI_RUN_ID\" == 31710198720 && \"\$CORE_CI_HEAD_SHA\" == \"\$SOURCE_SHA\" && \"\$CORE_CI_CONCLUSION\" == __PENDING_EXACT_SHA_CI_SUCCESS__ && \"\$CORE_CI_WORKFLOW\" == .github/workflows/pr-gate.yml ]]"
 expect_fail 'recorded pending CI state remains fail-closed' bash -c \
   "source '$package_dir/lib/common.sh'; source '$package_dir/rollout.env.example'; v3015_validate_release_env"
+revoked_source_env="$tmp/revoked-source.env"
+cp "$env_file" "$revoked_source_env"
+printf "SOURCE_SHA='309731e3340f380e48cb67f94a243725465420fb'\nSOURCE_TREE='1517a277e1ab6355db0a14ed40d21e4e5e1dc846'\nCORE_CI_HEAD_SHA='309731e3340f380e48cb67f94a243725465420fb'\n" \
+  >>"$revoked_source_env"
+expect_fail 'revoked predecessor source/tree cannot satisfy release validation' bash -c \
+  "source '$package_dir/lib/common.sh'; source '$revoked_source_env'; v3015_validate_release_env"
 mixed_probe_env="$tmp/mixed-probe-tool.env"
 cp "$env_file" "$mixed_probe_env"
 printf "NODE30_FREE_CLAIM_PROBE_SHA256='%064d'\n" 0 >>"$mixed_probe_env"
@@ -4375,8 +4385,18 @@ expect_pass 'node30 runtime admits only canonical safe external receive addition
   "grep -Fq '.safe_external_receive == true' '$package_dir/fleet_rollout.sh' && ! grep -Fq '.delta.added_txids == []' '$package_dir/fleet_rollout.sh'"
 expect_pass 'v30.1.5 package does not source v30.1.4 libraries' bash -c \
   "! grep -Eq 'source .*v30[.]1[.]4' '$package_dir/fleet_rollout.sh' '$package_dir/native_restart_durability.sh' '$package_dir/verify-evidence.sh'"
-expect_pass 'package contains exactly sixteen authorized paths' bash -c \
-  "find '$package_dir' -type f | wc -l | grep -q '16'"
+# The single-quoted body is intentionally evaluated by the child Bash.
+# shellcheck disable=SC2016
+expect_pass 'package contains the exact twenty-one-payload reviewed inventory' bash -c \
+  'set -euo pipefail
+   package_dir=$1
+   source "$package_dir/lib/common.sh"
+   actual=$(cd "$package_dir" && find . -type f ! -name SHA256SUMS -print |
+     sed "s#^[.]/##" | LC_ALL=C sort)
+   expected=$(v3015_expected_package_payloads | LC_ALL=C sort)
+   test "$actual" = "$expected"
+   test "$(printf "%s\n" "$expected" | wc -l | tr -d " ")" = 21' \
+  bash "$package_dir"
 expect_pass 'maintenance include declares Bash for standalone ShellCheck' bash -c \
   "head -n 1 '$package_dir/guard_rollout_maintenance_block.sh.inc' | grep -Fqx '# shellcheck shell=bash' && shellcheck -x '$package_dir/guard_rollout_maintenance_block.sh.inc'"
 expect_pass 'maintenance guard exact-checks rollout authority schema' bash -c \
@@ -4393,15 +4413,25 @@ expect_pass 'live scripts resolve service and container names only through seale
   "grep -Fq 'v3015_topology_lookup' '$package_dir/native_restart_durability.sh' && grep -Fq 'v3015_topology_lookup' '$package_dir/fleet_rollout.sh' && ! grep -Eq 'service=\"node\\\$\\\{node\\\}\"|container=\"blackcoin-v4-gui-\\\$\\\{node\\\}\"|blackcoin-v4-gui-[0-9]+' '$package_dir/native_restart_durability.sh' '$package_dir/fleet_rollout.sh'"
 expect_pass 'live mutation validates the rendered Compose topology before use' bash -c \
   "grep -Fq 'v3015_compose_topology_matches' '$package_dir/native_restart_durability.sh' && grep -Fq 'v3015_compose_topology_matches' '$package_dir/fleet_rollout.sh'"
+expect_pass 'dedicated PoS renewal supervisor hostile suite passes' \
+  bash "$package_dir/tests/pos_unlock_renewal_supervisor.sh"
+expect_pass 'dedicated node30 audit-only release-gate hostile suite passes' \
+  bash "$package_dir/tests/node30_free_claim_release.sh"
 # The single-quoted body is intentionally evaluated by the child Bash.
 # shellcheck disable=SC2016
-expect_pass 'provisional source/CI-bound seal covers the exact fifteen payloads' bash -c '
+expect_pass 'accepted source/artifact predicates contain no revoked predecessor identity' bash -c \
+  '! grep -Eq "309731e3340f380e48cb67f94a243725465420fb|1517a277e1ab6355db0a14ed40d21e4e5e1dc846" \
+    "$1/lib/common.sh" "$1/lib/node30_free_claim_release_contract.sh"' \
+  bash "$package_dir"
+# The single-quoted body is intentionally evaluated by the child Bash.
+# shellcheck disable=SC2016
+expect_pass 'nondeployable H0e62 integration preseal covers exact twenty-one payloads' bash -c '
   set -euo pipefail
   package_dir=$1
   actual=$(cd "$package_dir" && find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort)
   listed=$(cd "$package_dir" && awk "{print \$2}" SHA256SUMS | LC_ALL=C sort)
   test "$actual" = "$listed"
-  test "$(printf "%s\n" "$listed" | uniq | wc -l | tr -d " ")" = 15
+  test "$(printf "%s\n" "$listed" | uniq | wc -l | tr -d " ")" = 21
   ! grep -Eq "UNSEALED|PLACEHOLDER|__" "$package_dir/SHA256SUMS"
   (cd "$package_dir" && sha256sum --strict -c SHA256SUMS >/dev/null)
 ' bash "$package_dir"

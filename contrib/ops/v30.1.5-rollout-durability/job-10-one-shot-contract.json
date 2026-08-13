@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "kind": "historical-emergency-pos-renewal-one-shot",
+  "status": "accepted-live-audit",
+  "installed_or_executed_by_this_package": false,
+  "scheduler": {
+    "type": "at",
+    "job_id": 10,
+    "scheduled_local": "2026-08-13T21:41:00-06:00",
+    "scheduled_utc": "2026-08-14T03:41:00Z",
+    "inspect_argv": ["at", "-c", "10"],
+    "cancel_argv": ["atrm", "10"],
+    "recurring": false
+  },
+  "body": {
+    "audited_local_sha256": "c3b8302cd1c173e72d229570f4d5df59c4b0ca64d8c9c865be2ea36a8b62396e",
+    "stored_suffix_sha256": "bab34133edc6abd83bdfa0398421a02d3f3d9ddee590bdbbdfba417bc9186451",
+    "stored_suffix_has_one_appended_blank_line": true,
+    "stored_minus_final_blank_reproduces_local_sha256": true,
+    "sentinel_count": 1,
+    "contains_secret_passphrase_private_key_payout_or_endpoint": false
+  },
+  "spool": {
+    "owner": "root",
+    "group": "daemon",
+    "mode": "0700"
+  },
+  "global_mutex": "/run/blackcoin-emergency-pos-renewal.lock",
+  "receipt_target": "/mnt/disk1/blackcoin-wallet-safety/runtime-audits/emergency-pos-renewal-20260814T034100Z.log",
+  "preflight": {
+    "maintenance_marker_sha256": "87ecb2e0d7df9f90eabf0a546459779116a4bc634d3cbc37b1dd824c1dfcf311",
+    "normal_unlock_helper_sha256": "acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1",
+    "image_id": "sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909",
+    "image_ref": "qqblackcoin/blackcoin-v4-gui@sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2",
+    "healthy": true,
+    "chain": "main",
+    "initial_block_download": false,
+    "peers_required": true,
+    "one_wallet_per_node": true,
+    "manifests_verified": true,
+    "roles_verified": true
+  },
+  "action": {
+    "helper_nodes": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32],
+    "helper_order": "sequential-ascending",
+    "post_helper_wait_seconds": 60
+  },
+  "postflight": {
+    "minimum_normal_unlock_remaining_seconds": 43200,
+    "pos_active_nodes": 32,
+    "regular_pow_intent_nodes_observed_by_historical_job": 31,
+    "node30_ordinary_pow_disabled": true
+  },
+  "one_shot_only": true,
+  "historical_receipt_is_read_only": true
+}

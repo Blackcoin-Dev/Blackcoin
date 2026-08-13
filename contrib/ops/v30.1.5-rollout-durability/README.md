@@ -5,18 +5,22 @@ the eventual signed v30.1.5 Core release. It does not alter the immutable
 v30.1.4 rollout transaction and does not source any v30.1.4 operations library.
 It is currently **offline-only and nondeployable**.
 
-One previously recorded signed source identity and its then-pending exact-SHA
-CI run are retained for audit continuity, but they are not current or final
-rollout authority. The release remains fail-closed until a final source/run
-receipt and all artifact/handoff gates are complete:
+The integration preseal binds the intended H0e62 source, tree, merge lineage,
+and expected exact-SHA CI run as constraints. It does not assert that the run
+succeeded or that a public artifact exists. The release remains fail-closed
+until exact source/run, packaging, artifact, registry, Phase-A/Phase-B, and
+handoff receipts are complete:
 
-- source commit: `309731e3340f380e48cb67f94a243725465420fb`
-- source tree: `1517a277e1ab6355db0a14ed40d21e4e5e1dc846`
+- source commit: `0e62ec0af3daefba30f87382d9b3cc8b00224e62`
+- source tree: `d460eee11b7c8c6d5fffe6935f2e9a5d58e18aac`
+- reviewed merge constraint: `e85668ed26ef75d92e234488cbd85e146f6ffd5a`
+- ordered merge parents: `19baffef25af36e177db2975780e0641b59753aa`,
+  `0e62ec0af3daefba30f87382d9b3cc8b00224e62`
 - signer fingerprint: `SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70`
 - network version: `300105`
 - subversion: `/Blackcoin:30.1.5/`
-- exact-SHA CI run: `31560485480`, head-bound to the source commit above; its
-  recorded state was pending and this package contains no successful
+- expected exact-SHA CI run: `31710198720`, head-bound to the source commit
+  above; this package records a pending sentinel and contains no successful
   release-authorizing receipt
 
 `rollout.env.example` deliberately contains an unresolved successful-CI
@@ -30,22 +34,13 @@ The candidate image must use the canonical immutable
 suffix of that reference must exactly equal `CANDIDATE_OCI_MANIFEST_SHA256` in
 both the reviewed environment and the release-identity document.
 
-`SHA256SUMS` is a provisional current-byte preseal over the exact fifteen
-non-manifest files. The integrated hostile suite reports 605/605 assertions
-passing, including the topology and independent image/OCI-manifest
-cross-bindings. Independent hostile review of signed parent commit
-`3b8fa9b092caed5f915489dc6195386bd14d07ca` and tree
-`a3e31e3d941622aa05e65b3598d5bf3850245875` found no P0, P1, or P2 issue.
-That review independently repeated all 605 assertions, strict manifest and
-topology checks, Bash and ShellCheck gates, image/OCI cross-binding hostiles,
-and remote/signature verification. This follow-up changes only this review
-record, `VALIDATION.txt`, and the corresponding `SHA256SUMS` entries. The
-preseal proves only exact offline package-byte closure; it does not validate Core
-product behavior, authorize a source/run or ordinary-user artifact, execute a
-canary, or establish rollout, live-fleet, or release acceptance evidence.
-Recording a successful R conclusion and later bundle/OCI/Phase-B/handoff
-identities remains a separate change and must regenerate both `VALIDATION.txt`
-and `SHA256SUMS`.
+`SHA256SUMS` is an offline integration preseal over the exact twenty-one
+non-manifest files. It seals tooling and hostile tests, including the PoS
+unlock-renewal supervisor and the audit-only node30 Free-Claim gate. It does
+not validate Core product behavior, authorize a successful source/run or
+public artifact, execute a canary, authorize a node30 fee/sign/broadcast, or
+establish live-fleet acceptance. Any later receipt repin must regenerate
+`VALIDATION.txt` and `SHA256SUMS` and repeat hostile review.
 
 `topology.map` is the single sealed translation from logical nodes 1–32 to
 Compose service names and container names. It records the preserved baseline's
@@ -68,7 +63,8 @@ The final fleet result is one contract with two distinct roles:
 - Nodes 1–29 and 31–32: legacy PoS active/searching with positive weight and
   regular Gold Rush PoW operational under the v30.1.5 typed-gate definition.
 - Node 30: legacy PoS active, regular PoW disabled, and the separately protected
-  Free Claim service healthy and unpaused.
+  Free Claim service healthy but still paused in explicit terminal state
+  `pause_preserved_pending_separate_release`.
 
 Regular PoW does not require all 31 wallets to show positive hashrate in one
 sample. `create_new_anchor` and `refresh_same_anchor` require `can_submit=true`.
@@ -374,9 +370,36 @@ exact bytes. A preexisting or racing marker and a partial durability failure
 cannot be overwritten or treated as authority. Removal requires the originally
 recorded bytes and also fsyncs the parent directory.
 
-No script in this package installs a recurring host keeper, restarts a failed
-miner in a loop, rotates VPN identity, creates an address/key, or pays a
-recovery fee.
+`pos_unlock_renewal_supervisor.sh` is a bounded offline supervisor design for
+renewing normal wallet unlock through the exact installed helper SHA256
+`acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1`.
+Its install mode remains disabled without an exact authority receipt. Runtime
+requires the durable installation receipt, exact package/tool/topology/image/
+manifest identities, one wallet, synchronized main-chain stable census,
+peers, active PoS, the intended 31 regular-PoW roles, and node30 ordinary PoW
+disabled. It acquires the canonical rollout, endpoint, cutover, PoW, and wallet
+locks before its private global/node locks; rechecks authority lifetime before
+each helper call; invokes nodes sequentially once per cycle; retries only
+read-only census sampling; emits a non-PASS PARTIAL receipt for incomplete
+post-observation; and supports explicit authority rotation/deactivation. It
+cannot read or write regular-PoW intent, remove the maintenance inhibitor,
+touch chain/config/key/transaction data, or reproduce the historical root `at`
+job 10. `job-10-one-shot-contract.json` preserves that accepted job only as a
+historical audit contract; this package makes no installation/execution claim.
+
+`node30_free_claim_release.sh` is audit-capable but release-ineligible. Audit
+requires no fee/spend authority and binds a fresh stable tip, wallet, queue,
+candidate legacy fee observation, payout script, public-artifact/package,
+fleet, and pause-preserved finalization cut. The reviewed public QQP2/QQP3 RPC
+cannot bind an exact fee input or maximum total fee, and no reviewed atomic
+one-shot dispatcher/re-pause receipt exists. Therefore the contract accepts no
+fee/sign/broadcast receipt, exports no pause-marker transition primitive, and
+terminates every release request fail-closed after comparing the prior audit
+with a fresh under-lock resample. Node30 ordinary PoW remains disabled.
+
+No package script rotates VPN identity, creates an address/key, performs a
+recovery transaction, pays a recovery fee, reindexes/rewinds chain data, or
+enables node30 ordinary PoW.
 
 ## Evidence
 
@@ -401,7 +424,7 @@ lists and counts. Package-owned result/authority envelopes use exact outer key
 sets. `verify-evidence.sh` rejects swaps, duplicates, omissions,
 node30 role leakage, missing/extra/nested/linked/tampered evidence, partial
 schema, ambiguity, unsafe or stale gates, recovery fees, repair RPCs, false
-counts, raw-probe mismatch, or a paused Free Claim service.
+counts, raw-probe mismatch, or a premature Free Claim unpause.
 
 ## Offline validation
 
@@ -414,10 +437,17 @@ bash -n contrib/ops/v30.1.5-rollout-durability/*.sh \
   contrib/ops/v30.1.5-rollout-durability/*.sh.inc
 shellcheck -x contrib/ops/v30.1.5-rollout-durability/*.sh \
   contrib/ops/v30.1.5-rollout-durability/lib/*.sh \
-  contrib/ops/v30.1.5-rollout-durability/tests/run.sh \
+  contrib/ops/v30.1.5-rollout-durability/tests/*.sh \
   contrib/ops/v30.1.5-rollout-durability/guard_rollout_maintenance_block.sh.inc
 contrib/ops/v30.1.5-rollout-durability/tests/run.sh
+contrib/ops/v30.1.5-fleet-semantic-integration-tests.sh
 ```
+
+The final command is a commit-level integration runner. It executes this
+package's aggregate suite—including the dedicated PoS-renewal and node30
+release-gate suites—and then the separately sealed installed-v30.1.4 node27
+sign-only/observation suite. It does not make either deployment payload depend
+on the other at runtime.
 
 Do not run `fleet_rollout.sh apply`, `native_restart_durability.sh`, or the
 guard installer against a live host until all placeholders are replaced from
@@ -431,9 +461,8 @@ fresh exact collision/live authority is recorded.
 This package does not substitute host selection or filtering for Core behavior.
 Before live clearance, the following external facts remain mandatory:
 
-1. a successful exact-SHA CI run `R` for the final signed source identity, with
-   its exact head, workflow, and successful conclusion recorded; the historical
-   H/R audit-continuity values above are not authority;
+1. a successful exact-SHA CI receipt for H0e62 and expected run 31710198720,
+   with its exact head, workflow, attempt, and successful conclusion recorded;
 2. sealed Linux x86_64 bundle, OCI, image ID/digest, tooling, and executable
    identities for the signed source;
 3. a complete verified Phase-A/Phase-B nine-path canary with Phase B promoted,
@@ -450,6 +479,14 @@ Before live clearance, the following external facts remain mandatory:
 8. a fresh nonce-bound execution authority.
 
 Until all eight exist, the package is intentionally non-runnable.
+
+Node30 public release remains independently hard-disabled until reviewed Core
+or one-shot worker semantics can enforce the exact input, total-fee cap,
+single dispatch, terminal queue/payout evidence, and atomic re-pause. The
+installed-v30.1.4 node27 canary likewise permits audit/sign-only only: its
+targeted commit RPC cannot atomically consume the externally reviewed
+plan/tip/wallet/component/raw-byte tuple, so node27 relay and final acceptance
+remain nondeployable.
 
 ## Replacement-identity repin ledger
 
@@ -470,7 +507,7 @@ update and review these groups in order:
    unlock helper, reviewed read-only node30 probe, and separately reviewed
    persistent Compose/image-policy/300105 guard handoff receipts and the exact
    post-reconcile identity proof;
-5. regenerated `VALIDATION.txt`, then `SHA256SUMS` over the other fifteen
+5. regenerated `VALIDATION.txt`, then `SHA256SUMS` over the other twenty-one
    package files, then the external hash of that manifest; and
 6. `ROLLOUT_IDENTITY_RECONCILED=1` and fresh matching live/native/guard
    nonce-bound authorities only after independent collision clearance.

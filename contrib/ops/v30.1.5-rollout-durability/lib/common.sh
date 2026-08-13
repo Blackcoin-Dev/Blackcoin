@@ -321,9 +321,35 @@ v3015_compose_topology_matches()
     [[ "$actual" == "$expected" ]]
 }
 
+v3015_expected_package_payloads()
+{
+    printf '%s\n' \
+      README.md \
+      VALIDATION.txt \
+      fleet_rollout.sh \
+      guard_rollout_maintenance_block.sh.inc \
+      install_runtime_guard_3015_compat.sh \
+      job-10-one-shot-contract.json \
+      lib/common.sh \
+      lib/node30_free_claim_release_contract.sh \
+      lib/typed_contract.sh \
+      native_restart_durability.sh \
+      node30_free_claim_release.sh \
+      pos_unlock_renewal_supervisor.sh \
+      render_compose_runtime.awk \
+      render_policy.sh \
+      rollout.env.example \
+      tests/node30_free_claim_release.sh \
+      tests/pos_unlock_renewal_supervisor.sh \
+      tests/run.sh \
+      topology.map \
+      verify-evidence.sh \
+      waves.txt
+}
+
 v3015_verify_package_tree()
 {
-    local root=$1 manifest actual listed file owner mode
+    local root=$1 manifest actual listed expected file owner mode
     manifest="$root/SHA256SUMS"
     [[ "$(realpath -e -- "$root" 2>/dev/null)" == "$root" ]] || return 1
     v3015_secure_ancestry "$root" || return 1
@@ -336,7 +362,9 @@ v3015_verify_package_tree()
       for path do printf "%s\n" "${path#"$1"/}"; done
     ' sh "$root" {} + | sort) || return 1
     listed=$(awk '{print $2}' "$manifest" | sed 's#^\*\?##; s#^\./##' | sort) || return 1
-    [[ "$actual" == "$listed" && "$(printf '%s\n' "$actual" | sed '/^$/d' | wc -l)" -eq 15 ]] || return 1
+    expected=$(v3015_expected_package_payloads | sort) || return 1
+    [[ "$actual" == "$expected" && "$listed" == "$expected" &&
+       "$(printf '%s\n' "$expected" | sed '/^$/d' | wc -l)" -eq 21 ]] || return 1
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         [[ -f "$root/$file" && ! -L "$root/$file" ]] || return 1
@@ -351,11 +379,16 @@ v3015_verify_package_tree()
 v3015_validate_release_env()
 {
     local expected_fingerprint='SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70'
+    local expected_source='0e62ec0af3daefba30f87382d9b3cc8b00224e62'
+    local expected_tree='d460eee11b7c8c6d5fffe6935f2e9a5d58e18aac'
+    local expected_run='31710198720'
     local name
     v3015_is_git_sha "${SOURCE_SHA:-}" ||
         v3015_die 'SOURCE_SHA is not a resolved full commit identity' || return
     v3015_is_git_sha "${SOURCE_TREE:-}" ||
         v3015_die 'SOURCE_TREE is not a resolved full tree identity' || return
+    [[ "$SOURCE_SHA" == "$expected_source" && "$SOURCE_TREE" == "$expected_tree" ]] ||
+        v3015_die 'source identity is not the exact reviewed H0e62 tree' || return
     [[ "${SOURCE_SIGNING_FINGERPRINT:-}" == "$expected_fingerprint" &&
        "${SOURCE_SIGNATURE_VERIFIED:-}" == 1 ]] ||
         v3015_die 'final source signature is not reconciled to Blackcoin-Dev' || return
@@ -368,16 +401,20 @@ v3015_validate_release_env()
     [[ "${NORMAL_UNLOCK_HELPER_SHA256:-}" == \
          acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1 ]] ||
         v3015_die 'normal-unlock-only helper identity mismatch' || return
-    [[ "${CORE_CI_RUN_ID:-}" =~ ^[1-9][0-9]*$ ]] ||
-        v3015_die 'CORE_CI_RUN_ID is invalid' || return
+    [[ "${CORE_CI_RUN_ID:-}" == "$expected_run" ]] ||
+        v3015_die 'CORE_CI_RUN_ID is not the exact reviewed H0e62 run' || return
     [[ "${CORE_CI_CONCLUSION:-}" == success ]] ||
         v3015_die 'exact-SHA Core CI is not recorded as successful' || return
     [[ "${CORE_CI_HEAD_SHA:-}" == "$SOURCE_SHA" ]] ||
         v3015_die 'Core CI head does not equal SOURCE_SHA' || return
-    v3015_require_resolved CORE_CI_WORKFLOW "${CORE_CI_WORKFLOW:-}" || return
+    [[ "${CORE_CI_WORKFLOW:-}" == '.github/workflows/pr-gate.yml' ]] ||
+        v3015_die 'CORE_CI_WORKFLOW is not the reviewed workflow' || return
     [[ "${CANDIDATE_ARTIFACT_RUN_ID:-}" =~ ^[1-9][0-9]*$ &&
        "${CANDIDATE_ARTIFACT_RUN_ATTEMPT:-}" =~ ^[1-9][0-9]*$ ]] ||
         v3015_die 'candidate artifact run identity is unresolved' || return
+    [[ "$CANDIDATE_ARTIFACT_RUN_ID" == "$expected_run" &&
+       "$CANDIDATE_ARTIFACT_RUN_ATTEMPT" == 1 ]] ||
+        v3015_die 'candidate artifact is not bound to exact H0e62 run attempt one' || return
     v3015_require_resolved CANDIDATE_ARTIFACT_NAME "${CANDIDATE_ARTIFACT_NAME:-}" || return
     v3015_is_candidate_image_ref "${CANDIDATE_IMAGE_REF:-}" ||
         v3015_die 'CANDIDATE_IMAGE_REF must be the canonical immutable candidate repository' || return

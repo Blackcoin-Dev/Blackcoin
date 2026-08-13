@@ -377,14 +377,78 @@ expect_fail 'resolved summary must equal typed component classifications' \
 
 image="qqblackcoin/blackcoin-v4-gui@sha256:$(printf '1%.0s' {1..64})"
 image_id="sha256:$(printf '2%.0s' {1..64})"
+topology="$package_dir/topology.map"
+topology_lookup_equals()
+{
+    [[ "$(v3015_topology_lookup "$1" "$2")" == "$3" ]]
+}
+expect_pass 'sealed logical-node topology is complete and unambiguous' \
+  v3015_validate_topology_map "$topology"
+expect_pass 'logical node1 maps to recorded zero-padded service and unsuffixed container' \
+  topology_lookup_equals "$topology" 1 $'node01\tblackcoin-v4-gui'
+expect_pass 'logical node9 maps to recorded zero-padded service' \
+  topology_lookup_equals "$topology" 9 $'node09\tblackcoin-v4-gui-9'
+expect_pass 'logical node10 maps to recorded unpadded service' \
+  topology_lookup_equals "$topology" 10 $'node10\tblackcoin-v4-gui-10'
+expect_fail 'topology lookup rejects node outside the fleet' \
+  v3015_topology_lookup "$topology" 33
+
+missing_topology="$tmp/topology-missing.map"
+awk '$1 != 32' "$topology" >"$missing_topology"
+expect_fail 'topology rejects a missing logical node' \
+  v3015_validate_topology_map "$missing_topology"
+duplicate_node_topology="$tmp/topology-duplicate-node.map"
+awk '$1 == 32 {$1=31} {print}' "$topology" >"$duplicate_node_topology"
+expect_fail 'topology rejects a duplicate logical node' \
+  v3015_validate_topology_map "$duplicate_node_topology"
+duplicate_service_topology="$tmp/topology-duplicate-service.map"
+awk '$1 == 32 {$2="node31"} {print}' "$topology" >"$duplicate_service_topology"
+expect_fail 'topology rejects an ambiguous Compose service' \
+  v3015_validate_topology_map "$duplicate_service_topology"
+duplicate_container_topology="$tmp/topology-duplicate-container.map"
+awk '$1 == 32 {$3="blackcoin-v4-gui-31"} {print}' "$topology" >"$duplicate_container_topology"
+expect_fail 'topology rejects an ambiguous container name' \
+  v3015_validate_topology_map "$duplicate_container_topology"
+leading_zero_topology="$tmp/topology-leading-zero.map"
+awk '$1 == 1 {$1="01"} {print}' "$topology" >"$leading_zero_topology"
+expect_fail 'topology rejects noncanonical logical node numbers' \
+  v3015_validate_topology_map "$leading_zero_topology"
+extra_field_topology="$tmp/topology-extra-field.map"
+awk '$1 == 1 {$0=$0 " extra"} {print}' "$topology" >"$extra_field_topology"
+expect_fail 'topology rejects rows with hidden extra fields' \
+  v3015_validate_topology_map "$extra_field_topology"
+
+compose_topology=$(jq -Rn '
+  [inputs | select(length > 0 and (startswith("#") | not)) | split(" ") |
+    {key:.[1],value:{container_name:.[2]}}] | {services:(from_entries)}' <"$topology")
+expect_pass 'Compose model exactly matches the sealed topology' \
+  v3015_compose_topology_matches "$topology" "$compose_topology"
+expect_fail 'Compose topology rejects a missing service' \
+  v3015_compose_topology_matches "$topology" \
+  "$(jq 'del(.services.node32)' <<<"$compose_topology")"
+expect_fail 'Compose topology rejects an extra service' \
+  v3015_compose_topology_matches "$topology" \
+  "$(jq '.services.extra={container_name:"extra-container"}' <<<"$compose_topology")"
+expect_fail 'Compose topology rejects duplicate container ownership' \
+  v3015_compose_topology_matches "$topology" \
+  "$(jq '.services.node32.container_name=.services.node31.container_name' <<<"$compose_topology")"
+
 expect_pass 'regular Compose overlay renders' bash -c \
-  "awk -v image_ref='$image' -v role=regular -v nodes='1 31' -f '$package_dir/render_compose_runtime.awk' /dev/null | grep -q -- '- -powmining=1'"
+  "awk -v image_ref='$image' -v role=regular -v nodes='1 31' -v topology_file='$topology' -f '$package_dir/render_compose_runtime.awk' /dev/null | grep -q -- '- -powmining=1'"
 expect_pass 'Free Claim overlay hard-disables regular PoW' bash -c \
-  "awk -v image_ref='$image' -v role=free_claim -v nodes=30 -f '$package_dir/render_compose_runtime.awk' /dev/null | grep -q -- '- -powmining=0'"
+  "awk -v image_ref='$image' -v role=free_claim -v nodes=30 -v topology_file='$topology' -f '$package_dir/render_compose_runtime.awk' /dev/null | grep -q -- '- -powmining=0'"
 expect_pass 'Compose wrapper body has reviewed exact hash' bash -c \
-  "awk -v image_ref='$image' -v role=regular -v nodes=1 -f '$package_dir/render_compose_runtime.awk' /dev/null | awk '/- \|/{body=1;next} /      - node1-v3015-rollout/{exit} body{sub(/^          /,\"\");print}' | sed 's/[$][$]/$/g' | sha256sum | grep -q '^753acc9904b48c411f5514abface930f79d72d00c9d73e91435a6511877d47b4'"
-expect_fail 'Compose overlay rejects mutable tag' awk -v image_ref=example:latest -v role=regular -v nodes=1 -f "$package_dir/render_compose_runtime.awk" /dev/null
-expect_fail 'Compose overlay rejects node outside fleet' awk -v image_ref="$image" -v role=regular -v nodes=33 -f "$package_dir/render_compose_runtime.awk" /dev/null
+  "awk -v image_ref='$image' -v role=regular -v nodes=1 -v topology_file='$topology' -f '$package_dir/render_compose_runtime.awk' /dev/null | awk '/- \|/{body=1;next} /      - node1-v3015-rollout/{exit} body{sub(/^          /,\"\");print}' | sed 's/[$][$]/$/g' | sha256sum | grep -q '^753acc9904b48c411f5514abface930f79d72d00c9d73e91435a6511877d47b4'"
+expect_pass 'Compose overlay addresses recorded node01 for logical node1' bash -c \
+  "awk -v image_ref='$image' -v role=regular -v nodes=1 -v topology_file='$topology' -f '$package_dir/render_compose_runtime.awk' /dev/null | grep -q '^  node01:'"
+expect_pass 'Compose overlay addresses recorded node09 for logical node9' bash -c \
+  "awk -v image_ref='$image' -v role=regular -v nodes=9 -v topology_file='$topology' -f '$package_dir/render_compose_runtime.awk' /dev/null | grep -q '^  node09:'"
+expect_pass 'Compose overlay preserves recorded node10 for logical node10' bash -c \
+  "awk -v image_ref='$image' -v role=regular -v nodes=10 -v topology_file='$topology' -f '$package_dir/render_compose_runtime.awk' /dev/null | grep -q '^  node10:'"
+expect_fail 'Compose overlay rejects missing topology authority' awk -v image_ref="$image" -v role=regular -v nodes=1 -f "$package_dir/render_compose_runtime.awk" /dev/null
+expect_fail 'Compose overlay rejects incomplete topology authority' awk -v image_ref="$image" -v role=regular -v nodes=1 -v topology_file="$missing_topology" -f "$package_dir/render_compose_runtime.awk" /dev/null
+expect_fail 'Compose overlay rejects mutable tag' awk -v image_ref=example:latest -v role=regular -v nodes=1 -v topology_file="$topology" -f "$package_dir/render_compose_runtime.awk" /dev/null
+expect_fail 'Compose overlay rejects node outside fleet' awk -v image_ref="$image" -v role=regular -v nodes=33 -v topology_file="$topology" -f "$package_dir/render_compose_runtime.awk" /dev/null
 
 policy_in="$tmp/policy.json"
 jq -cn 'reduce range(1;33) as $n ({schema:1,images:{},nodes:{}};
@@ -1259,8 +1323,8 @@ expect_pass 'native proof contains no worker-enable repair RPC' bash -c \
   "! grep -Eiq 'setpowmining[[:space:]]+true|staking[[:space:]]+true' '$package_dir/native_restart_durability.sh'"
 expect_pass 'v30.1.5 package does not source v30.1.4 libraries' bash -c \
   "! grep -Eq 'source .*v30[.]1[.]4' '$package_dir/fleet_rollout.sh' '$package_dir/native_restart_durability.sh' '$package_dir/verify-evidence.sh'"
-expect_pass 'package contains exactly fifteen authorized paths' bash -c \
-  "find '$package_dir' -type f | wc -l | grep -q '15'"
+expect_pass 'package contains exactly sixteen authorized paths' bash -c \
+  "find '$package_dir' -type f | wc -l | grep -q '16'"
 expect_pass 'maintenance include declares Bash for standalone ShellCheck' bash -c \
   "head -n 1 '$package_dir/guard_rollout_maintenance_block.sh.inc' | grep -Fqx '# shellcheck shell=bash' && shellcheck -x '$package_dir/guard_rollout_maintenance_block.sh.inc'"
 expect_pass 'maintenance guard exact-checks rollout authority schema' bash -c \
@@ -1269,15 +1333,19 @@ expect_pass 'terminal node30 Core sample is captured after the multi-tip probe' 
   "awk '/capture_node30_probe_evidence .*terminal/{p=NR} p && !s && /staking=.*getstakinginfo/{s=NR} p && s && !v && /v3015_pos_json_is_active/{v=NR} END{exit !(p && p<s && s<v)}' '$package_dir/fleet_rollout.sh'"
 expect_pass 'runtime invocation binds actual container image identity' bash -c \
   "grep -Fq '.[0].Image == \$image_id' '$package_dir/native_restart_durability.sh' && grep -Fq '.[0].Image == \$image_id' '$package_dir/fleet_rollout.sh' && grep -Fq \"docker inspect -f '{{.Image}}'\" '$package_dir/fleet_rollout.sh'"
+expect_pass 'live scripts resolve service and container names only through sealed topology' bash -c \
+  "grep -Fq 'v3015_topology_lookup' '$package_dir/native_restart_durability.sh' && grep -Fq 'v3015_topology_lookup' '$package_dir/fleet_rollout.sh' && ! grep -Eq 'service=\"node\\\$\\\{node\\\}\"|container=\"blackcoin-v4-gui-\\\$\\\{node\\\}\"|blackcoin-v4-gui-[0-9]+' '$package_dir/native_restart_durability.sh' '$package_dir/fleet_rollout.sh'"
+expect_pass 'live mutation validates the rendered Compose topology before use' bash -c \
+  "grep -Fq 'v3015_compose_topology_matches' '$package_dir/native_restart_durability.sh' && grep -Fq 'v3015_compose_topology_matches' '$package_dir/fleet_rollout.sh'"
 # The single-quoted body is intentionally evaluated by the child Bash.
 # shellcheck disable=SC2016
-expect_pass 'provisional source/CI-bound seal covers the exact fourteen payloads' bash -c '
+expect_pass 'provisional source/CI-bound seal covers the exact fifteen payloads' bash -c '
   set -euo pipefail
   package_dir=$1
   actual=$(cd "$package_dir" && find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort)
   listed=$(cd "$package_dir" && awk "{print \$2}" SHA256SUMS | LC_ALL=C sort)
   test "$actual" = "$listed"
-  test "$(printf "%s\n" "$listed" | uniq | wc -l | tr -d " ")" = 14
+  test "$(printf "%s\n" "$listed" | uniq | wc -l | tr -d " ")" = 15
   ! grep -Eq "UNSEALED|PLACEHOLDER|__" "$package_dir/SHA256SUMS"
   (cd "$package_dir" && sha256sum --strict -c SHA256SUMS >/dev/null)
 ' bash "$package_dir"

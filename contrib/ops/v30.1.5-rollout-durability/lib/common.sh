@@ -265,6 +265,62 @@ v3015_unlock_helper_is_audited()
     [[ "$size" == 3206 && "$lines" == 54 ]]
 }
 
+# The topology map is the only translation from a logical node number to a
+# Compose service and a Docker container. Validate the complete map before
+# returning any row so a duplicated, missing, or malformed entry can never be
+# used as a partial lookup result.
+v3015_validate_topology_map()
+{
+    local map=$1
+    [[ -f "$map" && ! -L "$map" ]] || return 1
+    awk '
+      BEGIN { rows = 0 }
+      /^$/ { next }
+      /^#/ { next }
+      {
+        if ($0 !~ /^[1-9][0-9]* [A-Za-z0-9][A-Za-z0-9_.-]* [A-Za-z0-9][A-Za-z0-9_.-]*$/)
+          exit 1
+        if (NF != 3 || $1 < 1 || $1 > 32 || sprintf("%d", $1) != $1)
+          exit 1
+        if (node[$1]++ || service[$2]++ || container[$3]++)
+          exit 1
+        rows++
+      }
+      END {
+        if (rows != 32) exit 1
+        for (node_number = 1; node_number <= 32; node_number++)
+          if (node[node_number] != 1) exit 1
+      }
+    ' "$map"
+}
+
+v3015_topology_lookup()
+{
+    local map=$1 node=$2
+    [[ "$node" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || return 1
+    v3015_validate_topology_map "$map" || return 1
+    awk -v wanted="$node" '
+      !/^#/ && NF == 3 && $1 == wanted { print $2 "\t" $3; found++ }
+      END { if (found != 1) exit 1 }
+    ' "$map"
+}
+
+v3015_compose_topology_matches()
+{
+    local map=$1 compose_json=$2 expected actual
+    v3015_validate_topology_map "$map" || return 1
+    jq -e '
+      type == "object" and (.services | type == "object") and
+      ([.services[] | .container_name] | all(type == "string" and length > 0)) and
+      ([.services[] | .container_name] | length) ==
+        ([.services[] | .container_name] | unique | length)
+    ' <<<"$compose_json" >/dev/null || return 1
+    expected=$(awk '!/^#/ && NF == 3 { print $2 "\t" $3 }' "$map" | sort) || return 1
+    actual=$(jq -er '.services | to_entries[] | [.key,.value.container_name] | @tsv' \
+      <<<"$compose_json" | sort) || return 1
+    [[ "$actual" == "$expected" ]]
+}
+
 v3015_verify_package_tree()
 {
     local root=$1 manifest actual listed file owner mode
@@ -280,7 +336,7 @@ v3015_verify_package_tree()
       for path do printf "%s\n" "${path#"$1"/}"; done
     ' sh "$root" {} + | sort) || return 1
     listed=$(awk '{print $2}' "$manifest" | sed 's#^\*\?##; s#^\./##' | sort) || return 1
-    [[ "$actual" == "$listed" && "$(printf '%s\n' "$actual" | sed '/^$/d' | wc -l)" -eq 14 ]] || return 1
+    [[ "$actual" == "$listed" && "$(printf '%s\n' "$actual" | sed '/^$/d' | wc -l)" -eq 15 ]] || return 1
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         [[ -f "$root/$file" && ! -L "$root/$file" ]] || return 1

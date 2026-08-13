@@ -21,6 +21,8 @@ v3015_load_reviewed_env "$env_file"
 v3015_validate_release_env
 v3015_require_commands docker jq sha256sum awk grep date find realpath stat sed wc tr sort
 v3015_verify_package_tree "$package_dir" || v3015_die 'sealed package tree is invalid'
+topology_map="$package_dir/topology.map"
+v3015_validate_topology_map "$topology_map" || v3015_die 'sealed node topology map is invalid'
 v3015_secure_directory "$evidence" || v3015_die 'evidence directory is not secure'
 v3015_secure_ancestry "$evidence" || v3015_die 'evidence ancestry is untrusted'
 [[ -f "$overlay" && ! -L "$overlay" ]] || v3015_die 'Compose overlay missing'
@@ -38,6 +40,10 @@ v3015_phase_b_evidence_is_valid "$PHASE_B_RESULT" "$PHASE_B_PROMOTION_MARKER" ||
 v3015_release_identity_is_valid "$RELEASE_IDENTITY_JSON" || v3015_die 'release identity invalid'
 [[ "$(v3015_sha256_file "$COMPOSE_FILE")" == "$FINAL_COMPOSE_SHA256" ]] ||
     v3015_die 'live Compose does not match the durable handoff receipt'
+compose_model=$(docker compose -f "$COMPOSE_FILE" -f "$overlay" config --format json) ||
+    v3015_die 'merged Compose topology could not be rendered'
+v3015_compose_topology_matches "$topology_map" "$compose_model" ||
+    v3015_die 'merged Compose service/container topology is incomplete or ambiguous'
 v3015_unlock_helper_is_audited "$NORMAL_UNLOCK_HELPER" ||
     v3015_die 'normal-unlock helper identity/content audit failed'
 
@@ -53,8 +59,10 @@ jq -e --arg run "$evidence" --arg nonce "$nonce" --arg source "$SOURCE_SHA" '
     run_dir:$run,nonce:$nonce,source_sha:$source}
 ' "$marker" >/dev/null || v3015_die 'fleet transaction marker does not bind this proof'
 
-service="node${node}"
-container="blackcoin-v4-gui-${node}"
+topology_row=$(v3015_topology_lookup "$topology_map" "$node") ||
+    v3015_die 'logical node is missing from the sealed topology map'
+IFS=$'\t' read -r service container <<<"$topology_row"
+[[ -n "$service" && -n "$container" ]] || v3015_die 'topology lookup is incomplete'
 cli='/usr/local/bin/blackcoin-cli'
 datadir='/home/blackcoin/.blackcoin'
 output=$(printf '%s/node-%02d.json' "$evidence" "$node")
@@ -84,8 +92,9 @@ verify_runtime_invocation()
     sentinel="node${node}-v3015-rollout"
     [[ "$body_sha" == "$RUNTIME_ENTRYPOINT_BODY_SHA256" ]] || return 1
     jq -e --arg sentinel "$sentinel" --arg image "$CANDIDATE_IMAGE_REF" \
+      --arg container "/$container" \
       --arg image_id "$CANDIDATE_IMAGE_ID" '
-      .[0].Config.Entrypoint[0] == "/bin/bash" and
+      .[0].Name == $container and .[0].Config.Entrypoint[0] == "/bin/bash" and
       .[0].Config.Entrypoint[1] == "-c" and
       .[0].Config.Entrypoint[3] == $sentinel and
       .[0].Config.Image == $image and .[0].Image == $image_id and

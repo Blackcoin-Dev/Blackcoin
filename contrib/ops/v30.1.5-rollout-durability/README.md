@@ -25,11 +25,25 @@ execution-authority values. Any one unresolved value prevents preflight.
 The candidate image must use the canonical immutable
 `qqblackcoin/blackcoin-v4-gui@sha256:...` reference; the historical
 `hotfix-candidate` naming convention is not rollout authority.
-`SHA256SUMS` seals the exact fourteen non-manifest files in this provisionally
+`SHA256SUMS` seals the exact fifteen non-manifest files in this provisionally
 source/CI-bound package. That byte seal is package-integrity evidence only; it
 is not rollout authority. Recording a successful R conclusion and later
 bundle/OCI/Phase-B/handoff identities is a separate change and must regenerate
 both `VALIDATION.txt` and `SHA256SUMS`.
+
+`topology.map` is the single sealed translation from logical nodes 1–32 to
+Compose service names and container names. It records the preserved baseline's
+zero-padded services `node01` through `node09`, unpadded services `node10`
+through `node32`, the unsuffixed node1 container `blackcoin-v4-gui`, and
+containers `blackcoin-v4-gui-2` through `blackcoin-v4-gui-32`. The renderer,
+restart proof, failure containment, node30 path, and terminal census all use
+that map. A missing logical node, duplicate node, duplicate service, duplicate
+container, malformed row, extra or missing Compose service, or Compose
+container mismatch fails before candidate mutation. This checked-in map
+reflects the recorded baseline; it is not a fresh live-topology receipt and
+does not make the package deployable. Final execution still requires the
+reviewed Compose hash, handoff receipt, post-reconcile identity proof, and
+nonce authorities.
 
 ## Acceptance contract
 
@@ -64,7 +78,9 @@ For each regular-PoW node, `native_restart_durability.sh`:
 1. verifies the signed source, successful exact-SHA CI, sealed artifact/image
    and all six runtime binary identities, completed no-rewind Phase B, package seal, Compose
    hash, and normal-unlock helper hash;
-2. recreates the service with the immutable v30.1.5 image and exact Core-native
+2. resolves the logical node through the sealed topology, proves the merged
+   Compose model has exactly the mapped services and containers, and recreates
+   that service with the immutable v30.1.5 image and exact Core-native
    settings `-walletbroadcast=1`, `-autostartstaking=1`, `-powmining=1`, `-powminingthreads=1`, and
    `-powminingcpu=1`;
 3. establishes candidate operation with the pinned normal-unlock-only helper;
@@ -242,7 +258,7 @@ update and review these groups in order:
    unlock helper, reviewed read-only node30 probe, and separately reviewed
    persistent Compose/image-policy/300105 guard handoff receipts and the exact
    post-reconcile identity proof;
-5. regenerated `VALIDATION.txt`, then `SHA256SUMS` over the other fourteen
+5. regenerated `VALIDATION.txt`, then `SHA256SUMS` over the other fifteen
    package files, then the external hash of that manifest; and
 6. `ROLLOUT_IDENTITY_RECONCILED=1` and fresh matching live/native/guard
    nonce-bound authorities only after independent collision clearance.

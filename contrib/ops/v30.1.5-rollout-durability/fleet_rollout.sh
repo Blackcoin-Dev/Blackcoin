@@ -33,6 +33,8 @@ v3015_require_commands jq awk sha256sum sort uniq find date install flock docker
     sed wc tr grep sync ln mv mktemp id
 v3015_validate_release_env
 v3015_verify_package_tree "$package_dir" || v3015_die 'sealed package tree is invalid'
+topology_map="$package_dir/topology.map"
+v3015_validate_topology_map "$topology_map" || v3015_die 'sealed node topology map is invalid'
 for reviewed_file in "$PHASE_B_RESULT" "$PHASE_B_PROMOTION_MARKER" \
     "$NINE_PATH_CANARY_SHA256SUMS" "$RELEASE_IDENTITY_JSON" \
     "$RUNTIME_POLICY_HANDOFF_RECEIPT" "$PERSISTENT_COMPOSE_HANDOFF_RECEIPT" \
@@ -89,6 +91,14 @@ expected_regular=$(printf '%s\n' {1..29} 31 32 | sort -n | tr '\n' ' ')
 v3015_require_resolved NODE30_FREE_CLAIM_PROBE "${NODE30_FREE_CLAIM_PROBE:-}"
 v3015_is_sha256 "${NODE30_FREE_CLAIM_PROBE_SHA256:-}" ||
     v3015_die 'node30 probe identity unresolved'
+if [[ "$mode" == preflight && "${V3015_PREFLIGHT_FIXTURE:-0}" != 1 ]]; then
+    [[ "$(v3015_sha256_file "$COMPOSE_FILE")" == "$FINAL_COMPOSE_SHA256" ]] ||
+        v3015_die 'Compose does not match the durable handoff receipt'
+    preflight_compose_model=$(docker compose -f "$COMPOSE_FILE" config --format json) ||
+        v3015_die 'reviewed Compose topology could not be rendered'
+    v3015_compose_topology_matches "$topology_map" "$preflight_compose_model" ||
+        v3015_die 'reviewed Compose service/container topology is incomplete or ambiguous'
+fi
 
 printf 'v30.1.5 preflight PASS: signed source %s, PoS target 32, regular-PoW target 31, node30 Free Claim separate\n' "$SOURCE_SHA"
 [[ "$mode" == apply ]] || exit 0
@@ -101,6 +111,10 @@ nonce=${LIVE_EXECUTION_CLEARED##*:}
     v3015_die 'node30 read-only probe hash mismatch'
 [[ "$(v3015_sha256_file "$COMPOSE_FILE")" == "$FINAL_COMPOSE_SHA256" ]] ||
     v3015_die 'Compose does not match the durable handoff receipt'
+compose_model=$(docker compose -f "$COMPOSE_FILE" config --format json) ||
+    v3015_die 'reviewed Compose topology could not be rendered'
+v3015_compose_topology_matches "$topology_map" "$compose_model" ||
+    v3015_die 'reviewed Compose service/container topology is incomplete or ambiguous'
 [[ "$(v3015_sha256_file "$IMAGE_POLICY_PATH")" == "$FINAL_IMAGE_POLICY_SHA256" ]] ||
     v3015_die 'image policy does not match the durable handoff receipt'
 [[ "$(v3015_sha256_file "$POST_COMPOSE_RECONCILE_IDENTITY_PROOF")" == \
@@ -155,11 +169,20 @@ touched=()
 success=0
 contain_touched()
 {
-    local status=$?
+    local status=$? topology_row touched_service touched_container
     if ((status != 0 && success == 0)); then
         containment_failed=0
         for node in "${touched[@]}"; do
-            v3015_contain_container "blackcoin-v4-gui-${node}" || containment_failed=1
+            topology_row=$(v3015_topology_lookup "$topology_map" "$node") || {
+                containment_failed=1
+                continue
+            }
+            IFS=$'\t' read -r touched_service touched_container <<<"$topology_row"
+            [[ -n "$touched_service" && -n "$touched_container" ]] || {
+                containment_failed=1
+                continue
+            }
+            v3015_contain_container "$touched_container" || containment_failed=1
         done
         if ((containment_failed == 0)); then
             printf 'fleet rollout contained; live datasets preserved; no image or data rollback attempted\n' >&2
@@ -176,9 +199,14 @@ node30_cli='/usr/local/bin/blackcoin-cli'
 node30_datadir='/home/blackcoin/.blackcoin'
 node30_argv_sha=''
 node30_probe_tool="$run_dir/.node-30-free-claim-probe.tool"
+node30_topology=$(v3015_topology_lookup "$topology_map" 30) ||
+    v3015_die 'node30 is missing from the sealed topology map'
+IFS=$'\t' read -r node30_service node30_container <<<"$node30_topology"
+[[ -n "$node30_service" && -n "$node30_container" ]] ||
+    v3015_die 'node30 topology lookup is incomplete'
 node30_rpc()
 {
-    docker exec blackcoin-v4-gui-30 "$node30_cli" -datadir="$node30_datadir" "$@"
+    docker exec "$node30_container" "$node30_cli" -datadir="$node30_datadir" "$@"
 }
 wait_node30_rpc()
 {
@@ -240,31 +268,32 @@ capture_node30_probe_evidence()
 verify_node30_invocation()
 {
     local inspect body body_sha argv_lines argv_json pid1_sha binary expected network
-    inspect=$(docker inspect blackcoin-v4-gui-30)
+    inspect=$(docker inspect "$node30_container")
     body=$(jq -er '.[0].Config.Entrypoint[2]' <<<"$inspect") || return 1
     body_sha=$(printf '%s\n' "$body" | sha256sum | awk '{print $1}')
     [[ "$body_sha" == "$RUNTIME_ENTRYPOINT_BODY_SHA256" ]] || return 1
-    jq -e '.[0].Config.Entrypoint[0] == "/bin/bash" and
+    jq -e '.[0].Name == $container and .[0].Config.Entrypoint[0] == "/bin/bash" and
       .[0].Config.Entrypoint[1] == "-c" and
       .[0].Config.Entrypoint[3] == "node30-v3015-rollout" and
       .[0].Config.Cmd == ["-walletbroadcast=1","-autostartstaking=1","-powmining=0"] and
       .[0].Config.Image == $image and .[0].Image == $image_id' \
-      --arg image "$CANDIDATE_IMAGE_REF" --arg image_id "$CANDIDATE_IMAGE_ID" \
+      --arg container "/$node30_container" --arg image "$CANDIDATE_IMAGE_REF" \
+      --arg image_id "$CANDIDATE_IMAGE_ID" \
       <<<"$inspect" >/dev/null || return 1
     [[ "$(docker image inspect "$CANDIDATE_IMAGE_REF" -f '{{.Id}}')" == \
        "$CANDIDATE_IMAGE_ID" ]] || return 1
-    argv_lines=$(docker exec blackcoin-v4-gui-30 /bin/bash -c \
+    argv_lines=$(docker exec "$node30_container" /bin/bash -c \
       'tr "\000" "\n" < /proc/1/cmdline') || return 1
     argv_json=$(printf '%s\n' "$argv_lines" | jq -Rsc 'split("\n") | map(select(length > 0))')
     jq -e '. == ["/usr/local/bin/blackcoin-qt","-datadir=/home/blackcoin/.blackcoin",
       "-walletbroadcast=1","-autostartstaking=1","-powmining=0"]' \
       <<<"$argv_json" >/dev/null || return 1
-    node30_argv_sha=$(docker exec blackcoin-v4-gui-30 sha256sum /proc/1/cmdline | awk '{print $1}')
+    node30_argv_sha=$(docker exec "$node30_container" sha256sum /proc/1/cmdline | awk '{print $1}')
     v3015_is_sha256 "$node30_argv_sha" || return 1
-    pid1_sha=$(docker exec blackcoin-v4-gui-30 sha256sum /proc/1/exe | awk '{print $1}')
+    pid1_sha=$(docker exec "$node30_container" sha256sum /proc/1/exe | awk '{print $1}')
     [[ "$pid1_sha" == "$CANDIDATE_BLACKCOIN_QT_SHA256" ]] || return 1
     while read -r binary expected; do
-        [[ "$(docker exec blackcoin-v4-gui-30 sha256sum "/usr/local/bin/$binary" | awk '{print $1}')" == \
+        [[ "$(docker exec "$node30_container" sha256sum "/usr/local/bin/$binary" | awk '{print $1}')" == \
            "$expected" ]] || return 1
     done <<EOF
 blackcoind $CANDIDATE_BLACKCOIND_SHA256
@@ -281,10 +310,13 @@ EOF
 
 capture_terminal_census_row()
 {
-    local census_node=$1 census_container census_rpc chain network wallet staking pow
+    local census_node=$1 census_container census_service census_topology census_rpc
+    local chain network wallet staking pow
     local role result_file result_sha free_healthy=false free_paused=false probe_sha=null
     local probe_tool_sha=null terminal_probe
-    census_container="blackcoin-v4-gui-${census_node}"
+    census_topology=$(v3015_topology_lookup "$topology_map" "$census_node") || return 1
+    IFS=$'\t' read -r census_service census_container <<<"$census_topology"
+    [[ -n "$census_service" && -n "$census_container" ]] || return 1
     census_rpc=(docker exec "$census_container" /usr/local/bin/blackcoin-cli
       -datadir=/home/blackcoin/.blackcoin)
     chain=$("${census_rpc[@]}" getblockchaininfo)
@@ -346,8 +378,13 @@ while read -r role nodes; do
     read -r -a wave_nodes <<<"$nodes"
     overlay="$run_dir/overlay-${role}-$(IFS=-; printf '%s' "${wave_nodes[*]}").yml"
     awk -v image_ref="$CANDIDATE_IMAGE_REF" -v role="$role" \
-      -v nodes="${wave_nodes[*]}" -f "$package_dir/render_compose_runtime.awk" /dev/null |
+      -v nodes="${wave_nodes[*]}" -v topology_file="$topology_map" \
+      -f "$package_dir/render_compose_runtime.awk" /dev/null |
       v3015_atomic_write "$overlay"
+    overlay_compose_model=$(docker compose -f "$COMPOSE_FILE" -f "$overlay" \
+      config --format json) || v3015_die 'merged Compose topology could not be rendered'
+    v3015_compose_topology_matches "$topology_map" "$overlay_compose_model" ||
+        v3015_die 'merged Compose service/container topology is incomplete or ambiguous'
     if [[ "$role" == regular ]]; then
         for node in "${wave_nodes[@]}"; do
             # Parent containment ownership must precede child/Compose mutation.
@@ -358,15 +395,15 @@ while read -r role nodes; do
         # Node30 is upgraded separately with regular PoW hard-disabled. The
         # separately reviewed probe owns Free Claim service truth; it is read-only.
         node=30
-        node30_before_id=$(docker inspect -f '{{.Id}}' blackcoin-v4-gui-30)
+        node30_before_id=$(docker inspect -f '{{.Id}}' "$node30_container")
         node30_baseline=$(capture_node30_wallet_state)
         touched+=(30)
         docker compose -f "$COMPOSE_FILE" -f "$overlay" up -d --no-deps \
-          --force-recreate --pull never node30 >/dev/null
+          --force-recreate --pull never "$node30_service" >/dev/null
         wait_node30_rpc || v3015_die 'node30 RPC did not return after recreation'
         verify_node30_invocation || v3015_die 'node30 candidate invocation or binary identity mismatch'
         node30_first_argv_sha=$node30_argv_sha
-        node30_after_id=$(docker inspect -f '{{.Id}}' blackcoin-v4-gui-30)
+        node30_after_id=$(docker inspect -f '{{.Id}}' "$node30_container")
         [[ "$node30_after_id" != "$node30_before_id" ]] ||
             v3015_die 'node30 candidate container was not recreated'
         /bin/bash "$NORMAL_UNLOCK_HELPER" 30 >/dev/null
@@ -380,7 +417,7 @@ while read -r role nodes; do
                 v3015_die 'node30 PoS/regular-PoW role did not become operational before restart'
             sleep 2
         done
-        docker restart --time 30 blackcoin-v4-gui-30 >/dev/null
+        docker restart --time 30 "$node30_container" >/dev/null
         wait_node30_rpc || v3015_die 'node30 RPC did not return after restart'
         verify_node30_invocation || v3015_die 'node30 restarted invocation identity mismatch'
         [[ "$node30_argv_sha" == "$node30_first_argv_sha" ]] ||

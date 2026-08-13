@@ -19,14 +19,22 @@ Exact-SHA Core CI:
 Current offline package checks:
   Bash syntax: PASS
   ShellCheck -x, including the .sh.inc guard: PASS
-  exact sealed-byte hostile fixture suite: 152/152 PASS
-  independent exact sealed-byte hostile replay: 152/152 PASS
-  exact package inventory: 15/15 PASS
-  SHA256SUMS exact 14-payload seal: PASS
+  exact sealed-byte hostile fixture suite: 174/174 PASS
+  second exact sealed-byte hostile replay: 174/174 PASS
+  independent reviewer replay: PENDING
+  exact package inventory: 16/16 PASS
+  SHA256SUMS exact 15-payload seal: PASS
   symlink, mode, whitespace, stale-pin, mutator/RPC scans: PASS
-  pre/post behavior-byte equality: PASS
-  existing-path mutation check: PASS (new directory only)
+  pre/post package-byte equality around the hostile suite: PASS
   live Docker/wallet/network/GitHub action: NONE
+
+Recorded topology input:
+  preserved baseline Compose SHA256:
+    d2f4ea0cea91ed313266a9d4762c8c00b33f2f63fd5a2c9a9d8acfacef88d8cf
+  sealed topology.map SHA256:
+    20598574496f82490073ca836c6bedcb98a229cd263698dc7b38896dae1cd260
+  logical/service/container rows: 32/32 complete and unique
+  fresh live-topology receipt: NONE; final live review remains mandatory
 
 The fixture suite covers all five typed mining actions, zero-hash safe waits,
 per-interval create/refresh progress, partial/extra/unsafe/ambiguous schema
@@ -45,6 +53,14 @@ missing nodes, node30 role leakage, a fresh terminal 32-node census, exact
 handoff receipts and post-Compose identity proof, authority no-clobber/race/
 partial-fsync/removal ownership (including the VFAT marker's hard-link-free
 path), and missing/extra/tampered evidence.
+
+The sealed topology contract covers the recorded node01–node09 service names,
+node10–node32 service names, the unsuffixed node1 container, and the suffixed
+node2–node32 containers. It rejects missing or duplicate logical nodes,
+duplicate services, duplicate containers, malformed or noncanonical rows, and
+missing, extra, or mismatched services or containers in the rendered Compose
+model. This is an offline encoding of the preserved baseline, not a fresh live
+topology observation or rollout authorization.
 
 The suite accepts only the exact irreversible, snapshot-absent, no-rewind
 Phase-B marker/result schemas with shared Phase-A, package, tooling, script,

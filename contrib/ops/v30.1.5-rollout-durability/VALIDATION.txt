@@ -1,39 +1,37 @@
 IDENTITY-NEUTRAL OFFLINE TOOLING-INTEGRITY VALIDATION
 NOT CORE, RELEASE, CANARY, ROLLOUT, OR LIVE AUTHORITY
 
-Final signed source identity (audit continuity only; not execution authority):
+Previously recorded signed source identity (audit continuity only; not final or
+execution authority):
   signed commit H 309731e3340f380e48cb67f94a243725465420fb
   exact tree 1517a277e1ab6355db0a14ed40d21e4e5e1dc846
   required signer SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
   GitHub signature verification: valid
   version 300105 / /Blackcoin:30.1.5/
 
-Pending exact-SHA Core CI (audit continuity only):
-  pending run R 31560485480
+Recorded exact-SHA Core CI state (audit continuity only):
+  run R 31560485480 was pending when recorded
   head 309731e3340f380e48cb67f94a243725465420fb
   workflow .github/workflows/pr-gate.yml / pull-request safety gate
-  no successful conclusion recorded; not release authority
-  checked-in conclusion sentinel __PENDING_EXACT_SHA_CI_SUCCESS__
+  no successful conclusion receipt included; not release authority
+  checked-in pending conclusion sentinel __PENDING_EXACT_SHA_CI_SUCCESS__
 
-Current exact-H semantic reconciliation (preseal):
-  prior frozen hostile fixture replay: 571/572 behavioral/static assertions PASS;
-    only the intentionally stale prior SHA256SUMS assertion failed
-  exact-H source/run pin and retained-family payout-continuity focused checks: PASS
-  current-byte authoritative preseal replay: 580/581 assertions;
-    all 580 non-seal behavioral/static assertions PASS and only the intentionally
-    stale prior SHA256SUMS assertion failed
+Current recorded-H semantic/topology reconciliation (provisional preseal):
+  recorded-H source/run pin and retained-family payout-continuity checks: PASS
+  explicit 32-row logical-node/service/container topology checks: PASS
+  candidate image digest / OCI manifest SHA256 cross-bindings: PASS
+  current-byte hostile fixture suite: 605/605 assertions PASS
   Bash syntax: PASS (all .sh and the standalone .sh.inc guard)
   ShellCheck -x: PASS (all .sh and the standalone .sh.inc guard)
   git diff --check: PASS
-  prior exact manifest bytes: PRESERVED as historical audit evidence;
-    no current-byte manifest reseal performed
+  exact package inventory: 16 files / 15 manifest payloads
+  provisional SHA256SUMS current-byte preseal: PASS
   independent current-byte P0/P1 review: PENDING
   live Docker/wallet/network/GitHub action: NONE
 
-Historical prior tooling-integrity seal (now superseded for current bytes):
-  exact package inventory: 15 files / 14 manifest payloads
-  strict old SHA256SUMS seal and full 366/366 replay: PASS at the prior boundary
-  the old seal is not authority for this unstaged reconciliation
+This provisional preseal proves package-byte integrity only. It is not final
+source, artifact, publication, Phase-A, Phase-B, canary, rollout, release, or
+fleet authority.
 
 The current fixture suite covers all five typed mining actions, the exact familyless
 fresh-new-anchor next-tip transition, a ten-minute global zero-hash no-progress
@@ -124,6 +122,18 @@ node30 role leakage, node30 safe-external-receive-only additions, a fresh termin
 post-Compose identity proof, authority no-clobber/race/partial-fsync/removal
 ownership (including the VFAT marker's hard-link-free path), early containment
 ownership for partial Compose failure, and missing/extra/tampered evidence.
+The release environment and release-identity document independently require
+the immutable image-reference digest to equal the candidate OCI manifest
+SHA256; changing both the document and its matching environment variable while
+leaving the image reference intact still fails closed.
+
+The sealed topology contract covers the recorded node01–node09 service names,
+node10–node32 service names, the unsuffixed node1 container, and the suffixed
+node2–node32 containers. It rejects missing or duplicate logical nodes,
+duplicate services, duplicate containers, malformed or noncanonical rows, and
+missing, extra, or mismatched services or containers in the rendered Compose
+model. This is an offline encoding of the preserved baseline, not a fresh live
+topology observation or rollout authorization.
 
 The suite accepts only the exact irreversible, snapshot-absent, no-rewind
 Phase-B marker/result schemas with shared Phase-A, package, tooling, script,
@@ -137,7 +147,8 @@ Mixed runs, packages, keys, tooling, data rewind, and a non-successful CI
 conclusion fail closed.
 
 UNRESOLVED AND FAIL-CLOSED:
-  - a successful exact-H CI run R for the final signed Core H above
+  - a successful exact-SHA CI receipt for the final signed Core source; the
+    historical H/R values above are not authority
   - sealed candidate bundle/OCI/image/binary/tooling identities
   - completed Phase-B RESULT and PROMOTED_NO_REWIND marker
   - live Phase-B-bound nine-path result seal and authority receipt; the offline
@@ -151,9 +162,9 @@ UNRESOLVED AND FAIL-CLOSED:
   - nonce-bound live authority
 
 Independent review has not yet cleared the current reconciled bytes. Closure
-remains two-pass: freeze all payloads, obtain a current-byte hostile P0/P1 review,
-then regenerate `SHA256SUMS` and repeat strict topology/manifest, static, full
-raw-exit-zero, and all-15-file stability checks. The resulting seal will prove
+requires a current-byte hostile P0/P1 review, then a final regeneration of
+`SHA256SUMS` and repetition of strict topology/manifest, static, full
+raw-exit-zero, and all-16-file stability checks. The resulting seal will prove
 only exact offline package-byte closure; it will not validate Core behavior,
 authorize a source/run or artifact identity, execute a canary, or establish
 rollout or fleet acceptance evidence. The pending-success sentinel and every

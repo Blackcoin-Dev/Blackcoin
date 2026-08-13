@@ -7,7 +7,7 @@ readonly V3015_ZERO_TXID='000000000000000000000000000000000000000000000000000000
 
 v3015_release_identity_is_valid()
 {
-    local file=$1
+    local file=$1 image_manifest=${CANDIDATE_IMAGE_REF##*@sha256:}
     jq -e --arg source "$SOURCE_SHA" --arg tree "$SOURCE_TREE" \
         --argjson run "$CORE_CI_RUN_ID" --arg workflow "$CORE_CI_WORKFLOW" \
         --arg artifact "$CANDIDATE_ARTIFACT_NAME" \
@@ -17,6 +17,7 @@ v3015_release_identity_is_valid()
         --arg image_id "$CANDIDATE_IMAGE_ID" --arg bundle "$CANDIDATE_BUNDLE_SHA256" \
         --arg oci_archive "$CANDIDATE_OCI_ARCHIVE_SHA256" \
         --arg oci_manifest "$CANDIDATE_OCI_MANIFEST_SHA256" \
+        --arg image_manifest "$image_manifest" \
         --arg tooling "$CANDIDATE_TOOLING_SHA256" \
         --arg manifest "$CANDIDATE_MANIFEST_SHA256" \
         --arg provenance "$CANDIDATE_PROVENANCE_SHA256" \
@@ -42,6 +43,7 @@ v3015_release_identity_is_valid()
         .candidate_bundle_sha256 == $bundle and
         .candidate_oci_archive_sha256 == $oci_archive and
         .candidate_oci_manifest_sha256 == $oci_manifest and
+        .candidate_oci_manifest_sha256 == $image_manifest and
         .candidate_tooling_sha256 == $tooling and
         .candidate_manifest_sha256 == $manifest and
         .candidate_provenance_sha256 == $provenance and

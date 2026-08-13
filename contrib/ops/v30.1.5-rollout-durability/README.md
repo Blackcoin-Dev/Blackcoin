@@ -5,19 +5,19 @@ the eventual signed v30.1.5 Core release. It does not alter the immutable
 v30.1.4 rollout transaction and does not source any v30.1.4 operations library.
 It is currently **offline-only and nondeployable**.
 
-The final signed source identity and its pending exact-SHA CI run are recorded
-for audit continuity, but are not current rollout authority. The release
-remains fail-closed until that exact-H run and all artifact/handoff gates are
-complete:
+One previously recorded signed source identity and its then-pending exact-SHA
+CI run are retained for audit continuity, but they are not current or final
+rollout authority. The release remains fail-closed until a final source/run
+receipt and all artifact/handoff gates are complete:
 
 - source commit: `309731e3340f380e48cb67f94a243725465420fb`
 - source tree: `1517a277e1ab6355db0a14ed40d21e4e5e1dc846`
 - signer fingerprint: `SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70`
 - network version: `300105`
 - subversion: `/Blackcoin:30.1.5/`
-- exact-SHA CI run: `31560485480`, head-bound to the source commit above;
-  no successful release-authorizing conclusion is recorded while the run is
-  pending
+- exact-SHA CI run: `31560485480`, head-bound to the source commit above; its
+  recorded state was pending and this package contains no successful
+  release-authorizing receipt
 
 `rollout.env.example` deliberately contains an unresolved successful-CI
 conclusion plus unresolved bundle, OCI,
@@ -26,22 +26,34 @@ post-reconcile proof, handoff-receipt, guard, node30 probe, and
 execution-authority values. Any one unresolved value prevents preflight.
 The candidate image must use the canonical immutable
 `qqblackcoin/blackcoin-v4-gui@sha256:...` reference; the historical
-`hotfix-candidate` naming convention is not rollout authority.
-The checked-in `SHA256SUMS` is the prior exact fourteen-payload tooling seal. It
-is intentionally stale while this frozen-Core semantic reconciliation awaits
-independent review. The previous frozen local preseal replay reported 571/572,
-with all 571 behavioral/static fixtures passing and only the old manifest
-assertion failing. The exact-H reconciliation adds source/run pins and
-retained-family carrier-continuity coverage. Its current-byte authoritative
-preseal replay reports 580/581, with all 580 non-seal behavioral/static
-assertions passing and only the intentionally stale manifest assertion failing.
-No current-byte seal or independent review closure is claimed yet. A later reviewed
-tooling-integrity seal will prove only exact offline package-byte closure; it
-will not validate Core product behavior, authorize a source/run or ordinary-user
-artifact, execute a canary, or establish rollout, live-fleet, or release
-acceptance evidence. Recording a successful R conclusion and later
-bundle/OCI/Phase-B/handoff identities remains a separate change and must
-regenerate both `VALIDATION.txt` and `SHA256SUMS`.
+`hotfix-candidate` naming convention is not rollout authority. The 64-hex digest
+suffix of that reference must exactly equal `CANDIDATE_OCI_MANIFEST_SHA256` in
+both the reviewed environment and the release-identity document.
+
+`SHA256SUMS` is a provisional current-byte preseal over the exact fifteen
+non-manifest files. The integrated hostile suite reports 605/605 assertions
+passing, including the topology and independent image/OCI-manifest
+cross-bindings. Independent current-byte review remains pending. This preseal
+proves only exact offline package-byte closure; it does not validate Core
+product behavior, authorize a source/run or ordinary-user artifact, execute a
+canary, or establish rollout, live-fleet, or release acceptance evidence.
+Recording a successful R conclusion and later bundle/OCI/Phase-B/handoff
+identities remains a separate change and must regenerate both `VALIDATION.txt`
+and `SHA256SUMS`.
+
+`topology.map` is the single sealed translation from logical nodes 1–32 to
+Compose service names and container names. It records the preserved baseline's
+zero-padded services `node01` through `node09`, unpadded services `node10`
+through `node32`, the unsuffixed node1 container `blackcoin-v4-gui`, and
+containers `blackcoin-v4-gui-2` through `blackcoin-v4-gui-32`. The renderer,
+restart proof, failure containment, node30 path, and terminal census all use
+that map. A missing logical node, duplicate node, duplicate service, duplicate
+container, malformed row, extra or missing Compose service, or Compose
+container mismatch fails before candidate mutation. This checked-in map
+reflects the recorded baseline; it is not a fresh live-topology receipt and
+does not make the package deployable. Final execution still requires the
+reviewed Compose hash, handoff receipt, post-reconcile identity proof, and
+nonce authorities.
 
 ## Acceptance contract
 
@@ -229,7 +241,9 @@ For each regular-PoW node, `native_restart_durability.sh`:
 1. verifies the signed source, successful exact-SHA CI, sealed artifact/image
    and all six runtime binary identities, completed no-rewind Phase B, package seal, Compose
    hash, and normal-unlock helper hash;
-2. recreates the service with the immutable v30.1.5 image and exact Core-native
+2. resolves the logical node through the sealed topology, proves the merged
+   Compose model has exactly the mapped services and containers, and recreates
+   that service with the immutable v30.1.5 image and exact Core-native
    settings `-walletbroadcast=1`, `-autostartstaking=1`, `-powmining=1`, `-powminingthreads=1`, and
    `-powminingcpu=1`;
 3. proves a portable locked pre-unlock migration guard over wallet name,
@@ -411,9 +425,9 @@ fresh exact collision/live authority is recorded.
 This package does not substitute host selection or filtering for Core behavior.
 Before live clearance, the following external facts remain mandatory:
 
-1. a successful exact-H CI run `R` for the final signed source identity above,
-   with its exact head, workflow, and successful conclusion recorded; the
-   currently pending run is not authority;
+1. a successful exact-SHA CI run `R` for the final signed source identity, with
+   its exact head, workflow, and successful conclusion recorded; the historical
+   H/R audit-continuity values above are not authority;
 2. sealed Linux x86_64 bundle, OCI, image ID/digest, tooling, and executable
    identities for the signed source;
 3. a complete verified Phase-A/Phase-B nine-path canary with Phase B promoted,
@@ -450,7 +464,7 @@ update and review these groups in order:
    unlock helper, reviewed read-only node30 probe, and separately reviewed
    persistent Compose/image-policy/300105 guard handoff receipts and the exact
    post-reconcile identity proof;
-5. regenerated `VALIDATION.txt`, then `SHA256SUMS` over the other fourteen
+5. regenerated `VALIDATION.txt`, then `SHA256SUMS` over the other fifteen
    package files, then the external hash of that manifest; and
 6. `ROLLOUT_IDENTITY_RECONCILED=1` and fresh matching live/native/guard
    nonce-bound authorities only after independent collision clearance.

@@ -1,15 +1,35 @@
 # Generate a Compose overlay. Invocation must provide immutable image_ref,
-# role=(regular|free_claim), and a space-separated nodes list with -v.
+# role=(regular|free_claim), a space-separated nodes list, and the sealed
+# logical-node topology map with -v.
 BEGIN {
     if (image_ref !~ /^[A-Za-z0-9._\/-]+@sha256:[0-9a-f]{64}$/) exit 65
     if (role != "regular" && role != "free_claim") exit 65
+    if (topology_file == "") exit 65
+    topology_rows = 0
+    while ((topology_status = (getline topology_line < topology_file)) > 0) {
+        if (topology_line == "" || topology_line ~ /^#/) continue
+        if (topology_line !~ /^[1-9][0-9]* [A-Za-z0-9][A-Za-z0-9_.-]* [A-Za-z0-9][A-Za-z0-9_.-]*$/)
+            exit 65
+        split(topology_line, topology_fields, " ")
+        logical = topology_fields[1] + 0
+        if (logical < 1 || logical > 32 || sprintf("%d", logical) != topology_fields[1] ||
+            topology_node_seen[logical]++ || topology_service_seen[topology_fields[2]]++ ||
+            topology_container_seen[topology_fields[3]]++) exit 65
+        compose_service[logical] = topology_fields[2]
+        container_name[logical] = topology_fields[3]
+        topology_rows++
+    }
+    close(topology_file)
+    if (topology_status < 0 || topology_rows != 32) exit 65
+    for (logical = 1; logical <= 32; logical++)
+        if (!(logical in compose_service) || !(logical in container_name)) exit 65
     count = split(nodes, raw, /[[:space:]]+/)
     if (count < 1 || count > 4) exit 65
     print "services:"
     for (i = 1; i <= count; i++) {
         node = raw[i] + 0
         if (raw[i] !~ /^[0-9]+$/ || node < 1 || node > 32 || seen[node]++) exit 65
-        print "  node" node ":"
+        print "  " compose_service[node] ":"
         print "    image: " image_ref
         print "    entrypoint:"
         print "      - /bin/bash"

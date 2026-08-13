@@ -2597,8 +2597,29 @@ void CWallet::transactionSubmittedByRpc(const CTransactionRef& tx)
     }
     const auto relay_authority = it->second.mapValue.find(
         SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY);
-    if (relay_authority != it->second.mapValue.end() &&
-        relay_authority->second == "1") {
+    const auto relay_revocation = it->second.mapValue.find(
+        SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY);
+    const bool authority_valid =
+        relay_authority == it->second.mapValue.end() ||
+        relay_authority->second == "0" || relay_authority->second == "1";
+    const bool revocation_valid =
+        relay_revocation == it->second.mapValue.end() ||
+        relay_revocation->second == "0" || relay_revocation->second == "1";
+    const bool authorized = authority_valid &&
+        relay_authority != it->second.mapValue.end() &&
+        relay_authority->second == "1";
+    const bool revoked = revocation_valid &&
+        relay_revocation != it->second.mapValue.end() &&
+        relay_revocation->second == "1";
+    if (!authority_valid || !revocation_valid || (authorized && revoked)) {
+        WalletLogPrintf("Not promoting locally submitted Gold Rush recovery %s because its relay-authority metadata is malformed\n",
+                        tx->GetHash().ToString());
+        return;
+    }
+    if (authorized) return;
+    if (revoked) {
+        WalletLogPrintf("Not promoting locally submitted Gold Rush recovery %s because its durable relay authority is revoked\n",
+                        tx->GetHash().ToString());
         return;
     }
 
@@ -2608,7 +2629,8 @@ void CWallet::transactionSubmittedByRpc(const CTransactionRef& tx)
     // operator workflow without granting a peer a consent primitive.
     std::string promote_error;
     if (!SetManagedShadowPowResolutionRelayAuthority(
-            tx->GetHash(), true, promote_error)) {
+            tx->GetHash(), true,
+            /*explicit_reauthorization=*/false, promote_error)) {
         WalletLogPrintf("Failed to durably authorize locally submitted Gold Rush recovery %s for exact-byte retry: %s\n",
                         tx->GetHash().ToString(), promote_error);
     }
@@ -3907,6 +3929,57 @@ bool CWallet::SubmitTxMemoryPoolAndRelay(
         if (ShadowPowClaimPastRelayTtl(wtx, GetTime())) {
             err_string = "shadow-proof-relay-ttl-expired";
             return false;
+        }
+        const auto managed_schema = wtx.mapValue.find(
+            SHADOW_POW_RESOLUTION_SCHEMA_KEY);
+        const auto relay_authority = wtx.mapValue.find(
+            SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY);
+        const auto relay_revocation = wtx.mapValue.find(
+            SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY);
+        const bool has_managed_metadata =
+            managed_schema != wtx.mapValue.end() ||
+            relay_authority != wtx.mapValue.end() ||
+            relay_revocation != wtx.mapValue.end();
+        if (has_managed_metadata) {
+            // A failed durable revocation commit deliberately leaves memory
+            // unchanged because disk may contain either the old authority or
+            // the new tombstone. No wallet relay path may choose between
+            // those outcomes until reload resolves the ambiguity.
+            if (m_shadow_pow_claim_recovery_db_ambiguous ||
+                m_locked_coins_db_ambiguous) {
+                err_string = "recovery-database-outcome-ambiguous";
+                return false;
+            }
+            const bool authority_valid =
+                relay_authority == wtx.mapValue.end() ||
+                relay_authority->second == "0" ||
+                relay_authority->second == "1";
+            const bool revocation_valid =
+                relay_revocation == wtx.mapValue.end() ||
+                relay_revocation->second == "0" ||
+                relay_revocation->second == "1";
+            const bool authorized = authority_valid &&
+                relay_authority != wtx.mapValue.end() &&
+                relay_authority->second == "1";
+            const bool revoked = revocation_valid &&
+                relay_revocation != wtx.mapValue.end() &&
+                relay_revocation->second == "1";
+            if (managed_schema == wtx.mapValue.end() ||
+                managed_schema->second !=
+                    SHADOW_POW_RESOLUTION_SCHEMA_VERSION ||
+                !authority_valid || !revocation_valid ||
+                (authorized && revoked)) {
+                err_string = "managed-recovery-metadata-invalid";
+                return false;
+            }
+            if (revoked) {
+                err_string = "recovery-relay-authority-revoked";
+                return false;
+            }
+            if (!authorized) {
+                err_string = "signed-recovery-draft-not-authorized";
+                return false;
+            }
         }
         if (m_inflight_wallet_broadcasts.count(txid)) {
             err_string = "wallet-broadcast-in-flight";

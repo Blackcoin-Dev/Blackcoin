@@ -220,6 +220,65 @@ that wrap this engine. Compatibility commands from older releases may remain,
 but their help is authoritative for whether they expose only preview/signing or
 also the separate commit step.
 
+## Local relay-authority revocation
+
+The v30.1.5 candidate can durably cancel this wallet's future relay authority
+for one exact managed resolution without deleting the signed transaction or
+making its anchor spendable:
+
+```bash
+blackcoin-cli -rpcwallet="Wallet Name" \
+  revokeshadowpowclaimresolution "<resolution_txid>" true
+```
+
+The required `true` acknowledges that signed bytes may already exist in this
+node's mempool, a peer, a miner, a log, or a backup. Local revocation cannot
+recall those copies, undo an existing confirmation, or prevent either the
+original claim or the conflicting resolution from confirming. After the
+managed record is authenticated against a wallet with a chain interface, the
+result reports the exact mempool snapshot and `may_still_confirm=true`. It also
+reports whether relay authority was active, whether a new durable state was
+committed, whether a local wallet broadcast is already reserved in flight,
+whether the anchor remains reserved, and the resulting typed mining-gate
+action. Observations that cannot be authenticated are omitted rather than
+reported with default values.
+
+Revocation is restriction-only and does not require a wallet unlock. It writes
+the canonical durable state `relay_authorized=0, relay_revoked=1`; the
+`relay_revoked` bit is a per-transaction tombstone, not the wallet-wide
+automatic-recovery policy. The operation never abandons the transaction,
+erases its signed bytes or metadata, removes it from the mempool, releases or
+unlocks the shared anchor, enables normal coin selection, or enables mining.
+An already-revoked record is an idempotent success. A local wallet broadcast
+already in flight is refused without changing durable authority, so the
+operator can wait for its verdict and retry.
+
+The tombstone survives restart. The recovery scheduler, ordinary wallet relay
+paths, and the successful-`sendrawtransaction` wallet callback cannot promote
+or retry the tombstoned bytes. The raw-transaction RPC is still an explicit
+node-level disclosure mechanism: a caller who possesses the hex can submit it
+again, and revocation cannot make already accepted bytes disappear. Such a
+submission does not clear the wallet tombstone or restore later scheduler
+authority.
+
+Reauthorization requires a new read-only preview for the current chain and
+wallet generation, followed by an explicit exact-plan commit while the wallet
+is normally unlocked. That commit atomically clears the tombstone and grants
+authority only to the same authenticated transaction bytes. A plan created
+before revocation is stale and cannot reauthorize anything. Generic relay
+notifications and persisted-retry paths cannot perform this transition.
+
+Database begin or write failures leave the prior authoritative state in force.
+An indeterminate commit outcome latches recovery closed and reports
+`durable_state_ambiguous=true`; reload the wallet and inspect the exact managed
+record before relying on either the former authority or the requested
+tombstone. Fields whose durable value cannot be known, including
+`durable_state_changed`, `relay_authority_revoked`, and `locally_cancelled`,
+are omitted from that ambiguous receipt rather than serialized as false.
+Revocation likewise refuses malformed, foreign, legacy, missing,
+unreserved, or database-ambiguous records instead of describing them as
+locally cancelled.
+
 ## Optional automatic recovery
 
 Automatic recovery is wallet-scoped and off by default. An unset policy or

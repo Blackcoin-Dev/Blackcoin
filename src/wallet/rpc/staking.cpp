@@ -2503,6 +2503,7 @@ static UniValue ShadowPowRecoveryActionToJSON(const ShadowPowClaimRecoveryAction
     result.pushKV("fee", ValueFromAmount(action.fee));
     result.pushKV("persisted", action.persisted);
     result.pushKV("relay_authorized", action.relay_authorized);
+    result.pushKV("relay_revoked", action.relay_revoked);
     result.pushKV("in_mempool", action.in_mempool);
     result.pushKV("frontier_may_advance", action.frontier_may_advance);
     result.pushKV("conflicts_with_revalidating_unbound_proof",
@@ -2773,6 +2774,7 @@ static UniValue ShadowPowRecoveryNodeToJSON(const ShadowPowClaimRecoveryNode& no
     result.pushKV("stale_depth_known", node.stale_depth_known);
     result.pushKV("resolution_metadata_valid", node.resolution_metadata_valid);
     result.pushKV("resolution_relay_authorized", node.resolution_relay_authorized);
+    result.pushKV("resolution_relay_revoked", node.resolution_relay_revoked);
     return result;
 }
 
@@ -2923,7 +2925,7 @@ static RPCHelpMan createshadowpowclaimresolution()
 {
     return RPCHelpMan{
         "createshadowpowclaimresolution",
-        "\nPreview or sign, but never broadcast, one canonical Gold Rush PoW claim-component resolution. Any claim txid in the component maps to the same current confirmed anchor. Newly signed bytes are durably retained as a non-relayable draft until commitshadowpowclaimresolution, an explicit sendrawtransaction, or a bulk commit authorizes those exact bytes. A reused managed resolution may already have durable relay authority, which is reported explicitly.\n",
+        "\nPreview or sign, but never broadcast, one canonical Gold Rush PoW claim-component resolution. Any claim txid in the component maps to the same current confirmed anchor. Newly signed bytes are durably retained as a non-relayable draft until commitshadowpowclaimresolution, an explicit sendrawtransaction, or a bulk commit authorizes those exact bytes. A reused managed resolution may already have durable relay authority or a local revocation tombstone, both of which are reported explicitly. A tombstone can be cleared only by a fresh exact-plan commit.\n",
         {
             {"claim_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Wallet-known QQSPROOF transaction id."},
             {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{true}, "Return a side-effect-free exact plan when true."},
@@ -2962,6 +2964,7 @@ static RPCHelpMan createshadowpowclaimresolution()
             {RPCResult::Type::BOOL, "durable_state_ambiguous", "Whether database commit or rollback had an indeterminate outcome. Reload may reveal the exact bytes."},
             {RPCResult::Type::NUM, "relay_authority_granted", "Always zero here; this RPC never grants relay authority."},
             {RPCResult::Type::BOOL, "relay_authorized", "Whether these exact managed bytes already have durable relay authority. This RPC never grants it."},
+            {RPCResult::Type::BOOL, "relay_revoked", "Whether these exact managed bytes carry a durable local relay-revocation tombstone."},
             {RPCResult::Type::BOOL, "conflicts_with_revalidating_unbound_proof", "Whether this resolution deliberately conflicts with an unbound proof that is invalid on the pinned tip but may become valid on a descendant."},
             {RPCResult::Type::OBJ, "current_plan", /*optional=*/true, "Fresh read-only preview after signing. Its nested plan_id is present and usable only when nested plan_reusable=true.", {{RPCResult::Type::ELISION, "", ""}}},
             {RPCResult::Type::STR, "next_step", "Next explicit action."},
@@ -3060,6 +3063,7 @@ static RPCHelpMan createshadowpowclaimresolution()
     result.pushKV("durable_state_ambiguous", execution.durable_state_ambiguous);
     result.pushKV("relay_authority_granted", static_cast<uint64_t>(execution.relay_authority_granted));
     result.pushKV("relay_authorized", action.relay_authorized);
+    result.pushKV("relay_revoked", action.relay_revoked);
     result.pushKV("conflicts_with_revalidating_unbound_proof",
                   action.conflicts_with_revalidating_unbound_proof);
     if (current_plan) {
@@ -3075,6 +3079,8 @@ static RPCHelpMan createshadowpowclaimresolution()
             ? "The durable database outcome is ambiguous. Stop recovery activity and reload the wallet. Reload may reveal these exact bytes; inspect wallet records before retrying and do not assume the operation rolled back."
             : action.relay_authorized
             ? "These exact bytes already have durable relay authority; monitor mempool and confirmation state while the scheduler safely retries them."
+            : action.relay_revoked
+            ? "Local relay authority is durably revoked. Obtain a fresh current recovery plan and explicitly commit it while normally unlocked only if these exact bytes should be reauthorized."
             : "Review the exact fee and warning, then call commitshadowpowclaimresolution with this txid and explicit acknowledgement. sendrawtransaction remains compatible.");
     } else {
         result.pushKV("next_step", "Repeat with dry_run=false and acknowledge_fee_and_conflict_risk=true to sign and durably store exact non-broadcast bytes.");
@@ -3170,6 +3176,150 @@ static RPCHelpMan commitshadowpowclaimresolution()
     return ShadowPowRecoveryResultToJSON(
         execution, commit.mode,
         current_plan ? &*current_plan : nullptr);
+},
+    };
+}
+
+static UniValue ShadowPowClaimResolutionRevocationToJSON(
+    const ShadowPowClaimResolutionRevocationResult& revocation)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("status", std::string(
+        ShadowPowClaimResolutionRevocationStatusName(revocation.status)));
+    result.pushKV("success", revocation.success);
+    result.pushKV("resolution_txid", revocation.resolution_txid.GetHex());
+    if (!revocation.anchor.IsNull()) {
+        UniValue anchor(UniValue::VOBJ);
+        anchor.pushKV("txid", revocation.anchor.hash.GetHex());
+        anchor.pushKV("vout", revocation.anchor.n);
+        result.pushKV("anchor", std::move(anchor));
+        result.pushKV("generation_fingerprint",
+                      revocation.generation_fingerprint.GetHex());
+    }
+    result.pushKV("acknowledged_signed_bytes_may_exist_elsewhere", true);
+    if (revocation.relay_authority_was_active) {
+        result.pushKV("relay_authority_was_active",
+                      *revocation.relay_authority_was_active);
+    }
+    if (revocation.relay_authority_revoked) {
+        result.pushKV("relay_authority_revoked",
+                      *revocation.relay_authority_revoked);
+    }
+    if (revocation.locally_cancelled) {
+        result.pushKV("locally_cancelled", *revocation.locally_cancelled);
+    }
+    if (revocation.durable_state_changed) {
+        result.pushKV("durable_state_changed",
+                      *revocation.durable_state_changed);
+    }
+    result.pushKV("durable_state_ambiguous",
+                  revocation.durable_state_ambiguous);
+    if (revocation.in_mempool) {
+        result.pushKV("in_mempool", *revocation.in_mempool);
+    }
+    if (revocation.broadcast_in_flight) {
+        result.pushKV("broadcast_in_flight", *revocation.broadcast_in_flight);
+    }
+    if (revocation.may_still_confirm) {
+        result.pushKV("may_still_confirm", *revocation.may_still_confirm);
+    }
+    if (revocation.anchor_reserved) {
+        result.pushKV("anchor_reserved", *revocation.anchor_reserved);
+    }
+    if (revocation.normal_coin_selection_enabled) {
+        result.pushKV("normal_coin_selection_enabled",
+                      *revocation.normal_coin_selection_enabled);
+    }
+    if (revocation.mining_gate_available) {
+        result.pushKV("mining_gate_action", ShadowPowMiningGateActionName(
+            revocation.mining_gate_action));
+    }
+    result.pushKV("detail", revocation.detail);
+    if (revocation.durable_state_ambiguous) {
+        result.pushKV("next_step", "Stop recovery activity and reload the wallet. Inspect the exact managed record after reload before relying on either the prior relay authority or the requested tombstone.");
+    } else if (revocation.broadcast_in_flight.value_or(false)) {
+        result.pushKV("next_step", "Wait for the in-flight local broadcast verdict, then call revokeshadowpowclaimresolution again. This failed attempt changed no durable authority.");
+    } else if (revocation.success) {
+        result.pushKV("next_step", "Local automatic retry is cancelled. The transaction and anchor remain reserved. To reauthorize these exact bytes, obtain a fresh recovery preview and explicitly commit its exact plan while normally unlocked.");
+    } else {
+        result.pushKV("next_step", "No revocation was committed. Correct the reported wallet state, then inspect and retry without assuming relay authority changed.");
+    }
+    std::string warning = "Revocation affects only this wallet's future relay authority. Any copies already disclosed to this node's mempool, peers, miners, logs, or backups cannot be recalled and may still confirm.";
+    if (revocation.anchor_reserved.value_or(false)) {
+        warning += " The shared anchor remains unavailable to normal coin selection until active-chain confirmation resolves the conflict.";
+    } else if (revocation.anchor_reserved.has_value()) {
+        warning += " The wallet did not authenticate the shared anchor as reserved, so no local cancellation was committed.";
+    } else {
+        warning += " Anchor reservation and normal-coin-selection state are unknown until the wallet is reloaded and the managed record is authenticated.";
+    }
+    result.pushKV("warning", std::move(warning));
+    return result;
+}
+
+static RPCHelpMan revokeshadowpowclaimresolution()
+{
+    return RPCHelpMan{
+        "revokeshadowpowclaimresolution",
+        "\nDurably cancel this wallet's future scheduler/relay authority for one exact managed Gold Rush PoW claim resolution. This restriction-only operation does not require wallet unlock, abandon or delete the signed transaction, remove it from the mempool, recall peer copies, release its anchor, or enable mining. A fresh exact-plan commit is required to clear the durable tombstone.\n",
+        {
+            {"resolution_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Exact wallet-managed resolution transaction id."},
+            {"acknowledge_signed_bytes_may_exist_elsewhere", RPCArg::Type::BOOL, RPCArg::Optional::NO, "Must be true; local revocation cannot recall already disclosed or relayed bytes and cannot prevent their confirmation."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Durable local-cancellation receipt.", {
+            {RPCResult::Type::STR, "status", "success, already_revoked, broadcast_in_flight, database_failure, or database_outcome_ambiguous."},
+            {RPCResult::Type::BOOL, "success", "Whether the durable tombstone is authoritatively active."},
+            {RPCResult::Type::STR_HEX, "resolution_txid", "Exact managed transaction."},
+            {RPCResult::Type::OBJ, "anchor", /*optional=*/true, "Still-reserved confirmed anchor.", {
+                {RPCResult::Type::STR_HEX, "txid", "Anchor transaction id."},
+                {RPCResult::Type::NUM, "vout", "Anchor output index."},
+            }},
+            {RPCResult::Type::STR_HEX, "generation_fingerprint", /*optional=*/true, "Authenticated anchor-generation identity."},
+            {RPCResult::Type::BOOL, "acknowledged_signed_bytes_may_exist_elsewhere", "Always true for a processed request."},
+            {RPCResult::Type::BOOL, "relay_authority_was_active", /*optional=*/true, "Whether durable retry authority was active before this call; omitted when prior database ambiguity prevents authentication."},
+            {RPCResult::Type::BOOL, "relay_authority_revoked", /*optional=*/true, "Whether the durable relay-revocation tombstone is active; omitted when the requested commit outcome is ambiguous."},
+            {RPCResult::Type::BOOL, "locally_cancelled", /*optional=*/true, "Whether this wallet authoritatively refuses scheduler and generic wallet relay promotion for the exact bytes; omitted when durable outcome is unknown."},
+            {RPCResult::Type::BOOL, "durable_state_changed", /*optional=*/true, "Whether this invocation newly committed the tombstone; omitted when commit outcome is ambiguous."},
+            {RPCResult::Type::BOOL, "durable_state_ambiguous", "Whether the database commit outcome is unknown and requires reload."},
+            {RPCResult::Type::BOOL, "in_mempool", /*optional=*/true, "Whether the exact bytes were already in this node's mempool at the revocation snapshot; omitted when the record could not be authenticated."},
+            {RPCResult::Type::BOOL, "broadcast_in_flight", /*optional=*/true, "Whether an already-reserved local broadcast prevented revocation; omitted when the record could not be authenticated."},
+            {RPCResult::Type::BOOL, "may_still_confirm", /*optional=*/true, "Always true after authentication: local cancellation cannot undo an existing confirmation or recall copies that may confirm."},
+            {RPCResult::Type::BOOL, "anchor_reserved", /*optional=*/true, "Whether the shared anchor remains wallet-reserved; omitted when the record could not be authenticated."},
+            {RPCResult::Type::BOOL, "normal_coin_selection_enabled", /*optional=*/true, "Always false on successful revocation; omitted when the record could not be authenticated."},
+            {RPCResult::Type::STR, "mining_gate_action", /*optional=*/true, "Post-attempt typed mining-gate action when a wallet/chain snapshot was available."},
+            {RPCResult::Type::STR, "detail", "Machine outcome detail."},
+            {RPCResult::Type::STR, "next_step", "Required reload, retry, monitoring, or fresh-plan action."},
+            {RPCResult::Type::STR, "warning", "Irrevocable-copy and anchor-reservation warning."},
+        }},
+        RPCExamples{
+            HelpExampleCli("revokeshadowpowclaimresolution", "\"resolution_txid\" true")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+    if (!request.params[1].get_bool()) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "acknowledge_signed_bytes_may_exist_elsewhere=true is required; local revocation cannot recall signed bytes already held by this node, peers, miners, logs, or backups");
+    }
+    const uint256 resolution_txid = ParseHashV(
+        request.params[0], "resolution_txid");
+    const ShadowPowClaimResolutionRevocationResult revocation =
+        pwallet->RevokeManagedShadowPowResolutionRelayAuthority(
+            resolution_txid);
+    if (revocation.status ==
+        ShadowPowClaimResolutionRevocationStatus::NOT_FOUND) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, revocation.detail);
+    }
+    if (revocation.status ==
+            ShadowPowClaimResolutionRevocationStatus::NOT_MANAGED ||
+        revocation.status ==
+            ShadowPowClaimResolutionRevocationStatus::INVALID_METADATA ||
+        revocation.status ==
+            ShadowPowClaimResolutionRevocationStatus::ANCHOR_NOT_RESERVED) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, revocation.detail);
+    }
+    return ShadowPowClaimResolutionRevocationToJSON(revocation);
 },
     };
 }
@@ -5299,6 +5449,7 @@ static const CRPCCommand commands[] =
     { "staking",            &sendshadowpowclaim,             },
     { "staking",            &createshadowpowclaimresolution, },
     { "staking",            &commitshadowpowclaimresolution, },
+    { "staking",            &revokeshadowpowclaimresolution, },
     { "staking",            &resolveallshadowpowclaims,       },
     { "staking",            &adoptshadowpowclaimcomponent,    },
     { "staking",            &getpowclaimrecoveryinfo,        },

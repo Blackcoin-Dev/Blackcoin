@@ -2003,8 +2003,14 @@ public:
         int active_height, int64_t created_time, std::string& error)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     bool SetManagedShadowPowResolutionRelayAuthority(
-        const uint256& txid, bool authorized, std::string& error)
+        const uint256& txid, bool authorized,
+        bool explicit_reauthorization, std::string& error)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Durably cancel this wallet's relay/scheduler authority for exact
+     * managed resolution bytes. This restriction-only operation never
+     * abandons the transaction, unlocks the wallet, or releases its anchor. */
+    ShadowPowClaimResolutionRevocationResult
+    RevokeManagedShadowPowResolutionRelayAuthority(const uint256& txid);
     /** Periodic wallet-scoped automatic execution; never enables the miner. */
     void MaybeAutoResolveShadowPowClaims();
     /** Count quarantined claim objects that currently gate claim creation.

@@ -72,6 +72,14 @@ inline constexpr char SHADOW_POW_RESOLUTION_CREATED_TIME_KEY[]{"qq_shadow_pow_re
 // before attempting relay. A mempool-observed exact draft may be promoted by
 // the resolver after it proves that those same bytes were explicitly relayed.
 inline constexpr char SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY[]{"qq_shadow_pow_resolution_relay_authorized"};
+// A restriction-only, durable operator tombstone.  The canonical states are:
+//   authorized=0, revoked=0: signed draft;
+//   authorized=1, revoked=0: exact bytes may be retried by the scheduler; and
+//   authorized=0, revoked=1: local relay authority was explicitly cancelled.
+// authorized=1, revoked=1 is malformed and fails closed.  The tombstone never
+// abandons the transaction or releases its confirmed anchor.  It is cleared
+// only by a fresh exact-plan recovery commit, never by a generic relay callback.
+inline constexpr char SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY[]{"qq_shadow_pow_resolution_relay_revoked"};
 // Older releases use a selected claim txid as this marker's value. New code
 // retains it for downgrade-safe non-rebroadcast behavior while the anchor
 // metadata above is authoritative for idempotency.
@@ -161,6 +169,7 @@ struct ShadowPowClaimRecoveryNode
     int resolution_created_height{-1};
     int64_t resolution_created_time{0};
     bool resolution_relay_authorized{false};
+    bool resolution_relay_revoked{false};
 };
 
 struct ShadowPowClaimRecoveryComponent
@@ -383,6 +392,8 @@ struct ShadowPowClaimRecoveryAction
     bool in_mempool{false};
     /** Exact managed bytes already have durable scheduler/relay authority. */
     bool relay_authorized{false};
+    /** Exact managed bytes carry a durable local relay-revocation tombstone. */
+    bool relay_revoked{false};
     bool frontier_may_advance{true};
     /** The action deliberately conflicts with an unbound proof that may
      * become valid on a descendant even though it is invalid now. */
@@ -451,6 +462,48 @@ struct ShadowPowClaimRecoveryResult
      * after this invocation relayed one transaction. */
     size_t relay_deferred{0};
     std::string error;
+};
+
+/** Stable machine outcomes for restriction-only managed-resolution
+ * revocation.  A database-outcome ambiguity is distinct from an ordinary
+ * failure because the durable tombstone may or may not have committed. */
+enum class ShadowPowClaimResolutionRevocationStatus : uint8_t {
+    SUCCESS,
+    ALREADY_REVOKED,
+    NOT_FOUND,
+    NOT_MANAGED,
+    INVALID_METADATA,
+    ANCHOR_NOT_RESERVED,
+    BROADCAST_IN_FLIGHT,
+    DATABASE_FAILURE,
+    DATABASE_OUTCOME_AMBIGUOUS,
+};
+
+/** Atomic, truthful result of cancelling this wallet's future relay authority
+ * for one exact managed resolution.  Revocation cannot recall bytes already
+ * submitted to a peer or mempool and never releases the shared anchor. */
+struct ShadowPowClaimResolutionRevocationResult
+{
+    ShadowPowClaimResolutionRevocationStatus status{
+        ShadowPowClaimResolutionRevocationStatus::DATABASE_FAILURE};
+    bool success{false};
+    std::optional<bool> durable_state_changed{false};
+    bool durable_state_ambiguous{false};
+    uint256 resolution_txid;
+    COutPoint anchor;
+    uint256 generation_fingerprint;
+    std::optional<bool> relay_authority_was_active;
+    std::optional<bool> relay_authority_revoked;
+    std::optional<bool> locally_cancelled;
+    std::optional<bool> in_mempool;
+    std::optional<bool> broadcast_in_flight;
+    std::optional<bool> may_still_confirm;
+    std::optional<bool> anchor_reserved;
+    std::optional<bool> normal_coin_selection_enabled;
+    bool mining_gate_available{false};
+    ShadowPowClaimMiningGateAction mining_gate_action{
+        ShadowPowClaimMiningGateAction::UNSAFE};
+    std::string detail;
 };
 
 /** Stable machine outcomes for explicit historical component adoption. */

@@ -183,6 +183,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "createshadowpowclaimresolution", 2, "acknowledge_fee_and_conflict_risk" },
     { "createshadowpowclaimresolution", 3, "fee_rate" },
     { "commitshadowpowclaimresolution", 1, "acknowledge_fee_and_conflict_risk" },
+    { "revokeshadowpowclaimresolution", 1, "acknowledge_signed_bytes_may_exist_elsewhere" },
     { "resolveallshadowpowclaims", 0, "options" },
     { "resolveallshadowpowclaims", 0, "acknowledge_fee_and_conflict_risk" },
     { "resolveallshadowpowclaims", 0, "fee_rate" },

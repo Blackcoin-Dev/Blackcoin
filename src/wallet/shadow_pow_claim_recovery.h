@@ -34,6 +34,9 @@ uint256 ComputeShadowPowClaimRecoveryPlanId(
 const char* ShadowPowClaimRecoveryPolicyMutationStatusName(
     ShadowPowClaimRecoveryPolicyMutationStatus status);
 
+const char* ShadowPowClaimResolutionRevocationStatusName(
+    ShadowPowClaimResolutionRevocationStatus status);
+
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_SHADOW_POW_CLAIM_RECOVERY_H

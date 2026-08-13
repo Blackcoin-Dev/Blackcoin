@@ -312,6 +312,7 @@ uint256 FingerprintComponent(const uint256& active_tip,
         hasher << node.resolution_created_height;
         hasher << node.resolution_created_time;
         hasher << node.resolution_relay_authorized;
+        hasher << node.resolution_relay_revoked;
     }
     return hasher.GetHash();
 }
@@ -334,6 +335,7 @@ struct ManagedResolutionFacts
     int created_height{-1};
     int64_t created_time{0};
     bool relay_authorized{false};
+    bool relay_revoked{false};
     CAmount fee{0};
 };
 
@@ -378,7 +380,11 @@ bool ParseManagedResolutionFacts(const CWallet& wallet, const CWalletTx& wtx,
                                    facts.created_time) ||
         !ParseCanonicalMetadataBool(
             wtx.mapValue, SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY,
-            facts.relay_authorized)) {
+            facts.relay_authorized) ||
+        !ParseCanonicalMetadataBool(
+            wtx.mapValue, SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY,
+            facts.relay_revoked) ||
+        (facts.relay_authorized && facts.relay_revoked)) {
         return false;
     }
     facts.anchor = COutPoint{anchor_hash, anchor_vout};
@@ -1022,6 +1028,8 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                     node.resolution_created_time = managed_facts.created_time;
                     node.resolution_relay_authorized =
                         managed_facts.relay_authorized;
+                    node.resolution_relay_revoked =
+                        managed_facts.relay_revoked;
                     component.has_managed_resolution = true;
                     component.resolution_txids.push_back(txid);
                 } else if (legacy_marker && legacy_nonreplaceable_sequence) {
@@ -2106,6 +2114,7 @@ uint256 ComputeShadowPowClaimRecoveryPlanId(
         hasher << action.persisted;
         hasher << action.in_mempool;
         hasher << action.relay_authorized;
+        hasher << action.relay_revoked;
     }
     hasher << static_cast<uint64_t>(plan.refused.size());
     for (const ShadowPowClaimRecoveryAction& refused : plan.refused) {
@@ -2521,11 +2530,26 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
                 plan.refused.push_back(std::move(action));
                 continue;
             }
+            action.relay_authorized =
+                existing_node->kind ==
+                    ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION &&
+                existing_node->resolution_relay_authorized;
+            action.relay_revoked =
+                existing_node->kind ==
+                    ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION &&
+                existing_node->resolution_relay_revoked;
             if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC &&
                 existing_node->kind ==
                     ShadowPowClaimRecoveryNodeKind::LEGACY_RESOLUTION) {
                 action.detail = "legacy cleanup transactions require explicit manual relay";
                 action.reason_code = "legacy-manual-only";
+                plan.refused.push_back(std::move(action));
+                continue;
+            }
+            if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC &&
+                existing_node->resolution_relay_revoked) {
+                action.detail = "local relay authority for this exact managed resolution was explicitly revoked";
+                action.reason_code = "resolution-relay-revoked";
                 plan.refused.push_back(std::move(action));
                 continue;
             }
@@ -2558,10 +2582,6 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
             action.vsize = GetVirtualTransactionSize(*action.transaction);
             action.persisted = true;
             action.in_mempool = existing_node->in_mempool;
-            action.relay_authorized =
-                existing_node->kind ==
-                    ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION &&
-                existing_node->resolution_relay_authorized;
             action.status =
                 existing_node->kind ==
                         ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION
@@ -2753,6 +2773,23 @@ const char* ShadowPowClaimRecoveryPolicyMutationStatusName(
     return "database_failure";
 }
 
+const char* ShadowPowClaimResolutionRevocationStatusName(
+    ShadowPowClaimResolutionRevocationStatus status)
+{
+    switch (status) {
+    case ShadowPowClaimResolutionRevocationStatus::SUCCESS: return "success";
+    case ShadowPowClaimResolutionRevocationStatus::ALREADY_REVOKED: return "already_revoked";
+    case ShadowPowClaimResolutionRevocationStatus::NOT_FOUND: return "not_found";
+    case ShadowPowClaimResolutionRevocationStatus::NOT_MANAGED: return "not_managed";
+    case ShadowPowClaimResolutionRevocationStatus::INVALID_METADATA: return "invalid_metadata";
+    case ShadowPowClaimResolutionRevocationStatus::ANCHOR_NOT_RESERVED: return "anchor_not_reserved";
+    case ShadowPowClaimResolutionRevocationStatus::BROADCAST_IN_FLIGHT: return "broadcast_in_flight";
+    case ShadowPowClaimResolutionRevocationStatus::DATABASE_FAILURE: return "database_failure";
+    case ShadowPowClaimResolutionRevocationStatus::DATABASE_OUTCOME_AMBIGUOUS: return "database_outcome_ambiguous";
+    }
+    return "database_failure";
+}
+
 bool CWallet::PersistNewManagedShadowPowResolution(
     const ShadowPowClaimRecoveryAction& action,
     ShadowPowClaimRecoveryOrigin origin, bool relay_authorized,
@@ -2795,6 +2832,7 @@ bool CWallet::PersistNewManagedShadowPowResolution(
         ToString(created_time);
     metadata[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] =
         relay_authorized ? "1" : "0";
+    metadata[SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY] = "0";
     metadata[SHADOW_POW_LEGACY_CLEANUP_FOR_KEY] =
         (*std::min_element(action.claim_txids.begin(),
                            action.claim_txids.end())).GetHex();
@@ -2859,11 +2897,12 @@ bool CWallet::PersistNewManagedShadowPowResolution(
 
 bool CWallet::SetManagedShadowPowResolutionRelayAuthority(
     const uint256& txid, bool authorized,
-    std::string& error)
+    bool explicit_reauthorization, std::string& error)
 {
     AssertLockHeld(cs_wallet);
-    if (m_shadow_pow_claim_recovery_db_ambiguous) {
-        error = "recovery database outcome is ambiguous; reload wallet before relay promotion";
+    if (m_shadow_pow_claim_recovery_db_ambiguous ||
+        m_locked_coins_db_ambiguous) {
+        error = "recovery or coin-lock database outcome is ambiguous; reload wallet before relay-authority mutation";
         return false;
     }
     const auto it = mapWallet.find(txid);
@@ -2878,16 +2917,27 @@ bool CWallet::SetManagedShadowPowResolutionRelayAuthority(
         error = "legacy resolution has no managed relay-authority record";
         return false;
     }
-    const std::string desired = authorized ? "1" : "0";
-    const auto current = it->second.mapValue.find(
-        SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY);
-    if (current != it->second.mapValue.end() && current->second == desired) {
+    ManagedResolutionFacts facts;
+    if (!ParseManagedResolutionFacts(*this, it->second, facts)) {
+        error = "managed resolution metadata is invalid";
+        return false;
+    }
+    if (authorized && facts.relay_revoked && !explicit_reauthorization) {
+        error = "managed resolution relay authority was explicitly revoked; use a fresh exact recovery plan to reauthorize it";
+        return false;
+    }
+    const bool desired_revoked = !authorized;
+    if (facts.relay_authorized == authorized &&
+        facts.relay_revoked == desired_revoked) {
         return true;
     }
 
     CWalletTx persisted(it->second.tx, it->second.m_state);
     persisted.CopyFrom(it->second);
-    persisted.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] = desired;
+    persisted.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] =
+        authorized ? "1" : "0";
+    persisted.mapValue[SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY] =
+        desired_revoked ? "1" : "0";
     WalletBatch batch(GetDatabase());
     if (!batch.TxnBegin(/*durable=*/true)) {
         error = "failed to begin durable managed-resolution relay-authority update";
@@ -2908,10 +2958,139 @@ bool CWallet::SetManagedShadowPowResolutionRelayAuthority(
         error = "relay-authority commit outcome is ambiguous; reload the wallet before retrying";
         return false;
     }
-    it->second.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] = desired;
+    it->second.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] =
+        authorized ? "1" : "0";
+    it->second.mapValue[SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY] =
+        desired_revoked ? "1" : "0";
     it->second.MarkDirty();
     NotifyTransactionChanged(txid, CT_UPDATED);
     return true;
+}
+
+ShadowPowClaimResolutionRevocationResult
+CWallet::RevokeManagedShadowPowResolutionRelayAuthority(
+    const uint256& txid)
+{
+    ShadowPowClaimResolutionRevocationResult result;
+    result.resolution_txid = txid;
+
+    // Serialize against planning, signing, relay promotion, and the recovery
+    // scheduler. Generic wallet broadcasts use m_inflight_wallet_broadcasts;
+    // the wallet lock below makes that reservation and this tombstone one
+    // total order as well.
+    LOCK(m_pow_recovery_authority_mutex);
+    const auto revoke_locked = [&] {
+        LOCK(cs_wallet);
+        if (m_shadow_pow_claim_recovery_db_ambiguous ||
+            m_locked_coins_db_ambiguous) {
+            result.status =
+                ShadowPowClaimResolutionRevocationStatus::DATABASE_OUTCOME_AMBIGUOUS;
+            result.durable_state_ambiguous = true;
+            result.detail = "a prior recovery or coin-lock database commit had an ambiguous outcome; reload the wallet before revocation";
+            return;
+        }
+
+        const auto it = mapWallet.find(txid);
+        if (it == mapWallet.end() || !it->second.tx) {
+            result.status = ShadowPowClaimResolutionRevocationStatus::NOT_FOUND;
+            result.detail = "managed claim-resolution transaction not found in this wallet";
+            return;
+        }
+        const auto schema = it->second.mapValue.find(
+            SHADOW_POW_RESOLUTION_SCHEMA_KEY);
+        if (schema == it->second.mapValue.end() ||
+            schema->second != SHADOW_POW_RESOLUTION_SCHEMA_VERSION) {
+            result.status = ShadowPowClaimResolutionRevocationStatus::NOT_MANAGED;
+            result.detail = "transaction is not an authenticated managed claim resolution";
+            return;
+        }
+
+        ManagedResolutionFacts facts;
+        if (!ParseManagedResolutionFacts(*this, it->second, facts)) {
+            result.status =
+                ShadowPowClaimResolutionRevocationStatus::INVALID_METADATA;
+            result.detail = "managed claim-resolution metadata or transaction shape is invalid";
+            return;
+        }
+        result.anchor = facts.anchor;
+        result.generation_fingerprint = facts.generation_fingerprint;
+        result.relay_authority_was_active = facts.relay_authorized;
+        // Validation-interface delivery can lag a caller that immediately
+        // revokes after submission. When a chain interface exists, report
+        // the node's current mempool truth rather than a potentially older
+        // wallet callback state. Chainless wallets can still durably narrow
+        // local authority, but must not invent a mempool observation.
+        if (HaveChain()) {
+            result.in_mempool = chain().isInMempool(txid);
+        }
+        result.broadcast_in_flight =
+            m_inflight_wallet_broadcasts.count(txid) != 0;
+        result.may_still_confirm = true;
+        result.anchor_reserved = IsSpent(facts.anchor);
+        result.normal_coin_selection_enabled = !*result.anchor_reserved;
+
+        if (*result.broadcast_in_flight) {
+            result.status =
+                ShadowPowClaimResolutionRevocationStatus::BROADCAST_IN_FLIGHT;
+            result.detail = "an exact local broadcast is already in flight; wait for its verdict and revoke again";
+            return;
+        }
+        if (!*result.anchor_reserved) {
+            result.status =
+                ShadowPowClaimResolutionRevocationStatus::ANCHOR_NOT_RESERVED;
+            result.detail = "managed resolution anchor is not reserved by the wallet; refusing to report a restriction-only cancellation";
+            return;
+        }
+        if (facts.relay_revoked) {
+            result.status =
+                ShadowPowClaimResolutionRevocationStatus::ALREADY_REVOKED;
+            result.success = true;
+            result.relay_authority_revoked = true;
+            result.locally_cancelled = true;
+            result.detail = "local relay authority was already durably revoked";
+        } else {
+            std::string error;
+            if (!SetManagedShadowPowResolutionRelayAuthority(
+                    txid, /*authorized=*/false,
+                    /*explicit_reauthorization=*/false, error)) {
+                result.durable_state_ambiguous =
+                    m_shadow_pow_claim_recovery_db_ambiguous;
+                result.status = result.durable_state_ambiguous
+                    ? ShadowPowClaimResolutionRevocationStatus::DATABASE_OUTCOME_AMBIGUOUS
+                    : ShadowPowClaimResolutionRevocationStatus::DATABASE_FAILURE;
+                if (result.durable_state_ambiguous) {
+                    // The durable outcome may be either the old authority or
+                    // the new tombstone. Never serialize either as factual.
+                    result.durable_state_changed.reset();
+                    result.relay_authority_revoked.reset();
+                    result.locally_cancelled.reset();
+                } else {
+                    result.relay_authority_revoked = false;
+                    result.locally_cancelled = false;
+                }
+                result.detail = std::move(error);
+                return;
+            }
+            result.status = ShadowPowClaimResolutionRevocationStatus::SUCCESS;
+            result.success = true;
+            result.durable_state_changed = true;
+            result.relay_authority_revoked = true;
+            result.locally_cancelled = true;
+            result.detail = "local relay authority was durably revoked; exact bytes and the shared anchor remain reserved";
+        }
+    };
+    revoke_locked();
+
+    // Report the post-attempt typed miner consequence when a chain snapshot
+    // exists. This read-only gate is computed while the recovery-authority
+    // mutex still excludes a competing fresh-plan commit that could clear the
+    // tombstone. A chainless wallet leaves it explicitly unavailable rather
+    // than mislabelling an unknown gate with a default.
+    if (HaveChain()) {
+        result.mining_gate_action = GetShadowPowClaimMiningGate().action;
+        result.mining_gate_available = true;
+    }
+    return result;
 }
 
 ShadowPowClaimRecoveryPlan CWallet::PlanShadowPowClaimRecovery(
@@ -3300,6 +3479,7 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
                 }
                 action.persisted = true;
                 action.relay_authorized = commit_authority;
+                action.relay_revoked = false;
                 action.status = ShadowPowClaimRecoveryActionStatus::SIGNED_AND_PERSISTED;
                 ++result.signed_and_persisted;
                 result.durable_state_changed = true;
@@ -3321,6 +3501,7 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
                 }
                 if (!SetManagedShadowPowResolutionRelayAuthority(
                         item.transaction->GetHash(), true,
+                        /*explicit_reauthorization=*/true,
                         result.error)) {
                     result.durable_state_ambiguous =
                         m_shadow_pow_claim_recovery_db_ambiguous;
@@ -3330,6 +3511,7 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
                     item.transaction->GetHash());
                 item.relay_authorized = true;
                 action.relay_authorized = true;
+                action.relay_revoked = false;
                 result.durable_state_changed = true;
                 ++result.relay_authority_granted;
             }
@@ -3402,12 +3584,18 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
             }
             const bool managed = it->second.mapValue.count(
                                      SHADOW_POW_RESOLUTION_SCHEMA_KEY) != 0;
+            ManagedResolutionFacts managed_facts;
+            if (managed && !ParseManagedResolutionFacts(
+                               *this, it->second, managed_facts)) {
+                result.error = "managed resolution metadata changed before relay";
+                return result;
+            }
             const bool relay_authorized =
-                it->second.mapValue.find(
-                    SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY) !=
-                    it->second.mapValue.end() &&
-                it->second.mapValue.at(
-                    SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY) == "1";
+                managed && managed_facts.relay_authorized;
+            if (managed && managed_facts.relay_revoked) {
+                result.error = "local relay authority for the signed recovery was revoked before relay";
+                return result;
+            }
             if (managed && !relay_authorized) {
                 result.error = "signed recovery draft has no durable relay authority";
                 return result;
@@ -3704,6 +3892,7 @@ void CWallet::MaybeAutoResolveShadowPowClaims()
                     node.resolution_origin ==
                         SHADOW_POW_RESOLUTION_ORIGIN_MANUAL &&
                     node.resolution_relay_authorized &&
+                    !node.resolution_relay_revoked &&
                     !node.active_chain_confirmed && !node.in_mempool) {
                     manual_retry.selectors.push_back(node.txid);
                 }

@@ -2017,7 +2017,7 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
         QStringList node_details;
         for (const auto& node : component.nodes) {
             provenance.push_back(recoveryProvenanceText(node.provenance));
-            node_details.push_back(
+            QString node_detail =
                 tr("%1 — %2, %3, disposition=%4%5%6%7%8")
                     .arg(shortenHex(node.txid))
                     .arg(recoveryNodeKindText(node.kind))
@@ -2028,7 +2028,11 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
                     .arg(node.abandoned ? tr(", abandoned") : QString())
                     .arg(node.proof_may_revalidate_on_descendant
                              ? tr(", may become eligible on a descendant")
-                             : QString()));
+                             : QString());
+            if (node.resolution_relay_revoked) {
+                node_detail += tr(", local relay authority revoked");
+            }
+            node_details.push_back(node_detail);
         }
         provenance.removeDuplicates();
         auto* provenance_item = new QTableWidgetItem(provenance.join(QStringLiteral(", ")));
@@ -2058,6 +2062,9 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
         if (action && action->relay_authorized && !action->in_mempool) {
             outcome += tr(" — relay authorized");
         }
+        if (action && action->relay_revoked) {
+            outcome += tr(" — local relay revoked; fresh exact-plan commit required");
+        }
         if (unbound_legacy_proof) {
             outcome += tr(" — original claim may revalidate");
         }
@@ -2070,6 +2077,11 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
         if (action && !action->detail.empty()) {
             if (!outcome_detail.isEmpty()) outcome_detail += QStringLiteral("\n");
             outcome_detail += QString::fromStdString(action->detail);
+        }
+        if (action && action->relay_revoked) {
+            if (!outcome_detail.isEmpty()) outcome_detail += QStringLiteral("\n");
+            outcome_detail += tr(
+                "The signed bytes and shared anchor remain reserved, but this wallet will not retry them. Reauthorization requires a fresh exact-plan commit.");
         }
         if (!outcome_detail.isEmpty()) outcome_item->setToolTip(outcome_detail);
         m_pow_recovery_components->setItem(row, 6, outcome_item);

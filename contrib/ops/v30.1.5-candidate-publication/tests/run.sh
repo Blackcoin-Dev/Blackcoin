@@ -128,6 +128,15 @@ def make_policy(directory, ready=False):
                 "reports_sha256": "b" * 64,
             },
         }
+    else:
+        value["authorization"] = {
+            "state": "blocked_pending_final_signed_source_and_green_ci",
+            "dispatch_enabled": False,
+            "temporary_source_pin": True,
+            "core_ci_run_id": None,
+            "core_ci_run_attempt": None,
+            "thread_sanitizer_artifact": None,
+        }
     output = directory / ("ready-policy.json" if ready else "blocked-policy.json")
     write_json(output, value)
     return output
@@ -138,8 +147,26 @@ def make_bundle(directory, ready=False):
     case = candidate_tests.V3015CandidateMetadataTest()
     case.workflow_run_id = str(packaging_run)
     case.workflow_run_attempt = str(packaging_attempt)
-    _, names = case.create_fixture(directory)
     selected_policy = make_policy(directory.parent, ready)
+    selected_authorization = json.loads(
+        selected_policy.read_text(encoding="utf-8")
+    )["authorization"]
+    assert (selected_authorization["state"] == metadata.READY_AUTHORIZATION_STATE) is ready
+    assert selected_authorization["dispatch_enabled"] is ready
+    assert selected_authorization["core_ci_run_id"] == (core_run if ready else None)
+    assert selected_authorization["core_ci_run_attempt"] == (
+        core_attempt if ready else None
+    )
+    # The imported candidate test helper normally reads its checked-in POLICY
+    # global. Point it at the explicit synthetic blocked/ready policy before it
+    # constructs any evidence, so a later checked-in authorization transition
+    # cannot silently change either publication fixture.
+    original_fixture_policy = candidate_tests.POLICY
+    candidate_tests.POLICY = selected_policy
+    try:
+        _, names = case.create_fixture(directory)
+    finally:
+        candidate_tests.POLICY = original_fixture_policy
     metadata.generate(
         selected_policy, directory, tooling, str(packaging_run), str(packaging_attempt),
         directory / names["manifest"], directory / names["provenance"],

@@ -265,6 +265,7 @@ class CoreCiReceiptTests(unittest.TestCase):
             lambda checks: checks["check_runs"][0]["app"].update({"id": 1}),
             lambda checks: checks["check_runs"][0]["app"].update({"id": True}),
             lambda checks: checks["check_runs"][0]["check_suite"].update({"id": 1}),
+            lambda checks: checks["check_runs"][0]["check_suite"].update({"id": 246810.0}),
             lambda checks: checks["check_runs"][0].update({"conclusion": "failure"}),
         )
         for mutate in mutations:
@@ -286,6 +287,7 @@ class CoreCiReceiptTests(unittest.TestCase):
             lambda run: run["actor"].update({"login": "Other"}),
             lambda run: run["triggering_actor"].update({"login": "Other"}),
             lambda run: run["pull_requests"][0].update({"number": 50}),
+            lambda run: run["pull_requests"][0].update({"number": float(metadata.EXPECTED_CORE_CI_PR)}),
             lambda run: run["pull_requests"][0]["base"].update({"sha": "0" * 40}),
         )
         for mutate in mutations:
@@ -329,6 +331,7 @@ class CoreCiReceiptTests(unittest.TestCase):
             lambda main, pull: pull.update({"draft": True}),
             lambda main, pull: pull.update({"mergeable": False}),
             lambda main, pull: pull.update({"mergeable_state": "blocked"}),
+            lambda main, pull: pull.update({"number": float(metadata.EXPECTED_CORE_CI_PR)}),
             lambda main, pull: pull["head"].update({"sha": "0" * 40}),
             lambda main, pull: pull["head"]["repo"].update({"full_name": "other/repo"}),
             lambda main, pull: pull["base"].update({"ref": "other"}),

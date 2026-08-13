@@ -84,7 +84,11 @@ def validate_run(run, policy):
     pull_requests = run.get("pull_requests")
     require(isinstance(pull_requests, list) and len(pull_requests) == 1, "Core CI pull request binding changed")
     pull_request = pull_requests[0]
-    require(pull_request.get("number") == core["pull_request_number"], "Core CI pull request changed")
+    require(
+        type(pull_request.get("number")) is int
+        and pull_request["number"] == core["pull_request_number"],
+        "Core CI pull request changed",
+    )
     require(pull_request.get("head", {}).get("sha") == core["head_sha"], "Core CI PR head changed")
     require(pull_request.get("base", {}).get("sha") == core["base_sha"], "Core CI PR base changed")
 
@@ -141,7 +145,11 @@ def validate_jobs(jobs_document, check_runs_document, run, policy):
         require(check_run.get("head_sha") == policy["core_ci"]["head_sha"], "Core CI check-run head changed")
         require(check_run.get("status") == "completed", f"Core CI check run did not complete: {name}")
         require(check_run.get("conclusion") == "success", f"Core CI check run did not pass: {name}")
-        require(check_run.get("check_suite", {}).get("id") == run.get("check_suite_id"), "Core CI check suite changed")
+        require(
+            type(check_run.get("check_suite", {}).get("id")) is int
+            and check_run["check_suite"]["id"] == run["check_suite_id"],
+            "Core CI check suite changed",
+        )
         require(
             type(check_run.get("app", {}).get("id")) is int
             and check_run["app"]["id"] == policy["core_ci"]["required_checks_app_id"],
@@ -212,7 +220,11 @@ def validate_current_authority(main_branch, pull_request, policy):
             "Core protected check app changed",
         )
         protected_checks.append({"context": name, "app_id": check["app_id"]})
-    require(pull_request.get("number") == core["pull_request_number"], "current pull request changed")
+    require(
+        type(pull_request.get("number")) is int
+        and pull_request["number"] == core["pull_request_number"],
+        "current pull request changed",
+    )
     require(pull_request.get("state") == "open", "current pull request is not open")
     require(pull_request.get("draft") is False, "current pull request is draft")
     require(pull_request.get("mergeable") is True, "current pull request is not mergeable")

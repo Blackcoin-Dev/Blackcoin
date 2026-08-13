@@ -150,7 +150,8 @@ def validate_policy(policy_path):
         },
         "candidate policy",
     )
-    require(policy["schema"] == 2, "candidate policy schema is not supported")
+    require(type(policy["schema"]) is int and policy["schema"] == 2,
+            "candidate policy schema is not supported")
     require(policy["classification"] == EXPECTED_CLASSIFICATION, "candidate classification changed")
     require(policy["version"] == "30.1.5", "candidate version must be 30.1.5")
 
@@ -235,7 +236,9 @@ def validate_policy(policy_path):
         "Core CI policy",
     )
     require(core_ci["event"] == EXPECTED_CORE_CI_EVENT, "Core CI event changed")
-    require(core_ci["pull_request_number"] == EXPECTED_CORE_CI_PR, "Core CI pull request changed")
+    require(type(core_ci["pull_request_number"]) is int
+            and core_ci["pull_request_number"] == EXPECTED_CORE_CI_PR,
+            "Core CI pull request changed")
     require(core_ci["head_sha"] == EXPECTED_SOURCE_COMMIT, "Core CI policy head changed")
     require(core_ci["head_tree"] == EXPECTED_SOURCE_TREE, "Core CI policy head tree changed")
     require(core_ci["base_sha"] == EXPECTED_CORE_CI_BASE, "Core CI policy base changed")
@@ -418,7 +421,8 @@ def validate_core_ci(path, policy):
         },
         "Core CI evidence",
     )
-    require(value["schema"] == 2, "Core CI evidence schema is not supported")
+    require(type(value["schema"]) is int and value["schema"] == 2,
+            "Core CI evidence schema is not supported")
     require(value["workflow_path"] == policy["core_ci"]["workflow_path"], "Core CI workflow path changed")
     require(value["workflow_name"] == policy["core_ci"]["workflow_name"], "Core CI workflow name changed")
     require(
@@ -436,7 +440,8 @@ def validate_core_ci(path, policy):
         "Core CI head repository changed",
     )
     require(
-        value["pull_request_number"] == policy["core_ci"]["pull_request_number"],
+        type(value["pull_request_number"]) is int
+        and value["pull_request_number"] == policy["core_ci"]["pull_request_number"],
         "Core CI pull request changed",
     )
     require(

@@ -486,13 +486,14 @@ class V3015CandidateMetadataTest(unittest.TestCase):
                 METADATA.validate_policy(path)
 
     def test_policy_rejects_schema1(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            policy = json.loads(POLICY.read_text(encoding="utf-8"))
-            policy["schema"] = 1
-            path = Path(temporary) / "policy.json"
-            write_json(path, policy)
-            with self.assertRaisesRegex(RuntimeError, "candidate policy schema"):
-                METADATA.validate_policy(path)
+        for schema in (1, 2.0):
+            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as temporary:
+                policy = json.loads(POLICY.read_text(encoding="utf-8"))
+                policy["schema"] = schema
+                path = Path(temporary) / "policy.json"
+                write_json(path, policy)
+                with self.assertRaisesRegex(RuntimeError, "candidate policy schema"):
+                    METADATA.validate_policy(path)
 
     def test_policy_rejects_partial_or_inconsistent_authorization(self):
         substitutions = (
@@ -577,6 +578,7 @@ class V3015CandidateMetadataTest(unittest.TestCase):
         substitutions = {
             "event": "workflow_dispatch",
             "pull_request_number": METADATA.EXPECTED_CORE_CI_PR + 1,
+            "pull_request_number_float": float(METADATA.EXPECTED_CORE_CI_PR),
             "head_sha": "0" * 40,
             "head_tree": "0" * 40,
             "base_sha": "0" * 40,
@@ -592,7 +594,11 @@ class V3015CandidateMetadataTest(unittest.TestCase):
         for field, replacement in substitutions.items():
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
                 policy = json.loads(POLICY.read_text(encoding="utf-8"))
-                target_field = "required_checks_app_id" if field == "required_checks_app_id_boolean" else field
+                aliases = {
+                    "required_checks_app_id_boolean": "required_checks_app_id",
+                    "pull_request_number_float": "pull_request_number",
+                }
+                target_field = aliases.get(field, field)
                 policy["core_ci"][target_field] = replacement
                 path = Path(temporary) / "policy.json"
                 write_json(path, policy)
@@ -666,6 +672,7 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             "repository": "substituted/Blackcoin",
             "head_repository": "substituted/Blackcoin",
             "pull_request_number": METADATA.EXPECTED_CORE_CI_PR + 1,
+            "pull_request_number_float": float(METADATA.EXPECTED_CORE_CI_PR),
             "pull_request_head_sha": "0" * 40,
             "pull_request_base_sha": "0" * 40,
             "base_tree": "0" * 40,
@@ -680,7 +687,7 @@ class V3015CandidateMetadataTest(unittest.TestCase):
                 policy, names = self.create_fixture(root)
                 path = root / names["core_ci"]
                 value = json.loads(path.read_text(encoding="utf-8"))
-                value[field] = replacement
+                value["pull_request_number" if field == "pull_request_number_float" else field] = replacement
                 write_json(path, value)
                 with self.assertRaisesRegex(RuntimeError, "Core CI"):
                     METADATA.validate_core_ci(path, policy)
@@ -777,15 +784,16 @@ class V3015CandidateMetadataTest(unittest.TestCase):
                     METADATA.validate_core_ci(path, policy)
 
     def test_core_ci_rejects_schema1(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            policy, names = self.create_fixture(root)
-            path = root / names["core_ci"]
-            value = json.loads(path.read_text(encoding="utf-8"))
-            value["schema"] = 1
-            write_json(path, value)
-            with self.assertRaisesRegex(RuntimeError, "Core CI evidence schema"):
-                METADATA.validate_core_ci(path, policy)
+        for schema in (1, 2.0):
+            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                policy, names = self.create_fixture(root)
+                path = root / names["core_ci"]
+                value = json.loads(path.read_text(encoding="utf-8"))
+                value["schema"] = schema
+                write_json(path, value)
+                with self.assertRaisesRegex(RuntimeError, "Core CI evidence schema"):
+                    METADATA.validate_core_ci(path, policy)
 
     def test_policy_rejects_legacy_or_extra_core_ci_digest_fields(self):
         for legacy_only in (True, False):

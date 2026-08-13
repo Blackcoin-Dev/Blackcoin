@@ -70,21 +70,19 @@ Phase A never invokes Phase B.
 8. `VALIDATION.txt`.
 9. `SHA256SUMS`.
 
-Before narrative closure, the six exact environment, contract, phase,
-test, and verifier payloads passed local and independent 403/403 hostile
-replays without byte drift. The digest of their ordered `sha256sum` list, in
-manifest order with the two narrative files omitted, is
-`cd15e93f006ae83920fc2817e8d0c1bc7e1cad69f5aa783f9751f2aa145637af`.
-`SHA256SUMS` binds those six payloads together with the final `README.md` and
-`VALIDATION.txt`; it is generated mechanically only after both narrative
-files are frozen.
+The six exact environment, contract, phase, test, and verifier payloads are
+frozen for this identity-neutral preseal. The SHA-256 of their ordered
+`sha256sum` list, in manifest order with the two narrative files omitted, is
+`48bb93d2daa00f059fb2ec0db110d55c3a74b37d2d38cda78b891128f6f3f7f8`.
+`SHA256SUMS` mechanically binds those six payloads together with the final
+`README.md` and `VALIDATION.txt` bytes.
 
-A completed tooling checkpoint additionally requires strict manifest
-verification, exact package topology and static checks, a local full sealed
-403/403 replay with all nine package-file hashes unchanged, and an independent
-post-seal replay recorded in an external commit ledger. This narrative
-intentionally does not attest or predict the status of that external step and
-does not embed a volatile replay path.
+A completed preseal review additionally requires strict manifest verification,
+exact package topology and static checks, a local full sealed 528-assertion
+hostile replay with all nine package-file hashes unchanged, and an independent
+post-seal review recorded outside this package. This narrative intentionally
+does not attest or predict an external review result and does not embed a
+volatile replay path.
 
 A valid checksum seal proves identity-neutral offline tooling integrity only;
 it does not prove Core correctness or grant execution authority. Recording the
@@ -92,6 +90,13 @@ final source/run and adapter/bundle identities remains a separate reviewed
 repin and seal. Live preflight treats `SHA256SUMS` as the ninth required regular
 file and rejects a mismatch, extra or non-regular objects, symlinks, unsafe
 ownership or modes, and multiply linked files.
+
+The test suite retains signed commit
+`309731e3340f380e48cb67f94a243725465420fb` only as an immutable diagnostic
+source oracle for the typed RPC/API shape exercised by the offline fixtures.
+That commit is a revoked, failed predecessor. It is not substituted into the
+production identity sentinels and supplies no Core, packaging, seal, canary, or
+rollout authority.
 
 ## Unlock-helper audit
 

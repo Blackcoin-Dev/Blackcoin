@@ -6,6 +6,10 @@ ROOT=$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P) || e
 readonly ROOT
 readonly TEST_CANDIDATE_SOURCE_SHA='0123456789abcdef0123456789abcdef01234567'
 readonly TEST_CORE_CI_RUN_ID='42424242424'
+# Revoked H309 is retained only as an immutable diagnostic source oracle for
+# the typed RPC/API semantics exercised below. It is a failed predecessor, is
+# never substituted into the production identity sentinels, and provides no
+# Core, packaging, seal, canary, or rollout authority.
 readonly TEST_CORE_AUDIT_SOURCE_SHA='309731e3340f380e48cb67f94a243725465420fb'
 readonly TEST_CORE_AUDIT_SOURCE_TREE='1517a277e1ab6355db0a14ed40d21e4e5e1dc846'
 readonly TEST_CORE_AUDIT_SOURCE_PARENT='b08ae92024f3586f9d571df885f70af6ebc504ba'
@@ -4550,7 +4554,7 @@ ok 'package contains no build/publish/release mutation' /bin/bash -c '
   ! grep -E "docker (build|push|pull|load)|gh release|git tag|workflow run" "$1" "$2" "$3"
 ' _ "$PHASE_A" "$PHASE_B" "$VERIFIER"
 # shellcheck disable=SC2016 # Intentional child-shell fixture; $1 expands there.
-ok 'Core source audit checkout is the exact signed final H, parent, and tree' /bin/bash -c '
+ok 'revoked predecessor source oracle is exact, signed, clean, and diagnostic-only' /bin/bash -c '
   [[ "$(git -C "$1" rev-parse HEAD)" == "$2" &&
      "$(git -C "$1" rev-parse "HEAD^{tree}")" == "$3" &&
      "$(git -C "$1" rev-parse HEAD^)" == "$4" &&

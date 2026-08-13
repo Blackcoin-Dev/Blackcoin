@@ -76,54 +76,54 @@ PASS  Configured-future payout may be empty for retained wait/relay/refresh
 PASS  The corrected implicit metadata-absent root contract binds zero lineage
       defaults, the exact QQP2/3/4 origin/input tuples, authored and carrier
       metadata, Core disposition/revalidation semantics, unspent-anchor
-      proof-evaluation status, and the singleton-QQP2 authored-tip rule. Exact
-      producer, contract, verifier, and test payload bytes passed both local
-      and independent 403/403 preseal replay.
+      proof-evaluation status, and the singleton-QQP2 authored-tip rule.
 PASS  PoS remains explicitly active in Phase B; no recovery/cleanup payment,
       abandon, raw broadcast, host repair, data rewind, or old-Core restart is
       permitted after promotion.
 
 Exact offline validation
 ------------------------
-PRESEAL-PASS  Local and independent hostile suites each passed 403/403, exit 0,
-              against the same exact six non-narrative payloads: environment,
-              contract, Phase A, Phase B, tests, and verifier. The digest of
-              their ordered sha256sum list, in manifest order with README and
-              VALIDATION omitted, is
-              cd15e93f006ae83920fc2817e8d0c1bc7e1cad69f5aa783f9751f2aa145637af.
+PRESEAL-INPUT  The exact six non-narrative payloads are frozen: environment,
+               contract, Phase A, Phase B, tests, and verifier. The digest of
+               their ordered sha256sum list, in manifest order with README and
+               VALIDATION omitted, is
+               48bb93d2daa00f059fb2ec0db110d55c3a74b37d2d38cda78b891128f6f3f7f8.
 PASS  Bash syntax for every .sh/.sh.inc input and candidate.env.example.
 PASS  Full ShellCheck -x for every package shell input, with no findings.
 PASS  Git diff whitespace validation.
-SEAL-PROCEDURE  SHA256SUMS binds the six reviewed payloads with final README
-                and VALIDATION bytes and is generated mechanically only after
-                both narratives are frozen. A completed checkpoint requires
-                strict verification of that exact eight-payload manifest,
-                exact topology and static gates, a local full sealed 403/403
-                replay with all nine file hashes unchanged, and an independent
-                post-seal replay recorded in the external commit ledger. This
-                file intentionally does not attest or predict the status of
-                that external step and does not embed volatile fixture paths.
+PRESEAL-PROCEDURE  SHA256SUMS mechanically binds the six reviewed payloads with
+                   final README and VALIDATION bytes. A completed review
+                   requires strict verification of that exact eight-payload
+                   manifest, exact topology and static gates, a local full
+                   sealed 528-assertion replay with all nine file hashes
+                   unchanged, and an independent post-seal review recorded
+                   outside this package. This file intentionally does not
+                   attest or predict that external result and does not embed
+                   volatile fixture paths.
 
 The two verifier routing fixtures use the deterministic copied contract and
 therefore reach the named unknown-mode and missing-root branches. A separate
 fixture proves that the unrepinned production contract fails exact identity
 resolution.
 
-Explicit Core/API blockers
---------------------------
-BLOCKED  A newly wallet-visible receive-only foreign QQSPROOF cannot yet be
-         authenticated as the exact no-debit/from-me-false, non-wallet-anchor
-         audit class. Phase-B wallet-delta classification remains fail closed.
-BLOCKED  A retained family's authenticated synthetic payout may use its
-         persisted family payout rather than the configured-future payout.
-         Exact selected-family persisted-payout evidence is not yet exposed,
-         so the tooling does not guess or host-select it.
-BLOCKED  The final per-family selection schema must expose enough evidence to
-         independently prove global RELAY_EXISTING > REFRESH_SAME_ANCHOR >
-         bounded WAIT priority, WAIT-only-when-all-safe-families-live, and the
-         exact per-tx suppression/reselection decision. The current tooling
-         authenticates Core's selected component but does not reconstruct
-         missing global authority on the host.
+External authority blockers
+---------------------------
+BLOCKED  Production Core H and exact-SHA run R remain invalid sentinels. No
+         signed successor or hosted run is accepted by these production bytes.
+BLOCKED  The signed adapter/workflow commit, candidate packaging run and
+         attempt, bundle, OCI archive/graph, image, provenance, and six-binary
+         identities remain unresolved placeholders.
+BLOCKED  Live Compose/runtime hashes, Phase-A evidence identity, separate
+         Phase-A and Phase-B confirmations, independent identity-bound review,
+         and explicit canary authorization remain external and unresolved.
+
+Revoked predecessor boundary
+----------------------------
+Signed commit 309731e3340f380e48cb67f94a243725465420fb is retained only as
+an immutable diagnostic source oracle for the typed RPC/API shape exercised by
+the offline suite. It is a revoked, failed predecessor. It is never substituted
+into the production identity sentinels and supplies no Core, package, preseal,
+canary, or rollout authority.
 
 Seal and authorization boundary
 -------------------------------
@@ -135,8 +135,9 @@ rollout, and fleet mutation remain impossible by design.
 
 Not executed or claimed
 -----------------------
-No Docker or Compose command, network access or mutation, GitHub mutation,
-workflow dispatch, artifact build/download/load, wallet RPC, container change,
-ZFS operation, live canary, or fleet action was performed. No successful Core
-candidate, package, artifact, image, release, PoS fleet count, PoW fleet count,
-or node30 Free Claim health is claimed by this offline checkpoint.
+No Docker or Compose command, workflow dispatch, GitHub release/build action,
+artifact build/download/load, wallet RPC, container change, ZFS operation, live
+canary, or fleet action was performed by the offline validation described here.
+No successful Core candidate, identity-bound package, artifact, image, release,
+PoS fleet count, PoW fleet count, or node30 Free Claim health is claimed by this
+offline checkpoint.

@@ -193,10 +193,52 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             "pull_request_base_sha": METADATA.EXPECTED_CORE_CI_BASE,
             "base_tree": METADATA.EXPECTED_CORE_CI_BASE_TREE,
             "run_id": 987654,
+            "run_attempt": 1,
             "head_sha": METADATA.EXPECTED_SOURCE_COMMIT,
             "head_tree": METADATA.EXPECTED_SOURCE_TREE,
             "status": "completed",
             "conclusion": "success",
+            "workflow_actor": METADATA.EXPECTED_ACTOR,
+            "workflow_triggering_actor": METADATA.EXPECTED_ACTOR,
+            "base_branch": "main",
+            "base_branch_head_sha": METADATA.EXPECTED_CORE_CI_BASE,
+            "strict_base_fresh": True,
+            "pull_request_state": "open",
+            "pull_request_draft": False,
+            "pull_request_mergeable": True,
+            "pull_request_mergeable_state": "clean",
+            "exact_head_run_count": 1,
+            "required_checks": [
+                {
+                    "id": 1000 + index,
+                    "name": name,
+                    "app_id": METADATA.EXPECTED_REQUIRED_CHECKS_APP_ID,
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+                for index, name in enumerate(METADATA.EXPECTED_REQUIRED_CHECKS)
+            ],
+            "thread_sanitizer_artifact": {
+                "id": 765432,
+                "name": (
+                    f"sanitizer-reports-thread-sanitizer-{METADATA.EXPECTED_SOURCE_COMMIT}-attempt-1"
+                ),
+                "size_in_bytes": 256,
+                "expired": False,
+                "api_digest": f"sha256:{'a' * 64}",
+                "zip_sha256": "a" * 64,
+                "reports_sha256": "b" * 64,
+                "report": {
+                    "target_sha": METADATA.EXPECTED_SOURCE_COMMIT,
+                    "sanitizer": "thread-sanitizer",
+                    "report_count": 0,
+                    "report_bytes": 0,
+                    "framing_error_count": 0,
+                    "collector_error_count": 0,
+                    "artifact_error": 0,
+                    "capture_complete": 1,
+                },
+            },
         }
         write_json(root / names["core_ci"], core_ci)
         (root / names["toolchain"]).write_text(
@@ -304,6 +346,8 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             self.assertFalse(manifest["authorization"]["dispatch_enabled"])
             self.assertTrue(manifest["authorization"]["temporary_source_pin"])
             self.assertIsNone(manifest["authorization"]["core_ci_run_id"])
+            self.assertIsNone(manifest["authorization"]["core_ci_run_attempt"])
+            self.assertIsNone(manifest["authorization"]["thread_sanitizer_artifact"])
             self.assertEqual(manifest["build"]["tooling_commit"], self.adapter_sha)
             self.assertEqual(manifest["build"]["workflow_definition_commit"], self.adapter_sha)
             self.assertEqual(manifest["build"]["workflow_run_id"], int(self.workflow_run_id))
@@ -446,6 +490,8 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             {"dispatch_enabled": True},
             {"temporary_source_pin": False},
             {"core_ci_run_id": 987654},
+            {"core_ci_run_attempt": 1},
+            {"thread_sanitizer_artifact": {}},
             {"state": METADATA.READY_AUTHORIZATION_STATE},
         )
         for substitution in substitutions:
@@ -465,6 +511,15 @@ class V3015CandidateMetadataTest(unittest.TestCase):
                 "dispatch_enabled": True,
                 "temporary_source_pin": False,
                 "core_ci_run_id": 987654,
+                "core_ci_run_attempt": 1,
+                "thread_sanitizer_artifact": {
+                    "id": 765432,
+                    "name": (
+                        f"sanitizer-reports-thread-sanitizer-{METADATA.EXPECTED_SOURCE_COMMIT}-attempt-1"
+                    ),
+                    "zip_sha256": "a" * 64,
+                    "reports_sha256": "b" * 64,
+                },
             }
             path = Path(temporary) / "policy.json"
             write_json(path, policy)
@@ -479,6 +534,36 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "authorized exact run"):
                 METADATA.validate_core_ci(root / names["core_ci"], ready)
 
+    def test_ready_authorization_rejects_boolean_integer_fields(self):
+        mutations = (
+            lambda authorization: authorization.update({"core_ci_run_id": True}),
+            lambda authorization: authorization.update({"core_ci_run_attempt": True}),
+            lambda authorization: authorization["thread_sanitizer_artifact"].update({"id": True}),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                policy = json.loads(POLICY.read_text(encoding="utf-8"))
+                policy["authorization"] = {
+                    "state": METADATA.READY_AUTHORIZATION_STATE,
+                    "dispatch_enabled": True,
+                    "temporary_source_pin": False,
+                    "core_ci_run_id": 987654,
+                    "core_ci_run_attempt": 1,
+                    "thread_sanitizer_artifact": {
+                        "id": 765432,
+                        "name": (
+                            f"sanitizer-reports-thread-sanitizer-{METADATA.EXPECTED_SOURCE_COMMIT}-attempt-1"
+                        ),
+                        "zip_sha256": "a" * 64,
+                        "reports_sha256": "b" * 64,
+                    },
+                }
+                mutation(policy["authorization"])
+                path = Path(temporary) / "policy.json"
+                write_json(path, policy)
+                with self.assertRaises(RuntimeError):
+                    METADATA.validate_policy(path)
+
     def test_policy_rejects_core_ci_identity_substitution(self):
         substitutions = {
             "event": "workflow_dispatch",
@@ -491,11 +576,15 @@ class V3015CandidateMetadataTest(unittest.TestCase):
             "head_repository": "substituted/Blackcoin",
             "base_workflow_blob_sha256": "0" * 64,
             "source_workflow_blob_sha256": "0" * 64,
+            "required_checks_app_id": 1,
+            "required_checks_app_id_boolean": True,
+            "required_checks": [],
         }
         for field, replacement in substitutions.items():
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
                 policy = json.loads(POLICY.read_text(encoding="utf-8"))
-                policy["core_ci"][field] = replacement
+                target_field = "required_checks_app_id" if field == "required_checks_app_id_boolean" else field
+                policy["core_ci"][target_field] = replacement
                 path = Path(temporary) / "policy.json"
                 write_json(path, policy)
                 with self.assertRaisesRegex(RuntimeError, "Core CI"):
@@ -585,6 +674,47 @@ class V3015CandidateMetadataTest(unittest.TestCase):
                 value[field] = replacement
                 write_json(path, value)
                 with self.assertRaisesRegex(RuntimeError, "Core CI"):
+                    METADATA.validate_core_ci(path, policy)
+
+    def test_core_ci_requires_unique_run_current_mergeability_and_exact_actions_app(self):
+        mutations = (
+            lambda value: value.update({"exact_head_run_count": 0}),
+            lambda value: value.update({"exact_head_run_count": True}),
+            lambda value: value.update({"pull_request_mergeable": False}),
+            lambda value: value.update({"pull_request_mergeable_state": "blocked"}),
+            lambda value: value["required_checks"][0].update({"app_id": 1}),
+            lambda value: value["required_checks"][0].update({"app_id": True}),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                policy, names = self.create_fixture(root)
+                path = root / names["core_ci"]
+                value = json.loads(path.read_text(encoding="utf-8"))
+                mutation(value)
+                write_json(path, value)
+                with self.assertRaises(RuntimeError):
+                    METADATA.validate_core_ci(path, policy)
+
+    def test_core_ci_rejects_boolean_numeric_evidence(self):
+        mutations = (
+            lambda value: value.update({"run_id": True}),
+            lambda value: value.update({"run_attempt": True}),
+            lambda value: value["required_checks"][0].update({"id": True}),
+            lambda value: value["thread_sanitizer_artifact"].update({"id": True}),
+            lambda value: value["thread_sanitizer_artifact"].update({"size_in_bytes": True}),
+            lambda value: value["thread_sanitizer_artifact"]["report"].update({"report_count": False}),
+            lambda value: value["thread_sanitizer_artifact"]["report"].update({"capture_complete": True}),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                policy, names = self.create_fixture(root)
+                path = root / names["core_ci"]
+                value = json.loads(path.read_text(encoding="utf-8"))
+                mutation(value)
+                write_json(path, value)
+                with self.assertRaises(RuntimeError):
                     METADATA.validate_core_ci(path, policy)
 
     def test_core_ci_schema2_rejects_legacy_missing_and_extra_digest_fields(self):

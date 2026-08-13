@@ -6,7 +6,9 @@ current source pin, commit `a0695f22740e111d0487a194fb46f1bae05952c5` and tree
 non-final. The checked-in authorization state is fail-closed:
 dispatch remains disabled until this pin is replaced with the exact final
 Blackcoin-Dev-signed PR #49 head and the exact successful safety-gate run ID.
-The binaries must truthfully self-report `v30.1.5`.
+The final authorization must also pin that run's attempt plus the exact
+ThreadSanitizer artifact ID, ZIP digest, and `reports.log` digest. The binaries
+must truthfully self-report `v30.1.5`.
 
 The package does not modify or reuse the immutable v30.1.4 release/tag
 publication adapters. Its pinned v30.1.4 image digest and config are retained
@@ -34,7 +36,16 @@ Blackcoin-Dev SSH-signed tooling commit and must supply:
   workflow blob SHA256 values:
   one for the base commit and one for the source commit. Both temporary values
   are `24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869`; and
-  status/conclusion `completed`/`success`; and
+  status/conclusion `completed`/`success`, uniqueness as the sole
+  `pull_request` workflow run for that exact head, a currently mergeable PR
+  against the exact fresh base, and a complete check-run inventory consisting
+  of exactly the same sixteen jobs bound to GitHub Actions app ID `15368`, all
+  independently
+  `completed`/`success`, and the exact attempt-scoped
+  ThreadSanitizer artifact whose API digest equals its downloaded ZIP SHA256
+  and whose strict eight-field `reports.log` records a complete capture with
+  zero reports, bytes, framing errors, collector errors, and artifact errors;
+  and
 - `BUILD_V30_1_5_CANDIDATE_LINUX_X86_64` as the explicit confirmation.
 
 The final-pin update must atomically change the temporary source commit and
@@ -44,7 +55,9 @@ document; set `authorization.state` to
 `authorized_exact_signed_source_and_green_ci`; set
 `dispatch_enabled=true` and `temporary_source_pin=false`; and pin the exact
 positive `core_ci_run_id` in both policy and workflow. Any partial update is
-rejected.
+rejected. It must also pin the positive run attempt and the exact sanitizer
+artifact ID/name/ZIP/report digests; aggregate run success alone is not
+authorization.
 
 Both the original workflow actor and the actor triggering the current run
 attempt must be `Blackcoin-Dev`. The authorization job and every build and
@@ -52,8 +65,14 @@ assembly job enforce both identities independently. Authorization, raw-build,
 and final artifact names include the exact `github.run_attempt`, so a partial
 rerun cannot consume evidence or binaries from an earlier attempt. The
 authorization evidence records both actors, the source commit and tree, and
-the distinct base/source workflow digests in Core-CI schema `2`. Exact-key
-validation rejects the legacy single-digest field, missing fields, and extras.
+the distinct base/source workflow digests, all sixteen exact protected job
+receipts, and the byte-verified zero-report ThreadSanitizer receipt in Core-CI
+schema `2`. Safe ZIP inspection rejects extra, duplicate, nested, traversing,
+encrypted, oversized, and nonregular members. Exact-key validation rejects the
+legacy single-digest field, missing fields, extras, duplicate job IDs,
+non-unique exact-head runs, a stale or currently blocked PR, substituted
+check-run apps, and malformed
+boolean-as-integer evidence.
 The workflow records the Core source SHA and the tooling/workflow-definition
 SHA separately. Candidate source cannot affect authorization until the tooling
 commit has been verified against the pinned Blackcoin-Dev ED25519 fingerprint.

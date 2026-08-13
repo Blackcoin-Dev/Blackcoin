@@ -6,7 +6,9 @@
     "state": "blocked_pending_final_signed_source_and_green_ci",
     "dispatch_enabled": false,
     "temporary_source_pin": true,
-    "core_ci_run_id": null
+    "core_ci_run_id": null,
+    "core_ci_run_attempt": null,
+    "thread_sanitizer_artifact": null
   },
   "source": {
     "repository": "Blackcoin-Dev/Blackcoin",
@@ -32,7 +34,26 @@
     "workflow_path": ".github/workflows/pr-gate.yml",
     "workflow_name": "pull-request safety gate",
     "base_workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869",
-    "source_workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869"
+    "source_workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869",
+    "required_checks_app_id": 15368,
+    "required_checks": [
+      "source identity, workflow syntax, and lint",
+      "pinned independent quantum crypto provenance",
+      "pinned native build and unit tests",
+      "measured worst-case quantum crypto resources (Linux x86_64)",
+      "Linux ARM64 native cryptographic vectors and resources",
+      "Linux ARM64 native UBSan block-harness gate",
+      "Build pinned Windows x86_64 vector binaries",
+      "Windows x86_64 native cryptographic vectors and resources",
+      "macOS Intel native cryptographic vectors",
+      "macOS Apple Silicon native cryptographic vectors",
+      "critical Gold Rush, lifecycle, wallet, and recovery tests",
+      "real v26.2, v28.4, v30.1, and candidate interoperability",
+      "complete extended functional suite",
+      "address-undefined-sanitizer consensus and liveness gate",
+      "thread-sanitizer consensus and liveness gate",
+      "source-pinned sanitizer regression smoke"
+    ]
   },
   "base_image": {
     "role": "immutable-v30.1.4-rootfs-and-rollback-only",

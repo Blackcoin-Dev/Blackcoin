@@ -1598,6 +1598,44 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     QTRY_COMPARE_WITH_TIMEOUT(
         model.getCachedEncryptionStatus(), WalletModel::Locked, 1000);
 
+    // The Staking & Mining page uses a separate normal-unlock helper. A
+    // cancelled dialog must preserve the same locked staking-only preference
+    // as the generic WalletModel path.
+    QVERIFY(model.setWalletLocked(false, passphrase,
+                                  /*staking_only=*/true));
+    {
+        StakingMiningPage unlock_page(platform_style);
+        unlock_page.setClientModel(mini_gui.clientModel.get());
+        unlock_page.setWalletModel(&model);
+        unlock_page.show();
+        auto* pow_unlock =
+            unlock_page.findChild<QCheckBox*>("powUnlockWallet");
+        QVERIFY(pow_unlock);
+        QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isVisible(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isEnabled(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!pow_unlock->isChecked(), 5000);
+        QCOMPARE(model.getEncryptionStatus(), WalletModel::Unlocked);
+        QVERIFY(model.getWalletUnlockStakingOnly());
+        bool normal_unlock_rejected{false};
+        WaitForModal(QStringLiteral("normal wallet unlock dialog"), [&normal_unlock_rejected] {
+            QWidget* modal = QApplication::activeModalWidget();
+            if (!modal || !modal->inherits("AskPassphraseDialog")) {
+                return false;
+            }
+            normal_unlock_rejected = true;
+            qobject_cast<QDialog*>(modal)->reject();
+            return true;
+        });
+        pow_unlock->click();
+        QVERIFY(normal_unlock_rejected);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            model.getEncryptionStatus(), WalletModel::Locked, 5000);
+        QVERIFY(model.getWalletUnlockStakingOnly());
+        QVERIFY(!wallet->HasNormalPowMiningWalletAuthority());
+        QTRY_VERIFY_WITH_TIMEOUT(!pow_unlock->isChecked(), 5000);
+        QVERIFY(!model.wallet().getPowMiningInfo().enabled);
+    }
+
     // The retained marker is only the staged preference for the next unlock.
     // A locked wallet must not be presented as actively staking-only unlocked.
     {

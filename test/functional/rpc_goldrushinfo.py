@@ -243,10 +243,9 @@ class GoldRushInfoTest(BitcoinTestFramework):
         wallet_name = "goldrush_pow_builtin"
         strict_wallet_name = "goldrush_pow_interactive_strict"
 
-        # Interactive starts remain strict independently of the retained
-        # startup worker exercised below. SetPowMining stops an existing worker
-        # before validating a fresh interactive request, so this deliberately
-        # uses a separate wallet/lifecycle phase.
+        # Interactive starts remain strict for a wallet without a retained
+        # worker. The startup lifecycle below separately proves that a rejected
+        # reconfiguration preserves an already-enabled waiting worker.
         node.createwallet(wallet_name=strict_wallet_name, load_on_startup=False)
         strict_wallet = node.get_wallet_rpc(strict_wallet_name)
         strict_wallet.getnewquantumaddress("PoW - Quantum Claim Address")
@@ -398,6 +397,33 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(wallet.getwalletinfo()["txcount"], wallet_txcount_before)
             assert_equal(self._wallet_pow_claims(wallet), wallet_claims_before)
 
+            self.log.info(
+                "A rejected locked reconfiguration preserves the startup worker"
+            )
+            assert_raises_rpc_error(
+                -4,
+                "requires an unlocked wallet",
+                wallet.setpowmining,
+                True,
+                2,
+                25,
+            )
+            locked_after_reject = wallet.getpowmininginfo()
+            assert_equal(locked_after_reject["enabled"], True)
+            assert_equal(locked_after_reject["threads"], 1)
+            assert_equal(locked_after_reject["cpu_percent"], 1)
+            assert_equal(
+                locked_after_reject["state"],
+                "wallet_locked_or_staking_only",
+            )
+            assert_equal(locked_after_reject["hashrate"], 0)
+            assert_equal(
+                {entry["address"] for entry in wallet.listquantumaddresses()},
+                quantum_addresses_before,
+            )
+            assert_equal(wallet.getwalletinfo()["txcount"], wallet_txcount_before)
+            assert_equal(self._wallet_pow_claims(wallet), wallet_claims_before)
+
             self.log.info("A staking-only unlock keeps the retained startup worker paused")
             wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, True)
             self.wait_until(
@@ -410,6 +436,33 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(staking_only["cpu_percent"], 1)
             assert_equal(staking_only["state"], "wallet_locked_or_staking_only")
             assert_equal(staking_only["hashrate"], 0)
+            assert_equal(
+                {entry["address"] for entry in wallet.listquantumaddresses()},
+                quantum_addresses_before,
+            )
+            assert_equal(wallet.getwalletinfo()["txcount"], wallet_txcount_before)
+            assert_equal(self._wallet_pow_claims(wallet), wallet_claims_before)
+
+            assert_raises_rpc_error(
+                -4,
+                "normal wallet unlock",
+                wallet.setpowmining,
+                True,
+                2,
+                25,
+            )
+            staking_only_after_reject = wallet.getpowmininginfo()
+            assert_equal(
+                wallet.getwalletinfo()["unlocked_staking_only"], True
+            )
+            assert_equal(staking_only_after_reject["enabled"], True)
+            assert_equal(staking_only_after_reject["threads"], 1)
+            assert_equal(staking_only_after_reject["cpu_percent"], 1)
+            assert_equal(
+                staking_only_after_reject["state"],
+                "wallet_locked_or_staking_only",
+            )
+            assert_equal(staking_only_after_reject["hashrate"], 0)
             assert_equal(
                 {entry["address"] for entry in wallet.listquantumaddresses()},
                 quantum_addresses_before,

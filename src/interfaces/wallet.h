@@ -866,6 +866,7 @@ struct WalletPowClaimRecoveryComponent
     bool all_claims_zero_payment_retirable{false};
     bool all_claims_expired_locally_retired{false};
     bool has_revalidating_unbound_proof{false};
+    bool adoption_graph_safe{false};
     size_t descendant_claims{0};
     int minimum_stale_depth{0};
     bool stale_depth_known{false};

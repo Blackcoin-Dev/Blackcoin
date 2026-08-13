@@ -258,6 +258,7 @@ interfaces::WalletPowClaimRecoveryComponent MakeRecoveryComponent(
         component.all_claims_expired_locally_retired;
     out.has_revalidating_unbound_proof =
         component.has_revalidating_unbound_proof;
+    out.adoption_graph_safe = component.adoption_graph_safe;
     out.descendant_claims = component.descendant_claims;
     out.minimum_stale_depth = component.minimum_stale_depth;
     out.stale_depth_known = component.stale_depth_known;

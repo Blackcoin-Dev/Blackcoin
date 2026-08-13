@@ -201,6 +201,10 @@ struct ShadowPowClaimRecoveryComponent
     bool all_claims_zero_payment_retirable{false};
     bool all_claims_expired_locally_retired{false};
     bool has_branch_relative_ineligibility{false};
+    // Derived from the complete Core graph snapshot. GUI and RPC callers may
+    // use it to decide whether offering adoption is appropriate, but Core
+    // revalidates the graph again before any mutation.
+    bool adoption_graph_safe{false};
     size_t descendant_claims{0};
     int minimum_stale_depth{0};
     bool stale_depth_known{false};

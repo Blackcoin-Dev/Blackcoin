@@ -2465,6 +2465,15 @@ BOOST_AUTO_TEST_CASE(full_graph_groups_conflicts_branches_and_independent_anchor
     BOOST_CHECK_EQUAL(first.components.size(), 3U);
     BOOST_CHECK_EQUAL(first.unanchored_claim_txids.size(), 1U);
     BOOST_CHECK(first.unanchored_claim_txids.front() == foreign->GetHash());
+    const auto foreign_component = std::find_if(
+        first.components.begin(), first.components.end(),
+        [&](const ShadowPowClaimRecoveryComponent& component) {
+            return std::find(component.claim_txids.begin(),
+                             component.claim_txids.end(),
+                             foreign->GetHash()) != component.claim_txids.end();
+        });
+    BOOST_REQUIRE(foreign_component != first.components.end());
+    BOOST_CHECK(!foreign_component->adoption_graph_safe);
 
     const auto& component_a = FindRecoveryComponent(first, anchor_a);
     BOOST_CHECK(component_a.anchor_authenticated);
@@ -2992,6 +3001,7 @@ BOOST_AUTO_TEST_CASE(component_adoption_has_typed_atomic_outcomes)
         wallet->GetShadowPowClaimRecoveryInventory();
     const auto& initial_component = FindRecoveryComponent(initial, anchor);
     BOOST_CHECK(!initial_component.all_claims_explicitly_provenanced);
+    BOOST_CHECK(initial_component.adoption_graph_safe);
 
     const ShadowPowClaimRecoveryAdoptionResult not_found =
         wallet->AdoptShadowPowClaimRecoveryComponent(
@@ -3092,6 +3102,7 @@ BOOST_AUTO_TEST_CASE(component_adoption_has_typed_atomic_outcomes)
     const ShadowPowClaimRecoveryInventory mixed =
         wallet->GetShadowPowClaimRecoveryInventory();
     const auto& mixed_component = FindRecoveryComponent(mixed, anchor);
+    BOOST_CHECK(!mixed_component.adoption_graph_safe);
     const ShadowPowClaimRecoveryAdoptionResult not_claim =
         wallet->AdoptShadowPowClaimRecoveryComponent(
             descendant_ref->GetHash(), mixed.active_tip,
@@ -3107,6 +3118,7 @@ BOOST_AUTO_TEST_CASE(component_adoption_has_typed_atomic_outcomes)
     const ShadowPowClaimRecoveryInventory reviewed =
         wallet->GetShadowPowClaimRecoveryInventory();
     const auto& reviewed_component = FindRecoveryComponent(reviewed, anchor);
+    BOOST_CHECK(!reviewed_component.adoption_graph_safe);
     BOOST_REQUIRE_EQUAL(reviewed_component.ordinary_or_mixed_txids.size(), 1U);
     BOOST_CHECK(reviewed_component.ordinary_or_mixed_txids.front() ==
                 descendant_ref->GetHash());

@@ -99,6 +99,23 @@ fee cap, rolling fee budget, rolling fee/action window, maximum actions per
 window, and minimum stale-block depth before the wallet records standing
 authority.
 
+The headless manual path enforces both exact consent steps. A mutating
+`createshadowpowclaimresolution` call requires the `expected_plan_id` from its
+prior dry-run preview. Its successful signing response includes a fresh
+`current_plan` keyed to the exact persisted resolution txid. A side-effect-free
+`commitshadowpowclaimresolution <resolution_txid>` preview is also available
+after restart; only a later call with acknowledgement and that exact plan ID
+may grant relay authority. A successful `sendshadowpowclaim` relay of retained
+exact bytes returns a typed success response instead of reporting an error
+after the relay side effect.
+
+Configured, cached, and labeled automatic quantum payout bindings share one
+validation rule: the address must be wallet-owned, durably stored, and an
+ordinary direct quantum destination rather than a tiered or cold-stake alias.
+For legacy label migration, current labels take precedence over older labels;
+multiple different direct addresses at the same highest precedence fail
+closed as ambiguous.
+
 GUI mining and recovery prompts distinguish the normal authenticated
 same-anchor path from optional fee-paying conflict recovery. A coherent safe
 family waits while a member is live, relays an eligible absent member, or is

@@ -34,6 +34,10 @@
 namespace wallet {
 namespace {
 
+bool SafeGraphForAdoption(
+    const ShadowPowClaimRecoveryComponent& component,
+    std::string& reason_code, std::string& reason);
+
 bool MetadataFlag(const mapValue_t& values, const char* key)
 {
     const auto it = values.find(key);
@@ -1094,6 +1098,10 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
             ++inventory.blocking_components;
         }
 
+        std::string adoption_reason_code;
+        std::string adoption_reason;
+        component.adoption_graph_safe = SafeGraphForAdoption(
+            component, adoption_reason_code, adoption_reason);
         component.fingerprint = FingerprintComponent(
             inventory.active_tip, component);
         inventory.components.push_back(std::move(component));

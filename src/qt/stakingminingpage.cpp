@@ -2122,6 +2122,7 @@ bool StakingMiningPage::selectedPowClaimRecoveryComponentNeedsAdoption() const
         interfaces::WalletPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN) {
         return false;
     }
+    if (!component.adoption_graph_safe) return false;
     return std::any_of(
         component.nodes.begin(), component.nodes.end(), [](const auto& node) {
             if (node.kind != interfaces::WalletPowClaimRecoveryNodeKind::CLAIM) {
@@ -3039,9 +3040,11 @@ void StakingMiningPage::abortPendingPowStart(const QString& message)
 {
     m_pow_apply_pending = false;
     m_pow_pending_enabled = false;
+    const bool enabled = m_wallet_model &&
+        m_wallet_model->wallet().getPowMiningInfo().enabled;
     {
         QSignalBlocker blocker(m_pow_enable);
-        m_pow_enable->setChecked(false);
+        m_pow_enable->setChecked(enabled);
     }
     if (m_pow_status) m_pow_status->setText(message);
     refreshControlsEnabled();
@@ -3096,7 +3099,12 @@ void StakingMiningPage::applyPowWithCurrentRecoveryPolicy()
         &created_payout_key);
     m_pow_apply_pending = false;
     if (!ok) {
-        m_pow_enable->setChecked(false);
+        const bool authoritative_enabled =
+            m_wallet_model->wallet().getPowMiningInfo().enabled;
+        {
+            QSignalBlocker blocker(m_pow_enable);
+            m_pow_enable->setChecked(authoritative_enabled);
+        }
         const QString msg = error.empty()
             ? tr("Unable to start Gold Rush PoW mining. Unlock the wallet and check debug.log for details.")
             : QString::fromStdString(error);
@@ -4087,6 +4095,11 @@ void StakingMiningPage::updateStatus()
     // key, so never present a locked wallet as unlocked from the marker alone.
     m_unlock_staking_only->setChecked(staking_only_unlocked);
     m_unlock_quantum_legacy_staking->setChecked(normal_unlocked);
+    // This control is part of the cheap authority view, not the expensive
+    // wallet-detail snapshot. In particular, a cancelled normal-unlock dialog
+    // must immediately clear its optimistic checked state while preserving the
+    // locked wallet's staking-only preference for the next unlock.
+    m_pow_unlock_wallet->setChecked(normal_unlocked);
     const bool actively_searching = staking_info.enabled &&
         staking_info.worker_running && staking_info.eligible &&
         staking_info.state == interfaces::WalletStakingState::SEARCHING;
@@ -5197,6 +5210,16 @@ bool StakingMiningPage::requestNormalUnlock()
     if (!m_wallet_model) return false;
 
     const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getEncryptionStatus();
+    const bool initially_staking_only =
+        m_wallet_model->getWalletUnlockStakingOnly();
+    const auto restore_failed_normal_unlock = [&]() {
+        if (m_wallet_model->getEncryptionStatus() == WalletModel::Unlocked) {
+            m_wallet_model->setWalletLocked(true);
+        }
+        m_wallet_model->setWalletUnlockStakingOnly(initially_staking_only);
+        m_wallet_model->updateStatus();
+        return false;
+    };
     if (encryption_status == WalletModel::NoKeys) {
         return false;
     }
@@ -5223,23 +5246,19 @@ bool StakingMiningPage::requestNormalUnlock()
         AskPassphraseDialog dlg(AskPassphraseDialog::Unlock, this);
         dlg.setModel(m_wallet_model);
         if (dlg.exec() != QDialog::Accepted) {
-            return false;
+            return restore_failed_normal_unlock();
         }
     }
 
     if (m_wallet_model->getEncryptionStatus() != WalletModel::Unlocked) {
-        return false;
+        return restore_failed_normal_unlock();
     }
 
     if (m_wallet_model->getWalletUnlockStakingOnly()) {
         // Accepted must mean the dialog performed an atomic normal unlock. If
         // an unexpected handler left staking-only scope installed, fail closed
         // by locking; never expand authority after the prompt has returned.
-        if (m_wallet_model->getEncryptionStatus() == WalletModel::Unlocked) {
-            m_wallet_model->setWalletLocked(true);
-        }
-        m_wallet_model->updateStatus();
-        return false;
+        return restore_failed_normal_unlock();
     }
     return true;
 }

@@ -10281,6 +10281,29 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
     }
 
     LOCK(m_pow_recovery_authority_mutex);
+    // Reject an interactive start/reconfiguration without changing an
+    // already-enabled startup worker. In particular, an encrypted wallet may
+    // intentionally retain a zero-work worker while locked or staking-only so
+    // it can resume after a later normal unlock.
+    if (enabled) {
+        LOCK(cs_wallet);
+        if (!HasPrivateKeys() ||
+            IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+            error = _("Gold Rush PoW mining requires a wallet with private keys.");
+            return false;
+        }
+        if (IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+            error = _("Gold Rush PoW mining is not available for external-signer wallets.");
+            return false;
+        }
+        if (!wait_for_normal_unlock &&
+            !HasNormalPowMiningWalletAuthorityLocked()) {
+            error = IsCrypted() && vMasterKey.empty()
+                ? _("Gold Rush PoW mining requires an unlocked wallet.")
+                : _("Gold Rush PoW mining requires a normal wallet unlock, not staking-only unlock.");
+            return false;
+        }
+    }
     StopPowMiningLocked();
     if (!enabled) {
         m_pow_threads = 1;
@@ -10720,12 +10743,27 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
 
     std::string restored_payout;
     std::optional<CTxDestination> relabel_dest;
+    int restored_label_priority{-1};
+    bool restored_label_ambiguous{false};
     {
         LOCK(cs_wallet);
         if (!m_pow_payout_quantum.empty()) {
             const CTxDestination existing = DecodeDestination(m_pow_payout_quantum);
             const auto key_info = GetQuantumKeyInfo(existing);
-            if (IsValidDestination(existing) && IsQuantumMigrationDestination(existing) && key_info && key_info->durably_stored) return true;
+            if (IsValidDestination(existing) &&
+                IsQuantumMigrationDestination(existing) &&
+                IsDirectQuantumMigrationScript(
+                    GetScriptForDestination(existing)) &&
+                key_info && key_info->durably_stored) {
+                return true;
+            }
+            if (IsValidDestination(existing) &&
+                IsQuantumMigrationDestination(existing) &&
+                !IsDirectQuantumMigrationScript(
+                    GetScriptForDestination(existing))) {
+                error = _("Stored Gold Rush PoW payout address must be an ordinary direct (non-tiered, non-cold-stake) quantum receive address.");
+                return false;
+            }
             error = _("Stored Gold Rush PoW payout address is not backed by a durably stored wallet quantum key.");
             return false;
         }
@@ -10733,22 +10771,43 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
         for (const auto& [dest, entry] : m_address_book) {
             const std::string label = entry.GetLabel();
             if (entry.IsChange() || (label != POW_PAYOUT_LABEL && label != OLD_POW_PAYOUT_LABEL && label != LEGACY_POW_PAYOUT_LABEL)) continue;
-            if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest)) continue;
+            if (!IsValidDestination(dest) ||
+                !IsQuantumMigrationDestination(dest) ||
+                !IsDirectQuantumMigrationScript(
+                    GetScriptForDestination(dest))) {
+                continue;
+            }
             const auto key_info = GetQuantumKeyInfo(dest);
             if (!key_info || !key_info->durably_stored) continue;
-            restored_payout = EncodeDestination(dest);
-            m_pow_payout_quantum = restored_payout;
-            if (label != POW_PAYOUT_LABEL) {
-                relabel_dest = dest;
+            const int label_priority =
+                label == POW_PAYOUT_LABEL ? 2 :
+                label == OLD_POW_PAYOUT_LABEL ? 1 : 0;
+            if (label_priority < restored_label_priority) continue;
+            if (label_priority == restored_label_priority) {
+                restored_label_ambiguous = true;
+                continue;
             }
-            break;
+            restored_label_priority = label_priority;
+            restored_label_ambiguous = false;
+            restored_payout = EncodeDestination(dest);
+            relabel_dest = label == POW_PAYOUT_LABEL
+                ? std::nullopt
+                : std::optional<CTxDestination>{dest};
         }
     }
 
+    if (restored_label_ambiguous) {
+        error = _("Gold Rush PoW payout labels are ambiguous at the highest-priority label; keep one such wallet-owned ordinary direct quantum payout label or configure -qqpowpayoutaddress explicitly.");
+        return false;
+    }
     if (!restored_payout.empty()) {
         if (relabel_dest && !SetAddressBook(*relabel_dest, POW_PAYOUT_LABEL, AddressPurpose::RECEIVE)) {
             error = _("Failed to update Gold Rush PoW payout address label.");
             return false;
+        }
+        {
+            LOCK(cs_wallet);
+            m_pow_payout_quantum = restored_payout;
         }
         WalletLogPrintf("Gold Rush PoW miner restored payout address %s.\n", restored_payout);
         return true;
@@ -10815,6 +10874,8 @@ bool CWallet::EnsureShadowSignalPayoutAddress(
 
     std::optional<CTxDestination> reused_dest;
     bool relabel_reused_dest{false};
+    int reused_label_priority{-1};
+    bool reused_label_ambiguous{false};
     {
         LOCK(cs_wallet);
         for (const auto& [dest, entry] : m_address_book) {
@@ -10825,21 +10886,39 @@ bool CWallet::EnsureShadowSignalPayoutAddress(
                  label != LEGACY_SHADOW_SIGNAL_PAYOUT_LABEL)) {
                 continue;
             }
-            if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest)) continue;
+            if (!IsValidDestination(dest) ||
+                !IsQuantumMigrationDestination(dest) ||
+                !IsDirectQuantumMigrationScript(
+                    GetScriptForDestination(dest))) {
+                continue;
+            }
             const auto key_info = GetQuantumKeyInfo(dest);
             if (!key_info || !key_info->durably_stored) continue;
-            payout_address = EncodeDestination(dest);
-            payout_script = GetScriptForDestination(dest);
+            const int label_priority =
+                label == SHADOW_SIGNAL_PAYOUT_LABEL ? 2 :
+                label == OLD_SHADOW_SIGNAL_PAYOUT_LABEL ? 1 : 0;
+            if (label_priority < reused_label_priority) continue;
+            if (label_priority == reused_label_priority) {
+                reused_label_ambiguous = true;
+                continue;
+            }
+            reused_label_priority = label_priority;
+            reused_label_ambiguous = false;
             reused_dest = dest;
             relabel_reused_dest = label != SHADOW_SIGNAL_PAYOUT_LABEL;
-            break;
         }
+    }
+    if (reused_label_ambiguous) {
+        error = _("Gold Rush PoS payout labels are ambiguous at the highest-priority label; keep one such wallet-owned ordinary direct quantum payout label or configure -qqpospayoutaddress explicitly.");
+        return false;
     }
     if (reused_dest) {
         if (relabel_reused_dest && !SetAddressBook(*reused_dest, SHADOW_SIGNAL_PAYOUT_LABEL, AddressPurpose::RECEIVE)) {
             error = _("Failed to update Gold Rush PoS payout address label.");
             return false;
         }
+        payout_address = EncodeDestination(*reused_dest);
+        payout_script = GetScriptForDestination(*reused_dest);
         return true;
     }
 

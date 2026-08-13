@@ -1817,7 +1817,8 @@ static RPCHelpMan sendshadowpowclaim()
                 "If proof is omitted, grinding is memory-hard (Argon2id, ~1 MiB per try) and synchronous; tune max_tries accordingly.\n"
                 "If proof is supplied, it must be the hex QQSPROOF payload for the current tip, target address, and quantum payout address.\n"
                 "The active proof format is reported by getshadowpowwork. QQP2/QQP3 do not bind an exact fee input; QQP4 does so only after its separately scheduled activation. Never reuse one externally supplied proof for multiple claim transactions.\n"
-                "Only valid during the Gold Rush reward window. An unconfirmed wallet-authored QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it. The typed, active-tip-pinned gate validates each wallet-owned same-anchor family. Within one family a live member blocks a competing sibling; across independent safe families Core relays eligible absent bytes first, then refreshes one family, and waits only when no independent relay or refresh work remains. Audit-only incoming proofs do not gain mining authority; any wallet-owned unsafe component still fails closed.\n" +
+                "Only valid during the Gold Rush reward window. An unconfirmed wallet-authored QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it. The typed, active-tip-pinned gate validates each wallet-owned same-anchor family. Within one family a live member blocks a competing sibling; across independent safe families Core relays eligible absent bytes first, then refreshes one family, and waits only when no independent relay or refresh work remains. Audit-only incoming proofs do not gain mining authority; any wallet-owned unsafe component still fails closed.\n"
+                "When retained bytes are selected for relay, address and quantum_address must match that authenticated family. With multiple retained relayable families, getpowmininginfo.mining_gate_relay_txid identifies the one deterministic next relay; a request naming another family fails without a side effect until earlier work is serviced. max_tries and fee_rate are not applied because no transaction is created or repriced, and an external proof is rejected because it cannot replace the retained transaction's committed proof. Success means local mempool acceptance plus a relay attempt; it does not prove peer receipt or confirmation.\n" +
                 HELP_REQUIRING_PASSPHRASE,
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet legacy address that owns the UTXO authenticating this PoW claim. It does not need to be whitelisted."},
@@ -1826,10 +1827,12 @@ static RPCHelpMan sendshadowpowclaim()
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Optional fee rate in " + CURRENCY_ATOM + "/vB."},
                     {"proof", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Optional externally mined QQSPROOF payload hex from getshadowpowwork parameters."},
                 },
-                RPCResult{
-                    RPCResult::Type::OBJ, "", "",
-                    {
+                RPCResults{
+                    RPCResult{"when a new claim transaction is created", RPCResult::Type::OBJ, "", "", {
                         {RPCResult::Type::STR_HEX, "txid", "The broadcast claim transaction id."},
+                        {RPCResult::Type::STR, "outcome", "Always created_new_claim."},
+                        {RPCResult::Type::BOOL, "relayed_existing", "False when this call created a new claim transaction."},
+                        {RPCResult::Type::BOOL, "created_new_claim", "True when this call created a new claim transaction."},
                         {RPCResult::Type::STR_HEX, "hex", "The signed claim transaction hex."},
                         {RPCResult::Type::STR_HEX, "proof", "The QQSPROOF payload committed by the transaction."},
                         {RPCResult::Type::STR, "proof_mode", "Always pow for a wallet-created fee-paying QQSPROOF claim."},
@@ -1840,7 +1843,13 @@ static RPCHelpMan sendshadowpowclaim()
                         {RPCResult::Type::NUM, "vsize", "Estimated virtual transaction size."},
                         {RPCResult::Type::STR, "address", "The target legacy address."},
                         {RPCResult::Type::STR, "quantum_address", "The linked quantum migration payout address."},
-                    }
+                    }},
+                    RPCResult{"when exact retained claim bytes are relayed", RPCResult::Type::OBJ, "", "", {
+                        {RPCResult::Type::STR_HEX, "txid", "The exact retained claim transaction id accepted into the local mempool and submitted to the relay path."},
+                        {RPCResult::Type::STR, "outcome", "Always relayed_existing."},
+                        {RPCResult::Type::BOOL, "relayed_existing", "True when this call relayed existing wallet bytes."},
+                        {RPCResult::Type::BOOL, "created_new_claim", "False because no new transaction or fee was created."},
+                    }},
                 },
                 RPCExamples{
                     HelpExampleCli("sendshadowpowclaim", "\"" + EXAMPLE_ADDRESS[0] + "\" \"quantum_address\"")
@@ -1925,9 +1934,10 @@ static RPCHelpMan sendshadowpowclaim()
         coin_control.fOverrideFeeRate = true;
     }
 
-    // Validate every caller-supplied argument before any historical relay
-    // side effect, then reserve the wallet's complete claim/recovery submit
-    // path for both retained-byte relay and any subsequent new claim.
+    // Reserve the wallet's complete claim/recovery submit path for both
+    // retained-byte relay and any subsequent new claim. A retained relay is
+    // permitted only for the caller-selected target/payout family; proof is
+    // deliberately rejected because it cannot change already-signed bytes.
     ShadowPowClaimSubmissionGuard submission_guard(*pwallet);
     if (!submission_guard) {
         throw JSONRPCError(RPC_WALLET_ERROR,
@@ -1959,6 +1969,17 @@ static RPCHelpMan sendshadowpowclaim()
                 "Existing Gold Rush PoW relay selection did not converge within the bounded per-call attempt limit; no new fee transaction was created");
         }
         const ShadowPowClaimMiningGate relay_gate = current_gate;
+        if (relay_gate.target != target ||
+            relay_gate.payout_script != quantum_payout_script) {
+            throw JSONRPCError(
+                RPC_INVALID_PARAMETER,
+                "The selected retained Gold Rush PoW claim family does not match address and quantum_address; no historical bytes were relayed");
+        }
+        if (supplied_proof) {
+            throw JSONRPCError(
+                RPC_INVALID_PARAMETER,
+                "proof cannot be applied to an existing signed Gold Rush PoW claim; omit proof to relay the matching retained family");
+        }
         std::string relay_error;
         bool relayed{false};
         ShadowPowClaimRecoveryBroadcastGuard broadcast_guard;
@@ -1984,10 +2005,12 @@ static RPCHelpMan sendshadowpowclaim()
                 "Existing Gold Rush PoW claim relay encountered an unknown local exception; no sibling was authorized");
         }
         if (relayed) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                strprintf("An existing eligible Gold Rush PoW claim %s was relayed; no additional fee transaction was created",
-                          relay_gate.relay_txid.GetHex()));
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("txid", relay_gate.relay_txid.GetHex());
+            result.pushKV("outcome", "relayed_existing");
+            result.pushKV("relayed_existing", true);
+            result.pushKV("created_new_claim", false);
+            return result;
         }
         if (ShadowPowClaimRelayRequiresFreshGate(relay_error)) {
             initial_gate = pwallet->GetShadowPowClaimMiningGate();
@@ -2362,6 +2385,9 @@ static RPCHelpMan sendshadowpowclaim()
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("txid", tx->GetHash().GetHex());
+    result.pushKV("outcome", "created_new_claim");
+    result.pushKV("relayed_existing", false);
+    result.pushKV("created_new_claim", true);
     result.pushKV("hex", hex);
     result.pushKV("proof", HexStr(proof));
     result.pushKV("proof_mode", "pow");
@@ -2806,6 +2832,7 @@ static UniValue ShadowPowRecoveryComponentToJSON(const ShadowPowClaimRecoveryCom
                   component.all_claims_expired_locally_retired);
     result.pushKV("has_revalidating_unbound_proof",
                   component.has_revalidating_unbound_proof);
+    result.pushKV("adoption_graph_safe", component.adoption_graph_safe);
     UniValue nodes(UniValue::VARR);
     for (const auto& node : component.nodes) nodes.push_back(ShadowPowRecoveryNodeToJSON(node));
     result.pushKV("nodes", std::move(nodes));
@@ -2929,6 +2956,7 @@ static RPCHelpMan createshadowpowclaimresolution()
             {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{true}, "Return a side-effect-free exact plan when true."},
             {"acknowledge_fee_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Default{false}, "Required when dry_run=false; signing never broadcasts."},
             {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Optional fee rate in " + CURRENCY_ATOM + "/vB."},
+            {"expected_plan_id", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Exact plan_id returned by a prior dry_run=true preview. Required when dry_run=false."},
         },
         RPCResult{RPCResult::Type::OBJ, "", "Compatibility fields plus the exact component plan.", {
             {RPCResult::Type::BOOL, "dry_run", "Whether this was a preview."},
@@ -2963,14 +2991,14 @@ static RPCHelpMan createshadowpowclaimresolution()
             {RPCResult::Type::NUM, "relay_authority_granted", "Always zero here; this RPC never grants relay authority."},
             {RPCResult::Type::BOOL, "relay_authorized", "Whether these exact managed bytes already have durable relay authority. This RPC never grants it."},
             {RPCResult::Type::BOOL, "conflicts_with_revalidating_unbound_proof", "Whether this resolution deliberately conflicts with an unbound proof that is invalid on the pinned tip but may become valid on a descendant."},
-            {RPCResult::Type::OBJ, "current_plan", /*optional=*/true, "Fresh read-only preview after signing. Its nested plan_id is present and usable only when nested plan_reusable=true.", {{RPCResult::Type::ELISION, "", ""}}},
+            {RPCResult::Type::OBJ, "current_plan", /*optional=*/true, "Fresh read-only commit preview keyed by the exact signed resolution txid. Pass its plan_id to commitshadowpowclaimresolution only when nested plan_reusable=true.", {{RPCResult::Type::ELISION, "", ""}}},
             {RPCResult::Type::STR, "next_step", "Next explicit action."},
             {RPCResult::Type::STR, "warning", "Conflict, fee, and confirmation warning."},
         }},
         RPCExamples{
             HelpExampleCli("createshadowpowclaimresolution", "\"claim_txid\"") +
-            HelpExampleCli("createshadowpowclaimresolution", "\"claim_txid\" false true") +
-            HelpExampleCli("-named createshadowpowclaimresolution", "claim_txid=\"claim_txid\" dry_run=false acknowledge_fee_and_conflict_risk=true fee_rate=1")
+            HelpExampleCli("createshadowpowclaimresolution", "\"claim_txid\" false true null \"expected_plan_id\"") +
+            HelpExampleCli("-named createshadowpowclaimresolution", "claim_txid=\"claim_txid\" dry_run=false acknowledge_fee_and_conflict_risk=true fee_rate=1 expected_plan_id=\"expected_plan_id\"")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -2991,6 +3019,20 @@ static RPCHelpMan createshadowpowclaimresolution()
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            "acknowledge_fee_and_conflict_risk=true is required to sign a claim-resolution transaction; preview first with dry_run=true");
     }
+    std::optional<uint256> expected_plan_id;
+    if (!request.params[4].isNull()) {
+        expected_plan_id = ParseHashV(request.params[4], "expected_plan_id");
+    }
+    if (dry_run && (acknowledged || expected_plan_id)) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "dry_run=true is side-effect-free and does not accept acknowledgement or expected_plan_id");
+    }
+    if (!dry_run && !expected_plan_id) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "expected_plan_id from a prior dry_run=true preview is required to sign a claim-resolution transaction");
+    }
 
     ShadowPowClaimRecoveryRequest preview = ManualShadowPowRecoveryRequest(*pwallet, {claim_txid});
     preview.mode = ShadowPowClaimRecoveryMode::PREVIEW;
@@ -3007,15 +3049,22 @@ static RPCHelpMan createshadowpowclaimresolution()
         sign.mode = ShadowPowClaimRecoveryMode::SIGN_ONLY;
         sign.execution_authority = ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
         sign.acknowledge_fee_and_conflict_risk = true;
-        sign.expected_plan_id = execution.plan.plan_id;
+        sign.expected_plan_id = expected_plan_id;
         execution = pwallet->ResolveShadowPowClaims(sign);
         if ((!execution.success && !execution.durable_state_changed &&
              !execution.durable_state_ambiguous) ||
             execution.plan.actions.size() != 1) {
             ThrowCreateShadowPowClaimResolutionFailure(execution);
         }
-        if (!execution.durable_state_ambiguous) {
-            current_plan = CurrentShadowPowRecoveryPlan(*pwallet, sign);
+        if (!execution.durable_state_ambiguous &&
+            execution.plan.actions.size() == 1 &&
+            execution.plan.actions.front().transaction) {
+            ShadowPowClaimRecoveryRequest commit_preview =
+                ManualShadowPowRecoveryRequest(
+                    *pwallet,
+                    {execution.plan.actions.front().transaction->GetHash()});
+            current_plan = CurrentShadowPowRecoveryPlan(
+                *pwallet, std::move(commit_preview));
         }
     }
 
@@ -3071,11 +3120,17 @@ static RPCHelpMan createshadowpowclaimresolution()
         result.pushKV("txid", action.transaction->GetHash().GetHex());
     }
     if (!dry_run) {
+        const bool reusable_commit_plan = current_plan &&
+            current_plan->complete && current_plan->wallet_tip_matches &&
+            !current_plan->plan_id.IsNull() &&
+            current_plan->actions.size() == 1;
         result.pushKV("next_step", execution.durable_state_ambiguous
             ? "The durable database outcome is ambiguous. Stop recovery activity and reload the wallet. Reload may reveal these exact bytes; inspect wallet records before retrying and do not assume the operation rolled back."
             : action.relay_authorized
             ? "These exact bytes already have durable relay authority; monitor mempool and confirmation state while the scheduler safely retries them."
-            : "Review the exact fee and warning, then call commitshadowpowclaimresolution with this txid and explicit acknowledgement. sendrawtransaction remains compatible.");
+            : reusable_commit_plan
+            ? "Review the exact fee and warning, then call commitshadowpowclaimresolution with this txid, explicit acknowledgement, and current_plan.plan_id. sendrawtransaction remains compatible."
+            : "The signed bytes are retained without relay authority, but no reusable commit plan is available on the current snapshot. Call commitshadowpowclaimresolution with this txid and no acknowledgement to obtain a fresh side-effect-free plan before authorizing relay.");
     } else {
         result.pushKV("next_step", "Repeat with dry_run=false and acknowledge_fee_and_conflict_risk=true to sign and durably store exact non-broadcast bytes.");
     }
@@ -3093,31 +3148,43 @@ static RPCHelpMan commitshadowpowclaimresolution()
 {
     return RPCHelpMan{
         "commitshadowpowclaimresolution",
-        "\nAuthorize and broadcast one exact, previously signed claim-component resolution. The component and transaction are revalidated on the current tip. A managed resolution receives durable exact-byte retry authority across restart. A legacy resolution may be relayed by this explicit call but does not gain managed scheduler authority. This RPC never authorizes another transaction or enables mining.\n",
+        "\nPreview, or explicitly authorize and broadcast, one exact previously signed claim-component resolution. With acknowledgement omitted or false, this is side-effect-free and returns the resolution-selector plan needed for a later commit. A managed resolution receives durable exact-byte retry authority across restart. A legacy resolution may be relayed by an explicit commit but does not gain managed scheduler authority. This RPC never authorizes another transaction or enables mining.\n",
         {
             {"resolution_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Persisted managed or legacy resolution transaction id."},
-            {"acknowledge_fee_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Optional::NO, "Must be true to authorize relay and its fee/conflict risk."},
+            {"acknowledge_fee_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Default{false}, "False returns a side-effect-free commit preview. True authorizes relay and requires expected_plan_id."},
+            {"expected_plan_id", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Exact plan_id returned by this RPC's side-effect-free preview or as current_plan after signing. Required only when acknowledgement is true."},
         },
         RPCResult{RPCResult::Type::OBJ, "", "Execution result.", ShadowPowRecoveryExecutionResults()},
-        RPCExamples{HelpExampleCli("commitshadowpowclaimresolution", "\"resolution_txid\" true")},
+        RPCExamples{
+            HelpExampleCli("commitshadowpowclaimresolution", "\"resolution_txid\"") +
+            HelpExampleCli("commitshadowpowclaimresolution", "\"resolution_txid\" true \"expected_plan_id\"")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
     EnsureShadowPowRecoveryChainReady(*pwallet);
+    const bool acknowledged =
+        !request.params[1].isNull() && request.params[1].get_bool();
+    const bool has_expected_plan = !request.params[2].isNull();
+    if (!acknowledged && has_expected_plan) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "expected_plan_id is accepted only with acknowledge_fee_and_conflict_risk=true");
+    }
+    if (acknowledged && !has_expected_plan) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "expected_plan_id from a side-effect-free commit preview is required to authorize relay");
+    }
     if (pwallet->IsShadowPowClaimRecoveryDatabaseAmbiguous()) {
         ShadowPowClaimRecoveryResult ambiguous;
         ambiguous.durable_state_ambiguous = true;
         ambiguous.error = "Recovery database outcome is ambiguous. Reload the wallet; exact persisted or relay-authorized bytes may appear after reload";
         return ShadowPowRecoveryResultToJSON(
             ambiguous,
-            ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST);
+            acknowledged
+                ? ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST
+                : ShadowPowClaimRecoveryMode::PREVIEW);
     }
     const uint256 resolution_txid = ParseHashV(request.params[0], "resolution_txid");
-    if (!request.params[1].get_bool()) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER,
-                           "acknowledge_fee_and_conflict_risk=true is required to commit and broadcast a resolution");
-    }
     bool selector_known{false};
     bool selector_is_resolution{false};
     const ShadowPowClaimRecoveryInventory inventory =
@@ -3139,24 +3206,30 @@ static RPCHelpMan commitshadowpowclaimresolution()
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            "resolution_txid must identify exact, previously signed claim-resolution bytes; use createshadowpowclaimresolution first");
     }
-    EnsureWalletIsUnlocked(*pwallet);
-
     ShadowPowClaimRecoveryRequest preview = ManualShadowPowRecoveryRequest(*pwallet, {resolution_txid});
     preview.mode = ShadowPowClaimRecoveryMode::PREVIEW;
     ShadowPowClaimRecoveryResult execution = pwallet->ResolveShadowPowClaims(preview);
     if (execution.durable_state_ambiguous) {
         return ShadowPowRecoveryResultToJSON(
             execution,
-            ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST);
+            acknowledged
+                ? ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST
+                : ShadowPowClaimRecoveryMode::PREVIEW);
     }
     if (!execution.success || execution.plan.actions.size() != 1) {
         ThrowShadowPowRecoveryFailure(execution);
     }
+    if (!acknowledged) {
+        return ShadowPowRecoveryResultToJSON(
+            execution, ShadowPowClaimRecoveryMode::PREVIEW);
+    }
+    EnsureWalletIsUnlocked(*pwallet);
     ShadowPowClaimRecoveryRequest commit = preview;
     commit.mode = ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
     commit.execution_authority = ShadowPowClaimRecoveryExecutionAuthority::EXPLICIT_MANUAL;
     commit.acknowledge_fee_and_conflict_risk = true;
-    commit.expected_plan_id = execution.plan.plan_id;
+    commit.expected_plan_id =
+        ParseHashV(request.params[2], "expected_plan_id");
     execution = pwallet->ResolveShadowPowClaims(commit);
     if (!execution.success && !execution.durable_state_changed &&
         !execution.durable_state_ambiguous) {

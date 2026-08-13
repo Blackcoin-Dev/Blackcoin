@@ -201,6 +201,18 @@ The resolver separates three authorities:
    A retry reuses those bytes; it does not fee-bump, replace them, or create a
    second resolution for the same anchor generation.
 
+The current headless flow makes both consent boundaries explicit. First call
+`createshadowpowclaimresolution <claim_txid>` to obtain a claim-selector
+preview. Signing requires that exact `plan_id` as `expected_plan_id`. A
+successful signing response then returns `current_plan`, a fresh read-only
+commit preview keyed to the exact signed resolution txid. Pass that nested
+`plan_id` to `commitshadowpowclaimresolution <resolution_txid> true
+<expected_plan_id>`. Calling `commitshadowpowclaimresolution
+<resolution_txid>` without acknowledgement is side-effect-free and provides a
+fresh commit plan after restart or for an authenticated legacy resolution.
+Claim-selector and resolution-selector plans are intentionally not
+interchangeable.
+
 Immediately before signing, persistence, and relay, the engine rechecks the
 active tip, wallet-processed tip, wallet generation, confirmed unspent anchor,
 component fingerprint, fee limits, and exact transaction shape. A changed tip

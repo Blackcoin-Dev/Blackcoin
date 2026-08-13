@@ -865,6 +865,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert not first_thread.is_alive(), "first sendshadowpowclaim caller did not finish"
         assert_equal(first_errors, [])
         assert_equal(len(first_results), 1)
+        assert_equal(first_results[0]["relayed_existing"], False)
+        assert_equal(first_results[0]["created_new_claim"], True)
+        assert_equal(first_results[0]["outcome"], "created_new_claim")
         first_txid = first_results[0]["txid"]
         first_raw = node.getrawtransaction(first_txid)
         claim_change = node.getrawtransaction(first_txid, True)["vout"][0]["value"]
@@ -926,25 +929,114 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             False,
             False,
         )
+        assert_raises_rpc_error(
+            -8,
+            "expected_plan_id from a prior dry_run=true preview is required",
+            manual.createshadowpowclaimresolution,
+            first_txid,
+            False,
+            True,
+        )
+        assert_raises_rpc_error(
+            -26,
+            "recovery plan is stale",
+            manual.createshadowpowclaimresolution,
+            first_txid,
+            False,
+            True,
+            None,
+            ZERO_HASH,
+        )
+        assert_equal(
+            manual.getpowclaimrecoveryinfo()["pending_manual_resolutions"], 0
+        )
+
+        stale_plan_id = preview["plan_id"]
+        self.generateblock(node, output=funding_address, transactions=[])
+        node.syncwithvalidationinterfacequeue()
+        assert_raises_rpc_error(
+            -26,
+            "recovery plan is stale",
+            manual.createshadowpowclaimresolution,
+            first_txid,
+            False,
+            True,
+            None,
+            stale_plan_id,
+        )
+        assert_equal(
+            manual.getpowclaimrecoveryinfo()["pending_manual_resolutions"], 0
+        )
+        preview = manual.createshadowpowclaimresolution(first_txid)
         resolution = manual.createshadowpowclaimresolution(
             first_txid,
             False,
             True,
+            None,
+            preview["plan_id"],
         )
         assert_equal(resolution["dry_run"], False)
         assert_equal(resolution["broadcast"], False)
         assert_equal(resolution["fee"], preview["fee"])
         assert_equal(resolution["output_amount"], preview["output_amount"])
+        assert_equal(resolution["acknowledged_plan_id"], preview["plan_id"])
         assert_equal(
             resolution["conflicts_with_revalidating_unbound_proof"], True
+        )
+        assert_raises_rpc_error(
+            -8,
+            "dry_run=true is side-effect-free",
+            manual.createshadowpowclaimresolution,
+            first_txid,
+            True,
+            True,
+            None,
+            preview["plan_id"],
         )
         assert resolution["txid"] not in node.getrawmempool()
         self._assert_claim_inventory(
             manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
         )
 
-        resolution_txid = node.sendrawtransaction(resolution["hex"])
-        assert_equal(resolution_txid, resolution["txid"])
+        resolution_txid = resolution["txid"]
+        commit_preview = manual.commitshadowpowclaimresolution(
+            resolution_txid
+        )
+        assert_equal(commit_preview["action"], "preview")
+        assert_equal(commit_preview["success"], True)
+        assert_equal(commit_preview["plan_reusable"], True)
+        assert_equal(
+            commit_preview["plan_id"],
+            resolution["current_plan"]["plan_id"],
+        )
+        assert_raises_rpc_error(
+            -26,
+            "recovery plan is stale",
+            manual.commitshadowpowclaimresolution,
+            resolution_txid,
+            True,
+            preview["plan_id"],
+        )
+        assert_raises_rpc_error(
+            -26,
+            "recovery plan is stale",
+            manual.commitshadowpowclaimresolution,
+            resolution_txid,
+            True,
+            ZERO_HASH,
+        )
+        assert resolution_txid not in node.getrawmempool()
+        committed = manual.commitshadowpowclaimresolution(
+            resolution_txid,
+            True,
+            commit_preview["plan_id"],
+        )
+        assert_equal(committed["success"], True)
+        assert_equal(committed["action"], "commit_and_broadcast")
+        assert_equal(
+            committed["acknowledged_plan_id"],
+            commit_preview["plan_id"],
+        )
         self.wait_until(lambda: resolution_txid in node.getrawmempool(), timeout=20)
         # Publishing the conflict does not release the input. Only an active
         # chain confirmation of one side may resolve the reservation.
@@ -1781,6 +1873,68 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(absent_head["quarantined"], True)
 
         claims_before_restart_mining = self._claim_txids(boundary)
+        wallet_txids_before_relay = {
+            entry["txid"]
+            for entry in boundary.listtransactions("*", 1000, 0, True)
+        }
+        assert_raises_rpc_error(
+            -8,
+            "does not match address and quantum_address",
+            boundary.sendshadowpowclaim,
+            manual_address,
+            manual_payout,
+            1,
+        )
+        assert refreshed_claim_txid not in node.getrawmempool()
+        assert_raises_rpc_error(
+            -8,
+            "proof cannot be applied to an existing signed",
+            boundary.sendshadowpowclaim,
+            boundary_address,
+            boundary_payout,
+            1,
+            None,
+            boundary_claim["proof"],
+        )
+        assert refreshed_claim_txid not in node.getrawmempool()
+        relay_result = boundary.sendshadowpowclaim(
+            boundary_address, boundary_payout, 1
+        )
+        assert_equal(
+            relay_result,
+            {
+                "txid": refreshed_claim_txid,
+                "outcome": "relayed_existing",
+                "relayed_existing": True,
+                "created_new_claim": False,
+            },
+        )
+        self.wait_until(
+            lambda: refreshed_claim_txid in node.getrawmempool(), timeout=20
+        )
+        assert_equal(node.getrawtransaction(refreshed_claim_txid), refreshed_raw)
+        assert_equal(self._claim_txids(boundary), claims_before_restart_mining)
+        assert_equal(
+            {
+                entry["txid"]
+                for entry in boundary.listtransactions("*", 1000, 0, True)
+            },
+            wallet_txids_before_relay,
+        )
+        assert_equal(boundary.getpowmininginfo()["claims_submitted"], 0)
+
+        # Restore the same absent-head precondition so the worker path below
+        # independently proves the same no-new-fee relay behavior.
+        self._advance_past_mempool_entry_time(node, refreshed_claim_txid)
+        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
+        node.syncwithvalidationinterfacequeue()
+        self.wait_until(
+            lambda: refreshed_claim_txid not in node.getrawmempool(), timeout=20
+        )
+        assert_equal(
+            boundary.getpowmininginfo()["mining_gate_action"],
+            "relay_existing",
+        )
         boundary.setpowmining(True, 1, 100)
         try:
             self.wait_until(

@@ -3282,6 +3282,43 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_autostart_waits_for_normal_unlock)
     BOOST_CHECK(m_wallet.m_pow_state.load() ==
                 interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
 
+    const size_t startup_key_count = WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size());
+    const uint64_t startup_claims = m_wallet.m_pow_claims_submitted.load();
+    const uint64_t startup_tries = m_wallet.m_pow_total_tries.load();
+    bool rejected_created_payout{true};
+    error.clear();
+    BOOST_CHECK(!m_wallet.SetPowMining(
+        /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/50, error,
+        &rejected_created_payout));
+    BOOST_CHECK(!rejected_created_payout);
+    BOOST_CHECK(error.original.find("requires an unlocked wallet") !=
+                std::string::npos);
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_threads.load(), 2);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_cpu_percent.load(), 1);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup.get()),
+        startup_worker_group);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup->size()),
+        2U);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_claims_submitted.load(), startup_claims);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_total_tries.load(), startup_tries);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.cs_wallet,
+                  return m_wallet.ListQuantumKeyInfos().size()),
+        startup_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+                          m_wallet.cs_wallet,
+                          return m_wallet.m_pow_payout_quantum),
+                      payout);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+
     BOOST_REQUIRE(m_wallet.Unlock(passphrase, /*accept_no_keys=*/false,
                                   /*staking_only=*/true));
     BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
@@ -3300,6 +3337,36 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_autostart_waits_for_normal_unlock)
                           m_wallet.cs_wallet,
                           return m_wallet.m_pow_payout_quantum),
                       payout);
+
+    rejected_created_payout = true;
+    error.clear();
+    BOOST_CHECK(!m_wallet.SetPowMining(
+        /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/50, error,
+        &rejected_created_payout));
+    BOOST_CHECK(!rejected_created_payout);
+    BOOST_CHECK(error.original.find("normal wallet unlock") !=
+                std::string::npos);
+    BOOST_CHECK(m_wallet.m_wallet_unlock_staking_only.load());
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_threads.load(), 2);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_cpu_percent.load(), 1);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup.get()),
+        startup_worker_group);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_claims_submitted.load(), startup_claims);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_total_tries.load(), startup_tries);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.cs_wallet,
+                  return m_wallet.ListQuantumKeyInfos().size()),
+        startup_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+                          m_wallet.cs_wallet,
+                          return m_wallet.m_pow_payout_quantum),
+                      payout);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
 
     // A marker-only GUI transition may narrow an installed key, but it cannot
     // expand staking-only authority. Normal signing authority must come from a
@@ -4518,6 +4585,152 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTesti
     BOOST_CHECK(error.original.find("ordinary direct") != std::string::npos);
     BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
 
+    // Address-book fallback must apply the same direct-address predicate as
+    // explicit configuration. A wallet-owned tiered alias resolves to a real
+    // key, but it is not a valid payout script and must never shadow a later
+    // ordinary direct labeled address.
+    args_guard.Unset("-qqpowpayoutaddress");
+    args_guard.Unset("-qqpospayoutaddress");
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_pow_payout_quantum = tiered_address;
+    }
+    error.clear();
+    created = true;
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("ordinary direct") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.m_pow_payout_quantum),
+        tiered_address);
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_pow_payout_quantum.clear();
+    }
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        tiered_dest, "PoW - Quantum Claim Address",
+        AddressPurpose::RECEIVE));
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_pow_payout_quantum.clear();
+    }
+    error.clear();
+    created = true;
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("no existing payout key") !=
+                std::string::npos);
+    BOOST_CHECK(WITH_LOCK(
+        m_wallet.cs_wallet,
+        return m_wallet.m_pow_payout_quantum.empty()));
+
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        owned_dest, "PoW - Quantum Claim Address",
+        AddressPurpose::RECEIVE));
+    error.clear();
+    created = true;
+    BOOST_REQUIRE_MESSAGE(
+        m_wallet.EnsurePowPayoutAddress(error, &created), error.original);
+    BOOST_CHECK(!created);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.cs_wallet,
+                  return m_wallet.m_pow_payout_quantum),
+        owned_address);
+
+    // Multiple valid direct labels are operator-ambiguous. Fail before
+    // publishing a cached address or creating any hidden key.
+    CTxDestination second_direct_dest;
+    {
+        LOCK(m_wallet.cs_wallet);
+        auto second =
+            m_wallet.GetNewQuantumDestination("second direct quantum key");
+        BOOST_REQUIRE(second);
+        second_direct_dest = *second;
+        m_wallet.m_pow_payout_quantum.clear();
+    }
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "Quantum PoW Reward Address",
+        AddressPurpose::RECEIVE));
+    const size_t fallback_key_count = WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size());
+    error.clear();
+    created = true;
+    BOOST_REQUIRE_MESSAGE(
+        m_wallet.EnsurePowPayoutAddress(error, &created), error.original);
+    BOOST_CHECK(!created);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.m_pow_payout_quantum),
+        owned_address);
+
+    // Two different direct addresses carrying the same highest-priority
+    // current label are ambiguous, independent of destination map ordering.
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "PoW - Quantum Claim Address",
+        AddressPurpose::RECEIVE));
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_pow_payout_quantum.clear();
+    }
+    error.clear();
+    created = true;
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("ambiguous") != std::string::npos);
+    BOOST_CHECK(WITH_LOCK(
+        m_wallet.cs_wallet,
+        return m_wallet.m_pow_payout_quantum.empty()));
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()),
+        fallback_key_count);
+
+    // Repeat the fallback proof for PoS. Invalid tiered labels are skipped,
+    // one direct label is accepted, and two direct labels fail without
+    // leaking a partially selected output to the caller.
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        tiered_dest, "PoS - Quantum Stake Address",
+        AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        owned_dest, "PoS - Quantum Stake Address",
+        AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "Quantum PoS Reward Address",
+        AddressPurpose::RECEIVE));
+    payout_script.clear();
+    payout_address.clear();
+    error.clear();
+    created = true;
+    BOOST_REQUIRE_MESSAGE(
+        m_wallet.EnsureShadowSignalPayoutAddress(
+            payout_script, payout_address, error, &created),
+        error.original);
+    BOOST_CHECK(!created);
+    BOOST_CHECK_EQUAL(payout_address, owned_address);
+    BOOST_CHECK(payout_script == GetScriptForDestination(owned_dest));
+
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "PoS - Quantum Stake Address",
+        AddressPurpose::RECEIVE));
+    payout_script.clear();
+    payout_address.clear();
+    error.clear();
+    created = true;
+    BOOST_CHECK(!m_wallet.EnsureShadowSignalPayoutAddress(
+        payout_script, payout_address, error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("ambiguous") != std::string::npos);
+    BOOST_CHECK(payout_script.empty());
+    BOOST_CHECK(payout_address.empty());
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()),
+        fallback_key_count);
+
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        tiered_dest, "tiered binding rejection", AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        owned_dest, "ordinary quantum key", AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "second direct quantum key",
+        AddressPurpose::RECEIVE));
     args_guard.Unset("-qqpospayoutaddress");
     payout_script.clear();
     payout_address.clear();
@@ -4531,7 +4744,7 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTesti
     BOOST_CHECK(m_wallet.PrepareAutomaticDemurrageChangeAddress(coin_control, error));
     BOOST_CHECK(std::holds_alternative<CNoDestination>(coin_control.destChange));
     BOOST_CHECK(!coin_control.m_allow_new_quantum_key);
-    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), fallback_key_count);
 
     args_guard.Force("-qqautodemurrageattest", "0");
     {
@@ -4544,13 +4757,13 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTesti
     BOOST_CHECK_EQUAL(
         WITH_LOCK(m_wallet.cs_wallet, return m_wallet.m_demurrage_last_auto_attest_scan_height),
         77);
-    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), fallback_key_count);
 
     // The source-level guard remains fail-closed even if a caller bypasses
     // startup parameter interaction and leaves auto-redelegation enabled.
     args_guard.Force("-qqautoredelegate", "1");
     BOOST_CHECK_EQUAL(MaybeAutoRedelegateQuantumColdStake(m_wallet), 0);
-    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), fallback_key_count);
 }
 
 BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)

@@ -140,6 +140,29 @@ for mining. Persistent PoW consent also states that a locked or staking-only
 wallet retains the configured worker at zero hashrate until a normal unlock
 rather than silently discarding the operator's request.
 
+## Runtime wallet-load lifecycle
+
+A wallet loaded or created at runtime remains absent from wallet RPC routing,
+wallet-load callbacks, and the shared wallet list while
+`AttachChainUnpublished` attaches it. Core now also drains validation
+notifications queued during that attachment before publishing the wallet or
+running `postInitProcess`. An explicitly configured PoW or staking worker
+therefore cannot start against an intermediate rescan or setup state, and
+observers cannot receive a loaded-wallet callback before the wallet's
+registered validation callbacks have caught up.
+The node-startup `LoadWallets`/`StartWallets` sequence remains separate and
+does not acquire this runtime-load barrier. Unloading first unregisters the
+validation handler, so an event still queued at unload cannot call the removed
+wallet and does not delay synchronous unload.
+
+The attachment phase still uses the inherited wallet-to-chain lock order while
+the wallet is private and unroutable. Published validation and mining paths use
+the opposite runtime order. The ThreadSanitizer deadlock suppression remains
+restricted to `wallet::CWallet::AttachChainUnpublished`; deterministic unit
+coverage holds a real block notification behind a live runtime rescan, proves
+both unpublished phases, and then starts and stops the real configured PoW
+worker.
+
 ## Validation and upgrade boundary
 
 The v30.1.5 candidate includes focused unit and functional coverage for

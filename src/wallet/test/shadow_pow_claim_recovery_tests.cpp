@@ -4883,6 +4883,105 @@ BOOST_AUTO_TEST_CASE(implicit_claim_ownership_tracks_parent_and_key_epochs)
 }
 
 BOOST_AUTO_TEST_CASE(
+    explicit_claims_obey_script_manager_and_ismine_work_bounds)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+
+    const CTransactionRef& anchor_tx = m_coinbase_txns.at(0);
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        COutPoint{anchor_tx->GetHash(), 0},
+        anchor_tx->vout.at(0).nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.at(0).scriptPubKey);
+    AddRecoveryTestClaim(
+        *wallet, claim, tip->nHeight, tip->GetBlockHash(), tip->nHeight,
+        tip->GetBlockHash(), /*explicit_authored=*/true);
+
+    const auto manager_count = [&] {
+        LOCK(wallet->cs_wallet);
+        return wallet->GetAllScriptPubKeyMans().size();
+    };
+    const auto add_unique_manager = [&] {
+        CKey key;
+        key.MakeNewKey(/*fCompressed=*/true);
+        FlatSigningProvider provider;
+        std::string descriptor_error;
+        std::unique_ptr<Descriptor> descriptor = Parse(
+            "combo(" + EncodeSecret(key) + ")", provider,
+            descriptor_error, /*require_checksum=*/false);
+        BOOST_REQUIRE_MESSAGE(descriptor, descriptor_error);
+        WalletDescriptor wallet_descriptor(
+            std::move(descriptor), /*creation_time=*/1,
+            /*range_start=*/0, /*range_end=*/1, /*next_index=*/1);
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddWalletDescriptor(
+            wallet_descriptor, provider, "", /*internal=*/false));
+    };
+
+    BOOST_REQUIRE_LE(manager_count(),
+                     SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY);
+    while (manager_count() <
+           SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY) {
+        add_unique_manager();
+    }
+    BOOST_REQUIRE_EQUAL(manager_count(),
+                        SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY);
+    const ShadowPowClaimRecoveryInventory at_capacity =
+        wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_CHECK(!at_capacity.claim_ownership_capacity_exceeded);
+    BOOST_CHECK(!at_capacity.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_EQUAL(at_capacity.components.size(), 1U);
+
+    add_unique_manager();
+    BOOST_REQUIRE_EQUAL(
+        manager_count(),
+        SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY + 1);
+    // The manager was added after the last public inventory read. The locked
+    // builder must derive the limit from the current manager set rather than
+    // trusting any capacity state cached by the earlier ownership refresh.
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const ShadowPowClaimRecoveryInventory raced =
+            wallet->GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
+                {}, /*pending=*/nullptr);
+        BOOST_CHECK(raced.claim_ownership_capacity_exceeded);
+        BOOST_CHECK_EQUAL(
+            raced.claim_ownership_capacity_work,
+            SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY + 1);
+        BOOST_CHECK(raced.components.empty());
+    }
+    ResetShadowPowClaimRecoveryProofEvaluationStatsForTesting();
+    const ShadowPowClaimRecoveryInventory over_capacity =
+        wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_CHECK(over_capacity.claim_ownership_capacity_exceeded);
+    BOOST_CHECK_EQUAL(
+        over_capacity.claim_ownership_capacity_work,
+        SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY + 1);
+    BOOST_CHECK(over_capacity.components.empty());
+    BOOST_CHECK_EQUAL(
+        GetShadowPowClaimRecoveryProofEvaluationCountForTesting(), 0U);
+    BOOST_CHECK_EQUAL(
+        GetShadowPowClaimRecoveryPathVisitCountForTesting(), 0U);
+    BOOST_CHECK_EQUAL(
+        GetShadowPowClaimRecoveryTopologyVisitCountForTesting(), 0U);
+    const ShadowPowClaimMiningGate gate =
+        BuildShadowPowClaimMiningGate(over_capacity);
+    BOOST_CHECK(gate.claim_ownership_capacity_exceeded);
+    BOOST_CHECK(!gate.MayCreateClaim());
+    BOOST_CHECK(!gate.ShouldRelayExisting());
+    BOOST_CHECK(!gate.MayRefreshSameAnchor());
+}
+
+BOOST_AUTO_TEST_CASE(
     confirmed_implicit_history_does_not_block_ownership_epoch_refresh)
 {
     RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,

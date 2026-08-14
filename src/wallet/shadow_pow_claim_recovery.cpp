@@ -803,10 +803,17 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventory() co
             !m_shadow_pow_unclassified_claim_txids.empty() ||
             m_shadow_pow_claim_stale_ownership_records != 0 ||
             ownership_epoch_pending;
+        const size_t script_manager_work = m_spk_managers.size();
+        const bool script_manager_capacity_exceeded =
+            script_manager_work >
+                SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY;
         inventory.claim_ownership_capacity_exceeded =
-            m_shadow_pow_claim_ownership_capacity_exceeded;
+            m_shadow_pow_claim_ownership_capacity_exceeded ||
+            script_manager_capacity_exceeded;
         inventory.claim_ownership_capacity_work =
-            m_shadow_pow_claim_ownership_capacity_work;
+            script_manager_capacity_exceeded
+                ? script_manager_work
+                : m_shadow_pow_claim_ownership_capacity_work;
         if (inventory.claim_ownership_pending ||
             inventory.claim_ownership_capacity_exceeded) {
             return inventory;
@@ -1231,13 +1238,14 @@ uint256 CWallet::GetShadowPowClaimCandidateStateFingerprintLocked() const
     // is represented by the inventory's O(1) next-expiry frontier rather than
     // hashing wall time or walking all wallet records on each warm worker
     // iteration. This function must remain independent of mapWallet size.
-    hasher << uint8_t{4};
+    hasher << uint8_t{5};
     hasher << m_shadow_pow_claim_candidate_state_generation;
     // Script/key managers publish this epoch before changing an IsMine
     // result. Binding it closes the interval between the wallet-only
     // ownership prepass and later LOCK2 inventory construction.
     hasher << m_shadow_pow_claim_ownership_source_generation.load(
         std::memory_order_acquire);
+    hasher << uint64_t{m_spk_managers.size()};
     hasher << GetDatabase().nUpdateCounter.load();
     hasher << m_shadow_pow_claim_relay_clock_high_water;
     hasher << m_shadow_pow_claim_legacy_relay_clock_high_water;
@@ -1476,10 +1484,8 @@ void CWallet::RefreshShadowPowClaimOwnershipIndex() const
     }
     m_shadow_pow_claim_ownership_capacity_exceeded = false;
     m_shadow_pow_claim_ownership_capacity_work = 0;
-    if ((!m_shadow_pow_unclassified_claim_txids.empty() ||
-         m_shadow_pow_claim_stale_ownership_records != 0) &&
-        m_spk_managers.size() >
-            SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY) {
+    if (m_spk_managers.size() >
+        SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY) {
         m_shadow_pow_claim_ownership_capacity_exceeded = true;
         m_shadow_pow_claim_ownership_capacity_work =
             m_spk_managers.size();
@@ -1695,6 +1701,17 @@ bool CWallet::ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
     const bool signing_safe = tip &&
         IsShadowPowClaimRelayClockSigningSafeLocked(
             wall_time, median_time);
+    const size_t script_manager_work = m_spk_managers.size();
+    const bool script_manager_capacity_exceeded =
+        script_manager_work >
+            SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY;
+    const bool ownership_capacity_exceeded =
+        m_shadow_pow_claim_ownership_capacity_exceeded ||
+        script_manager_capacity_exceeded;
+    const size_t ownership_capacity_work =
+        script_manager_capacity_exceeded
+            ? script_manager_work
+            : m_shadow_pow_claim_ownership_capacity_work;
     return tip && inventory.wallet_tip_matches &&
            tip->GetBlockHash() == inventory.active_tip &&
            tip->nHeight == inventory.active_height &&
@@ -1737,9 +1754,9 @@ bool CWallet::ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
                     std::memory_order_acquire) !=
                     m_shadow_pow_claim_ownership_applied_source_generation) &&
            inventory.claim_ownership_capacity_exceeded ==
-               m_shadow_pow_claim_ownership_capacity_exceeded &&
+               ownership_capacity_exceeded &&
            inventory.claim_ownership_capacity_work ==
-               m_shadow_pow_claim_ownership_capacity_work &&
+               ownership_capacity_work &&
            (m_shadow_pow_claim_recovery_db_ambiguous ||
             m_locked_coins_db_ambiguous) ==
                inventory.recovery_database_ambiguous;
@@ -1822,10 +1839,17 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
         }
         inventory.claim_ownership_pending = true;
     }
+    const size_t script_manager_work = m_spk_managers.size();
+    const bool script_manager_capacity_exceeded =
+        script_manager_work >
+            SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY;
     inventory.claim_ownership_capacity_exceeded =
-        m_shadow_pow_claim_ownership_capacity_exceeded;
+        m_shadow_pow_claim_ownership_capacity_exceeded ||
+        script_manager_capacity_exceeded;
     inventory.claim_ownership_capacity_work =
-        m_shadow_pow_claim_ownership_capacity_work;
+        script_manager_capacity_exceeded
+            ? script_manager_work
+            : m_shadow_pow_claim_ownership_capacity_work;
     inventory.wallet_tip_matches = tip &&
         m_last_block_processed == inventory.active_tip &&
         m_last_block_processed_height == inventory.active_height;
@@ -2089,6 +2113,14 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
             const CTxOut& parent_output = parent.tx->vout[prevout.n];
             if (GetTxDepthInMainChain(parent) > 0) {
                 terminal.anchor = prevout;
+                // CWallet::IsMine(CTxOut) may perform two script-manager
+                // passes. Charge the worst case before entering it so the
+                // advertised topology budget also bounds manager visits
+                // while cs_main is held.
+                if (!consume_topology_work(
+                        script_manager_work * 2)) {
+                    return;
+                }
                 if ((IsMine(parent_output) & ISMINE_SPENDABLE) !=
                     ISMINE_NO) {
                     terminal.amount = parent_output.nValue;
@@ -2144,6 +2176,9 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
         Coin anchor_coin;
         if (coins_tip.GetCoin(anchor, anchor_coin) && !anchor_coin.IsSpent()) {
             component.anchor_unspent = true;
+            if (!consume_topology_work(script_manager_work * 2)) {
+                return inventory;
+            }
             if (anchor_coin.out.nValue != component.anchor_amount ||
                 anchor_coin.out.scriptPubKey != component.anchor_script ||
                 (IsMine(anchor_coin.out) & ISMINE_SPENDABLE) == ISMINE_NO) {

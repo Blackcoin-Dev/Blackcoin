@@ -1913,7 +1913,20 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
         BOOST_REQUIRE(wallet->AddToWallet(
             tx, TxStateConfirmed{confirmation_block->GetBlockHash(),
                                  confirmation_block->nHeight, 1}));
-        return COutPoint{tx->GetHash(), 0};
+        const COutPoint outpoint{tx->GetHash(), 0};
+        {
+            LOCK(::cs_main);
+            Assert(m_node.chainman)
+                ->ActiveChainstate()
+                .CoinsTip()
+                .AddCoin(
+                    outpoint,
+                    Coin{tx->vout.at(0), confirmation_block->nHeight,
+                         /*coinbase=*/false, /*coinstake=*/false,
+                         tx->nTime},
+                    /*possible_overwrite=*/false);
+        }
+        return outpoint;
     };
 
     const COutPoint first = add_confirmed_coin(0x41, 10 * COIN);
@@ -2018,6 +2031,18 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
     BOOST_REQUIRE(peer_wallet->AddToWallet(
         peer_tx, TxStateConfirmed{confirmation_block->GetBlockHash(),
                                   confirmation_block->nHeight, 1}));
+    {
+        LOCK(::cs_main);
+        Assert(m_node.chainman)
+            ->ActiveChainstate()
+            .CoinsTip()
+            .AddCoin(
+                COutPoint{peer_tx->GetHash(), 0},
+                Coin{peer_tx->vout.at(0), confirmation_block->nHeight,
+                     /*coinbase=*/false, /*coinstake=*/false,
+                     peer_tx->nTime},
+                /*possible_overwrite=*/false);
+    }
     peer_wallet->m_enabled_staking = false;
     const ShadowPowClaimMiningGate peer_selection_gate =
         peer_wallet->GetShadowPowClaimMiningGate();

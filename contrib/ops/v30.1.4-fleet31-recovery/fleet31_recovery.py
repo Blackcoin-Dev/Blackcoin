@@ -42,7 +42,7 @@ EXPECTED_VSIZE = 191
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PRODUCTION_DOCKER = pathlib.Path("/usr/bin/docker")
 # Filled from the repository fixture after the fixture is finalized.
-TEST_TRANSPORT_SHA256 = "55f33419b97641f0f52fb41109a31d3d753cb838b5df39293f85d488130739aa"
+TEST_TRANSPORT_SHA256 = "de0180917c9c436d68b7c7f85c4276ad6564c95c30ca444395b7b05d21a9bf56"
 
 
 class GateError(RuntimeError):
@@ -319,7 +319,7 @@ def validate_runtime_manifest(path: pathlib.Path, expected_hash: str | None = No
         for field in ["service", "container", "wallet"]:
             if not isinstance(item[field], str):
                 die(f"runtime node {node} {field} must be a string")
-        if item["service"] != f"node{node}":
+        if item["service"] != f"node{node:02d}":
             die(f"runtime node {node} service mismatch")
         nodes.append(RuntimeNode(node, item["service"], item["container"], item["wallet"]))
     if tuple(n.node for n in nodes) != NODE_SET:

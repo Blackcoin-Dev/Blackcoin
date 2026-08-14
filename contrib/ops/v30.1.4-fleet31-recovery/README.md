@@ -9,6 +9,9 @@ wallet secrets, transaction bytes, or evidence of live execution. It does not
 contact SSH by itself. An operator must supply a locally sealed mode-0600
 runtime manifest with the exact installed image, executable, wallet, service,
 container, Docker-transport, and lock identities.
+Compose services use the exact zero-padded topology labels `node01` through
+`node32`; node1's container remains `blackcoin-v4-gui` and other regular-node
+containers remain `blackcoin-v4-gui-N` as declared by the sealed manifest.
 
 ## Commands
 

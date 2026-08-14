@@ -244,7 +244,7 @@ def main() -> None:
                                      "Health": {"Status": "healthy"}},
                            "Config": {"Image": IMAGE_REF, "Labels": {
                                "com.docker.compose.project": "blackcoin30",
-                               "com.docker.compose.service": f"node{node}"}}}]))
+                               "com.docker.compose.service": f"node{node:02d}"}}}]))
         return
     if args[:1] != ["exec"] or len(args) < 4:
         raise SystemExit(2)

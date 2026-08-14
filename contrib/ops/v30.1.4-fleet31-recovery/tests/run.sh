@@ -66,7 +66,7 @@ make_runtime()
        datadir:"/home/blackcoin/.blackcoin",transport_sha256:("1"*64),
        global_lock_paths:[$lock_root+"/rollout.lock",$lock_root+"/wallet.lock",$lock_root+"/recovery.lock"],
        node_lock_template:($lock_root+"/node-{node:02d}.lock"),
-       nodes:([range(1;30),31,32] | map({node:.,service:("node"+tostring),
+       nodes:([range(1;30),31,32] | map({node:.,service:("node"+(tostring|if length==1 then "0"+. else . end)),
          container:(if . == 1 then "blackcoin-v4-gui" else "blackcoin-v4-gui-"+tostring end),wallet:""}))}
     ' >"$path"
     chmod 0600 "$path"
@@ -168,6 +168,17 @@ chmod 0600 "$BADNODE/runtime-bad.json"
 export FLEET31_FIXTURE="$BADNODE/state"
 assert_fails 'node30 manifest exclusion' "$TOOL" audit --runtime-manifest "$BADNODE/runtime-bad.json" --run-dir "$BADNODE/run"
 [[ ! -e "$BADNODE/state/transport.log" ]] || fail 'node30 hostile reached transport'
+ok
+
+# An unpadded single-digit Compose service is rejected before transport.
+BADTOPO="$FIX/badtopo"
+mkdir -m 0700 "$BADTOPO" "$BADTOPO/state"
+make_runtime "$BADTOPO/runtime.json" "$BADTOPO/locks"
+jq '(.nodes[]|select(.node==1).service)="node1"' "$BADTOPO/runtime.json" >"$BADTOPO/runtime-bad.json"
+chmod 0600 "$BADTOPO/runtime-bad.json"
+export FLEET31_FIXTURE="$BADTOPO/state"
+assert_fails 'unpadded node01 service' "$TOOL" audit --runtime-manifest "$BADTOPO/runtime-bad.json" --run-dir "$BADTOPO/run"
+[[ ! -e "$BADTOPO/state/transport.log" ]] || fail 'bad topology hostile reached transport'
 ok
 
 # A fee drift fails the read-only audit with no mutation.

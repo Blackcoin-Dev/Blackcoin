@@ -29,6 +29,11 @@ Free-Claim storage policy: exact live user-share ancestry accepted; no chmod/cho
 Queue prerequisite: exactly one canonical queued JSON; zero broadcast markers
 Payout prerequisite: exact direct witness-v16 script, not already awarded
 Work prerequisite: exact active unbound PoW-mode QQP2 for the queued payout
+Snapshot attempt budget: 3 complete snapshots before audit authority; each retry restarts role/queue/payout/input/work/chain validation
+Snapshot retry trigger: bracketed active-chain identity moved, or otherwise-exact work differs only at height/prevhash
+Snapshot retry exclusions: stable-tip inventory drift and all non-tip work/role/queue/storage/security mismatches remain immediately fatal
+Snapshot input rule during tip advance: only tip-relative confirmation counts may move; outpoint/member/address/script/value identity drift is fatal
+Snapshot drift tests: one ordinary in-scan tip advance succeeds on attempt 2; continuous drift exhausts attempt 3 without audit authority
 Fee input prerequisite: complete exact safe confirmed wallet-owned legacy P2PKH eligible set at one exact address/script
 Fee input authority: any one member of the immutable audited set; exact outpoint cannot be pre-bound by installed Core
 Fee input set binding: sorted unique outpoints, exact active-chain values/scripts/confirmations, member count, and canonical members SHA256
@@ -71,11 +76,11 @@ Installed API limitation: no plan/idempotency token, exact-input selector, calle
 Live financial authority in repository: false
 Deployable public-release authority: false
 
-Hostile suite result: PASS: 217 hostile node30 Free-Claim one-shot assertions
-Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-audited-input-set-20260814.out
-Hostile suite log SHA256: 150e5748748001aa0166ed393f07f63862ebb9b0447276cfd55a03bccdaedacb
-Tool SHA256: b89ce5b618ff62b2482419550f9f63e30f5c412b4a2d1fe42757cc3e22479391
-Test transport SHA256: d4918297a48bd80195d0f58b8e8839dc663a1e1b9fdaf807f0f7b17f7342c53b
-Test driver SHA256: 330bb2e81bac17bb45c91dccc3c5cfb433896a802233c083f587f64755149183
+Hostile suite result: PASS: 223 hostile node30 Free-Claim one-shot assertions
+Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-bounded-tip-retry-20260814.out
+Hostile suite log SHA256: 2ce08089c655615ffe79c3e57ba9157faa51d8dee4903c8443317647bf277067
+Tool SHA256: 26e38fbd46cd427642f73daedfbbc08dfffcb1e4a166db7c3e0abb6006e832b2
+Test transport SHA256: 35d226faefab894793bbf211d1f8ff9dc15be9730dad21174407c53f82348381
+Test driver SHA256: 096599cf7db47ed2698783c538a9a241f440ddfdf9fdd4f38a43e31a3fd086ad
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

@@ -338,6 +338,24 @@ assert_eq "$(sha "$HAPPY/free-claim/.v30.1.4-free-claim-paused")" \
   "$(jq -r .pause_marker_sha256 "$HAPPY/runtime.json")"
 assert_eq "$(grep -c '^qfixtureWitnessV16$' "$HAPPY/free-claim/awarded.txt" || true)" 0
 
+# A single ordinary tip advance during the bounded 100-member scan retries the
+# entire snapshot and publishes only the stable second attempt. A tip that
+# advances on every attempt exhausts the fixed budget without audit authority.
+TIP_ADVANCE=$(make_fixture normal-tip-advance)
+run_audit "$TIP_ADVANCE" normal-tip-advance >/dev/null
+assert_jq '.result=="READY_FOR_SEPARATE_ONE_SHOT_AUTHORITY" and
+  .snapshot.snapshot_attempts==2 and .snapshot.chain.height==5991701' \
+  "$TIP_ADVANCE/run/audit.json"
+assert_eq "$(grep -c sendshadowpowclaim "$TIP_ADVANCE/state/transport.log" || true)" 0
+
+TIP_EXHAUST=$(make_fixture continuous-tip-drift)
+assert_fails 'continuous active-tip drift exhausts the bounded snapshot budget' \
+  run_audit "$TIP_EXHAUST" continuous-tip-drift
+assert_eq "$(jq -r .listunspent_calls "$TIP_EXHAUST/state/state.json")" 6
+assert_fails 'continuous tip drift publishes no audit authority' \
+  test -e "$TIP_EXHAUST/run/audit.json"
+assert_eq "$(grep -c sendshadowpowclaim "$TIP_EXHAUST/state/transport.log" || true)" 0
+
 invoke "$HAPPY" happy monitor >"$HAPPY/pending.out"
 PENDING=$(jq -r .receipt "$HAPPY/pending.out")
 assert_jq '.result=="BROADCAST_PENDING_ACTIVE_CHAIN_CONFIRMATION" and

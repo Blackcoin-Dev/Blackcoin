@@ -37,6 +37,7 @@ MAX_TRIES = 2_000_000
 EXPECTED_VSIZE = 287
 FEE_CAP = Decimal("0.00028700")
 ZERO = Decimal("0.00000000")
+SNAPSHOT_ATTEMPTS = 3
 USER_ORDERS = [
     "we need to be POW mining as well, and we need to have claims submitted so POW and POS quantum payouts can continue",
     "fix all of the quarantined issues even if you have to pay a small fee to fix it on each node. all issues must be resolved",
@@ -74,7 +75,7 @@ QQP2_MAGIC = b"QQP2"
 NODE30_PRIMITIVE_RELATIVE = pathlib.Path(
     "../v30.1.4-node30-retained-claim-recovery/node30_recovery.py")
 NODE30_PRIMITIVE_SHA256 = "41c4bbc7d0aa6a3e21715937abda13f9ece879cfb34c4517cf87a6dd3835f605"
-TEST_TRANSPORT_SHA256 = "d4918297a48bd80195d0f58b8e8839dc663a1e1b9fdaf807f0f7b17f7342c53b"
+TEST_TRANSPORT_SHA256 = "35d226faefab894793bbf211d1f8ff9dc15be9730dad21174407c53f82348381"
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -730,6 +731,16 @@ def fee_inventory_authority(inventory: dict[str, Any]) -> dict[str, Any]:
             "core_exact_outpoint_prebound": False}
 
 
+def fee_inventory_non_tip_identity(inventory: dict[str, Any]) -> dict[str, Any]:
+    """Separate stable membership/value/script identity from tip-relative confirmations."""
+    projection = json.loads(json.dumps(inventory))
+    for member in projection["members"]:
+        member.pop("confirmations")
+        member["coin"].pop("confirmations")
+    projection["members_sha256"] = sha256_json(projection["members"])
+    return projection
+
+
 def pre_call_resample(transport: Any, node: Any) -> dict[str, Any]:
     """Bracket the exact mutable inputs immediately before intent publication."""
     chain_before = node30.base.validate_chain(transport.rpc(node, "getblockchaininfo"), NODE)
@@ -746,19 +757,33 @@ def pre_call_resample(transport: Any, node: Any) -> dict[str, Any]:
             "wallet_txids_sha256": sha256_json(txids)}
 
 
+def work_non_tip_fields_exact(work: Any, selected: dict[str, Any],
+                              payout: dict[str, Any]) -> bool:
+    return (isinstance(work, dict) and work.get("active") is True and
+            work.get("proof_mode") == "pow" and work.get("proof_mode_byte") == 0 and
+            work.get("proof_version") == 2 and
+            work.get("claim_outpoint_required") is False and
+            work.get("qqp4_active_next_block") is False and
+            work.get("target_script") == selected["scriptPubKey"] and
+            work.get("quantum_address") == payout["address"] and
+            work.get("quantum_payout_script") == payout["scriptPubKey"] and
+            work.get("claim_txid") in {None, ""} and
+            work.get("claim_vout") in {None, -1} and
+            type(work.get("target_bits")) is int and work["target_bits"] > 0)
+
+
+def work_tip_fields_well_formed(work: dict[str, Any]) -> bool:
+    return (type(work.get("height")) is int and work["height"] > 0 and
+            isinstance(work.get("prevhash"), str) and
+            HEX64.fullmatch(work["prevhash"]) is not None)
+
+
 def validate_work(work: Any, chain: dict[str, Any], selected: dict[str, Any],
                   payout: dict[str, Any]) -> dict[str, Any]:
-    if (not isinstance(work, dict) or work.get("active") is not True or
+    if (not work_non_tip_fields_exact(work, selected, payout) or
+            not work_tip_fields_well_formed(work) or
             work.get("height") != chain["blocks"] + 1 or
-            work.get("prevhash") != chain["bestblockhash"] or
-            work.get("proof_mode") != "pow" or work.get("proof_mode_byte") != 0 or
-            work.get("proof_version") != 2 or work.get("claim_outpoint_required") is not False or
-            work.get("qqp4_active_next_block") is not False or
-            work.get("target_script") != selected["scriptPubKey"] or
-            work.get("quantum_address") != payout["address"] or
-            work.get("quantum_payout_script") != payout["scriptPubKey"] or
-            work.get("claim_txid") not in {None, ""} or work.get("claim_vout") not in {None, -1} or
-            type(work.get("target_bits")) is not int or work["target_bits"] <= 0):
+            work.get("prevhash") != chain["bestblockhash"]):
         die("getshadowpowwork is not exact active QQP2 work for the queued payout")
     return {key: work.get(key) for key in [
         "active", "height", "prevhash", "target_bits", "prefix", "proof_mode",
@@ -769,38 +794,65 @@ def validate_work(work: Any, chain: dict[str, Any], selected: dict[str, Any],
 
 def stable_live_snapshot(transport: Any, contract: Contract, exact_node: Any,
                          require_queue: bool = True) -> dict[str, Any]:
-    chain_before = node30.base.validate_chain(
-        transport.rpc(exact_node, "getblockchaininfo"), NODE)
-    role = node30.role_snapshot(transport, exact_node, False)
-    if (role["recovery"].get("blocking_quarantined_claims") != 0 or
-            role["recovery"].get("database_outcome_ambiguous") is not False):
-        die("node30 retained-claim recovery is not clean")
-    queue = audit_queue(contract) if require_queue else None
-    if queue is None:
-        die("internal queue snapshot error")
-    payout = validate_payout_address(
-        transport, exact_node, queue["item"]["record"]["quantum_address"])
-    selected = fee_input_inventory(transport, exact_node)
-    goldrush = transport.rpc(exact_node, "getgoldrushinfo")
-    if (not isinstance(goldrush, dict) or goldrush.get("active") is not True or
-            goldrush.get("competing_claim_rule_active_next_block") is not False or
-            goldrush.get("qqp4_active_next_block") is not False):
-        die("node30 is not in the exact active QQP2 reward window")
-    work = validate_work(
-        transport.rpc(exact_node, "getshadowpowwork", selected["address"], payout["address"]),
-        chain_before, selected, payout)
-    selected_after = fee_input_inventory(transport, exact_node)
-    chain_after = node30.base.validate_chain(
-        transport.rpc(exact_node, "getblockchaininfo"), NODE)
-    if (node30.base.chain_identity(chain_before) != node30.base.chain_identity(chain_after) or
-            selected_after != selected):
-        die("node30 tip or eligible fee-input inventory moved during audit")
-    txids = wallet_txids(transport, exact_node)
-    return {"chain": {"height": chain_after["blocks"], "tip": chain_after["bestblockhash"]},
-            "role": role, "queue": queue, "payout": payout, "fee_input": selected,
-            "work": work,
-            "wallet_txids_before": txids,
-            "wallet_txids_before_sha256": sha256_json(txids)}
+    for attempt in range(1, SNAPSHOT_ATTEMPTS + 1):
+        chain_before = node30.base.validate_chain(
+            transport.rpc(exact_node, "getblockchaininfo"), NODE)
+        role = node30.role_snapshot(transport, exact_node, False)
+        if (role["recovery"].get("blocking_quarantined_claims") != 0 or
+                role["recovery"].get("database_outcome_ambiguous") is not False):
+            die("node30 retained-claim recovery is not clean")
+        queue = audit_queue(contract) if require_queue else None
+        if queue is None:
+            die("internal queue snapshot error")
+        payout = validate_payout_address(
+            transport, exact_node, queue["item"]["record"]["quantum_address"])
+        selected = fee_input_inventory(transport, exact_node)
+        goldrush = transport.rpc(exact_node, "getgoldrushinfo")
+        if (not isinstance(goldrush, dict) or goldrush.get("active") is not True or
+                goldrush.get("competing_claim_rule_active_next_block") is not False or
+                goldrush.get("qqp4_active_next_block") is not False):
+            die("node30 is not in the exact active QQP2 reward window")
+        raw_work = transport.rpc(
+            exact_node, "getshadowpowwork", selected["address"], payout["address"])
+        selected_after = fee_input_inventory(transport, exact_node)
+        chain_after = node30.base.validate_chain(
+            transport.rpc(exact_node, "getblockchaininfo"), NODE)
+        if not work_non_tip_fields_exact(raw_work, selected, payout):
+            die("getshadowpowwork is not exact active QQP2 work for the queued payout")
+        if not work_tip_fields_well_formed(raw_work):
+            die("getshadowpowwork tip fields are malformed")
+        chain_non_tip_fields = ["chain", "initialblockdownload", "pruned", "warnings"]
+        if ({key: chain_before.get(key) for key in chain_non_tip_fields} !=
+                {key: chain_after.get(key) for key in chain_non_tip_fields}):
+            die("node30 non-tip chain identity moved during an audit snapshot")
+        chain_tip_fields = ["blocks", "headers", "bestblockhash", "chainwork"]
+        chain_moved = ({key: chain_before.get(key) for key in chain_tip_fields} !=
+                       {key: chain_after.get(key) for key in chain_tip_fields})
+        if chain_moved:
+            if (fee_inventory_non_tip_identity(selected_after) !=
+                    fee_inventory_non_tip_identity(selected)):
+                die("node30 eligible fee-input identity moved during an audit tip advance")
+            if attempt == SNAPSHOT_ATTEMPTS:
+                die("node30 active tip moved throughout the bounded snapshot attempts")
+            continue
+        if selected_after != selected:
+            die("node30 eligible fee-input inventory moved on a stable audit tip")
+        work_tip_drift = (raw_work["height"] != chain_after["blocks"] + 1 or
+                          raw_work["prevhash"] != chain_after["bestblockhash"])
+        if work_tip_drift:
+            if attempt == SNAPSHOT_ATTEMPTS:
+                die("node30 QQP2 work tip drifted throughout the bounded snapshot attempts")
+            continue
+        work = validate_work(raw_work, chain_after, selected, payout)
+        txids = wallet_txids(transport, exact_node)
+        return {"chain": {"height": chain_after["blocks"],
+                          "tip": chain_after["bestblockhash"]},
+                "role": role, "queue": queue, "payout": payout,
+                "fee_input": selected, "work": work,
+                "snapshot_attempts": attempt,
+                "wallet_txids_before": txids,
+                "wallet_txids_before_sha256": sha256_json(txids)}
+    die("node30 bounded snapshot attempts exhausted")
 
 
 def load_audit(run_dir: pathlib.Path, contract: Contract) -> tuple[dict[str, Any], str]:

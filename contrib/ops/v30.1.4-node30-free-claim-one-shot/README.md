@@ -47,6 +47,20 @@ wallet secret, or executable financial authority is checked in.
 - a stable active tip, active-chain `gettxout(...,false)` value and script for
   every eligible member, wallet inventory, queue bytes, and work projection.
 
+Scanning the complete live eligible set may cross an ordinary block boundary.
+The audit therefore permits at most three whole-snapshot attempts. It retries
+only when the bracketed active-chain identity moved or when every non-tip work
+field is exact and only the work height/previous-hash binding drifted. Each
+retry starts again at the chain read and revalidates the role, queue, payout,
+complete input set, reward phase, work, and closing chain read. A stable-tip
+input-set difference, any non-tip work difference, or any queue, role,
+storage, ownership, mode, symlink, receipt, or security failure remains
+immediately fatal. Continuous tip movement exhausts the fixed budget without
+publishing `audit.json` or financial authority. During a proved tip move, only
+the expected tip-relative confirmation counts may differ between the two input
+scans; any outpoint, membership, address, script, value, or other input
+identity difference is fatal rather than retried.
+
 The audit emits `audit.json` plus its SHA256 sidecar. Its
 `required_authority` member is only a template. A human must review the exact
 receipt, copy that member to a separate mode-0600 file, change only `decision`
@@ -250,7 +264,9 @@ hard-link, symlink, and inode-substitution hostiles;
 the complete any-one-of-an-exact-audited-set fee contract, sole
 address/script, digest and member binding, immediate pre-call inventory/tip/
 wallet resampling, set drift, duplicate outpoint, multiple-address, multi-input,
-and nonmember hostiles; independent signed-byte fee proof; immediate acknowledgment
+and nonmember hostiles; one normal in-scan tip advance and bounded continuous
+tip-drift exhaustion; non-tip work failures that never retry; independent
+signed-byte fee proof; immediate acknowledgment
 ordering; response corruption and overprecision; process death before and
 after wallet persistence and after response publication; no-retry
 reconciliation; queue, awarded-ledger, confirmed, JSON, sidecar, and publisher

@@ -52,6 +52,23 @@ def save_state(value: dict) -> None:
     tmp.replace(state_path())
 
 
+def active_chain(state: dict) -> tuple[int, str, str]:
+    calls = state.get("listunspent_calls", 0)
+    if SCENARIO == "normal-tip-advance":
+        epoch = int(calls >= 2)
+    elif SCENARIO == "continuous-tip-drift":
+        epoch = calls // 2
+    elif SCENARIO == "precall-tip-drift":
+        epoch = int(calls >= 5)
+    else:
+        epoch = 0
+    if epoch == 0:
+        return HEIGHT, TIP, CHAINWORK
+    marker = str(epoch).encode()
+    return (HEIGHT + epoch, hashlib.sha256(b"tip-" + marker).hexdigest(),
+            hashlib.sha256(b"chainwork-" + marker).hexdigest())
+
+
 def proof_hex() -> str:
     target = bytes.fromhex(TARGET_SCRIPT)
     payout = bytes.fromhex(PAYOUT_SCRIPT)
@@ -104,10 +121,9 @@ def claim_result() -> dict:
 
 def role_rpc(method: str, state: dict) -> object:
     if method == "getblockchaininfo":
-        drift = SCENARIO == "precall-tip-drift" and state.get("listunspent_calls", 0) >= 5
-        return {"chain": "main", "blocks": HEIGHT + int(drift),
-                "headers": HEIGHT + int(drift),
-                "bestblockhash": "a" * 64 if drift else TIP, "chainwork": CHAINWORK,
+        height, tip, chainwork = active_chain(state)
+        return {"chain": "main", "blocks": height, "headers": height,
+                "bestblockhash": tip, "chainwork": chainwork,
                 "initialblockdownload": False, "pruned": False, "warnings": ""}
     if method == "getnetworkinfo":
         return {"version": 300104, "subversion": "/Blackcoin:30.1.4/"}
@@ -138,9 +154,10 @@ def role_rpc(method: str, state: dict) -> object:
                 "indeterminate_quarantined_claims": 0,
                 "claim_recovery_database_outcome_ambiguous": False}
     if method == "getpowclaimrecoveryinfo":
+        height, tip, _ = active_chain(state)
         return {"chain_ready": True, "wallet_tip_matches": True,
-                "database_outcome_ambiguous": False, "active_tip": TIP,
-                "active_height": HEIGHT,
+                "database_outcome_ambiguous": False, "active_tip": tip,
+                "active_height": height,
                 "blocking_quarantined_claims": 1 if SCENARIO == "blocking" else 0,
                 "component_details": []}
     raise KeyError(method)
@@ -155,9 +172,11 @@ def rpc(method: str, params: list[str]) -> object:
     if method == "listunspent":
         state["listunspent_calls"] = state.get("listunspent_calls", 0) + 1
         save_state(state)
+        height, _, _ = active_chain(state)
+        confirmations = 50 + height - HEIGHT
         first = {"txid": INPUT_TXID, "vout": 0, "address": LEGACY_ADDRESS,
                  "scriptPubKey": TARGET_SCRIPT, "amount": INPUT_AMOUNT,
-                 "confirmations": 50, "spendable": True, "safe": True,
+                 "confirmations": confirmations, "spendable": True, "safe": True,
                  "spendability_state": "spendable_legacy"}
         rows = [first, {**first, "txid": INPUT_TXID_2}]
         if SCENARIO == "multiple-addresses":
@@ -174,7 +193,8 @@ def rpc(method: str, params: list[str]) -> object:
             return None
         if params[0] not in {INPUT_TXID, INPUT_TXID_2} and SCENARIO != "multiple-addresses":
             return None
-        return {"confirmations": 50, "value": INPUT_AMOUNT,
+        height, _, _ = active_chain(state)
+        return {"confirmations": 50 + height - HEIGHT, "value": INPUT_AMOUNT,
                 "scriptPubKey": {"hex": TARGET_SCRIPT}}
     if method == "getgoldrushinfo":
         return {"active": True,
@@ -199,7 +219,8 @@ def rpc(method: str, params: list[str]) -> object:
         return {"address": address, "scriptPubKey": "", "ismine": False,
                 "iswatchonly": False, "solvable": False}
     if method == "getshadowpowwork":
-        return {"active": True, "height": HEIGHT + 1, "prevhash": TIP,
+        height, tip, _ = active_chain(state)
+        return {"active": True, "height": height + 1, "prevhash": tip,
                 "target_bits": 12, "prefix": "QQSPROOF", "proof_mode": "pow",
                 "proof_mode_byte": 0, "proof_version": 3 if SCENARIO == "qqp3" else 2,
                 "claim_outpoint_required": False, "qqp4_active_next_block": False,

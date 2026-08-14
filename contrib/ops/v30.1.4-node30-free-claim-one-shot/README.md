@@ -1,0 +1,161 @@
+# Installed-v30.1.4 node30 Free-Claim one-shot
+
+This fleet-only package submits exactly one already-queued node30 Free-Claim
+under a separately reviewed owner-only authority. It never starts the recurring
+Free-Claim worker, removes the pause marker, enables ordinary PoW, unlocks a
+wallet, repairs or rewrites a chain, or deploys software. Normal node30 PoS must
+remain active with positive weight throughout. The public Core/release lane is
+outside this package.
+
+The runtime is bound to signed installed source commit
+`13262151077cce3f72d07d17dc7725b2b6a8e1ab`, tree
+`a6f7757c34b70fab841905765462d6769112d049`, and signer fingerprint
+`SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70`. The one-shot tool also
+hash-pins the signed node30 retained-claim primitive that authenticates the
+installed container, wallet, chain, PoS/PoW roles, pause artifacts, locks, and
+receipt publisher. No live address, outpoint, transaction, runtime identity,
+wallet secret, or executable financial authority is checked in.
+
+## Exact scope
+
+`audit` is read-only. Under the complete fleet lock set, it requires:
+
+- the exact healthy installed node30 container and unnamed wallet;
+- main chain, peers, no IBD, normal unlock, active PoS, and positive stake
+  weight;
+- ordinary PoW disabled with zero hashrate;
+- zero ambiguous or blocking retained-claim recovery state;
+- the exact pause marker, pause wrapper, and preserved original worker hashes;
+- exactly one canonical queue JSON, no broadcast marker, and a queued payout
+  absent from the awarded ledger;
+- a valid direct witness-v16 quantum payout script;
+- active unbound QQP2 work for that exact payout;
+- one safe, confirmed, wallet-owned legacy P2PKH input at the selected address;
+  and
+- a stable active tip, active-chain `gettxout(...,false)` value and script,
+  wallet inventory, queue bytes, and work projection.
+
+The audit emits `audit.json` plus its SHA256 sidecar. Its
+`required_authority` member is only a template. A human must review the exact
+receipt, copy that member to a separate mode-0600 file, change only `decision`
+to `authorize`, insert the exact audit SHA256, and supply that authority's
+SHA256 explicitly. Every other field must remain byte-for-byte semantic JSON
+equal, including the exact queue, payout, fee input, active tip, work digest,
+wallet inventory digest, user order, fee rate, vsize, fee cap, maximum tries,
+and risk acknowledgements.
+
+`execute` revalidates the complete audit, authority, runtime, wallet selection,
+queue, payout, active QQP2 work, fee input, tip, role, pause artifacts, and
+locks. It fsyncs a no-clobber `intent.json` before the only wallet-mutating RPC:
+
+```text
+sendshadowpowclaim <exact legacy address> <exact queued witness-v16 address> 2000000 100
+```
+
+There is no proof-override argument. The call budget is one. The exact RPC
+return is fsynced as `rpc-response.json` before any post-call RPC read. The tool
+then decodes the exact signed bytes and requires one audited input, two exact
+outputs, unbound PoW-mode QQP2 proof bytes for the audited target and queued
+payout scripts, exact size 287 vbytes, exact same-script change, and an
+independently computed fee of `0.00028700 BLK` (`287 * 100 atoms/vB`). Only
+then does it atomically rename the queue item to its `.broadcast` outcome and
+publish `broadcast-complete.json`.
+
+`reconcile` is the only permitted continuation after a killed process, timeout,
+lost response, malformed response, or unmatched intent. It never invokes
+`sendshadowpowclaim`. It serializes under the same locks, revalidates the exact
+wallet selection and receipt chain, compares the pre-call wallet txid
+inventory, queries the audited input's spender, loads candidate wallet bytes,
+and accepts only one transaction that independently reproduces the exact
+input, scripts, QQP2 proof, vsize, and fee. If no exact transaction is visible,
+it records an observation and leaves authority consumed. It never authorizes a
+retry. If an immediate response receipt survived, reconciliation heals a
+missing sidecar and binds that exact acknowledgment into the completion chain.
+
+`monitor` is read-only with respect to the wallet and chain. It re-proves the
+confirmed wallet transaction bytes against the immutable authorized evidence,
+separating txid/raw bytes/input/output/proof/fee from mutable confirmations and
+blockhash. It requires an active block header and exactly one synthetic payout
+record for the exact claim txid, proof output, queued script/address, credited
+QQP2 disposition, inclusion height, and exact base fee. Only after that proof
+does it atomically append the queued identity to `awarded.txt`, atomically move
+the `.broadcast` item to `.confirmed.json`, and publish `terminal.json`.
+Mempool presence or a confirmation without the exact indexed quantum payout is
+not terminal success.
+
+## Crash and receipt contract
+
+An unknown response consumes authority permanently. The tool never guesses
+whether the installed RPC mutated the wallet and never calls it again. Durable
+intent, response, completion, observation, and terminal receipts are canonical
+owner-only JSON files with SHA256 sidecars, fsync, hard-link no-clobber
+publication, and secure fixed child names. A valid JSON receipt whose sidecar
+was interrupted can recreate only that missing sidecar. A crash that leaves
+the publisher's exact same-inode temporary hard link can remove only that sole
+recognized second link. Symlinks, an unrecognized hard link, unsafe modes,
+non-owner files, malformed JSON, mismatched sidecars, and path escapes fail
+closed.
+
+The state transitions are restart-safe:
+
+```text
+queued -> broadcast -> confirmed
+   |          ^
+   +-> uncertain -- read-only reconcile only
+```
+
+A crash after intent but before a known response remains consumed and
+reconcilable. A crash after the response receipt, queue rename, awarded-ledger
+replacement, confirmed rename, terminal JSON link, or JSON/sidecar temporary
+link resumes without another send. Fully published broadcast and terminal
+receipts are idempotently validated rather than overwritten.
+
+## Installed-v30.1.4 API limitation
+
+Installed v30.1.4 `sendshadowpowclaim` signs, wallet-persists, test-accepts, and
+broadcasts before returning. It has no plan/idempotency token, exact-input
+selector, caller-supplied maximum-total-fee parameter, or separate sign/commit
+phase. Its product-level fee cap is broader than this package's
+`0.00028700 BLK` authority. The package reduces pre-call uncertainty by binding
+one safe P2PKH target-address input and explicit `100 atoms/vB`, and it proves
+the actual fee from the signed bytes immediately after return. It cannot undo a
+transaction already broadcast by Core if those returned bytes violate the
+narrow cap. The separate authority therefore acknowledges this installed-API
+risk expressly. Requiring Core-enforced idempotency, exact-input selection, or
+a hard caller fee cap remains a public-product requirement, not a fleet
+workaround.
+
+## Operator sequence
+
+1. Create a fresh owner-only run directory and a completed mode-0600 runtime
+   manifest from `RUNTIME-MANIFEST.example.json`.
+2. Run `audit` once and independently inspect `audit.json` and its sidecar.
+3. Create the separate mode-0600 authority exactly as described above. This
+   repository contains no live authority.
+4. Run `execute` once. If it does not return an exact completion, never run it
+   again; use only `reconcile` with the same authority and hash.
+5. Run `monitor` until it records the exact active-chain synthetic payout. A
+   pending observation is not success.
+6. Preserve the complete run directory and its sidecars as the financial and
+   operational receipt chain.
+
+Every command requires the exact runtime manifest/receipt chain and authority
+SHA256. Live use requires root and the production Free-Claim root. The
+hash-pinned mock transport is accepted only for nonroot offline tests and can
+never substitute for `/usr/bin/docker` in live mode.
+
+## Validation
+
+Run `tests/run.sh` as a nonroot user. The stateful fixture contacts no Docker
+daemon, SSH host, wallet, chain, or network. It tests the exact call and
+parameters; authority, fee, queue, witness, QQP2, runtime, wallet, role, pause,
+and lock gates; independent signed-byte fee proof; immediate acknowledgment
+ordering; response corruption and overprecision; process death before and
+after wallet persistence and after response publication; no-retry
+reconciliation; queue, awarded-ledger, confirmed, JSON, sidecar, and publisher
+hard-link crash windows; symlink rejection; confirmed-byte reproof; active
+header proof; and exact synthetic payout completion.
+
+This package is offline tooling only. A signed commit is not live financial
+authority. A fresh exact audit and a separate exact mode-0600 authorization are
+required before any one-shot execution.

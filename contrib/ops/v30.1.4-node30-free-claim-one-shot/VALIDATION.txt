@@ -1,0 +1,53 @@
+Scope: offline node30 queued Free-Claim one-shot package
+Contract: installed-v30.1.4-node30-free-claim-one-shot/v1
+Receipt/runtime schema: 1/2
+Fleet integration base commit: 801ffe62929675725c1261c913683aa48ea2e4bd
+Installed runtime target: signed v30.1.4 only
+Installed source commit: 13262151077cce3f72d07d17dc7725b2b6a8e1ab
+Installed source tree: a6f7757c34b70fab841905765462d6769112d049
+Installed source signer: SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
+Live contact: none
+Wallet mutation during validation: none
+Network contact: none
+Node: 30, Free-Claim role
+Ordinary PoW: required disabled before, during, and after
+PoS: required active with positive weight
+Free-Claim pause: exact marker/wrapper/worker hashes required and preserved
+Recurring worker: never invoked or enabled
+Queue prerequisite: exactly one canonical queued JSON; zero broadcast markers
+Payout prerequisite: exact direct witness-v16 script, not already awarded
+Work prerequisite: exact active unbound PoW-mode QQP2 for the queued payout
+Fee input prerequisite: one exact safe confirmed wallet-owned legacy P2PKH input at the selected address
+Wallet prerequisite: exact unnamed wallet, normal unlock, stable immutable inventory
+Recovery prerequisite: no ambiguity and zero current retained-claim blockers
+Mutating RPC surface: sendshadowpowclaim only
+RPC call budget: one
+RPC arguments: exact audited legacy address, exact queued quantum address, max_tries=2000000, fee_rate=100
+Proof override: absent
+Fee rate: 100 atoms/vB
+Exact expected vsize: 287
+Exact package fee cap: 0.00028700 BLK
+Fee proof: active-chain gettxout(...,false) input value minus exact signed same-script output
+Immediate acknowledgment rule: exact RPC return is durably published before every post-call RPC read
+Unknown response rule: authority consumed permanently; never blind retry
+Reconcile rule: read-only wallet inventory + exact audited-anchor spender + exact signed-byte proof
+Transaction identity: immutable txid/raw bytes/input/output/proof/fee separated from confirmations/blockhash
+Confirmation rule: exact wallet bytes re-proved; active header required
+Payout rule: one exact credited synthetic QQP2 payout record for the queued script and claim txid
+Queue outcome rule: atomic queued/uncertain -> broadcast -> confirmed renames
+Awarded ledger rule: exact before/after bytes and atomic same-owner/mode/group replacement
+Crash rule: resume safely after intent, persistence, response, queue rename, awarded replace, confirmed rename, or receipt/sidecar publication
+Receipt rule: canonical owner-only no-clobber JSON plus SHA256 sidecar; exact publisher hard-link healing only
+Resume rule: revalidate complete receipt/authority chain, exact wallet selection, pause artifacts, and durable queue/ledger state
+Installed API limitation: no plan/idempotency token, exact-input selector, caller total-fee cap, or separate sign/commit phase
+Live financial authority in repository: false
+Deployable public-release authority: false
+
+Hostile suite result: PASS: 149 hostile node30 Free-Claim one-shot assertions
+Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-20260814.out
+Hostile suite log SHA256: 26ab07658bb463db5c3af6c0280a6921f9499c5d363f29ab17797eea49826ed7
+Tool SHA256: e084a515d18f19db1a3840c543153dc26f5c506ff3fc54a1dfb659d0c0e50090
+Test transport SHA256: c1987a9646d5a9f375f7e982f59ef9c29b1f1434d4990c4005ab9e9454bebc9e
+Test driver SHA256: 5a2f4e42ce71482785b05db9cacaaaea79317d41d0e15c04335653c9de550f37
+Package tree SHA256 manifest: SHA256SUMS
+Git commit/tree/signature: populated by signed source-control receipt

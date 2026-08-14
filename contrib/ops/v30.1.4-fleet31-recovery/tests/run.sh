@@ -108,6 +108,10 @@ assert_jq '.result == "READY_FOR_PHASE_A_AUTHORITY" and .node30_excluded == true
   .node_set == ([range(1;30),31,32]) and (.nodes|length)==31 and
   all(.nodes[]; .status == "ready" and .component.fee == "0.00019100" and
     .plan.actionable_components == 1 and .plan.actions[0].status == "ready")' "$HAPPY/run/audit.json"
+if grep -Fq -- '-rpcwallet=' "$HAPPY/state/transport.log"; then
+    fail 'unnamed-wallet audit passed an explicit empty wallet selector'
+fi
+ok
 assert_eq "$(stat -f '%Lp' "$HAPPY/run/audit.json" 2>/dev/null || stat -c '%a' "$HAPPY/run/audit.json")" 600
 assert_eq "$(stat -f '%Lp' "$HAPPY/run/audit.json.sha256" 2>/dev/null || stat -c '%a' "$HAPPY/run/audit.json.sha256")" 600
 make_phase_a_authority "$HAPPY/run" "$HAPPY/phase-a-authority.json"

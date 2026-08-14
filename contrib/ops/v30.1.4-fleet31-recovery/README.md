@@ -12,6 +12,8 @@ container, Docker-transport, and lock identities.
 Compose services use the exact zero-padded topology labels `node01` through
 `node32`; node1's container remains `blackcoin-v4-gui` and other regular-node
 containers remain `blackcoin-v4-gui-N` as declared by the sealed manifest.
+For the sole unnamed wallet (`""`), the RPC transport omits `-rpcwallet`
+entirely; it emits `-rpcwallet=<name>` only for a nonempty manifest wallet.
 
 ## Commands
 

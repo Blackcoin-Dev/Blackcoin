@@ -256,6 +256,9 @@ def main() -> None:
         print(f"{DAEMON_SHA}  {args[4]}")
         return
     rest = args[3:]
+    if "-rpcwallet=" in rest:
+        print("fixture rejects an explicit empty wallet selector", file=sys.stderr)
+        raise SystemExit(18)
     while rest and rest[0].startswith("-"):
         rest = rest[1:]
     if not rest:

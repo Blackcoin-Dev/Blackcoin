@@ -42,7 +42,7 @@ EXPECTED_VSIZE = 191
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PRODUCTION_DOCKER = pathlib.Path("/usr/bin/docker")
 # Filled from the repository fixture after the fixture is finalized.
-TEST_TRANSPORT_SHA256 = "de0180917c9c436d68b7c7f85c4276ad6564c95c30ca444395b7b05d21a9bf56"
+TEST_TRANSPORT_SHA256 = "f37ba6e88791cb7067387ea20e60b95cee5718ebe9b083eaf75a51f71c729534"
 
 
 class GateError(RuntimeError):
@@ -392,7 +392,10 @@ class Transport:
         if method not in allowed:
             raise RpcError(node.node, method, "RPC method is not allowlisted")
         cli_args = ["exec", node.container, self.runtime.cli_path,
-                    f"-datadir={self.runtime.datadir}", f"-rpcwallet={node.wallet}", method]
+                    f"-datadir={self.runtime.datadir}"]
+        if node.wallet:
+            cli_args.append(f"-rpcwallet={node.wallet}")
+        cli_args.append(method)
         for param in params:
             if isinstance(param, (dict, list)):
                 cli_args.append(json.dumps(param, sort_keys=True, separators=(",", ":")))

@@ -43,6 +43,14 @@ USER_ORDERS = [
     "you need to expedite POW and POS mining online for all nodes NOW. remove safeguards if necessary we must start mining/staking ASAP on my order",
 ]
 PRODUCTION_ROOT = pathlib.Path("/mnt/pulsar/Blackcoin_Blocks/operations/free-claim-pool")
+PRODUCTION_PYTHON = pathlib.Path(
+    "/mnt/user/appdata/projectblackcoin-ops-runtime/"
+    "cpython-3.12.13-20260510/python/bin/python3.12")
+PRODUCTION_PYTHON_SHA256 = "202c17d1671602a4ef1d43e9b2fdbef0769443f37bf5e51f6b603e0b2c27d9d8"
+PRODUCTION_PYTHON_SIZE = 30_846_632
+PRODUCTION_ENVIRONMENT = {
+    "HOME": "/root", "PATH": "/usr/bin:/bin", "LC_ALL": "C", "TZ": "UTC",
+}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 QUEUE_NAME = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}[.]json$")
 P2PKH_SCRIPT = re.compile(r"^76a914[0-9a-f]{40}88ac$")
@@ -163,6 +171,37 @@ def test_mode() -> bool:
     return bool(os.environ.get("FLEET31_TEST_TRANSPORT"))
 
 
+def validate_controller_runtime() -> None:
+    """Bind live execution to the audited isolated host interpreter."""
+    executable = pathlib.Path(sys.executable)
+    try:
+        st = executable.lstat()
+    except FileNotFoundError:
+        die("audited controller interpreter is absent")
+    if (executable != PRODUCTION_PYTHON or executable.resolve(strict=True) != executable or
+            not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_nlink != 1 or
+            st.st_uid != 0 or st.st_gid != 0 or stat.S_IMODE(st.st_mode) != 0o700 or
+            st.st_size != PRODUCTION_PYTHON_SIZE or
+            sha256_file(executable) != PRODUCTION_PYTHON_SHA256):
+        die("live controller interpreter differs from the exact audited Python binary")
+    parent = executable.parent
+    while True:
+        parent_st = parent.lstat()
+        if (not stat.S_ISDIR(parent_st.st_mode) or stat.S_ISLNK(parent_st.st_mode) or
+                parent.resolve(strict=True) != parent or parent_st.st_uid != 0 or
+                parent_st.st_mode & 0o022):
+            die(f"controller interpreter parent is not root-controlled: {parent}")
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+    flags = sys.flags
+    if (sys.implementation.name != "cpython" or sys.version_info[:3] != (3, 12, 13) or
+            flags.isolated != 1 or flags.ignore_environment != 1 or
+            flags.no_user_site != 1 or getattr(flags, "safe_path", False) is not True or
+            dict(os.environ) != PRODUCTION_ENVIRONMENT):
+        die("live controller is not the exact isolated Python 3.12.13 environment")
+
+
 @dataclasses.dataclass(frozen=True)
 class Contract:
     raw: dict[str, Any]
@@ -176,18 +215,36 @@ class Contract:
     pool_group_gid: int
 
 
-def secure_dir(path: pathlib.Path, label: str) -> os.stat_result:
+def secure_dir(path: pathlib.Path, label: str, expected_mode: int,
+               expected_gid: int) -> os.stat_result:
     if not path.is_absolute():
         die(f"{label} path is not absolute")
     try:
         st = path.lstat()
     except FileNotFoundError:
         die(f"{label} is absent")
+    expected_uid = os.geteuid() if test_mode() else 0
     if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or
-            path.resolve(strict=True) != path or st.st_uid != os.geteuid() or
-            st.st_mode & 0o022):
-        die(f"{label} is not a canonical owner-controlled directory")
+            path.resolve(strict=True) != path or st.st_uid != expected_uid or
+            st.st_gid != expected_gid or stat.S_IMODE(st.st_mode) != expected_mode):
+        die(f"{label} is not the exact canonical owner/group/mode directory")
     return st
+
+
+def secure_parent_chain(path: pathlib.Path, label: str) -> None:
+    """Prove the manifest anchor's canonical root-controlled parent chain."""
+    expected_uid = os.geteuid() if test_mode() else 0
+    stop = path if test_mode() else pathlib.Path("/")
+    current = path
+    while True:
+        st = current.lstat()
+        if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or
+                current.resolve(strict=True) != current or st.st_uid != expected_uid or
+                st.st_mode & 0o022):
+            die(f"{label} parent chain is not canonical and root-controlled: {current}")
+        if current == stop:
+            break
+        current = current.parent
 
 
 def secure_state_file(path: pathlib.Path, label: str, modes: set[int]) -> tuple[bytes, os.stat_result]:
@@ -337,9 +394,13 @@ def queue_file_snapshot(path: pathlib.Path, contract: Contract, label: str,
 
 
 def audit_queue(contract: Contract) -> dict[str, Any]:
-    root_st = secure_dir(contract.root, "Free-Claim root")
-    queue_st = secure_dir(contract.queue_dir, "Free-Claim queue")
-    done_st = secure_dir(contract.done_dir, "Free-Claim done directory")
+    secure_parent_chain(contract.root.parent, "Free-Claim root")
+    root_st = secure_dir(contract.root, "Free-Claim root", 0o750,
+                         contract.pool_group_gid)
+    queue_st = secure_dir(contract.queue_dir, "Free-Claim queue", 0o770,
+                          contract.pool_group_gid)
+    done_st = secure_dir(contract.done_dir, "Free-Claim done directory", 0o750,
+                         contract.pool_group_gid)
     if queue_st.st_dev != done_st.st_dev:
         die("queue and done directories are not on one atomic-rename filesystem")
     entries = sorted(contract.queue_dir.iterdir(), key=lambda item: item.name)
@@ -362,12 +423,22 @@ def audit_queue(contract: Contract) -> dict[str, Any]:
     qaddr = item["record"]["quantum_address"]
     if qaddr in awarded["records"]:
         die("queued quantum payout is already in the awarded ledger")
+    for path, label, mode, prior in [
+            (contract.root, "Free-Claim root", 0o750, root_st),
+            (contract.queue_dir, "Free-Claim queue", 0o770, queue_st),
+            (contract.done_dir, "Free-Claim done directory", 0o750, done_st)]:
+        current = secure_dir(path, label, mode, contract.pool_group_gid)
+        if (current.st_dev != prior.st_dev or current.st_ino != prior.st_ino):
+            die(f"{label} changed while its state was audited")
     return {"root": {"path": str(contract.root), "device": root_st.st_dev,
-                     "inode": root_st.st_ino},
+                     "inode": root_st.st_ino, "uid": root_st.st_uid,
+                     "gid": root_st.st_gid, "mode": "0750"},
             "queue_directory": {"path": str(contract.queue_dir), "device": queue_st.st_dev,
-                                "inode": queue_st.st_ino},
+                                "inode": queue_st.st_ino, "uid": queue_st.st_uid,
+                                "gid": queue_st.st_gid, "mode": "0770"},
             "done_directory": {"path": str(contract.done_dir), "device": done_st.st_dev,
-                               "inode": done_st.st_ino},
+                               "inode": done_st.st_ino, "uid": done_st.st_uid,
+                               "gid": done_st.st_gid, "mode": "0750"},
             "item": item, "outcome_names": names,
             "existing_done_entries": [entry.name for entry in done_entries],
             "broadcast_marker_count": 0, "awarded": awarded}
@@ -1432,6 +1503,12 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     os.umask(0o077)
+    try:
+        if not test_mode():
+            validate_controller_runtime()
+    except (node30.base.GateError, node30.GateError, GateError, OSError) as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        return 1
     for name in ["PYTHONPATH", "PYTHONHOME", "BASH_ENV", "ENV", "CDPATH"]:
         os.environ.pop(name, None)
     args = parser().parse_args(argv)

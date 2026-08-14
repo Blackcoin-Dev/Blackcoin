@@ -14,6 +14,9 @@ Ordinary PoW: required disabled before, during, and after
 PoS: required active with positive weight
 Free-Claim pause: exact marker/wrapper/worker hashes required and preserved
 Recurring worker: never invoked or enabled
+Free-Claim directory owner/group: live uid 0 and exact manifest pool_group_gid=100
+Free-Claim directory modes: root 0750; ingress queue 0770; done 0750
+Directory security: canonical nonsymlink exact modes/gid/inodes; parent chain not group/other writable; special bits and path substitution rejected
 Queue prerequisite: exactly one canonical queued JSON; zero broadcast markers
 Payout prerequisite: exact direct witness-v16 script, not already awarded
 Work prerequisite: exact active unbound PoW-mode QQP2 for the queued payout
@@ -39,15 +42,21 @@ Awarded ledger rule: exact before/after bytes and atomic same-owner/mode/group r
 Crash rule: resume safely after intent, persistence, response, queue rename, awarded replace, confirmed rename, or receipt/sidecar publication
 Receipt rule: canonical owner-only no-clobber JSON plus SHA256 sidecar; exact publisher hard-link healing only
 Resume rule: revalidate complete receipt/authority chain, exact wallet selection, pause artifacts, and durable queue/ledger state
+Controller realpath: /mnt/user/appdata/projectblackcoin-ops-runtime/cpython-3.12.13-20260510/python/bin/python3.12
+Controller identity: CPython 3.12.13, root:root, mode0700, nlink1, size30846632
+Controller SHA256: 202c17d1671602a4ef1d43e9b2fdbef0769443f37bf5e51f6b603e0b2c27d9d8
+Controller invocation: /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LC_ALL=C TZ=UTC <realpath> -I TOOL ...
+Controller flags: isolated=1, ignore_environment=1, no_user_site=1, safe_path=true
+Controller symlink/direct-shebang/nonisolated invocation: rejected before manifest, Docker, or RPC access
 Installed API limitation: no plan/idempotency token, exact-input selector, caller total-fee cap, or separate sign/commit phase
 Live financial authority in repository: false
 Deployable public-release authority: false
 
-Hostile suite result: PASS: 149 hostile node30 Free-Claim one-shot assertions
-Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-20260814.out
-Hostile suite log SHA256: 26ab07658bb463db5c3af6c0280a6921f9499c5d363f29ab17797eea49826ed7
-Tool SHA256: e084a515d18f19db1a3840c543153dc26f5c506ff3fc54a1dfb659d0c0e50090
+Hostile suite result: PASS: 166 hostile node30 Free-Claim one-shot assertions
+Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-directory-contract-20260814.out
+Hostile suite log SHA256: 9de7ce994ccab5bada384ef86451a8c12de35ba6678ae31d21cb8d415ab33ccb
+Tool SHA256: 8bf23e54a5854da19977c9281834370660acc8191974ce9d4d63d6dd0e43ae4b
 Test transport SHA256: c1987a9646d5a9f375f7e982f59ef9c29b1f1434d4990c4005ab9e9454bebc9e
-Test driver SHA256: 5a2f4e42ce71482785b05db9cacaaaea79317d41d0e15c04335653c9de550f37
+Test driver SHA256: fdbc249f7cf7e6c800f8c0c839ebae9e9376bc9b4e4edfa53fef533660988c34
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

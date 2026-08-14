@@ -44,5 +44,5 @@
   "queue_dir": "/mnt/pulsar/Blackcoin_Blocks/operations/free-claim-pool/queue",
   "done_dir": "/mnt/pulsar/Blackcoin_Blocks/operations/free-claim-pool/done",
   "awarded_file": "/mnt/pulsar/Blackcoin_Blocks/operations/free-claim-pool/awarded.txt",
-  "pool_group_gid": 0
+  "pool_group_gid": 100
 }

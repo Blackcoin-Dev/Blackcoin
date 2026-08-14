@@ -26,6 +26,12 @@ wallet secret, or executable financial authority is checked in.
 - ordinary PoW disabled with zero hashrate;
 - zero ambiguous or blocking retained-claim recovery state;
 - the exact pause marker, pause wrapper, and preserved original worker hashes;
+- the canonical root-owned, manifest-group-owned Free-Claim root at mode 0750,
+  ingress queue at mode 0770, and done directory at mode 0750; the queue's
+  group-write bit is the intentional API ingress contract, while every other
+  mode, group, special bit, symlink, or substituted inode is rejected; the
+  manifest root's parent chain must remain owner-root and neither group- nor
+  other-writable;
 - exactly one canonical queue JSON, no broadcast marker, and a queued payout
   absent from the awarded ledger;
 - a valid direct witness-v16 quantum payout script;
@@ -125,11 +131,45 @@ risk expressly. Requiring Core-enforced idempotency, exact-input selection, or
 a hard caller fee cap remains a public-product requirement, not a fleet
 workaround.
 
+## Controller runtime
+
+The live host has no `/usr/bin/python3`. Never execute this tool through its
+portable test shebang. Live commands are accepted only under the audited real
+interpreter:
+
+```text
+/mnt/user/appdata/projectblackcoin-ops-runtime/cpython-3.12.13-20260510/python/bin/python3.12
+```
+
+That file must be root:root, mode 0700, single-link, size 30,846,632 bytes,
+and SHA256
+`202c17d1671602a4ef1d43e9b2fdbef0769443f37bf5e51f6b603e0b2c27d9d8`.
+It must report CPython 3.12.13. The interpreter and every parent are required
+to be canonical, nonsymlink, root-controlled, and not group- or other-writable.
+The convenience `python3` symlink is not accepted. The tool validates this
+identity itself before parsing a live command.
+
+Invoke the real binary under the exact isolated environment and `-I`:
+
+```bash
+sudo /usr/bin/env -i \
+  HOME=/root PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+  /mnt/user/appdata/projectblackcoin-ops-runtime/cpython-3.12.13-20260510/python/bin/python3.12 \
+  -I "$TOOL" <command-and-arguments>
+```
+
+The tool requires `isolated=1`, `ignore_environment=1`, `no_user_site=1`,
+`safe_path=true`, and exactly those four environment variables. A different
+interpreter, the symlink, an unsafe parent, a different mode/owner/group/size,
+an added environment variable, or a non-isolated invocation fails before any
+manifest, Docker, or RPC operation.
+
 ## Operator sequence
 
 1. Create a fresh owner-only run directory and a completed mode-0600 runtime
    manifest from `RUNTIME-MANIFEST.example.json`.
-2. Run `audit` once and independently inspect `audit.json` and its sidecar.
+2. Use only the exact controller invocation above to run `audit` once, then
+   independently inspect `audit.json` and its sidecar.
 3. Create the separate mode-0600 authority exactly as described above. This
    repository contains no live authority.
 4. Run `execute` once. If it does not return an exact completion, never run it
@@ -139,8 +179,9 @@ workaround.
 6. Preserve the complete run directory and its sidecars as the financial and
    operational receipt chain.
 
-Every command requires the exact runtime manifest/receipt chain and authority
-SHA256. Live use requires root and the production Free-Claim root. The
+Every command requires the exact controller, runtime manifest/receipt chain,
+and authority SHA256. Live use requires root and the production Free-Claim
+root. The
 hash-pinned mock transport is accepted only for nonroot offline tests and can
 never substitute for `/usr/bin/docker` in live mode.
 
@@ -149,11 +190,13 @@ never substitute for `/usr/bin/docker` in live mode.
 Run `tests/run.sh` as a nonroot user. The stateful fixture contacts no Docker
 daemon, SSH host, wallet, chain, or network. It tests the exact call and
 parameters; authority, fee, queue, witness, QQP2, runtime, wallet, role, pause,
-and lock gates; independent signed-byte fee proof; immediate acknowledgment
+lock, exact directory identity/mode/group, and controller-runtime gates;
+independent signed-byte fee proof; immediate acknowledgment
 ordering; response corruption and overprecision; process death before and
 after wallet persistence and after response publication; no-retry
 reconciliation; queue, awarded-ledger, confirmed, JSON, sidecar, and publisher
-hard-link crash windows; symlink rejection; confirmed-byte reproof; active
+hard-link crash windows; directory/receipt/authority symlink and path-swap
+rejection; special-bit/world-write rejection; confirmed-byte reproof; active
 header proof; and exact synthetic payout completion.
 
 This package is offline tooling only. A signed commit is not live financial

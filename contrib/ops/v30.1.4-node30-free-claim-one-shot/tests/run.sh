@@ -56,6 +56,8 @@ make_fixture()
     gid=$(id -g)
     mkdir -m 0700 "$root" "$root/state" "$root/free-claim" "$root/free-claim/queue" \
         "$root/free-claim/done" "$root/locks"
+    chmod 0750 "$root/free-claim" "$root/free-claim/done"
+    chmod 0770 "$root/free-claim/queue"
     printf '%s\n' 'schema=1 state=paused authority=v30.1.4-fleet-transaction' \
         >"$root/free-claim/.v30.1.4-free-claim-paused"
     printf '%s\n' '#!/bin/sh' 'exit 0' >"$root/free-claim/pool_daemon.sh"
@@ -148,6 +150,19 @@ assert_fails 'tool contains no wallet unlock RPC call' \
     grep -Eq 'rpc\([^\n]*"walletpassphrase"' "$TOOL"
 assert_fails 'tool contains no recovery transaction RPC call' \
     grep -Eq 'rpc\([^\n]*"(resolveallshadowpowclaims|sendrawtransaction|abandontransaction)"' "$TOOL"
+assert_fails 'direct unisolated controller interpreter is rejected' \
+    env -i HOME=/root PATH=/usr/bin:/bin LC_ALL=C TZ=UTC "$TOOL" --help
+assert_eq "$(python3 - "$TOOL" <<'PY'
+import ast,sys
+t=ast.parse(open(sys.argv[1]).read())
+values={}
+for n in t.body:
+    if isinstance(n,ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0],ast.Name):
+        if n.targets[0].id in {'PRODUCTION_PYTHON_SHA256','PRODUCTION_PYTHON_SIZE'}:
+            values[n.targets[0].id]=ast.literal_eval(n.value)
+print(f"{values['PRODUCTION_PYTHON_SHA256']}:{values['PRODUCTION_PYTHON_SIZE']}")
+PY
+)" '202c17d1671602a4ef1d43e9b2fdbef0769443f37bf5e51f6b603e0b2c27d9d8:30846632'
 
 HAPPY=$(make_fixture happy)
 AUDIT_SHA=$(run_audit "$HAPPY")
@@ -155,6 +170,8 @@ assert_jq '.result=="READY_FOR_SEPARATE_ONE_SHOT_AUTHORITY" and
   .mutation_performed==false and .snapshot.queue.broadcast_marker_count==0 and
   .snapshot.payout.witness_version==16 and .snapshot.work.proof_version==2 and
   .snapshot.role.ordinary_pow.enabled==false and .snapshot.role.pos.staking==true and
+  .snapshot.queue.root.mode=="0750" and .snapshot.queue.queue_directory.mode=="0770" and
+  .snapshot.queue.done_directory.mode=="0750" and
   .required_authority.proof_override==null and .required_authority.maximum_fee_blk=="0.00028700"' \
   "$HAPPY/run/audit.json"
 assert_eq "$(grep -c sendshadowpowclaim "$HAPPY/state/transport.log" || true)" 0
@@ -342,6 +359,57 @@ SYMLINK=$(make_fixture queue-symlink)
 mv "$SYMLINK/free-claim/queue/20260814T030000Z-deadbeef.json" "$SYMLINK/item"
 ln -s "$SYMLINK/item" "$SYMLINK/free-claim/queue/20260814T030000Z-deadbeef.json"
 assert_fails 'audit rejects symlink queue item' run_audit "$SYMLINK" happy
+
+# The live Free-Claim API has an exact root:pool-group directory contract:
+# root 0750, group-writable ingress queue 0770, and done 0750. No broader
+# group/world/special-bit or path-substitution state is accepted.
+WRONG_GID=$(make_fixture directory-wrong-gid)
+jq '.pool_group_gid += 1' "$WRONG_GID/runtime.json" >"$WRONG_GID/runtime.next"
+mv "$WRONG_GID/runtime.next" "$WRONG_GID/runtime.json"
+chmod 0600 "$WRONG_GID/runtime.json"
+assert_fails 'audit rejects manifest/directory group mismatch' run_audit "$WRONG_GID" happy
+
+for name_path_mode in \
+  'root-narrow:free-claim:0700' \
+  'root-world-write:free-claim:0752' \
+  'queue-narrow:free-claim/queue:0750' \
+  'queue-world-write:free-claim/queue:0777' \
+  'queue-sticky:free-claim/queue:1770' \
+  'queue-setgid:free-claim/queue:2770' \
+  'queue-setuid:free-claim/queue:4770' \
+  'done-group-write:free-claim/done:0770' \
+  'done-world-write:free-claim/done:0752'; do
+    IFS=: read -r case_name relative mode <<<"$name_path_mode"
+    DIR_CASE=$(make_fixture "directory-$case_name")
+    chmod "$mode" "$DIR_CASE/$relative"
+    assert_fails "audit rejects directory mode $case_name" run_audit "$DIR_CASE" happy
+done
+
+PARENT_WORLD=$(make_fixture directory-parent-world)
+chmod 0702 "$PARENT_WORLD"
+assert_fails 'audit rejects world-writable manifest anchor parent' \
+  run_audit "$PARENT_WORLD" happy
+
+PARENT_GROUP=$(make_fixture directory-parent-group)
+chmod 0720 "$PARENT_GROUP"
+assert_fails 'audit rejects group-writable manifest anchor parent' \
+  run_audit "$PARENT_GROUP" happy
+
+DIR_SYMLINK=$(make_fixture directory-symlink)
+mv "$DIR_SYMLINK/free-claim/queue" "$DIR_SYMLINK/free-claim/queue.real"
+ln -s "$DIR_SYMLINK/free-claim/queue.real" "$DIR_SYMLINK/free-claim/queue"
+assert_fails 'audit rejects symlink ingress directory' run_audit "$DIR_SYMLINK" happy
+
+DIR_SWAP=$(make_fixture directory-path-swap)
+run_audit "$DIR_SWAP" >/dev/null
+mv "$DIR_SWAP/free-claim/queue" "$DIR_SWAP/free-claim/queue.old"
+mkdir -m 0770 "$DIR_SWAP/free-claim/queue"
+cp "$DIR_SWAP/free-claim/queue.old/20260814T030000Z-deadbeef.json" \
+  "$DIR_SWAP/free-claim/queue/20260814T030000Z-deadbeef.json"
+chmod 0644 "$DIR_SWAP/free-claim/queue/20260814T030000Z-deadbeef.json"
+assert_fails 'directory inode substitution invalidates audited authority' \
+  invoke "$DIR_SWAP" happy execute
+assert_eq "$(grep -c sendshadowpowclaim "$DIR_SWAP/state/transport.log" || true)" 0
 
 # Authority tampering and stale state fail before the sole RPC.
 AUTH=$(make_fixture authority)

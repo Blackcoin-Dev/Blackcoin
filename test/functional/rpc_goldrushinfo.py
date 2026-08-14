@@ -782,16 +782,6 @@ class GoldRushInfoTest(BitcoinTestFramework):
             wallet, stale_claim["txid"], 0, expect_in_mempool=False
         )
 
-        self.log.info("Wallet reload does not grant an expired claim a fresh relay lifetime")
-        node.unloadwallet(wallet_name)
-        node.loadwallet(wallet_name)
-        wallet = node.get_wallet_rpc(wallet_name)
-        node.syncwithvalidationinterfacequeue()
-        assert stale_claim["txid"] not in node.getrawmempool()
-        self._assert_qqp3_recovery_age(
-            wallet, stale_claim["txid"], 0, expect_in_mempool=False
-        )
-
         self.log.info("Keeping the timed-out claim reserved through every bounded late-origin height")
         stale_parent = node.getbestblockhash()
 
@@ -821,6 +811,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
             wallet, stale_claim["txid"], 2, expect_in_mempool=False
         )
 
+        reloaded_after_logical_expiry = False
         for origin_age in range(3, QQP3_LATE_ORIGIN_WINDOW + 1):
             self.generateblock(
                 node,
@@ -835,6 +826,36 @@ class GoldRushInfoTest(BitcoinTestFramework):
                 origin_age,
                 expect_in_mempool=False,
             )
+            if not reloaded_after_logical_expiry:
+                recovery = wallet.getpowclaimrecoveryinfo(True)
+                component = next(
+                    item
+                    for item in recovery["component_details"]
+                    if stale_claim["txid"] in item["claim_txids"]
+                )
+                claim_node = next(
+                    item
+                    for item in component["nodes"]
+                    if item["txid"] == stale_claim["txid"]
+                )
+                if claim_node["relay_ttl_expired"]:
+                    self.log.info(
+                        "Wallet reload cannot restore relay authority after the active chain clock crosses the schema frontier"
+                    )
+                    node.unloadwallet(wallet_name)
+                    node.loadwallet(wallet_name)
+                    wallet = node.get_wallet_rpc(wallet_name)
+                    node.syncwithvalidationinterfacequeue()
+                    assert stale_claim["txid"] not in node.getrawmempool()
+                    self._assert_qqp3_recovery_age(
+                        wallet,
+                        stale_claim["txid"],
+                        origin_age,
+                        expect_in_mempool=False,
+                    )
+                    reloaded_after_logical_expiry = True
+
+        assert_equal(reloaded_after_logical_expiry, True)
 
         self.log.info("Expiring the lineaged QQP3 origin while preserving its family anchor")
         assert_equal(

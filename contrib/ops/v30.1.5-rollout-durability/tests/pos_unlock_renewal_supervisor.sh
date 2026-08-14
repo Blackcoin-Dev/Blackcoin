@@ -65,7 +65,7 @@ make_state_manifests()
       "$root/runtime-identity-manifests"
     for node in $(seq 1 32); do
         printf -v padded '%02d' "$node"
-        wallet="wallet-$padded"
+        if [[ "$node" -eq 30 ]]; then wallet=''; else wallet="wallet-$padded"; fi
         jq -cn --arg wallet "$wallet" '[$wallet]' \
           >"$root/runtime-wallet-manifests/node-$padded.json"
         jq -cn --arg node "$padded" --arg wallet "$wallet" --arg h "$hex_a" '{
@@ -252,8 +252,10 @@ expect_pass 'all exact runtime wallet and identity manifest bytes verify' \
   renewal_verify_manifest_bytes "$authority" "$state" "$uid"
 for node in $(seq 1 32); do
     printf -v padded '%02d' "$node"
+    wallet="wallet-$padded"
+    [[ "$node" -eq 30 ]] && wallet=''
     expect_pass "node $padded manifests bind the one loaded wallet" \
-      renewal_verify_node_manifests "$authority" "$state" "$node" "wallet-$padded" "$uid"
+      renewal_verify_node_manifests "$authority" "$state" "$node" "$wallet" "$uid"
 done
 expect_fail 'manifest contract rejects a different live wallet identity' \
   renewal_verify_node_manifests "$authority" "$state" 1 'other-wallet' "$uid"
@@ -360,6 +362,34 @@ else
     not_ok 'named-wallet unlock argv contains exactly one rpcwallet option'
 fi
 
+declare -a RENEWAL_CAPTURE_ARGS=()
+# shellcheck disable=SC2329 # Invoked indirectly through renewal_wallet_rpc.
+renewal_docker() { RENEWAL_CAPTURE_ARGS=("$@"); }
+renewal_capture_matches()
+{
+    [[ "${#RENEWAL_CAPTURE_ARGS[@]}" -eq "$#" ]] || return 1
+    [[ "$(printf '%s\n' "${RENEWAL_CAPTURE_ARGS[@]}")" == "$(printf '%s\n' "$@")" ]]
+}
+renewal_wallet_rpc blackcoin-v4-gui-30 '' getwalletinfo
+expect_pass 'supervisor node30 unnamed-wallet census omits the empty selector entirely' \
+  renewal_capture_matches exec blackcoin-v4-gui-30 \
+    /usr/local/bin/blackcoin-cli -datadir=/home/blackcoin/.blackcoin getwalletinfo
+if ! printf '%s\n' "${RENEWAL_CAPTURE_ARGS[@]}" | grep -q '^-rpcwallet='; then
+    ok 'supervisor unnamed-wallet argv contains no rpcwallet option'
+else
+    not_ok 'supervisor unnamed-wallet argv contains no rpcwallet option'
+fi
+renewal_wallet_rpc blackcoin-v4-gui-30 "$named_wallet" getstakinginfo
+expect_pass 'supervisor named-wallet census retains one exact selector argv element' \
+  renewal_capture_matches exec blackcoin-v4-gui-30 \
+    /usr/local/bin/blackcoin-cli -datadir=/home/blackcoin/.blackcoin \
+    '-rpcwallet=named wallet with spaces' getstakinginfo
+if [[ "$(printf '%s\n' "${RENEWAL_CAPTURE_ARGS[@]}" | grep -c '^-rpcwallet=')" -eq 1 ]]; then
+    ok 'supervisor named-wallet argv contains exactly one rpcwallet option'
+else
+    not_ok 'supervisor named-wallet argv contains exactly one rpcwallet option'
+fi
+
 if ! grep -Eiq '\b(setpowmining|getpowmininginfo|setpowminingaddress|sendrawtransaction|sendtoaddress|sendmany|createshadowpowclaimresolution|commitshadowpowclaimresolution|setpowclaimrecovery|resolveshadowpowclaims|abandontransaction|bumpfee)\b' \
   "$normal_unlock_helper"; then
     ok 'normal-unlock helper contains no PoW, claim-recovery, relay, or payment action'
@@ -435,7 +465,7 @@ mock_node_for_container()
 }
 renewal_docker()
 {
-    local command=$1 container=$2 node method tip counter calls=0
+    local command=$1 container=$2 node method tip counter wallet calls=0
     shift 2
     node=$(mock_node_for_container "$container") || return 1
     if [[ "$command" == inspect ]]; then
@@ -447,6 +477,9 @@ renewal_docker()
         return
     fi
     [[ "$command" == exec ]] || return 1
+    if [[ "$node" -eq 30 ]] && printf '%s\n' "$@" | grep -Fxq -- '-rpcwallet='; then
+        return 1
+    fi
     method=${!#}
     case "$method" in
         getblockchaininfo)
@@ -471,13 +504,17 @@ renewal_docker()
             printf -v padded '%02d' "$node"
             if [[ "$node" -eq "$MOCK_TWO_WALLETS_NODE" ]]; then
                 jq -cn --arg wallet "wallet-$padded" '[$wallet,"extra"]'
+            elif [[ "$node" -eq 30 ]]; then
+                printf '[""]\n'
             else
                 jq -cn --arg wallet "wallet-$padded" '[$wallet]'
             fi
             ;;
         getwalletinfo)
             printf -v padded '%02d' "$node"
-            jq -cn --arg wallet "wallet-$padded" --argjson unlock "$((test_now + 50000))" '{
+            wallet="wallet-$padded"
+            [[ "$node" -eq 30 ]] && wallet=''
+            jq -cn --arg wallet "$wallet" --argjson unlock "$((test_now + 50000))" '{
               walletname:$wallet,private_keys_enabled:true,scanning:false,
               unlocked_until:$unlock,unlocked_staking_only:false}'
             ;;

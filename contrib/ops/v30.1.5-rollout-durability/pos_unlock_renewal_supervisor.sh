@@ -540,9 +540,10 @@ renewal_rpc()
 renewal_wallet_rpc()
 {
     local container=$1 wallet=$2
+    local -a rpc_args=(-datadir="$DATADIR")
     shift 2
-    renewal_docker exec "$container" "$CLI" -datadir="$DATADIR" \
-      "-rpcwallet=$wallet" "$@"
+    [[ -z "$wallet" ]] || rpc_args+=("-rpcwallet=$wallet")
+    renewal_docker exec "$container" "$CLI" "${rpc_args[@]}" "$@"
 }
 
 renewal_capture_node()

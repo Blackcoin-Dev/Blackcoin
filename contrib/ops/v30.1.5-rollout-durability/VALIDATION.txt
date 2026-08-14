@@ -43,7 +43,8 @@ PoS renewal invariants:
   - invokes only installed normal-unlock helper SHA256
     aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7
   - helper accepts every canonical integer node 1 through 32, including node30
-  - unnamed-wallet RPCs omit -rpcwallet; named wallets retain one exact selector
+  - helper and supervisor unnamed-wallet RPCs omit -rpcwallet; named wallets
+    retain one exact selector
   - the passphrase is stdin-only and never enters argv, source, or test output
   - helper contains no PoW, claim-recovery, relay, payment, key, or address action
   - audit/plan/install/run modes remain fail-closed without exact authority
@@ -93,8 +94,8 @@ Current-byte offline checks (2026-08-14 UTC):
   shellcheck -x on every .sh and the standalone .sh.inc: PASS
   complete aggregate suite including both dedicated suites: 609/609 PASS
     log SHA256 8e5852c70b66b9b61d181d57450197183e08b6775d8ee63cc7664898abd5be5c
-  focused PoS/helper hostile suite: 237/237 PASS
-    log SHA256 ca59cbae798fc6b689c4a20707d68202488cbb772c268c8df546eead3093b52c
+  focused PoS/helper hostile suite: 241/241 PASS
+    log SHA256 89f0851228560632f9ba4d2988b4ed725b3bf0733afe99bc3d793ddf19fe1892
   focused node30 audit/release-gate hostile suite: 151/151 PASS
     log SHA256 e1c468f202fcafac0510e285adfa8f1ebb1b4f552c9fe70c5529f9960771001c
   separate node27 sign-only/observation suite: 208/208 PASS

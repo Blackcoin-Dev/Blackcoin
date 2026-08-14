@@ -378,6 +378,8 @@ renewing normal wallet unlock through the corrected, package-local helper
 The helper accepts each canonical integer node 1 through 32. Its wallet-RPC
 argv builder omits `-rpcwallet` for the unnamed wallet and preserves one exact
 selector argument for a nonempty wallet name. The passphrase remains stdin-only.
+The supervisor's independent read-only census uses the same selector rule, so
+node30's unnamed wallet is observed without emitting the invalid empty selector.
 The helper contains no ordinary-PoW, claim-recovery, relay, payment, key, or
 address action. It may only perform normal wallet unlock and explicitly retain
 PoS intent, followed by read-only wallet/staking convergence checks.

@@ -150,6 +150,14 @@ class FakeRuntime:
                 "stderr_sha256": "e" * 64}
 
 
+class PreflightFailureRuntime:
+    def capture(self, node):
+        raise ROTATION.RotationError(f"injected preflight failure at node {node}")
+
+    def invoke_helper(self, node):
+        raise AssertionError(f"helper unexpectedly invoked at node {node}")
+
+
 class DummyLocks:
     def __init__(self, log=None, label="fleet"):
         self.handles = [1]
@@ -410,6 +418,27 @@ def test_transaction_success_and_rollback():
             ok(not runtime.invoked, "mid-apply failure invokes no wallet helper")
             failure = json.loads((run_dir / "FAILURE.json").read_text())
             ok(failure["status"] == "ROLLED_BACK", "mid-apply failure has a rolled-back receipt")
+
+    with synthetic_identities() as (old_helper, new_helper, old_supervisor, _new_supervisor):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            helper, supervisor, _history = fixture(base / "state", old_helper, old_supervisor)
+            plan = ROTATION.scan_plan(base / "state", helper, UID)
+            run_dir = base / "run"
+            run_dir.mkdir(mode=0o700)
+            payload = write_secure(base / "payload", new_helper)
+            rejects(lambda: ROTATION.execute_transaction(
+                plan, PreflightFailureRuntime(), run_dir, DummyLocks([]),
+                lambda paths: DummyLocks([], str(paths[0])), {"authority_sha256": "1" * 64},
+                payload, UID, now_function=lambda: 100000,
+            ), "preflight failure aborts before mutation")
+            preflight_failure = json.loads((run_dir / "FAILURE.json").read_text())
+            ok(preflight_failure["changed_paths"] == [] and preflight_failure["status"] == "FAILED",
+               "preflight failure receipt proves zero changed paths")
+            ok(preflight_failure["historical_job10_unchanged"] is True,
+               "preflight failure truthfully preserves historical evidence")
+            ok(not (run_dir / "BACKUP-MANIFEST.json").exists(),
+               "preflight failure requires no nonexistent backup manifest")
 
 
 def test_lockset_and_file_security():

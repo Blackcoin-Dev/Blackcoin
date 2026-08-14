@@ -17,9 +17,9 @@ Exact byte contracts:
 Focused hostile suite:
 - Command: python3 contrib/ops/v30.1.4-normal-unlock-helper-rotation/tests/run.py
 - Exit: 0
-- Result: PASS: 120 offline helper-rotation assertions
+- Result: PASS: 124 offline helper-rotation assertions
 - Log: /private/tmp/normal-unlock-helper-rotation-20260814.out
-- Log SHA256: 8555884a83c5ae8f52877d046266d02649eab4f10dceadb539cf6116275209e7
+- Log SHA256: 929338e097efe79e2fd36d655400d539b093ff75ef329a06a56da422a53e96c8
 - Coverage: nodes 1..32; node30 first; unnamed and named wallet argv; exact supervisor transform;
   historical job10 immutability; exact owner-only authority and drift rejection; canonical lock
   contention; successful terminal cut; node30 failure stop/rollback; mid-apply rollback; secure
@@ -33,8 +33,8 @@ Static validation (all exit 0):
 - git diff --check
 
 Source SHA256 at validation:
-- helper_rotation.py da4a989ba93bd07272bde2e25d44912e5f4b37a2e32d859e44c168d19097000e
-- tests/run.py d1f877c8da029179836d68145d729e6b8eb3304e5566d12a69ecfdcd69ff329c
+- helper_rotation.py 45887442da58e3b6b2a46738179c7e0184ed0ace3276a52ca952e023a7ad2fc6
+- tests/run.py ab8502670314d92153ce54a44ec739110ee22c903ec485e504d63948e9069b3a
 - AUTHORITY.schema.json b96a3daa275cf2ad387bd3e234e2d0bc93898e77fc41cce63637dd12026b5e24
 - README.md 4027b464157f4a65002cd144069010318153023916555dd8bb1c1ece1e7756cb
 

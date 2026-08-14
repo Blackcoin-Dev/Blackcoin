@@ -839,7 +839,8 @@ def execute_transaction(plan, runtime, run_dir, runtime_locks, lock_factory,
             "schema": SCHEMA, "kind": RESULT_KIND, "status": "ROLLED_BACK" if rollback["performed"] else "FAILED",
             "error": str(error), "changed_paths": changed,
             "helper_attempted_nodes": [row["node"] for row in attempts],
-            "rollback": rollback, "historical_job10_unchanged": rollback["performed"],
+            "rollback": rollback,
+            "historical_job10_unchanged": not changed or rollback["performed"],
             **bindings,
         }
         publish_json(run_dir / "FAILURE.json", failure, expected_uid, os.getgid())
@@ -983,9 +984,18 @@ def command_verify(arguments):
         if (run_dir / "RESULT.json").read_bytes() != (run_dir / "TERMINAL.json").read_bytes():
             raise RotationError("success terminal receipts disagree")
     if success or failure:
-        for required in ("AUTHORITY.json", "AUTHORITY-CONSUMED.json", "BACKUP-MANIFEST.json"):
+        for required in ("AUTHORITY.json", "AUTHORITY-CONSUMED.json"):
             if not (run_dir / required).exists():
                 raise RotationError(f"terminal run is missing {required}")
+    if success and not (run_dir / "BACKUP-MANIFEST.json").exists():
+        raise RotationError("successful run is missing BACKUP-MANIFEST.json")
+    if failure:
+        failure_receipt = load_json_file(run_dir / "FAILURE.json", os.geteuid())
+        changed_paths = failure_receipt.get("changed_paths")
+        if not isinstance(changed_paths, list):
+            raise RotationError("failure receipt changed_paths is invalid")
+        if changed_paths and not (run_dir / "BACKUP-MANIFEST.json").exists():
+            raise RotationError("mutating failure is missing BACKUP-MANIFEST.json")
     if (run_dir / "BACKUP-MANIFEST.json").exists():
         backup = load_json_file(run_dir / "BACKUP-MANIFEST.json", os.geteuid())
         if (backup.get("schema") != SCHEMA or backup.get("kind") != BACKUP_KIND or

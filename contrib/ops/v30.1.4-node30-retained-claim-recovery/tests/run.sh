@@ -227,8 +227,53 @@ export FLEET31_SCENARIO=empty-spent-gettxout
 MON_EMPTY=$(jq -r .receipt "$HAPPY/monitor-empty-gettxout.out")
 assert_jq '.result=="RETAINED_CLAIM_CLEARED_ROLE_PRESERVED" and
   .anchor_spent_on_active_chain==true and
-  (.confirmed_component_transactions|length)==1' "$HAPPY/run/$MON_EMPTY"
+  (.confirmed_component_transactions|length)==1 and
+  .receipt_compatibility.mode=="CURRENT_TOOL_RECEIPT_MONITOR"' "$HAPPY/run/$MON_EMPTY"
 assert_eq "$(grep -c 'commit_and_broadcast' "$HAPPY/state/transport.log")" 1
+
+# Monitor-only predecessor compatibility uses authentic 9b6ce9-generated
+# receipts and requires the exact owner-only 801ffe6 product-test receipt.
+PREDSRC="$FIX/predecessor-source"
+PREDPKG="$PREDSRC/contrib/ops/v30.1.4-node30-retained-claim-recovery"
+PREDBASE="$PREDSRC/contrib/ops/v30.1.4-fleet31-recovery"
+mkdir -p "$PREDPKG/tests" "$PREDBASE"
+/usr/bin/git -C "$ROOT/../../.." show 9b6ce967e581efcdeeeea1b8aee29c6146b9e9e5:contrib/ops/v30.1.4-node30-retained-claim-recovery/node30_recovery.py >"$PREDPKG/node30_recovery.py"
+/usr/bin/git -C "$ROOT/../../.." show 9b6ce967e581efcdeeeea1b8aee29c6146b9e9e5:contrib/ops/v30.1.4-node30-retained-claim-recovery/tests/mock_transport.py >"$PREDPKG/tests/mock_transport.py"
+/usr/bin/git -C "$ROOT/../../.." show 9b6ce967e581efcdeeeea1b8aee29c6146b9e9e5:contrib/ops/v30.1.4-fleet31-recovery/fleet31_recovery.py >"$PREDBASE/fleet31_recovery.py"
+chmod 0700 "$PREDPKG/node30_recovery.py" "$PREDPKG/tests/mock_transport.py"
+chmod 0600 "$PREDBASE/fleet31_recovery.py"
+assert_eq "$(shasum -a 256 "$PREDPKG/node30_recovery.py"|awk '{print $1}')" 55b79cde81f6d00ff105c454b6106026dcae794aa60ef55f0c3b27016c8c3cd1
+assert_eq "$(shasum -a 256 "$PREDPKG/tests/mock_transport.py"|awk '{print $1}')" bd9672a4518f9834011bbb80db4b28553be7d289bec110c939b314dcce7f91fc
+assert_eq "$(shasum -a 256 "$PREDBASE/fleet31_recovery.py"|awk '{print $1}')" b97f239569be4d9bb8bdb43163c3ef25fa9f7bba276d2ace835d93264e0ff518
+
+PRED="$FIX/predecessor-monitor"
+mkdir -m 0700 "$PRED" "$PRED/state"
+make_artifacts "$PRED"
+make_runtime "$PRED/runtime.json" "$PRED"
+export FLEET31_TEST_TRANSPORT="$PREDPKG/tests/mock_transport.py"
+export FLEET31_FIXTURE="$PRED/state" FLEET31_SCENARIO=happy
+"$PREDPKG/node30_recovery.py" audit --runtime-manifest "$PRED/runtime.json" --run-dir "$PRED/run" >/dev/null
+make_a_authority "$PRED/run" "$PRED/a.json"
+PRED_A_SHA=$(shasum -a 256 "$PRED/a.json"|awk '{print $1}')
+"$PREDPKG/node30_recovery.py" phase-a --run-dir "$PRED/run" --authority "$PRED/a.json" --authority-sha256 "$PRED_A_SHA" >/dev/null
+jq '.confirmed=true|.confirmed_tx="resolution"' "$PRED/state/node30.json" >"$PRED/state/node30.tmp" && mv "$PRED/state/node30.tmp" "$PRED/state/node30.json"
+
+export FLEET31_TEST_TRANSPORT="$MOCK" FLEET31_SCENARIO=empty-spent-gettxout
+/usr/bin/git -C "$ROOT/../../.." show 801ffe62929675725c1261c913683aa48ea2e4bd:contrib/ops/v30.1.4-node30-retained-claim-recovery/PRODUCT-TEST-RECEIPT.json >"$PRED/801ffe-product.json"
+chmod 0600 "$PRED/801ffe-product.json"
+assert_eq "$(shasum -a 256 "$PRED/801ffe-product.json"|awk '{print $1}')" 3dfe86f2eb0b539ab26655ed2edd12b74fceb7cf7c36a376926b7cf3ec7c7356
+assert_fails 'predecessor monitor without exact product receipt' "$TOOL" monitor --run-dir "$PRED/run"
+assert_fails 'predecessor monitor with wrong product receipt digest' "$TOOL" monitor --run-dir "$PRED/run" --predecessor-product-receipt "$PRED/801ffe-product.json" --predecessor-product-receipt-sha256 "$(printf '0%.0s' {1..64})"
+"$TOOL" monitor --run-dir "$PRED/run" --predecessor-product-receipt "$PRED/801ffe-product.json" --predecessor-product-receipt-sha256 3dfe86f2eb0b539ab26655ed2edd12b74fceb7cf7c36a376926b7cf3ec7c7356 >"$PRED/monitor.out"
+PRED_MON=$(jq -r .receipt "$PRED/monitor.out")
+assert_jq '.result=="RETAINED_CLAIM_CLEARED_ROLE_PRESERVED" and
+  .receipt_compatibility.mode=="READ_ONLY_EXACT_PREDECESSOR_RECEIPT_MONITOR" and
+  .receipt_compatibility.predecessor_receipt_identity.commit=="9b6ce967e581efcdeeeea1b8aee29c6146b9e9e5" and
+  .receipt_compatibility.compatibility_review_identity.commit=="801ffe62929675725c1261c913683aa48ea2e4bd" and
+  .receipt_compatibility.compatibility_review_identity.product_test_receipt_sha256=="3dfe86f2eb0b539ab26655ed2edd12b74fceb7cf7c36a376926b7cf3ec7c7356" and
+  .receipt_compatibility.mutation_authorized==false' "$PRED/run/$PRED_MON"
+assert_fails 'predecessor receipts on non-monitor command' "$TOOL" phase-b-preview --run-dir "$PRED/run"
+assert_eq "$(grep -c 'commit_and_broadcast' "$PRED/state/transport.log" || true)" 0
 
 # A pause artifact drift fails before Docker/CLI contact.
 DRIFT="$FIX/drift"; mkdir -m 0700 "$DRIFT" "$DRIFT/state"; make_artifacts "$DRIFT"; make_runtime "$DRIFT/runtime.json" "$DRIFT"

@@ -127,6 +127,22 @@ It never claims that mempool presence alone cleared the blocker and never
 releases or invokes the Free-Claim worker. An original-claim confirmation can
 clear the retained component without authorizing or broadcasting the recovery.
 
+Receipts created by signed predecessor commit `9b6ce967e581efcdeeeea1b8aee29c6146b9e9e5`
+carry tool SHA256
+`55b79cde81f6d00ff105c454b6106026dcae794aa60ef55f0c3b27016c8c3cd1`.
+They are accepted only by `monitor`, only as a uniform audit/Phase-A/intent
+chain, and only when the operator supplies an owner-only mode-0600 copy of the
+exact `801ffe62929675725c1261c913683aa48ea2e4bd` product-test receipt:
+
+```text
+--predecessor-product-receipt <absolute-path> \
+--predecessor-product-receipt-sha256 3dfe86f2eb0b539ab26655ed2edd12b74fceb7cf7c36a376926b7cf3ec7c7356
+```
+
+That compatibility evidence authorizes read-only monitoring only. Every
+phase, reconciliation, signing, relay, and broadcast path continues to require
+receipts created by the exact currently executing tool.
+
 ## Prohibited surfaces
 
 The executable contains no targeted recovery commit, generic transaction,
@@ -154,4 +170,7 @@ wallet inventory on resume, lost-response reconciliation ordering, exact-byte
 Phase B, publisher hard-link crash healing, hostile lock paths, unique decoded
 original-claim and resolution confirmation races, complete authority-chain
 tampering, the installed empty-stdout `gettxout` behavior, rejection of empty
-stdout from every other RPC, and active-chain clearance.
+stdout from every other RPC, authentic predecessor-receipt monitor
+compatibility, rejection of missing or mismatched compatibility evidence,
+rejection of predecessor receipts on phase commands, and active-chain
+clearance.

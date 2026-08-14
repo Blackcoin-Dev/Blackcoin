@@ -62,6 +62,15 @@ SAFE_RECEIPT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 BASE_RELATIVE = pathlib.Path("../v30.1.4-fleet31-recovery/fleet31_recovery.py")
 BASE_SHA256 = "b97f239569be4d9bb8bdb43163c3ef25fa9f7bba276d2ace835d93264e0ff518"
 TEST_TRANSPORT_SHA256 = "11eba8be3677397f5182990060628326fd7e0fabf6d262198994243b80437877"
+PREDECESSOR_MONITOR_COMMIT = "9b6ce967e581efcdeeeea1b8aee29c6146b9e9e5"
+PREDECESSOR_MONITOR_TREE = "35cd3133c2cfddac34e664ba2bb05c264b2df883"
+PREDECESSOR_MONITOR_TOOL_SHA256 = "55b79cde81f6d00ff105c454b6106026dcae794aa60ef55f0c3b27016c8c3cd1"
+COMPATIBILITY_REVIEW_COMMIT = "801ffe62929675725c1261c913683aa48ea2e4bd"
+COMPATIBILITY_REVIEW_TREE = "97010998bebd65773ea1144467b737099697ac23"
+COMPATIBILITY_REVIEW_TOOL_SHA256 = "41c4bbc7d0aa6a3e21715937abda13f9ece879cfb34c4517cf87a6dd3835f605"
+COMPATIBILITY_REVIEW_TEST_TRANSPORT_SHA256 = "11eba8be3677397f5182990060628326fd7e0fabf6d262198994243b80437877"
+COMPATIBILITY_REVIEW_TEST_DRIVER_SHA256 = "e3cff9db62e64293883bd7272753a3d390614c51a3fdc73712f3d16c6ef32249"
+COMPATIBILITY_PRODUCT_RECEIPT_SHA256 = "3dfe86f2eb0b539ab26655ed2edd12b74fceb7cf7c36a376926b7cf3ec7c7356"
 
 
 def _sha256_file(path: pathlib.Path) -> str:
@@ -655,12 +664,13 @@ def base_receipt(kind: str, contract: Contract) -> dict[str, Any]:
             "user_order_sha256": USER_ORDER_SHA256}
 
 
-def validate_common_receipt(receipt: Any, kind: str, contract: Contract) -> dict[str, Any]:
+def validate_common_receipt(receipt: Any, kind: str, contract: Contract,
+                            allow_predecessor_monitor: bool = False) -> dict[str, Any]:
     if not isinstance(receipt, dict):
         die(f"{kind} receipt is not an object")
     expected = {
         "schema": RECEIPT_SCHEMA, "contract": CONTRACT, "kind": kind,
-        "tool_sha256": tool_sha(), "shared_primitive_sha256": BASE_SHA256,
+        "shared_primitive_sha256": BASE_SHA256,
         "runtime_manifest_sha256": contract.sha256, "node": NODE, "role": "free_claim",
         "ordinary_pow_must_remain_disabled": True,
         "free_claim_pause_must_remain_present": True,
@@ -671,6 +681,10 @@ def validate_common_receipt(receipt: Any, kind: str, contract: Contract) -> dict
     for key, value in expected.items():
         if receipt.get(key) != value:
             die(f"{kind} receipt field {key} differs from the current exact contract")
+    receipt_tool = receipt.get("tool_sha256")
+    if receipt_tool != tool_sha() and not (
+            allow_predecessor_monitor and receipt_tool == PREDECESSOR_MONITOR_TOOL_SHA256):
+        die(f"{kind} receipt tool identity differs from the current exact contract")
     if receipt.get("installed_source") != {
             "commit": SOURCE_COMMIT, "tree": SOURCE_TREE,
             "signer_fingerprint": SOURCE_SIGNER}:
@@ -680,9 +694,11 @@ def validate_common_receipt(receipt: Any, kind: str, contract: Contract) -> dict
     return receipt
 
 
-def load_audit(run_dir: pathlib.Path, contract: Contract) -> tuple[dict[str, Any], str]:
+def load_audit(run_dir: pathlib.Path, contract: Contract,
+               allow_predecessor_monitor: bool = False) -> tuple[dict[str, Any], str]:
     audit, digest = load_run_receipt(run_dir, "audit.json")
-    validate_common_receipt(audit, "node30-retained-claim-recovery-audit", contract)
+    validate_common_receipt(audit, "node30-retained-claim-recovery-audit", contract,
+                            allow_predecessor_monitor)
     if (audit.get("result") != "READY_FOR_SEPARATE_PHASE_A_AUTHORITY" or
             audit.get("mutation_performed") is not False or
             not isinstance(audit.get("node_state"), dict)):
@@ -690,9 +706,11 @@ def load_audit(run_dir: pathlib.Path, contract: Contract) -> tuple[dict[str, Any
     return audit, digest
 
 
-def load_phase_a(run_dir: pathlib.Path, contract: Contract) -> tuple[dict[str, Any], str]:
+def load_phase_a(run_dir: pathlib.Path, contract: Contract,
+                 allow_predecessor_monitor: bool = False) -> tuple[dict[str, Any], str]:
     phase_a, digest = load_run_receipt(run_dir, "phase-a.json")
-    validate_common_receipt(phase_a, "node30-retained-claim-phase-a-complete", contract)
+    validate_common_receipt(phase_a, "node30-retained-claim-phase-a-complete", contract,
+                            allow_predecessor_monitor)
     row = phase_a.get("node_result")
     if (phase_a.get("result") != "SIGNED_WITHOUT_RELAY_AUTHORITY" or
             phase_a.get("relay_or_broadcast_authorized") is not False or
@@ -707,7 +725,9 @@ def load_phase_a(run_dir: pathlib.Path, contract: Contract) -> tuple[dict[str, A
         die("node30 Phase-A receipt is not the exact nonrelayable completion")
     for key in ["audit_receipt_sha256", "phase_a_authority_sha256", "node_result_sha256"]:
         require_hex64(phase_a.get(key), f"Phase-A receipt {key}")
-    _, audit_sha = load_audit(run_dir, contract)
+    audit, audit_sha = load_audit(run_dir, contract, allow_predecessor_monitor)
+    if phase_a.get("tool_sha256") != audit.get("tool_sha256"):
+        die("node30 audit and Phase-A receipt tool identities differ")
     if phase_a["audit_receipt_sha256"] != audit_sha:
         die("node30 Phase-A completion no longer binds the exact audit receipt")
     row_file, row_sha = load_run_receipt(run_dir, "phase-a-node30.json")
@@ -718,11 +738,56 @@ def load_phase_a(run_dir: pathlib.Path, contract: Contract) -> tuple[dict[str, A
             intent.get("contract") != CONTRACT or intent.get("kind") != "node30-phase-a-intent" or
             intent.get("action") != "sign_only" or intent.get("audit_sha256") != audit_sha or
             intent.get("authority_sha256") != phase_a["phase_a_authority_sha256"] or
-            intent.get("tool_sha256") != tool_sha() or
+            intent.get("tool_sha256") != phase_a.get("tool_sha256") or
             intent.get("runtime_manifest_sha256") != contract.sha256 or
             row.get("intent_sha256") != intent_sha):
         die("node30 Phase-A intent/authority/result chain changed")
     return phase_a, digest
+
+
+def predecessor_monitor_compatibility(args: argparse.Namespace) -> dict[str, Any]:
+    path_value = getattr(args, "predecessor_product_receipt", None)
+    digest_value = getattr(args, "predecessor_product_receipt_sha256", None)
+    if not isinstance(path_value, str) or not path_value:
+        die("predecessor monitor requires the exact 801ffe6 product-test receipt")
+    if digest_value != COMPATIBILITY_PRODUCT_RECEIPT_SHA256:
+        die("predecessor monitor product-test receipt SHA256 differs from 801ffe6")
+    receipt, digest = base.parse_secure_json(
+        pathlib.Path(path_value), "predecessor monitor product-test receipt", digest_value)
+    expected = {
+        "schema": RECEIPT_SCHEMA,
+        "kind": "node30-retained-claim-recovery-offline-product-test",
+        "status": "PASS", "contract": CONTRACT,
+        "live_contact": False, "wallet_mutation": False, "network_contact": False,
+        "tool_sha256": COMPATIBILITY_REVIEW_TOOL_SHA256,
+        "test_transport_sha256": COMPATIBILITY_REVIEW_TEST_TRANSPORT_SHA256,
+        "test_driver_sha256": COMPATIBILITY_REVIEW_TEST_DRIVER_SHA256,
+        "assertions": 125,
+        "result_line": "PASS: 125 hostile node30 retained-claim recovery assertions",
+        "test_log_sha256": "f90f03fef6f46a09da44dead18743a7164996edb5038bd02ca374bd9e2eda283",
+        "empty_stdout_gettxout_typed_none_tested": True,
+        "empty_stdout_other_rpc_fatal_tested": True,
+        "deployable_release_authority": False,
+        "live_financial_authority_in_repository": False,
+    }
+    if not isinstance(receipt, dict):
+        die("predecessor monitor product-test receipt is not an object")
+    for key, value in expected.items():
+        if receipt.get(key) != value:
+            die(f"predecessor monitor product-test receipt field {key} changed")
+    return {
+        "mode": "READ_ONLY_EXACT_PREDECESSOR_RECEIPT_MONITOR",
+        "predecessor_receipt_identity": {
+            "commit": PREDECESSOR_MONITOR_COMMIT, "tree": PREDECESSOR_MONITOR_TREE,
+            "tool_sha256": PREDECESSOR_MONITOR_TOOL_SHA256,
+        },
+        "compatibility_review_identity": {
+            "commit": COMPATIBILITY_REVIEW_COMMIT, "tree": COMPATIBILITY_REVIEW_TREE,
+            "tool_sha256": COMPATIBILITY_REVIEW_TOOL_SHA256,
+            "product_test_receipt_sha256": digest,
+        },
+        "mutation_authorized": False,
+    }
 
 
 def load_phase_b_preview(run_dir: pathlib.Path, contract: Contract,
@@ -1794,8 +1859,18 @@ def monitor_command(args: argparse.Namespace) -> None:
     run_dir = pathlib.Path(args.run_dir)
     base.ensure_secure_dir(run_dir)
     contract = load_contract(run_dir)
-    audit, audit_sha = load_audit(run_dir, contract)
-    phase_a, phase_a_sha = load_phase_a(run_dir, contract)
+    audit, audit_sha = load_audit(run_dir, contract, allow_predecessor_monitor=True)
+    phase_a, phase_a_sha = load_phase_a(run_dir, contract, allow_predecessor_monitor=True)
+    receipt_tool = audit["tool_sha256"]
+    if receipt_tool == PREDECESSOR_MONITOR_TOOL_SHA256:
+        compatibility = predecessor_monitor_compatibility(args)
+    else:
+        if (args.predecessor_product_receipt is not None or
+                args.predecessor_product_receipt_sha256 is not None):
+            die("predecessor product-test evidence is invalid for current-tool receipts")
+        compatibility = {"mode": "CURRENT_TOOL_RECEIPT_MONITOR",
+                         "receipt_tool_sha256": receipt_tool,
+                         "mutation_authorized": False}
     transport = Transport(contract.runtime)
     node = contract.runtime.nodes[0]
     exact_node, runtime_before = pin_node(transport, node)
@@ -1815,6 +1890,7 @@ def monitor_command(args: argparse.Namespace) -> None:
                     "phase_a_receipt_sha256": phase_a_sha, "anchor_spent_on_active_chain": anchor_utxo is None,
                     "confirmed_component_transactions": confirmed, "blocking_quarantined_claims": blockers,
                     "ordinary_pow_disabled": role["ordinary_pow"], "pos": role["pos"],
+                    "receipt_compatibility": compatibility,
                     "free_claim": free_claim_snapshot(contract),
                     "free_claim_worker_invoked": False, "pause_marker_removed": False})
     if transport.runtime_snapshot(node) != runtime_before:
@@ -1843,6 +1919,8 @@ def parser() -> argparse.ArgumentParser:
     preview.set_defaults(func=phase_b_preview_command)
     monitor = commands.add_parser("monitor")
     monitor.add_argument("--run-dir", required=True)
+    monitor.add_argument("--predecessor-product-receipt")
+    monitor.add_argument("--predecessor-product-receipt-sha256")
     monitor.set_defaults(func=monitor_command)
     return result
 

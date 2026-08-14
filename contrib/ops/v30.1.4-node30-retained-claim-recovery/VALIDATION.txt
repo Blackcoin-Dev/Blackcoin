@@ -32,12 +32,14 @@ Post-intent read rule: mutex-serializing preview precedes durable metadata, anch
 Receipt crash rule: heal only the exact sole publisher-temp second hard link or a valid owner-only JSON receipt with an absent sidecar; reject every other extra link and every malformed sidecar
 Lock rule: canonical owner-controlled parent; unique owner-only mode-0600 regular file; O_EXCL create; stable device/inode
 Resume rule: revalidate runtime, complete receipt/authority chain, exact unnamed-wallet inventory, PoS, disabled ordinary PoW, and pause artifacts
+Predecessor monitor rule: only uniform 9b6ce967e581efcdeeeea1b8aee29c6146b9e9e5/55b79cde81f6d00ff105c454b6106026dcae794aa60ef55f0c3b27016c8c3cd1 receipts plus exact mode-0600 801ffe62929675725c1261c913683aa48ea2e4bd product receipt SHA256 3dfe86f2eb0b539ab26655ed2edd12b74fceb7cf7c36a376926b7cf3ec7c7356 are accepted
+Predecessor mutation rule: every phase/reconcile/sign/relay/broadcast path rejects predecessor receipts
 Confirmation rule: exactly one allowlisted transaction must decode to the exact anchor input on the active chain with zero blockers; mempool is insufficient
 Fast-confirm rule: accept exact resolution or original-claim confirmation only with unique decoded anchor spend and active block-header evidence
 Free-Claim release: explicitly outside this package
 
-Hostile suite result: PASS: 125 hostile node30 retained-claim recovery assertions
-Hostile suite log: /private/tmp/node30-retained-claim-recovery-v2-empty-gettxout-20260814.out
-Hostile suite log SHA256: f90f03fef6f46a09da44dead18743a7164996edb5038bd02ca374bd9e2eda283
+Hostile suite result: PASS: 134 hostile node30 retained-claim recovery assertions
+Hostile suite log: /private/tmp/node30-retained-claim-recovery-v2-predecessor-monitor-20260814.out
+Hostile suite log SHA256: b9d446a0122c6d56e4ccba83ccf833ad13f4c5f854fe07f461fb9f536dd42ca0
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

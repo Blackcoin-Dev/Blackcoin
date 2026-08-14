@@ -1,0 +1,47 @@
+Validation status: PASS (offline package only)
+Frozen at: 2026-08-14T04:41:33Z
+
+Scope:
+- Isolated fleet branch based exactly on signed af73ef239641639ca087639869c5a1c145aec6b6.
+- No SSH, Docker, wallet, node, scheduler, chain, Core, or live-fleet contact.
+- No live helper installation or authority creation.
+
+Exact byte contracts:
+- Helper predecessor acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1.
+- Helper successor aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7.
+- Supervisor predecessor 112ffbaa2702f9e4a9568948ef383cd22ae70876376c29602629e4c3d15d7341.
+- Supervisor successor b879bb3833bc5786aa34918741550119cde4ddf71ca00f06b73cfe1863aaa8c0.
+- The three exact supervisor rewrite anchors reproduce the signed successor byte-for-byte.
+- The historical job-10 helper identity remains the predecessor identity.
+
+Focused hostile suite:
+- Command: python3 contrib/ops/v30.1.4-normal-unlock-helper-rotation/tests/run.py
+- Exit: 0
+- Result: PASS: 120 offline helper-rotation assertions
+- Log: /private/tmp/normal-unlock-helper-rotation-20260814.out
+- Log SHA256: 8555884a83c5ae8f52877d046266d02649eab4f10dceadb539cf6116275209e7
+- Coverage: nodes 1..32; node30 first; unnamed and named wallet argv; exact supervisor transform;
+  historical job10 immutability; exact owner-only authority and drift rejection; canonical lock
+  contention; successful terminal cut; node30 failure stop/rollback; mid-apply rollback; secure
+  file modes; forbidden PoW/transaction methods.
+
+Static validation (all exit 0):
+- bash -n contrib/ops/v30.1.4-normal-unlock-helper-rotation/blackcoin_node_normal_unlock.sh
+- shellcheck -x contrib/ops/v30.1.4-normal-unlock-helper-rotation/blackcoin_node_normal_unlock.sh
+- python3 -c 'compile(open(path).read(), path, "exec")' for helper_rotation.py and tests/run.py
+- python3 -m flake8 helper_rotation.py tests/run.py --max-line-length=120 --ignore=E501,W503,W504
+- git diff --check
+
+Source SHA256 at validation:
+- helper_rotation.py da4a989ba93bd07272bde2e25d44912e5f4b37a2e32d859e44c168d19097000e
+- tests/run.py d1f877c8da029179836d68145d729e6b8eb3304e5566d12a69ecfdcd69ff329c
+- AUTHORITY.schema.json b96a3daa275cf2ad387bd3e234e2d0bc93898e77fc41cce63637dd12026b5e24
+- README.md 4027b464157f4a65002cd144069010318153023916555dd8bb1c1ece1e7756cb
+
+Live boundary:
+- audit is filesystem-only and remains unexecuted against the live host.
+- install contacts installed v30.1.4 wallets and remains unauthorized/unexecuted.
+- A fresh exact audit plan plus a separate root-owned, hash-sidecar-sealed live authority is required.
+- Latest read-only receipt: no supervisor install root or top-level supervisor/job10 object is installed.
+- Expected live plan: helper-only mutation with zero active consumers; any contrary pin fails closed.
+- Persistent supervisor setup is a later generation-1 initial activation under its own authority.

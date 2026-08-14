@@ -15,7 +15,11 @@
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
 
+#include <array>
 #include <boost/test/unit_test.hpp>
+#include <limits>
+#include <string>
+#include <vector>
 
 namespace wallet {
 BOOST_FIXTURE_TEST_SUITE(walletdb_tests, BasicTestingSetup)
@@ -33,6 +37,243 @@ BOOST_AUTO_TEST_CASE(walletdb_readkeyvalue)
     CDataStream ssValue(SER_DISK);
     uint256 dummy;
     BOOST_CHECK_THROW(ssValue >> dummy, std::ios_base::failure);
+}
+
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_relay_clock_storage_is_exact_and_fail_closed)
+{
+    const auto serialized = [](const auto& object) {
+        DataStream stream;
+        stream << object;
+        return SerializeData{stream.begin(), stream.end()};
+    };
+    const auto canonical_records = [&](bool legacy, int64_t value) {
+        MockableData records;
+        records.emplace(
+            serialized(legacy
+                           ? DBKeys::SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER
+                           : DBKeys::SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER),
+            serialized(value));
+        return records;
+    };
+    const auto read = [](WalletBatch& batch, bool legacy,
+                         int64_t& value, std::string& error) {
+        return legacy
+            ? batch.ReadShadowPowClaimLegacyRelayClockHighWater(
+                  value, &error)
+            : batch.ReadShadowPowClaimRelayClockHighWater(value, &error);
+    };
+    const auto check_read = [&](bool legacy, MockableData records,
+                                DBErrors expected, int64_t expected_value,
+                                const auto& configure) {
+        std::unique_ptr<WalletDatabase> database =
+            CreateMockableWalletDatabase(std::move(records));
+        MockableDatabase& mock =
+            dynamic_cast<MockableDatabase&>(*database);
+        configure(mock);
+        WalletBatch batch(*database, /*flush_on_close=*/false);
+        int64_t value{-1};
+        std::string error{"not cleared"};
+        BOOST_CHECK_EQUAL(read(batch, legacy, value, error), expected);
+        BOOST_CHECK_EQUAL(value, expected_value);
+        if (expected == DBErrors::LOAD_OK) {
+            BOOST_CHECK(error.empty());
+        } else {
+            BOOST_CHECK(!error.empty());
+        }
+    };
+    const auto no_configuration = [](MockableDatabase&) {};
+
+    for (const bool legacy : {false, true}) {
+        check_read(legacy, {}, DBErrors::LOAD_OK, 0, no_configuration);
+        for (const int64_t value :
+             std::array<int64_t, 3>{0, 42,
+                                    std::numeric_limits<int64_t>::max()}) {
+            check_read(legacy, canonical_records(legacy, value),
+                       DBErrors::LOAD_OK, value, no_configuration);
+        }
+
+        {
+            std::unique_ptr<WalletDatabase> database =
+                CreateMockableWalletDatabase();
+            WalletBatch batch(*database, /*flush_on_close=*/false);
+            BOOST_CHECK(!(legacy
+                ? batch.WriteShadowPowClaimLegacyRelayClockHighWater(-1)
+                : batch.WriteShadowPowClaimRelayClockHighWater(-1)));
+        }
+
+        MockableData truncated = canonical_records(legacy, 7);
+        BOOST_REQUIRE(!truncated.begin()->second.empty());
+        truncated.begin()->second.pop_back();
+        check_read(legacy, std::move(truncated),
+                   DBErrors::NONCRITICAL_ERROR, 0, no_configuration);
+
+        MockableData trailing = canonical_records(legacy, 7);
+        trailing.begin()->second.push_back(std::byte{0x00});
+        check_read(legacy, std::move(trailing),
+                   DBErrors::NONCRITICAL_ERROR, 0, no_configuration);
+
+        check_read(legacy, canonical_records(legacy, -1),
+                   DBErrors::NONCRITICAL_ERROR, 0, no_configuration);
+
+        MockableData suffix_only;
+        SerializeData suffix_key = serialized(
+            legacy
+                ? DBKeys::SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER
+                : DBKeys::SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER);
+        suffix_key.push_back(std::byte{0x01});
+        suffix_only.emplace(suffix_key, serialized(int64_t{9}));
+        check_read(legacy, suffix_only, DBErrors::NONCRITICAL_ERROR, 0,
+                   no_configuration);
+
+        MockableData duplicate_prefix = canonical_records(legacy, 9);
+        duplicate_prefix.emplace(std::move(suffix_key), serialized(int64_t{9}));
+        check_read(legacy, std::move(duplicate_prefix),
+                   DBErrors::NONCRITICAL_ERROR, 0, no_configuration);
+
+        check_read(
+            legacy, canonical_records(legacy, 9),
+            DBErrors::NONCRITICAL_ERROR, 0,
+            [](MockableDatabase& mock) { mock.m_fail_cursor_create = true; });
+        check_read(
+            legacy, canonical_records(legacy, 9),
+            DBErrors::NONCRITICAL_ERROR, 0,
+            [](MockableDatabase& mock) { mock.m_throw_cursor_create = true; });
+        check_read(
+            legacy, canonical_records(legacy, 9),
+            DBErrors::NONCRITICAL_ERROR, 0,
+            [](MockableDatabase& mock) {
+                mock.m_fail_cursor_next_at = 0;
+            });
+        check_read(
+            legacy, canonical_records(legacy, 9),
+            DBErrors::NONCRITICAL_ERROR, 0,
+            [](MockableDatabase& mock) {
+                mock.m_fail_cursor_next_at = 1;
+            });
+    }
+
+    // A malformed restriction is noncritical to general wallet loading, but
+    // it must latch the shared claim-recovery authority closed rather than
+    // silently treating either scalar as absent.
+    MockableData malformed = canonical_records(/*legacy=*/false, 11);
+    MockableData canonical_legacy = canonical_records(/*legacy=*/true, 12);
+    malformed.insert(canonical_legacy.begin(), canonical_legacy.end());
+    const auto malformed_schema = malformed.find(serialized(
+        DBKeys::SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER));
+    BOOST_REQUIRE(malformed_schema != malformed.end());
+    malformed_schema->second.push_back(std::byte{0x00});
+    CWallet malformed_wallet(
+        m_node.chain.get(), "malformed-relay-clock",
+        CreateMockableWalletDatabase(std::move(malformed)));
+    BOOST_CHECK_EQUAL(malformed_wallet.LoadWallet(),
+                      DBErrors::NONCRITICAL_ERROR);
+    BOOST_CHECK(malformed_wallet.IsShadowPowClaimRecoveryDatabaseAmbiguous());
+    const auto malformed_high_waters =
+        malformed_wallet.GetShadowPowClaimRelayClockHighWatersForTesting();
+    BOOST_CHECK_EQUAL(malformed_high_waters.first,
+                      std::numeric_limits<int64_t>::max());
+    BOOST_CHECK_EQUAL(malformed_high_waters.second,
+                      std::numeric_limits<int64_t>::max());
+    BOOST_CHECK(!malformed_wallet
+                     .AdvanceShadowPowClaimRelayClockHighWatersForTesting(
+                         0, 0));
+}
+
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_relay_clock_transaction_is_atomic)
+{
+    const auto high_waters = [](const CWallet& wallet) {
+        return wallet.GetShadowPowClaimRelayClockHighWatersForTesting();
+    };
+    const auto make_wallet = [&] {
+        auto wallet = std::make_unique<CWallet>(
+            m_node.chain.get(), "relay-clock-transaction",
+            CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+        return wallet;
+    };
+    enum class Failure { BEGIN, FIRST_WRITE, SECOND_WRITE,
+                         COMMIT_OLD, COMMIT_APPLIED };
+    for (const Failure failure :
+         {Failure::BEGIN, Failure::FIRST_WRITE, Failure::SECOND_WRITE,
+          Failure::COMMIT_OLD, Failure::COMMIT_APPLIED}) {
+        auto wallet = make_wallet();
+        MockableDatabase& mock = GetMockableDatabase(*wallet);
+        const MockableData before = mock.m_records;
+        if (failure == Failure::BEGIN) mock.m_fail_begin = true;
+        if (failure == Failure::FIRST_WRITE) mock.m_fail_write_at = 0;
+        if (failure == Failure::SECOND_WRITE) mock.m_fail_write_at = 1;
+        if (failure == Failure::COMMIT_OLD) mock.m_fail_commit = true;
+        if (failure == Failure::COMMIT_APPLIED) {
+            mock.m_fail_commit_after_apply = true;
+        }
+        BOOST_CHECK(!wallet->AdvanceShadowPowClaimRelayClockHighWatersForTesting(
+            101, 202));
+        BOOST_CHECK(wallet->IsShadowPowClaimRecoveryDatabaseAmbiguous());
+        BOOST_CHECK((high_waters(*wallet) ==
+                     std::pair<int64_t, int64_t>{0, 0}));
+        if (failure == Failure::COMMIT_APPLIED) {
+            BOOST_CHECK(mock.m_records != before);
+        } else {
+            BOOST_CHECK(mock.m_records == before);
+        }
+        // Ambiguity dominates the compare-and-max no-op path too.
+        BOOST_CHECK(!wallet->AdvanceShadowPowClaimRelayClockHighWatersForTesting(
+            0, 0));
+
+        if (failure == Failure::COMMIT_APPLIED) {
+            CWallet reload(
+                m_node.chain.get(), "relay-clock-applied-reload",
+                DuplicateMockDatabase(mock));
+            BOOST_REQUIRE_EQUAL(reload.LoadWallet(), DBErrors::LOAD_OK);
+            BOOST_CHECK((high_waters(reload) ==
+                         std::pair<int64_t, int64_t>{101, 202}));
+        }
+    }
+
+    auto wallet = make_wallet();
+    MockableDatabase& mock = GetMockableDatabase(*wallet);
+    BOOST_CHECK(!wallet->AdvanceShadowPowClaimRelayClockHighWatersForTesting(
+        -1, 0));
+    BOOST_CHECK(!wallet->IsShadowPowClaimRecoveryDatabaseAmbiguous());
+    BOOST_CHECK((high_waters(*wallet) ==
+                 std::pair<int64_t, int64_t>{0, 0}));
+
+    const uint256 fingerprint_before = WITH_LOCK(
+        wallet->cs_wallet,
+        return wallet->GetShadowPowClaimCandidateStateFingerprintLocked());
+    BOOST_REQUIRE(wallet->AdvanceShadowPowClaimRelayClockHighWatersForTesting(
+        101, 202));
+    BOOST_CHECK(mock.m_last_txn_durable);
+    BOOST_CHECK_EQUAL(mock.m_write_calls, 2U);
+    BOOST_CHECK((high_waters(*wallet) ==
+                 std::pair<int64_t, int64_t>{101, 202}));
+    const uint256 fingerprint_after = WITH_LOCK(
+        wallet->cs_wallet,
+        return wallet->GetShadowPowClaimCandidateStateFingerprintLocked());
+    BOOST_CHECK(fingerprint_after != fingerprint_before);
+
+    const MockableData both_records = mock.m_records;
+    mock.m_write_calls = 0;
+    BOOST_REQUIRE(wallet->AdvanceShadowPowClaimRelayClockHighWatersForTesting(
+        100, 201));
+    BOOST_CHECK_EQUAL(mock.m_write_calls, 0U);
+    BOOST_CHECK(mock.m_records == both_records);
+
+    BOOST_REQUIRE(wallet->AdvanceShadowPowClaimRelayClockHighWatersForTesting(
+        303, 201));
+    BOOST_CHECK((high_waters(*wallet) ==
+                 std::pair<int64_t, int64_t>{303, 202}));
+    BOOST_REQUIRE(wallet->AdvanceShadowPowClaimRelayClockHighWatersForTesting(
+        303, 404));
+    BOOST_CHECK((high_waters(*wallet) ==
+                 std::pair<int64_t, int64_t>{303, 404}));
+
+    CWallet reload(
+        m_node.chain.get(), "relay-clock-success-reload",
+        DuplicateMockDatabase(mock));
+    BOOST_REQUIRE_EQUAL(reload.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK((high_waters(reload) ==
+                 std::pair<int64_t, int64_t>{303, 404}));
 }
 
 BOOST_AUTO_TEST_CASE(walletdb_read_write_deadlock)

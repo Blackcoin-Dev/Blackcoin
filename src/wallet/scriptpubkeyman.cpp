@@ -22,6 +22,29 @@
 #include <optional>
 
 namespace wallet {
+namespace {
+
+class OwnershipChangePostNotifier
+{
+public:
+    explicit OwnershipChangePostNotifier(WalletStorage& storage)
+        : m_storage{storage}
+    {
+    }
+    ~OwnershipChangePostNotifier()
+    {
+        // WalletStorage implementations must make this notification
+        // nonblocking. Construct this guard after the SPKM lock so the post
+        // epoch is published before the mutated ownership state is unlocked.
+        m_storage.NotifyOwnershipChanged();
+    }
+
+private:
+    WalletStorage& m_storage;
+};
+
+} // namespace
+
 //! Value for the first BIP 32 hardened derivation. Can be used as a bit mask and as a value. See BIP 32 for more details.
 const uint32_t BIP32_HARDENED_KEY_LIMIT = 0x80000000;
 
@@ -796,6 +819,9 @@ bool LegacyScriptPubKeyMan::AddKeyPubKeyWithDB(WalletBatch& batch, const CKey& s
 
 bool LegacyScriptPubKeyMan::LoadCScript(const CScript& redeemScript)
 {
+    m_storage.NotifyOwnershipChanged();
+    LOCK(cs_KeyStore);
+    OwnershipChangePostNotifier post_notify{m_storage};
     /* A sanity check was added in pull #3843 to avoid adding redeemScripts
      * that never can be redeemed. However, old wallets may still contain
      * these. Do not add them to the wallet and warn. */
@@ -825,7 +851,9 @@ void LegacyScriptPubKeyMan::LoadScriptMetadata(const CScriptID& script_id, const
 
 bool LegacyScriptPubKeyMan::AddKeyPubKeyInner(const CKey& key, const CPubKey &pubkey)
 {
+    m_storage.NotifyOwnershipChanged();
     LOCK(cs_KeyStore);
+    OwnershipChangePostNotifier post_notify{m_storage};
     if (!m_storage.HasEncryptionKeys()) {
         return FillableSigningProvider::AddKeyPubKey(key, pubkey);
     }
@@ -858,7 +886,9 @@ bool LegacyScriptPubKeyMan::LoadCryptedKey(const CPubKey &vchPubKey, const std::
 
 bool LegacyScriptPubKeyMan::AddCryptedKeyInner(const CPubKey &vchPubKey, const std::vector<unsigned char> &vchCryptedSecret)
 {
+    m_storage.NotifyOwnershipChanged();
     LOCK(cs_KeyStore);
+    OwnershipChangePostNotifier post_notify{m_storage};
     assert(mapKeys.empty());
 
     mapCryptedKeys[vchPubKey.GetID()] = make_pair(vchPubKey, vchCryptedSecret);
@@ -905,8 +935,10 @@ static bool ExtractPubKey(const CScript &dest, CPubKey& pubKeyOut)
 
 bool LegacyScriptPubKeyMan::RemoveWatchOnly(const CScript &dest)
 {
+    m_storage.NotifyOwnershipChanged();
     {
         LOCK(cs_KeyStore);
+        OwnershipChangePostNotifier post_notify{m_storage};
         setWatchOnly.erase(dest);
         CPubKey pubKey;
         if (ExtractPubKey(dest, pubKey)) {
@@ -931,7 +963,9 @@ bool LegacyScriptPubKeyMan::LoadWatchOnly(const CScript &dest)
 
 bool LegacyScriptPubKeyMan::AddWatchOnlyInMem(const CScript &dest)
 {
+    m_storage.NotifyOwnershipChanged();
     LOCK(cs_KeyStore);
+    OwnershipChangePostNotifier post_notify{m_storage};
     setWatchOnly.insert(dest);
     CPubKey pubKey;
     if (ExtractPubKey(dest, pubKey)) {
@@ -1296,6 +1330,7 @@ bool LegacyScriptPubKeyMan::NewKeyPool()
 
 bool LegacyScriptPubKeyMan::TopUp(unsigned int kpSize)
 {
+    m_storage.NotifyOwnershipChanged();
     if (!CanGenerateKeys()) {
         return false;
     }
@@ -1315,6 +1350,7 @@ bool LegacyScriptPubKeyMan::TopUp(unsigned int kpSize)
 bool LegacyScriptPubKeyMan::TopUpChain(CHDChain& chain, unsigned int kpSize)
 {
     LOCK(cs_KeyStore);
+    OwnershipChangePostNotifier post_notify{m_storage};
 
     if (m_storage.IsLocked()) return false;
 
@@ -1570,6 +1606,9 @@ bool LegacyScriptPubKeyMan::AddCScript(const CScript& redeemScript)
 
 bool LegacyScriptPubKeyMan::AddCScriptWithDB(WalletBatch& batch, const CScript& redeemScript)
 {
+    m_storage.NotifyOwnershipChanged();
+    LOCK(cs_KeyStore);
+    OwnershipChangePostNotifier post_notify{m_storage};
     if (!FillableSigningProvider::AddCScript(redeemScript))
         return false;
     if (batch.WriteCScript(Hash160(redeemScript), redeemScript)) {
@@ -2103,7 +2142,9 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
 
 bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)
 {
+    m_storage.NotifyOwnershipChanged();
     LOCK(cs_desc_man);
+    OwnershipChangePostNotifier post_notify{m_storage};
     if (!m_map_crypted_keys.empty()) {
         return false;
     }
@@ -2162,7 +2203,9 @@ std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const
 
 bool DescriptorScriptPubKeyMan::TopUp(unsigned int size)
 {
+    m_storage.NotifyOwnershipChanged();
     LOCK(cs_desc_man);
+    OwnershipChangePostNotifier post_notify{m_storage};
     unsigned int target_size;
     if (size > 0) {
         target_size = size;
@@ -2262,7 +2305,9 @@ void DescriptorScriptPubKeyMan::AddDescriptorKey(const CKey& key, const CPubKey 
 
 bool DescriptorScriptPubKeyMan::AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey)
 {
+    m_storage.NotifyOwnershipChanged();
     AssertLockHeld(cs_desc_man);
+    OwnershipChangePostNotifier post_notify{m_storage};
     assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));
 
     // Check if provided key already exists
@@ -2647,7 +2692,9 @@ uint256 DescriptorScriptPubKeyMan::GetID() const
 
 void DescriptorScriptPubKeyMan::SetCache(const DescriptorCache& cache)
 {
+    m_storage.NotifyOwnershipChanged();
     LOCK(cs_desc_man);
+    OwnershipChangePostNotifier post_notify{m_storage};
     m_wallet_descriptor.cache = cache;
     for (int32_t i = m_wallet_descriptor.range_start; i < m_wallet_descriptor.range_end; ++i) {
         FlatSigningProvider out_keys;
@@ -2677,14 +2724,18 @@ void DescriptorScriptPubKeyMan::SetCache(const DescriptorCache& cache)
 
 bool DescriptorScriptPubKeyMan::AddKey(const CKeyID& key_id, const CKey& key)
 {
+    m_storage.NotifyOwnershipChanged();
     LOCK(cs_desc_man);
+    OwnershipChangePostNotifier post_notify{m_storage};
     m_map_keys[key_id] = key;
     return true;
 }
 
 bool DescriptorScriptPubKeyMan::AddCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& crypted_key)
 {
+    m_storage.NotifyOwnershipChanged();
     LOCK(cs_desc_man);
+    OwnershipChangePostNotifier post_notify{m_storage};
     if (!m_map_keys.empty()) {
         return false;
     }
@@ -2783,7 +2834,9 @@ void DescriptorScriptPubKeyMan::UpgradeDescriptorCache()
 
 void DescriptorScriptPubKeyMan::UpdateWalletDescriptor(WalletDescriptor& descriptor)
 {
+    m_storage.NotifyOwnershipChanged();
     LOCK(cs_desc_man);
+    OwnershipChangePostNotifier post_notify{m_storage};
     std::string error;
     if (!CanUpdateToWalletDescriptor(descriptor, error)) {
         throw std::runtime_error(std::string(__func__) + ": " + error);

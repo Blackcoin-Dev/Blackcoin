@@ -121,7 +121,6 @@ interfaces::WalletPowClaimRecoveryState MakeRecoveryState(
     case ShadowPowClaimRecoveryState::INDETERMINATE: return Out::INDETERMINATE;
     case ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE: return Out::CURRENT_BRANCH_INELIGIBLE;
     case ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP: return Out::TERMINAL_ON_PINNED_TIP;
-    case ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH: return Out::RETIRED_ON_ACTIVE_BRANCH;
     case ShadowPowClaimRecoveryState::RESOLUTION_PENDING: return Out::RESOLUTION_PENDING;
     case ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN: return Out::RESOLVED_ON_ACTIVE_CHAIN;
     }
@@ -214,7 +213,6 @@ interfaces::WalletPowClaimRecoveryNode MakeRecoveryNode(
     out.in_mempool = node.in_mempool;
     out.quarantined = node.quarantined;
     out.abandoned = node.abandoned;
-    out.expired_locally_retired = node.expired_locally_retired;
     out.expected_shape = node.expected_shape;
     out.wallet_authored = node.wallet_authored;
     out.created_height = node.created_height;
@@ -253,10 +251,6 @@ interfaces::WalletPowClaimRecoveryComponent MakeRecoveryComponent(
     out.anchor_authenticated = component.anchor_authenticated;
     out.anchor_unspent = component.anchor_unspent;
     out.all_claims_explicitly_provenanced = component.all_claims_explicitly_provenanced;
-    out.all_claims_zero_payment_retirable =
-        component.all_claims_zero_payment_retirable;
-    out.all_claims_expired_locally_retired =
-        component.all_claims_expired_locally_retired;
     out.has_revalidating_unbound_proof =
         component.has_revalidating_unbound_proof;
     out.adoption_graph_safe = component.adoption_graph_safe;
@@ -3155,8 +3149,6 @@ public:
         review.live_claim_objects = inventory.live_claim_objects;
         review.quarantined_claim_objects = inventory.quarantined_claim_objects;
         review.blocking_components = inventory.blocking_components;
-        review.retired_claim_objects = inventory.retired_claim_objects;
-        review.retired_components = inventory.retired_components;
         review.resolved_components = inventory.resolved_components;
         review.components.reserve(inventory.components.size());
         for (const auto& component : inventory.components) {

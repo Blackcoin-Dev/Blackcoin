@@ -54,21 +54,27 @@ CTxDestination getNewDestination(CWallet& w, OutputType output_type);
 
 using MockableData = std::map<SerializeData, SerializeData, std::less<>>;
 
+class MockableDatabase;
+
 class MockableCursor: public DatabaseCursor
 {
 public:
     MockableData::const_iterator m_cursor;
     MockableData::const_iterator m_cursor_end;
     bool m_pass;
+    MockableDatabase* m_database;
 
-    explicit MockableCursor(const MockableData& records, bool pass) : m_cursor(records.begin()), m_cursor_end(records.end()), m_pass(pass) {}
-    MockableCursor(const MockableData& records, bool pass, Span<const std::byte> prefix);
+    explicit MockableCursor(const MockableData& records, bool pass,
+                            MockableDatabase* database = nullptr)
+        : m_cursor(records.begin()), m_cursor_end(records.end()),
+          m_pass(pass), m_database(database) {}
+    MockableCursor(const MockableData& records, bool pass,
+                   Span<const std::byte> prefix,
+                   MockableDatabase* database = nullptr);
     ~MockableCursor() {}
 
     Status Next(DataStream& key, DataStream& value) override;
 };
-
-class MockableDatabase;
 
 class MockableBatch : public DatabaseBatch
 {
@@ -116,6 +122,11 @@ public:
     bool m_fail_abort{false};
     size_t m_commit_calls{0};
     size_t m_abort_calls{0};
+    bool m_fail_commit_after_apply{false};
+    bool m_fail_cursor_create{false};
+    bool m_throw_cursor_create{false};
+    std::optional<size_t> m_fail_cursor_next_at;
+    size_t m_cursor_next_calls{0};
     bool m_fail_rewrite{false};
     bool m_last_txn_durable{false};
 

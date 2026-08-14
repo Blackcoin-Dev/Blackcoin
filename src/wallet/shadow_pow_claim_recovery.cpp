@@ -23,20 +23,81 @@
 #include <wallet/walletdb.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace wallet {
 namespace {
 
+constexpr size_t MAX_SHADOW_POW_CLAIM_PROOF_EVALUATION_CACHE{1024};
+constexpr size_t MAX_SHADOW_POW_CLAIM_PROOF_EVALUATIONS_PER_CALL{64};
+std::atomic<uint64_t> g_shadow_pow_claim_recovery_proof_evaluations{0};
+std::atomic<uint64_t> g_active_shadow_pow_claim_recovery_proof_evaluations{0};
+std::atomic<uint64_t> g_shadow_pow_claim_recovery_inventory_builds{0};
+std::atomic<uint64_t> g_shadow_pow_claim_recovery_path_visits{0};
+std::atomic<uint64_t> g_shadow_pow_claim_recovery_topology_visits{0};
+std::atomic<uint64_t>
+    g_shadow_pow_claim_candidate_fingerprint_map_visits{0};
+std::atomic<int64_t> g_shadow_pow_claim_recovery_proof_evaluation_delay_ms{0};
+std::atomic<size_t> g_shadow_pow_claim_recovery_proof_evaluation_budget{
+    MAX_SHADOW_POW_CLAIM_PROOF_EVALUATIONS_PER_CALL};
+std::atomic<size_t> g_shadow_pow_claim_recovery_proof_evaluation_cache_capacity{
+    MAX_SHADOW_POW_CLAIM_PROOF_EVALUATION_CACHE};
+
 bool SafeGraphForAdoption(
     const ShadowPowClaimRecoveryComponent& component,
     std::string& reason_code, std::string& reason);
+
+bool ConsumeShadowPowClaimMetadataBudget(const mapValue_t& values,
+                                         size_t& aggregate_entries,
+                                         size_t& aggregate_bytes)
+{
+    static const std::string prefix{"qq_shadow_pow_"};
+    size_t record_entries{0};
+    size_t record_bytes{0};
+    for (auto it = values.lower_bound(prefix);
+         it != values.end() &&
+         it->first.compare(0, prefix.size(), prefix) == 0;
+         ++it) {
+        if (record_entries == SHADOW_POW_CLAIM_METADATA_ENTRY_CAPACITY ||
+            it->first.size() >
+                SHADOW_POW_CLAIM_METADATA_KEY_BYTE_CAPACITY ||
+            it->second.size() >
+                SHADOW_POW_CLAIM_METADATA_VALUE_BYTE_CAPACITY) {
+            return false;
+        }
+        ++record_entries;
+        const size_t entry_bytes = it->first.size() + it->second.size();
+        if (entry_bytes >
+            SHADOW_POW_CLAIM_METADATA_RECORD_BYTE_CAPACITY -
+                std::min(record_bytes,
+                         SHADOW_POW_CLAIM_METADATA_RECORD_BYTE_CAPACITY)) {
+            return false;
+        }
+        record_bytes += entry_bytes;
+    }
+    if (record_entries >
+            SHADOW_POW_CLAIM_METADATA_TOTAL_ENTRY_CAPACITY -
+                std::min(aggregate_entries,
+                         SHADOW_POW_CLAIM_METADATA_TOTAL_ENTRY_CAPACITY) ||
+        record_bytes >
+            SHADOW_POW_CLAIM_METADATA_TOTAL_BYTE_CAPACITY -
+                std::min(aggregate_bytes,
+                         SHADOW_POW_CLAIM_METADATA_TOTAL_BYTE_CAPACITY)) {
+        return false;
+    }
+    aggregate_entries += record_entries;
+    aggregate_bytes += record_bytes;
+    return true;
+}
 
 bool MetadataFlag(const mapValue_t& values, const char* key)
 {
@@ -79,7 +140,9 @@ bool ParseMetadataHeight(const mapValue_t& values, const char* key, int& value)
 {
     const auto it = values.find(key);
     int32_t parsed{-1};
-    if (it == values.end() || !ParseInt32(it->second, &parsed) || parsed < 0) {
+    if (it == values.end() ||
+        it->second.size() > SHADOW_POW_CLAIM_METADATA_VALUE_BYTE_CAPACITY ||
+        !ParseInt32(it->second, &parsed) || parsed < 0) {
         return false;
     }
     value = parsed;
@@ -100,14 +163,20 @@ bool ParseMetadataHash(const mapValue_t& values, const char* key, uint256& value
 bool ParseMetadataVout(const mapValue_t& values, const char* key, uint32_t& value)
 {
     const auto it = values.find(key);
-    return it != values.end() && ParseUInt32(it->second, &value);
+    return it != values.end() &&
+        it->second.size() <=
+            SHADOW_POW_CLAIM_METADATA_VALUE_BYTE_CAPACITY &&
+        ParseUInt32(it->second, &value);
 }
 
 bool ParseMetadataOrdinal(const mapValue_t& values, const char* key,
                           uint32_t& value)
 {
     const auto it = values.find(key);
-    return it != values.end() && ParseUInt32(it->second, &value);
+    return it != values.end() &&
+        it->second.size() <=
+            SHADOW_POW_CLAIM_METADATA_VALUE_BYTE_CAPACITY &&
+        ParseUInt32(it->second, &value);
 }
 
 bool ParsePositiveMetadataTime(const mapValue_t& values, const char* key,
@@ -115,10 +184,42 @@ bool ParsePositiveMetadataTime(const mapValue_t& values, const char* key,
 {
     const auto it = values.find(key);
     int64_t parsed{0};
-    if (it == values.end() || !ParseInt64(it->second, &parsed) || parsed <= 0) {
+    if (it == values.end() ||
+        it->second.size() > SHADOW_POW_CLAIM_METADATA_VALUE_BYTE_CAPACITY ||
+        !ParseInt64(it->second, &parsed) || parsed <= 0) {
         return false;
     }
     value = parsed;
+    return true;
+}
+
+bool ParseShadowPowClaimRelayClockMetadata(
+    const mapValue_t& values, const uint256& txid, bool& present,
+    int64_t& birth_time)
+{
+    const auto schema = values.find(
+        SHADOW_POW_CLAIM_RELAY_CLOCK_SCHEMA_KEY);
+    const auto birth = values.find(SHADOW_POW_CLAIM_RELAY_BIRTH_KEY);
+    const auto binding = values.find(SHADOW_POW_CLAIM_RELAY_TXID_KEY);
+    present = schema != values.end() || birth != values.end() ||
+        binding != values.end();
+    birth_time = 0;
+    if (!present) return true;
+    if (schema == values.end() ||
+        schema->second !=
+            SHADOW_POW_CLAIM_RELAY_CLOCK_SCHEMA_VERSION ||
+        birth == values.end() ||
+        birth->second.size() >
+            SHADOW_POW_CLAIM_METADATA_VALUE_BYTE_CAPACITY ||
+        !ParseInt64(birth->second, &birth_time) || birth_time <= 0 ||
+        ToString(birth_time) != birth->second ||
+        birth_time > std::numeric_limits<int64_t>::max() -
+                         SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS ||
+        binding == values.end() ||
+        binding->second != txid.GetHex()) {
+        birth_time = 0;
+        return false;
+    }
     return true;
 }
 
@@ -140,7 +241,8 @@ bool HasActiveBranchObservation(const mapValue_t& values,
 
 ShadowPowClaimRecoveryProvenance ClaimProvenance(
     const CWalletTx& wtx, ShadowPowClaimRecoveryNode& node,
-    const uint256* generation_fingerprint = nullptr)
+    const uint256* generation_fingerprint = nullptr,
+    const uint256* active_tip = nullptr)
 {
     node.authored_metadata_valid =
         ParseMetadataHeight(wtx.mapValue,
@@ -165,6 +267,7 @@ ShadowPowClaimRecoveryProvenance ClaimProvenance(
     node.adoption_generation_fingerprint = adoption_fingerprint;
     node.adoption_metadata_valid =
         adoption_metadata_complete && generation_fingerprint &&
+        active_tip && node.adoption_tip == *active_tip &&
         !generation_fingerprint->IsNull() &&
         adoption_fingerprint == *generation_fingerprint;
     if (MetadataFlag(wtx.mapValue, SHADOW_POW_CLAIM_ADOPTED_KEY) &&
@@ -257,8 +360,6 @@ uint256 FingerprintComponent(const uint256& active_tip,
     hasher << component.has_legacy_resolution;
     hasher << component.has_live_resolution;
     hasher << component.all_claims_terminal_on_pinned_tip;
-    hasher << component.all_claims_zero_payment_retirable;
-    hasher << component.all_claims_expired_locally_retired;
     hasher << component.has_branch_relative_ineligibility;
     hasher << static_cast<uint64_t>(component.descendant_claims);
     hasher << component.minimum_stale_depth;
@@ -274,7 +375,6 @@ uint256 FingerprintComponent(const uint256& active_tip,
         hasher << node.in_mempool;
         hasher << node.abandoned;
         hasher << node.quarantined;
-        hasher << node.expired_locally_retired;
         hasher << node.expected_shape;
         hasher << node.wallet_authored;
         hasher << node.wallet_from_me;
@@ -424,6 +524,93 @@ bool ParseManagedResolutionFacts(const CWallet& wallet, const CWalletTx& wtx,
 
 } // namespace
 
+void ResetShadowPowClaimRecoveryProofEvaluationStatsForTesting()
+{
+    g_shadow_pow_claim_recovery_proof_evaluations.store(
+        0, std::memory_order_relaxed);
+    g_active_shadow_pow_claim_recovery_proof_evaluations.store(
+        0, std::memory_order_relaxed);
+    g_shadow_pow_claim_recovery_inventory_builds.store(
+        0, std::memory_order_relaxed);
+    g_shadow_pow_claim_recovery_path_visits.store(
+        0, std::memory_order_relaxed);
+    g_shadow_pow_claim_recovery_topology_visits.store(
+        0, std::memory_order_relaxed);
+    g_shadow_pow_claim_candidate_fingerprint_map_visits.store(
+        0, std::memory_order_relaxed);
+    g_shadow_pow_claim_recovery_proof_evaluation_delay_ms.store(
+        0, std::memory_order_relaxed);
+    g_shadow_pow_claim_recovery_proof_evaluation_budget.store(
+        MAX_SHADOW_POW_CLAIM_PROOF_EVALUATIONS_PER_CALL,
+        std::memory_order_relaxed);
+    g_shadow_pow_claim_recovery_proof_evaluation_cache_capacity.store(
+        MAX_SHADOW_POW_CLAIM_PROOF_EVALUATION_CACHE,
+        std::memory_order_relaxed);
+}
+
+uint64_t GetShadowPowClaimRecoveryProofEvaluationCountForTesting()
+{
+    return g_shadow_pow_claim_recovery_proof_evaluations.load(
+        std::memory_order_relaxed);
+}
+
+uint64_t GetActiveShadowPowClaimRecoveryProofEvaluationsForTesting()
+{
+    return g_active_shadow_pow_claim_recovery_proof_evaluations.load(
+        std::memory_order_relaxed);
+}
+
+uint64_t GetShadowPowClaimRecoveryInventoryBuildCountForTesting()
+{
+    // This counter measures complete cheap graph construction, separately
+    // from the memory-hard proof-evaluation counter above.
+    return g_shadow_pow_claim_recovery_inventory_builds.load(
+        std::memory_order_relaxed);
+}
+
+uint64_t GetShadowPowClaimRecoveryPathVisitCountForTesting()
+{
+    return g_shadow_pow_claim_recovery_path_visits.load(
+        std::memory_order_relaxed);
+}
+
+uint64_t GetShadowPowClaimRecoveryTopologyVisitCountForTesting()
+{
+    return g_shadow_pow_claim_recovery_topology_visits.load(
+        std::memory_order_relaxed);
+}
+
+uint64_t GetShadowPowClaimCandidateFingerprintMapVisitCountForTesting()
+{
+    return g_shadow_pow_claim_candidate_fingerprint_map_visits.load(
+        std::memory_order_relaxed);
+}
+
+void SetShadowPowClaimRecoveryProofEvaluationDelayForTesting(int64_t delay_ms)
+{
+    g_shadow_pow_claim_recovery_proof_evaluation_delay_ms.store(
+        std::clamp<int64_t>(delay_ms, 0, 10000),
+        std::memory_order_relaxed);
+}
+
+void SetShadowPowClaimRecoveryProofEvaluationBudgetForTesting(size_t budget)
+{
+    g_shadow_pow_claim_recovery_proof_evaluation_budget.store(
+        std::clamp<size_t>(
+            budget, 1,
+            MAX_SHADOW_POW_CLAIM_PROOF_EVALUATIONS_PER_CALL),
+        std::memory_order_relaxed);
+}
+
+void SetShadowPowClaimRecoveryProofEvaluationCacheCapacityForTesting(
+    size_t capacity)
+{
+    g_shadow_pow_claim_recovery_proof_evaluation_cache_capacity.store(
+        std::clamp<size_t>(
+            capacity, 1, MAX_SHADOW_POW_CLAIM_PROOF_EVALUATION_CACHE),
+        std::memory_order_relaxed);
+}
+
 uint256 ComputeShadowPowClaimLineageFamilyFingerprint(
     const COutPoint& anchor, CAmount anchor_amount,
     const CScript& anchor_script)
@@ -440,8 +627,161 @@ uint256 ComputeShadowPowClaimLineageFamilyFingerprint(
     return hasher.GetHash();
 }
 
+bool CWallet::RefreshShadowPowClaimRelayClock() const
+{
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(cs_wallet);
+    if (!HaveChain()) return true;
+
+    struct FrontierObservation {
+        int64_t schema_frontier{0};
+        int64_t legacy_frontier{0};
+        int64_t schema_high_water{0};
+        int64_t legacy_high_water{0};
+    };
+    FrontierObservation observation;
+    {
+        LOCK2(::cs_main, cs_wallet);
+        if (m_shadow_pow_claim_recovery_db_ambiguous ||
+            m_locked_coins_db_ambiguous) {
+            return false;
+        }
+        const CBlockIndex* tip =
+            chain().chainman().ActiveChain().Tip();
+        if (!tip) return true;
+        const int64_t schema_logical_time = std::max(
+            m_shadow_pow_claim_relay_clock_high_water,
+            tip->GetMedianTimePast());
+        const int64_t wall_time = GetTime();
+        const int64_t legacy_logical_time = std::max(
+            {m_shadow_pow_claim_legacy_relay_clock_high_water,
+             tip->GetMedianTimePast(), wall_time});
+        observation.schema_high_water =
+            m_shadow_pow_claim_relay_clock_high_water;
+        observation.legacy_high_water =
+            m_shadow_pow_claim_legacy_relay_clock_high_water;
+
+        // Ordered frontiers include confirmed records without rescanning
+        // lifetime claim history. Validate only the greatest crossed witness
+        // in each typed clock domain; advancing H/L to that exact frontier
+        // monotonically covers every smaller frontier as well.
+        const auto observe_domain = [&](const auto& frontiers,
+                                        int64_t domain_time,
+                                        int64_t domain_high_water,
+                                        bool legacy) {
+            auto upper = domain_time ==
+                    std::numeric_limits<int64_t>::max()
+                ? frontiers.end()
+                : frontiers.lower_bound(
+                      {domain_time + 1, uint256{}});
+            if (upper == frontiers.begin()) return true;
+            --upper;
+            const int64_t indexed_frontier = upper->first;
+            const uint256& txid = upper->second;
+            if (indexed_frontier <= domain_high_water) return true;
+            const auto wallet_it = mapWallet.find(txid);
+            if (wallet_it == mapWallet.end() || !wallet_it->second.tx ||
+                wallet_it->second.tx->GetTotalSize() >
+                    SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY ||
+                wallet_it->second.GetHash() != txid) {
+                return false;
+            }
+            const CWalletTx& wtx = wallet_it->second;
+            int64_t relay_birth{0};
+            bool birth_chain_anchored{false};
+            if (!GetShadowPowClaimRelayBirthLocked(
+                    wtx, relay_birth, &birth_chain_anchored)) {
+                return false;
+            }
+            const bool schema_clocked =
+                wtx.mapValue.count(
+                    SHADOW_POW_CLAIM_RELAY_CLOCK_SCHEMA_KEY) != 0 ||
+                wtx.mapValue.count(
+                    SHADOW_POW_CLAIM_RELAY_BIRTH_KEY) != 0 ||
+                wtx.mapValue.count(
+                    SHADOW_POW_CLAIM_RELAY_TXID_KEY) != 0;
+            if (schema_clocked == legacy) return false;
+            int64_t record_logical_time = schema_clocked
+                ? std::max(schema_logical_time, relay_birth)
+                : std::max(legacy_logical_time, relay_birth);
+            if (birth_chain_anchored) {
+                record_logical_time = std::max(
+                    record_logical_time, relay_birth);
+            }
+            if (relay_birth <= 0 ||
+                relay_birth > record_logical_time ||
+                relay_birth >
+                    std::numeric_limits<int64_t>::max() -
+                        SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS) {
+                return false;
+            }
+            const int64_t frontier =
+                relay_birth +
+                SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS;
+            if (frontier != indexed_frontier ||
+                frontier > record_logical_time) {
+                return false;
+            }
+            int64_t& observed_frontier = schema_clocked
+                ? observation.schema_frontier
+                : observation.legacy_frontier;
+            observed_frontier = std::max(observed_frontier, frontier);
+            return true;
+        };
+        if (!observe_domain(
+                m_shadow_pow_schema_relay_frontiers,
+                schema_logical_time,
+                observation.schema_high_water,
+                /*legacy=*/false) ||
+            !observe_domain(
+                m_shadow_pow_legacy_relay_frontiers,
+                legacy_logical_time,
+                observation.legacy_high_water,
+                /*legacy=*/true)) {
+            return false;
+        }
+    }
+    if (observation.schema_frontier <= observation.schema_high_water &&
+        observation.legacy_frontier <= observation.legacy_high_water) {
+        return true;
+    }
+
+    // Crossing E is itself a restriction-only linearization point. Once the
+    // canonical record was observed under the pinned chain/wallet snapshot,
+    // unrelated wallet churn or a later rollback cannot invalidate that
+    // observation. Persist compare-and-max without cs_main; DB ambiguity is
+    // the only reason to withhold publication.
+    LOCK(cs_wallet);
+    if (m_shadow_pow_claim_recovery_db_ambiguous ||
+        m_locked_coins_db_ambiguous) {
+        return false;
+    }
+    if (m_shadow_pow_claim_relay_clock_high_water >=
+            observation.schema_frontier &&
+        m_shadow_pow_claim_legacy_relay_clock_high_water >=
+            observation.legacy_frontier) {
+        return true;
+    }
+    return const_cast<CWallet*>(this)
+        ->AdvanceShadowPowClaimRelayClockHighWatersDurably(
+            observation.schema_frontier,
+            observation.legacy_frontier);
+}
+
 ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventory() const
 {
+    g_shadow_pow_claim_recovery_inventory_builds.fetch_add(
+        1, std::memory_order_relaxed);
+    // Legacy/imported proof ownership can require walking every script
+    // manager. Do that only in a bounded wallet-only slice, never while the
+    // chain lock is held by inventory construction or a validation callback.
+    RefreshShadowPowClaimOwnershipIndex();
+    // This cheap pass includes confirmed authored proofs and performs at most
+    // one scalar durable write with cs_main released. The graph/evaluator
+    // below therefore never returns authority from a pre-high-water snapshot.
+    if (HaveChain()) {
+        RefreshShadowPowClaimRelayClock();
+    }
     if (!HaveChain() || !chain().isReadyToBroadcast()) {
         ShadowPowClaimRecoveryInventory inventory;
         LOCK(cs_wallet);
@@ -451,11 +791,95 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventory() co
         inventory.wallet_processed_tip = m_last_block_processed;
         inventory.wallet_processed_height = m_last_block_processed_height;
         inventory.wallet_generation = GetDatabase().nUpdateCounter.load();
-        for (const auto& [txid, wtx] : mapWallet) {
-            if (!wtx.tx || GetTxDepthInMainChain(wtx) > 0 ||
-                !TransactionHasShadowProof(*wtx.tx)) {
-                continue;
+        const bool ownership_epoch_pending =
+            m_shadow_pow_claim_ownership_source_generation.load(
+                std::memory_order_acquire) !=
+            m_shadow_pow_claim_ownership_applied_source_generation;
+        inventory.claim_ownership_pending_records =
+            m_shadow_pow_unclassified_claim_txids.size() +
+            m_shadow_pow_claim_stale_ownership_records +
+            (ownership_epoch_pending ? 1 : 0);
+        inventory.claim_ownership_pending =
+            !m_shadow_pow_unclassified_claim_txids.empty() ||
+            m_shadow_pow_claim_stale_ownership_records != 0 ||
+            ownership_epoch_pending;
+        const size_t script_manager_work = m_spk_managers.size();
+        const bool script_manager_capacity_exceeded =
+            script_manager_work >
+                SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY;
+        inventory.claim_ownership_capacity_exceeded =
+            m_shadow_pow_claim_ownership_capacity_exceeded ||
+            script_manager_capacity_exceeded;
+        inventory.claim_ownership_capacity_work =
+            script_manager_capacity_exceeded
+                ? script_manager_work
+                : m_shadow_pow_claim_ownership_capacity_work;
+        if (inventory.claim_ownership_pending ||
+            inventory.claim_ownership_capacity_exceeded) {
+            return inventory;
+        }
+        if (m_shadow_pow_unconfirmed_claim_txids.size() >
+            SHADOW_POW_CLAIM_INDEX_CAPACITY) {
+            inventory.claim_inventory_capacity_exceeded = true;
+            inventory.claim_inventory_capacity_work =
+                m_shadow_pow_unconfirmed_claim_txids.size();
+            return inventory;
+        }
+        size_t topology_work{0};
+        size_t topology_bytes{0};
+        size_t metadata_entries{0};
+        size_t metadata_bytes{0};
+        std::vector<const CWalletTx*> bounded_claims;
+        bounded_claims.reserve(
+            m_shadow_pow_unconfirmed_claim_txids.size());
+        // Preflight the complete hot set before parsing or publishing any
+        // node. The not-ready/startup branch must have the same aggregate
+        // lock-work bound as the ready inventory and must never expose an
+        // authoritative-looking partial prefix.
+        for (const uint256& txid : m_shadow_pow_unconfirmed_claim_txids) {
+            const auto wallet_it = mapWallet.find(txid);
+            if (wallet_it == mapWallet.end() || !wallet_it->second.tx) {
+                inventory.recovery_database_ambiguous = true;
+                return inventory;
             }
+            const CTransaction& tx = *wallet_it->second.tx;
+            const size_t tx_bytes = tx.GetTotalSize();
+            const size_t record_work = 1 + tx.vin.size() + tx.vout.size();
+            if (tx_bytes > SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY ||
+                tx_bytes > SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY -
+                               std::min(
+                                   topology_bytes,
+                                   SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY) ||
+                record_work > SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY -
+                                  std::min(
+                                      topology_work,
+                                      SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY)) {
+                inventory.claim_inventory_capacity_exceeded = true;
+                inventory.claim_inventory_capacity_work =
+                    SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1;
+                return inventory;
+            }
+            if (!ConsumeShadowPowClaimMetadataBudget(
+                    wallet_it->second.mapValue, metadata_entries,
+                    metadata_bytes)) {
+                inventory.claim_inventory_capacity_exceeded = true;
+                inventory.claim_inventory_capacity_work =
+                    SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1;
+                return inventory;
+            }
+            topology_bytes += tx_bytes;
+            topology_work += record_work;
+            inventory.claim_inventory_capacity_work = topology_work;
+            if (wallet_it->second.GetHash() != txid ||
+                !TransactionHasShadowProof(tx)) {
+                inventory.recovery_database_ambiguous = true;
+                return inventory;
+            }
+            bounded_claims.push_back(&wallet_it->second);
+        }
+        for (const CWalletTx* bounded : bounded_claims) {
+            const CWalletTx& wtx = *bounded;
+            const uint256 txid = wtx.GetHash();
 
             ShadowPowClaimRecoveryNode node;
             node.txid = txid;
@@ -464,7 +888,7 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventory() co
             node.in_mempool = wtx.InMempool();
             node.quarantined = MetadataFlag(
                 wtx.mapValue, SHADOW_POW_QUARANTINE_MARKER_KEY);
-            node.wallet_authored = GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0;
+            node.wallet_authored = true;
             node.wallet_from_me = wtx.fFromMe;
             node.expected_shape = wtx.tx->vin.size() == 1 &&
                                   !wtx.tx->vin.front().prevout.IsNull() &&
@@ -493,45 +917,857 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventory() co
         return inventory;
     }
 
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(cs_wallet);
+    // One wallet-scoped singleflight covers the entire cold-cache fill. A
+    // concurrent reader waits here without either global lock, then observes
+    // the first reader's bounded cache publication instead of repeating the
+    // same Argon2 work.
+    LOCK(m_shadow_pow_claim_proof_evaluation_mutex);
+
+    // Build a cheap, fail-closed pass under the chain/wallet locks to obtain
+    // exact immutable proof contexts. Evaluate each distinct missing context
+    // after releasing both locks, then accept those results only if the active
+    // tip and complete wallet candidate fingerprint still match. A moving
+    // snapshot is retried a bounded number of times and otherwise returns the
+    // normal conservative LOCAL_STATE_ERROR classification.
+    static constexpr unsigned int MAX_SNAPSHOT_ATTEMPTS{3};
+    size_t evaluations_this_call{0};
+    const size_t evaluation_budget =
+        g_shadow_pow_claim_recovery_proof_evaluation_budget.load(
+            std::memory_order_relaxed);
+    const size_t evaluation_cache_capacity =
+        g_shadow_pow_claim_recovery_proof_evaluation_cache_capacity.load(
+            std::memory_order_relaxed);
+    enum class RelayClockPersistResult : uint8_t {
+        SUCCESS,
+        SNAPSHOT_DRIFT,
+        DATABASE_AMBIGUOUS,
+    };
+    const auto persist_relay_clock_frontier =
+        [&](const ShadowPowClaimRecoveryInventory& snapshot) {
+            AssertLockNotHeld(::cs_main);
+            AssertLockNotHeld(cs_wallet);
+            if (!snapshot.relay_clock_persistence_pending ||
+                snapshot.relay_clock_pending_frontier <= 0 ||
+                snapshot.relay_clock_pending_txid.IsNull()) {
+                return RelayClockPersistResult::SNAPSHOT_DRIFT;
+            }
+            LOCK(cs_wallet);
+            if (m_shadow_pow_claim_recovery_db_ambiguous ||
+                m_locked_coins_db_ambiguous) {
+                return RelayClockPersistResult::DATABASE_AMBIGUOUS;
+            }
+            // The crossed frontier was observed under the provisional exact
+            // LOCK2 snapshot. It is restriction-only and cannot be revoked by
+            // unrelated wallet churn or a later clock/reorg rollback. Publish
+            // it directly into its typed domain with cs_main released.
+            const bool advanced =
+                const_cast<CWallet*>(this)
+                    ->AdvanceShadowPowClaimRelayClockHighWatersDurably(
+                    snapshot.relay_clock_pending_legacy
+                        ? m_shadow_pow_claim_relay_clock_high_water
+                        : snapshot.relay_clock_pending_frontier,
+                    snapshot.relay_clock_pending_legacy
+                        ? snapshot.relay_clock_pending_frontier
+                        : m_shadow_pow_claim_legacy_relay_clock_high_water);
+            return advanced
+                ? RelayClockPersistResult::SUCCESS
+                : RelayClockPersistResult::DATABASE_AMBIGUOUS;
+        };
+    for (unsigned int attempt = 0; attempt < MAX_SNAPSHOT_ATTEMPTS; ++attempt) {
+        std::vector<std::pair<uint256,
+                              ShadowPowClaimProofEvaluationContext>> pending;
+        std::vector<ShadowPowClaimProofEvaluationContext> all_contexts;
+        ShadowPowClaimRecoveryInventory provisional;
+        {
+            LOCK2(::cs_main, cs_wallet);
+            provisional =
+                GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
+                    /*evaluations=*/{}, &pending, &all_contexts);
+
+            if (provisional.relay_clock_persistence_pending) {
+                pending.clear();
+                all_contexts.clear();
+            } else {
+
+                std::set<uint256> current_context_keys;
+                for (const ShadowPowClaimProofEvaluationContext& context :
+                     all_contexts) {
+                    if (context.valid && !context.cache_key.IsNull()) {
+                        current_context_keys.insert(context.cache_key);
+                    }
+                }
+                if (current_context_keys.size() >
+                    evaluation_cache_capacity) {
+                    provisional.proof_evaluation_capacity_contexts =
+                        current_context_keys.size();
+                    provisional.proof_evaluation_capacity_exceeded = true;
+                    return provisional;
+                }
+
+                // Retain only proof contexts relevant to this exact wallet/tip
+                // snapshot. Besides keeping the cache bounded, pruning before
+                // a fill guarantees that a serviceable set no larger than the
+                // capacity converges instead of thrashing against stale-tip or
+                // removed-candidate entries.
+                for (auto it =
+                         m_shadow_pow_claim_proof_evaluation_cache.begin();
+                     it !=
+                         m_shadow_pow_claim_proof_evaluation_cache.end();) {
+                    if (current_context_keys.count(it->first) == 0) {
+                        it = m_shadow_pow_claim_proof_evaluation_cache.erase(
+                            it);
+                    } else {
+                        ++it;
+                    }
+                }
+                m_shadow_pow_claim_proof_evaluation_cache_order.erase(
+                    std::remove_if(
+                        m_shadow_pow_claim_proof_evaluation_cache_order.begin(),
+                        m_shadow_pow_claim_proof_evaluation_cache_order.end(),
+                        [&](const uint256& key) {
+                            return current_context_keys.count(key) == 0;
+                        }),
+                    m_shadow_pow_claim_proof_evaluation_cache_order.end());
+            }
+        }
+        if (provisional.relay_clock_persistence_pending) {
+            const RelayClockPersistResult persisted =
+                persist_relay_clock_frontier(provisional);
+            if (persisted == RelayClockPersistResult::DATABASE_AMBIGUOUS) {
+                provisional.recovery_database_ambiguous = true;
+                return provisional;
+            }
+            continue;
+        }
+        if (pending.empty()) return provisional;
+
+        std::map<uint256, ShadowPowClaimProofEvaluation> fresh_by_txid;
+        std::map<uint256, ShadowPowClaimProofEvaluation> distinct;
+        std::set<uint256> retryable_local_failure_contexts;
+        for (const auto& [txid, context] : pending) {
+            auto cached = distinct.find(context.cache_key);
+            if (cached != distinct.end() &&
+                cached->second.context == context) {
+                fresh_by_txid.emplace(txid, cached->second);
+                continue;
+            }
+            if (evaluations_this_call >= evaluation_budget) {
+                break;
+            }
+
+            AssertLockNotHeld(::cs_main);
+            AssertLockNotHeld(cs_wallet);
+            struct ActiveEvaluationGuard {
+                ActiveEvaluationGuard()
+                {
+                    g_active_shadow_pow_claim_recovery_proof_evaluations
+                        .fetch_add(1, std::memory_order_relaxed);
+                }
+                ~ActiveEvaluationGuard()
+                {
+                    g_active_shadow_pow_claim_recovery_proof_evaluations
+                        .fetch_sub(1, std::memory_order_relaxed);
+                }
+            } active_evaluation;
+            const int64_t delay_ms =
+                g_shadow_pow_claim_recovery_proof_evaluation_delay_ms.load(
+                    std::memory_order_relaxed);
+            if (delay_ms > 0) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds{delay_ms});
+            }
+            ShadowPowClaimProofEvaluation evaluation;
+            evaluation.context = context;
+            try {
+                evaluation = EvaluateShadowPowClaimProof(context);
+            } catch (const std::exception& exception) {
+                WalletLogPrintf(
+                    "Gold Rush recovery proof evaluation failed locally: %s\n",
+                    exception.what());
+            } catch (...) {
+                WalletLogPrintf(
+                    "Gold Rush recovery proof evaluation failed locally with an unknown exception\n");
+            }
+            ++evaluations_this_call;
+            g_shadow_pow_claim_recovery_proof_evaluations.fetch_add(
+                1, std::memory_order_relaxed);
+            if (evaluation.result ==
+                    ShadowProofValidationResult::LOCAL_INTERNAL_ERROR) {
+                retryable_local_failure_contexts.insert(
+                    evaluation.context.cache_key);
+            }
+            distinct[context.cache_key] = evaluation;
+            fresh_by_txid.emplace(txid, std::move(evaluation));
+        }
+
+        std::vector<std::pair<uint256,
+                              ShadowPowClaimProofEvaluationContext>> remaining;
+        ShadowPowClaimRecoveryInventory complete;
+        bool exact_snapshot{false};
+        {
+            LOCK2(::cs_main, cs_wallet);
+            const CBlockIndex* tip =
+                chain().chainman().ActiveChain().Tip();
+            const uint256 active_tip =
+                tip ? tip->GetBlockHash() : uint256{};
+            const uint64_t wallet_generation =
+                GetDatabase().nUpdateCounter.load();
+            const uint256 candidate_state =
+                GetShadowPowClaimCandidateStateFingerprintLocked();
+            exact_snapshot = tip &&
+                active_tip == provisional.active_tip &&
+                tip->nHeight == provisional.active_height &&
+                m_last_block_processed ==
+                    provisional.wallet_processed_tip &&
+                m_last_block_processed_height ==
+                    provisional.wallet_processed_height &&
+                wallet_generation == provisional.wallet_generation &&
+                candidate_state ==
+                    provisional.candidate_state_fingerprint &&
+                (m_shadow_pow_claim_recovery_db_ambiguous ||
+                 m_locked_coins_db_ambiguous) ==
+                    provisional.recovery_database_ambiguous;
+            if (!exact_snapshot) {
+                continue;
+            }
+
+            for (const auto& [txid, evaluation] : fresh_by_txid) {
+                if (evaluation.result ==
+                        ShadowProofValidationResult::LOCAL_INTERNAL_ERROR ||
+                    !evaluation.context.valid ||
+                    evaluation.context.cache_key.IsNull()) {
+                    continue;
+                }
+                const uint256& key = evaluation.context.cache_key;
+                const auto existing =
+                    m_shadow_pow_claim_proof_evaluation_cache.find(key);
+                if (existing !=
+                        m_shadow_pow_claim_proof_evaluation_cache.end() &&
+                    existing->second.context == evaluation.context) {
+                    existing->second = evaluation;
+                    continue;
+                }
+                if (existing !=
+                    m_shadow_pow_claim_proof_evaluation_cache.end()) {
+                    m_shadow_pow_claim_proof_evaluation_cache.erase(existing);
+                    m_shadow_pow_claim_proof_evaluation_cache_order.erase(
+                        std::remove(
+                            m_shadow_pow_claim_proof_evaluation_cache_order.begin(),
+                            m_shadow_pow_claim_proof_evaluation_cache_order.end(),
+                            key),
+                        m_shadow_pow_claim_proof_evaluation_cache_order.end());
+                }
+                while (m_shadow_pow_claim_proof_evaluation_cache.size() >=
+                           evaluation_cache_capacity &&
+                       !m_shadow_pow_claim_proof_evaluation_cache_order.empty()) {
+                    m_shadow_pow_claim_proof_evaluation_cache.erase(
+                        m_shadow_pow_claim_proof_evaluation_cache_order.front());
+                    m_shadow_pow_claim_proof_evaluation_cache_order.pop_front();
+                }
+                m_shadow_pow_claim_proof_evaluation_cache.emplace(
+                    key, evaluation);
+                m_shadow_pow_claim_proof_evaluation_cache_order.push_back(key);
+            }
+
+            complete =
+                GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
+                    fresh_by_txid, &remaining,
+                    /*all_contexts=*/nullptr);
+        }
+        if (complete.relay_clock_persistence_pending) {
+            const RelayClockPersistResult persisted =
+                persist_relay_clock_frontier(complete);
+            if (persisted == RelayClockPersistResult::DATABASE_AMBIGUOUS) {
+                complete.recovery_database_ambiguous = true;
+                return complete;
+            }
+            continue;
+        }
+        complete.proof_evaluation_retryable_local_failure_contexts =
+            retryable_local_failure_contexts.size();
+        complete.proof_evaluation_retryable_local_failure =
+            !retryable_local_failure_contexts.empty();
+        // A local failure is complete for this one read: return its typed,
+        // nonauthorizing result without spinning through all snapshot retries.
+        // Because it was not cached, a later read retries the exact context.
+        if (complete.proof_evaluation_retryable_local_failure) {
+            return complete;
+        }
+        if (remaining.empty()) return complete;
+        if (evaluations_this_call >= evaluation_budget) {
+            std::set<uint256> deferred_contexts;
+            for (const auto& [txid, context] : remaining) {
+                deferred_contexts.insert(context.cache_key);
+            }
+            complete.proof_evaluation_deferred_contexts =
+                deferred_contexts.size();
+            complete.proof_evaluation_budget_exhausted =
+                !deferred_contexts.empty();
+            return complete;
+        }
+        // A context can remain only if the cheap final pass derived different
+        // immutable inputs. Treat that as drift and never authorize from it.
+    }
+
     LOCK2(::cs_main, cs_wallet);
-    return GetShadowPowClaimRecoveryInventoryLocked();
+    std::vector<std::pair<uint256,
+                          ShadowPowClaimProofEvaluationContext>> remaining;
+    ShadowPowClaimRecoveryInventory incomplete =
+        GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
+            /*evaluations=*/{}, &remaining);
+    std::set<uint256> deferred_contexts;
+    for (const auto& [txid, context] : remaining) {
+        deferred_contexts.insert(context.cache_key);
+    }
+    incomplete.proof_evaluation_deferred_contexts =
+        deferred_contexts.size();
+    incomplete.proof_evaluation_budget_exhausted =
+        !deferred_contexts.empty();
+    return incomplete;
 }
 
 uint256 CWallet::GetShadowPowClaimCandidateStateFingerprintLocked() const
 {
-    AssertLockHeld(::cs_main);
     AssertLockHeld(cs_wallet);
     HashWriter hasher{};
-    // Relay eligibility changes at a wall-clock boundary without mutating the
-    // wallet. Hash that derived phase so snapshot-local family suppression and
-    // worker WAIT caches expire into a same-anchor refresh on a stalled tip.
-    const int64_t now = GetTime();
-    hasher << uint8_t{2};
+    // Every in-memory candidate/graph transition advances the wallet-scoped
+    // generation below; every durable record mutation also advances the
+    // database counter. User coin locks have their own generation. Relay TTL
+    // is represented by the inventory's O(1) next-expiry frontier rather than
+    // hashing wall time or walking all wallet records on each warm worker
+    // iteration. This function must remain independent of mapWallet size.
+    hasher << uint8_t{5};
+    hasher << m_shadow_pow_claim_candidate_state_generation;
+    // Script/key managers publish this epoch before changing an IsMine
+    // result. Binding it closes the interval between the wallet-only
+    // ownership prepass and later LOCK2 inventory construction.
+    hasher << m_shadow_pow_claim_ownership_source_generation.load(
+        std::memory_order_acquire);
+    hasher << uint64_t{m_spk_managers.size()};
+    hasher << GetDatabase().nUpdateCounter.load();
+    hasher << m_shadow_pow_claim_relay_clock_high_water;
+    hasher << m_shadow_pow_claim_legacy_relay_clock_high_water;
     hasher << m_coin_lock_generation;
     hasher << m_locked_coins_db_ambiguous;
-    size_t candidates{0};
-    for (const auto& [txid, wtx] : mapWallet) {
-        if (!wtx.tx || GetTxDepthInMainChain(wtx) > 0 ||
-            !TransactionHasShadowProof(*wtx.tx)) {
-            continue;
-        }
-        ++candidates;
-        hasher << txid;
-        hasher << GetTxDepthInMainChain(wtx);
-        hasher << wtx.InMempool();
-        hasher << wtx.isAbandoned();
-        hasher << wtx.fFromMe;
-        hasher << wtx.nTimeReceived;
-        hasher << (wtx.nTimeReceived <= 0 ||
-                   wtx.nTimeReceived <=
-                       now - SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS);
-        hasher << wtx.mapValue;
-    }
-    hasher << static_cast<uint64_t>(candidates);
     return hasher.GetHash();
 }
 
-ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocked() const
+void CWallet::InvalidateShadowPowClaimImplicitOwnershipLocked()
+{
+    AssertLockHeld(cs_wallet);
+    m_shadow_pow_claim_ownership_applied_source_generation =
+        m_shadow_pow_claim_ownership_source_generation.load(
+            std::memory_order_acquire);
+    // Do not walk the cached classifications here. Key imports and descriptor
+    // changes are ordinary wallet operations and must remain O(1). The next
+    // public inventory calls refresh the old epoch in bounded wallet-only
+    // slices; no claim authority is available until the count reaches zero.
+    if (++m_shadow_pow_claim_ownership_generation == 0) {
+        // A practical impossibility, but retaining an epoch value of zero for
+        // neither old nor new classifications keeps wraparound fail closed.
+        ++m_shadow_pow_claim_ownership_generation;
+    }
+    m_shadow_pow_claim_stale_ownership_records =
+        m_shadow_pow_unconfirmed_implicit_claim_txids.size();
+    m_shadow_pow_claim_ownership_reclassification_cursor.reset();
+    m_shadow_pow_claim_ownership_capacity_exceeded = false;
+    m_shadow_pow_claim_ownership_capacity_work = 0;
+    MarkShadowPowClaimCandidateStateChangedLocked();
+}
+
+void CWallet::InvalidateShadowPowClaimImplicitOwnershipEntryLocked(
+    const uint256& txid)
+{
+    AssertLockHeld(cs_wallet);
+    const auto wallet_it = mapWallet.find(txid);
+    if (wallet_it == mapWallet.end() || !wallet_it->second.tx) return;
+    const CWalletTx& wtx = wallet_it->second;
+    if (wtx.fFromMe ||
+        wtx.mapValue.count(SHADOW_POW_CLAIM_AUTHORED_KEY) != 0 ||
+        wtx.mapValue.count(SHADOW_POW_CLAIM_ADOPTED_KEY) != 0) {
+        return;
+    }
+
+    const bool cached =
+        m_shadow_pow_legacy_local_claim_txids.count(txid) != 0 ||
+        m_shadow_pow_foreign_claim_txids.count(txid) != 0;
+    const bool stale_unconfirmed =
+        m_shadow_pow_unconfirmed_implicit_claim_txids.count(txid) != 0;
+    const auto generation =
+        m_shadow_pow_claim_ownership_generation_by_txid.find(txid);
+    if (cached && stale_unconfirmed && generation !=
+                      m_shadow_pow_claim_ownership_generation_by_txid.end() &&
+        generation->second != m_shadow_pow_claim_ownership_generation &&
+        m_shadow_pow_claim_stale_ownership_records > 0) {
+        --m_shadow_pow_claim_stale_ownership_records;
+    }
+    m_shadow_pow_claim_ownership_generation_by_txid.erase(txid);
+    m_shadow_pow_legacy_local_claim_txids.erase(txid);
+    m_shadow_pow_foreign_claim_txids.erase(txid);
+    m_shadow_pow_unconfirmed_implicit_claim_txids.erase(txid);
+    m_shadow_pow_unclassified_claim_txids.insert(txid);
+    RefreshShadowPowClaimIndexEntryLocked(wtx);
+    MarkShadowPowClaimCandidateStateChangedLocked();
+}
+
+void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    if (!wtx.tx) return;
+    const uint256 txid = wtx.GetHash();
+    const bool was_unconfirmed_implicit =
+        m_shadow_pow_unconfirmed_implicit_claim_txids.count(txid) != 0;
+    const auto forget_implicit_ownership = [&] {
+        const bool cached =
+            m_shadow_pow_legacy_local_claim_txids.count(txid) != 0 ||
+            m_shadow_pow_foreign_claim_txids.count(txid) != 0;
+        const auto generation =
+            m_shadow_pow_claim_ownership_generation_by_txid.find(txid);
+        if (cached && was_unconfirmed_implicit && generation !=
+                          m_shadow_pow_claim_ownership_generation_by_txid.end() &&
+            generation->second != m_shadow_pow_claim_ownership_generation &&
+            m_shadow_pow_claim_stale_ownership_records > 0) {
+            --m_shadow_pow_claim_stale_ownership_records;
+        }
+        m_shadow_pow_claim_ownership_generation_by_txid.erase(txid);
+        m_shadow_pow_legacy_local_claim_txids.erase(txid);
+        m_shadow_pow_foreign_claim_txids.erase(txid);
+        m_shadow_pow_unconfirmed_implicit_claim_txids.erase(txid);
+    };
+    const auto prior_frontier =
+        m_shadow_pow_relay_frontier_by_txid.find(txid);
+    if (prior_frontier !=
+        m_shadow_pow_relay_frontier_by_txid.end()) {
+        auto& domain = prior_frontier->second.first
+            ? m_shadow_pow_legacy_relay_frontiers
+            : m_shadow_pow_schema_relay_frontiers;
+        domain.erase({prior_frontier->second.second, txid});
+        m_shadow_pow_relay_frontier_by_txid.erase(prior_frontier);
+    }
+    m_shadow_pow_unconfirmed_claim_txids.erase(txid);
+    m_shadow_pow_unconfirmed_implicit_claim_txids.erase(txid);
+    const bool explicit_local_metadata =
+        wtx.mapValue.count(SHADOW_POW_CLAIM_AUTHORED_KEY) != 0 ||
+        wtx.mapValue.count(SHADOW_POW_CLAIM_ADOPTED_KEY) != 0;
+    // This parser is linear in the immutable transaction bytes. Refuse to do
+    // even that work in a runtime callback for an oversized record; the
+    // wallet-only classifier below will retain it as nonauthorizing audit
+    // state. Normal consensus-sized claims are far below this bound.
+    if (wtx.tx->GetTotalSize() >
+            SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY) {
+        m_shadow_pow_claim_txids.erase(txid);
+        m_shadow_pow_unconfirmed_claim_txids.erase(txid);
+        forget_implicit_ownership();
+        // A confirmed record without explicit local provenance is inert until
+        // an exact disconnect makes it unconfirmed. Avoid letting oversized
+        // confirmed foreign/audit history globally block current authority;
+        // the state-transition callback requeues the exact record before it
+        // can become hot.
+        if (!wtx.isConfirmed() || wtx.fFromMe ||
+            explicit_local_metadata) {
+            m_shadow_pow_unclassified_claim_txids.insert(txid);
+        } else {
+            m_shadow_pow_unclassified_claim_txids.erase(txid);
+        }
+        return;
+    }
+    if (!TransactionHasShadowProof(*wtx.tx)) {
+        m_shadow_pow_claim_txids.erase(txid);
+        m_shadow_pow_unclassified_claim_txids.erase(txid);
+        forget_implicit_ownership();
+        return;
+    }
+    // Released Core-authored records usually carry fFromMe and current
+    // records carry explicit authored/adopted provenance. Historical imports
+    // can have neither. Never discover their ownership here: this callback
+    // can be nested beneath cs_main and GetDebit walks every script manager.
+    // The public inventory prepass classifies such records in bounded slices
+    // while cs_main is provably released.
+    const bool explicit_local = wtx.fFromMe || explicit_local_metadata;
+    // Relay aging is a restriction, not spend authority. Keep legacy
+    // receipt-time frontiers for every known proof record, including
+    // confirmed records whose debit ownership is currently foreign or
+    // unknown. If a later key/parent import makes such a record local, an
+    // intervening wall-clock expiry has already advanced the typed durable
+    // high-water and cannot be revived by a rollback plus disconnect.
+    bool schema_present{false};
+    int64_t relay_birth{0};
+    bool relay_clock_valid = ParseShadowPowClaimRelayClockMetadata(
+        wtx.mapValue, txid, schema_present, relay_birth);
+    if (!schema_present) {
+        relay_birth = wtx.nTimeReceived;
+        relay_clock_valid = relay_birth > 0 &&
+            relay_birth <= std::numeric_limits<int64_t>::max() -
+                               SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS;
+    } else {
+        const auto authored = wtx.mapValue.find(
+            SHADOW_POW_CLAIM_AUTHORED_KEY);
+        relay_clock_valid = relay_clock_valid &&
+            authored != wtx.mapValue.end() && authored->second == "1";
+    }
+    if (relay_clock_valid) {
+        const int64_t frontier = relay_birth +
+            SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS;
+        const bool legacy = !schema_present;
+        auto& domain = legacy ? m_shadow_pow_legacy_relay_frontiers
+                              : m_shadow_pow_schema_relay_frontiers;
+        domain.emplace(frontier, txid);
+        m_shadow_pow_relay_frontier_by_txid.emplace(
+            txid, std::pair{legacy, frontier});
+    }
+    const auto classified_generation =
+        m_shadow_pow_claim_ownership_generation_by_txid.find(txid);
+    const bool current_implicit_classification =
+        classified_generation !=
+            m_shadow_pow_claim_ownership_generation_by_txid.end() &&
+        classified_generation->second ==
+            m_shadow_pow_claim_ownership_generation;
+    if (explicit_local) {
+        forget_implicit_ownership();
+    } else if (!current_implicit_classification) {
+        forget_implicit_ownership();
+    }
+    const bool locally_relevant = explicit_local ||
+        (current_implicit_classification &&
+         m_shadow_pow_legacy_local_claim_txids.count(txid) != 0);
+    const bool classified_foreign = current_implicit_classification &&
+        m_shadow_pow_foreign_claim_txids.count(txid) != 0;
+    if (!locally_relevant && !classified_foreign) {
+        m_shadow_pow_claim_txids.erase(txid);
+        m_shadow_pow_unconfirmed_claim_txids.erase(txid);
+        // Confirmed implicit history is inert. Reclassify it only if an exact
+        // state transition later makes it unconfirmed and therefore relevant
+        // to current authority. This prevents key imports from turning a
+        // large confirmed foreign history into a wallet-wide N/64-call pause.
+        if (wtx.isConfirmed()) {
+            m_shadow_pow_unclassified_claim_txids.erase(txid);
+        } else {
+            m_shadow_pow_unclassified_claim_txids.insert(txid);
+        }
+        return;
+    }
+    m_shadow_pow_unclassified_claim_txids.erase(txid);
+    if (!explicit_local && !wtx.isConfirmed()) {
+        m_shadow_pow_unconfirmed_implicit_claim_txids.insert(txid);
+    }
+    if (locally_relevant) {
+        m_shadow_pow_foreign_claim_txids.erase(txid);
+        m_shadow_pow_claim_txids.insert(txid);
+        if (!wtx.isConfirmed()) {
+            m_shadow_pow_unconfirmed_claim_txids.insert(txid);
+        }
+
+    } else {
+        m_shadow_pow_claim_txids.erase(txid);
+        m_shadow_pow_foreign_claim_txids.insert(txid);
+    }
+}
+
+void CWallet::RefreshShadowPowClaimOwnershipIndex() const
+{
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(cs_wallet);
+
+    WAIT_LOCK(cs_wallet, ownership_lock);
+    CWallet& wallet = *const_cast<CWallet*>(this);
+    const uint64_t source_generation =
+        m_shadow_pow_claim_ownership_source_generation.load(
+            std::memory_order_acquire);
+    if (m_shadow_pow_claim_ownership_applied_source_generation !=
+        source_generation) {
+        wallet.InvalidateShadowPowClaimImplicitOwnershipLocked();
+        // Invalidate sampled the same atomic while holding cs_wallet. If a
+        // concurrent SPKM mutation races after it, the next call observes a
+        // different source generation and keeps authority pending again.
+    }
+    m_shadow_pow_claim_ownership_capacity_exceeded = false;
+    m_shadow_pow_claim_ownership_capacity_work = 0;
+    if (m_spk_managers.size() >
+        SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY) {
+        m_shadow_pow_claim_ownership_capacity_exceeded = true;
+        m_shadow_pow_claim_ownership_capacity_work =
+            m_spk_managers.size();
+        return;
+    }
+    size_t classified{0};
+    size_t ownership_work{0};
+    size_t ownership_bytes{0};
+    while (classified < SHADOW_POW_CLAIM_OWNERSHIP_SLICE) {
+        bool stale_cached_entry{false};
+        std::optional<uint256> selected;
+        if (!m_shadow_pow_unclassified_claim_txids.empty()) {
+            selected = *m_shadow_pow_unclassified_claim_txids.begin();
+        } else if (m_shadow_pow_claim_stale_ownership_records != 0) {
+            auto stale = m_shadow_pow_claim_ownership_reclassification_cursor
+                ? m_shadow_pow_unconfirmed_implicit_claim_txids.upper_bound(
+                      *m_shadow_pow_claim_ownership_reclassification_cursor)
+                : m_shadow_pow_unconfirmed_implicit_claim_txids.begin();
+            if (stale ==
+                m_shadow_pow_unconfirmed_implicit_claim_txids.end()) {
+                // A bounded pass reached the end. Mutations during earlier
+                // slices can move entries behind the cursor; wrap once and
+                // continue on the next bounded iteration/call.
+                m_shadow_pow_claim_ownership_reclassification_cursor.reset();
+                stale = m_shadow_pow_unconfirmed_implicit_claim_txids.begin();
+            }
+            if (stale !=
+                m_shadow_pow_unconfirmed_implicit_claim_txids.end()) {
+                selected = *stale;
+            }
+            if (!selected) break;
+            m_shadow_pow_claim_ownership_reclassification_cursor = *selected;
+            const auto prior_generation =
+                m_shadow_pow_claim_ownership_generation_by_txid.find(*selected);
+            if (prior_generation !=
+                    m_shadow_pow_claim_ownership_generation_by_txid.end() &&
+                prior_generation->second ==
+                    m_shadow_pow_claim_ownership_generation) {
+                // This entry was refreshed by an exact parent callback after
+                // the epoch changed. Charge the visit so a large current
+                // prefix cannot turn one call into an unbounded scan.
+                ++classified;
+                continue;
+            }
+            stale_cached_entry = true;
+        } else {
+            break;
+        }
+        const uint256 txid = *selected;
+        const auto it = mapWallet.find(txid);
+        if (it == mapWallet.end() || !it->second.tx) {
+            m_shadow_pow_claim_ownership_capacity_exceeded = true;
+            m_shadow_pow_claim_ownership_capacity_work =
+                std::max<size_t>(1, ownership_work);
+            break;
+        }
+        const CTransactionRef tx_ref = it->second.tx;
+        const uint64_t candidate_generation =
+            m_shadow_pow_claim_candidate_state_generation;
+        const uint64_t ownership_generation =
+            m_shadow_pow_claim_ownership_generation;
+        const uint64_t applied_source_generation =
+            m_shadow_pow_claim_ownership_applied_source_generation;
+        const size_t manager_work = std::max<size_t>(
+            1, m_spk_managers.size());
+        bool has_shadow_proof{false};
+        size_t tx_bytes{0};
+        size_t vin_size{0};
+        size_t vout_size{0};
+        try {
+            // Potentially large ordinary records are inspected only here,
+            // with both cs_main and cs_wallet released. Once proven ordinary
+            // they leave every claim index and can never create a persistent
+            // claim-capacity result merely because of their unrelated
+            // transaction size.
+            REVERSE_LOCK(ownership_lock);
+            has_shadow_proof = TransactionHasShadowProof(*tx_ref);
+            if (has_shadow_proof) {
+                tx_bytes = tx_ref->GetTotalSize();
+                vin_size = tx_ref->vin.size();
+                vout_size = tx_ref->vout.size();
+            }
+        } catch (...) {
+            break;
+        }
+        const auto current = mapWallet.find(txid);
+        if (current == mapWallet.end() || current->second.tx != tx_ref ||
+            candidate_generation !=
+                m_shadow_pow_claim_candidate_state_generation ||
+            ownership_generation !=
+                m_shadow_pow_claim_ownership_generation ||
+            applied_source_generation !=
+                m_shadow_pow_claim_ownership_applied_source_generation ||
+            applied_source_generation !=
+                m_shadow_pow_claim_ownership_source_generation.load(
+                    std::memory_order_acquire)) {
+            // The immutable record or ownership domain changed while the
+            // expensive type/size scan ran without wallet locks. Leave the
+            // record pending; a later bounded call snapshots the new state.
+            break;
+        }
+        const CTransaction& tx = *tx_ref;
+        if (!has_shadow_proof) {
+            m_shadow_pow_unclassified_claim_txids.erase(txid);
+            m_shadow_pow_legacy_local_claim_txids.erase(txid);
+            wallet.m_shadow_pow_foreign_claim_txids.erase(txid);
+            m_shadow_pow_unconfirmed_implicit_claim_txids.erase(txid);
+            m_shadow_pow_claim_ownership_generation_by_txid.erase(txid);
+            if (stale_cached_entry &&
+                m_shadow_pow_claim_stale_ownership_records > 0) {
+                --m_shadow_pow_claim_stale_ownership_records;
+            }
+            wallet.m_shadow_pow_claim_txids.erase(txid);
+            wallet.m_shadow_pow_unconfirmed_claim_txids.erase(txid);
+            wallet.MarkShadowPowClaimCandidateStateChangedLocked();
+            ++classified;
+            continue;
+        }
+        const bool work_overflow = vin_size != 0 &&
+            manager_work >
+                SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY /
+                    vin_size;
+        const size_t record_work = work_overflow
+            ? SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1
+            : vin_size * manager_work + vout_size + 1;
+        if (tx_bytes > SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY ||
+            tx_bytes > SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY -
+                           std::min(
+                               ownership_bytes,
+                               SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY) ||
+            record_work > SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY -
+                              std::min(
+                                  ownership_work,
+                                  SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY)) {
+            m_shadow_pow_claim_ownership_capacity_exceeded = true;
+            m_shadow_pow_claim_ownership_capacity_work =
+                std::max(record_work,
+                         SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1);
+            break;
+        }
+        ownership_bytes += tx_bytes;
+        ownership_work += record_work;
+        m_shadow_pow_claim_ownership_capacity_work = ownership_work;
+
+        try {
+            const bool locally_owned =
+                GetDebit(tx, ISMINE_SPENDABLE) > 0;
+            if (applied_source_generation !=
+                m_shadow_pow_claim_ownership_source_generation.load(
+                    std::memory_order_acquire)) {
+                break;
+            }
+            if (locally_owned) {
+                wallet.m_shadow_pow_foreign_claim_txids.erase(txid);
+                m_shadow_pow_legacy_local_claim_txids.insert(txid);
+            } else {
+                m_shadow_pow_legacy_local_claim_txids.erase(txid);
+                wallet.m_shadow_pow_foreign_claim_txids.insert(txid);
+            }
+        } catch (...) {
+            // A local ownership evaluator failure grants no authority and is
+            // retried by a later bounded wallet-only slice.
+            break;
+        }
+        m_shadow_pow_claim_ownership_generation_by_txid[txid] =
+            m_shadow_pow_claim_ownership_generation;
+        if (stale_cached_entry &&
+            m_shadow_pow_claim_stale_ownership_records > 0) {
+            --m_shadow_pow_claim_stale_ownership_records;
+        }
+        m_shadow_pow_unclassified_claim_txids.erase(txid);
+        wallet.RefreshShadowPowClaimIndexEntryLocked(current->second);
+        wallet.MarkShadowPowClaimCandidateStateChangedLocked();
+        ++classified;
+    }
+}
+
+void CWallet::RebuildShadowPowClaimIndexesLocked()
+{
+    AssertLockHeld(cs_wallet);
+    m_shadow_pow_claim_txids.clear();
+    m_shadow_pow_unconfirmed_claim_txids.clear();
+    m_shadow_pow_unclassified_claim_txids.clear();
+    m_shadow_pow_legacy_local_claim_txids.clear();
+    m_shadow_pow_foreign_claim_txids.clear();
+    m_shadow_pow_unconfirmed_implicit_claim_txids.clear();
+    m_shadow_pow_claim_ownership_generation_by_txid.clear();
+    m_shadow_pow_claim_stale_ownership_records = 0;
+    m_shadow_pow_claim_ownership_reclassification_cursor.reset();
+    m_shadow_pow_schema_relay_frontiers.clear();
+    m_shadow_pow_legacy_relay_frontiers.clear();
+    m_shadow_pow_relay_frontier_by_txid.clear();
+    for (const auto& [txid, wtx] : mapWallet) {
+        (void)txid;
+        RefreshShadowPowClaimIndexEntryLocked(wtx);
+    }
+}
+
+bool CWallet::ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+    const ShadowPowClaimRecoveryInventory& inventory) const
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_wallet);
+    const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
+    const int64_t wall_time = GetTime();
+    const int64_t median_time = tip ? tip->GetMedianTimePast() : 0;
+    const bool wall_time_plausible = tip &&
+        IsShadowPowClaimRelayWallTimePlausibleLocked(
+            wall_time, median_time);
+    const int64_t effective_time =
+        GetShadowPowClaimRelayEffectiveTimeLocked(
+            wall_time, median_time);
+    const bool signing_safe = tip &&
+        IsShadowPowClaimRelayClockSigningSafeLocked(
+            wall_time, median_time);
+    const size_t script_manager_work = m_spk_managers.size();
+    const bool script_manager_capacity_exceeded =
+        script_manager_work >
+            SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY;
+    const bool ownership_capacity_exceeded =
+        m_shadow_pow_claim_ownership_capacity_exceeded ||
+        script_manager_capacity_exceeded;
+    const size_t ownership_capacity_work =
+        script_manager_capacity_exceeded
+            ? script_manager_work
+            : m_shadow_pow_claim_ownership_capacity_work;
+    return tip && inventory.wallet_tip_matches &&
+           tip->GetBlockHash() == inventory.active_tip &&
+           tip->nHeight == inventory.active_height &&
+           inventory.wallet_processed_tip == inventory.active_tip &&
+           inventory.wallet_processed_height == inventory.active_height &&
+           m_last_block_processed == inventory.wallet_processed_tip &&
+           m_last_block_processed_height ==
+               inventory.wallet_processed_height &&
+           inventory.relay_clock_high_water ==
+               m_shadow_pow_claim_relay_clock_high_water &&
+           inventory.legacy_relay_clock_high_water ==
+               m_shadow_pow_claim_legacy_relay_clock_high_water &&
+           inventory.relay_clock_median_time_past == median_time &&
+           inventory.relay_clock_wall_time_plausible ==
+               wall_time_plausible &&
+           inventory.relay_clock_signing_safe == signing_safe &&
+           !inventory.relay_clock_persistence_pending &&
+           effective_time >= inventory.classification_time &&
+           (inventory.next_relay_expiry_time <= 0 ||
+            effective_time < inventory.next_relay_expiry_time) &&
+           (inventory.next_legacy_relay_expiry_wall_time <= 0 ||
+            wall_time <
+                inventory.next_legacy_relay_expiry_wall_time) &&
+           GetDatabase().nUpdateCounter.load() ==
+               inventory.wallet_generation &&
+           GetShadowPowClaimCandidateStateFingerprintLocked() ==
+               inventory.candidate_state_fingerprint &&
+           inventory.claim_ownership_pending_records ==
+               m_shadow_pow_unclassified_claim_txids.size() +
+                   m_shadow_pow_claim_stale_ownership_records +
+                   (m_shadow_pow_claim_ownership_source_generation.load(
+                        std::memory_order_acquire) !=
+                            m_shadow_pow_claim_ownership_applied_source_generation
+                        ? 1
+                        : 0) &&
+           inventory.claim_ownership_pending ==
+               (!m_shadow_pow_unclassified_claim_txids.empty() ||
+                m_shadow_pow_claim_stale_ownership_records != 0 ||
+                m_shadow_pow_claim_ownership_source_generation.load(
+                    std::memory_order_acquire) !=
+                    m_shadow_pow_claim_ownership_applied_source_generation) &&
+           inventory.claim_ownership_capacity_exceeded ==
+               ownership_capacity_exceeded &&
+           inventory.claim_ownership_capacity_work ==
+               ownership_capacity_work &&
+           (m_shadow_pow_claim_recovery_db_ambiguous ||
+            m_locked_coins_db_ambiguous) ==
+               inventory.recovery_database_ambiguous;
+}
+
+ShadowPowClaimRecoveryInventory
+CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
+    const std::map<uint256, ShadowPowClaimProofEvaluation>& evaluations,
+    std::vector<std::pair<uint256,
+                          ShadowPowClaimProofEvaluationContext>>* pending,
+    std::vector<ShadowPowClaimProofEvaluationContext>* all_contexts) const
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(cs_wallet);
@@ -543,24 +1779,221 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
     if (tip) {
         inventory.active_tip = tip->GetBlockHash();
         inventory.active_height = tip->nHeight;
+        inventory.relay_clock_median_time_past =
+            tip->GetMedianTimePast();
     }
+    inventory.relay_clock_wall_time = GetTime();
+    inventory.relay_clock_high_water =
+        m_shadow_pow_claim_relay_clock_high_water;
+    inventory.legacy_relay_clock_high_water =
+        m_shadow_pow_claim_legacy_relay_clock_high_water;
+    const int64_t wall_time = inventory.relay_clock_wall_time;
+    const int64_t median_time =
+        inventory.relay_clock_median_time_past;
+    inventory.relay_clock_wall_time_plausible = tip &&
+        IsShadowPowClaimRelayWallTimePlausibleLocked(
+            wall_time, median_time);
+    inventory.classification_time =
+        GetShadowPowClaimRelayEffectiveTimeLocked(
+            wall_time, median_time);
+    const int64_t logical_relay_time = std::max(
+        inventory.relay_clock_high_water, median_time);
+    const int64_t legacy_relay_time = std::max(
+        {inventory.legacy_relay_clock_high_water, median_time,
+         inventory.relay_clock_wall_time});
+    // New claim signing is anchored to max(H, pinned active-tip MTP), never
+    // to host wall time. Legacy receive-time records still use the effective
+    // clock above only until they are replaced by schema-v1 claim bytes.
+    inventory.relay_clock_signing_safe = tip &&
+        IsShadowPowClaimRelayClockSigningSafeLocked(
+            wall_time, median_time);
     inventory.wallet_processed_tip = m_last_block_processed;
     inventory.wallet_processed_height = m_last_block_processed_height;
     inventory.wallet_generation = GetDatabase().nUpdateCounter.load();
-    inventory.candidate_state_fingerprint =
-        GetShadowPowClaimCandidateStateFingerprintLocked();
     inventory.recovery_database_ambiguous =
         m_shadow_pow_claim_recovery_db_ambiguous ||
         m_locked_coins_db_ambiguous;
+    const uint64_t ownership_source_before =
+        m_shadow_pow_claim_ownership_source_generation.load(
+            std::memory_order_acquire);
+    const bool ownership_epoch_pending = ownership_source_before !=
+        m_shadow_pow_claim_ownership_applied_source_generation;
+    inventory.claim_ownership_pending_records =
+        m_shadow_pow_unclassified_claim_txids.size() +
+        m_shadow_pow_claim_stale_ownership_records +
+        (ownership_epoch_pending ? 1 : 0);
+    inventory.claim_ownership_pending =
+        !m_shadow_pow_unclassified_claim_txids.empty() ||
+        m_shadow_pow_claim_stale_ownership_records != 0 ||
+        ownership_epoch_pending;
+    inventory.candidate_state_fingerprint =
+        GetShadowPowClaimCandidateStateFingerprintLocked();
+    const uint64_t ownership_source_after =
+        m_shadow_pow_claim_ownership_source_generation.load(
+            std::memory_order_acquire);
+    if (ownership_source_after != ownership_source_before ||
+        ownership_source_after !=
+            m_shadow_pow_claim_ownership_applied_source_generation) {
+        if (!inventory.claim_ownership_pending) {
+            ++inventory.claim_ownership_pending_records;
+        }
+        inventory.claim_ownership_pending = true;
+    }
+    const size_t script_manager_work = m_spk_managers.size();
+    const bool script_manager_capacity_exceeded =
+        script_manager_work >
+            SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY;
+    inventory.claim_ownership_capacity_exceeded =
+        m_shadow_pow_claim_ownership_capacity_exceeded ||
+        script_manager_capacity_exceeded;
+    inventory.claim_ownership_capacity_work =
+        script_manager_capacity_exceeded
+            ? script_manager_work
+            : m_shadow_pow_claim_ownership_capacity_work;
     inventory.wallet_tip_matches = tip &&
-                                   m_last_block_processed == inventory.active_tip;
+        m_last_block_processed == inventory.active_tip &&
+        m_last_block_processed_height == inventory.active_height;
+
+    if (inventory.claim_ownership_pending ||
+        inventory.claim_ownership_capacity_exceeded) {
+        return inventory;
+    }
+
+    size_t topology_work{0};
+    size_t topology_bytes{0};
+    size_t metadata_entries{0};
+    size_t metadata_bytes{0};
+    std::set<uint256> metadata_budgeted_txids;
+    const auto consume_topology_work = [&](size_t amount = 1) {
+        if (amount > SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY -
+                         std::min(topology_work,
+                                  SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY)) {
+            inventory.claim_inventory_capacity_exceeded = true;
+            inventory.claim_inventory_capacity_work =
+                SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1;
+            return false;
+        }
+        topology_work += amount;
+        inventory.claim_inventory_capacity_work = topology_work;
+        return true;
+    };
+    const auto consume_transaction_work = [&](const CWalletTx& wtx) {
+        if (!wtx.tx) {
+            inventory.recovery_database_ambiguous = true;
+            return false;
+        }
+        const CTransaction& tx = *wtx.tx;
+        const size_t tx_bytes = tx.GetTotalSize();
+        if (tx_bytes > SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY ||
+            tx_bytes > SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY -
+                           std::min(
+                               topology_bytes,
+                               SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY)) {
+            inventory.claim_inventory_capacity_exceeded = true;
+            inventory.claim_inventory_capacity_work =
+                SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1;
+            return false;
+        }
+        if (metadata_budgeted_txids.insert(wtx.GetHash()).second &&
+            !ConsumeShadowPowClaimMetadataBudget(
+                wtx.mapValue, metadata_entries, metadata_bytes)) {
+            inventory.claim_inventory_capacity_exceeded = true;
+            inventory.claim_inventory_capacity_work =
+                SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1;
+            return false;
+        }
+        topology_bytes += tx_bytes;
+        return consume_topology_work(1) &&
+            consume_topology_work(tx.vin.size()) &&
+            consume_topology_work(tx.vout.size());
+    };
+    if (m_shadow_pow_unconfirmed_claim_txids.size() >
+            SHADOW_POW_CLAIM_INDEX_CAPACITY) {
+        inventory.claim_inventory_capacity_exceeded = true;
+        inventory.claim_inventory_capacity_work =
+            m_shadow_pow_unconfirmed_claim_txids.size();
+        return inventory;
+    }
 
     std::vector<uint256> candidate_claims;
-    for (const auto& [txid, wtx] : mapWallet) {
-        if (!wtx.tx || GetTxDepthInMainChain(wtx) > 0 ||
-            !TransactionHasShadowProof(*wtx.tx)) {
-            continue;
+    for (const uint256& txid : m_shadow_pow_unconfirmed_claim_txids) {
+        const auto wallet_it = mapWallet.find(txid);
+        if (wallet_it == mapWallet.end() || !wallet_it->second.tx) {
+            inventory.recovery_database_ambiguous = true;
+            return inventory;
         }
+        if (!consume_transaction_work(wallet_it->second)) {
+            return inventory;
+        }
+        if (
+            wallet_it->second.GetHash() != txid ||
+            !TransactionHasShadowProof(*wallet_it->second.tx)) {
+            inventory.recovery_database_ambiguous = true;
+            return inventory;
+        }
+        const CWalletTx& wtx = wallet_it->second;
+        const bool wallet_authored = true;
+        if (wallet_authored) {
+            int64_t relay_birth{0};
+            bool birth_chain_anchored{false};
+            const bool receive_time_valid =
+                GetShadowPowClaimRelayBirthLocked(
+                    wtx, relay_birth, &birth_chain_anchored) &&
+                relay_birth > 0 && relay_birth <=
+                    std::numeric_limits<int64_t>::max() -
+                        SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS;
+            if (receive_time_valid) {
+                const bool schema_clocked =
+                    wtx.mapValue.count(
+                        SHADOW_POW_CLAIM_RELAY_CLOCK_SCHEMA_KEY) != 0 ||
+                    wtx.mapValue.count(
+                        SHADOW_POW_CLAIM_RELAY_BIRTH_KEY) != 0 ||
+                    wtx.mapValue.count(
+                        SHADOW_POW_CLAIM_RELAY_TXID_KEY) != 0;
+                int64_t record_logical_time = schema_clocked
+                    ? std::max(logical_relay_time, relay_birth)
+                    : std::max(legacy_relay_time, relay_birth);
+                if (birth_chain_anchored) {
+                    record_logical_time = std::max(
+                        record_logical_time, relay_birth);
+                }
+                const int64_t frontier =
+                    relay_birth +
+                    SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS;
+                if (relay_birth <= record_logical_time &&
+                    frontier > record_logical_time) {
+                    int64_t& next_frontier = schema_clocked
+                        ? inventory.next_relay_expiry_time
+                        : inventory.next_legacy_relay_expiry_wall_time;
+                    if (next_frontier == 0 || frontier < next_frontier) {
+                        next_frontier = frontier;
+                    }
+                }
+                if (relay_birth <= record_logical_time &&
+                    frontier <= record_logical_time &&
+                    frontier > (schema_clocked
+                        ? inventory.relay_clock_high_water
+                        : inventory.legacy_relay_clock_high_water) &&
+                    (frontier >
+                         inventory.relay_clock_pending_frontier ||
+                     (frontier ==
+                          inventory.relay_clock_pending_frontier &&
+                      (inventory.relay_clock_pending_txid.IsNull() ||
+                       txid < inventory.relay_clock_pending_txid)))) {
+                    inventory.relay_clock_persistence_pending = true;
+                    inventory.relay_clock_pending_frontier = frontier;
+                    inventory.relay_clock_pending_legacy =
+                        !schema_clocked;
+                    inventory.relay_clock_pending_txid = txid;
+                    inventory.relay_clock_pending_receive_time =
+                        relay_birth;
+                }
+            }
+        }
+        // Confirmed authored proofs still contribute clock frontiers above so
+        // an expiry observed while confirmed survives a later reorg. Only
+        // unresolved records participate in the recovery component graph.
+        if (GetTxDepthInMainChain(wtx) > 0) continue;
         candidate_claims.push_back(txid);
         ++inventory.raw_claim_objects;
         if (wtx.InMempool()) ++inventory.live_claim_objects;
@@ -569,6 +2002,7 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         }
     }
     std::sort(candidate_claims.begin(), candidate_claims.end());
+    if (inventory.relay_clock_persistence_pending) return inventory;
     if (candidate_claims.empty()) return inventory;
 
     // A wallet/chain tip mismatch makes every inference stale. Preserve all
@@ -584,7 +2018,7 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
             node.in_mempool = wtx.InMempool();
             node.quarantined = MetadataFlag(
                 wtx.mapValue, SHADOW_POW_QUARANTINE_MARKER_KEY);
-            node.wallet_authored = GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0;
+            node.wallet_authored = true;
             node.wallet_from_me = wtx.fFromMe;
             node.expected_shape = wtx.tx->vin.size() == 1 &&
                                   !wtx.tx->vin.front().prevout.IsNull() &&
@@ -614,51 +2048,111 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         bool authenticated{false};
     };
     std::map<uint256, ClaimPath> paths;
+    enum class ClaimPathVisit : uint8_t { UNVISITED, VISITING, RESOLVED };
+    std::map<uint256, ClaimPathVisit> path_visits;
 
     // Canonicalize each claim to its nearest active-chain-confirmed,
-    // wallet-owned ancestor output. Only wallet-authored proof transactions
-    // may form the inactive ancestry between a claim and that anchor.
-    for (const uint256& candidate_txid : candidate_claims) {
-        const CWalletTx* current = &mapWallet.at(candidate_txid);
-        std::set<uint256> seen;
-        ClaimPath path;
-        while (current && current->tx) {
-            if (!seen.insert(current->GetHash()).second ||
-                current->tx->vin.size() != 1 ||
-                current->tx->vin.front().prevout.IsNull()) {
+    // wallet-owned ancestor output. The inactive ancestry is a functional
+    // graph (one input per candidate). Memoized tri-color traversal visits
+    // each candidate once across the whole snapshot instead of walking an
+    // N-deep lineage independently for each of its N descendants. With the
+    // wallet's ordered maps the complete bound is O(W + (V + E) log W), not
+    // strict linear time. A cycle,
+    // malformed edge, foreign parent, or missing output resolves the complete
+    // dependent path as unauthenticated; no partial ancestor can authorize a
+    // recovery or mining action.
+    const auto resolve_path = [&](const uint256& candidate_txid) {
+        if (path_visits[candidate_txid] == ClaimPathVisit::RESOLVED) return;
+
+        std::vector<uint256> stack;
+        uint256 current_txid = candidate_txid;
+        ClaimPath terminal;
+        bool terminal_resolved{false};
+        while (!terminal_resolved) {
+            if (!consume_topology_work()) return;
+            const ClaimPathVisit state = path_visits[current_txid];
+            if (state == ClaimPathVisit::RESOLVED) {
+                terminal = paths.at(current_txid);
+                terminal_resolved = true;
+                break;
+            }
+            if (state == ClaimPathVisit::VISITING) {
+                // A cycle cannot be canonicalized to a confirmed wallet
+                // anchor. Leave the terminal path unauthenticated and resolve
+                // every dependent in this traversal fail-closed.
+                terminal_resolved = true;
                 break;
             }
 
-            const COutPoint prevout = current->tx->vin.front().prevout;
-            path.anchor = prevout;
+            path_visits[current_txid] = ClaimPathVisit::VISITING;
+            stack.push_back(current_txid);
+            g_shadow_pow_claim_recovery_path_visits.fetch_add(
+                1, std::memory_order_relaxed);
+
+            const auto current_it = mapWallet.find(current_txid);
+            if (current_it == mapWallet.end() || !current_it->second.tx ||
+                current_it->second.tx->vin.size() != 1 ||
+                current_it->second.tx->vin.front().prevout.IsNull()) {
+                terminal_resolved = true;
+                break;
+            }
+            if (!consume_transaction_work(current_it->second)) return;
+
+            const COutPoint prevout =
+                current_it->second.tx->vin.front().prevout;
             const auto parent_it = mapWallet.find(prevout.hash);
             if (parent_it == mapWallet.end() || !parent_it->second.tx ||
                 prevout.n >= parent_it->second.tx->vout.size()) {
+                terminal.anchor = prevout;
+                terminal_resolved = true;
                 break;
             }
 
             const CWalletTx& parent = parent_it->second;
+            if (!consume_transaction_work(parent)) return;
             const CTxOut& parent_output = parent.tx->vout[prevout.n];
             if (GetTxDepthInMainChain(parent) > 0) {
-                if ((IsMine(parent_output) & ISMINE_SPENDABLE) != ISMINE_NO) {
-                    path.amount = parent_output.nValue;
-                    path.script = parent_output.scriptPubKey;
-                    path.authenticated = true;
+                terminal.anchor = prevout;
+                // CWallet::IsMine(CTxOut) may perform two script-manager
+                // passes. Charge the worst case before entering it so the
+                // advertised topology budget also bounds manager visits
+                // while cs_main is held.
+                if (!consume_topology_work(
+                        script_manager_work * 2)) {
+                    return;
                 }
+                if ((IsMine(parent_output) & ISMINE_SPENDABLE) !=
+                    ISMINE_NO) {
+                    terminal.amount = parent_output.nValue;
+                    terminal.script = parent_output.scriptPubKey;
+                    terminal.authenticated = true;
+                }
+                terminal_resolved = true;
                 break;
             }
 
             if (!TransactionHasShadowProof(*parent.tx) ||
-                GetDebit(*parent.tx, ISMINE_SPENDABLE) <= 0) {
+                m_shadow_pow_claim_txids.count(parent.GetHash()) == 0) {
+                terminal.anchor = prevout;
+                terminal_resolved = true;
                 break;
             }
-            current = &parent;
+            current_txid = parent.GetHash();
         }
-        paths.emplace(candidate_txid, std::move(path));
+
+        for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+            paths[*it] = terminal;
+            path_visits[*it] = ClaimPathVisit::RESOLVED;
+        }
+    };
+    for (const uint256& candidate_txid : candidate_claims) {
+        resolve_path(candidate_txid);
+        if (inventory.claim_inventory_capacity_exceeded) return inventory;
     }
 
     std::map<COutPoint, std::vector<uint256>> roots_by_anchor;
     for (const uint256& txid : candidate_claims) {
+        if (!consume_topology_work()) return inventory;
         const ClaimPath& path = paths.at(txid);
         if (path.authenticated && !path.anchor.IsNull()) {
             roots_by_anchor[path.anchor].push_back(txid);
@@ -667,8 +2161,10 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
 
     const CCoinsViewCache& coins_tip = chainman.ActiveChainstate().CoinsTip();
     std::set<uint256> assigned_claims;
+    std::map<uint256, size_t> graph_owner_component;
 
     for (const auto& [anchor, canonical_claims] : roots_by_anchor) {
+        if (!consume_topology_work()) return inventory;
         const ClaimPath& first_path = paths.at(canonical_claims.front());
         ShadowPowClaimRecoveryComponent component;
         component.anchor = anchor;
@@ -680,6 +2176,9 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         Coin anchor_coin;
         if (coins_tip.GetCoin(anchor, anchor_coin) && !anchor_coin.IsSpent()) {
             component.anchor_unspent = true;
+            if (!consume_topology_work(script_manager_work * 2)) {
+                return inventory;
+            }
             if (anchor_coin.out.nValue != component.anchor_amount ||
                 anchor_coin.out.scriptPubKey != component.anchor_script ||
                 (IsMine(anchor_coin.out) & ISMINE_SPENDABLE) == ISMINE_NO) {
@@ -693,31 +2192,69 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         std::set<uint256> graph_txids;
         std::vector<uint256> queue;
         auto enqueue = [&](const uint256& txid) {
-            if (mapWallet.count(txid) != 0 && graph_txids.insert(txid).second) {
-                queue.push_back(txid);
+            if (!consume_topology_work()) return;
+            if (mapWallet.count(txid) == 0 ||
+                !graph_txids.insert(txid).second) return;
+            const size_t current_component = inventory.components.size();
+            const auto [owner, inserted] = graph_owner_component.emplace(
+                txid, current_component);
+            if (!inserted && owner->second != current_component) {
+                // A wallet transaction reachable from two confirmed anchors
+                // is a cross-component boundary. It cannot be represented as
+                // an independently safe one-anchor family. Retain the exact
+                // boundary node in this component, mark both sides
+                // indeterminate, and do not expand the already-audited shared
+                // subtree again. This makes traversal proportional to unique
+                // graph work plus compact shared boundaries rather than
+                // anchors multiplied by a common descendant tail.
+                component.has_indeterminate_node = true;
+                inventory.components.at(owner->second)
+                    .has_indeterminate_node = true;
+                return;
             }
+            queue.push_back(txid);
         };
 
-        for (const uint256& txid : canonical_claims) enqueue(txid);
+        for (const uint256& txid : canonical_claims) {
+            enqueue(txid);
+            if (inventory.claim_inventory_capacity_exceeded) {
+                return inventory;
+            }
+        }
         const auto anchor_spenders = mapTxSpends.equal_range(anchor);
         for (auto it = anchor_spenders.first; it != anchor_spenders.second; ++it) {
+            if (!consume_topology_work()) return inventory;
             enqueue(it->second);
+            if (inventory.claim_inventory_capacity_exceeded) {
+                return inventory;
+            }
         }
 
         for (size_t cursor = 0; cursor < queue.size(); ++cursor) {
+            if (!consume_topology_work()) return inventory;
             const uint256 txid = queue[cursor];
+            g_shadow_pow_claim_recovery_topology_visits.fetch_add(
+                1, std::memory_order_relaxed);
             const auto wtx_it = mapWallet.find(txid);
             if (wtx_it == mapWallet.end() || !wtx_it->second.tx) continue;
+            if (!consume_transaction_work(wtx_it->second)) {
+                return inventory;
+            }
             // A confirmed winning spender is the outcome boundary for this
             // anchor generation. Keep it in the old component as evidence,
             // but its unconfirmed descendants canonicalize only to its newly
             // confirmed outputs and must not be duplicated here.
             if (GetTxDepthInMainChain(wtx_it->second) > 0) continue;
             for (uint32_t output = 0; output < wtx_it->second.tx->vout.size(); ++output) {
+                if (!consume_topology_work()) return inventory;
                 const auto spenders = mapTxSpends.equal_range(
                     COutPoint{txid, output});
                 for (auto it = spenders.first; it != spenders.second; ++it) {
+                    if (!consume_topology_work()) return inventory;
                     enqueue(it->second);
+                    if (inventory.claim_inventory_capacity_exceeded) {
+                        return inventory;
+                    }
                 }
             }
         }
@@ -726,18 +2263,16 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         for (const uint256& txid : graph_txids) {
             const auto it = mapWallet.find(txid);
             if (it != mapWallet.end() && it->second.tx &&
+                !consume_transaction_work(it->second)) {
+                return inventory;
+            }
+            if (it != mapWallet.end() && it->second.tx &&
                 TransactionHasShadowProof(*it->second.tx)) {
                 graph_claim_txids.insert(txid);
             }
         }
 
         bool all_claims_terminal{true};
-        // Origin expiry removes shadow-reward eligibility but does not make
-        // the signed base transaction invalid for direct block inclusion.
-        // No unspent claim component may therefore release its anchor merely
-        // because its mempool policy window elapsed.
-        bool all_claims_zero_payment_retirable{false};
-        bool all_claims_expired_locally_retired{true};
         bool have_claim{false};
         bool all_stale_depth_known{true};
         int minimum_stale_depth = std::numeric_limits<int>::max();
@@ -745,18 +2280,23 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         for (const uint256& txid : graph_txids) {
             const CWalletTx& wtx = mapWallet.at(txid);
             const CTransaction& tx = *wtx.tx;
+            if (!consume_transaction_work(wtx)) return inventory;
             ShadowPowClaimRecoveryNode node;
             node.txid = txid;
             node.active_chain_confirmed = GetTxDepthInMainChain(wtx) > 0;
             node.in_mempool = wtx.InMempool();
             node.abandoned = wtx.isAbandoned();
-            node.wallet_authored = GetDebit(tx, ISMINE_SPENDABLE) > 0;
+            node.wallet_authored =
+                TransactionHasShadowProof(tx)
+                    ? m_shadow_pow_claim_txids.count(txid) != 0
+                    : wtx.fFromMe;
             node.wallet_from_me = wtx.fFromMe;
 
             if (TransactionHasShadowProof(tx)) {
                 node.kind = ShadowPowClaimRecoveryNodeKind::CLAIM;
                 node.provenance = ClaimProvenance(
-                    wtx, node, &component.generation_fingerprint);
+                    wtx, node, &component.generation_fingerprint,
+                    &inventory.active_tip);
                 ParseClaimLineage(
                     wtx, component.generation_fingerprint, node);
                 if (node.authored_metadata_valid &&
@@ -770,28 +2310,51 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                 }
                 node.quarantined = MetadataFlag(
                     wtx.mapValue, SHADOW_POW_QUARANTINE_MARKER_KEY);
-                node.expired_locally_retired = node.abandoned &&
-                    MetadataFlag(
-                        wtx.mapValue,
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY) &&
-                    HasActiveBranchObservation(
-                        wtx.mapValue,
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY,
-                        SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY,
-                        active_chain);
                 node.expected_shape = tx.vin.size() == 1 &&
                                       !tx.vin.front().prevout.IsNull() &&
                                       !tx.IsCoinBase() && !tx.IsCoinStake();
-                node.relay_ttl_expired =
-                    wtx.nTimeReceived <= 0 ||
-                    wtx.nTimeReceived <=
-                        GetTime() - SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS;
-                if (wtx.nTimeReceived > 0) {
+                bool schema_clocked{false};
+                int64_t schema_relay_birth{0};
+                const bool schema_metadata_valid =
+                    ParseShadowPowClaimRelayClockMetadata(
+                        wtx.mapValue, txid, schema_clocked,
+                        schema_relay_birth);
+                int64_t relay_birth{0};
+                bool birth_chain_anchored{false};
+                const bool clock_metadata_valid =
+                    schema_metadata_valid &&
+                    GetShadowPowClaimRelayBirthLocked(
+                        wtx, relay_birth, &birth_chain_anchored);
+                const bool relay_expiry_representable =
+                    clock_metadata_valid && relay_birth > 0 &&
+                    relay_birth <=
+                        std::numeric_limits<int64_t>::max() -
+                            SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS;
+                node.relay_clock_metadata_present = schema_clocked;
+                node.relay_clock_metadata_valid =
+                    clock_metadata_valid;
+                node.relay_birth_time = schema_clocked
+                    ? relay_birth
+                    : 0;
+                int64_t record_logical_time = schema_clocked
+                    ? std::max(logical_relay_time, relay_birth)
+                    : std::max(legacy_relay_time, relay_birth);
+                if (birth_chain_anchored) {
+                    record_logical_time = std::max(
+                        record_logical_time, relay_birth);
+                }
+                node.relay_time_invalid =
+                    !relay_expiry_representable ||
+                    relay_birth > record_logical_time;
+                node.relay_ttl_expired = node.relay_time_invalid ||
+                    record_logical_time >=
+                        relay_birth +
+                            SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS;
+                if (relay_expiry_representable) {
                     node.relay_expiry_time =
-                        static_cast<int64_t>(wtx.nTimeReceived) +
+                        relay_birth +
                         SHADOW_POW_CLAIM_MEMPOOL_TTL_SECONDS;
                 }
-
                 const std::optional<ShadowPowClaimDescriptor> descriptor =
                     GetShadowPowClaimDescriptor(tx);
                 if (descriptor) {
@@ -901,9 +2464,55 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                     const bool gold_rush_active = IsShadowGoldRushRewardActive(
                         Params().GetConsensus(), tip->GetMedianTimePast(),
                         tip->nHeight + 1);
-                    CheckShadowPowClaimForMempoolDetailed(
+                    ShadowPowClaimProofEvaluationContext
+                        evaluation_context;
+                    bool evaluation_required{false};
+                    const ShadowPowClaimProofEvaluation* evaluation{nullptr};
+                    const auto fresh = evaluations.find(txid);
+                    if (fresh != evaluations.end()) {
+                        evaluation = &fresh->second;
+                    }
+                    node.proof_validation_result =
+                        CheckShadowPowClaimForMempoolDetailedWithEvaluation(
                         tx, tip, coins_tip, gold_rush_active, reject_reason,
-                        &node.disposition);
+                        &node.disposition, evaluation, &evaluation_context,
+                        &evaluation_required);
+                    if (all_contexts && evaluation_context.valid &&
+                        !evaluation_context.cache_key.IsNull()) {
+                        all_contexts->push_back(evaluation_context);
+                    }
+                    if (evaluation_required) {
+                        const auto cached =
+                            m_shadow_pow_claim_proof_evaluation_cache.find(
+                                evaluation_context.cache_key);
+                        if (cached !=
+                                m_shadow_pow_claim_proof_evaluation_cache.end() &&
+                            cached->second.context == evaluation_context) {
+                            evaluation_required = false;
+                            node.proof_validation_result =
+                                CheckShadowPowClaimForMempoolDetailedWithEvaluation(
+                                tx, tip, coins_tip, gold_rush_active,
+                                reject_reason, &node.disposition,
+                                &cached->second, &evaluation_context,
+                                &evaluation_required);
+                        }
+                    }
+                    node.proof_reject_reason = reject_reason;
+                    if (evaluation_required && pending) {
+                        pending->emplace_back(txid,
+                                              std::move(evaluation_context));
+                    }
+                    if (!evaluation_required &&
+                        node.disposition ==
+                            ShadowPowClaimMempoolDisposition::
+                                LOCAL_STATE_ERROR &&
+                        node.proof_reject_reason !=
+                            "local-shadow-proof-error") {
+                        ++inventory
+                              .proof_evaluation_retryable_local_state_contexts;
+                        inventory.proof_evaluation_retryable_local_state =
+                            true;
+                    }
                 } else {
                     // A confirmed, authenticated anchor absent from CoinsTip
                     // conclusively resolves this generation. Preserve all
@@ -959,10 +2568,6 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                 const bool typed_terminal =
                     IsShadowPowClaimCurrentBranchTerminal(node.disposition);
                 if (!typed_terminal) all_claims_terminal = false;
-                if (!node.expired_locally_retired) {
-                    all_claims_expired_locally_retired = false;
-                }
-
                 if (node.in_mempool ||
                     node.disposition == ShadowPowClaimMempoolDisposition::ELIGIBLE) {
                     component.has_live_claim = true;
@@ -1065,10 +2670,6 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
 
         component.all_claims_terminal_on_pinned_tip =
             have_claim && all_claims_terminal;
-        component.all_claims_zero_payment_retirable =
-            have_claim && all_claims_zero_payment_retirable;
-        component.all_claims_expired_locally_retired =
-            have_claim && all_claims_expired_locally_retired;
         component.stale_depth_known = have_claim && all_stale_depth_known;
         component.minimum_stale_depth = component.stale_depth_known
                                             ? minimum_stale_depth
@@ -1090,12 +2691,6 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         } else if (!component.resolution_txids.empty()) {
             component.state = ShadowPowClaimRecoveryState::RESOLUTION_PENDING;
             ++inventory.blocking_components;
-        } else if (component.all_claims_zero_payment_retirable &&
-                   component.all_claims_expired_locally_retired) {
-            component.state =
-                ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH;
-            inventory.retired_claim_objects += component.claim_txids.size();
-            ++inventory.retired_components;
         } else if (component.all_claims_terminal_on_pinned_tip) {
             component.state = component.has_branch_relative_ineligibility
                                   ? ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE
@@ -1122,6 +2717,7 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
     // apparent action per claim object.
     std::set<uint256> assigned_unanchored_txids;
     for (const uint256& candidate_txid : candidate_claims) {
+        if (!consume_topology_work()) return inventory;
         if (assigned_claims.count(candidate_txid) != 0 ||
             assigned_unanchored_txids.count(candidate_txid) != 0) {
             continue;
@@ -1130,8 +2726,11 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         std::set<uint256> graph_txids;
         std::vector<uint256> queue;
         auto enqueue = [&](const uint256& txid) {
+            if (!consume_topology_work()) return;
             const auto it = mapWallet.find(txid);
-            if (it == mapWallet.end() || !it->second.tx ||
+            if (it == mapWallet.end() || !it->second.tx) return;
+            if (!consume_transaction_work(it->second)) return;
+            if (
                 GetTxDepthInMainChain(it->second) > 0 ||
                 (TransactionHasShadowProof(*it->second.tx) &&
                  assigned_claims.count(txid) != 0)) {
@@ -1140,13 +2739,20 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
             if (graph_txids.insert(txid).second) queue.push_back(txid);
         };
         enqueue(candidate_txid);
+        if (inventory.claim_inventory_capacity_exceeded) return inventory;
 
         for (size_t cursor = 0; cursor < queue.size(); ++cursor) {
+            if (!consume_topology_work()) return inventory;
             const CWalletTx& wtx = mapWallet.at(queue[cursor]);
             for (const CTxIn& input : wtx.tx->vin) {
+                if (!consume_topology_work()) return inventory;
                 const auto siblings = mapTxSpends.equal_range(input.prevout);
                 for (auto it = siblings.first; it != siblings.second; ++it) {
+                    if (!consume_topology_work()) return inventory;
                     enqueue(it->second);
+                    if (inventory.claim_inventory_capacity_exceeded) {
+                        return inventory;
+                    }
                 }
 
                 // Walk toward an unconfirmed wallet-known root so starting
@@ -1154,17 +2760,26 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
                 // components. A confirmed parent is an anchor observation,
                 // not a graph node, and is deliberately not enqueued.
                 const auto parent = mapWallet.find(input.prevout.hash);
+                if (!consume_topology_work()) return inventory;
                 if (parent != mapWallet.end() && parent->second.tx &&
                     GetTxDepthInMainChain(parent->second) <= 0) {
                     enqueue(parent->first);
+                    if (inventory.claim_inventory_capacity_exceeded) {
+                        return inventory;
+                    }
                 }
             }
             for (uint32_t output = 0; output < wtx.tx->vout.size(); ++output) {
+                if (!consume_topology_work()) return inventory;
                 const auto descendants = mapTxSpends.equal_range(
                     COutPoint{wtx.GetHash(), output});
                 for (auto it = descendants.first; it != descendants.second;
                      ++it) {
+                    if (!consume_topology_work()) return inventory;
                     enqueue(it->second);
+                    if (inventory.claim_inventory_capacity_exceeded) {
+                        return inventory;
+                    }
                 }
             }
         }
@@ -1173,12 +2788,15 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         bool have_claim{false};
         for (const uint256& txid : graph_txids) {
             const CWalletTx& wtx = mapWallet.at(txid);
+            if (!consume_transaction_work(wtx)) return inventory;
             ShadowPowClaimRecoveryNode node;
             node.txid = txid;
             node.active_chain_confirmed = false;
             node.in_mempool = wtx.InMempool();
             node.wallet_authored =
-                GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0;
+                TransactionHasShadowProof(*wtx.tx)
+                    ? m_shadow_pow_claim_txids.count(txid) != 0
+                    : wtx.fFromMe;
             node.wallet_from_me = wtx.fFromMe;
 
             if (TransactionHasShadowProof(*wtx.tx)) {
@@ -1221,6 +2839,7 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         bool have_common_anchor{false};
         bool common_anchor_matches{true};
         for (const uint256& txid : component.claim_txids) {
+            if (!consume_topology_work()) return inventory;
             const CWalletTx& wtx = mapWallet.at(txid);
             if (wtx.tx->vin.size() == 1 &&
                 component_claims.count(wtx.tx->vin.front().prevout.hash) == 0) {
@@ -1255,6 +2874,38 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventoryLocke
         ++inventory.blocking_components;
     }
 
+    // A later anchor can reveal that an earlier component shares an ordinary
+    // descendant boundary. Normalize the affected prior component only after
+    // all anchors have been visited, then recompute aggregate counters and
+    // fingerprints from the final fail-closed graph facts.
+    inventory.blocking_components = 0;
+    inventory.resolved_components = 0;
+    for (ShadowPowClaimRecoveryComponent& component : inventory.components) {
+        if (!consume_topology_work()) return inventory;
+        if (component.anchor_unspent && component.has_indeterminate_node) {
+            component.state = ShadowPowClaimRecoveryState::INDETERMINATE;
+        }
+        // Recompute adoption safety from the finalized graph. Unknown
+        // provenance is deliberately adoptable after an explicit review;
+        // only the concrete graph hazards recognized by SafeGraphForAdoption
+        // may refuse it. A blanket indeterminate check would make the
+        // adoption API incapable of establishing provenance.
+        std::string adoption_reason_code;
+        std::string adoption_reason;
+        component.adoption_graph_safe = SafeGraphForAdoption(
+            component, adoption_reason_code, adoption_reason);
+        switch (component.state) {
+        case ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN:
+            ++inventory.resolved_components;
+            break;
+        default:
+            ++inventory.blocking_components;
+            break;
+        }
+        component.fingerprint = FingerprintComponent(
+            inventory.active_tip, component);
+    }
+
     std::sort(inventory.components.begin(), inventory.components.end(),
               [](const auto& left, const auto& right) {
                   if (left.anchor != right.anchor) return left.anchor < right.anchor;
@@ -1277,6 +2928,8 @@ struct ShadowPowClaimRelaySuppression
     uint256 active_tip;
     uint64_t wallet_generation{0};
     uint256 candidate_state_fingerprint;
+    int64_t next_relay_expiry_time{0};
+    int64_t next_legacy_relay_expiry_wall_time{0};
     const std::set<uint256>* relay_txids{nullptr};
     const std::set<uint256>* deferred_family_roots{nullptr};
 };
@@ -1347,13 +3000,15 @@ ShadowPowClaimMiningGate EvaluateShadowPowClaimMiningFamily(
     for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
         if (node.kind != ShadowPowClaimRecoveryNodeKind::CLAIM ||
             node.active_chain_confirmed ||
-            (node.abandoned && !node.expired_locally_retired) ||
+            node.abandoned ||
             node.provenance !=
                 ShadowPowClaimRecoveryProvenance::EXPLICIT_AUTHORED ||
             !node.authored_metadata_valid || !node.expected_shape ||
             !node.wallet_authored || !node.wallet_from_me ||
             !node.claim_descriptor_valid ||
             !node.exact_authored_carrier_shape ||
+            !node.relay_clock_metadata_valid ||
+            node.relay_time_invalid ||
             (!node.in_mempool && !node.quarantined) ||
             !claims.emplace(node.txid, &node).second) {
             family_safe = false;
@@ -1496,7 +3151,11 @@ ShadowPowClaimMiningGate EvaluateShadowPowClaimMiningFamily(
         inventory.active_tip == suppression->active_tip &&
         inventory.wallet_generation == suppression->wallet_generation &&
         inventory.candidate_state_fingerprint ==
-            suppression->candidate_state_fingerprint;
+            suppression->candidate_state_fingerprint &&
+        inventory.next_relay_expiry_time ==
+            suppression->next_relay_expiry_time &&
+        inventory.next_legacy_relay_expiry_wall_time ==
+            suppression->next_legacy_relay_expiry_wall_time;
     for (const auto& [ordinal, node] : by_ordinal) {
         if (!disposition_is_family_safe(*node)) {
             family_safe = false;
@@ -1648,9 +3307,57 @@ bool ShadowPowClaimMiningGateSnapshotMatches(
            expected.wallet_generation == current.wallet_generation &&
            expected.candidate_state_fingerprint ==
                current.candidate_state_fingerprint &&
+           expected.next_relay_expiry_time ==
+               current.next_relay_expiry_time &&
+           expected.next_legacy_relay_expiry_wall_time ==
+               current.next_legacy_relay_expiry_wall_time &&
+           expected.relay_clock_high_water ==
+               current.relay_clock_high_water &&
+           expected.legacy_relay_clock_high_water ==
+               current.legacy_relay_clock_high_water &&
+           expected.relay_clock_median_time_past ==
+               current.relay_clock_median_time_past &&
+           expected.relay_clock_wall_time_plausible ==
+               current.relay_clock_wall_time_plausible &&
+           expected.relay_clock_signing_safe ==
+               current.relay_clock_signing_safe &&
+           expected.relay_clock_persistence_pending ==
+               current.relay_clock_persistence_pending &&
+           expected.relay_clock_pending_frontier ==
+               current.relay_clock_pending_frontier &&
+           expected.relay_clock_pending_legacy ==
+               current.relay_clock_pending_legacy &&
            expected.coherent == current.coherent &&
            expected.recovery_database_ambiguous ==
                current.recovery_database_ambiguous &&
+           expected.proof_evaluation_deferred_contexts ==
+               current.proof_evaluation_deferred_contexts &&
+           expected.proof_evaluation_budget_exhausted ==
+               current.proof_evaluation_budget_exhausted &&
+           expected.proof_evaluation_retryable_local_failure_contexts ==
+               current.proof_evaluation_retryable_local_failure_contexts &&
+           expected.proof_evaluation_retryable_local_failure ==
+               current.proof_evaluation_retryable_local_failure &&
+           expected.proof_evaluation_retryable_local_state_contexts ==
+               current.proof_evaluation_retryable_local_state_contexts &&
+           expected.proof_evaluation_retryable_local_state ==
+               current.proof_evaluation_retryable_local_state &&
+           expected.proof_evaluation_capacity_contexts ==
+               current.proof_evaluation_capacity_contexts &&
+           expected.proof_evaluation_capacity_exceeded ==
+               current.proof_evaluation_capacity_exceeded &&
+           expected.claim_ownership_pending_records ==
+               current.claim_ownership_pending_records &&
+           expected.claim_ownership_pending ==
+               current.claim_ownership_pending &&
+           expected.claim_ownership_capacity_work ==
+               current.claim_ownership_capacity_work &&
+           expected.claim_ownership_capacity_exceeded ==
+               current.claim_ownership_capacity_exceeded &&
+           expected.claim_inventory_capacity_work ==
+               current.claim_inventory_capacity_work &&
+           expected.claim_inventory_capacity_exceeded ==
+               current.claim_inventory_capacity_exceeded &&
            expected.unresolved_components ==
                current.unresolved_components &&
            expected.live_claims == current.live_claims &&
@@ -1670,25 +3377,6 @@ bool ShadowPowClaimMiningGateSnapshotMatches(
                current.next_lineage_ordinal &&
            expected.relay_txid == current.relay_txid &&
            expected.relay_expiry_time == current.relay_expiry_time;
-}
-
-bool ShadowPowClaimCachedRelayStateExpired(
-    const ShadowPowClaimRecoveryInventory& inventory, int64_t now)
-{
-    for (const ShadowPowClaimRecoveryComponent& component :
-         inventory.components) {
-        for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
-            if (node.kind == ShadowPowClaimRecoveryNodeKind::CLAIM &&
-                !node.in_mempool &&
-                node.disposition ==
-                    ShadowPowClaimMempoolDisposition::ELIGIBLE &&
-                !node.relay_ttl_expired && node.relay_expiry_time > 0 &&
-                now >= node.relay_expiry_time) {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 bool ShadowPowClaimDeferrableFamilyIntentMatches(
@@ -1711,20 +3399,98 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
     gate.wallet_generation = inventory.wallet_generation;
     gate.candidate_state_fingerprint =
         inventory.candidate_state_fingerprint;
+    gate.classification_time = inventory.classification_time;
+    gate.next_relay_expiry_time = inventory.next_relay_expiry_time;
+    gate.next_legacy_relay_expiry_wall_time =
+        inventory.next_legacy_relay_expiry_wall_time;
+    gate.relay_clock_high_water = inventory.relay_clock_high_water;
+    gate.legacy_relay_clock_high_water =
+        inventory.legacy_relay_clock_high_water;
+    gate.relay_clock_median_time_past =
+        inventory.relay_clock_median_time_past;
+    gate.relay_clock_wall_time = inventory.relay_clock_wall_time;
+    gate.relay_clock_wall_time_plausible =
+        inventory.relay_clock_wall_time_plausible;
+    gate.relay_clock_signing_safe = inventory.relay_clock_signing_safe;
+    gate.relay_clock_persistence_pending =
+        inventory.relay_clock_persistence_pending;
+    gate.relay_clock_pending_frontier =
+        inventory.relay_clock_pending_frontier;
+    gate.relay_clock_pending_legacy =
+        inventory.relay_clock_pending_legacy;
     gate.recovery_database_ambiguous =
         inventory.recovery_database_ambiguous;
+    gate.proof_evaluation_deferred_contexts =
+        inventory.proof_evaluation_deferred_contexts;
+    gate.proof_evaluation_budget_exhausted =
+        inventory.proof_evaluation_budget_exhausted;
+    gate.proof_evaluation_retryable_local_failure_contexts =
+        inventory.proof_evaluation_retryable_local_failure_contexts;
+    gate.proof_evaluation_retryable_local_failure =
+        inventory.proof_evaluation_retryable_local_failure;
+    gate.proof_evaluation_retryable_local_state_contexts =
+        inventory.proof_evaluation_retryable_local_state_contexts;
+    gate.proof_evaluation_retryable_local_state =
+        inventory.proof_evaluation_retryable_local_state;
+    gate.proof_evaluation_capacity_contexts =
+        inventory.proof_evaluation_capacity_contexts;
+    gate.proof_evaluation_capacity_exceeded =
+        inventory.proof_evaluation_capacity_exceeded;
+    gate.claim_ownership_pending_records =
+        inventory.claim_ownership_pending_records;
+    gate.claim_ownership_pending =
+        inventory.claim_ownership_pending;
+    gate.claim_ownership_capacity_work =
+        inventory.claim_ownership_capacity_work;
+    gate.claim_ownership_capacity_exceeded =
+        inventory.claim_ownership_capacity_exceeded;
+    gate.claim_inventory_capacity_work =
+        inventory.claim_inventory_capacity_work;
+    gate.claim_inventory_capacity_exceeded =
+        inventory.claim_inventory_capacity_exceeded;
     gate.coherent = inventory.wallet_tip_matches &&
                     !inventory.active_tip.IsNull() &&
                     inventory.active_height >= 0;
     if (!gate.coherent || gate.recovery_database_ambiguous) return gate;
+    if (gate.relay_clock_persistence_pending ||
+        !gate.relay_clock_signing_safe) {
+        gate.action =
+            ShadowPowClaimMiningGateAction::WAIT_FOR_RELAY_CLOCK;
+        return gate;
+    }
+    if (gate.claim_ownership_capacity_exceeded) {
+        gate.action =
+            ShadowPowClaimMiningGateAction::CLAIM_OWNERSHIP_CAPACITY;
+        return gate;
+    }
+    if (gate.claim_ownership_pending) {
+        gate.action =
+            ShadowPowClaimMiningGateAction::WAIT_FOR_CLAIM_OWNERSHIP;
+        return gate;
+    }
+    if (gate.claim_inventory_capacity_exceeded) {
+        gate.action =
+            ShadowPowClaimMiningGateAction::CLAIM_INVENTORY_CAPACITY;
+        return gate;
+    }
+    if (gate.proof_evaluation_capacity_exceeded) {
+        gate.action =
+            ShadowPowClaimMiningGateAction::PROOF_EVALUATION_CAPACITY;
+        return gate;
+    }
+    if (gate.proof_evaluation_budget_exhausted ||
+        gate.proof_evaluation_retryable_local_failure ||
+        gate.proof_evaluation_retryable_local_state) {
+        gate.action =
+            ShadowPowClaimMiningGateAction::WAIT_FOR_PROOF_EVALUATION;
+        return gate;
+    }
 
     std::optional<ShadowPowClaimMiningGate> selected;
     for (const ShadowPowClaimRecoveryComponent& component :
          inventory.components) {
         if (component.state ==
-                ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN ||
-            component.state ==
-                ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH) {
+            ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN) {
             continue;
         }
         if (IsAuditOnlyForeignShadowPowClaimComponent(component)) {
@@ -1774,9 +3540,7 @@ bool HasMiningRelevantUnresolvedShadowPowClaimComponent(
         inventory.components.begin(), inventory.components.end(),
         [](const ShadowPowClaimRecoveryComponent& component) {
             if (component.state ==
-                    ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN ||
-                component.state ==
-                    ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH) {
+                ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN) {
                 return false;
             }
             return !IsAuditOnlyForeignShadowPowClaimComponent(component);
@@ -1800,6 +3564,11 @@ ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
     if (!miner_enabled || cached_gate.active_tip.IsNull() ||
         !fresh_gate.coherent ||
         fresh_gate.recovery_database_ambiguous ||
+        fresh_gate.RelayClockPending() ||
+        fresh_gate.ProofEvaluationPending() ||
+        fresh_gate.ProofEvaluationCapacityExceeded() ||
+        fresh_gate.ClaimOwnershipCapacityExceeded() ||
+        fresh_gate.ClaimInventoryCapacityExceeded() ||
         fresh_gate.HasUnsafeClaims() ||
         cached_gate.active_tip != fresh_gate.active_tip ||
         cached_gate.active_height != fresh_gate.active_height) {
@@ -1819,7 +3588,51 @@ ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
         cached_gate.HasUnsafeClaims() ||
         cached_gate.coherent != fresh_gate.coherent ||
         cached_gate.recovery_database_ambiguous !=
-            fresh_gate.recovery_database_ambiguous) {
+            fresh_gate.recovery_database_ambiguous ||
+        cached_gate.relay_clock_high_water !=
+            fresh_gate.relay_clock_high_water ||
+        cached_gate.legacy_relay_clock_high_water !=
+            fresh_gate.legacy_relay_clock_high_water ||
+        cached_gate.relay_clock_median_time_past !=
+            fresh_gate.relay_clock_median_time_past ||
+        cached_gate.relay_clock_wall_time_plausible !=
+            fresh_gate.relay_clock_wall_time_plausible ||
+        cached_gate.relay_clock_signing_safe !=
+            fresh_gate.relay_clock_signing_safe ||
+        cached_gate.relay_clock_persistence_pending !=
+            fresh_gate.relay_clock_persistence_pending ||
+        cached_gate.relay_clock_pending_frontier !=
+            fresh_gate.relay_clock_pending_frontier ||
+        cached_gate.relay_clock_pending_legacy !=
+            fresh_gate.relay_clock_pending_legacy ||
+        cached_gate.proof_evaluation_deferred_contexts !=
+            fresh_gate.proof_evaluation_deferred_contexts ||
+        cached_gate.proof_evaluation_budget_exhausted !=
+            fresh_gate.proof_evaluation_budget_exhausted ||
+        cached_gate.proof_evaluation_retryable_local_failure_contexts !=
+            fresh_gate.proof_evaluation_retryable_local_failure_contexts ||
+        cached_gate.proof_evaluation_retryable_local_failure !=
+            fresh_gate.proof_evaluation_retryable_local_failure ||
+        cached_gate.proof_evaluation_retryable_local_state_contexts !=
+            fresh_gate.proof_evaluation_retryable_local_state_contexts ||
+        cached_gate.proof_evaluation_retryable_local_state !=
+            fresh_gate.proof_evaluation_retryable_local_state ||
+        cached_gate.proof_evaluation_capacity_contexts !=
+            fresh_gate.proof_evaluation_capacity_contexts ||
+        cached_gate.proof_evaluation_capacity_exceeded !=
+            fresh_gate.proof_evaluation_capacity_exceeded ||
+        cached_gate.claim_ownership_pending_records !=
+            fresh_gate.claim_ownership_pending_records ||
+        cached_gate.claim_ownership_pending !=
+            fresh_gate.claim_ownership_pending ||
+        cached_gate.claim_ownership_capacity_work !=
+            fresh_gate.claim_ownership_capacity_work ||
+        cached_gate.claim_ownership_capacity_exceeded !=
+            fresh_gate.claim_ownership_capacity_exceeded ||
+        cached_gate.claim_inventory_capacity_work !=
+            fresh_gate.claim_inventory_capacity_work ||
+        cached_gate.claim_inventory_capacity_exceeded !=
+            fresh_gate.claim_inventory_capacity_exceeded) {
         return fresh_gate.action;
     }
     if (
@@ -1827,6 +3640,10 @@ ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
         cached_gate.candidate_state_fingerprint.IsNull() ||
         cached_gate.candidate_state_fingerprint !=
             fresh_gate.candidate_state_fingerprint ||
+        cached_gate.next_relay_expiry_time !=
+            fresh_gate.next_relay_expiry_time ||
+        cached_gate.next_legacy_relay_expiry_wall_time !=
+            fresh_gate.next_legacy_relay_expiry_wall_time ||
         cached_gate.unresolved_components !=
             fresh_gate.unresolved_components ||
         cached_gate.live_claims != fresh_gate.live_claims ||
@@ -1849,22 +3666,33 @@ ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
     return ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP;
 }
 
-ShadowPowClaimMiningGate CWallet::GetShadowPowClaimMiningGate() const
+ShadowPowClaimMiningGate CWallet::GetShadowPowClaimMiningGate(
+    ShadowPowClaimRecoveryInventory* evaluated_inventory) const
 {
+    ShadowPowClaimRecoveryInventory inventory =
+        GetShadowPowClaimRecoveryInventory();
+    // A mining action gets one additional bounded cache-fill slice. This
+    // makes a just-over-budget cold wallet serviceable without relying on an
+    // unrelated RPC/GUI prepass, while retaining a hard per-slice Argon2 cap
+    // and explicit pending telemetry if more work remains.
+    if (inventory.proof_evaluation_budget_exhausted &&
+        !inventory.proof_evaluation_capacity_exceeded &&
+        !inventory.claim_inventory_capacity_exceeded) {
+        inventory = GetShadowPowClaimRecoveryInventory();
+    }
+    if (inventory.claim_ownership_pending &&
+        !inventory.claim_ownership_capacity_exceeded) {
+        inventory = GetShadowPowClaimRecoveryInventory();
+    }
+    if (evaluated_inventory) *evaluated_inventory = inventory;
     if (!HaveChain() || !chain().isReadyToBroadcast()) {
-        return BuildShadowPowClaimMiningGate(
-            GetShadowPowClaimRecoveryInventory());
+        return BuildShadowPowClaimMiningGate(inventory);
     }
     LOCK2(::cs_main, cs_wallet);
-    return GetShadowPowClaimMiningGateLocked();
-}
-
-ShadowPowClaimMiningGate CWallet::GetShadowPowClaimMiningGateLocked() const
-{
-    AssertLockHeld(::cs_main);
-    AssertLockHeld(cs_wallet);
-    return GetShadowPowClaimMiningGateFromInventoryLocked(
-        GetShadowPowClaimRecoveryInventoryLocked());
+    if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory)) {
+        return {};
+    }
+    return GetShadowPowClaimMiningGateFromInventoryLocked(inventory);
 }
 
 ShadowPowClaimMiningGate
@@ -1873,16 +3701,88 @@ CWallet::GetShadowPowClaimMiningGateFromInventoryLocked(
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(cs_wallet);
+    if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory)) {
+        return {};
+    }
     ShadowPowClaimRelaySuppression suppression;
     suppression.active_tip = m_shadow_pow_relay_reject_tip;
     suppression.wallet_generation =
         m_shadow_pow_relay_reject_wallet_generation;
     suppression.candidate_state_fingerprint =
         m_shadow_pow_relay_reject_candidate_state;
+    suppression.next_relay_expiry_time =
+        m_shadow_pow_relay_reject_next_expiry;
+    suppression.next_legacy_relay_expiry_wall_time =
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry;
     suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
     suppression.deferred_family_roots =
         &m_shadow_pow_relay_wait_roots;
     return BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+}
+
+ShadowPowClaimMiningGate
+CWallet::DeferShadowPowClaimFamilyForInventoryLocked(
+    const ShadowPowClaimMiningGate& deferred_gate,
+    const ShadowPowClaimRecoveryInventory& evaluated_inventory)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_wallet);
+    if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+            evaluated_inventory)) {
+        return {};
+    }
+    m_shadow_pow_relay_reject_inventory = evaluated_inventory;
+    ShadowPowClaimRelaySuppression suppression;
+    suppression.active_tip = m_shadow_pow_relay_reject_tip;
+    suppression.wallet_generation =
+        m_shadow_pow_relay_reject_wallet_generation;
+    suppression.candidate_state_fingerprint =
+        m_shadow_pow_relay_reject_candidate_state;
+    suppression.next_relay_expiry_time =
+        m_shadow_pow_relay_reject_next_expiry;
+    suppression.next_legacy_relay_expiry_wall_time =
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry;
+    suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
+    suppression.deferred_family_roots = &m_shadow_pow_relay_wait_roots;
+    const ShadowPowClaimMiningGate current =
+        BuildShadowPowClaimMiningGateImpl(
+            evaluated_inventory, &suppression);
+    if (!ShadowPowClaimDeferrableFamilyIntentMatches(
+            deferred_gate, current)) {
+        return current;
+    }
+    if (m_shadow_pow_relay_reject_tip != current.active_tip ||
+        m_shadow_pow_relay_reject_wallet_generation !=
+            current.wallet_generation ||
+        m_shadow_pow_relay_reject_candidate_state !=
+            current.candidate_state_fingerprint ||
+        m_shadow_pow_relay_reject_next_expiry !=
+            current.next_relay_expiry_time ||
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry !=
+            current.next_legacy_relay_expiry_wall_time) {
+        m_shadow_pow_relay_reject_txids.clear();
+        m_shadow_pow_relay_wait_roots.clear();
+        m_shadow_pow_relay_reject_tip = current.active_tip;
+        m_shadow_pow_relay_reject_wallet_generation =
+            current.wallet_generation;
+        m_shadow_pow_relay_reject_candidate_state =
+            current.candidate_state_fingerprint;
+        m_shadow_pow_relay_reject_next_expiry =
+            current.next_relay_expiry_time;
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry =
+            current.next_legacy_relay_expiry_wall_time;
+    }
+    m_shadow_pow_relay_wait_roots.insert(current.lineage_root_txid);
+    suppression.active_tip = current.active_tip;
+    suppression.wallet_generation = current.wallet_generation;
+    suppression.candidate_state_fingerprint =
+        current.candidate_state_fingerprint;
+    suppression.next_relay_expiry_time =
+        current.next_relay_expiry_time;
+    suppression.next_legacy_relay_expiry_wall_time =
+        current.next_legacy_relay_expiry_wall_time;
+    return BuildShadowPowClaimMiningGateImpl(
+        evaluated_inventory, &suppression);
 }
 
 ShadowPowClaimMiningGateAction
@@ -1906,71 +3806,59 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
     const ShadowPowClaimMiningGate& rejected_gate,
     ShadowPowClaimMiningGate* reselected_gate)
 {
-    LOCK2(::cs_main, cs_wallet);
+    const ShadowPowClaimRecoveryInventory evaluated_inventory =
+        GetShadowPowClaimRecoveryInventory();
     if (!rejected_gate.ShouldRelayExisting() ||
         rejected_gate.recovery_database_ambiguous ||
         !rejected_gate.coherent) {
         return false;
     }
-    const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
-    const uint256 active_tip = tip ? tip->GetBlockHash() : uint256{};
-    const uint64_t wallet_generation =
-        GetDatabase().nUpdateCounter.load();
-    const uint256 candidate_state =
-        GetShadowPowClaimCandidateStateFingerprintLocked();
-    if (!tip || m_last_block_processed != active_tip ||
-        m_shadow_pow_claim_recovery_db_ambiguous ||
-        active_tip != rejected_gate.active_tip ||
-        wallet_generation != rejected_gate.wallet_generation ||
-        candidate_state != rejected_gate.candidate_state_fingerprint) {
-        m_shadow_pow_relay_reject_inventory.reset();
-        return false;
+    CTransactionRef relay_tx;
+    ShadowPowClaimMiningGate reviewed_gate;
+    {
+        LOCK2(::cs_main, cs_wallet);
+        if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+                evaluated_inventory)) {
+            m_shadow_pow_relay_reject_inventory.reset();
+            return false;
+        }
+        ShadowPowClaimRelaySuppression suppression;
+        suppression.active_tip = m_shadow_pow_relay_reject_tip;
+        suppression.wallet_generation =
+            m_shadow_pow_relay_reject_wallet_generation;
+        suppression.candidate_state_fingerprint =
+            m_shadow_pow_relay_reject_candidate_state;
+        suppression.next_relay_expiry_time =
+            m_shadow_pow_relay_reject_next_expiry;
+        suppression.next_legacy_relay_expiry_wall_time =
+            m_shadow_pow_relay_reject_next_legacy_wall_expiry;
+        suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
+        suppression.deferred_family_roots = &m_shadow_pow_relay_wait_roots;
+        reviewed_gate = BuildShadowPowClaimMiningGateImpl(
+            evaluated_inventory, &suppression);
+        if (!ShadowPowClaimRelayIntentMatches(
+                rejected_gate, reviewed_gate)) {
+            return false;
+        }
+        const auto relay = mapWallet.find(reviewed_gate.relay_txid);
+        if (relay == mapWallet.end() || !relay->second.tx ||
+            relay->second.InMempool() || relay->second.isAbandoned()) {
+            return false;
+        }
+        relay_tx = relay->second.tx;
     }
-    if (!m_shadow_pow_relay_reject_inventory ||
-        m_shadow_pow_relay_reject_inventory->active_tip != active_tip ||
-        m_shadow_pow_relay_reject_inventory->wallet_generation !=
-            wallet_generation ||
-        m_shadow_pow_relay_reject_inventory
-                ->candidate_state_fingerprint != candidate_state ||
-        ShadowPowClaimCachedRelayStateExpired(
-            *m_shadow_pow_relay_reject_inventory, GetTime())) {
-        m_shadow_pow_relay_reject_inventory =
-            GetShadowPowClaimRecoveryInventoryLocked();
-    }
-    const ShadowPowClaimRecoveryInventory& inventory =
-        *m_shadow_pow_relay_reject_inventory;
-    ShadowPowClaimRelaySuppression suppression;
-    suppression.active_tip = m_shadow_pow_relay_reject_tip;
-    suppression.wallet_generation =
-        m_shadow_pow_relay_reject_wallet_generation;
-    suppression.candidate_state_fingerprint =
-        m_shadow_pow_relay_reject_candidate_state;
-    suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
-    suppression.deferred_family_roots =
-        &m_shadow_pow_relay_wait_roots;
-    const ShadowPowClaimMiningGate current =
-        BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
-    if (!current.ShouldRelayExisting() ||
-        current.active_tip != rejected_gate.active_tip ||
-        current.wallet_generation != rejected_gate.wallet_generation ||
-        current.candidate_state_fingerprint !=
-            rejected_gate.candidate_state_fingerprint ||
-        current.relay_txid != rejected_gate.relay_txid ||
-        current.anchor != rejected_gate.anchor ||
-        current.generation_fingerprint !=
-            rejected_gate.generation_fingerprint ||
-        current.lineage_root_txid != rejected_gate.lineage_root_txid ||
-        current.lineage_head_txid != rejected_gate.lineage_head_txid) {
-        return false;
-    }
-    const auto relay = mapWallet.find(current.relay_txid);
-    if (relay == mapWallet.end() || !relay->second.tx ||
-        relay->second.InMempool() || relay->second.isAbandoned()) {
-        return false;
-    }
-    const MempoolAcceptResult accept =
-        chain().chainman().ProcessTransaction(
-            relay->second.tx, /*test_accept=*/true);
+
+    // Full mempool policy may run the memory-hard proof verifier. Execute it
+    // under the validation-required cs_main only, never cs_wallet, then
+    // publish suppression only after an exact snapshot and retained-byte
+    // revalidation below.
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(cs_wallet);
+    const MempoolAcceptResult accept = [&] {
+        LOCK(::cs_main);
+        return chain().chainman().ProcessTransaction(
+            relay_tx, /*test_accept=*/true);
+    }();
     if (accept.m_result_type !=
             MempoolAcceptResult::ResultType::INVALID ||
         !IsRepairableShadowPowRelayFeePolicyRejection(accept.m_state)) {
@@ -1979,11 +3867,44 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
         // sibling. Only a reproducible deterministic policy rejection does.
         return false;
     }
+    LOCK2(::cs_main, cs_wallet);
+    if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+            evaluated_inventory)) {
+        return false;
+    }
+    const auto relay = mapWallet.find(reviewed_gate.relay_txid);
+    if (relay == mapWallet.end() || relay->second.tx != relay_tx ||
+        relay->second.InMempool() || relay->second.isAbandoned()) {
+        return false;
+    }
+    ShadowPowClaimRelaySuppression suppression;
+    suppression.active_tip = m_shadow_pow_relay_reject_tip;
+    suppression.wallet_generation =
+        m_shadow_pow_relay_reject_wallet_generation;
+    suppression.candidate_state_fingerprint =
+        m_shadow_pow_relay_reject_candidate_state;
+    suppression.next_relay_expiry_time =
+        m_shadow_pow_relay_reject_next_expiry;
+    suppression.next_legacy_relay_expiry_wall_time =
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry;
+    suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
+    suppression.deferred_family_roots = &m_shadow_pow_relay_wait_roots;
+    const ShadowPowClaimMiningGate current =
+        BuildShadowPowClaimMiningGateImpl(
+            evaluated_inventory, &suppression);
+    if (!ShadowPowClaimRelayIntentMatches(reviewed_gate, current)) {
+        return false;
+    }
+    m_shadow_pow_relay_reject_inventory = evaluated_inventory;
     if (m_shadow_pow_relay_reject_tip != current.active_tip ||
         m_shadow_pow_relay_reject_wallet_generation !=
             current.wallet_generation ||
         m_shadow_pow_relay_reject_candidate_state !=
-            current.candidate_state_fingerprint) {
+            current.candidate_state_fingerprint ||
+        m_shadow_pow_relay_reject_next_expiry !=
+            current.next_relay_expiry_time ||
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry !=
+            current.next_legacy_relay_expiry_wall_time) {
         m_shadow_pow_relay_reject_txids.clear();
         m_shadow_pow_relay_wait_roots.clear();
         m_shadow_pow_relay_reject_tip = current.active_tip;
@@ -1991,6 +3912,10 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
             current.wallet_generation;
         m_shadow_pow_relay_reject_candidate_state =
             current.candidate_state_fingerprint;
+        m_shadow_pow_relay_reject_next_expiry =
+            current.next_relay_expiry_time;
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry =
+            current.next_legacy_relay_expiry_wall_time;
     }
     m_shadow_pow_relay_reject_txids.insert(current.relay_txid);
     if (reselected_gate) {
@@ -1998,8 +3923,13 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
         suppression.wallet_generation = current.wallet_generation;
         suppression.candidate_state_fingerprint =
             current.candidate_state_fingerprint;
+        suppression.next_relay_expiry_time =
+            current.next_relay_expiry_time;
+        suppression.next_legacy_relay_expiry_wall_time =
+            current.next_legacy_relay_expiry_wall_time;
         *reselected_gate =
-            BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+            BuildShadowPowClaimMiningGateImpl(
+                evaluated_inventory, &suppression);
     }
     return true;
 }
@@ -2008,43 +3938,34 @@ ShadowPowClaimMiningGate
 CWallet::DeferShadowPowClaimFamilyForSnapshot(
     const ShadowPowClaimMiningGate& deferred_gate)
 {
+    const ShadowPowClaimRecoveryInventory evaluated_inventory =
+        GetShadowPowClaimRecoveryInventory();
     LOCK2(::cs_main, cs_wallet);
-    return DeferShadowPowClaimFamilyForSnapshotLocked(deferred_gate);
-}
-
-ShadowPowClaimMiningGate
-CWallet::DeferShadowPowClaimFamilyForSnapshotLocked(
-    const ShadowPowClaimMiningGate& deferred_gate)
-{
-    AssertLockHeld(::cs_main);
-    AssertLockHeld(cs_wallet);
     const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
     const uint256 active_tip = tip ? tip->GetBlockHash() : uint256{};
     const uint64_t wallet_generation =
         GetDatabase().nUpdateCounter.load();
     const uint256 candidate_state =
         GetShadowPowClaimCandidateStateFingerprintLocked();
-    if ((!deferred_gate.ShouldRelayExisting() &&
-         !deferred_gate.MayRefreshSameAnchor()) ||
-        !tip ||
+    if (!tip ||
         m_last_block_processed != active_tip ||
-        m_shadow_pow_claim_recovery_db_ambiguous ||
-        active_tip != deferred_gate.active_tip ||
-        wallet_generation != deferred_gate.wallet_generation ||
-        candidate_state != deferred_gate.candidate_state_fingerprint) {
+        m_last_block_processed_height != tip->nHeight ||
+        m_shadow_pow_claim_recovery_db_ambiguous) {
         m_shadow_pow_relay_reject_inventory.reset();
-        return GetShadowPowClaimMiningGateLocked();
+        return {};
+    }
+    if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+            evaluated_inventory)) {
+        m_shadow_pow_relay_reject_inventory.reset();
+        return {};
     }
     if (!m_shadow_pow_relay_reject_inventory ||
         m_shadow_pow_relay_reject_inventory->active_tip != active_tip ||
         m_shadow_pow_relay_reject_inventory->wallet_generation !=
             wallet_generation ||
         m_shadow_pow_relay_reject_inventory
-                ->candidate_state_fingerprint != candidate_state ||
-        ShadowPowClaimCachedRelayStateExpired(
-            *m_shadow_pow_relay_reject_inventory, GetTime())) {
-        m_shadow_pow_relay_reject_inventory =
-            GetShadowPowClaimRecoveryInventoryLocked();
+                ->candidate_state_fingerprint != candidate_state) {
+        m_shadow_pow_relay_reject_inventory = evaluated_inventory;
     }
     const ShadowPowClaimRecoveryInventory& inventory =
         *m_shadow_pow_relay_reject_inventory;
@@ -2054,6 +3975,10 @@ CWallet::DeferShadowPowClaimFamilyForSnapshotLocked(
         m_shadow_pow_relay_reject_wallet_generation;
     suppression.candidate_state_fingerprint =
         m_shadow_pow_relay_reject_candidate_state;
+    suppression.next_relay_expiry_time =
+        m_shadow_pow_relay_reject_next_expiry;
+    suppression.next_legacy_relay_expiry_wall_time =
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry;
     suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
     suppression.deferred_family_roots =
         &m_shadow_pow_relay_wait_roots;
@@ -2067,7 +3992,11 @@ CWallet::DeferShadowPowClaimFamilyForSnapshotLocked(
         m_shadow_pow_relay_reject_wallet_generation !=
             current.wallet_generation ||
         m_shadow_pow_relay_reject_candidate_state !=
-            current.candidate_state_fingerprint) {
+            current.candidate_state_fingerprint ||
+        m_shadow_pow_relay_reject_next_expiry !=
+            current.next_relay_expiry_time ||
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry !=
+            current.next_legacy_relay_expiry_wall_time) {
         m_shadow_pow_relay_reject_txids.clear();
         m_shadow_pow_relay_wait_roots.clear();
         m_shadow_pow_relay_reject_tip = current.active_tip;
@@ -2075,6 +4004,10 @@ CWallet::DeferShadowPowClaimFamilyForSnapshotLocked(
             current.wallet_generation;
         m_shadow_pow_relay_reject_candidate_state =
             current.candidate_state_fingerprint;
+        m_shadow_pow_relay_reject_next_expiry =
+            current.next_relay_expiry_time;
+        m_shadow_pow_relay_reject_next_legacy_wall_expiry =
+            current.next_legacy_relay_expiry_wall_time;
     }
     m_shadow_pow_relay_wait_roots.insert(
         current.lineage_root_txid);
@@ -2082,6 +4015,10 @@ CWallet::DeferShadowPowClaimFamilyForSnapshotLocked(
     suppression.wallet_generation = current.wallet_generation;
     suppression.candidate_state_fingerprint =
         current.candidate_state_fingerprint;
+    suppression.next_relay_expiry_time =
+        current.next_relay_expiry_time;
+    suppression.next_legacy_relay_expiry_wall_time =
+        current.next_legacy_relay_expiry_wall_time;
     return BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
 }
 
@@ -2181,17 +4118,6 @@ bool SafeClaimGraphForRecovery(
         reason = message;
         return false;
     };
-    if (component.state ==
-        ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH) {
-        return refuse(
-            "claim-expired-locally-retired",
-            "the component has an inconsistent deprecated local-retirement classification; reopen and repair its retained claim records before recovery");
-    }
-    if (component.all_claims_zero_payment_retirable) {
-        return refuse(
-            "zero-payment-retirement-pending",
-            "the component has an inconsistent deprecated zero-payment-retirement classification; repair its retained claim records before recovery");
-    }
     if (!component.anchor_authenticated || component.anchor.IsNull() ||
         component.generation_fingerprint.IsNull()) {
         return refuse("anchor-not-authenticated",
@@ -2376,7 +4302,8 @@ ShadowPowClaimRecoveryUsage BuildRecoveryUsageLocked(
 
 ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
     const CWallet& wallet, const ShadowPowClaimRecoveryRequest& request,
-    const ShadowPowClaimRecoveryPolicy* automatic_policy)
+    const ShadowPowClaimRecoveryPolicy* automatic_policy,
+    const ShadowPowClaimRecoveryInventory& inventory)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
@@ -2389,8 +4316,6 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
         plan.fee_rate_atoms_per_k = request.fee_rate->GetFeePerK();
     }
 
-    const ShadowPowClaimRecoveryInventory inventory =
-        wallet.GetShadowPowClaimRecoveryInventoryLocked();
     plan.active_tip = inventory.active_tip;
     plan.active_height = inventory.active_height;
     plan.wallet_generation = inventory.wallet_generation;
@@ -2399,6 +4324,31 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
         ShadowPowClaimRecoveryAction refused;
         refused.reason_code = "database-outcome-ambiguous";
         refused.detail = "wallet recovery or coin-lock database outcome is ambiguous; reload and inspect exact records before any new plan";
+        plan.refused.push_back(std::move(refused));
+        plan.complete = false;
+        plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+            plan, request.selectors);
+        return plan;
+    }
+    if (inventory.claim_ownership_pending ||
+        inventory.claim_ownership_capacity_exceeded) {
+        ShadowPowClaimRecoveryAction refused;
+        refused.reason_code = inventory.claim_ownership_capacity_exceeded
+            ? "claim-ownership-capacity"
+            : "claim-ownership-pending";
+        refused.detail = inventory.claim_ownership_capacity_exceeded
+            ? "implicit legacy-claim ownership exceeds the bounded classifier resource budget; no recovery action is authorized"
+            : "implicit legacy-claim ownership classification is incomplete; no partial-prefix recovery plan is authorized";
+        plan.refused.push_back(std::move(refused));
+        plan.complete = false;
+        plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+            plan, request.selectors);
+        return plan;
+    }
+    if (inventory.claim_inventory_capacity_exceeded) {
+        ShadowPowClaimRecoveryAction refused;
+        refused.reason_code = "claim-inventory-capacity";
+        refused.detail = "the retained-claim graph exceeds the bounded recovery topology budget; no partial-prefix recovery plan is authorized";
         plan.refused.push_back(std::move(refused));
         plan.complete = false;
         plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
@@ -2472,7 +4422,8 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
     size_t new_automatic_actions{0};
     const CBlockIndex* pinned_tip =
         wallet.chain().chainman().ActiveChain().Tip();
-    if (!pinned_tip || pinned_tip->GetBlockHash() != inventory.active_tip) {
+    if (!pinned_tip || pinned_tip->GetBlockHash() != inventory.active_tip ||
+        pinned_tip->nHeight != inventory.active_height) {
         plan.complete = false;
         plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
             plan, request.selectors);
@@ -3125,20 +5076,38 @@ ShadowPowClaimRecoveryPlan CWallet::PlanShadowPowClaimRecovery(
             plan, effective.selectors);
         return plan;
     }
+    const ShadowPowClaimRecoveryInventory inventory =
+        GetShadowPowClaimRecoveryInventory();
     LOCK2(::cs_main, cs_wallet);
+    if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory)) {
+        ShadowPowClaimRecoveryPlan plan;
+        plan.origin = effective.origin;
+        plan.max_fee_per_resolution = effective.max_fee_per_resolution;
+        plan.aggregate_batch_fee_cap = effective.aggregate_batch_fee_cap;
+        plan.active_tip = inventory.active_tip;
+        plan.active_height = inventory.active_height;
+        plan.wallet_generation = inventory.wallet_generation;
+        plan.plan_id = ComputeShadowPowClaimRecoveryPlanId(
+            plan, effective.selectors);
+        return plan;
+    }
     return BuildRecoveryPlanLocked(*this, effective,
                                    automatic_policy
                                        ? &*automatic_policy
-                                       : nullptr);
+                                       : nullptr,
+                                   inventory);
 }
 
 ShadowPowClaimRecoveryUsage CWallet::GetShadowPowClaimRecoveryUsage(
     uint32_t rolling_window_seconds) const
 {
     if (!HaveChain()) return {};
-    LOCK2(::cs_main, cs_wallet);
     const ShadowPowClaimRecoveryInventory inventory =
-        GetShadowPowClaimRecoveryInventoryLocked();
+        GetShadowPowClaimRecoveryInventory();
+    LOCK2(::cs_main, cs_wallet);
+    if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory)) {
+        return {};
+    }
     return GetShadowPowClaimRecoveryUsageFromInventoryLocked(
         inventory, rolling_window_seconds);
 }
@@ -3150,6 +5119,11 @@ CWallet::GetShadowPowClaimRecoveryUsageFromInventoryLocked(
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(cs_wallet);
+    if (inventory.claim_ownership_pending ||
+        inventory.claim_ownership_capacity_exceeded ||
+        inventory.claim_inventory_capacity_exceeded) {
+        return {};
+    }
     return BuildRecoveryUsageLocked(
         *this, inventory,
         rolling_window_seconds);
@@ -3165,6 +5139,7 @@ ShadowPowClaimRecoveryReview CWallet::GetShadowPowClaimRecoveryReview(
         return review;
     }
 
+    review.inventory = GetShadowPowClaimRecoveryInventory();
     LOCK2(::cs_main, cs_wallet);
     const ShadowPowClaimRecoveryPolicyMutationResult policy_state =
         GetShadowPowClaimRecoveryPolicyState();
@@ -3183,12 +5158,21 @@ ShadowPowClaimRecoveryReview CWallet::GetShadowPowClaimRecoveryReview(
         automatic_policy = &review.policy;
     }
 
-    review.inventory = GetShadowPowClaimRecoveryInventoryLocked();
-    review.plan = BuildRecoveryPlanLocked(
-        *this, effective, automatic_policy);
-    review.usage = BuildRecoveryUsageLocked(
-        *this, review.inventory,
-        review.policy.rolling_fee_window_seconds);
+    const bool inventory_current =
+        ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+            review.inventory);
+    review.plan = inventory_current
+        ? BuildRecoveryPlanLocked(
+              *this, effective, automatic_policy, review.inventory)
+        : ShadowPowClaimRecoveryPlan{};
+    if (inventory_current &&
+        !review.inventory.claim_ownership_pending &&
+        !review.inventory.claim_ownership_capacity_exceeded &&
+        !review.inventory.claim_inventory_capacity_exceeded) {
+        review.usage = GetShadowPowClaimRecoveryUsageFromInventoryLocked(
+            review.inventory,
+            review.policy.rolling_fee_window_seconds);
+    }
     review.active_tip = review.inventory.active_tip;
     review.active_height = review.inventory.active_height;
     review.wallet_generation = review.inventory.wallet_generation;
@@ -3250,6 +5234,8 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
         result.error = "active chain is not synchronized and ready for recovery";
         return result;
     }
+    const ShadowPowClaimRecoveryInventory planning_inventory =
+        GetShadowPowClaimRecoveryInventory();
     // Keep durable recovery mutations and miner consent changes in one
     // authorization order. If disable acquires this lock first, automatic
     // planning observes mining off. If an authorized recovery already holds
@@ -3300,6 +5286,13 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
     uint64_t post_persist_generation{0};
     {
         LOCK2(::cs_main, cs_wallet);
+        if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+                planning_inventory)) {
+            result.stale_plan = true;
+            result.error =
+                "recovery inventory changed before planning; retry from the current wallet and chain snapshot";
+            return result;
+        }
         // The policy is re-read under the same wallet lock as planning so a
         // concurrent revocation can never authorize another automatic sign or
         // relay action.
@@ -3318,7 +5311,8 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
         }
         result.plan = BuildRecoveryPlanLocked(
             *this, effective,
-            automatic_policy ? &*automatic_policy : nullptr);
+            automatic_policy ? &*automatic_policy : nullptr,
+            planning_inventory);
         if (request.expected_plan_id &&
             *request.expected_plan_id != result.plan.plan_id) {
             result.stale_plan = true;
@@ -3358,7 +5352,9 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
         const uint256 pinned_tip = result.plan.active_tip;
         const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
         if (!tip || tip->GetBlockHash() != pinned_tip ||
+            tip->nHeight != result.plan.active_height ||
             m_last_block_processed != pinned_tip ||
+            m_last_block_processed_height != result.plan.active_height ||
             GetDatabase().nUpdateCounter.load() !=
                 result.plan.wallet_generation) {
             result.stale_plan = true;
@@ -3380,8 +5376,8 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
 
         const CCoinsViewCache& coins_tip =
             chain().chainman().ActiveChainstate().CoinsTip();
-        const ShadowPowClaimRecoveryInventory execution_inventory =
-            GetShadowPowClaimRecoveryInventoryLocked();
+        const ShadowPowClaimRecoveryInventory& execution_inventory =
+            planning_inventory;
         for (size_t i = 0; i < result.plan.actions.size(); ++i) {
             ShadowPowClaimRecoveryAction& action = result.plan.actions[i];
             Coin anchor_coin;
@@ -3555,7 +5551,8 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
         const uint256& txid = relay_txids[relay_index];
         LOCK(::cs_main);
         const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
-        if (!tip || tip->GetBlockHash() != result.plan.active_tip) {
+        if (!tip || tip->GetBlockHash() != result.plan.active_tip ||
+            tip->nHeight != result.plan.active_height) {
             result.stale_plan = true;
             result.error = "active tip changed after persistence; signed bytes remain safely stored";
             return result;
@@ -3579,6 +5576,7 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
                 return result;
             }
             if (m_last_block_processed != result.plan.active_tip ||
+                m_last_block_processed_height != result.plan.active_height ||
                 GetDatabase().nUpdateCounter.load() !=
                     post_persist_generation) {
                 result.stale_plan = true;
@@ -3643,6 +5641,7 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
         broadcast_guard.expected_wallet_generation =
             post_persist_generation;
         broadcast_guard.expected_wallet_tip = result.plan.active_tip;
+        broadcast_guard.expected_wallet_height = result.plan.active_height;
         broadcast_guard.expected_unlocked_input =
             relay_anchors.at(txid);
         broadcast_guard.require_normal_unlock =
@@ -3699,6 +5698,8 @@ CWallet::AdoptShadowPowClaimRecoveryComponent(
         return fail(ShadowPowClaimRecoveryAdoptionStatus::NO_CHAIN,
                     "wallet has no active chain interface");
     }
+    const ShadowPowClaimRecoveryInventory inventory =
+        GetShadowPowClaimRecoveryInventory();
     LOCK2(::cs_main, cs_wallet);
     if (m_shadow_pow_claim_recovery_db_ambiguous) {
         result.durable_state_ambiguous = true;
@@ -3714,13 +5715,28 @@ CWallet::AdoptShadowPowClaimRecoveryComponent(
             "normal local private-key wallet unlock is required before adopting historical claims");
     }
 
-    const ShadowPowClaimRecoveryInventory inventory =
-        GetShadowPowClaimRecoveryInventoryLocked();
     result.active_tip = inventory.active_tip;
-    if (!inventory.wallet_tip_matches || inventory.active_tip != expected_tip) {
+    if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory) ||
+        !inventory.wallet_tip_matches || inventory.active_tip != expected_tip) {
         return fail(
             ShadowPowClaimRecoveryAdoptionStatus::STALE_TIP,
             "active or wallet-processed tip changed; review the component again");
+    }
+    if (inventory.claim_ownership_pending ||
+        inventory.claim_ownership_capacity_exceeded) {
+        result.component_refusal_code =
+            inventory.claim_ownership_capacity_exceeded
+                ? "claim-ownership-capacity"
+                : "claim-ownership-pending";
+        return fail(
+            ShadowPowClaimRecoveryAdoptionStatus::UNSAFE_GRAPH,
+            "implicit legacy-claim ownership is not fully classified; adoption from a partial inventory is forbidden");
+    }
+    if (inventory.claim_inventory_capacity_exceeded) {
+        result.component_refusal_code = "claim-inventory-capacity";
+        return fail(
+            ShadowPowClaimRecoveryAdoptionStatus::UNSAFE_GRAPH,
+            "the retained-claim graph exceeds the bounded recovery topology budget; adoption from a partial inventory is forbidden");
     }
 
     std::vector<const ShadowPowClaimRecoveryComponent*> matches;
@@ -3843,30 +5859,54 @@ CWallet::AdoptShadowPowClaimRecoveryComponent(
         CWalletTx& wtx = mapWallet.at(update.txid);
         wtx.mapValue = std::move(update.metadata);
         wtx.MarkDirty();
+        RefreshShadowPowClaimIndexEntryLocked(wtx);
         NotifyTransactionChanged(update.txid, CT_UPDATED);
     }
+    MarkShadowPowClaimCandidateStateChangedLocked();
     result.durable_state_changed = true;
     result.adopted = true;
     result.status = ShadowPowClaimRecoveryAdoptionStatus::SUCCESS;
     result.detail = "complete claim component was durably adopted";
 
-    // Report the post-commit fingerprint from the same chain/wallet lock and
-    // durable in-memory publication. Adapters must never perform a racy second
-    // inventory lookup merely to describe this successful mutation.
-    const ShadowPowClaimRecoveryInventory post =
-        GetShadowPowClaimRecoveryInventoryLocked();
-    const auto post_component = std::find_if(
-        post.components.begin(), post.components.end(),
-        [&](const ShadowPowClaimRecoveryComponent& candidate) {
-            return candidate.generation_fingerprint ==
-                   result.generation_fingerprint;
-        });
-    if (post_component != post.components.end()) {
-        result.post_adoption_component_fingerprint =
-            post_component->fingerprint;
-        result.automatic_eligible_after_adoption =
-            post_component->all_claims_explicitly_provenanced;
+    // Adoption changes only the durable provenance fields represented below;
+    // chain, graph, transaction, and proof facts remain the exact prechecked
+    // snapshot. Derive the post-commit fingerprint from that carried component
+    // instead of rebuilding the classifier while mutation locks are held.
+    ShadowPowClaimRecoveryComponent post_component = component;
+    for (ShadowPowClaimRecoveryNode& node : post_component.nodes) {
+        if (node.kind != ShadowPowClaimRecoveryNodeKind::CLAIM ||
+            IsExplicitProvenance(node.provenance)) {
+            continue;
+        }
+        node.provenance =
+            ShadowPowClaimRecoveryProvenance::EXPLICIT_ADOPTED;
+        node.adoption_tip = expected_tip;
+        node.adoption_generation_fingerprint =
+            component.generation_fingerprint;
+        node.adoption_metadata_valid = true;
     }
+    post_component.all_claims_explicitly_provenanced = true;
+    post_component.has_indeterminate_node = false;
+    if (post_component.anchor_unspent) {
+        if (post_component.has_live_claim) {
+            post_component.state = ShadowPowClaimRecoveryState::LIVE;
+        } else if (post_component.has_transient_claim) {
+            post_component.state = ShadowPowClaimRecoveryState::TRANSIENT;
+        } else if (post_component.all_claims_terminal_on_pinned_tip) {
+            post_component.state =
+                post_component.has_branch_relative_ineligibility
+                    ? ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE
+                    : ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP;
+        } else {
+            post_component.state =
+                ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE;
+        }
+    }
+    post_component.fingerprint = FingerprintComponent(
+        inventory.active_tip, post_component);
+    result.post_adoption_component_fingerprint =
+        post_component.fingerprint;
+    result.automatic_eligible_after_adoption = true;
     return result;
 }
 

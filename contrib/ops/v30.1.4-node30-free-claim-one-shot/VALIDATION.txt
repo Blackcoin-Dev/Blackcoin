@@ -47,16 +47,22 @@ Controller identity: CPython 3.12.13, root:root, mode0700, nlink1, size30846632
 Controller SHA256: 202c17d1671602a4ef1d43e9b2fdbef0769443f37bf5e51f6b603e0b2c27d9d8
 Controller invocation: /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LC_ALL=C TZ=UTC <realpath> -I TOOL ...
 Controller flags: isolated=1, ignore_environment=1, no_user_site=1, safe_path=true
+Controller safe prefixes: / and /mnt canonical root-owned, not group/other writable
+Controller Unraid share ancestry: /mnt/user and /mnt/user/appdata exact uid99:gid100 mode0777
+Controller protected boundary: /mnt/user/appdata/projectblackcoin-ops-runtime downward exact root:root mode0700 nlink1
+Controller path binding: prefix/share/protected/binary device+inode identities captured in every receipt and authority-bound by digest
+Controller stability: path identities and exact opened-binary hash rechecked during validation
+Controller share policy: exact live user-share ancestry accepted; no chmod/chown proposed
 Controller symlink/direct-shebang/nonisolated invocation: rejected before manifest, Docker, or RPC access
 Installed API limitation: no plan/idempotency token, exact-input selector, caller total-fee cap, or separate sign/commit phase
 Live financial authority in repository: false
 Deployable public-release authority: false
 
-Hostile suite result: PASS: 166 hostile node30 Free-Claim one-shot assertions
-Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-directory-contract-20260814.out
-Hostile suite log SHA256: 9de7ce994ccab5bada384ef86451a8c12de35ba6678ae31d21cb8d415ab33ccb
-Tool SHA256: 8bf23e54a5854da19977c9281834370660acc8191974ce9d4d63d6dd0e43ae4b
+Hostile suite result: PASS: 175 hostile node30 Free-Claim one-shot assertions
+Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-unraid-controller-boundary-20260814.out
+Hostile suite log SHA256: e5300e4a2385565a79bcb39facf001f4dc98c499f2ae406f4ff54e02e6aab682
+Tool SHA256: c4c36be5d5d5419ccf37130497a0e9303694737bd382d5bb81bae11c551a6b31
 Test transport SHA256: c1987a9646d5a9f375f7e982f59ef9c29b1f1434d4990c4005ab9e9454bebc9e
-Test driver SHA256: fdbc249f7cf7e6c800f8c0c839ebae9e9376bc9b4e4edfa53fef533660988c34
+Test driver SHA256: 47f930fae7d8a9f60d7014632ee6bd1172ce1d7a77078655d9eeca15bfc7e8e1
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

@@ -135,6 +135,38 @@ invoke()
       --authority "$root/authority.json" --authority-sha256 "$(sha "$root/authority.json")" "$@"
 }
 
+controller_dir_identity()
+{
+    local path=$1 uid=$2 gid=$3 mode=$4 nlink=${5:--}
+    FLEET31_TEST_TRANSPORT="$MOCK" python3 - "$TOOL" "$path" "$uid" "$gid" \
+      "$mode" "$nlink" <<'PY'
+import importlib.util,json,pathlib,sys
+spec=importlib.util.spec_from_file_location('node30_one_shot_dir_test',sys.argv[1])
+mod=importlib.util.module_from_spec(spec)
+sys.modules[spec.name]=mod
+spec.loader.exec_module(mod)
+nlink=None if sys.argv[6]=='-' else int(sys.argv[6])
+value=mod.exact_directory_identity(pathlib.Path(sys.argv[2]),
+    'fixture controller directory',int(sys.argv[3]),int(sys.argv[4]),
+    int(sys.argv[5],8),nlink)
+print(json.dumps(value,sort_keys=True,separators=(',',':')))
+PY
+}
+
+controller_identities_stable()
+{
+    local before=$1 after=$2
+    FLEET31_TEST_TRANSPORT="$MOCK" python3 - "$TOOL" "$before" "$after" <<'PY'
+import importlib.util,json,sys
+spec=importlib.util.spec_from_file_location('node30_one_shot_stability_test',sys.argv[1])
+mod=importlib.util.module_from_spec(spec)
+sys.modules[spec.name]=mod
+spec.loader.exec_module(mod)
+mod.stable_directory_identities([json.loads(sys.argv[2])],
+                                [json.loads(sys.argv[3])],'fixture controller')
+PY
+}
+
 # Static scope: exactly one wallet-mutating RPC call site and no role/unlock,
 # recurring-worker, recovery, repair, or chain-rewrite invocation.
 assert_eq "$(python3 - "$TOOL" <<'PY'
@@ -164,6 +196,46 @@ print(f"{values['PRODUCTION_PYTHON_SHA256']}:{values['PRODUCTION_PYTHON_SIZE']}"
 PY
 )" '202c17d1671602a4ef1d43e9b2fdbef0769443f37bf5e51f6b603e0b2c27d9d8:30846632'
 
+# The controller boundary intentionally crosses two exact Unraid user-share
+# ancestors before entering a root-owned 0700 protected subtree. Exercise the
+# common exact-identity primitive with that mode split and hostile changes.
+CTRL="$FIX/controller-shape"
+mkdir -m 0777 "$CTRL" "$CTRL/appdata"
+mkdir -m 0700 "$CTRL/appdata/protected"
+CTRL_UID=$(id -u)
+CTRL_GID=$(id -g)
+SHARE_ID=$(controller_dir_identity "$CTRL/appdata" "$CTRL_UID" "$CTRL_GID" 0777)
+assert_eq "$(jq -r .mode <<<"$SHARE_ID")" 0777
+PROTECTED_NLINK=$(stat -f %l "$CTRL/appdata/protected")
+PROTECTED_ID=$(controller_dir_identity "$CTRL/appdata/protected" "$CTRL_UID" \
+  "$CTRL_GID" 0700 "$PROTECTED_NLINK")
+assert_eq "$(jq -r .mode <<<"$PROTECTED_ID")" 0700
+assert_fails 'controller share rejects the wrong gid' controller_dir_identity \
+  "$CTRL/appdata" "$CTRL_UID" "$((CTRL_GID + 1))" 0777
+chmod 0775 "$CTRL/appdata"
+assert_fails 'controller share rejects an unexpected mode' controller_dir_identity \
+  "$CTRL/appdata" "$CTRL_UID" "$CTRL_GID" 0777
+chmod 0777 "$CTRL/appdata"
+chmod 1777 "$CTRL/appdata"
+assert_fails 'controller share rejects an unexpected sticky bit' controller_dir_identity \
+  "$CTRL/appdata" "$CTRL_UID" "$CTRL_GID" 0777
+chmod 0777 "$CTRL/appdata"
+chmod 0770 "$CTRL/appdata/protected"
+assert_fails 'controller protected subtree rejects group write' controller_dir_identity \
+  "$CTRL/appdata/protected" "$CTRL_UID" "$CTRL_GID" 0700 "$PROTECTED_NLINK"
+chmod 0700 "$CTRL/appdata/protected"
+mv "$CTRL/appdata/protected" "$CTRL/appdata/protected.real"
+ln -s "$CTRL/appdata/protected.real" "$CTRL/appdata/protected"
+assert_fails 'controller protected subtree rejects a symlink' controller_dir_identity \
+  "$CTRL/appdata/protected" "$CTRL_UID" "$CTRL_GID" 0700 "$PROTECTED_NLINK"
+unlink "$CTRL/appdata/protected"
+mkdir -m 0700 "$CTRL/appdata/protected"
+REBOUND_NLINK=$(stat -f %l "$CTRL/appdata/protected")
+REBOUND_ID=$(controller_dir_identity "$CTRL/appdata/protected" "$CTRL_UID" \
+  "$CTRL_GID" 0700 "$REBOUND_NLINK")
+assert_fails 'controller protected subtree inode substitution is detectable' \
+  controller_identities_stable "$PROTECTED_ID" "$REBOUND_ID"
+
 HAPPY=$(make_fixture happy)
 AUDIT_SHA=$(run_audit "$HAPPY")
 assert_jq '.result=="READY_FOR_SEPARATE_ONE_SHOT_AUTHORITY" and
@@ -172,6 +244,9 @@ assert_jq '.result=="READY_FOR_SEPARATE_ONE_SHOT_AUTHORITY" and
   .snapshot.role.ordinary_pow.enabled==false and .snapshot.role.pos.staking==true and
   .snapshot.queue.root.mode=="0750" and .snapshot.queue.queue_directory.mode=="0770" and
   .snapshot.queue.done_directory.mode=="0750" and
+  .controller_runtime.contract=="hash-pinned-offline-test-controller/v1" and
+  (.controller_runtime_sha256|test("^[0-9a-f]{64}$")) and
+  .required_authority.controller_runtime_sha256==.controller_runtime_sha256 and
   .required_authority.proof_override==null and .required_authority.maximum_fee_blk=="0.00028700"' \
   "$HAPPY/run/audit.json"
 assert_eq "$(grep -c sendshadowpowclaim "$HAPPY/state/transport.log" || true)" 0
@@ -424,6 +499,7 @@ for filter in \
   '.user_order_sha256=("0"*64)' \
   '.queue_item_sha256=("0"*64)' \
   '.tool_sha256=("0"*64)' \
+  '.controller_runtime_sha256=("0"*64)' \
   '.extra=true'; do
     jq "$filter" "$AUTH/authority.json" >"$AUTH/bad-authority.json"
     chmod 0600 "$AUTH/bad-authority.json"

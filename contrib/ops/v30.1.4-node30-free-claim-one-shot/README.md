@@ -144,10 +144,24 @@ interpreter:
 That file must be root:root, mode 0700, single-link, size 30,846,632 bytes,
 and SHA256
 `202c17d1671602a4ef1d43e9b2fdbef0769443f37bf5e51f6b603e0b2c27d9d8`.
-It must report CPython 3.12.13. The interpreter and every parent are required
-to be canonical, nonsymlink, root-controlled, and not group- or other-writable.
-The convenience `python3` symlink is not accepted. The tool validates this
-identity itself before parsing a live command.
+It must report CPython 3.12.13. The convenience `python3` symlink is not
+accepted.
+
+The real Unraid host exposes `/mnt/user` and `/mnt/user/appdata` as uid 99,
+gid 100, mode 0777 user-share directories. Those two ancestors are accepted
+only at those exact canonical nonsymlink identities and modes; the package
+does not require or recommend changing them. `/` and `/mnt` must remain
+canonical root-owned prefixes without group or other write. The protected
+boundary begins at
+`/mnt/user/appdata/projectblackcoin-ops-runtime`: that directory and every
+directory below it through the interpreter's parent must remain root:root,
+mode 0700, single-link, canonical, and nonsymlink. The tool reads each prefix,
+share, protected-subtree, and executable device/inode identity twice, hashes
+the exact opened executable, and fails if any identity moves during
+validation. The complete controller identity and its digest are included in
+every receipt; the separate authority binds the same digest, so a later
+invocation cannot resume an audit produced by a different controller path
+identity.
 
 Invoke the real binary under the exact isolated environment and `-I`:
 
@@ -160,9 +174,10 @@ sudo /usr/bin/env -i \
 
 The tool requires `isolated=1`, `ignore_environment=1`, `no_user_site=1`,
 `safe_path=true`, and exactly those four environment variables. A different
-interpreter, the symlink, an unsafe parent, a different mode/owner/group/size,
-an added environment variable, or a non-isolated invocation fails before any
-manifest, Docker, or RPC operation.
+interpreter, the symlink, any drift in the exact Unraid share ancestry or
+protected subtree, a different mode/owner/group/size/link/inode, an added
+environment variable, or a non-isolated invocation fails before any manifest,
+Docker, or RPC operation.
 
 ## Operator sequence
 
@@ -191,6 +206,9 @@ Run `tests/run.sh` as a nonroot user. The stateful fixture contacts no Docker
 daemon, SSH host, wallet, chain, or network. It tests the exact call and
 parameters; authority, fee, queue, witness, QQP2, runtime, wallet, role, pause,
 lock, exact directory identity/mode/group, and controller-runtime gates;
+the exact Unraid uid-99/gid-100/mode-0777 share ancestry, root-owned
+mode-0700 protected controller subtree, stable device/inode binding, and
+share/protected mode, group, special-bit, symlink, and path-swap hostiles;
 independent signed-byte fee proof; immediate acknowledgment
 ordering; response corruption and overprecision; process death before and
 after wallet persistence and after response publication; no-retry

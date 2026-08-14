@@ -46,11 +46,18 @@ PRODUCTION_ROOT = pathlib.Path("/mnt/pulsar/Blackcoin_Blocks/operations/free-cla
 PRODUCTION_PYTHON = pathlib.Path(
     "/mnt/user/appdata/projectblackcoin-ops-runtime/"
     "cpython-3.12.13-20260510/python/bin/python3.12")
+PRODUCTION_CONTROLLER_ROOT = pathlib.Path(
+    "/mnt/user/appdata/projectblackcoin-ops-runtime")
 PRODUCTION_PYTHON_SHA256 = "202c17d1671602a4ef1d43e9b2fdbef0769443f37bf5e51f6b603e0b2c27d9d8"
 PRODUCTION_PYTHON_SIZE = 30_846_632
 PRODUCTION_ENVIRONMENT = {
     "HOME": "/root", "PATH": "/usr/bin:/bin", "LC_ALL": "C", "TZ": "UTC",
 }
+UNRAID_SHARE_DIRECTORIES = [
+    (pathlib.Path("/mnt/user"), 99, 100, 0o777),
+    (pathlib.Path("/mnt/user/appdata"), 99, 100, 0o777),
+]
+CONTROLLER_RUNTIME_IDENTITY: dict[str, Any] | None = None
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 QUEUE_NAME = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}[.]json$")
 P2PKH_SCRIPT = re.compile(r"^76a914[0-9a-f]{40}88ac$")
@@ -171,35 +178,126 @@ def test_mode() -> bool:
     return bool(os.environ.get("FLEET31_TEST_TRANSPORT"))
 
 
-def validate_controller_runtime() -> None:
-    """Bind live execution to the audited isolated host interpreter."""
-    executable = pathlib.Path(sys.executable)
+def exact_directory_identity(path: pathlib.Path, label: str, expected_uid: int,
+                             expected_gid: int, expected_mode: int,
+                             expected_nlink: int | None = None) -> dict[str, Any]:
+    """Return one exact canonical directory identity or fail closed."""
+    st = path.lstat()
+    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or
+            path.resolve(strict=True) != path or st.st_uid != expected_uid or
+            st.st_gid != expected_gid or stat.S_IMODE(st.st_mode) != expected_mode or
+            (expected_nlink is not None and st.st_nlink != expected_nlink)):
+        die(f"{label} does not have its exact canonical directory identity")
+    return {"path": str(path), "device": st.st_dev, "inode": st.st_ino,
+            "uid": st.st_uid, "gid": st.st_gid,
+            "mode": format(stat.S_IMODE(st.st_mode), "04o"), "nlink": st.st_nlink}
+
+
+def safe_prefix_identity(path: pathlib.Path, label: str) -> dict[str, Any]:
+    st = path.lstat()
+    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or
+            path.resolve(strict=True) != path or st.st_uid != 0 or st.st_mode & 0o022):
+        die(f"{label} is not a canonical root-controlled prefix")
+    return {"path": str(path), "device": st.st_dev, "inode": st.st_ino,
+            "uid": st.st_uid, "gid": st.st_gid,
+            "mode": format(stat.S_IMODE(st.st_mode), "04o"), "nlink": st.st_nlink}
+
+
+def stable_directory_identities(prior: list[dict[str, Any]],
+                                current: list[dict[str, Any]], label: str) -> None:
+    if prior != current:
+        die(f"{label} directory identity changed during validation")
+
+
+def exact_controller_binary_identity(executable: pathlib.Path) -> dict[str, Any]:
+    """Hash the exact opened executable and prove the pathname stayed bound."""
     try:
-        st = executable.lstat()
+        before = executable.lstat()
+        resolved = executable.resolve(strict=True)
+        digest = hashlib.sha256()
+        with executable.open("rb", buffering=0) as handle:
+            opened = os.fstat(handle.fileno())
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = executable.lstat()
     except FileNotFoundError:
         die("audited controller interpreter is absent")
-    if (executable != PRODUCTION_PYTHON or executable.resolve(strict=True) != executable or
-            not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_nlink != 1 or
-            st.st_uid != 0 or st.st_gid != 0 or stat.S_IMODE(st.st_mode) != 0o700 or
-            st.st_size != PRODUCTION_PYTHON_SIZE or
-            sha256_file(executable) != PRODUCTION_PYTHON_SHA256):
+    identity_fields = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode",
+                       "st_nlink", "st_size")
+    if (executable != PRODUCTION_PYTHON or resolved != executable or
+            not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or
+            before.st_nlink != 1 or before.st_uid != 0 or before.st_gid != 0 or
+            stat.S_IMODE(before.st_mode) != 0o700 or
+            before.st_size != PRODUCTION_PYTHON_SIZE or
+            digest.hexdigest() != PRODUCTION_PYTHON_SHA256 or
+            any(getattr(before, field) != getattr(opened, field) or
+                getattr(before, field) != getattr(after, field)
+                for field in identity_fields)):
         die("live controller interpreter differs from the exact audited Python binary")
+    return {"path": str(executable), "device": after.st_dev, "inode": after.st_ino,
+            "uid": after.st_uid, "gid": after.st_gid, "mode": "0700",
+            "nlink": after.st_nlink, "size": after.st_size,
+            "sha256": PRODUCTION_PYTHON_SHA256, "version": "3.12.13"}
+
+
+def validate_controller_runtime() -> dict[str, Any]:
+    """Bind live execution to the audited Unraid-hosted isolated interpreter."""
+    executable = pathlib.Path(sys.executable)
+    binary_before = exact_controller_binary_identity(executable)
+    protected_paths: list[pathlib.Path] = []
     parent = executable.parent
-    while True:
-        parent_st = parent.lstat()
-        if (not stat.S_ISDIR(parent_st.st_mode) or stat.S_ISLNK(parent_st.st_mode) or
-                parent.resolve(strict=True) != parent or parent_st.st_uid != 0 or
-                parent_st.st_mode & 0o022):
-            die(f"controller interpreter parent is not root-controlled: {parent}")
+    while parent != PRODUCTION_CONTROLLER_ROOT:
         if parent == parent.parent:
-            break
+            die("controller interpreter is outside the exact protected subtree")
+        protected_paths.append(parent)
         parent = parent.parent
+    protected_paths.append(PRODUCTION_CONTROLLER_ROOT)
+    protected_paths.reverse()
+    safe_before = [safe_prefix_identity(path, f"controller prefix {path}")
+                   for path in [pathlib.Path("/"), pathlib.Path("/mnt")]]
+    share_before = [exact_directory_identity(path, f"Unraid share {path}", uid, gid, mode)
+                    for path, uid, gid, mode in UNRAID_SHARE_DIRECTORIES]
+    protected_before = [exact_directory_identity(
+        path, f"protected controller subtree {path}", 0, 0, 0o700, 1)
+        for path in protected_paths]
     flags = sys.flags
     if (sys.implementation.name != "cpython" or sys.version_info[:3] != (3, 12, 13) or
             flags.isolated != 1 or flags.ignore_environment != 1 or
             flags.no_user_site != 1 or getattr(flags, "safe_path", False) is not True or
             dict(os.environ) != PRODUCTION_ENVIRONMENT):
         die("live controller is not the exact isolated Python 3.12.13 environment")
+    safe_after = [safe_prefix_identity(path, f"controller prefix {path}")
+                  for path in [pathlib.Path("/"), pathlib.Path("/mnt")]]
+    share_after = [exact_directory_identity(path, f"Unraid share {path}", uid, gid, mode)
+                   for path, uid, gid, mode in UNRAID_SHARE_DIRECTORIES]
+    protected_after = [exact_directory_identity(
+        path, f"protected controller subtree {path}", 0, 0, 0o700, 1)
+        for path in protected_paths]
+    stable_directory_identities(safe_before, safe_after, "controller prefix")
+    stable_directory_identities(share_before, share_after, "Unraid share")
+    stable_directory_identities(protected_before, protected_after,
+                                "protected controller subtree")
+    binary_after = exact_controller_binary_identity(executable)
+    if binary_before != binary_after:
+        die("controller interpreter identity changed during validation")
+    return {
+        "contract": "unraid-protected-cpython-controller/v1",
+        "safe_prefix": safe_after, "unraid_share_ancestry": share_after,
+        "protected_subtree": protected_after,
+        "binary": binary_after,
+        "isolation": {"isolated": 1, "ignore_environment": 1,
+                      "no_user_site": 1, "safe_path": True,
+                      "environment": PRODUCTION_ENVIRONMENT},
+    }
+
+
+def controller_runtime_identity() -> dict[str, Any]:
+    if test_mode():
+        return {"contract": "hash-pinned-offline-test-controller/v1",
+                "test_transport_sha256": TEST_TRANSPORT_SHA256}
+    if CONTROLLER_RUNTIME_IDENTITY is None:
+        die("live controller identity was not established")
+    return CONTROLLER_RUNTIME_IDENTITY
 
 
 @dataclasses.dataclass(frozen=True)
@@ -302,6 +400,8 @@ def base_receipt(kind: str, contract: Contract) -> dict[str, Any]:
         "kind": kind,
         "tool_sha256": tool_sha(),
         "node30_primitive_sha256": NODE30_PRIMITIVE_SHA256,
+        "controller_runtime_sha256": sha256_json(controller_runtime_identity()),
+        "controller_runtime": controller_runtime_identity(),
         "runtime_manifest_sha256": contract.sha256,
         "installed_source": {"commit": SOURCE_COMMIT, "tree": SOURCE_TREE,
                              "signer_fingerprint": SOURCE_SIGNER},
@@ -632,6 +732,7 @@ def audit_command(args: argparse.Namespace) -> None:
         "runtime_manifest_sha256": contract.sha256,
         "tool_sha256": tool_sha(),
         "node30_primitive_sha256": NODE30_PRIMITIVE_SHA256,
+        "controller_runtime_sha256": sha256_json(controller_runtime_identity()),
         "queue_item_sha256": snapshot["queue"]["item"]["sha256"],
         "queue_item_basename": snapshot["queue"]["item"]["basename"],
         "quantum_address": snapshot["payout"]["address"],
@@ -681,6 +782,7 @@ def validate_authority(authority: Any, contract: Contract, audit: dict[str, Any]
         "node": NODE, "role": "free_claim", "audit_receipt_sha256": audit_sha,
         "runtime_manifest_sha256": contract.sha256, "tool_sha256": tool_sha(),
         "node30_primitive_sha256": NODE30_PRIMITIVE_SHA256,
+        "controller_runtime_sha256": sha256_json(controller_runtime_identity()),
         "queue_item_sha256": snapshot["queue"]["item"]["sha256"],
         "queue_item_basename": snapshot["queue"]["item"]["basename"],
         "quantum_address": snapshot["payout"]["address"],
@@ -1502,10 +1604,11 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global CONTROLLER_RUNTIME_IDENTITY
     os.umask(0o077)
     try:
         if not test_mode():
-            validate_controller_runtime()
+            CONTROLLER_RUNTIME_IDENTITY = validate_controller_runtime()
     except (node30.base.GateError, node30.GateError, GateError, OSError) as exc:
         print(f"FATAL: {exc}", file=sys.stderr)
         return 1

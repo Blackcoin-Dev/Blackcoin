@@ -1,101 +1,219 @@
-# Installed-v30.1.4 fleet31 Phase-A recovery
+# Installed-v30.1.4 fleet31 two-phase quarantine recovery
 
-This is a fleet-owned, Phase-A-only operator stage for the 31 regular-PoW
-wallets: nodes 1–29 and 31–32. Node30 is structurally excluded. The public Core
-development/release lane is outside this package.
+This fleet-owned operator package handles the 31 regular-PoW wallets on nodes
+1–29 and 31–32. Node30 is structurally excluded. It operates only against the
+already-installed, signed v30.1.4 source identity recorded in the runtime
+manifest. It does not deploy Core, change Compose, unlock wallets, change PoW
+or PoS intent, reindex, rewind, repair, recover, or use generic transaction
+RPCs.
 
-The stage does not contain live runtime identities, financial authority,
-wallet secrets, transaction bytes, or evidence of live execution. It does not
-contact SSH by itself. An operator must supply a locally sealed mode-0600
-runtime manifest with the exact installed image, executable, wallet, service,
-container, Docker-transport, and lock identities.
-Compose services use the exact zero-padded topology labels `node01` through
-`node32`; node1's container remains `blackcoin-v4-gui` and other regular-node
-containers remain `blackcoin-v4-gui-N` as declared by the sealed manifest.
-For the sole unnamed wallet (`""`), the RPC transport omits `-rpcwallet`
-entirely; it emits `-rpcwallet=<name>` only for a nonempty manifest wallet.
+The only live wallet-mutating RPC is `resolveallshadowpowclaims` with
+`commit_and_broadcast`, and only after a separate exact Phase-B authority
+receipt. This follow-up artifact is structurally Phase-B-only: live `audit`,
+`phase-a`, and `reconcile-a` entrypoints fail before locks, transport, or RPC.
+Those entrypoints remain executable only with the sealed offline fixture so the
+exact signed predecessor's `sign_only` receipt contract can be hostile-tested.
+The tool never contains or calls
+`commitshadowpowclaimresolution`, `sendrawtransaction`, `abandontransaction`,
+`bumpfee`, `setpowmining`, or `walletpassphrase`.
 
-## Commands
+No live runtime identity, authority receipt, wallet secret, raw transaction,
+or live execution evidence is checked into this directory. The operator must
+supply an owner-only mode-0600 runtime manifest and authority files. The run
+directory must be a canonical owner-only mode-0700 directory.
 
-`audit` takes a read-only stable chain cut for every regular-PoW node. It
-requires main chain, no IBD, no pruning, peers, the exact installed signed
-v30.1.4 source/runtime, normal unlock, active PoS, enabled PoW intent, exactly
-one actionable quarantine component, and no indeterminate component. It calls
-only `resolveallshadowpowclaims` in `preview` mode with an exact
-`0.00019100 BLK` per-wallet cap and `100 atoms/vB` fee rate. The aggregate
-31-wallet cap is exactly `0.00592100 BLK`.
-If a normal block arrives after the stable preview but before the full
-read-only node census finishes, `audit` retries the entire node envelope up to
-five times. Runtime identity drift remains immediately fatal; continuous
-chain/recovery-cut drift exhausts closed and never reaches a mutation.
+## Fixed authority boundary
 
-The installed component fingerprint deliberately includes the active tip, so
-Phase A permits that dynamic fingerprint to change only as part of the fresh,
-stable, lock-held plan rebind authorized by the Phase-A receipt. The anchor,
-generation fingerprint, claim set, classification, descendants, fee, vsize,
-input, and output remain exact against the audit. The mutation response must
-then match the exact fresh component, including its dynamic fingerprint.
+The exact regular-node set is `1-29,31,32`; node30 is excluded. Compose service
+labels are `node01` through `node32`. Node1's container is
+`blackcoin-v4-gui`; the other regular-node containers are
+`blackcoin-v4-gui-N`. For the sole unnamed wallet (`""`), the transport omits
+`-rpcwallet` entirely.
 
-`phase-a` accepts only a separate owner-only mode-0600 authority receipt. The
-authority must bind the audit hash, tool hash, runtime-manifest hash, installed
-source commit/tree, exact node set, fee rate and caps, action `sign_only`, and
-risk acknowledgements. It also must authorize an immediate fresh-plan rebind
-only when the component identity, transaction shape, and fee are unchanged
-from the audit. Each node receives a durable no-clobber intent before the only
-allowed wallet mutation:
+The fee cap is exactly `0.00019100 BLK` per node and `0.00592100 BLK` for all
+31 nodes. The Phase-B authority must bind this exact user order:
 
 ```
-resolveallshadowpowclaims {
-  "action": "sign_only",
+fix all of the quarantined issues even if you have to pay a small fee to fix it on each node. all issues must be resolved
+```
+
+Its SHA256 is
+`0252ebcc3dc2ca8a20e8b9708738c30f9c32f6b0dea213bb8937467b2dab2dff`.
+The authority also acknowledges that broadcast is irreversible and that
+confirmation may permanently forfeit the retained QQP2 proof's chance at a
+future quantum payout.
+
+## Workflow
+
+The already-complete Phase A was produced by the exact signed predecessor tool
+whose hash is sealed in this follow-up. The following audit and Phase-A
+description documents the required predecessor receipt chain; it is not a live
+invocation surface in this artifact.
+
+`audit` takes a stable read-only cut for every regular node. It requires the
+exact installed runtime, main chain, no IBD or pruning, peers, the exact sole
+wallet, normal unlock, active PoS with positive weight, enabled PoW intent,
+exactly one blocking quarantine, and no ambiguous recovery database state. A
+normal tip change retries the complete read-only node envelope; runtime drift
+fails immediately.
+
+`phase-a` requires a separate mode-0600 authority copied from the audit's
+`required_phase_a_authority` template and bound to the exact `audit.json`
+SHA256. It writes a no-clobber intent before each `sign_only` call. Each result
+must prove one persisted, unconfirmed, non-relayable 191-vbyte signed draft.
+Phase A never grants relay authority or broadcasts.
+
+`reconcile-a` is read-only crash handling. It never blindly repeats an
+unmatched mutation. A post-sign observation preserves the original intent
+plan/component separately from the later reconciliation plan/component and
+explicitly states that no RPC acknowledgement is claimed. The live Phase-A
+receipt produced by the signed predecessor tool is accepted only after the
+complete audit, intent, 31 per-node result, aggregate cap, runtime, source, and
+sidecar chain is independently validated. In live mode, only the exact
+immutable predecessor tool hash is accepted.
+
+`phase-b-preview` revalidates all 31 durable Phase-A drafts. For every node it
+separates immutable signed-byte identity from mutable confirmation metadata,
+reads the exact active-chain anchor with `gettxout(..., false)`, proves the
+one-input/one-output same-script recycle, and independently computes
+`input - output == 0.00019100 BLK`. It also rechecks peers, installed network
+identity, normal unlock, PoS coherence, and the current one-claim PoW
+quarantine. Node27 may be recorded only as the exact temporary
+`claim-not-terminal/live` branch and is assigned to the final deferred wave.
+If the exact signed resolution or an authorized original claim is already the
+unique active-chain anchor spender before the preview, the node is instead
+bound as `ALREADY_RESOLVED_ON_ACTIVE_CHAIN`. That terminal node receives no
+recovery relay or fee authority. The authority binds the exact terminal node
+set, remaining relay node set, and remaining maximum fee.
+
+```sh
+./fleet31_recovery.py phase-b-preview \
+  --run-dir /absolute/private/run-directory
+```
+
+The separate mode-0600 Phase-B authority is copied from the preview's
+`required_phase_b_authority` template. It must replace the preview placeholder
+with the exact `phase-b-preview.json` SHA256 and preserve every node, fee,
+user-order, risk, tool, runtime, source, signed-byte, wave, and deferred-node
+binding.
+
+Runtime receipts distinguish stable installed identity from restart metadata.
+Image reference/ID, executable hashes, Compose service, logical container,
+wallet, health, and node identity remain exact. A changed container ID or start
+time is accepted only as a typed same-product restart after a fresh inspect;
+every RPC cut is pinned to that freshly inspected container ID, and recreation
+during a cut fails.
+
+Phase B executes these exact waves in order:
+
+```
+1:  [16]
+2:  [1,2,3,4]
+3:  [5,6,7,8]
+4:  [9,10,11,12]
+5:  [13,14,15,17]
+6:  [18,19,20,21]
+7:  [22,23,24,25]
+8:  [26,28,29]
+9:  [31,32]
+10: [27]
+```
+
+Each node receives a durable no-clobber intent before the only Phase-B
+mutation:
+
+```json
+{
+  "action": "commit_and_broadcast",
   "expected_plan_id": "<fresh exact plan>",
   "acknowledge_fee_and_conflict_risk": true,
-  "fee_rate": "100",
   "max_fee_per_resolution": "0.00019100",
   "max_total_fee": "0.00019100"
 }
 ```
 
-The result must prove one exact signed transaction was persisted with zero
-relay authority, zero broadcast, one input, one final-sequence input, one
-same-wallet output, no change output, and the exact 191-vbyte fee. Per-node
-intent/result receipts and SHA256 sidecars are mode 0600 and no-clobber.
+Invoke one wave at a time. The final node27 bounds may be increased only up to
+the tool's 60-attempt/60-second limits; the defaults are 12 attempts and five
+seconds.
 
-`reconcile-a` is read-only crash handling. It never signs or retries an
-unmatched intent. If the exact durable non-relayable bytes are observable, it
-records that fact; if no mutation is observable, a new audit and authority are
-required before that unfinished node may be attempted. The completed nodes
-remain receipt-bound.
+```sh
+./fleet31_recovery.py phase-b --wave 1 \
+  --run-dir /absolute/private/run-directory \
+  --authority /absolute/private/phase-b-authority.json \
+  --authority-sha256 <exact-authority-sha256>
+```
 
-`phase-b-preview`, `reconcile-b`, and `monitor` contain read-only successor
-logic for review. `phase-b` is unconditionally hard-disabled before it parses
-receipts, acquires locks, contacts Docker, or invokes RPC. This stage cannot
-grant relay authority or broadcast. Phase B requires a separately reviewed,
-signed, and pushed follow-up stage plus a distinct exact-signed-byte financial
-authority receipt.
+Repeat with waves 2 through 10 only after each prior wave receipt verifies.
+The tool validates the complete 31-node predecessor and preview chain before
+any wave mutation. Existing results, acknowledgements, and wave receipts are
+accepted only after exact authority-chain revalidation.
 
-The tool never calls `commitshadowpowclaimresolution`, `sendrawtransaction`,
-`abandontransaction`, `bumpfee`, `setpowmining`, `walletpassphrase`, recovery,
-repair, reindex, rewind, Compose, or deployment operations. The only mutating
-RPC text in the executable is `resolveallshadowpowclaims`, whose action is
-validated by phase.
+## Crash and race behavior
 
-## Risk boundary
+The exact RPC return is written as an acknowledgement before any fallible
+post-call read. Complete responses must bind the intent plan, tip, height,
+wallet generation, fee, component, returned raw bytes, relay counters, and
+nonambiguous durable state. A structured post-persistence stop is recorded as
+durable relay authority pending and is never remutated.
 
-A durable signed draft has no clean public cancellation path. A later
-confirmed recovery pays the displayed base-chain fee and may permanently
-forfeit the retained QQP2 proof’s chance at a future quantum payout. Phase A
-does not authorize that confirmation, relay, broadcast, future claim fees, or
-any action on node30. Installed v30.1.4 also cannot reconstruct the original
-acknowledged plan/tip/generation receipt after a crash that occurred after a
-durable Phase-B relay grant but before the RPC result; a successor must label
-that state as observation-only and must never blind-retry it.
+An RPC error after the durable intent is never retried directly. `reconcile-b`
+first serializes behind Core's recovery mutex, then rereads the exact signed
+bytes, wallet relay metadata, active-chain anchor, and preview. A new bounded
+attempt is permitted only after an exact no-authority receipt. Durable relay
+authority, mempool presence, ambiguity, or an untyped state always stops
+mutation. Installed v30.1.4 cannot reconstruct the original acknowledged
+plan/tip/generation receipt after a lost response following durable grant; the
+tool preserves that gap and does not invent an acknowledgement.
+
+A valid structured pending acknowledgement is never discarded: later mempool
+or active-chain evidence is bound to the exact intent and acknowledgement and
+finishes as `ACK_PLUS_READ_ONLY_OBSERVATION`. Only an ambiguous or unclassified
+response lacks a usable acknowledgement; if one later reaches an exact
+active-chain terminal state it can finish observation-only, with the unusable
+response identity preserved and no retry.
+
+If the exact authorized resolution or an authorized original claim is proven
+to be the unique active-chain spender of the exact anchor, the tool may record
+an observation-only terminal outcome. It does not relabel that observation as
+an RPC acknowledgement. This lets later nodes continue without retrying an
+already-resolved component.
+
+Receipts and SHA256 sidecars are append-only, mode 0600, and no-clobber. A
+power loss after the final hard link but before temporary-link removal is
+healed only when exactly one correctly named publisher temporary link refers
+to the same secure inode. A missing sidecar is reconstructed only for secure,
+valid JSON bytes; an existing malformed or mismatched sidecar is never
+replaced. Mutation locks reject symlinks, extra hard links, wrong owners,
+wrong modes, nonregular files, and inode substitution.
+
+## Final monitoring
+
+`monitor` is read-only and requires the exact complete Phase-B receipt chain.
+For every node it pins runtime, wallet, installed network, peers, chain, and
+recovery inventory. It requires exactly one authorized transaction to be the
+active-chain spender of the exact anchor, zero blocking quarantines, PoW state
+`hashing`, positive hashrate, and a typed claim-submission increment from the
+Phase-B preview in the same process epoch. If the daemon restarted, the counter
+is evaluated from its documented reset epoch and must be positive. Configuration
+flags alone are not success evidence.
+
+```sh
+./fleet31_recovery.py monitor \
+  --run-dir /absolute/private/run-directory \
+  --samples 12 --interval 10
+```
 
 ## Offline validation
 
-Run `tests/run.sh`. The sealed nonroot mock is the only accepted test
-transport. The suite exercises the exact 31-node set, node30 exclusion,
-authority hash/mode/schema/cap/acknowledgement gates, per-node fee drift,
-stable preview binding, no-relay Phase-A results, no-clobber receipts,
-lost-response reconciliation, resumable unfinished nodes, and Phase-B
-before-transport failure. It does not contact Docker, SSH, wallets, or the
-network.
+Run `tests/run.sh`. The exact sealed nonroot mock is the only accepted test
+transport. The suite is offline: it contacts no Docker daemon, SSH host,
+wallet, node, or network. It covers all authority and source/runtime bindings,
+node30 exclusion, stable tip retries, independent fee proof, exact returned
+bytes, full Phase-A receipt-chain validation, post-persistence stops,
+unknown-result no-grant retry, durable-authority nonretry, original-claim
+active-chain resolution, exact pre-preview terminal fee exclusion, terminal
+reorg rejection, same-product restart continuation, stable runtime drift and
+mid-cut recreation rejection, ACK-preserving and observation-only terminal
+closure, receipt/sidecar crash healing, no-clobber behavior, wave ordering,
+idempotent receipt validation, and static rejection of targeted or generic
+transaction RPCs.

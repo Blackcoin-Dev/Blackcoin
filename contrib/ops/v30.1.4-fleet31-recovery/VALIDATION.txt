@@ -1,9 +1,9 @@
-INSTALLED-v30.1.4 FLEET31 PHASE-A RECOVERY TOOL
-OFFLINE FLEET-OWNED STAGE; NOT CORE, RELEASE, DEPLOYMENT, OR LIVE AUTHORITY
+INSTALLED-v30.1.4 FLEET31 TWO-PHASE QUARANTINE RECOVERY
+OFFLINE FLEET-OWNED TOOLING; NOT CORE, RELEASE, PACKAGE, OR DEPLOYMENT AUTHORITY
 
-Base:
-  commit 3837ce4ce90a2088f80001aa6a58852e9986bd2a
-  tree   33bfd7c885a53966f74c8492938f10b8126f7996
+Integration base:
+  commit 328bce04c67d95a27d74b78cc015f40c682de231
+  tree   ebe02b2e21fbacef8b9a4352793137dba6eb7f91
 
 Installed runtime source predicate:
   commit 13262151077cce3f72d07d17dc7725b2b6a8e1ab
@@ -11,51 +11,73 @@ Installed runtime source predicate:
   signer SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
   version 300104 / /Blackcoin:30.1.4/
 
-Scope:
-  exact regular-PoW node set 1-29,31,32
-  node30 structurally excluded
-  exact per-node cap 0.00019100 BLK
-  exact aggregate cap 0.00592100 BLK
-  exact Phase-A action sign_only
-  resolveallshadowpowclaims only
-  no relay or broadcast authority in this stage
+Fixed scope:
+  regular nodes 1-29,31,32; node30 excluded
+  per-node fee cap 0.00019100 BLK
+  aggregate fee cap 0.00592100 BLK
+  Phase A resolveallshadowpowclaims sign_only
+  Phase B resolveallshadowpowclaims commit_and_broadcast
+  targeted commit and generic transaction RPCs absent
 
-Current-byte offline checks (2026-08-13 UTC):
+Current-byte offline checks (2026-08-14 UTC):
   Python compilation: PASS
   Bash syntax: PASS
-  hostile Phase-A suite: 55/55 PASS
-  hostile log SHA256:
-    f5d88815222aa506813fb13316bea34218a4b171d439b6ee6cc286c2350636e6
   git diff --check: PASS
+  hostile two-phase suite: 120/120 PASS
+  hostile log SHA256:
+    fedcab5b5945d3f3bfa459aef91d8afce638cff9f11733944f993d1ba6793b26
+  independent frozen-byte P0/P1 review: CLEAN
+  independent terminal log/hash verification: PASS
+  tool SHA256:
+    206c3293502f209515898d6ed81fe800383968e43509d33789097ab4fd09ed39
+  mock SHA256:
+    78cc07463827d9c5b05b24f05dcc5acc6550daae02cd4af8a2493b496971fd57
+  test SHA256:
+    d661c4c4fb89ae43f74ba16618baad5442c275af1ea8882aa2ce440e57fbbef2
   live Docker/SSH/wallet/network contact: NONE
   live signing/relay/broadcast: NONE
-  Core/release/package/deployment action: NONE
 
-Hostile coverage:
-  exact node set and node30 exclusion
-  exact zero-padded Compose services node01 through node32
-  unnamed wallet omits -rpcwallet instead of emitting -rpcwallet=
-  one normal block retries and accepts a fresh coherent full audit envelope
-  continuous chain/recovery-cut drift exhausts after five attempts with no sign
-  tip-relative component fingerprint rebind under a fresh stable plan
-  anchor/generation/claim/fee/output drift rejection before signing
-  mutation result component exact-match against the fresh plan
-  source/runtime/tool/transport manifest binding
-  authority owner/mode/hash/schema/action/node/cap binding
-  fee and conflict-risk acknowledgements
-  per-node fee drift rejection
-  stable chain and exact fresh-plan binding
-  one non-relayable signed draft per node
-  zero relay authority and zero broadcast in Phase A
-  durable no-clobber intents/results/SHA256 sidecars
-  lost-response observation without blind retry
-  resumable later nodes after explicit reconciliation
-  Phase-B failure before receipt parsing, locks, transport, or RPC
-  static rejection of targeted commit and generic transaction RPCs
+Hostile coverage includes:
+  Phase-B-only live command surface; audit/Phase-A/reconcile-A stop pre-transport
+  exact immutable signed-predecessor Phase-A receipt identity
+  lost-Phase-A response provenance separated from later observation
+  exact topology/node/wallet/runtime/source/tool bindings
+  normal tip retry and continuous drift exhaustion
+  complete Phase-A audit/intent/per-node/aggregate chain validation
+  exact nonrelay Phase-A predecessor compatibility
+  post-sign resolution_pending classification
+  all-31 Phase-B authority preview validation before wave mutation
+  independent active-chain input minus output fee proof
+  same-script one-input/one-output exact signed transaction
+  returned action raw-byte SHA256 equality
+  immediate durable ACK before any post-call read
+  exact ACK-to-intent plan/tip/height/generation/fee/counter binding
+  structured post-persistence durable-authority stop
+  pending ACK retained through resolution and original-claim terminal outcomes
+  ambiguous/unclassified response terminal observation without invented ACK
+  recovery-mutex barrier before unknown-result metadata proof
+  bounded new attempt only after exact no-authority receipt
+  never-remutate handling for durable authority/ambiguity/untyped state
+  unique active-chain exact-anchor spender proof
+  original authorized claim winner as observation, never invented ACK
+  pre-preview original/recovery winner typed and excluded from relay/fee authority
+  terminal-set reorg, inactive-header, and wrong-anchor rejection
+  stable same-product restart identity with fresh container-ID RPC pinning
+  mid-cut container recreation and stable product/config drift rejection
+  process-epoch-aware claim-submission counter after restart
+  node27 final/deferred wave semantics
+  exact wave/result/aggregate resume validation
+  no-clobber receipts and sidecars
+  missing-sidecar and interrupted publisher-hardlink healing
+  secure canonical regular single-link mutation lock inodes
+  final monitor runtime/network/wallet/anchor/hashrate/claim-increment proof
 
-Fail-closed remainder:
-  no live runtime manifest is checked in
-  no financial authority receipt is checked in
-  no live transaction or wallet bytes are checked in
-  Phase B requires a separate signed/pushed stage and separate authority
-  confirmation and positive-hashrate/claim-submission receipts are future facts
+Required external inputs intentionally absent:
+  exact live runtime manifest
+  exact mode-0600 Phase-A and Phase-B financial authority receipts
+  live wallet/raw-transaction evidence
+  live wave and final operational receipts
+
+No checked-in receipt is live authority. Live Phase B remains unauthorized until
+an operator supplies the exact separate authority bound to the live Phase-A and
+Phase-B preview SHA256 identities and invokes each bounded wave explicitly.

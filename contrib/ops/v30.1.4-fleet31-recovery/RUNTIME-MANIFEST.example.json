@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "kind": "fleet31-installed-v30.1.4-runtime-contract",
+  "source_commit": "13262151077cce3f72d07d17dc7725b2b6a8e1ab",
+  "source_tree": "a6f7757c34b70fab841905765462d6769112d049",
+  "source_signer_fingerprint": "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70",
+  "network_version": 300104,
+  "subversion": "/Blackcoin:30.1.4/",
+  "compose_project": "REPLACE_WITH_EXACT_INSTALLED_PROJECT",
+  "image_ref": "REPLACE_WITH_EXACT_INSTALLED_IMMUTABLE_IMAGE_REF",
+  "image_id": "REPLACE_WITH_EXACT_INSTALLED_IMAGE_ID",
+  "cli_path": "/usr/local/bin/blackcoin-cli",
+  "cli_sha256": "REPLACE_WITH_EXACT_INSTALLED_CLI_SHA256",
+  "daemon_path": "/usr/local/bin/blackcoind",
+  "daemon_sha256": "REPLACE_WITH_EXACT_INSTALLED_DAEMON_SHA256",
+  "datadir": "/home/blackcoin/.blackcoin",
+  "transport_sha256": "REPLACE_WITH_EXACT_USR_BIN_DOCKER_SHA256",
+  "global_lock_paths": [
+    "/run/blackcoin-v3015-rollout.lock",
+    "/run/blackcoin-endpoint-guard.lock",
+    "/run/blackcoin-node-cutover.lock",
+    "/run/blackcoin-pow-quarantine-cycle.lock",
+    "/run/blackcoin-wallet-runtime-guard.lock",
+    "/run/blackcoin-fleet31-recovery.lock"
+  ],
+  "node_lock_template": "/run/blackcoin-node-{node:02d}-runtime.lock",
+  "nodes": "REPLACE_WITH_EXACT_ORDERED_ARRAY_FOR_NODES_1_TO_29_31_32_ONLY"
+}

@@ -1,0 +1,54 @@
+INSTALLED-v30.1.4 FLEET31 PHASE-A RECOVERY TOOL
+OFFLINE FLEET-OWNED STAGE; NOT CORE, RELEASE, DEPLOYMENT, OR LIVE AUTHORITY
+
+Base:
+  commit 3837ce4ce90a2088f80001aa6a58852e9986bd2a
+  tree   33bfd7c885a53966f74c8492938f10b8126f7996
+
+Installed runtime source predicate:
+  commit 13262151077cce3f72d07d17dc7725b2b6a8e1ab
+  tree   a6f7757c34b70fab841905765462d6769112d049
+  signer SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
+  version 300104 / /Blackcoin:30.1.4/
+
+Scope:
+  exact regular-PoW node set 1-29,31,32
+  node30 structurally excluded
+  exact per-node cap 0.00019100 BLK
+  exact aggregate cap 0.00592100 BLK
+  exact Phase-A action sign_only
+  resolveallshadowpowclaims only
+  no relay or broadcast authority in this stage
+
+Current-byte offline checks (2026-08-13 UTC):
+  Python compilation: PASS
+  Bash syntax: PASS
+  hostile Phase-A suite: 32/32 PASS
+  hostile log SHA256:
+    9578f8eeb172128d8986d3e4c96c9fcbbdc1c394397e87f27e1ef8fb6ac7b8a8
+  git diff --check: PASS
+  live Docker/SSH/wallet/network contact: NONE
+  live signing/relay/broadcast: NONE
+  Core/release/package/deployment action: NONE
+
+Hostile coverage:
+  exact node set and node30 exclusion
+  source/runtime/tool/transport manifest binding
+  authority owner/mode/hash/schema/action/node/cap binding
+  fee and conflict-risk acknowledgements
+  per-node fee drift rejection
+  stable chain and exact fresh-plan binding
+  one non-relayable signed draft per node
+  zero relay authority and zero broadcast in Phase A
+  durable no-clobber intents/results/SHA256 sidecars
+  lost-response observation without blind retry
+  resumable later nodes after explicit reconciliation
+  Phase-B failure before receipt parsing, locks, transport, or RPC
+  static rejection of targeted commit and generic transaction RPCs
+
+Fail-closed remainder:
+  no live runtime manifest is checked in
+  no financial authority receipt is checked in
+  no live transaction or wallet bytes are checked in
+  Phase B requires a separate signed/pushed stage and separate authority
+  confirmation and positive-hashrate/claim-submission receipts are future facts

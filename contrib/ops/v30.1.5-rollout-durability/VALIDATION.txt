@@ -69,6 +69,20 @@ PoS renewal invariants:
     durable rollback archive, commits the cron-inert successor first, consumes
     one no-retry initial-run claim, and activates cron only from a validated
     32-node PASS plus exact activation and terminal receipts
+  - generation-two apply rechecks rotation authority and successor runway before
+    its journal, after verified journal publication immediately before cron
+    removal, and after verified precommit immediately before rollback-journal
+    removal; each runway gate retains a 900-second handoff plus 60-second
+    claim-commit margin beyond one complete bounded renewal cycle
+  - initial-run claim publication requires the complete bounded cycle plus the
+    60-second commit margin; one-second-short and delayed authorities write no claim
+  - recurring-cron activation requires the worst-case six-hour next-slot delay,
+    one complete bounded renewal cycle, and a 60-second publication margin; the
+    gate is rechecked before its journal, before cron, and immediately before commit
+  - every rollback-journal cut is recoverable under real nounset from the durable
+    staged successor before installed-supervisor replacement and from the installed
+    successor afterward; recovery requires only exact staged, backup, and installed
+    `source-package-SHA256SUMS` identities, never a source-tree `SHA256SUMS`
   - no chain/config/key/transaction mutation and no regular-PoW intent mutation
   - historical root at job 10 and predecessor helper SHA256
     acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1
@@ -106,8 +120,8 @@ Current-byte offline checks (2026-08-14 UTC):
   shellcheck -x on every .sh and the standalone .sh.inc: PASS
   complete aggregate suite including both dedicated suites: 609/609 PASS
     log SHA256 8e5852c70b66b9b61d181d57450197183e08b6775d8ee63cc7664898abd5be5c
-  focused PoS/helper hostile suite: 305/305 PASS
-    log SHA256 41ddc2b2d2b0dceb900c767d21ce7775bbcf87757ae6fc89d923896bf44e3675
+  focused PoS/helper hostile suite: 332/332 PASS
+    log SHA256 86289752b963c250343acce8408c7b9481ee54715fe4add1cee949bff71e81f0
   focused node30 audit/release-gate hostile suite: 151/151 PASS
     log SHA256 e1c468f202fcafac0510e285adfa8f1ebb1b4f552c9fe70c5529f9960771001c
   separate node27 sign-only/observation suite: 208/208 PASS

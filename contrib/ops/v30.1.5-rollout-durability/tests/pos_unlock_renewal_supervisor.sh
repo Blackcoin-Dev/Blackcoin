@@ -783,6 +783,7 @@ expect_fail 'PARTIAL receipt publisher never overwrites an existing cycle receip
     '[{"node":1}]' '[1,2]' '[1]' helper_failed null
 
 REAL_PARTIAL_PUBLISHER=$(declare -f renewal_publish_partial_receipt)
+REAL_AUTHORITY_HAS_RUNWAY=$(declare -f renewal_authority_has_runway)
 ORCHESTRATION_LOG="$tmp/orchestration.log"
 ORCHESTRATION_FAIL_PREFLIGHT=0
 ORCHESTRATION_FAIL_POSTFLIGHT=0
@@ -1043,6 +1044,7 @@ if grep -Eq '^partial-abnormal_exit attempted=\[1\] succeeded=\[\] post=null$' \
 else
     not_ok 'unexpected-exit PARTIAL evidence preserves the exact in-flight node boundary'
 fi
+eval "$REAL_AUTHORITY_HAS_RUNWAY"
 
 previous_sha=$(command sha256sum "$authority" | awk '{print $1}')
 rotated_authority="$tmp/rotated-authority.json"
@@ -1406,6 +1408,122 @@ expect_fail 'generation-two code upgrade rejects a mismatched predecessor identi
     "$test_now" "$gen2_previous" "$hex_e" "$supervisor" "$JOB10_CONTRACT" \
     "$TOPOLOGY_MAP" "$package_dir/SHA256SUMS"
 
+gen2_runway="$tmp/gen2-runway-authority.json"
+apply_runway=$((MINIMUM_CYCLE_RUNWAY_SECONDS + GEN2_INITIAL_HANDOFF_MARGIN_SECONDS +
+  GEN2_INITIAL_CLAIM_COMMIT_MARGIN_SECONDS))
+jq --argjson valid_until "$((test_now + apply_runway))" \
+  '.valid_until_epoch=$valid_until' "$gen2_successor" >"$gen2_runway"
+chmod 600 "$gen2_runway"
+expect_pass 'generation-two apply accepts exactly one full cycle plus handoff and claim-commit runway' \
+  renewal_authority_has_runway "$gen2_runway" "$test_now" "$apply_runway"
+jq --argjson valid_until "$((test_now + apply_runway - 1))" \
+  '.valid_until_epoch=$valid_until' "$gen2_successor" >"$gen2_runway"
+chmod 600 "$gen2_runway"
+expect_fail 'generation-two apply rejects one-second-short successor runway' \
+  renewal_authority_has_runway "$gen2_runway" "$test_now" "$apply_runway"
+initial_runway=$((MINIMUM_CYCLE_RUNWAY_SECONDS + GEN2_INITIAL_CLAIM_COMMIT_MARGIN_SECONDS))
+jq --argjson valid_until "$((test_now + initial_runway))" \
+  '.valid_until_epoch=$valid_until' "$gen2_successor" >"$gen2_runway"
+chmod 600 "$gen2_runway"
+expect_pass 'generation-two initial claim accepts a full cycle plus claim-commit runway' \
+  renewal_authority_has_runway "$gen2_runway" "$test_now" "$initial_runway"
+jq --argjson valid_until "$((test_now + initial_runway - 1))" \
+  '.valid_until_epoch=$valid_until' "$gen2_successor" >"$gen2_runway"
+chmod 600 "$gen2_runway"
+gen2_rejected_claim="$tmp/gen2-rejected-initial-claim.json"
+initial_short_rejects_without_write()
+{
+    if renewal_authority_has_runway "$gen2_runway" "$test_now" "$initial_runway"; then
+        printf '{}\n' >"$gen2_rejected_claim"
+        return 1
+    fi
+    [[ ! -e "$gen2_rejected_claim" && ! -L "$gen2_rejected_claim" ]]
+}
+expect_pass 'generation-two initial claim rejects one-second-short runway without writing a claim' \
+  initial_short_rejects_without_write
+
+gen2_clock_claim="$tmp/gen2-clock-advance-initial-claim.json"
+gen2_clock_claim_json=$(jq -nS --argjson claimed "$test_now" \
+  --arg claimed_utc '2026-08-14T05:30:00Z' --arg rotation_result_sha "$hex_d" \
+  --arg successor_sha "$gen2_successor_sha" '{
+    schema:1,kind:"blackcoin-pos-supervisor-generation-2-initial-run-claim",
+    status:"CLAIMED_NO_RETRY",claimed_at_epoch:$claimed,claimed_at_utc:$claimed_utc,
+    rotation_result_sha256:$rotation_result_sha,successor_authority_sha256:$successor_sha
+  }')
+clock_advance_through_claim_keeps_full_cycle()
+(
+    # shellcheck disable=SC2329 # Invoked indirectly by the production JSON publisher.
+    renewal_install_text_noclobber()
+    {
+        local destination=$1 mode=$2 expected_sha=$3 temporary
+        [[ ! -e "$destination" && ! -L "$destination" ]] || return 1
+        temporary=$(mktemp "$tmp/.clock-claim.XXXXXX") || return 1
+        cat >"$temporary" || return 1
+        chmod "$mode" "$temporary" || return 1
+        [[ "$(renewal_sha256_file "$temporary")" == "$expected_sha" ]] || return 1
+        mv -n -- "$temporary" "$destination"
+    }
+    local claim_sha
+    claim_sha=$(renewal_gen2_publish_json_noclobber "$gen2_clock_claim" \
+      "$gen2_clock_claim_json") || return 1
+    [[ "$claim_sha" == "$(renewal_sha256_file "$gen2_clock_claim")" ]] || return 1
+    renewal_authority_has_runway "$gen2_runway" \
+      "$((test_now + GEN2_INITIAL_CLAIM_COMMIT_MARGIN_SECONDS))" \
+      "$MINIMUM_CYCLE_RUNWAY_SECONDS"
+)
+jq --argjson valid_until "$((test_now + initial_runway))" \
+  '.valid_until_epoch=$valid_until' "$gen2_successor" >"$gen2_runway"
+chmod 600 "$gen2_runway"
+expect_pass 'clock advance through durable no-retry claim leaves one full cycle runway' \
+  clock_advance_through_claim_keeps_full_cycle
+
+activation_window_at()
+(
+    local authority=$1 injected_now=$2
+    # shellcheck disable=SC2329 # Invoked by the production activation-window predicate.
+    renewal_now_epoch() { printf '%s\n' "$injected_now"; }
+    renewal_gen2_activation_window_is_valid "$authority"
+)
+gen2_activation_authority="$tmp/gen2-activation-runway-authority.json"
+jq --argjson valid_until "$((test_now + GEN2_ACTIVATION_RUNWAY_SECONDS))" \
+  '.valid_until_epoch=$valid_until' "$gen2_successor" >"$gen2_activation_authority"
+chmod 600 "$gen2_activation_authority"
+expect_pass 'generation-two cron activation accepts exact next-slot plus full-cycle runway' \
+  activation_window_at "$gen2_activation_authority" "$test_now"
+gen2_activation_cron="$tmp/gen2-activation-cron"
+gen2_activation_receipt="$tmp/gen2-activation-receipt"
+jq --argjson valid_until "$((test_now + GEN2_ACTIVATION_RUNWAY_SECONDS - 1))" \
+  '.valid_until_epoch=$valid_until' "$gen2_successor" >"$gen2_activation_authority"
+chmod 600 "$gen2_activation_authority"
+activation_short_rejects_without_write()
+{
+    if activation_window_at "$gen2_activation_authority" "$test_now"; then
+        : >"$gen2_activation_cron"
+        : >"$gen2_activation_receipt"
+        return 1
+    fi
+    [[ ! -e "$gen2_activation_cron" && ! -e "$gen2_activation_receipt" ]]
+}
+expect_pass 'one-second-short generation-two activation writes no cron or activation receipt' \
+  activation_short_rejects_without_write
+jq --argjson valid_until "$((test_now + GEN2_ACTIVATION_RUNWAY_SECONDS))" \
+  '.valid_until_epoch=$valid_until' "$gen2_successor" >"$gen2_activation_authority"
+chmod 600 "$gen2_activation_authority"
+gen2_activation_journal="$tmp/gen2-activation-journal"
+activation_journal_clock_advance_fails_closed()
+{
+    activation_window_at "$gen2_activation_authority" "$test_now" || return 1
+    printf 'rollback-armed\n' >"$gen2_activation_journal"
+    if activation_window_at "$gen2_activation_authority" "$((test_now + 1))"; then
+        : >"$gen2_activation_cron"
+        return 1
+    fi
+    [[ -f "$gen2_activation_journal" && ! -e "$gen2_activation_cron" &&
+       ! -e "$gen2_activation_receipt" ]]
+}
+expect_pass 'clock advance after cron journal retains rollback and publishes no cron' \
+  activation_journal_clock_advance_fails_closed
+
 gen2_rotation_authority="$tmp/gen2-rotation-authority.json"
 gen2_plan_sha=$hex_e
 jq -nS --arg nonce 00112233445566778899aabbccddeeff \
@@ -1437,6 +1555,28 @@ renewal_secure_file_for_owner()
 expect_pass 'owner-only rotation authority binds the exact plan, code, predecessor, and safe actions' \
   renewal_gen2_rotation_authority_is_valid "$gen2_rotation_authority" "$gen2_rotation_sha" \
     "$gen2_plan_sha" "$gen2_successor_sha" "$test_now"
+gen2_delayed_successor="$tmp/gen2-delayed-apply-successor.json"
+jq --argjson valid_until "$((test_now + apply_runway))" \
+  '.valid_until_epoch=$valid_until' "$gen2_successor" >"$gen2_delayed_successor"
+chmod 600 "$gen2_delayed_successor"
+gen2_delayed_write="$tmp/gen2-delayed-apply-write"
+delayed_apply_gates_reject_without_write()
+{
+    if renewal_authority_has_runway "$gen2_delayed_successor" "$((test_now + 1))" \
+      "$apply_runway"; then
+        : >"$gen2_delayed_write"
+        return 1
+    fi
+    if renewal_gen2_rotation_authority_is_valid "$gen2_rotation_authority" \
+      "$gen2_rotation_sha" "$gen2_plan_sha" "$gen2_successor_sha" \
+      "$((test_now + 1001))"; then
+        : >"$gen2_delayed_write"
+        return 1
+    fi
+    [[ ! -e "$gen2_delayed_write" && ! -L "$gen2_delayed_write" ]]
+}
+expect_pass 'injected apply delays expire successor and rotation gates without a journal or write' \
+  delayed_apply_gates_reject_without_write
 gen2_rotation_mutations=(
   '.financial_action_authorized=true'
   '.node30_role_change_authorized=true'
@@ -1571,20 +1711,305 @@ for mutation in '.first_run_terminal_pass=false' '.staking_nodes_verified=31' \
 done
 eval "$ORIGINAL_SECURE_FILE_FOR_OWNER"
 
+gen2_restore_nounset_cut()
+{
+    local cut=$1 mode=$2
+    bash -u -c '
+      set -Eeuo pipefail
+      supervisor=$1
+      root=$2/$3
+      cut=$3
+      mode=$4
+      run=$root/run
+      active=$root/active
+      rm -rf -- "$root"
+      mkdir -p "$run/BACKUP" "$run/STAGED" "$active"
+
+      printf "old-supervisor\n" >"$run/BACKUP/pos_unlock_renewal_supervisor.sh"
+      printf "old-package\n" >"$run/BACKUP/source-package-SHA256SUMS"
+      jq -nS "{valid_from_epoch:1}" >"$run/BACKUP/AUTHORITY.json"
+      printf "old-receipt\n" >"$run/BACKUP/INSTALL-RECEIPT.json"
+      printf "old-cron\n" >"$run/BACKUP/CRON"
+      cp "$supervisor" "$run/STAGED/pos_unlock_renewal_supervisor.sh"
+      printf "new-package\n" >"$run/STAGED/source-package-SHA256SUMS"
+      printf "new-receipt\n" >"$run/STAGED/INSTALL-RECEIPT.json"
+
+      renewal_sha256_file() { sha256sum -- "$1" | cut -d" " -f1; }
+      staged_supervisor_sha=$(renewal_sha256_file \
+        "$run/STAGED/pos_unlock_renewal_supervisor.sh")
+      staged_package_sha=$(renewal_sha256_file "$run/STAGED/source-package-SHA256SUMS")
+      jq -nS --arg supervisor_sha "$staged_supervisor_sha" \
+        --arg package_sha "$staged_package_sha" \
+        "{supervisor_sha256:\$supervisor_sha,package_manifest_sha256:\$package_sha}" \
+        >"$run/STAGED/AUTHORITY.json"
+      GEN2_PREDECESSOR_SUPERVISOR_SHA256=$(renewal_sha256_file \
+        "$run/BACKUP/pos_unlock_renewal_supervisor.sh")
+      GEN2_PREDECESSOR_PACKAGE_MANIFEST_SHA256=$(renewal_sha256_file \
+        "$run/BACKUP/source-package-SHA256SUMS")
+      GEN2_PREDECESSOR_AUTHORITY_SHA256=$(renewal_sha256_file "$run/BACKUP/AUTHORITY.json")
+      printf "%s\n" "$GEN2_PREDECESSOR_AUTHORITY_SHA256" >"$run/BACKUP/AUTHORITY.sha256"
+      GEN2_PREDECESSOR_AUTHORITY_SIDECAR_SHA256=$(renewal_sha256_file \
+        "$run/BACKUP/AUTHORITY.sha256")
+      GEN2_PREDECESSOR_INSTALL_RECEIPT_SHA256=$(renewal_sha256_file \
+        "$run/BACKUP/INSTALL-RECEIPT.json")
+      GEN2_PREDECESSOR_CRON_SHA256=$(renewal_sha256_file "$run/BACKUP/CRON")
+      successor_sha=$(renewal_sha256_file "$run/STAGED/AUTHORITY.json")
+      printf "%s\n" "$successor_sha" >"$run/STAGED/AUTHORITY.sha256"
+      staged_receipt_sha=$(renewal_sha256_file "$run/STAGED/INSTALL-RECEIPT.json")
+      printf "%s\n" "$staged_receipt_sha" >"$run/STAGED/INSTALL-RECEIPT.sha256"
+      cp "$run/STAGED/AUTHORITY.json" "$run/SUCCESSOR-AUTHORITY.json"
+      printf "%s\n" "$successor_sha" >"$run/SUCCESSOR-AUTHORITY.sha256"
+      plan_sha=$(printf "b%.0s" {1..64})
+      rotation_authority_sha=$(printf "a%.0s" {1..64})
+      jq -nS --arg run "$run" --arg plan "$plan_sha" \
+        --arg rotation "$rotation_authority_sha" --arg successor "$successor_sha" \
+        "{run_dir:\$run,plan_sha256:\$plan,rotation_authority_sha256:\$rotation,
+          successor_authority_sha256:\$successor}" >"$active/JOURNAL.json"
+      chmod 600 "$run"/BACKUP/* "$run"/STAGED/* "$run"/SUCCESSOR-AUTHORITY.* \
+        "$active/JOURNAL.json"
+
+      put_old() {
+        cp "$run/BACKUP/pos_unlock_renewal_supervisor.sh" \
+          "$active/pos_unlock_renewal_supervisor.sh"
+        cp "$run/BACKUP/source-package-SHA256SUMS" "$active/source-package-SHA256SUMS"
+        cp "$run/BACKUP/AUTHORITY.json" "$active/AUTHORITY.json"
+        cp "$run/BACKUP/AUTHORITY.sha256" "$active/AUTHORITY.sha256"
+        cp "$run/BACKUP/INSTALL-RECEIPT.json" "$active/INSTALL-RECEIPT.json"
+      }
+      put_new_supervisor() {
+        cp "$run/STAGED/pos_unlock_renewal_supervisor.sh" \
+          "$active/pos_unlock_renewal_supervisor.sh"
+      }
+      put_new_package() {
+        cp "$run/STAGED/source-package-SHA256SUMS" "$active/source-package-SHA256SUMS"
+      }
+      put_new_authority() { cp "$run/STAGED/AUTHORITY.json" "$active/AUTHORITY.json"; }
+      put_new_sidecar() { cp "$run/STAGED/AUTHORITY.sha256" "$active/AUTHORITY.sha256"; }
+      put_new_receipt() {
+        cp "$run/STAGED/INSTALL-RECEIPT.json" "$active/INSTALL-RECEIPT.json"
+      }
+      put_old
+      case "$cut" in
+        before-cron-removal) cp "$run/BACKUP/CRON" "$active/cron" ;;
+        after-cron-removal) ;;
+        after-supervisor-replace) put_new_supervisor ;;
+        after-package-replace) put_new_supervisor; put_new_package ;;
+        after-authority-replace) put_new_supervisor; put_new_package; put_new_authority ;;
+        after-sidecar-replace)
+          put_new_supervisor; put_new_package; put_new_authority; put_new_sidecar ;;
+        after-receipt-replace)
+          put_new_supervisor; put_new_package; put_new_authority; put_new_sidecar; put_new_receipt ;;
+        *) exit 64 ;;
+      esac
+      source_dir=$(dirname -- "$supervisor")
+      cp "$source_dir/job-10-one-shot-contract.json" "$active/job-10-one-shot-contract.json"
+      cp "$source_dir/topology.map" "$active/topology.map"
+      printf "helper\n" >"$active/blackcoin_node_normal_unlock.sh"
+      printf "marker\n" >"$active/V30_1_4_ROLLOUT_MAINTENANCE.json"
+      printf "historical-job10\n" >"$active/historical-job10.log"
+      chmod 600 "$active"/*
+
+      INSTALL_ROOT=$active
+      INSTALLED_SUPERVISOR=$active/pos_unlock_renewal_supervisor.sh
+      INSTALLED_PACKAGE_MANIFEST=$active/source-package-SHA256SUMS
+      INSTALLED_AUTHORITY=$active/AUTHORITY.json
+      INSTALLED_AUTHORITY_SHA256=$active/AUTHORITY.sha256
+      INSTALLED_INSTALL_RECEIPT=$active/INSTALL-RECEIPT.json
+      INSTALLED_JOB10_CONTRACT=$active/job-10-one-shot-contract.json
+      INSTALLED_TOPOLOGY_MAP=$active/topology.map
+      PACKAGE_MANIFEST=$active/SHA256SUMS
+      STATE_DIR=$active
+      NORMAL_UNLOCK_HELPER=$active/blackcoin_node_normal_unlock.sh
+      MAINTENANCE_MARKER=$active/V30_1_4_ROLLOUT_MAINTENANCE.json
+      HISTORICAL_JOB10_RECEIPT=$active/historical-job10.log
+      GEN2_HISTORICAL_JOB10_RECEIPT_SHA256=$(renewal_sha256_file \
+        "$HISTORICAL_JOB10_RECEIPT")
+      RUNTIME_RECEIPT_ROOT=$root/runtime-receipts
+      mkdir -p "$RUNTIME_RECEIPT_ROOT"
+      INSTALLED_ACTIVATION_JOURNAL=$active/ACTIVATION-JOURNAL.json
+      GEN2_INITIAL_RUN_CLAIM=$active/GEN2-INITIAL-RUN-CLAIM.json
+      GEN2_ACTIVATION_RECEIPT=$active/GEN2-ACTIVATION-RECEIPT.json
+      GEN2_CRON_ACTIVATION_JOURNAL=$active/GEN2-CRON-ACTIVATION-JOURNAL.json
+      CRON_PATH=$active/cron
+      GEN2_ROTATION_JOURNAL=$active/JOURNAL.json
+      RENEWAL_GEN2_ROLLBACK_ACTIVE=false
+      RENEWAL_GEN2_ROLLBACK_ARMED=true
+
+      case "$cut" in
+        before-cron-removal|after-cron-removal)
+          recovery_entrypoint=$run/STAGED/pos_unlock_renewal_supervisor.sh ;;
+        *) recovery_entrypoint=$INSTALLED_SUPERVISOR ;;
+      esac
+      script_path=$recovery_entrypoint
+      validate_stage_body=$(sed -n "/^renewal_gen2_validate_backup_and_stage()$/,/^}$/p" \
+        "$recovery_entrypoint")
+      restored_core_body=$(sed -n "/^renewal_gen2_validate_restored_predecessor_core()$/,/^}$/p" \
+        "$recovery_entrypoint")
+      restored_body=$(sed -n "/^renewal_gen2_validate_restored_predecessor()$/,/^}$/p" \
+        "$recovery_entrypoint")
+      body=$(sed -n "/^renewal_gen2_restore_predecessor()$/,/^}$/p" "$recovery_entrypoint")
+      reconcile_body=$(sed -n "/^renewal_gen2_reconcile()$/,/^}$/p" "$recovery_entrypoint")
+      root_check="[[ \"\$EUID\" -eq 0 ]]"
+      reconcile_body=${reconcile_body/"$root_check"/true}
+      eval "$validate_stage_body"
+      eval "$restored_core_body"
+      eval "$restored_body"
+      eval "$body"
+      eval "$reconcile_body"
+      renewal_is_sha256() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+      renewal_secure_file_for_owner() { [[ -f "$1" && ! -L "$1" ]]; }
+      renewal_secure_file_for_uid() { [[ -f "$1" && ! -L "$1" ]]; }
+      renewal_secure_directory_for_owner() { [[ -d "$1" && ! -L "$1" ]]; }
+      renewal_gen2_run_dir_is_secure() { [[ "$1" == "$run" ]]; }
+      renewal_gen2_exact_file() {
+        renewal_secure_file_for_owner "$1" 600 0 0 &&
+          [[ "$(renewal_sha256_file "$1")" == "$2" ]]
+      }
+      renewal_install_receipt_is_valid() { :; }
+      renewal_validate_authority_semantics() { :; }
+      renewal_authority_files_match() { :; }
+      renewal_cron_activation_is_valid() { :; }
+      renewal_verify_marker() { :; }
+      renewal_verify_helper() { :; }
+      renewal_verify_manifest_bytes() { :; }
+      renewal_cron_sha256() { printf "%s\n" "$GEN2_PREDECESSOR_CRON_SHA256"; }
+      renewal_gen2_journal_is_valid() {
+        [[ "$1" == "$run" && "$2" == "$plan_sha" &&
+           "$3" == "$rotation_authority_sha" && "$4" == "$successor_sha" ]] &&
+          [[ "$(jq -r .successor_authority_sha256 "$GEN2_ROTATION_JOURNAL")" == \
+             "$successor_sha" ]]
+      }
+      renewal_file_is_known_or_absent() {
+        local file=$1 actual allowed
+        shift 3
+        [[ ! -e "$file" && ! -L "$file" ]] && return 0
+        actual=$(renewal_sha256_file "$file")
+        for allowed in "$@"; do [[ "$actual" == "$allowed" ]] && return 0; done
+        return 1
+      }
+      renewal_remove_known_file() {
+        local file=$1
+        renewal_file_is_known_or_absent "$@" || return 1
+        rm -f -- "$file"
+      }
+      renewal_install_text_replace() {
+        local destination=$1 expected_sha=$3
+        cat >"$destination"
+        chmod 600 "$destination"
+        [[ "$(renewal_sha256_file "$destination")" == "$expected_sha" ]]
+      }
+      renewal_install_text_noclobber() {
+        local destination=$1 expected_sha=$3
+        [[ ! -e "$destination" && ! -L "$destination" ]] || return 1
+        cat >"$destination"
+        chmod 600 "$destination"
+        [[ "$(renewal_sha256_file "$destination")" == "$expected_sha" ]]
+      }
+      renewal_now_epoch() { printf "1\n"; }
+      renewal_die() { printf "%s\n" "$*" >&2; return 1; }
+      renewal_acquire_fleet_locks() { :; }
+      renewal_release_locks() { :; }
+      renewal_gen2_publish_json_noclobber() {
+        local destination=$1 value=$2 expected
+        expected=$(printf "%s\n" "$value" | sha256sum | cut -d" " -f1)
+        printf "%s\n" "$value" >"$destination"
+        chmod 600 "$destination"
+        printf "%s\n" "$expected"
+      }
+      sync() { :; }
+      GLOBAL_LOCK=$active/global.lock
+      PER_NODE_LOCK_PATTERN=$active/node-%02d.lock
+
+      if [[ "$mode" == direct ]]; then
+        renewal_gen2_restore_predecessor "$run" >/dev/null
+      else
+        renewal_gen2_reconcile "$run" >/dev/null
+      fi
+      renewal_gen2_validate_restored_predecessor
+      [[ "$RENEWAL_GEN2_ROLLBACK_ARMED" == false &&
+         "$RENEWAL_GEN2_ROLLBACK_ACTIVE" == false &&
+         ! -e "$PACKAGE_MANIFEST" && -e "$INSTALLED_PACKAGE_MANIFEST" &&
+         "$(find "$run" -maxdepth 1 -name "ROLLBACK-*.json" | wc -l | tr -d " ")" == 1 ]]
+    ' bash "$supervisor" "$tmp" "$cut" "$mode"
+}
+
+for gen2_restore_cut in before-cron-removal after-cron-removal \
+  after-supervisor-replace after-package-replace after-authority-replace \
+  after-sidecar-replace after-receipt-replace; do
+    expect_pass "generation-two nounset automatic rollback restores predecessor from $gen2_restore_cut" \
+      gen2_restore_nounset_cut "$gen2_restore_cut" direct
+    expect_pass "generation-two nounset reconcile restores predecessor from $gen2_restore_cut" \
+      gen2_restore_nounset_cut "$gen2_restore_cut" reconcile
+done
+
+gen2_expired_apply_window_rejects()
+(
+    # shellcheck disable=SC2329 # Invoked by the production apply-window predicate.
+    renewal_now_epoch() { printf '%s\n' "$((test_now + 1001))"; }
+    # shellcheck disable=SC2329 # Invoked by the production apply-window predicate.
+    renewal_secure_file_for_owner()
+    {
+        local actual
+        actual=$(stat -c '%a:%h' "$1" 2>/dev/null || stat -f '%Lp:%l' "$1" 2>/dev/null) ||
+          return 1
+        [[ -f "$1" && ! -L "$1" && "$actual" == "$2:1" ]]
+    }
+    ! renewal_gen2_apply_window_is_valid "$gen2_rotation_authority" \
+      "$gen2_rotation_sha" "$gen2_plan_sha" "$gen2_successor_sha" \
+      "$gen2_delayed_successor"
+)
+
+post_seam_expiry_restores_exact_cut()
+{
+    local cut=$1 mode=$2
+    gen2_expired_apply_window_rejects && gen2_restore_nounset_cut "$cut" "$mode"
+}
+
+for gen2_expiry_case in \
+  'post-journal:before-cron-removal:direct' \
+  'post-journal:before-cron-removal:reconcile' \
+  'post-precommit:after-receipt-replace:direct' \
+  'post-precommit:after-receipt-replace:reconcile'; do
+    IFS=: read -r gen2_expiry_seam gen2_expiry_cut gen2_expiry_mode <<<"$gen2_expiry_case"
+    expect_pass "generation-two $gen2_expiry_seam clock expiry preserves journal and exact $gen2_expiry_mode rollback" \
+      post_seam_expiry_restores_exact_cut "$gen2_expiry_cut" "$gen2_expiry_mode"
+done
+
 # shellcheck disable=SC2016 # Exact source ordering is part of the fail-closed transaction contract.
 expect_pass 'generation-two apply journals before cron removal and commits only a cron-inert successor' bash -c '
   set -euo pipefail
   body=$(sed -n "/^renewal_gen2_apply()$/,/^renewal_gen2_rotation_result_is_valid()$/p" "$1")
+  windows=$(grep -n "renewal_gen2_apply_window_is_valid" <<<"$body" | cut -d: -f1)
+  early_window=$(sed -n "1p" <<<"$windows")
+  prejournal_window=$(sed -n "2p" <<<"$windows")
+  postjournal_window=$(sed -n "3p" <<<"$windows")
+  precommit_window=$(sed -n "4p" <<<"$windows")
+  postprecommit_window=$(sed -n "5p" <<<"$windows")
   backup=$(grep -n -m1 "renewal_gen2_backup_predecessor" <<<"$body" | cut -d: -f1)
-  journal=$(grep -n -m1 "GEN2_ROTATION_JOURNAL.*journal" <<<"$body" | cut -d: -f1)
+  archive=$(grep -n -m1 "renewal_gen2_archive_predecessor" <<<"$body" | cut -d: -f1)
+  journal=$(grep -nF -m1 "journal_sha=\$(renewal_gen2_publish_json_noclobber \"\$GEN2_ROTATION_JOURNAL\"" <<<"$body" | cut -d: -f1)
+  journal_valid=$(grep -n -m1 "renewal_gen2_journal_is_valid" <<<"$body" | cut -d: -f1)
   deactivate=$(grep -n -m1 "renewal_deactivate_cron" <<<"$body" | cut -d: -f1)
   supervisor=$(grep -n -m1 "renewal_install_text_replace.*INSTALLED_SUPERVISOR" <<<"$body" | cut -d: -f1)
   pending=$(grep -n -m1 "renewal_gen2_validate_pending_set" <<<"$body" | cut -d: -f1)
+  precommit=$(grep -nF -m1 "precommit_sha=\$(renewal_gen2_publish_json_noclobber" <<<"$body" | cut -d: -f1)
+  precommit_valid=$(grep -n -m1 "renewal_gen2_precommit_is_valid" <<<"$body" | cut -d: -f1)
   commit=$(grep -n -m1 "renewal_remove_known_file.*GEN2_ROTATION_JOURNAL" <<<"$body" | cut -d: -f1)
   result=$(grep -n -m1 "renewal_gen2_finalize_rotation_result" <<<"$body" | cut -d: -f1)
-  test "$backup" -lt "$journal" && test "$journal" -lt "$deactivate" &&
+  window_body=$(sed -n "/^renewal_gen2_apply_window_is_valid()$/,/^}$/p" "$1")
+  test "$(wc -l <<<"$windows" | tr -d " ")" = 5 &&
+    grep -Fq "renewal_gen2_rotation_authority_is_valid" <<<"$window_body" &&
+    grep -Fq "renewal_authority_has_runway" <<<"$window_body" &&
+    grep -Fq "GEN2_INITIAL_HANDOFF_MARGIN_SECONDS" <<<"$window_body" &&
+    grep -Fq "GEN2_INITIAL_CLAIM_COMMIT_MARGIN_SECONDS" <<<"$window_body" &&
+    test "$early_window" -lt "$backup" && test "$backup" -lt "$archive" &&
+    test "$archive" -lt "$prejournal_window" && test "$prejournal_window" -lt "$journal" &&
+    test "$journal" -lt "$journal_valid" && test "$journal_valid" -lt "$postjournal_window" &&
+    test "$postjournal_window" -lt "$deactivate" &&
     test "$deactivate" -lt "$supervisor" && test "$supervisor" -lt "$pending" &&
-    test "$pending" -lt "$commit" && test "$commit" -lt "$result" &&
+    test "$pending" -lt "$precommit_window" && test "$precommit_window" -lt "$precommit" &&
+    test "$precommit" -lt "$precommit_valid" && test "$precommit_valid" -lt "$postprecommit_window" &&
+    test "$postprecommit_window" -lt "$commit" && test "$commit" -lt "$result" &&
     ! grep -Fq "renewal_cron_body | renewal_install_text_noclobber" <<<"$body"
 ' bash "$supervisor"
 # shellcheck disable=SC2016 # One-shot claim must precede every live cycle boundary.
@@ -1592,10 +2017,13 @@ expect_pass 'initial generation-two run is one-shot, cron-inert, and receipt-arm
   set -euo pipefail
   body=$(sed -n "/^renewal_gen2_run_initial()$/,/^renewal_gen2_pass_receipt_semantics_is_valid()$/p" "$1")
   absent=$(grep -n -m1 "! -e.*CRON_PATH" <<<"$body" | cut -d: -f1)
-  claim=$(grep -n -m1 "GEN2_INITIAL_RUN_CLAIM.*claim" <<<"$body" | cut -d: -f1)
+  runway=$(grep -n -m1 "renewal_authority_has_runway.*INSTALLED_AUTHORITY" <<<"$body" | cut -d: -f1)
+  claim_margin=$(grep -n -m1 "MINIMUM_CYCLE_RUNWAY_SECONDS + GEN2_INITIAL_CLAIM_COMMIT_MARGIN_SECONDS" <<<"$body" | cut -d: -f1)
+  claim=$(grep -n -m1 "renewal_gen2_publish_json_noclobber.*GEN2_INITIAL_RUN_CLAIM" <<<"$body" | cut -d: -f1)
   arm=$(grep -n -m1 "renewal_arm_partial_context" <<<"$body" | cut -d: -f1)
   execute=$(grep -n -m1 "renewal_execute_cycle" <<<"$body" | cut -d: -f1)
-  test "$absent" -lt "$claim" && test "$claim" -lt "$arm" && test "$arm" -lt "$execute" &&
+  test "$absent" -lt "$runway" && test "$runway" -le "$claim_margin" && test "$claim_margin" -lt "$claim" &&
+    test "$claim" -lt "$arm" && test "$arm" -lt "$execute" &&
     ! grep -Fq "renewal_cron_body" <<<"$body"
 ' bash "$supervisor"
 # shellcheck disable=SC2016 # PASS verification and activation receipt gate recurring cron.
@@ -1603,15 +2031,25 @@ expect_pass 'generation-two activation validates the unique PASS before cron and
   set -euo pipefail
   body=$(sed -n "/^renewal_gen2_activate()$/,/^renewal_gen2_reconcile()$/p" "$1")
   pass=$(grep -n -m1 "renewal_gen2_pass_receipt_is_valid" <<<"$body" | cut -d: -f1)
+  windows=$(grep -n "renewal_gen2_activation_window_is_valid" <<<"$body" | cut -d: -f1)
+  prejournal_window=$(sed -n "1p" <<<"$windows")
+  postjournal_window=$(sed -n "2p" <<<"$windows")
+  precommit_window=$(sed -n "3p" <<<"$windows")
   journal=$(grep -nF -m1 "journal_sha=\$(renewal_gen2_publish_json_noclobber" <<<"$body" | cut -d: -f1)
   validate_journal=$(grep -n -m1 "renewal_gen2_cron_journal_is_valid" <<<"$body" | cut -d: -f1)
   cron=$(grep -n -m1 "renewal_cron_body | renewal_install_text_noclobber" <<<"$body" | cut -d: -f1)
   receipt=$(grep -nF -m1 "activation_sha=\$(renewal_gen2_publish_json_noclobber" <<<"$body" | cut -d: -f1)
+  validate_receipt=$(grep -n -m1 "renewal_gen2_activation_receipt_is_valid" <<<"$body" | cut -d: -f1)
   commit=$(grep -n -m1 "renewal_remove_known_file.*GEN2_CRON_ACTIVATION_JOURNAL" <<<"$body" | cut -d: -f1)
   terminal=$(grep -n -m1 "renewal_gen2_finalize_terminal_result" <<<"$body" | cut -d: -f1)
-  test "$pass" -lt "$journal" && test "$journal" -lt "$validate_journal" &&
-    test "$validate_journal" -lt "$cron" && test "$cron" -lt "$receipt" &&
-    test "$receipt" -lt "$commit" && test "$commit" -lt "$terminal"
+  window_body=$(sed -n "/^renewal_gen2_activation_window_is_valid()$/,/^}$/p" "$1")
+  test "$(wc -l <<<"$windows" | tr -d " ")" = 3 &&
+    grep -Fq "GEN2_ACTIVATION_RUNWAY_SECONDS" <<<"$window_body" &&
+    test "$pass" -lt "$prejournal_window" && test "$prejournal_window" -lt "$journal" &&
+    test "$journal" -lt "$validate_journal" && test "$validate_journal" -lt "$postjournal_window" &&
+    test "$postjournal_window" -lt "$cron" && test "$cron" -lt "$receipt" &&
+    test "$receipt" -lt "$validate_receipt" && test "$validate_receipt" -lt "$precommit_window" &&
+    test "$precommit_window" -lt "$commit" && test "$commit" -lt "$terminal"
 ' bash "$supervisor"
 # shellcheck disable=SC2016 # Crash-cut reconciliation contracts are source ordered.
 expect_pass 'generation-two reconcile rolls back an active journal and finalizes both journal-free cuts' bash -c '

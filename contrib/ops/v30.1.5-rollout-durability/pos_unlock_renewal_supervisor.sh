@@ -105,6 +105,13 @@ readonly GEN2_INITIAL_RUN_CLAIM="$INSTALL_ROOT/GEN2-INITIAL-RUN-CLAIM.json"
 readonly GEN2_ACTIVATION_RECEIPT="$INSTALL_ROOT/GEN2-ACTIVATION-RECEIPT.json"
 readonly GEN2_CRON_ACTIVATION_JOURNAL="$INSTALL_ROOT/GEN2-CRON-ACTIVATION-JOURNAL.json"
 readonly GEN2_ROTATION_AUTHORITY_MAX_SECONDS=3600
+readonly GEN2_INITIAL_HANDOFF_MARGIN_SECONDS=900
+readonly GEN2_INITIAL_CLAIM_COMMIT_MARGIN_SECONDS=60
+readonly GEN2_CRON_PUBLICATION_MARGIN_SECONDS=60
+readonly GEN2_ACTIVATION_RUNWAY_SECONDS=$((
+    RENEWAL_CADENCE_MINUTES * 60 + MINIMUM_CYCLE_RUNWAY_SECONDS +
+    GEN2_CRON_PUBLICATION_MARGIN_SECONDS
+))
 
 declare -a RENEWAL_LOCK_FDS=()
 RENEWAL_HELPER_WORK_DIR=''
@@ -1611,10 +1618,9 @@ renewal_gen2_exact_file()
       [[ "$(renewal_sha256_file "$file")" == "$expected_sha" ]]
 }
 
-renewal_gen2_validate_predecessor()
+renewal_gen2_validate_restored_predecessor_core()
 {
     local validation_epoch
-    renewal_package_tree_is_valid "$script_dir" || return 1
     renewal_gen2_exact_file "$INSTALLED_SUPERVISOR" \
       "$GEN2_PREDECESSOR_SUPERVISOR_SHA256" &&
       renewal_gen2_exact_file "$INSTALLED_PACKAGE_MANIFEST" \
@@ -1650,10 +1656,21 @@ renewal_gen2_validate_predecessor()
       renewal_verify_helper "$NORMAL_UNLOCK_HELPER" 0 &&
       renewal_verify_manifest_bytes "$INSTALLED_AUTHORITY" "$STATE_DIR" 0 || return 1
     [[ ! -e "$INSTALLED_ACTIVATION_JOURNAL" && ! -L "$INSTALLED_ACTIVATION_JOURNAL" &&
-       ! -e "$GEN2_ROTATION_JOURNAL" && ! -L "$GEN2_ROTATION_JOURNAL" &&
        ! -e "$GEN2_INITIAL_RUN_CLAIM" && ! -L "$GEN2_INITIAL_RUN_CLAIM" &&
        ! -e "$GEN2_ACTIVATION_RECEIPT" && ! -L "$GEN2_ACTIVATION_RECEIPT" &&
        ! -e "$GEN2_CRON_ACTIVATION_JOURNAL" && ! -L "$GEN2_CRON_ACTIVATION_JOURNAL" ]]
+}
+
+renewal_gen2_validate_restored_predecessor()
+{
+    renewal_gen2_validate_restored_predecessor_core &&
+      [[ ! -e "$GEN2_ROTATION_JOURNAL" && ! -L "$GEN2_ROTATION_JOURNAL" ]]
+}
+
+renewal_gen2_validate_predecessor()
+{
+    renewal_package_tree_is_valid "$script_dir" &&
+      renewal_gen2_validate_restored_predecessor
 }
 
 renewal_gen2_successor_relation_is_valid_for()
@@ -1986,6 +2003,7 @@ renewal_gen2_stage_successor()
 renewal_gen2_validate_backup_and_stage()
 {
     local run_dir=$1 successor_sha=$2 backup="$1/BACKUP" stage="$1/STAGED"
+    local staged_supervisor_sha staged_package_sha
     renewal_secure_directory_for_owner "$backup" 700 0 0 &&
       renewal_secure_directory_for_owner "$stage" 700 0 0 || return 1
     renewal_gen2_exact_file "$backup/pos_unlock_renewal_supervisor.sh" \
@@ -1998,11 +2016,15 @@ renewal_gen2_validate_backup_and_stage()
       renewal_gen2_exact_file "$backup/INSTALL-RECEIPT.json" \
         "$GEN2_PREDECESSOR_INSTALL_RECEIPT_SHA256" &&
       renewal_gen2_exact_file "$backup/CRON" "$GEN2_PREDECESSOR_CRON_SHA256" || return 1
+    renewal_gen2_exact_file "$stage/AUTHORITY.json" "$successor_sha" || return 1
+    staged_supervisor_sha=$(jq -er '.supervisor_sha256 | select(test("^[0-9a-f]{64}$"))' \
+      "$stage/AUTHORITY.json") || return 1
+    staged_package_sha=$(jq -er '.package_manifest_sha256 | select(test("^[0-9a-f]{64}$"))' \
+      "$stage/AUTHORITY.json") || return 1
     renewal_gen2_exact_file "$stage/pos_unlock_renewal_supervisor.sh" \
-      "$(renewal_sha256_file "$script_path")" &&
+      "$staged_supervisor_sha" &&
       renewal_gen2_exact_file "$stage/source-package-SHA256SUMS" \
-        "$(renewal_sha256_file "$PACKAGE_MANIFEST")" &&
-      renewal_gen2_exact_file "$stage/AUTHORITY.json" "$successor_sha" &&
+        "$staged_package_sha" &&
       renewal_secure_file_for_owner "$stage/AUTHORITY.sha256" 600 0 0 &&
       renewal_secure_file_for_owner "$stage/INSTALL-RECEIPT.json" 600 0 0 &&
       renewal_secure_file_for_owner "$stage/INSTALL-RECEIPT.sha256" 600 0 0 || return 1
@@ -2100,9 +2122,25 @@ renewal_gen2_journal_is_valid()
 renewal_gen2_restore_predecessor()
 {
     local run_dir=$1 successor_sha self_sha package_sha successor_sidecar_sha successor_receipt_sha
-    local journal_sha rollback rollback_sha
+    local journal_sha plan_sha rotation_authority_sha rollback rollback_sha
     [[ "$RENEWAL_GEN2_ROLLBACK_ACTIVE" == false ]] || return 1
     RENEWAL_GEN2_ROLLBACK_ACTIVE=true
+    renewal_gen2_run_dir_is_secure "$run_dir" &&
+      renewal_secure_file_for_owner "$GEN2_ROTATION_JOURNAL" 600 0 0 &&
+      renewal_secure_file_for_owner "$run_dir/SUCCESSOR-AUTHORITY.sha256" 600 0 0 || return 1
+    successor_sha=$(<"$run_dir/SUCCESSOR-AUTHORITY.sha256")
+    plan_sha=$(jq -er '.plan_sha256 | select(test("^[0-9a-f]{64}$"))' \
+      "$GEN2_ROTATION_JOURNAL") || return 1
+    rotation_authority_sha=$(jq -er \
+      '.rotation_authority_sha256 | select(test("^[0-9a-f]{64}$"))' \
+      "$GEN2_ROTATION_JOURNAL") || return 1
+    renewal_is_sha256 "$successor_sha" &&
+      [[ "$(jq -er '.successor_authority_sha256' "$GEN2_ROTATION_JOURNAL")" == \
+           "$successor_sha" ]] &&
+      renewal_gen2_exact_file "$run_dir/SUCCESSOR-AUTHORITY.json" "$successor_sha" &&
+      renewal_gen2_validate_backup_and_stage "$run_dir" "$successor_sha" &&
+      renewal_gen2_journal_is_valid "$run_dir" "$plan_sha" "$rotation_authority_sha" \
+        "$successor_sha" || return 1
     self_sha=$(renewal_sha256_file "$run_dir/STAGED/pos_unlock_renewal_supervisor.sh") || return 1
     package_sha=$(renewal_sha256_file "$run_dir/STAGED/source-package-SHA256SUMS") || return 1
     successor_sidecar_sha=$(renewal_sha256_file "$run_dir/STAGED/AUTHORITY.sha256") || return 1
@@ -2135,12 +2173,13 @@ renewal_gen2_restore_predecessor()
       <"$run_dir/BACKUP/INSTALL-RECEIPT.json" || return 1
     renewal_install_text_noclobber "$CRON_PATH" 600 "$GEN2_PREDECESSOR_CRON_SHA256" \
       <"$run_dir/BACKUP/CRON" || return 1
+    renewal_gen2_validate_restored_predecessor_core || return 1
     if [[ -e "$GEN2_ROTATION_JOURNAL" || -L "$GEN2_ROTATION_JOURNAL" ]]; then
         journal_sha=$(renewal_sha256_file "$GEN2_ROTATION_JOURNAL") || return 1
         renewal_remove_known_file "$GEN2_ROTATION_JOURNAL" 600 0 "$journal_sha" || return 1
     fi
+    renewal_gen2_validate_restored_predecessor || return 1
     RENEWAL_GEN2_ROLLBACK_ARMED=false
-    renewal_gen2_validate_predecessor || return 1
     rollback=$(jq -nS --argjson rolled_back "$(renewal_now_epoch)" \
       --arg predecessor "$GEN2_PREDECESSOR_AUTHORITY_SHA256" '{
         schema:1,kind:"blackcoin-pos-supervisor-generation-2-rollback",status:"ROLLED_BACK",
@@ -2250,6 +2289,18 @@ renewal_gen2_finalize_rotation_result()
     printf '%s\n' "$result_sha"
 }
 
+renewal_gen2_apply_window_is_valid()
+{
+    local rotation_authority=$1 rotation_authority_sha=$2 plan_sha=$3 successor_sha=$4
+    local successor_authority=$5 now
+    now=$(renewal_now_epoch) || return 1
+    renewal_gen2_rotation_authority_is_valid "$rotation_authority" \
+      "$rotation_authority_sha" "$plan_sha" "$successor_sha" "$now" &&
+      renewal_authority_has_runway "$successor_authority" "$now" \
+        "$((MINIMUM_CYCLE_RUNWAY_SECONDS + GEN2_INITIAL_HANDOFF_MARGIN_SECONDS +
+          GEN2_INITIAL_CLAIM_COMMIT_MARGIN_SECONDS))"
+}
+
 renewal_gen2_apply()
 {
     local run_dir=$1 rotation_authority=$2 rotation_authority_sha=$3
@@ -2280,6 +2331,9 @@ renewal_gen2_apply()
     renewal_gen2_rotation_authority_is_valid "$rotation_authority" \
       "$rotation_authority_sha" "$plan_sha" "$successor_sha" "$(renewal_now_epoch)" ||
         renewal_die 'generation-2 authority changed or expired after lock acquisition' || return
+    renewal_gen2_apply_window_is_valid "$rotation_authority" "$rotation_authority_sha" \
+      "$plan_sha" "$successor_sha" "$run_dir/SUCCESSOR-AUTHORITY.json" ||
+        renewal_die 'generation-two successor lacks one full cycle plus handoff and claim-commit runway' || return
     renewal_gen2_backup_predecessor "$run_dir" ||
         renewal_die 'generation-one durable backup failed' || return
     renewal_gen2_stage_successor "$run_dir" "$successor_sha" ||
@@ -2288,6 +2342,9 @@ renewal_gen2_apply()
         renewal_die 'generation-two backup/staging verification failed' || return
     archive_stem=$(renewal_gen2_archive_predecessor "$run_dir") ||
         renewal_die 'generation-one immutable archive failed' || return
+    renewal_gen2_apply_window_is_valid "$rotation_authority" "$rotation_authority_sha" \
+      "$plan_sha" "$successor_sha" "$run_dir/SUCCESSOR-AUTHORITY.json" ||
+        renewal_die 'generation-2 authority or successor runway expired before the durable mutation journal' || return
     journal=$(renewal_gen2_make_journal "$run_dir" "$plan_sha" \
       "$rotation_authority_sha" "$successor_sha" "$archive_stem") || return 1
     journal_sha=$(renewal_gen2_publish_json_noclobber "$GEN2_ROTATION_JOURNAL" "$journal") ||
@@ -2300,6 +2357,9 @@ renewal_gen2_apply()
     trap 'renewal_gen2_handle_signal 129' HUP
     trap 'renewal_gen2_handle_signal 130' INT
     trap 'renewal_gen2_handle_signal 143' TERM
+    renewal_gen2_apply_window_is_valid "$rotation_authority" "$rotation_authority_sha" \
+      "$plan_sha" "$successor_sha" "$run_dir/SUCCESSOR-AUTHORITY.json" ||
+        renewal_die 'generation-2 authority or successor runway expired after journal publication' || return
     renewal_deactivate_cron "$CRON_PATH" 0 || return 1
     self_sha=$(renewal_sha256_file "$run_dir/STAGED/pos_unlock_renewal_supervisor.sh") || return 1
     package_sha=$(renewal_sha256_file "$run_dir/STAGED/source-package-SHA256SUMS") || return 1
@@ -2316,6 +2376,9 @@ renewal_gen2_apply()
     renewal_install_text_replace "$INSTALLED_INSTALL_RECEIPT" 600 "$successor_receipt_sha" \
       <"$run_dir/STAGED/INSTALL-RECEIPT.json" || return 1
     renewal_gen2_validate_pending_set "$run_dir" "$successor_sha" || return 1
+    renewal_gen2_apply_window_is_valid "$rotation_authority" "$rotation_authority_sha" \
+      "$plan_sha" "$successor_sha" "$INSTALLED_AUTHORITY" ||
+        renewal_die 'generation-2 authority or successor runway expired before rotation precommit' || return
     precommit=$(jq -nS --argjson installed "$(renewal_now_epoch)" --arg run_dir "$run_dir" \
       --arg plan_sha "$plan_sha" --arg rotation_authority_sha "$rotation_authority_sha" \
       --arg predecessor "$GEN2_PREDECESSOR_AUTHORITY_SHA256" \
@@ -2333,6 +2396,14 @@ renewal_gen2_apply()
       }') || return 1
     precommit_sha=$(renewal_gen2_publish_json_noclobber "$run_dir/ROTATION-PRECOMMIT.json" \
       "$precommit") || return 1
+    renewal_gen2_precommit_is_valid "$run_dir" &&
+      [[ "$(renewal_sha256_file "$run_dir/ROTATION-PRECOMMIT.json")" == "$precommit_sha" &&
+         "$(renewal_sha256_file "$GEN2_ROTATION_JOURNAL")" == "$journal_sha" &&
+         "$(jq -er '.journal_sha256' "$run_dir/ROTATION-PRECOMMIT.json")" == \
+           "$journal_sha" ]] || return 1
+    renewal_gen2_apply_window_is_valid "$rotation_authority" "$rotation_authority_sha" \
+      "$plan_sha" "$successor_sha" "$INSTALLED_AUTHORITY" ||
+        renewal_die 'generation-2 authority or successor runway expired after precommit publication' || return
     renewal_remove_known_file "$GEN2_ROTATION_JOURNAL" 600 0 "$journal_sha" || return 1
     RENEWAL_GEN2_ROLLBACK_ARMED=false
     trap - EXIT HUP INT TERM
@@ -2438,6 +2509,7 @@ renewal_gen2_initial_claim_is_valid()
 renewal_gen2_run_initial()
 {
     local rotation_result=$1 rotation_result_sha=$2 run_dir successor_sha authority_sha claim claim_sha
+    local now
     [[ "$EUID" -eq 0 ]] || renewal_die 'generation-2 initial run requires root' || return
     [[ "$(renewal_realpath_existing "$script_path")" == "$INSTALLED_SUPERVISOR" ]] ||
         renewal_die 'generation-2 initial run is accepted only from the installed path' || return
@@ -2461,6 +2533,10 @@ renewal_gen2_run_initial()
         renewal_die 'generation-2 installed set changed before the initial run' || return
     [[ ! -e "$CRON_PATH" && ! -L "$CRON_PATH" &&
        ! -e "$GEN2_INITIAL_RUN_CLAIM" && ! -L "$GEN2_INITIAL_RUN_CLAIM" ]] || return 1
+    now=$(renewal_now_epoch)
+    renewal_authority_has_runway "$INSTALLED_AUTHORITY" "$now" \
+      "$((MINIMUM_CYCLE_RUNWAY_SECONDS + GEN2_INITIAL_CLAIM_COMMIT_MARGIN_SECONDS))" ||
+        renewal_die 'generation-two successor lacks one full cycle plus claim-commit runway before initial claim' || return
     claim=$(jq -nS --argjson claimed "$(renewal_now_epoch)" \
       --arg claimed_utc "$(renewal_now_utc)" --arg rotation_result_sha "$rotation_result_sha" \
       --arg successor_sha "$successor_sha" '{
@@ -2715,6 +2791,13 @@ renewal_gen2_finalize_terminal_result()
     printf '%s\n' "$result_sha"
 }
 
+renewal_gen2_activation_window_is_valid()
+{
+    local authority=$1 now
+    now=$(renewal_now_epoch) || return 1
+    renewal_authority_has_runway "$authority" "$now" "$GEN2_ACTIVATION_RUNWAY_SECONDS"
+}
+
 renewal_gen2_activate()
 {
     local rotation_result=$1 rotation_result_sha=$2 pass_receipt=$3 pass_receipt_sha=$4
@@ -2738,6 +2821,8 @@ renewal_gen2_activate()
         "$rotation_result_sha" || renewal_die 'initial PASS receipt or installed set is invalid' || return
     [[ ! -e "$CRON_PATH" && ! -L "$CRON_PATH" ]] || return 1
     claim_sha=$(renewal_sha256_file "$GEN2_INITIAL_RUN_CLAIM") || return 1
+    renewal_gen2_activation_window_is_valid "$INSTALLED_AUTHORITY" ||
+        renewal_die 'generation-two successor lacks next-slot plus full-cycle runway before cron journal' || return
     journal=$(jq -nS --argjson created "$(renewal_now_epoch)" --arg run_dir "$run_dir" \
       --arg rotation_result_sha "$rotation_result_sha" --arg pass_receipt "$pass_receipt" \
       --arg pass_receipt_sha "$pass_receipt_sha" --arg claim_sha "$claim_sha" \
@@ -2758,6 +2843,8 @@ renewal_gen2_activate()
     trap 'renewal_gen2_handle_signal 129' HUP
     trap 'renewal_gen2_handle_signal 130' INT
     trap 'renewal_gen2_handle_signal 143' TERM
+    renewal_gen2_activation_window_is_valid "$INSTALLED_AUTHORITY" ||
+        renewal_die 'generation-two successor runway expired after cron journal publication' || return
     renewal_cron_body | renewal_install_text_noclobber "$CRON_PATH" 600 \
       "$GEN2_PREDECESSOR_CRON_SHA256" || return 1
     renewal_cron_activation_is_valid "$CRON_PATH" "$INSTALLED_INSTALL_RECEIPT" 0 || return 1
@@ -2780,6 +2867,8 @@ renewal_gen2_activate()
     renewal_gen2_activation_receipt_is_valid "$GEN2_ACTIVATION_RECEIPT" "$activation_sha" \
       "$run_dir" "$rotation_result_sha" "$pass_receipt" "$pass_receipt_sha" \
       "$claim_sha" "$successor_sha" || return 1
+    renewal_gen2_activation_window_is_valid "$INSTALLED_AUTHORITY" ||
+        renewal_die 'generation-two successor runway expired before cron activation commit' || return
     renewal_remove_known_file "$GEN2_CRON_ACTIVATION_JOURNAL" 600 0 "$journal_sha" || return 1
     RENEWAL_GEN2_CRON_ROLLBACK_ARMED=false
     trap - EXIT HUP INT TERM
@@ -2819,7 +2908,7 @@ renewal_gen2_reconcile()
         renewal_release_locks
         return
     fi
-    if renewal_gen2_validate_predecessor; then
+    if renewal_gen2_validate_restored_predecessor; then
         printf 'state=generation-one-active run_dir=%s authority_sha256=%s cron_active=true\n' \
           "$run_dir" "$GEN2_PREDECESSOR_AUTHORITY_SHA256"
         renewal_release_locks

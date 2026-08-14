@@ -29,6 +29,13 @@ read-only node census finishes, `audit` retries the entire node envelope up to
 five times. Runtime identity drift remains immediately fatal; continuous
 chain/recovery-cut drift exhausts closed and never reaches a mutation.
 
+The installed component fingerprint deliberately includes the active tip, so
+Phase A permits that dynamic fingerprint to change only as part of the fresh,
+stable, lock-held plan rebind authorized by the Phase-A receipt. The anchor,
+generation fingerprint, claim set, classification, descendants, fee, vsize,
+input, and output remain exact against the audit. The mutation response must
+then match the exact fresh component, including its dynamic fingerprint.
+
 `phase-a` accepts only a separate owner-only mode-0600 authority receipt. The
 authority must bind the audit hash, tool hash, runtime-manifest hash, installed
 source commit/tree, exact node set, fee rate and caps, action `sign_only`, and

@@ -23,9 +23,9 @@ Scope:
 Current-byte offline checks (2026-08-13 UTC):
   Python compilation: PASS
   Bash syntax: PASS
-  hostile Phase-A suite: 40/40 PASS
+  hostile Phase-A suite: 55/55 PASS
   hostile log SHA256:
-    a9aa7201fe63d54c2ab75c400b841286a9c268284f2d0a82b9748873a6730d3d
+    f5d88815222aa506813fb13316bea34218a4b171d439b6ee6cc286c2350636e6
   git diff --check: PASS
   live Docker/SSH/wallet/network contact: NONE
   live signing/relay/broadcast: NONE
@@ -37,6 +37,9 @@ Hostile coverage:
   unnamed wallet omits -rpcwallet instead of emitting -rpcwallet=
   one normal block retries and accepts a fresh coherent full audit envelope
   continuous chain/recovery-cut drift exhausts after five attempts with no sign
+  tip-relative component fingerprint rebind under a fresh stable plan
+  anchor/generation/claim/fee/output drift rejection before signing
+  mutation result component exact-match against the fresh plan
   source/runtime/tool/transport manifest binding
   authority owner/mode/hash/schema/action/node/cap binding
   fee and conflict-risk acknowledgements

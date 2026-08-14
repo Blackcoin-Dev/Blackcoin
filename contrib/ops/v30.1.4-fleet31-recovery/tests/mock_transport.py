@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 """Offline stateful Docker/CLI fixture for fleet31_recovery.py."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -52,17 +54,26 @@ def current_chain(state: dict) -> tuple[str, int, str]:
             state.get("current_chainwork", CHAINWORK))
 
 
-def component(node: int) -> dict:
-    fee = "0.00019200" if SCENARIO == "wrong-fee" and node == 5 else "0.00019100"
+def component(node: int, state: dict | None = None) -> dict:
+    state = load_state(node) if state is None else state
+    tip, _height, _chainwork = current_chain(state)
+    drift = state.get("stable_component_drift")
+    fee = "0.00019200" if (SCENARIO == "wrong-fee" and node == 5) or drift == "fee" else "0.00019100"
+    anchor_label = "anchor-drift" if drift == "anchor" else "anchor"
+    generation_label = "generation-drift" if drift == "generation" else "generation"
+    claim_label = "claim-drift" if drift == "claim" else "claim"
+    input_amount = f"{node + 1}.00000000"
+    output_amount = f"{DecimalLike(node + 1) - DecimalLike('0.00019100'):.8f}"
+    if drift == "output":
+        output_amount = f"{DecimalLike(output_amount) - DecimalLike('0.00000001'):.8f}"
     return {
-        "anchor": {"txid": h("anchor", node), "vout": 0},
-        "generation_fingerprint": h("generation", node),
-        "component_fingerprint": h("component", node),
+        "anchor": {"txid": h(anchor_label, node), "vout": 0},
+        "generation_fingerprint": h(generation_label, node),
+        "component_fingerprint": h("component-" + tip, node),
         "classification": "current_branch_ineligible",
-        "claim_txids": [h("claim", node)], "descendant_claims": 0,
+        "claim_txids": [h(claim_label, node)], "descendant_claims": 0,
         "fee": fee, "vsize": 191,
-        "input_amount": f"{node + 1}.00000000",
-        "output_amount": f"{DecimalLike(node + 1) - DecimalLike('0.00019100'):.8f}",
+        "input_amount": input_amount, "output_amount": output_amount,
         "frontier_may_advance": True,
         "conflicts_with_revalidating_unbound_proof": True,
         "reason_code": "unbound-proof-may-revalidate",
@@ -75,8 +86,8 @@ class DecimalLike(float):
         return super().__new__(cls, float(value))
 
 
-def action(node: int, status: str) -> dict:
-    result = component(node)
+def action(node: int, status: str, state: dict | None = None) -> dict:
+    result = component(node, state)
     if status == "ready":
         result.update({"status": "ready", "persisted": False, "relay_authorized": False,
                        "in_mempool": False, "unsigned_template_hash": h("unsigned", node)})
@@ -96,7 +107,7 @@ def preview(node: int, options: dict, status: str) -> dict:
                 "durable_state_changed": False, "durable_state_ambiguous": True,
                 "relay_authority_granted": 0, "broadcast": 0, "already_in_mempool": 0,
                 "relay_deferred": 0, "error": "fixture ambiguous"}
-    current = action(node, status)
+    current = action(node, status, state)
     if status != "ready" and "fee_rate" in options:
         refused = dict(current)
         refused.update({"status": "refused", "reason_code": "fee-rate-cannot-modify-signed"})
@@ -161,7 +172,9 @@ def mutation(node: int, options: dict, state: dict) -> dict:
         already = 0
     else:
         raise SystemExit(2)
-    result_action = action(node, state["status"])
+    result_action = action(node, state["status"], state)
+    if SCENARIO == "result-component-mismatch" and node == 1 and action_name == "sign_only":
+        result_action["component_fingerprint"] = h("result-component-mismatch", node)
     result_action["status"] = status
     raw = ("02" + h("raw", node)) * 3
     result_action["hex"] = raw

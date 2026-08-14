@@ -133,7 +133,71 @@ assert_fails 'world-readable authority' "$TOOL" phase-a --run-dir "$HAPPY/run" \
 assert_fails 'wrong authority digest' "$TOOL" phase-a --run-dir "$HAPPY/run" \
   --authority "$HAPPY/phase-a-authority.json" --authority-sha256 "$(printf '0%.0s' {1..64})"
 
+# A fresh plan may rebind the installed tip-relative component fingerprint,
+# but every stable component identity/economic field remains audit-bound.  The
+# mutation result must in turn match the exact fresh fingerprint.
+REBIND_BASE="$FIX/rebind-base"
+mkdir -m 0700 "$REBIND_BASE" "$REBIND_BASE/state"
+make_runtime "$REBIND_BASE/runtime.json" "$REBIND_BASE/locks"
+export FLEET31_FIXTURE="$REBIND_BASE/state"
+export FLEET31_SCENARIO=happy
+"$TOOL" audit --runtime-manifest "$REBIND_BASE/runtime.json" --run-dir "$REBIND_BASE/run" >/dev/null
+make_phase_a_authority "$REBIND_BASE/run" "$REBIND_BASE/authority.json"
+
+REBIND="$FIX/rebind"
+mkdir -m 0700 "$REBIND" "$REBIND/state"
+cp -R "$REBIND_BASE/run" "$REBIND/run"
+cp "$REBIND_BASE/authority.json" "$REBIND/authority.json"
+chmod 0600 "$REBIND/authority.json"
+jq -n --arg tip "$(printf '1%.0s' {1..64})" --arg work "$(printf '2%.0s' {1..64})" \
+  '{status:"ready",claims_submitted:4,confirmed:false,current_tip:$tip,
+    current_height:5991551,current_chainwork:$work}' >"$REBIND/state/node01.json"
+chmod 0600 "$REBIND/state/node01.json"
+export FLEET31_FIXTURE="$REBIND/state"
+REBIND_AUTH_SHA=$(shasum -a 256 "$REBIND/authority.json" | awk '{print $1}')
+"$TOOL" phase-a --run-dir "$REBIND/run" --authority "$REBIND/authority.json" \
+  --authority-sha256 "$REBIND_AUTH_SHA" >/dev/null
+assert_jq '(.nodes[]|select(.node==1)) as $n |
+  ($n.audit_component_fingerprint != $n.fresh_component_fingerprint) and
+  ($n.component.component_fingerprint == $n.fresh_component_fingerprint) and
+  ($n.fresh_plan.tip == ("1"*64))' "$REBIND/run/phase-a.json"
+assert_eq "$(grep -c 'sign_only' "$REBIND/state/transport.log")" 31
+
+for FIELD in anchor generation claim fee output; do
+  DRIFT="$FIX/drift-$FIELD"
+  mkdir -m 0700 "$DRIFT" "$DRIFT/state"
+  cp -R "$REBIND_BASE/run" "$DRIFT/run"
+  cp "$REBIND_BASE/authority.json" "$DRIFT/authority.json"
+  chmod 0600 "$DRIFT/authority.json"
+  jq -n --arg field "$FIELD" \
+    '{status:"ready",claims_submitted:4,confirmed:false,stable_component_drift:$field}' \
+    >"$DRIFT/state/node01.json"
+  chmod 0600 "$DRIFT/state/node01.json"
+  export FLEET31_FIXTURE="$DRIFT/state"
+  assert_fails "stable $FIELD drift" "$TOOL" phase-a --run-dir "$DRIFT/run" \
+    --authority "$DRIFT/authority.json" \
+    --authority-sha256 "$(shasum -a 256 "$DRIFT/authority.json" | awk '{print $1}')"
+  assert_eq "$(grep -c 'sign_only' "$DRIFT/state/transport.log" || true)" 0
+done
+
+RESULT_DRIFT="$FIX/result-drift"
+mkdir -m 0700 "$RESULT_DRIFT" "$RESULT_DRIFT/state"
+cp -R "$REBIND_BASE/run" "$RESULT_DRIFT/run"
+cp "$REBIND_BASE/authority.json" "$RESULT_DRIFT/authority.json"
+chmod 0600 "$RESULT_DRIFT/authority.json"
+export FLEET31_FIXTURE="$RESULT_DRIFT/state"
+export FLEET31_SCENARIO=result-component-mismatch
+assert_fails 'result differs from exact fresh component' "$TOOL" phase-a \
+  --run-dir "$RESULT_DRIFT/run" --authority "$RESULT_DRIFT/authority.json" \
+  --authority-sha256 "$(shasum -a 256 "$RESULT_DRIFT/authority.json" | awk '{print $1}')"
+grep -Fq 'result component differs from the exact fresh plan' "$FIX/fail.err" ||
+  fail 'fresh-result component mismatch did not reach the exact gate'
+ok
+assert_eq "$(grep -c 'sign_only' "$RESULT_DRIFT/state/transport.log")" 1
+
 # Phase A signs exactly once per node and grants no relay/broadcast authority.
+export FLEET31_FIXTURE="$HAPPY/state"
+export FLEET31_SCENARIO=happy
 BEFORE=$(wc -l <"$HAPPY/state/transport.log" | tr -d ' ')
 "$TOOL" phase-a --run-dir "$HAPPY/run" --authority "$HAPPY/phase-a-authority.json" \
   --authority-sha256 "$AUTH_SHA" >"$HAPPY/phase-a.out"

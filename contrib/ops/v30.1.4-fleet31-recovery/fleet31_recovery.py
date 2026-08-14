@@ -42,7 +42,7 @@ EXPECTED_VSIZE = 191
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PRODUCTION_DOCKER = pathlib.Path("/usr/bin/docker")
 # Filled from the repository fixture after the fixture is finalized.
-TEST_TRANSPORT_SHA256 = "d90f413d1997c18be2443b79996e3b72923477d4a76047a507542146a1d0655f"
+TEST_TRANSPORT_SHA256 = "a316a40b6aa469772239d8c459ffacb2dcd94f5c1f7aafb107e175258465888c"
 
 
 class GateError(RuntimeError):
@@ -813,9 +813,32 @@ def mutation_locks(runtime: RuntimeContract) -> Iterator[list[dict[str, Any]]]:
                 os.close(fd)
 
 
-def same_component(audit_node_row: dict[str, Any], action: dict[str, Any], node: int) -> None:
-    if component_identity(action) != audit_node_row.get("component"):
-        die(f"node{node} component/fee/output changed from the authority-bound audit")
+def same_authorized_component(audit_node_row: dict[str, Any], action: dict[str, Any], node: int) -> None:
+    """Bind a fresh plan to the audit while permitting only tip-relative drift.
+
+    Installed v30.1.4 deliberately includes the active tip in
+    component_fingerprint.  A normal block therefore changes that dynamic
+    fingerprint even when the recovery component itself is unchanged.  The
+    authority permits a fresh-plan rebind, but only when every stable identity,
+    economic, and transaction-shape field remains byte-for-byte equal.
+    """
+    audit_component = audit_node_row.get("component")
+    fresh_component = component_identity(action)
+    expected_fields = set(fresh_component)
+    if not isinstance(audit_component, dict) or set(audit_component) != expected_fields:
+        die(f"node{node} authority-bound component shape changed")
+    require_hex64(audit_component.get("component_fingerprint"),
+                  f"node{node} audit component fingerprint")
+    stable_fields = expected_fields - {"component_fingerprint"}
+    if ({key: audit_component[key] for key in stable_fields} !=
+            {key: fresh_component[key] for key in stable_fields}):
+        die(f"node{node} stable component/fee/output changed from the authority-bound audit")
+
+
+def same_fresh_component(fresh_action: dict[str, Any], result_action: dict[str, Any], node: int) -> None:
+    """Require the mutation result to bind the exact fresh plan component."""
+    if component_identity(result_action) != component_identity(fresh_action):
+        die(f"node{node} Phase-A result component differs from the exact fresh plan")
 
 
 def phase_a_result_from_execution(node: RuntimeNode, audit_row: dict[str, Any], fresh: dict[str, Any],
@@ -825,6 +848,9 @@ def phase_a_result_from_execution(node: RuntimeNode, audit_row: dict[str, Any], 
     if not isinstance(execution, dict):
         die(f"node{node.node} Phase-A result is not an object")
     required = {"action": "sign_only", "acknowledged_plan_id": fresh["plan_id"],
+                "acknowledged_active_tip": fresh["active_tip"],
+                "acknowledged_active_height": fresh["active_height"],
+                "acknowledged_wallet_generation": fresh["wallet_generation"],
                 "plan_consumed": True, "plan_reusable": False, "success": True,
                 "stale_plan": False, "durable_state_ambiguous": False,
                 "relay_authority_granted": 0, "broadcast": 0, "already_in_mempool": 0,
@@ -838,13 +864,17 @@ def phase_a_result_from_execution(node: RuntimeNode, audit_row: dict[str, Any], 
     if (result_action.get("status") != "signed_and_persisted" or result_action.get("persisted") is not True or
             result_action.get("relay_authorized") is not False or result_action.get("in_mempool") is not False):
         die(f"node{node.node} Phase-A did not retain one non-relayable signed draft")
-    same_component(audit_row, result_action, node.node)
+    exact_amount(execution.get("acknowledged_total_fee"), PER_NODE_CAP,
+                 f"node{node.node} acknowledged Phase-A total fee")
+    same_fresh_component(action, result_action, node.node)
     signed = signed_transaction(transport, node, result_action)
     return {
         "schema": 1, "contract": CONTRACT, "kind": "fleet31-phase-a-node-result",
         "node": node.node, "status": "SIGNED_AND_PERSISTED", "intent_sha256": intent_sha,
         "fresh_plan": {"plan_id": fresh["plan_id"], "tip": fresh["active_tip"],
                        "height": fresh["active_height"], "wallet_generation": fresh["wallet_generation"]},
+        "audit_component_fingerprint": audit_row["component"]["component_fingerprint"],
+        "fresh_component_fingerprint": action["component_fingerprint"],
         "acknowledged_plan_id": execution["acknowledged_plan_id"],
         "fee_blk": result_action["fee"], "component": component_identity(result_action),
         "signed_transaction": signed, "runtime": runtime_snapshot,
@@ -898,7 +928,7 @@ def phase_a_command(args: argparse.Namespace) -> None:
             status_hint = "ready" if audit_rows[node.node]["status"] == "ready" else "reuse_managed"
             chain, fresh, action = stable_preview(transport, node, status_hint,
                                                    {"ready", "reuse_managed"})
-            same_component(audit_rows[node.node], action, node.node)
+            same_authorized_component(audit_rows[node.node], action, node.node)
             runtime_snapshot = transport.runtime_snapshot(node)
             intent = {
                 "schema": 1, "contract": CONTRACT, "kind": "fleet31-phase-a-node-intent",
@@ -907,6 +937,8 @@ def phase_a_command(args: argparse.Namespace) -> None:
                 "runtime_manifest_sha256": runtime.sha256, "runtime": runtime_snapshot,
                 "plan_id": fresh["plan_id"], "active_tip": fresh["active_tip"],
                 "active_height": fresh["active_height"], "wallet_generation": fresh["wallet_generation"],
+                "audit_component_fingerprint": audit_rows[node.node]["component"]["component_fingerprint"],
+                "fresh_component_fingerprint": action["component_fingerprint"],
                 "component": component_identity(action), "created_at": utc_now(),
             }
             intent_sha = publish_json(intent_path, intent)
@@ -917,6 +949,8 @@ def phase_a_command(args: argparse.Namespace) -> None:
                     "node": node.node, "status": "ALREADY_SIGNED_NONRELAY", "intent_sha256": intent_sha,
                     "fresh_plan": {"plan_id": fresh["plan_id"], "tip": fresh["active_tip"],
                                    "height": fresh["active_height"], "wallet_generation": fresh["wallet_generation"]},
+                    "audit_component_fingerprint": audit_rows[node.node]["component"]["component_fingerprint"],
+                    "fresh_component_fingerprint": action["component_fingerprint"],
                     "fee_blk": action["fee"], "component": component_identity(action),
                     "signed_transaction": signed, "runtime": runtime_snapshot,
                     "relay_authority_granted": 0, "broadcast": 0, "mutation_performed": False,
@@ -979,7 +1013,7 @@ def reconcile_a_command(args: argparse.Namespace) -> None:
             intent, intent_sha = load_run_receipt(run_dir, f"phase-a-intent-node{node.node:02d}.json")
             chain, fresh, action = stable_preview(transport, node, "reuse_managed",
                                                    {"ready", "reuse_managed"})
-            same_component(audit_rows[node.node], action, node.node)
+            same_authorized_component(audit_rows[node.node], action, node.node)
             if action["status"] == "reuse_managed":
                 signed = signed_transaction(transport, node, action)
                 row = {
@@ -989,6 +1023,8 @@ def reconcile_a_command(args: argparse.Namespace) -> None:
                     "attribution": "exact_persisted_bytes_observed_after_durable_intent",
                     "fresh_plan": {"plan_id": fresh["plan_id"], "tip": fresh["active_tip"],
                                    "height": fresh["active_height"], "wallet_generation": fresh["wallet_generation"]},
+                    "audit_component_fingerprint": audit_rows[node.node]["component"]["component_fingerprint"],
+                    "fresh_component_fingerprint": action["component_fingerprint"],
                     "fee_blk": action["fee"], "component": component_identity(action),
                     "signed_transaction": signed, "runtime": transport.runtime_snapshot(node),
                     "relay_authority_granted": 0, "broadcast": 0, "mutation_performed": "unknown",

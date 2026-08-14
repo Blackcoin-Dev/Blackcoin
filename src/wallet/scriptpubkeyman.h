@@ -51,6 +51,10 @@ public:
     virtual const CKeyingMaterial& GetEncryptionKey() const = 0;
     virtual bool HasEncryptionKeys() const = 0;
     virtual bool IsLocked() const = 0;
+    /** Notify the wallet that IsMine/GetDebit results may have changed.
+     * Implementations must make this callback nonblocking because it may be
+     * invoked while a ScriptPubKeyMan mutex is held. */
+    virtual void NotifyOwnershipChanged() = 0;
 };
 
 //! Constant representing an unknown spkm creation time

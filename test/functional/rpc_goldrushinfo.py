@@ -150,8 +150,6 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(component["root_claim_txids"], [claim_txid])
         assert_equal(component["resolution_txids"], [])
         assert_equal(component["ordinary_or_mixed_txids"], [])
-        assert_equal(component["all_claims_zero_payment_retirable"], False)
-        assert_equal(component["all_claims_expired_locally_retired"], False)
         assert_equal(len(component["generation_fingerprint"]), 64)
         assert component["generation_fingerprint"] != ZERO_HASH
 
@@ -159,7 +157,6 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(claim_node["in_mempool"], False)
         assert_equal(claim_node["quarantined"], True)
         assert_equal(claim_node["abandoned"], False)
-        assert_equal(claim_node["expired_locally_retired"], False)
         assert_equal(claim_node["lineage_metadata_present"], True)
         assert_equal(claim_node["lineage_metadata_valid"], True)
         assert_equal(claim_node["lineage_root_txid"], claim_txid)
@@ -179,12 +176,6 @@ class GoldRushInfoTest(BitcoinTestFramework):
             record["qq_shadow_pow_lineage_family"],
             component["generation_fingerprint"],
         )
-        assert "qq_shadow_pow_expired_retired" not in record
-        assert "qq_shadow_pow_expired_retired_height" not in record
-        assert "qq_shadow_pow_expired_retired_tip" not in record
-
-        assert_equal(recovery["retired_claim_objects"], 0)
-        assert_equal(recovery["retired_components"], 0)
         assert_equal(recovery["blocking_components"], 1)
         assert_equal(recovery["pending_manual_resolutions"], 0)
         assert_equal(recovery["pending_automatic_resolutions"], 0)

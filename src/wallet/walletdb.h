@@ -109,6 +109,8 @@ extern const std::string QUANTUM_REDELEGATION_LAST_WIN;
 extern const std::string SETTINGS;
 extern const std::string QQ_DEVELOPMENT_DONATION_CONSENT;
 extern const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY;
+extern const std::string SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER;
+extern const std::string SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER;
 extern const std::string TX;
 extern const std::string VERSION;
 extern const std::string WALLETDESCRIPTOR;
@@ -322,6 +324,15 @@ public:
     bool HasShadowPowClaimRecoveryPolicy() { return m_batch->Exists(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY); }
     DBErrors ReadShadowPowClaimRecoveryPolicy(ShadowPowClaimRecoveryPolicy& policy, std::string* error = nullptr);
     bool EraseShadowPowClaimRecoveryPolicy();
+
+    /** Monotonic maximum crossed chain-logical claim relay frontier. */
+    bool WriteShadowPowClaimRelayClockHighWater(int64_t high_water);
+    DBErrors ReadShadowPowClaimRelayClockHighWater(
+        int64_t& high_water, std::string* error = nullptr);
+    /** Monotonic maximum crossed released pre-schema wall-TTL frontier. */
+    bool WriteShadowPowClaimLegacyRelayClockHighWater(int64_t high_water);
+    DBErrors ReadShadowPowClaimLegacyRelayClockHighWater(
+        int64_t& high_water, std::string* error = nullptr);
 
     /** Optional wallet-scoped Quantum Quasar development-donation consent. */
     bool WriteQQDevelopmentDonationConsent(const QQDevelopmentDonationConsent& consent);

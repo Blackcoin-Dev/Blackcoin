@@ -548,6 +548,37 @@ enum class ShadowProofValidationResult {
     LOCAL_INTERNAL_ERROR,
 };
 
+/** Immutable inputs to the memory-hard half of one QQSPROOF policy check.
+ * Chain/view-dependent policy is prepared and later revalidated separately;
+ * this value can therefore be evaluated without holding cs_main. */
+struct ShadowPowClaimProofEvaluationContext {
+    bool valid{false};
+    uint256 cache_key;
+    std::vector<unsigned char> proof;
+    int height{0};
+    uint256 previous_block_hash;
+    unsigned int target_bits{0};
+    bool require_qqp4{false};
+    bool qqp3_active_at_proof_height{false};
+    bool qqp4_active_at_proof_height{false};
+
+    bool operator==(const ShadowPowClaimProofEvaluationContext& other) const;
+};
+
+/** Result bound to the complete immutable context above. A local evaluator
+ * failure is intentionally representable so callers can fail closed, but it
+ * must not be retained in a cross-call cache. */
+struct ShadowPowClaimProofEvaluation {
+    ShadowPowClaimProofEvaluationContext context;
+    ShadowProofValidationResult result{
+        ShadowProofValidationResult::LOCAL_INTERNAL_ERROR};
+    bool proof_limit_exceeded{false};
+};
+
+/** Run only the memory-hard, chain-independent proof step. */
+ShadowPowClaimProofEvaluation EvaluateShadowPowClaimProof(
+    const ShadowPowClaimProofEvaluationContext& context);
+
 /** Typed mempool-policy disposition for one fee-paying Gold Rush PoW claim.
  *
  * This is intentionally more specific than ShadowProofValidationResult. The
@@ -641,6 +672,17 @@ GetShadowPowClaimDescriptor(const CTransaction& tx);
  *  No configuration, RPC, or network path can arm this hook. */
 void SetShadowArgon2FailuresForTesting(uint64_t count = 1);
 void ClearShadowArgon2FailuresForTesting();
+/** Test-only pre-evaluator local chain-state failure injection. */
+void SetShadowPowClaimLocalStateFailuresForTesting(uint64_t count = 1);
+void ClearShadowPowClaimLocalStateFailuresForTesting();
+void ResetShadowPowClaimLocalStateFailureCountForTesting();
+uint64_t GetShadowPowClaimLocalStateFailureCountForTesting();
+/** Test-only total call counter used to prove bulk wallet maintenance cannot
+ *  hide duplicate memory-hard validation behind a lock-free inventory pass. */
+void ResetShadowArgon2EvaluationCountForTesting();
+uint64_t GetShadowArgon2EvaluationCountForTesting();
+void SetShadowArgon2DelayForTesting(int64_t delay_ms);
+uint64_t GetActiveShadowArgon2EvaluationsForTesting();
 /** Test-only allocation-failure injection. APPLY fails before constructing
  *  shadow state; APPLY_AFTER_STAGED_MUTATION fails after the child cache has
  *  received a pool mutation but before it is published; ACCOUNTING throws
@@ -728,6 +770,18 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
     const CCoinsViewCache& view, bool gold_rush_active,
     std::string& reject_reason,
     ShadowPowClaimMempoolDisposition* disposition_out = nullptr);
+/** Recovery-only split classifier. It never performs Argon2 itself. If the
+ * supplied result is absent or does not exactly match the freshly prepared
+ * context, evaluation_required_out is set and the call fails closed with a
+ * LOCAL_STATE_ERROR disposition. */
+ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailedWithEvaluation(
+    const CTransaction& tx, const CBlockIndex* pindexPrev,
+    const CCoinsViewCache& view, bool gold_rush_active,
+    std::string& reject_reason,
+    ShadowPowClaimMempoolDisposition* disposition_out,
+    const ShadowPowClaimProofEvaluation* evaluation,
+    ShadowPowClaimProofEvaluationContext* evaluation_context_out,
+    bool* evaluation_required_out);
 bool CheckShadowPowClaimForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);
 bool CheckShadowSignalForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev,
                                  const CCoinsViewCache& view, bool gold_rush_active,

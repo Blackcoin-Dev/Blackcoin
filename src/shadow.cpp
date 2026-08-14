@@ -20,12 +20,14 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <new>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <thread>
 
 bool IsDirectQuantumMigrationScript(const CScript& script)
 {
@@ -91,6 +93,11 @@ static_assert(static_cast<CAmount>(MAX_SHADOW_POW_EVALS_PER_BLOCK - 1) * CENT <
               (463 * COIN) / 2,
               "Gold Rush POW pool must exceed all capped loser reimbursements");
 std::atomic<uint64_t> g_shadow_argon2_test_failures{0};
+std::atomic<uint64_t> g_shadow_argon2_test_evaluations{0};
+std::atomic<uint64_t> g_shadow_argon2_test_active_evaluations{0};
+std::atomic<int64_t> g_shadow_argon2_test_delay_ms{0};
+std::atomic<uint64_t> g_shadow_pow_claim_local_state_test_failures{0};
+std::atomic<uint64_t> g_shadow_pow_claim_local_state_test_failure_count{0};
 std::atomic<ShadowAllocationFailurePoint> g_shadow_allocation_test_failure{
     ShadowAllocationFailurePoint::NONE};
 
@@ -2340,6 +2347,25 @@ bool ComputeShadowProofHash(const CScript& target, const CScript& payout_script,
                             ShadowProofMode mode, uint64_t nonce,
                             const COutPoint* claim_outpoint, uint256& result)
 {
+    g_shadow_argon2_test_evaluations.fetch_add(
+        1, std::memory_order_relaxed);
+    struct ActiveShadowArgon2Evaluation {
+        ActiveShadowArgon2Evaluation()
+        {
+            g_shadow_argon2_test_active_evaluations.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        ~ActiveShadowArgon2Evaluation()
+        {
+            g_shadow_argon2_test_active_evaluations.fetch_sub(
+                1, std::memory_order_relaxed);
+        }
+    } active_evaluation;
+    const int64_t delay_ms = g_shadow_argon2_test_delay_ms.load(
+        std::memory_order_relaxed);
+    if (delay_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms});
+    }
     const bool input_bound = claim_outpoint && !claim_outpoint->IsNull();
     CHashWriter ss;
     ss << std::string(input_bound
@@ -5865,6 +5891,53 @@ void ClearShadowArgon2FailuresForTesting()
     g_shadow_argon2_test_failures.store(0, std::memory_order_relaxed);
 }
 
+void SetShadowPowClaimLocalStateFailuresForTesting(uint64_t count)
+{
+    g_shadow_pow_claim_local_state_test_failures.store(
+        count, std::memory_order_relaxed);
+}
+
+void ClearShadowPowClaimLocalStateFailuresForTesting()
+{
+    g_shadow_pow_claim_local_state_test_failures.store(
+        0, std::memory_order_relaxed);
+}
+
+void ResetShadowPowClaimLocalStateFailureCountForTesting()
+{
+    g_shadow_pow_claim_local_state_test_failure_count.store(
+        0, std::memory_order_relaxed);
+}
+
+uint64_t GetShadowPowClaimLocalStateFailureCountForTesting()
+{
+    return g_shadow_pow_claim_local_state_test_failure_count.load(
+        std::memory_order_relaxed);
+}
+
+void ResetShadowArgon2EvaluationCountForTesting()
+{
+    g_shadow_argon2_test_evaluations.store(0, std::memory_order_relaxed);
+}
+
+uint64_t GetShadowArgon2EvaluationCountForTesting()
+{
+    return g_shadow_argon2_test_evaluations.load(std::memory_order_relaxed);
+}
+
+void SetShadowArgon2DelayForTesting(int64_t delay_ms)
+{
+    g_shadow_argon2_test_delay_ms.store(
+        std::clamp<int64_t>(delay_ms, 0, 10000),
+        std::memory_order_relaxed);
+}
+
+uint64_t GetActiveShadowArgon2EvaluationsForTesting()
+{
+    return g_shadow_argon2_test_active_evaluations.load(
+        std::memory_order_relaxed);
+}
+
 void SetShadowAllocationFailureForTesting(ShadowAllocationFailurePoint point)
 {
     g_shadow_allocation_test_failure.store(point, std::memory_order_relaxed);
@@ -6879,17 +6952,24 @@ bool IsShadowPowClaimMempoolRetryable(
     return false;
 }
 
-ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
+namespace {
+
+ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailedImpl(
     const CTransaction& tx, const CBlockIndex* pindexPrev,
     const CCoinsViewCache& view, bool gold_rush_active,
     std::string& reject_reason,
-    ShadowPowClaimMempoolDisposition* disposition_out)
+    ShadowPowClaimMempoolDisposition* disposition_out,
+    const ShadowPowClaimProofEvaluation* evaluation,
+    ShadowPowClaimProofEvaluationContext* evaluation_context_out,
+    bool* evaluation_required_out, bool evaluate_if_required)
 {
+    if (evaluation_context_out) *evaluation_context_out = {};
+    if (evaluation_required_out) *evaluation_required_out = false;
     const auto finish = [&](ShadowProofValidationResult result,
                             ShadowPowClaimMempoolDisposition disposition,
                             const char* reason = nullptr) {
         if (disposition_out) *disposition_out = disposition;
-        if (reason) reject_reason = reason;
+        reject_reason = reason ? reason : "";
         return result;
     };
 
@@ -6935,10 +7015,26 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
                       "shadow-proof-height");
     }
 
+    uint64_t injected_local_failures =
+        g_shadow_pow_claim_local_state_test_failures.load(
+            std::memory_order_relaxed);
+    while (injected_local_failures != 0 &&
+           !g_shadow_pow_claim_local_state_test_failures.compare_exchange_weak(
+               injected_local_failures, injected_local_failures - 1,
+               std::memory_order_relaxed)) {
+    }
+    if (injected_local_failures != 0) {
+        g_shadow_pow_claim_local_state_test_failure_count.fetch_add(
+            1, std::memory_order_relaxed);
+        return finish(ShadowProofValidationResult::LOCAL_INTERNAL_ERROR,
+                      ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR,
+                      "local-shadow-proof-chain-state");
+    }
+
     bool pool_state_valid{true};
     ShadowPoolState pool = ReadPool(view, &pool_state_valid);
     if (!pool_state_valid) {
-        return finish(ShadowProofValidationResult::INVALID,
+        return finish(ShadowProofValidationResult::LOCAL_INTERNAL_ERROR,
                       ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR,
                       "shadow-proof-pool-state");
     }
@@ -6969,8 +7065,6 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
 
     const Consensus::Params& consensus = Params().GetConsensus();
     const bool require_qqp4 = consensus.IsShadowQQP4Active(height);
-    unsigned int proof_evals = 0;
-    bool proof_limit_exceeded = false;
     const ShadowProofPayloadMode payload_mode =
         ClassifyProofPayloadMode(proofs.front(), require_qqp4);
     if (payload_mode == ShadowProofPayloadMode::POS) {
@@ -7111,17 +7205,59 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
         }
     }
 
+    ShadowPowClaimProofEvaluationContext evaluation_context;
+    evaluation_context.valid = true;
+    evaluation_context.proof = proofs.front();
+    evaluation_context.height = proof_height;
+    evaluation_context.previous_block_hash = proof_previous_block_hash;
+    evaluation_context.target_bits = proof_target_bits;
+    evaluation_context.require_qqp4 = require_qqp4;
+    evaluation_context.qqp3_active_at_proof_height =
+        consensus.IsShadowCompetingClaimsActive(proof_height);
+    evaluation_context.qqp4_active_at_proof_height =
+        consensus.IsShadowQQP4Active(proof_height);
+    HashWriter context_hasher{};
+    context_hasher << uint8_t{1};
+    context_hasher << evaluation_context.proof;
+    context_hasher << evaluation_context.height;
+    context_hasher << evaluation_context.previous_block_hash;
+    context_hasher << evaluation_context.target_bits;
+    context_hasher << evaluation_context.require_qqp4;
+    context_hasher << evaluation_context.qqp3_active_at_proof_height;
+    context_hasher << evaluation_context.qqp4_active_at_proof_height;
+    evaluation_context.cache_key = context_hasher.GetHash();
+    if (evaluation_context_out) *evaluation_context_out = evaluation_context;
+
     ShadowProof decoded;
-    const ShadowProofValidationResult status = ValidateQQProofAtBits(
-        proofs.front(), proof_height, proof_previous_block_hash,
-        proof_target_bits, require_qqp4,
-        consensus.IsShadowCompetingClaimsActive(proof_height),
-        consensus.IsShadowQQP4Active(proof_height),
-        decoded, proof_evals, proof_limit_exceeded);
-    if (proof_limit_exceeded) {
-        return finish(ShadowProofValidationResult::INVALID,
-                      ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT,
-                      "shadow-proof-limit");
+    ShadowProofValidationResult status{
+        ShadowProofValidationResult::LOCAL_INTERNAL_ERROR};
+    if (evaluation && evaluation->context == evaluation_context) {
+        status = evaluation->result;
+        if (evaluation->proof_limit_exceeded) {
+            return finish(ShadowProofValidationResult::INVALID,
+                          ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT,
+                          "shadow-proof-limit");
+        }
+        if (status == ShadowProofValidationResult::VALID) {
+            decoded = decoded_shape;
+        }
+    } else if (!evaluate_if_required) {
+        if (evaluation_required_out) *evaluation_required_out = true;
+        return finish(ShadowProofValidationResult::LOCAL_INTERNAL_ERROR,
+                      ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR,
+                      "local-shadow-proof-evaluation-pending");
+    } else {
+        const ShadowPowClaimProofEvaluation computed =
+            EvaluateShadowPowClaimProof(evaluation_context);
+        status = computed.result;
+        if (computed.proof_limit_exceeded) {
+            return finish(ShadowProofValidationResult::INVALID,
+                          ShadowPowClaimMempoolDisposition::EVALUATION_LIMIT,
+                          "shadow-proof-limit");
+        }
+        if (status == ShadowProofValidationResult::VALID) {
+            decoded = decoded_shape;
+        }
     }
     if (status != ShadowProofValidationResult::VALID) {
         const bool unbound_proof_may_revalidate =
@@ -7188,6 +7324,75 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
 
     return finish(ShadowProofValidationResult::VALID,
                   ShadowPowClaimMempoolDisposition::ELIGIBLE);
+}
+
+} // namespace
+
+bool ShadowPowClaimProofEvaluationContext::operator==(
+    const ShadowPowClaimProofEvaluationContext& other) const
+{
+    return valid == other.valid && cache_key == other.cache_key &&
+           proof == other.proof && height == other.height &&
+           previous_block_hash == other.previous_block_hash &&
+           target_bits == other.target_bits &&
+           require_qqp4 == other.require_qqp4 &&
+           qqp3_active_at_proof_height ==
+               other.qqp3_active_at_proof_height &&
+           qqp4_active_at_proof_height ==
+               other.qqp4_active_at_proof_height;
+}
+
+ShadowPowClaimProofEvaluation EvaluateShadowPowClaimProof(
+    const ShadowPowClaimProofEvaluationContext& context)
+{
+    ShadowPowClaimProofEvaluation evaluation;
+    evaluation.context = context;
+    if (!context.valid || context.cache_key.IsNull()) return evaluation;
+
+    ShadowProof decoded;
+    unsigned int proof_evals{0};
+    bool proof_limit_exceeded{false};
+    evaluation.result = ValidateQQProofAtBits(
+        context.proof, context.height, context.previous_block_hash,
+        context.target_bits, context.require_qqp4,
+        context.qqp3_active_at_proof_height,
+        context.qqp4_active_at_proof_height, decoded, proof_evals,
+        proof_limit_exceeded);
+    evaluation.proof_limit_exceeded = proof_limit_exceeded;
+    if (proof_limit_exceeded) {
+        evaluation.result = ShadowProofValidationResult::INVALID;
+    }
+    return evaluation;
+}
+
+ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(
+    const CTransaction& tx, const CBlockIndex* pindexPrev,
+    const CCoinsViewCache& view, bool gold_rush_active,
+    std::string& reject_reason,
+    ShadowPowClaimMempoolDisposition* disposition_out)
+{
+    return CheckShadowPowClaimForMempoolDetailedImpl(
+        tx, pindexPrev, view, gold_rush_active, reject_reason,
+        disposition_out, /*evaluation=*/nullptr,
+        /*evaluation_context_out=*/nullptr,
+        /*evaluation_required_out=*/nullptr,
+        /*evaluate_if_required=*/true);
+}
+
+ShadowProofValidationResult
+CheckShadowPowClaimForMempoolDetailedWithEvaluation(
+    const CTransaction& tx, const CBlockIndex* pindexPrev,
+    const CCoinsViewCache& view, bool gold_rush_active,
+    std::string& reject_reason,
+    ShadowPowClaimMempoolDisposition* disposition_out,
+    const ShadowPowClaimProofEvaluation* evaluation,
+    ShadowPowClaimProofEvaluationContext* evaluation_context_out,
+    bool* evaluation_required_out)
+{
+    return CheckShadowPowClaimForMempoolDetailedImpl(
+        tx, pindexPrev, view, gold_rush_active, reject_reason,
+        disposition_out, evaluation, evaluation_context_out,
+        evaluation_required_out, /*evaluate_if_required=*/false);
 }
 
 bool CheckShadowPowClaimForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason)

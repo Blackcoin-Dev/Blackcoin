@@ -18,6 +18,7 @@
 #include <wallet/walletdb.h>
 
 #include <memory>
+#include <stdexcept>
 
 namespace wallet {
 std::unique_ptr<CWallet> CreateSyncedWallet(interfaces::Chain& chain, CChain& cchain, const CKey& key)
@@ -101,7 +102,10 @@ struct BytePrefix { Span<const std::byte> prefix; };
 bool operator<(BytePrefix a, Span<const std::byte> b) { return a.prefix < b.subspan(0, std::min(a.prefix.size(), b.size())); }
 bool operator<(Span<const std::byte> a, BytePrefix b) { return a.subspan(0, std::min(a.size(), b.prefix.size())) < b.prefix; }
 
-MockableCursor::MockableCursor(const MockableData& records, bool pass, Span<const std::byte> prefix)
+MockableCursor::MockableCursor(const MockableData& records, bool pass,
+                               Span<const std::byte> prefix,
+                               MockableDatabase* database)
+    : m_database(database)
 {
     m_pass = pass;
     std::tie(m_cursor, m_cursor_end) = records.equal_range(BytePrefix{prefix});
@@ -109,6 +113,12 @@ MockableCursor::MockableCursor(const MockableData& records, bool pass, Span<cons
 
 DatabaseCursor::Status MockableCursor::Next(DataStream& key, DataStream& value)
 {
+    if (m_database) {
+        const size_t call = m_database->m_cursor_next_calls++;
+        if (m_database->m_fail_cursor_next_at == call) {
+            return Status::FAIL;
+        }
+    }
     if (!m_pass) {
         return Status::FAIL;
     }
@@ -212,12 +222,22 @@ bool MockableBatch::ShouldFailWrite()
 
 std::unique_ptr<DatabaseCursor> MockableBatch::GetNewCursor()
 {
-    return std::make_unique<MockableCursor>(Records(), m_database.m_pass);
+    if (m_database.m_throw_cursor_create) {
+        throw std::runtime_error{"injected cursor construction failure"};
+    }
+    if (m_database.m_fail_cursor_create) return nullptr;
+    return std::make_unique<MockableCursor>(
+        Records(), m_database.m_pass, &m_database);
 }
 
 std::unique_ptr<DatabaseCursor> MockableBatch::GetNewPrefixCursor(Span<const std::byte> prefix)
 {
-    return std::make_unique<MockableCursor>(Records(), m_database.m_pass, prefix);
+    if (m_database.m_throw_cursor_create) {
+        throw std::runtime_error{"injected prefix cursor construction failure"};
+    }
+    if (m_database.m_fail_cursor_create) return nullptr;
+    return std::make_unique<MockableCursor>(
+        Records(), m_database.m_pass, prefix, &m_database);
 }
 
 bool MockableBatch::TxnBegin(bool durable)
@@ -234,6 +254,7 @@ bool MockableBatch::TxnCommit()
     if (!m_database.m_pass || !m_transaction_records || m_database.m_fail_commit) return false;
     m_database.m_records = std::move(*m_transaction_records);
     m_transaction_records.reset();
+    if (m_database.m_fail_commit_after_apply) return false;
     return true;
 }
 

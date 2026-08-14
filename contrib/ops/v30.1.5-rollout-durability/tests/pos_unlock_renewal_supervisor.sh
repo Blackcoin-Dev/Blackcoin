@@ -5,8 +5,11 @@ umask 077
 
 package_dir=$(CDPATH='' cd -P -- "$(dirname -- "$0")/.." && pwd -P)
 supervisor="$package_dir/pos_unlock_renewal_supervisor.sh"
+normal_unlock_helper="$package_dir/blackcoin_node_normal_unlock.sh"
 # shellcheck disable=SC1090 # The exact package-local supervisor is the unit under test.
 source "$supervisor"
+# shellcheck disable=SC1090 # Pure helper functions are exercised with a mocked Docker boundary.
+source "$normal_unlock_helper"
 
 tests=0
 failures=0
@@ -256,29 +259,113 @@ expect_fail 'manifest contract rejects a different live wallet identity' \
   renewal_verify_node_manifests "$authority" "$state" 1 'other-wallet' "$uid"
 
 helper_fixture="$tmp/helper.sh"
-{
-    printf '%s\n' '#!/usr/bin/env bash'
-    printf '%s\n' '# listwallets'
-    printf '%s\n' '# getwalletinfo'
-    printf '%s\n' '# getwalletinfo'
-    printf '%s\n' '# getstakinginfo'
-    printf '%s\n' '# getstakinginfo'
-    printf '%s\n' '# walletpassphrase exact-secret-file-value 999999 false'
-    for _ in $(seq 8 53); do printf '%s\n' '# audited helper padding'; done
-} >"$helper_fixture"
-delta=$((3206 - $(wc -c <"$helper_fixture")))
-((delta >= 2))
-printf '#%*s\n' "$((delta - 2))" '' >>"$helper_fixture"
+cp -- "$normal_unlock_helper" "$helper_fixture"
 chmod 600 "$helper_fixture"
-expect_pass 'helper content audit accepts only the exact six-RPC normal-unlock shape' \
+expect_pass 'helper content audit accepts the exact corrected normal-unlock bytes' \
   renewal_helper_content_is_audited "$helper_fixture"
 helper_bad="$tmp/helper-bad.sh"
-sed 's/audited helper padding/setpowmining true/' "$helper_fixture" >"$helper_bad"
+sed 's/staking true/setpowmining true/' "$helper_fixture" >"$helper_bad"
 chmod 600 "$helper_bad"
 expect_fail 'helper content audit rejects an ordinary-PoW mutation primitive' \
   renewal_helper_content_is_audited "$helper_bad"
-expect_fail 'installed helper verifier rejects non-pinned bytes even when content shape is safe' \
+expect_pass 'installed helper verifier accepts a secure exact-byte copy' \
   renewal_verify_helper "$helper_fixture" "$uid"
+
+for node in $(seq 1 32); do
+    expect_pass "normal-unlock helper accepts exact fleet node $node" \
+      normal_unlock_valid_node "$node"
+done
+for node in '' 0 00 01 033 33 -1 abc '30 '; do
+    expect_fail "normal-unlock helper rejects out-of-contract node '${node}'" \
+      normal_unlock_valid_node "$node"
+done
+if [[ "$(normal_unlock_container_for_node 1)" == blackcoin-v4-gui &&
+      "$(normal_unlock_container_for_node 30)" == blackcoin-v4-gui-30 &&
+      "$(normal_unlock_container_for_node 32)" == blackcoin-v4-gui-32 ]]; then
+    ok 'normal-unlock helper maps node1 and suffixed node30/node32 containers exactly'
+else
+    not_ok 'normal-unlock helper maps node1 and suffixed node30/node32 containers exactly'
+fi
+
+declare -a NORMAL_UNLOCK_CAPTURE_ARGS=()
+NORMAL_UNLOCK_CAPTURE_TIMEOUT=''
+NORMAL_UNLOCK_CAPTURE_STDIN="$tmp/captured-helper-stdin"
+NORMAL_UNLOCK_CAPTURE_READ_STDIN=false
+normal_unlock_docker()
+{
+    NORMAL_UNLOCK_CAPTURE_TIMEOUT=$1
+    shift
+    NORMAL_UNLOCK_CAPTURE_ARGS=("$@")
+    if [[ "$NORMAL_UNLOCK_CAPTURE_READ_STDIN" == true ]]; then
+        cat >"$NORMAL_UNLOCK_CAPTURE_STDIN"
+    fi
+}
+normal_unlock_capture_matches()
+{
+    local timeout_seconds=$1
+    shift
+    [[ "$NORMAL_UNLOCK_CAPTURE_TIMEOUT" == "$timeout_seconds" &&
+       "${#NORMAL_UNLOCK_CAPTURE_ARGS[@]}" -eq "$#" ]] || return 1
+    [[ "$(printf '%s\n' "${NORMAL_UNLOCK_CAPTURE_ARGS[@]}")" == "$(printf '%s\n' "$@")" ]]
+}
+
+normal_unlock_wallet_rpc 30 blackcoin-v4-gui-30 '' getwalletinfo
+expect_pass 'node30 unnamed-wallet RPC omits the empty selector entirely' \
+  normal_unlock_capture_matches 30 exec blackcoin-v4-gui-30 \
+    /usr/local/bin/blackcoin-cli -datadir=/home/blackcoin/.blackcoin getwalletinfo
+if ! printf '%s\n' "${NORMAL_UNLOCK_CAPTURE_ARGS[@]}" | grep -q '^-rpcwallet='; then
+    ok 'node30 unnamed-wallet argv contains no rpcwallet option'
+else
+    not_ok 'node30 unnamed-wallet argv contains no rpcwallet option'
+fi
+
+named_wallet='named wallet with spaces'
+normal_unlock_wallet_rpc 30 blackcoin-v4-gui-30 "$named_wallet" getstakinginfo
+expect_pass 'node30 named-wallet RPC retains one exact selector argv element' \
+  normal_unlock_capture_matches 30 exec blackcoin-v4-gui-30 \
+    /usr/local/bin/blackcoin-cli -datadir=/home/blackcoin/.blackcoin \
+    '-rpcwallet=named wallet with spaces' getstakinginfo
+if [[ "$(printf '%s\n' "${NORMAL_UNLOCK_CAPTURE_ARGS[@]}" | grep -c '^-rpcwallet=')" -eq 1 ]]; then
+    ok 'named-wallet argv contains exactly one rpcwallet option'
+else
+    not_ok 'named-wallet argv contains exactly one rpcwallet option'
+fi
+
+secret_sentinel='hostile-secret-must-never-enter-argv-or-output'
+NORMAL_UNLOCK_CAPTURE_READ_STDIN=true
+normal_unlock_wallet_rpc_stdin 65 blackcoin-v4-gui-30 '' \
+  -stdinwalletpassphrase walletpassphrase 86400 false <<<"$secret_sentinel"
+NORMAL_UNLOCK_CAPTURE_READ_STDIN=false
+expect_pass 'node30 unnamed-wallet unlock keeps the secret on stdin and omits selector' \
+  normal_unlock_capture_matches 65 exec -i blackcoin-v4-gui-30 \
+    /usr/local/bin/blackcoin-cli -datadir=/home/blackcoin/.blackcoin \
+    -stdinwalletpassphrase walletpassphrase 86400 false
+if [[ "$(<"$NORMAL_UNLOCK_CAPTURE_STDIN")" == "$secret_sentinel" ]] &&
+   ! printf '%s\n' "${NORMAL_UNLOCK_CAPTURE_ARGS[@]}" | grep -Fq "$secret_sentinel" &&
+   ! grep -Fq "$secret_sentinel" "$normal_unlock_helper"; then
+    ok 'unlock secret is consumed only through stdin and is absent from helper argv/source'
+else
+    not_ok 'unlock secret is consumed only through stdin and is absent from helper argv/source'
+fi
+
+normal_unlock_wallet_rpc_stdin 65 blackcoin-v4-gui-30 "$named_wallet" \
+  -stdinwalletpassphrase walletpassphrase 86400 false <<<"$secret_sentinel"
+expect_pass 'node30 named-wallet unlock retains one exact selector argv element' \
+  normal_unlock_capture_matches 65 exec -i blackcoin-v4-gui-30 \
+    /usr/local/bin/blackcoin-cli -datadir=/home/blackcoin/.blackcoin \
+    '-rpcwallet=named wallet with spaces' -stdinwalletpassphrase walletpassphrase 86400 false
+if [[ "$(printf '%s\n' "${NORMAL_UNLOCK_CAPTURE_ARGS[@]}" | grep -c '^-rpcwallet=')" -eq 1 ]]; then
+    ok 'named-wallet unlock argv contains exactly one rpcwallet option'
+else
+    not_ok 'named-wallet unlock argv contains exactly one rpcwallet option'
+fi
+
+if ! grep -Eiq '\b(setpowmining|getpowmininginfo|setpowminingaddress|sendrawtransaction|sendtoaddress|sendmany|createshadowpowclaimresolution|commitshadowpowclaimresolution|setpowclaimrecovery|resolveshadowpowclaims|abandontransaction|bumpfee)\b' \
+  "$normal_unlock_helper"; then
+    ok 'normal-unlock helper contains no PoW, claim-recovery, relay, or payment action'
+else
+    not_ok 'normal-unlock helper contains no PoW, claim-recovery, relay, or payment action'
+fi
 
 global_lock="$tmp/global.lock"
 expect_pass 'authority start horizon accepts one complete bounded cycle' \

@@ -34,9 +34,10 @@ The candidate image must use the canonical immutable
 suffix of that reference must exactly equal `CANDIDATE_OCI_MANIFEST_SHA256` in
 both the reviewed environment and the release-identity document.
 
-`SHA256SUMS` is an offline integration preseal over the exact twenty-one
+`SHA256SUMS` is an offline integration preseal over the exact twenty-two
 non-manifest files. It seals tooling and hostile tests, including the PoS
-unlock-renewal supervisor and the audit-only node30 Free-Claim gate. It does
+unlock-renewal supervisor, its fleet-owned normal-unlock helper source, and the
+audit-only node30 Free-Claim gate. It does
 not validate Core product behavior, authorize a successful source/run or
 public artifact, execute a canary, authorize a node30 fee/sign/broadcast, or
 establish live-fleet acceptance. Any later receipt repin must regenerate
@@ -371,8 +372,19 @@ cannot be overwritten or treated as authority. Removal requires the originally
 recorded bytes and also fsyncs the parent directory.
 
 `pos_unlock_renewal_supervisor.sh` is a bounded offline supervisor design for
-renewing normal wallet unlock through the exact installed helper SHA256
-`acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1`.
+renewing normal wallet unlock through the corrected, package-local helper
+`blackcoin_node_normal_unlock.sh`, SHA256
+`aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7`.
+The helper accepts each canonical integer node 1 through 32. Its wallet-RPC
+argv builder omits `-rpcwallet` for the unnamed wallet and preserves one exact
+selector argument for a nonempty wallet name. The passphrase remains stdin-only.
+The helper contains no ordinary-PoW, claim-recovery, relay, payment, key, or
+address action. It may only perform normal wallet unlock and explicitly retain
+PoS intent, followed by read-only wallet/staking convergence checks.
+This offline package does not replace the installed helper. A separate live
+installation authority must stage these exact signed bytes as root-owned mode
+`0600`, prove their SHA256 after the durable rename, and preserve a rollback
+copy before the renewal supervisor can accept them.
 Its install mode remains disabled without an exact authority receipt. Runtime
 requires the durable installation receipt, exact package/tool/topology/image/
 manifest identities, one wallet, synchronized main-chain stable census,
@@ -384,8 +396,13 @@ read-only census sampling; emits a non-PASS PARTIAL receipt for incomplete
 post-observation; and supports explicit authority rotation/deactivation. It
 cannot read or write regular-PoW intent, remove the maintenance inhibitor,
 touch chain/config/key/transaction data, or reproduce the historical root `at`
-job 10. `job-10-one-shot-contract.json` preserves that accepted job only as a
-historical audit contract; this package makes no installation/execution claim.
+job 10. That historical job used predecessor helper SHA256
+`acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1`;
+its node validator excluded node30 and its empty selector was not valid for the
+unnamed wallet. `job-10-one-shot-contract.json` preserves those predecessor
+bytes only as a historical audit contract. This corrected package makes no
+installation or execution claim and does not rewrite the failed predecessor
+receipt.
 
 `node30_free_claim_release.sh` is audit-capable but release-ineligible. Audit
 requires no fee/spend authority and binds a fresh stable tip, wallet, queue,
@@ -507,7 +524,7 @@ update and review these groups in order:
    unlock helper, reviewed read-only node30 probe, and separately reviewed
    persistent Compose/image-policy/300105 guard handoff receipts and the exact
    post-reconcile identity proof;
-5. regenerated `VALIDATION.txt`, then `SHA256SUMS` over the other twenty-one
+5. regenerated `VALIDATION.txt`, then `SHA256SUMS` over the other twenty-two
    package files, then the external hash of that manifest; and
 6. `ROLLOUT_IDENTITY_RECONCILED=1` and fresh matching live/native/guard
    nonce-bound authorities only after independent collision clearance.

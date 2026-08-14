@@ -24,10 +24,10 @@ the H0e62/tree/run constraints after every other receipt gate is resolved.
 Integrated offline surfaces:
   - base v30.1.5 typed rollout/durability and exact topology contract
   - explicit terminal pause_preserved_pending_separate_release state
-  - PoS normal-unlock renewal supervisor and hostile fixtures
+  - corrected fleet-owned normal-unlock helper, renewal supervisor, and hostiles
   - node30 audit-only Free-Claim release gate and hostile fixtures
   - historical one-shot job-10 contract (receipt preservation only)
-  - exact 21-payload package inventory plus SHA256SUMS
+  - exact 22-payload package inventory plus SHA256SUMS
 
 Base rollout invariants:
   - all 32 nodes must have active PoS
@@ -41,7 +41,11 @@ Base rollout invariants:
 
 PoS renewal invariants:
   - invokes only installed normal-unlock helper SHA256
-    acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1
+    aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7
+  - helper accepts every canonical integer node 1 through 32, including node30
+  - unnamed-wallet RPCs omit -rpcwallet; named wallets retain one exact selector
+  - the passphrase is stdin-only and never enters argv, source, or test output
+  - helper contains no PoW, claim-recovery, relay, payment, key, or address action
   - audit/plan/install/run modes remain fail-closed without exact authority
   - canonical shared locks precede private global and per-node locks
   - exact image/main/sync/peer/one-wallet/manifest and live PoW-role guards
@@ -53,7 +57,10 @@ PoS renewal invariants:
     revalidates it
   - explicit generation rotation archives/deactivates prior authority/schedule
   - no chain/config/key/transaction mutation and no regular-PoW intent mutation
-  - historical root at job 10 is not installed, executed, renewed, or cancelled
+  - historical root at job 10 and predecessor helper SHA256
+    acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1
+    remain immutable failed-predecessor evidence; they are not rewritten,
+    installed, executed, renewed, or cancelled by this package
 
 Node30 invariants:
   - audit requires public artifact, packaging verifier, successor semantics,
@@ -81,23 +88,23 @@ partial evidence, role drift, stale audit and queue/wallet/tip drift, unavailabl
 or invented product/packaging receipts, and forbidden mutating RPC/static scans.
 The aggregate runner invokes both dedicated supervisor/node30 suites.
 
-Current-byte offline checks (2026-08-13 UTC):
+Current-byte offline checks (2026-08-14 UTC):
   bash -n on every .sh and the standalone .sh.inc: PASS
   shellcheck -x on every .sh and the standalone .sh.inc: PASS
   complete aggregate suite including both dedicated suites: 609/609 PASS
-    log SHA256 75ba8fdae9e9562756d058500ef89f152a801aba8d34c6094be3902a8d9fed05
-  focused PoS supervisor hostile suite: 186/186 PASS
-    log SHA256 1399fbd71b2a8dc2b96091bbc9b7081c66fc05a190081e5985a4fc63b6183711
+    log SHA256 8e5852c70b66b9b61d181d57450197183e08b6775d8ee63cc7664898abd5be5c
+  focused PoS/helper hostile suite: 237/237 PASS
+    log SHA256 ca59cbae798fc6b689c4a20707d68202488cbb772c268c8df546eead3093b52c
   focused node30 audit/release-gate hostile suite: 151/151 PASS
     log SHA256 e1c468f202fcafac0510e285adfa8f1ebb1b4f552c9fe70c5529f9960771001c
   separate node27 sign-only/observation suite: 208/208 PASS
     log SHA256 58e68f45e9a5726ba70dc26bcd2f0e444d481f1f07350f2fe162ee37c6e12139
     product receipt is sealed in the sibling package and says relay_eligible=false
   deterministic top-level fleet integration runner: PASS
-    log SHA256 c922c08a97935e3401dc0b9d8479e85d7762255b4ab2e76138c4625f2a908d9f
+    log SHA256 18f9c9fecc5886b47bf0302ae60141f6860c9da35d5691df7f196a1675405e73
     runner SHA256 dea54bb8030e7967208e670954145e590509340dd2da770b41cffe2d76f04b57
   git diff --check: PASS
-  exact 21-payload inventory equality: PASS
+  exact 22-payload inventory equality: PASS
   sha256sum --strict -c SHA256SUMS: PASS after final manifest regeneration
   live Docker/SSH/wallet/network/fleet contact: NONE
   Core development/PR/build/package/registry action: NONE

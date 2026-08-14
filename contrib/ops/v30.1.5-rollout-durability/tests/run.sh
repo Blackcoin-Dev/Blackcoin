@@ -3606,7 +3606,7 @@ compose_receipt_sha=$(sha256sum "$compose_receipt" | awk '{print $1}')
     printf "POST_COMPOSE_RECONCILE_IDENTITY_SHA256='%s'\n" "$reconcile_sha"
     printf "RUNTIME_POLICY_HANDOFF_RECEIPT='%s'\nRUNTIME_POLICY_HANDOFF_RECEIPT_SHA256='%s'\n" "$policy_receipt" "$policy_receipt_sha"
     printf "PERSISTENT_COMPOSE_HANDOFF_RECEIPT='%s'\nPERSISTENT_COMPOSE_HANDOFF_RECEIPT_SHA256='%s'\n" "$compose_receipt" "$compose_receipt_sha"
-    printf "NORMAL_UNLOCK_HELPER_SHA256='acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1'\n"
+    printf "NORMAL_UNLOCK_HELPER_SHA256='aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7'\n"
     printf "COMPOSE_FILE='/boot/config/plugins/compose.manager/projects/blackcoin30/docker-compose.yml'\n"
     printf "EVIDENCE_ROOT='/mnt/pulsar/Blackcoin_Blocks/operations/v30.1.5-rollout'\n"
     printf "STATE_DIR='/boot/config/plugins/blackcoin-quantum-nodes'\n"
@@ -4387,7 +4387,7 @@ expect_pass 'v30.1.5 package does not source v30.1.4 libraries' bash -c \
   "! grep -Eq 'source .*v30[.]1[.]4' '$package_dir/fleet_rollout.sh' '$package_dir/native_restart_durability.sh' '$package_dir/verify-evidence.sh'"
 # The single-quoted body is intentionally evaluated by the child Bash.
 # shellcheck disable=SC2016
-expect_pass 'package contains the exact twenty-one-payload reviewed inventory' bash -c \
+expect_pass 'package contains the exact twenty-two-payload reviewed inventory' bash -c \
   'set -euo pipefail
    package_dir=$1
    source "$package_dir/lib/common.sh"
@@ -4395,7 +4395,7 @@ expect_pass 'package contains the exact twenty-one-payload reviewed inventory' b
      sed "s#^[.]/##" | LC_ALL=C sort)
    expected=$(v3015_expected_package_payloads | LC_ALL=C sort)
    test "$actual" = "$expected"
-   test "$(printf "%s\n" "$expected" | wc -l | tr -d " ")" = 21' \
+   test "$(printf "%s\n" "$expected" | wc -l | tr -d " ")" = 22' \
   bash "$package_dir"
 expect_pass 'maintenance include declares Bash for standalone ShellCheck' bash -c \
   "head -n 1 '$package_dir/guard_rollout_maintenance_block.sh.inc' | grep -Fqx '# shellcheck shell=bash' && shellcheck -x '$package_dir/guard_rollout_maintenance_block.sh.inc'"
@@ -4425,13 +4425,13 @@ expect_pass 'accepted source/artifact predicates contain no revoked predecessor 
   bash "$package_dir"
 # The single-quoted body is intentionally evaluated by the child Bash.
 # shellcheck disable=SC2016
-expect_pass 'nondeployable H0e62 integration preseal covers exact twenty-one payloads' bash -c '
+expect_pass 'nondeployable H0e62 integration preseal covers exact twenty-two payloads' bash -c '
   set -euo pipefail
   package_dir=$1
   actual=$(cd "$package_dir" && find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort)
   listed=$(cd "$package_dir" && awk "{print \$2}" SHA256SUMS | LC_ALL=C sort)
   test "$actual" = "$listed"
-  test "$(printf "%s\n" "$listed" | uniq | wc -l | tr -d " ")" = 21
+  test "$(printf "%s\n" "$listed" | uniq | wc -l | tr -d " ")" = 22
   ! grep -Eq "UNSEALED|PLACEHOLDER|__" "$package_dir/SHA256SUMS"
   (cd "$package_dir" && sha256sum --strict -c SHA256SUMS >/dev/null)
 ' bash "$package_dir"

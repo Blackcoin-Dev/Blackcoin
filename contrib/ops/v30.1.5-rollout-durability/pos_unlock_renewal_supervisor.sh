@@ -26,7 +26,8 @@ readonly JOB10_CONTRACT="$script_dir/$JOB10_CONTRACT_NAME"
 readonly TOPOLOGY_MAP="$script_dir/$TOPOLOGY_MAP_NAME"
 readonly PACKAGE_MANIFEST="$script_dir/$PACKAGE_MANIFEST_NAME"
 
-readonly EXPECTED_HELPER_SHA256='acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1'
+readonly EXPECTED_HELPER_SHA256='aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7'
+readonly HISTORICAL_JOB10_HELPER_SHA256='acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1'
 readonly EXPECTED_MARKER_SHA256='87ecb2e0d7df9f90eabf0a546459779116a4bc634d3cbc37b1dd824c1dfcf311'
 readonly EXPECTED_IMAGE_ID='sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909'
 readonly EXPECTED_IMAGE_REF='qqblackcoin/blackcoin-v4-gui@sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2'
@@ -239,7 +240,7 @@ renewal_job10_contract_is_valid()
     local contract=$1
     [[ -f "$contract" && ! -L "$contract" ]] || return 1
     jq -e \
-      --arg helper "$EXPECTED_HELPER_SHA256" \
+      --arg helper "$HISTORICAL_JOB10_HELPER_SHA256" \
       --arg marker "$EXPECTED_MARKER_SHA256" \
       --arg image_id "$EXPECTED_IMAGE_ID" \
       --arg image_ref "$EXPECTED_IMAGE_REF" \
@@ -438,21 +439,28 @@ renewal_authority_files_match()
 renewal_helper_content_is_audited()
 {
     local helper=$1 forbidden size lines
+    [[ "$(renewal_sha256_file "$helper")" == "$EXPECTED_HELPER_SHA256" ]] || return 1
     bash -n "$helper" || return 1
     forbidden=$(grep -Eio '\b(setstaking|setpowmining|getpowmininginfo|sendrawtransaction|createshadowpowclaimresolution|commitshadowpowclaimresolution|resolveshadowpowclaims|setpowclaimrecovery|getnewaddress|getnewquantumaddress|setpowminingaddress|sendtoaddress|sendmany|fundrawtransaction|signrawtransaction[^[:space:]]*|abandontransaction|resendwallettransactions|forcerelay|walletnotify|zmqpub(rawtx|hashtx|sequence)|eval|source)\b' \
         "$helper" | tr '[:upper:]' '[:lower:]' | sort -u || true)
     [[ -z "$forbidden" ]] || return 1
     [[ "$(grep -Eio '\bwalletpassphrase\b' "$helper" | wc -l | tr -d ' ')" == 1 &&
-       "$(grep -Eio '\blistwallets\b' "$helper" | wc -l | tr -d ' ')" == 1 &&
-       "$(grep -Eio '\bgetwalletinfo\b' "$helper" | wc -l | tr -d ' ')" == 2 &&
-       "$(grep -Eio '\bgetstakinginfo\b' "$helper" | wc -l | tr -d ' ')" == 2 &&
+       "$(grep -Eio '\blistwallets\b' "$helper" | wc -l | tr -d ' ')" == 2 &&
+       "$(grep -Eio '\bgetwalletinfo\b' "$helper" | wc -l | tr -d ' ')" == 1 &&
+       "$(grep -Eio '\bgetstakinginfo\b' "$helper" | wc -l | tr -d ' ')" == 1 &&
        "$(grep -Eio '\b(walletpassphrase|listwallets|getwalletinfo|getstakinginfo)\b' \
-          "$helper" | wc -l | tr -d ' ')" == 6 ]] || return 1
+          "$helper" | wc -l | tr -d ' ')" == 5 ]] || return 1
     grep -Eq 'walletpassphrase.*[[:space:]]false([[:space:]]|$)' "$helper" || return 1
+    # shellcheck disable=SC2016 # Exact literal source text is the audited contract.
+    grep -Fq '[[ -z "$wallet" ]] || rpc_args+=("-rpcwallet=$wallet")' "$helper" || return 1
+    # shellcheck disable=SC2016 # Exact literal source text is the audited contract.
+    [[ "$(grep -Fc '[[ -z "$wallet" ]] || rpc_args+=("-rpcwallet=$wallet")' "$helper")" == 2 ]] ||
+        return 1
+    grep -Fq '^([1-9]|[12][0-9]|3[0-2])$' "$helper" || return 1
     size=$(stat -c '%s' -- "$helper" 2>/dev/null ||
       stat -f '%z' -- "$helper" 2>/dev/null) || return 1
     lines=$(wc -l <"$helper" | tr -d ' ') || return 1
-    [[ "$size" == 3206 && "$lines" == 54 ]]
+    [[ "$size" == 4947 && "$lines" == 122 ]]
 }
 
 renewal_verify_helper()

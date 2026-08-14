@@ -246,23 +246,29 @@ v3015_unlock_helper_is_audited()
     local helper=$1 forbidden size lines
     v3015_secure_regular_file "$helper" 600 && v3015_secure_ancestry "$helper" || return 1
     [[ "$(v3015_sha256_file "$helper")" == \
-       acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1 ]] || return 1
+       aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7 ]] || return 1
     bash -n "$helper" || return 1
     forbidden=$(grep -Eio '\b(setstaking|setpowmining|sendrawtransaction|createshadowpowclaimresolution|commitshadowpowclaimresolution|resolveshadowpowclaims|setpowclaimrecovery|getnewaddress|getnewquantumaddress|setpowminingaddress|sendtoaddress|sendmany|fundrawtransaction|signrawtransaction[^[:space:]]*|abandontransaction|resendwallettransactions|forcerelay|walletnotify|zmqpub(rawtx|hashtx|sequence)|eval|source)\b' \
         "$helper" | tr '[:upper:]' '[:lower:]' | sort -u || true)
     [[ -z "$forbidden" ]] || return 1
     [[ "$(grep -Eio '\bwalletpassphrase\b' "$helper" | wc -l | tr -d ' ')" == 1 &&
-       "$(grep -Eio '\blistwallets\b' "$helper" | wc -l | tr -d ' ')" == 1 &&
-       "$(grep -Eio '\bgetwalletinfo\b' "$helper" | wc -l | tr -d ' ')" == 2 &&
-       "$(grep -Eio '\bgetstakinginfo\b' "$helper" | wc -l | tr -d ' ')" == 2 &&
+       "$(grep -Eio '\blistwallets\b' "$helper" | wc -l | tr -d ' ')" == 2 &&
+       "$(grep -Eio '\bgetwalletinfo\b' "$helper" | wc -l | tr -d ' ')" == 1 &&
+       "$(grep -Eio '\bgetstakinginfo\b' "$helper" | wc -l | tr -d ' ')" == 1 &&
        "$(grep -Eio '\b(walletpassphrase|listwallets|getwalletinfo|getstakinginfo)\b' \
-          "$helper" | wc -l | tr -d ' ')" == 6 ]] || return 1
+          "$helper" | wc -l | tr -d ' ')" == 5 ]] || return 1
     grep -Eq 'walletpassphrase.*[[:space:]]false([[:space:]]|$)' "$helper" || return 1
+    # shellcheck disable=SC2016 # Exact literal source text is the audited contract.
+    grep -Fq '[[ -z "$wallet" ]] || rpc_args+=("-rpcwallet=$wallet")' "$helper" || return 1
+    # shellcheck disable=SC2016 # Exact literal source text is the audited contract.
+    [[ "$(grep -Fc '[[ -z "$wallet" ]] || rpc_args+=("-rpcwallet=$wallet")' "$helper")" == 2 ]] ||
+        return 1
+    grep -Fq '^([1-9]|[12][0-9]|3[0-2])$' "$helper" || return 1
     grep -Eq '(^|[^[:alnum:]_])(eval|source|xtrace|set[[:space:]]+-x)([^[:alnum:]_]|$)' \
         "$helper" && return 1
     size=$(stat -c '%s' -- "$helper") || return 1
     lines=$(wc -l <"$helper" | tr -d ' ') || return 1
-    [[ "$size" == 3206 && "$lines" == 54 ]]
+    [[ "$size" == 4947 && "$lines" == 122 ]]
 }
 
 # The topology map is the only translation from a logical node number to a
@@ -326,6 +332,7 @@ v3015_expected_package_payloads()
     printf '%s\n' \
       README.md \
       VALIDATION.txt \
+      blackcoin_node_normal_unlock.sh \
       fleet_rollout.sh \
       guard_rollout_maintenance_block.sh.inc \
       install_runtime_guard_3015_compat.sh \
@@ -364,7 +371,7 @@ v3015_verify_package_tree()
     listed=$(awk '{print $2}' "$manifest" | sed 's#^\*\?##; s#^\./##' | sort) || return 1
     expected=$(v3015_expected_package_payloads | sort) || return 1
     [[ "$actual" == "$expected" && "$listed" == "$expected" &&
-       "$(printf '%s\n' "$expected" | sed '/^$/d' | wc -l)" -eq 21 ]] || return 1
+       "$(printf '%s\n' "$expected" | sed '/^$/d' | wc -l)" -eq 22 ]] || return 1
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         [[ -f "$root/$file" && ! -L "$root/$file" ]] || return 1
@@ -399,7 +406,7 @@ v3015_validate_release_env()
     [[ "${RUNTIME_ENTRYPOINT_BODY_SHA256:-}" == 753acc9904b48c411f5514abface930f79d72d00c9d73e91435a6511877d47b4 ]] ||
         v3015_die 'runtime wrapper body identity mismatch' || return
     [[ "${NORMAL_UNLOCK_HELPER_SHA256:-}" == \
-         acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1 ]] ||
+         aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7 ]] ||
         v3015_die 'normal-unlock-only helper identity mismatch' || return
     [[ "${CORE_CI_RUN_ID:-}" == "$expected_run" ]] ||
         v3015_die 'CORE_CI_RUN_ID is not the exact reviewed H0e62 run' || return

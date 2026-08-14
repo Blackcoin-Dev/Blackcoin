@@ -149,6 +149,8 @@ The state transitions are restart-safe:
 queued -> broadcast -> confirmed
    |          ^
    +-> uncertain -- read-only reconcile only
+              |
+              +-> rejected -- separately authorized requeue only --> queued
 ```
 
 A crash after intent but before a known response remains consumed and
@@ -157,12 +159,87 @@ replacement, confirmed rename, terminal JSON link, or JSON/sidecar temporary
 link resumes without another send. Fully published broadcast and terminal
 receipts are idempotently validated rather than overwritten.
 
+## Exact deterministic-rejection continuation
+
+The fleet-only `node30_free_claim_rejection_requeue.py` companion handles one
+narrow installed-v30.1.4 outcome. It accepts only the exact RPC `-26` text
+`Shadow PoW claim rejected: shadow-proof-mempool-limit`, an already-published
+one-shot intent, an `UNKNOWN_AUTHORITY_CONSUMED_NEVER_RETRY` receipt, and the
+same authority's canonical reconciliation receipt proving zero exact wallet or
+anchor candidates. Every identity is hash-bound. A different RPC error, no
+intent, any exact candidate, a response/broadcast receipt, or any retry
+authorization fails closed.
+
+At installed staking-RPC source SHA256
+`611e7acb2b6d90edf2df988adae33b17a67e398e189de1427a0bbb40fbbd70df`,
+`sendshadowpowclaim` calls `ProcessTransaction(..., test_accept=true)` and
+throws this policy error before `CommitWalletTransactionOrThrow`. The exact
+outcome is therefore pre-commit: that call did not persist the candidate in
+the wallet and did not relay it. `terminalize` re-proves zero exact candidates
+under the full lock set, moves the same-inode item from `.uncertain.json` to
+`.rejected.json` through a no-replace hard-link/fsync/unlink/fsync protocol,
+and publishes
+`definitive-rejection.json`. It never calls a wallet-mutating RPC. The old
+financial authority remains permanently consumed and must never be passed to
+`execute` again.
+
+Installed validation source SHA256
+`1fa0a9d2777d680d2230a9201e89ed8fda4c73b9bccdf5db3d9d6df6d30b5270`
+enforces a one-QQSPROOF mempool limit in the current QQP2 regime. A changing
+occupant does not make the slot available. `audit-requeue` brackets the active
+tip and complete raw-mempool identity, decodes every mempool transaction, and
+requires exactly zero canonical QQSPROOF transactions against limit one. It
+also re-proves zero exact old-authority candidates, the exact queue identity,
+normal unlock, active PoS with positive weight, disabled ordinary PoW, and the
+pause artifacts. The resulting authority permits only a rejected-to-queued
+no-clobber lifecycle move and explicitly sets
+`sendshadowpowclaim_authorized=false`.
+`requeue` samples the slot again before its durable intent and again
+immediately before the move. A refill stops without a financial call.
+
+Requeue is not permission to submit. After requeue, the operator must run a
+fresh legacy one-shot `audit` in a new run directory. Before any new
+`AUTHORITY.json` exists, `audit-new-authority-window` validates the completed
+requeue chain, the exact fresh audit and queue identity, and a newly sampled
+zero-slot mempool. It refuses an occupied slot or any preexisting authority or
+execution receipt. Its timestamped receipt binds the semantic SHA256 of the
+only future authority template, records `new_call_budget=1`, and records
+`automatic_retry_authorized=false`. Only after independently reviewing that
+receipt may the exact fresh authority be created. The eventual one-shot
+`execute` may be invoked once. Any non-completion consumes that new authority;
+the only continuation is `reconcile`, never an automatic or repeated send.
+
+The exact continuation order is:
+
+1. Run `terminalize` against the consumed source run, its canonical authority,
+   and the exact no-transaction reconciliation receipt.
+2. Wait. Do not poll by mutation and do not create a requeue authority while a
+   QQSPROOF occupies the one available slot.
+3. When a read-only `audit-requeue` reports a stable count of zero, review its
+   exact template and create a separate owner-only requeue authority.
+4. Run `requeue` once. If clearance expires before its intent, stop and produce
+   a fresh requeue audit and authority after the slot clears again.
+5. Run the original one-shot `audit` into a new owner-only run directory. Do
+   not create its financial authority yet.
+6. Run `audit-new-authority-window` with the completed requeue run and the new
+   one-shot run. Require its exact zero-slot receipt and semantic authority
+   digest.
+7. Only then create the exact fresh one-shot authority, verify its canonical
+   JSON semantic SHA256 against the window receipt, and invoke `execute` once.
+   If it does not complete exactly, use only `reconcile`.
+
+No stage removes the Free-Claim pause, starts the recurring worker, enables
+ordinary PoW on node30, changes the fee rate or `0.00028700 BLK` cap, repairs a
+wallet, reindexes or rewinds a chain, or authorizes public-Core deployment.
+
 ## Installed-v30.1.4 API limitation
 
-Installed v30.1.4 `sendshadowpowclaim` signs, wallet-persists, test-accepts, and
-broadcasts before returning. It has no plan/idempotency token, exact-input
-selector, caller-supplied maximum-total-fee parameter, or separate sign/commit
-phase. Its product-level fee cap is broader than this package's
+Installed v30.1.4 `sendshadowpowclaim` builds and signs the candidate in memory,
+test-accepts it, and only after successful test acceptance commits it to the
+wallet and relays it. It returns plain JSON-RPC failures without a structured
+phase or durable-mutation guarantee. It also has no plan/idempotency token,
+exact-input selector, caller-supplied maximum-total-fee parameter, or separate
+public sign/commit phase. Its product-level fee cap is broader than this package's
 `0.00028700 BLK` authority. On the audited installed wallet, one target address
 can hold multiple eligible fee UTXOs, so the installed RPC cannot truthfully
 pre-bind an exact outpoint. The package instead binds the complete eligible set
@@ -240,6 +317,10 @@ Docker, or RPC operation.
 6. Preserve the complete run directory and its sidecars as the financial and
    operational receipt chain.
 
+If `execute` produced the exact deterministic mempool-limit incident described
+above, do not repeat these one-shot steps with its consumed authority. Follow
+the separately authorized deterministic-rejection continuation instead.
+
 Every command requires the exact controller, runtime manifest/receipt chain,
 and authority SHA256. Live use requires root and the production Free-Claim
 root. The
@@ -273,6 +354,17 @@ reconciliation; queue, awarded-ledger, confirmed, JSON, sidecar, and publisher
 hard-link crash windows; directory/receipt/authority symlink and path-swap
 rejection; special-bit/world-write rejection; confirmed-byte reproof; active
 header proof; and exact synthetic payout completion.
+
+Run `tests/rejection_requeue_run.sh` as a nonroot user for the companion. Its
+offline fixture proves the exact pre-commit rejection classification, consumed
+old authority, no-transaction reconciliation, same-inode terminalization,
+read-only canonical QQSPROOF inventory, occupied-slot refusal, refill refusal
+before requeue intent, nonfinancial requeue authority, intent-before-move
+ordering, no-clobber destination races, queue/done parent-inode substitution
+rejection, exact two-link crash healing, pause/PoS/ordinary-PoW preservation,
+a fresh post-requeue one-shot audit, occupied-slot and premature-authority
+refusal at the new-authority window, and the exact future-authority semantic
+digest. The companion's AST contains zero `sendshadowpowclaim` call sites.
 
 This package is offline tooling only. A signed commit is not live financial
 authority. A fresh exact audit and a separate exact mode-0600 authorization are

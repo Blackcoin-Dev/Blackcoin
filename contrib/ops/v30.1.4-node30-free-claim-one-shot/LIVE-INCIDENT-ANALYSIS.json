@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "kind": "node30-free-claim-live-incident-analysis",
+  "recorded_at": "2026-08-14T07:45:36Z",
+  "fleet_lane_only": true,
+  "public_core_release_authority": false,
+  "installed_source_commit": "13262151077cce3f72d07d17dc7725b2b6a8e1ab",
+  "installed_source_tree": "a6f7757c34b70fab841905765462d6769112d049",
+  "installed_source_signer_fingerprint": "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70",
+  "legacy_one_shot_tool_sha256": "26e38fbd46cd427642f73daedfbbc08dfffcb1e4a166db7c3e0abb6006e832b2",
+  "first_pre_intent_failure": {
+    "run": "/mnt/disk1/blackcoin-wallet-safety/runtime-audits/node30-free-claim-one-shot-20260814T071942Z-02f978d-execute",
+    "audit_sha256": "d8c88c2d2654059f53cb14c72541f4022b2e16215a7050aa2e89784b60271750",
+    "authority_sha256": "f0da628ba33c8246a7f7a536a96f8cb8b33f871aa65d66c2a15835616cf519ee",
+    "execute_stderr_sha256": "91c6b0ace1c7eba7b5330ea1225743ecee51883c12ab401af1a4697544e2c779",
+    "error": "FATAL: node30 recovery inventory is incoherent",
+    "intent_present": false,
+    "rpc_contact_reached": false,
+    "audit_height": 5991978,
+    "audit_tip": "2684ebdbedbe4c1469bdfaf2ec79f75aaa1d8cf48dbc4ec04c9e67dffc3eaea2",
+    "execute_failure_time_utc": "2026-08-14T07:21:11Z",
+    "coincident_update_tip": {
+      "height": 5991979,
+      "tip": "5e74cfe7630e3cc4f23af7b1bbbaf3bc61c4f64c70cb2ca70222b91900982d4f",
+      "debug_log_time_utc": "2026-08-14T07:21:11Z"
+    },
+    "classification": "cross-RPC active-tip transition during role/recovery coherence sampling",
+    "fresh_run_permitted_from_this_failure_alone": true
+  },
+  "consumed_deterministic_rejection": {
+    "run": "/mnt/disk1/blackcoin-wallet-safety/runtime-audits/node30-free-claim-one-shot-20260814T072416Z-02f978d-bounded1",
+    "audit_sha256": "1b8bdddaabd65660b7ebb435b360f437ef18314f79431bf1bad8be8962b5def9",
+    "authority_sha256": "b176c6cf3d4565e342a6beed615b41509b4381a368942d12efe7f30ae6bc61e6",
+    "intent_sha256": "37c910b869922449ecab1860942687b1b30cf3d07690e46f0b27e289a91bfb45",
+    "rpc_unknown_sha256": "ff91f2053a347c02dada0c3ea97a389b4020ba6ddc78b3effb1903a18b5654d8",
+    "error": "node30 sendshadowpowclaim: error code: -26\nerror message:\nShadow PoW claim rejected: shadow-proof-mempool-limit",
+    "rpc_response_present": false,
+    "broadcast_complete_present": false,
+    "reconcile_receipt": "reconcile-1786692354560331794.json",
+    "reconcile_sha256": "b91fffb54df13d368b6344715cbe795af4ee90e5a2eadace1757d326cf3b2e7b",
+    "reconcile_result": "NO_EXACT_TRANSACTION_YET_AUTHORITY_CONSUMED",
+    "exact_transaction_candidate_count": 0,
+    "retry_authorized": false,
+    "installed_call_order": "test_accept_before_wallet_persistence_and_relay"
+  },
+  "read_only_mempool_observation": {
+    "mempool_transaction_count": 1,
+    "shadow_proof_count": 1,
+    "shadow_proof_limit": 1,
+    "blocking_transaction": "bf28997cdd4b3b778569ac470be95e500bf4d3be54672418e3e1496e79091f38",
+    "slot_clear": false,
+    "transient_observation_only": true,
+    "fresh_zero_slot_proof_required": true
+  },
+  "required_continuation": {
+    "terminalize_exact_rejection": true,
+    "terminalize_no_clobber_move": true,
+    "old_authority_never_retry": true,
+    "wait_for_stable_zero_shadow_proof_mempool_count": true,
+    "separate_requeue_only_authority": true,
+    "fresh_one_shot_audit_after_requeue": true,
+    "zero_slot_receipt_before_fresh_financial_authority": true,
+    "fresh_one_shot_financial_authority_after_requeue": true,
+    "fresh_financial_call_budget": 1,
+    "automatic_retry_authorized": false,
+    "node30_ordinary_pow_remains_disabled": true,
+    "free_claim_pause_remains_present": true,
+    "fee_cap_blk": "0.00028700"
+  },
+  "user_order_sha256": "9627b5f6b4ed67a50b62d2c1da0d4f92f762c7a4688cb4b04b7305d773048e77"
+}

@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C
+umask 077
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+LEGACY="$ROOT/node30_free_claim_one_shot.py"
+TOOL="$ROOT/node30_free_claim_rejection_requeue.py"
+MOCK="$ROOT/tests/rejection_requeue_mock_transport.py"
+FIX_RAW=$(mktemp -d "${TMPDIR:-/tmp}/node30-rejection-requeue.XXXXXX")
+FIX=$(CDPATH='' cd -- "$FIX_RAW" && pwd -P)
+trap 'rm -rf -- "$FIX"' EXIT HUP INT TERM
+COUNT=0
+HOSTILE_COLLISION_SHA=$(printf '%s\n' '{"hostile":"destination-appeared"}' | \
+  shasum -a 256 | awk '{print $1}')
+
+ok()
+{
+    COUNT=$((COUNT + 1))
+}
+
+sha()
+{
+    shasum -a 256 "$1" | awk '{print $1}'
+}
+
+assert_eq()
+{
+    [[ "$1" == "$2" ]] || {
+        printf 'ASSERT_EQ failed: <%s> != <%s>\n' "$1" "$2" >&2
+        exit 1
+    }
+    ok
+}
+
+assert_jq()
+{
+    jq -e "$1" "$2" >/dev/null || {
+        printf 'ASSERT_JQ failed: %s in %s\n' "$1" "$2" >&2
+        exit 1
+    }
+    ok
+}
+
+assert_fails()
+{
+    local label=$1
+    shift
+    if "$@" >"$FIX/fail.out" 2>"$FIX/fail.err"; then
+        printf 'expected failure: %s\n' "$label" >&2
+        exit 1
+    fi
+    ok
+}
+
+make_fixture()
+{
+    local root="$FIX/fleet" gid marker wrapper worker transport
+    gid=$(id -g)
+    mkdir -m 0700 "$root" "$root/state" "$root/free-claim" \
+        "$root/free-claim/queue" "$root/free-claim/done" "$root/locks"
+    chmod 0750 "$root/free-claim" "$root/free-claim/done"
+    chmod 0770 "$root/free-claim/queue"
+    printf '%s\n' 'schema=1 state=paused authority=v30.1.4-fleet-transaction' \
+        >"$root/free-claim/.v30.1.4-free-claim-paused"
+    printf '%s\n' '#!/bin/sh' 'exit 0' >"$root/free-claim/pool_daemon.sh"
+    printf '%s\n' '#!/bin/sh' '# preserved worker fixture' 'exit 0' \
+        >"$root/free-claim/pool_daemon.v30.1.4-original"
+    chmod 0600 "$root/free-claim/.v30.1.4-free-claim-paused"
+    chmod 0700 "$root/free-claim/pool_daemon.sh"
+    chmod 0600 "$root/free-claim/pool_daemon.v30.1.4-original"
+    printf '%s\n' qpriorAward >"$root/free-claim/awarded.txt"
+    chmod 0640 "$root/free-claim/awarded.txt"
+    jq -cn '{attempts:3,ip:"fixture",quantum_address:"qfixtureWitnessV16",
+      submitted:"2026-08-14T03:00:00+00:00"}' \
+      >"$root/free-claim/queue/20260814T030000Z-deadbeef.json"
+    chmod 0644 "$root/free-claim/queue/20260814T030000Z-deadbeef.json"
+    marker=$(sha "$root/free-claim/.v30.1.4-free-claim-paused")
+    wrapper=$(sha "$root/free-claim/pool_daemon.sh")
+    worker=$(sha "$root/free-claim/pool_daemon.v30.1.4-original")
+    transport=$(sha "$MOCK")
+    jq -n --arg root "$root" --arg marker "$marker" --arg wrapper "$wrapper" \
+      --arg worker "$worker" --arg transport "$transport" --argjson gid "$gid" '{
+        schema:2,kind:"node30-installed-v30.1.4-runtime-contract",
+        recovery_contract:"installed-v30.1.4-node30-retained-claim-recovery/v2",
+        one_shot_contract:"installed-v30.1.4-node30-free-claim-one-shot/v1",
+        source_commit:"13262151077cce3f72d07d17dc7725b2b6a8e1ab",
+        source_tree:"a6f7757c34b70fab841905765462d6769112d049",
+        source_signer_fingerprint:"SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70",
+        network_version:300104,subversion:"/Blackcoin:30.1.4/",
+        compose_project:"blackcoin30",
+        image_ref:("qqblackcoin/blackcoin-v4-gui@sha256:"+("c"*64)),
+        image_id:("sha256:"+("d"*64)),cli_path:"/usr/local/bin/blackcoin-cli",
+        cli_sha256:("a"*64),daemon_path:"/usr/local/bin/blackcoind",
+        daemon_sha256:("b"*64),datadir:"/home/blackcoin/.blackcoin",
+        transport_sha256:$transport,
+        global_lock_paths:[($root+"/locks/rollout.lock"),($root+"/locks/endpoint.lock"),
+          ($root+"/locks/cutover.lock"),($root+"/locks/quarantine.lock"),
+          ($root+"/locks/wallet.lock"),($root+"/locks/pause.lock"),
+          ($root+"/locks/pool.lock"),($root+"/locks/recovery.lock")],
+        node_lock_path:($root+"/locks/node30.lock"),
+        node:{node:30,service:"node30",container:"blackcoin-v4-gui-30",wallet:""},
+        pause_marker:($root+"/free-claim/.v30.1.4-free-claim-paused"),
+        pause_marker_sha256:$marker,pause_wrapper:($root+"/free-claim/pool_daemon.sh"),
+        pause_wrapper_sha256:$wrapper,
+        original_worker:($root+"/free-claim/pool_daemon.v30.1.4-original"),
+        original_worker_sha256:$worker,free_claim_root:($root+"/free-claim"),
+        queue_dir:($root+"/free-claim/queue"),done_dir:($root+"/free-claim/done"),
+        awarded_file:($root+"/free-claim/awarded.txt"),pool_group_gid:$gid}' \
+      >"$root/runtime.json"
+    chmod 0600 "$root/runtime.json"
+    printf '%s\n' "$root"
+}
+
+legacy_call()
+{
+    local fixture=$1 scenario=$2
+    shift 2
+    FLEET31_TEST_TRANSPORT="$MOCK" FLEET31_FIXTURE="$fixture/state" \
+      FLEET31_SCENARIO="$scenario" python3 - "$LEGACY" "$MOCK" "$@" <<'PY'
+import hashlib,importlib.util,pathlib,sys
+tool=pathlib.Path(sys.argv[1])
+mock=pathlib.Path(sys.argv[2])
+spec=importlib.util.spec_from_file_location('legacy_requeue_test_tool',tool)
+mod=importlib.util.module_from_spec(spec)
+sys.modules[spec.name]=mod
+spec.loader.exec_module(mod)
+mod.node30.base.TEST_TRANSPORT_SHA256=hashlib.sha256(mock.read_bytes()).hexdigest()
+raise SystemExit(mod.main(sys.argv[3:]))
+PY
+}
+
+companion_call()
+{
+    local fixture=$1 scenario=$2
+    shift 2
+    FLEET31_TEST_TRANSPORT="$MOCK" FLEET31_FIXTURE="$fixture/state" \
+      FLEET31_SCENARIO="$scenario" "$TOOL" "$@"
+}
+
+# The companion has no wallet-mutating RPC call site and cannot consume the
+# old one-shot authority for another financial call.
+assert_eq "$(python3 - "$TOOL" <<'PY'
+import ast,sys
+t=ast.parse(open(sys.argv[1]).read())
+print(sum(isinstance(n,ast.Call) and len(n.args)>=2 and
+          isinstance(n.args[1],ast.Constant) and
+          n.args[1].value=='sendshadowpowclaim' for n in ast.walk(t)))
+PY
+)" 0
+
+FLEET=$(make_fixture)
+SOURCE="$FLEET/source-run"
+legacy_call "$FLEET" mempool-reject audit \
+  --runtime-manifest "$FLEET/runtime.json" --run-dir "$SOURCE" >"$FLEET/audit.out"
+AUDIT_SHA=$(jq -r .audit_sha256 "$FLEET/audit.out")
+jq --arg digest "$AUDIT_SHA" \
+  '.required_authority | .decision="authorize" | .audit_receipt_sha256=$digest' \
+  "$SOURCE/audit.json" >"$SOURCE/AUTHORITY.json"
+chmod 0600 "$SOURCE/AUTHORITY.json"
+AUTH_SHA=$(sha "$SOURCE/AUTHORITY.json")
+
+assert_fails 'deterministic Core rejection consumes the old authority' \
+  legacy_call "$FLEET" mempool-reject execute --run-dir "$SOURCE" \
+    --authority "$SOURCE/AUTHORITY.json" --authority-sha256 "$AUTH_SHA"
+assert_jq '.state=="UNKNOWN_AUTHORITY_CONSUMED_NEVER_RETRY" and
+  .retry_authorized==false and .sendshadowpowclaim_call_count==1 and
+  .error=="node30 sendshadowpowclaim: error code: -26\nerror message:\nShadow PoW claim rejected: shadow-proof-mempool-limit" and
+  .queue_outcome.state=="uncertain"' "$SOURCE/rpc-unknown.json"
+assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+
+legacy_call "$FLEET" cleared reconcile --run-dir "$SOURCE" \
+  --authority "$SOURCE/AUTHORITY.json" --authority-sha256 "$AUTH_SHA" \
+  >"$FLEET/reconcile.out"
+RECONCILE_NAME=$(jq -r .receipt "$FLEET/reconcile.out")
+RECONCILE_SHA=$(jq -r .sha256 "$FLEET/reconcile.out")
+assert_jq '.result=="NO_EXACT_TRANSACTION_YET_AUTHORITY_CONSUMED" and
+  .retry_authorized==false and .candidate_count==0 and .queue_state=="uncertain"' \
+  "$SOURCE/$RECONCILE_NAME"
+
+# A hostile destination that appears during the live no-transaction proof is
+# never overwritten, and no terminal receipt is published around it.
+UNCERTAIN=$(find "$FLEET/free-claim/done" -name '*.uncertain.json')
+REJECTED=${UNCERTAIN%.uncertain.json}.rejected.json
+assert_fails \
+  'terminalization destination appearance is no-clobber' \
+  companion_call "$FLEET" terminal-target-race terminalize --run-dir "$SOURCE" \
+    --authority "$SOURCE/AUTHORITY.json" --authority-sha256 "$AUTH_SHA" \
+    --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+    --reconcile-sha256 "$RECONCILE_SHA"
+if [[ ! -e "$REJECTED" ]]; then
+    printf 'terminal race did not create its hostile target:\n' >&2
+    sed -n '1,120p' "$FIX/fail.err" >&2
+    exit 1
+fi
+assert_eq "$(sha "$REJECTED")" "$HOSTILE_COLLISION_SHA"
+assert_eq "$(sha "$UNCERTAIN")" "$(jq -r .snapshot.queue.item.sha256 "$SOURCE/audit.json")"
+assert_fails 'destination collision publishes no terminal receipt' \
+  test -e "$SOURCE/definitive-rejection.json"
+rm -- "$REJECTED"
+
+# Replacing the done-directory pathname with a lookalike inode fails before
+# lifecycle mutation. Restore the exact audited directory before continuing.
+mv -- "$FLEET/free-claim/done" "$FLEET/free-claim/done.audited"
+mkdir -m 0750 "$FLEET/free-claim/done"
+chgrp "$(id -g)" "$FLEET/free-claim/done"
+assert_fails 'terminalization rejects done-directory path substitution' \
+  companion_call "$FLEET" cleared terminalize --run-dir "$SOURCE" \
+    --authority "$SOURCE/AUTHORITY.json" --authority-sha256 "$AUTH_SHA" \
+    --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+    --reconcile-sha256 "$RECONCILE_SHA"
+rmdir -- "$FLEET/free-claim/done"
+mv -- "$FLEET/free-claim/done.audited" "$FLEET/free-claim/done"
+
+# Heal only the exact two-link state left by a crash after the no-clobber link
+# was fsynced but before the source unlink. The inode and bytes remain exact.
+ln -- "$UNCERTAIN" "$REJECTED"
+companion_call "$FLEET" cleared terminalize --run-dir "$SOURCE" \
+  --authority "$SOURCE/AUTHORITY.json" --authority-sha256 "$AUTH_SHA" \
+  --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+  --reconcile-sha256 "$RECONCILE_SHA" >"$FLEET/terminalize.out"
+assert_jq '.result=="DEFINITIVE_PRECOMMIT_MEMPOOL_LIMIT_REJECTION" and
+  .rpc_error=="node30 sendshadowpowclaim: error code: -26\nerror message:\nShadow PoW claim rejected: shadow-proof-mempool-limit" and
+  .installed_call_order=="test_accept_before_wallet_persistence_and_relay" and
+  .candidate_count==0 and .old_authority_consumed==true and
+  .old_authority_retry_authorized==false and .new_attempt_authorized==false and
+  .queue_outcome.state=="rejected" and
+  .queue_outcome.move_protocol=="hard-link-fsync-unlink-fsync-noreplace/v1" and
+  .queue_outcome.no_clobber==true and .queue_outcome.same_inode==true and
+  .queue_outcome.atomic_rename==false and
+  .queue_outcome.crash_link_reconciled==true' "$SOURCE/definitive-rejection.json"
+assert_eq "$(find "$FLEET/free-claim/done" -name '*.rejected.json' | wc -l | tr -d ' ')" 1
+assert_fails 'terminalization source was removed after crash-link healing' \
+  test -e "$UNCERTAIN"
+assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+
+companion_call "$FLEET" cleared terminalize --run-dir "$SOURCE" \
+  --authority "$SOURCE/AUTHORITY.json" --authority-sha256 "$AUTH_SHA" \
+  --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+  --reconcile-sha256 "$RECONCILE_SHA" >"$FLEET/terminalize-again.out"
+assert_jq '.already_complete==true and
+  .result=="DEFINITIVE_PRECOMMIT_MEMPOOL_LIMIT_REJECTION"' \
+  "$FLEET/terminalize-again.out"
+
+# A full local shadow-proof slot blocks requeue audit. No authority or queue
+# transition is emitted until the slot is stably empty.
+BLOCKED="$FLEET/requeue-blocked"
+assert_fails 'occupied shadow-proof slot blocks requeue audit' \
+  companion_call "$FLEET" mempool-blocked audit-requeue \
+    --source-run "$SOURCE" --source-authority "$SOURCE/AUTHORITY.json" \
+    --source-authority-sha256 "$AUTH_SHA" \
+    --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+    --reconcile-sha256 "$RECONCILE_SHA" --run-dir "$BLOCKED"
+assert_fails 'blocked slot publishes no requeue audit authority' \
+  test -e "$BLOCKED/requeue-audit.json"
+
+CLEAR="$FLEET/requeue-clear"
+companion_call "$FLEET" cleared audit-requeue \
+  --source-run "$SOURCE" --source-authority "$SOURCE/AUTHORITY.json" \
+  --source-authority-sha256 "$AUTH_SHA" \
+  --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+  --reconcile-sha256 "$RECONCILE_SHA" --run-dir "$CLEAR" >"$FLEET/requeue-audit.out"
+REQUEUE_AUDIT_SHA=$(jq -r .requeue_audit_sha256 "$FLEET/requeue-audit.out")
+assert_jq '.result=="READY_FOR_SEPARATE_REQUEUE_ONLY_AUTHORITY" and
+  .mutation_performed==false and .snapshot.candidate_count==0 and
+  .snapshot.mempool.shadow_proof_count==0 and .snapshot.mempool.shadow_proof_limit==1 and
+  .snapshot.mempool.slot_clear==true and
+  .required_authority.old_authority_retry_authorized==false and
+  .required_authority.sendshadowpowclaim_authorized==false and
+  .required_authority.new_one_shot_audit_required==true and
+  .required_authority.new_one_shot_authority_required==true' \
+  "$CLEAR/requeue-audit.json"
+jq --arg digest "$REQUEUE_AUDIT_SHA" \
+  '.required_authority | .decision="authorize" | .audit_receipt_sha256=$digest' \
+  "$CLEAR/requeue-audit.json" >"$CLEAR/AUTHORITY.json"
+chmod 0600 "$CLEAR/AUTHORITY.json"
+REQUEUE_AUTH_SHA=$(sha "$CLEAR/AUTHORITY.json")
+
+# Clearance is sampled again immediately before requeue. A filled slot after
+# audit fails before intent or filesystem movement.
+assert_fails 'slot refill invalidates reviewed requeue authority' \
+  companion_call "$FLEET" mempool-blocked requeue --run-dir "$CLEAR" \
+    --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA"
+assert_fails 'slot refill publishes no requeue-only intent' \
+  test -e "$CLEAR/requeue-intent.json"
+assert_eq "$(find "$FLEET/free-claim/done" -name '*.rejected.json' | wc -l | tr -d ' ')" 1
+
+# Authority scope cannot be broadened into a send permission.
+jq '.sendshadowpowclaim_authorized=true' "$CLEAR/AUTHORITY.json" \
+  >"$CLEAR/bad-authority.json"
+chmod 0600 "$CLEAR/bad-authority.json"
+assert_fails 'requeue authority rejects financial scope escalation' \
+  companion_call "$FLEET" cleared requeue --run-dir "$CLEAR" \
+    --authority "$CLEAR/bad-authority.json" \
+    --authority-sha256 "$(sha "$CLEAR/bad-authority.json")"
+
+# A lookalike queue-directory inode is rejected before requeue intent. The
+# exact audited directory is then restored.
+mv -- "$FLEET/free-claim/queue" "$FLEET/free-claim/queue.audited"
+mkdir -m 0770 "$FLEET/free-claim/queue"
+chgrp "$(id -g)" "$FLEET/free-claim/queue"
+assert_fails 'requeue rejects queue-directory path substitution' \
+  companion_call "$FLEET" cleared requeue --run-dir "$CLEAR" \
+    --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA"
+rmdir -- "$FLEET/free-claim/queue"
+mv -- "$FLEET/free-claim/queue.audited" "$FLEET/free-claim/queue"
+assert_fails 'queue path substitution publishes no requeue intent' \
+  test -e "$CLEAR/requeue-intent.json"
+
+# A destination appearing after the second clearance sample is preserved and
+# blocks the move. The durable requeue-only intent may exist, but no completion
+# receipt or wallet call may exist.
+QUEUED="$FLEET/free-claim/queue/$(jq -r .snapshot.queue.item.basename "$SOURCE/audit.json")"
+assert_fails \
+  'requeue destination appearance is no-clobber' \
+  companion_call "$FLEET" requeue-target-race requeue --run-dir "$CLEAR" \
+    --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA"
+assert_eq "$(sha "$QUEUED")" "$HOSTILE_COLLISION_SHA"
+assert_eq "$(sha "$REJECTED")" "$(jq -r .snapshot.queue.item.sha256 "$SOURCE/audit.json")"
+assert_fails 'requeue destination collision publishes no completion' \
+  test -e "$CLEAR/requeue-complete.json"
+assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+rm -- "$QUEUED"
+
+# With the collision removed, the same durable nonfinancial intent completes
+# through the ordinary no-replace link/fsync/unlink/fsync path.
+companion_call "$FLEET" cleared requeue --run-dir "$CLEAR" \
+  --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA" \
+  >"$FLEET/requeue.out"
+assert_jq '.state=="REQUEUE_ONLY_AUTHORITY_CONSUMED_FILESYSTEM_RENAME_PENDING_OR_COMPLETE" and
+  .sendshadowpowclaim_authorized==false and .old_authority_retry_authorized==false and
+  .new_one_shot_authority_required==true and
+  .mempool_clearance.shadow_proof_count==0' "$CLEAR/requeue-intent.json"
+assert_jq '.result=="REQUEUED_FOR_NEW_ONE_SHOT_AUTHORITY" and
+  .queue_outcome.state=="queued" and .sendshadowpowclaim_call_count==0 and
+  .queue_outcome.move_protocol=="hard-link-fsync-unlink-fsync-noreplace/v1" and
+  .queue_outcome.no_clobber==true and .queue_outcome.same_inode==true and
+  .queue_outcome.atomic_rename==false and
+  .queue_outcome.crash_link_reconciled==false and
+  .old_authority_retry_authorized==false and .new_one_shot_audit_required==true and
+  .new_one_shot_authority_required==true and .pause_preserved==true and
+  .ordinary_pow_enabled==false and .recurring_worker_invoked==false' \
+  "$CLEAR/requeue-complete.json"
+assert_eq "$(find "$FLEET/free-claim/queue" -name '*.json' | wc -l | tr -d ' ')" 1
+assert_fails 'rejected source was removed after requeue crash-link healing' \
+  test -e "$REJECTED"
+assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+
+# The consumed source authority can never be executed again. Requeued state
+# is acceptable only to a brand-new audit/run and its separately created
+# authority file.
+assert_fails 'old consumed financial authority remains nonretryable' \
+  legacy_call "$FLEET" cleared execute --run-dir "$SOURCE" \
+    --authority "$SOURCE/AUTHORITY.json" --authority-sha256 "$AUTH_SHA"
+assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+NEW_RUN="$FLEET/new-one-shot-run"
+legacy_call "$FLEET" cleared audit --runtime-manifest "$FLEET/runtime.json" \
+  --run-dir "$NEW_RUN" >"$FLEET/new-audit.out"
+NEW_AUDIT_SHA=$(jq -r .audit_sha256 "$FLEET/new-audit.out")
+
+# The transient slot must be clear after the fresh audit but before a new
+# financial authority exists.  An occupied slot emits no clearance receipt.
+WINDOW_COUNT=$(find "$CLEAR" -name 'new-authority-window-*.json' | wc -l | tr -d ' ')
+assert_fails 'occupied slot blocks the pre-authority window' \
+  companion_call "$FLEET" mempool-blocked audit-new-authority-window \
+    --run-dir "$CLEAR" --authority "$CLEAR/AUTHORITY.json" \
+    --authority-sha256 "$REQUEUE_AUTH_SHA" --one-shot-run "$NEW_RUN"
+assert_eq "$(find "$CLEAR" -name 'new-authority-window-*.json' | wc -l | tr -d ' ')" \
+  "$WINDOW_COUNT"
+
+# Even an otherwise exact authority is forbidden until the clearance receipt
+# exists.  This fixture authority is deleted without use after proving the
+# pre-authority ordering gate.
+jq --arg digest "$NEW_AUDIT_SHA" \
+  '.required_authority | .decision="authorize" | .audit_receipt_sha256=$digest' \
+  "$NEW_RUN/audit.json" >"$NEW_RUN/AUTHORITY.json"
+chmod 0600 "$NEW_RUN/AUTHORITY.json"
+assert_fails 'new financial authority must be absent during the slot gate' \
+  companion_call "$FLEET" cleared audit-new-authority-window \
+    --run-dir "$CLEAR" --authority "$CLEAR/AUTHORITY.json" \
+    --authority-sha256 "$REQUEUE_AUTH_SHA" --one-shot-run "$NEW_RUN"
+rm -- "$NEW_RUN/AUTHORITY.json"
+assert_eq "$(find "$CLEAR" -name 'new-authority-window-*.json' | wc -l | tr -d ' ')" \
+  "$WINDOW_COUNT"
+
+companion_call "$FLEET" cleared audit-new-authority-window \
+  --run-dir "$CLEAR" --authority "$CLEAR/AUTHORITY.json" \
+  --authority-sha256 "$REQUEUE_AUTH_SHA" --one-shot-run "$NEW_RUN" \
+  >"$FLEET/new-authority-window.out"
+WINDOW_NAME=$(jq -r .receipt "$FLEET/new-authority-window.out")
+WINDOW_SHA=$(jq -r .sha256 "$FLEET/new-authority-window.out")
+assert_eq "$(sha "$CLEAR/$WINDOW_NAME")" "$WINDOW_SHA"
+assert_jq '.result=="SLOT_CLEAR_BEFORE_NEW_ONE_SHOT_AUTHORITY" and
+  .one_shot_authority_present==false and
+  .mempool_clearance.shadow_proof_count==0 and
+  .mempool_clearance.shadow_proof_limit==1 and
+  .mempool_clearance.slot_clear==true and
+  .old_authority_retry_authorized==false and .new_call_budget==1 and
+  .automatic_retry_authorized==false' "$CLEAR/$WINDOW_NAME"
+
+# Only after the clearance receipt may the exact fresh one-shot authority be
+# materialized.  Its semantic digest must match the pre-authority receipt.
+jq --arg digest "$NEW_AUDIT_SHA" \
+  '.required_authority | .decision="authorize" | .audit_receipt_sha256=$digest' \
+  "$NEW_RUN/audit.json" >"$NEW_RUN/AUTHORITY.json"
+chmod 0600 "$NEW_RUN/AUTHORITY.json"
+NEW_AUTH_SEMANTIC_SHA=$(jq -cS . "$NEW_RUN/AUTHORITY.json" | shasum -a 256 | awk '{print $1}')
+assert_eq "$(jq -r .one_shot_authority_semantic_sha256 "$CLEAR/$WINDOW_NAME")" \
+  "$NEW_AUTH_SEMANTIC_SHA"
+assert_jq '.kind=="node30-free-claim-one-shot-authority" and
+  .decision=="authorize" and .single_submission_only==true and
+  .ordinary_pow_authorized==false and .pause_removal_authorized==false' \
+  "$NEW_RUN/AUTHORITY.json"
+assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+
+printf 'PASS: %d hostile node30 deterministic-rejection/requeue assertions\n' "$COUNT"

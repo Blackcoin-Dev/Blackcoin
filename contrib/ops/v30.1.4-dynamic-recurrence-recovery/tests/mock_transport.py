@@ -16,6 +16,10 @@ BASE = HERE.parent.parent.parent / "v30.1.4-fleet31-recovery" / "tests" / "mock_
 FIXTURE = pathlib.Path(os.environ["FLEET31_FIXTURE"])
 FULL = tuple([*range(1, 30), 31, 32])
 SCENARIO = os.environ.get("FLEET31_SCENARIO", "happy")
+CLEAR_LIVE_SCENARIOS = {
+    "clear-live-coherent", "clear-live-ready", "clear-live-zero-hash",
+    "clear-live-blocker", "clear-live-ambiguous", "clear-live-wrong-class",
+}
 
 
 def h(label: str, node: int) -> str:
@@ -64,6 +68,22 @@ def observed_calls(node: int, method: str) -> int:
         if observed_node == node and observed_method == method:
             count += 1
     return count
+
+
+def passive_refusal(node: int, reason_code: str, classification: str) -> dict:
+    return {
+        "anchor": {"txid": h(f"{reason_code}-anchor", node), "vout": 0},
+        "generation_fingerprint": h("generation", node),
+        "component_fingerprint": h(f"{reason_code}-component", node),
+        "classification": classification, "status": "refused",
+        "claim_txids": [h(f"{reason_code}-claim", node)],
+        "descendant_claims": 0, "fee": "0.00000000",
+        "persisted": False, "relay_authorized": False, "in_mempool": False,
+        "frontier_may_advance": False,
+        "conflicts_with_revalidating_unbound_proof": False,
+        "reason_code": reason_code,
+        "reason": f"fixture passive {reason_code} refusal",
+    }
 
 
 def main() -> None:
@@ -117,6 +137,12 @@ def main() -> None:
             "indeterminate_quarantined_claims": 0,
             "claim_recovery_database_outcome_ambiguous": False,
         })
+        if node == 12 and SCENARIO in CLEAR_LIVE_SCENARIOS:
+            value["state"] = "ready" if SCENARIO == "clear-live-ready" else "claim_in_flight"
+            value["hashrate"] = 0 if SCENARIO == "clear-live-zero-hash" else 42.5
+            value["blocking_quarantined_claims"] = 1 if SCENARIO == "clear-live-blocker" else 0
+            value["claim_recovery_database_outcome_ambiguous"] = (
+                SCENARIO == "clear-live-ambiguous")
     elif method == "resolveallshadowpowclaims":
         # Only previews occur on clear nodes. A mutation routed here is a
         # test failure, not an emulated behavior.
@@ -131,6 +157,16 @@ def main() -> None:
             "total_fee": "0.00000000", "actionable_components": 0,
             "actions": [], "refused_components": 0, "refused": [],
         })
+        if node == 12 and SCENARIO in CLEAR_LIVE_SCENARIOS:
+            historical = [
+                passive_refusal(node + index, "anchor-spent", "resolved_on_active_chain")
+                for index in range(40)
+            ]
+            live_classification = (
+                "live" if SCENARIO == "clear-live-wrong-class" else "indeterminate")
+            value["refused"] = historical + [
+                passive_refusal(node, "claim-live", live_classification)]
+            value["refused_components"] = len(value["refused"])
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 

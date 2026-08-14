@@ -168,6 +168,110 @@ export FLEET31_FIXTURE=$N/state FLEET31_SCENARIO=happy
 assert_jq '.audited_blocked_node_set==[14] and .aggregate_fee_cap_blk=="0.00019100" and
   .required_phase_a_authority.maximum_cycle_fee_blk=="0.00019100"' "$N/run/audit.json"
 
+# Installed v30.1.4 may report a current mempool claim as the exact passive
+# claim-live/indeterminate refusal while public PoW is positively hashing in
+# claim_in_flight with zero hot blockers. Historical anchor-spent inventory is
+# permitted in that same stable cut and is recorded, never selected or signed.
+Q=$FIX/clear-live
+mkdir -m 0700 "$Q" "$Q/state"
+make_runtime "$Q/runtime.json" "$Q/locks"
+set_blocked "$Q/state" '5,28'
+export FLEET31_FIXTURE=$Q/state FLEET31_SCENARIO=clear-live-coherent
+"$TOOL" audit --runtime-manifest "$Q/runtime.json" --run-dir "$Q/run" >/dev/null
+assert_jq '.audited_blocked_node_set==[5,28] and
+  (.fleet_census[]|select(.node==12)|.classification)=="CLEAR_POSITIVE_HASHRATE" and
+  (.fleet_census[]|select(.node==12)|.pow.state)=="claim_in_flight" and
+  (.fleet_census[]|select(.node==12)|.pow.hashrate)>0 and
+  (.fleet_census[]|select(.node==12)|.pow.blocking_quarantined_claims)==0 and
+  (.fleet_census[]|select(.node==12)|.preview_refusal_families)==[
+    {classification:"resolved_on_active_chain",count:40,reason_code:"anchor-spent"},
+    {classification:"indeterminate",count:1,reason_code:"claim-live"}]' "$Q/run/audit.json"
+assert_eq "$(grep -cE 'sign_only|commit_and_broadcast' "$Q/state/transport.log" || true)" 0
+
+# The same fixture is fatal when its classification differs. No authority,
+# intent, signing, or relay surface is reached.
+export FLEET31_SCENARIO=clear-live-wrong-class
+assert_fails 'claim-live wrong classification' "$TOOL" audit \
+  --runtime-manifest "$Q/runtime.json" --run-dir "$Q/wrong-class-run"
+assert_eq "$(grep -cE 'sign_only|commit_and_broadcast' "$Q/state/transport.log" || true)" 0
+
+# Focused pure-validator hostiles cover the remaining public-state
+# contradictions without adding redundant 31-node subprocess sweeps.
+REFUSAL_HOSTILES=$(/usr/bin/python3 - "$TOOL" <<'PY'
+import copy
+import importlib.util
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1]).resolve(strict=True)
+spec = importlib.util.spec_from_file_location("dynamic_refusal_hostiles", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+def refusal(reason, classification):
+    return {
+        "anchor": {"txid": "a" * 64, "vout": 0},
+        "generation_fingerprint": "b" * 64,
+        "component_fingerprint": "c" * 64,
+        "classification": classification, "status": "refused",
+        "claim_txids": ["d" * 64], "descendant_claims": 0,
+        "fee": "0.00000000", "persisted": False,
+        "relay_authorized": False, "in_mempool": False,
+        "reason_code": reason, "reason": "typed hostile fixture",
+    }
+
+mining = {
+    "state": "claim_in_flight", "hashrate": 1,
+    "blocking_quarantined_claims": 0,
+    "indeterminate_quarantined_claims": 0,
+    "claim_recovery_database_outcome_ambiguous": False,
+}
+preview = {"refused_components": 2, "refused": [
+    refusal("anchor-spent", "resolved_on_active_chain"),
+    refusal("claim-live", "indeterminate"),
+]}
+expected = [
+    {"reason_code": "anchor-spent", "classification": "resolved_on_active_chain", "count": 1},
+    {"reason_code": "claim-live", "classification": "indeterminate", "count": 1},
+]
+if module.validate_clear_refusals(mining, preview, 12) != expected:
+    raise SystemExit("coherent passive refusal census changed")
+
+cases = []
+for key, value in [
+        ("state", "ready"), ("hashrate", 0),
+        ("blocking_quarantined_claims", 1),
+        ("indeterminate_quarantined_claims", 1),
+        ("claim_recovery_database_outcome_ambiguous", True)]:
+    changed = copy.deepcopy(mining)
+    changed[key] = value
+    cases.append((changed, copy.deepcopy(preview)))
+changed = copy.deepcopy(preview)
+changed["refused"][1]["classification"] = "live"
+cases.append((copy.deepcopy(mining), changed))
+changed = copy.deepcopy(preview)
+changed["refused"][1]["relay_authorized"] = True
+cases.append((copy.deepcopy(mining), changed))
+changed = copy.deepcopy(preview)
+changed["refused_components"] = 1
+cases.append((copy.deepcopy(mining), changed))
+changed = copy.deepcopy(preview)
+changed["refused"][1]["reason_code"] = []
+cases.append((copy.deepcopy(mining), changed))
+
+for hostile_mining, hostile_preview in cases:
+    try:
+        module.validate_clear_refusals(hostile_mining, hostile_preview, 12)
+    except module.b.GateError:
+        continue
+    raise SystemExit("hostile passive refusal fixture unexpectedly succeeded")
+print(len(cases))
+PY
+)
+assert_eq "$REFUSAL_HOSTILES" 9
+export FLEET31_SCENARIO=happy
+
 # Any selected/clear-set change between audit and Phase A stops before the
 # first durable intent or sign_only. Both a new recurrence and self-clear are
 # covered against the same immutable audit/authority baseline.

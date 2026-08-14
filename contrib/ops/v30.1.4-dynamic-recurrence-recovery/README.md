@@ -59,6 +59,15 @@ hashrate, zero hot blockers, no ambiguity, and state `ready`,
 `claim_in_flight`, or `hashing`. Historical recovery inventory is not confused
 with the public mining hot-blocker count.
 
+Installed v30.1.4 can expose a mempool-live claim in the recovery preview as
+`reason_code=claim-live`, `classification=indeterminate` while the public PoW
+state is already `claim_in_flight`, positively hashing, and unblocked. The
+audit treats only that exact zero-fee, nonpersisted, nonrelay refusal as
+informational. It binds the refusal-family counts into the census row. A
+different classification, a `ready` state, zero hashrate, any hot blocker or
+indeterminate count, database ambiguity, mutation metadata, an unknown refusal
+family, or a preview tip outside the stable bracket remains fatal.
+
 `audit.json` binds the exact selected and clear sets, all 31 census rows, the
 per-node cap, the computed aggregate cap, and a Phase-A authority template.
 If no node is blocked, the command stops because no fee authority is needed.
@@ -154,4 +163,5 @@ selection and cap math, exact selected-only Phase A and Phase B, authority
 drift, singleton-wave ordering, active-chain monitoring, later different
 subsets with identical bytes, new-blocker and self-clear races before the first
 intent, lagging recovery-inventory retry, lost Phase-A response reconciliation,
-and node30 exclusion.
+node30 exclusion, the exact live-claim informational refusal, and hostile
+live-refusal state/classification/authority contradictions.

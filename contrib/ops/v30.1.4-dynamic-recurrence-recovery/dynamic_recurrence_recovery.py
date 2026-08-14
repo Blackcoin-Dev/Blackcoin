@@ -28,11 +28,16 @@ from typing import Any, Sequence
 
 FULL_NODE_SET = tuple([*range(1, 30), 31, 32])
 BASE_TOOL_SHA256 = "eb529eb87ad1abc740345ddf5e06e0bbb8ae60b264b0d257fc95bad248a72680"
-TEST_TRANSPORT_SHA256 = "5960308ae3f967f64edffeacf3ae3669f90529ef24b3dce1ddb90814b7601aa6"
+TEST_TRANSPORT_SHA256 = "40b23c7849a8cc70dd7b5a6e65500248286b00031a4f92056763107b70c60db0"
 RECURRENCE_CONTRACT = "installed-v30.1.4-dynamic-shadowpow-recurrence/v1"
 RECURRENCE_AUDIT_KIND = "dynamic-shadowpow-recurrence-audit"
 RECURRENCE_PHASE_A_RESULT = "SIGNED_EXACT_AUDITED_SUBSET_WITHOUT_RELAY_AUTHORITY"
 ALLOWED_CLEAR_STATES = {"ready", "claim_in_flight", "hashing"}
+PASSIVE_CLEAR_REFUSAL_CLASSIFICATIONS = {
+    "anchor-spent": {"resolved_on_active_chain"},
+    "claim-not-terminal": {"live", "transient", "indeterminate"},
+    "claim-live": {"indeterminate"},
+}
 
 
 def _load_base():
@@ -231,6 +236,80 @@ def full_runtime(path: pathlib.Path, expected_hash: str | None = None):
         b.NODE_SET = current
 
 
+def validate_clear_refusals(mining: dict[str, Any], preview: dict[str, Any],
+                            node_number: int) -> list[dict[str, Any]]:
+    """Validate informational refusals for an already-operational PoW node.
+
+    Installed v30.1.4 can report a mempool-live claim as an indeterminate
+    ``claim-live`` refusal while its public mining state is coherently
+    ``claim_in_flight`` with positive hashrate and no hot blocker.  That is not
+    a recovery candidate.  Admit only that exact state (plus the previously
+    supported passive families); every authority-bearing or unknown refusal
+    remains fatal.
+    """
+    refused = preview.get("refused")
+    if (not isinstance(refused, list) or
+            isinstance(preview.get("refused_components"), bool) or
+            not isinstance(preview.get("refused_components"), int) or
+            preview.get("refused_components") != len(refused)):
+        b.die(f"node{node_number} clear preview refusal count changed")
+
+    families: dict[tuple[str, str], int] = {}
+    for item in refused:
+        if not isinstance(item, dict):
+            b.die(f"node{node_number} clear preview refusal shape changed")
+        reason_code = item.get("reason_code")
+        classification = item.get("classification")
+        if (not isinstance(reason_code, str) or
+                not isinstance(classification, str) or
+                reason_code not in PASSIVE_CLEAR_REFUSAL_CLASSIFICATIONS or
+                classification not in
+                PASSIVE_CLEAR_REFUSAL_CLASSIFICATIONS[reason_code] or
+                item.get("status") != "refused"):
+            b.die(f"node{node_number} clear preview refusal family changed")
+        if (reason_code in {"claim-live", "claim-not-terminal"} and
+                (mining.get("state") != "claim_in_flight" or
+                 b.decimal_amount(mining.get("hashrate", 0), "PoW hashrate") <= 0 or
+                 mining.get("blocking_quarantined_claims") != 0 or
+                 mining.get("indeterminate_quarantined_claims") != 0 or
+                 mining.get("claim_recovery_database_outcome_ambiguous") is not False)):
+            b.die(f"node{node_number} live refusal is not a coherent claim-in-flight state")
+        anchor = item.get("anchor")
+        if (not isinstance(anchor, dict) or
+                isinstance(anchor.get("vout"), bool) or
+                not isinstance(anchor.get("vout"), int) or anchor.get("vout") < 0):
+            b.die(f"node{node_number} clear preview refusal anchor changed")
+        b.require_hex64(anchor.get("txid"), "clear refusal anchor txid")
+        b.require_hex64(item.get("generation_fingerprint"),
+                        "clear refusal generation fingerprint")
+        b.require_hex64(item.get("component_fingerprint"),
+                        "clear refusal component fingerprint")
+        claims = item.get("claim_txids")
+        if (not isinstance(claims, list) or not claims or
+                isinstance(item.get("descendant_claims"), bool) or
+                not isinstance(item.get("descendant_claims"), int) or
+                item.get("descendant_claims") < 0):
+            b.die(f"node{node_number} clear preview refusal claim identity changed")
+        for txid in claims:
+            b.require_hex64(txid, "clear refusal claim txid")
+        b.exact_amount(item.get("fee"), Decimal("0"),
+                       f"node{node_number} clear refusal fee")
+        if (item.get("persisted") is not False or
+                item.get("relay_authorized") is not False or
+                item.get("in_mempool") is not False or
+                any(key in item for key in (
+                    "hex", "resolution_txid", "unsigned_template_hash")) or
+                not isinstance(item.get("reason"), str) or not item.get("reason")):
+            b.die(f"node{node_number} clear preview refusal carries mutation state")
+        key = (reason_code, classification)
+        families[key] = families.get(key, 0) + 1
+    return [
+        {"reason_code": reason_code, "classification": classification,
+         "count": count}
+        for (reason_code, classification), count in sorted(families.items())
+    ]
+
+
 def clear_node_cut(transport: Any, node: Any) -> dict[str, Any]:
     """Prove one coherent currently-unblocked ordinary-PoW cut."""
     for _ in range(5):
@@ -279,15 +358,13 @@ def clear_node_cut(transport: Any, node: Any) -> dict[str, Any]:
               "durable_state_changed": False, "durable_state_ambiguous": False,
               "actionable_components": 0}
     if (not isinstance(preview, dict) or any(preview.get(k) != v for k, v in common.items()) or
-            preview.get("actions") != []):
+            preview.get("actions") != [] or
+            preview.get("active_tip") != after["bestblockhash"] or
+            preview.get("active_height") != after["blocks"]):
         b.die(f"node{node.node} clear node has an actionable recovery component")
     b.exact_amount(preview.get("total_fee"), Decimal("0"),
                    f"node{node.node} clear preview fee")
-    refused = preview.get("refused")
-    if (not isinstance(refused, list) or any(
-            not isinstance(item, dict) or item.get("reason_code") not in {
-                "anchor-spent", "claim-not-terminal"} for item in refused)):
-        b.die(f"node{node.node} clear preview refusal family changed")
+    refusal_families = validate_clear_refusals(mining, preview, node.node)
     return {
         "node": node.node, "classification": "CLEAR_POSITIVE_HASHRATE",
         "runtime": runtime_after,
@@ -302,6 +379,7 @@ def clear_node_cut(transport: Any, node: Any) -> dict[str, Any]:
         "preview_plan_id": preview.get("plan_id"),
         "preview_tip": preview.get("active_tip"),
         "preview_height": preview.get("active_height"),
+        "preview_refusal_families": refusal_families,
         "mutation_performed": False,
     }
 

@@ -1,4 +1,4 @@
-Offline validation completed 2026-08-14T05:43:56Z.
+Offline validation completed 2026-08-14T06:27:53Z.
 
 Python compilation: PASS
 Bash syntax: PASS
@@ -6,8 +6,14 @@ Git whitespace check: PASS
 Signed fleet31 base primitive SHA256 binding: PASS
 Forbidden targeted/generic/wallet mutation RPC scan: PASS
 Uninterrupted hostile suite exit: 0
-Uninterrupted hostile suite result: PASS: 44 hostile dynamic recurrence assertions
-Uninterrupted hostile log SHA256: 8fa715e76edceaaa893ce6cf93f1b0ba5c4cf5589c20aeb89e0f935d73848939
+Uninterrupted hostile suite result: PASS: 49 hostile dynamic recurrence assertions
+Uninterrupted hostile log SHA256: 9e7fde6a7f5de1def9ae17219562d48b41c20e83eafbb05796c89dee36fadbcb
+
+The exact installed-v30.1.4 `claim-live` / `indeterminate` refusal is accepted
+only under a stable `claim_in_flight`, positive-hashrate, zero-hot-blocker,
+zero-ambiguity cut. Wrong state, zero hashrate, blockers, ambiguity, malformed
+identity, mutation metadata, count drift, and wrong or unknown families are
+hostile-tested fail-closed.
 
 No SSH host, Docker daemon, live wallet, node, or network was contacted by
 this validation. No live authority, raw recovery transaction, wallet secret,

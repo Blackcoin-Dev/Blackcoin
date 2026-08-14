@@ -22,7 +22,8 @@ assert_jq() { local filter=$1 file=$2; jq -e "$filter" "$file" >/dev/null || fai
 make_artifacts()
 {
     local root=$1
-    mkdir -m 0700 -p "$root/free-claim"
+    mkdir -p "$root/free-claim"
+    chmod 0700 "$root/free-claim"
     printf '%s\n' 'schema=1 state=paused authority=v30.1.4-fleet-transaction' >"$root/free-claim/.v30.1.4-free-claim-paused"
     printf '%s\n' '#!/bin/sh' 'exit 0' >"$root/free-claim/pool_daemon.sh"
     printf '%s\n' '#!/bin/sh' 'exit 0' >"$root/free-claim/pool_daemon.v30.1.4-original"
@@ -41,7 +42,8 @@ make_runtime()
     jq -n --arg root "$root" --arg marker "$marker" --arg wrapper "$wrapper" --arg worker "$worker" \
       --arg image_ref "qqblackcoin/blackcoin-v4-gui@sha256:$(printf 'c%.0s' {1..64})" \
       --arg image_id "sha256:$(printf 'd%.0s' {1..64})" '
-      {schema:1,kind:"node30-installed-v30.1.4-runtime-contract",
+      {schema:2,kind:"node30-installed-v30.1.4-runtime-contract",
+       recovery_contract:"installed-v30.1.4-node30-retained-claim-recovery/v2",
        source_commit:"13262151077cce3f72d07d17dc7725b2b6a8e1ab",
        source_tree:"a6f7757c34b70fab841905765462d6769112d049",
        source_signer_fingerprint:"SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70",
@@ -80,6 +82,29 @@ make_b_authority()
     chmod 0600 "$path"
 }
 
+prepare_phase_a()
+{
+    local root=$1
+    mkdir -m 0700 "$root" "$root/state"
+    make_artifacts "$root"
+    make_runtime "$root/runtime.json" "$root"
+    export FLEET31_FIXTURE="$root/state" FLEET31_SCENARIO=happy
+    "$TOOL" audit --runtime-manifest "$root/runtime.json" --run-dir "$root/run" >"$root/audit.out"
+    make_a_authority "$root/run" "$root/a.json"
+    local a_sha
+    a_sha=$(shasum -a 256 "$root/a.json" | awk '{print $1}')
+    "$TOOL" phase-a --run-dir "$root/run" --authority "$root/a.json" --authority-sha256 "$a_sha" >"$root/a.out"
+}
+
+prepare_phase_b()
+{
+    local root=$1
+    prepare_phase_a "$root"
+    export FLEET31_FIXTURE="$root/state" FLEET31_SCENARIO=happy
+    "$TOOL" phase-b-preview --run-dir "$root/run" >"$root/b-preview.out"
+    make_b_authority "$root/run" "$root/b.json"
+}
+
 export FLEET31_TEST_TRANSPORT="$MOCK"
 
 /usr/bin/python3 -m py_compile "$TOOL" "$MOCK" || fail 'Python compilation failed'
@@ -100,6 +125,7 @@ make_runtime "$HAPPY/runtime.json" "$HAPPY"
 export FLEET31_FIXTURE="$HAPPY/state" FLEET31_SCENARIO=happy
 "$TOOL" audit --runtime-manifest "$HAPPY/runtime.json" --run-dir "$HAPPY/run" >"$HAPPY/audit.out"
 assert_jq '.result=="READY_FOR_SEPARATE_PHASE_A_AUTHORITY" and .node==30 and
+  .schema==2 and .contract=="installed-v30.1.4-node30-retained-claim-recovery/v2" and
   .role=="free_claim" and .ordinary_pow_must_remain_disabled==true and
   .node_state.role.ordinary_pow.enabled==false and .node_state.role.pos.staking==true and
   .node_state.status=="ready" and .node_state.component.fee=="0.00019100" and
@@ -125,6 +151,13 @@ assert_jq '.result=="SIGNED_WITHOUT_RELAY_AUTHORITY" and .relay_or_broadcast_aut
   .node_result.relay_authority_granted==0 and .node_result.broadcast==0 and
   .node_result.role_after.ordinary_pow.enabled==false and .node_result.role_after.pos.staking==true and
   .node_result.free_claim_after.pause_preserved==true' "$HAPPY/run/phase-a.json"
+assert_jq '.published_before_post_call_reads==true and .rpc_action=="sign_only" and
+  .rpc_response.success==true and .rpc_response.relay_authority_granted==0' "$HAPPY/run/phase-a-ack-node30.json"
+assert_eq "$(jq -r .node_state.component.classification "$HAPPY/run/audit.json")" current_branch_ineligible
+assert_eq "$(jq -r .node_result.component.classification "$HAPPY/run/phase-a.json")" resolution_pending
+[[ "$(jq -r .node_state.component.component_fingerprint "$HAPPY/run/audit.json")" != \
+   "$(jq -r .node_result.component.component_fingerprint "$HAPPY/run/phase-a.json")" ]] || fail 'tip-relative component fingerprint did not change in fixture'
+ok
 assert_eq "$(grep -c 'sign_only' "$HAPPY/state/transport.log")" 1
 assert_eq "$(grep -c 'commit_and_broadcast' "$HAPPY/state/transport.log" || true)" 0
 assert_eq "$(shasum -a 256 "$HAPPY/free-claim/.v30.1.4-free-claim-paused"|awk '{print $1}')" "$MARKER_BEFORE"
@@ -133,9 +166,15 @@ assert_eq "$(grep -c 'sign_only' "$HAPPY/state/transport.log")" 1
 
 "$TOOL" phase-b-preview --run-dir "$HAPPY/run" >"$HAPPY/b-preview.out"
 assert_jq '.result=="READY_FOR_SEPARATE_PHASE_B_AUTHORITY" and
-  (.signed_transaction.resolution_txid|test("^[0-9a-f]{64}$")) and
+  (.signed_evidence.identity.resolution_txid|test("^[0-9a-f]{64}$")) and
   (.signed_transaction_identity_sha256|test("^[0-9a-f]{64}$")) and
-  .role.ordinary_pow.enabled==false and .free_claim.pause_preserved==true' "$HAPPY/run/phase-b-preview.json"
+  .signed_evidence.fee_proof.computed_fee_blk=="0.00019100" and
+  .signed_evidence.fee_proof.same_script==true and
+  .signed_evidence.fee_proof.include_mempool==false and
+  .signed_evidence.observation.durable_relay_authorized_metadata=="0" and
+  .role_state.ordinary_pow.enabled==false and .free_claim.pause_preserved==true' "$HAPPY/run/phase-b-preview.json"
+assert_eq "$(jq -r .signed_evidence.identity_sha256 "$HAPPY/run/phase-b-preview.json")" \
+          "$(jq -r .node_result.signed_evidence.identity_sha256 "$HAPPY/run/phase-a.json")"
 make_b_authority "$HAPPY/run" "$HAPPY/b-authority.json"
 B_SHA=$(shasum -a 256 "$HAPPY/b-authority.json" | awk '{print $1}')
 jq '.acknowledgements.broadcast_is_irreversible=false' "$HAPPY/b-authority.json" >"$HAPPY/bad-b.json"; chmod 0600 "$HAPPY/bad-b.json"
@@ -147,10 +186,25 @@ assert_jq '.result=="EXACT_PLAN_ACKNOWLEDGED_AND_RELAYED" and
   .node_result.acknowledged_total_fee=="0.00019100" and
   .node_result.status=="EXACT_PLAN_ACKNOWLEDGED_AND_RELAYED" and
   (.node_result.broadcast+.node_result.already_in_mempool)==1 and
+  .node_result.post_call_state.signed_evidence.observation.durable_relay_authorized_metadata=="1" and
   .node_result.role_after.ordinary_pow.enabled==false and
   .node_result.free_claim_after.pause_preserved==true' "$HAPPY/run/phase-b.json"
+assert_jq '.published_before_post_call_reads==true and .rpc_action=="commit_and_broadcast" and
+  .rpc_response.success==true and .rpc_response.relay_authority_granted==1 and
+  (.rpc_response.broadcast+.rpc_response.already_in_mempool)==1' "$HAPPY/run/phase-b-ack-node30.json"
 assert_eq "$(grep -c 'commit_and_broadcast' "$HAPPY/state/transport.log")" 1
 assert_eq "$(shasum -a 256 "$HAPPY/free-claim/.v30.1.4-free-claim-paused"|awk '{print $1}')" "$MARKER_BEFORE"
+"$TOOL" reconcile-b --run-dir "$HAPPY/run" --authority "$HAPPY/b-authority.json" --authority-sha256 "$B_SHA" >"$HAPPY/reconcile-complete.out"
+assert_eq "$(jq -r .result "$HAPPY/reconcile-complete.out")" EXACT_PLAN_ACKNOWLEDGED_AND_RELAYED
+cp "$HAPPY/run/phase-b.json" "$HAPPY/phase-b.saved"
+cp "$HAPPY/run/phase-b.json.sha256" "$HAPPY/phase-b.saved.sha256"
+jq '.node_result.confirmation_claimed=true' "$HAPPY/run/phase-b.json" >"$HAPPY/run/phase-b.tmp"
+mv "$HAPPY/run/phase-b.tmp" "$HAPPY/run/phase-b.json"
+HAPPY_FINAL_SHA=$(shasum -a 256 "$HAPPY/run/phase-b.json"|awk '{print $1}')
+printf '%s  phase-b.json\n' "$HAPPY_FINAL_SHA" >"$HAPPY/run/phase-b.json.sha256"
+assert_fails 're-sealed incomplete Phase-B result chain' "$TOOL" reconcile-b --run-dir "$HAPPY/run" --authority "$HAPPY/b-authority.json" --authority-sha256 "$B_SHA"
+mv "$HAPPY/phase-b.saved" "$HAPPY/run/phase-b.json"
+mv "$HAPPY/phase-b.saved.sha256" "$HAPPY/run/phase-b.json.sha256"
 assert_fails 'Phase-B replay' "$TOOL" phase-b --run-dir "$HAPPY/run" --authority "$HAPPY/b-authority.json" --authority-sha256 "$B_SHA"
 assert_eq "$(grep -c 'commit_and_broadcast' "$HAPPY/state/transport.log")" 1
 
@@ -158,7 +212,7 @@ assert_eq "$(grep -c 'commit_and_broadcast' "$HAPPY/state/transport.log")" 1
 MON_BEFORE=$(jq -r .receipt "$HAPPY/monitor-before.out")
 assert_jq '.result=="NOT_YET_CONFIRMED" and .ordinary_pow_disabled.enabled==false and
   .free_claim.pause_preserved==true and .free_claim_worker_invoked==false' "$HAPPY/run/$MON_BEFORE"
-jq '.confirmed=true' "$HAPPY/state/node30.json" >"$HAPPY/state/node30.tmp" && mv "$HAPPY/state/node30.tmp" "$HAPPY/state/node30.json"
+jq '.confirmed=true|.confirmed_tx="resolution"' "$HAPPY/state/node30.json" >"$HAPPY/state/node30.tmp" && mv "$HAPPY/state/node30.tmp" "$HAPPY/state/node30.json"
 "$TOOL" monitor --run-dir "$HAPPY/run" >"$HAPPY/monitor-after.out"
 MON_AFTER=$(jq -r .receipt "$HAPPY/monitor-after.out")
 assert_jq '.result=="RETAINED_CLAIM_CLEARED_ROLE_PRESERVED" and
@@ -203,11 +257,221 @@ assert_fails 'lost Phase-B response' "$TOOL" phase-b --run-dir "$LOSTB/run" --au
 assert_eq "$(grep -c 'commit_and_broadcast' "$LOSTB/state/transport.log")" 1
 export FLEET31_SCENARIO=happy
 "$TOOL" reconcile-b --run-dir "$LOSTB/run" --authority "$LOSTB/b.json" --authority-sha256 "$LOSTB_SHA" >"$LOSTB/reconcile.out"
+LOSTB_RECON=$(jq -r .receipt "$LOSTB/reconcile.out")
 assert_jq '.result=="OBSERVATION_ONLY_NOT_ADMISSIBLE_AS_PHASE_B_COMPLETION" and
   .observed_status=="EXACT_BYTES_RELAY_AUTHORIZED_BUT_ACKNOWLEDGED_PLAN_UNATTRIBUTABLE" and
-  .never_retry_after_unmatched_phase_b_intent==true and .observation.durable_relay_authorized==true' "$LOSTB/run/phase-b-reconcile.json"
+  .never_retry_after_unmatched_phase_b_intent==true and .observation.relay_authorized==true' "$LOSTB/run/$LOSTB_RECON"
+/usr/bin/python3 - "$LOSTB/state/transport.log" <<'PY' || fail 'Phase-B reconciliation read before serialization preview'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+cut = max(i for i, row in enumerate(rows) if "commit_and_broadcast" in json.dumps(row))
+after = rows[cut + 1:]
+preview = next(i for i, row in enumerate(after) if "resolveallshadowpowclaims" in row)
+anchor = next(i for i, row in enumerate(after) if "gettxout" in row)
+wallet = next(i for i, row in enumerate(after) if "listwallets" in row)
+raise SystemExit(0 if preview < anchor and preview < wallet else 1)
+PY
+ok
 assert_fails 'Phase-B blind retry' "$TOOL" phase-b --run-dir "$LOSTB/run" --authority "$LOSTB/b.json" --authority-sha256 "$LOSTB_SHA"
 assert_eq "$(grep -c 'commit_and_broadcast' "$LOSTB/state/transport.log")" 1
+
+# Independently computed fee and exact same-script proof reject every source of drift.
+for scenario in wrong-anchor-value wrong-anchor-script wrong-output-script; do
+    PROOF="$FIX/proof-$scenario"
+    mkdir -m 0700 "$PROOF" "$PROOF/state"
+    make_artifacts "$PROOF"
+    make_runtime "$PROOF/runtime.json" "$PROOF"
+    printf '%s\n' '{"status":"signed","confirmed":false}' >"$PROOF/state/node30.json"
+    export FLEET31_FIXTURE="$PROOF/state" FLEET31_SCENARIO="$scenario"
+    assert_fails "$scenario exact fee/script proof" "$TOOL" audit --runtime-manifest "$PROOF/runtime.json" --run-dir "$PROOF/run"
+    assert_eq "$(grep -c 'sign_only\|commit_and_broadcast' "$PROOF/state/transport.log" || true)" 0
+done
+
+# Exact wallet inventory is checked before any financial mutation.
+BADWALLET="$FIX/badwallet"
+mkdir -m 0700 "$BADWALLET" "$BADWALLET/state"
+make_artifacts "$BADWALLET"
+make_runtime "$BADWALLET/runtime.json" "$BADWALLET"
+export FLEET31_FIXTURE="$BADWALLET/state" FLEET31_SCENARIO=wrong-wallet-inventory
+assert_fails 'wrong loaded-wallet inventory' "$TOOL" audit --runtime-manifest "$BADWALLET/runtime.json" --run-dir "$BADWALLET/run"
+assert_eq "$(grep -c 'sign_only\|commit_and_broadcast' "$BADWALLET/state/transport.log" || true)" 0
+
+# A v1 or differently named runtime contract cannot drive the v2 controller.
+OLDMANIFEST="$FIX/oldmanifest"
+mkdir -m 0700 "$OLDMANIFEST" "$OLDMANIFEST/state"
+make_artifacts "$OLDMANIFEST"
+make_runtime "$OLDMANIFEST/runtime.json" "$OLDMANIFEST"
+jq '.schema=1' "$OLDMANIFEST/runtime.json" >"$OLDMANIFEST/runtime.tmp" && mv "$OLDMANIFEST/runtime.tmp" "$OLDMANIFEST/runtime.json"
+chmod 0600 "$OLDMANIFEST/runtime.json"
+export FLEET31_FIXTURE="$OLDMANIFEST/state" FLEET31_SCENARIO=happy
+assert_fails 'v1 runtime manifest at v2 boundary' "$TOOL" audit --runtime-manifest "$OLDMANIFEST/runtime.json" --run-dir "$OLDMANIFEST/run"
+[[ ! -e "$OLDMANIFEST/state/transport.log" ]] || fail 'v1 runtime manifest reached transport'
+ok
+
+# A receipt securely published before its sidecar is crash-healed; a malformed
+# existing sidecar is never replaced or trusted.
+ORPHAN="$FIX/orphan"
+prepare_phase_a "$ORPHAN"
+ln "$ORPHAN/run/phase-a.json" "$ORPHAN/run/.phase-a.json.tmp.123.456"
+ln "$ORPHAN/run/audit.json.sha256" "$ORPHAN/run/.audit.json.sha256.tmp.234.567"
+rm "$ORPHAN/run/phase-a.json.sha256"
+export FLEET31_FIXTURE="$ORPHAN/state" FLEET31_SCENARIO=happy
+"$TOOL" phase-b-preview --run-dir "$ORPHAN/run" >"$ORPHAN/preview.out"
+[[ -f "$ORPHAN/run/phase-a.json.sha256" ]] || fail 'missing Phase-A sidecar was not repaired'
+ok
+assert_eq "$(awk '{print $1}' "$ORPHAN/run/phase-a.json.sha256")" "$(shasum -a 256 "$ORPHAN/run/phase-a.json"|awk '{print $1}')"
+[[ ! -e "$ORPHAN/run/.phase-a.json.tmp.123.456" &&
+   ! -e "$ORPHAN/run/.audit.json.sha256.tmp.234.567" ]] || fail 'publisher hard links were not healed'
+ok
+
+BADLINK="$FIX/badlink"
+prepare_phase_a "$BADLINK"
+ln "$BADLINK/run/phase-a.json" "$BADLINK/run/not-a-publisher-temp"
+export FLEET31_FIXTURE="$BADLINK/state" FLEET31_SCENARIO=happy
+assert_fails 'unrecognized receipt hard link' "$TOOL" phase-b-preview --run-dir "$BADLINK/run"
+assert_eq "$(grep -c 'commit_and_broadcast' "$BADLINK/state/transport.log" || true)" 0
+
+BADSIDECAR="$FIX/badsidecar"
+prepare_phase_a "$BADSIDECAR"
+printf '%064d  phase-a.json\n' 0 >"$BADSIDECAR/run/phase-a.json.sha256"
+export FLEET31_FIXTURE="$BADSIDECAR/state" FLEET31_SCENARIO=happy
+assert_fails 'malformed existing receipt sidecar' "$TOOL" phase-b-preview --run-dir "$BADSIDECAR/run"
+assert_eq "$(grep -c 'commit_and_broadcast' "$BADSIDECAR/state/transport.log" || true)" 0
+
+# The exact RPC return is durable before every post-call read. A simulated
+# crash at the first post-read retains the ACK; resume is read-only and heals
+# an orphan ACK sidecar without issuing a second commit.
+POSTREAD="$FIX/postread"
+prepare_phase_b "$POSTREAD"
+POSTREAD_B_SHA=$(shasum -a 256 "$POSTREAD/b.json"|awk '{print $1}')
+export FLEET31_FIXTURE="$POSTREAD/state" FLEET31_SCENARIO=post-read-failure
+assert_fails 'first post-call read failure' "$TOOL" phase-b --run-dir "$POSTREAD/run" --authority "$POSTREAD/b.json" --authority-sha256 "$POSTREAD_B_SHA"
+assert_jq '.published_before_post_call_reads==true and .rpc_response.success==true and
+  .rpc_response.relay_authority_granted==1' "$POSTREAD/run/phase-b-ack-node30.json"
+assert_eq "$(grep -c 'commit_and_broadcast' "$POSTREAD/state/transport.log")" 1
+rm "$POSTREAD/run/phase-b-ack-node30.json.sha256"
+export FLEET31_SCENARIO=wrong-wallet-inventory
+assert_fails 'resume with wrong exact wallet inventory' "$TOOL" phase-b --run-dir "$POSTREAD/run" --authority "$POSTREAD/b.json" --authority-sha256 "$POSTREAD_B_SHA"
+assert_eq "$(grep -c 'commit_and_broadcast' "$POSTREAD/state/transport.log")" 1
+export FLEET31_SCENARIO=happy
+"$TOOL" phase-b --run-dir "$POSTREAD/run" --authority "$POSTREAD/b.json" --authority-sha256 "$POSTREAD_B_SHA" >"$POSTREAD/resume.out"
+assert_jq '.result=="EXACT_PLAN_ACKNOWLEDGED_AND_RELAYED" and
+  .node_result.rpc_ack_sha256 and .node_result.role_after.ordinary_pow.enabled==false' "$POSTREAD/run/phase-b.json"
+[[ -f "$POSTREAD/run/phase-b-ack-node30.json.sha256" ]] || fail 'orphan Phase-B ACK sidecar was not repaired'
+ok
+assert_eq "$(grep -c 'commit_and_broadcast' "$POSTREAD/state/transport.log")" 1
+
+# A structured stale result after durable authority is a precise pending state,
+# never a retry. The same authority can only resume read-only, then reconcile a
+# fast active-chain confirmation.
+PARTIAL="$FIX/partial"
+prepare_phase_b "$PARTIAL"
+PARTIAL_B_SHA=$(shasum -a 256 "$PARTIAL/b.json"|awk '{print $1}')
+export FLEET31_FIXTURE="$PARTIAL/state" FLEET31_SCENARIO=post-persist-stale
+"$TOOL" phase-b --run-dir "$PARTIAL/run" --authority "$PARTIAL/b.json" --authority-sha256 "$PARTIAL_B_SHA" >"$PARTIAL/partial.out"
+assert_jq '.rpc_response.success==false and .rpc_response.stale_plan==true and
+  .rpc_response.durable_state_changed==true and .rpc_response.relay_authority_granted==1 and
+  .rpc_response.broadcast==0' "$PARTIAL/run/phase-b-ack-node30.json"
+[[ ! -e "$PARTIAL/run/phase-b.json" ]] || fail 'partial relay authority was mislabeled complete'
+ok
+assert_eq "$(grep -c 'commit_and_broadcast' "$PARTIAL/state/transport.log")" 1
+export FLEET31_SCENARIO=happy
+"$TOOL" phase-b --run-dir "$PARTIAL/run" --authority "$PARTIAL/b.json" --authority-sha256 "$PARTIAL_B_SHA" >"$PARTIAL/resume-pending.out"
+assert_eq "$(jq -r .result "$PARTIAL/resume-pending.out")" EXACT_RELAY_AUTHORITY_PERSISTED_PENDING_RELAY
+assert_eq "$(grep -c 'commit_and_broadcast' "$PARTIAL/state/transport.log")" 1
+jq '.confirmed=true|.confirmed_tx="resolution"' "$PARTIAL/state/node30.json" >"$PARTIAL/state/node30.tmp" && mv "$PARTIAL/state/node30.tmp" "$PARTIAL/state/node30.json"
+"$TOOL" reconcile-b --run-dir "$PARTIAL/run" --authority "$PARTIAL/b.json" --authority-sha256 "$PARTIAL_B_SHA" >"$PARTIAL/reconcile-confirmed.out"
+assert_jq '.result=="EXACT_AUTHORIZED_COMPONENT_CONFIRMED_ON_ACTIVE_CHAIN" and
+  .node_result.confirmation_claimed==true and .node_result.post_call_state.anchor_spent_on_active_chain==true and
+  .node_result.role_after.ordinary_pow.enabled==false and .node_result.free_claim_after.pause_preserved==true' "$PARTIAL/run/phase-b.json"
+assert_eq "$(grep -c 'commit_and_broadcast' "$PARTIAL/state/transport.log")" 1
+
+# A confirmation racing the RPC response is reconciled without requiring the
+# post-call recovery action to remain actionable.
+FAST="$FIX/fast"
+prepare_phase_b "$FAST"
+FAST_B_SHA=$(shasum -a 256 "$FAST/b.json"|awk '{print $1}')
+export FLEET31_FIXTURE="$FAST/state" FLEET31_SCENARIO=fast-confirm-after-ack
+"$TOOL" phase-b --run-dir "$FAST/run" --authority "$FAST/b.json" --authority-sha256 "$FAST_B_SHA" >"$FAST/b.out"
+assert_jq '.result=="EXACT_AUTHORIZED_COMPONENT_CONFIRMED_ON_ACTIVE_CHAIN" and
+  .confirmation_or_free_claim_success_claimed==true and
+  .node_result.post_call_state.blocking_quarantined_claims==0 and
+  .node_result.role_after.pos.staking==true' "$FAST/run/phase-b.json"
+assert_eq "$(grep -c 'commit_and_broadcast' "$FAST/state/transport.log")" 1
+
+# If the original claim wins before Phase B, preview emits no spend authority.
+ORIGINAL="$FIX/original"
+prepare_phase_a "$ORIGINAL"
+jq '.confirmed=true|.confirmed_tx="claim"' "$ORIGINAL/state/node30.json" >"$ORIGINAL/state/node30.tmp" && mv "$ORIGINAL/state/node30.tmp" "$ORIGINAL/state/node30.json"
+export FLEET31_FIXTURE="$ORIGINAL/state" FLEET31_SCENARIO=happy
+"$TOOL" phase-b-preview --run-dir "$ORIGINAL/run" >"$ORIGINAL/preview.out"
+assert_jq '.result=="ALREADY_CLEARED_NO_PHASE_B_AUTHORITY" and
+  .clearance.anchor_spent_on_active_chain==true and
+  .clearance.blocking_quarantined_claims==0 and
+  (.required_phase_b_authority|not)' "$ORIGINAL/run/phase-b-preview.json"
+assert_eq "$(grep -c 'commit_and_broadcast' "$ORIGINAL/state/transport.log" || true)" 0
+
+# A spent anchor is not clearance unless exactly one allowlisted component
+# transaction decodes to the exact anchor input on the active chain.
+FOREIGN="$FIX/foreign-spender"
+prepare_phase_a "$FOREIGN"
+jq '.confirmed=true|.confirmed_tx="claim"' "$FOREIGN/state/node30.json" >"$FOREIGN/state/node30.tmp" && mv "$FOREIGN/state/node30.tmp" "$FOREIGN/state/node30.json"
+export FLEET31_FIXTURE="$FOREIGN/state" FLEET31_SCENARIO=wrong-confirmed-spender
+assert_fails 'confirmed claim does not spend exact anchor' "$TOOL" phase-b-preview --run-dir "$FOREIGN/run"
+assert_eq "$(grep -c 'commit_and_broadcast' "$FOREIGN/state/transport.log" || true)" 0
+
+DOUBLE="$FIX/double-spender"
+prepare_phase_a "$DOUBLE"
+jq '.confirmed=true|del(.confirmed_tx)' "$DOUBLE/state/node30.json" >"$DOUBLE/state/node30.tmp" && mv "$DOUBLE/state/node30.tmp" "$DOUBLE/state/node30.json"
+export FLEET31_FIXTURE="$DOUBLE/state" FLEET31_SCENARIO=happy
+assert_fails 'multiple claimed active-chain component spenders' "$TOOL" phase-b-preview --run-dir "$DOUBLE/run"
+assert_eq "$(grep -c 'commit_and_broadcast' "$DOUBLE/state/transport.log" || true)" 0
+
+# Unrecognized post-persistence acknowledgements remain durably inspectable and
+# permanently block a blind second RPC.
+for scenario in structured-invalid-after-persist wrong-ack-hex wrong-ack-generation \
+                wrong-full-counter-type wrong-full-error; do
+    BADACK="$FIX/badack-$scenario"
+    prepare_phase_b "$BADACK"
+    BADACK_SHA=$(shasum -a 256 "$BADACK/b.json"|awk '{print $1}')
+    export FLEET31_FIXTURE="$BADACK/state" FLEET31_SCENARIO="$scenario"
+    assert_fails "$scenario acknowledgement" "$TOOL" phase-b --run-dir "$BADACK/run" --authority "$BADACK/b.json" --authority-sha256 "$BADACK_SHA"
+    assert_jq '.published_before_post_call_reads==true and .rpc_response.durable_state_changed==true' "$BADACK/run/phase-b-ack-node30.json"
+    assert_eq "$(grep -c 'commit_and_broadcast' "$BADACK/state/transport.log")" 1
+    assert_fails "$scenario blind retry" "$TOOL" phase-b --run-dir "$BADACK/run" --authority "$BADACK/b.json" --authority-sha256 "$BADACK_SHA"
+    assert_eq "$(grep -c 'commit_and_broadcast' "$BADACK/state/transport.log")" 1
+done
+
+# Sidecar-bound Phase-A bytes, preview bytes, and the separate authority are a
+# single chain. Re-sealing a modified embedded result cannot preserve it.
+CHAIN="$FIX/chain"
+prepare_phase_b "$CHAIN"
+CHAIN_B_SHA=$(shasum -a 256 "$CHAIN/b.json"|awk '{print $1}')
+jq '.component.fee="0.00019000"' "$CHAIN/run/phase-a-node30.json" >"$CHAIN/run/phase-a-node30.tmp"
+mv "$CHAIN/run/phase-a-node30.tmp" "$CHAIN/run/phase-a-node30.json"
+CHAIN_ROW_SHA=$(shasum -a 256 "$CHAIN/run/phase-a-node30.json"|awk '{print $1}')
+printf '%s  phase-a-node30.json\n' "$CHAIN_ROW_SHA" >"$CHAIN/run/phase-a-node30.json.sha256"
+export FLEET31_FIXTURE="$CHAIN/state" FLEET31_SCENARIO=happy
+assert_fails 'modified Phase-A result chain' "$TOOL" phase-b --run-dir "$CHAIN/run" --authority "$CHAIN/b.json" --authority-sha256 "$CHAIN_B_SHA"
+assert_eq "$(grep -c 'commit_and_broadcast' "$CHAIN/state/transport.log" || true)" 0
+
+# Owner-only canonical receipt directories and unique authority files are
+# enforced on resume before any financial RPC.
+SECURE="$FIX/secure"
+prepare_phase_b "$SECURE"
+SECURE_B_SHA=$(shasum -a 256 "$SECURE/b.json"|awk '{print $1}')
+chmod 0755 "$SECURE/run"
+export FLEET31_FIXTURE="$SECURE/state" FLEET31_SCENARIO=happy
+assert_fails 'group-readable run directory' "$TOOL" phase-b --run-dir "$SECURE/run" --authority "$SECURE/b.json" --authority-sha256 "$SECURE_B_SHA"
+chmod 0700 "$SECURE/run"
+chmod 0644 "$SECURE/locks/rollout"
+assert_fails 'insecure pre-existing mutation lock' "$TOOL" phase-b --run-dir "$SECURE/run" --authority "$SECURE/b.json" --authority-sha256 "$SECURE_B_SHA"
+chmod 0600 "$SECURE/locks/rollout"
+ln "$SECURE/b.json" "$SECURE/b-hardlink.json"
+assert_fails 'hard-linked Phase-B authority' "$TOOL" phase-b --run-dir "$SECURE/run" --authority "$SECURE/b-hardlink.json" --authority-sha256 "$SECURE_B_SHA"
+ln -s "$SECURE/b.json" "$SECURE/b-symlink.json"
+assert_fails 'symlink Phase-B authority' "$TOOL" phase-b --run-dir "$SECURE/run" --authority "$SECURE/b-symlink.json" --authority-sha256 "$SECURE_B_SHA"
+assert_eq "$(grep -c 'commit_and_broadcast' "$SECURE/state/transport.log" || true)" 0
 
 git -C "$ROOT/../../.." diff --check -- contrib/ops/v30.1.4-node30-retained-claim-recovery >/dev/null || fail 'git diff --check failed'
 ok

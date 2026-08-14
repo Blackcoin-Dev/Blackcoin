@@ -1,4 +1,6 @@
 Scope: offline node30 retained-claim two-phase recovery package
+Contract: installed-v30.1.4-node30-retained-claim-recovery/v2
+Receipt/runtime schema: 2
 Live contact: none
 Wallet mutation: none
 Network contact: none
@@ -13,15 +15,28 @@ Phase B action: commit_and_broadcast
 Fee rate: 100 atoms/vB
 Exact fee cap: 0.00019100 BLK
 Transaction shape: one 191-vbyte same-anchor recovery
+Post-sign state: classification=resolution_pending, status=reuse_managed
+Dynamic rebind: component fingerprint only; classification only across the exact current_branch_ineligible -> resolution_pending transition
+Independent fee proof: gettxout(anchor,false) value minus exact signed output; input/output script equality required
+Signed-byte receipt: immutable identity separated from confirmations/blockhash observation
+Durable relay proof: gettransaction metadata string must agree with preview relay_authorized
 Prior read-only receipt SHA256: ca084d6d76fb67532fd65ff8b44943bc3a8c12f589708a11872417223066eec9
 User-order SHA256: 0252ebcc3dc2ca8a20e8b9708738c30f9c32f6b0dea213bb8937467b2dab2dff
 Crash rule: durable intent precedes mutation; unmatched intent is never retried
+Phase-B ACK rule: exact RPC return is durably published before every post-call read
+Phase-B full-ACK rule: exact integer counters, signed_and_persisted=0, one relay grant, one broadcast/already-in-mempool, empty error
+Phase-B partial-persistence rule: durable relay authority and exact nonempty RPC error are preserved pending, never blindly retried
 Phase-B lost-response rule: observation only, never completion authority
-Confirmation rule: active-chain spend plus zero blockers; mempool is insufficient
+Post-intent read rule: mutex-serializing preview precedes durable metadata, anchor, wallet, role, and pause observation
+Receipt crash rule: heal only the exact sole publisher-temp second hard link or a valid owner-only JSON receipt with an absent sidecar; reject every other extra link and every malformed sidecar
+Lock rule: canonical owner-controlled parent; unique owner-only mode-0600 regular file; O_EXCL create; stable device/inode
+Resume rule: revalidate runtime, complete receipt/authority chain, exact unnamed-wallet inventory, PoS, disabled ordinary PoW, and pause artifacts
+Confirmation rule: exactly one allowlisted transaction must decode to the exact anchor input on the active chain with zero blockers; mempool is insufficient
+Fast-confirm rule: accept exact resolution or original-claim confirmation only with unique decoded anchor spend and active block-header evidence
 Free-Claim release: explicitly outside this package
 
-Hostile suite result: PASS: 40 hostile node30 retained-claim recovery assertions
-Hostile suite log: /private/tmp/node30-retained-claim-recovery-full-20260813.out
-Hostile suite log SHA256: 3c86a90644d35cd9241c97df9cdf5603d0322bf1d52170a0daf343d71413f1e7
+Hostile suite result: PASS: 121 hostile node30 retained-claim recovery assertions
+Hostile suite log: /private/tmp/node30-retained-claim-recovery-v2-full-20260814.out
+Hostile suite log SHA256: b82392915535a1a2e914359a327d9cc39b1545f886783c8823f4b765807c6a85
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

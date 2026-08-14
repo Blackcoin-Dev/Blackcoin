@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 """Stateful offline Docker/CLI fixture for node30_recovery.py."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -40,12 +42,15 @@ def save_state(state: dict) -> None:
     tmp.replace(state_path())
 
 
-def component() -> dict:
+def component(status: str | None = None) -> dict:
+    if status is None:
+        status = load_state()["status"]
     fee = "0.00019200" if SCENARIO == "wrong-fee" else "0.00019100"
+    classification = "current_branch_ineligible" if status == "ready" else "resolution_pending"
     return {"anchor": {"txid": h("anchor"), "vout": 0},
             "generation_fingerprint": h("generation"),
-            "component_fingerprint": h("component"),
-            "classification": "current_branch_ineligible",
+            "component_fingerprint": h("component-" + status),
+            "classification": classification,
             "claim_txids": [h("claim")], "descendant_claims": 0,
             "fee": fee, "vsize": 191, "input_amount": "1.24691810",
             "output_amount": "1.24672710", "frontier_may_advance": True,
@@ -55,20 +60,40 @@ def component() -> dict:
 
 
 def action(status: str) -> dict:
-    result = component()
+    result = component(status)
     if status == "ready":
         result.update({"status": "ready", "persisted": False,
                        "relay_authorized": False, "in_mempool": False,
                        "unsigned_template_hash": h("unsigned")})
     else:
         result.update({"status": "reuse_managed", "persisted": True,
-                       "relay_authorized": status == "relayed",
+                       "relay_authorized": status in {"authorized", "relayed"},
                        "in_mempool": status == "relayed",
                        "resolution_txid": h("resolution")})
     return result
 
 
 def preview(options: dict, status: str) -> dict:
+    state = load_state()
+    if state.get("confirmed"):
+        refused = [{**component(status), "classification": "resolved_on_active_chain",
+                    "status": "refused", "persisted": False,
+                    "relay_authorized": False, "in_mempool": False,
+                    "reason_code": "anchor-spent",
+                    "reason": "confirmed anchor is already spent on the active chain"}]
+        return {"action": "preview", "plan_id": h("plan-confirmed"),
+                "plan_reusable": True, "active_tip": TIP, "active_height": HEIGHT,
+                "wallet_generation": 49, "wallet_tip_matches": True,
+                "complete": True, "one_call_finality": False,
+                "frontier_may_advance": True, "contains_revalidating_unbound_proof": True,
+                "max_fee_per_resolution": "0.00019100",
+                "aggregate_batch_fee_cap": "0.00019100", "total_fee": "0.00000000",
+                "actionable_components": 0, "refused_components": 1,
+                "actions": [], "refused": refused, "success": True,
+                "stale_plan": False, "signed_and_persisted": 0,
+                "durable_state_changed": False, "durable_state_ambiguous": False,
+                "relay_authority_granted": 0, "broadcast": 0,
+                "already_in_mempool": 0, "relay_deferred": 0, "error": ""}
     current = action(status)
     if status != "ready" and "fee_rate" in options:
         actions = []
@@ -98,10 +123,25 @@ def preview(options: dict, status: str) -> dict:
 
 
 def decoded_tx() -> dict:
+    script = "76a914" + h("script")[:40] + "88ac"
+    if SCENARIO == "wrong-output-script":
+        script = "76a914" + h("other-script")[:40] + "88ac"
     return {"txid": h("resolution"), "version": 2, "vsize": 191,
             "vin": [{"txid": h("anchor"), "vout": 0, "sequence": 4294967295}],
             "vout": [{"n": 0, "value": "1.24672710",
+                      "scriptPubKey": {"hex": script}}]}
+
+
+def decoded_claim_tx() -> dict:
+    anchor = h("other-anchor") if SCENARIO == "wrong-confirmed-spender" else h("anchor")
+    return {"txid": h("claim"), "version": 2, "vsize": 221,
+            "vin": [{"txid": anchor, "vout": 0, "sequence": 4294967295}],
+            "vout": [{"n": 0, "value": "1.24691810",
                       "scriptPubKey": {"hex": "76a914" + h("script")[:40] + "88ac"}}]}
+
+
+def raw_hex() -> str:
+    return ("02" + h("raw")) * 3
 
 
 def mutation(options: dict, state: dict) -> dict:
@@ -118,7 +158,14 @@ def mutation(options: dict, state: dict) -> dict:
             raise SystemExit(1)
         status, grant, broadcast = "signed_and_persisted", 0, 0
     elif name == "commit_and_broadcast":
-        state["status"] = "relayed"
+        state["status"] = ("authorized" if SCENARIO in {
+            "lost-relay-result", "post-persist-stale", "structured-invalid-after-persist",
+        } else "relayed")
+        if SCENARIO == "fast-confirm-after-ack":
+            state["confirmed"] = True
+            state["confirmed_tx"] = "resolution"
+        if SCENARIO == "post-read-failure":
+            state["fail_post_reads"] = True
         save_state(state)
         if SCENARIO == "lost-relay-result":
             print("fixture lost relay result after durable grant", file=sys.stderr)
@@ -128,7 +175,8 @@ def mutation(options: dict, state: dict) -> dict:
         raise SystemExit(2)
     result_action = action(state["status"])
     result_action["status"] = status
-    return {"action": name, "acknowledged_plan_id": expected,
+    result_action["hex"] = raw_hex()
+    result = {"action": name, "acknowledged_plan_id": expected,
             "acknowledged_active_tip": TIP, "acknowledged_active_height": HEIGHT,
             "acknowledged_wallet_generation": 47 if name == "sign_only" else 48,
             "acknowledged_total_fee": "0.00019100", "plan_consumed": True,
@@ -140,10 +188,41 @@ def mutation(options: dict, state: dict) -> dict:
             "relay_authority_granted": grant, "broadcast": broadcast,
             "already_in_mempool": 0, "relay_deferred": 0, "error": "",
             "relay_complete": name == "commit_and_broadcast"}
+    if name == "commit_and_broadcast" and SCENARIO == "post-persist-stale":
+        result.update({"success": False, "stale_plan": True,
+                       "durable_state_changed": True,
+                       "relay_authority_granted": 1, "broadcast": 0,
+                       "already_in_mempool": 0, "relay_deferred": 0,
+                       "relay_complete": False,
+                       "error": "active tip changed after persistence; signed bytes remain safely stored",
+                       "current_plan": preview({}, state["status"])})
+        result_action["status"] = "reuse_managed"
+        result_action["in_mempool"] = False
+    if name == "commit_and_broadcast" and SCENARIO == "structured-invalid-after-persist":
+        result.update({"success": False, "stale_plan": True,
+                       "durable_state_changed": True,
+                       "relay_authority_granted": 1, "broadcast": 0,
+                       "already_in_mempool": 0, "relay_deferred": 0,
+                       "relay_complete": False, "error": "fixture post-persist failure"})
+        result.pop("current_plan", None)
+        result_action["status"] = "reuse_managed"
+        result_action["in_mempool"] = False
+    if name == "commit_and_broadcast" and SCENARIO == "wrong-ack-hex":
+        result_action["hex"] = "03" + raw_hex()[2:]
+    if name == "commit_and_broadcast" and SCENARIO == "wrong-ack-generation":
+        result["acknowledged_wallet_generation"] = 999
+    if name == "commit_and_broadcast" and SCENARIO == "wrong-full-counter-type":
+        result["broadcast"] = True
+    if name == "commit_and_broadcast" and SCENARIO == "wrong-full-error":
+        result["error"] = "unexpected success error"
+    return result
 
 
 def rpc(method: str, params: list[str]) -> object:
     state = load_state()
+    if SCENARIO == "post-read-failure" and state.get("fail_post_reads"):
+        print("fixture blocks every post-RPC read", file=sys.stderr)
+        raise SystemExit(1)
     if method == "getblockchaininfo":
         return {"chain": "main", "blocks": HEIGHT, "headers": HEIGHT,
                 "bestblockhash": TIP, "chainwork": CHAINWORK,
@@ -153,7 +232,7 @@ def rpc(method: str, params: list[str]) -> object:
     if method == "getconnectioncount":
         return 92
     if method == "listwallets":
-        return [""]
+        return ["wrong"] if SCENARIO == "wrong-wallet-inventory" else [""]
     if method == "getwalletinfo":
         return {"walletname": "", "format": "sqlite", "private_keys_enabled": True,
                 "external_signer": False, "scanning": False,
@@ -171,7 +250,7 @@ def rpc(method: str, params: list[str]) -> object:
                 "indeterminate_quarantined_claims": 0,
                 "claim_recovery_database_outcome_ambiguous": False}
     if method == "getpowclaimrecoveryinfo":
-        detail = component()
+        detail = component(state["status"])
         detail.update({"anchor": {**detail["anchor"], "amount": detail["input_amount"],
                                    "scriptPubKey": "76a914" + h("script")[:40] + "88ac"},
                        "anchor_authenticated": True,
@@ -192,13 +271,24 @@ def rpc(method: str, params: list[str]) -> object:
         if txid not in {h("resolution"), h("claim")}:
             print("unknown fixture txid", file=sys.stderr)
             raise SystemExit(1)
-        confirmations = 3 if state.get("confirmed") else 0
-        return {"txid": txid, "hex": ("02" + h("raw")) * 3,
-                "decoded": decoded_tx() if txid == h("resolution") else {"txid": txid},
+        which = state.get("confirmed_tx")
+        confirmed_here = state.get("confirmed") and (
+            which is None or (which == "resolution" and txid == h("resolution")) or
+            (which == "claim" and txid == h("claim")))
+        confirmations = 3 if confirmed_here else 0
+        return {"txid": txid, "hex": raw_hex(),
+                "decoded": decoded_tx() if txid == h("resolution") else decoded_claim_tx(),
                 "confirmations": confirmations,
+                "qq_shadow_pow_resolution_relay_authorized":
+                    "1" if state["status"] in {"authorized", "relayed"} else "0",
                 **({"blockhash": h("block")} if confirmations else {})}
     if method == "gettxout":
-        return None if state.get("confirmed") else {"confirmations": 100, "value": "1.24691810"}
+        if state.get("confirmed"):
+            return None
+        value = "1.24691910" if SCENARIO == "wrong-anchor-value" else "1.24691810"
+        script = ("76a914" + h("other-script")[:40] + "88ac" if SCENARIO == "wrong-anchor-script"
+                  else "76a914" + h("script")[:40] + "88ac")
+        return {"confirmations": 100, "value": value, "scriptPubKey": {"hex": script}}
     if method == "getblockheader":
         return {"confirmations": 3, "hash": params[0]}
     print(f"unsupported mock RPC {method}", file=sys.stderr)

@@ -1,6 +1,7 @@
 {
-  "schema": 1,
+  "schema": 2,
   "kind": "node30-installed-v30.1.4-runtime-contract",
+  "recovery_contract": "installed-v30.1.4-node30-retained-claim-recovery/v2",
   "source_commit": "13262151077cce3f72d07d17dc7725b2b6a8e1ab",
   "source_tree": "a6f7757c34b70fab841905765462d6769112d049",
   "source_signer_fingerprint": "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70",

@@ -325,7 +325,12 @@ def main() -> None:
         rest = rest[1:]
     if not rest:
         raise SystemExit(2)
-    print(json.dumps(rpc(rest[0], rest[1:]), sort_keys=True, separators=(",", ":")))
+    result = rpc(rest[0], rest[1:])
+    if ((SCENARIO == "empty-spent-gettxout" and rest[0] == "gettxout" and
+         load_state().get("confirmed")) or
+            (SCENARIO == "empty-getnetworkinfo" and rest[0] == "getnetworkinfo")):
+        return
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
 if __name__ == "__main__":

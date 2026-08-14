@@ -61,7 +61,7 @@ SAFE_RECEIPT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # node30 package supplies its own runtime, role, authority and receipt schemas.
 BASE_RELATIVE = pathlib.Path("../v30.1.4-fleet31-recovery/fleet31_recovery.py")
 BASE_SHA256 = "b97f239569be4d9bb8bdb43163c3ef25fa9f7bba276d2ace835d93264e0ff518"
-TEST_TRANSPORT_SHA256 = "bd9672a4518f9834011bbb80db4b28553be7d289bec110c939b314dcce7f91fc"
+TEST_TRANSPORT_SHA256 = "11eba8be3677397f5182990060628326fd7e0fabf6d262198994243b80437877"
 
 
 def _sha256_file(path: pathlib.Path) -> str:
@@ -95,6 +95,36 @@ try:
 except (OSError, RuntimeError) as exc:
     print(f"FATAL: {exc}", file=sys.stderr)
     raise SystemExit(1)
+
+
+class Transport(base.Transport):
+    """Preserve the shared transport contract with one installed-CLI quirk."""
+
+    def rpc(self, node: Any, method: str, *params: Any) -> Any:
+        if method != "gettxout":
+            return super().rpc(node, method, *params)
+        cli_args = ["exec", node.container, self.runtime.cli_path,
+                    f"-datadir={self.runtime.datadir}"]
+        if node.wallet:
+            cli_args.append(f"-rpcwallet={node.wallet}")
+        cli_args.append(method)
+        for param in params:
+            if isinstance(param, (dict, list)):
+                cli_args.append(json.dumps(param, sort_keys=True, separators=(",", ":")))
+            elif isinstance(param, bool):
+                cli_args.append("true" if param else "false")
+            else:
+                cli_args.append(str(param))
+        try:
+            output = self.run(cli_args)
+            # Installed v30.1.4 blackcoin-cli emits no bytes, with exit 0, for
+            # a spent gettxout outpoint. This exception is deliberately exact:
+            # whitespace and every other RPC's empty response remain invalid.
+            if output == "":
+                return None
+            return json.loads(output)
+        except (base.GateError, json.JSONDecodeError) as exc:
+            raise base.RpcError(node.node, method, str(exc)) from exc
 
 
 def _receipt_path(run_dir: pathlib.Path, name: str) -> pathlib.Path:
@@ -860,7 +890,7 @@ def audit_command(args: argparse.Namespace) -> None:
     publish_bytes(run_dir / "runtime-manifest.json",
                   base.owned_secure_file(contract.path, "runtime manifest", contract.sha256))
     pause_before = free_claim_snapshot(contract)
-    transport = base.Transport(contract.runtime)
+    transport = Transport(contract.runtime)
     node = contract.runtime.nodes[0]
     exact_node, runtime_before = pin_node(transport, node)
     role = role_snapshot(transport, exact_node, True)
@@ -931,7 +961,7 @@ def phase_a_command(args: argparse.Namespace) -> None:
     audit, audit_sha = load_audit(run_dir, contract)
     authority, authority_sha = base.parse_secure_json(pathlib.Path(args.authority), "Phase-A authority", args.authority_sha256)
     phase_a_authority(authority, contract, audit_sha)
-    transport = base.Transport(contract.runtime)
+    transport = Transport(contract.runtime)
     node = contract.runtime.nodes[0]
     with mutation_locks(contract) as lock_ids:
         if (run_dir / "phase-a.json").exists():
@@ -1028,7 +1058,7 @@ def reconcile_a_command(args: argparse.Namespace) -> None:
     audit, audit_sha = load_audit(run_dir, contract)
     authority, authority_sha = base.parse_secure_json(pathlib.Path(args.authority), "Phase-A authority", args.authority_sha256)
     phase_a_authority(authority, contract, audit_sha)
-    transport = base.Transport(contract.runtime)
+    transport = Transport(contract.runtime)
     node = contract.runtime.nodes[0]
     with mutation_locks(contract) as lock_ids:
         if (run_dir / "phase-a-node30.json").exists():
@@ -1541,7 +1571,7 @@ def phase_b_preview_command(args: argparse.Namespace) -> None:
     phase_a, phase_a_sha = load_phase_a(run_dir, contract)
     row = phase_a["node_result"]
     pause_before = free_claim_snapshot(contract)
-    transport = base.Transport(contract.runtime)
+    transport = Transport(contract.runtime)
     node = contract.runtime.nodes[0]
     exact_node, runtime_before = pin_node(transport, node)
     anchor = row["component"]["anchor"]
@@ -1617,7 +1647,7 @@ def phase_b_command(args: argparse.Namespace) -> None:
     run_dir = pathlib.Path(args.run_dir)
     base.ensure_secure_dir(run_dir)
     contract, phase_a, phase_a_sha, preview, preview_sha, authority_sha = phase_b_context(run_dir, args)
-    transport = base.Transport(contract.runtime)
+    transport = Transport(contract.runtime)
     node = contract.runtime.nodes[0]
     with mutation_locks(contract) as lock_ids:
         if (run_dir / "phase-b.json").exists():
@@ -1708,7 +1738,7 @@ def reconcile_b_command(args: argparse.Namespace) -> None:
     run_dir = pathlib.Path(args.run_dir)
     base.ensure_secure_dir(run_dir)
     contract, phase_a, phase_a_sha, preview, preview_sha, authority_sha = phase_b_context(run_dir, args)
-    transport = base.Transport(contract.runtime)
+    transport = Transport(contract.runtime)
     node = contract.runtime.nodes[0]
     with mutation_locks(contract) as lock_ids:
         if (run_dir / "phase-b.json").exists():
@@ -1766,7 +1796,7 @@ def monitor_command(args: argparse.Namespace) -> None:
     contract = load_contract(run_dir)
     audit, audit_sha = load_audit(run_dir, contract)
     phase_a, phase_a_sha = load_phase_a(run_dir, contract)
-    transport = base.Transport(contract.runtime)
+    transport = Transport(contract.runtime)
     node = contract.runtime.nodes[0]
     exact_node, runtime_before = pin_node(transport, node)
     role = role_snapshot(transport, exact_node, False)

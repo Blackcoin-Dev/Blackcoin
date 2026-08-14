@@ -18,6 +18,7 @@ Transaction shape: one 191-vbyte same-anchor recovery
 Post-sign state: classification=resolution_pending, status=reuse_managed
 Dynamic rebind: component fingerprint only; classification only across the exact current_branch_ineligible -> resolution_pending transition
 Independent fee proof: gettxout(anchor,false) value minus exact signed output; input/output script equality required
+Installed CLI null rule: exact zero-byte successful stdout maps to None only for gettxout; all other empty/whitespace output remains fatal
 Signed-byte receipt: immutable identity separated from confirmations/blockhash observation
 Durable relay proof: gettransaction metadata string must agree with preview relay_authorized
 Prior read-only receipt SHA256: ca084d6d76fb67532fd65ff8b44943bc3a8c12f589708a11872417223066eec9
@@ -35,8 +36,8 @@ Confirmation rule: exactly one allowlisted transaction must decode to the exact 
 Fast-confirm rule: accept exact resolution or original-claim confirmation only with unique decoded anchor spend and active block-header evidence
 Free-Claim release: explicitly outside this package
 
-Hostile suite result: PASS: 121 hostile node30 retained-claim recovery assertions
-Hostile suite log: /private/tmp/node30-retained-claim-recovery-v2-full-20260814.out
-Hostile suite log SHA256: b82392915535a1a2e914359a327d9cc39b1545f886783c8823f4b765807c6a85
+Hostile suite result: PASS: 125 hostile node30 retained-claim recovery assertions
+Hostile suite log: /private/tmp/node30-retained-claim-recovery-v2-empty-gettxout-20260814.out
+Hostile suite log SHA256: f90f03fef6f46a09da44dead18743a7164996edb5038bd02ca374bd9e2eda283
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

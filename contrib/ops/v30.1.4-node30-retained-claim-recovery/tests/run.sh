@@ -220,6 +220,16 @@ assert_jq '.result=="RETAINED_CLAIM_CLEARED_ROLE_PRESERVED" and
   .ordinary_pow_disabled.enabled==false and .pos.staking==true and
   .free_claim.pause_preserved==true and .pause_marker_removed==false' "$HAPPY/run/$MON_AFTER"
 
+# Installed v30.1.4 returns exit 0 with exactly empty stdout for gettxout on a
+# spent outpoint. Only that exact method/output pair maps to typed null.
+export FLEET31_SCENARIO=empty-spent-gettxout
+"$TOOL" monitor --run-dir "$HAPPY/run" >"$HAPPY/monitor-empty-gettxout.out"
+MON_EMPTY=$(jq -r .receipt "$HAPPY/monitor-empty-gettxout.out")
+assert_jq '.result=="RETAINED_CLAIM_CLEARED_ROLE_PRESERVED" and
+  .anchor_spent_on_active_chain==true and
+  (.confirmed_component_transactions|length)==1' "$HAPPY/run/$MON_EMPTY"
+assert_eq "$(grep -c 'commit_and_broadcast' "$HAPPY/state/transport.log")" 1
+
 # A pause artifact drift fails before Docker/CLI contact.
 DRIFT="$FIX/drift"; mkdir -m 0700 "$DRIFT" "$DRIFT/state"; make_artifacts "$DRIFT"; make_runtime "$DRIFT/runtime.json" "$DRIFT"
 printf '%s\n' changed >"$DRIFT/free-claim/.v30.1.4-free-claim-paused"; chmod 0600 "$DRIFT/free-claim/.v30.1.4-free-claim-paused"
@@ -295,6 +305,16 @@ make_runtime "$BADWALLET/runtime.json" "$BADWALLET"
 export FLEET31_FIXTURE="$BADWALLET/state" FLEET31_SCENARIO=wrong-wallet-inventory
 assert_fails 'wrong loaded-wallet inventory' "$TOOL" audit --runtime-manifest "$BADWALLET/runtime.json" --run-dir "$BADWALLET/run"
 assert_eq "$(grep -c 'sign_only\|commit_and_broadcast' "$BADWALLET/state/transport.log" || true)" 0
+
+# Empty stdout from every RPC other than gettxout remains a fatal transport
+# violation and cannot reach either financial action.
+EMPTYRPC="$FIX/empty-non-gettxout"
+mkdir -m 0700 "$EMPTYRPC" "$EMPTYRPC/state"
+make_artifacts "$EMPTYRPC"
+make_runtime "$EMPTYRPC/runtime.json" "$EMPTYRPC"
+export FLEET31_FIXTURE="$EMPTYRPC/state" FLEET31_SCENARIO=empty-getnetworkinfo
+assert_fails 'empty non-gettxout RPC response' "$TOOL" audit --runtime-manifest "$EMPTYRPC/runtime.json" --run-dir "$EMPTYRPC/run"
+assert_eq "$(grep -c 'sign_only\|commit_and_broadcast' "$EMPTYRPC/state/transport.log" || true)" 0
 
 # A v1 or differently named runtime contract cannot drive the v2 controller.
 OLDMANIFEST="$FIX/oldmanifest"

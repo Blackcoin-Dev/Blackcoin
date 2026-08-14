@@ -82,6 +82,11 @@ separate Phase-B authority template. If the anchor is already spent by an
 authenticated active-chain component transaction, it emits no Phase-B spend
 authority.
 
+Installed v30.1.4 `blackcoin-cli` exits successfully with exactly empty stdout
+when `gettxout` addresses a spent outpoint. The node30 transport maps only that
+exact method and zero-byte output to typed `None`. Whitespace, invalid JSON,
+nonzero exit, and empty output from every other RPC remain fatal.
+
 `phase-b` accepts only a distinct mode-0600 authority bound to the Phase-A and
 Phase-B-preview receipt hashes and the exact signed-transaction identity. It
 writes and fsyncs a no-clobber intent before the only Phase-B mutation:
@@ -148,4 +153,5 @@ ordering, typed full and structured partial post-persistence outcomes, exact
 wallet inventory on resume, lost-response reconciliation ordering, exact-byte
 Phase B, publisher hard-link crash healing, hostile lock paths, unique decoded
 original-claim and resolution confirmation races, complete authority-chain
-tampering, and active-chain clearance.
+tampering, the installed empty-stdout `gettxout` behavior, rejection of empty
+stdout from every other RPC, and active-chain clearance.

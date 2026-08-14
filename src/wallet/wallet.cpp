@@ -10243,6 +10243,17 @@ ShadowPowClaimInputSelectionResult CWallet::SelectShadowPowClaimInput(
             historical_claim_anchors.insert(txin.prevout);
         }
     }
+    if (authoritative_gate.reserved_family_anchors.size() !=
+            authoritative_gate.unresolved_components ||
+        !std::all_of(
+            authoritative_gate.reserved_family_anchors.begin(),
+            authoritative_gate.reserved_family_anchors.end(),
+            [&](const COutPoint& anchor) {
+                return historical_claim_anchors.count(anchor) != 0;
+            })) {
+        error = _("Gold Rush PoW cannot prove that every retained family anchor is reserved; independent claim selection remains disabled.");
+        return ShadowPowClaimInputSelectionResult::NO_ELIGIBLE_INPUT;
+    }
     bool found{false};
     bool fee_exceeded{false};
     bool reimbursable_fee_exceeded{false};
@@ -10252,6 +10263,12 @@ ShadowPowClaimInputSelectionResult CWallet::SelectShadowPowClaimInput(
         // unconfirmed claim change would create a dependent claim chain whose
         // parent can be evicted, replaced, or quarantined before settlement.
         if (output.depth <= 0) continue;
+        if (std::binary_search(
+                authoritative_gate.reserved_family_anchors.begin(),
+                authoritative_gate.reserved_family_anchors.end(),
+                output.outpoint)) {
+            continue;
+        }
         if (historical_claim_anchors.count(output.outpoint) != 0) continue;
         if (proof_binds_input && output.outpoint != proof_bound_outpoint) continue;
         if (output.txout.nValue <= 0) continue;
@@ -11509,6 +11526,10 @@ ShadowPowClaimSubmitResult CWallet::SubmitShadowPowClaim(
                       selected_input, final_mining_gate, selected_coin,
                       error)
                 : final_mining_gate.MayCreateNewAnchorClaim() &&
+                      !std::binary_search(
+                          final_mining_gate.reserved_family_anchors.begin(),
+                          final_mining_gate.reserved_family_anchors.end(),
+                          selected_input.outpoint) &&
                       chainman.ActiveChainstate().CoinsTip().GetCoin(
                           selected_input.outpoint, selected_coin) &&
                       !selected_coin.IsSpent() &&

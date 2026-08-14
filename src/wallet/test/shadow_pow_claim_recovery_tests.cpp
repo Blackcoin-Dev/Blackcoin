@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -653,9 +654,11 @@ BOOST_AUTO_TEST_CASE(
         std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x5a)});
 
     uint64_t nonce{50000};
+    std::set<COutPoint> retained_anchors;
     for (size_t anchor_index : {2U, 3U, 4U}) {
         const CTransactionRef anchor_tx = m_coinbase_txns.at(anchor_index);
         const COutPoint anchor{anchor_tx->GetHash(), 0};
+        retained_anchors.insert(anchor);
         const CAmount anchor_amount = anchor_tx->vout.at(0).nValue;
         const CScript target = CanonicalizeLegacyStakeScript(
             anchor_tx->vout.at(0).scriptPubKey);
@@ -736,7 +739,7 @@ BOOST_AUTO_TEST_CASE(
 
     // A family-local refresh failure is suppressed only for the exact
     // authoritative snapshot. The aggregate selector must then service every
-    // independent refresh family before falling back to a wallet-wide wait.
+    // independent refresh family before falling back to an independent root.
     const ShadowPowClaimMiningGate first_refresh =
         wallet->GetShadowPowClaimMiningGate();
     BOOST_REQUIRE(first_refresh.MayRefreshSameAnchor());
@@ -768,25 +771,138 @@ BOOST_AUTO_TEST_CASE(
     const ShadowPowClaimMiningGate all_refreshes_deferred =
         wallet->DeferShadowPowClaimFamilyForSnapshot(third_refresh);
     BOOST_CHECK(all_refreshes_deferred.action ==
-                ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP);
-    BOOST_CHECK(!all_refreshes_deferred.MayCreateClaim());
+                ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR);
+    BOOST_CHECK(all_refreshes_deferred.MayCreateNewAnchorClaim());
     BOOST_CHECK(all_refreshes_deferred.relay_txid.IsNull());
     BOOST_CHECK_EQUAL(all_refreshes_deferred.unresolved_components, 3U);
     BOOST_CHECK_EQUAL(all_refreshes_deferred.family_claims, 3U);
-    created_payout = true;
-    BOOST_REQUIRE_MESSAGE(
-        wallet->SetPowMining(
-            /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/1,
-            start_error, &created_payout,
-            /*allow_new_payout_key=*/false),
-        start_error.original);
-    BOOST_CHECK(!created_payout);
-    const ShadowPowClaimMiningGate restarted_worker_gate = WITH_LOCK(
-        wallet->m_pow_miner_mutex, return wallet->m_pow_mining_gate);
-    BOOST_CHECK(restarted_worker_gate.action ==
-                ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP);
-    BOOST_CHECK(!restarted_worker_gate.MayCreateClaim());
-    wallet->StopPowMining();
+    BOOST_CHECK(std::set<COutPoint>(
+                    all_refreshes_deferred.reserved_family_anchors.begin(),
+                    all_refreshes_deferred.reserved_family_anchors.end()) ==
+                retained_anchors);
+    BOOST_CHECK(all_refreshes_deferred.anchor.IsNull());
+    BOOST_CHECK(all_refreshes_deferred.generation_fingerprint.IsNull());
+    BOOST_CHECK(all_refreshes_deferred.lineage_root_txid.IsNull());
+
+    // Every deferred/user-locked safe family keeps its exact anchor, but an
+    // unrelated confirmed coin remains selectable for one bounded new root.
+    const CTransactionRef independent_tx = m_coinbase_txns.at(10);
+    const COutPoint independent_anchor{independent_tx->GetHash(), 0};
+    BOOST_REQUIRE(retained_anchors.count(independent_anchor) == 0);
+    const int independent_depth = WITH_LOCK(
+        wallet->cs_wallet,
+        return wallet->GetTxDepthInMainChain(
+            wallet->mapWallet.at(independent_tx->GetHash())));
+    BOOST_REQUIRE_GT(independent_depth, 0);
+    CCoinControl independent_control;
+    independent_control.m_allow_other_inputs = false;
+    independent_control.m_avoid_address_reuse = false;
+    independent_control.m_min_depth = independent_depth;
+    independent_control.m_max_depth = independent_depth;
+    ShadowPowClaimInput independent_selection;
+    bilingual_str independent_error;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_CHECK(wallet->SelectShadowPowClaimInput(
+                        CanonicalizeLegacyStakeScript(
+                            independent_tx->vout.at(0).scriptPubKey),
+                        payout, nullptr, independent_control,
+                        independent_selection, independent_error,
+                        &all_refreshes_deferred) ==
+                    ShadowPowClaimInputSelectionResult::SELECTED);
+    }
+    BOOST_CHECK(independent_selection.outpoint == independent_anchor);
+    BOOST_CHECK(retained_anchors.count(independent_selection.outpoint) == 0);
+    for (const COutPoint& retained_anchor : retained_anchors) {
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet,
+                              return wallet->IsSpent(retained_anchor)));
+    }
+
+    // Selector-side enforcement is independent of the aggregate builder. A
+    // truncated or forged reservation snapshot never authorizes even the
+    // otherwise-valid independent coin.
+    const auto assert_reservation_snapshot_rejected =
+        [&](ShadowPowClaimMiningGate invalid_gate) {
+            ShadowPowClaimInput rejected_selection;
+            bilingual_str rejected_error;
+            LOCK2(::cs_main, wallet->cs_wallet);
+            BOOST_CHECK(
+                wallet->SelectShadowPowClaimInput(
+                    CanonicalizeLegacyStakeScript(
+                        independent_tx->vout.at(0).scriptPubKey),
+                    payout, nullptr, independent_control,
+                    rejected_selection, rejected_error, &invalid_gate) ==
+                ShadowPowClaimInputSelectionResult::NO_ELIGIBLE_INPUT);
+        };
+    ShadowPowClaimMiningGate truncated_reservations =
+        all_refreshes_deferred;
+    truncated_reservations.reserved_family_anchors.pop_back();
+    assert_reservation_snapshot_rejected(truncated_reservations);
+    ShadowPowClaimMiningGate forged_reservations =
+        all_refreshes_deferred;
+    forged_reservations.reserved_family_anchors.back() =
+        independent_anchor;
+    std::sort(forged_reservations.reserved_family_anchors.begin(),
+              forged_reservations.reserved_family_anchors.end());
+    assert_reservation_snapshot_rejected(forged_reservations);
+
+    // A live family still owns the wallet-wide single-flight barrier. Other
+    // independently safe but user-deferred families cannot authorize another
+    // fee claim until that live member leaves the mempool.
+    ShadowPowClaimRecoveryInventory live_and_deferred = inventory;
+    live_and_deferred.components.front().nodes.front().in_mempool = true;
+    for (size_t index = 1; index < live_and_deferred.components.size();
+         ++index) {
+        live_and_deferred.components[index].anchor_user_locked = true;
+    }
+    const ShadowPowClaimMiningGate live_barrier =
+        BuildShadowPowClaimMiningGate(live_and_deferred);
+    BOOST_CHECK(live_barrier.action ==
+                ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE);
+    BOOST_CHECK(!live_barrier.MayCreateClaim());
+    BOOST_CHECK_EQUAL(live_barrier.reserved_family_anchors.size(), 3U);
+
+    ShadowPowClaimRecoveryInventory all_user_deferred = inventory;
+    for (auto& component : all_user_deferred.components) {
+        component.anchor_user_locked = true;
+    }
+    const ShadowPowClaimMiningGate user_deferred_fallback =
+        BuildShadowPowClaimMiningGate(all_user_deferred);
+    BOOST_CHECK(user_deferred_fallback.MayCreateNewAnchorClaim());
+    BOOST_CHECK_EQUAL(
+        user_deferred_fallback.reserved_family_anchors.size(), 3U);
+
+    // Duplicate aggregate identity is not independence. Even individually
+    // safe components fail closed if they claim one anchor, generation, or
+    // lineage root.
+    const auto assert_duplicate_identity_unsafe =
+        [&](const auto& mutate) {
+            ShadowPowClaimRecoveryInventory duplicate = inventory;
+            mutate(duplicate.components.at(1),
+                   duplicate.components.at(0));
+            const ShadowPowClaimMiningGate duplicate_gate =
+                BuildShadowPowClaimMiningGate(duplicate);
+            BOOST_CHECK(duplicate_gate.action ==
+                        ShadowPowClaimMiningGateAction::UNSAFE);
+            BOOST_CHECK(duplicate_gate.HasUnsafeClaims());
+            BOOST_CHECK(!duplicate_gate.MayCreateClaim());
+        };
+    assert_duplicate_identity_unsafe(
+        [](auto& duplicate, const auto& first) {
+            duplicate.anchor = first.anchor;
+        });
+    assert_duplicate_identity_unsafe(
+        [](auto& duplicate, const auto& first) {
+            duplicate.generation_fingerprint =
+                first.generation_fingerprint;
+        });
+    assert_duplicate_identity_unsafe(
+        [](auto& duplicate, const auto& first) {
+            duplicate.nodes.front().txid = first.nodes.front().txid;
+            duplicate.claim_txids.front() = first.claim_txids.front();
+            duplicate.root_claim_txids.front() =
+                first.root_claim_txids.front();
+        });
 
     // Model one live family, one relayable family, and one family ready for a
     // same-anchor continuation. These are ordinary upgrade states that older
@@ -822,6 +938,11 @@ BOOST_AUTO_TEST_CASE(
                 relay_first_gate.lineage_root_txid);
     BOOST_CHECK(reordered_relay_gate.lineage_head_txid ==
                 relay_first_gate.lineage_head_txid);
+    BOOST_CHECK(reordered_relay_gate.reserved_family_anchors ==
+                relay_first_gate.reserved_family_anchors);
+    BOOST_CHECK(std::is_sorted(
+        reordered_relay_gate.reserved_family_anchors.begin(),
+        reordered_relay_gate.reserved_family_anchors.end()));
 
     const auto find_component =
         [&](const COutPoint& anchor)
@@ -927,6 +1048,7 @@ BOOST_AUTO_TEST_CASE(
     BOOST_CHECK(unsafe_gate.lineage_root_txid.IsNull());
     BOOST_CHECK(unsafe_gate.lineage_head_txid.IsNull());
     BOOST_CHECK(unsafe_gate.relay_txid.IsNull());
+    BOOST_CHECK(unsafe_gate.reserved_family_anchors.empty());
 }
 
 BOOST_AUTO_TEST_CASE(mining_gate_has_no_wallet_history_cap_for_same_anchor_lineage)
@@ -1115,11 +1237,12 @@ BOOST_FIXTURE_TEST_CASE(
         wait_wallet->DeferShadowPowClaimFamilyForSnapshot(
             wait_second);
     BOOST_CHECK(all_deferred.action ==
-                ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP);
+                ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR);
     BOOST_CHECK(all_deferred.relay_txid.IsNull());
-    BOOST_CHECK(!all_deferred.MayCreateClaim());
+    BOOST_CHECK(all_deferred.MayCreateNewAnchorClaim());
+    BOOST_CHECK_EQUAL(all_deferred.reserved_family_anchors.size(), 2U);
     BOOST_CHECK(wait_wallet->GetShadowPowClaimMiningGate().action ==
-                ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP);
+                ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR);
     const int64_t all_deferred_expiry = std::max(
         wait_first.relay_expiry_time, wait_second.relay_expiry_time);
     BOOST_REQUIRE_GT(all_deferred_expiry, 0);

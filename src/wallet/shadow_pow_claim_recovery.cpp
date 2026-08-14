@@ -1584,9 +1584,9 @@ int ShadowPowClaimMiningActionPriority(
         return 0;
     case ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR:
         return 1;
-    case ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP:
-        return 2;
     case ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE:
+        return 2;
+    case ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP:
         return 3;
     default:
         return 4;
@@ -1658,6 +1658,8 @@ bool ShadowPowClaimMiningGateSnapshotMatches(
            expected.family_claims == current.family_claims &&
            expected.unsafe_claims == current.unsafe_claims &&
            expected.unsafe_components == current.unsafe_components &&
+           expected.reserved_family_anchors ==
+               current.reserved_family_anchors &&
            expected.anchor == current.anchor &&
            expected.anchor_amount == current.anchor_amount &&
            expected.target == current.target &&
@@ -1719,6 +1721,9 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
     if (!gate.coherent || gate.recovery_database_ambiguous) return gate;
 
     std::optional<ShadowPowClaimMiningGate> selected;
+    std::set<COutPoint> family_anchors;
+    std::set<uint256> family_generations;
+    std::set<uint256> family_roots;
     for (const ShadowPowClaimRecoveryComponent& component :
          inventory.components) {
         if (component.state ==
@@ -1742,18 +1747,64 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
         if (family.action == ShadowPowClaimMiningGateAction::UNSAFE) {
             continue;
         }
+        const bool unique_anchor =
+            family_anchors.insert(family.anchor).second;
+        const bool unique_generation =
+            family_generations.insert(
+                family.generation_fingerprint).second;
+        const bool unique_root =
+            family_roots.insert(family.lineage_root_txid).second;
+        const bool unique_identity =
+            unique_anchor && unique_generation && unique_root;
+        if (!unique_identity) {
+            // Two components claiming one authenticated anchor, generation,
+            // or lineage root cannot be proven independent. Do not derive a
+            // partial-family action from ambiguous aggregate identity.
+            ++gate.unsafe_components;
+            gate.unsafe_claims += family.family_claims;
+            continue;
+        }
+        gate.reserved_family_anchors.push_back(family.anchor);
         if (!selected ||
             PreferShadowPowClaimMiningFamily(family, *selected)) {
             selected = std::move(family);
         }
     }
-    if (gate.unsafe_components != 0) return gate;
+    if (gate.unsafe_components != 0) {
+        // A globally closed gate exposes no partial reservation set as if it
+        // were an actionable independence proof.
+        gate.reserved_family_anchors.clear();
+        return gate;
+    }
+    std::sort(gate.reserved_family_anchors.begin(),
+              gate.reserved_family_anchors.end());
+    if (gate.reserved_family_anchors.size() !=
+        gate.unresolved_components) {
+        // Every mining-relevant unresolved component must have contributed
+        // one unique safe family before any wallet action is authorized.
+        gate.action = ShadowPowClaimMiningGateAction::UNSAFE;
+        ++gate.unsafe_components;
+        gate.reserved_family_anchors.clear();
+        return gate;
+    }
     if (gate.unresolved_components == 0) {
         gate.action =
             ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR;
         return gate;
     }
     if (selected) {
+        if (selected->action ==
+            ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP) {
+            // RELAY_EXISTING and REFRESH_SAME_ANCHOR outrank this branch, and
+            // WAIT_FOR_LIVE now outranks it as the wallet-wide single-flight
+            // barrier. Reaching here proves that every safe retained family
+            // is unserviceable for this exact snapshot. Keep every family
+            // anchor reserved, but allow one independently selected fee coin
+            // to make forward progress.
+            gate.action =
+                ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR;
+            return gate;
+        }
         CopyShadowPowClaimMiningFamilySelection(gate, *selected);
     }
     return gate;
@@ -1834,6 +1885,8 @@ ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
         cached_gate.family_claims != fresh_gate.family_claims ||
         cached_gate.unsafe_claims != fresh_gate.unsafe_claims ||
         cached_gate.unsafe_components != fresh_gate.unsafe_components ||
+        cached_gate.reserved_family_anchors !=
+            fresh_gate.reserved_family_anchors ||
         cached_gate.anchor != fresh_gate.anchor ||
         cached_gate.anchor_amount != fresh_gate.anchor_amount ||
         cached_gate.target != fresh_gate.target ||

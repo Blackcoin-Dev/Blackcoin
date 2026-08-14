@@ -29,9 +29,13 @@ wallet secret, or executable financial authority is checked in.
 - the canonical root-owned, manifest-group-owned Free-Claim root at mode 0750,
   ingress queue at mode 0770, and done directory at mode 0750; the queue's
   group-write bit is the intentional API ingress contract, while every other
-  mode, group, special bit, symlink, or substituted inode is rejected; the
-  manifest root's parent chain must remain owner-root and neither group- nor
-  other-writable;
+  mode, group, special bit, symlink, or substituted inode is rejected;
+- the exact canonical Unraid storage ancestry: `/mnt/pulsar` and
+  `/mnt/pulsar/Blackcoin_Blocks` must remain uid 99, gid 100, mode 0777, while
+  the protected boundary at `/mnt/pulsar/Blackcoin_Blocks/operations` must
+  remain root:root, mode 0700; every prefix, share, protected-root, pool-root,
+  queue, and done device/inode identity is bound without changing the
+  intentional user-share permissions;
 - exactly one canonical queue JSON, no broadcast marker, and a queued payout
   absent from the awarded ledger;
 - a valid direct witness-v16 quantum payout script;
@@ -101,6 +105,11 @@ the publisher's exact same-inode temporary hard link can remove only that sole
 recognized second link. Symlinks, an unrecognized hard link, unsafe modes,
 non-owner files, malformed JSON, mismatched sidecars, and path escapes fail
 closed.
+
+Every receipt also records the complete Free-Claim storage ancestry and its
+digest. The separate authority binds that digest. Audit, execute, reconcile,
+and monitor reject a different share, protected-root, or device/inode identity
+even when the textual path is unchanged.
 
 The state transitions are restart-safe:
 
@@ -209,6 +218,9 @@ lock, exact directory identity/mode/group, and controller-runtime gates;
 the exact Unraid uid-99/gid-100/mode-0777 share ancestry, root-owned
 mode-0700 protected controller subtree, stable device/inode binding, and
 share/protected mode, group, special-bit, symlink, and path-swap hostiles;
+the exact uid-99/gid-100/mode-0777 Pulsar share ancestry, root-owned
+mode-0700 protected `operations` root, stable device/inode binding, and
+storage-share mode, group, symlink, and path-swap hostiles;
 independent signed-byte fee proof; immediate acknowledgment
 ordering; response corruption and overprecision; process death before and
 after wallet persistence and after response publication; no-retry

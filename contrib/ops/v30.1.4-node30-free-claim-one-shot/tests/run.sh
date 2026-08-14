@@ -195,6 +195,17 @@ for n in t.body:
 print(f"{values['PRODUCTION_PYTHON_SHA256']}:{values['PRODUCTION_PYTHON_SIZE']}")
 PY
 )" '202c17d1671602a4ef1d43e9b2fdbef0769443f37bf5e51f6b603e0b2c27d9d8:30846632'
+assert_eq "$(FLEET31_TEST_TRANSPORT="$MOCK" python3 - "$TOOL" <<'PY'
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location('node30_one_shot_storage_constants',sys.argv[1])
+mod=importlib.util.module_from_spec(spec)
+sys.modules[spec.name]=mod
+spec.loader.exec_module(mod)
+shares=','.join(f'{path}:{uid}:{gid}:{mode:04o}'
+                for path,uid,gid,mode in mod.PULSAR_SHARE_DIRECTORIES)
+print(f'{mod.PRODUCTION_STORAGE_PROTECTED_ROOT}|{shares}')
+PY
+)" '/mnt/pulsar/Blackcoin_Blocks/operations|/mnt/pulsar:99:100:0777,/mnt/pulsar/Blackcoin_Blocks:99:100:0777'
 
 # The controller boundary intentionally crosses two exact Unraid user-share
 # ancestors before entering a root-owned 0700 protected subtree. Exercise the
@@ -236,6 +247,39 @@ REBOUND_ID=$(controller_dir_identity "$CTRL/appdata/protected" "$CTRL_UID" \
 assert_fails 'controller protected subtree inode substitution is detectable' \
   controller_identities_stable "$PROTECTED_ID" "$REBOUND_ID"
 
+# The Free-Claim state has its own exact Unraid share boundary before the
+# root-owned protected operations directory. Prove the accepted shape and
+# reject identity, mode, symlink, and inode changes through the same primitive.
+PULSAR="$FIX/pulsar-shape"
+mkdir -m 0777 "$PULSAR" "$PULSAR/Blackcoin_Blocks"
+mkdir -m 0700 "$PULSAR/Blackcoin_Blocks/operations"
+PULSAR_SHARE=$(controller_dir_identity "$PULSAR/Blackcoin_Blocks" \
+  "$CTRL_UID" "$CTRL_GID" 0777)
+assert_eq "$(jq -r .mode <<<"$PULSAR_SHARE")" 0777
+PULSAR_OPS_NLINK=$(stat -f %l "$PULSAR/Blackcoin_Blocks/operations")
+PULSAR_OPS=$(controller_dir_identity "$PULSAR/Blackcoin_Blocks/operations" \
+  "$CTRL_UID" "$CTRL_GID" 0700 "$PULSAR_OPS_NLINK")
+assert_eq "$(jq -r .mode <<<"$PULSAR_OPS")" 0700
+assert_fails 'Pulsar share rejects the wrong gid' controller_dir_identity \
+  "$PULSAR/Blackcoin_Blocks" "$CTRL_UID" "$((CTRL_GID + 1))" 0777
+chmod 0775 "$PULSAR/Blackcoin_Blocks"
+assert_fails 'Pulsar share rejects unexpected mode drift' controller_dir_identity \
+  "$PULSAR/Blackcoin_Blocks" "$CTRL_UID" "$CTRL_GID" 0777
+chmod 0777 "$PULSAR/Blackcoin_Blocks"
+mv "$PULSAR/Blackcoin_Blocks/operations" "$PULSAR/Blackcoin_Blocks/operations.real"
+ln -s "$PULSAR/Blackcoin_Blocks/operations.real" \
+  "$PULSAR/Blackcoin_Blocks/operations"
+assert_fails 'protected operations root rejects a symlink' controller_dir_identity \
+  "$PULSAR/Blackcoin_Blocks/operations" "$CTRL_UID" "$CTRL_GID" 0700 \
+  "$PULSAR_OPS_NLINK"
+unlink "$PULSAR/Blackcoin_Blocks/operations"
+mkdir -m 0700 "$PULSAR/Blackcoin_Blocks/operations"
+PULSAR_REBOUND_NLINK=$(stat -f %l "$PULSAR/Blackcoin_Blocks/operations")
+PULSAR_REBOUND=$(controller_dir_identity "$PULSAR/Blackcoin_Blocks/operations" \
+  "$CTRL_UID" "$CTRL_GID" 0700 "$PULSAR_REBOUND_NLINK")
+assert_fails 'protected operations root inode substitution is detectable' \
+  controller_identities_stable "$PULSAR_OPS" "$PULSAR_REBOUND"
+
 HAPPY=$(make_fixture happy)
 AUDIT_SHA=$(run_audit "$HAPPY")
 assert_jq '.result=="READY_FOR_SEPARATE_ONE_SHOT_AUTHORITY" and
@@ -247,6 +291,9 @@ assert_jq '.result=="READY_FOR_SEPARATE_ONE_SHOT_AUTHORITY" and
   .controller_runtime.contract=="hash-pinned-offline-test-controller/v1" and
   (.controller_runtime_sha256|test("^[0-9a-f]{64}$")) and
   .required_authority.controller_runtime_sha256==.controller_runtime_sha256 and
+  .free_claim_storage.contract=="offline-fixture-free-claim-storage/v1" and
+  (.free_claim_storage_sha256|test("^[0-9a-f]{64}$")) and
+  .required_authority.free_claim_storage_sha256==.free_claim_storage_sha256 and
   .required_authority.proof_override==null and .required_authority.maximum_fee_blk=="0.00028700"' \
   "$HAPPY/run/audit.json"
 assert_eq "$(grep -c sendshadowpowclaim "$HAPPY/state/transport.log" || true)" 0
@@ -500,6 +547,7 @@ for filter in \
   '.queue_item_sha256=("0"*64)' \
   '.tool_sha256=("0"*64)' \
   '.controller_runtime_sha256=("0"*64)' \
+  '.free_claim_storage_sha256=("0"*64)' \
   '.extra=true'; do
     jq "$filter" "$AUTH/authority.json" >"$AUTH/bad-authority.json"
     chmod 0600 "$AUTH/bad-authority.json"

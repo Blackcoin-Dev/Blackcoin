@@ -43,6 +43,12 @@ USER_ORDERS = [
     "you need to expedite POW and POS mining online for all nodes NOW. remove safeguards if necessary we must start mining/staking ASAP on my order",
 ]
 PRODUCTION_ROOT = pathlib.Path("/mnt/pulsar/Blackcoin_Blocks/operations/free-claim-pool")
+PRODUCTION_STORAGE_PROTECTED_ROOT = pathlib.Path(
+    "/mnt/pulsar/Blackcoin_Blocks/operations")
+PULSAR_SHARE_DIRECTORIES = [
+    (pathlib.Path("/mnt/pulsar"), 99, 100, 0o777),
+    (pathlib.Path("/mnt/pulsar/Blackcoin_Blocks"), 99, 100, 0o777),
+]
 PRODUCTION_PYTHON = pathlib.Path(
     "/mnt/user/appdata/projectblackcoin-ops-runtime/"
     "cpython-3.12.13-20260510/python/bin/python3.12")
@@ -311,6 +317,7 @@ class Contract:
     done_dir: pathlib.Path
     awarded_file: pathlib.Path
     pool_group_gid: int
+    storage_identity: dict[str, Any]
 
 
 def secure_dir(path: pathlib.Path, label: str, expected_mode: int,
@@ -329,20 +336,49 @@ def secure_dir(path: pathlib.Path, label: str, expected_mode: int,
     return st
 
 
-def secure_parent_chain(path: pathlib.Path, label: str) -> None:
-    """Prove the manifest anchor's canonical root-controlled parent chain."""
-    expected_uid = os.geteuid() if test_mode() else 0
-    stop = path if test_mode() else pathlib.Path("/")
-    current = path
-    while True:
-        st = current.lstat()
-        if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or
-                current.resolve(strict=True) != current or st.st_uid != expected_uid or
-                st.st_mode & 0o022):
-            die(f"{label} parent chain is not canonical and root-controlled: {current}")
-        if current == stop:
-            break
-        current = current.parent
+def validate_free_claim_storage(root: pathlib.Path) -> dict[str, Any]:
+    """Bind the exact Unraid share ancestry and protected operations root."""
+    if test_mode():
+        anchor = exact_directory_identity(
+            root.parent, "offline Free-Claim fixture anchor", os.geteuid(), os.getegid(), 0o700)
+        # Stateful fixtures add owner-only child directories to their private
+        # anchor; bind its path/device/inode/owner/mode, not that test-only
+        # directory link count. Production identities retain their live nlink.
+        del anchor["nlink"]
+        return {"contract": "offline-fixture-free-claim-storage/v1",
+                "fixture_anchor": anchor}
+    if root != PRODUCTION_ROOT or root.parent != PRODUCTION_STORAGE_PROTECTED_ROOT:
+        die("live Free-Claim root is outside the exact protected operations subtree")
+    safe_before = [safe_prefix_identity(path, f"Free-Claim storage prefix {path}")
+                   for path in [pathlib.Path("/"), pathlib.Path("/mnt")]]
+    share_before = [exact_directory_identity(
+        path, f"Pulsar share {path}", uid, gid, mode)
+        for path, uid, gid, mode in PULSAR_SHARE_DIRECTORIES]
+    protected_before = [exact_directory_identity(
+        PRODUCTION_STORAGE_PROTECTED_ROOT, "protected Free-Claim operations root",
+        0, 0, 0o700)]
+    safe_after = [safe_prefix_identity(path, f"Free-Claim storage prefix {path}")
+                  for path in [pathlib.Path("/"), pathlib.Path("/mnt")]]
+    share_after = [exact_directory_identity(
+        path, f"Pulsar share {path}", uid, gid, mode)
+        for path, uid, gid, mode in PULSAR_SHARE_DIRECTORIES]
+    protected_after = [exact_directory_identity(
+        PRODUCTION_STORAGE_PROTECTED_ROOT, "protected Free-Claim operations root",
+        0, 0, 0o700)]
+    stable_directory_identities(safe_before, safe_after, "Free-Claim storage prefix")
+    stable_directory_identities(share_before, share_after, "Pulsar share")
+    stable_directory_identities(protected_before, protected_after,
+                                "protected Free-Claim operations root")
+    return {"contract": "unraid-protected-free-claim-storage/v1",
+            "safe_prefix": safe_after, "pulsar_share_ancestry": share_after,
+            "protected_operations_root": protected_after[0]}
+
+
+def current_free_claim_storage(contract: Contract) -> dict[str, Any]:
+    current = validate_free_claim_storage(contract.root)
+    if current != contract.storage_identity:
+        die("Free-Claim storage ancestry changed after manifest validation")
+    return current
 
 
 def secure_state_file(path: pathlib.Path, label: str, modes: set[int]) -> tuple[bytes, os.stat_result]:
@@ -385,8 +421,9 @@ def validate_manifest(path: pathlib.Path, expected_hash: str | None = None) -> C
         die("runtime manifest Free-Claim state paths are not exact children")
     if not test_mode() and root != PRODUCTION_ROOT:
         die("live Free-Claim root differs from the reviewed production path")
+    storage_identity = validate_free_claim_storage(root)
     return Contract(raw, retained.sha256, path, retained, root, queue_dir, done_dir,
-                    awarded_file, gid)
+                    awarded_file, gid, storage_identity)
 
 
 def tool_sha() -> str:
@@ -394,6 +431,7 @@ def tool_sha() -> str:
 
 
 def base_receipt(kind: str, contract: Contract) -> dict[str, Any]:
+    storage = current_free_claim_storage(contract)
     return {
         "schema": RECEIPT_SCHEMA,
         "contract": CONTRACT,
@@ -402,6 +440,8 @@ def base_receipt(kind: str, contract: Contract) -> dict[str, Any]:
         "node30_primitive_sha256": NODE30_PRIMITIVE_SHA256,
         "controller_runtime_sha256": sha256_json(controller_runtime_identity()),
         "controller_runtime": controller_runtime_identity(),
+        "free_claim_storage_sha256": sha256_json(storage),
+        "free_claim_storage": storage,
         "runtime_manifest_sha256": contract.sha256,
         "installed_source": {"commit": SOURCE_COMMIT, "tree": SOURCE_TREE,
                              "signer_fingerprint": SOURCE_SIGNER},
@@ -494,7 +534,7 @@ def queue_file_snapshot(path: pathlib.Path, contract: Contract, label: str,
 
 
 def audit_queue(contract: Contract) -> dict[str, Any]:
-    secure_parent_chain(contract.root.parent, "Free-Claim root")
+    storage_before = current_free_claim_storage(contract)
     root_st = secure_dir(contract.root, "Free-Claim root", 0o750,
                          contract.pool_group_gid)
     queue_st = secure_dir(contract.queue_dir, "Free-Claim queue", 0o770,
@@ -530,6 +570,8 @@ def audit_queue(contract: Contract) -> dict[str, Any]:
         current = secure_dir(path, label, mode, contract.pool_group_gid)
         if (current.st_dev != prior.st_dev or current.st_ino != prior.st_ino):
             die(f"{label} changed while its state was audited")
+    if current_free_claim_storage(contract) != storage_before:
+        die("Free-Claim storage ancestry changed while its state was audited")
     return {"root": {"path": str(contract.root), "device": root_st.st_dev,
                      "inode": root_st.st_ino, "uid": root_st.st_uid,
                      "gid": root_st.st_gid, "mode": "0750"},
@@ -733,6 +775,7 @@ def audit_command(args: argparse.Namespace) -> None:
         "tool_sha256": tool_sha(),
         "node30_primitive_sha256": NODE30_PRIMITIVE_SHA256,
         "controller_runtime_sha256": sha256_json(controller_runtime_identity()),
+        "free_claim_storage_sha256": sha256_json(current_free_claim_storage(contract)),
         "queue_item_sha256": snapshot["queue"]["item"]["sha256"],
         "queue_item_basename": snapshot["queue"]["item"]["basename"],
         "quantum_address": snapshot["payout"]["address"],
@@ -783,6 +826,7 @@ def validate_authority(authority: Any, contract: Contract, audit: dict[str, Any]
         "runtime_manifest_sha256": contract.sha256, "tool_sha256": tool_sha(),
         "node30_primitive_sha256": NODE30_PRIMITIVE_SHA256,
         "controller_runtime_sha256": sha256_json(controller_runtime_identity()),
+        "free_claim_storage_sha256": sha256_json(current_free_claim_storage(contract)),
         "queue_item_sha256": snapshot["queue"]["item"]["sha256"],
         "queue_item_basename": snapshot["queue"]["item"]["basename"],
         "quantum_address": snapshot["payout"]["address"],

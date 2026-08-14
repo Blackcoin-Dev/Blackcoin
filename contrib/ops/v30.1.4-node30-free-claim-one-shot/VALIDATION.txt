@@ -16,7 +16,13 @@ Free-Claim pause: exact marker/wrapper/worker hashes required and preserved
 Recurring worker: never invoked or enabled
 Free-Claim directory owner/group: live uid 0 and exact manifest pool_group_gid=100
 Free-Claim directory modes: root 0750; ingress queue 0770; done 0750
-Directory security: canonical nonsymlink exact modes/gid/inodes; parent chain not group/other writable; special bits and path substitution rejected
+Directory security: canonical nonsymlink exact modes/gid/inodes; special bits and path substitution rejected
+Free-Claim safe prefixes: / and /mnt canonical root-owned, not group/other writable
+Free-Claim Pulsar share ancestry: /mnt/pulsar and /mnt/pulsar/Blackcoin_Blocks exact uid99:gid100 mode0777
+Free-Claim protected boundary: /mnt/pulsar/Blackcoin_Blocks/operations exact root:root mode0700
+Free-Claim storage binding: prefix/share/protected/pool/queue/done device+inode identities captured in receipts and authority-bound by digest
+Free-Claim storage stability: path identities rechecked before receipt publication and on every resume
+Free-Claim storage policy: exact live user-share ancestry accepted; no chmod/chown proposed
 Queue prerequisite: exactly one canonical queued JSON; zero broadcast markers
 Payout prerequisite: exact direct witness-v16 script, not already awarded
 Work prerequisite: exact active unbound PoW-mode QQP2 for the queued payout
@@ -58,11 +64,11 @@ Installed API limitation: no plan/idempotency token, exact-input selector, calle
 Live financial authority in repository: false
 Deployable public-release authority: false
 
-Hostile suite result: PASS: 175 hostile node30 Free-Claim one-shot assertions
-Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-unraid-controller-boundary-20260814.out
-Hostile suite log SHA256: e5300e4a2385565a79bcb39facf001f4dc98c499f2ae406f4ff54e02e6aab682
-Tool SHA256: c4c36be5d5d5419ccf37130497a0e9303694737bd382d5bb81bae11c551a6b31
+Hostile suite result: PASS: 183 hostile node30 Free-Claim one-shot assertions
+Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-pulsar-storage-boundary-20260814.out
+Hostile suite log SHA256: 901cfa274b7dcd41d20be02f8059fe2c489a536b989413540b7ab9040cc5dc6c
+Tool SHA256: 68c2fc3e7b7c21fa94d0404c1253ecb2d180fd0fa3746e4171eef67d2a880d7d
 Test transport SHA256: c1987a9646d5a9f375f7e982f59ef9c29b1f1434d4990c4005ab9e9454bebc9e
-Test driver SHA256: 47f930fae7d8a9f60d7014632ee6bd1172ce1d7a77078655d9eeca15bfc7e8e1
+Test driver SHA256: ecf528fcc2a03b53b39852486be35cbde151631b30e6d0a84d1fcb67eea8f63a
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

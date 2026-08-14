@@ -862,6 +862,19 @@ BOOST_AUTO_TEST_CASE(
     BOOST_CHECK(!live_barrier.MayCreateClaim());
     BOOST_CHECK_EQUAL(live_barrier.reserved_family_anchors.size(), 3U);
 
+    // A user lock on the same anchor must not demote a live family to the
+    // deferred fallback. This state is reachable when a retained absent
+    // claim's anchor is locked and the exact claim later enters the mempool.
+    ShadowPowClaimRecoveryInventory locked_live = live_and_deferred;
+    locked_live.components.front().anchor_user_locked = true;
+    const ShadowPowClaimMiningGate locked_live_barrier =
+        BuildShadowPowClaimMiningGate(locked_live);
+    BOOST_CHECK(locked_live_barrier.action ==
+                ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE);
+    BOOST_CHECK(!locked_live_barrier.MayCreateClaim());
+    BOOST_CHECK_EQUAL(
+        locked_live_barrier.reserved_family_anchors.size(), 3U);
+
     ShadowPowClaimRecoveryInventory all_user_deferred = inventory;
     for (auto& component : all_user_deferred.components) {
         component.anchor_user_locked = true;

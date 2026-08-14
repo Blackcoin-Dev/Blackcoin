@@ -2567,6 +2567,100 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(absent_head["in_mempool"], False)
         assert_equal(absent_head["quarantined"], True)
 
+        self.log.info(
+            "A persistent anchor hold cannot demote an exact live family member"
+        )
+        locked_live_claims = self._claim_txids(boundary)
+        assert_equal(
+            boundary.lockunspent(False, [boundary_claim_input], True), True
+        )
+        assert boundary_claim_input in boundary.listlockunspent()
+        assert node.gettxout(
+            boundary_claim_input["txid"], boundary_claim_input["vout"], False
+        )
+        assert_equal(
+            node.sendrawtransaction(refreshed_raw), refreshed_claim_txid
+        )
+        node.syncwithvalidationinterfacequeue()
+        locked_live_gate = self._assert_family_liveness_gate(
+            boundary,
+            expected_action="wait_for_live",
+            expected_anchors={
+                (
+                    boundary_claim_input["txid"],
+                    boundary_claim_input["vout"],
+                )
+            },
+            can_submit=False,
+        )
+        assert refreshed_claim_txid in node.getrawmempool()
+        assert boundary_claim_input in boundary.listlockunspent()
+        assert_equal(locked_live_gate["mining_gate_live_claims"], 1)
+        assert_raises_rpc_error(
+            -4,
+            "waiting for an existing live claim family member",
+            boundary.sendshadowpowclaim,
+            boundary_address,
+            boundary_payout,
+            1,
+        )
+        boundary.setpowmining(True, 1, 100)
+        try:
+            self.wait_until(
+                lambda: boundary.getpowmininginfo()["state"]
+                == "claim_in_flight",
+                timeout=20,
+            )
+            assert_equal(
+                boundary.getpowmininginfo()["mining_gate_action"],
+                "wait_for_live",
+            )
+            assert_equal(self._claim_txids(boundary), locked_live_claims)
+        finally:
+            boundary.setpowmining(False)
+
+        self.restart_node(
+            0,
+            extra_args=[
+                *self.base_args,
+                "-mempoolexpiry=0",
+                f"-mocktime={self.mock_time}",
+            ],
+        )
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        default_wallet = node.get_wallet_rpc(self.default_wallet_name)
+        boundary = self._load_wallet(BOUNDARY_WALLET)
+        self.wait_until(
+            lambda: refreshed_claim_txid in node.getrawmempool(), timeout=30
+        )
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(node.getrawtransaction(refreshed_claim_txid), refreshed_raw)
+        assert boundary_claim_input in boundary.listlockunspent()
+        restarted_locked_live = self._assert_family_liveness_gate(
+            boundary,
+            expected_action="wait_for_live",
+            expected_anchors={
+                (
+                    boundary_claim_input["txid"],
+                    boundary_claim_input["vout"],
+                )
+            },
+            can_submit=False,
+        )
+        assert_equal(restarted_locked_live["mining_gate_live_claims"], 1)
+        assert_equal(self._claim_txids(boundary), locked_live_claims)
+        assert_equal(
+            boundary.lockunspent(True, [boundary_claim_input]), True
+        )
+        assert boundary_claim_input not in boundary.listlockunspent()
+        self._advance_past_mempool_entry_time(node, refreshed_claim_txid)
+        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
+        node.syncwithvalidationinterfacequeue()
+        self.wait_until(
+            lambda: refreshed_claim_txid not in node.getrawmempool(), timeout=20
+        )
+
         claims_before_restart_mining = self._claim_txids(boundary)
         wallet_txids_before_relay = {
             entry["txid"]
@@ -3431,6 +3525,143 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             Decimal("0"),
         )
         assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
+
+        self.log.info(
+            "The direct RPC creates only one independent claim after a bounded retained-family defer"
+        )
+        self.restart_node(
+            0,
+            extra_args=[
+                *self.base_args,
+                "-mempoolexpiry=0",
+                f"-mocktime={self.mock_time}",
+            ],
+        )
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        default_wallet = node.get_wallet_rpc(self.default_wallet_name)
+        cross_boundary = self._load_wallet(CROSS_BOUNDARY_WALLET)
+        self.wait_until(
+            lambda: cross_head_txid in node.getrawmempool(), timeout=30
+        )
+        assert_equal(node.getrawtransaction(cross_head_txid), cross_head_raw)
+        self._advance_past_mempool_entry_time(node, cross_head_txid)
+        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
+        node.syncwithvalidationinterfacequeue()
+        self.wait_until(
+            lambda: cross_head_txid not in node.getrawmempool(), timeout=20
+        )
+        deferred_cross = cross_boundary.getpowmininginfo()
+        assert_equal(deferred_cross["mining_gate_action"], "relay_existing")
+        assert_equal(
+            deferred_cross["mining_gate_reserved_family_anchors"],
+            [cross_anchor],
+        )
+        cross_claims_before_fallback = self._claim_txids(cross_boundary)
+
+        self.restart_node(
+            0,
+            extra_args=[
+                *self.base_args,
+                "-mempoolexpiry=0",
+                "-walletbroadcast=0",
+                f"-mocktime={self.mock_time}",
+            ],
+        )
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        cross_boundary = self._load_wallet(CROSS_BOUNDARY_WALLET)
+        assert cross_head_txid not in node.getrawmempool()
+        assert_equal(
+            cross_boundary.getpowmininginfo()["mining_gate_action"],
+            "relay_existing",
+        )
+        fallback = cross_boundary.sendshadowpowclaim(
+            cross_boundary_address, cross_payout, 500_000
+        )
+        assert_equal(fallback["outcome"], "created_new_claim")
+        assert_equal(fallback["relayed_existing"], False)
+        assert_equal(fallback["created_new_claim"], True)
+        fallback_txid = fallback["txid"]
+        assert fallback_txid not in cross_claims_before_fallback
+        assert_equal(
+            self._claim_txids(cross_boundary),
+            cross_claims_before_fallback | {fallback_txid},
+        )
+        assert_equal(
+            self._claim_input(fallback_txid, cross_boundary),
+            untouched_cross_input,
+        )
+        assert untouched_cross_input != cross_anchor
+        assert_equal(
+            cross_boundary.gettransaction(cross_head_txid)["hex"],
+            cross_head_raw,
+        )
+        assert cross_head_txid not in node.getrawmempool()
+        assert fallback_txid not in node.getrawmempool()
+        fallback_records = {
+            entry["txid"]: entry
+            for entry in cross_boundary.listtransactions(
+                "*", 1000, 0, True
+            )
+            if entry["txid"] in {cross_head_txid, fallback_txid}
+        }
+        assert_equal(
+            set(fallback_records), {cross_head_txid, fallback_txid}
+        )
+        assert_equal(
+            fallback_records[cross_head_txid]["qq_shadow_pow_quarantine"],
+            "1",
+        )
+        assert_equal(
+            fallback_records[fallback_txid]["qq_shadow_pow_quarantine"],
+            "1",
+        )
+        fallback_gate = cross_boundary.getpowmininginfo()
+        assert_equal(fallback_gate["mining_gate_coherent"], True)
+        assert_equal(fallback_gate["mining_gate_database_ambiguous"], False)
+        assert_equal(fallback_gate["mining_gate_unsafe_claims"], 0)
+        assert_equal(fallback_gate["mining_gate_unsafe_components"], 0)
+        assert_equal(
+            self._gate_reserved_anchors(fallback_gate),
+            {
+                (cross_anchor["txid"], cross_anchor["vout"]),
+                (
+                    untouched_cross_input["txid"],
+                    untouched_cross_input["vout"],
+                ),
+            },
+        )
+        fallback_recovery = cross_boundary.getpowclaimrecoveryinfo(True)
+        old_component = next(
+            component
+            for component in fallback_recovery["component_details"]
+            if cross_head_txid in component["claim_txids"]
+        )
+        new_component = next(
+            component
+            for component in fallback_recovery["component_details"]
+            if fallback_txid in component["claim_txids"]
+        )
+        assert_equal(
+            set(old_component["claim_txids"]),
+            {cross_root_txid, cross_head_txid},
+        )
+        assert_equal(new_component["claim_txids"], [fallback_txid])
+        assert_equal(
+            {
+                "txid": old_component["anchor"]["txid"],
+                "vout": old_component["anchor"]["vout"],
+            },
+            cross_anchor,
+        )
+        assert_equal(
+            {
+                "txid": new_component["anchor"]["txid"],
+                "vout": new_component["anchor"]["vout"],
+            },
+            untouched_cross_input,
+        )
 
 
 if __name__ == "__main__":

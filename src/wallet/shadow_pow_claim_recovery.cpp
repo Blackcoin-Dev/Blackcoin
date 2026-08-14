@@ -1549,6 +1549,15 @@ ShadowPowClaimMiningGate EvaluateShadowPowClaimMiningFamily(
     gate.lineage_head_txid = head.txid;
     gate.next_lineage_ordinal = head.lineage_ordinal + 1;
 
+    if (gate.live_claims != 0) {
+        // A live member is the wallet-wide single-flight barrier even when
+        // its retained anchor is user-locked or a stale family suppression
+        // still matches this snapshot. Neither restriction may turn live
+        // work into an independently serviceable deferred family.
+        gate.action = ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE;
+        return gate;
+    }
+
     const bool defer_family_until_snapshot_changes =
         suppression_matches_snapshot &&
         suppression->deferred_family_roots &&
@@ -1563,8 +1572,6 @@ ShadowPowClaimMiningGate EvaluateShadowPowClaimMiningFamily(
     if (component.anchor_user_locked) {
         gate.action =
             ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP;
-    } else if (gate.live_claims != 0) {
-        gate.action = ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE;
     } else if (relay_candidate) {
         gate.action = ShadowPowClaimMiningGateAction::RELAY_EXISTING;
         gate.relay_txid = relay_candidate->txid;
@@ -1795,6 +1802,15 @@ ShadowPowClaimMiningGate BuildShadowPowClaimMiningGateImpl(
     if (selected) {
         if (selected->action ==
             ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP) {
+            if (gate.live_claims != 0) {
+                // Defense in depth: an aggregate with a live member must
+                // never pass through the all-deferred new-anchor fallback,
+                // even if a future family-classification change reports the
+                // selected family as deferred.
+                gate.action =
+                    ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE;
+                return gate;
+            }
             // RELAY_EXISTING and REFRESH_SAME_ANCHOR outrank this branch, and
             // WAIT_FOR_LIVE now outranks it as the wallet-wide single-flight
             // barrier. Reaching here proves that every safe retained family

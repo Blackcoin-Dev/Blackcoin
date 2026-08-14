@@ -380,6 +380,13 @@ argv builder omits `-rpcwallet` for the unnamed wallet and preserves one exact
 selector argument for a nonempty wallet name. The passphrase remains stdin-only.
 The supervisor's independent read-only census uses the same selector rule, so
 node30's unnamed wallet is observed without emitting the invalid empty selector.
+The installed v30.1.4 runtime deliberately uses manual-only service intent:
+`autostart_staking=false` while the staking worker is active, and
+`autostart=false` while each regular PoW worker is enabled and hashing. The
+supervisor binds those exact non-autostart policies and never changes either.
+Runtime identity manifests are exact schema-2 objects that include nonnegative
+integer `keypool_external` and `keypool_internal` observations; their complete
+bytes remain authority-hash-bound.
 The installed supervisor is a root:root-owned, single-linked mode `0600` object on
 the Unraid boot filesystem; both cron and manual operation invoke it through
 exact `/bin/bash`, so no executable bit is required. Initial-install resumption

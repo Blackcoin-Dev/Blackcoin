@@ -555,13 +555,16 @@ renewal_verify_node_manifests()
       "runtime-identity-manifests/node-$padded.json" "$uid" || return 1
     jq -e --arg wallet "$wallet" '. == [$wallet]' "$wallet_file" >/dev/null || return 1
     jq -e --arg node "$padded" --arg wallet "$wallet" '
-      (keys | sort) == (["legacy_descriptors_sha256","node_id","quantum_identity_sha256",
-        "schema","trusted_legacy_descriptor_set_sha256","trusted_policy_sha256",
-        "trusted_quantum_address_count","trusted_quantum_address_set_sha256","wallet"] | sort) and
+      (keys | sort) == (["keypool_external","keypool_internal","legacy_descriptors_sha256",
+        "node_id","quantum_identity_sha256","schema","trusted_legacy_descriptor_set_sha256",
+        "trusted_policy_sha256","trusted_quantum_address_count",
+        "trusted_quantum_address_set_sha256","wallet"] | sort) and
       .schema == 2 and .node_id == $node and .wallet == $wallet and
       ([.legacy_descriptors_sha256,.quantum_identity_sha256,.trusted_policy_sha256,
         .trusted_legacy_descriptor_set_sha256,.trusted_quantum_address_set_sha256] |
         all(type == "string" and test("^[0-9a-f]{64}$"))) and
+      (.keypool_external | type == "number" and floor == . and . >= 0) and
+      (.keypool_internal | type == "number" and floor == . and . >= 0) and
       (.trusted_quantum_address_count | type == "number" and floor == . and . >= 1)
     ' "$identity_file" >/dev/null || return 1
 }
@@ -628,7 +631,7 @@ renewal_capture_node()
       (.unlocked_staking_only | type == "boolean")
     ' <<<"$wallet_info" >/dev/null || return 1
     jq -e '
-      .enabled == true and .autostart_staking == true and
+      .enabled == true and .autostart_staking == false and
       .automatic_qqsignal == false and .automatic_demurrage_attestation == false and
       .automatic_redelegation == false and .allow_automatic_quantum_key_creation == false
     ' <<<"$staking" >/dev/null || return 1
@@ -641,7 +644,7 @@ renewal_capture_node()
         ' <<<"$pow" >/dev/null || return 1
     else
         jq -e '
-          .enabled == true and .autostart == true and .threads == 1 and
+          .enabled == true and .autostart == false and .threads == 1 and
           .cpu_percent == 1 and (.hashrate | type == "number" and . >= 0) and
           (.claims_submitted | type == "number" and floor == . and . >= 0) and
           (.state | type == "string" and length > 0) and
@@ -697,7 +700,7 @@ renewal_capture_fleet_once()
       ([.[].height] | unique | length) == 1 and
       ([.[].chainwork] | unique | length) == 1 and
       ([.[] | select(.node != 30 and .regular_pow_role == "regular-enabled" and
-        .pow.enabled == true and .pow.autostart == true and .pow.threads == 1 and
+        .pow.enabled == true and .pow.autostart == false and .pow.threads == 1 and
         .pow.cpu_percent == 1)] | length) == 31 and
       ([.[] | select(.node == 30 and .regular_pow_role == "special-disabled" and
         .pow.enabled == false and .pow.autostart == false and .pow.state == "disabled" and

@@ -45,6 +45,10 @@ PoS renewal invariants:
   - helper accepts every canonical integer node 1 through 32, including node30
   - helper and supervisor unnamed-wallet RPCs omit -rpcwallet; named wallets
     retain one exact selector
+  - active PoS and regular-PoW workers retain the installed v30.1.4
+    manual-only autostart=false policy; the supervisor only observes it
+  - exact schema-2 identity manifests retain nonnegative integer external/internal keypool
+    observations and remain authority-hash-bound
   - installed supervisor is exact root:root-owned single-link mode 0600 and is
     invoked only through /bin/bash; Unraid need not preserve an executable bit
   - initial resume accepts only an empty root or the exact current/d433 mode-0600
@@ -98,8 +102,8 @@ Current-byte offline checks (2026-08-14 UTC):
   shellcheck -x on every .sh and the standalone .sh.inc: PASS
   complete aggregate suite including both dedicated suites: 609/609 PASS
     log SHA256 8e5852c70b66b9b61d181d57450197183e08b6775d8ee63cc7664898abd5be5c
-  focused PoS/helper hostile suite: 254/254 PASS
-    log SHA256 dbdaaf55313091d7c4690d8eff147e2be261b470d02a607f8589569fb3236972
+  focused PoS/helper hostile suite: 259/259 PASS
+    log SHA256 5962bb70c0fab39d03fe2dc6138d9eb5dd525c829b7b16805a67e9cf49a7983b
   focused node30 audit/release-gate hostile suite: 151/151 PASS
     log SHA256 e1c468f202fcafac0510e285adfa8f1ebb1b4f552c9fe70c5529f9960771001c
   separate node27 sign-only/observation suite: 208/208 PASS
@@ -111,8 +115,33 @@ Current-byte offline checks (2026-08-14 UTC):
   git diff --check: PASS
   exact 22-payload inventory equality: PASS
   sha256sum --strict -c SHA256SUMS: PASS after final manifest regeneration
-  live Docker/SSH/wallet/network/fleet contact: NONE
+  test-suite live Docker/SSH/wallet/network/fleet contact: NONE
   Core development/PR/build/package/registry action: NONE
+
+Separate installed-v30.1.4 read-only diagnosis (2026-08-14T07:11:32Z):
+  installed generation-one authority SHA256:
+    05df229f0657b40b52b99334d34a353a98f0fdf696183607c5d033e595ef934f
+  failed first-run RUN.out SHA256 (empty, no diagnostic text):
+    e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  failed first-run RUN.exit SHA256 (exact `1` plus newline):
+    4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865
+  renewal receipt inventory before/after: empty; no helper was invoked
+  exact earliest silent predicate: node 1 reported active/searching/eligible
+    PoS with positive weight and autostart_staking=false, while predecessor
+    supervisor bytes incorrectly required autostart_staking=true
+  deterministic downstream predecessor mismatches: all 31 regular-PoW nodes
+    were enabled and hashing with intended autostart=false; all 32 exact
+    authority-bound identity manifests included nonnegative integer
+    keypool_external/keypool_internal fields rejected by the predecessor key set
+  complete read-only census: all 32 on one main-chain tip, out of IBD, peered,
+    PoS active/searching with positive weight; all 31 regular-PoW nodes had
+    positive hashrate; node30 ordinary PoW remained disabled
+  installed bytes, authority, receipt, helper, marker, cron, historical job-10,
+    64 manifest hashes, and 38 lock-file identities matched; no lock holder or
+    supervisor/helper process was active
+  live action scope: SSH and allowlisted read-only Docker/RPC observation only;
+    no retry, helper invocation, wallet unlock, PoW mutation, fee, transaction,
+    chain/config/key mutation, file mutation, or cron mutation
   candidate deployment, wallet signing, transaction relay/broadcast: NONE
 
 UNRESOLVED AND FAIL-CLOSED:

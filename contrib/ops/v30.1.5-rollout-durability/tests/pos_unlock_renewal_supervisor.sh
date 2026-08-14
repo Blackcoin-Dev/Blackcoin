@@ -72,7 +72,8 @@ make_state_manifests()
           schema:2,node_id:$node,wallet:$wallet,legacy_descriptors_sha256:$h,
           quantum_identity_sha256:$h,trusted_policy_sha256:$h,
           trusted_legacy_descriptor_set_sha256:$h,
-          trusted_quantum_address_set_sha256:$h,trusted_quantum_address_count:1
+          trusted_quantum_address_set_sha256:$h,trusted_quantum_address_count:1,
+          keypool_external:4000,keypool_internal:4000
         }' >"$root/runtime-identity-manifests/node-$padded.json"
     done
     find "$root" -type f -exec chmod 600 {} +
@@ -259,6 +260,26 @@ for node in $(seq 1 32); do
 done
 expect_fail 'manifest contract rejects a different live wallet identity' \
   renewal_verify_node_manifests "$authority" "$state" 1 'other-wallet' "$uid"
+identity_one="$state/runtime-identity-manifests/node-01.json"
+identity_one_original="$tmp/node-01-identity-original.json"
+cp -- "$identity_one" "$identity_one_original"
+identity_mutations=(
+  'del(.keypool_external)'
+  '.keypool_internal="4000"'
+  '.keypool_external=-1'
+)
+for mutation in "${identity_mutations[@]}"; do
+    jq "$mutation" "$identity_one_original" >"$identity_one"
+    chmod 600 "$identity_one"
+    mutated_map="$tmp/identity-mutated-map.json"
+    mutated_authority="$tmp/identity-mutated-authority.json"
+    make_manifest_map "$state" "$mutated_map"
+    make_authority "$mutated_authority" "$mutated_map"
+    expect_fail "identity manifest rejects $mutation even when its exact bytes are authority-bound" \
+      renewal_verify_node_manifests "$mutated_authority" "$state" 1 'wallet-01' "$uid"
+done
+cp -- "$identity_one_original" "$identity_one"
+chmod 600 "$identity_one"
 
 helper_fixture="$tmp/helper.sh"
 cp -- "$normal_unlock_helper" "$helper_fixture"
@@ -517,7 +538,9 @@ MOCK_ZERO_PEERS_NODE=0
 MOCK_TWO_WALLETS_NODE=0
 MOCK_CHAIN_DRIFT_NODE=0
 MOCK_UNSAFE_STAKING_NODE=0
+MOCK_BAD_STAKING_AUTOSTART_NODE=0
 MOCK_BAD_REGULAR_POW_NODE=0
+MOCK_BAD_REGULAR_POW_AUTOSTART_NODE=0
 MOCK_BAD_NODE30_POW=0
 mock_node_for_container()
 {
@@ -582,8 +605,9 @@ renewal_docker()
               unlocked_until:$unlock,unlocked_staking_only:false}'
             ;;
         getstakinginfo)
-            jq -cn --argjson unsafe "$([[ "$node" -eq "$MOCK_UNSAFE_STAKING_NODE" ]] && printf true || printf false)" '{
-              enabled:true,autostart_staking:true,automatic_qqsignal:$unsafe,
+            jq -cn --argjson unsafe "$([[ "$node" -eq "$MOCK_UNSAFE_STAKING_NODE" ]] && printf true || printf false)" \
+              --argjson bad_autostart "$([[ "$node" -eq "$MOCK_BAD_STAKING_AUTOSTART_NODE" ]] && printf true || printf false)" '{
+              enabled:true,autostart_staking:$bad_autostart,automatic_qqsignal:$unsafe,
               automatic_demurrage_attestation:false,automatic_redelegation:false,
               allow_automatic_quantum_key_creation:false,staking:true,worker_running:true,
               eligible:true,staking_snapshot_current:true,staking_state:"searching",
@@ -599,8 +623,9 @@ renewal_docker()
                   allow_automatic_quantum_key_creation:false}'
             else
                 jq -cn --arg payout "pow-payout-$padded" \
-                  --argjson bad "$([[ "$node" -eq "$MOCK_BAD_REGULAR_POW_NODE" ]] && printf true || printf false)" '{
-                  enabled:($bad|not),autostart:($bad|not),threads:1,cpu_percent:1,
+                  --argjson bad "$([[ "$node" -eq "$MOCK_BAD_REGULAR_POW_NODE" ]] && printf true || printf false)" \
+                  --argjson bad_autostart "$([[ "$node" -eq "$MOCK_BAD_REGULAR_POW_AUTOSTART_NODE" ]] && printf true || printf false)" '{
+                  enabled:($bad|not),autostart:$bad_autostart,threads:1,cpu_percent:1,
                   state:(if $bad then "disabled" else "claim_quarantined" end),hashrate:0,
                   payout_address:$payout,claims_submitted:0,
                   allow_automatic_quantum_key_creation:false}'
@@ -614,7 +639,8 @@ reset_mock()
 {
     MOCK_BAD_IMAGE_NODE=0 MOCK_BAD_CHAIN_NODE=0 MOCK_IBD_NODE=0 MOCK_ZERO_PEERS_NODE=0
     MOCK_TWO_WALLETS_NODE=0 MOCK_CHAIN_DRIFT_NODE=0 MOCK_UNSAFE_STAKING_NODE=0
-    MOCK_BAD_REGULAR_POW_NODE=0 MOCK_BAD_NODE30_POW=0
+    MOCK_BAD_STAKING_AUTOSTART_NODE=0 MOCK_BAD_REGULAR_POW_NODE=0
+    MOCK_BAD_REGULAR_POW_AUTOSTART_NODE=0 MOCK_BAD_NODE30_POW=0
     find "$tmp" -type f -name 'mock-chain-call-*' -delete
 }
 
@@ -641,8 +667,14 @@ expect_fail 'node preflight rejects a mixed chain bracket' \
 reset_mock; MOCK_UNSAFE_STAKING_NODE=1
 expect_fail 'node preflight rejects automatic staking-side key authority' \
   renewal_capture_node "$authority" "$state" "$TOPOLOGY_MAP" 1 pre "$uid"
+reset_mock; MOCK_BAD_STAKING_AUTOSTART_NODE=1
+expect_fail 'node preflight rejects drift from manual-only staking autostart policy' \
+  renewal_capture_node "$authority" "$state" "$TOPOLOGY_MAP" 1 pre "$uid"
 reset_mock; MOCK_BAD_REGULAR_POW_NODE=1
 expect_fail 'node preflight rejects disabled ordinary-PoW intent on a regular node' \
+  renewal_capture_node "$authority" "$state" "$TOPOLOGY_MAP" 1 pre "$uid"
+reset_mock; MOCK_BAD_REGULAR_POW_AUTOSTART_NODE=1
+expect_fail 'node preflight rejects drift from manual-only regular-PoW autostart policy' \
   renewal_capture_node "$authority" "$state" "$TOPOLOGY_MAP" 1 pre "$uid"
 reset_mock; MOCK_BAD_NODE30_POW=1
 expect_fail 'node30 preflight rejects any ordinary-PoW enablement' \

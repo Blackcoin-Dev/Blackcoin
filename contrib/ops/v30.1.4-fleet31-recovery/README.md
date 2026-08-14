@@ -189,13 +189,36 @@ wrong modes, nonregular files, and inode substitution.
 ## Final monitoring
 
 `monitor` is read-only and requires the exact complete Phase-B receipt chain.
+It can consume receipts from the exact signed Phase-B executor at commit
+`18ca9f4d5087668ae25257a5b978c06f4e1e1f00` only through its immutable
+commit/tree/signer/tool-blob/product-test-blob and hostile-test evidence.
+That compatibility is local to `monitor`: `phase-b` and `reconcile-b` continue
+to require receipts made by their current exact tool bytes and reject the
+predecessor chain before transport, locks, or publication. The monitor also
+revalidates all ten durable wave receipts, not only the aggregate and node
+receipts.
+
 For every node it pins runtime, wallet, installed network, peers, chain, and
 recovery inventory. It requires exactly one authorized transaction to be the
-active-chain spender of the exact anchor, zero blocking quarantines, PoW state
-`hashing`, positive hashrate, and a typed claim-submission increment from the
-Phase-B preview in the same process epoch. If the daemon restarted, the counter
-is evaluated from its documented reset epoch and must be positive. Configuration
-flags alone are not success evidence.
+active-chain spender of the exact anchor, public PoW state `ready` or
+`claim_in_flight`, positive hashrate, zero hot blockers from
+`getpowmininginfo`, and no ambiguous or indeterminate hot state. The historical
+`getpowclaimrecoveryinfo.blocking_quarantined_claims` inventory is recorded but
+is not mislabeled as a current mining blocker.
+
+Claim submission is probabilistic and the counter is process-local. A fleet
+success therefore requires at least one fresh aggregate claim since the exact
+Phase-B preview baselines; it does not falsely require or claim an immediate
+increment on all 31 nodes. Each node records its own exact baseline, current
+counter, delta, and whether a fresh claim was observed. If the daemon restarted,
+the counter is evaluated from its documented reset epoch. Configuration flags
+alone are not success evidence.
+
+Installed v30.1.4 represents a spent `gettxout` as exit-zero with exactly empty
+stdout. Only that exact method/output pair is normalized to JSON null. Empty
+stdout from another method, whitespace-only output, or malformed JSON remains
+a fatal protocol error and cannot be swallowed as an ordinary missing wallet
+transaction result.
 
 ```sh
 ./fleet31_recovery.py monitor \
@@ -215,5 +238,9 @@ active-chain resolution, exact pre-preview terminal fee exclusion, terminal
 reorg rejection, same-product restart continuation, stable runtime drift and
 mid-cut recreation rejection, ACK-preserving and observation-only terminal
 closure, receipt/sidecar crash healing, no-clobber behavior, wave ordering,
-idempotent receipt validation, and static rejection of targeted or generic
+idempotent receipt validation, exact-empty `gettxout` normalization, fatal
+protocol corruption for all other empty/malformed outputs, monitor-only signed
+predecessor compatibility, current-hash mutation/reconciliation rejection,
+public `ready`/`claim_in_flight` PoW semantics, historical-inventory separation,
+fleet-level fresh-claim accounting, and static rejection of targeted or generic
 transaction RPCs.

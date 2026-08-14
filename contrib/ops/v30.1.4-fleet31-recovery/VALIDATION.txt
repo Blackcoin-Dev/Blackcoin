@@ -2,8 +2,13 @@ INSTALLED-v30.1.4 FLEET31 TWO-PHASE QUARANTINE RECOVERY
 OFFLINE FLEET-OWNED TOOLING; NOT CORE, RELEASE, PACKAGE, OR DEPLOYMENT AUTHORITY
 
 Integration base:
-  commit 328bce04c67d95a27d74b78cc015f40c682de231
-  tree   ebe02b2e21fbacef8b9a4352793137dba6eb7f91
+  commit 18ca9f4d5087668ae25257a5b978c06f4e1e1f00
+  tree   e66d03a4aeb4d45f1085edea179eb11cc957aeff
+  signer SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
+  exact Phase-B executor tool SHA256
+         206c3293502f209515898d6ed81fe800383968e43509d33789097ab4fd09ed39
+  exact product-test receipt SHA256
+         490939cffdcbe1c3ee9c92588bd70d1dc2bea3a0cee00005d89deb8e4da00720
 
 Installed runtime source predicate:
   commit 13262151077cce3f72d07d17dc7725b2b6a8e1ab
@@ -23,17 +28,15 @@ Current-byte offline checks (2026-08-14 UTC):
   Python compilation: PASS
   Bash syntax: PASS
   git diff --check: PASS
-  hostile two-phase suite: 120/120 PASS
+  hostile two-phase/monitor suite: 137/137 PASS
   hostile log SHA256:
-    fedcab5b5945d3f3bfa459aef91d8afce638cff9f11733944f993d1ba6793b26
-  independent frozen-byte P0/P1 review: CLEAN
-  independent terminal log/hash verification: PASS
+    4ebfcace8323e9794fcdd6b450f0148090a267cab0795a21518fd12f0dea7618
   tool SHA256:
-    206c3293502f209515898d6ed81fe800383968e43509d33789097ab4fd09ed39
+    eb529eb87ad1abc740345ddf5e06e0bbb8ae60b264b0d257fc95bad248a72680
   mock SHA256:
-    78cc07463827d9c5b05b24f05dcc5acc6550daae02cd4af8a2493b496971fd57
+    706a2269cb23d3995434760462b86813b9ec5e487f1851e7994deb3428775a45
   test SHA256:
-    d661c4c4fb89ae43f74ba16618baad5442c275af1ea8882aa2ce440e57fbbef2
+    012bf63a2dfe5b68ac7a9caf612a4102dc1203105eacea0070d31c5434d34536
   live Docker/SSH/wallet/network contact: NONE
   live signing/relay/broadcast: NONE
 
@@ -70,7 +73,16 @@ Hostile coverage includes:
   no-clobber receipts and sidecars
   missing-sidecar and interrupted publisher-hardlink healing
   secure canonical regular single-link mutation lock inodes
-  final monitor runtime/network/wallet/anchor/hashrate/claim-increment proof
+  exact signed Phase-B predecessor commit/tree/signer/tool/product-test bridge
+  monitor-only predecessor acceptance; mutation/reconciliation reject pre-transport
+  all ten durable Phase-B wave receipts revalidated before monitoring transport
+  exact empty gettxout stdout normalized only for an active-chain-spent anchor
+  whitespace/malformed gettxout and all other empty/malformed RPC output fatal
+  gettransaction protocol corruption cannot be swallowed as a wallet miss
+  final monitor runtime/network/wallet/exact-anchor-spender proof
+  ready/claim_in_flight PoW state with positive hashrate and zero hot blockers
+  typed historical recovery inventory blockers recorded as informational
+  at least one aggregate fresh fleet claim without false per-node success claims
 
 Required external inputs intentionally absent:
   exact live runtime manifest
@@ -78,6 +90,7 @@ Required external inputs intentionally absent:
   live wallet/raw-transaction evidence
   live wave and final operational receipts
 
-No checked-in receipt is live authority. Live Phase B remains unauthorized until
-an operator supplies the exact separate authority bound to the live Phase-A and
-Phase-B preview SHA256 identities and invokes each bounded wave explicitly.
+No checked-in receipt is live authority. This follow-up grants no mutation,
+financial, or relay authority. Its signed-predecessor exception is confined to
+read-only monitoring; every mutation and reconciliation path remains bound to
+the current exact tool identity.

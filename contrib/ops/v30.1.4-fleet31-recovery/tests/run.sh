@@ -95,6 +95,9 @@ make_phase_b_authority()
 }
 
 export FLEET31_TEST_TRANSPORT="$MOCK"
+PHASE_A_RECEIPT_TOOL_SHA=fe81981d7ed59b277108ed50128c82b3a2df8a2127a731c8e47d343c55860fed
+PHASE_B_EXECUTOR_TOOL_SHA=206c3293502f209515898d6ed81fe800383968e43509d33789097ab4fd09ed39
+export FLEET31_TEST_TOOL_SHA256="$PHASE_A_RECEIPT_TOOL_SHA"
 
 # Static boundary: there is no targeted commit or generic transaction RPC,
 # node30 is absent from the exact node set, and Phase B fails before transport.
@@ -107,6 +110,27 @@ fi
 ok
 grep -Fq '"action": "commit_and_broadcast"' "$TOOL" || fail 'Phase-B exact bulk action absent'
 ok
+
+# The monitor-only predecessor bridge is anchored to the exact signed commit,
+# tree, blobs, byte hashes, and independently reviewed product-test receipt.
+REPO=$(cd "$ROOT/../../.." && pwd -P)
+git -C "$REPO" verify-commit 18ca9f4d5087668ae25257a5b978c06f4e1e1f00 >/dev/null ||
+  fail 'Phase-B predecessor signature verification failed'
+ok
+assert_eq "$(git -C "$REPO" show -s --format=%T 18ca9f4d5087668ae25257a5b978c06f4e1e1f00)" \
+  e66d03a4aeb4d45f1085edea179eb11cc957aeff
+assert_eq "$(git -C "$REPO" show -s --format=%P 18ca9f4d5087668ae25257a5b978c06f4e1e1f00)" \
+  328bce04c67d95a27d74b78cc015f40c682de231
+assert_eq "$(git -C "$REPO" show -s --format=%GF 18ca9f4d5087668ae25257a5b978c06f4e1e1f00)" \
+  SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
+assert_eq "$(git -C "$REPO" rev-parse 18ca9f4d5087668ae25257a5b978c06f4e1e1f00:contrib/ops/v30.1.4-fleet31-recovery/fleet31_recovery.py)" \
+  a49a9316690289e25bf64692cf0a34e02141afe3
+assert_eq "$(git -C "$REPO" show 18ca9f4d5087668ae25257a5b978c06f4e1e1f00:contrib/ops/v30.1.4-fleet31-recovery/fleet31_recovery.py | shasum -a 256 | awk '{print $1}')" \
+  "$PHASE_B_EXECUTOR_TOOL_SHA"
+assert_eq "$(git -C "$REPO" rev-parse 18ca9f4d5087668ae25257a5b978c06f4e1e1f00:contrib/ops/v30.1.4-fleet31-recovery/PRODUCT-TEST-RECEIPT.json)" \
+  abeb23f5df235e75db981af01052ec1078a8850a
+assert_eq "$(git -C "$REPO" show 18ca9f4d5087668ae25257a5b978c06f4e1e1f00:contrib/ops/v30.1.4-fleet31-recovery/PRODUCT-TEST-RECEIPT.json | shasum -a 256 | awk '{print $1}')" \
+  490939cffdcbe1c3ee9c92588bd70d1dc2bea3a0cee00005d89deb8e4da00720
 
 # The signed follow-up is structurally Phase-B-only in live mode. Historical
 # Phase-A entrypoints stop before locks, transport construction, or RPC.
@@ -259,6 +283,7 @@ chmod 0700 "$PREB/run"
 
 # Phase B requires a separate exact-signed-byte preview and authority, then
 # processes only the exact bounded wave requested by each invocation.
+export FLEET31_TEST_TOOL_SHA256="$PHASE_B_EXECUTOR_TOOL_SHA"
 "$TOOL" phase-b-preview --run-dir "$HAPPY/run" >"$HAPPY/phase-b-preview.out"
 assert_jq '.result == "READY_FOR_SEPARATE_PHASE_B_AUTHORITY" and
   .wave_plan == [[16],[1,2,3,4],[5,6,7,8],[9,10,11,12],
@@ -295,20 +320,88 @@ assert_eq "$(grep -c 'commit_and_broadcast' "$HAPPY/state/transport.log")" 31
 
 # A healthy same-product container restart does not invalidate durable recovery
 # evidence. The restarted process counter is evaluated from its reset epoch,
-# not against the old process's audit counter.
+# not against the old process's audit counter. Operational PoW is the public
+# ready/claim_in_flight state with positive hashrate and zero hot blockers; the
+# recovery inventory's historical blocker count is informational. Only one
+# fresh fleet claim is required, and no receipt claims all nodes submitted one.
 for STATE_FILE in "$HAPPY/state"/node*.json; do
-  jq '.confirmed=true | .original_confirmed=false | .restarted=true | .claims_submitted=1' \
+  jq '.confirmed=true | .original_confirmed=false | .restarted=true |
+      .claims_submitted=0 | .pow_state="ready"' \
     "$STATE_FILE" >"$HAPPY/state/.restart"
   mv "$HAPPY/state/.restart" "$STATE_FILE"
   chmod 0600 "$STATE_FILE"
 done
+jq '.claims_submitted=1 | .pow_state="claim_in_flight"' "$HAPPY/state/node16.json" \
+  >"$HAPPY/state/.node16"
+mv "$HAPPY/state/.node16" "$HAPPY/state/node16.json"
+chmod 0600 "$HAPPY/state/node16.json"
+jq '.recovery_inventory_blockers=43' "$HAPPY/state/node14.json" >"$HAPPY/state/.node14"
+mv "$HAPPY/state/.node14" "$HAPPY/state/node14.json"
+chmod 0600 "$HAPPY/state/node14.json"
+
+# Drop the sealed fixture identity override: this is the new monitor consuming
+# the exact signed/tested predecessor Phase-B receipt chain.
+unset FLEET31_TEST_TOOL_SHA256
+export FLEET31_SCENARIO=empty-gettxout-spent
 "$TOOL" monitor --run-dir "$HAPPY/run" --samples 1 --interval 0 >"$HAPPY/monitor.out"
 HAPPY_MONITOR=$(jq -r '.receipt' "$HAPPY/monitor.out")
 assert_jq '.result=="ALL_31_POW_OPERATIONAL" and .operational_nodes==31 and
+  .validated_phase_b_receipt_tool_sha256==
+    "206c3293502f209515898d6ed81fe800383968e43509d33789097ab4fd09ed39" and
+  .phase_b_executor_product_test_evidence.mode=="exact_signed_tested_predecessor" and
+  .phase_b_executor_product_test_evidence.commit==
+    "18ca9f4d5087668ae25257a5b978c06f4e1e1f00" and
+  .phase_b_executor_product_test_evidence.tree==
+    "e66d03a4aeb4d45f1085edea179eb11cc957aeff" and
+  .phase_b_executor_product_test_evidence.product_test_receipt_sha256==
+    "490939cffdcbe1c3ee9c92588bd70d1dc2bea3a0cee00005d89deb8e4da00720" and
+  .fleet_fresh_claims_submitted==1 and .nodes_with_fresh_claims==[16] and
+  .requires_fleet_fresh_claim_submission==true and
+  .requires_per_node_claim_submission_increment==false and
   all(.nodes[]; .runtime_transition.ephemeral_container_changed==true and
     .claims_baseline==0 and
     .claims_baseline_source=="positive_counter_since_restarted_process_epoch" and
-    .claims_submitted==1 and .operational==true)' "$HAPPY/run/$HAPPY_MONITOR"
+    .pow_state=="ready" or .node==16) and
+  all(.nodes[]; .pow_hot_blocking_quarantined_claims==0 and .operational==true) and
+  (.nodes[]|select(.node==16)|
+    .pow_state=="claim_in_flight" and .fresh_claim_observed==true and
+    .fresh_claims_submitted==1) and
+  (.nodes[]|select(.node==14)|
+    .recovery_inventory_blocking_quarantined_claims==43 and
+    .fresh_claim_observed==false)' "$HAPPY/run/$HAPPY_MONITOR"
+
+# Exact empty stdout is normalized only for gettxout. Whitespace/malformed
+# gettxout and empty/malformed responses from other methods are fatal protocol
+# errors, including gettransaction paths whose ordinary RPC errors are skipped.
+for BAD_PROTOCOL in whitespace-gettxout-spent malformed-gettxout-spent \
+                    empty-non-gettxout empty-gettransaction malformed-gettransaction; do
+  export FLEET31_SCENARIO="$BAD_PROTOCOL"
+  assert_fails "$BAD_PROTOCOL protocol output" "$TOOL" monitor \
+    --run-dir "$HAPPY/run" --samples 1 --interval 0
+done
+
+export FLEET31_SCENARIO=empty-gettxout-spent
+jq '.recovery_inventory_blockers="43"' "$HAPPY/state/node14.json" >"$HAPPY/state/.node14"
+mv "$HAPPY/state/.node14" "$HAPPY/state/node14.json"
+chmod 0600 "$HAPPY/state/node14.json"
+assert_fails 'historical recovery blocker count remains typed' "$TOOL" monitor \
+  --run-dir "$HAPPY/run" --samples 1 --interval 0
+jq '.recovery_inventory_blockers=43' "$HAPPY/state/node14.json" >"$HAPPY/state/.node14"
+mv "$HAPPY/state/.node14" "$HAPPY/state/node14.json"
+chmod 0600 "$HAPPY/state/node14.json"
+
+# The compatibility bridge is monitor-only. Against the same predecessor
+# chain, mutation and reconciliation reject before transport or publication.
+export FLEET31_SCENARIO=happy
+BEFORE_REJECT_LOG=$(wc -l <"$HAPPY/state/transport.log" | tr -d ' ')
+assert_fails 'predecessor receipts rejected by current Phase-B mutation' \
+  "$TOOL" phase-b --wave 1 --run-dir "$HAPPY/run" \
+  --authority "$HAPPY/phase-b-authority.json" --authority-sha256 "$PHASE_B_AUTH_SHA"
+assert_fails 'predecessor receipts rejected by current reconciliation' \
+  "$TOOL" reconcile-b --run-dir "$HAPPY/run" \
+  --authority "$HAPPY/phase-b-authority.json" --authority-sha256 "$PHASE_B_AUTH_SHA"
+assert_eq "$(wc -l <"$HAPPY/state/transport.log" | tr -d ' ')" "$BEFORE_REJECT_LOG"
+export FLEET31_TEST_TOOL_SHA256="$PHASE_B_EXECUTOR_TOOL_SHA"
 
 # A response lost after durable relay grant is observation-only on installed
 # v30.1.4. It is never converted into an acknowledged-plan success receipt and
@@ -661,6 +754,7 @@ export FLEET31_SCENARIO=happy
 assert_eq "$(grep -c 'commit_and_broadcast' "$HAPPY/state/transport.log")" 31
 
 # Exact node-set contract rejects node30 before contacting transport.
+export FLEET31_TEST_TOOL_SHA256="$PHASE_A_RECEIPT_TOOL_SHA"
 BADNODE="$FIX/badnode"
 mkdir -m 0700 "$BADNODE" "$BADNODE/state"
 make_runtime "$BADNODE/runtime.json" "$BADNODE/locks"
@@ -748,6 +842,7 @@ assert_jq '.result == "SIGNED_ALL_31_WITHOUT_RELAY_AUTHORITY" and
     .original_intent_plan.plan_id != .reconciliation_plan.plan_id and
     .intent_component.classification == "current_branch_ineligible" and
     .component.classification == "resolution_pending")]|length)==1' "$LOST/run/phase-a.json"
+export FLEET31_TEST_TOOL_SHA256="$PHASE_B_EXECUTOR_TOOL_SHA"
 "$TOOL" phase-b-preview --run-dir "$LOST/run" >/dev/null
 assert_jq '.result=="READY_FOR_SEPARATE_PHASE_B_AUTHORITY" and
   (.nodes[]|select(.node==9).eligibility)=="ACTIONABLE_REUSE_MANAGED"' \

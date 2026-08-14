@@ -51,8 +51,23 @@ EXPECTED_VSIZE = 191
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PRODUCTION_DOCKER = pathlib.Path("/usr/bin/docker")
 # Filled from the repository fixture after the fixture is finalized.
-TEST_TRANSPORT_SHA256 = "78cc07463827d9c5b05b24f05dcc5acc6550daae02cd4af8a2493b496971fd57"
+TEST_TRANSPORT_SHA256 = "706a2269cb23d3995434760462b86813b9ec5e487f1851e7994deb3428775a45"
 PHASE_A_TOOL_SHA256 = "fe81981d7ed59b277108ed50128c82b3a2df8a2127a731c8e47d343c55860fed"
+PHASE_B_EXECUTOR_EVIDENCE = {
+    "commit": "18ca9f4d5087668ae25257a5b978c06f4e1e1f00",
+    "tree": "e66d03a4aeb4d45f1085edea179eb11cc957aeff",
+    "parent": "328bce04c67d95a27d74b78cc015f40c682de231",
+    "signer_fingerprint": SOURCE_SIGNER,
+    "tool_sha256": "206c3293502f209515898d6ed81fe800383968e43509d33789097ab4fd09ed39",
+    "tool_git_blob": "a49a9316690289e25bf64692cf0a34e02141afe3",
+    "product_test_receipt_sha256": "490939cffdcbe1c3ee9c92588bd70d1dc2bea3a0cee00005d89deb8e4da00720",
+    "product_test_receipt_git_blob": "abeb23f5df235e75db981af01052ec1078a8850a",
+    "hostile_test_sha256": "d661c4c4fb89ae43f74ba16618baad5442c275af1ea8882aa2ce440e57fbbef2",
+    "hostile_assertions": 120,
+    "hostile_log_sha256": "fedcab5b5945d3f3bfa459aef91d8afce638cff9f11733944f993d1ba6793b26",
+    "independent_p0_p1_review": "CLEAN",
+}
+PHASE_B_EXECUTOR_TOOL_SHA256 = PHASE_B_EXECUTOR_EVIDENCE["tool_sha256"]
 
 
 class GateError(RuntimeError):
@@ -483,9 +498,20 @@ class Transport:
                 cli_args.append(str(param))
         try:
             output = self.run(cli_args)
-            return json.loads(output)
-        except (GateError, json.JSONDecodeError) as exc:
+        except GateError as exc:
             raise RpcError(node.node, method, str(exc)) from exc
+        # Installed v30.1.4 prints no bytes (exit 0) for a null gettxout result.
+        # Normalize only that exact public-RPC encoding. Whitespace, malformed
+        # JSON, and empty output from every other method are protocol failures,
+        # not ordinary RpcError values that a caller may intentionally ignore.
+        if method == "gettxout" and output == "":
+            return None
+        if output == "":
+            die(f"node{node.node} {method} returned empty stdout")
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError as exc:
+            die(f"node{node.node} {method} returned invalid JSON: {exc}")
 
     def runtime_snapshot(self, node: RuntimeNode) -> dict[str, Any]:
         inspect = self.docker_json(["inspect", node.container])
@@ -991,7 +1017,14 @@ def audit_node(transport: Transport, runtime: RuntimeContract, node: RuntimeNode
 
 def tool_identity() -> tuple[pathlib.Path, str]:
     path = pathlib.Path(__file__).resolve(strict=True)
-    return path, sha256_file(path)
+    actual = sha256_file(path)
+    test_override = os.environ.get("FLEET31_TEST_TOOL_SHA256")
+    if test_override:
+        if (not os.environ.get("FLEET31_TEST_TRANSPORT") or os.geteuid() == 0 or
+                test_override not in {PHASE_A_TOOL_SHA256, PHASE_B_EXECUTOR_TOOL_SHA256}):
+            die("test-only historical tool identity override is forbidden outside the sealed nonroot fixture")
+        return path, test_override
+    return path, actual
 
 
 def require_phase_a_fixture_mode(command: str) -> None:
@@ -3193,6 +3226,38 @@ def reconcile_b_command(args: argparse.Namespace) -> None:
                       "reconcile_sha256": digest}, sort_keys=True))
 
 
+def phase_b_receipt_tool_for_monitor(phase_b_receipt: Any,
+                                     current_tool_sha: str) -> tuple[str, dict[str, Any]]:
+    """Select one exact receipt producer for the read-only monitor only."""
+    if not isinstance(phase_b_receipt, dict):
+        die("Phase-B aggregate completion is not an object")
+    receipt_tool_sha = require_hex64(
+        phase_b_receipt.get("tool_sha256"), "Phase-B aggregate receipt tool SHA256")
+    if receipt_tool_sha == current_tool_sha:
+        return receipt_tool_sha, {
+            "mode": "current_exact_monitor_tool",
+            "tool_sha256": current_tool_sha,
+        }
+    if receipt_tool_sha != PHASE_B_EXECUTOR_TOOL_SHA256:
+        die("Phase-B aggregate completion was not produced by the current tool or the exact signed Phase-B executor")
+    evidence = dict(PHASE_B_EXECUTOR_EVIDENCE)
+    if (evidence.get("tool_sha256") != receipt_tool_sha or
+            evidence.get("signer_fingerprint") != SOURCE_SIGNER or
+            evidence.get("independent_p0_p1_review") != "CLEAN" or
+            evidence.get("hostile_assertions") != 120):
+        die("exact Phase-B executor product-test evidence is internally inconsistent")
+    for key in ("tool_sha256", "product_test_receipt_sha256", "hostile_test_sha256",
+                "hostile_log_sha256"):
+        require_hex64(evidence.get(key), f"Phase-B executor evidence {key}")
+    for key in ("commit", "tree", "parent", "tool_git_blob",
+                "product_test_receipt_git_blob"):
+        value = evidence.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
+            die(f"Phase-B executor evidence {key} is not a Git object identity")
+    evidence["mode"] = "exact_signed_tested_predecessor"
+    return receipt_tool_sha, evidence
+
+
 def monitor_command(args: argparse.Namespace) -> None:
     run_dir = pathlib.Path(args.run_dir)
     ensure_secure_dir(run_dir)
@@ -3202,21 +3267,28 @@ def monitor_command(args: argparse.Namespace) -> None:
     phase_a_rows = validate_phase_a_receipt_chain(
         run_dir, phase_a, phase_a_sha, runtime, tool_sha)
     audit, audit_sha = load_run_receipt(run_dir, "audit.json")
+    phase_b_receipt, _ = load_run_receipt(run_dir, "phase-b.json")
+    receipt_tool_sha, executor_evidence = phase_b_receipt_tool_for_monitor(
+        phase_b_receipt, tool_sha)
     preview_receipt, preview_sha = load_run_receipt(run_dir, "phase-b-preview.json")
     expected_rows = validate_phase_b_preview_receipt(
-        preview_receipt, runtime, tool_sha, phase_a_sha, phase_a_rows)
-    phase_b_receipt, _ = load_run_receipt(run_dir, "phase-b.json")
+        preview_receipt, runtime, receipt_tool_sha, phase_a_sha, phase_a_rows)
     authority_sha = require_hex64(phase_b_receipt.get("phase_b_authority_sha256"),
                                   "Phase-B monitor authority SHA256")
     _, phase_b_sha = validate_phase_b_complete(
-        run_dir, runtime, tool_sha, phase_a_sha, preview_sha, authority_sha, expected_rows)
+        run_dir, runtime, receipt_tool_sha, phase_a_sha, preview_sha, authority_sha,
+        expected_rows)
+    for wave in range(1, len(WAVE_PLAN) + 1):
+        validate_phase_b_wave(
+            run_dir, wave, runtime, receipt_tool_sha, phase_a_sha, preview_sha,
+            authority_sha, expected_rows)
     transport = Transport(runtime)
     samples = require_int(args.samples, "samples", 1)
     interval = require_int(args.interval, "interval", 0)
     latest: list[dict[str, Any]] = []
     for sample in range(samples):
         latest = []
-        complete = True
+        all_nodes_service_ready = True
         for node in runtime.nodes:
             for _ in range(5):
                 runtime_before = transport.runtime_snapshot(node)
@@ -3284,52 +3356,83 @@ def monitor_command(args: argparse.Namespace) -> None:
             preview_claims = require_int(
                 expected_rows[node.node]["operational_preflight"].get("claims_submitted"),
                 f"node{node.node} Phase-B preview claims_submitted", 0)
-            current_claims = (require_int(mining.get("claims_submitted"),
-                                          f"node{node.node} current claims_submitted", 0)
-                              if isinstance(mining, dict) else -1)
+            if not isinstance(mining, dict):
+                die(f"node{node.node} PoW mining status is not an object")
+            current_claims = require_int(
+                mining.get("claims_submitted"),
+                f"node{node.node} current claims_submitted", 0)
             restarted_since_preview = transition["ephemeral_container_changed"]
             claims_baseline = 0 if restarted_since_preview else preview_claims
             claims_evidence = (
                 "positive_counter_since_restarted_process_epoch" if restarted_since_preview else
                 "increment_from_phase_b_preview_in_same_process_epoch")
+            if not restarted_since_preview and current_claims < claims_baseline:
+                die(f"node{node.node} claims_submitted regressed in the same process epoch")
+            fresh_claim_delta = max(0, current_claims - claims_baseline)
+            pow_hot_blockers = require_int(
+                mining.get("blocking_quarantined_claims"),
+                f"node{node.node} PoW hot blocking quarantines", 0)
+            pow_hot_indeterminate = require_int(
+                mining.get("indeterminate_quarantined_claims"),
+                f"node{node.node} PoW hot indeterminate quarantines", 0)
+            recovery_inventory_blockers = require_int(
+                recovery.get("blocking_quarantined_claims"),
+                f"node{node.node} historical recovery inventory blockers", 0)
             operational = (
                 anchor_spent_on_active_chain and isinstance(recovery, dict) and
                 recovery.get("database_outcome_ambiguous") is False and
-                recovery.get("blocking_quarantined_claims") == 0 and
                 isinstance(mining, dict) and mining.get("enabled") is True and
-                mining.get("state") == "hashing" and
+                mining.get("state") in {"ready", "claim_in_flight"} and
                 decimal_amount(mining.get("hashrate", 0), "monitor hashrate") > 0 and
-                current_claims > claims_baseline
+                pow_hot_blockers == 0 and
+                pow_hot_indeterminate == 0 and
+                mining.get("claim_recovery_database_outcome_ambiguous") is False
             )
-            complete &= operational
+            all_nodes_service_ready &= operational
             latest.append({
                 "node": node.node, "height": chain["blocks"], "tip": chain["bestblockhash"],
                 "anchor_spent_on_active_chain": anchor_spent_on_active_chain,
                 "confirmed_component_transactions": confirmed,
                 "runtime": runtime_before, "runtime_transition": transition,
                 "network_version": network["version"], "peers": peers,
-                "blocking_quarantined_claims": recovery.get("blocking_quarantined_claims") if isinstance(recovery, dict) else None,
+                "pow_hot_blocking_quarantined_claims": pow_hot_blockers,
+                "pow_hot_indeterminate_quarantined_claims": pow_hot_indeterminate,
+                "recovery_inventory_blocking_quarantined_claims": recovery_inventory_blockers,
                 "pow_enabled": mining.get("enabled") if isinstance(mining, dict) else None,
                 "pow_state": mining.get("state") if isinstance(mining, dict) else None,
                 "hashrate": mining.get("hashrate") if isinstance(mining, dict) else None,
                 "claims_submitted": current_claims,
                 "claims_baseline": claims_baseline,
                 "claims_baseline_source": claims_evidence,
+                "fresh_claims_submitted": fresh_claim_delta,
+                "fresh_claim_observed": fresh_claim_delta > 0,
                 "phase_b_preview_claims_submitted": preview_claims,
                 "operational": operational,
             })
+        fleet_fresh_claims = sum(row["fresh_claims_submitted"] for row in latest)
+        complete = all_nodes_service_ready and fleet_fresh_claims > 0
         if complete or sample + 1 == samples:
             break
         time.sleep(interval)
     receipt = base_receipt("fleet31-shadowpow-recovery-operational-monitor", runtime, tool_sha)
     operational_count = sum(1 for row in latest if row["operational"])
+    fleet_fresh_claims = sum(row["fresh_claims_submitted"] for row in latest)
+    fresh_claim_nodes = [row["node"] for row in latest if row["fresh_claim_observed"]]
+    complete = operational_count == len(NODE_SET) and fleet_fresh_claims > 0
     receipt.update({
         "audit_receipt_sha256": audit_sha, "phase_a_receipt_sha256": phase_a_sha,
         "phase_b_receipt_sha256": phase_b_sha, "mutation_performed": False,
-        "result": "ALL_31_POW_OPERATIONAL" if operational_count == len(NODE_SET) else "NOT_YET_OPERATIONAL",
+        "validated_phase_b_receipt_tool_sha256": receipt_tool_sha,
+        "phase_b_executor_product_test_evidence": executor_evidence,
+        "result": "ALL_31_POW_OPERATIONAL" if complete else "NOT_YET_OPERATIONAL",
         "operational_nodes": operational_count, "required_nodes": len(NODE_SET), "nodes": latest,
+        "fleet_fresh_claims_submitted": fleet_fresh_claims,
+        "nodes_with_fresh_claims": fresh_claim_nodes,
         "requires_active_chain_anchor_spend": True, "requires_positive_hashrate": True,
-        "requires_claim_submission_increment": True,
+        "requires_zero_pow_hot_blockers": True,
+        "recovery_inventory_blocker_count_is_informational": True,
+        "requires_fleet_fresh_claim_submission": True,
+        "requires_per_node_claim_submission_increment": False,
     })
     name = f"monitor-{int(time.time())}.json"
     digest = publish_json(run_dir / name, receipt)

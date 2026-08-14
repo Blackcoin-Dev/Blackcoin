@@ -317,7 +317,8 @@ def rpc(node: int, method: str, params: list[str]) -> object:
         return {"enabled": True, "staking": True, "weight": 1000 + node}
     if method == "getpowmininginfo":
         operational = state.get("confirmed", False)
-        return {"enabled": True, "state": "hashing" if operational else "claim_quarantined",
+        pow_state = state.get("pow_state", "hashing" if operational else "claim_quarantined")
+        return {"enabled": True, "state": pow_state,
                 "hashrate": 42.5 if operational else 0, "claims_submitted": state["claims_submitted"],
                 "threads": 1, "cpu_percent": 1, "payout_address": "blk1s" + h("payout", node),
                 "blocking_quarantined_claims": 0 if operational else 1,
@@ -333,7 +334,9 @@ def rpc(node: int, method: str, params: list[str]) -> object:
                        "has_revalidating_unbound_proof": True})
         return {"chain_ready": True, "wallet_tip_matches": True, "database_outcome_ambiguous": False,
                 "active_tip": tip, "active_height": height,
-                "blocking_quarantined_claims": 0 if state.get("confirmed", False) else 1,
+                "blocking_quarantined_claims": state.get(
+                    "recovery_inventory_blockers",
+                    0 if state.get("confirmed", False) else 1),
                 "component_details": [detail]}
     if method == "resolveallshadowpowclaims":
         options = json.loads(params[0]) if params else {}
@@ -423,7 +426,25 @@ def main() -> None:
         rest = rest[1:]
     if not rest:
         raise SystemExit(2)
-    print(json.dumps(rpc(node, rest[0], rest[1:]), sort_keys=True, separators=(",", ":")))
+    method = rest[0]
+    result = rpc(node, method, rest[1:])
+    if method == "gettxout" and result is None:
+        if SCENARIO == "empty-gettxout-spent":
+            return
+        if SCENARIO == "whitespace-gettxout-spent":
+            sys.stdout.write(" \n")
+            return
+        if SCENARIO == "malformed-gettxout-spent":
+            sys.stdout.write("{\n")
+            return
+    if SCENARIO == "empty-non-gettxout" and method == "getnetworkinfo" and node == 1:
+        return
+    if SCENARIO == "empty-gettransaction" and method == "gettransaction" and node == 1:
+        return
+    if SCENARIO == "malformed-gettransaction" and method == "gettransaction" and node == 1:
+        sys.stdout.write("{\n")
+        return
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
 if __name__ == "__main__":

@@ -29,6 +29,13 @@ SUCCESSOR_SUPERVISOR_SHA256 = "b879bb3833bc5786aa34918741550119cde4ddf71ca00f06b
 SUPERVISOR_BASENAME = "pos_unlock_renewal_supervisor.sh"
 STATE_ROOT = Path("/boot/config/plugins/blackcoin-quantum-nodes")
 HELPER_PATH = STATE_ROOT / "blackcoin_node_normal_unlock.sh"
+ACTIVE_POW_CYCLE_BASENAME = "blackcoin_pow_quarantine_cycle.sh"
+ACTIVE_POW_CYCLE_PATH = STATE_ROOT / ACTIVE_POW_CYCLE_BASENAME
+ACTIVE_POW_CYCLE_PREDECESSOR_SHA256 = "1dbb72bd0e400806a8b1cdf9337cd28672f9242c5d18feb65dd6c64ce27b6f1c"
+ACTIVE_POW_CYCLE_SUCCESSOR_SHA256 = "9936417a89bc34ae9dbe7a22346ed0dd78d79fcee401a10481e6b5ccdcb54b67"
+DISABLED_POW_CYCLE_BASENAME = "blackcoin_pow_quarantine_cycle.v30.1.3-fee-capable.disabled"
+DISABLED_POW_CYCLE_PATH = STATE_ROOT / DISABLED_POW_CYCLE_BASENAME
+DISABLED_POW_CYCLE_SHA256 = "156acca0ed86fbeba008d9f87eb862aa2f93fc32f57ed2995d7dc05dcdb7312d"
 UNRAID_DISK_ROOT = Path("/mnt/disk1")
 UNRAID_SHARE_ROOT = UNRAID_DISK_ROOT / "blackcoin-wallet-safety"
 RUNTIME_AUDITS_ROOT = UNRAID_SHARE_ROOT / "runtime-audits"
@@ -45,6 +52,11 @@ PACKAGE_PAYLOADS = (
     "tests/run.py",
 )
 HISTORICAL_JOB10_KIND = "historical-emergency-pos-renewal-one-shot"
+FAILED_JOB10_RECEIPT_KIND = "failed-emergency-pos-renewal-job10-log"
+FAILED_JOB10_RECEIPT_PATH = (
+    RUNTIME_AUDITS_ROOT / "emergency-pos-renewal-20260814T034100Z.log"
+)
+FAILED_JOB10_RECEIPT_SHA256 = "23030a65f9b182534d82f6d67709b9cd088cbe6907bae56647d9780f9b9cf3cb"
 AUTHORITY_KIND = "blackcoin-normal-unlock-helper-rotation-authority"
 PLAN_KIND = "blackcoin-normal-unlock-helper-rotation-plan"
 RESULT_KIND = "blackcoin-normal-unlock-helper-rotation-result"
@@ -229,6 +241,13 @@ def secure_ancestry(path, expected_uid=0):
     current = Path(path).resolve()
     if not current.is_dir():
         current = current.parent
+    while True:
+        info = current.lstat()
+        if info.st_uid != expected_uid or stat.S_IMODE(info.st_mode) & 0o022:
+            raise RotationError(f"writable or foreign ancestry: {current}")
+        if current.parent == current:
+            return
+        current = current.parent
 
 
 def secure_runtime_audit_ancestry(path, expected_uid=0, expected_gid=0,
@@ -280,13 +299,6 @@ def secure_runtime_audit_ancestry(path, expected_uid=0, expected_gid=0,
         current /= component
         exact_directory(current, expected_uid, expected_gid, 0o700, "protected-runtime-audit-descendant")
     return records
-    while True:
-        info = current.lstat()
-        if info.st_uid != expected_uid or stat.S_IMODE(info.st_mode) & 0o022:
-            raise RotationError(f"writable or foreign ancestry: {current}")
-        if current.parent == current:
-            return
-        current = current.parent
 
 
 def verify_sidecar(path, expected_uid=0):
@@ -355,6 +367,19 @@ def rotate_supervisor_bytes(data):
     return transformed
 
 
+def rotate_active_pow_cycle_bytes(data):
+    old = PREDECESSOR_HELPER_SHA256.encode()
+    new = SUCCESSOR_HELPER_SHA256.encode()
+    if sha256_bytes(data) != ACTIVE_POW_CYCLE_PREDECESSOR_SHA256:
+        raise RotationError("active PoW-cycle predecessor identity mismatch")
+    if data.count(old) != 1 or data.count(new) != 0:
+        raise RotationError("active PoW-cycle helper pin is not the exact predecessor singleton")
+    transformed = data.replace(old, new, 1)
+    if sha256_bytes(transformed) != ACTIVE_POW_CYCLE_SUCCESSOR_SHA256:
+        raise RotationError("active PoW-cycle successor identity mismatch")
+    return transformed
+
+
 def file_record(path, info):
     return {
         "path": str(path),
@@ -367,7 +392,8 @@ def file_record(path, info):
 
 
 def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0,
-              audit_run_dir=None, expected_gid=0, audit_ancestry_kwargs=None):
+              audit_run_dir=None, expected_gid=None, audit_ancestry_kwargs=None,
+              failed_job10_receipt_path=None, failed_job10_ancestry_kwargs=None):
     state_root = Path(state_root).resolve()
     helper_path = Path(helper_path).resolve()
     secure_directory(state_root, expected_uid, 0o700)
@@ -376,7 +402,13 @@ def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0,
     active = []
     current = []
     historical = []
+    immutable_historical = []
     unsupported = []
+    if expected_gid is not None and helper_info.st_gid != expected_gid:
+        unsupported.append({
+            "path": str(helper_path), "reason": "helper-GID-mismatch",
+            "sha256": helper_sha, "gid": helper_info.st_gid,
+        })
     old = PREDECESSOR_HELPER_SHA256.encode()
     new = SUCCESSOR_HELPER_SHA256.encode()
     helper_name = b"blackcoin_node_normal_unlock.sh"
@@ -392,7 +424,10 @@ def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0,
             except FileNotFoundError:
                 raise RotationError(f"scan raced with file removal: {path}")
             if not stat.S_ISREG(info.st_mode):
-                if path.name in {"blackcoin_node_normal_unlock.sh", "pos_unlock_renewal_supervisor.sh"}:
+                if path.name in {
+                    "blackcoin_node_normal_unlock.sh", SUPERVISOR_BASENAME,
+                    ACTIVE_POW_CYCLE_BASENAME, DISABLED_POW_CYCLE_BASENAME,
+                }:
                     unsupported.append({"path": str(path), "reason": "relevant-nonregular-path"})
                 continue
             with open(path, "rb") as handle:
@@ -400,19 +435,70 @@ def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0,
             old_count = data.count(old)
             new_count = data.count(new)
             file_sha = sha256_bytes(data)
-            if old_count == 0 and new_count == 0 and path.name != SUPERVISOR_BASENAME:
+            relevant_named_path = path in {
+                state_root / ACTIVE_POW_CYCLE_BASENAME,
+                state_root / DISABLED_POW_CYCLE_BASENAME,
+            }
+            if (old_count == 0 and new_count == 0 and path.name != SUPERVISOR_BASENAME and
+                    not relevant_named_path):
                 continue
             record = file_record(path, info)
             record.update({"old_pin_occurrences": old_count, "new_pin_occurrences": new_count})
-            if old_count and is_historical_job10(data):
-                if old_count != 1:
-                    record["reason"] = "historical-job10-pin-count"
+            if path == state_root / DISABLED_POW_CYCLE_BASENAME:
+                if (file_sha != DISABLED_POW_CYCLE_SHA256 or old_count != 1 or new_count != 0 or
+                        info.st_uid != expected_uid or
+                        (expected_gid is not None and info.st_gid != expected_gid) or info.st_nlink != 1 or
+                        stat.S_IMODE(info.st_mode) != 0o600):
+                    record["reason"] = "disabled-historical-PoW-cycle-identity-mismatch"
+                    unsupported.append(record)
+                else:
+                    record.update({
+                        "historical_kind": "disabled-v30.1.3-fee-capable-PoW-cycle",
+                        "immutable": True,
+                    })
+                    immutable_historical.append(record)
+            elif path == state_root / ACTIVE_POW_CYCLE_BASENAME:
+                if file_sha == ACTIVE_POW_CYCLE_PREDECESSOR_SHA256:
+                    if (old_count != 1 or new_count != 0 or helper_name not in data or b"\x00" in data or
+                            info.st_uid != expected_uid or
+                            (expected_gid is not None and info.st_gid != expected_gid) or info.st_nlink != 1 or
+                            stat.S_IMODE(info.st_mode) != 0o600):
+                        record["reason"] = "active-PoW-cycle-is-not-the-exact-secure-predecessor"
+                        unsupported.append(record)
+                        continue
+                    replaced = rotate_active_pow_cycle_bytes(data)
+                    record.update({
+                        "after_sha256": sha256_bytes(replaced),
+                        "replacement_kind": "exact-single-helper-pin-substitution",
+                        "replacement_occurrences": 1,
+                        "preserves_historical_helper_identity": False,
+                    })
+                    active.append(record)
+                elif file_sha == ACTIVE_POW_CYCLE_SUCCESSOR_SHA256:
+                    if (old_count != 0 or new_count != 1 or info.st_uid != expected_uid or
+                            (expected_gid is not None and info.st_gid != expected_gid) or
+                            info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                        record["reason"] = "active-PoW-cycle-successor-identity-mismatch"
+                        unsupported.append(record)
+                    else:
+                        record["state"] = "successor-pinned"
+                        record["preserves_historical_helper_identity"] = False
+                        current.append(record)
+                else:
+                    record["reason"] = "active-PoW-cycle-identity-mismatch"
+                    unsupported.append(record)
+            elif old_count and is_historical_job10(data):
+                if (old_count != 1 or info.st_uid != expected_uid or
+                        (expected_gid is not None and info.st_gid != expected_gid) or
+                        info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                    record["reason"] = "historical-job10-identity-mismatch"
                     unsupported.append(record)
                 else:
                     record["historical_kind"] = HISTORICAL_JOB10_KIND
                     historical.append(record)
             elif path.name == SUPERVISOR_BASENAME and file_sha == PREDECESSOR_SUPERVISOR_SHA256:
-                if (helper_name not in data or b"\x00" in data or info.st_uid != expected_uid
+                if (helper_name not in data or b"\x00" in data or info.st_uid != expected_uid or
+                        (expected_gid is not None and info.st_gid != expected_gid)
                         or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) not in (0o600, 0o700)):
                     record["reason"] = "predecessor-supervisor-is-not-a-secure-active-consumer"
                     unsupported.append(record)
@@ -432,6 +518,58 @@ def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0,
             else:
                 record["reason"] = "unrecognized-helper-pin-reference"
                 unsupported.append(record)
+
+    if failed_job10_receipt_path is not None:
+        receipt_path = Path(os.path.abspath(failed_job10_receipt_path))
+        try:
+            receipt_info = receipt_path.lstat()
+        except FileNotFoundError:
+            receipt_record = {
+                "path": str(receipt_path), "reason": "failed-job10-receipt-absent",
+            }
+            unsupported.append(receipt_record)
+        else:
+            receipt_gid = os.getgid() if expected_gid is None else expected_gid
+            if not stat.S_ISREG(receipt_info.st_mode):
+                receipt_record = {
+                    "path": str(receipt_path), "uid": receipt_info.st_uid,
+                    "gid": receipt_info.st_gid,
+                    "mode": format(stat.S_IMODE(receipt_info.st_mode), "04o"),
+                    "nlink": receipt_info.st_nlink,
+                    "reason": "failed-job10-receipt-identity-mismatch",
+                }
+                unsupported.append(receipt_record)
+                receipt_record = None
+            else:
+                receipt_record = file_record(receipt_path, receipt_info)
+            if receipt_record is None:
+                pass
+            elif (receipt_path != FAILED_JOB10_RECEIPT_PATH or
+                    receipt_record["sha256"] != FAILED_JOB10_RECEIPT_SHA256 or
+                    receipt_info.st_uid != expected_uid or
+                    receipt_info.st_gid != receipt_gid or receipt_info.st_nlink != 1 or
+                    stat.S_IMODE(receipt_info.st_mode) != 0o600):
+                receipt_record["reason"] = "failed-job10-receipt-identity-mismatch"
+                unsupported.append(receipt_record)
+            else:
+                try:
+                    receipt_ancestry_kwargs = (
+                        {} if failed_job10_ancestry_kwargs is None
+                        else dict(failed_job10_ancestry_kwargs)
+                    )
+                    receipt_ancestry = secure_runtime_audit_ancestry(
+                        receipt_path, expected_uid, receipt_gid, **receipt_ancestry_kwargs,
+                    )
+                except RotationError:
+                    receipt_record["reason"] = "failed-job10-receipt-ancestry-mismatch"
+                    unsupported.append(receipt_record)
+                else:
+                    receipt_record.update({
+                        "historical_kind": FAILED_JOB10_RECEIPT_KIND,
+                        "immutable": True,
+                        "runtime_audit_ancestry": receipt_ancestry,
+                    })
+                    historical.append(receipt_record)
 
     state = "READY" if helper_sha == PREDECESSOR_HELPER_SHA256 and not unsupported else "BLOCKED"
     if helper_sha == SUCCESSOR_HELPER_SHA256 and not active and not unsupported:
@@ -457,6 +595,7 @@ def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0,
         "active_consumers": sorted(active, key=lambda row: row["path"]),
         "successor_consumers": sorted(current, key=lambda row: row["path"]),
         "historical_job10_refs": sorted(historical, key=lambda row: row["path"]),
+        "immutable_historical_refs": sorted(immutable_historical, key=lambda row: row["path"]),
         "unsupported_refs": sorted(unsupported, key=lambda row: row["path"]),
         "mutation_order": (
             [row["path"] for row in sorted(active, key=lambda row: row["path"])] + [str(helper_path)]
@@ -464,13 +603,15 @@ def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0,
         "helper_order": list(HELPER_ORDER),
         "verification_order": list(VERIFICATION_ORDER),
         "historical_job10_immutable": True,
+        "disabled_pow_cycle_immutable": True,
         "ordinary_pow_mutation_forbidden": True,
         "core_deployment_forbidden": True,
     }
     if audit_run_dir is not None:
         ancestry_kwargs = {} if audit_ancestry_kwargs is None else dict(audit_ancestry_kwargs)
         plan["runtime_audit_ancestry"] = secure_runtime_audit_ancestry(
-            audit_run_dir, expected_uid, expected_gid, **ancestry_kwargs,
+            audit_run_dir, expected_uid, os.getgid() if expected_gid is None else expected_gid,
+            **ancestry_kwargs,
         )
     return plan
 
@@ -489,8 +630,14 @@ def authority_projection(plan):
             for row in plan["active_consumers"]
         ],
         "historical_job10_refs": [
-            {"path": row["path"], "sha256": row["sha256"]}
+            {"path": row["path"], "sha256": row["sha256"],
+             "historical_kind": row["historical_kind"]}
             for row in plan["historical_job10_refs"]
+        ],
+        "immutable_historical_refs": [
+            {"path": row["path"], "sha256": row["sha256"],
+             "historical_kind": row["historical_kind"]}
+            for row in plan["immutable_historical_refs"]
         ],
     }
 
@@ -523,6 +670,7 @@ def authority_template(plan, plan_sha, package):
         "backup_required": True,
         "atomic_replace_required": True,
         "historical_job10_immutable": True,
+        "disabled_pow_cycle_immutable": True,
         "node30_ordinary_pow_must_remain_disabled": True,
         "regular_pow_policy_must_remain_unchanged": True,
         "helper_order": list(HELPER_ORDER),
@@ -754,9 +902,17 @@ def replacement_bytes(row):
     data = path.read_bytes()
     if sha256_bytes(data) != row["sha256"]:
         raise RotationError(f"consumer changed before replacement: {path}")
-    if row.get("replacement_kind") != "exact-supervisor-semantic-transform":
+    replacement_kind = row.get("replacement_kind")
+    if replacement_kind == "exact-supervisor-semantic-transform":
+        replaced = rotate_supervisor_bytes(data)
+    elif replacement_kind == "exact-single-helper-pin-substitution":
+        if path != ACTIVE_POW_CYCLE_PATH:
+            # Unit fixtures use a custom state root but retain the exact basename.
+            if path.name != ACTIVE_POW_CYCLE_BASENAME:
+                raise RotationError(f"active PoW-cycle replacement path is unsupported: {path}")
+        replaced = rotate_active_pow_cycle_bytes(data)
+    else:
         raise RotationError(f"consumer replacement kind is unsupported: {path}")
-    replaced = rotate_supervisor_bytes(data)
     if sha256_bytes(replaced) != row["after_sha256"]:
         raise RotationError(f"consumer replacement plan mismatch: {path}")
     return replaced
@@ -786,6 +942,8 @@ def apply_files(plan, payload_helper, changed, expected_uid=0):
     for row in plan["active_consumers"]:
         path = Path(row["path"])
         info = secure_regular(path, expected_uid, (0o600, 0o700), row["sha256"])
+        if info.st_gid != row["gid"] or format(stat.S_IMODE(info.st_mode), "04o") != row["mode"]:
+            raise RotationError(f"consumer security identity changed before replacement: {path}")
         atomic_write(path, replacement_bytes(row), stat.S_IMODE(info.st_mode), replace=True,
                      uid=info.st_uid, gid=info.st_gid)
         changed.append(str(path))
@@ -793,6 +951,8 @@ def apply_files(plan, payload_helper, changed, expected_uid=0):
             raise RotationError(f"consumer post-install mismatch: {path}")
     helper_path = Path(plan["helper"]["path"])
     info = secure_regular(helper_path, expected_uid, (0o600,), PREDECESSOR_HELPER_SHA256)
+    if info.st_gid != plan["helper"]["gid"]:
+        raise RotationError("helper security identity changed before replacement")
     secure_regular(payload_helper, expected_uid, (0o600, 0o644), SUCCESSOR_HELPER_SHA256)
     atomic_write(helper_path, Path(payload_helper).read_bytes(), 0o600, replace=True,
                  uid=info.st_uid, gid=info.st_gid)
@@ -802,11 +962,40 @@ def apply_files(plan, payload_helper, changed, expected_uid=0):
     return None
 
 
-def verify_historical(plan):
+def verify_historical(plan, expected_uid=0, expected_gid=0,
+                      failed_job10_ancestry_kwargs=None):
     for row in plan["historical_job10_refs"]:
         path = Path(row["path"])
-        if sha256_file(path) != row["sha256"] or not is_historical_job10(path.read_bytes()):
+        info = secure_regular(path, expected_uid, (0o600,), row["sha256"])
+        kind = row.get("historical_kind")
+        if kind == HISTORICAL_JOB10_KIND:
+            valid_kind = is_historical_job10(path.read_bytes())
+        elif kind == FAILED_JOB10_RECEIPT_KIND:
+            valid_kind = (
+                path == FAILED_JOB10_RECEIPT_PATH and
+                row["sha256"] == FAILED_JOB10_RECEIPT_SHA256
+            )
+            if valid_kind:
+                ancestry_kwargs = (
+                    {} if failed_job10_ancestry_kwargs is None
+                    else dict(failed_job10_ancestry_kwargs)
+                )
+                secure_runtime_audit_ancestry(
+                    path, expected_uid, expected_gid, **ancestry_kwargs,
+                )
+        else:
+            valid_kind = False
+        if info.st_gid != expected_gid or not valid_kind:
             raise RotationError(f"historical job10 evidence changed: {path}")
+    for row in plan["immutable_historical_refs"]:
+        path = Path(row["path"])
+        info = secure_regular(path, expected_uid, (0o600,), row["sha256"])
+        if (path != Path(plan["state_root"]) / DISABLED_POW_CYCLE_BASENAME or
+                info.st_gid != expected_gid or row.get("historical_kind") !=
+                "disabled-v30.1.3-fee-capable-PoW-cycle" or
+                row["sha256"] != DISABLED_POW_CYCLE_SHA256 or
+                path.read_bytes().count(PREDECESSOR_HELPER_SHA256.encode()) != 1):
+            raise RotationError(f"immutable disabled PoW-cycle evidence changed: {path}")
 
 
 def rollback_files(backup_manifest, expected_uid=0):
@@ -836,7 +1025,7 @@ def execute_transaction(plan, runtime, run_dir, runtime_locks, lock_factory,
             before[node] = runtime.capture(node)
         backup_manifest = make_backup_manifest(plan, run_dir, expected_uid)
         apply_files(plan, payload_helper, changed, expected_uid)
-        verify_historical(plan)
+        verify_historical(plan, expected_uid, os.getgid())
         # All files are now coherently replaced while every node runtime lock is
         # held.  Release the fleet locks before invoking the helper because the
         # helper obtains the matching per-node lock itself.
@@ -863,12 +1052,16 @@ def execute_transaction(plan, runtime, run_dir, runtime_locks, lock_factory,
             after = runtime.capture(node)
             verify_after(before[node], after, int(now_function()))
             final.append(after)
-        if sha256_file(Path(plan["helper"]["path"])) != SUCCESSOR_HELPER_SHA256:
+        helper_path = Path(plan["helper"]["path"])
+        helper_info = secure_regular(helper_path, expected_uid, (0o600,), SUCCESSOR_HELPER_SHA256)
+        if helper_info.st_gid != plan["helper"]["gid"]:
             raise RotationError("successor helper drifted before terminal receipt")
         for row in plan["active_consumers"]:
-            if sha256_file(Path(row["path"])) != row["after_sha256"]:
+            path = Path(row["path"])
+            info = secure_regular(path, expected_uid, (int(row["mode"], 8),), row["after_sha256"])
+            if info.st_gid != row["gid"]:
                 raise RotationError(f"active consumer drifted before terminal receipt: {row['path']}")
-        verify_historical(plan)
+        verify_historical(plan, expected_uid, os.getgid())
         result = {
             "schema": SCHEMA, "kind": RESULT_KIND, "status": "PASS",
             "predecessor_helper_sha256": PREDECESSOR_HELPER_SHA256,
@@ -878,6 +1071,8 @@ def execute_transaction(plan, runtime, run_dir, runtime_locks, lock_factory,
             "node30_canary_first": True, "all_nodes_normally_unlocked_pos_active": True,
             "node30_ordinary_pow_disabled": True, "regular_pow_policy_unchanged": True,
             "historical_job10_unchanged": True,
+            "immutable_historical_refs_unchanged": True,
+            "immutable_historical_ref_count": len(plan["immutable_historical_refs"]),
             "preflight_sha256": sha256_bytes(canonical_json_bytes(list(before.values()))),
             "postflight_sha256": sha256_bytes(canonical_json_bytes(final)),
             "rollback_performed": False,
@@ -892,7 +1087,7 @@ def execute_transaction(plan, runtime, run_dir, runtime_locks, lock_factory,
                 if not runtime_locks.handles:
                     runtime_locks.acquire()
                 rollback["restored_paths"] = rollback_files(backup_manifest, expected_uid)
-                verify_historical(plan)
+                verify_historical(plan, expected_uid, os.getgid())
                 rollback["performed"] = True
             except Exception as rollback_error:
                 rollback["error"] = str(rollback_error)
@@ -902,6 +1097,7 @@ def execute_transaction(plan, runtime, run_dir, runtime_locks, lock_factory,
             "helper_attempted_nodes": [row["node"] for row in attempts],
             "rollback": rollback,
             "historical_job10_unchanged": not changed or rollback["performed"],
+            "immutable_historical_refs_unchanged": not changed or rollback["performed"],
             **bindings,
         }
         publish_json(run_dir / "FAILURE.json", failure, expected_uid, os.getgid())
@@ -928,7 +1124,10 @@ def command_audit(arguments):
         raise RotationError("audit requires root")
     package = verify_package()
     run_dir = create_run_dir(arguments.run_dir)
-    plan = scan_plan(audit_run_dir=run_dir, expected_gid=os.getgid())
+    plan = scan_plan(
+        audit_run_dir=run_dir, expected_gid=os.getgid(),
+        failed_job10_receipt_path=FAILED_JOB10_RECEIPT_PATH,
+    )
     plan_sha = publish_json(run_dir / "PLAN.json", plan, 0, os.getgid())
     template = authority_template(plan, plan_sha, package)
     publish_json(run_dir / "AUTHORITY.template.json", template, 0, os.getgid())
@@ -938,6 +1137,7 @@ def command_audit(arguments):
         "plan_sha256": plan_sha, **package,
         "active_consumer_count": len(plan["active_consumers"]),
         "historical_job10_ref_count": len(plan["historical_job10_refs"]),
+        "immutable_historical_ref_count": len(plan["immutable_historical_refs"]),
         "unsupported_ref_count": len(plan["unsupported_refs"]),
         "live_contact": False, "wallet_contact": False, "docker_contact": False,
     }
@@ -978,7 +1178,10 @@ def command_install(arguments):
     runtime_locks = None
     try:
         runtime_locks = LockSet(RUNTIME_LOCKS, 0).acquire()
-        current = scan_plan(audit_run_dir=run_dir, expected_gid=os.getgid())
+        current = scan_plan(
+            audit_run_dir=run_dir, expected_gid=os.getgid(),
+            failed_job10_receipt_path=FAILED_JOB10_RECEIPT_PATH,
+        )
         if canonical_json_bytes(current) != canonical_json_bytes(plan):
             raise RotationError("live consumer/helper plan drifted after authority")
         consumption = {

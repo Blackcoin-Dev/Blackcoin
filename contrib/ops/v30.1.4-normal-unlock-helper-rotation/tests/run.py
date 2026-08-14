@@ -82,6 +82,34 @@ def synthetic_identities():
             setattr(ROTATION, name, value)
 
 
+@contextmanager
+def synthetic_cycle_identities():
+    names = (
+        "ACTIVE_POW_CYCLE_PREDECESSOR_SHA256", "ACTIVE_POW_CYCLE_SUCCESSOR_SHA256",
+        "DISABLED_POW_CYCLE_SHA256",
+    )
+    saved = {name: getattr(ROTATION, name) for name in names}
+    active_before = (
+        b"#!/bin/bash\nblackcoin_node_normal_unlock.sh\nNORMAL_UNLOCK_SHA256=" +
+        ROTATION.PREDECESSOR_HELPER_SHA256.encode() + b"\n"
+    )
+    active_after = active_before.replace(
+        ROTATION.PREDECESSOR_HELPER_SHA256.encode(), ROTATION.SUCCESSOR_HELPER_SHA256.encode(), 1,
+    )
+    disabled = (
+        b"#!/bin/bash\ndisabled-v30.1.3-fee-capable\nNORMAL_UNLOCK_SHA256=" +
+        ROTATION.PREDECESSOR_HELPER_SHA256.encode() + b"\n"
+    )
+    ROTATION.ACTIVE_POW_CYCLE_PREDECESSOR_SHA256 = sha(active_before)
+    ROTATION.ACTIVE_POW_CYCLE_SUCCESSOR_SHA256 = sha(active_after)
+    ROTATION.DISABLED_POW_CYCLE_SHA256 = sha(disabled)
+    try:
+        yield active_before, active_after, disabled
+    finally:
+        for name, value in saved.items():
+            setattr(ROTATION, name, value)
+
+
 def historical_contract(old_sha):
     return ROTATION.canonical_json_bytes({
         "schema": 1,
@@ -210,6 +238,43 @@ def test_static_contract():
        "all 32 canonical node runtime locks are present")
     ok("/boot/config/plugins/blackcoin-quantum-nodes" == str(ROTATION.STATE_ROOT),
        "installed state root is fixed")
+    ok(ROTATION.ACTIVE_POW_CYCLE_PREDECESSOR_SHA256 ==
+       "1dbb72bd0e400806a8b1cdf9337cd28672f9242c5d18feb65dd6c64ce27b6f1c",
+       "active PoW-cycle predecessor identity is exact")
+    ok(ROTATION.ACTIVE_POW_CYCLE_SUCCESSOR_SHA256 ==
+       "9936417a89bc34ae9dbe7a22346ed0dd78d79fcee401a10481e6b5ccdcb54b67",
+       "active PoW-cycle successor identity is exact")
+    ok(ROTATION.DISABLED_POW_CYCLE_SHA256 ==
+       "156acca0ed86fbeba008d9f87eb862aa2f93fc32f57ed2995d7dc05dcdb7312d",
+       "disabled historical PoW-cycle identity is exact")
+    ok(str(ROTATION.FAILED_JOB10_RECEIPT_PATH) ==
+       "/mnt/disk1/blackcoin-wallet-safety/runtime-audits/emergency-pos-renewal-20260814T034100Z.log" and
+       ROTATION.FAILED_JOB10_RECEIPT_SHA256 ==
+       "23030a65f9b182534d82f6d67709b9cd088cbe6907bae56647d9780f9b9cf3cb",
+       "failed historical job10 receipt path and identity are exact")
+    schema = json.loads((PACKAGE / "AUTHORITY.schema.json").read_text())
+    active_variants = schema["properties"]["active_consumers"]["items"]["oneOf"]
+    cycle_schema = next(
+        row for row in active_variants
+        if row["properties"]["replacement_kind"].get("const") ==
+        "exact-single-helper-pin-substitution"
+    )["properties"]
+    ok(cycle_schema["path"]["const"] == str(ROTATION.ACTIVE_POW_CYCLE_PATH) and
+       cycle_schema["before_sha256"]["const"] == ROTATION.ACTIVE_POW_CYCLE_PREDECESSOR_SHA256 and
+       cycle_schema["after_sha256"]["const"] == ROTATION.ACTIVE_POW_CYCLE_SUCCESSOR_SHA256,
+       "authority schema binds exact active PoW-cycle path and identities")
+    immutable_schema = schema["properties"]["immutable_historical_refs"]["items"]["properties"]
+    ok(immutable_schema["path"]["const"] == str(ROTATION.DISABLED_POW_CYCLE_PATH) and
+       immutable_schema["sha256"]["const"] == ROTATION.DISABLED_POW_CYCLE_SHA256,
+       "authority schema binds exact immutable disabled PoW-cycle path and identity")
+    job10_variants = schema["properties"]["historical_job10_refs"]["items"]["oneOf"]
+    failed_job10_schema = next(
+        row for row in job10_variants
+        if row["properties"]["historical_kind"]["const"] == ROTATION.FAILED_JOB10_RECEIPT_KIND
+    )["properties"]
+    ok(failed_job10_schema["path"]["const"] == str(ROTATION.FAILED_JOB10_RECEIPT_PATH) and
+       failed_job10_schema["sha256"]["const"] == ROTATION.FAILED_JOB10_RECEIPT_SHA256,
+       "authority schema binds exact failed historical job10 receipt")
     with tempfile.TemporaryDirectory() as temporary:
         py_compile.compile(str(MODULE_PATH), cfile=str(Path(temporary) / "helper_rotation.pyc"), doraise=True)
     ok(True, "rotation Python compiles")
@@ -298,6 +363,7 @@ def test_scan_and_authority():
                 "normal_unlock_node30_canary_authorized": False,
                 "normal_unlock_fleet_authorized": False, "rollback_authorized": False,
                 "helper_order": list(range(1, 33)), "historical_job10_immutable": False,
+                "disabled_pow_cycle_immutable": False,
             }
             for key, value in mutations.items():
                 candidate = copy.deepcopy(authority)
@@ -459,6 +525,8 @@ def test_lockset_and_file_security():
         regular.chmod(0o644)
         rejects(lambda: ROTATION.secure_regular(regular, UID, (0o600,)),
                 "secure-file verifier rejects broader permissions")
+    rejects(lambda: ROTATION.secure_ancestry(Path(tempfile.gettempdir()), 0),
+            "writable or foreign generic ancestry fails closed")
 
 
 def test_unraid_runtime_audit_ancestry():
@@ -528,6 +596,153 @@ def test_unraid_runtime_audit_ancestry():
             ok(plan["runtime_audit_ancestry"] == records,
                "PLAN binds the exact validated Unraid/protected ancestry receipt")
 
+            failed_job10 = write_secure(
+                protected / "emergency-pos-renewal-20260814T034100Z.log",
+                b"HELPER_OK node=1\nHELPER_FAIL node=30\nRENEWAL_FAIL stage=helper-wave\n",
+            )
+            saved_path = ROTATION.FAILED_JOB10_RECEIPT_PATH
+            saved_sha = ROTATION.FAILED_JOB10_RECEIPT_SHA256
+            ROTATION.FAILED_JOB10_RECEIPT_PATH = failed_job10
+            ROTATION.FAILED_JOB10_RECEIPT_SHA256 = ROTATION.sha256_file(failed_job10)
+            try:
+                receipt_plan = ROTATION.scan_plan(
+                    state, helper, UID, audit_run_dir=run, expected_gid=GID,
+                    audit_ancestry_kwargs=kwargs,
+                    failed_job10_receipt_path=failed_job10,
+                    failed_job10_ancestry_kwargs=kwargs,
+                )
+                failed_refs = [
+                    row for row in receipt_plan["historical_job10_refs"]
+                    if row["historical_kind"] == ROTATION.FAILED_JOB10_RECEIPT_KIND
+                ]
+                ok(receipt_plan["state"] == "READY" and len(failed_refs) == 1 and
+                   failed_refs[0]["path"] == str(failed_job10),
+                   "PLAN binds exact failed historical job10 receipt as immutable evidence")
+                ROTATION.verify_historical(
+                    receipt_plan, UID, GID, failed_job10_ancestry_kwargs=kwargs,
+                )
+                ok(True, "historical verifier preserves exact failed job10 receipt")
+                failed_job10.write_bytes(failed_job10.read_bytes() + b"drift\n")
+                drifted_receipt = ROTATION.scan_plan(
+                    state, helper, UID, expected_gid=GID,
+                    failed_job10_receipt_path=failed_job10,
+                    failed_job10_ancestry_kwargs=kwargs,
+                )
+                ok(drifted_receipt["state"] == "BLOCKED" and any(
+                    row.get("reason") == "failed-job10-receipt-identity-mismatch"
+                    for row in drifted_receipt["unsupported_refs"]
+                ), "failed historical job10 receipt byte drift fails closed")
+            finally:
+                ROTATION.FAILED_JOB10_RECEIPT_PATH = saved_path
+                ROTATION.FAILED_JOB10_RECEIPT_SHA256 = saved_sha
+
+
+def test_active_and_disabled_pow_cycle_pins():
+    with synthetic_identities() as (old_helper, new_helper, _old_supervisor, _new_supervisor):
+        with synthetic_cycle_identities() as (active_before, active_after, disabled):
+            with tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary).resolve() / "state"
+                state.mkdir(mode=0o700)
+                helper = write_secure(state / "blackcoin_node_normal_unlock.sh", old_helper)
+                active = write_secure(state / ROTATION.ACTIVE_POW_CYCLE_BASENAME, active_before)
+                historical = write_secure(state / ROTATION.DISABLED_POW_CYCLE_BASENAME, disabled)
+                historical_sha = ROTATION.sha256_file(historical)
+                plan = ROTATION.scan_plan(state, helper, UID, expected_gid=GID)
+                ok(plan["state"] == "READY", "exact active and disabled PoW-cycle live shape is READY")
+                ok(len(plan["active_consumers"]) == 1,
+                   "exact active PoW-cycle is the sole selected consumer")
+                row = plan["active_consumers"][0]
+                ok(row["path"] == str(active) and row["sha256"] == sha(active_before) and
+                   row["after_sha256"] == sha(active_after),
+                   "active PoW-cycle plan binds exact before and after bytes")
+                ok(row["replacement_kind"] == "exact-single-helper-pin-substitution" and
+                   row["replacement_occurrences"] == 1,
+                   "active PoW-cycle plan permits exactly one helper-pin substitution")
+                ok(plan["mutation_order"] == [str(active), str(helper)],
+                   "active consumer and helper form one coherent mutation order")
+                ok(len(plan["immutable_historical_refs"]) == 1 and
+                   plan["immutable_historical_refs"][0]["sha256"] == historical_sha,
+                   "disabled v30.1.3 artifact is classified immutable")
+                ok(not plan["unsupported_refs"], "exact PoW-cycle fixture has no unsupported references")
+                ok(ROTATION.rotate_active_pow_cycle_bytes(active_before) == active_after,
+                   "active PoW-cycle transform produces exact successor bytes")
+                authority = ROTATION.authority_template(
+                    plan, sha(ROTATION.canonical_json_bytes(plan)),
+                    {"manifest_sha256": "1" * 64, "tool_sha256": "2" * 64},
+                )
+                ok(authority["active_consumers"][0]["before_sha256"] == sha(active_before) and
+                   authority["active_consumers"][0]["after_sha256"] == sha(active_after),
+                   "authority binds active PoW-cycle before and after identities")
+                ok(authority["immutable_historical_refs"] == [{
+                    "path": str(historical), "sha256": historical_sha,
+                    "historical_kind": "disabled-v30.1.3-fee-capable-PoW-cycle",
+                }], "authority binds disabled historical identity without making it mutable")
+                ok(authority["disabled_pow_cycle_immutable"] is True,
+                   "authority explicitly requires disabled PoW-cycle immutability")
+
+                wrong_gid = ROTATION.scan_plan(state, helper, UID, expected_gid=GID + 1)
+                reasons = {row.get("reason") for row in wrong_gid["unsupported_refs"]}
+                ok(wrong_gid["state"] == "BLOCKED" and {
+                    "helper-GID-mismatch", "active-PoW-cycle-is-not-the-exact-secure-predecessor",
+                    "disabled-historical-PoW-cycle-identity-mismatch",
+                }.issubset(reasons), "helper, active, and disabled PoW-cycle GID drift fails closed")
+
+                active.write_bytes(active_before + b"drift")
+                blocked_active = ROTATION.scan_plan(state, helper, UID, expected_gid=GID)
+                ok(blocked_active["state"] == "BLOCKED" and any(
+                    row.get("reason") == "active-PoW-cycle-identity-mismatch"
+                    for row in blocked_active["unsupported_refs"]
+                ), "active PoW-cycle byte drift fails closed")
+                active.write_bytes(active_before)
+                historical.write_bytes(disabled + b"drift")
+                blocked_disabled = ROTATION.scan_plan(state, helper, UID, expected_gid=GID)
+                ok(blocked_disabled["state"] == "BLOCKED" and any(
+                    row.get("reason") == "disabled-historical-PoW-cycle-identity-mismatch"
+                    for row in blocked_disabled["unsupported_refs"]
+                ), "disabled historical PoW-cycle byte drift fails closed")
+                historical.write_bytes(disabled)
+
+                run_dir = Path(temporary) / "run-success"
+                run_dir.mkdir(mode=0o700)
+                payload = write_secure(Path(temporary) / "payload", new_helper)
+                result = ROTATION.execute_transaction(
+                    plan, FakeRuntime(), run_dir, DummyLocks([]),
+                    lambda paths: DummyLocks([], str(paths[0])), {"authority_sha256": "1" * 64},
+                    payload, UID, now_function=lambda: 100000,
+                )
+                ok(result["status"] == "PASS" and active.read_bytes() == active_after and
+                   helper.read_bytes() == new_helper,
+                   "transaction rotates active PoW-cycle and helper coherently")
+                ok(ROTATION.sha256_file(historical) == historical_sha,
+                   "successful transaction preserves disabled historical bytes")
+                ok(result["immutable_historical_refs_unchanged"] is True and
+                   result["immutable_historical_ref_count"] == 1,
+                   "terminal receipt proves one immutable historical reference")
+                active.chmod(0o644)
+                insecure_successor = ROTATION.scan_plan(state, helper, UID, expected_gid=GID)
+                ok(insecure_successor["state"] == "BLOCKED" and any(
+                    row.get("reason") == "active-PoW-cycle-successor-identity-mismatch"
+                    for row in insecure_successor["unsupported_refs"]
+                ), "active PoW-cycle successor metadata drift fails closed")
+                active.chmod(0o600)
+
+                active.write_bytes(active_before)
+                helper.write_bytes(old_helper)
+                failure_dir = Path(temporary) / "run-failure"
+                failure_dir.mkdir(mode=0o700)
+                rejects(lambda: ROTATION.execute_transaction(
+                    plan, FakeRuntime(fail_node=30), failure_dir, DummyLocks([]),
+                    lambda paths: DummyLocks([], str(paths[0])), {"authority_sha256": "1" * 64},
+                    payload, UID, now_function=lambda: 100000,
+                ), "node30 failure aborts active PoW-cycle/helper transaction")
+                ok(active.read_bytes() == active_before and helper.read_bytes() == old_helper,
+                   "node30 failure restores active PoW-cycle and helper predecessors")
+                ok(ROTATION.sha256_file(historical) == historical_sha,
+                   "node30 rollback preserves disabled historical artifact")
+                failure = json.loads((failure_dir / "FAILURE.json").read_text())
+                ok(failure["status"] == "ROLLED_BACK" and str(active) in failure["changed_paths"],
+                   "failure receipt binds active PoW-cycle rollback")
+
 
 def main():
     print("TAP version 13")
@@ -538,6 +753,7 @@ def main():
     test_transaction_success_and_rollback()
     test_lockset_and_file_security()
     test_unraid_runtime_audit_ancestry()
+    test_active_and_disabled_pow_cycle_pins()
     print(f"1..{COUNT}")
     print(f"PASS: {COUNT} offline helper-rotation assertions")
 

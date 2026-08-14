@@ -2161,8 +2161,9 @@ BOOST_FIXTURE_TEST_CASE(
 
     // A chain-unspent anchor reserved only by an exact durable QQSPROOF may
     // receive an additional user coin lock. This never makes the anchor
-    // spendable; it only pauses that retained family until the user unlocks
-    // it. Exercise the persistent database path used by lockunspent too.
+    // spendable; it pauses only that retained family while preserving the
+    // option to use a proven-independent anchor. Exercise the persistent
+    // database path used by lockunspent too.
     const ShadowPowClaimRecoveryInventory unlocked_inventory =
         wallet->GetShadowPowClaimRecoveryInventory();
     const auto unlocked_component = std::find_if(
@@ -2249,10 +2250,13 @@ BOOST_FIXTURE_TEST_CASE(
         << " live=" << locked_gate.live_claims
         << " eligible=" << locked_gate.eligible_claims) {
         BOOST_CHECK(locked_gate.action ==
-                    ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP);
+                    ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR);
     }
     BOOST_CHECK(!locked_gate.ShouldRelayExisting());
-    BOOST_CHECK(!locked_gate.MayCreateClaim());
+    BOOST_CHECK(locked_gate.MayCreateNewAnchorClaim());
+    BOOST_REQUIRE_EQUAL(
+        locked_gate.reserved_family_anchors.size(), 1U);
+    BOOST_CHECK(locked_gate.reserved_family_anchors.front() == anchor);
 
     // A default in-memory unlock changes the candidate snapshot immediately,
     // restores the same safe family action on the same tip, and restores the

@@ -330,9 +330,11 @@ enum class ShadowPowClaimMiningGateAction : uint8_t {
 };
 
 /** Read-only, active-tip-pinned wallet action for QQSPROOF production. Counters
- * aggregate every safe authenticated wallet-owned family; the action payload
- * identifies one deterministically selected family. A refresh never selects a
- * second fee UTXO: it spends that family's authenticated confirmed anchor. */
+ * aggregate every safe authenticated wallet-owned family. A family action's
+ * payload identifies one deterministic family; an independent-root fallback
+ * instead leaves that payload empty and reserves every retained family anchor.
+ * A refresh never selects a second fee UTXO: it spends that family's
+ * authenticated confirmed anchor. */
 struct ShadowPowClaimMiningGate
 {
     ShadowPowClaimMiningGateAction action{
@@ -375,6 +377,11 @@ struct ShadowPowClaimMiningGate
     size_t family_claims{0};
     size_t unsafe_claims{0};
     size_t unsafe_components{0};
+    /** Every safe unresolved family's authenticated anchor. The ordered set
+     * remains populated when all such families are snapshot-deferred and the
+     * aggregate action permits one independent new anchor. Selection must
+     * exclude every entry; missing or duplicate family identity is unsafe. */
+    std::vector<COutPoint> reserved_family_anchors;
     COutPoint anchor;
     CAmount anchor_amount{0};
     CScript target;

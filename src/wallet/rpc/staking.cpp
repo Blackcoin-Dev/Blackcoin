@@ -1817,7 +1817,7 @@ static RPCHelpMan sendshadowpowclaim()
                 "If proof is omitted, grinding is memory-hard (Argon2id, ~1 MiB per try) and synchronous; tune max_tries accordingly.\n"
                 "If proof is supplied, it must be the hex QQSPROOF payload for the current tip, target address, and quantum payout address.\n"
                 "The active proof format is reported by getshadowpowwork. QQP2/QQP3 do not bind an exact fee input; QQP4 does so only after its separately scheduled activation. Never reuse one externally supplied proof for multiple claim transactions.\n"
-                "Only valid during the Gold Rush reward window. An unconfirmed wallet-authored QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it. The typed, active-tip-pinned gate validates each wallet-owned same-anchor family. Within one family a live member blocks a competing sibling; across independent safe families Core relays eligible absent bytes first, then refreshes one family, and waits only when no independent relay or refresh work remains. Audit-only incoming proofs do not gain mining authority; any wallet-owned unsafe component still fails closed.\n"
+                "Only valid during the Gold Rush reward window. An unconfirmed wallet-authored QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it. The typed, active-tip-pinned gate validates each wallet-owned same-anchor family. Within one family a live member blocks a competing sibling; across independent safe families Core relays eligible absent bytes first, then refreshes one family. If every safe retained family is snapshot-deferred, Core reserves each family anchor and may create one claim from a proven-independent confirmed coin. Audit-only incoming proofs do not gain mining authority; any wallet-owned unsafe component still fails closed.\n"
                 "When retained bytes are selected for relay, address and quantum_address must match that authenticated family. With multiple retained relayable families, getpowmininginfo.mining_gate_relay_txid identifies the one deterministic next relay; a request naming another family fails without a side effect until earlier work is serviced. max_tries and fee_rate are not applied because no transaction is created or repriced, and an external proof is rejected because it cannot replace the retained transaction's committed proof. Success means local mempool acceptance plus a relay attempt; it does not prove peer receipt or confirmation.\n" +
                 HELP_REQUIRING_PASSPHRASE,
                 {
@@ -2047,7 +2047,7 @@ static RPCHelpMan sendshadowpowclaim()
         if (initial_gate.ShouldRelayExisting()) {
             continue;
         }
-        if (initial_gate.MayRefreshSameAnchor()) {
+        if (initial_gate.MayCreateClaim()) {
             break;
         }
         if (wait_for_snapshot_change) {
@@ -2344,10 +2344,14 @@ static RPCHelpMan sendshadowpowclaim()
                         : refresh_error.original);
             }
         } else {
-            if (!mining_gate.MayCreateNewAnchorClaim()) {
+            if (!mining_gate.MayCreateNewAnchorClaim() ||
+                std::binary_search(
+                    mining_gate.reserved_family_anchors.begin(),
+                    mining_gate.reserved_family_anchors.end(),
+                    selected_input.outpoint)) {
                 throw JSONRPCError(
                     RPC_VERIFY_REJECTED,
-                    "The current wallet action no longer permits a new Gold Rush PoW fee anchor");
+                    "The current wallet action no longer permits the selected Gold Rush PoW fee anchor");
             }
             for (const COutput& output :
                  AvailableCoins(*pwallet, &coin_control).All()) {
@@ -2426,6 +2430,10 @@ static RPCHelpMan sendshadowpowclaim()
                       selected_input, final_mining_gate, selected_coin,
                       refresh_error)
                 : final_mining_gate.MayCreateNewAnchorClaim() &&
+                      !std::binary_search(
+                          final_mining_gate.reserved_family_anchors.begin(),
+                          final_mining_gate.reserved_family_anchors.end(),
+                          selected_input.outpoint) &&
                       chainman.ActiveChainstate().CoinsTip().GetCoin(
                           selected_input.outpoint, selected_coin) &&
                       !selected_coin.IsSpent() &&
@@ -4663,8 +4671,14 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "claim_ownership_capacity_work", "Bounded ownership-classification work units observed before completion or capacity."},
             {RPCResult::Type::BOOL, "claim_inventory_capacity_exceeded", "Whether the exact wallet/tip retained-claim graph exceeds the strict topology work budget used while the global chain lock is held."},
             {RPCResult::Type::NUM, "claim_inventory_capacity_work", "Bounded claim-record/topology work units observed before capacity was reached, or the completed work count otherwise."},
+            {RPCResult::Type::ARR, "mining_gate_reserved_family_anchors", "Exact ordered anchors reserved for every safe unresolved family. A create_new_anchor action with a nonempty array may select only a proven-independent confirmed coin outside this set.", {
+                {RPCResult::Type::OBJ, "", "", {
+                    {RPCResult::Type::STR_HEX, "txid", "Retained family's authenticated anchor transaction."},
+                    {RPCResult::Type::NUM, "vout", "Retained family's authenticated anchor output index."},
+                }},
+            }},
             {RPCResult::Type::STR_HEX, "mining_gate_relay_txid", "Eligible under-TTL relay claim for the reported gate snapshot, or all-zero when no relay is currently actionable, including while that family is deferred until the next tip."},
-            {RPCResult::Type::STR_HEX, "mining_gate_lineage_head_txid", "Current durable same-anchor lineage head, or all-zero when no family is active."},
+            {RPCResult::Type::STR_HEX, "mining_gate_lineage_head_txid", "Selected durable same-anchor lineage head for a family action, or all-zero when no family is selected, including an independent new-anchor fallback that preserves families only in mining_gate_reserved_family_anchors."},
             {RPCResult::Type::STR_HEX, "mining_gate_candidate_state_fingerprint", "Cheap in-memory wallet-claim state key used with tip and database generation to invalidate the cached gate."},
             {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual claim resolutions."},
             {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic claim resolutions."},
@@ -4821,6 +4835,15 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("claim_inventory_capacity_work",
                static_cast<uint64_t>(
                    recovery_inventory.claim_inventory_capacity_work));
+    UniValue reserved_family_anchors(UniValue::VARR);
+    for (const COutPoint& anchor : mining_gate.reserved_family_anchors) {
+        UniValue reserved_anchor(UniValue::VOBJ);
+        reserved_anchor.pushKV("txid", anchor.hash.GetHex());
+        reserved_anchor.pushKV("vout", static_cast<uint64_t>(anchor.n));
+        reserved_family_anchors.push_back(std::move(reserved_anchor));
+    }
+    obj.pushKV("mining_gate_reserved_family_anchors",
+               std::move(reserved_family_anchors));
     obj.pushKV("mining_gate_relay_txid", mining_gate.relay_txid.GetHex());
     obj.pushKV("mining_gate_lineage_head_txid",
                mining_gate.lineage_head_txid.GetHex());

@@ -18,6 +18,10 @@ Installed semantic boundary: ProcessTransaction(..., test_accept=true) precedes 
 Required legacy proof: canonical audit, owner-only authority, consumed intent, rpc-unknown receipt, and exact no-transaction reconcile receipt
 Required no-transaction proof: zero exact wallet/anchor candidates from all audited fee-input members
 Forbidden source outcomes: missing intent, different error text/code, any exact transaction candidate, response/broadcast completion, retry authorization, or noncanonical receipt
+Lock baseline rule: pause/runtime baseline is sampled only after the complete mutation lock set is acquired
+PASS publication rule: pause/runtime postcondition is proved while locks remain held and before any audit, terminal, completion, or authority-window PASS receipt is published
+Stale-lock hostile result: serialized pre-lock pause transitions fail before lifecycle mutation, intent publication, or PASS publication
+Postcondition hostile result: terminal/requeue lifecycle recovery may resume safely, but a failed locked postcondition publishes no PASS artifact
 Lifecycle move protocol: hard-link-fsync-unlink-fsync-noreplace/v1; atomic-rename claim false
 Terminalization transition: exact same-inode .uncertain.json -> .rejected.json no-clobber move
 Terminalization collision rule: a destination that appears is preserved; it is never overwritten
@@ -34,12 +38,15 @@ Required clearance: zero shadow-proof mempool transactions against limit one
 Clearance race rule: slot refill after audit fails before requeue intent or filesystem move
 Requeue authority: separate owner-only authority with sendshadowpowclaim_authorized=false
 Requeue intent: durable no-clobber receipt precedes the only rejected->queued lifecycle move
+Requeue completion chain: canonical requeue-intent.json plus its sidecar are mandatory and semantically validated; completion binds its actual SHA256
+Requeue intent hostile rule: missing, semantically tampered, or digest-substituted intent chains are rejected by idempotent completion and the authority window
 Requeue collision rule: a queue destination that appears is preserved; it is never overwritten
 Queue-directory rule: exact audited path/device/inode/owner/group/mode pinned before and during mutation
 Requeue result: queue admission only; zero sendshadowpowclaim calls; zero wallet-mutating RPCs
 Subsequent financial rule: a new one-shot run, fresh live audit, and separate one-shot authority are mandatory
 Pre-authority rule: occupying QQSPROOF must clear before any fresh one-shot AUTHORITY.json exists
 New-authority window: binds completed requeue, fresh one-shot audit, zero-slot inventory, and exact future authority semantic SHA256
+New-authority lock rule: baseline and postcondition remain under fleet locks; a stale pre-lock state or failed postcondition emits no window receipt
 New financial call budget: one separately receipt-bound call; automatic retry false
 Old authority rule: never execute again; only its signed receipts remain evidence
 Free-Claim pause: preserved
@@ -50,12 +57,14 @@ Fee rate: preserved at 100 atoms/vB
 Repair/reindex/rewind: never authorized
 Public Core/release authority: none
 
-Hostile suite result: PASS: 45 hostile node30 deterministic-rejection/requeue assertions
-Hostile suite log: /private/tmp/node30-requeue-expanded-20260814T0820Z.out
-Hostile suite log SHA256: ee7a07f1183031e100f5100eb873e9e44e208632f33055966b77eb7ecd4abb05
-Tool SHA256: 01d6fdf61e1e4189b03812d1ae5c5cc4a94402bb4c0639ac07d2f17e7332b627
+Hostile suite result: PASS: 77 hostile node30 deterministic-rejection/requeue assertions
+Hostile suite log: /private/tmp/node30-requeue-lock-intent-20260814T084411Z.out
+Hostile suite log SHA256: bd3c1cbc049d7d05ac5e42b8b40761f56043e8eb73aa3cdb18ac033270920a1a
+Tool SHA256: 66a3ec627214ce60bcd3a96bf49d580aa4957a2dc4a2ba35b7032bf5066c15c8
 Test transport SHA256: a41bc2ee67eb00c6849a9cb2fad9f5c5eb7d476b85c0c540d7a330522cfa804a
-Test driver SHA256: 2c25e293cbd040e8d1584bb505cf770f235999b0538d2e660b31e3c620b764a8
-Original one-shot regression: PASS: 223 hostile assertions (unchanged tool SHA256 26e38fbd46cd427642f73daedfbbc08dfffcb1e4a166db7c3e0abb6006e832b2)
+Test driver SHA256: 8f89e7c080b876cde2afa8dab172779434330c2f09e8d9fd2e9f438bdf3e275f
+Original one-shot regression: PASS: 223 hostile node30 Free-Claim one-shot assertions (unchanged tool SHA256 26e38fbd46cd427642f73daedfbbc08dfffcb1e4a166db7c3e0abb6006e832b2)
+Original one-shot regression log: /private/tmp/node30-one-shot-regression-20260814T084544Z.out
+Original one-shot regression log SHA256: 2ce08089c655615ffe79c3e57ba9157faa51d8dee4903c8443317647bf277067
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

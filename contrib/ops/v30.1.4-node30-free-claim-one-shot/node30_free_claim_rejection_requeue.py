@@ -579,9 +579,9 @@ def terminalize_command(args: argparse.Namespace) -> None:
         return
     transport = Transport(contract.retained.runtime)
     node = contract.retained.runtime.nodes[0]
-    pause_before = legacy.node30.free_claim_snapshot(contract.retained)
-    exact_node, runtime_before = legacy.node30.pin_node(transport, node)
     with legacy.node30.mutation_locks(contract.retained) as lock_ids:
+        pause_before = legacy.node30.free_claim_snapshot(contract.retained)
+        exact_node, runtime_before = legacy.node30.pin_node(transport, node)
         proof = live_no_transaction(transport, exact_node, audit, intent)
         names = audit["snapshot"]["queue"]["outcome_names"]
         source_path = contract.done_dir / names["uncertain"]
@@ -598,6 +598,9 @@ def terminalize_command(args: argparse.Namespace) -> None:
             contract, audit, source_path, target, "rejection terminalization")
         if any(contract.queue_dir.iterdir()):
             die("Free-Claim ingress queue changed during rejection terminalization")
+        if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
+                transport.runtime_snapshot(node) != runtime_before):
+            die("node30 pause or runtime changed during rejection terminalization")
         receipt = base_receipt("node30-free-claim-definitive-rejection", contract)
         receipt.update({
             "result": "DEFINITIVE_PRECOMMIT_MEMPOOL_LIMIT_REJECTION",
@@ -619,9 +622,6 @@ def terminalize_command(args: argparse.Namespace) -> None:
             "lock_identities": lock_ids,
         })
         digest = legacy.node30.publish_json(terminal_path, receipt)
-    if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
-            transport.runtime_snapshot(node) != runtime_before):
-        die("node30 pause or runtime changed during rejection terminalization")
     print(json.dumps({"result": receipt["result"],
                       "definitive_rejection_sha256": digest}, sort_keys=True))
 
@@ -735,73 +735,73 @@ def requeue_audit_command(args: argparse.Namespace) -> None:
                                              contract.sha256))
     transport = Transport(contract.retained.runtime)
     node = contract.retained.runtime.nodes[0]
-    pause_before = legacy.node30.free_claim_snapshot(contract.retained)
-    exact_node, runtime_before = legacy.node30.pin_node(transport, node)
     with legacy.node30.mutation_locks(contract.retained) as lock_ids:
+        pause_before = legacy.node30.free_claim_snapshot(contract.retained)
+        exact_node, runtime_before = legacy.node30.pin_node(transport, node)
         snapshot = readiness_snapshot(transport, exact_node, contract, audit, intent)
-    if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
-            transport.runtime_snapshot(node) != runtime_before):
-        die("node30 pause or runtime changed during requeue audit")
-    receipt = base_receipt("node30-free-claim-requeue-audit", contract)
-    receipt.update({
-        "result": "READY_FOR_SEPARATE_REQUEUE_ONLY_AUTHORITY",
-        "mutation_performed": False,
-        "source_run": source["source_run"],
-        "source_authority": source["source_authority"],
-        "source_authority_sha256": source["authority_sha256"],
-        "source_audit_sha256": audit_sha,
-        "source_intent_sha256": intent_sha,
-        "source_rpc_unknown_sha256": unknown_sha,
-        "source_reconcile_receipt": pathlib.Path(args.reconcile_receipt).name,
-        "source_reconcile_sha256": reconcile_sha,
-        "source_definitive_rejection_sha256": definitive_sha,
-        "snapshot": snapshot,
-        "lock_identities": lock_ids,
-    })
-    receipt["required_authority"] = {
-        "schema": RECEIPT_SCHEMA,
-        "kind": "node30-free-claim-requeue-authority",
-        "decision": "REPLACE_WITH_authorize_AFTER_REVIEW",
-        "action": "requeue_definitively_rejected_item_only",
-        "node": legacy.NODE,
-        "role": "free_claim",
-        "audit_receipt_sha256": "REPLACE_WITH_REQUEUE_AUDIT_SHA256",
-        "runtime_manifest_sha256": contract.sha256,
-        "tool_sha256": tool_sha(),
-        "legacy_one_shot_tool_sha256": LEGACY_TOOL_SHA256,
-        "source_authority_sha256": source["authority_sha256"],
-        "source_intent_sha256": intent_sha,
-        "source_definitive_rejection_sha256": definitive_sha,
-        "queue_item_identity_sha256": sha256_json(
-            legacy.immutable_queue_item_identity(snapshot["queue"]["item"])),
-        "queue_item_sha256": snapshot["queue"]["item"]["sha256"],
-        "quantum_address": snapshot["payout"]["address"],
-        "mempool_shadow_proof_count": 0,
-        "mempool_shadow_proof_limit": 1,
-        "mempool_inventory_sha256": snapshot["mempool"]["mempool_txids_sha256"],
-        "old_authority_retry_authorized": False,
-        "sendshadowpowclaim_authorized": False,
-        "new_one_shot_audit_required": True,
-        "new_one_shot_authority_required": True,
-        "ordinary_pow_authorized": False,
-        "pause_removal_authorized": False,
-        "recurring_worker_authorized": False,
-        "repair_authorized": False,
-        "reindex_authorized": False,
-        "rewind_authorized": False,
-        "user_orders": legacy.USER_ORDERS,
-        "user_order_sha256": legacy.USER_ORDER_SHA256,
-        "acknowledgements": {
-            "old_financial_authority_is_permanently_consumed": True,
-            "requeue_is_not_a_send_or_broadcast_authority": True,
-            "mempool_clearance_may_expire_after_requeue": True,
-            "fresh_one_shot_audit_and_authority_are_mandatory": True,
-            "ordinary_pow_remains_disabled": True,
-            "free_claim_pause_remains_present": True,
-            "pos_remains_active": True,
-        },
-    }
-    digest = legacy.node30.publish_json(requeue_run / "requeue-audit.json", receipt)
+        if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
+                transport.runtime_snapshot(node) != runtime_before):
+            die("node30 pause or runtime changed during requeue audit")
+        receipt = base_receipt("node30-free-claim-requeue-audit", contract)
+        receipt.update({
+            "result": "READY_FOR_SEPARATE_REQUEUE_ONLY_AUTHORITY",
+            "mutation_performed": False,
+            "source_run": source["source_run"],
+            "source_authority": source["source_authority"],
+            "source_authority_sha256": source["authority_sha256"],
+            "source_audit_sha256": audit_sha,
+            "source_intent_sha256": intent_sha,
+            "source_rpc_unknown_sha256": unknown_sha,
+            "source_reconcile_receipt": pathlib.Path(args.reconcile_receipt).name,
+            "source_reconcile_sha256": reconcile_sha,
+            "source_definitive_rejection_sha256": definitive_sha,
+            "snapshot": snapshot,
+            "lock_identities": lock_ids,
+        })
+        receipt["required_authority"] = {
+            "schema": RECEIPT_SCHEMA,
+            "kind": "node30-free-claim-requeue-authority",
+            "decision": "REPLACE_WITH_authorize_AFTER_REVIEW",
+            "action": "requeue_definitively_rejected_item_only",
+            "node": legacy.NODE,
+            "role": "free_claim",
+            "audit_receipt_sha256": "REPLACE_WITH_REQUEUE_AUDIT_SHA256",
+            "runtime_manifest_sha256": contract.sha256,
+            "tool_sha256": tool_sha(),
+            "legacy_one_shot_tool_sha256": LEGACY_TOOL_SHA256,
+            "source_authority_sha256": source["authority_sha256"],
+            "source_intent_sha256": intent_sha,
+            "source_definitive_rejection_sha256": definitive_sha,
+            "queue_item_identity_sha256": sha256_json(
+                legacy.immutable_queue_item_identity(snapshot["queue"]["item"])),
+            "queue_item_sha256": snapshot["queue"]["item"]["sha256"],
+            "quantum_address": snapshot["payout"]["address"],
+            "mempool_shadow_proof_count": 0,
+            "mempool_shadow_proof_limit": 1,
+            "mempool_inventory_sha256": snapshot["mempool"]["mempool_txids_sha256"],
+            "old_authority_retry_authorized": False,
+            "sendshadowpowclaim_authorized": False,
+            "new_one_shot_audit_required": True,
+            "new_one_shot_authority_required": True,
+            "ordinary_pow_authorized": False,
+            "pause_removal_authorized": False,
+            "recurring_worker_authorized": False,
+            "repair_authorized": False,
+            "reindex_authorized": False,
+            "rewind_authorized": False,
+            "user_orders": legacy.USER_ORDERS,
+            "user_order_sha256": legacy.USER_ORDER_SHA256,
+            "acknowledgements": {
+                "old_financial_authority_is_permanently_consumed": True,
+                "requeue_is_not_a_send_or_broadcast_authority": True,
+                "mempool_clearance_may_expire_after_requeue": True,
+                "fresh_one_shot_audit_and_authority_are_mandatory": True,
+                "ordinary_pow_remains_disabled": True,
+                "free_claim_pause_remains_present": True,
+                "pos_remains_active": True,
+            },
+        }
+        digest = legacy.node30.publish_json(requeue_run / "requeue-audit.json", receipt)
     print(json.dumps({"result": receipt["result"],
                       "requeue_audit_sha256": digest}, sort_keys=True))
 
@@ -932,8 +932,13 @@ def validate_requeue_intent(receipt: Any, contract: Any, audit: dict[str, Any],
     return receipt
 
 
-def validate_requeue_complete(receipt: Any, contract: Any, audit: dict[str, Any],
-                              audit_sha: str, authority_sha: str) -> dict[str, Any]:
+def validate_requeue_complete(run_dir: pathlib.Path, receipt: Any, contract: Any,
+                              audit: dict[str, Any], audit_sha: str,
+                              authority_sha: str) -> dict[str, Any]:
+    intent, intent_sha = legacy.node30.load_run_receipt(
+        run_dir, "requeue-intent.json")
+    validate_requeue_intent(
+        intent, contract, audit, audit_sha, authority_sha)
     validate_common(receipt, "node30-free-claim-requeue-complete", contract)
     exact_fields = set(base_receipt(
         "node30-free-claim-requeue-complete", contract)) | {
@@ -963,8 +968,7 @@ def validate_requeue_complete(receipt: Any, contract: Any, audit: dict[str, Any]
             receipt.get("result") != "REQUEUED_FOR_NEW_ONE_SHOT_AUTHORITY" or
             receipt.get("requeue_audit_sha256") != audit_sha or
             receipt.get("requeue_authority_sha256") != authority_sha or
-            not isinstance(receipt.get("requeue_intent_sha256"), str) or
-            not HEX64.fullmatch(receipt["requeue_intent_sha256"]) or
+            receipt.get("requeue_intent_sha256") != intent_sha or
             receipt.get("source_authority_sha256") != audit["source_authority_sha256"] or
             receipt.get("source_intent_sha256") != audit["source_intent_sha256"] or
             receipt.get("source_definitive_rejection_sha256") !=
@@ -1012,7 +1016,8 @@ def requeue_command(args: argparse.Namespace) -> None:
     complete_path = run_dir / "requeue-complete.json"
     if complete_path.exists() or complete_path.is_symlink():
         complete, digest = legacy.node30.load_run_receipt(run_dir, "requeue-complete.json")
-        validate_requeue_complete(complete, contract, audit, audit_sha, authority_sha)
+        validate_requeue_complete(
+            run_dir, complete, contract, audit, audit_sha, authority_sha)
         state, _, _ = current_rejection_item_after_requeue(contract, source_audit)
         if complete.get("result") != "REQUEUED_FOR_NEW_ONE_SHOT_AUTHORITY" or state != "queued":
             die("completed requeue receipt has no exact queued item")
@@ -1022,9 +1027,9 @@ def requeue_command(args: argparse.Namespace) -> None:
         return
     transport = Transport(contract.retained.runtime)
     node = contract.retained.runtime.nodes[0]
-    pause_before = legacy.node30.free_claim_snapshot(contract.retained)
-    exact_node, runtime_before = legacy.node30.pin_node(transport, node)
     with legacy.node30.mutation_locks(contract.retained) as lock_ids:
+        pause_before = legacy.node30.free_claim_snapshot(contract.retained)
+        exact_node, runtime_before = legacy.node30.pin_node(transport, node)
         intent_path = run_dir / "requeue-intent.json"
         if intent_path.exists() or intent_path.is_symlink():
             requeue_intent, requeue_intent_sha = legacy.node30.load_run_receipt(
@@ -1064,6 +1069,9 @@ def requeue_command(args: argparse.Namespace) -> None:
             contract, source_audit)
         if current_state != "queued":
             die("requeue no-clobber move did not reach the exact queued state")
+        if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
+                transport.runtime_snapshot(node) != runtime_before):
+            die("node30 pause or runtime changed during requeue")
         receipt = base_receipt("node30-free-claim-requeue-complete", contract)
         receipt.update({
             "result": "REQUEUED_FOR_NEW_ONE_SHOT_AUTHORITY",
@@ -1086,9 +1094,6 @@ def requeue_command(args: argparse.Namespace) -> None:
             "lock_identities": lock_ids,
         })
         digest = legacy.node30.publish_json(complete_path, receipt)
-    if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
-            transport.runtime_snapshot(node) != runtime_before):
-        die("node30 pause or runtime changed during requeue")
     print(json.dumps({"result": receipt["result"],
                       "requeue_complete_sha256": digest}, sort_keys=True))
 
@@ -1129,7 +1134,7 @@ def authority_window_command(args: argparse.Namespace) -> None:
     complete, complete_sha = legacy.node30.load_run_receipt(
         run_dir, "requeue-complete.json")
     validate_requeue_complete(
-        complete, contract, requeue_audit, requeue_audit_sha,
+        run_dir, complete, contract, requeue_audit, requeue_audit_sha,
         requeue_authority_sha)
 
     one_shot_run = pathlib.Path(args.one_shot_run)
@@ -1153,9 +1158,9 @@ def authority_window_command(args: argparse.Namespace) -> None:
 
     transport = Transport(contract.retained.runtime)
     node = contract.retained.runtime.nodes[0]
-    pause_before = legacy.node30.free_claim_snapshot(contract.retained)
-    exact_node, runtime_before = legacy.node30.pin_node(transport, node)
     with legacy.node30.mutation_locks(contract.retained) as lock_ids:
+        pause_before = legacy.node30.free_claim_snapshot(contract.retained)
+        exact_node, runtime_before = legacy.node30.pin_node(transport, node)
         role = stable_role(transport, exact_node)
         legacy.node30.same_wallet_inventory(
             one_shot_audit["snapshot"]["role"]["wallet_inventory"],
@@ -1170,6 +1175,9 @@ def authority_window_command(args: argparse.Namespace) -> None:
             one_shot_audit["required_authority"]))
         expected_authority["decision"] = "authorize"
         expected_authority["audit_receipt_sha256"] = one_shot_audit_sha
+        if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
+                transport.runtime_snapshot(node) != runtime_before):
+            die("node30 pause or runtime changed during new-authority slot gate")
         receipt = base_receipt(
             "node30-free-claim-new-authority-window", contract)
         receipt.update({
@@ -1190,9 +1198,6 @@ def authority_window_command(args: argparse.Namespace) -> None:
         })
         name = f"new-authority-window-{time.time_ns()}.json"
         digest = legacy.node30.publish_json(run_dir / name, receipt)
-    if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
-            transport.runtime_snapshot(node) != runtime_before):
-        die("node30 pause or runtime changed during new-authority slot gate")
     print(json.dumps({"result": receipt["result"], "receipt": name,
                       "sha256": digest,
                       "one_shot_authority_semantic_sha256":

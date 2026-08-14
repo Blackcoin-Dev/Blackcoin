@@ -183,6 +183,15 @@ and publishes
 financial authority remains permanently consumed and must never be passed to
 `execute` again.
 
+Every companion command samples its pause/runtime baseline only after the full
+fleet mutation-lock set has been acquired. It keeps those locks through the
+closing pause/runtime comparison and publishes an audit, terminal, completion,
+or authority-window PASS receipt only after that locked postcondition succeeds.
+A serialized transition before lock acquisition therefore fails before an
+intent or lifecycle mutation. A transition detected after a restart-safe
+lifecycle move may leave that move for exact reconciliation, but it cannot
+leave a receipt that claims the failed postcondition passed.
+
 Installed validation source SHA256
 `1fa0a9d2777d680d2230a9201e89ed8fda4c73b9bccdf5db3d9d6df6d30b5270`
 enforces a one-QQSPROOF mempool limit in the current QQP2 regime. A changing
@@ -196,6 +205,11 @@ no-clobber lifecycle move and explicitly sets
 `sendshadowpowclaim_authorized=false`.
 `requeue` samples the slot again before its durable intent and again
 immediately before the move. A refill stops without a financial call.
+The completed requeue chain is not self-authenticating through a free-form
+digest: every idempotent completion check and every authority-window check must
+load the canonical `requeue-intent.json` and sidecar, validate its exact
+semantics, and match its actual SHA256 to `requeue-complete.json`. A missing,
+tampered, or digest-substituted intent fails closed.
 
 Requeue is not permission to submit. After requeue, the operator must run a
 fresh legacy one-shot `audit` in a new run directory. Before any new
@@ -361,10 +375,13 @@ old authority, no-transaction reconciliation, same-inode terminalization,
 read-only canonical QQSPROOF inventory, occupied-slot refusal, refill refusal
 before requeue intent, nonfinancial requeue authority, intent-before-move
 ordering, no-clobber destination races, queue/done parent-inode substitution
-rejection, exact two-link crash healing, pause/PoS/ordinary-PoW preservation,
-a fresh post-requeue one-shot audit, occupied-slot and premature-authority
-refusal at the new-authority window, and the exact future-authority semantic
-digest. The companion's AST contains zero `sendshadowpowclaim` call sites.
+rejection, exact two-link crash healing, locked-baseline staleness before all
+four companion stages, postcondition failures with no PASS artifact, canonical
+intent deletion/tamper/digest-substitution rejection, pause/PoS/ordinary-PoW
+preservation, a fresh post-requeue one-shot audit, occupied-slot and
+premature-authority refusal at the new-authority window, and the exact
+future-authority semantic digest. The companion's AST contains zero
+`sendshadowpowclaim` call sites.
 
 This package is offline tooling only. A signed commit is not live financial
 authority. A fresh exact audit and a separate exact mode-0600 authorization are

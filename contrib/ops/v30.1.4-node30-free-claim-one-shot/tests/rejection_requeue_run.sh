@@ -24,6 +24,14 @@ sha()
     shasum -a 256 "$1" | awk '{print $1}'
 }
 
+rewrite_sidecar()
+{
+    local path=$1
+    printf '%s  %s\n' "$(sha "$path")" "$(basename "$path")" \
+      >"$path.sha256"
+    chmod 0600 "$path" "$path.sha256"
+}
+
 assert_eq()
 {
     [[ "$1" == "$2" ]] || {
@@ -138,6 +146,83 @@ companion_call()
       FLEET31_SCENARIO="$scenario" "$TOOL" "$@"
 }
 
+# Inject a serialized pause transition after the fleet locks are acquired but
+# before the command receives them.  The pause stays absent until main()
+# returns, so a stale pre-lock baseline would allow a mutation/PASS receipt and
+# only then notice the change.  A correct command fails before doing either.
+companion_prelock_transition_call()
+{
+    local fixture=$1 scenario=$2 marker=$3
+    shift 3
+    FLEET31_TEST_TRANSPORT="$MOCK" FLEET31_FIXTURE="$fixture/state" \
+      FLEET31_SCENARIO="$scenario" python3 - "$TOOL" "$marker" "$@" <<'PY'
+import contextlib
+import importlib.util
+import os
+import pathlib
+import sys
+
+tool = pathlib.Path(sys.argv[1])
+marker = pathlib.Path(sys.argv[2])
+saved = marker.with_name(marker.name + ".hostile-prelock-saved")
+spec = importlib.util.spec_from_file_location("requeue_prelock_hostile", tool)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+original = mod.legacy.node30.mutation_locks
+
+@contextlib.contextmanager
+def transition(contract):
+    with original(contract) as identities:
+        os.rename(marker, saved)
+        yield identities
+
+mod.legacy.node30.mutation_locks = transition
+try:
+    result = mod.main(sys.argv[3:])
+finally:
+    if saved.exists():
+        os.rename(saved, marker)
+raise SystemExit(result)
+PY
+}
+
+# Project a runtime/pause mismatch only on the second snapshot.  The first is
+# the locked baseline; the second is the locked postcondition.  A PASS artifact
+# must not exist when the postcondition rejects the operation.
+companion_postcheck_drift_call()
+{
+    local fixture=$1 scenario=$2
+    shift 2
+    FLEET31_TEST_TRANSPORT="$MOCK" FLEET31_FIXTURE="$fixture/state" \
+      FLEET31_SCENARIO="$scenario" python3 - "$TOOL" "$@" <<'PY'
+import copy
+import importlib.util
+import pathlib
+import sys
+
+tool = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("requeue_postcheck_hostile", tool)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+original = mod.legacy.node30.free_claim_snapshot
+calls = 0
+
+def drift(contract):
+    global calls
+    calls += 1
+    snapshot = original(contract)
+    if calls == 2:
+        snapshot = copy.deepcopy(snapshot)
+        snapshot["hostile_serialized_transition"] = True
+    return snapshot
+
+mod.legacy.node30.free_claim_snapshot = drift
+raise SystemExit(mod.main(sys.argv[2:]))
+PY
+}
+
 # The companion has no wallet-mutating RPC call site and cannot consume the
 # old one-shot authority for another financial call.
 assert_eq "$(python3 - "$TOOL" <<'PY'
@@ -178,6 +263,21 @@ assert_jq '.result=="NO_EXACT_TRANSACTION_YET_AUTHORITY_CONSUMED" and
   .retry_authorized==false and .candidate_count==0 and .queue_state=="uncertain"' \
   "$SOURCE/$RECONCILE_NAME"
 
+# A serialized pause transition at lock acquisition invalidates any stale
+# pre-lock baseline.  It must fail before moving the item or publishing PASS.
+PAUSE_MARKER="$FLEET/free-claim/.v30.1.4-free-claim-paused"
+assert_fails 'terminalization rejects a stale pre-lock pause baseline' \
+  companion_prelock_transition_call "$FLEET" cleared "$PAUSE_MARKER" \
+    terminalize --run-dir "$SOURCE" \
+    --authority "$SOURCE/AUTHORITY.json" --authority-sha256 "$AUTH_SHA" \
+    --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+    --reconcile-sha256 "$RECONCILE_SHA"
+assert_fails 'pre-lock terminalization failure publishes no PASS receipt' \
+  test -e "$SOURCE/definitive-rejection.json"
+assert_eq "$(find "$FLEET/free-claim/done" -name '*.uncertain.json' | wc -l | tr -d ' ')" 1
+assert_eq "$(find "$FLEET/free-claim/done" -name '*.rejected.json' | wc -l | tr -d ' ')" 0
+assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+
 # A hostile destination that appears during the live no-transaction proof is
 # never overwritten, and no terminal receipt is published around it.
 UNCERTAIN=$(find "$FLEET/free-claim/done" -name '*.uncertain.json')
@@ -213,8 +313,21 @@ rmdir -- "$FLEET/free-claim/done"
 mv -- "$FLEET/free-claim/done.audited" "$FLEET/free-claim/done"
 
 # Heal only the exact two-link state left by a crash after the no-clobber link
-# was fsynced but before the source unlink. The inode and bytes remain exact.
+# was fsynced but before the source unlink.  A hostile locked postcondition then
+# fails after healing but before PASS publication; a target-only resume may
+# publish the terminal receipt only after a clean postcondition.
 ln -- "$UNCERTAIN" "$REJECTED"
+assert_fails 'terminalization postcondition failure publishes no PASS receipt' \
+  companion_postcheck_drift_call "$FLEET" cleared terminalize \
+    --run-dir "$SOURCE" --authority "$SOURCE/AUTHORITY.json" \
+    --authority-sha256 "$AUTH_SHA" \
+    --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+    --reconcile-sha256 "$RECONCILE_SHA"
+assert_fails 'postcondition-rejected terminalization has no PASS artifact' \
+  test -e "$SOURCE/definitive-rejection.json"
+assert_fails 'postcondition-rejected terminalization healed the crash source' \
+  test -e "$UNCERTAIN"
+assert_eq "$(sha "$REJECTED")" "$(jq -r .snapshot.queue.item.sha256 "$SOURCE/audit.json")"
 companion_call "$FLEET" cleared terminalize --run-dir "$SOURCE" \
   --authority "$SOURCE/AUTHORITY.json" --authority-sha256 "$AUTH_SHA" \
   --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
@@ -228,7 +341,8 @@ assert_jq '.result=="DEFINITIVE_PRECOMMIT_MEMPOOL_LIMIT_REJECTION" and
   .queue_outcome.move_protocol=="hard-link-fsync-unlink-fsync-noreplace/v1" and
   .queue_outcome.no_clobber==true and .queue_outcome.same_inode==true and
   .queue_outcome.atomic_rename==false and
-  .queue_outcome.crash_link_reconciled==true' "$SOURCE/definitive-rejection.json"
+  .queue_outcome.already_complete==true and
+  .queue_outcome.crash_link_reconciled==false' "$SOURCE/definitive-rejection.json"
 assert_eq "$(find "$FLEET/free-claim/done" -name '*.rejected.json' | wc -l | tr -d ' ')" 1
 assert_fails 'terminalization source was removed after crash-link healing' \
   test -e "$UNCERTAIN"
@@ -254,6 +368,25 @@ assert_fails 'occupied shadow-proof slot blocks requeue audit' \
 assert_fails 'blocked slot publishes no requeue audit authority' \
   test -e "$BLOCKED/requeue-audit.json"
 
+PRELOCK_AUDIT="$FLEET/requeue-prelock-hostile"
+assert_fails 'requeue audit rejects a stale pre-lock pause baseline' \
+  companion_prelock_transition_call "$FLEET" cleared "$PAUSE_MARKER" \
+    audit-requeue --source-run "$SOURCE" \
+    --source-authority "$SOURCE/AUTHORITY.json" \
+    --source-authority-sha256 "$AUTH_SHA" \
+    --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+    --reconcile-sha256 "$RECONCILE_SHA" --run-dir "$PRELOCK_AUDIT"
+assert_fails 'pre-lock requeue audit failure publishes no PASS receipt' \
+  test -e "$PRELOCK_AUDIT/requeue-audit.json"
+POSTCHECK_AUDIT="$FLEET/requeue-postcheck-hostile"
+assert_fails 'requeue audit postcondition failure publishes no PASS receipt' \
+  companion_postcheck_drift_call "$FLEET" cleared audit-requeue \
+    --source-run "$SOURCE" --source-authority "$SOURCE/AUTHORITY.json" \
+    --source-authority-sha256 "$AUTH_SHA" \
+    --reconcile-receipt "$SOURCE/$RECONCILE_NAME" \
+    --reconcile-sha256 "$RECONCILE_SHA" --run-dir "$POSTCHECK_AUDIT"
+assert_fails 'postcondition-rejected requeue audit has no PASS artifact' \
+  test -e "$POSTCHECK_AUDIT/requeue-audit.json"
 CLEAR="$FLEET/requeue-clear"
 companion_call "$FLEET" cleared audit-requeue \
   --source-run "$SOURCE" --source-authority "$SOURCE/AUTHORITY.json" \
@@ -275,6 +408,19 @@ jq --arg digest "$REQUEUE_AUDIT_SHA" \
   "$CLEAR/requeue-audit.json" >"$CLEAR/AUTHORITY.json"
 chmod 0600 "$CLEAR/AUTHORITY.json"
 REQUEUE_AUTH_SHA=$(sha "$CLEAR/AUTHORITY.json")
+
+# The requeue mutation proves its pause/runtime baseline only after acquiring
+# all mutation locks.  A serialized transition at acquisition must leave both
+# lifecycle and durable authority-consumption state untouched.
+assert_fails 'requeue rejects a stale pre-lock pause baseline' \
+  companion_prelock_transition_call "$FLEET" cleared "$PAUSE_MARKER" \
+    requeue --run-dir "$CLEAR" --authority "$CLEAR/AUTHORITY.json" \
+    --authority-sha256 "$REQUEUE_AUTH_SHA"
+assert_fails 'pre-lock requeue failure publishes no intent' \
+  test -e "$CLEAR/requeue-intent.json"
+assert_fails 'pre-lock requeue failure publishes no completion' \
+  test -e "$CLEAR/requeue-complete.json"
+assert_eq "$(find "$FLEET/free-claim/done" -name '*.rejected.json' | wc -l | tr -d ' ')" 1
 
 # Clearance is sampled again immediately before requeue. A filled slot after
 # audit fails before intent or filesystem movement.
@@ -322,8 +468,19 @@ assert_fails 'requeue destination collision publishes no completion' \
 assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
 rm -- "$QUEUED"
 
-# With the collision removed, the same durable nonfinancial intent completes
-# through the ordinary no-replace link/fsync/unlink/fsync path.
+# With the collision removed, the same durable nonfinancial intent may move the
+# item, but a locked postcondition failure still forbids a completion receipt.
+# The target-only resume then proves a clean postcondition before publishing.
+assert_fails 'requeue postcondition failure publishes no PASS receipt' \
+  companion_postcheck_drift_call "$FLEET" cleared requeue --run-dir "$CLEAR" \
+    --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA"
+assert_fails 'postcondition-rejected requeue has no completion artifact' \
+  test -e "$CLEAR/requeue-complete.json"
+assert_eq "$(sha "$QUEUED")" "$(jq -r .snapshot.queue.item.sha256 "$SOURCE/audit.json")"
+assert_fails 'postcondition-rejected requeue removed the rejected source' \
+  test -e "$REJECTED"
+assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+
 companion_call "$FLEET" cleared requeue --run-dir "$CLEAR" \
   --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA" \
   >"$FLEET/requeue.out"
@@ -335,7 +492,7 @@ assert_jq '.result=="REQUEUED_FOR_NEW_ONE_SHOT_AUTHORITY" and
   .queue_outcome.state=="queued" and .sendshadowpowclaim_call_count==0 and
   .queue_outcome.move_protocol=="hard-link-fsync-unlink-fsync-noreplace/v1" and
   .queue_outcome.no_clobber==true and .queue_outcome.same_inode==true and
-  .queue_outcome.atomic_rename==false and
+  .queue_outcome.atomic_rename==false and .queue_outcome.already_complete==true and
   .queue_outcome.crash_link_reconciled==false and
   .old_authority_retry_authorized==false and .new_one_shot_audit_required==true and
   .new_one_shot_authority_required==true and .pause_preserved==true and
@@ -344,6 +501,45 @@ assert_jq '.result=="REQUEUED_FOR_NEW_ONE_SHOT_AUTHORITY" and
 assert_eq "$(find "$FLEET/free-claim/queue" -name '*.json' | wc -l | tr -d ' ')" 1
 assert_fails 'rejected source was removed after requeue crash-link healing' \
   test -e "$REJECTED"
+assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+
+# A completion is valid only through the canonical, sidecar-verified intent
+# receipt.  Idempotent completion must reject deletion, semantic tampering, and
+# a completion whose intent digest was substituted and re-sidecarred.
+INTENT_RECEIPT="$CLEAR/requeue-intent.json"
+INTENT_SIDECAR="$INTENT_RECEIPT.sha256"
+COMPLETE_RECEIPT="$CLEAR/requeue-complete.json"
+COMPLETE_SIDECAR="$COMPLETE_RECEIPT.sha256"
+mv -- "$INTENT_RECEIPT" "$INTENT_RECEIPT.saved"
+mv -- "$INTENT_SIDECAR" "$INTENT_SIDECAR.saved"
+assert_fails 'completed requeue rejects a missing canonical intent receipt' \
+  companion_call "$FLEET" cleared requeue --run-dir "$CLEAR" \
+    --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA"
+mv -- "$INTENT_RECEIPT.saved" "$INTENT_RECEIPT"
+mv -- "$INTENT_SIDECAR.saved" "$INTENT_SIDECAR"
+
+mv -- "$INTENT_RECEIPT" "$INTENT_RECEIPT.saved"
+mv -- "$INTENT_SIDECAR" "$INTENT_SIDECAR.saved"
+jq '.candidate_count=1' "$INTENT_RECEIPT.saved" >"$INTENT_RECEIPT"
+rewrite_sidecar "$INTENT_RECEIPT"
+assert_fails 'completed requeue rejects a semantically tampered intent receipt' \
+  companion_call "$FLEET" cleared requeue --run-dir "$CLEAR" \
+    --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA"
+rm -- "$INTENT_RECEIPT" "$INTENT_SIDECAR"
+mv -- "$INTENT_RECEIPT.saved" "$INTENT_RECEIPT"
+mv -- "$INTENT_SIDECAR.saved" "$INTENT_SIDECAR"
+
+mv -- "$COMPLETE_RECEIPT" "$COMPLETE_RECEIPT.saved"
+mv -- "$COMPLETE_SIDECAR" "$COMPLETE_SIDECAR.saved"
+jq '.requeue_intent_sha256="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+  "$COMPLETE_RECEIPT.saved" >"$COMPLETE_RECEIPT"
+rewrite_sidecar "$COMPLETE_RECEIPT"
+assert_fails 'completed requeue rejects an intent digest substitution' \
+  companion_call "$FLEET" cleared requeue --run-dir "$CLEAR" \
+    --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA"
+rm -- "$COMPLETE_RECEIPT" "$COMPLETE_SIDECAR"
+mv -- "$COMPLETE_RECEIPT.saved" "$COMPLETE_RECEIPT"
+mv -- "$COMPLETE_SIDECAR.saved" "$COMPLETE_SIDECAR"
 assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
 
 # The consumed source authority can never be executed again. Requeued state
@@ -361,6 +557,32 @@ NEW_AUDIT_SHA=$(jq -r .audit_sha256 "$FLEET/new-audit.out")
 # The transient slot must be clear after the fresh audit but before a new
 # financial authority exists.  An occupied slot emits no clearance receipt.
 WINDOW_COUNT=$(find "$CLEAR" -name 'new-authority-window-*.json' | wc -l | tr -d ' ')
+mv -- "$INTENT_RECEIPT" "$INTENT_RECEIPT.saved"
+mv -- "$INTENT_SIDECAR" "$INTENT_SIDECAR.saved"
+assert_fails 'authority window rejects a missing canonical requeue intent' \
+  companion_call "$FLEET" cleared audit-new-authority-window \
+    --run-dir "$CLEAR" --authority "$CLEAR/AUTHORITY.json" \
+    --authority-sha256 "$REQUEUE_AUTH_SHA" --one-shot-run "$NEW_RUN"
+mv -- "$INTENT_RECEIPT.saved" "$INTENT_RECEIPT"
+mv -- "$INTENT_SIDECAR.saved" "$INTENT_SIDECAR"
+assert_eq "$(find "$CLEAR" -name 'new-authority-window-*.json' | wc -l | tr -d ' ')" \
+  "$WINDOW_COUNT"
+
+assert_fails 'authority window rejects a stale pre-lock pause baseline' \
+  companion_prelock_transition_call "$FLEET" cleared "$PAUSE_MARKER" \
+    audit-new-authority-window --run-dir "$CLEAR" \
+    --authority "$CLEAR/AUTHORITY.json" --authority-sha256 "$REQUEUE_AUTH_SHA" \
+    --one-shot-run "$NEW_RUN"
+assert_eq "$(find "$CLEAR" -name 'new-authority-window-*.json' | wc -l | tr -d ' ')" \
+  "$WINDOW_COUNT"
+
+assert_fails 'authority-window postcondition failure publishes no PASS receipt' \
+  companion_postcheck_drift_call "$FLEET" cleared audit-new-authority-window \
+    --run-dir "$CLEAR" --authority "$CLEAR/AUTHORITY.json" \
+    --authority-sha256 "$REQUEUE_AUTH_SHA" --one-shot-run "$NEW_RUN"
+assert_eq "$(find "$CLEAR" -name 'new-authority-window-*.json' | wc -l | tr -d ' ')" \
+  "$WINDOW_COUNT"
+
 assert_fails 'occupied slot blocks the pre-authority window' \
   companion_call "$FLEET" mempool-blocked audit-new-authority-window \
     --run-dir "$CLEAR" --authority "$CLEAR/AUTHORITY.json" \

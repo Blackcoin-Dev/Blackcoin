@@ -23,9 +23,9 @@ Scope:
 Current-byte offline checks (2026-08-13 UTC):
   Python compilation: PASS
   Bash syntax: PASS
-  hostile Phase-A suite: 35/35 PASS
+  hostile Phase-A suite: 40/40 PASS
   hostile log SHA256:
-    93de07c67309fb2cce7731575a7e49e2265acf09d97542d535abb484b9b7f608
+    a9aa7201fe63d54c2ab75c400b841286a9c268284f2d0a82b9748873a6730d3d
   git diff --check: PASS
   live Docker/SSH/wallet/network contact: NONE
   live signing/relay/broadcast: NONE
@@ -35,6 +35,8 @@ Hostile coverage:
   exact node set and node30 exclusion
   exact zero-padded Compose services node01 through node32
   unnamed wallet omits -rpcwallet instead of emitting -rpcwallet=
+  one normal block retries and accepts a fresh coherent full audit envelope
+  continuous chain/recovery-cut drift exhausts after five attempts with no sign
   source/runtime/tool/transport manifest binding
   authority owner/mode/hash/schema/action/node/cap binding
   fee and conflict-risk acknowledgements

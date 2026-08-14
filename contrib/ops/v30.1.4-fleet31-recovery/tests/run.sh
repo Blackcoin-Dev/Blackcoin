@@ -194,6 +194,31 @@ export FLEET31_SCENARIO=wrong-fee
 assert_fails 'per-node fee drift' "$TOOL" audit --runtime-manifest "$BADFEE/runtime.json" --run-dir "$BADFEE/run"
 assert_eq "$(grep -c 'sign_only' "$BADFEE/state/transport.log" || true)" 0
 
+# A normal block after the first stable preview retries the complete read-only
+# envelope and succeeds on the next coherent cut. Continuous full-envelope
+# drift exhausts the bounded retry without mutation.
+TIPONCE="$FIX/tiponce"
+mkdir -m 0700 "$TIPONCE" "$TIPONCE/state"
+make_runtime "$TIPONCE/runtime.json" "$TIPONCE/locks"
+export FLEET31_FIXTURE="$TIPONCE/state"
+export FLEET31_SCENARIO=tip-advance-once
+"$TOOL" audit --runtime-manifest "$TIPONCE/runtime.json" --run-dir "$TIPONCE/run" >/dev/null
+assert_jq '.result=="READY_FOR_PHASE_A_AUTHORITY" and
+  (.nodes[]|select(.node==1).chain.height)==5991551' "$TIPONCE/run/audit.json"
+assert_eq "$(grep -c 'sign_only' "$TIPONCE/state/transport.log" || true)" 0
+
+CHURN="$FIX/churn"
+mkdir -m 0700 "$CHURN" "$CHURN/state"
+make_runtime "$CHURN/runtime.json" "$CHURN/locks"
+export FLEET31_FIXTURE="$CHURN/state"
+export FLEET31_SCENARIO=tip-churn
+assert_fails 'continuous full-envelope chain drift' "$TOOL" audit \
+  --runtime-manifest "$CHURN/runtime.json" --run-dir "$CHURN/run"
+grep -Fq 'kept advancing across five full read-only audit attempts' "$FIX/fail.err" ||
+  fail 'continuous drift did not reach the bounded full-envelope exhaustion gate'
+ok
+assert_eq "$(grep -c 'sign_only' "$CHURN/state/transport.log" || true)" 0
+
 # Lost sign response is never retried. Reconciliation observes the durable
 # non-relayable draft, labels later nodes NO_PHASE_A_INTENT, and requires a new
 # audit/authority for unfinished nodes.

@@ -47,6 +47,11 @@ def save_state(node: int, state: dict) -> None:
     tmp.replace(path)
 
 
+def current_chain(state: dict) -> tuple[str, int, str]:
+    return (state.get("current_tip", TIP), state.get("current_height", HEIGHT),
+            state.get("current_chainwork", CHAINWORK))
+
+
 def component(node: int) -> dict:
     fee = "0.00019200" if SCENARIO == "wrong-fee" and node == 5 else "0.00019100"
     return {
@@ -83,6 +88,8 @@ def action(node: int, status: str) -> dict:
 
 
 def preview(node: int, options: dict, status: str) -> dict:
+    state = load_state(node)
+    tip, height, chainwork = current_chain(state)
     if SCENARIO == "ambiguous" and node == 7:
         return {"action": "preview", "plan_reusable": False, "actions": [], "refused": [],
                 "success": False, "stale_plan": False, "signed_and_persisted": 0,
@@ -101,8 +108,8 @@ def preview(node: int, options: dict, status: str) -> dict:
         refusals = [{"reason_code": "anchor-spent"} for _ in range(49)]
         total = "0.00019100"
     result = {
-        "action": "preview", "plan_id": h("plan-" + status, node), "plan_reusable": True,
-        "active_tip": TIP, "active_height": HEIGHT, "wallet_generation": 1000 + node,
+        "action": "preview", "plan_id": h("plan-" + status + "-" + tip, node), "plan_reusable": True,
+        "active_tip": tip, "active_height": height, "wallet_generation": 1000 + node,
         "wallet_tip_matches": True, "complete": True, "one_call_finality": False,
         "frontier_may_advance": True, "contains_revalidating_unbound_proof": True,
         "max_fee_per_resolution": "0.00019100", "aggregate_batch_fee_cap": "0.00019100",
@@ -128,7 +135,8 @@ def decoded_tx(node: int) -> dict:
 
 def mutation(node: int, options: dict, state: dict) -> dict:
     action_name = options.get("action")
-    expected = h("plan-" + state["status"], node)
+    tip, height, chainwork = current_chain(state)
+    expected = h("plan-" + state["status"] + "-" + tip, node)
     if options.get("expected_plan_id") != expected:
         print("stale fixture plan", file=sys.stderr)
         raise SystemExit(1)
@@ -159,7 +167,7 @@ def mutation(node: int, options: dict, state: dict) -> dict:
     result_action["hex"] = raw
     return {
         "action": action_name, "acknowledged_plan_id": expected,
-        "acknowledged_active_tip": TIP, "acknowledged_active_height": HEIGHT,
+        "acknowledged_active_tip": tip, "acknowledged_active_height": height,
         "acknowledged_wallet_generation": 1000 + node,
         "acknowledged_total_fee": "0.00019100", "plan_consumed": True,
         "plan_reusable": False, "contains_revalidating_unbound_proof": True,
@@ -176,8 +184,17 @@ def mutation(node: int, options: dict, state: dict) -> dict:
 def rpc(node: int, method: str, params: list[str]) -> object:
     state = load_state(node)
     if method == "getblockchaininfo":
-        return {"chain": "main", "blocks": HEIGHT, "headers": HEIGHT, "bestblockhash": TIP,
-                "chainwork": CHAINWORK, "initialblockdownload": False, "pruned": False, "warnings": ""}
+        if node == 1 and SCENARIO in {"tip-advance-once", "tip-churn"}:
+            calls = state.get("chain_calls", 0) + 1
+            state["chain_calls"] = calls
+            generation = (0 if calls <= 2 else 1) if SCENARIO == "tip-advance-once" else calls // 3
+            state["current_tip"] = h(f"tip-{generation}", node)
+            state["current_height"] = HEIGHT + generation
+            state["current_chainwork"] = h(f"chainwork-{generation}", node)
+            save_state(node, state)
+        tip, height, chainwork = current_chain(state)
+        return {"chain": "main", "blocks": height, "headers": height, "bestblockhash": tip,
+                "chainwork": chainwork, "initialblockdownload": False, "pruned": False, "warnings": ""}
     if method == "getnetworkinfo":
         return {"version": 300104, "subversion": "/Blackcoin:30.1.4/"}
     if method == "getconnectioncount":
@@ -200,13 +217,14 @@ def rpc(node: int, method: str, params: list[str]) -> object:
                 "indeterminate_quarantined_claims": 0,
                 "claim_recovery_database_outcome_ambiguous": False}
     if method == "getpowclaimrecoveryinfo":
+        tip, height, chainwork = current_chain(state)
         detail = component(node)
         detail.update({"anchor": {**detail["anchor"], "amount": detail["input_amount"],
                                    "scriptPubKey": "76a914" + h("script", node)[:40] + "88ac"},
                        "anchor_authenticated": True, "anchor_unspent": not state.get("confirmed", False),
                        "has_revalidating_unbound_proof": True})
         return {"chain_ready": True, "wallet_tip_matches": True, "database_outcome_ambiguous": False,
-                "active_tip": TIP, "active_height": HEIGHT,
+                "active_tip": tip, "active_height": height,
                 "blocking_quarantined_claims": 0 if state.get("confirmed", False) else 1,
                 "component_details": [detail]}
     if method == "resolveallshadowpowclaims":

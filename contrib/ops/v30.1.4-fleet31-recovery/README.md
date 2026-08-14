@@ -24,6 +24,10 @@ one actionable quarantine component, and no indeterminate component. It calls
 only `resolveallshadowpowclaims` in `preview` mode with an exact
 `0.00019100 BLK` per-wallet cap and `100 atoms/vB` fee rate. The aggregate
 31-wallet cap is exactly `0.00592100 BLK`.
+If a normal block arrives after the stable preview but before the full
+read-only node census finishes, `audit` retries the entire node envelope up to
+five times. Runtime identity drift remains immediately fatal; continuous
+chain/recovery-cut drift exhausts closed and never reaches a mutation.
 
 `phase-a` accepts only a separate owner-only mode-0600 authority receipt. The
 authority must bind the audit hash, tool hash, runtime-manifest hash, installed

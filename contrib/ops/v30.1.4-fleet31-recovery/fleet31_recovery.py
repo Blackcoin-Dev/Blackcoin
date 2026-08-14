@@ -42,7 +42,7 @@ EXPECTED_VSIZE = 191
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PRODUCTION_DOCKER = pathlib.Path("/usr/bin/docker")
 # Filled from the repository fixture after the fixture is finalized.
-TEST_TRANSPORT_SHA256 = "f37ba6e88791cb7067387ea20e60b95cee5718ebe9b083eaf75a51f71c729534"
+TEST_TRANSPORT_SHA256 = "d90f413d1997c18be2443b79996e3b72923477d4a76047a507542146a1d0655f"
 
 
 class GateError(RuntimeError):
@@ -589,23 +589,36 @@ def stable_preview(transport: Transport, node: RuntimeNode, status_hint: str,
 
 
 def audit_node(transport: Transport, runtime: RuntimeContract, node: RuntimeNode) -> dict[str, Any]:
-    runtime_before = transport.runtime_snapshot(node)
-    chain, preview, action = stable_preview(transport, node, "ready", {"ready", "reuse_managed"})
-    # Existing signed drafts reject an explicit fee-rate override; retry the
-    # preview without repricing only for that exact, persisted status.
-    if action.get("status") == "reuse_managed" and "fee_rate_atoms_per_k" in preview:
-        die(f"node{node.node} signed draft was unexpectedly repriced")
-    network = transport.rpc(node, "getnetworkinfo")
-    peers = transport.rpc(node, "getconnectioncount")
-    wallets = transport.rpc(node, "listwallets")
-    wallet = transport.rpc(node, "getwalletinfo")
-    staking = transport.rpc(node, "getstakinginfo")
-    mining = transport.rpc(node, "getpowmininginfo")
-    recovery = transport.rpc(node, "getpowclaimrecoveryinfo", True)
-    runtime_after = transport.runtime_snapshot(node)
-    after = validate_chain(transport.rpc(node, "getblockchaininfo"), node.node)
-    if runtime_before != runtime_after or chain_identity(chain) != chain_identity(after):
-        die(f"node{node.node} runtime or chain changed across the audit cut")
+    # A normally advancing chain is not an identity failure. Retry the entire
+    # read-only envelope so the preview, wallet/recovery inventory, and final
+    # bracket all describe one cut. Runtime drift remains immediately fatal.
+    for _ in range(5):
+        runtime_before = transport.runtime_snapshot(node)
+        chain, preview, action = stable_preview(transport, node, "ready", {"ready", "reuse_managed"})
+        # Existing signed drafts reject an explicit fee-rate override; retry the
+        # preview without repricing only for that exact, persisted status.
+        if action.get("status") == "reuse_managed" and "fee_rate_atoms_per_k" in preview:
+            die(f"node{node.node} signed draft was unexpectedly repriced")
+        network = transport.rpc(node, "getnetworkinfo")
+        peers = transport.rpc(node, "getconnectioncount")
+        wallets = transport.rpc(node, "listwallets")
+        wallet = transport.rpc(node, "getwalletinfo")
+        staking = transport.rpc(node, "getstakinginfo")
+        mining = transport.rpc(node, "getpowmininginfo")
+        recovery = transport.rpc(node, "getpowclaimrecoveryinfo", True)
+        runtime_after = transport.runtime_snapshot(node)
+        after = validate_chain(transport.rpc(node, "getblockchaininfo"), node.node)
+        if runtime_before != runtime_after:
+            die(f"node{node.node} runtime changed across the audit cut")
+        recovery_cut_matches = (
+            isinstance(recovery, dict) and
+            recovery.get("active_tip") == chain["bestblockhash"] and
+            recovery.get("active_height") == chain["blocks"])
+        if chain_identity(chain) != chain_identity(after) or not recovery_cut_matches:
+            continue
+        break
+    else:
+        die(f"node{node.node} chain/recovery cut kept advancing across five full read-only audit attempts")
     if not isinstance(network, dict) or network.get("version") != NETWORK_VERSION or network.get("subversion") != SUBVERSION:
         die(f"node{node.node} network identity is not installed v30.1.4")
     if not isinstance(peers, int) or peers < 1:

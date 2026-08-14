@@ -1,0 +1,27 @@
+Scope: offline node30 retained-claim two-phase recovery package
+Live contact: none
+Wallet mutation: none
+Network contact: none
+Installed runtime target: signed v30.1.4 only
+Node: 30, Free-Claim role
+Ordinary PoW: required disabled before, during, and after both phases
+PoS: required active with positive weight
+Free-Claim pause: exact marker/wrapper/worker hashes required and preserved
+Recovery RPC surface: resolveallshadowpowclaims only
+Phase A action: sign_only
+Phase B action: commit_and_broadcast
+Fee rate: 100 atoms/vB
+Exact fee cap: 0.00019100 BLK
+Transaction shape: one 191-vbyte same-anchor recovery
+Prior read-only receipt SHA256: ca084d6d76fb67532fd65ff8b44943bc3a8c12f589708a11872417223066eec9
+User-order SHA256: 0252ebcc3dc2ca8a20e8b9708738c30f9c32f6b0dea213bb8937467b2dab2dff
+Crash rule: durable intent precedes mutation; unmatched intent is never retried
+Phase-B lost-response rule: observation only, never completion authority
+Confirmation rule: active-chain spend plus zero blockers; mempool is insufficient
+Free-Claim release: explicitly outside this package
+
+Hostile suite result: PASS: 40 hostile node30 retained-claim recovery assertions
+Hostile suite log: /private/tmp/node30-retained-claim-recovery-full-20260813.out
+Hostile suite log SHA256: 3c86a90644d35cd9241c97df9cdf5603d0322bf1d52170a0daf343d71413f1e7
+Package tree SHA256 manifest: SHA256SUMS
+Git commit/tree/signature: populated by signed source-control receipt

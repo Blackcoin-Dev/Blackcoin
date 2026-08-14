@@ -509,11 +509,22 @@ def awarded_snapshot(contract: Contract, expected_sha: str | None = None) -> dic
             "records": lines}
 
 
+def immutable_queue_item_identity(item: Any) -> dict[str, Any]:
+    keys = ["sha256", "size", "device", "inode", "uid", "gid", "mode", "nlink",
+            "record"]
+    if not isinstance(item, dict) or any(key not in item for key in keys):
+        die("Free-Claim queue item identity is incomplete")
+    return {key: item[key] for key in keys}
+
+
 def queue_file_snapshot(path: pathlib.Path, contract: Contract, label: str,
-                        expected_sha: str | None = None) -> tuple[dict[str, Any], bytes]:
+                        expected_sha: str | None = None,
+                        expected_identity: dict[str, Any] | None = None
+                        ) -> tuple[dict[str, Any], bytes]:
     data, st = secure_state_file(path, label, {0o644})
-    if st.st_gid != contract.pool_group_gid:
-        die(f"{label} group differs from the runtime contract")
+    expected_gid = os.getegid() if test_mode() else 0
+    if st.st_gid != expected_gid:
+        die(f"{label} is not owned by the exact queue-entry group")
     digest = hashlib.sha256(data).hexdigest()
     if expected_sha is not None and digest != expected_sha:
         die(f"{label} SHA256 changed")
@@ -528,9 +539,15 @@ def queue_file_snapshot(path: pathlib.Path, contract: Contract, label: str,
             not isinstance(value.get("submitted"), str) or not value["submitted"] or
             not isinstance(value.get("quantum_address"), str) or not value["quantum_address"]):
         die(f"{label} has an unexpected schema")
-    return ({"path": str(path), "basename": path.name, "sha256": digest,
-             "size": len(data), "device": st.st_dev, "inode": st.st_ino,
-             "mode": "0644", "gid": st.st_gid, "record": value}, data)
+    snapshot = {"path": str(path), "basename": path.name, "sha256": digest,
+                "size": len(data), "device": st.st_dev, "inode": st.st_ino,
+                "uid": st.st_uid, "gid": st.st_gid, "mode": "0644",
+                "nlink": st.st_nlink, "record": value}
+    if (expected_identity is not None and
+            immutable_queue_item_identity(snapshot) !=
+            immutable_queue_item_identity(expected_identity)):
+        die(f"{label} immutable identity changed")
+    return snapshot, data
 
 
 def audit_queue(contract: Contract) -> dict[str, Any]:
@@ -570,6 +587,7 @@ def audit_queue(contract: Contract) -> dict[str, Any]:
         current = secure_dir(path, label, mode, contract.pool_group_gid)
         if (current.st_dev != prior.st_dev or current.st_ino != prior.st_ino):
             die(f"{label} changed while its state was audited")
+    queue_file_snapshot(entries[0], contract, "queued Free-Claim item", item["sha256"], item)
     if current_free_claim_storage(contract) != storage_before:
         die("Free-Claim storage ancestry changed while its state was audited")
     return {"root": {"path": str(contract.root), "device": root_st.st_dev,
@@ -776,6 +794,8 @@ def audit_command(args: argparse.Namespace) -> None:
         "node30_primitive_sha256": NODE30_PRIMITIVE_SHA256,
         "controller_runtime_sha256": sha256_json(controller_runtime_identity()),
         "free_claim_storage_sha256": sha256_json(current_free_claim_storage(contract)),
+        "queue_item_identity_sha256": sha256_json(
+            immutable_queue_item_identity(snapshot["queue"]["item"])),
         "queue_item_sha256": snapshot["queue"]["item"]["sha256"],
         "queue_item_basename": snapshot["queue"]["item"]["basename"],
         "quantum_address": snapshot["payout"]["address"],
@@ -827,6 +847,8 @@ def validate_authority(authority: Any, contract: Contract, audit: dict[str, Any]
         "node30_primitive_sha256": NODE30_PRIMITIVE_SHA256,
         "controller_runtime_sha256": sha256_json(controller_runtime_identity()),
         "free_claim_storage_sha256": sha256_json(current_free_claim_storage(contract)),
+        "queue_item_identity_sha256": sha256_json(
+            immutable_queue_item_identity(snapshot["queue"]["item"])),
         "queue_item_sha256": snapshot["queue"]["item"]["sha256"],
         "queue_item_basename": snapshot["queue"]["item"]["basename"],
         "quantum_address": snapshot["payout"]["address"],
@@ -1081,7 +1103,7 @@ def current_queue_state(contract: Contract, audit: dict[str, Any]) -> tuple[str,
     if len(present) != 1:
         die("exactly one authenticated queue/outcome state must exist")
     state_name, path = present[0]
-    queue_file_snapshot(path, contract, f"Free-Claim {state_name} item", item["sha256"])
+    queue_file_snapshot(path, contract, f"Free-Claim {state_name} item", item["sha256"], item)
     return state_name, path
 
 
@@ -1108,7 +1130,8 @@ def transition_queue(contract: Contract, audit: dict[str, Any], target: str) -> 
     if source.parent != destination.parent:
         node30.base.fsync_dir(destination.parent)
     final, _ = queue_file_snapshot(destination, contract, f"Free-Claim {target} item",
-                                   audit["snapshot"]["queue"]["item"]["sha256"])
+                                   audit["snapshot"]["queue"]["item"]["sha256"],
+                                   audit["snapshot"]["queue"]["item"])
     return {"state": target, "path": str(destination), "sha256": final["sha256"],
             "device": final["device"], "inode": final["inode"],
             "already_complete": False, "atomic_rename": True}

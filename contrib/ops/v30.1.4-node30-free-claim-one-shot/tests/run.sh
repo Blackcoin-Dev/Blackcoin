@@ -2,6 +2,9 @@
 set -Eeuo pipefail
 export LC_ALL=C
 umask 077
+FIXTURE_UID=$(id -u)
+FIXTURE_GID=$(id -g)
+export FIXTURE_UID FIXTURE_GID
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 TOOL="$ROOT/node30_free_claim_one_shot.py"
@@ -288,12 +291,16 @@ assert_jq '.result=="READY_FOR_SEPARATE_ONE_SHOT_AUTHORITY" and
   .snapshot.role.ordinary_pow.enabled==false and .snapshot.role.pos.staking==true and
   .snapshot.queue.root.mode=="0750" and .snapshot.queue.queue_directory.mode=="0770" and
   .snapshot.queue.done_directory.mode=="0750" and
+  .snapshot.queue.item.uid==(env.FIXTURE_UID|tonumber) and
+  .snapshot.queue.item.gid==(env.FIXTURE_GID|tonumber) and
+  .snapshot.queue.item.mode=="0644" and .snapshot.queue.item.nlink==1 and
   .controller_runtime.contract=="hash-pinned-offline-test-controller/v1" and
   (.controller_runtime_sha256|test("^[0-9a-f]{64}$")) and
   .required_authority.controller_runtime_sha256==.controller_runtime_sha256 and
   .free_claim_storage.contract=="offline-fixture-free-claim-storage/v1" and
   (.free_claim_storage_sha256|test("^[0-9a-f]{64}$")) and
   .required_authority.free_claim_storage_sha256==.free_claim_storage_sha256 and
+  (.required_authority.queue_item_identity_sha256|test("^[0-9a-f]{64}$")) and
   .required_authority.proof_override==null and .required_authority.maximum_fee_blk=="0.00028700"' \
   "$HAPPY/run/audit.json"
 assert_eq "$(grep -c sendshadowpowclaim "$HAPPY/state/transport.log" || true)" 0
@@ -482,6 +489,42 @@ mv "$SYMLINK/free-claim/queue/20260814T030000Z-deadbeef.json" "$SYMLINK/item"
 ln -s "$SYMLINK/item" "$SYMLINK/free-claim/queue/20260814T030000Z-deadbeef.json"
 assert_fails 'audit rejects symlink queue item' run_audit "$SYMLINK" happy
 
+# The API-produced queue item is a root:root 0644 single-link regular file in
+# live mode (the fixture equivalent is current-user:current-group). The queue
+# directory remains independently group-writable for ingress.
+ALT_GID=$(id -G | tr ' ' '\n' | awk -v primary="$(id -g)" '$1 != primary {print; exit}')
+[[ -n "$ALT_GID" ]] || { printf 'fixture user has no alternate test group\n' >&2; exit 1; }
+QUEUE_GID_CASE=$(make_fixture queue-item-wrong-gid)
+chgrp "$ALT_GID" "$QUEUE_GID_CASE/free-claim/queue/20260814T030000Z-deadbeef.json"
+assert_fails 'audit rejects queue item group drift' run_audit "$QUEUE_GID_CASE" happy
+
+for name_mode in \
+  'owner-only:0600' \
+  'group-write:0664' \
+  'world-write:0646' \
+  'setuid:4644'; do
+    IFS=: read -r case_name mode <<<"$name_mode"
+    ITEM_MODE=$(make_fixture "queue-item-$case_name")
+    chmod "$mode" "$ITEM_MODE/free-claim/queue/20260814T030000Z-deadbeef.json"
+    assert_fails "audit rejects queue item mode $case_name" run_audit "$ITEM_MODE" happy
+done
+
+ITEM_LINK=$(make_fixture queue-item-hardlink)
+ln "$ITEM_LINK/free-claim/queue/20260814T030000Z-deadbeef.json" \
+  "$ITEM_LINK/queue-item-second-link"
+assert_fails 'audit rejects multiply-linked queue item' run_audit "$ITEM_LINK" happy
+
+ITEM_SWAP=$(make_fixture queue-item-inode-swap)
+run_audit "$ITEM_SWAP" >/dev/null
+mv "$ITEM_SWAP/free-claim/queue/20260814T030000Z-deadbeef.json" \
+  "$ITEM_SWAP/original-queue-item"
+cp "$ITEM_SWAP/original-queue-item" \
+  "$ITEM_SWAP/free-claim/queue/20260814T030000Z-deadbeef.json"
+chmod 0644 "$ITEM_SWAP/free-claim/queue/20260814T030000Z-deadbeef.json"
+assert_fails 'queue item inode substitution invalidates audited authority' \
+  invoke "$ITEM_SWAP" happy execute
+assert_eq "$(grep -c sendshadowpowclaim "$ITEM_SWAP/state/transport.log" || true)" 0
+
 # The live Free-Claim API has an exact root:pool-group directory contract:
 # root 0750, group-writable ingress queue 0770, and done 0750. No broader
 # group/world/special-bit or path-substitution state is accepted.
@@ -548,6 +591,7 @@ for filter in \
   '.tool_sha256=("0"*64)' \
   '.controller_runtime_sha256=("0"*64)' \
   '.free_claim_storage_sha256=("0"*64)' \
+  '.queue_item_identity_sha256=("0"*64)' \
   '.extra=true'; do
     jq "$filter" "$AUTH/authority.json" >"$AUTH/bad-authority.json"
     chmod 0600 "$AUTH/bad-authority.json"

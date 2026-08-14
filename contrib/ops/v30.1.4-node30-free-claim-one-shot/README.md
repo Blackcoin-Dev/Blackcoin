@@ -36,8 +36,8 @@ wallet secret, or executable financial authority is checked in.
   remain root:root, mode 0700; every prefix, share, protected-root, pool-root,
   queue, and done device/inode identity is bound without changing the
   intentional user-share permissions;
-- exactly one canonical queue JSON, no broadcast marker, and a queued payout
-  absent from the awarded ledger;
+- exactly one canonical root:root, mode-0644, single-link regular queue JSON,
+  no broadcast marker, and a queued payout absent from the awarded ledger;
 - a valid direct witness-v16 quantum payout script;
 - active unbound QQP2 work for that exact payout;
 - one safe, confirmed, wallet-owned legacy P2PKH input at the selected address;
@@ -51,8 +51,8 @@ receipt, copy that member to a separate mode-0600 file, change only `decision`
 to `authorize`, insert the exact audit SHA256, and supply that authority's
 SHA256 explicitly. Every other field must remain byte-for-byte semantic JSON
 equal, including the exact queue, payout, fee input, active tip, work digest,
-wallet inventory digest, user order, fee rate, vsize, fee cap, maximum tries,
-and risk acknowledgements.
+wallet inventory digest, immutable queue-file identity digest, user order, fee
+rate, vsize, fee cap, maximum tries, and risk acknowledgements.
 
 `execute` revalidates the complete audit, authority, runtime, wallet selection,
 queue, payout, active QQP2 work, fee input, tip, role, pause artifacts, and
@@ -110,6 +110,13 @@ Every receipt also records the complete Free-Claim storage ancestry and its
 digest. The separate authority binds that digest. Audit, execute, reconcile,
 and monitor reject a different share, protected-root, or device/inode identity
 even when the textual path is unchanged.
+
+The ingress directory's gid-100 group-write permission does not extend to the
+existing API-produced queue item. That file must remain root:root, mode 0644,
+single-link, canonical, and regular. Its bytes, size, device, inode, uid, gid,
+mode, link count, and record are reduced to an immutable identity digest in the
+authority. Atomic queue-to-done renames preserve that identity; copied,
+replaced, relinked, re-owned, or permission-changed outcome files fail closed.
 
 The state transitions are restart-safe:
 
@@ -221,6 +228,9 @@ share/protected mode, group, special-bit, symlink, and path-swap hostiles;
 the exact uid-99/gid-100/mode-0777 Pulsar share ancestry, root-owned
 mode-0700 protected `operations` root, stable device/inode binding, and
 storage-share mode, group, symlink, and path-swap hostiles;
+the root:root mode-0644 single-link queue-item contract, immutable authority
+binding, and wrong-group, wrong-mode, group/world-write, special-bit,
+hard-link, symlink, and inode-substitution hostiles;
 independent signed-byte fee proof; immediate acknowledgment
 ordering; response corruption and overprecision; process death before and
 after wallet persistence and after response publication; no-retry

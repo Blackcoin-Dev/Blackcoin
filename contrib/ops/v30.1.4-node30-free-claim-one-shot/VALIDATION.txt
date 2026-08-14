@@ -17,6 +17,9 @@ Recurring worker: never invoked or enabled
 Free-Claim directory owner/group: live uid 0 and exact manifest pool_group_gid=100
 Free-Claim directory modes: root 0750; ingress queue 0770; done 0750
 Directory security: canonical nonsymlink exact modes/gid/inodes; special bits and path substitution rejected
+Queue item identity: live root:root regular mode0644 nlink1; exact bytes/size/device/inode/uid/gid/mode/nlink/record bound
+Queue item authority: immutable identity SHA256 explicit in separate authority; rechecked through queued/broadcast/uncertain/confirmed states
+Queue item security: wrong gid/mode, group/world write, special bits, hard links, symlinks, and inode replacement rejected
 Free-Claim safe prefixes: / and /mnt canonical root-owned, not group/other writable
 Free-Claim Pulsar share ancestry: /mnt/pulsar and /mnt/pulsar/Blackcoin_Blocks exact uid99:gid100 mode0777
 Free-Claim protected boundary: /mnt/pulsar/Blackcoin_Blocks/operations exact root:root mode0700
@@ -64,11 +67,11 @@ Installed API limitation: no plan/idempotency token, exact-input selector, calle
 Live financial authority in repository: false
 Deployable public-release authority: false
 
-Hostile suite result: PASS: 183 hostile node30 Free-Claim one-shot assertions
-Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-pulsar-storage-boundary-20260814.out
-Hostile suite log SHA256: 901cfa274b7dcd41d20be02f8059fe2c489a536b989413540b7ab9040cc5dc6c
-Tool SHA256: 68c2fc3e7b7c21fa94d0404c1253ecb2d180fd0fa3746e4171eef67d2a880d7d
+Hostile suite result: PASS: 192 hostile node30 Free-Claim one-shot assertions
+Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-queue-item-contract-20260814.out
+Hostile suite log SHA256: 6e6c80ac850a72cf74349ca100d220f915aed84e67903866acbf4973b9f1324a
+Tool SHA256: 5ff475875d9a9495bb6838cb28f5be09fa0287fd6be92b3b4a768468593498ac
 Test transport SHA256: c1987a9646d5a9f375f7e982f59ef9c29b1f1434d4990c4005ab9e9454bebc9e
-Test driver SHA256: ecf528fcc2a03b53b39852486be35cbde151631b30e6d0a84d1fcb67eea8f63a
+Test driver SHA256: 58f1c9c76720c1dec4a5f02e8bfce8b617ed5cf9efa79fa4c25d02fc9c89281d
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

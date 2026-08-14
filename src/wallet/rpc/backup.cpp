@@ -154,52 +154,51 @@ RPCHelpMan importprivkey()
     EnsureLegacyScriptPubKeyMan(*pwallet, true);
 
     WalletRescanReserver reserver(*pwallet);
-    bool fRescan = true;
+    const bool fRescan = request.params[2].isNull() || request.params[2].get_bool();
+    if (fRescan && !reserver.reserve()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet is currently rescanning. Abort existing rescan or wait.");
+    }
+
+    const std::string strSecret = request.params[0].get_str();
+    const std::string strLabel{LabelFromValue(request.params[1])};
+    CKey key = DecodeSecret(strSecret);
+    if (!key.IsValid()) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key encoding");
+    }
+    CPubKey pubkey = key.GetPubKey();
+    CHECK_NONFATAL(key.VerifyPubKey(pubkey));
+    CKeyID vchAddress = pubkey.GetID();
     {
         LOCK(pwallet->cs_wallet);
-
         EnsureWalletIsUnlocked(*pwallet);
+        if (pwallet->m_wallet_unlock_staking_only) {
+            throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet is unlocked for staking only.");
+        }
+        pwallet->MarkDirty();
 
-        std::string strSecret = request.params[0].get_str();
-        const std::string strLabel{LabelFromValue(request.params[1])};
-
-        // Whether to perform rescan after import
-        if (!request.params[2].isNull())
-            fRescan = request.params[2].get_bool();
-
-        if (fRescan && !reserver.reserve()) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Wallet is currently rescanning. Abort existing rescan or wait.");
+        // Use timestamp of 1 to scan the whole chain.
+        if (!pwallet->ImportPrivKeys({{vchAddress, key}}, 1)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error adding key to wallet");
         }
 
-        CKey key = DecodeSecret(strSecret);
-        if (!key.IsValid()) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key encoding");
+        // Add the wpkh script for this key if possible. The key is already
+        // durable if this separate write fails.
+        if (pubkey.IsCompressed() &&
+            !pwallet->ImportScripts(
+                {GetScriptForDestination(WitnessV0KeyHash(vchAddress))},
+                /*timestamp=*/0)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "The private key was imported, but its witness script could not be stored. Back up and reload the wallet before retrying.");
+        }
 
-        if (pwallet->m_wallet_unlock_staking_only)
-            throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet is unlocked for staking only.");
-
-        CPubKey pubkey = key.GetPubKey();
-        CHECK_NONFATAL(key.VerifyPubKey(pubkey));
-        CKeyID vchAddress = pubkey.GetID();
-        {
-            pwallet->MarkDirty();
-
-            // We don't know which corresponding address will be used;
-            // label all new addresses, and label existing addresses if a
-            // label was passed.
-            for (const auto& dest : GetAllDestinationsForKey(pubkey)) {
-                if (!request.params[1].isNull() || !pwallet->FindAddressBookEntry(dest)) {
-                    pwallet->SetAddressBook(dest, strLabel, AddressPurpose::RECEIVE);
-                }
-            }
-
-            // Use timestamp of 1 to scan the whole chain
-            if (!pwallet->ImportPrivKeys({{vchAddress, key}}, 1)) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Error adding key to wallet");
-            }
-
-            // Add the wpkh script for this key if possible
-            if (pubkey.IsCompressed()) {
-                pwallet->ImportScripts({GetScriptForDestination(WitnessV0KeyHash(vchAddress))}, /*timestamp=*/0);
+        // The key is already durable if this later label update fails, so
+        // report that precise partial result instead of nominal success.
+        for (const auto& dest : GetAllDestinationsForKey(pubkey)) {
+            const bool label_needed = !request.params[1].isNull() ||
+                pwallet->FindAddressBookEntry(dest) == nullptr;
+            if (label_needed &&
+                !pwallet->SetAddressBook(
+                    dest, strLabel, AddressPurpose::RECEIVE)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "The private key was imported, but an address label could not be committed; earlier labels may already be durable. Back up and reload the wallet before retrying the label.");
             }
         }
     }
@@ -393,19 +392,25 @@ RPCHelpMan importaddress()
 
             pwallet->MarkDirty();
 
-            pwallet->ImportScriptPubKeys(strLabel, {GetScriptForDestination(dest)}, /*have_solving_data=*/false, /*apply_label=*/true, /*timestamp=*/1);
+            if (!pwallet->ImportScriptPubKeys(strLabel, {GetScriptForDestination(dest)}, /*have_solving_data=*/false, /*apply_label=*/true, /*timestamp=*/1)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "The address import or label commit failed; its watch-only script may already be durable. Back up and reload the wallet before retrying.");
+            }
         } else if (IsHex(request.params[0].get_str())) {
             std::vector<unsigned char> data(ParseHex(request.params[0].get_str()));
             CScript redeem_script(data.begin(), data.end());
 
             std::set<CScript> scripts = {redeem_script};
-            pwallet->ImportScripts(scripts, /*timestamp=*/0);
+            if (!pwallet->ImportScripts(scripts, /*timestamp=*/0)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Error adding redeem script to wallet");
+            }
 
             if (fP2SH) {
                 scripts.insert(GetScriptForDestination(ScriptHash(redeem_script)));
             }
 
-            pwallet->ImportScriptPubKeys(strLabel, scripts, /*have_solving_data=*/false, /*apply_label=*/true, /*timestamp=*/1);
+            if (!pwallet->ImportScriptPubKeys(strLabel, scripts, /*have_solving_data=*/false, /*apply_label=*/true, /*timestamp=*/1)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "The redeem script is durable, but a watch-only script import or label commit failed; some watch-only scripts may also be durable. Back up and reload the wallet before retrying.");
+            }
         } else {
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Blackcoin address or script");
         }
@@ -482,9 +487,13 @@ RPCHelpMan importpubkey()
 
         pwallet->MarkDirty();
 
-        pwallet->ImportScriptPubKeys(strLabel, script_pub_keys, /*have_solving_data=*/true, /*apply_label=*/true, /*timestamp=*/1);
+        if (!pwallet->ImportScriptPubKeys(strLabel, script_pub_keys, /*have_solving_data=*/true, /*apply_label=*/true, /*timestamp=*/1)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "A public-key script import or label commit failed; some watch-only scripts may already be durable. Back up and reload the wallet before retrying.");
+        }
 
-        pwallet->ImportPubKeys({pubKey.GetID()}, {{pubKey.GetID(), pubKey}} , /*key_origins=*/{}, /*add_keypool=*/false, /*internal=*/false, /*timestamp=*/1);
+        if (!pwallet->ImportPubKeys({pubKey.GetID()}, {{pubKey.GetID(), pubKey}}, /*key_origins=*/{}, /*add_keypool=*/false, /*internal=*/false, /*timestamp=*/1)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "The watch-only scripts and labels were imported, but the public key could not be stored. Back up and reload the wallet before retrying.");
+        }
     }
     if (fRescan)
     {
@@ -660,8 +669,14 @@ RPCHelpMan importwallet()
                 continue;
             }
 
-            if (has_label)
-                pwallet->SetAddressBook(PKHash(keyid), label, AddressPurpose::RECEIVE);
+            if (has_label) {
+                if (!pwallet->SetAddressBook(
+                        PKHash(keyid), label, AddressPurpose::RECEIVE)) {
+                    pwallet->WalletLogPrintf("Error importing label for %s\n", EncodeDestination(PKHash(keyid)));
+                    fGood = false;
+                    continue;
+                }
+            }
             progress++;
         }
         for (const auto& key_tuple : quantum_keys) {
@@ -1298,16 +1313,16 @@ static UniValue ProcessImport(CWallet& wallet, const UniValue& data, const int64
         // All good, time to import
         wallet.MarkDirty();
         if (!wallet.ImportScripts(import_data.import_scripts, timestamp)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Error adding script to wallet");
+            throw JSONRPCError(RPC_WALLET_ERROR, "A script import failed; earlier scripts may already be durable. Back up and reload the wallet before retrying.");
         }
         if (!wallet.ImportPrivKeys(privkey_map, timestamp)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Error adding key to wallet");
+            throw JSONRPCError(RPC_WALLET_ERROR, "A private-key import failed; earlier scripts or keys may already be durable. Back up and reload the wallet before retrying.");
         }
         if (!wallet.ImportPubKeys(ordered_pubkeys, pubkey_map, import_data.key_origins, add_keypool, internal, timestamp)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Error adding address to wallet");
+            throw JSONRPCError(RPC_WALLET_ERROR, "A public-key import failed; earlier scripts or keys may already be durable. Back up and reload the wallet before retrying.");
         }
         if (!wallet.ImportScriptPubKeys(label, script_pub_keys, have_solving_data, !internal, timestamp)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Error adding address to wallet");
+            throw JSONRPCError(RPC_WALLET_ERROR, "A watch-only script import or label commit failed; earlier scripts, keys, or labels may already be durable. Back up and reload the wallet before retrying.");
         }
 
         result.pushKV("success", UniValue(true));
@@ -1663,9 +1678,15 @@ static UniValue ProcessDescriptorImport(CWallet& wallet, const UniValue& data, c
         }
 
         // Add descriptor to the wallet
-        auto spk_manager = wallet.AddWalletDescriptor(w_desc, keys, label, internal);
+        bilingual_str add_error;
+        auto spk_manager = wallet.AddWalletDescriptor(
+            w_desc, keys, label, internal, &add_error);
         if (spk_manager == nullptr) {
-            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Could not add descriptor '%s'", descriptor));
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                add_error.empty()
+                    ? strprintf("Could not add descriptor '%s'", descriptor)
+                    : add_error.original);
         }
 
         // Set descriptor as active if necessary

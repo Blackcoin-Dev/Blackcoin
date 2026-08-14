@@ -93,6 +93,14 @@ struct WalletEncryptionStatus
     bool private_keys_disabled{false};
 };
 
+/** Whether getNewDestination reserved a destination before returning. This
+ * distinguishes a retryable pre-reservation failure from a durable partial
+ * result whose label could not be committed. */
+enum class NewDestinationStatus {
+    NOT_RESERVED,
+    RESERVED,
+};
+
 //! Interface for accessing a wallet.
 class Wallet
 {
@@ -135,7 +143,7 @@ public:
     virtual std::string getWalletName() = 0;
 
     // Get a new address.
-    virtual util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) = 0;
+    virtual util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label, NewDestinationStatus* status = nullptr) = 0;
 
     //! Get public key.
     virtual bool getPubKey(const CScript& script, const CKeyID& address, CPubKey& pub_key) = 0;
@@ -154,6 +162,9 @@ public:
 
     // Remove address.
     virtual bool delAddressBook(const CTxDestination& dest) = 0;
+
+    //! Atomically replace one sending address-book entry with another.
+    virtual bool moveAddressBook(const CTxDestination& old_dest, const CTxDestination& new_dest) = 0;
 
     //! Look up address in wallet, return whether exists.
     virtual bool getAddress(const CTxDestination& dest,

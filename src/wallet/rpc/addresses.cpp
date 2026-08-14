@@ -755,10 +755,10 @@ RPCHelpMan setlabel()
 
     const std::string label{LabelFromValue(request.params[1])};
 
-    if (pwallet->IsMine(dest)) {
-        pwallet->SetAddressBook(dest, label, AddressPurpose::RECEIVE);
-    } else {
-        pwallet->SetAddressBook(dest, label, AddressPurpose::SEND);
+    const AddressPurpose purpose = pwallet->IsMine(dest)
+        ? AddressPurpose::RECEIVE : AddressPurpose::SEND;
+    if (!pwallet->SetAddressBook(dest, label, purpose)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error committing address label to wallet; reload the wallet before retrying");
     }
 
     return UniValue::VNULL;
@@ -944,7 +944,9 @@ RPCHelpMan addmultisigaddress()
     // Construct using pay-to-script-hash:
     CScript inner;
     CTxDestination dest = AddAndGetMultisigDestination(required, pubkeys, output_type, spk_man, inner);
-    pwallet->SetAddressBook(dest, label, AddressPurpose::SEND);
+    if (!pwallet->SetAddressBook(dest, label, AddressPurpose::SEND)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error committing multisig address label to wallet; the redeem script may already be stored, so back up and reload the wallet before retrying");
+    }
 
     // Make the descriptor
     std::unique_ptr<Descriptor> descriptor = InferDescriptor(GetScriptForDestination(dest), spk_man);

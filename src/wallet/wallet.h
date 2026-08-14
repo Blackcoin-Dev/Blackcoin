@@ -884,7 +884,57 @@ private:
     /** WalletFlags set on this wallet. */
     std::atomic<uint64_t> m_wallet_flags{0};
 
-    bool SetAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& strPurpose);
+    // A failed address-book commit has an unknowable on-disk outcome. Keep
+    // later label-based automatic payout selection closed until wallet reload.
+    bool m_address_book_db_ambiguous GUARDED_BY(cs_wallet){false};
+
+    void MarkAddressBookDatabaseAmbiguous() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        m_address_book_db_ambiguous = true;
+    }
+
+    // A failed non-HD ML-DSA key transaction can have committed despite a
+    // false return. Do not generate or automatically select another key until
+    // a reload establishes the database's authoritative state.
+    bool m_quantum_key_db_ambiguous GUARDED_BY(cs_wallet){false};
+
+    void MarkQuantumKeyDatabaseAmbiguous() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        m_quantum_key_db_ambiguous = true;
+    }
+
+    // A failed ML-DSA delegation transaction can have committed despite a
+    // false return. Do not create or relabel another delegation until reload
+    // establishes the database's authoritative state.
+    bool m_quantum_delegation_db_ambiguous GUARDED_BY(cs_wallet){false};
+
+    void MarkQuantumDelegationDatabaseAmbiguous() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        m_quantum_delegation_db_ambiguous = true;
+    }
+
+    struct AddressBookNotification
+    {
+        CTxDestination destination;
+        std::string label;
+        bool is_mine;
+        AddressPurpose purpose;
+        ChangeType status;
+    };
+
+    /** Notify observers after a committed address-book mutation. Observer
+     * exceptions must not make a committed operation appear to have failed. */
+    void NotifyAddressBookChangedNoThrow(const AddressBookNotification& notification) noexcept;
+
+    /**
+     * Stage one address-book entry in a caller-owned database transaction.
+     * This does not update memory or notify observers. The caller must publish
+     * the matching in-memory update only after its transaction commits.
+     */
+    bool WriteAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& name, const std::optional<AddressPurpose>& purpose) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SetAddressBookLocked(const CTxDestination& address, const std::string& name, const std::optional<AddressPurpose>& purpose, AddressBookNotification& notification) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    util::Result<CTxDestination> AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination);
 
     //! Unsets a wallet flag and saves it to disk
     void UnsetWalletFlagWithDB(WalletBatch& batch, uint64_t flag);
@@ -1512,7 +1562,7 @@ public:
      */
     void MarkDestinationsDirty(const std::set<CTxDestination>& destinations) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    util::Result<CTxDestination> GetNewDestination(const OutputType type, const std::string label);
+    util::Result<CTxDestination> GetNewDestination(const OutputType type, const std::string label, bool* reserved = nullptr);
     util::Result<CTxDestination> GetNewChangeDestination(const OutputType type);
     util::Result<CTxDestination> GetNewQuantumDestination(const std::string label);
     util::Result<CTxDestination> GetNewTieredQuantumDestination(const std::string label, uint16_t unbonding_blocks);
@@ -1586,9 +1636,32 @@ public:
     DBErrors LoadWallet();
     DBErrors ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256>& vHashOut) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
+    /** Commit one entry atomically before publishing it to memory and observers. */
     bool SetAddressBook(const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& purpose);
 
+    bool IsAddressBookDatabaseAmbiguous() const
+    {
+        LOCK(cs_wallet);
+        return m_address_book_db_ambiguous;
+    }
+
+    bool IsQuantumKeyDatabaseAmbiguous() const
+    {
+        LOCK(cs_wallet);
+        return m_quantum_key_db_ambiguous;
+    }
+
+    bool IsQuantumDelegationDatabaseAmbiguous() const
+    {
+        LOCK(cs_wallet);
+        return m_quantum_delegation_db_ambiguous;
+    }
+
     bool DelAddressBook(const CTxDestination& address);
+
+    /** Atomically move an address-book entry, preserving its authoritative
+     * label and purpose while holding cs_wallet. */
+    bool MoveAddressBook(const CTxDestination& old_address, const CTxDestination& new_address);
 
     bool IsAddressPreviouslySpent(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool SetAddressPreviouslySpent(WalletBatch& batch, const CTxDestination& dest, bool used) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1834,8 +1907,15 @@ public:
     //! @return contains value only for active DescriptorScriptPubKeyMan, otherwise undefined
     std::optional<bool> IsInternalScriptPubKeyMan(ScriptPubKeyMan* spk_man) const;
 
-    //! Add a descriptor to the wallet, return a ScriptPubKeyMan & associated output type
-    ScriptPubKeyMan* AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Add a descriptor to the wallet and return its ScriptPubKeyMan.
+     *
+     * Descriptor keys, cache, and descriptor metadata are durably stored
+     * before a non-ranged receive label is committed. If the later label
+     * transaction fails, this returns nullptr and @p error reports that the
+     * descriptor is already present and must not be treated as rolled back.
+     * A retry of the same descriptor may commit the missing label.
+     */
+    ScriptPubKeyMan* AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal, bilingual_str* error = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Move all records from the BDB database to a new SQLite database for storage.
      * The original BDB file will be deleted and replaced with a new SQLite file.

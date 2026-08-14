@@ -128,6 +128,11 @@ void EditAddressDialog::accept()
                 tr("New key generation failed."),
                 QMessageBox::Ok, QMessageBox::Ok);
             break;
+        case AddressTableModel::ADDRESS_BOOK_FAILURE:
+            QMessageBox::critical(this, windowTitle(),
+                tr("Could not commit the address-book change. Reload the wallet before retrying."),
+                QMessageBox::Ok, QMessageBox::Ok);
+            break;
 
         }
         return;

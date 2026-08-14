@@ -111,6 +111,11 @@ public:
     std::optional<size_t> m_fail_write_at;
     size_t m_write_calls{0};
     bool m_fail_commit{false};
+    std::optional<size_t> m_fail_commit_at;
+    bool m_commit_records_on_failure{false};
+    bool m_fail_abort{false};
+    size_t m_commit_calls{0};
+    size_t m_abort_calls{0};
     bool m_fail_rewrite{false};
     bool m_last_txn_durable{false};
 

@@ -1074,14 +1074,12 @@ void WalletModel::sendCoins(WalletModelTransaction& transaction)
             {
                 // Check if we have a new address or an updated label
                 std::string name;
-                if (!m_wallet->getAddress(
-                     dest, &name, /* is_mine= */ nullptr, /* purpose= */ nullptr))
-                {
-                    m_wallet->setAddressBook(dest, strLabel, wallet::AddressPurpose::SEND);
-                }
-                else if (name != strLabel)
-                {
-                    m_wallet->setAddressBook(dest, strLabel, {}); // {} means don't change purpose
+                const bool has_address = m_wallet->getAddress(dest, &name, /*is_mine=*/nullptr, /*purpose=*/nullptr);
+                const bool needs_update = !has_address || name != strLabel;
+                if (needs_update && !m_wallet->setAddressBook(
+                        dest, strLabel,
+                        has_address ? std::optional<wallet::AddressPurpose>{} : wallet::AddressPurpose::SEND)) {
+                    qWarning("Could not commit recipient address-book label; reload the wallet before retrying");
                 }
             }
         }

@@ -2311,7 +2311,11 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
                         // (e.g. it wasn't generated on this node or we're restoring from backup)
                         // add it to the address book for proper transaction accounting
                         if (!*dest.internal && !FindAddressBookEntry(dest.dest, /* allow_change= */ false)) {
-                            SetAddressBook(dest.dest, "", AddressPurpose::RECEIVE);
+                            if (!SetAddressBook(
+                                    dest.dest, "", AddressPurpose::RECEIVE)) {
+                                WalletLogPrintf("Unable to persist restored receiving-address label for %s; continuing transaction synchronization with the address book fail-closed\n",
+                                                EncodeDestination(dest.dest));
+                            }
                         }
                     }
                 }
@@ -3631,23 +3635,59 @@ bool CWallet::ImportPubKeys(const std::vector<CKeyID>& ordered_pubkeys, const st
 
 bool CWallet::ImportScriptPubKeys(const std::string& label, const std::set<CScript>& script_pub_keys, const bool have_solving_data, const bool apply_label, const int64_t timestamp)
 {
-    auto spk_man = GetLegacyScriptPubKeyMan();
-    if (!spk_man) {
-        return false;
-    }
-    LOCK(spk_man->cs_KeyStore);
-    if (!spk_man->ImportScriptPubKeys(script_pub_keys, have_solving_data, timestamp)) {
-        return false;
-    }
-    if (apply_label) {
-        WalletBatch batch(GetDatabase());
-        for (const CScript& script : script_pub_keys) {
-            CTxDestination dest;
-            ExtractDestination(script, dest);
-            if (IsValidDestination(dest)) {
-                SetAddressBookWithDB(batch, dest, label, AddressPurpose::RECEIVE);
+    std::vector<AddressBookNotification> notifications;
+    {
+        // Match the wallet -> keystore order used by key creation paths. The
+        // address-book transaction below must not acquire cs_wallet while
+        // holding only cs_KeyStore.
+        LOCK(cs_wallet);
+        LegacyScriptPubKeyMan* spk_man = GetLegacyScriptPubKeyMan();
+        if (!spk_man) return false;
+        LOCK(spk_man->cs_KeyStore);
+        if (!spk_man->ImportScriptPubKeys(script_pub_keys, have_solving_data, timestamp)) {
+            return false;
+        }
+        if (apply_label) {
+            if (m_address_book_db_ambiguous) return false;
+
+            WalletBatch batch(GetDatabase());
+            if (!batch.TxnBegin()) return false;
+
+            std::vector<CTxDestination> destinations;
+            destinations.reserve(script_pub_keys.size());
+            for (const CScript& script : script_pub_keys) {
+                CTxDestination dest;
+                ExtractDestination(script, dest);
+                if (!IsValidDestination(dest)) continue;
+                if (!WriteAddressBookWithDB(batch, dest, label, AddressPurpose::RECEIVE)) {
+                    if (!batch.TxnAbort()) MarkAddressBookDatabaseAmbiguous();
+                    return false;
+                }
+                destinations.push_back(std::move(dest));
+            }
+
+            if (!batch.TxnCommit()) {
+                MarkAddressBookDatabaseAmbiguous();
+                batch.TxnAbort();
+                return false;
+            }
+
+            notifications.reserve(destinations.size());
+            for (const CTxDestination& dest : destinations) {
+                const auto entry = m_address_book.find(dest);
+                const bool updated = entry != m_address_book.end() && !entry->second.IsChange();
+                CAddressBookData& address_book = m_address_book[dest];
+                address_book.SetLabel(label);
+                address_book.purpose = AddressPurpose::RECEIVE;
+                notifications.push_back({
+                    dest, label, IsMine(dest) != ISMINE_NO,
+                    AddressPurpose::RECEIVE,
+                    updated ? CT_UPDATED : CT_NEW});
             }
         }
+    }
+    for (const auto& notification : notifications) {
+        NotifyAddressBookChangedNoThrow(notification);
     }
     return true;
 }
@@ -5811,59 +5851,198 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
     return DBErrors::LOAD_OK;
 }
 
-bool CWallet::SetAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& new_purpose)
+bool CWallet::WriteAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& name, const std::optional<AddressPurpose>& purpose)
 {
-    bool fUpdated = false;
-    bool is_mine;
-    std::optional<AddressPurpose> purpose;
-    {
-        LOCK(cs_wallet);
-        std::map<CTxDestination, CAddressBookData>::iterator mi = m_address_book.find(address);
-        fUpdated = (mi != m_address_book.end() && !mi->second.IsChange());
-        m_address_book[address].SetLabel(strName);
-        is_mine = IsMine(address) != ISMINE_NO;
-        if (new_purpose) { /* update purpose only if requested */
-            purpose = m_address_book[address].purpose = new_purpose;
-        } else {
-            purpose = m_address_book[address].purpose;
+    AssertLockHeld(cs_wallet);
+    const std::string encoded_address = EncodeDestination(address);
+    if (purpose && !batch.WritePurpose(encoded_address, PurposeToString(*purpose))) {
+        return false;
+    }
+    return batch.WriteName(encoded_address, name);
+}
+
+void CWallet::NotifyAddressBookChangedNoThrow(const AddressBookNotification& notification) noexcept
+{
+    try {
+        NotifyAddressBookChanged(
+            notification.destination, notification.label,
+            notification.is_mine, notification.purpose,
+            notification.status);
+    } catch (const std::exception& e) {
+        try {
+            WalletLogPrintf(
+                "Address-book observer threw after a committed update: %s\n",
+                e.what());
+        } catch (...) {
+        }
+    } catch (...) {
+        try {
+            WalletLogPrintf(
+                "Address-book observer threw an unknown exception after a committed update\n");
+        } catch (...) {
         }
     }
-    // In very old wallets, address purpose may not be recorded so we derive it from IsMine
-    NotifyAddressBookChanged(address, strName, is_mine,
-                             purpose.value_or(is_mine ? AddressPurpose::RECEIVE : AddressPurpose::SEND),
-                             (fUpdated ? CT_UPDATED : CT_NEW));
-    if (new_purpose && !batch.WritePurpose(EncodeDestination(address), PurposeToString(*new_purpose)))
-        return false;
-    return batch.WriteName(EncodeDestination(address), strName);
 }
 
 bool CWallet::SetAddressBook(const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& purpose)
 {
+    AddressBookNotification notification;
+    {
+        LOCK(cs_wallet);
+        if (!SetAddressBookLocked(
+                address, strName, purpose, notification)) {
+            return false;
+        }
+    }
+
+    NotifyAddressBookChangedNoThrow(notification);
+    return true;
+}
+
+bool CWallet::SetAddressBookLocked(
+    const CTxDestination& address, const std::string& name,
+    const std::optional<AddressPurpose>& purpose,
+    AddressBookNotification& notification)
+{
+    AssertLockHeld(cs_wallet);
+    if (m_address_book_db_ambiguous) return false;
+
+    const auto entry = m_address_book.find(address);
+    const bool updated =
+        entry != m_address_book.end() && !entry->second.IsChange();
+    const bool is_mine = IsMine(address) != ISMINE_NO;
+    const std::optional<AddressPurpose> old_purpose =
+        entry == m_address_book.end() ? std::nullopt : entry->second.purpose;
+    const AddressPurpose effective_purpose = purpose.value_or(
+        old_purpose.value_or(
+            is_mine ? AddressPurpose::RECEIVE : AddressPurpose::SEND));
+
     WalletBatch batch(GetDatabase());
-    return SetAddressBookWithDB(batch, address, strName, purpose);
+    if (!batch.TxnBegin()) return false;
+    if (!WriteAddressBookWithDB(batch, address, name, purpose)) {
+        if (!batch.TxnAbort()) MarkAddressBookDatabaseAmbiguous();
+        return false;
+    }
+    if (!batch.TxnCommit()) {
+        MarkAddressBookDatabaseAmbiguous();
+        batch.TxnAbort();
+        return false;
+    }
+
+    CAddressBookData& address_book = m_address_book[address];
+    address_book.SetLabel(name);
+    if (purpose) address_book.purpose = purpose;
+    notification = {
+        address, name, is_mine, effective_purpose,
+        updated ? CT_UPDATED : CT_NEW};
+    return true;
 }
 
 bool CWallet::DelAddressBook(const CTxDestination& address)
 {
-    WalletBatch batch(GetDatabase());
+    bool deleted{false};
     {
         LOCK(cs_wallet);
-        // If we want to delete receiving addresses, we should avoid calling EraseAddressData because it will delete the previously_spent value. Could instead just erase the label so it becomes a change address, and keep the data.
-        // NOTE: This isn't a problem for sending addresses because they don't have any data that needs to be kept.
-        // When adding new address data, it should be considered here whether to retain or delete it.
+        if (m_address_book_db_ambiguous) return false;
+        // If we want to delete receiving addresses, we should avoid calling
+        // EraseAddressData because it will delete the previously_spent value.
+        // Sending addresses do not have data that must be retained.
         if (IsMine(address)) {
             WalletLogPrintf("%s called with IsMine address, NOT SUPPORTED. Please report this bug! %s\n", __func__, PACKAGE_BUGREPORT);
             return false;
         }
-        // Delete data rows associated with this address
-        batch.EraseAddressData(address);
-        m_address_book.erase(address);
+        const auto entry = m_address_book.find(address);
+        if (entry == m_address_book.end() || entry->second.IsChange()) return false;
+
+        WalletBatch batch(GetDatabase());
+        if (!batch.TxnBegin()) return false;
+        const std::string encoded_address = EncodeDestination(address);
+        if (!batch.EraseAddressData(address) ||
+            !batch.ErasePurpose(encoded_address) ||
+            !batch.EraseName(encoded_address)) {
+            if (!batch.TxnAbort()) MarkAddressBookDatabaseAmbiguous();
+            return false;
+        }
+        if (!batch.TxnCommit()) {
+            MarkAddressBookDatabaseAmbiguous();
+            batch.TxnAbort();
+            return false;
+        }
+
+        deleted = m_address_book.erase(address) != 0;
     }
 
-    NotifyAddressBookChanged(address, "", /*is_mine=*/false, AddressPurpose::SEND, CT_DELETED);
+    if (deleted) {
+        NotifyAddressBookChangedNoThrow({
+            address, "", /*is_mine=*/false,
+            AddressPurpose::SEND, CT_DELETED});
+    }
+    return deleted;
+}
 
-    batch.ErasePurpose(EncodeDestination(address));
-    return batch.EraseName(EncodeDestination(address));
+bool CWallet::MoveAddressBook(const CTxDestination& old_address, const CTxDestination& new_address)
+{
+    bool new_is_mine;
+    std::string name;
+    std::optional<AddressPurpose> stored_purpose;
+    AddressPurpose notification_purpose;
+    {
+        LOCK(cs_wallet);
+        if (m_address_book_db_ambiguous || old_address == new_address ||
+            !IsValidDestination(old_address) || !IsValidDestination(new_address)) {
+            return false;
+        }
+        const auto old_entry = m_address_book.find(old_address);
+        if (old_entry == m_address_book.end() || old_entry->second.IsChange() ||
+            m_address_book.count(new_address) != 0) {
+            return false;
+        }
+        if (IsMine(old_address) != ISMINE_NO) {
+            WalletLogPrintf("%s called with IsMine address, NOT SUPPORTED. Please report this bug! %s\n", __func__, PACKAGE_BUGREPORT);
+            return false;
+        }
+        new_is_mine = IsMine(new_address) != ISMINE_NO;
+        if (new_is_mine) return false;
+
+        // Read the value to preserve from the authoritative wallet map while
+        // holding cs_wallet. In particular, do not trust a stale Qt model
+        // snapshot supplied before another writer changed the entry.
+        name = old_entry->second.GetLabel();
+        stored_purpose = old_entry->second.purpose;
+        notification_purpose = stored_purpose.value_or(AddressPurpose::SEND);
+
+        WalletBatch batch(GetDatabase());
+        if (!batch.TxnBegin()) return false;
+        const std::string old_encoded = EncodeDestination(old_address);
+        if (!WriteAddressBookWithDB(batch, new_address, name, stored_purpose) ||
+            !batch.EraseAddressData(old_address) ||
+            !batch.ErasePurpose(old_encoded) ||
+            !batch.EraseName(old_encoded)) {
+            if (!batch.TxnAbort()) MarkAddressBookDatabaseAmbiguous();
+            return false;
+        }
+        if (!batch.TxnCommit()) {
+            MarkAddressBookDatabaseAmbiguous();
+            // Best effort only: every supported backend clears its active
+            // transaction after a successful commit, so this cannot undo a
+            // commit whose success was merely reported ambiguously.
+            batch.TxnAbort();
+            return false;
+        }
+
+        m_address_book.erase(old_address);
+        CAddressBookData& new_entry = m_address_book[new_address];
+        new_entry.SetLabel(name);
+        new_entry.purpose = stored_purpose;
+    }
+
+    NotifyAddressBookChangedNoThrow({
+        old_address, "", /*is_mine=*/false,
+        AddressPurpose::SEND, CT_DELETED});
+    NotifyAddressBookChangedNoThrow({
+        new_address, name, new_is_mine,
+        notification_purpose, CT_NEW});
+    return true;
 }
 
 uint64_t CWallet::GetStakeWeight() const
@@ -5912,19 +6091,21 @@ bool CWallet::TopUpKeyPool(unsigned int kpSize)
     return res;
 }
 
-util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, const std::string label)
+util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, const std::string label, bool* reserved)
 {
     LOCK(cs_wallet);
+    if (reserved) *reserved = false;
     auto spk_man = GetScriptPubKeyMan(type, /*internal=*/false);
     if (!spk_man) {
         return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(type))};
     }
 
     auto op_dest = spk_man->GetNewDestination(type);
-    if (op_dest) {
-        SetAddressBook(*op_dest, label, AddressPurpose::RECEIVE);
+    if (op_dest && reserved) *reserved = true;
+    if (op_dest && !SetAddressBook(
+            *op_dest, label, AddressPurpose::RECEIVE)) {
+        return util::Error{_("Error: A new wallet key was reserved, but its address-book label could not be committed. Reload the wallet before generating another address.")};
     }
-
     return op_dest;
 }
 
@@ -6927,21 +7108,17 @@ util::Result<CTxDestination> CWallet::GetNewTieredQuantumDestination(const std::
     CKeyingMaterial private_key(generated_private_key.begin(), generated_private_key.end());
     CleanseVector(generated_private_key);
 
-    auto base_result = AddQuantumKey(std::vector<unsigned char>(public_key.begin(), public_key.end()), private_key, "", GetTime(), /*record_as_receive=*/false);
-    if (!base_result) {
-        return base_result;
-    }
-
     const std::vector<unsigned char> tiered_program = QuantumTieredMigrationProgramForPubkey(
         public_key, QUANTUM_TIERED_STATE_BONDED, unbonding_blocks, /*unlock_height=*/0);
     const CTxDestination tiered_dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, tiered_program};
-    {
-        LOCK(cs_wallet);
-        if (!SetAddressBook(tiered_dest, label, AddressPurpose::RECEIVE)) {
-            return util::Error{_("Error: Failed to write address book entry")};
-        }
+    auto result = AddQuantumKeyInternal(
+        std::vector<unsigned char>(public_key.begin(), public_key.end()),
+        private_key, label, GetTime(), /*record_as_receive=*/true,
+        tiered_dest);
+    if (result && EncodeDestination(*result) != EncodeDestination(tiered_dest)) {
+        return util::Error{_("Error: Generated tiered destination did not match its committed address-book destination")};
     }
-    return tiered_dest;
+    return result;
 }
 
 util::Result<CTxDestination> CWallet::GetNewQuantumChangeDestination()
@@ -6958,13 +7135,27 @@ util::Result<CTxDestination> CWallet::GetNewQuantumChangeDestination()
 
 util::Result<CTxDestination> CWallet::AddQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive)
 {
+    return AddQuantumKeyInternal(public_key, private_key, label, creation_time,
+                                 record_as_receive, std::nullopt);
+}
+
+util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination)
+{
     CTxDestination dest;
+    CTxDestination address_book_dest;
     bool updated = false;
     bool notify_address_book = false;
+    AddressBookNotification notification;
     int64_t key_time = creation_time > 0 ? creation_time : GetTime();
 
     {
         LOCK(cs_wallet);
+        if (m_quantum_key_db_ambiguous) {
+            return util::Error{_("Error: A prior ML-DSA key database transaction has an uncertain outcome. Reload the wallet before creating or labeling another quantum key.")};
+        }
+        if (record_as_receive && m_address_book_db_ambiguous) {
+            return util::Error{_("Error: A prior address-book database transaction has an uncertain outcome. Reload the wallet before labeling another quantum key.")};
+        }
         if (!HasPrivateKeys() || IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
             return util::Error{_("Error: Private keys are disabled for this wallet")};
         }
@@ -6980,6 +7171,14 @@ util::Result<CTxDestination> CWallet::AddQuantumKey(const std::vector<unsigned c
 
         const std::vector<unsigned char> witness_program = QuantumWalletProgramForPubkey(public_key);
         dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, witness_program};
+        address_book_dest = receive_destination.value_or(dest);
+        if (receive_destination) {
+            const auto* witness = std::get_if<WitnessUnknown>(&address_book_dest);
+            if (!witness || witness->GetWitnessVersion() != QUANTUM_MIGRATION_WITNESS_VERSION ||
+                QuantumWalletKeyLookupProgram(witness->GetWitnessProgram()) != witness_program) {
+                return util::Error{_("Error: Address-book destination does not belong to the generated ML-DSA key")};
+            }
+        }
         const auto existing = m_quantum_keys.find(witness_program);
         if (existing != m_quantum_keys.end()) {
             if (existing->second.public_key != public_key) {
@@ -6988,86 +7187,103 @@ util::Result<CTxDestination> CWallet::AddQuantumKey(const std::vector<unsigned c
             if (!record_as_receive) {
                 return dest;
             }
-            if (!SetAddressBook(dest, label, AddressPurpose::RECEIVE)) {
+            if (!SetAddressBookLocked(
+                    address_book_dest, label, AddressPurpose::RECEIVE,
+                    notification)) {
+                if (m_address_book_db_ambiguous) {
+                    return util::Error{_("Error: The quantum-key label database outcome is uncertain. Reload the wallet before retrying.")};
+                }
                 return util::Error{_("Error: Failed to write address book entry")};
             }
-            return dest;
-        }
-
-        WalletBatch batch(GetDatabase());
-        if (!batch.TxnBegin(/*durable=*/true)) {
-            return util::Error{_("Error: Failed to begin wallet database transaction")};
-        }
-
-        CKeyMetadata key_meta(key_time);
-        QuantumKeyRecord record;
-        record.public_key = public_key;
-        record.creation_time = key_time;
-
-        if (IsCrypted()) {
-            if (!EncryptSecret(vMasterKey, private_key, QuantumWalletKeyIV(witness_program), record.crypted_private_key)) {
-                batch.TxnAbort();
-                return util::Error{_("Error: Failed to encrypt ML-DSA wallet key")};
-            }
-            if (!batch.WriteCryptedQuantumKey(record.public_key, record.crypted_private_key, key_meta)) {
-                batch.TxnAbort();
-                return util::Error{_("Error: Failed to write encrypted ML-DSA wallet key")};
-            }
-        } else {
-            record.private_key = private_key;
-            if (!batch.WriteQuantumKey(record.public_key, record.private_key, key_meta)) {
-                batch.TxnAbort();
-                return util::Error{_("Error: Failed to write ML-DSA wallet key")};
-            }
-        }
-
-        if (!batch.WriteQuantumKeyBackupState(witness_program, /*verified=*/false)) {
-            batch.TxnAbort();
-            return util::Error{_("Error: Failed to initialize ML-DSA key backup state")};
-        }
-
-        const uint64_t new_flags = (m_wallet_flags | WALLET_FLAG_QUANTUM_KEYS) & ~WALLET_FLAG_BLANK_WALLET;
-        if (!batch.WriteWalletFlags(new_flags)) {
-            batch.TxnAbort();
-            return util::Error{_("Error: Failed to write wallet flags")};
-        }
-        const std::string encoded_dest = EncodeDestination(dest);
-        if (record_as_receive) {
-            if (!batch.WritePurpose(encoded_dest, PurposeToString(AddressPurpose::RECEIVE))) {
-                batch.TxnAbort();
-                return util::Error{_("Error: Failed to write address purpose")};
-            }
-            if (!batch.WriteName(encoded_dest, label)) {
-                batch.TxnAbort();
-                return util::Error{_("Error: Failed to write address book entry")};
-            }
-        }
-
-        if (!batch.TxnCommit()) {
-            return util::Error{_("Error: Failed to commit wallet database transaction")};
-        }
-
-        record.durably_stored = true;
-        record.backup_verified = false;
-        m_wallet_flags = new_flags;
-        m_quantum_keys.emplace(witness_program, std::move(record));
-        MaybeUpdateBirthTime(key_time);
-
-        if (record_as_receive) {
-            auto entry = m_address_book.find(dest);
-            updated = entry != m_address_book.end() && !entry->second.IsChange();
-            CAddressBookData& address_book = m_address_book[dest];
-            address_book.SetLabel(label);
-            address_book.purpose = AddressPurpose::RECEIVE;
             notify_address_book = true;
+        } else {
+            WalletBatch batch(GetDatabase());
+            if (!batch.TxnBegin(/*durable=*/true)) {
+                return util::Error{_("Error: Failed to begin wallet database transaction")};
+            }
+            auto mark_ambiguous = [&] {
+                MarkQuantumKeyDatabaseAmbiguous();
+                if (record_as_receive) MarkAddressBookDatabaseAmbiguous();
+            };
+            auto abort_with_error = [&](bilingual_str failure) -> util::Result<CTxDestination> {
+                if (batch.TxnAbort()) return util::Error{std::move(failure)};
+                mark_ambiguous();
+                return util::Error{_("Error: The ML-DSA key database transaction could not be aborted, so its outcome is uncertain. Reload the wallet before retrying.")};
+            };
+
+            CKeyMetadata key_meta(key_time);
+            QuantumKeyRecord record;
+            record.public_key = public_key;
+            record.creation_time = key_time;
+
+            if (IsCrypted()) {
+                if (!EncryptSecret(vMasterKey, private_key, QuantumWalletKeyIV(witness_program), record.crypted_private_key)) {
+                    return abort_with_error(_("Error: Failed to encrypt ML-DSA wallet key"));
+                }
+                if (!batch.WriteCryptedQuantumKey(record.public_key, record.crypted_private_key, key_meta)) {
+                    return abort_with_error(_("Error: Failed to write encrypted ML-DSA wallet key"));
+                }
+            } else {
+                record.private_key = private_key;
+                if (!batch.WriteQuantumKey(record.public_key, record.private_key, key_meta)) {
+                    return abort_with_error(_("Error: Failed to write ML-DSA wallet key"));
+                }
+            }
+
+            if (!batch.WriteQuantumKeyBackupState(witness_program, /*verified=*/false)) {
+                return abort_with_error(_("Error: Failed to initialize ML-DSA key backup state"));
+            }
+
+            const uint64_t new_flags = (m_wallet_flags | WALLET_FLAG_QUANTUM_KEYS) & ~WALLET_FLAG_BLANK_WALLET;
+            if (!batch.WriteWalletFlags(new_flags)) {
+                return abort_with_error(_("Error: Failed to write wallet flags"));
+            }
+            const std::string encoded_dest = EncodeDestination(address_book_dest);
+            if (record_as_receive) {
+                if (!batch.WritePurpose(encoded_dest, PurposeToString(AddressPurpose::RECEIVE))) {
+                    return abort_with_error(_("Error: Failed to write address purpose"));
+                }
+                if (!batch.WriteName(encoded_dest, label)) {
+                    return abort_with_error(_("Error: Failed to write address book entry"));
+                }
+            }
+
+            if (!batch.TxnCommit()) {
+                mark_ambiguous();
+                // A backend may either leave an active transaction to abort or
+                // have committed despite reporting failure. Aborting is therefore
+                // best effort only; publication remains withheld until reload.
+                batch.TxnAbort();
+                return util::Error{_("Error: The ML-DSA key database commit outcome is uncertain. Reload the wallet before retrying.")};
+            }
+
+            record.durably_stored = true;
+            record.backup_verified = false;
+            m_wallet_flags = new_flags;
+            m_quantum_keys.emplace(witness_program, std::move(record));
+            MaybeUpdateBirthTime(key_time);
+
+            if (record_as_receive) {
+                auto entry = m_address_book.find(address_book_dest);
+                updated = entry != m_address_book.end() && !entry->second.IsChange();
+                CAddressBookData& address_book = m_address_book[address_book_dest];
+                address_book.SetLabel(label);
+                address_book.purpose = AddressPurpose::RECEIVE;
+                notify_address_book = true;
+                notification = {
+                    address_book_dest, label,
+                    IsMine(address_book_dest) != ISMINE_NO,
+                    AddressPurpose::RECEIVE,
+                    updated ? CT_UPDATED : CT_NEW};
+            }
         }
     }
 
     if (notify_address_book) {
-        NotifyAddressBookChanged(dest, label, true, AddressPurpose::RECEIVE, updated ? CT_UPDATED : CT_NEW);
+        NotifyAddressBookChangedNoThrow(notification);
     }
 
-    return dest;
+    return record_as_receive ? address_book_dest : dest;
 }
 
 util::Result<CTxDestination> CWallet::AddQuantumColdStakeDelegation(const std::vector<unsigned char>& staker_pubkey, const std::vector<unsigned char>& owner_pubkey, const std::string& label, int64_t creation_time, bool record_as_receive, uint16_t unbonding_blocks, bool tiered)
@@ -7089,8 +7305,15 @@ util::Result<CTxDestination> CWallet::AddQuantumColdStakeDelegation(const std::v
 
     bool updated = false;
     bool notify_address_book = false;
+    AddressBookNotification notification;
     {
         LOCK(cs_wallet);
+        if (m_quantum_delegation_db_ambiguous) {
+            return util::Error{_("Error: A prior quantum cold-stake delegation database transaction has an uncertain outcome. Reload the wallet before creating or labeling another delegation.")};
+        }
+        if (record_as_receive && m_address_book_db_ambiguous) {
+            return util::Error{_("Error: A prior address-book database transaction has an uncertain outcome. Reload the wallet before recording another delegation label.")};
+        }
         const bool has_staker_key = HaveQuantumKeyForProgram(VectorForUint256(staker_hash));
         const bool has_owner_key = HaveQuantumKeyForProgram(VectorForUint256(owner_hash));
         if (!has_staker_key && !has_owner_key) {
@@ -7110,50 +7333,64 @@ util::Result<CTxDestination> CWallet::AddQuantumColdStakeDelegation(const std::v
             if (!record_as_receive) {
                 return dest;
             }
-            if (!SetAddressBook(dest, label, AddressPurpose::RECEIVE)) {
+            if (!SetAddressBookLocked(
+                    dest, label, AddressPurpose::RECEIVE,
+                    notification)) {
+                if (m_address_book_db_ambiguous) {
+                    return util::Error{_("Error: The delegation-label database outcome is uncertain. Reload the wallet before retrying.")};
+                }
                 return util::Error{_("Error: Failed to write address book entry")};
             }
-            return dest;
-        }
-
-        WalletBatch batch(GetDatabase());
-        if (!batch.TxnBegin()) {
-            return util::Error{_("Error: Failed to begin wallet database transaction")};
-        }
-        if (!batch.WriteQuantumColdStakeDelegation(witness_program, record)) {
-            batch.TxnAbort();
-            return util::Error{_("Error: Failed to write quantum cold-stake delegation")};
-        }
-        const std::string encoded_dest = EncodeDestination(dest);
-        if (record_as_receive) {
-            if (!batch.WritePurpose(encoded_dest, PurposeToString(AddressPurpose::RECEIVE))) {
-                batch.TxnAbort();
-                return util::Error{_("Error: Failed to write address purpose")};
-            }
-            if (!batch.WriteName(encoded_dest, label)) {
-                batch.TxnAbort();
-                return util::Error{_("Error: Failed to write address book entry")};
-            }
-        }
-        if (!batch.TxnCommit()) {
-            return util::Error{_("Error: Failed to commit wallet database transaction")};
-        }
-
-        m_quantum_coldstake_delegations.emplace(witness_program, record);
-        MaybeUpdateBirthTime(key_time);
-
-        if (record_as_receive) {
-            auto entry = m_address_book.find(dest);
-            updated = entry != m_address_book.end() && !entry->second.IsChange();
-            CAddressBookData& address_book = m_address_book[dest];
-            address_book.SetLabel(label);
-            address_book.purpose = AddressPurpose::RECEIVE;
             notify_address_book = true;
+        } else {
+            WalletBatch batch(GetDatabase());
+            if (!batch.TxnBegin(/*durable=*/true)) {
+                return util::Error{_("Error: Failed to begin wallet database transaction")};
+            }
+            auto abort_with_error = [&](bilingual_str failure) -> util::Result<CTxDestination> {
+                if (batch.TxnAbort()) return util::Error{std::move(failure)};
+                MarkQuantumDelegationDatabaseAmbiguous();
+                if (record_as_receive) MarkAddressBookDatabaseAmbiguous();
+                return util::Error{_("Error: The quantum cold-stake delegation database transaction could not be aborted, so its outcome is uncertain. Reload the wallet before retrying.")};
+            };
+            if (!batch.WriteQuantumColdStakeDelegation(witness_program, record)) {
+                return abort_with_error(_("Error: Failed to write quantum cold-stake delegation"));
+            }
+            const std::string encoded_dest = EncodeDestination(dest);
+            if (record_as_receive) {
+                if (!batch.WritePurpose(encoded_dest, PurposeToString(AddressPurpose::RECEIVE))) {
+                    return abort_with_error(_("Error: Failed to write address purpose"));
+                }
+                if (!batch.WriteName(encoded_dest, label)) {
+                    return abort_with_error(_("Error: Failed to write address book entry"));
+                }
+            }
+            if (!batch.TxnCommit()) {
+                MarkQuantumDelegationDatabaseAmbiguous();
+                if (record_as_receive) MarkAddressBookDatabaseAmbiguous();
+                batch.TxnAbort();
+                return util::Error{_("Error: The quantum cold-stake delegation database commit outcome is uncertain. Reload the wallet before retrying.")};
+            }
+
+            m_quantum_coldstake_delegations.emplace(witness_program, record);
+            MaybeUpdateBirthTime(key_time);
+
+            if (record_as_receive) {
+                auto entry = m_address_book.find(dest);
+                updated = entry != m_address_book.end() && !entry->second.IsChange();
+                CAddressBookData& address_book = m_address_book[dest];
+                address_book.SetLabel(label);
+                address_book.purpose = AddressPurpose::RECEIVE;
+                notify_address_book = true;
+                notification = {
+                    dest, label, /*is_mine=*/true, AddressPurpose::RECEIVE,
+                    updated ? CT_UPDATED : CT_NEW};
+            }
         }
     }
 
     if (notify_address_book) {
-        NotifyAddressBookChanged(dest, label, true, AddressPurpose::RECEIVE, updated ? CT_UPDATED : CT_NEW);
+        NotifyAddressBookChangedNoThrow(notification);
     }
     return dest;
 }
@@ -7181,8 +7418,15 @@ util::Result<CTxDestination> CWallet::AddQuantumColdStakeDelegationForKeyHashes(
 
     bool updated = false;
     bool notify_address_book = false;
+    AddressBookNotification notification;
     {
         LOCK(cs_wallet);
+        if (m_quantum_delegation_db_ambiguous) {
+            return util::Error{_("Error: A prior quantum cold-stake delegation database transaction has an uncertain outcome. Reload the wallet before creating or labeling another delegation.")};
+        }
+        if (record_as_receive && m_address_book_db_ambiguous) {
+            return util::Error{_("Error: A prior address-book database transaction has an uncertain outcome. Reload the wallet before recording another delegation label.")};
+        }
         const bool has_staker_key = HaveQuantumKeyForProgram(VectorForUint256(staker_pubkey_hash));
         const bool has_owner_key = HaveQuantumKeyForProgram(VectorForUint256(owner_pubkey_hash));
         if (!has_staker_key && !has_owner_key) {
@@ -7202,50 +7446,64 @@ util::Result<CTxDestination> CWallet::AddQuantumColdStakeDelegationForKeyHashes(
             if (!record_as_receive) {
                 return dest;
             }
-            if (!SetAddressBook(dest, label, AddressPurpose::RECEIVE)) {
+            if (!SetAddressBookLocked(
+                    dest, label, AddressPurpose::RECEIVE,
+                    notification)) {
+                if (m_address_book_db_ambiguous) {
+                    return util::Error{_("Error: The delegation-label database outcome is uncertain. Reload the wallet before retrying.")};
+                }
                 return util::Error{_("Error: Failed to write address book entry")};
             }
-            return dest;
-        }
-
-        WalletBatch batch(GetDatabase());
-        if (!batch.TxnBegin()) {
-            return util::Error{_("Error: Failed to begin wallet database transaction")};
-        }
-        if (!batch.WriteQuantumColdStakeDelegation(witness_program, record)) {
-            batch.TxnAbort();
-            return util::Error{_("Error: Failed to write quantum cold-stake delegation")};
-        }
-        const std::string encoded_dest = EncodeDestination(dest);
-        if (record_as_receive) {
-            if (!batch.WritePurpose(encoded_dest, PurposeToString(AddressPurpose::RECEIVE))) {
-                batch.TxnAbort();
-                return util::Error{_("Error: Failed to write address purpose")};
-            }
-            if (!batch.WriteName(encoded_dest, label)) {
-                batch.TxnAbort();
-                return util::Error{_("Error: Failed to write address book entry")};
-            }
-        }
-        if (!batch.TxnCommit()) {
-            return util::Error{_("Error: Failed to commit wallet database transaction")};
-        }
-
-        m_quantum_coldstake_delegations.emplace(witness_program, record);
-        MaybeUpdateBirthTime(key_time);
-
-        if (record_as_receive) {
-            auto entry = m_address_book.find(dest);
-            updated = entry != m_address_book.end() && !entry->second.IsChange();
-            CAddressBookData& address_book = m_address_book[dest];
-            address_book.SetLabel(label);
-            address_book.purpose = AddressPurpose::RECEIVE;
             notify_address_book = true;
+        } else {
+            WalletBatch batch(GetDatabase());
+            if (!batch.TxnBegin(/*durable=*/true)) {
+                return util::Error{_("Error: Failed to begin wallet database transaction")};
+            }
+            auto abort_with_error = [&](bilingual_str failure) -> util::Result<CTxDestination> {
+                if (batch.TxnAbort()) return util::Error{std::move(failure)};
+                MarkQuantumDelegationDatabaseAmbiguous();
+                if (record_as_receive) MarkAddressBookDatabaseAmbiguous();
+                return util::Error{_("Error: The quantum cold-stake delegation database transaction could not be aborted, so its outcome is uncertain. Reload the wallet before retrying.")};
+            };
+            if (!batch.WriteQuantumColdStakeDelegation(witness_program, record)) {
+                return abort_with_error(_("Error: Failed to write quantum cold-stake delegation"));
+            }
+            const std::string encoded_dest = EncodeDestination(dest);
+            if (record_as_receive) {
+                if (!batch.WritePurpose(encoded_dest, PurposeToString(AddressPurpose::RECEIVE))) {
+                    return abort_with_error(_("Error: Failed to write address purpose"));
+                }
+                if (!batch.WriteName(encoded_dest, label)) {
+                    return abort_with_error(_("Error: Failed to write address book entry"));
+                }
+            }
+            if (!batch.TxnCommit()) {
+                MarkQuantumDelegationDatabaseAmbiguous();
+                if (record_as_receive) MarkAddressBookDatabaseAmbiguous();
+                batch.TxnAbort();
+                return util::Error{_("Error: The quantum cold-stake delegation database commit outcome is uncertain. Reload the wallet before retrying.")};
+            }
+
+            m_quantum_coldstake_delegations.emplace(witness_program, record);
+            MaybeUpdateBirthTime(key_time);
+
+            if (record_as_receive) {
+                auto entry = m_address_book.find(dest);
+                updated = entry != m_address_book.end() && !entry->second.IsChange();
+                CAddressBookData& address_book = m_address_book[dest];
+                address_book.SetLabel(label);
+                address_book.purpose = AddressPurpose::RECEIVE;
+                notify_address_book = true;
+                notification = {
+                    dest, label, /*is_mine=*/true, AddressPurpose::RECEIVE,
+                    updated ? CT_UPDATED : CT_NEW};
+            }
         }
     }
 
     if (notify_address_book) {
-        NotifyAddressBookChanged(dest, label, true, AddressPurpose::RECEIVE, updated ? CT_UPDATED : CT_NEW);
+        NotifyAddressBookChangedNoThrow(notification);
     }
     return dest;
 }
@@ -9086,12 +9344,13 @@ std::optional<bool> CWallet::IsInternalScriptPubKeyMan(ScriptPubKeyMan* spk_man)
     return GetScriptPubKeyMan(*type, /* internal= */ true) == desc_spk_man;
 }
 
-ScriptPubKeyMan* CWallet::AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal)
+ScriptPubKeyMan* CWallet::AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal, bilingual_str* error)
 {
     AssertLockHeld(cs_wallet);
 
     if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
         WalletLogPrintf("Cannot add WalletDescriptor to a non-descriptor wallet\n");
+        if (error) *error = _("Cannot add a descriptor to a non-descriptor wallet");
         return nullptr;
     }
 
@@ -9117,8 +9376,13 @@ ScriptPubKeyMan* CWallet::AddWalletDescriptor(WalletDescriptor& desc, const Flat
     // Top up key pool, the manager will generate new scriptPubKeys internally
     if (!spk_man->TopUp()) {
         WalletLogPrintf("Could not top up scriptPubKeys\n");
+        if (error) *error = _("Could not generate descriptor scriptPubKeys");
         return nullptr;
     }
+
+    // From this point onward the descriptor is an intentional, durable
+    // partial result even if its separately transactional label fails.
+    spk_man->WriteDescriptor();
 
     // Apply the label if necessary
     // Note: we disable labels for ranged descriptors
@@ -9126,21 +9390,57 @@ ScriptPubKeyMan* CWallet::AddWalletDescriptor(WalletDescriptor& desc, const Flat
         auto script_pub_keys = spk_man->GetScriptPubKeys();
         if (script_pub_keys.empty()) {
             WalletLogPrintf("Could not generate scriptPubKeys (cache is empty)\n");
+            if (error) *error = _("The descriptor was stored, but its scriptPubKey cache is empty");
             return nullptr;
         }
 
         if (!internal) {
+            std::vector<CTxDestination> destinations;
             for (const auto& script : script_pub_keys) {
                 CTxDestination dest;
                 if (ExtractDestination(script, dest)) {
-                    SetAddressBook(dest, label, AddressPurpose::RECEIVE);
+                    destinations.push_back(std::move(dest));
                 }
+            }
+            if (m_address_book_db_ambiguous) {
+                if (error) *error = _("The descriptor, keys, and script cache were stored, but a prior address-label database outcome is uncertain. Reload the wallet before retrying this same descriptor.");
+                return nullptr;
+            }
+
+            WalletBatch batch(GetDatabase());
+            if (!batch.TxnBegin()) {
+                if (error) *error = _("The descriptor, keys, and script cache were stored, but its address-label transaction could not begin. Reload the wallet before retrying this same descriptor; do not import a replacement descriptor.");
+                return nullptr;
+            }
+            for (const CTxDestination& dest : destinations) {
+                if (!WriteAddressBookWithDB(
+                        batch, dest, label, AddressPurpose::RECEIVE)) {
+                    if (!batch.TxnAbort()) MarkAddressBookDatabaseAmbiguous();
+                    if (error) *error = _("The descriptor, keys, and script cache were stored, but none of its address labels could be committed. Reload the wallet before retrying this same descriptor; do not import a replacement descriptor.");
+                    return nullptr;
+                }
+            }
+            if (!batch.TxnCommit()) {
+                MarkAddressBookDatabaseAmbiguous();
+                batch.TxnAbort();
+                if (error) *error = _("The descriptor, keys, and script cache were stored, but its address-label commit outcome is uncertain. Reload the wallet before retrying this same descriptor; do not import a replacement descriptor.");
+                return nullptr;
+            }
+
+            for (const CTxDestination& dest : destinations) {
+                const auto entry = m_address_book.find(dest);
+                const bool updated = entry != m_address_book.end() &&
+                    !entry->second.IsChange();
+                CAddressBookData& address_book = m_address_book[dest];
+                address_book.SetLabel(label);
+                address_book.purpose = AddressPurpose::RECEIVE;
+                NotifyAddressBookChangedNoThrow({
+                    dest, label, IsMine(dest) != ISMINE_NO,
+                    AddressPurpose::RECEIVE,
+                    updated ? CT_UPDATED : CT_NEW});
             }
         }
     }
-
-    // Save the descriptor to DB
-    spk_man->WriteDescriptor();
 
     return spk_man;
 }
@@ -9409,19 +9709,47 @@ bool CWallet::ApplyMigrationData(MigrationData& data, bilingual_str& error)
     }
 
     // Persist added address book entries (labels, purpose) for watchonly and solvable wallets
-    auto persist_address_book = [](const CWallet& wallet) {
+    auto persist_address_book = [&](CWallet& wallet) {
         LOCK(wallet.cs_wallet);
+        if (wallet.m_address_book_db_ambiguous) {
+            error = _("Error: A migrated wallet has an uncertain address-book database state. Reload it before retrying migration.");
+            return false;
+        }
         WalletBatch batch{wallet.GetDatabase()};
+        if (!batch.TxnBegin()) {
+            error = _("Error: Unable to begin migrated address-book database transaction");
+            return false;
+        }
+        auto abort_with_error = [&](bilingual_str failure) {
+            if (batch.TxnAbort()) {
+                error = std::move(failure);
+            } else {
+                wallet.MarkAddressBookDatabaseAmbiguous();
+                error = _("Error: A migrated address-book database transaction could not be aborted, so its outcome is uncertain. Reload the migrated wallet before retrying.");
+            }
+            return false;
+        };
         for (const auto& [destination, addr_book_data] : wallet.m_address_book) {
             auto address{EncodeDestination(destination)};
             std::optional<std::string> label = addr_book_data.IsChange() ? std::nullopt : std::make_optional(addr_book_data.GetLabel());
             // don't bother writing default values (unknown purpose)
-            if (addr_book_data.purpose) batch.WritePurpose(address, PurposeToString(*addr_book_data.purpose));
-            if (label) batch.WriteName(address, *label);
+            if (addr_book_data.purpose && !batch.WritePurpose(address, PurposeToString(*addr_book_data.purpose))) {
+                return abort_with_error(_("Error: Unable to write migrated address purpose"));
+            }
+            if (label && !batch.WriteName(address, *label)) {
+                return abort_with_error(_("Error: Unable to write migrated address label"));
+            }
         }
+        if (!batch.TxnCommit()) {
+            wallet.MarkAddressBookDatabaseAmbiguous();
+            batch.TxnAbort();
+            error = _("Error: The migrated address-book database commit outcome is uncertain. Reload the migrated wallet before retrying.");
+            return false;
+        }
+        return true;
     };
-    if (data.watchonly_wallet) persist_address_book(*data.watchonly_wallet);
-    if (data.solvable_wallet) persist_address_book(*data.solvable_wallet);
+    if (data.watchonly_wallet && !persist_address_book(*data.watchonly_wallet)) return false;
+    if (data.solvable_wallet && !persist_address_book(*data.solvable_wallet)) return false;
 
     // Remove the things to delete
     if (dests_to_delete.size() > 0) {
@@ -9513,7 +9841,14 @@ bool DoMigration(CWallet& wallet, WalletContext& context, bilingual_str& error, 
 
                 // Add to the wallet
                 WalletDescriptor w_desc(std::move(desc), creation_time, 0, 0, 0);
-                data->watchonly_wallet->AddWalletDescriptor(w_desc, keys, "", false);
+                bilingual_str descriptor_error;
+                if (!data->watchonly_wallet->AddWalletDescriptor(
+                        w_desc, keys, "", false, &descriptor_error)) {
+                    error = descriptor_error.empty()
+                        ? _("Error: Failed to add migrated watch-only descriptor")
+                        : strprintf(_("Error: A descriptor could not be completed in the temporary migrated watch-only wallet. Migration will roll back and remove that temporary wallet. Internal detail: %s"), descriptor_error);
+                    return false;
+                }
             }
 
             // Add the wallet to settings
@@ -9550,7 +9885,14 @@ bool DoMigration(CWallet& wallet, WalletContext& context, bilingual_str& error, 
 
                 // Add to the wallet
                 WalletDescriptor w_desc(std::move(desc), creation_time, 0, 0, 0);
-                data->solvable_wallet->AddWalletDescriptor(w_desc, keys, "", false);
+                bilingual_str descriptor_error;
+                if (!data->solvable_wallet->AddWalletDescriptor(
+                        w_desc, keys, "", false, &descriptor_error)) {
+                    error = descriptor_error.empty()
+                        ? _("Error: Failed to add migrated solvable descriptor")
+                        : strprintf(_("Error: A descriptor could not be completed in the temporary migrated solvable wallet. Migration will roll back and remove that temporary wallet. Internal detail: %s"), descriptor_error);
+                    return false;
+                }
             }
 
             // Add the wallet to settings
@@ -10804,6 +11146,13 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
 {
     LOCK(m_pow_payout_mutex);
     if (created) *created = false;
+    {
+        LOCK(cs_wallet);
+        if (m_quantum_key_db_ambiguous) {
+            error = _("Gold Rush PoW payout-key durability has an uncertain database outcome; reload the wallet before selecting a payout address.");
+            return false;
+        }
+    }
     static constexpr const char* POW_PAYOUT_LABEL{"PoW - Quantum Claim Address"};
     static constexpr const char* OLD_POW_PAYOUT_LABEL{"Quantum PoW Reward Address"};
     static constexpr const char* LEGACY_POW_PAYOUT_LABEL{"goldrush-pow"};
@@ -10838,6 +11187,10 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
     bool restored_label_ambiguous{false};
     {
         LOCK(cs_wallet);
+        if (m_address_book_db_ambiguous) {
+            error = _("Gold Rush PoW payout labels have an uncertain database outcome; reload the wallet before selecting an automatic payout address.");
+            return false;
+        }
         if (!m_pow_payout_quantum.empty()) {
             const CTxDestination existing = DecodeDestination(m_pow_payout_quantum);
             const auto key_info = GetQuantumKeyInfo(existing);
@@ -10934,6 +11287,15 @@ bool CWallet::EnsureShadowSignalPayoutAddress(
     bool* created)
 {
     if (created) *created = false;
+    payout_script.clear();
+    payout_address.clear();
+    {
+        LOCK(cs_wallet);
+        if (m_quantum_key_db_ambiguous) {
+            error = _("Gold Rush PoS payout-key durability has an uncertain database outcome; reload the wallet before selecting a payout address.");
+            return false;
+        }
+    }
     static constexpr const char* SHADOW_SIGNAL_PAYOUT_LABEL{"PoS - Quantum Stake Address"};
     static constexpr const char* OLD_SHADOW_SIGNAL_PAYOUT_LABEL{"Quantum PoS Reward Address"};
     static constexpr const char* LEGACY_SHADOW_SIGNAL_PAYOUT_LABEL{"goldrush-pos"};
@@ -10969,6 +11331,10 @@ bool CWallet::EnsureShadowSignalPayoutAddress(
     bool reused_label_ambiguous{false};
     {
         LOCK(cs_wallet);
+        if (m_address_book_db_ambiguous) {
+            error = _("Gold Rush PoS payout labels have an uncertain database outcome; reload the wallet before selecting an automatic payout address.");
+            return false;
+        }
         for (const auto& [dest, entry] : m_address_book) {
             const std::string label = entry.GetLabel();
             if (entry.IsChange() ||

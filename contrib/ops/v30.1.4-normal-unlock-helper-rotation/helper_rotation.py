@@ -29,7 +29,10 @@ SUCCESSOR_SUPERVISOR_SHA256 = "b879bb3833bc5786aa34918741550119cde4ddf71ca00f06b
 SUPERVISOR_BASENAME = "pos_unlock_renewal_supervisor.sh"
 STATE_ROOT = Path("/boot/config/plugins/blackcoin-quantum-nodes")
 HELPER_PATH = STATE_ROOT / "blackcoin_node_normal_unlock.sh"
-RUNS_ROOT = Path("/mnt/disk1/blackcoin-wallet-safety/runtime-audits/normal-unlock-helper-rotation")
+UNRAID_DISK_ROOT = Path("/mnt/disk1")
+UNRAID_SHARE_ROOT = UNRAID_DISK_ROOT / "blackcoin-wallet-safety"
+RUNTIME_AUDITS_ROOT = UNRAID_SHARE_ROOT / "runtime-audits"
+RUNS_ROOT = RUNTIME_AUDITS_ROOT / "normal-unlock-helper-rotation"
 PACKAGE_DIR = Path(__file__).resolve().parent
 PAYLOAD_HELPER = PACKAGE_DIR / "blackcoin_node_normal_unlock.sh"
 PACKAGE_MANIFEST = PACKAGE_DIR / "SHA256SUMS"
@@ -226,6 +229,57 @@ def secure_ancestry(path, expected_uid=0):
     current = Path(path).resolve()
     if not current.is_dir():
         current = current.parent
+
+
+def secure_runtime_audit_ancestry(path, expected_uid=0, expected_gid=0,
+                                  disk_root=UNRAID_DISK_ROOT, share_root=UNRAID_SHARE_ROOT,
+                                  protected_root=RUNTIME_AUDITS_ROOT,
+                                  share_uid=99, share_gid=100):
+    """Validate the exact Unraid share boundary and root-only receipt subtree."""
+    disk_root = Path(disk_root)
+    share_root = Path(share_root)
+    protected_root = Path(protected_root)
+    candidate = Path(path)
+    target = candidate if candidate.is_dir() else candidate.parent
+    target_absolute = Path(os.path.abspath(target))
+    try:
+        target_resolved = target.resolve(strict=True)
+        disk_resolved = disk_root.resolve(strict=True)
+        share_resolved = share_root.resolve(strict=True)
+        protected_resolved = protected_root.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RotationError(f"runtime-audit ancestry is absent: {error.filename}") from error
+    if (disk_resolved != disk_root or share_resolved != share_root or
+            protected_resolved != protected_root or target_resolved != target_absolute):
+        raise RotationError("runtime-audit ancestry contains a symlink or noncanonical component")
+    if share_root.parent != disk_root or protected_root.parent != share_root:
+        raise RotationError("runtime-audit fixed roots are not nested exactly")
+    if target_resolved != protected_root and protected_root not in target_resolved.parents:
+        raise RotationError("runtime-audit path is outside the root-only protected subtree")
+    if disk_root == UNRAID_DISK_ROOT:
+        secure_ancestry(disk_root.parent, 0)
+
+    records = []
+
+    def exact_directory(directory, uid, gid, mode, role):
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_gid != gid or
+                stat.S_IMODE(info.st_mode) != mode):
+            raise RotationError(f"runtime-audit ancestry identity mismatch: {directory}")
+        records.append({
+            "role": role, "path": str(directory), "uid": info.st_uid, "gid": info.st_gid,
+            "mode": format(stat.S_IMODE(info.st_mode), "04o"),
+        })
+
+    exact_directory(disk_root, share_uid, share_gid, 0o777, "unraid-disk-root")
+    exact_directory(share_root, share_uid, share_gid, 0o777, "unraid-share-root")
+    exact_directory(protected_root, expected_uid, expected_gid, 0o700, "protected-runtime-audits-root")
+    relative = target_resolved.relative_to(protected_root)
+    current = protected_root
+    for component in relative.parts:
+        current /= component
+        exact_directory(current, expected_uid, expected_gid, 0o700, "protected-runtime-audit-descendant")
+    return records
     while True:
         info = current.lstat()
         if info.st_uid != expected_uid or stat.S_IMODE(info.st_mode) & 0o022:
@@ -312,7 +366,8 @@ def file_record(path, info):
     }
 
 
-def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0):
+def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0,
+              audit_run_dir=None, expected_gid=0, audit_ancestry_kwargs=None):
     state_root = Path(state_root).resolve()
     helper_path = Path(helper_path).resolve()
     secure_directory(state_root, expected_uid, 0o700)
@@ -388,7 +443,7 @@ def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0):
         unsupported.append({"path": str(helper_path), "reason": "successor-helper-with-predecessor-consumers"})
         state = "BLOCKED"
 
-    return {
+    plan = {
         "schema": SCHEMA,
         "kind": PLAN_KIND,
         "state": state,
@@ -412,6 +467,12 @@ def scan_plan(state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0):
         "ordinary_pow_mutation_forbidden": True,
         "core_deployment_forbidden": True,
     }
+    if audit_run_dir is not None:
+        ancestry_kwargs = {} if audit_ancestry_kwargs is None else dict(audit_ancestry_kwargs)
+        plan["runtime_audit_ancestry"] = secure_runtime_audit_ancestry(
+            audit_run_dir, expected_uid, expected_gid, **ancestry_kwargs,
+        )
+    return plan
 
 
 def authority_projection(plan):
@@ -854,10 +915,11 @@ def create_run_dir(run_dir, expected_uid=0):
     if run_dir.parent.resolve() != RUNS_ROOT.resolve():
         raise RotationError("run directory is outside the fixed audit root")
     secure_directory(RUNS_ROOT, expected_uid, 0o700)
-    secure_ancestry(RUNS_ROOT, expected_uid)
+    secure_runtime_audit_ancestry(RUNS_ROOT, expected_uid, os.getgid())
     run_dir.mkdir(mode=0o700)
     os.chown(run_dir, expected_uid, os.getgid())
     fsync_directory(run_dir.parent)
+    secure_runtime_audit_ancestry(run_dir, expected_uid, os.getgid())
     return run_dir
 
 
@@ -866,7 +928,7 @@ def command_audit(arguments):
         raise RotationError("audit requires root")
     package = verify_package()
     run_dir = create_run_dir(arguments.run_dir)
-    plan = scan_plan()
+    plan = scan_plan(audit_run_dir=run_dir, expected_gid=os.getgid())
     plan_sha = publish_json(run_dir / "PLAN.json", plan, 0, os.getgid())
     template = authority_template(plan, plan_sha, package)
     publish_json(run_dir / "AUTHORITY.template.json", template, 0, os.getgid())
@@ -895,7 +957,7 @@ def command_install(arguments):
     package = verify_package()
     run_dir = Path(arguments.run_dir).resolve()
     secure_directory(run_dir, 0, 0o700)
-    secure_ancestry(run_dir, 0)
+    secure_runtime_audit_ancestry(run_dir, 0, os.getgid())
     plan_path = run_dir / "PLAN.json"
     plan_sha = verify_sidecar(plan_path, 0)
     plan = load_json_file(plan_path, 0)
@@ -904,7 +966,7 @@ def command_install(arguments):
     authority_path = Path(arguments.authority).resolve()
     if authority_path != run_dir / "AUTHORITY.json":
         raise RotationError("authority must be the fixed run-local AUTHORITY.json")
-    secure_ancestry(authority_path, 0)
+    secure_runtime_audit_ancestry(authority_path, 0, os.getgid())
     authority_sha = verify_sidecar(authority_path, 0)
     authority = load_json_file(authority_path, 0)
     validate_authority(authority, plan, plan_sha, package)
@@ -916,7 +978,7 @@ def command_install(arguments):
     runtime_locks = None
     try:
         runtime_locks = LockSet(RUNTIME_LOCKS, 0).acquire()
-        current = scan_plan()
+        current = scan_plan(audit_run_dir=run_dir, expected_gid=os.getgid())
         if canonical_json_bytes(current) != canonical_json_bytes(plan):
             raise RotationError("live consumer/helper plan drifted after authority")
         consumption = {
@@ -962,7 +1024,7 @@ def command_install(arguments):
 def command_verify(arguments):
     run_dir = Path(arguments.run_dir).resolve()
     secure_directory(run_dir, os.geteuid(), 0o700)
-    secure_ancestry(run_dir, os.geteuid())
+    secure_runtime_audit_ancestry(run_dir, os.geteuid(), os.getegid())
     for name in ("AUDIT.json", "PLAN.json", "AUTHORITY.template.json"):
         verify_sidecar(run_dir / name, os.geteuid())
     optional = [

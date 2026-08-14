@@ -94,6 +94,16 @@ RPC, wallet, or network call. Continue only when `PLAN.json.state` is `READY`,
 every active consumer is understood, every historical job-10 reference is
 classified immutable, and `unsupported_refs` is empty.
 
+The audit accepts the exact existing Unraid storage boundary without changing
+it: `/mnt/disk1` and `/mnt/disk1/blackcoin-wallet-safety` must both be
+uid `99`, gid `100`, mode `0777`. The protected
+`/mnt/disk1/blackcoin-wallet-safety/runtime-audits` directory and every
+descendant through the run directory must be root:root mode `0700`. Symlinks,
+different identities/modes, noncanonical paths, or a run outside that protected
+subtree fail closed. These exact records are embedded in `PLAN.json`, bound by
+the authority's plan hash, and rechecked at install and receipt verification.
+Do not chmod or chown the Unraid disk/share prefix.
+
 After a separate explicit live authorization, copy the exact template to the
 same run directory as `AUTHORITY.json`. Fill every required field without
 adding or removing a key. Set a nonzero 32-hex nonce, bind the exact external

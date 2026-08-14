@@ -17,13 +17,14 @@ Exact byte contracts:
 Focused hostile suite:
 - Command: python3 contrib/ops/v30.1.4-normal-unlock-helper-rotation/tests/run.py
 - Exit: 0
-- Result: PASS: 124 offline helper-rotation assertions
+- Result: PASS: 137 offline helper-rotation assertions
 - Log: /private/tmp/normal-unlock-helper-rotation-20260814.out
-- Log SHA256: 929338e097efe79e2fd36d655400d539b093ff75ef329a06a56da422a53e96c8
+- Log SHA256: 433a31288e90966828ff96158a2de1aa963aa3205b5fe98fa4762626316c672d
 - Coverage: nodes 1..32; node30 first; unnamed and named wallet argv; exact supervisor transform;
   historical job10 immutability; exact owner-only authority and drift rejection; canonical lock
   contention; successful terminal cut; node30 failure stop/rollback; mid-apply rollback; secure
-  file modes; forbidden PoW/transaction methods.
+  file modes; forbidden PoW/transaction methods; exact uid99:gid100 mode0777 Unraid prefixes;
+  root:root mode0700 protected audit descendants; symlink/outside/owner/mode drift rejection.
 
 Static validation (all exit 0):
 - bash -n contrib/ops/v30.1.4-normal-unlock-helper-rotation/blackcoin_node_normal_unlock.sh
@@ -33,10 +34,10 @@ Static validation (all exit 0):
 - git diff --check
 
 Source SHA256 at validation:
-- helper_rotation.py 45887442da58e3b6b2a46738179c7e0184ed0ace3276a52ca952e023a7ad2fc6
-- tests/run.py ab8502670314d92153ce54a44ec739110ee22c903ec485e504d63948e9069b3a
+- helper_rotation.py f14b66aaf64cb7e07acbe5fcab037b0af954fe9151de99ff434e2b8470b8bbc5
+- tests/run.py 7e3fe51171aa9ff31e4f4f06b427bf5d629c0ec9d320ad6bb448e2d8e00a0547
 - AUTHORITY.schema.json b96a3daa275cf2ad387bd3e234e2d0bc93898e77fc41cce63637dd12026b5e24
-- README.md 4027b464157f4a65002cd144069010318153023916555dd8bb1c1ece1e7756cb
+- README.md 874143c9a5bb1afa7d211fff73300087f239da8c83860c1fcb24e377f6032e51
 
 Live boundary:
 - audit is filesystem-only and remains unexecuted against the live host.

@@ -461,6 +461,74 @@ def test_lockset_and_file_security():
                 "secure-file verifier rejects broader permissions")
 
 
+def test_unraid_runtime_audit_ancestry():
+    ok(ROTATION.UNRAID_DISK_ROOT == Path("/mnt/disk1"), "live Unraid disk root is exact")
+    ok(ROTATION.UNRAID_SHARE_ROOT == Path("/mnt/disk1/blackcoin-wallet-safety"),
+       "live Unraid share root is exact")
+    ok(ROTATION.RUNTIME_AUDITS_ROOT ==
+       Path("/mnt/disk1/blackcoin-wallet-safety/runtime-audits"),
+       "root-only runtime-audits anchor is exact")
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary).resolve()
+        disk = base / "disk1"
+        share = disk / "blackcoin-wallet-safety"
+        protected = share / "runtime-audits"
+        runs = protected / "normal-unlock-helper-rotation"
+        run = runs / "run-001"
+        for path, mode in ((disk, 0o777), (share, 0o777), (protected, 0o700),
+                           (runs, 0o700), (run, 0o700)):
+            path.mkdir()
+            path.chmod(mode)
+        kwargs = {
+            "disk_root": disk, "share_root": share, "protected_root": protected,
+            "share_uid": UID, "share_gid": GID,
+        }
+        records = ROTATION.secure_runtime_audit_ancestry(run, UID, GID, **kwargs)
+        ok([record["role"] for record in records] == [
+            "unraid-disk-root", "unraid-share-root", "protected-runtime-audits-root",
+            "protected-runtime-audit-descendant", "protected-runtime-audit-descendant",
+        ], "exact Unraid share prefix and protected descendants validate")
+        ok([record["mode"] for record in records] == ["0777", "0777", "0700", "0700", "0700"],
+           "ancestry receipt binds exact live-shape modes")
+        rejects(lambda: ROTATION.secure_runtime_audit_ancestry(run, UID, GID, **{
+            **kwargs, "share_uid": UID + 1,
+        }), "Unraid disk/share owner drift is rejected")
+        disk.chmod(0o775)
+        rejects(lambda: ROTATION.secure_runtime_audit_ancestry(run, UID, GID, **kwargs),
+                "Unraid disk mode drift is rejected")
+        disk.chmod(0o777)
+        share.chmod(0o775)
+        rejects(lambda: ROTATION.secure_runtime_audit_ancestry(run, UID, GID, **kwargs),
+                "Unraid share mode drift is rejected")
+        share.chmod(0o777)
+        protected.chmod(0o755)
+        rejects(lambda: ROTATION.secure_runtime_audit_ancestry(run, UID, GID, **kwargs),
+                "protected runtime-audits mode drift is rejected")
+        protected.chmod(0o700)
+        run.chmod(0o755)
+        rejects(lambda: ROTATION.secure_runtime_audit_ancestry(run, UID, GID, **kwargs),
+                "protected run descendant mode drift is rejected")
+        run.chmod(0o700)
+        outside = base / "outside"
+        outside.mkdir(mode=0o700)
+        rejects(lambda: ROTATION.secure_runtime_audit_ancestry(outside, UID, GID, **kwargs),
+                "path outside protected runtime-audits is rejected")
+        linked = protected / "linked-run"
+        linked.symlink_to(run, target_is_directory=True)
+        rejects(lambda: ROTATION.secure_runtime_audit_ancestry(linked, UID, GID, **kwargs),
+                "symlinked audit descendant is rejected")
+
+        with synthetic_identities() as (old_helper, _new_helper, old_supervisor, _new_supervisor):
+            state = base / "state"
+            helper, _supervisor, _history = fixture(state, old_helper, old_supervisor)
+            plan = ROTATION.scan_plan(
+                state, helper, UID, audit_run_dir=run, expected_gid=GID,
+                audit_ancestry_kwargs=kwargs,
+            )
+            ok(plan["runtime_audit_ancestry"] == records,
+               "PLAN binds the exact validated Unraid/protected ancestry receipt")
+
+
 def main():
     print("TAP version 13")
     test_static_contract()
@@ -469,6 +537,7 @@ def main():
     test_scan_and_authority()
     test_transaction_success_and_rollback()
     test_lockset_and_file_security()
+    test_unraid_runtime_audit_ancestry()
     print(f"1..{COUNT}")
     print(f"PASS: {COUNT} offline helper-rotation assertions")
 

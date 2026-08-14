@@ -231,7 +231,17 @@ bool MockableBatch::TxnBegin(bool durable)
 
 bool MockableBatch::TxnCommit()
 {
-    if (!m_database.m_pass || !m_transaction_records || m_database.m_fail_commit) return false;
+    const size_t commit_index = m_database.m_commit_calls++;
+    if (!m_database.m_pass || !m_transaction_records) return false;
+    if (m_database.m_fail_commit ||
+        (m_database.m_fail_commit_at &&
+         commit_index == *m_database.m_fail_commit_at)) {
+        if (m_database.m_commit_records_on_failure) {
+            m_database.m_records = std::move(*m_transaction_records);
+            m_transaction_records.reset();
+        }
+        return false;
+    }
     m_database.m_records = std::move(*m_transaction_records);
     m_transaction_records.reset();
     return true;
@@ -239,9 +249,10 @@ bool MockableBatch::TxnCommit()
 
 bool MockableBatch::TxnAbort()
 {
+    ++m_database.m_abort_calls;
     if (!m_transaction_records) return false;
     m_transaction_records.reset();
-    return m_database.m_pass;
+    return m_database.m_pass && !m_database.m_fail_abort;
 }
 
 std::unique_ptr<WalletDatabase> CreateMockableWalletDatabase(MockableData records)

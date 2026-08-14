@@ -8,6 +8,7 @@
 
 #include <interfaces/chain.h>
 #include <interfaces/node.h>
+#include <qt/addresstablemodel.h>
 #include <qt/addressbookpage.h>
 #include <qt/clientmodel.h>
 #include <qt/editaddressdialog.h>
@@ -33,6 +34,7 @@
 using wallet::AddWallet;
 using wallet::CWallet;
 using wallet::CreateMockableWalletDatabase;
+using wallet::GetMockableDatabase;
 using wallet::RemoveWallet;
 using wallet::WALLET_FLAG_DESCRIPTORS;
 using wallet::WalletContext;
@@ -106,17 +108,16 @@ void TestAddAddressesToSendBook(interfaces::Node& node)
     // Define a new address (which should add to the address book successfully).
     QString new_address_a;
     QString new_address_b;
+    QString replacement_address;
 
     std::tie(r_key_dest, preexisting_r_address) = build_address();
     std::tie(s_key_dest, preexisting_s_address) = build_address();
     std::tie(std::ignore, new_address_a) = build_address();
     std::tie(std::ignore, new_address_b) = build_address();
+    std::tie(std::ignore, replacement_address) = build_address();
 
-    {
-        LOCK(wallet->cs_wallet);
-        wallet->SetAddressBook(r_key_dest, r_label.toStdString(), wallet::AddressPurpose::RECEIVE);
-        wallet->SetAddressBook(s_key_dest, s_label.toStdString(), wallet::AddressPurpose::SEND);
-    }
+    QVERIFY(wallet->SetAddressBook(r_key_dest, r_label.toStdString(), wallet::AddressPurpose::RECEIVE));
+    QVERIFY(wallet->SetAddressBook(s_key_dest, s_label.toStdString(), wallet::AddressPurpose::SEND));
 
     auto check_addbook_size = [&wallet](int expected_size) {
         LOCK(wallet->cs_wallet);
@@ -213,6 +214,50 @@ void TestAddAddressesToSendBook(interfaces::Node& node)
 
     search_line->setText("");
     QCOMPARE(table_view->model()->rowCount(), 3);
+
+    // Editing the address column atomically moves the sending entry while
+    // preserving its label. A failed database write leaves both the wallet
+    // and model on the old address.
+    AddressTableModel* address_model = walletModel.getAddressTableModel();
+    const int old_row = address_model->lookupAddress(new_address_a);
+    QVERIFY(old_row >= 0);
+    GetMockableDatabase(*wallet).m_fail_write_at = 0;
+    QVERIFY(!address_model->setData(
+        address_model->index(old_row, AddressTableModel::Address, QModelIndex()),
+        replacement_address, Qt::EditRole));
+    QCOMPARE(address_model->getEditStatus(), AddressTableModel::ADDRESS_BOOK_FAILURE);
+    QVERIFY(address_model->lookupAddress(new_address_a) >= 0);
+    QCOMPARE(address_model->lookupAddress(replacement_address), -1);
+
+    GetMockableDatabase(*wallet).m_fail_write_at.reset();
+    const int retry_row = address_model->lookupAddress(new_address_a);
+    QVERIFY(address_model->setData(
+        address_model->index(retry_row, AddressTableModel::Address, QModelIndex()),
+        replacement_address, Qt::EditRole));
+    QCOMPARE(address_model->lookupAddress(new_address_a), -1);
+    const int replacement_row = address_model->lookupAddress(replacement_address);
+    QVERIFY(replacement_row >= 0);
+    QCOMPARE(address_model->data(
+        address_model->index(replacement_row, AddressTableModel::Label, QModelIndex()),
+        Qt::EditRole).toString(), QString("io - new A"));
+    // The unfiltered model also contains the preexisting receiving entry.
+    QCOMPARE(address_model->rowCount(QModelIndex()), 4);
+
+    // A receiving-label commit failure occurs after one key is reserved. It
+    // must be reported as an address-book partial result without retrying and
+    // consuming a second key under the unlock-retry path.
+    wallet::MockableDatabase& database = GetMockableDatabase(*wallet);
+    const size_t keypool_before = WITH_LOCK(
+        wallet->cs_wallet, return wallet->KeypoolCountExternalKeys());
+    database.m_fail_commit = true;
+    QCOMPARE(address_model->addRow(
+        AddressTableModel::Receive, "label-commit-failure", "",
+        wallet->m_default_address_type), QString());
+    QCOMPARE(address_model->getEditStatus(),
+             AddressTableModel::ADDRESS_BOOK_FAILURE);
+    const size_t keypool_after = WITH_LOCK(
+        wallet->cs_wallet, return wallet->KeypoolCountExternalKeys());
+    QCOMPARE(keypool_before, keypool_after + 1);
 }
 
 } // namespace

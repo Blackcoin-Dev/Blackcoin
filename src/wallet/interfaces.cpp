@@ -1391,7 +1391,17 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
                 tier->unbonding_blocks,
                 unlock_height);
             const CTxDestination unbonding_dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, unbonding_program};
-            wallet.SetAddressBook(unbonding_dest, unbonding_label, AddressPurpose::RECEIVE);
+            if (!wallet.SetAddressBook(
+                    unbonding_dest, unbonding_label,
+                    AddressPurpose::RECEIVE)) {
+                const bilingual_str label_failure =
+                    wallet.IsAddressBookDatabaseAmbiguous()
+                    ? _("The unbonding address-label commit outcome is uncertain. Reload the wallet before retrying; no transaction was created.")
+                    : _("The unbonding address label could not be committed; no transaction was created.");
+                return util::Error{DurableQuantumKeyFailure(
+                    *created_key, "Staking address unbonding",
+                    label_failure)};
+            }
 
             amount = outputs.bonded_amount;
             destination_address = EncodeDestination(unbonding_dest);
@@ -2418,10 +2428,16 @@ public:
     void abortRescan() override { m_wallet->AbortRescan(); }
     bool backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
     std::string getWalletName() override { return m_wallet->GetName(); }
-    util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) override
+    util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label, interfaces::NewDestinationStatus* status) override
     {
         LOCK(m_wallet->cs_wallet);
-        return m_wallet->GetNewDestination(type, label);
+        bool reserved{false};
+        auto result = m_wallet->GetNewDestination(type, label, &reserved);
+        if (status) {
+            *status = reserved ? interfaces::NewDestinationStatus::RESERVED
+                               : interfaces::NewDestinationStatus::NOT_RESERVED;
+        }
+        return result;
     }
     bool getPubKey(const CScript& script, const CKeyID& address, CPubKey& pub_key) override
     {
@@ -2455,6 +2471,10 @@ public:
     bool delAddressBook(const CTxDestination& dest) override
     {
         return m_wallet->DelAddressBook(dest);
+    }
+    bool moveAddressBook(const CTxDestination& old_dest, const CTxDestination& new_dest) override
+    {
+        return m_wallet->MoveAddressBook(old_dest, new_dest);
     }
     bool getAddress(const CTxDestination& dest,
         std::string* name,

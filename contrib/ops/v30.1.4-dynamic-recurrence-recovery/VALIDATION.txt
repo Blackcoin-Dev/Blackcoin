@@ -1,0 +1,14 @@
+Offline validation completed 2026-08-14T05:43:56Z.
+
+Python compilation: PASS
+Bash syntax: PASS
+Git whitespace check: PASS
+Signed fleet31 base primitive SHA256 binding: PASS
+Forbidden targeted/generic/wallet mutation RPC scan: PASS
+Uninterrupted hostile suite exit: 0
+Uninterrupted hostile suite result: PASS: 44 hostile dynamic recurrence assertions
+Uninterrupted hostile log SHA256: 8fa715e76edceaaa893ce6cf93f1b0ba5c4cf5589c20aeb89e0f935d73848939
+
+No SSH host, Docker daemon, live wallet, node, or network was contacted by
+this validation. No live authority, raw recovery transaction, wallet secret,
+or live execution receipt is included in this package.

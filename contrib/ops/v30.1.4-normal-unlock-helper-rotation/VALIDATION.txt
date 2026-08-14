@@ -1,5 +1,5 @@
 Validation status: PASS (offline package only)
-Frozen at: 2026-08-14T05:12:29Z
+Frozen at: 2026-08-14T05:33:13Z
 
 Scope:
 - Isolated fleet branch based on the signed normal-unlock rotation lineage rooted at
@@ -15,6 +15,18 @@ Preserved predecessor audit evidence:
 - AUDIT.json SHA256:
   6be13d99625e321ec42a43fb1c8e8ffad85d302c3c02f2c306835a22d0ee6b2c
 - The failed run is immutable evidence only and is not reusable authority.
+
+Preserved live rollback evidence from signed predecessor 5d4feb2128258f72327af232628fe0f7508ba3c7:
+- Attempt 1 FAILURE.json SHA256:
+  9f1243269ce629f8800a1686345c8dd555c2ee22794c33d100aedcb820c5f1f7
+- Attempt 1 error: mixed chain cut for node 18; helper attempts node30, then nodes1..18.
+- Attempt 2 FAILURE.json SHA256:
+  f37d17062ea3017f5f66e0da955d8890fecfdeb43f3480e658771333464bf291
+- Attempt 2 error: protected runtime projection changed for node 3: pow_policy;
+  helper attempts node30, then nodes1..3.
+- Both attempts restored helper acf28446... and active cycle 1dbb72bd... exactly.
+- Both attempts preserved disabled cycle 156acca0... and failed-job10 log 23030a65... exactly.
+- Both consumed runs remain terminal evidence and are not reusable authority.
 
 Exact byte and filesystem contracts:
 - Helper predecessor acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1.
@@ -35,14 +47,18 @@ Exact byte and filesystem contracts:
 Focused hostile suite:
 - Command: python3 contrib/ops/v30.1.4-normal-unlock-helper-rotation/tests/run.py
 - Exit: 0
-- Result: PASS: 171 offline helper-rotation assertions
+- Result: PASS: 189 offline helper-rotation assertions
 - Log: /private/tmp/normal-unlock-helper-rotation-20260814.out
-- Log SHA256: 1bbf8c570c29e0de511ffafc32f6fdbc86270ce746959574adc724607e02bf73
+- Log SHA256: 9061ccc5406498f28d6a813c45533908863974e1ee129ee10049a5011b8ff71b
 - Coverage: nodes 1..32; node30 first; unnamed and named wallet argv; no passphrase output;
   exact helper/supervisor/active-cycle transformations; exact authority-schema identities;
   completed failed-job10 receipt binding; disabled-cycle and job10 immutability; helper/active/
   disabled GID drift; active successor metadata drift; byte drift; canonical shared/runtime locks;
   successful terminal cut; node30 failure stop/rollback; mid-apply rollback; exact backup order;
+  five-attempt stable-chain bound; active-chain anchor validation; normal-tip resampling;
+  same-height/unanchored/nonmonotonic rejection; ready/claim-in-flight/hash/quarantine telemetry
+  transitions; CPU-percent and payout-policy drift rejection; helper-versus-verification failure stage;
+  preflight/post-helper/terminal bracket receipts;
   forbidden PoW/claim/transaction methods; uid99:gid100 mode0777 Unraid prefixes; root:root
   mode0700 protected audit descendants; symlink/outside/owner/mode/ancestry drift rejection.
 
@@ -55,10 +71,10 @@ Static validation (all exit 0):
 - git diff --check
 
 Source SHA256 at validation:
-- helper_rotation.py d62d22c62fe133e9b485b2d0e4c9fe7c0be4a6446ddff5faf67af7dd73569cf8
-- tests/run.py a79771f059fbb980ff97b13f3ce926348f7e615326050cbfecf7958974896e97
+- helper_rotation.py 8d37cb1cce207e6e9f9f618389d4e12c2429861d2372e14dde33ac643bba6412
+- tests/run.py bbf422541258fa11f3074be178f0dc74ff850c48506bc2f763d19008f288e702
 - AUTHORITY.schema.json 565f1c58c5d37244bfa1baae0d8a6315b893ff3f99b38b0c2eb45d71c0c8da52
-- README.md 19fcd5c1b28481668aec25b41f2a1aa4f2a898779a4695e51f577aa370554daa
+- README.md 4e7238696a2cc3661687a6d679571228e807df193b0e4eb4b0beb9f49ae12961
 - blackcoin_node_normal_unlock.sh aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7
 
 Live boundary and expected fresh audit:

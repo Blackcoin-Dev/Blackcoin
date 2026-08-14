@@ -142,6 +142,8 @@ def snapshot(node, active):
         "chain": {"chain": "main", "blocks": 100, "headers": 100,
                   "bestblockhash": "a" * 64, "chainwork": "b" * 64,
                   "initialblockdownload": False},
+        "chain_bracket_attempts": 1,
+        "normal_tip_advances_resampled": 0,
         "network_version": ROTATION.EXPECTED_NETWORK_VERSION,
         "subversion": ROTATION.EXPECTED_SUBVERSION,
         "connections": 3,
@@ -153,9 +155,14 @@ def snapshot(node, active):
         "pos_weight": 1 if active else 0,
         "pow_policy": {
             "enabled": pow_enabled, "autostart": pow_enabled, "threads": 1,
-            "cpu_percent": 10, "payout_address": "q", "state": "claim_quarantined",
-            "claim_quarantined": node != 30, "blocking_quarantined_claims": 1 if node != 30 else 0,
-            "pending_manual_resolutions": 0, "allow_automatic_quantum_key_creation": False,
+            "cpu_percent": 10, "payout_address": "q",
+            "allow_automatic_quantum_key_creation": False,
+        },
+        "pow_dynamic": {
+            "state": "claim_quarantined", "ready": False, "claim_in_flight": False,
+            "hashrate": 0, "claim_quarantined": node != 30,
+            "blocking_quarantined_claims": 1 if node != 30 else 0,
+            "pending_manual_resolutions": 0,
         },
         "pow_hashrate": 0,
         "quantum_inventory_sha256": "c" * 64,
@@ -163,11 +170,14 @@ def snapshot(node, active):
 
 
 class FakeRuntime:
-    def __init__(self, fail_node=None):
+    def __init__(self, fail_node=None, fail_verify_node=None):
         self.invoked = []
         self.fail_node = fail_node
+        self.fail_verify_node = fail_verify_node
 
     def capture(self, node):
+        if node == self.fail_verify_node and node in self.invoked:
+            raise ROTATION.RotationError(f"injected post-helper verification failure at node {node}")
         return snapshot(node, node in self.invoked)
 
     def invoke_helper(self, node):
@@ -184,6 +194,68 @@ class PreflightFailureRuntime:
 
     def invoke_helper(self, node):
         raise AssertionError(f"helper unexpectedly invoked at node {node}")
+
+
+def chain_cut(height, marker, work=None):
+    work = height if work is None else work
+    return {
+        "chain": "main", "blocks": height, "headers": height,
+        "bestblockhash": marker * 64, "chainwork": f"{work:064x}",
+        "initialblockdownload": False,
+    }
+
+
+def live_bracket(before, after=None, dynamic_state="ready", cpu_percent=10):
+    after = before if after is None else after
+    return {
+        "chain_before": before,
+        "network": {
+            "connections": 3, "version": ROTATION.EXPECTED_NETWORK_VERSION,
+            "subversion": ROTATION.EXPECTED_SUBVERSION,
+        },
+        "wallets_live": ["wallet"],
+        "wallet_info": {
+            "unlocked_until": 200000, "unlocked_staking_only": False, "scanning": False,
+        },
+        "staking": {"enabled": True, "staking": True, "weight": 1},
+        "pow_info": {
+            "enabled": True, "autostart": True, "threads": 1,
+            "cpu_percent": cpu_percent, "payout_address": "q",
+            "allow_automatic_quantum_key_creation": False,
+            "state": dynamic_state, "ready": dynamic_state == "ready",
+            "claim_in_flight": dynamic_state == "claim_in_flight", "hashrate": 10,
+            "claim_quarantined": dynamic_state == "claim_quarantined",
+            "blocking_quarantined_claims": 1 if dynamic_state == "claim_quarantined" else 0,
+            "pending_manual_resolutions": 0,
+        },
+        "quantum": {"available": 1},
+        "chain_after": after,
+    }
+
+
+class BracketRuntime(ROTATION.DockerRuntime):
+    def __init__(self, state_root, brackets, anchors=None):
+        super().__init__(state_root=state_root, expected_uid=UID)
+        self.brackets = list(brackets)
+        self.anchors = {} if anchors is None else dict(anchors)
+        self.bracket_calls = 0
+
+    @staticmethod
+    def call(argv, timeout=35):
+        if argv[:2] == ["/usr/bin/docker", "inspect"]:
+            return json.dumps([{"State": {"Running": True, "Health": {"Status": "healthy"}}}])
+        raise AssertionError(f"unexpected external call: {argv} timeout={timeout}")
+
+    def capture_bracket(self, node, wallet):
+        if node != 3 or wallet != "wallet" or not self.brackets:
+            raise AssertionError("unexpected bracket request")
+        self.bracket_calls += 1
+        return copy.deepcopy(self.brackets.pop(0))
+
+    def rpc(self, node, wallet, method, *arguments):
+        if node == 3 and wallet == "" and method == "getblockheader" and len(arguments) == 1:
+            return copy.deepcopy(self.anchors[arguments[0]])
+        raise AssertionError(f"unexpected RPC: node={node} wallet={wallet!r} method={method}")
 
 
 class DummyLocks:
@@ -236,6 +308,14 @@ def test_static_contract():
        "canonical shared lock set is complete and unique")
     ok(len(ROTATION.RUNTIME_LOCKS) == 32 and len(set(ROTATION.RUNTIME_LOCKS)) == 32,
        "all 32 canonical node runtime locks are present")
+    ok(ROTATION.CHAIN_BRACKET_MAX_ATTEMPTS == 5,
+       "stable chain bracket resampling is exactly bounded")
+    policy_keys = {"enabled", "autostart", "threads", "cpu_percent"}
+    dynamic_keys = {"state", "ready", "claim_in_flight", "hashrate", "claim_quarantined"}
+    ok(set(ROTATION.POW_POLICY_KEYS).isdisjoint(ROTATION.POW_DYNAMIC_KEYS) and
+       policy_keys.issubset(ROTATION.POW_POLICY_KEYS) and
+       dynamic_keys.issubset(ROTATION.POW_DYNAMIC_KEYS),
+       "PoW policy invariants are separated from dynamic mining and claim telemetry")
     ok("/boot/config/plugins/blackcoin-quantum-nodes" == str(ROTATION.STATE_ROOT),
        "installed state root is fixed")
     ok(ROTATION.ACTIVE_POW_CYCLE_PREDECESSOR_SHA256 ==
@@ -426,6 +506,14 @@ def test_transaction_success_and_rollback():
                "success receipt attests historical immutability")
             ok(len(result_disk["helper_attempts"]) == 32,
                "success receipt contains all 32 helper attempts")
+            ok(len(result_disk["preflight_chain_brackets"]) == 32 and
+               len(result_disk["terminal_chain_brackets"]) == 32 and
+               all(row["attempts"] == 1 for row in result_disk["preflight_chain_brackets"]),
+               "success receipt preserves bounded stable-bracket evidence")
+            ok(all(row["failure_stage"] is None and
+                   row["verification_chain_bracket"]["attempts"] == 1
+                   for row in result_disk["helper_attempts"]),
+               "every successful helper attempt binds its post-helper verification bracket")
 
     with synthetic_identities() as (old_helper, new_helper, old_supervisor, _new_supervisor):
         with tempfile.TemporaryDirectory() as temporary:
@@ -450,6 +538,31 @@ def test_transaction_success_and_rollback():
             ok(failure["status"] == "ROLLED_BACK" and failure["rollback"]["performed"] is True,
                "node30 failure receipt proves rollback")
             ok(failure["helper_attempted_nodes"] == [30], "failure receipt includes failed canary attempt")
+            ok(failure["helper_attempts"][0]["failure_stage"] == "helper" and
+               len(failure["preflight_chain_brackets"]) == 32,
+               "failed helper receipt distinguishes helper stage and preserves preflight brackets")
+
+    with synthetic_identities() as (old_helper, new_helper, old_supervisor, _new_supervisor):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            helper, supervisor, _history = fixture(base / "state", old_helper, old_supervisor)
+            plan = ROTATION.scan_plan(base / "state", helper, UID)
+            run_dir = base / "run"
+            run_dir.mkdir(mode=0o700)
+            payload = write_secure(base / "payload", new_helper)
+            runtime = FakeRuntime(fail_verify_node=30)
+            rejects(lambda: ROTATION.execute_transaction(
+                plan, runtime, run_dir, DummyLocks([]),
+                lambda paths: DummyLocks([], str(paths[0])), {"authority_sha256": "1" * 64},
+                payload, UID, now_function=lambda: 100000,
+            ), "post-helper verification failure aborts and rolls back")
+            failure = json.loads((run_dir / "FAILURE.json").read_text())
+            ok(failure["status"] == "ROLLED_BACK" and
+               failure["helper_attempts"][0]["status"] == "FAILED" and
+               failure["helper_attempts"][0]["failure_stage"] == "post-helper-verification",
+               "failure receipt distinguishes post-helper verification from helper execution")
+            ok(helper.read_bytes() == old_helper and supervisor.read_bytes() == old_supervisor,
+               "post-helper verification failure restores exact predecessor files")
 
     with synthetic_identities() as (old_helper, new_helper, old_supervisor, _new_supervisor):
         with tempfile.TemporaryDirectory() as temporary:
@@ -637,6 +750,89 @@ def test_unraid_runtime_audit_ancestry():
                 ROTATION.FAILED_JOB10_RECEIPT_SHA256 = saved_sha
 
 
+def test_stable_chain_brackets_and_dynamic_pow_state():
+    with tempfile.TemporaryDirectory() as temporary:
+        state = Path(temporary) / "state"
+        write_secure(
+            state / "runtime-wallet-manifests" / "node-03.json",
+            b'["wallet"]\n',
+        )
+        height100 = chain_cut(100, "a", 100)
+        height101 = chain_cut(101, "b", 101)
+        runtime = BracketRuntime(
+            state,
+            [live_bracket(height100, height101), live_bracket(height101)],
+            {height100["bestblockhash"]: {
+                "height": 100, "confirmations": 2, "chainwork": height100["chainwork"],
+            }},
+        )
+        captured = runtime.capture(3)
+        ok(captured["chain"] == height101 and captured["chain_bracket_attempts"] == 2 and
+           captured["normal_tip_advances_resampled"] == 1 and runtime.bracket_calls == 2,
+           "one active-chain-anchored tip advance resamples to a stable bracket")
+
+        reorg = chain_cut(100, "c", 101)
+        reorg_runtime = BracketRuntime(state, [live_bracket(height100, reorg)])
+        rejects(lambda: reorg_runtime.capture(3),
+                "same-height hash replacement is not treated as a normal tip advance")
+        ok(reorg_runtime.bracket_calls == 1, "nonmonotonic chain cut fails without retry expansion")
+
+        unanchored_runtime = BracketRuntime(
+            state, [live_bracket(height100, height101)],
+            {height100["bestblockhash"]: {
+                "height": 100, "confirmations": 0, "chainwork": height100["chainwork"],
+            }},
+        )
+        rejects(lambda: unanchored_runtime.capture(3),
+                "tip advance without an active-chain predecessor anchor fails closed")
+
+        markers = ("1", "2", "3", "4", "5", "6")
+        moving_brackets = []
+        moving_anchors = {}
+        for offset in range(ROTATION.CHAIN_BRACKET_MAX_ATTEMPTS):
+            before = chain_cut(200 + offset, markers[offset], 200 + offset)
+            after = chain_cut(201 + offset, markers[offset + 1], 201 + offset)
+            moving_brackets.append(live_bracket(before, after))
+            moving_anchors[before["bestblockhash"]] = {
+                "height": before["blocks"], "confirmations": 2,
+                "chainwork": before["chainwork"],
+            }
+        moving_runtime = BracketRuntime(state, moving_brackets, moving_anchors)
+        rejects(lambda: moving_runtime.capture(3),
+                "continuously advancing tip exhausts the exact stable-bracket bound")
+        ok(moving_runtime.bracket_calls == ROTATION.CHAIN_BRACKET_MAX_ATTEMPTS,
+           "stable-bracket retry count never exceeds the fixed bound")
+
+        stable = chain_cut(300, "d", 300)
+        claim_transition = live_bracket(stable, dynamic_state="claim_in_flight")
+        claim_transition["pow_info"].update({
+            "hashrate": 25, "claim_quarantined": True,
+            "blocking_quarantined_claims": 2,
+        })
+        dynamic_runtime = BracketRuntime(
+            state,
+            [live_bracket(stable, dynamic_state="ready"),
+             claim_transition],
+        )
+        before = dynamic_runtime.capture(3)
+        after = dynamic_runtime.capture(3)
+        ok(before["pow_policy"] == after["pow_policy"] and
+           before["pow_dynamic"] != after["pow_dynamic"] and
+           after["pow_dynamic"]["hashrate"] == 25 and
+           after["pow_dynamic"]["claim_quarantined"] is True,
+           "ready-to-claim-in-flight telemetry transition preserves PoW policy")
+        ROTATION.verify_after(before, after, 100000)
+        ok(True, "dynamic PoW state/hash/quarantine transition is accepted after normal unlock")
+        policy_drift = copy.deepcopy(after)
+        policy_drift["pow_policy"]["cpu_percent"] = 25
+        rejects(lambda: ROTATION.verify_after(before, policy_drift, 100000),
+                "PoW CPU-percent policy drift still fails closed")
+        address_drift = copy.deepcopy(after)
+        address_drift["pow_policy"]["payout_address"] = "changed"
+        rejects(lambda: ROTATION.verify_after(before, address_drift, 100000),
+                "PoW payout policy drift still fails closed")
+
+
 def test_active_and_disabled_pow_cycle_pins():
     with synthetic_identities() as (old_helper, new_helper, _old_supervisor, _new_supervisor):
         with synthetic_cycle_identities() as (active_before, active_after, disabled):
@@ -753,6 +949,7 @@ def main():
     test_transaction_success_and_rollback()
     test_lockset_and_file_security()
     test_unraid_runtime_audit_ancestry()
+    test_stable_chain_brackets_and_dynamic_pow_state()
     test_active_and_disabled_pow_cycle_pins()
     print(f"1..{COUNT}")
     print(f"PASS: {COUNT} offline helper-rotation assertions")

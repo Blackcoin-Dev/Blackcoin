@@ -64,6 +64,18 @@ BACKUP_KIND = "blackcoin-normal-unlock-helper-rotation-backup-manifest"
 CONSUMPTION_KIND = "blackcoin-normal-unlock-helper-rotation-authority-consumption"
 EXPECTED_NETWORK_VERSION = 300104
 EXPECTED_SUBVERSION = "/Blackcoin:30.1.4/"
+CHAIN_BRACKET_MAX_ATTEMPTS = 5
+CHAIN_CUT_KEYS = (
+    "chain", "blocks", "headers", "bestblockhash", "chainwork", "initialblockdownload",
+)
+POW_POLICY_KEYS = (
+    "enabled", "autostart", "threads", "cpu_percent", "payout_address",
+    "allow_automatic_quantum_key_creation",
+)
+POW_DYNAMIC_KEYS = (
+    "state", "ready", "claim_in_flight", "hashrate", "claim_quarantined",
+    "blocking_quarantined_claims", "pending_manual_resolutions",
+)
 SHARED_LOCKS = (
     Path("/run/blackcoin-v3015-rollout.lock"),
     Path("/run/blackcoin-endpoint-guard.lock"),
@@ -778,9 +790,10 @@ def wallet_rpc_argv(container, wallet, method, *arguments, stdin=False):
 
 
 class DockerRuntime:
-    def __init__(self, state_root=STATE_ROOT, helper_path=HELPER_PATH):
+    def __init__(self, state_root=STATE_ROOT, helper_path=HELPER_PATH, expected_uid=0):
         self.state_root = Path(state_root)
         self.helper_path = Path(helper_path)
+        self.expected_uid = expected_uid
 
     @staticmethod
     def call(argv, timeout=35):
@@ -797,10 +810,49 @@ class DockerRuntime:
     def rpc(self, node, wallet, method, *arguments):
         return json.loads(self.call(wallet_rpc_argv(container_for_node(node), wallet, method, *arguments)))
 
+    def capture_bracket(self, node, wallet):
+        return {
+            "chain_before": self.rpc(node, "", "getblockchaininfo"),
+            "network": self.rpc(node, "", "getnetworkinfo"),
+            "wallets_live": self.rpc(node, "", "listwallets"),
+            "wallet_info": self.rpc(node, wallet, "getwalletinfo"),
+            "staking": self.rpc(node, wallet, "getstakinginfo"),
+            "pow_info": self.rpc(node, wallet, "getpowmininginfo"),
+            "quantum": self.rpc(node, wallet, "getquantumkeyinventory"),
+            "chain_after": self.rpc(node, "", "getblockchaininfo"),
+        }
+
+    def normal_tip_advance(self, node, before_cut, after_cut):
+        try:
+            before_height = int(before_cut["blocks"])
+            after_height = int(after_cut["blocks"])
+            before_work = int(str(before_cut["chainwork"]), 16)
+            after_work = int(str(after_cut["chainwork"]), 16)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (before_cut["chain"] != "main" or after_cut["chain"] != "main" or
+                before_cut["initialblockdownload"] is not False or
+                after_cut["initialblockdownload"] is not False or
+                before_cut["headers"] != before_height or after_cut["headers"] != after_height or
+                after_height <= before_height or after_work <= before_work or
+                before_cut["bestblockhash"] == after_cut["bestblockhash"]):
+            return False
+        anchor = self.rpc(node, "", "getblockheader", before_cut["bestblockhash"])
+        try:
+            confirmations = int(anchor.get("confirmations", 0))
+            anchor_height = int(anchor.get("height", -1))
+            anchor_work = int(str(anchor.get("chainwork", "")), 16)
+        except (TypeError, ValueError):
+            return False
+        return (
+            anchor_height == before_height and confirmations >= after_height - before_height + 1 and
+            anchor_work == before_work
+        )
+
     def capture(self, node):
         padded = f"{node:02d}"
         manifest = self.state_root / "runtime-wallet-manifests" / f"node-{padded}.json"
-        secure_regular(manifest, 0, (0o600,))
+        secure_regular(manifest, self.expected_uid, (0o600,))
         wallets_expected = json.loads(manifest.read_text(encoding="utf-8"))
         if (not isinstance(wallets_expected, list) or len(wallets_expected) != 1 or
                 not isinstance(wallets_expected[0], str)):
@@ -812,19 +864,28 @@ class DockerRuntime:
                 inspect[0].get("State", {}).get("Running") is not True or
                 inspect[0].get("State", {}).get("Health", {}).get("Status") != "healthy"):
             raise RotationError(f"container is not healthy for node {node}")
-        chain_before = self.rpc(node, "", "getblockchaininfo")
-        network = self.rpc(node, "", "getnetworkinfo")
-        wallets_live = self.rpc(node, "", "listwallets")
-        wallet_info = self.rpc(node, wallet, "getwalletinfo")
-        staking = self.rpc(node, wallet, "getstakinginfo")
-        pow_info = self.rpc(node, wallet, "getpowmininginfo")
-        quantum = self.rpc(node, wallet, "getquantumkeyinventory")
-        chain_after = self.rpc(node, "", "getblockchaininfo")
-        chain_keys = ("chain", "blocks", "headers", "bestblockhash", "chainwork", "initialblockdownload")
-        before_cut = {key: chain_before.get(key) for key in chain_keys}
-        after_cut = {key: chain_after.get(key) for key in chain_keys}
-        if before_cut != after_cut:
-            raise RotationError(f"mixed chain cut for node {node}")
+        bracket = None
+        before_cut = None
+        normal_advances = 0
+        for attempt in range(1, CHAIN_BRACKET_MAX_ATTEMPTS + 1):
+            bracket = self.capture_bracket(node, wallet)
+            before_cut = {key: bracket["chain_before"].get(key) for key in CHAIN_CUT_KEYS}
+            after_cut = {key: bracket["chain_after"].get(key) for key in CHAIN_CUT_KEYS}
+            if before_cut == after_cut:
+                break
+            if not self.normal_tip_advance(node, before_cut, after_cut):
+                raise RotationError(f"non-monotonic or unanchored mixed chain cut for node {node}")
+            normal_advances += 1
+        else:
+            raise RotationError(
+                f"stable chain bracket unavailable after {CHAIN_BRACKET_MAX_ATTEMPTS} attempts for node {node}"
+            )
+        network = bracket["network"]
+        wallets_live = bracket["wallets_live"]
+        wallet_info = bracket["wallet_info"]
+        staking = bracket["staking"]
+        pow_info = bracket["pow_info"]
+        quantum = bracket["quantum"]
         if (before_cut["chain"] != "main" or before_cut["initialblockdownload"] is not False or
                 before_cut["blocks"] != before_cut["headers"] or network.get("connections", 0) < 1 or
                 wallets_live != wallets_expected):
@@ -832,13 +893,8 @@ class DockerRuntime:
         if (network.get("version") != EXPECTED_NETWORK_VERSION or
                 network.get("subversion") != EXPECTED_SUBVERSION):
             raise RotationError(f"installed runtime identity changed for node {node}")
-        pow_projection = {
-            key: pow_info.get(key) for key in (
-                "enabled", "autostart", "threads", "cpu_percent", "payout_address",
-                "allow_automatic_quantum_key_creation", "state", "claim_quarantined",
-                "blocking_quarantined_claims", "pending_manual_resolutions",
-            )
-        }
+        pow_policy = {key: pow_info.get(key) for key in POW_POLICY_KEYS}
+        pow_dynamic = {key: pow_info.get(key) for key in POW_DYNAMIC_KEYS}
         if node == 30:
             if pow_info.get("enabled") is not False or float(pow_info.get("hashrate", 0)) != 0:
                 raise RotationError("node30 ordinary PoW role changed")
@@ -850,6 +906,8 @@ class DockerRuntime:
             "wallet_selector_sha256": sha256_bytes(wallet.encode()),
             "wallet_unnamed": wallet == "",
             "chain": before_cut,
+            "chain_bracket_attempts": normal_advances + 1,
+            "normal_tip_advances_resampled": normal_advances,
             "network_version": network.get("version"),
             "subversion": network.get("subversion"),
             "connections": network.get("connections"),
@@ -859,7 +917,8 @@ class DockerRuntime:
             "pos_enabled": staking.get("enabled"),
             "pos_staking": staking.get("staking"),
             "pos_weight": staking.get("weight", 0),
-            "pow_policy": pow_projection,
+            "pow_policy": pow_policy,
+            "pow_dynamic": pow_dynamic,
             "pow_hashrate": pow_info.get("hashrate", 0),
             "quantum_inventory_sha256": sha256_bytes(canonical_json_bytes(quantum)),
         }
@@ -895,6 +954,20 @@ def verify_after(before, after, now):
         raise RotationError(f"normal unlock or PoS did not converge for node {before['node']}")
     if before["node"] == 30 and (after["pow_policy"]["enabled"] is not False or float(after["pow_hashrate"]) != 0):
         raise RotationError("node30 ordinary PoW escaped during canary")
+
+
+def chain_bracket_receipts(snapshots):
+    rows = snapshots.values() if isinstance(snapshots, dict) else snapshots
+    return [
+        {
+            "node": row["node"],
+            "attempts": row["chain_bracket_attempts"],
+            "normal_tip_advances_resampled": row["normal_tip_advances_resampled"],
+            "stable_tip_height": row["chain"]["blocks"],
+            "stable_tip_hash": row["chain"]["bestblockhash"],
+        }
+        for row in rows
+    ]
 
 
 def replacement_bytes(row):
@@ -1031,20 +1104,31 @@ def execute_transaction(plan, runtime, run_dir, runtime_locks, lock_factory,
         # helper obtains the matching per-node lock itself.
         runtime_locks.release()
         for node in HELPER_ORDER:
-            attempt = {"node": node, "status": "STARTED", "started_at_epoch": int(now_function())}
+            attempt = {
+                "node": node, "status": "STARTED", "failure_stage": None,
+                "started_at_epoch": int(now_function()),
+            }
             attempts.append(attempt)
             try:
                 helper_result = runtime.invoke_helper(node)
             except Exception:
                 attempt["status"] = "FAILED"
+                attempt["failure_stage"] = "helper"
                 attempt["finished_at_epoch"] = int(now_function())
                 raise
             attempt.update(helper_result)
+            try:
+                with lock_factory((RUNTIME_LOCKS[node - 1],)):
+                    after = runtime.capture(node)
+                    verify_after(before[node], after, int(now_function()))
+            except Exception:
+                attempt["status"] = "FAILED"
+                attempt["failure_stage"] = "post-helper-verification"
+                attempt["finished_at_epoch"] = int(now_function())
+                raise
             attempt["status"] = "PASS"
+            attempt["verification_chain_bracket"] = chain_bracket_receipts((after,))[0]
             attempt["finished_at_epoch"] = int(now_function())
-            with lock_factory((RUNTIME_LOCKS[node - 1],)):
-                after = runtime.capture(node)
-                verify_after(before[node], after, int(now_function()))
         # Freeze every runtime again for one coherent terminal fleet cut.
         runtime_locks.acquire()
         final = []
@@ -1073,6 +1157,8 @@ def execute_transaction(plan, runtime, run_dir, runtime_locks, lock_factory,
             "historical_job10_unchanged": True,
             "immutable_historical_refs_unchanged": True,
             "immutable_historical_ref_count": len(plan["immutable_historical_refs"]),
+            "preflight_chain_brackets": chain_bracket_receipts(before),
+            "terminal_chain_brackets": chain_bracket_receipts(final),
             "preflight_sha256": sha256_bytes(canonical_json_bytes(list(before.values()))),
             "postflight_sha256": sha256_bytes(canonical_json_bytes(final)),
             "rollback_performed": False,
@@ -1095,6 +1181,8 @@ def execute_transaction(plan, runtime, run_dir, runtime_locks, lock_factory,
             "schema": SCHEMA, "kind": RESULT_KIND, "status": "ROLLED_BACK" if rollback["performed"] else "FAILED",
             "error": str(error), "changed_paths": changed,
             "helper_attempted_nodes": [row["node"] for row in attempts],
+            "helper_attempts": attempts,
+            "preflight_chain_brackets": chain_bracket_receipts(before),
             "rollback": rollback,
             "historical_job10_unchanged": not changed or rollback["performed"],
             "immutable_historical_refs_unchanged": not changed or rollback["performed"],

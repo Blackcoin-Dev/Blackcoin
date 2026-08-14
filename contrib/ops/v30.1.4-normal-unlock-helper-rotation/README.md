@@ -90,6 +90,23 @@ with its one manifested wallet, normally unlocked for more than 12 hours, and
 actively staking with positive weight. Regular-node PoW policy and node30's
 ordinary-PoW-disabled role must match the preflight projection.
 
+Each runtime sample is enclosed by two chain reads. A normal tip advance during
+that bracket is accepted only when both cuts are main, out of IBD, fully
+header-synced, strictly increase height and chainwork, and `getblockheader`
+proves the first tip remains the active-chain ancestor at its exact height and
+chainwork. The node is then resampled from the beginning. Five attempts is the
+hard bound. A same-height hash replacement, nonmonotonic work/height,
+unanchored advance, or five continuously moving brackets fails closed.
+
+PoW comparison distinguishes stable policy from expected live telemetry. The
+protected policy projection remains `enabled`, `autostart`, `threads`,
+`cpu_percent`, `payout_address`, and
+`allow_automatic_quantum_key_creation`. Dynamic `state`, `ready`,
+`claim_in_flight`, `hashrate`, quarantine, blocking-claim, and pending-resolution
+fields remain in the receipt but may change normally while the helper wave is
+running. Regular nodes must remain enabled. Every node30 capture independently
+requires ordinary PoW disabled and zero hashrate.
+
 On failure, later helper calls stop. All transaction-owned file changes are
 restored from the exact predecessor backups under the node locks and a failure
 receipt records every attempted node and rollback result. For the current live
@@ -98,6 +115,10 @@ predecessor, then proves the disabled artifact is still byte-identical. A
 wallet already normally unlocked before a later-node failure is deliberately not relocked:
 wallet relocking would be a separate live mutation and would reduce PoS
 availability. The receipt makes that partial helper-attempt prefix explicit.
+Every successful helper attempt records its post-helper stable bracket. A
+failure receipt identifies whether the helper itself failed or the subsequent
+runtime verification failed, and preserves all completed preflight bracket
+evidence.
 
 ## Owner-only live handoff
 
@@ -127,6 +148,23 @@ its `AUDIT.json` SHA256 is
 `6be13d99625e321ec42a43fb1c8e8ffad85d302c3c02f2c306835a22d0ee6b2c`.
 Those immutable receipts establish why the earlier package could not proceed;
 they are not install authority for this successor package.
+
+The signed `5d4feb2128258f72327af232628fe0f7508ba3c7` package was later
+attempted twice under separate exact fresh authorities. Both transactions
+restored the helper and active cycle to their exact predecessors and preserved
+both immutable objects:
+
+- first `FAILURE.json` SHA256
+  `9f1243269ce629f8800a1686345c8dd555c2ee22794c33d100aedcb820c5f1f7`:
+  `mixed chain cut for node 18`, after helper attempts through node18;
+- second `FAILURE.json` SHA256
+  `f37d17062ea3017f5f66e0da955d8890fecfdeb43f3480e658771333464bf291`:
+  `protected runtime projection changed for node 3: pow_policy`, after helper
+  attempts through node3.
+
+Those consumed terminal runs remain immutable rollback evidence and cannot be
+reused. They demonstrate the two bounded liveness false positives corrected by
+this successor: ordinary active-tip movement and dynamic PoW telemetry changes.
 
 The audit creates immutable `PLAN.json`, `AUDIT.json`, and
 `AUTHORITY.template.json` objects with `.sha256` sidecars. It makes no Docker,

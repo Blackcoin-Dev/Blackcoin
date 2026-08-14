@@ -29,7 +29,9 @@ Free-Claim storage policy: exact live user-share ancestry accepted; no chmod/cho
 Queue prerequisite: exactly one canonical queued JSON; zero broadcast markers
 Payout prerequisite: exact direct witness-v16 script, not already awarded
 Work prerequisite: exact active unbound PoW-mode QQP2 for the queued payout
-Fee input prerequisite: one exact safe confirmed wallet-owned legacy P2PKH input at the selected address
+Fee input prerequisite: complete exact safe confirmed wallet-owned legacy P2PKH eligible set at one exact address/script
+Fee input authority: any one member of the immutable audited set; exact outpoint cannot be pre-bound by installed Core
+Fee input set binding: sorted unique outpoints, exact active-chain values/scripts/confirmations, member count, and canonical members SHA256
 Wallet prerequisite: exact unnamed wallet, normal unlock, stable immutable inventory
 Recovery prerequisite: no ambiguity and zero current retained-claim blockers
 Mutating RPC surface: sendshadowpowclaim only
@@ -39,10 +41,12 @@ Proof override: absent
 Fee rate: 100 atoms/vB
 Exact expected vsize: 287
 Exact package fee cap: 0.00028700 BLK
-Fee proof: active-chain gettxout(...,false) input value minus exact signed same-script output
+Immediate pre-call resample: exact tip, wallet inventory, wallet txid inventory, and complete eligible set must equal the authorized audit
+Signed input proof: exactly one vin; exact member of the audited set; exact same address/script; multiple/nonmember inputs rejected
+Fee proof: selected member's active-chain gettxout(...,false) value minus exact signed same-script output
 Immediate acknowledgment rule: exact RPC return is durably published before every post-call RPC read
 Unknown response rule: authority consumed permanently; never blind retry
-Reconcile rule: read-only wallet inventory + exact audited-anchor spender + exact signed-byte proof
+Reconcile rule: read-only wallet inventory + every audited-member spender + exactly one matching signed-byte proof
 Transaction identity: immutable txid/raw bytes/input/output/proof/fee separated from confirmations/blockhash
 Confirmation rule: exact wallet bytes re-proved; active header required
 Payout rule: one exact credited synthetic QQP2 payout record for the queued script and claim txid
@@ -63,15 +67,15 @@ Controller path binding: prefix/share/protected/binary device+inode identities c
 Controller stability: path identities and exact opened-binary hash rechecked during validation
 Controller share policy: exact live user-share ancestry accepted; no chmod/chown proposed
 Controller symlink/direct-shebang/nonisolated invocation: rejected before manifest, Docker, or RPC access
-Installed API limitation: no plan/idempotency token, exact-input selector, caller total-fee cap, or separate sign/commit phase
+Installed API limitation: no plan/idempotency token, exact-input selector, caller total-fee cap, or separate sign/commit phase; one address may have multiple eligible inputs
 Live financial authority in repository: false
 Deployable public-release authority: false
 
-Hostile suite result: PASS: 192 hostile node30 Free-Claim one-shot assertions
-Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-queue-item-contract-20260814.out
-Hostile suite log SHA256: 6e6c80ac850a72cf74349ca100d220f915aed84e67903866acbf4973b9f1324a
-Tool SHA256: 5ff475875d9a9495bb6838cb28f5be09fa0287fd6be92b3b4a768468593498ac
-Test transport SHA256: c1987a9646d5a9f375f7e982f59ef9c29b1f1434d4990c4005ab9e9454bebc9e
-Test driver SHA256: 58f1c9c76720c1dec4a5f02e8bfce8b617ed5cf9efa79fa4c25d02fc9c89281d
+Hostile suite result: PASS: 217 hostile node30 Free-Claim one-shot assertions
+Hostile suite log: /private/tmp/node30-free-claim-one-shot-v1-audited-input-set-20260814.out
+Hostile suite log SHA256: 150e5748748001aa0166ed393f07f63862ebb9b0447276cfd55a03bccdaedacb
+Tool SHA256: b89ce5b618ff62b2482419550f9f63e30f5c412b4a2d1fe42757cc3e22479391
+Test transport SHA256: d4918297a48bd80195d0f58b8e8839dc663a1e1b9fdaf807f0f7b17f7342c53b
+Test driver SHA256: 330bb2e81bac17bb45c91dccc3c5cfb433896a802233c083f587f64755149183
 Package tree SHA256 manifest: SHA256SUMS
 Git commit/tree/signature: populated by signed source-control receipt

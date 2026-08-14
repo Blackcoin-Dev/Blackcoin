@@ -40,23 +40,30 @@ wallet secret, or executable financial authority is checked in.
   no broadcast marker, and a queued payout absent from the awarded ledger;
 - a valid direct witness-v16 quantum payout script;
 - active unbound QQP2 work for that exact payout;
-- one safe, confirmed, wallet-owned legacy P2PKH input at the selected address;
-  and
-- a stable active tip, active-chain `gettxout(...,false)` value and script,
-  wallet inventory, queue bytes, and work projection.
+- the complete exact set of safe, confirmed, wallet-owned legacy P2PKH fee
+  inputs eligible for Core's address selector; every member must share one
+  exact wallet-owned address and script, and every outpoint, value, script,
+  confirmation count, and canonical set digest is bound; and
+- a stable active tip, active-chain `gettxout(...,false)` value and script for
+  every eligible member, wallet inventory, queue bytes, and work projection.
 
 The audit emits `audit.json` plus its SHA256 sidecar. Its
 `required_authority` member is only a template. A human must review the exact
 receipt, copy that member to a separate mode-0600 file, change only `decision`
 to `authorize`, insert the exact audit SHA256, and supply that authority's
 SHA256 explicitly. Every other field must remain byte-for-byte semantic JSON
-equal, including the exact queue, payout, fee input, active tip, work digest,
-wallet inventory digest, immutable queue-file identity digest, user order, fee
-rate, vsize, fee cap, maximum tries, and risk acknowledgements.
+equal, including the exact queue, payout, fee-input-set digest/count and sole
+address/script, active tip, work digest, wallet inventory digest, immutable
+queue-file identity digest, user order, fee rate, vsize, fee cap, maximum
+tries, and risk acknowledgements. The authority expressly acknowledges that
+installed Core cannot pre-bind the selected outpoint and may select any one
+member of only that immutable audited set.
 
 `execute` revalidates the complete audit, authority, runtime, wallet selection,
-queue, payout, active QQP2 work, fee input, tip, role, pause artifacts, and
-locks. It fsyncs a no-clobber `intent.json` before the only wallet-mutating RPC:
+queue, payout, active QQP2 work, complete fee-input set, tip, role, pause
+artifacts, and locks. It then immediately re-samples and compares the exact
+tip, wallet inventory and txid inventory, and every eligible set member before
+it fsyncs a no-clobber `intent.json` ahead of the only wallet-mutating RPC:
 
 ```text
 sendshadowpowclaim <exact legacy address> <exact queued witness-v16 address> 2000000 100
@@ -64,23 +71,27 @@ sendshadowpowclaim <exact legacy address> <exact queued witness-v16 address> 200
 
 There is no proof-override argument. The call budget is one. The exact RPC
 return is fsynced as `rpc-response.json` before any post-call RPC read. The tool
-then decodes the exact signed bytes and requires one audited input, two exact
-outputs, unbound PoW-mode QQP2 proof bytes for the audited target and queued
-payout scripts, exact size 287 vbytes, exact same-script change, and an
-independently computed fee of `0.00028700 BLK` (`287 * 100 atoms/vB`). Only
-then does it atomically rename the queue item to its `.broadcast` outcome and
-publish `broadcast-complete.json`.
+then decodes the exact signed bytes and requires exactly one input that is a
+member of the immutable audited set, two exact outputs, same audited
+address/script, unbound PoW-mode QQP2 proof bytes for the audited target and
+queued payout scripts, exact size 287 vbytes, exact same-script change, and an
+independently computed fee of `0.00028700 BLK` (`287 * 100 atoms/vB`) from that
+member's immediately re-proved active-chain value minus the signed output.
+Multiple inputs, a nonmember input, or a different address/script fail closed.
+Only then does it atomically rename the queue item to its `.broadcast` outcome
+and publish `broadcast-complete.json`.
 
 `reconcile` is the only permitted continuation after a killed process, timeout,
 lost response, malformed response, or unmatched intent. It never invokes
 `sendshadowpowclaim`. It serializes under the same locks, revalidates the exact
 wallet selection and receipt chain, compares the pre-call wallet txid
-inventory, queries the audited input's spender, loads candidate wallet bytes,
-and accepts only one transaction that independently reproduces the exact
-input, scripts, QQP2 proof, vsize, and fee. If no exact transaction is visible,
-it records an observation and leaves authority consumed. It never authorizes a
-retry. If an immediate response receipt survived, reconciliation heals a
-missing sidecar and binds that exact acknowledgment into the completion chain.
+inventory, queries every audited set member's spender, loads candidate wallet
+bytes, and accepts only one transaction that independently reproduces one
+exact member, the sole address/script, QQP2 proof, vsize, and fee. If no exact
+transaction is visible, it records an observation and leaves authority
+consumed. It never authorizes a retry. If an immediate response receipt
+survived, reconciliation heals a missing sidecar and binds that exact
+acknowledgment into the completion chain.
 
 `monitor` is read-only with respect to the wallet and chain. It re-proves the
 confirmed wallet transaction bytes against the immutable authorized evidence,
@@ -138,14 +149,19 @@ Installed v30.1.4 `sendshadowpowclaim` signs, wallet-persists, test-accepts, and
 broadcasts before returning. It has no plan/idempotency token, exact-input
 selector, caller-supplied maximum-total-fee parameter, or separate sign/commit
 phase. Its product-level fee cap is broader than this package's
-`0.00028700 BLK` authority. The package reduces pre-call uncertainty by binding
-one safe P2PKH target-address input and explicit `100 atoms/vB`, and it proves
-the actual fee from the signed bytes immediately after return. It cannot undo a
-transaction already broadcast by Core if those returned bytes violate the
-narrow cap. The separate authority therefore acknowledges this installed-API
-risk expressly. Requiring Core-enforced idempotency, exact-input selection, or
-a hard caller fee cap remains a public-product requirement, not a fleet
-workaround.
+`0.00028700 BLK` authority. On the audited installed wallet, one target address
+can hold multiple eligible fee UTXOs, so the installed RPC cannot truthfully
+pre-bind an exact outpoint. The package instead binds the complete eligible set
+at one exact wallet-owned address/script, re-proves every member and the wallet
+immediately before the call, and authorizes Core to select any one member of
+only that immutable set. It then proves the sole signed input is a member and
+computes the actual fee from that member's active-chain value and the signed
+same-script output. It cannot undo a transaction already broadcast by Core if
+those returned bytes use multiple inputs, a nonmember, or violate the narrow
+cap. The separate authority therefore acknowledges the exact-outpoint and
+installed-API risk expressly. Requiring Core-enforced idempotency, plan-bound
+or exact-input selection, or a hard caller fee cap remains a public-product
+requirement, not a fleet workaround.
 
 ## Controller runtime
 
@@ -231,7 +247,10 @@ storage-share mode, group, symlink, and path-swap hostiles;
 the root:root mode-0644 single-link queue-item contract, immutable authority
 binding, and wrong-group, wrong-mode, group/world-write, special-bit,
 hard-link, symlink, and inode-substitution hostiles;
-independent signed-byte fee proof; immediate acknowledgment
+the complete any-one-of-an-exact-audited-set fee contract, sole
+address/script, digest and member binding, immediate pre-call inventory/tip/
+wallet resampling, set drift, duplicate outpoint, multiple-address, multi-input,
+and nonmember hostiles; independent signed-byte fee proof; immediate acknowledgment
 ordering; response corruption and overprecision; process death before and
 after wallet persistence and after response publication; no-retry
 reconciliation; queue, awarded-ledger, confirmed, JSON, sidecar, and publisher

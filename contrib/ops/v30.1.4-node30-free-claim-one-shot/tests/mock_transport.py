@@ -26,6 +26,7 @@ QUANTUM_ADDRESS = "qfixtureWitnessV16"
 TARGET_SCRIPT = "76a914" + "1" * 40 + "88ac"
 PAYOUT_SCRIPT = "6020" + "2" * 64
 INPUT_TXID = hashlib.sha256(b"fee-input").hexdigest()
+INPUT_TXID_2 = hashlib.sha256(b"fee-input-2").hexdigest()
 CLAIM_TXID = hashlib.sha256(b"one-shot-claim").hexdigest()
 BASE_TXID = hashlib.sha256(b"preexisting-wallet-tx").hexdigest()
 INPUT_AMOUNT = "1.00000000"
@@ -41,7 +42,8 @@ def state_path() -> pathlib.Path:
 def load_state() -> dict:
     if state_path().exists():
         return json.loads(state_path().read_text())
-    return {"claim": False, "confirmed": False, "send_calls": 0}
+    return {"claim": False, "confirmed": False, "send_calls": 0,
+            "listunspent_calls": 0}
 
 
 def save_state(value: dict) -> None:
@@ -68,8 +70,13 @@ def decoded() -> dict:
     script = TARGET_SCRIPT if SCENARIO != "wrong-change-script" else "76a914" + "3" * 40 + "88ac"
     proof_script = ("6a4c53" if SCENARIO == "wrong-proof-script-encoding" else
                     "6a4c54") + proof_hex()
+    selected = (hashlib.sha256(b"not-an-audited-member").hexdigest()
+                if SCENARIO == "no-member-response" else INPUT_TXID_2)
+    vin = [{"txid": selected, "vout": 0, "sequence": 4294967293}]
+    if SCENARIO == "multi-vin-response":
+        vin.append({"txid": INPUT_TXID, "vout": 0, "sequence": 4294967293})
     return {"txid": CLAIM_TXID, "version": 2, "vsize": vsize,
-            "vin": [{"txid": INPUT_TXID, "vout": 0, "sequence": 4294967293}],
+            "vin": vin,
             "vout": [
                 {"n": 0, "value": change,
                  "scriptPubKey": {"hex": script, "type": "pubkeyhash"}},
@@ -97,8 +104,10 @@ def claim_result() -> dict:
 
 def role_rpc(method: str, state: dict) -> object:
     if method == "getblockchaininfo":
-        return {"chain": "main", "blocks": HEIGHT, "headers": HEIGHT,
-                "bestblockhash": TIP, "chainwork": CHAINWORK,
+        drift = SCENARIO == "precall-tip-drift" and state.get("listunspent_calls", 0) >= 5
+        return {"chain": "main", "blocks": HEIGHT + int(drift),
+                "headers": HEIGHT + int(drift),
+                "bestblockhash": "a" * 64 if drift else TIP, "chainwork": CHAINWORK,
                 "initialblockdownload": False, "pruned": False, "warnings": ""}
     if method == "getnetworkinfo":
         return {"version": 300104, "subversion": "/Blackcoin:30.1.4/"}
@@ -107,11 +116,12 @@ def role_rpc(method: str, state: dict) -> object:
     if method == "listwallets":
         return [""]
     if method == "getwalletinfo":
+        drift = SCENARIO == "precall-wallet-drift" and state.get("listunspent_calls", 0) >= 4
         return {"walletname": "", "format": "sqlite", "private_keys_enabled": True,
                 "external_signer": False, "scanning": False,
                 "unlocked_staking_only": False,
                 "unlocked_until": 2_000_000_000,
-                "txcount": 1500 + int(state["claim"])}
+                "txcount": 1500 + int(state["claim"]) + int(drift)}
     if method == "getstakinginfo":
         if SCENARIO == "pos-disabled":
             return {"enabled": True, "staking": False, "weight": 0}
@@ -143,15 +153,26 @@ def rpc(method: str, params: list[str]) -> object:
     except KeyError:
         pass
     if method == "listunspent":
-        rows = [{"txid": INPUT_TXID, "vout": 0, "address": LEGACY_ADDRESS,
+        state["listunspent_calls"] = state.get("listunspent_calls", 0) + 1
+        save_state(state)
+        first = {"txid": INPUT_TXID, "vout": 0, "address": LEGACY_ADDRESS,
                  "scriptPubKey": TARGET_SCRIPT, "amount": INPUT_AMOUNT,
                  "confirmations": 50, "spendable": True, "safe": True,
-                 "spendability_state": "spendable_legacy"}]
-        if SCENARIO == "multiple-target-inputs":
-            rows.append({**rows[0], "txid": hashlib.sha256(b"fee-input-2").hexdigest()})
+                 "spendability_state": "spendable_legacy"}
+        rows = [first, {**first, "txid": INPUT_TXID_2}]
+        if SCENARIO == "multiple-addresses":
+            rows.append({**first, "txid": hashlib.sha256(b"other-address-input").hexdigest(),
+                         "address": "BfixtureOtherTarget",
+                         "scriptPubKey": "76a914" + "9" * 40 + "88ac"})
+        if SCENARIO == "duplicate-outpoint":
+            rows.append(dict(first))
+        if SCENARIO == "precall-inventory-drift" and state["listunspent_calls"] >= 5:
+            rows = rows[1:]
         return rows
     if method == "gettxout":
         if state["claim"]:
+            return None
+        if params[0] not in {INPUT_TXID, INPUT_TXID_2} and SCENARIO != "multiple-addresses":
             return None
         return {"confirmations": 50, "value": INPUT_AMOUNT,
                 "scriptPubKey": {"hex": TARGET_SCRIPT}}
@@ -221,9 +242,12 @@ def rpc(method: str, params: list[str]) -> object:
             raise SystemExit(94)
         return decoded()
     if method == "gettxspendingprevout":
-        return [{"txid": INPUT_TXID, "vout": 0,
+        requested = json.loads(params[0])
+        return [{"txid": row["txid"], "vout": row["vout"],
                  **({"spendingtxid": CLAIM_TXID}
-                    if state["claim"] and not state["confirmed"] else {})}]
+                    if row["txid"] == INPUT_TXID_2 and state["claim"] and
+                    not state["confirmed"] else {})}
+                for row in requested]
     if method == "gettransaction":
         if params[0] != CLAIM_TXID or not state["claim"]:
             print("unknown mock wallet transaction", file=sys.stderr)

@@ -301,15 +301,31 @@ assert_jq '.result=="READY_FOR_SEPARATE_ONE_SHOT_AUTHORITY" and
   (.free_claim_storage_sha256|test("^[0-9a-f]{64}$")) and
   .required_authority.free_claim_storage_sha256==.free_claim_storage_sha256 and
   (.required_authority.queue_item_identity_sha256|test("^[0-9a-f]{64}$")) and
+  .snapshot.fee_input.selection_contract=="any-one-of-exact-audited-set/v1" and
+  .snapshot.fee_input.eligible_wallet_candidate_count==2 and
+  .snapshot.fee_input.eligible_address_script_group_count==1 and
+  .snapshot.fee_input.core_exact_outpoint_prebound==false and
+  (.snapshot.fee_input.members_sha256|test("^[0-9a-f]{64}$")) and
+  .required_authority.legacy_fee_input_set.members_sha256==.snapshot.fee_input.members_sha256 and
+  .required_authority.legacy_fee_input_set.member_count==2 and
+  .required_authority.acknowledgements.installed_rpc_cannot_prebind_the_exact_selected_outpoint==true and
+  .required_authority.acknowledgements.core_may_select_any_one_member_of_the_exact_audited_set==true and
+  .required_authority.acknowledgements.signed_transaction_must_spend_exactly_one_audited_member==true and
   .required_authority.proof_override==null and .required_authority.maximum_fee_blk=="0.00028700"' \
   "$HAPPY/run/audit.json"
 assert_eq "$(grep -c sendshadowpowclaim "$HAPPY/state/transport.log" || true)" 0
 assert_eq "$(sha "$HAPPY/run/audit.json")" "$AUDIT_SHA"
 
 invoke "$HAPPY" happy execute >"$HAPPY/execute.out"
+assert_jq '.pre_call_resample.matched_audit==true and
+  .pre_call_resample.chain.height==5991700 and .pre_call_resample.chain.tip==("f"*64) and
+  .pre_call_resample.fee_input_members_sha256==.fee_input.members_sha256 and
+  .pre_call_resample.wallet_txids_sha256==.wallet_txids_before_sha256 and
+  .pre_call_resample.wallet_inventory!=null' "$HAPPY/run/intent.json"
 assert_jq '.result=="EXACT_ONE_SHOT_BROADCAST" and .sendshadowpowclaim_call_count==1 and
   .proof_override_used==false and .transaction.fee.actual_fee_blk=="0.00028700" and
   .transaction.fee.independently_computed==true and .transaction.fee.vsize==287 and
+  (.transaction.input.audited_set_sha256|test("^[0-9a-f]{64}$")) and
   .queue_outcome.state=="broadcast" and .pause_preserved==true and
   .ordinary_pow_enabled==false and .recurring_worker_invoked==false' \
   "$HAPPY/run/broadcast-complete.json"
@@ -463,7 +479,8 @@ assert_jq '.queue_outcome.state=="confirmed" and .queue_outcome.already_complete
 assert_eq "$(grep -c sendshadowpowclaim "$CONFIRMED_CRASH/state/transport.log")" 1
 
 # Audit hostiles fail before authority or wallet mutation.
-for scenario in wrong-witness qqp3 pow-enabled pos-disabled blocking multiple-target-inputs; do
+for scenario in wrong-witness qqp3 pow-enabled pos-disabled blocking \
+                multiple-addresses duplicate-outpoint; do
     ROOT_CASE=$(make_fixture "audit-$scenario")
     assert_fails "audit rejects $scenario" run_audit "$ROOT_CASE" "$scenario"
     assert_eq "$(grep -c sendshadowpowclaim "$ROOT_CASE/state/transport.log" || true)" 0
@@ -592,6 +609,7 @@ for filter in \
   '.controller_runtime_sha256=("0"*64)' \
   '.free_claim_storage_sha256=("0"*64)' \
   '.queue_item_identity_sha256=("0"*64)' \
+  '.legacy_fee_input_set.members_sha256=("0"*64)' \
   '.extra=true'; do
     jq "$filter" "$AUTH/authority.json" >"$AUTH/bad-authority.json"
     chmod 0600 "$AUTH/bad-authority.json"
@@ -620,7 +638,7 @@ assert_eq "$(grep -c sendshadowpowclaim "$AUTH_LINK/state/transport.log" || true
 # uncertain. It cannot authorize a retry.
 for scenario in malformed-response wrong-address-response wrong-proof-payout \
                 wrong-change-script wrong-proof-script-encoding over-cap \
-                overprecision-fee; do
+                overprecision-fee multi-vin-response no-member-response; do
     BAD=$(make_fixture "response-$scenario")
     run_audit "$BAD" >/dev/null
     assert_fails "response rejects $scenario" invoke "$BAD" "$scenario" execute
@@ -632,6 +650,20 @@ for scenario in malformed-response wrong-address-response wrong-proof-payout \
     assert_eq "$(grep -c sendshadowpowclaim "$BAD/state/transport.log")" 1
     assert_fails "bad response $scenario cannot execute twice" invoke "$BAD" happy execute
     assert_eq "$(grep -c sendshadowpowclaim "$BAD/state/transport.log")" 1
+done
+
+# The exact two-member set is sampled twice during execution and once again
+# with the exact tip and full wallet inventory immediately before the durable
+# intent/call boundary. Any of those three boundaries drifting fails before
+# sendshadowpowclaim or authority consumption.
+for scenario in precall-inventory-drift precall-wallet-drift precall-tip-drift; do
+    PRECALL_DRIFT=$(make_fixture "$scenario")
+    run_audit "$PRECALL_DRIFT" "$scenario" >/dev/null
+    assert_fails "immediate $scenario fails closed" \
+      invoke "$PRECALL_DRIFT" "$scenario" execute
+    assert_eq "$(grep -c sendshadowpowclaim "$PRECALL_DRIFT/state/transport.log" || true)" 0
+    assert_fails "$scenario publishes no consumed intent" \
+      test -e "$PRECALL_DRIFT/run/intent.json"
 done
 
 # Confirmation without exact indexed quantum credit never updates the awarded

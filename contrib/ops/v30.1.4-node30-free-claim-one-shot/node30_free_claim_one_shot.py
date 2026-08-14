@@ -74,7 +74,7 @@ QQP2_MAGIC = b"QQP2"
 NODE30_PRIMITIVE_RELATIVE = pathlib.Path(
     "../v30.1.4-node30-retained-claim-recovery/node30_recovery.py")
 NODE30_PRIMITIVE_SHA256 = "41c4bbc7d0aa6a3e21715937abda13f9ece879cfb34c4517cf87a6dd3835f605"
-TEST_TRANSPORT_SHA256 = "c1987a9646d5a9f375f7e982f59ef9c29b1f1434d4990c4005ab9e9454bebc9e"
+TEST_TRANSPORT_SHA256 = "d4918297a48bd80195d0f58b8e8839dc663a1e1b9fdaf807f0f7b17f7342c53b"
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -644,7 +644,8 @@ def validate_payout_address(transport: Any, node: Any, address: str) -> dict[str
             "ismine": wallet["ismine"], "iswatchonly": wallet["iswatchonly"]}
 
 
-def select_fee_input(transport: Any, node: Any) -> dict[str, Any]:
+def fee_input_inventory(transport: Any, node: Any) -> dict[str, Any]:
+    """Bind every eligible member at the one exact RPC-selectable address."""
     rows = transport.rpc(node, "listunspent", 1, 9_999_999)
     if not isinstance(rows, list):
         die("listunspent is not an array")
@@ -668,26 +669,81 @@ def select_fee_input(transport: Any, node: Any) -> dict[str, Any]:
     if not candidates:
         die("node30 has no safe confirmed spendable P2PKH legacy fee UTXO")
     candidates.sort(key=lambda row: (row["txid"], row["vout"]))
-    selected = candidates[0]
-    same_address = [row for row in candidates if row["address"] == selected["address"]]
-    if len(same_address) != 1:
-        die("selected target address has more than one eligible fee input")
-    address = transport.rpc(node, "getaddressinfo", selected["address"])
-    if (not isinstance(address, dict) or address.get("address") != selected["address"] or
+    outpoints = [(row["txid"], row["vout"]) for row in candidates]
+    if len(outpoints) != len(set(outpoints)):
+        die("eligible fee-input inventory contains a duplicate outpoint")
+    groups = sorted({(row["address"], row["scriptPubKey"]) for row in candidates})
+    if len(groups) != 1:
+        die("eligible fee inputs do not share one exact address and script")
+    target_address, target_script = groups[0]
+    address = transport.rpc(node, "getaddressinfo", target_address)
+    if (not isinstance(address, dict) or address.get("address") != target_address or
             address.get("ismine") is not True or address.get("iswatchonly") is not False or
             address.get("solvable") is not True or
-            address.get("scriptPubKey") != selected["scriptPubKey"]):
+            address.get("scriptPubKey") != target_script):
         die("selected legacy fee address is not exact wallet-owned P2PKH")
-    coin = transport.rpc(node, "gettxout", selected["txid"], selected["vout"], False)
-    if (not isinstance(coin, dict) or
-            decimal_amount(coin.get("value"), "active fee input value") !=
-            Decimal(selected["amount"]) or
-            coin.get("scriptPubKey", {}).get("hex") != selected["scriptPubKey"]):
-        die("selected legacy fee UTXO is not exact on the active UTXO set")
-    selected["coin"] = {"value": selected["amount"], "scriptPubKey": selected["scriptPubKey"]}
-    selected["eligible_wallet_candidate_count"] = len(candidates)
-    selected["same_address_candidate_count"] = 1
-    return selected
+    members: list[dict[str, Any]] = []
+    for candidate in candidates:
+        coin = transport.rpc(node, "gettxout", candidate["txid"], candidate["vout"], False)
+        if (not isinstance(coin, dict) or
+                decimal_amount(coin.get("value"), "active fee input value") !=
+                Decimal(candidate["amount"]) or
+                coin.get("scriptPubKey", {}).get("hex") != target_script or
+                type(coin.get("confirmations")) is not int or coin["confirmations"] < 1):
+            die("eligible legacy fee UTXO is not exact on the active UTXO set")
+        members.append({**candidate,
+                        "coin": {"value": candidate["amount"],
+                                 "scriptPubKey": target_script,
+                                 "confirmations": coin["confirmations"]}})
+    digest = sha256_json(members)
+    return {"selection_contract": "any-one-of-exact-audited-set/v1",
+            "address": target_address, "scriptPubKey": target_script,
+            "members": members, "members_sha256": digest,
+            "eligible_wallet_candidate_count": len(members),
+            "eligible_address_script_group_count": 1,
+            "core_exact_outpoint_prebound": False}
+
+
+def audited_fee_member(inventory: Any, txid: Any, vout: Any) -> dict[str, Any]:
+    if (not isinstance(inventory, dict) or
+            inventory.get("selection_contract") != "any-one-of-exact-audited-set/v1" or
+            not isinstance(inventory.get("members"), list) or
+            inventory.get("members_sha256") != sha256_json(inventory["members"])):
+        die("audited fee-input inventory is malformed")
+    matches = [member for member in inventory["members"]
+               if isinstance(member, dict) and member.get("txid") == txid and
+               member.get("vout") == vout]
+    if len(matches) != 1:
+        die("signed claim input is not exactly one member of the audited set")
+    member = matches[0]
+    if (member.get("address") != inventory.get("address") or
+            member.get("scriptPubKey") != inventory.get("scriptPubKey")):
+        die("audited fee-input member differs from the exact address and script")
+    return member
+
+
+def fee_inventory_authority(inventory: dict[str, Any]) -> dict[str, Any]:
+    return {"selection_contract": inventory["selection_contract"],
+            "address": inventory["address"], "scriptPubKey": inventory["scriptPubKey"],
+            "members_sha256": inventory["members_sha256"],
+            "member_count": inventory["eligible_wallet_candidate_count"],
+            "core_exact_outpoint_prebound": False}
+
+
+def pre_call_resample(transport: Any, node: Any) -> dict[str, Any]:
+    """Bracket the exact mutable inputs immediately before intent publication."""
+    chain_before = node30.base.validate_chain(transport.rpc(node, "getblockchaininfo"), NODE)
+    role = node30.role_snapshot(transport, node, False)
+    inventory = fee_input_inventory(transport, node)
+    txids = wallet_txids(transport, node)
+    chain_after = node30.base.validate_chain(transport.rpc(node, "getblockchaininfo"), NODE)
+    if node30.base.chain_identity(chain_before) != node30.base.chain_identity(chain_after):
+        die("node30 tip moved during immediate pre-call resample")
+    return {"chain": {"height": chain_after["blocks"],
+                      "tip": chain_after["bestblockhash"]},
+            "wallet_inventory": role["wallet_inventory"],
+            "fee_input": inventory, "wallet_txids": txids,
+            "wallet_txids_sha256": sha256_json(txids)}
 
 
 def validate_work(work: Any, chain: dict[str, Any], selected: dict[str, Any],
@@ -724,7 +780,7 @@ def stable_live_snapshot(transport: Any, contract: Contract, exact_node: Any,
         die("internal queue snapshot error")
     payout = validate_payout_address(
         transport, exact_node, queue["item"]["record"]["quantum_address"])
-    selected = select_fee_input(transport, exact_node)
+    selected = fee_input_inventory(transport, exact_node)
     goldrush = transport.rpc(exact_node, "getgoldrushinfo")
     if (not isinstance(goldrush, dict) or goldrush.get("active") is not True or
             goldrush.get("competing_claim_rule_active_next_block") is not False or
@@ -733,15 +789,12 @@ def stable_live_snapshot(transport: Any, contract: Contract, exact_node: Any,
     work = validate_work(
         transport.rpc(exact_node, "getshadowpowwork", selected["address"], payout["address"]),
         chain_before, selected, payout)
-    coin_after = transport.rpc(exact_node, "gettxout", selected["txid"], selected["vout"], False)
+    selected_after = fee_input_inventory(transport, exact_node)
     chain_after = node30.base.validate_chain(
         transport.rpc(exact_node, "getblockchaininfo"), NODE)
     if (node30.base.chain_identity(chain_before) != node30.base.chain_identity(chain_after) or
-            not isinstance(coin_after, dict) or
-            decimal_amount(coin_after.get("value"), "bracketed fee input value") !=
-            Decimal(selected["amount"]) or
-            coin_after.get("scriptPubKey", {}).get("hex") != selected["scriptPubKey"]):
-        die("node30 tip or selected fee input moved during audit")
+            selected_after != selected):
+        die("node30 tip or eligible fee-input inventory moved during audit")
     txids = wallet_txids(transport, exact_node)
     return {"chain": {"height": chain_after["blocks"], "tip": chain_after["bestblockhash"]},
             "role": role, "queue": queue, "payout": payout, "fee_input": selected,
@@ -800,8 +853,7 @@ def audit_command(args: argparse.Namespace) -> None:
         "queue_item_basename": snapshot["queue"]["item"]["basename"],
         "quantum_address": snapshot["payout"]["address"],
         "quantum_payout_script": snapshot["payout"]["scriptPubKey"],
-        "legacy_fee_input": {key: snapshot["fee_input"][key]
-                             for key in ["txid", "vout", "address", "scriptPubKey", "amount"]},
+        "legacy_fee_input_set": fee_inventory_authority(snapshot["fee_input"]),
         "active_tip": snapshot["chain"]["tip"],
         "active_height": snapshot["chain"]["height"],
         "work_sha256": sha256_json(snapshot["work"]),
@@ -825,6 +877,9 @@ def audit_command(args: argparse.Namespace) -> None:
             "fee_sign_and_broadcast_are_irreversible": True,
             "installed_rpc_has_no_idempotency_token": True,
             "installed_rpc_has_no_exact_input_or_max_total_fee_parameter": True,
+            "installed_rpc_cannot_prebind_the_exact_selected_outpoint": True,
+            "core_may_select_any_one_member_of_the_exact_audited_set": True,
+            "signed_transaction_must_spend_exactly_one_audited_member": True,
             "unknown_response_consumes_authority_and_must_never_be_retried": True,
             "actual_fee_must_be_independently_proved_from_exact_signed_bytes": True,
             "free_claim_pause_remains_present": True,
@@ -853,8 +908,7 @@ def validate_authority(authority: Any, contract: Contract, audit: dict[str, Any]
         "queue_item_basename": snapshot["queue"]["item"]["basename"],
         "quantum_address": snapshot["payout"]["address"],
         "quantum_payout_script": snapshot["payout"]["scriptPubKey"],
-        "legacy_fee_input": {key: snapshot["fee_input"][key]
-                             for key in ["txid", "vout", "address", "scriptPubKey", "amount"]},
+        "legacy_fee_input_set": fee_inventory_authority(snapshot["fee_input"]),
         "active_tip": snapshot["chain"]["tip"], "active_height": snapshot["chain"]["height"],
         "work_sha256": sha256_json(snapshot["work"]),
         "wallet_txids_before_sha256": snapshot["wallet_txids_before_sha256"],
@@ -870,6 +924,9 @@ def validate_authority(authority: Any, contract: Contract, audit: dict[str, Any]
             "fee_sign_and_broadcast_are_irreversible": True,
             "installed_rpc_has_no_idempotency_token": True,
             "installed_rpc_has_no_exact_input_or_max_total_fee_parameter": True,
+            "installed_rpc_cannot_prebind_the_exact_selected_outpoint": True,
+            "core_may_select_any_one_member_of_the_exact_audited_set": True,
+            "signed_transaction_must_spend_exactly_one_audited_member": True,
             "unknown_response_consumes_authority_and_must_never_be_retried": True,
             "actual_fee_must_be_independently_proved_from_exact_signed_bytes": True,
             "free_claim_pause_remains_present": True,
@@ -896,6 +953,12 @@ def load_intent(run_dir: pathlib.Path, contract: Contract, audit: dict[str, Any]
                 authority_sha: str) -> tuple[dict[str, Any], str]:
     intent, digest = node30.load_run_receipt(run_dir, "intent.json")
     validate_common(intent, "node30-free-claim-one-shot-intent", contract)
+    expected_pre_call = {
+        "matched_audit": True, "chain": audit["snapshot"]["chain"],
+        "fee_input_members_sha256": audit["snapshot"]["fee_input"]["members_sha256"],
+        "wallet_txids_sha256": audit["snapshot"]["wallet_txids_before_sha256"],
+        "wallet_inventory": audit["snapshot"]["role"]["wallet_inventory"],
+    }
     if (intent.get("state") != "AUTHORITY_CONSUMED_RPC_PENDING_OR_COMPLETE" or
             intent.get("audit_receipt_sha256") != audit_sha or
             intent.get("authority_sha256") != authority_sha or
@@ -911,6 +974,7 @@ def load_intent(run_dir: pathlib.Path, contract: Contract, audit: dict[str, Any]
             intent.get("wallet_txids_before") != audit["snapshot"]["wallet_txids_before"] or
             intent.get("wallet_txids_before_sha256") !=
             audit["snapshot"]["wallet_txids_before_sha256"] or
+            intent.get("pre_call_resample") != expected_pre_call or
             intent.get("call_budget") != 1 or intent.get("calls_completed_before_intent") != 0):
         die("one-shot intent is not the exact consumed authority")
     return intent, digest
@@ -983,9 +1047,9 @@ def signed_transaction_evidence(transport: Any, node: Any, raw: Any,
             not isinstance(decoded.get("vout"), list) or len(decoded["vout"]) != 2):
         die("signed claim transaction identity or 287-vB shape changed")
     vin = decoded["vin"][0]
-    if (vin.get("txid") != intent["fee_input"]["txid"] or
-            vin.get("vout") != intent["fee_input"]["vout"]):
-        die("signed claim transaction does not spend the exact audited fee input")
+    if not isinstance(vin, dict):
+        die("signed claim transaction input is malformed")
+    member = audited_fee_member(intent["fee_input"], vin.get("txid"), vin.get("vout"))
     outputs = sorted(decoded["vout"], key=lambda row: row.get("n", -1))
     if [row.get("n") for row in outputs] != [0, 1]:
         die("signed claim transaction output indexes changed")
@@ -997,7 +1061,7 @@ def signed_transaction_evidence(transport: Any, node: Any, raw: Any,
             proof_out.get("scriptPubKey", {}).get("hex") != op_return_script(raw["proof"]) or
             proof_out.get("scriptPubKey", {}).get("asm") != "OP_RETURN " + raw["proof"]):
         die("signed claim outputs do not preserve change script and exact QQSPROOF bytes")
-    input_amount = Decimal(intent["fee_input"]["amount"])
+    input_amount = Decimal(member["amount"])
     change_amount = decimal_amount(change.get("value"), "signed claim change")
     actual_fee = (input_amount - change_amount).quantize(Decimal("0.00000001"))
     if (actual_fee <= ZERO or actual_fee > FEE_CAP or actual_fee != FEE_CAP or
@@ -1008,8 +1072,9 @@ def signed_transaction_evidence(transport: Any, node: Any, raw: Any,
     return {
         "identity": {"txid": txid, "hex": txhex,
                      "hex_sha256": hashlib.sha256(bytes.fromhex(txhex)).hexdigest()},
-        "input": {key: intent["fee_input"][key]
-                  for key in ["txid", "vout", "amount", "scriptPubKey", "address"]},
+        "input": {**{key: member[key]
+                     for key in ["txid", "vout", "amount", "scriptPubKey", "address"]},
+                  "audited_set_sha256": intent["fee_input"]["members_sha256"]},
         "output": {"n": 0, "amount": f"{change_amount:.8f}",
                    "scriptPubKey": intent["fee_input"]["scriptPubKey"]},
         "proof_output": {"n": 1, "amount": "0.00000000",
@@ -1042,9 +1107,15 @@ def validate_transaction_receipt(value: Any, intent: dict[str, Any],
             len(txhex) % 2 or identity.get("hex_sha256") !=
             hashlib.sha256(bytes.fromhex(txhex)).hexdigest()):
         die(f"{label} exact transaction bytes are malformed")
-    expected_input = {key: intent["fee_input"][key]
-                      for key in ["txid", "vout", "amount", "scriptPubKey", "address"]}
-    if value.get("input") != expected_input or value.get("payout") != intent["payout"]:
+    stored_input = value.get("input")
+    if not isinstance(stored_input, dict):
+        die(f"{label} input projection is malformed")
+    member = audited_fee_member(
+        intent["fee_input"], stored_input.get("txid"), stored_input.get("vout"))
+    expected_input = {**{key: member[key]
+                         for key in ["txid", "vout", "amount", "scriptPubKey", "address"]},
+                      "audited_set_sha256": intent["fee_input"]["members_sha256"]}
+    if stored_input != expected_input or value.get("payout") != intent["payout"]:
         die(f"{label} input or payout differs from the consumed intent")
     output = value.get("output")
     proof_output = value.get("proof_output")
@@ -1064,7 +1135,7 @@ def validate_transaction_receipt(value: Any, intent: dict[str, Any],
     if value.get("proof") != parsed_proof or value.get("external_proof") is not False:
         die(f"{label} proof projection differs from the exact QQP2 bytes")
     fee = value.get("fee")
-    input_amount = decimal_amount(intent["fee_input"]["amount"], f"{label} input amount")
+    input_amount = decimal_amount(member["amount"], f"{label} input amount")
     output_amount = decimal_amount(output.get("amount"), f"{label} output amount")
     actual_fee = (input_amount - output_amount).quantize(Decimal("0.00000001"))
     if (not isinstance(fee, dict) or fee != {
@@ -1172,6 +1243,16 @@ def execute_command(args: argparse.Namespace) -> None:
         node30.same_wallet_inventory(expected["role"]["wallet_inventory"],
                                      current["role"]["wallet_inventory"],
                                      "one-shot audit to execution")
+        immediate = pre_call_resample(transport, exact_node)
+        if (immediate["chain"] != current["chain"] or
+                immediate["fee_input"] != current["fee_input"] or
+                immediate["wallet_txids"] != current["wallet_txids_before"] or
+                immediate["wallet_txids_sha256"] != current["wallet_txids_before_sha256"] or
+                immediate["wallet_inventory"] != current["role"]["wallet_inventory"]):
+            die("immediate pre-call tip, wallet, or fee-input set differs from the audit")
+        node30.same_wallet_inventory(current["role"]["wallet_inventory"],
+                                     immediate["wallet_inventory"],
+                                     "one-shot immediate pre-call resample")
         intent = base_receipt("node30-free-claim-one-shot-intent", contract)
         intent.update({
             "state": "AUTHORITY_CONSUMED_RPC_PENDING_OR_COMPLETE",
@@ -1184,6 +1265,12 @@ def execute_command(args: argparse.Namespace) -> None:
             "fee_input": current["fee_input"], "payout": current["payout"],
             "work": current["work"], "wallet_txids_before": current["wallet_txids_before"],
             "wallet_txids_before_sha256": current["wallet_txids_before_sha256"],
+            "pre_call_resample": {
+                "matched_audit": True, "chain": immediate["chain"],
+                "fee_input_members_sha256": immediate["fee_input"]["members_sha256"],
+                "wallet_txids_sha256": immediate["wallet_txids_sha256"],
+                "wallet_inventory": immediate["wallet_inventory"],
+            },
             "call_budget": 1, "calls_completed_before_intent": 0,
             "lock_identities": lock_ids, "created_at": node30.base.utc_now(),
         })
@@ -1269,16 +1356,19 @@ def reconcile_candidates(transport: Any, node: Any, intent: dict[str, Any]) -> l
     current = wallet_txids(transport, node)
     before = set(intent["wallet_txids_before"])
     candidate_ids = set(current) - before
-    spending = transport.rpc(node, "gettxspendingprevout", [{
-        "txid": intent["fee_input"]["txid"], "vout": intent["fee_input"]["vout"]}])
-    if (not isinstance(spending, list) or len(spending) != 1 or
-            spending[0].get("txid") != intent["fee_input"]["txid"] or
-            spending[0].get("vout") != intent["fee_input"]["vout"]):
+    outpoints = [{"txid": member["txid"], "vout": member["vout"]}
+                 for member in intent["fee_input"]["members"]]
+    spending = transport.rpc(node, "gettxspendingprevout", outpoints)
+    if not isinstance(spending, list) or len(spending) != len(outpoints):
         die("gettxspendingprevout response changed")
-    spender = spending[0].get("spendingtxid")
-    if spender:
-        require_hex64(spender, "mempool spender txid")
-        candidate_ids.add(spender)
+    for expected, observed in zip(outpoints, spending):
+        if (not isinstance(observed, dict) or observed.get("txid") != expected["txid"] or
+                observed.get("vout") != expected["vout"]):
+            die("gettxspendingprevout response changed")
+        spender = observed.get("spendingtxid")
+        if spender:
+            require_hex64(spender, "mempool spender txid")
+            candidate_ids.add(spender)
     exact: list[dict[str, Any]] = []
     for txid in sorted(candidate_ids):
         try:

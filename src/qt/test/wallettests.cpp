@@ -1019,8 +1019,43 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     const QString expected_payout = QString::fromStdString(info.payout_address);
     // Full-detail wallet walks run on WalletWorker. The Qt event thread only
     // queues the refresh and applies one immutable result.
+    QSignalSpy payout_snapshot_ready(
+        &walletModel, &WalletModel::stakingMiningSnapshotReady);
+    std::promise<void> payout_main_lock_held;
+    std::promise<void> release_payout_main_lock;
+    std::shared_future<void> payout_main_lock_release =
+        release_payout_main_lock.get_future().share();
+    std::thread payout_main_lock_holder([&] {
+        LOCK(cs_main);
+        payout_main_lock_held.set_value();
+        payout_main_lock_release.wait();
+    });
+    payout_main_lock_held.get_future().wait();
+    const interfaces::WalletPowMiningInfo unavailable_info =
+        walletModel.wallet().getPowMiningInfo();
     refresh_details->click();
-    QTRY_COMPARE_WITH_TIMEOUT(pow_payout->text(), expected_payout, 20000);
+
+    // Queue while cs_main is unavailable, then acquire cs_wallet before
+    // releasing cs_main. This overlapping lock handoff forces the worker's
+    // first PoW sub-read to be incomplete without delaying the GUI thread.
+    std::promise<void> payout_wallet_lock_held;
+    std::promise<void> release_payout_wallet_lock;
+    std::shared_future<void> payout_wallet_lock_release =
+        release_payout_wallet_lock.get_future().share();
+    std::thread payout_wallet_lock_holder([&] {
+        LOCK(core_wallet->cs_wallet);
+        payout_wallet_lock_held.set_value();
+        payout_wallet_lock_release.wait();
+    });
+    payout_wallet_lock_held.get_future().wait();
+    release_payout_main_lock.set_value();
+    payout_main_lock_holder.join();
+    release_payout_wallet_lock.set_value();
+    payout_wallet_lock_holder.join();
+    QVERIFY(!unavailable_info.payout_address_available);
+    QTRY_COMPARE_WITH_TIMEOUT(payout_snapshot_ready.count(), 1, 20000);
+    QVERIFY(refresh_hint->text().contains(QStringLiteral("Detail panels updated")));
+    QCOMPARE(pow_payout->text(), expected_payout);
     QVERIFY(pow_copy->isEnabled());
 
     pow_copy->click();

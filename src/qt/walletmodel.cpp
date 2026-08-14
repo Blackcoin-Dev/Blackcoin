@@ -320,6 +320,23 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
 
             snapshot->pool = m_wallet->getQuantumPoolInfo();
             if (checkpoint()) { publish(); return; }
+            // getPowMiningInfo() deliberately uses try-locks so callers never
+            // stall a GUI thread. A transient miss is not an authoritative
+            // empty payout or eligibility state. The intervening detail reads
+            // have crossed the same wallet/chain locks, so resample once and
+            // reject the whole snapshot if it is still incomplete.
+            if (!snapshot->pow.payout_address_available ||
+                !snapshot->pow.wallet_goldrush_status_available) {
+                snapshot->pow = m_wallet->getPowMiningInfo();
+                if (checkpoint()) { publish(); return; }
+                if (!snapshot->pow.payout_address_available ||
+                    !snapshot->pow.wallet_goldrush_status_available) {
+                    snapshot->error =
+                        "Wallet mining details are temporarily unavailable; retry the refresh";
+                    publish();
+                    return;
+                }
+            }
             snapshot->end_tip = m_node.getBestBlockHash().GetHex();
             snapshot->stale_tip = snapshot->start_tip != snapshot->end_tip ||
                 (!request.expected_tip.empty() && snapshot->end_tip != request.expected_tip);

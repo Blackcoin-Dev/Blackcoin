@@ -1363,6 +1363,293 @@ offline_plan_contract_is_safe()
 expect_pass 'offline plan without authority is read-only and reports deployment disabled' \
   offline_plan_contract_is_safe
 
+gen2_previous="$tmp/gen2-previous-authority.json"
+gen2_successor="$tmp/gen2-successor-authority.json"
+gen2_supervisor_sha=$(sha256sum "$supervisor" | awk '{print $1}')
+gen2_package_sha=$(sha256sum "$package_dir/SHA256SUMS" | awk '{print $1}')
+gen2_topology_sha=$(sha256sum "$TOPOLOGY_MAP" | awk '{print $1}')
+gen2_job10_sha=$(sha256sum "$JOB10_CONTRACT" | awk '{print $1}')
+make_authority "$gen2_previous" "$manifest_map" "$hex_a" "$hex_b" \
+  "$gen2_topology_sha" "$gen2_job10_sha"
+gen2_previous_sha=$(sha256sum "$gen2_previous" | awk '{print $1}')
+jq --arg nonce fedcba9876543210fedcba9876543210 \
+  --arg predecessor "$gen2_previous_sha" --arg supervisor "$gen2_supervisor_sha" \
+  --arg package "$gen2_package_sha" --argjson issued "$test_now" \
+  --argjson valid_from "$test_now" --argjson valid_until "$((test_now + 86400))" '
+  .authority_generation=2 | .authority_nonce=$nonce |
+  .supersedes_authority_sha256=$predecessor | .issued_at_epoch=$issued |
+  .valid_from_epoch=$valid_from | .valid_until_epoch=$valid_until |
+  .supervisor_sha256=$supervisor | .package_manifest_sha256=$package
+' "$gen2_previous" >"$gen2_successor"
+chmod 600 "$gen2_previous" "$gen2_successor"
+gen2_successor_sha=$(sha256sum "$gen2_successor" | awk '{print $1}')
+expect_pass 'generation-two code upgrade accepts only the exact next authority and source identities' \
+  renewal_gen2_successor_relation_is_valid_for "$gen2_successor" "$gen2_successor_sha" \
+    "$test_now" "$gen2_previous" "$gen2_previous_sha" "$supervisor" \
+    "$JOB10_CONTRACT" "$TOPOLOGY_MAP" "$package_dir/SHA256SUMS"
+
+gen2_bad="$tmp/gen2-bad-authority.json"
+jq '.authority_generation=3' "$gen2_successor" >"$gen2_bad"; chmod 600 "$gen2_bad"
+expect_fail 'generation-two code upgrade rejects a skipped authority generation' \
+  renewal_gen2_successor_relation_is_valid_for "$gen2_bad" \
+    "$(sha256sum "$gen2_bad" | awk '{print $1}')" "$test_now" "$gen2_previous" \
+    "$gen2_previous_sha" "$supervisor" "$JOB10_CONTRACT" "$TOPOLOGY_MAP" \
+    "$package_dir/SHA256SUMS"
+jq '.regular_pow_mutation_rpc_forbidden=false' "$gen2_successor" >"$gen2_bad"; chmod 600 "$gen2_bad"
+expect_fail 'generation-two code upgrade cannot broaden ordinary-PoW mutation policy' \
+  renewal_gen2_successor_relation_is_valid_for "$gen2_bad" \
+    "$(sha256sum "$gen2_bad" | awk '{print $1}')" "$test_now" "$gen2_previous" \
+    "$gen2_previous_sha" "$supervisor" "$JOB10_CONTRACT" "$TOPOLOGY_MAP" \
+    "$package_dir/SHA256SUMS"
+expect_fail 'generation-two code upgrade rejects a mismatched predecessor identity' \
+  renewal_gen2_successor_relation_is_valid_for "$gen2_successor" "$gen2_successor_sha" \
+    "$test_now" "$gen2_previous" "$hex_e" "$supervisor" "$JOB10_CONTRACT" \
+    "$TOPOLOGY_MAP" "$package_dir/SHA256SUMS"
+
+gen2_rotation_authority="$tmp/gen2-rotation-authority.json"
+gen2_plan_sha=$hex_e
+jq -nS --arg nonce 00112233445566778899aabbccddeeff \
+  --argjson issued "$((test_now - 2))" --argjson valid_from "$((test_now - 1))" \
+  --argjson valid_until "$((test_now + 1000))" --arg plan "$gen2_plan_sha" \
+  --arg successor "$gen2_successor_sha" \
+  --arg predecessor "$GEN2_PREDECESSOR_AUTHORITY_SHA256" \
+  --arg supervisor "$gen2_supervisor_sha" --arg package "$gen2_package_sha" \
+  --arg historical "$GEN2_HISTORICAL_JOB10_RECEIPT_SHA256" '{
+    schema:1,kind:"blackcoin-pos-supervisor-generation-2-rotation-authority",state:"authorized",
+    authority_nonce:$nonce,issued_at_epoch:$issued,valid_from_epoch:$valid_from,
+    valid_until_epoch:$valid_until,plan_sha256:$plan,successor_authority_sha256:$successor,
+    predecessor_authority_sha256:$predecessor,source_supervisor_sha256:$supervisor,
+    source_package_manifest_sha256:$package,historical_job10_receipt_sha256:$historical,
+    initial_run_authorized:true,cron_activation_authorized:true,
+    financial_action_authorized:false,node30_role_change_authorized:false,
+    reindex_rewind_repair_authorized:false
+  }' >"$gen2_rotation_authority"
+chmod 600 "$gen2_rotation_authority"
+gen2_rotation_sha=$(sha256sum "$gen2_rotation_authority" | awk '{print $1}')
+ORIGINAL_SECURE_FILE_FOR_OWNER=$(declare -f renewal_secure_file_for_owner)
+# shellcheck disable=SC2329 # Invoked indirectly by the authority validator under test.
+renewal_secure_file_for_owner()
+{
+    local actual
+    actual=$(stat -c '%a:%h' "$1" 2>/dev/null || stat -f '%Lp:%l' "$1" 2>/dev/null) || return 1
+    [[ -f "$1" && ! -L "$1" && "$actual" == "$2:1" ]]
+}
+expect_pass 'owner-only rotation authority binds the exact plan, code, predecessor, and safe actions' \
+  renewal_gen2_rotation_authority_is_valid "$gen2_rotation_authority" "$gen2_rotation_sha" \
+    "$gen2_plan_sha" "$gen2_successor_sha" "$test_now"
+gen2_rotation_mutations=(
+  '.financial_action_authorized=true'
+  '.node30_role_change_authorized=true'
+  '.reindex_rewind_repair_authorized=true'
+  '.cron_activation_authorized=false'
+  '.plan_sha256=("0"*64)'
+  '.valid_until_epoch=(.issued_at_epoch+3601)'
+  '.extra=true'
+)
+for mutation in "${gen2_rotation_mutations[@]}"; do
+    jq "$mutation" "$gen2_rotation_authority" >"$gen2_bad"; chmod 600 "$gen2_bad"
+    expect_fail "generation-two rotation authority rejects $mutation" \
+      renewal_gen2_rotation_authority_is_valid "$gen2_bad" \
+        "$(sha256sum "$gen2_bad" | awk '{print $1}')" "$gen2_plan_sha" \
+        "$gen2_successor_sha" "$test_now"
+done
+eval "$ORIGINAL_SECURE_FILE_FOR_OWNER"
+
+gen2_pass="$tmp/gen2-pass.json"
+jq -nS --arg authority "$gen2_successor_sha" --arg supervisor "$gen2_supervisor_sha" \
+  --arg helper "$EXPECTED_HELPER_SHA256" --arg marker "$EXPECTED_MARKER_SHA256" \
+  --arg image_id "$EXPECTED_IMAGE_ID" --arg image_ref "$EXPECTED_IMAGE_REF" \
+  --argjson started "$test_now" --argjson finished "$((test_now + 60))" \
+  --argjson locks "$(renewal_shared_lock_paths_json)" '
+  def row($node): {
+    node:$node,tip:("a"*64),height:100,staking_active:true,staking_enabled:true,
+    staking_state:"searching",weight:1,unlocked_staking_only:false,
+    regular_pow_role:(if $node==30 then "special-disabled" else "regular-enabled" end),
+    pow:(if $node==30 then {enabled:false,autostart:false,threads:null,cpu_percent:null,
+      state:"disabled",hashrate:0,allow_automatic_quantum_key_creation:false}
+      else {enabled:true,autostart:false,threads:1,cpu_percent:1,state:"mining",hashrate:1,
+        allow_automatic_quantum_key_creation:false} end)
+  };
+  {schema:1,kind:"blackcoin-pos-unlock-renewal-supervisor-run",status:"PASS",
+    authority_sha256:$authority,supervisor_sha256:$supervisor,
+    normal_unlock_helper_sha256:$helper,maintenance_marker_sha256:$marker,
+    image_id:$image_id,image_ref:$image_ref,started_at_epoch:$started,
+    started_at_utc:"2026-08-14T00:00:00Z",finished_at_epoch:$finished,
+    finished_at_utc:"2026-08-14T00:01:00Z",shared_locks_held:$locks,
+    global_and_per_node_locks_held:true,helper_nodes:[range(1;33)],
+    helper_order:"sequential-ascending",post_helper_wait_seconds:60,
+    minimum_normal_unlock_remaining_seconds:43200,stable_census_attempts_maximum:3,
+    historical_job10_receipt_preserved_read_only:true,regular_pow_rpc_observed:true,
+    regular_pow_mutating_rpc_invoked:false,node30_ordinary_pow_enable_attempted:false,
+    maintenance_inhibitor_removed:false,chain_config_key_transaction_mutation_attempted:false,
+    preflight:[range(1;33)|row(.)],postflight:[range(1;33)|row(.)]}
+' >"$gen2_pass"
+expect_pass 'first-run PASS receipt binds all 32 staking nodes, 31 observed PoW policies, and node30 off' \
+  renewal_gen2_pass_receipt_semantics_is_valid "$gen2_pass" "$gen2_successor_sha" \
+    "$gen2_supervisor_sha" "$EXPECTED_HELPER_SHA256" "$EXPECTED_MARKER_SHA256" "$test_now"
+gen2_pass_mutations=(
+  '.postflight[0].pow.autostart=true'
+  '.postflight[29].pow.enabled=true'
+  '.postflight[15].staking_active=false'
+  '.postflight |= .[0:31]'
+  '.regular_pow_mutating_rpc_invoked=true'
+  '.image_id="sha256:"+("0"*64)'
+  '.started_at_epoch-=1'
+  '.extra=true'
+)
+for mutation in "${gen2_pass_mutations[@]}"; do
+    jq "$mutation" "$gen2_pass" >"$gen2_bad"
+    expect_fail "first-run PASS receipt rejects $mutation" \
+      renewal_gen2_pass_receipt_semantics_is_valid "$gen2_bad" "$gen2_successor_sha" \
+        "$gen2_supervisor_sha" "$EXPECTED_HELPER_SHA256" "$EXPECTED_MARKER_SHA256" "$test_now"
+done
+
+gen2_claim_sha=$hex_c
+gen2_activation="$tmp/gen2-activation.json"
+jq -nS --argjson activated "$test_now" --arg run_dir /exact/run \
+  --arg rotation_result_sha "$hex_a" --arg pass_receipt /exact/PASS.json \
+  --arg pass_receipt_sha "$hex_b" --arg claim_sha "$gen2_claim_sha" \
+  --arg successor_sha "$gen2_successor_sha" --arg cron_sha "$GEN2_PREDECESSOR_CRON_SHA256" '{
+    schema:1,kind:"blackcoin-pos-supervisor-generation-2-activation",status:"PASS",
+    activated_at_epoch:$activated,activated_at_utc:"2026-08-14T00:00:00Z",run_dir:$run_dir,
+    rotation_result_sha256:$rotation_result_sha,initial_pass_receipt:$pass_receipt,
+    initial_pass_receipt_sha256:$pass_receipt_sha,initial_run_claim_sha256:$claim_sha,
+    successor_authority_sha256:$successor_sha,cron_sha256:$cron_sha,
+    first_run_terminal_pass:true,recurring_cron_active:true,
+    historical_job10_preserved_read_only:true,regular_pow_mutating_rpc_invoked:false,
+    node30_ordinary_pow_changed:false,reindex_rewind_repair_attempted:false
+  }' >"$gen2_activation"
+chmod 600 "$gen2_activation"
+ORIGINAL_SECURE_FILE_FOR_OWNER=$(declare -f renewal_secure_file_for_owner)
+# shellcheck disable=SC2329 # Invoked indirectly by the activation-receipt validator under test.
+renewal_secure_file_for_owner()
+{
+    local actual
+    actual=$(stat -c '%a:%h' "$1" 2>/dev/null || stat -f '%Lp:%l' "$1" 2>/dev/null) || return 1
+    [[ -f "$1" && ! -L "$1" && "$actual" == "$2:1" ]]
+}
+gen2_activation_sha=$(sha256sum "$gen2_activation" | awk '{print $1}')
+expect_pass 'generation-two activation receipt binds the exact initial PASS and recurring cron' \
+  renewal_gen2_activation_receipt_is_valid "$gen2_activation" "$gen2_activation_sha" \
+    /exact/run "$hex_a" /exact/PASS.json "$hex_b" "$gen2_claim_sha" "$gen2_successor_sha"
+for mutation in '.first_run_terminal_pass=false' '.recurring_cron_active=false' \
+  '.initial_pass_receipt_sha256=("0"*64)' '.regular_pow_mutating_rpc_invoked=true' '.extra=true'; do
+    jq "$mutation" "$gen2_activation" >"$gen2_bad"; chmod 600 "$gen2_bad"
+    expect_fail "generation-two activation receipt rejects $mutation" \
+      renewal_gen2_activation_receipt_is_valid "$gen2_bad" \
+        "$(sha256sum "$gen2_bad" | awk '{print $1}')" /exact/run "$hex_a" \
+        /exact/PASS.json "$hex_b" "$gen2_claim_sha" "$gen2_successor_sha"
+done
+
+gen2_terminal="$tmp/gen2-terminal.json"
+jq -nS --argjson completed "$test_now" --arg run_dir /exact/run \
+  --arg successor_sha "$gen2_successor_sha" --arg rotation_result_sha "$hex_a" \
+  --arg pass_receipt /exact/PASS.json --arg pass_receipt_sha "$hex_b" \
+  --arg activation_sha "$hex_c" --arg cron_sha "$GEN2_PREDECESSOR_CRON_SHA256" '{
+    schema:1,kind:"blackcoin-pos-supervisor-generation-2-terminal-result",status:"PASS",
+    completed_at_epoch:$completed,run_dir:$run_dir,successor_authority_sha256:$successor_sha,
+    rotation_result_sha256:$rotation_result_sha,initial_pass_receipt:$pass_receipt,
+    initial_pass_receipt_sha256:$pass_receipt_sha,activation_receipt_sha256:$activation_sha,
+    cron_sha256:$cron_sha,first_run_terminal_pass:true,recurring_cron_active:true,
+    staking_nodes_verified:32,regular_pow_nodes_observed:31,node30_ordinary_pow_disabled:true,
+    historical_job10_preserved_read_only:true,regular_pow_mutating_rpc_invoked:false,
+    reindex_rewind_repair_attempted:false
+  }' >"$gen2_terminal"
+chmod 600 "$gen2_terminal"
+gen2_terminal_sha=$(sha256sum "$gen2_terminal" | awk '{print $1}')
+expect_pass 'generation-two terminal result binds the exact activation and fleet PASS facts' \
+  renewal_gen2_terminal_result_is_valid "$gen2_terminal" "$gen2_terminal_sha" \
+    /exact/run "$hex_a" /exact/PASS.json "$hex_b" "$hex_c" "$gen2_successor_sha"
+for mutation in '.first_run_terminal_pass=false' '.staking_nodes_verified=31' \
+  '.regular_pow_nodes_observed=32' '.node30_ordinary_pow_disabled=false' \
+  '.activation_receipt_sha256=("0"*64)' '.completed_at_epoch=0' '.extra=true'; do
+    jq "$mutation" "$gen2_terminal" >"$gen2_bad"; chmod 600 "$gen2_bad"
+    expect_fail "generation-two terminal result rejects $mutation" \
+      renewal_gen2_terminal_result_is_valid "$gen2_bad" \
+        "$(sha256sum "$gen2_bad" | awk '{print $1}')" /exact/run "$hex_a" \
+        /exact/PASS.json "$hex_b" "$hex_c" "$gen2_successor_sha"
+done
+eval "$ORIGINAL_SECURE_FILE_FOR_OWNER"
+
+# shellcheck disable=SC2016 # Exact source ordering is part of the fail-closed transaction contract.
+expect_pass 'generation-two apply journals before cron removal and commits only a cron-inert successor' bash -c '
+  set -euo pipefail
+  body=$(sed -n "/^renewal_gen2_apply()$/,/^renewal_gen2_rotation_result_is_valid()$/p" "$1")
+  backup=$(grep -n -m1 "renewal_gen2_backup_predecessor" <<<"$body" | cut -d: -f1)
+  journal=$(grep -n -m1 "GEN2_ROTATION_JOURNAL.*journal" <<<"$body" | cut -d: -f1)
+  deactivate=$(grep -n -m1 "renewal_deactivate_cron" <<<"$body" | cut -d: -f1)
+  supervisor=$(grep -n -m1 "renewal_install_text_replace.*INSTALLED_SUPERVISOR" <<<"$body" | cut -d: -f1)
+  pending=$(grep -n -m1 "renewal_gen2_validate_pending_set" <<<"$body" | cut -d: -f1)
+  commit=$(grep -n -m1 "renewal_remove_known_file.*GEN2_ROTATION_JOURNAL" <<<"$body" | cut -d: -f1)
+  result=$(grep -n -m1 "renewal_gen2_finalize_rotation_result" <<<"$body" | cut -d: -f1)
+  test "$backup" -lt "$journal" && test "$journal" -lt "$deactivate" &&
+    test "$deactivate" -lt "$supervisor" && test "$supervisor" -lt "$pending" &&
+    test "$pending" -lt "$commit" && test "$commit" -lt "$result" &&
+    ! grep -Fq "renewal_cron_body | renewal_install_text_noclobber" <<<"$body"
+' bash "$supervisor"
+# shellcheck disable=SC2016 # One-shot claim must precede every live cycle boundary.
+expect_pass 'initial generation-two run is one-shot, cron-inert, and receipt-armed before contact' bash -c '
+  set -euo pipefail
+  body=$(sed -n "/^renewal_gen2_run_initial()$/,/^renewal_gen2_pass_receipt_semantics_is_valid()$/p" "$1")
+  absent=$(grep -n -m1 "! -e.*CRON_PATH" <<<"$body" | cut -d: -f1)
+  claim=$(grep -n -m1 "GEN2_INITIAL_RUN_CLAIM.*claim" <<<"$body" | cut -d: -f1)
+  arm=$(grep -n -m1 "renewal_arm_partial_context" <<<"$body" | cut -d: -f1)
+  execute=$(grep -n -m1 "renewal_execute_cycle" <<<"$body" | cut -d: -f1)
+  test "$absent" -lt "$claim" && test "$claim" -lt "$arm" && test "$arm" -lt "$execute" &&
+    ! grep -Fq "renewal_cron_body" <<<"$body"
+' bash "$supervisor"
+# shellcheck disable=SC2016 # PASS verification and activation receipt gate recurring cron.
+expect_pass 'generation-two activation validates the unique PASS before cron and receipts before commit' bash -c '
+  set -euo pipefail
+  body=$(sed -n "/^renewal_gen2_activate()$/,/^renewal_gen2_reconcile()$/p" "$1")
+  pass=$(grep -n -m1 "renewal_gen2_pass_receipt_is_valid" <<<"$body" | cut -d: -f1)
+  journal=$(grep -nF -m1 "journal_sha=\$(renewal_gen2_publish_json_noclobber" <<<"$body" | cut -d: -f1)
+  validate_journal=$(grep -n -m1 "renewal_gen2_cron_journal_is_valid" <<<"$body" | cut -d: -f1)
+  cron=$(grep -n -m1 "renewal_cron_body | renewal_install_text_noclobber" <<<"$body" | cut -d: -f1)
+  receipt=$(grep -nF -m1 "activation_sha=\$(renewal_gen2_publish_json_noclobber" <<<"$body" | cut -d: -f1)
+  commit=$(grep -n -m1 "renewal_remove_known_file.*GEN2_CRON_ACTIVATION_JOURNAL" <<<"$body" | cut -d: -f1)
+  terminal=$(grep -n -m1 "renewal_gen2_finalize_terminal_result" <<<"$body" | cut -d: -f1)
+  test "$pass" -lt "$journal" && test "$journal" -lt "$validate_journal" &&
+    test "$validate_journal" -lt "$cron" && test "$cron" -lt "$receipt" &&
+    test "$receipt" -lt "$commit" && test "$commit" -lt "$terminal"
+' bash "$supervisor"
+# shellcheck disable=SC2016 # Crash-cut reconciliation contracts are source ordered.
+expect_pass 'generation-two reconcile rolls back an active journal and finalizes both journal-free cuts' bash -c '
+  body=$(sed -n "/^renewal_gen2_reconcile()$/,/^renewal_install()$/p" "$1")
+  rollback=$(grep -n -m1 "renewal_gen2_restore_predecessor" <<<"$body" | cut -d: -f1)
+  precommit=$(grep -n -m1 "renewal_gen2_finalize_rotation_result" <<<"$body" | cut -d: -f1)
+  terminal=$(grep -n -m1 "renewal_gen2_finalize_terminal_result" <<<"$body" | cut -d: -f1)
+  test -n "$rollback" && test -n "$precommit" && test -n "$terminal"
+' bash "$supervisor"
+# shellcheck disable=SC2016 # Every stable preflight has durable PARTIAL coverage.
+expect_pass 'cycle arms terminal evidence before the first fleet census' bash -c '
+  body=$(sed -n "/^renewal_execute_cycle()$/,/^renewal_install_exact_file()$/p" "$1")
+  arm=$(grep -n -m1 "renewal_arm_partial_context" <<<"$body" | cut -d: -f1)
+  capture=$(grep -n -m1 "pre=.*renewal_capture_fleet" <<<"$body" | cut -d: -f1)
+  test "$arm" -lt "$capture"
+' bash "$supervisor"
+# shellcheck disable=SC2016 # Literal source pins are inspected inside the child shell.
+expect_pass 'generation-two exact live predecessor pins remain literal and complete' bash -c '
+  grep -Eq "GEN2_PREDECESSOR_SUPERVISOR_SHA256=.*5ce5d4ff0aafd0e5c7fe0fe6a617d0315fd01d04396443423dd3208c54546b5c" "$1" &&
+  grep -Eq "GEN2_PREDECESSOR_AUTHORITY_SHA256=.*05df229f0657b40b52b99334d34a353a98f0fdf696183607c5d033e595ef934f" "$1" &&
+  grep -Eq "GEN2_PREDECESSOR_INSTALL_RECEIPT_SHA256=.*80d0579794018c9cb0f93ab12282c82d9221f3f674dd9ceb715123f4c9eb66bc" "$1" &&
+  grep -Eq "GEN2_HISTORICAL_JOB10_RECEIPT_SHA256=.*23030a65f9b182534d82f6d67709b9cd088cbe6907bae56647d9780f9b9cf3cb" "$1"
+' bash "$supervisor"
+# shellcheck disable=SC2016 # The child shell receives the exact source body as data.
+expect_pass 'generation-two transaction source contains no financial, chain-repair, or PoW mutation RPC' bash -c '
+  body=$(sed -n "/^renewal_gen2_publish_json_noclobber()$/,/^renewal_install()$/p" "$1")
+  ! grep -Eiq "renewal_(wallet_)?rpc.*(send|setpowmining|commit|resolve|abandon|repair|reindex|rewind)" <<<"$body" &&
+    ! grep -Eiq "renewal_docker[[:space:]]+(compose|start|stop|restart|update|rm|kill)" <<<"$body"
+' bash "$supervisor"
+expect_fail 'prepare-gen2 is unavailable without an exact one-use run directory' \
+  "$supervisor" prepare-gen2
+expect_fail 'apply-gen2 is unavailable without exact plan and owner authority inputs' \
+  "$supervisor" apply-gen2
+expect_fail 'run-initial is unavailable without an exact rotation receipt and hash' \
+  "$supervisor" run-initial
+expect_fail 'activate-gen2 is unavailable without exact rotation and PASS receipts' \
+  "$supervisor" activate-gen2
+
 printf '1..%d\n' "$tests"
 if ((failures != 0)); then
     printf '%d/%d tests failed\n' "$failures" "$tests" >&2

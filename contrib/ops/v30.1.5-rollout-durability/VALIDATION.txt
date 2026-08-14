@@ -65,6 +65,10 @@ PoS renewal invariants:
   - install receipt is durably published before schedule activation and runtime
     revalidates it
   - explicit generation rotation archives/deactivates prior authority/schedule
+  - exact generation-one-to-generation-two supervisor transaction preserves a
+    durable rollback archive, commits the cron-inert successor first, consumes
+    one no-retry initial-run claim, and activates cron only from a validated
+    32-node PASS plus exact activation and terminal receipts
   - no chain/config/key/transaction mutation and no regular-PoW intent mutation
   - historical root at job 10 and predecessor helper SHA256
     acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1
@@ -102,8 +106,8 @@ Current-byte offline checks (2026-08-14 UTC):
   shellcheck -x on every .sh and the standalone .sh.inc: PASS
   complete aggregate suite including both dedicated suites: 609/609 PASS
     log SHA256 8e5852c70b66b9b61d181d57450197183e08b6775d8ee63cc7664898abd5be5c
-  focused PoS/helper hostile suite: 259/259 PASS
-    log SHA256 5962bb70c0fab39d03fe2dc6138d9eb5dd525c829b7b16805a67e9cf49a7983b
+  focused PoS/helper hostile suite: 305/305 PASS
+    log SHA256 41ddc2b2d2b0dceb900c767d21ce7775bbcf87757ae6fc89d923896bf44e3675
   focused node30 audit/release-gate hostile suite: 151/151 PASS
     log SHA256 e1c468f202fcafac0510e285adfa8f1ebb1b4f552c9fe70c5529f9960771001c
   separate node27 sign-only/observation suite: 208/208 PASS

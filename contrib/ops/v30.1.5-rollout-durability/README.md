@@ -422,6 +422,42 @@ bytes only as a historical audit contract. This corrected package makes no
 installation or execution claim and does not rewrite the failed predecessor
 receipt.
 
+The generation-two transaction is a separate, exact predecessor-bound upgrade
+for the installed generation-one supervisor set. It accepts only supervisor
+SHA256 `5ce5d4ff0aafd0e5c7fe0fe6a617d0315fd01d04396443423dd3208c54546b5c`,
+package-manifest SHA256
+`3aa244764adb52c0188dd749db86c107ee9460dc73e763cd92cffe6cec8619d9`,
+authority SHA256
+`05df229f0657b40b52b99334d34a353a98f0fdf696183607c5d033e595ef934f`,
+install-receipt SHA256
+`80d0579794018c9cb0f93ab12282c82d9221f3f674dd9ceb715123f4c9eb66bc`,
+and the exact receipt-bound cron. `prepare-gen2` creates a one-use audit, a
+generation-two successor authority, and a hash-bound plan under the protected
+runtime-audit subtree. `apply-gen2` additionally requires a root:root mode
+`0600` owner authority with a maximum one-hour lifetime. That authority binds
+the exact plan, both authority generations, source supervisor/package bytes,
+and the immutable failed job-10 receipt. It expressly denies any financial,
+node30-role, repair, reindex, or rewind action.
+
+The upgrade holds the canonical five shared locks, the emergency-renewal lock,
+and all 32 per-node renewal locks. It makes a durable exact-byte generation-one
+backup and immutable history archive, publishes a rollback journal, removes
+cron, and only then atomically replaces the supervisor, package manifest,
+authority pair, and install receipt. Every error or signal before journal
+commit restores the exact generation-one set and cron. A hard-cut journal is
+also rollback-only under `reconcile-gen2`; the two journal-free commit cuts are
+reconstructed only from their exact precommit or activation receipts.
+
+The corrected supervisor remains cron-inert after code rotation. Its
+`run-initial` mode consumes a durable no-retry claim before any Docker or wallet
+contact, arms terminal PARTIAL evidence before the first census, and performs
+one sequential 32-node helper cycle. `activate-gen2` accepts only the unique
+generation-two PASS receipt proving all 32 staking nodes, the 31 manual-only
+regular-PoW policies, and node30 ordinary PoW disabled. It publishes a cron
+activation journal and receipt before committing recurring cron. A failed
+initial run therefore remains durable and cron-inert; it is never silently
+retried.
+
 `node30_free_claim_release.sh` is audit-capable but release-ineligible. Audit
 requires no fee/spend authority and binds a fresh stable tip, wallet, queue,
 candidate legacy fee observation, payout script, public-artifact/package,

@@ -45,6 +45,10 @@ PoS renewal invariants:
   - helper accepts every canonical integer node 1 through 32, including node30
   - helper and supervisor unnamed-wallet RPCs omit -rpcwallet; named wallets
     retain one exact selector
+  - installed supervisor is exact root:root-owned single-link mode 0600 and is
+    invoked only through /bin/bash; Unraid need not preserve an executable bit
+  - initial resume accepts only an empty root or the exact current/d433 mode-0600
+    supervisor singleton with no cron; every other partial shape fails closed
   - the passphrase is stdin-only and never enters argv, source, or test output
   - helper contains no PoW, claim-recovery, relay, payment, key, or address action
   - audit/plan/install/run modes remain fail-closed without exact authority
@@ -94,8 +98,8 @@ Current-byte offline checks (2026-08-14 UTC):
   shellcheck -x on every .sh and the standalone .sh.inc: PASS
   complete aggregate suite including both dedicated suites: 609/609 PASS
     log SHA256 8e5852c70b66b9b61d181d57450197183e08b6775d8ee63cc7664898abd5be5c
-  focused PoS/helper hostile suite: 241/241 PASS
-    log SHA256 89f0851228560632f9ba4d2988b4ed725b3bf0733afe99bc3d793ddf19fe1892
+  focused PoS/helper hostile suite: 254/254 PASS
+    log SHA256 dbdaaf55313091d7c4690d8eff147e2be261b470d02a607f8589569fb3236972
   focused node30 audit/release-gate hostile suite: 151/151 PASS
     log SHA256 e1c468f202fcafac0510e285adfa8f1ebb1b4f552c9fe70c5529f9960771001c
   separate node27 sign-only/observation suite: 208/208 PASS

@@ -27,6 +27,7 @@ readonly TOPOLOGY_MAP="$script_dir/$TOPOLOGY_MAP_NAME"
 readonly PACKAGE_MANIFEST="$script_dir/$PACKAGE_MANIFEST_NAME"
 
 readonly EXPECTED_HELPER_SHA256='aa924baf0a9d384759019d50e3815e03e264b906c7b51ecc76023c854b91a3e7'
+readonly HISTORICAL_PARTIAL_SUPERVISOR_SHA256='d433532d25187f763a67b57f4028a167cb7905b52b2382184ceaf7b27c3ca89d'
 readonly HISTORICAL_JOB10_HELPER_SHA256='acf28446e842fd0fa92b06c2ebc182e9da38fcde7bac06dd920d50a33e4e3dd1'
 readonly EXPECTED_MARKER_SHA256='87ecb2e0d7df9f90eabf0a546459779116a4bc634d3cbc37b1dd824c1dfcf311'
 readonly EXPECTED_IMAGE_ID='sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909'
@@ -191,6 +192,16 @@ renewal_secure_file_for_uid()
     [[ "$actual" == "$uid:$mode:1" ]]
 }
 
+renewal_secure_file_for_owner()
+{
+    local file=$1 mode=$2 uid=$3 gid=$4 actual
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    [[ "$(renewal_realpath_existing "$file")" == "$file" ]] || return 1
+    actual=$(stat -c '%u:%g:%a:%h' -- "$file" 2>/dev/null ||
+      stat -f '%u:%g:%Lp:%l' -- "$file" 2>/dev/null) || return 1
+    [[ "$actual" == "$uid:$gid:$mode:1" ]]
+}
+
 renewal_secure_directory_for_uid()
 {
     local directory=$1 mode=$2 uid=$3 actual
@@ -199,6 +210,31 @@ renewal_secure_directory_for_uid()
     actual=$(stat -c '%u:%a' -- "$directory" 2>/dev/null ||
       stat -f '%u:%Lp' -- "$directory" 2>/dev/null) || return 1
     [[ "$actual" == "$uid:$mode" ]]
+}
+
+renewal_classify_initial_install_shape()
+{
+    local install_root=$1 supervisor=$2 cron=$3 current_sha=$4 predecessor_sha=$5 uid=$6 gid=$7
+    local entries supervisor_sha
+    renewal_is_sha256 "$current_sha" && renewal_is_sha256 "$predecessor_sha" || return 1
+    renewal_secure_directory_for_uid "$install_root" 700 "$uid" || return 1
+    [[ "$(dirname -- "$supervisor")" == "$install_root" &&
+       ! -e "$cron" && ! -L "$cron" ]] || return 1
+    entries=$(find "$install_root" -mindepth 1 -maxdepth 1 -print | sort) || return 1
+    if [[ -z "$entries" ]]; then
+        printf 'clean\n'
+        return 0
+    fi
+    [[ "$entries" == "$supervisor" ]] || return 1
+    renewal_secure_file_for_owner "$supervisor" 600 "$uid" "$gid" || return 1
+    supervisor_sha=$(renewal_sha256_file "$supervisor") || return 1
+    if [[ "$supervisor_sha" == "$current_sha" ]]; then
+        printf 'current-singleton\n'
+    elif [[ "$supervisor_sha" == "$predecessor_sha" ]]; then
+        printf 'predecessor-singleton\n'
+    else
+        return 1
+    fi
 }
 
 renewal_validate_topology_map()
@@ -1511,7 +1547,7 @@ renewal_install()
     local authority=$1 authority_sha=$2 now self_sha contract_sha topology_sha manifest_sha
     local existing_sha='' receipt receipt_sha installed_epoch installed_utc
     local stage_dir journal journal_sha archive_stem predecessor_present=false predecessor_sha zero
-    local successor_sidecar_sha
+    local successor_sidecar_sha initial_shape='active'
     [[ "$EUID" -eq 0 ]] || renewal_die 'install requires root' || return
     renewal_secure_file_for_uid "$authority" 600 0 ||
         renewal_die 'install authority must be a root-owned 0600 single-link regular file' || return
@@ -1559,7 +1595,27 @@ renewal_install()
     contract_sha=$(renewal_sha256_file "$JOB10_CONTRACT")
     topology_sha=$(renewal_sha256_file "$TOPOLOGY_MAP")
     manifest_sha=$(renewal_sha256_file "$PACKAGE_MANIFEST")
-    renewal_install_exact_file "$script_path" "$self_sha" "$INSTALLED_SUPERVISOR" 700 || return 1
+    if [[ -e "$INSTALLED_AUTHORITY" || -L "$INSTALLED_AUTHORITY" ||
+          -e "$INSTALLED_AUTHORITY_SHA256" || -L "$INSTALLED_AUTHORITY_SHA256" ]]; then
+        [[ -e "$INSTALLED_AUTHORITY" && ! -L "$INSTALLED_AUTHORITY" &&
+           -e "$INSTALLED_AUTHORITY_SHA256" && ! -L "$INSTALLED_AUTHORITY_SHA256" ]] ||
+            renewal_die 'installed authority pair is incomplete before static reconciliation' || return
+    else
+        initial_shape=$(renewal_classify_initial_install_shape "$INSTALL_ROOT" \
+          "$INSTALLED_SUPERVISOR" "$CRON_PATH" "$self_sha" \
+          "$HISTORICAL_PARTIAL_SUPERVISOR_SHA256" 0 0) ||
+            renewal_die 'initial install static shape is neither clean nor an exact supervisor singleton' || return
+    fi
+    if [[ "$initial_shape" == predecessor-singleton ]]; then
+        renewal_secure_file_for_owner "$INSTALLED_SUPERVISOR" 600 0 0 &&
+          [[ "$(renewal_sha256_file "$INSTALLED_SUPERVISOR")" == \
+             "$HISTORICAL_PARTIAL_SUPERVISOR_SHA256" ]] ||
+            renewal_die 'partial predecessor supervisor changed before atomic replacement' || return
+        renewal_install_text_replace "$INSTALLED_SUPERVISOR" 600 "$self_sha" \
+          <"$script_path" || return 1
+    else
+        renewal_install_exact_file "$script_path" "$self_sha" "$INSTALLED_SUPERVISOR" 600 || return 1
+    fi
     renewal_install_exact_file "$JOB10_CONTRACT" "$contract_sha" "$INSTALLED_JOB10_CONTRACT" 600 || return 1
     renewal_install_exact_file "$TOPOLOGY_MAP" "$topology_sha" "$INSTALLED_TOPOLOGY_MAP" 600 || return 1
     renewal_install_exact_file "$PACKAGE_MANIFEST" "$manifest_sha" "$INSTALLED_PACKAGE_MANIFEST" 600 || return 1
@@ -1698,7 +1754,7 @@ renewal_run_installed()
     trap 'renewal_handle_signal 143 signal_term' TERM
     renewal_acquire_fleet_locks "$GLOBAL_LOCK" "$PER_NODE_LOCK_PATTERN" 0 ||
         renewal_die 'canonical shared/global/per-node lock set is busy' || return
-    renewal_secure_file_for_uid "$INSTALLED_SUPERVISOR" 700 0 &&
+    renewal_secure_file_for_owner "$INSTALLED_SUPERVISOR" 600 0 0 &&
       renewal_secure_file_for_uid "$INSTALLED_AUTHORITY" 600 0 &&
       renewal_secure_file_for_uid "$INSTALLED_AUTHORITY_SHA256" 600 0 &&
       renewal_secure_file_for_uid "$INSTALLED_INSTALL_RECEIPT" 600 0 &&

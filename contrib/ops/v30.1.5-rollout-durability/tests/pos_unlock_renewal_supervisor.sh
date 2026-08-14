@@ -447,6 +447,69 @@ else
 fi
 eval "$original_acquire_lock"
 
+shape_root="$tmp/initial-install-shape"
+shape_supervisor="$shape_root/pos_unlock_renewal_supervisor.sh"
+shape_cron="$tmp/initial-install.cron"
+mkdir -m 700 "$shape_root"
+shape_current_source="$tmp/shape-current-source"
+shape_predecessor_source="$tmp/shape-predecessor-source"
+printf 'current supervisor bytes\n' >"$shape_current_source"
+printf 'predecessor supervisor bytes\n' >"$shape_predecessor_source"
+shape_current_sha=$(sha256sum "$shape_current_source" | awk '{print $1}')
+shape_predecessor_sha=$(sha256sum "$shape_predecessor_source" | awk '{print $1}')
+gid=$(id -g)
+shape_is()
+{
+    local expected=$1
+    shift
+    [[ "$(renewal_classify_initial_install_shape "$@")" == "$expected" ]]
+}
+expect_pass 'initial install accepts an exact empty root with no cron' shape_is clean \
+  "$shape_root" "$shape_supervisor" "$shape_cron" "$shape_current_sha" \
+  "$shape_predecessor_sha" "$uid" "$gid"
+cp "$shape_current_source" "$shape_supervisor"; chmod 600 "$shape_supervisor"
+expect_pass 'initial install accepts only the exact current 0600 supervisor singleton' \
+  shape_is current-singleton "$shape_root" "$shape_supervisor" "$shape_cron" \
+  "$shape_current_sha" "$shape_predecessor_sha" "$uid" "$gid"
+cp "$shape_predecessor_source" "$shape_supervisor"; chmod 600 "$shape_supervisor"
+expect_pass 'initial install accepts the exact predecessor 0600 supervisor singleton' \
+  shape_is predecessor-singleton "$shape_root" "$shape_supervisor" "$shape_cron" \
+  "$shape_current_sha" "$shape_predecessor_sha" "$uid" "$gid"
+expect_fail 'initial install rejects a predecessor singleton with the wrong group identity' \
+  renewal_classify_initial_install_shape "$shape_root" "$shape_supervisor" "$shape_cron" \
+  "$shape_current_sha" "$shape_predecessor_sha" "$uid" "$((gid + 1))"
+printf 'unknown supervisor bytes\n' >"$shape_supervisor"; chmod 600 "$shape_supervisor"
+expect_fail 'initial install rejects an unknown supervisor singleton' \
+  renewal_classify_initial_install_shape "$shape_root" "$shape_supervisor" "$shape_cron" \
+  "$shape_current_sha" "$shape_predecessor_sha" "$uid" "$gid"
+cp "$shape_predecessor_source" "$shape_supervisor"; chmod 700 "$shape_supervisor"
+expect_fail 'initial install rejects an executable-mode predecessor on the Unraid boot contract' \
+  renewal_classify_initial_install_shape "$shape_root" "$shape_supervisor" "$shape_cron" \
+  "$shape_current_sha" "$shape_predecessor_sha" "$uid" "$gid"
+chmod 600 "$shape_supervisor"; printf 'unexpected\n' >"$shape_root/AUTHORITY.json"; chmod 600 "$shape_root/AUTHORITY.json"
+expect_fail 'initial install rejects a supervisor plus any partial companion' \
+  renewal_classify_initial_install_shape "$shape_root" "$shape_supervisor" "$shape_cron" \
+  "$shape_current_sha" "$shape_predecessor_sha" "$uid" "$gid"
+rm -f -- "$shape_root/AUTHORITY.json"; printf 'cron\n' >"$shape_cron"; chmod 600 "$shape_cron"
+expect_fail 'initial install rejects a predecessor singleton with an active cron' \
+  renewal_classify_initial_install_shape "$shape_root" "$shape_supervisor" "$shape_cron" \
+  "$shape_current_sha" "$shape_predecessor_sha" "$uid" "$gid"
+rm -f -- "$shape_cron" "$shape_supervisor"; ln -s "$shape_predecessor_source" "$shape_supervisor"
+expect_fail 'initial install rejects a symlinked predecessor singleton' \
+  renewal_classify_initial_install_shape "$shape_root" "$shape_supervisor" "$shape_cron" \
+  "$shape_current_sha" "$shape_predecessor_sha" "$uid" "$gid"
+rm -f -- "$shape_supervisor"; mkdir "$shape_root/activation-staging"
+expect_fail 'initial install rejects an unexplained partial subdirectory' \
+  renewal_classify_initial_install_shape "$shape_root" "$shape_supervisor" "$shape_cron" \
+  "$shape_current_sha" "$shape_predecessor_sha" "$uid" "$gid"
+rm -rf -- "$shape_root/activation-staging"
+if [[ "$HISTORICAL_PARTIAL_SUPERVISOR_SHA256" == \
+      d433532d25187f763a67b57f4028a167cb7905b52b2382184ceaf7b27c3ca89d ]]; then
+    ok 'initial reconciliation pins the exact observed d433 predecessor singleton'
+else
+    not_ok 'initial reconciliation pins the exact observed d433 predecessor singleton'
+fi
+
 MOCK_BAD_IMAGE_NODE=0
 MOCK_BAD_CHAIN_NODE=0
 MOCK_IBD_NODE=0
@@ -1218,6 +1281,17 @@ expect_pass 'installer commits and validates the install receipt before cron act
     test "$deactivate" -lt "$receipt" && test "$receipt" -lt "$validate_receipt" &&
     test "$validate_receipt" -lt "$cron" && test "$cron" -lt "$commit"
 ' bash "$supervisor"
+# shellcheck disable=SC2016 # Static ordering and exact modes bind the Unraid resume path.
+expect_pass 'installer classifies partial initial state before replacing exact 0600 supervisor bytes' bash -c '
+  set -euo pipefail
+  body=$(sed -n "/^renewal_install()$/,/^renewal_audit_or_plan()$/p" "$1")
+  classify=$(grep -n -m1 "renewal_classify_initial_install_shape" <<<"$body" | cut -d: -f1)
+  replace=$(grep -n -m1 "renewal_install_text_replace.*INSTALLED_SUPERVISOR" <<<"$body" | cut -d: -f1)
+  exact=$(grep -n -m1 "renewal_install_exact_file.*INSTALLED_SUPERVISOR.*600" <<<"$body" | cut -d: -f1)
+  test -n "$classify" && test -n "$replace" && test -n "$exact" &&
+    test "$classify" -lt "$replace" && test "$classify" -lt "$exact" &&
+    ! grep -q "INSTALLED_SUPERVISOR.*700" <<<"$body"
+' bash "$supervisor"
 # shellcheck disable=SC2016 # Static ordering protects runtime activation semantics.
 expect_pass 'runtime acquires canonical locks and validates receipt plus cron before any cycle' bash -c '
   set -euo pipefail
@@ -1228,6 +1302,14 @@ expect_pass 'runtime acquires canonical locks and validates receipt plus cron be
   execute=$(grep -n -m1 "renewal_execute_cycle" <<<"$body" | cut -d: -f1)
   test "$locks" -lt "$receipt" && test "$receipt" -lt "$cron" && test "$cron" -lt "$execute"
   grep -Eq "PER_NODE_LOCK_PATTERN.*0 /run true|0 /run true" <<<"$body"
+' bash "$supervisor"
+# shellcheck disable=SC2016 # Cron invokes the nonexecutable root-only supervisor through Bash.
+expect_pass 'runtime validates supervisor mode 0600 and cron invokes it through exact Bash' bash -c '
+  set -euo pipefail
+  file=$1
+  grep -Fq "renewal_secure_file_for_owner \"\$INSTALLED_SUPERVISOR\" 600 0 0" "$file"
+  grep -Fq "/bin/bash \$INSTALLED_SUPERVISOR run" "$file"
+  ! grep -Fq "renewal_secure_file_for_uid \"\$INSTALLED_SUPERVISOR\" 700 0" "$file"
 ' bash "$supervisor"
 
 expect_fail 'install mode is unavailable without an explicit receipt and exact hash' \

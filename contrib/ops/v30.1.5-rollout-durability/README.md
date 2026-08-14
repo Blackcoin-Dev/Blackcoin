@@ -380,6 +380,15 @@ argv builder omits `-rpcwallet` for the unnamed wallet and preserves one exact
 selector argument for a nonempty wallet name. The passphrase remains stdin-only.
 The supervisor's independent read-only census uses the same selector rule, so
 node30's unnamed wallet is observed without emitting the invalid empty selector.
+The installed supervisor is a root:root-owned, single-linked mode `0600` object on
+the Unraid boot filesystem; both cron and manual operation invoke it through
+exact `/bin/bash`, so no executable bit is required. Initial-install resumption
+accepts only an empty install root, the exact current supervisor singleton, or
+the observed predecessor supervisor SHA256
+`d433532d25187f763a67b57f4028a167cb7905b52b2382184ceaf7b27c3ca89d`
+as a mode `0600` singleton with no cron. The predecessor singleton is replaced
+atomically with the current sealed bytes before any companion object is added.
+Every other partial install inventory fails closed without deletion or chmod.
 The helper contains no ordinary-PoW, claim-recovery, relay, payment, key, or
 address action. It may only perform normal wallet unlock and explicitly retain
 PoS intent, followed by read-only wallet/staking convergence checks.

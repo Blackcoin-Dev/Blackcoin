@@ -6,10 +6,21 @@ umask 077
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 LEGACY="$ROOT/node30_free_claim_one_shot.py"
 TOOL="$ROOT/node30_free_claim_rejection_requeue.py"
+DURABLE="$ROOT/node30_free_claim_durable_requeue.py"
+EDGE="$ROOT/node30_free_claim_edge_one_shot.py"
 MOCK="$ROOT/tests/rejection_requeue_mock_transport.py"
+EDGE_MOCK="$ROOT/tests/edge_mock_transport.py"
 FIX_RAW=$(mktemp -d "${TMPDIR:-/tmp}/node30-rejection-requeue.XXXXXX")
 FIX=$(CDPATH='' cd -- "$FIX_RAW" && pwd -P)
-trap 'rm -rf -- "$FIX"' EXIT HUP INT TERM
+cleanup()
+{
+    if [[ "${KEEP_NODE30_FIXTURE:-0}" == 1 ]]; then
+        printf 'preserved fixture: %s\n' "$FIX" >&2
+    else
+        rm -rf -- "$FIX"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
 COUNT=0
 HOSTILE_COLLISION_SHA=$(printf '%s\n' '{"hostile":"destination-appeared"}' | \
   shasum -a 256 | awk '{print $1}')
@@ -63,7 +74,7 @@ assert_fails()
 
 make_fixture()
 {
-    local root="$FIX/fleet" gid marker wrapper worker transport
+    local root="$FIX/${1:-fleet}" gid marker wrapper worker transport
     gid=$(id -g)
     mkdir -m 0700 "$root" "$root/state" "$root/free-claim" \
         "$root/free-claim/queue" "$root/free-claim/done" "$root/locks"
@@ -144,6 +155,22 @@ companion_call()
     shift 2
     FLEET31_TEST_TRANSPORT="$MOCK" FLEET31_FIXTURE="$fixture/state" \
       FLEET31_SCENARIO="$scenario" "$TOOL" "$@"
+}
+
+durable_call()
+{
+    local fixture=$1 scenario=$2
+    shift 2
+    FLEET31_TEST_TRANSPORT="$MOCK" FLEET31_FIXTURE="$fixture/state" \
+      FLEET31_SCENARIO="$scenario" "$DURABLE" "$@"
+}
+
+edge_call()
+{
+    local fixture=$1 scenario=$2
+    shift 2
+    FLEET31_TEST_TRANSPORT="$EDGE_MOCK" FLEET31_FIXTURE="$fixture/state" \
+      FLEET31_SCENARIO="$scenario" "$EDGE" "$@"
 }
 
 # Inject a serialized pause transition after the fleet locks are acquired but
@@ -634,5 +661,238 @@ assert_jq '.kind=="node30-free-claim-one-shot-authority" and
   .ordinary_pow_authorized==false and .pause_removal_authorized==false' \
   "$NEW_RUN/AUTHORITY.json"
 assert_eq "$(jq -r .send_calls "$FLEET/state/state.json")" 1
+
+# The successor durable-requeue stage pins the exact reviewed companion and
+# has no financial call site.  It permits the filesystem-only move while the
+# QQP2 slot is occupied, but still requires an entirely new edge authority.
+assert_eq "$(python3 - "$DURABLE" <<'PY'
+import ast,sys
+t=ast.parse(open(sys.argv[1]).read())
+print(sum(isinstance(n,ast.Call) and len(n.args)>=2 and
+          isinstance(n.args[1],ast.Constant) and
+          n.args[1].value=='sendshadowpowclaim' for n in ast.walk(t)))
+PY
+)" 0
+
+FLEET2=$(make_fixture fleet-durable)
+SOURCE2="$FLEET2/source-run"
+legacy_call "$FLEET2" mempool-reject audit \
+  --runtime-manifest "$FLEET2/runtime.json" --run-dir "$SOURCE2" >"$FLEET2/audit.out"
+AUDIT2_SHA=$(jq -r .audit_sha256 "$FLEET2/audit.out")
+jq --arg digest "$AUDIT2_SHA" \
+  '.required_authority | .decision="authorize" | .audit_receipt_sha256=$digest' \
+  "$SOURCE2/audit.json" >"$SOURCE2/AUTHORITY.json"
+chmod 0600 "$SOURCE2/AUTHORITY.json"
+AUTH2_SHA=$(sha "$SOURCE2/AUTHORITY.json")
+assert_fails 'second source consumes authority at deterministic rejection' \
+  legacy_call "$FLEET2" mempool-reject execute --run-dir "$SOURCE2" \
+    --authority "$SOURCE2/AUTHORITY.json" --authority-sha256 "$AUTH2_SHA"
+legacy_call "$FLEET2" cleared reconcile --run-dir "$SOURCE2" \
+  --authority "$SOURCE2/AUTHORITY.json" --authority-sha256 "$AUTH2_SHA" \
+  >"$FLEET2/reconcile.out"
+RECON2_NAME=$(jq -r .receipt "$FLEET2/reconcile.out")
+RECON2_SHA=$(jq -r .sha256 "$FLEET2/reconcile.out")
+companion_call "$FLEET2" cleared terminalize --run-dir "$SOURCE2" \
+  --authority "$SOURCE2/AUTHORITY.json" --authority-sha256 "$AUTH2_SHA" \
+  --reconcile-receipt "$SOURCE2/$RECON2_NAME" \
+  --reconcile-sha256 "$RECON2_SHA" >"$FLEET2/terminalize.out"
+
+# Live parity: the consumed item remains definitively rejected while a newer
+# API item already occupies the paused ingress queue.  The successor must
+# preserve and select the newer item, not overwrite it with the old inode.
+REJECTED2=$(find "$FLEET2/free-claim/done" -name '*.rejected.json')
+REJECTED2_SHA=$(sha "$REJECTED2")
+NEW_QUEUE="$FLEET2/free-claim/queue/20260814T040000Z-cafebabe.json"
+jq -cn '{attempts:1,ip:"newer-fixture",quantum_address:"qfixtureWitnessV16",
+  submitted:"2026-08-14T04:00:00+00:00"}' >"$NEW_QUEUE"
+chmod 0644 "$NEW_QUEUE"
+NEW_QUEUE_SHA=$(sha "$NEW_QUEUE")
+
+DURABLE_RUN="$FLEET2/durable-requeue"
+durable_call "$FLEET2" mempool-blocked audit --source-run "$SOURCE2" \
+  --source-authority "$SOURCE2/AUTHORITY.json" \
+  --source-authority-sha256 "$AUTH2_SHA" \
+  --reconcile-receipt "$SOURCE2/$RECON2_NAME" \
+  --reconcile-sha256 "$RECON2_SHA" --run-dir "$DURABLE_RUN" \
+  >"$FLEET2/durable-audit.out"
+DURABLE_AUDIT_SHA=$(jq -r .audit_sha256 "$FLEET2/durable-audit.out")
+assert_jq '.result=="READY_FOR_SEPARATE_DURABLE_QUEUE_AUTHORITY" and
+  .mutation_performed==false and .snapshot.candidate_count==0 and
+  .snapshot.queue_strategy=="preserve_existing_queued_item" and
+  .snapshot.queue.state=="queued" and
+  .snapshot.source_rejected.state=="rejected" and
+  .snapshot.mempool_observation.shadow_proof_count==1 and
+  .snapshot.mempool_observation.slot_clear==false and
+  .required_authority.slot_clear_required_for_requeue==false and
+  .required_authority.observed_shadow_proof_count==1 and
+  .required_authority.queue_strategy=="preserve_existing_queued_item" and
+  .required_authority.filesystem_move_required==false and
+  .required_authority.preexisting_queue_preserved==true and
+  .required_authority.sendshadowpowclaim_authorized==false and
+  .required_authority.old_authority_retry_authorized==false and
+  .required_authority.new_edge_one_shot_audit_required==true and
+  .required_authority.new_edge_financial_authority_required==true' \
+  "$DURABLE_RUN/durable-requeue-audit.json"
+jq --arg digest "$DURABLE_AUDIT_SHA" \
+  '.required_authority | .decision="authorize" | .audit_receipt_sha256=$digest' \
+  "$DURABLE_RUN/durable-requeue-audit.json" >"$DURABLE_RUN/AUTHORITY.json"
+chmod 0600 "$DURABLE_RUN/AUTHORITY.json"
+DURABLE_AUTH_SHA=$(sha "$DURABLE_RUN/AUTHORITY.json")
+
+jq '.slot_clear_required_for_requeue=true' "$DURABLE_RUN/AUTHORITY.json" \
+  >"$DURABLE_RUN/bad-authority.json"
+chmod 0600 "$DURABLE_RUN/bad-authority.json"
+assert_fails 'durable authority cannot be changed into a slot reservation' \
+  durable_call "$FLEET2" mempool-blocked requeue --run-dir "$DURABLE_RUN" \
+    --authority "$DURABLE_RUN/bad-authority.json" \
+    --authority-sha256 "$(sha "$DURABLE_RUN/bad-authority.json")"
+assert_fails 'bad durable authority publishes no intent' \
+  test -e "$DURABLE_RUN/durable-requeue-intent.json"
+
+# The same already-consumed nonfinancial intent resumes while the slot is
+# occupied.  Occupancy is evidence, not a filesystem-move prerequisite.
+durable_call "$FLEET2" mempool-blocked requeue --run-dir "$DURABLE_RUN" \
+  --authority "$DURABLE_RUN/AUTHORITY.json" \
+  --authority-sha256 "$DURABLE_AUTH_SHA" >"$FLEET2/durable-requeue.out"
+assert_jq '.state=="DURABLE_QUEUE_AUTHORITY_CONSUMED_SELECTION_PENDING_OR_COMPLETE" and
+  .queue_strategy=="preserve_existing_queued_item" and
+  .filesystem_move_required==false and .preexisting_queue_preserved==true and
+  .slot_clear_required_for_requeue==false and .candidate_count==0 and
+  .sendshadowpowclaim_authorized==false and
+  .old_authority_retry_authorized==false and
+  .new_edge_financial_authority_required==true' \
+  "$DURABLE_RUN/durable-requeue-intent.json"
+assert_jq '.result=="DURABLE_QUEUE_SELECTION_COMPLETE_INDEPENDENT_OF_TRANSIENT_SLOT" and
+  .queue_strategy=="preserve_existing_queued_item" and
+  .filesystem_move_performed==false and .preexisting_queue_preserved==true and
+  .pre_move_mempool_observation.shadow_proof_count==1 and
+  .pre_move_mempool_observation.slot_clear==false and
+  .slot_clear_required_for_requeue==false and
+  .queue_outcome.state=="queued" and .queue_outcome.no_clobber==true and
+  .queue_outcome.same_inode==true and .queue_outcome.atomic_rename==false and
+  .queue_outcome.move_protocol=="preexisting-queue-preservation/v1" and
+  .sendshadowpowclaim_call_count==0 and
+  .old_authority_retry_authorized==false and
+  .new_edge_one_shot_audit_required==true and
+  .new_edge_financial_authority_required==true and
+  .pause_preserved==true and .ordinary_pow_enabled==false and
+  .recurring_worker_invoked==false' "$DURABLE_RUN/durable-requeue-complete.json"
+assert_eq "$(sha "$REJECTED2")" "$REJECTED2_SHA"
+assert_eq "$(sha "$NEW_QUEUE")" "$NEW_QUEUE_SHA"
+assert_eq "$(jq -r .send_calls "$FLEET2/state/state.json")" 1
+
+DINT="$DURABLE_RUN/durable-requeue-intent.json"
+DINT_SIDE="$DINT.sha256"
+mv -- "$DINT" "$DINT.saved"; mv -- "$DINT_SIDE" "$DINT_SIDE.saved"
+assert_fails 'durable completion rejects missing canonical intent' \
+  durable_call "$FLEET2" mempool-blocked requeue --run-dir "$DURABLE_RUN" \
+    --authority "$DURABLE_RUN/AUTHORITY.json" \
+    --authority-sha256 "$DURABLE_AUTH_SHA"
+mv -- "$DINT.saved" "$DINT"; mv -- "$DINT_SIDE.saved" "$DINT_SIDE"
+durable_call "$FLEET2" mempool-blocked requeue --run-dir "$DURABLE_RUN" \
+  --authority "$DURABLE_RUN/AUTHORITY.json" \
+  --authority-sha256 "$DURABLE_AUTH_SHA" >"$FLEET2/durable-again.out"
+assert_jq '.already_complete==true and
+  .result=="DURABLE_QUEUE_SELECTION_COMPLETE_INDEPENDENT_OF_TRANSIENT_SLOT"' \
+  "$FLEET2/durable-again.out"
+
+# A financial authority can be reviewed while the slot is occupied.  Repeated
+# refill during the locked dynamic rebind consumes no authority and makes no
+# call; that run is permanently discarded and cannot later be executed.
+EDGE_ABORT="$FLEET2/edge-refill-abort"
+edge_call "$FLEET2" mempool-blocked audit --durable-run "$DURABLE_RUN" \
+  --durable-authority "$DURABLE_RUN/AUTHORITY.json" \
+  --durable-authority-sha256 "$DURABLE_AUTH_SHA" --run-dir "$EDGE_ABORT" \
+  --max-wait-seconds 60 --poll-milliseconds 50 >"$FLEET2/edge-abort-audit.out"
+EDGE_ABORT_AUDIT_SHA=$(jq -r .audit_sha256 "$FLEET2/edge-abort-audit.out")
+assert_jq '.result=="READY_FOR_PREAUTHORIZED_DYNAMIC_EDGE" and
+  .mutation_performed==false and
+  .required_authority.dynamic_tip_rebind_authorized==true and
+  .required_authority.dynamic_qqp2_work_rebind_authorized==true and
+  .required_authority.slot_clear_immediately_before_intent_required==true and
+  .required_authority.single_invocation_only==true and
+  .required_authority.single_submission_only==true and
+  .required_authority.maximum_fee_blk=="0.00028700" and
+  .required_authority.ordinary_pow_authorized==false and
+  .required_authority.pause_removal_authorized==false' "$EDGE_ABORT/edge-audit.json"
+jq --arg digest "$EDGE_ABORT_AUDIT_SHA" \
+  '.required_authority | .decision="authorize" | .audit_receipt_sha256=$digest' \
+  "$EDGE_ABORT/edge-audit.json" >"$EDGE_ABORT/AUTHORITY.json"
+chmod 0600 "$EDGE_ABORT/AUTHORITY.json"
+EDGE_ABORT_AUTH_SHA=$(sha "$EDGE_ABORT/AUTHORITY.json")
+edge_call "$FLEET2" edge-refill-during-rebind execute --run-dir "$EDGE_ABORT" \
+  --authority "$EDGE_ABORT/AUTHORITY.json" \
+  --authority-sha256 "$EDGE_ABORT_AUTH_SHA" >"$FLEET2/edge-abort.out"
+assert_jq '.result=="NO_INTENT_EDGE_WINDOW_EXHAUSTED_AUTHORITY_DISCARDED" and
+  .intent_published==false and .sendshadowpowclaim_call_count==0 and
+  .authority_consumed==false and .authority_reuse_authorized==false and
+  .fresh_edge_audit_and_authority_required==true and
+  .clear_rebind_attempts==4' "$EDGE_ABORT/edge-aborted.json"
+assert_fails 'refill abort publishes no financial intent' test -e "$EDGE_ABORT/intent.json"
+assert_eq "$(jq -r .send_calls "$FLEET2/state/state.json")" 1
+assert_fails 'discarded edge run cannot execute later' \
+  edge_call "$FLEET2" edge-happy execute --run-dir "$EDGE_ABORT" \
+    --authority "$EDGE_ABORT/AUTHORITY.json" \
+    --authority-sha256 "$EDGE_ABORT_AUTH_SHA"
+jq 'del(.edge_mempool_calls)' "$FLEET2/state/state.json" \
+  >"$FLEET2/state/next" && mv "$FLEET2/state/next" "$FLEET2/state/state.json"
+
+# A fresh edge audit/authority waits through observed occupancy, binds the
+# current tip/work/input set under all locks, publishes intent, and makes the
+# only new financial call.  Confirmation preserves the pause and role.
+EDGE_RUN="$FLEET2/edge-success"
+edge_call "$FLEET2" mempool-blocked audit --durable-run "$DURABLE_RUN" \
+  --durable-authority "$DURABLE_RUN/AUTHORITY.json" \
+  --durable-authority-sha256 "$DURABLE_AUTH_SHA" --run-dir "$EDGE_RUN" \
+  --max-wait-seconds 2 --poll-milliseconds 50 >"$FLEET2/edge-audit.out"
+EDGE_AUDIT_SHA=$(jq -r .audit_sha256 "$FLEET2/edge-audit.out")
+jq --arg digest "$EDGE_AUDIT_SHA" \
+  '.required_authority | .decision="authorize" | .audit_receipt_sha256=$digest' \
+  "$EDGE_RUN/edge-audit.json" >"$EDGE_RUN/AUTHORITY.json"
+chmod 0600 "$EDGE_RUN/AUTHORITY.json"
+EDGE_AUTH_SHA=$(sha "$EDGE_RUN/AUTHORITY.json")
+jq '.maximum_tries=1999999' "$EDGE_RUN/AUTHORITY.json" >"$EDGE_RUN/bad-authority.json"
+chmod 0600 "$EDGE_RUN/bad-authority.json"
+assert_fails 'modified financial authority fails before intent' \
+  edge_call "$FLEET2" edge-happy execute --run-dir "$EDGE_RUN" \
+    --authority "$EDGE_RUN/bad-authority.json" \
+    --authority-sha256 "$(sha "$EDGE_RUN/bad-authority.json")"
+assert_fails 'bad edge authority publishes no intent' test -e "$EDGE_RUN/intent.json"
+edge_call "$FLEET2" edge-blocked-then-clear execute --run-dir "$EDGE_RUN" \
+  --authority "$EDGE_RUN/AUTHORITY.json" --authority-sha256 "$EDGE_AUTH_SHA" \
+  >"$FLEET2/edge-execute.out"
+assert_jq '.state=="EDGE_AUTHORITY_CONSUMED_RPC_PENDING_OR_COMPLETE" and
+  .dynamic_rebind.mempool_clearance.shadow_proof_count==0 and
+  .dynamic_rebind.mempool_clearance.slot_clear==true and
+  .dynamic_rebind.mempool_observations==3 and
+  .dynamic_rebind.clear_rebind_attempts==1 and
+  .rpc_method=="sendshadowpowclaim" and .call_budget==1 and
+  .calls_completed_before_intent==0' "$EDGE_RUN/intent.json"
+assert_jq '.result=="EXACT_DYNAMIC_EDGE_BROADCAST" and
+  .sendshadowpowclaim_call_count==1 and .proof_override_used==false and
+  .pause_preserved==true and .ordinary_pow_enabled==false and
+  .recurring_worker_invoked==false and .queue_outcome.state=="broadcast"' \
+  "$EDGE_RUN/broadcast-complete.json"
+assert_eq "$(jq -r .send_calls "$FLEET2/state/state.json")" 2
+assert_fails 'consumed edge run can never execute twice' \
+  edge_call "$FLEET2" edge-happy execute --run-dir "$EDGE_RUN" \
+    --authority "$EDGE_RUN/AUTHORITY.json" --authority-sha256 "$EDGE_AUTH_SHA"
+edge_call "$FLEET2" edge-happy monitor --run-dir "$EDGE_RUN" \
+  --authority "$EDGE_RUN/AUTHORITY.json" --authority-sha256 "$EDGE_AUTH_SHA" \
+  >"$FLEET2/edge-pending.out"
+EDGE_PENDING_RECEIPT="$EDGE_RUN/$(jq -r .receipt "$FLEET2/edge-pending.out")"
+assert_jq '.result=="DYNAMIC_EDGE_BROADCAST_PENDING_ACTIVE_CHAIN_CONFIRMATION" and
+  .confirmations==0 and .pause_preserved==true and .retry_authorized==false' \
+  "$EDGE_PENDING_RECEIPT"
+jq '.confirmed=true' "$FLEET2/state/state.json" >"$FLEET2/state/next" && \
+  mv "$FLEET2/state/next" "$FLEET2/state/state.json"
+edge_call "$FLEET2" edge-happy monitor --run-dir "$EDGE_RUN" \
+  --authority "$EDGE_RUN/AUTHORITY.json" --authority-sha256 "$EDGE_AUTH_SHA" \
+  >"$FLEET2/edge-terminal.out"
+assert_jq '.result=="CONFIRMED_DYNAMIC_EDGE_QUANTUM_PAYOUT" and
+  .confirmations==6 and .queue_outcome.state=="confirmed" and
+  .pause_preserved==true and .ordinary_pow_enabled==false and
+  .pos_active==true and .recurring_worker_invoked==false' "$EDGE_RUN/terminal.json"
+assert_eq "$(jq -r .send_calls "$FLEET2/state/state.json")" 2
 
 printf 'PASS: %d hostile node30 deterministic-rejection/requeue assertions\n' "$COUNT"

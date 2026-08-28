@@ -1,0 +1,52 @@
+Scope: fleet-only node30 durable queue selection and preauthorized dynamic edge one-shot
+Contracts: installed-v30.1.4-node30-free-claim-durable-requeue/v1; installed-v30.1.4-node30-free-claim-edge-one-shot/v1
+Installed runtime target: signed v30.1.4 only
+Live contact during validation: none
+Wallet mutation during validation: none
+Network contact during validation: none
+Public Core/release authority: none
+
+Consumed source prerequisite: exact definitive mempool-limit rejection receipt chain; old financial authority permanently nonretryable
+Queue selection empty-ingress outcome: exact rejected source inode moved by hard-link-fsync-unlink-fsync-noreplace/v1
+Queue selection occupied-ingress outcome: exactly one newer canonical queue inode selected and preserved by preexisting-queue-preservation/v1
+Occupied-ingress precedence: newer canonical queued item takes precedence over the historical rejected item
+Historical rejected item: preserved byte-for-byte and same-inode when a newer queued item exists
+Queue-selection wallet RPC calls: zero
+Queue-selection sendshadowpowclaim call sites: zero
+Transient QQP2 slot required for queue selection: false
+Old-authority transaction candidates required: zero
+Separate nonfinancial authority required: true
+
+Edge static audit: permitted while the one-slot QQP2 mempool is occupied
+Separate edge financial authority required: true
+Authority-bound watch interval: 1 through 900 seconds
+Authority-bound poll interval: 50 through 5000 milliseconds
+Clear-edge rebind budget: 4
+Dynamic locked rebind: active tip, QQP2 work, full eligible input set, wallet inventory, wallet txid inventory, and bracketed mempool vacancy
+Refill or tip race before intent: no authority consumption and no financial call
+Watch/budget abort: run discarded; fresh audit and authority required; reuse forbidden
+Intent publication: durable and immediately before the only sendshadowpowclaim call
+Post-intent retry: never authorized
+Unknown/invalid response continuation: reconcile only
+Financial call budget: one
+Proof override: none
+Fee rate: 100 atoms/vB
+Expected vsize: 287
+Maximum fee: 0.00028700 BLK
+Maximum tries: 2000000
+Signed input: exactly one member of the exact dynamically rebound authorized set
+Terminal proof: active-chain confirmation plus one exact indexed QQP2 synthetic payout
+Free-Claim pause: preserved
+Ordinary PoW role: preserved disabled
+PoS: required active with positive weight
+Repair/reindex/rewind: never authorized
+
+Expanded hostile suite: PASS: 103 hostile node30 deterministic-rejection/requeue assertions
+Legacy one-shot regression: PASS: 223 hostile node30 Free-Claim one-shot assertions
+Durable queue tool SHA256: a373139c1c265993b833a577871598cb855b2e812041797de14635aed59571a1
+Dynamic edge tool SHA256: 9f8fb6b5f2f6a1dc3bd0833afc9e441c81482852f49ba5d7ee75fa19cac8e388
+Edge test transport SHA256: 8775fbec4c4effdebf75e3569228514e67393ccfbbe178dcdc46d8aa53c4c983
+Expanded hostile driver SHA256: 19d796ce74dc3428915402d74caaefdb1d4376c03b94a95f17afcdc7f600dc04
+Legacy hostile driver SHA256: 096599cf7db47ed2698783c538a9a241f440ddfdf9fdd4f38a43e31a3fd086ad
+Package tree SHA256 manifest: SHA256SUMS
+Git commit/tree/signature: populated by signed source control

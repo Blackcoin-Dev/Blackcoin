@@ -246,6 +246,52 @@ No stage removes the Free-Claim pause, starts the recurring worker, enables
 ordinary PoW on node30, changes the fee rate or `0.00028700 BLK` cap, repairs a
 wallet, reindexes or rewinds a chain, or authorizes public-Core deployment.
 
+## Durable occupied-queue and dynamic-edge successor
+
+The earlier clearance-before-requeue sequence is retained as signed incident
+evidence, but it cannot reserve a transient QQP2 mempool vacancy. The fleet-only
+successor separates durable queue selection from the financial edge.
+
+`node30_free_claim_durable_requeue.py audit` accepts the exact consumed source
+receipt chain and the definitive rejected inode while the QQP2 slot is either
+occupied or clear. If ingress is empty, its separate nonfinancial authority
+permits only the old rejected-to-queued no-clobber move. If exactly one newer
+canonical item already occupies the paused ingress queue, that item takes
+precedence: the command preserves both the old rejected inode and the newer
+queued inode and publishes a receipt selecting the newer item without a
+filesystem move. More than one ingress item, a changed source lifecycle, an
+awarded payout, an old-authority transaction candidate, a role change, or a
+queue-identity change fails closed. This stage has no `sendshadowpowclaim` call
+site and grants no financial authority.
+
+`node30_free_claim_edge_one_shot.py audit` requires the completed durable
+selection and exact selected queue inode. It performs the expensive static
+role, storage, wallet, input-set, payout, queue, and receipt validation even if
+the mempool slot is occupied. Its separate owner-only authority binds the exact
+static identity, fee rate, `0.00028700 BLK` cap, watch duration, poll interval,
+and four-attempt clear-edge rebind budget.
+
+`execute` may be invoked only once for that authority. It first completes a
+locked static preflight, then waits read-only for a natural vacancy. At a clear
+observation it reacquires the full fleet lock set and dynamically rebinds the
+current active tip, QQP2 work, complete eligible input set, wallet inventory,
+wallet txid inventory, and a final bracketed empty-slot observation. A refill
+or tip race consumes no authority and returns to the bounded watch. After four
+failed clear-edge rebinds or the signed deadline, the run publishes an abort
+receipt with no intent and no call and permanently requires a fresh audit and
+authority. Only a successful locked rebind publishes `intent.json` immediately
+before the sole bounded call. Any published intent permanently consumes the
+authority; the only continuation after an unknown or invalid response is
+`reconcile`, never another call.
+
+The response, transaction, queue, awarded-ledger, and active-chain payout
+receipts are semantically revalidated on every restart. Successful completion
+requires one exact audited input member, 287 vbytes, fee `0.00028700 BLK`, the
+selected witness-v16 payout, an active confirmation block, and one exact indexed
+QQP2 synthetic payout. The Free-Claim pause stays present, node30 ordinary PoW
+stays disabled, PoS stays active, and the public Core/release lane remains out
+of scope.
+
 ## Installed-v30.1.4 API limitation
 
 Installed v30.1.4 `sendshadowpowclaim` builds and signs the candidate in memory,

@@ -1,3 +1,1 @@
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-7 * * * * root /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc /boot/config/plugins/blackcoin-quantum-nodes/pos-unlock-recurring/pos_unlock_recurring.sh >/dev/null 2>&1
+7 * * * * /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc /boot/config/plugins/blackcoin-quantum-nodes/pos-unlock-recurring/pos_unlock_recurring.sh >/dev/null 2>&1

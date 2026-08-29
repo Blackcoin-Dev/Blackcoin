@@ -24,6 +24,25 @@ expect_fail()
     if "$@" >/dev/null 2>&1; then not_ok "$name"; else ok "$name"; fi
 }
 
+cron_is_exact_unraid_root_fragment()
+{
+    local file=$1 expected
+    expected='7 * * * * /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc /boot/config/plugins/blackcoin-quantum-nodes/pos-unlock-recurring/pos_unlock_recurring.sh >/dev/null 2>&1'
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    [[ "$(wc -l <"$file" | tr -d ' ')" == 1 ]] || return 1
+    [[ "$(sed -n '1p' "$file")" == "$expected" ]] || return 1
+    [[ "$(awk '{print $6}' "$file")" == /usr/bin/env ]] || return 1
+    ! grep -Eq '^[[:space:]]*(SHELL|PATH)[[:space:]]*=' "$file"
+}
+
+cron_is_authority_free_and_environment_clean()
+{
+    local file=$1
+    ! grep -Eiq 'authority|receipt-sha|valid-until' "$file" &&
+      [[ "$(awk '{print $6}' "$file")" == /usr/bin/env ]] &&
+      ! grep -Eq '^[[:space:]]*(SHELL|PATH)[[:space:]]*=' "$file"
+}
+
 tmp=$(realpath "$(mktemp -d "${TMPDIR:-/tmp}/pos-unlock-recurring-tests.XXXXXX")")
 trap 'rm -rf -- "$tmp"' EXIT
 
@@ -41,11 +60,27 @@ expect_pass 'canonical supervisor lock order is preserved' bash -c \
    grep -Fq "POS_GLOBAL_LOCK=" "$1" && grep -Fq "/run/blackcoin-emergency-pos-renewal.lock" "$1" &&
    grep -Fq "POS_PER_NODE_LOCK_PATTERN=" "$1" && grep -Fq "/run/blackcoin-pos-unlock-renewal-node-%02d.lock" "$1"' \
   bash "$tool"
-expect_pass 'cron is hourly authority-free and environment-clean' bash -c \
-  'test "$(wc -l < "$1" | tr -d " ")" = 3 &&
-   grep -Fqx "7 * * * * root /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc /boot/config/plugins/blackcoin-quantum-nodes/pos-unlock-recurring/pos_unlock_recurring.sh >/dev/null 2>&1" "$1" &&
-   ! grep -Eiq "authority|receipt-sha|valid-until" "$1"' \
-  bash "$package_dir/blackcoin-pos-unlock-recurring.cron"
+cron_file="$package_dir/blackcoin-pos-unlock-recurring.cron"
+expect_pass 'cron is the exact one-line Unraid root fragment' \
+  cron_is_exact_unraid_root_fragment "$cron_file"
+expect_pass 'cron remains hourly authority-free and environment-clean' \
+  cron_is_authority_free_and_environment_clean "$cron_file"
+
+old_system_cron="$tmp/old-system.cron"
+printf '%s\n' \
+  'SHELL=/bin/bash' \
+  'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+  '7 * * * * root /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc /boot/config/plugins/blackcoin-quantum-nodes/pos-unlock-recurring/pos_unlock_recurring.sh >/dev/null 2>&1' \
+  >"$old_system_cron"
+expect_fail 'old system-crontab form is rejected as an Unraid fragment' \
+  cron_is_exact_unraid_root_fragment "$old_system_cron"
+
+root_column_cron="$tmp/root-column.cron"
+printf '%s\n' \
+  '7 * * * * root /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash --noprofile --norc /boot/config/plugins/blackcoin-quantum-nodes/pos-unlock-recurring/pos_unlock_recurring.sh >/dev/null 2>&1' \
+  >"$root_column_cron"
+expect_fail 'standalone root user column is rejected' \
+  cron_is_exact_unraid_root_fragment "$root_column_cron"
 expect_pass 'wrapper has no financial PoW chain or role-changing interface' bash -c \
   '! grep -Eiq "sendrawtransaction|setpowmining|createwallet|import(privkey|descriptors)|reindex|rewind|repairwallet|abandontransaction|walletpassphrase|fee[_ -]?rate|payout[_ -]?address" "$1" &&
    ! grep -Eq "docker[[:space:]]+(stop|start|restart|rm)|staking[[:space:]]+false" "$1"' \

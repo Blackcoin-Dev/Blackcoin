@@ -6,11 +6,13 @@ It removes the expiring external execution-authority dependency from routine
 PoS liveness. It does not alter public Core or any release design.
 
 The wrapper accepts no arguments and no authority file. Once installed as the
-exact root-owned, single-linked mode-`0600` path below, the supplied cron entry
-runs it hourly. A nonblocking mutex makes overlapping cron/manual invocations a
-durable `SKIPPED_BUSY` no-op. The wrapper takes the same five shared fleet
-locks, global renewal lock, and 32 renewal-node locks as the installed
-supervisor before it invokes any helper.
+exact root-owned, single-linked mode-`0600` path below, the supplied Unraid
+per-user cron fragment runs it hourly. The fragment is exactly one schedule
+line: it has no system-crontab `root` column and no standalone `SHELL=` or
+`PATH=` declarations. A nonblocking mutex makes overlapping cron/manual
+invocations a durable `SKIPPED_BUSY` no-op. The wrapper takes the same five
+shared fleet locks, global renewal lock, and 32 renewal-node locks as the
+installed supervisor before it invokes any helper.
 
 The only mutating implementation is the existing installed helper:
 
@@ -46,8 +48,14 @@ after an immediate manual `PASS`:
 2. Receipt root:
    `/mnt/disk1/blackcoin-wallet-safety/runtime-audits/pos-unlock-recurring`
    as `root:root`, mode `0700`.
-3. Cron path: `/etc/cron.d/blackcoin-pos-unlock-recurring` from the exact
-   supplied cron bytes, as `root:root`, mode `0600`, one link.
+3. Persistent Unraid cron-source path:
+   `/boot/config/plugins/dynamix/blackcoin-pos-unlock-recurring.cron` from the
+   exact supplied one-line cron bytes, as `root:root`, mode `0600`, one link.
+4. Run `/usr/local/sbin/update_cron`, then verify the exact line appears once in
+   root's active per-user crontab. Do not install these bytes under
+   `/etc/cron.d`: that system-crontab format has a user column, while Unraid's
+   Dynamix fragments are assembled into root's per-user crontab and therefore
+   must not contain one.
 
 The old expiring authority and its receipts remain immutable historical
 evidence. They are not runtime inputs to this successor and need not be

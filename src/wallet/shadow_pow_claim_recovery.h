@@ -37,6 +37,19 @@ const char* ShadowPowClaimRecoveryPolicyMutationStatusName(
 const char* ShadowPowClaimResolutionRevocationStatusName(
     ShadowPowClaimResolutionRevocationStatus status);
 
+/** Test-only observability for the wallet recovery evaluator boundary. */
+void ResetShadowPowClaimRecoveryProofEvaluationStatsForTesting();
+uint64_t GetShadowPowClaimRecoveryProofEvaluationCountForTesting();
+uint64_t GetActiveShadowPowClaimRecoveryProofEvaluationsForTesting();
+uint64_t GetShadowPowClaimRecoveryInventoryBuildCountForTesting();
+uint64_t GetShadowPowClaimRecoveryPathVisitCountForTesting();
+uint64_t GetShadowPowClaimRecoveryTopologyVisitCountForTesting();
+uint64_t GetShadowPowClaimCandidateFingerprintMapVisitCountForTesting();
+void SetShadowPowClaimRecoveryProofEvaluationDelayForTesting(int64_t delay_ms);
+void SetShadowPowClaimRecoveryProofEvaluationBudgetForTesting(size_t budget);
+void SetShadowPowClaimRecoveryProofEvaluationCacheCapacityForTesting(
+    size_t capacity);
+
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_SHADOW_POW_CLAIM_RECOVERY_H

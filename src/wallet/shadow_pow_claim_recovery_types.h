@@ -17,6 +17,20 @@
 #include <string>
 #include <vector>
 
+/** Strict upper bounds on wallet work performed while cs_main is held. */
+inline constexpr size_t SHADOW_POW_CLAIM_INDEX_CAPACITY{1024};
+inline constexpr size_t SHADOW_POW_CLAIM_OWNERSHIP_SLICE{64};
+inline constexpr size_t SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY{4096};
+inline constexpr size_t SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY{256};
+inline constexpr size_t SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY{8 * 1024 * 1024};
+inline constexpr size_t SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY{1024 * 1024};
+inline constexpr size_t SHADOW_POW_CLAIM_METADATA_ENTRY_CAPACITY{64};
+inline constexpr size_t SHADOW_POW_CLAIM_METADATA_KEY_BYTE_CAPACITY{128};
+inline constexpr size_t SHADOW_POW_CLAIM_METADATA_VALUE_BYTE_CAPACITY{256};
+inline constexpr size_t SHADOW_POW_CLAIM_METADATA_RECORD_BYTE_CAPACITY{16 * 1024};
+inline constexpr size_t SHADOW_POW_CLAIM_METADATA_TOTAL_ENTRY_CAPACITY{32 * 1024};
+inline constexpr size_t SHADOW_POW_CLAIM_METADATA_TOTAL_BYTE_CAPACITY{4 * 1024 * 1024};
+
 namespace wallet {
 
 // Durable CWalletTx metadata shared by claim creation, repair, recovery, RPC,
@@ -32,14 +46,6 @@ inline constexpr char SHADOW_POW_CLAIM_FIRST_QUARANTINE_TIP_KEY[]{"qq_shadow_pow
 // audit provenance and is never used to infer current-branch age.
 inline constexpr char SHADOW_POW_CLAIM_BRANCH_QUARANTINE_HEIGHT_KEY[]{"qq_shadow_pow_branch_quarantine_height"};
 inline constexpr char SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY[]{"qq_shadow_pow_branch_quarantine_tip"};
-// Deprecated release-candidate retirement metadata. Origin expiry removes
-// mempool/reward eligibility but does not make peer-retained claim bytes
-// invalid for direct block inclusion. v30.1.5 therefore treats the presence
-// of any of these keys as a fail-closed input hold, then atomically reopens,
-// quarantines, and clears the historical record during wallet repair.
-inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_KEY[]{"qq_shadow_pow_expired_retired"};
-inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_HEIGHT_KEY[]{"qq_shadow_pow_expired_retired_height"};
-inline constexpr char SHADOW_POW_CLAIM_EXPIRED_RETIRED_TIP_KEY[]{"qq_shadow_pow_expired_retired_tip"};
 inline constexpr char SHADOW_POW_CLAIM_ADOPTED_KEY[]{"qq_shadow_pow_adopted"};
 // Explicit adoption is authenticated to both the tip at which the operator
 // reviewed the component and the stable anchor-generation identity that was
@@ -85,6 +91,21 @@ inline constexpr char SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY[]{"qq_shadow_pow_r
 // metadata above is authoritative for idempotency.
 inline constexpr char SHADOW_POW_LEGACY_CLEANUP_FOR_KEY[]{"qq_shadow_pow_cleanup_for"};
 inline constexpr char SHADOW_POW_QUARANTINE_MARKER_KEY[]{"qq_shadow_pow_quarantine"};
+// v30.1.5+ claims age against a chain-derived logical clock instead of the
+// host-dependent CWalletTx receive timestamp.  The birth value is
+// max(wallet relay-clock high-water, pinned active-tip MTP) at the guarded
+// AddToWallet boundary and is written in that same transaction record.
+inline constexpr char SHADOW_POW_CLAIM_RELAY_CLOCK_SCHEMA_KEY[]{
+    "qq_shadow_pow_claim_relay_clock_schema"};
+inline constexpr char SHADOW_POW_CLAIM_RELAY_CLOCK_SCHEMA_VERSION[]{"1"};
+inline constexpr char SHADOW_POW_CLAIM_RELAY_BIRTH_KEY[]{
+    "qq_shadow_pow_claim_relay_birth"};
+// Bind schema-v1 clock metadata to the exact transaction. Older wallet
+// versions copied arbitrary mapValue fields across equivalent transactions;
+// a copied tuple therefore fails closed after a downgrade/re-upgrade instead
+// of extending another claim's relay lifetime.
+inline constexpr char SHADOW_POW_CLAIM_RELAY_TXID_KEY[]{
+    "qq_shadow_pow_claim_relay_txid"};
 
 enum class ShadowPowClaimRecoveryState : uint8_t {
     LIVE,
@@ -92,7 +113,6 @@ enum class ShadowPowClaimRecoveryState : uint8_t {
     INDETERMINATE,
     CURRENT_BRANCH_INELIGIBLE,
     TERMINAL_ON_PINNED_TIP,
-    RETIRED_ON_ACTIVE_BRANCH,
     RESOLUTION_PENDING,
     RESOLVED_ON_ACTIVE_CHAIN,
 };
@@ -116,7 +136,10 @@ struct ShadowPowClaimRecoveryNode
     uint256 txid;
     ShadowPowClaimRecoveryNodeKind kind{ShadowPowClaimRecoveryNodeKind::ORDINARY};
     ShadowPowClaimRecoveryProvenance provenance{ShadowPowClaimRecoveryProvenance::UNKNOWN};
+    ShadowProofValidationResult proof_validation_result{
+        ShadowProofValidationResult::LOCAL_INTERNAL_ERROR};
     ShadowPowClaimMempoolDisposition disposition{ShadowPowClaimMempoolDisposition::LOCAL_STATE_ERROR};
+    std::string proof_reject_reason;
     /** Invalid on this tip, but the same unbound proof bytes are rehashed
      * against descendant contexts and can become valid later. */
     bool proof_may_revalidate_on_descendant{false};
@@ -124,7 +147,6 @@ struct ShadowPowClaimRecoveryNode
     bool in_mempool{false};
     bool abandoned{false};
     bool quarantined{false};
-    bool expired_locally_retired{false};
     bool expected_shape{false};
     bool wallet_authored{false};
     bool wallet_from_me{false};
@@ -149,6 +171,10 @@ struct ShadowPowClaimRecoveryNode
     CAmount claim_fee{0};
     bool exact_authored_carrier_shape{false};
     bool relay_ttl_expired{false};
+    bool relay_time_invalid{false};
+    bool relay_clock_metadata_present{false};
+    bool relay_clock_metadata_valid{false};
+    int64_t relay_birth_time{0};
     int64_t relay_expiry_time{0};
     bool lineage_metadata_present{false};
     bool lineage_metadata_valid{false};
@@ -207,8 +233,6 @@ struct ShadowPowClaimRecoveryComponent
     bool has_legacy_resolution{false};
     bool has_live_resolution{false};
     bool all_claims_terminal_on_pinned_tip{false};
-    bool all_claims_zero_payment_retirable{false};
-    bool all_claims_expired_locally_retired{false};
     bool has_branch_relative_ineligibility{false};
     // Derived from the complete Core graph snapshot. GUI and RPC callers may
     // use it to decide whether offering adoption is appropriate, but Core
@@ -227,15 +251,65 @@ struct ShadowPowClaimRecoveryInventory
     int wallet_processed_height{-1};
     uint64_t wallet_generation{0};
     uint256 candidate_state_fingerprint;
+    // Chain-logical classification time and the earliest schema-v1 frontier.
+    // Released pre-schema records retain their nTimeReceived wall-TTL through
+    // a separately typed frontier so a stalled chain cannot revive old bytes
+    // or make schema-v1 records age against host time.
+    int64_t classification_time{0};
+    int64_t next_relay_expiry_time{0};
+    int64_t next_legacy_relay_expiry_wall_time{0};
+    // Durable max of validated expiry frontiers (birth + TTL), never raw wall
+    // time. Schema-v1 records use max(this value, pinned active-tip MTP);
+    // released pre-schema records additionally preserve their wallet receipt
+    // wall-time lifetime through the separately typed frontier above.
+    int64_t relay_clock_high_water{0};
+    int64_t legacy_relay_clock_high_water{0};
+    int64_t relay_clock_median_time_past{0};
+    int64_t relay_clock_wall_time{0};
+    bool relay_clock_wall_time_plausible{false};
+    bool relay_clock_signing_safe{false};
+    // A crossed frontier must be durably published before this snapshot can
+    // authorize relay, signing, fee selection, or recovery mutation.
+    bool relay_clock_persistence_pending{false};
+    int64_t relay_clock_pending_frontier{0};
+    bool relay_clock_pending_legacy{false};
+    uint256 relay_clock_pending_txid;
+    int64_t relay_clock_pending_receive_time{0};
     bool wallet_tip_matches{false};
     bool recovery_database_ambiguous{false};
     size_t raw_claim_objects{0};
     size_t live_claim_objects{0};
     size_t quarantined_claim_objects{0};
     size_t blocking_components{0};
-    size_t retired_claim_objects{0};
-    size_t retired_components{0};
     size_t resolved_components{0};
+    // A recovery inventory call evaluates at most a fixed number of distinct
+    // cold proof contexts. Additional contexts remain LOCAL_STATE_ERROR for
+    // this read and are filled incrementally by later reads; this is a
+    // resource bound, not evidence of corrupt wallet data.
+    size_t proof_evaluation_deferred_contexts{0};
+    bool proof_evaluation_budget_exhausted{false};
+    // A local evaluator exception/allocation failure is not evidence against
+    // the retained proof. The failed contexts are deliberately uncached and
+    // retried by a later bounded read on the same wallet/tip snapshot.
+    size_t proof_evaluation_retryable_local_failure_contexts{0};
+    bool proof_evaluation_retryable_local_failure{false};
+    // A chain-view read can fail locally before or after the immutable Argon2
+    // context is available (for example pool, origin-undo, or accounting
+    // state). This is a retryable nonauthorizing observation, not evidence
+    // that the retained proof is invalid.
+    size_t proof_evaluation_retryable_local_state_contexts{0};
+    bool proof_evaluation_retryable_local_state{false};
+    size_t proof_evaluation_capacity_contexts{0};
+    bool proof_evaluation_capacity_exceeded{false};
+    // Legacy/imported proof ownership can require a script-manager walk.
+    // Runtime readers classify it only in bounded wallet-only slices and
+    // authorize nothing while a potentially local record remains unknown.
+    size_t claim_ownership_pending_records{0};
+    bool claim_ownership_pending{false};
+    size_t claim_ownership_capacity_work{0};
+    bool claim_ownership_capacity_exceeded{false};
+    size_t claim_inventory_capacity_work{0};
+    bool claim_inventory_capacity_exceeded{false};
     std::vector<ShadowPowClaimRecoveryComponent> components;
     std::vector<uint256> unanchored_claim_txids;
 };
@@ -244,6 +318,12 @@ enum class ShadowPowClaimMiningGateAction : uint8_t {
     CREATE_NEW_ANCHOR,
     WAIT_FOR_LIVE,
     WAIT_FOR_NEXT_TIP,
+    WAIT_FOR_RELAY_CLOCK,
+    WAIT_FOR_PROOF_EVALUATION,
+    PROOF_EVALUATION_CAPACITY,
+    WAIT_FOR_CLAIM_OWNERSHIP,
+    CLAIM_OWNERSHIP_CAPACITY,
+    CLAIM_INVENTORY_CAPACITY,
     RELAY_EXISTING,
     REFRESH_SAME_ANCHOR,
     UNSAFE,
@@ -261,8 +341,34 @@ struct ShadowPowClaimMiningGate
     int active_height{-1};
     uint64_t wallet_generation{0};
     uint256 candidate_state_fingerprint;
+    int64_t classification_time{0};
+    int64_t next_relay_expiry_time{0};
+    int64_t next_legacy_relay_expiry_wall_time{0};
+    int64_t relay_clock_high_water{0};
+    int64_t legacy_relay_clock_high_water{0};
+    int64_t relay_clock_median_time_past{0};
+    int64_t relay_clock_wall_time{0};
+    bool relay_clock_wall_time_plausible{false};
+    bool relay_clock_signing_safe{false};
+    bool relay_clock_persistence_pending{false};
+    int64_t relay_clock_pending_frontier{0};
+    bool relay_clock_pending_legacy{false};
     bool coherent{false};
     bool recovery_database_ambiguous{false};
+    size_t proof_evaluation_deferred_contexts{0};
+    bool proof_evaluation_budget_exhausted{false};
+    size_t proof_evaluation_retryable_local_failure_contexts{0};
+    bool proof_evaluation_retryable_local_failure{false};
+    size_t proof_evaluation_retryable_local_state_contexts{0};
+    bool proof_evaluation_retryable_local_state{false};
+    size_t proof_evaluation_capacity_contexts{0};
+    bool proof_evaluation_capacity_exceeded{false};
+    size_t claim_ownership_pending_records{0};
+    bool claim_ownership_pending{false};
+    size_t claim_ownership_capacity_work{0};
+    bool claim_ownership_capacity_exceeded{false};
+    size_t claim_inventory_capacity_work{0};
+    bool claim_inventory_capacity_exceeded{false};
     size_t unresolved_components{0};
     size_t live_claims{0};
     size_t eligible_claims{0};
@@ -286,9 +392,56 @@ struct ShadowPowClaimMiningGate
                unsafe_claims != 0 || unsafe_components != 0;
     }
 
+    bool ProofEvaluationPending() const
+    {
+        return action ==
+                   ShadowPowClaimMiningGateAction::WAIT_FOR_PROOF_EVALUATION ||
+               proof_evaluation_budget_exhausted ||
+               proof_evaluation_retryable_local_failure ||
+               proof_evaluation_retryable_local_state;
+    }
+
+    bool RelayClockPending() const
+    {
+        return action ==
+                   ShadowPowClaimMiningGateAction::WAIT_FOR_RELAY_CLOCK ||
+               relay_clock_persistence_pending ||
+               !relay_clock_signing_safe;
+    }
+
+    bool ProofEvaluationCapacityExceeded() const
+    {
+        return action ==
+                   ShadowPowClaimMiningGateAction::PROOF_EVALUATION_CAPACITY ||
+               proof_evaluation_capacity_exceeded;
+    }
+
+    bool ClaimOwnershipPending() const
+    {
+        return action ==
+                   ShadowPowClaimMiningGateAction::WAIT_FOR_CLAIM_OWNERSHIP ||
+               claim_ownership_pending;
+    }
+
+    bool ClaimOwnershipCapacityExceeded() const
+    {
+        return action ==
+                   ShadowPowClaimMiningGateAction::CLAIM_OWNERSHIP_CAPACITY ||
+               claim_ownership_capacity_exceeded;
+    }
+
+    bool ClaimInventoryCapacityExceeded() const
+    {
+        return action ==
+                   ShadowPowClaimMiningGateAction::CLAIM_INVENTORY_CAPACITY ||
+               claim_inventory_capacity_exceeded;
+    }
+
     bool MayCreateClaim() const
     {
         return coherent && !recovery_database_ambiguous &&
+               relay_clock_signing_safe &&
+               !relay_clock_persistence_pending &&
                (action == ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR ||
                 action == ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR);
     }
@@ -308,6 +461,8 @@ struct ShadowPowClaimMiningGate
     bool ShouldRelayExisting() const
     {
         return coherent && !recovery_database_ambiguous &&
+               relay_clock_signing_safe &&
+               !relay_clock_persistence_pending &&
                action == ShadowPowClaimMiningGateAction::RELAY_EXISTING &&
                !relay_txid.IsNull();
     }

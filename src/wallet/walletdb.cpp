@@ -28,6 +28,7 @@
 #include <wallet/wallet.h>
 
 #include <atomic>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -71,6 +72,10 @@ const std::string QUANTUM_REDELEGATION_LAST_WIN{"quantumredelegationlastwin"};
 const std::string SETTINGS{"settings"};
 const std::string QQ_DEVELOPMENT_DONATION_CONSENT{"qqdevelopmentdonationconsent"};
 const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY{"shadowpowclaimrecoverypolicy"};
+const std::string SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER{
+    "shadowpowclaimrelayclockhighwater"};
+const std::string SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER{
+    "shadowpowclaimlegacyrelayclockhighwater"};
 const std::string TX{"tx"};
 const std::string VERSION{"version"};
 const std::string WALLETDESCRIPTOR{"walletdescriptor"};
@@ -464,6 +469,139 @@ DBErrors WalletBatch::ReadShadowPowClaimRecoveryPolicy(ShadowPowClaimRecoveryPol
 bool WalletBatch::EraseShadowPowClaimRecoveryPolicy()
 {
     return EraseIC(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY);
+}
+
+bool WalletBatch::WriteShadowPowClaimRelayClockHighWater(int64_t high_water)
+{
+    if (high_water < 0) {
+        return false;
+    }
+    return WriteIC(DBKeys::SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER,
+                   high_water);
+}
+
+DBErrors WalletBatch::ReadShadowPowClaimRelayClockHighWater(
+    int64_t& high_water, std::string* error)
+{
+    high_water = 0;
+    if (error) error->clear();
+    DataStream prefix;
+    prefix << DBKeys::SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER;
+    std::unique_ptr<DatabaseCursor> cursor;
+    try {
+        cursor = m_batch->GetNewPrefixCursor(prefix);
+    } catch (const std::exception&) {
+        cursor.reset();
+    }
+    if (!cursor) {
+        if (error) {
+            *error = "could not read Gold Rush claim relay clock high-water; "
+                     "claim relay remains disabled";
+        }
+        return DBErrors::NONCRITICAL_ERROR;
+    }
+
+    DataStream key;
+    CDataStream value(SER_DISK);
+    const DatabaseCursor::Status status = cursor->Next(key, value);
+    if (status == DatabaseCursor::Status::DONE) {
+        return DBErrors::LOAD_OK;
+    }
+
+    std::string stored_key;
+    int64_t stored{0};
+    bool canonical{status == DatabaseCursor::Status::MORE};
+    try {
+        if (canonical) key >> stored_key;
+        canonical = canonical && key.empty() &&
+            stored_key == DBKeys::SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER;
+        if (canonical) value >> stored;
+        canonical = canonical && value.empty();
+    } catch (const std::exception&) {
+        canonical = false;
+    }
+    if (canonical) {
+        DataStream duplicate_key;
+        CDataStream duplicate_value(SER_DISK);
+        canonical = cursor->Next(duplicate_key, duplicate_value) ==
+            DatabaseCursor::Status::DONE;
+    }
+    if (!canonical || stored < 0) {
+        if (error) {
+            *error = "malformed Gold Rush claim relay clock high-water; "
+                     "claim relay remains disabled";
+        }
+        return DBErrors::NONCRITICAL_ERROR;
+    }
+    high_water = stored;
+    return DBErrors::LOAD_OK;
+}
+
+bool WalletBatch::WriteShadowPowClaimLegacyRelayClockHighWater(
+    int64_t high_water)
+{
+    if (high_water < 0) return false;
+    return WriteIC(
+        DBKeys::SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER,
+        high_water);
+}
+
+DBErrors WalletBatch::ReadShadowPowClaimLegacyRelayClockHighWater(
+    int64_t& high_water, std::string* error)
+{
+    high_water = 0;
+    if (error) error->clear();
+    DataStream prefix;
+    prefix << DBKeys::SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER;
+    std::unique_ptr<DatabaseCursor> cursor;
+    try {
+        cursor = m_batch->GetNewPrefixCursor(prefix);
+    } catch (const std::exception&) {
+        cursor.reset();
+    }
+    if (!cursor) {
+        if (error) {
+            *error = "could not read released Gold Rush claim relay clock "
+                     "high-water; claim relay remains disabled";
+        }
+        return DBErrors::NONCRITICAL_ERROR;
+    }
+
+    DataStream key;
+    CDataStream value(SER_DISK);
+    const DatabaseCursor::Status status = cursor->Next(key, value);
+    if (status == DatabaseCursor::Status::DONE) {
+        return DBErrors::LOAD_OK;
+    }
+
+    std::string stored_key;
+    int64_t stored{0};
+    bool canonical{status == DatabaseCursor::Status::MORE};
+    try {
+        if (canonical) key >> stored_key;
+        canonical = canonical && key.empty() &&
+            stored_key ==
+                DBKeys::SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER;
+        if (canonical) value >> stored;
+        canonical = canonical && value.empty();
+    } catch (const std::exception&) {
+        canonical = false;
+    }
+    if (canonical) {
+        DataStream duplicate_key;
+        CDataStream duplicate_value(SER_DISK);
+        canonical = cursor->Next(duplicate_key, duplicate_value) ==
+            DatabaseCursor::Status::DONE;
+    }
+    if (!canonical || stored < 0) {
+        if (error) {
+            *error = "malformed released Gold Rush claim relay clock "
+                     "high-water; claim relay remains disabled";
+        }
+        return DBErrors::NONCRITICAL_ERROR;
+    }
+    high_water = stored;
+    return DBErrors::LOAD_OK;
 }
 
 bool WalletBatch::WriteQQDevelopmentDonationConsent(const QQDevelopmentDonationConsent& consent)
@@ -1795,6 +1933,39 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
             pwallet->WalletLogPrintf("Error reading wallet database: automated PoW claim recovery policy failed runtime validation; automation remains disabled\n");
             result = std::max(result, DBErrors::NONCRITICAL_ERROR);
         }
+
+        // Both records are absent on older wallets. The first is the
+        // chain-logical schema-v1 clock; the second is isolated to released
+        // pre-schema receipt-time semantics. Keeping the domains separate
+        // prevents a legacy host-clock observation from aging or poisoning a
+        // schema-v1 family.
+        int64_t relay_clock_high_water{0};
+        int64_t legacy_relay_clock_high_water{0};
+        std::string relay_clock_error;
+        std::string legacy_relay_clock_error;
+        const DBErrors relay_clock_result =
+            ReadShadowPowClaimRelayClockHighWater(
+                relay_clock_high_water, &relay_clock_error);
+        const DBErrors legacy_relay_clock_result =
+            ReadShadowPowClaimLegacyRelayClockHighWater(
+                legacy_relay_clock_high_water,
+                &legacy_relay_clock_error);
+        if (relay_clock_result != DBErrors::LOAD_OK) {
+            pwallet->WalletLogPrintf(
+                "Error reading wallet database: %s\n", relay_clock_error);
+        }
+        if (legacy_relay_clock_result != DBErrors::LOAD_OK) {
+            pwallet->WalletLogPrintf(
+                "Error reading wallet database: %s\n",
+                legacy_relay_clock_error);
+        }
+        result = std::max(result, relay_clock_result);
+        result = std::max(result, legacy_relay_clock_result);
+        pwallet->LoadShadowPowClaimRelayClockHighWater(
+            relay_clock_high_water,
+            legacy_relay_clock_high_water,
+            relay_clock_result == DBErrors::LOAD_OK &&
+                legacy_relay_clock_result == DBErrors::LOAD_OK);
 
         // This is a separate, new consent domain. No legacy donation option
         // or settings record is consulted while loading it.

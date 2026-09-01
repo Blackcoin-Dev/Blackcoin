@@ -1944,8 +1944,9 @@ static RPCHelpMan sendshadowpowclaim()
                            "Another Gold Rush PoW claim submission is already in progress for this wallet");
     }
 
+    ShadowPowClaimRecoveryInventory initial_inventory;
     ShadowPowClaimMiningGate initial_gate =
-        pwallet->GetShadowPowClaimMiningGate();
+        pwallet->GetShadowPowClaimMiningGate(&initial_inventory);
     std::set<uint256> relay_attempts;
     size_t relay_iterations{0};
     while (initial_gate.ShouldRelayExisting()) {
@@ -1954,13 +1955,14 @@ static RPCHelpMan sendshadowpowclaim()
                 RPC_VERIFY_REJECTED,
                 "Existing Gold Rush PoW relay selection did not converge within the bounded per-call snapshot limit; no new fee transaction was created");
         }
+        ShadowPowClaimRecoveryInventory current_inventory;
         const ShadowPowClaimMiningGate current_gate =
-            pwallet->GetShadowPowClaimMiningGate();
+            pwallet->GetShadowPowClaimMiningGate(&current_inventory);
         if (!ShadowPowClaimRelayIntentMatches(
                 initial_gate, current_gate) ||
-            current_gate.relay_expiry_time <= 0 ||
-            GetTime() >= current_gate.relay_expiry_time) {
+            !current_gate.ShouldRelayExisting()) {
             initial_gate = current_gate;
+            initial_inventory = std::move(current_inventory);
             continue;
         }
         if (!relay_attempts.insert(current_gate.relay_txid).second) {
@@ -1986,9 +1988,24 @@ static RPCHelpMan sendshadowpowclaim()
         broadcast_guard.expected_wallet_generation =
             relay_gate.wallet_generation;
         broadcast_guard.expected_wallet_tip = relay_gate.active_tip;
+        broadcast_guard.expected_wallet_height = relay_gate.active_height;
         broadcast_guard.expected_candidate_state_fingerprint =
             relay_gate.candidate_state_fingerprint;
         broadcast_guard.require_normal_unlock = true;
+        broadcast_guard.require_relay_clock_authority = true;
+        broadcast_guard.expected_relay_clock_high_water =
+            relay_gate.relay_clock_high_water;
+        broadcast_guard.expected_relay_clock_median_time_past =
+            relay_gate.relay_clock_median_time_past;
+        broadcast_guard.expected_relay_clock_classification_time =
+            relay_gate.classification_time;
+        broadcast_guard.expected_relay_clock_next_transition =
+            relay_gate.next_relay_expiry_time;
+        broadcast_guard
+            .expected_relay_clock_next_legacy_wall_transition =
+            relay_gate.next_legacy_relay_expiry_wall_time;
+        broadcast_guard.expected_legacy_relay_clock_high_water =
+            relay_gate.legacy_relay_clock_high_water;
         try {
             relayed = pwallet->SubmitTxMemoryPoolAndRelay(
                 relay_gate.relay_txid, relay_error, /*relay=*/true,
@@ -2013,7 +2030,8 @@ static RPCHelpMan sendshadowpowclaim()
             return result;
         }
         if (ShadowPowClaimRelayRequiresFreshGate(relay_error)) {
-            initial_gate = pwallet->GetShadowPowClaimMiningGate();
+            initial_gate = pwallet->GetShadowPowClaimMiningGate(
+                &initial_inventory);
             continue;
         }
         const bool wait_for_snapshot_change = relay_error.empty() ||
@@ -2049,6 +2067,10 @@ static RPCHelpMan sendshadowpowclaim()
             RPC_VERIFY_REJECTED,
             "Every bounded historical relay candidate was rejected and the typed gate did not authorize a same-anchor refresh");
     }
+    // Carry the exact evaluated inventory into every locked selection/signing
+    // boundary. Suppression may have changed during historical relay handling,
+    // so refresh the pair once before any new transaction is authorized.
+    initial_gate = pwallet->GetShadowPowClaimMiningGate(&initial_inventory);
     if (!initial_gate.MayCreateClaim()) {
         switch (initial_gate.action) {
         case ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE:
@@ -2059,6 +2081,30 @@ static RPCHelpMan sendshadowpowclaim()
             throw JSONRPCError(
                 RPC_WALLET_ERROR,
                 "Gold Rush PoW claim creation is waiting for a wallet or active-tip state change; no fee transaction was created");
+        case ShadowPowClaimMiningGateAction::WAIT_FOR_RELAY_CLOCK:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is waiting for a coherent monotonic relay clock; no key, fee transaction, or proof was created");
+        case ShadowPowClaimMiningGateAction::WAIT_FOR_PROOF_EVALUATION:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is waiting for the next bounded retained-proof evaluation slice; retry without changing or spending wallet state");
+        case ShadowPowClaimMiningGateAction::PROOF_EVALUATION_CAPACITY:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is paused because the wallet has more distinct retained proof contexts than the bounded evaluator can cache safely; no fee transaction was created; inspect getpowclaimrecoveryinfo");
+        case ShadowPowClaimMiningGateAction::WAIT_FOR_CLAIM_OWNERSHIP:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is waiting for the next bounded legacy-claim ownership classification slice; no key, fee transaction, proof, or relay authority was created");
+        case ShadowPowClaimMiningGateAction::CLAIM_OWNERSHIP_CAPACITY:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is paused because an implicit legacy claim exceeds the bounded ownership-classification budget; no key, fee transaction, proof, or relay authority was created");
+        case ShadowPowClaimMiningGateAction::CLAIM_INVENTORY_CAPACITY:
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Gold Rush PoW claim creation is paused because the retained claim graph exceeds the bounded inventory topology budget; no key, fee transaction, or proof was created; inspect getpowclaimrecoveryinfo");
         case ShadowPowClaimMiningGateAction::RELAY_EXISTING:
             throw JSONRPCError(
                 RPC_VERIFY_REJECTED,
@@ -2079,8 +2125,9 @@ static RPCHelpMan sendshadowpowclaim()
     ShadowPowClaimInput selected_input;
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
-        ShadowPowClaimMiningGate mining_gate =
-            pwallet->GetShadowPowClaimMiningGateLocked();
+        const ShadowPowClaimMiningGate mining_gate =
+            pwallet->GetShadowPowClaimMiningGateFromInventoryLocked(
+                initial_inventory);
         if (!mining_gate.MayCreateClaim()) {
             throw JSONRPCError(RPC_WALLET_ERROR,
                 "Gold Rush PoW claim creation is paused because the typed mining gate is unsafe, incoherent, or at capacity");
@@ -2097,9 +2144,17 @@ static RPCHelpMan sendshadowpowclaim()
             coin_control,
             selected_input,
             selection_error,
-            &mining_gate);
+            mining_gate);
         if (selection_result == ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX) {
             throw JSONRPCError(RPC_WALLET_ERROR, selection_error.original);
+        }
+        if (selection_result ==
+            ShadowPowClaimInputSelectionResult::CHAIN_TIME_UNAVAILABLE) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                selection_error.original.empty()
+                    ? "Gold Rush PoW claim creation is waiting for a valid next-block transaction time; no proof, key, fee, or signature was created"
+                    : selection_error.original);
         }
         if (selection_result != ShadowPowClaimInputSelectionResult::SELECTED) {
             if (mining_gate.MayRefreshSameAnchor()) {
@@ -2121,6 +2176,14 @@ static RPCHelpMan sendshadowpowclaim()
         const CBlockIndex* tip = chainman.ActiveChain().Tip();
         if (!tip) {
             throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "No active chain tip");
+        }
+        int64_t next_block_spend_time{0};
+        if (!pwallet->GetShadowPowClaimNextBlockSpendTimeLocked(
+                next_block_spend_time) ||
+            selected_input.coin_time > next_block_spend_time) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Gold Rush PoW claim creation is waiting for a valid next-block transaction time; no proof, key, fee, or signature was created");
         }
         const Consensus::Params& consensus = Params().GetConsensus();
         if (!IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), tip->nHeight + 1)) {
@@ -2168,6 +2231,14 @@ static RPCHelpMan sendshadowpowclaim()
             !IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), tip->nHeight + 1)) {
             throw JSONRPCError(RPC_VERIFY_REJECTED, "Active chain tip changed while grinding; retry the PoW claim");
         }
+        int64_t next_block_spend_time{0};
+        if (!pwallet->GetShadowPowClaimNextBlockSpendTimeLocked(
+                next_block_spend_time) ||
+            selected_input.coin_time > next_block_spend_time) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Gold Rush PoW claim creation is waiting for a valid next-block transaction time; no fee transaction or signature was created");
+        }
     }
 
     CMutableTransaction claim_tx;
@@ -2185,13 +2256,30 @@ static RPCHelpMan sendshadowpowclaim()
                 "Wallet signing authority changed while grinding; retry after a normal unlock");
         }
         const ShadowPowClaimMiningGate mining_gate =
-            pwallet->GetShadowPowClaimMiningGateLocked();
+            pwallet->GetShadowPowClaimMiningGateFromInventoryLocked(
+                initial_inventory);
         if (!mining_gate.MayCreateClaim() ||
             selected_input.same_anchor_refresh !=
                 mining_gate.MayRefreshSameAnchor()) {
+            if (!selected_input.same_anchor_refresh &&
+                pwallet->IsLockedCoin(selected_input.outpoint)) {
+                throw JSONRPCError(
+                    RPC_VERIFY_REJECTED,
+                    strprintf(
+                        "Selected Gold Rush PoW claim input %s changed while grinding; retry the PoW claim",
+                        selected_input.outpoint.ToString()));
+            }
             throw JSONRPCError(
                 RPC_VERIFY_REJECTED,
                 "Wallet claim action changed while grinding; retry the PoW claim");
+        }
+        int64_t next_block_spend_time{0};
+        if (!pwallet->GetShadowPowClaimNextBlockSpendTimeLocked(
+                next_block_spend_time) ||
+            selected_input.coin_time > next_block_spend_time) {
+            throw JSONRPCError(
+                RPC_VERIFY_REJECTED,
+                "Gold Rush PoW claim signing is waiting for a valid next-block transaction time; no fee transaction or signature was created");
         }
         const int64_t current_time = GetAdjustedTimeSeconds();
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
@@ -2202,6 +2290,10 @@ static RPCHelpMan sendshadowpowclaim()
         const auto build_candidate = [&](const COutPoint& outpoint,
                                          const CTxOut& output,
                                          const Coin& input_coin) {
+            if (input_coin.IsSpent() ||
+                input_coin.nTime > next_block_spend_time) {
+                return false;
+            }
             CMutableTransaction candidate;
             candidate.nVersion = CTransaction::CURRENT_VERSION;
             candidate.nTime = current_time;
@@ -2275,7 +2367,9 @@ static RPCHelpMan sendshadowpowclaim()
                 if (!pwallet->chain().chainman().ActiveChainstate()
                          .CoinsTip()
                          .GetCoin(output.outpoint, input_coin) ||
-                    input_coin.IsSpent()) {
+                    input_coin.IsSpent() ||
+                    input_coin.nTime != selected_input.coin_time ||
+                    input_coin.nTime > next_block_spend_time) {
                     continue;
                 }
                 if (build_candidate(
@@ -2311,15 +2405,20 @@ static RPCHelpMan sendshadowpowclaim()
         ChainstateManager& chainman = pwallet->chain().chainman();
         LOCK(cs_main);
         const CBlockIndex* tip = chainman.ActiveChain().Tip();
+        int64_t next_block_spend_time{0};
         if (!tip || tip->GetBlockHash() != pow_work.prev_hash ||
-            tip->nHeight + 1 != pow_work.height) {
+            tip->nHeight + 1 != pow_work.height ||
+            !pwallet->GetShadowPowClaimNextBlockSpendTimeLocked(
+                next_block_spend_time) ||
+            selected_input.coin_time > next_block_spend_time) {
             throw JSONRPCError(RPC_VERIFY_REJECTED, "Active chain tip changed before the PoW claim could be committed; retry on the new tip");
         }
         ShadowPowClaimMiningGate final_mining_gate;
         {
             LOCK(pwallet->cs_wallet);
             final_mining_gate =
-                pwallet->GetShadowPowClaimMiningGateLocked();
+                pwallet->GetShadowPowClaimMiningGateFromInventoryLocked(
+                    initial_inventory);
             Coin selected_coin;
             bilingual_str refresh_error;
             const bool gate_matches = selected_input.same_anchor_refresh
@@ -2330,6 +2429,8 @@ static RPCHelpMan sendshadowpowclaim()
                       chainman.ActiveChainstate().CoinsTip().GetCoin(
                           selected_input.outpoint, selected_coin) &&
                       !selected_coin.IsSpent() &&
+                      selected_coin.nTime == selected_input.coin_time &&
+                      selected_coin.nTime <= next_block_spend_time &&
                       ComputeShadowPowClaimLineageFamilyFingerprint(
                           selected_input.outpoint,
                           selected_coin.out.nValue,
@@ -2380,7 +2481,16 @@ static RPCHelpMan sendshadowpowclaim()
                 selected_input.coin_lock_generation,
                 selected_input.outpoint,
                 final_mining_gate.wallet_generation,
-                final_mining_gate.candidate_state_fingerprint});
+                final_mining_gate.candidate_state_fingerprint,
+                final_mining_gate.active_tip,
+                final_mining_gate.active_height,
+                /*require_relay_clock_authority=*/true,
+                final_mining_gate.relay_clock_high_water,
+                final_mining_gate.relay_clock_median_time_past,
+                final_mining_gate.classification_time,
+                final_mining_gate.next_relay_expiry_time,
+                final_mining_gate.next_legacy_relay_expiry_wall_time,
+                final_mining_gate.legacy_relay_clock_high_water});
     }
 
     UniValue result(UniValue::VOBJ);
@@ -2411,7 +2521,6 @@ static const char* ShadowPowRecoveryStateName(ShadowPowClaimRecoveryState state)
     case ShadowPowClaimRecoveryState::INDETERMINATE: return "indeterminate";
     case ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE: return "current_branch_ineligible";
     case ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP: return "terminal_on_pinned_tip";
-    case ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH: return "retired_on_active_branch";
     case ShadowPowClaimRecoveryState::RESOLUTION_PENDING: return "resolution_pending";
     case ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN: return "resolved_on_active_chain";
     }
@@ -2428,6 +2537,18 @@ static const char* ShadowPowMiningGateActionName(
         return "wait_for_live";
     case ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP:
         return "wait_for_next_tip";
+    case ShadowPowClaimMiningGateAction::WAIT_FOR_RELAY_CLOCK:
+        return "wait_for_relay_clock";
+    case ShadowPowClaimMiningGateAction::WAIT_FOR_PROOF_EVALUATION:
+        return "wait_for_proof_evaluation";
+    case ShadowPowClaimMiningGateAction::PROOF_EVALUATION_CAPACITY:
+        return "proof_evaluation_capacity";
+    case ShadowPowClaimMiningGateAction::WAIT_FOR_CLAIM_OWNERSHIP:
+        return "wait_for_claim_ownership";
+    case ShadowPowClaimMiningGateAction::CLAIM_OWNERSHIP_CAPACITY:
+        return "claim_ownership_capacity";
+    case ShadowPowClaimMiningGateAction::CLAIM_INVENTORY_CAPACITY:
+        return "claim_inventory_capacity";
     case ShadowPowClaimMiningGateAction::RELAY_EXISTING:
         return "relay_existing";
     case ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR:
@@ -2795,7 +2916,6 @@ static UniValue ShadowPowRecoveryNodeToJSON(const ShadowPowClaimRecoveryNode& no
                   node.lineage_parent_txid.GetHex());
     result.pushKV("lineage_ordinal", node.lineage_ordinal);
     result.pushKV("abandoned", node.abandoned);
-    result.pushKV("expired_locally_retired", node.expired_locally_retired);
     result.pushKV("stale_depth", node.stale_depth);
     result.pushKV("stale_depth_known", node.stale_depth_known);
     result.pushKV("resolution_metadata_valid", node.resolution_metadata_valid);
@@ -2828,10 +2948,6 @@ static UniValue ShadowPowRecoveryComponentToJSON(const ShadowPowClaimRecoveryCom
     result.pushKV("anchor_user_locked", component.anchor_user_locked);
     result.pushKV("all_claims_quarantined", component.all_claims_quarantined);
     result.pushKV("all_claims_explicitly_provenanced", component.all_claims_explicitly_provenanced);
-    result.pushKV("all_claims_zero_payment_retirable",
-                  component.all_claims_zero_payment_retirable);
-    result.pushKV("all_claims_expired_locally_retired",
-                  component.all_claims_expired_locally_retired);
     result.pushKV("has_revalidating_unbound_proof",
                   component.has_revalidating_unbound_proof);
     result.pushKV("adoption_graph_safe", component.adoption_graph_safe);
@@ -4164,9 +4280,21 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             {RPCResult::Type::NUM, "live_claim_objects", "Claim objects currently in the local mempool."},
             {RPCResult::Type::NUM, "quarantined_claim_objects", "Claim objects marked quarantined for audit and reorg safety."},
             {RPCResult::Type::NUM, "blocking_components", "Legacy recovery classification count retained for audit compatibility. Candidate claim creation is controlled by the complete typed mining gate."},
-            {RPCResult::Type::NUM, "retired_claim_objects", "Deprecated historical count retained for RPC compatibility. Current wallet repair reopens these records and keeps their inputs reserved, so authoritative post-repair state is zero."},
-            {RPCResult::Type::NUM, "retired_components", "Deprecated historical component count retained for RPC compatibility. Authoritative post-repair state is zero."},
             {RPCResult::Type::NUM, "resolved_components", "Typed components resolved on the active chain."},
+            {RPCResult::Type::BOOL, "proof_evaluation_budget_exhausted", "Whether this read reached the bounded cold-proof evaluation budget. Deferred contexts fail closed for this read and are evaluated incrementally by later reads; this does not by itself indicate corrupt wallet data."},
+            {RPCResult::Type::NUM, "proof_evaluation_deferred_contexts", "Distinct cold proof contexts deferred after the bounded per-read evaluation budget was reached."},
+            {RPCResult::Type::BOOL, "proof_evaluation_retryable_local_failure", "Whether at least one retained proof hit a transient local evaluator failure. The result is nonauthorizing, uncached, and retried by a later bounded read; it is not proof-corruption evidence."},
+            {RPCResult::Type::NUM, "proof_evaluation_retryable_local_failure_contexts", "Distinct retained proof contexts that hit a retryable local evaluator failure in this read."},
+            {RPCResult::Type::BOOL, "proof_evaluation_retryable_local_state", "Whether a retained proof hit a transient local chain-state read failure before or after proof evaluation. The result is nonauthorizing and retried with bounded backoff; it is not proof-corruption evidence."},
+            {RPCResult::Type::NUM, "proof_evaluation_retryable_local_state_contexts", "Retained claim contexts that hit a retryable local chain-state read failure in this read."},
+            {RPCResult::Type::BOOL, "proof_evaluation_capacity_exceeded", "Whether the exact wallet/tip snapshot has more distinct retained proof contexts than the bounded evaluator cache can hold. No proof is evaluated in this state; it is a stable resource-capacity result, not proof-corruption evidence."},
+            {RPCResult::Type::NUM, "proof_evaluation_capacity_contexts", "Distinct retained proof contexts in a capacity-exceeded snapshot, or zero otherwise."},
+            {RPCResult::Type::BOOL, "claim_ownership_pending", "Whether implicit legacy-claim ownership remains in a bounded wallet-only classification slice. All claim authority is withheld until classification completes."},
+            {RPCResult::Type::NUM, "claim_ownership_pending_records", "Implicit proof records still awaiting bounded ownership classification."},
+            {RPCResult::Type::BOOL, "claim_ownership_capacity_exceeded", "Whether an implicit proof record or wallet ownership set exceeds the bounded ownership-classification budget."},
+            {RPCResult::Type::NUM, "claim_ownership_capacity_work", "Bounded ownership work units observed before completion or capacity."},
+            {RPCResult::Type::BOOL, "claim_inventory_capacity_exceeded", "Whether the exact wallet/tip retained-claim graph exceeds the strict topology work budget used while the global chain lock is held. This is a stable nonauthorizing resource result, not proof-corruption evidence."},
+            {RPCResult::Type::NUM, "claim_inventory_capacity_work", "Bounded claim-record/topology work units observed before capacity was reached, or the completed work count otherwise."},
             {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual resolutions."},
             {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic resolutions."},
             {RPCResult::Type::NUM, "confirmed_manual_resolutions", "Confirmed manual resolutions reconstructed from wallet records."},
@@ -4196,6 +4324,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     ShadowPowClaimRecoveryUsage usage;
     ShadowPowClaimRecoveryPolicyMutationResult policy_state;
     bool database_ambiguous{false};
+    inventory = pwallet->GetShadowPowClaimRecoveryInventory();
     {
         // One recursive lock snapshot keeps legacy compatibility fields,
         // typed graph details, and durable usage counters on the same tip and
@@ -4206,10 +4335,16 @@ static RPCHelpMan getpowclaimrecoveryinfo()
         if (policy_state.authoritative_state_available) {
             policy = policy_state.authoritative_policy;
         }
-        compatibility_inventory = pwallet->GetShadowPowClaimInventoryLocked();
-        inventory = pwallet->GetShadowPowClaimRecoveryInventoryLocked();
-        usage = pwallet->GetShadowPowClaimRecoveryUsage(
-            policy.rolling_fee_window_seconds);
+        if (!pwallet->ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+                inventory)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "wallet or active-chain state changed while evaluating Gold Rush recovery proofs; retry");
+        }
+        compatibility_inventory =
+            BuildShadowPowClaimCompatibilityInventory(inventory);
+        usage = pwallet->GetShadowPowClaimRecoveryUsageFromInventoryLocked(
+            inventory, policy.rolling_fee_window_seconds);
     }
     const bool verbose = !request.params[0].isNull() && request.params[0].get_bool();
 
@@ -4241,9 +4376,42 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     result.pushKV("live_claim_objects", static_cast<uint64_t>(inventory.live_claim_objects));
     result.pushKV("quarantined_claim_objects", static_cast<uint64_t>(inventory.quarantined_claim_objects));
     result.pushKV("blocking_components", static_cast<uint64_t>(inventory.blocking_components));
-    result.pushKV("retired_claim_objects", static_cast<uint64_t>(inventory.retired_claim_objects));
-    result.pushKV("retired_components", static_cast<uint64_t>(inventory.retired_components));
     result.pushKV("resolved_components", static_cast<uint64_t>(inventory.resolved_components));
+    result.pushKV("proof_evaluation_budget_exhausted",
+                  inventory.proof_evaluation_budget_exhausted);
+    result.pushKV("proof_evaluation_deferred_contexts",
+                  static_cast<uint64_t>(
+                      inventory.proof_evaluation_deferred_contexts));
+    result.pushKV("proof_evaluation_retryable_local_failure",
+                  inventory.proof_evaluation_retryable_local_failure);
+    result.pushKV("proof_evaluation_retryable_local_failure_contexts",
+                  static_cast<uint64_t>(inventory
+                      .proof_evaluation_retryable_local_failure_contexts));
+    result.pushKV("proof_evaluation_retryable_local_state",
+                  inventory.proof_evaluation_retryable_local_state);
+    result.pushKV("proof_evaluation_retryable_local_state_contexts",
+                  static_cast<uint64_t>(inventory
+                      .proof_evaluation_retryable_local_state_contexts));
+    result.pushKV("proof_evaluation_capacity_exceeded",
+                  inventory.proof_evaluation_capacity_exceeded);
+    result.pushKV("proof_evaluation_capacity_contexts",
+                  static_cast<uint64_t>(
+                      inventory.proof_evaluation_capacity_contexts));
+    result.pushKV("claim_ownership_pending",
+                  inventory.claim_ownership_pending);
+    result.pushKV("claim_ownership_pending_records",
+                  static_cast<uint64_t>(
+                      inventory.claim_ownership_pending_records));
+    result.pushKV("claim_ownership_capacity_exceeded",
+                  inventory.claim_ownership_capacity_exceeded);
+    result.pushKV("claim_ownership_capacity_work",
+                  static_cast<uint64_t>(
+                      inventory.claim_ownership_capacity_work));
+    result.pushKV("claim_inventory_capacity_exceeded",
+                  inventory.claim_inventory_capacity_exceeded);
+    result.pushKV("claim_inventory_capacity_work",
+                  static_cast<uint64_t>(
+                      inventory.claim_inventory_capacity_work));
     result.pushKV("pending_manual_resolutions", static_cast<uint64_t>(usage.pending_manual));
     result.pushKV("pending_automatic_resolutions", static_cast<uint64_t>(usage.pending_automatic));
     result.pushKV("confirmed_manual_resolutions", static_cast<uint64_t>(usage.confirmed_manual));
@@ -4442,7 +4610,7 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is enabled."},
             {RPCResult::Type::BOOL, "autostart", "Whether process-wide persistent consent was given to start PoW mining for every eligible loaded wallet."},
             {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether process-wide background automation may create new non-HD keys in loaded wallets."},
-            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, ready, hashing, or error."},
+            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, claim_evaluation_pending, claim_evaluation_capacity, ready, hashing, or error."},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
             {RPCResult::Type::NUM, "cpu_percent", "Per-core CPU duty-cycle target."},
             {RPCResult::Type::NUM, "hashrate", "Aggregate Argon2id tries per second."},
@@ -4469,7 +4637,7 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::STR_HEX, "claim_inventory_tip", "Active tip to which component classification is bound, or all-zero when unavailable."},
             {RPCResult::Type::BOOL, "claim_inventory_wallet_tip_matches", "Whether the wallet-processed tip exactly matched the classified active tip."},
             {RPCResult::Type::BOOL, "mining_gate_coherent", "Whether the typed mining gate is bound to one matching active-chain and wallet tip."},
-            {RPCResult::Type::STR, "mining_gate_action", "Fresh inventory action, except that an enabled claim-in-flight worker may report the optional transient wait_for_next_tip from one exact matching cached snapshot: create_new_anchor, wait_for_live, wait_for_next_tip, relay_existing, refresh_same_anchor, or unsafe."},
+            {RPCResult::Type::STR, "mining_gate_action", "Fresh inventory action, except that an enabled claim-in-flight worker may report the optional transient wait_for_next_tip from one exact matching cached snapshot: create_new_anchor, wait_for_live, wait_for_next_tip, wait_for_proof_evaluation, proof_evaluation_capacity, wait_for_claim_ownership, claim_ownership_capacity, relay_existing, refresh_same_anchor, or unsafe."},
             {RPCResult::Type::BOOL, "mining_gate_can_submit", "Fresh inventory authorization to create one additional claim without mutating recovery state. It may be true while mining_gate_action reports a bounded wait_for_next_tip worker override, but does not authorize bypassing that wait."},
             {RPCResult::Type::BOOL, "mining_gate_database_ambiguous", "Whether an ambiguous claim-recovery or user coin-lock database outcome forces the gate closed until wallet reload."},
             {RPCResult::Type::NUM, "mining_gate_unresolved_components", "Unresolved mining-relevant wallet claim components in the typed snapshot. Audit-only incoming proof records remain visible in recovery inventory but do not count here."},
@@ -4478,6 +4646,20 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "mining_gate_family_claims", "Historical members across every safe authenticated wallet-owned same-anchor family."},
             {RPCResult::Type::NUM, "mining_gate_unsafe_claims", "Claim objects in mining-relevant unresolved components that fail the strict same-anchor family rules."},
             {RPCResult::Type::NUM, "mining_gate_unsafe_components", "Mining-relevant unresolved components that fail the strict same-anchor family rules."},
+            {RPCResult::Type::BOOL, "claim_proof_evaluation_budget_exhausted", "Whether this read reached the bounded cold-proof evaluation budget. Deferred contexts fail closed temporarily and are evaluated incrementally by later reads."},
+            {RPCResult::Type::NUM, "claim_proof_evaluation_deferred_contexts", "Distinct cold proof contexts deferred by the bounded per-read evaluation budget; this is resource telemetry, not by itself wallet-corruption evidence."},
+            {RPCResult::Type::BOOL, "claim_proof_evaluation_retryable_local_failure", "Whether at least one retained proof hit a transient local evaluator failure. Mining remains nonauthorizing and retries later without treating the proof as corrupt."},
+            {RPCResult::Type::NUM, "claim_proof_evaluation_retryable_local_failure_contexts", "Distinct retained proof contexts that hit a retryable local evaluator failure in this read."},
+            {RPCResult::Type::BOOL, "claim_proof_evaluation_retryable_local_state", "Whether a retained proof hit a transient local chain-state read failure. Mining remains nonauthorizing and retries later without treating the proof as corrupt."},
+            {RPCResult::Type::NUM, "claim_proof_evaluation_retryable_local_state_contexts", "Retained claim contexts that hit a retryable local chain-state read failure in this read."},
+            {RPCResult::Type::BOOL, "claim_proof_evaluation_capacity_exceeded", "Whether the exact wallet/tip snapshot has more distinct retained proof contexts than the bounded evaluator cache can hold. This is a stable resource-capacity result, not proof-corruption evidence."},
+            {RPCResult::Type::NUM, "claim_proof_evaluation_capacity_contexts", "Distinct retained proof contexts in a capacity-exceeded snapshot, or zero otherwise."},
+            {RPCResult::Type::BOOL, "claim_ownership_pending", "Whether implicit legacy-claim ownership remains in a bounded wallet-only classification slice. Mining and relay remain nonauthorizing."},
+            {RPCResult::Type::NUM, "claim_ownership_pending_records", "Implicit proof records still awaiting bounded ownership classification."},
+            {RPCResult::Type::BOOL, "claim_ownership_capacity_exceeded", "Whether implicit claim ownership exceeds the bounded classifier resource budget."},
+            {RPCResult::Type::NUM, "claim_ownership_capacity_work", "Bounded ownership-classification work units observed before completion or capacity."},
+            {RPCResult::Type::BOOL, "claim_inventory_capacity_exceeded", "Whether the exact wallet/tip retained-claim graph exceeds the strict topology work budget used while the global chain lock is held."},
+            {RPCResult::Type::NUM, "claim_inventory_capacity_work", "Bounded claim-record/topology work units observed before capacity was reached, or the completed work count otherwise."},
             {RPCResult::Type::STR_HEX, "mining_gate_relay_txid", "Eligible under-TTL relay claim for the reported gate snapshot, or all-zero when no relay is currently actionable, including while that family is deferred until the next tip."},
             {RPCResult::Type::STR_HEX, "mining_gate_lineage_head_txid", "Current durable same-anchor lineage head, or all-zero when no family is active."},
             {RPCResult::Type::STR_HEX, "mining_gate_candidate_state_fingerprint", "Cheap in-memory wallet-claim state key used with tip and database generation to invalidate the cached gate."},
@@ -4522,10 +4704,16 @@ static RPCHelpMan getpowmininginfo()
     bool pow_mining_enabled{false};
     interfaces::WalletPowMiningState pow_mining_state{
         interfaces::WalletPowMiningState::DISABLED};
+    recovery_inventory =
+        pwallet->GetShadowPowClaimRecoveryInventory();
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
-        recovery_inventory =
-            pwallet->GetShadowPowClaimRecoveryInventoryLocked();
+        if (!pwallet->ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+                recovery_inventory)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "wallet or active-chain state changed while evaluating Gold Rush recovery proofs; retry");
+        }
         claim_inventory = BuildShadowPowClaimCompatibilityInventory(
             recovery_inventory);
         mining_gate =
@@ -4593,6 +4781,43 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("mining_gate_family_claims", static_cast<uint64_t>(mining_gate.family_claims));
     obj.pushKV("mining_gate_unsafe_claims", static_cast<uint64_t>(mining_gate.unsafe_claims));
     obj.pushKV("mining_gate_unsafe_components", static_cast<uint64_t>(mining_gate.unsafe_components));
+    obj.pushKV("claim_proof_evaluation_budget_exhausted",
+               recovery_inventory.proof_evaluation_budget_exhausted);
+    obj.pushKV("claim_proof_evaluation_deferred_contexts",
+               static_cast<uint64_t>(
+                   recovery_inventory.proof_evaluation_deferred_contexts));
+    obj.pushKV("claim_proof_evaluation_retryable_local_failure",
+               recovery_inventory
+                   .proof_evaluation_retryable_local_failure);
+    obj.pushKV("claim_proof_evaluation_retryable_local_failure_contexts",
+               static_cast<uint64_t>(recovery_inventory
+                   .proof_evaluation_retryable_local_failure_contexts));
+    obj.pushKV("claim_proof_evaluation_retryable_local_state",
+               recovery_inventory
+                   .proof_evaluation_retryable_local_state);
+    obj.pushKV("claim_proof_evaluation_retryable_local_state_contexts",
+               static_cast<uint64_t>(recovery_inventory
+                   .proof_evaluation_retryable_local_state_contexts));
+    obj.pushKV("claim_proof_evaluation_capacity_exceeded",
+               recovery_inventory.proof_evaluation_capacity_exceeded);
+    obj.pushKV("claim_proof_evaluation_capacity_contexts",
+               static_cast<uint64_t>(
+                   recovery_inventory.proof_evaluation_capacity_contexts));
+    obj.pushKV("claim_ownership_pending",
+               recovery_inventory.claim_ownership_pending);
+    obj.pushKV("claim_ownership_pending_records",
+               static_cast<uint64_t>(
+                   recovery_inventory.claim_ownership_pending_records));
+    obj.pushKV("claim_ownership_capacity_exceeded",
+               recovery_inventory.claim_ownership_capacity_exceeded);
+    obj.pushKV("claim_ownership_capacity_work",
+               static_cast<uint64_t>(
+                   recovery_inventory.claim_ownership_capacity_work));
+    obj.pushKV("claim_inventory_capacity_exceeded",
+               recovery_inventory.claim_inventory_capacity_exceeded);
+    obj.pushKV("claim_inventory_capacity_work",
+               static_cast<uint64_t>(
+                   recovery_inventory.claim_inventory_capacity_work));
     obj.pushKV("mining_gate_relay_txid", mining_gate.relay_txid.GetHex());
     obj.pushKV("mining_gate_lineage_head_txid",
                mining_gate.lineage_head_txid.GetHex());

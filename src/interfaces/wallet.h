@@ -787,7 +787,6 @@ enum class WalletPowClaimRecoveryState : uint8_t {
     INDETERMINATE,
     CURRENT_BRANCH_INELIGIBLE,
     TERMINAL_ON_PINNED_TIP,
-    RETIRED_ON_ACTIVE_BRANCH,
     RESOLUTION_PENDING,
     RESOLVED_ON_ACTIVE_CHAIN,
 };
@@ -836,7 +835,6 @@ struct WalletPowClaimRecoveryNode
     bool in_mempool{false};
     bool quarantined{false};
     bool abandoned{false};
-    bool expired_locally_retired{false};
     bool expected_shape{false};
     bool wallet_authored{false};
     int created_height{-1};
@@ -864,8 +862,6 @@ struct WalletPowClaimRecoveryComponent
     bool anchor_authenticated{false};
     bool anchor_unspent{false};
     bool all_claims_explicitly_provenanced{false};
-    bool all_claims_zero_payment_retirable{false};
-    bool all_claims_expired_locally_retired{false};
     bool has_revalidating_unbound_proof{false};
     bool adoption_graph_safe{false};
     size_t descendant_claims{0};
@@ -940,8 +936,6 @@ struct WalletPowClaimRecoveryReview
     size_t live_claim_objects{0};
     size_t quarantined_claim_objects{0};
     size_t blocking_components{0};
-    size_t retired_claim_objects{0};
-    size_t retired_components{0};
     size_t resolved_components{0};
     std::vector<WalletPowClaimRecoveryComponent> components;
     std::vector<std::string> unanchored_claim_txids;

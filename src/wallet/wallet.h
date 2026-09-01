@@ -45,6 +45,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
@@ -90,14 +91,29 @@ struct ShadowPowClaimRecoveryBroadcastGuard
 {
     uint64_t expected_wallet_generation{0};
     uint256 expected_wallet_tip;
+    int expected_wallet_height{-1};
     std::optional<uint256> expected_candidate_state_fingerprint;
     /** If set, the exact one-input transaction must still spend this
      * user-unlocked outpoint at the atomic broadcast reservation. */
     std::optional<COutPoint> expected_unlocked_input;
     bool require_normal_unlock{false};
+    /** Permit one explicit, exact recovery call to relay a persisted draft.
+     * Standing relay authority is granted only after the same bytes are
+     * observed in the mempool or accepted by this guarded submission. */
+    bool allow_current_call_draft_relay{false};
     std::optional<ShadowPowClaimRecoveryPolicy> expected_automatic_policy;
     bool require_pow_mining_enabled{false};
     std::optional<uint64_t> expected_pow_mining_authority_generation;
+    /** Bind proof relay to the same durable monotonic relay-clock snapshot
+     * that selected the exact bytes.  This is intentionally absent for
+     * ordinary transactions; every QQSPROOF relay requires it. */
+    bool require_relay_clock_authority{false};
+    int64_t expected_relay_clock_high_water{0};
+    int64_t expected_relay_clock_median_time_past{0};
+    int64_t expected_relay_clock_classification_time{0};
+    int64_t expected_relay_clock_next_transition{0};
+    int64_t expected_relay_clock_next_legacy_wall_transition{0};
+    int64_t expected_legacy_relay_clock_high_water{0};
 };
 
 /** Exact wallet input selected to authenticate one fee-paying Gold Rush PoW claim. */
@@ -106,6 +122,7 @@ struct ShadowPowClaimInput {
     CScript target;
     CTxDestination destination;
     CAmount value{0};
+    uint32_t coin_time{0};
     CScript quantum_payout_script;
     uint64_t coin_lock_generation{0};
     bool same_anchor_refresh{false};
@@ -184,6 +201,7 @@ struct StakingTelemetrySnapshot {
 
 enum class ShadowPowClaimInputSelectionResult {
     SELECTED,
+    CHAIN_TIME_UNAVAILABLE,
     NO_ELIGIBLE_INPUT,
     FEE_EXCEEDS_MAX,
     STAKE_RESERVE_PROTECTED,
@@ -209,6 +227,17 @@ struct ShadowPowClaimCommitAuthority {
     COutPoint expected_input;
     uint64_t expected_wallet_generation{0};
     uint256 expected_candidate_state_fingerprint;
+    uint256 expected_active_tip;
+    int expected_active_height{-1};
+    /** Exact nonauthorizing/authorizing relay-time phase captured before any
+     * key, fee, or proof work.  Locally signed QQSPROOF commits require it. */
+    bool require_relay_clock_authority{false};
+    int64_t expected_relay_clock_high_water{0};
+    int64_t expected_relay_clock_median_time_past{0};
+    int64_t expected_relay_clock_classification_time{0};
+    int64_t expected_relay_clock_next_transition{0};
+    int64_t expected_relay_clock_next_legacy_wall_transition{0};
+    int64_t expected_legacy_relay_clock_high_water{0};
 };
 
 /** Active-chain-relative state of one wallet-known quarantined QQSPROOF component. */
@@ -922,10 +951,112 @@ private:
     uint256 m_shadow_pow_relay_reject_tip GUARDED_BY(cs_wallet);
     uint64_t m_shadow_pow_relay_reject_wallet_generation GUARDED_BY(cs_wallet){0};
     uint256 m_shadow_pow_relay_reject_candidate_state GUARDED_BY(cs_wallet);
+    int64_t m_shadow_pow_relay_reject_next_expiry
+        GUARDED_BY(cs_wallet){0};
+    int64_t m_shadow_pow_relay_reject_next_legacy_wall_expiry
+        GUARDED_BY(cs_wallet){0};
     std::set<uint256> m_shadow_pow_relay_reject_txids GUARDED_BY(cs_wallet);
     std::set<uint256> m_shadow_pow_relay_wait_roots GUARDED_BY(cs_wallet);
-    std::optional<ShadowPowClaimRecoveryInventory>
+    mutable std::optional<ShadowPowClaimRecoveryInventory>
         m_shadow_pow_relay_reject_inventory GUARDED_BY(cs_wallet);
+    // Exact immutable proof contexts already evaluated outside cs_main and
+    // cs_wallet. The FIFO is deliberately bounded; a full recovery pass also
+    // carries its fresh results locally so eviction can never turn an old or
+    // mismatched result into authority.
+    mutable std::map<uint256, ShadowPowClaimProofEvaluation>
+        m_shadow_pow_claim_proof_evaluation_cache GUARDED_BY(cs_wallet);
+    mutable std::deque<uint256>
+        m_shadow_pow_claim_proof_evaluation_cache_order GUARDED_BY(cs_wallet);
+    // Serialize cold recovery-proof evaluation for this wallet. The mutex is
+    // acquired only while neither cs_main nor cs_wallet is held, so concurrent
+    // RPC/GUI/miner reads share one cache fill instead of multiplying Argon2
+    // memory use.
+    mutable Mutex m_shadow_pow_claim_proof_evaluation_mutex;
+    // O(1) invalidation signal for in-memory transaction/graph transitions
+    // that are not guaranteed to advance the wallet database counter (for
+    // example mempool membership). Full inventory construction derives the
+    // relay-expiry frontier separately, so warm workers never scan mapWallet.
+    uint64_t m_shadow_pow_claim_candidate_state_generation
+        GUARDED_BY(cs_wallet){0};
+    // Exact wallet transaction ids whose immutable bytes carry a QQSPROOF.
+    // Maintaining this index at publication/load/removal keeps claim reads
+    // independent of unrelated ordinary wallet history while cs_main is
+    // held. Runtime graph construction still enforces its own strict work
+    // budget before any proof evaluation.
+    std::set<uint256> m_shadow_pow_claim_txids GUARDED_BY(cs_wallet);
+    // Hot recovery/mining subset. Confirmed history remains in the lifetime
+    // index for ancestry/audit but can never exhaust the runtime graph cap.
+    std::set<uint256> m_shadow_pow_unconfirmed_claim_txids
+        GUARDED_BY(cs_wallet);
+    // Proof records without explicit authored/adopted/from-me provenance are
+    // classified for debit ownership in bounded wallet-only slices. Runtime
+    // AddToWallet/state callbacks never perform an O(script-managers)
+    // ownership walk while they may also hold cs_main.
+    mutable std::set<uint256> m_shadow_pow_unclassified_claim_txids
+        GUARDED_BY(cs_wallet);
+    mutable std::set<uint256> m_shadow_pow_legacy_local_claim_txids
+        GUARDED_BY(cs_wallet);
+    // Only unconfirmed implicit records can affect current claim authority.
+    // Confirmed implicit history is requeued exactly when its state becomes
+    // unconfirmed, so an ownership epoch change never forces an unbounded
+    // rescan of inert lifetime history before mining can continue.
+    mutable std::set<uint256>
+        m_shadow_pow_unconfirmed_implicit_claim_txids
+        GUARDED_BY(cs_wallet);
+    // Implicit debit ownership is a cache, never authority by itself. Every
+    // successful key/script/descriptor mutation advances the epoch in O(1).
+    // Cached entries carry the epoch at which GetDebit classified them and
+    // the public inventory remains nonauthorizing until a bounded wallet-only
+    // pass has refreshed every stale unconfirmed entry.
+    uint64_t m_shadow_pow_claim_ownership_generation
+        GUARDED_BY(cs_wallet){1};
+    std::atomic<uint64_t> m_shadow_pow_claim_ownership_source_generation{1};
+    uint64_t m_shadow_pow_claim_ownership_applied_source_generation
+        GUARDED_BY(cs_wallet){1};
+    mutable std::map<uint256, uint64_t>
+        m_shadow_pow_claim_ownership_generation_by_txid
+        GUARDED_BY(cs_wallet);
+    mutable size_t m_shadow_pow_claim_stale_ownership_records
+        GUARDED_BY(cs_wallet){0};
+    mutable std::optional<uint256>
+        m_shadow_pow_claim_ownership_reclassification_cursor
+        GUARDED_BY(cs_wallet);
+    mutable bool m_shadow_pow_claim_ownership_capacity_exceeded
+        GUARDED_BY(cs_wallet){false};
+    mutable size_t m_shadow_pow_claim_ownership_capacity_work
+        GUARDED_BY(cs_wallet){0};
+    // Foreign incoming proof carriers remain separately indexable for
+    // bounded audit telemetry, but can never consume local mining/recovery
+    // authority capacity.
+    std::set<uint256> m_shadow_pow_foreign_claim_txids
+        GUARDED_BY(cs_wallet);
+    // Exact wallet transaction ids carrying managed recovery metadata.
+    // This keeps budget accounting proportional to recovery state instead of
+    // rescanning unrelated wallet history while cs_main is held.
+    std::set<uint256> m_shadow_pow_managed_resolution_txids
+        GUARDED_BY(cs_wallet);
+    // Local claim records that spend the sole output of a confirmed managed
+    // resolution. Maintained with the other exact indexes so rolling recovery
+    // usage never scans transaction inputs while cs_main is held.
+    std::set<uint256> m_shadow_pow_recycled_claim_txids
+        GUARDED_BY(cs_wallet);
+    // Ordered expiry frontiers make confirmed-claim reorg protection O(log N)
+    // instead of rescanning lifetime history under cs_main. The bool in the
+    // reverse index is true for released legacy receipt-clock frontiers.
+    std::set<std::pair<int64_t, uint256>>
+        m_shadow_pow_schema_relay_frontiers GUARDED_BY(cs_wallet);
+    std::set<std::pair<int64_t, uint256>>
+        m_shadow_pow_legacy_relay_frontiers GUARDED_BY(cs_wallet);
+    std::map<uint256, std::pair<bool, int64_t>>
+        m_shadow_pow_relay_frontier_by_txid GUARDED_BY(cs_wallet);
+    // Durable monotonic maximum of validated relay-expiry frontiers. It
+    // advances in one scalar write after cs_main is released, so a later
+    // chain-time or released-record receipt-clock rollback cannot revive
+    // bytes already observed beyond their relay lifetime.
+    int64_t m_shadow_pow_claim_relay_clock_high_water
+        GUARDED_BY(cs_wallet){0};
+    int64_t m_shadow_pow_claim_legacy_relay_clock_high_water
+        GUARDED_BY(cs_wallet){0};
     // Changes on every effective in-memory user coin-lock transition. The
     // value is folded into the typed-claim candidate fingerprint so a default
     // nonpersistent lock/unlock invalidates cached family selection too.
@@ -943,6 +1074,8 @@ private:
     bool m_qq_development_donation_db_ambiguous GUARDED_BY(cs_wallet){false};
     using ShadowPowClaimRecoveryRecordMutation =
         std::function<bool(CWalletTx&)>;
+    using ShadowPowClaimRecoveryBatchMutation =
+        std::function<bool(const uint256&, CWalletTx&)>;
     /**
      * Copy, mutate, and durably commit safety-relevant claim records before
      * publishing their metadata/state to mapWallet. Any database-stage
@@ -950,7 +1083,7 @@ private:
      */
     bool UpdateShadowPowClaimRecoveryRecordsDurably(
         const std::vector<uint256>& txids,
-        const ShadowPowClaimRecoveryRecordMutation& mutation,
+        const ShadowPowClaimRecoveryBatchMutation& mutation,
         std::string_view operation,
         std::vector<uint256>* changed_txids = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -960,9 +1093,31 @@ private:
         std::string_view operation,
         bool* changed = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool IsShadowPowClaimRelayWallTimePlausibleLocked(
+        int64_t wall_time, int64_t median_time_past) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    int64_t GetShadowPowClaimRelayEffectiveTimeLocked(
+        int64_t wall_time, int64_t median_time_past) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool IsShadowPowClaimRelayClockSigningSafeLocked(
+        int64_t wall_time, int64_t median_time_past) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool GetShadowPowClaimRelayBirthLocked(
+        const CWalletTx& wtx, int64_t& birth_time,
+        bool* chain_clocked = nullptr) const
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    bool AdvanceShadowPowClaimRelayClockHighWatersDurably(
+        int64_t observed_schema_time, int64_t observed_legacy_time)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+        LOCKS_EXCLUDED(::cs_main);
     friend class WalletBatch;
     /** Install an already validated database record without writing it again. */
     bool LoadShadowPowClaimRecoveryPolicy(const ShadowPowClaimRecoveryPolicy& policy) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void LoadShadowPowClaimRelayClockHighWater(
+                                               int64_t high_water,
+                                               int64_t legacy_high_water,
+                                               bool valid)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadQQDevelopmentDonationConsent(const QQDevelopmentDonationConsent& consent) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /**
@@ -1712,6 +1867,11 @@ public:
 
     /** check if a certain wallet flag is set */
     bool IsWalletFlagSet(uint64_t flag) const override;
+    void NotifyOwnershipChanged() override
+    {
+        m_shadow_pow_claim_ownership_source_generation.fetch_add(
+            1, std::memory_order_release);
+    }
 
     /** overwrite all flags by the given uint64_t
        flags must be uninitialised (or 0)
@@ -1933,24 +2093,56 @@ public:
      * already spent on the active chain remain in wallet history but do not
      * gate mining; a reorg makes them blocking again automatically. */
     ShadowPowClaimInventory GetShadowPowClaimInventory() const;
-    /** Locked implementation for final claim preflight. */
-    ShadowPowClaimInventory GetShadowPowClaimInventoryLocked() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     /** Build the complete wallet-known claim/conflict/descendant graph on one
      * active-chain tip. This is read-only and retains malformed or incomplete
      * components as indeterminate instead of inferring resolution. */
     ShadowPowClaimRecoveryInventory GetShadowPowClaimRecoveryInventory() const;
-    ShadowPowClaimRecoveryInventory GetShadowPowClaimRecoveryInventoryLocked() const
+    /** Advance at most one wallet-level retained-claim expiry frontier.
+     * Memory-hard proof evaluation is never performed, and any scalar
+     * database write occurs with cs_main released. */
+    bool RefreshShadowPowClaimRelayClock() const
+        LOCKS_EXCLUDED(::cs_main, cs_wallet);
+    ShadowPowClaimRecoveryInventory
+    GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
+        const std::map<uint256, ShadowPowClaimProofEvaluation>& evaluations,
+        std::vector<std::pair<uint256,
+                              ShadowPowClaimProofEvaluationContext>>* pending,
+        std::vector<ShadowPowClaimProofEvaluationContext>* all_contexts =
+            nullptr)
+        const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    void ClearShadowPowClaimProofEvaluationCacheForTesting()
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        m_shadow_pow_claim_proof_evaluation_cache.clear();
+        m_shadow_pow_claim_proof_evaluation_cache_order.clear();
+    }
+    bool ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+        const ShadowPowClaimRecoveryInventory& inventory) const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     /** Cheap cache key for in-memory claim membership/mempool-state changes
      * that do not necessarily advance the wallet database counter. */
     uint256 GetShadowPowClaimCandidateStateFingerprintLocked() const
-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void MarkShadowPowClaimCandidateStateChangedLocked()
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        ++m_shadow_pow_claim_candidate_state_generation;
+    }
+    void RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void InvalidateShadowPowClaimImplicitOwnershipLocked()
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void InvalidateShadowPowClaimImplicitOwnershipEntryLocked(
+        const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RefreshShadowPowClaimOwnershipIndex() const
+        EXCLUSIVE_LOCKS_REQUIRED(!::cs_main, !cs_wallet);
+    void RebuildShadowPowClaimIndexesLocked()
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Derive the read-only, active-tip-pinned claim-creation gate from the
      * complete recovery inventory without changing recovery classifications
      * or authorizing any wallet mutation. */
-    ShadowPowClaimMiningGate GetShadowPowClaimMiningGate() const;
-    ShadowPowClaimMiningGate GetShadowPowClaimMiningGateLocked() const
-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    ShadowPowClaimMiningGate GetShadowPowClaimMiningGate(
+        ShadowPowClaimRecoveryInventory* evaluated_inventory = nullptr) const;
     ShadowPowClaimMiningGate GetShadowPowClaimMiningGateFromInventoryLocked(
         const ShadowPowClaimRecoveryInventory& inventory) const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
@@ -1973,8 +2165,10 @@ public:
      * family on the unchanged snapshot. */
     ShadowPowClaimMiningGate DeferShadowPowClaimFamilyForSnapshot(
         const ShadowPowClaimMiningGate& deferred_gate);
-    ShadowPowClaimMiningGate DeferShadowPowClaimFamilyForSnapshotLocked(
-        const ShadowPowClaimMiningGate& deferred_gate)
+    ShadowPowClaimMiningGate
+    DeferShadowPowClaimFamilyForInventoryLocked(
+        const ShadowPowClaimMiningGate& deferred_gate,
+        const ShadowPowClaimRecoveryInventory& evaluated_inventory)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     /** Create one deterministic, tip-pinned action per confirmed anchor. */
     ShadowPowClaimRecoveryPlan PlanShadowPowClaimRecovery(
@@ -2033,8 +2227,12 @@ public:
         const CCoinControl& coin_control,
         ShadowPowClaimInput& selected,
         bilingual_str& error,
-        const ShadowPowClaimMiningGate* mining_gate = nullptr) const
+        const ShadowPowClaimMiningGate& mining_gate) const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    /** Resolve the exact next-block spend time used by v2 mempool admission.
+     * Failure is a nonauthorizing pause before proof grinding or signing. */
+    bool GetShadowPowClaimNextBlockSpendTimeLocked(int64_t& spend_time) const
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     /** Resolve and authenticate the confirmed chain coin for an exact
      * same-anchor refresh intent. Unlike AvailableCoins(), this deliberately
      * permits the anchor to remain reserved by older sibling claims. */
@@ -2090,6 +2288,18 @@ private:
  * their transactions. Actual rebroadcast schedule is managed by the wallets themselves.
  */
 void MaybeResendWalletTxs(WalletContext& context);
+
+/** Unit-test hook for the miner lifecycle's strong exception guarantee. A
+ * nonnegative value injects a worker-construction failure after that many
+ * replacement workers have been created but before any can run. */
+void SetPowMinerWorkerCreationFailureAfterForTesting(int created_workers);
+enum class ShadowPowClaimRepairRetryFailureForTesting : uint8_t {
+    NONE,
+    SNAPSHOT_DRIFT,
+    WALLET_LOCK_CONTENTION,
+};
+void SetShadowPowClaimRepairRetryFailureForTesting(
+    ShadowPowClaimRepairRetryFailureForTesting failure);
 
 /** RAII object to check and reserve a wallet rescan */
 class WalletRescanReserver

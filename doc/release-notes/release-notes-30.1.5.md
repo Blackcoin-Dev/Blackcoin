@@ -231,15 +231,17 @@ open reconstructs the same authenticated family and anchor. A concurrent
 two-version test sends candidate-authored same-anchor bytes through v30.1.4's
 P2P admission path, includes them in a v30.1.4 PoS block, restarts both
 versions, and checks removal and later reinclusion across a competing-branch
-reorganization. Release publication still requires the exact-SHA repository
-gate, reproducible candidate packaging, and a data-preserving canary before
-fleet rollout.
+reorganization. Release publication requires the exact-SHA repository gate,
+simulated upgrade and rollback coverage, and reproducible final packages.
+A live-wallet canary and separate pre-release canary package are not publication
+prerequisites for v30.1.5. Simulated qualification does not claim that a live
+fleet deployment has been performed or validated.
 
 Back up each wallet and take a cold datadir copy before replacing binaries.
 Stop the existing process cleanly. Do not run two versions against one datadir.
 An exact-active-tip authenticated schema-12 datadir produced by v30.1.4 does
 not require an automatic rewind or reindex merely because the client version
-changes. Any rollback must follow the reviewed canary or release procedure and
+changes. Any rollback must follow the reviewed release procedure and
 preserve wallet and chain state created after the upgrade. This tested rollback
 boundary is data-compatible, not feature-equivalent: v30.1.4 does not
 interpret the candidate's typed same-anchor family policy and may again report

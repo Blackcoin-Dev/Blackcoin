@@ -39,35 +39,31 @@ The v30.1.5 execution order is:
 1. Create the exact final source commit with the release-team identity and the
    allowlisted SSH key. Push it to the review branch without creating the final
    tag.
-2. Require the complete current-SHA pull-request gate. Treat its native
-   Linux x86-64 output as test evidence only: that gate builds debug, no-Qt
-   binaries and does not produce the deployable canary package. After the gate
-   succeeds, run the separately reviewed v30.1.5 candidate-packaging workflow
-   bound to the same signed source SHA and successful gate run. Require two
-   isolated byte-identical builds, the sealed candidate manifest, the separate
-   packaging-tooling SHA, and the embedded source identity before installing
-   that package on the canary.
-3. Back up one canary wallet and its complete datadir. Stop that canary
-   cleanly, install the exact candidate, and prove wallet names, existing
-   legacy and quantum keys, transaction history, configuration, block paths,
-   active tip, P2P, PoS, PoW, clean restart, and rollback preservation. Do not
-   create a replacement wallet, address, key, or payout destination.
-4. Merge without rewriting the reviewed, signed source commit, then prove that
+2. Require the complete current-SHA pull-request gate and simulated wallet,
+   upgrade, restart, rollback, P2P, PoS and PoW regression fixtures. Native
+   Linux x86-64 gate binaries are test evidence, not final release packages.
+   For v30.1.5, the release-owner decision of 2026-09-10 removes the live-wallet
+   canary requirement. Do not deploy to real wallets or authorize spending for
+   release qualification. A separate pre-release canary package build is not
+   required; the final tag workflow supplies the verified release packages.
+3. Merge without rewriting the reviewed, signed source commit, then prove that
    exact object is reachable from the default branch. Do not squash or rebase
    it. If the hosting platform creates a merge commit, never use that generated
-   object as the release source: the final tag and canary remain bound to the
+   object as the release source: the final tag and packages remain bound to the
    exact reviewed Blackcoin-Dev-signed source commit.
-5. Confirm repository immutable releases, tag protection, and the exact
+4. Confirm repository immutable releases, tag protection, and the exact
    protected `V30.1.5` acknowledgement. Create and verify the annotated,
    SSH-signed `v30.1.5` tag, then push it once.
-6. Treat any failed production job as a release blocker. Publication is
+5. Treat any failed production job as a release blocker. Publication is
    complete only after every exact-tag gate, both builders, reproducibility,
    package verification, attestations, and immutable release publication
    succeed and the published checksums verify.
 
 The remaining version-specific sections are historical controls. They do not
 authorize v30.1.5 to inherit tests, use unsigned source objects, or skip the
-canary and duplicate-build requirements above.
+simulated-regression and duplicate-build requirements above. Historical canary
+procedures do not reinstate a live-canary prerequisite for v30.1.5. Operators
+must still back up their wallets and datadirs before any actual upgrade.
 
 ## v30.1.3 signed corrective history
 

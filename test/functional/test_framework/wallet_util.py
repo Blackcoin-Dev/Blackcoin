@@ -6,7 +6,9 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Useful util functions for testing the wallet"""
 from collections import namedtuple
+import unittest
 
+from test_framework.authproxy import JSONRPCException
 from test_framework.address import (
     byte_to_base58,
     key_to_p2pkh,
@@ -24,6 +26,84 @@ from test_framework.script_util import (
     script_to_p2sh_script,
     script_to_p2wsh_script,
 )
+
+CLAIM_SNAPSHOT_CHANGED = (
+    "wallet or active-chain state changed while evaluating Gold Rush recovery proofs; retry"
+)
+
+
+def _read_claim_status(method, *args, **kwargs):
+    """Retry only explicit snapshot drift, never an action or a content mismatch."""
+    for attempt in range(5):
+        try:
+            return method(*args, **kwargs)
+        except JSONRPCException as error:
+            if (
+                error.error.get("code") != -1
+                or error.error.get("message") != CLAIM_SNAPSHOT_CHANGED
+                or attempt == 4
+            ):
+                raise
+
+
+def get_recovery_info(wallet, *args, **kwargs):
+    """Read a coherent recovery snapshot while background maintenance runs."""
+    return _read_claim_status(wallet.getpowclaimrecoveryinfo, *args, **kwargs)
+
+
+def get_pow_mining_info(wallet):
+    """Read mining status; do not retry signing, relay, or configuration calls."""
+    return _read_claim_status(wallet.getpowmininginfo)
+
+
+class TestClaimStatusReads(unittest.TestCase):
+    class Wallet:
+        def __init__(self, replies):
+            self.replies = iter(replies)
+            self.calls = []
+
+        def getpowclaimrecoveryinfo(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            result = next(self.replies)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        getpowmininginfo = getpowclaimrecoveryinfo
+
+    def test_exact_drift_retries_and_preserves_arguments(self):
+        error = JSONRPCException({"code": -1, "message": CLAIM_SNAPSHOT_CHANGED})
+        result = {"wallet_generation": 7}
+        wallet = self.Wallet([error, result])
+        self.assertIs(get_recovery_info(wallet, True, options={"page_size": 1}), result)
+        self.assertEqual(wallet.calls, [((True,), {"options": {"page_size": 1}})] * 2)
+
+    def test_mining_status_retries_same_exact_error(self):
+        error = JSONRPCException({"code": -1, "message": CLAIM_SNAPSHOT_CHANGED})
+        wallet = self.Wallet([error, {"enabled": True}])
+        self.assertEqual(get_pow_mining_info(wallet), {"enabled": True})
+        self.assertEqual(len(wallet.calls), 2)
+
+    def test_persistent_drift_is_bounded(self):
+        error = JSONRPCException({"code": -1, "message": CLAIM_SNAPSHOT_CHANGED})
+        wallet = self.Wallet([error] * 5)
+        with self.assertRaises(JSONRPCException) as caught:
+            get_recovery_info(wallet)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(len(wallet.calls), 5)
+
+    def test_other_errors_and_assertions_are_not_retried(self):
+        for error in (
+            JSONRPCException({"code": -8, "message": "recovery-page-cursor-stale"}),
+            JSONRPCException({"code": -1, "message": "different failure"}),
+            JSONRPCException({"code": -10, "message": CLAIM_SNAPSHOT_CHANGED}),
+            AssertionError("content mismatch"),
+        ):
+            wallet = self.Wallet([error])
+            with self.assertRaises(type(error)) as caught:
+                get_recovery_info(wallet)
+            self.assertIs(caught.exception, error)
+            self.assertEqual(len(wallet.calls), 1)
 
 Key = namedtuple('Key', ['privkey',
                          'pubkey',

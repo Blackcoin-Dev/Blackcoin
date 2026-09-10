@@ -24,6 +24,7 @@ from test_framework.authproxy import JSONRPCException
 from test_framework.blocktools import COIN, COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error, get_rpc_proxy
+from test_framework.wallet_util import get_pow_mining_info, get_recovery_info
 
 
 GOLD_RUSH_END_TIME = 2_000_000_000
@@ -117,7 +118,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
     def _expire_with_startup_relay_held(self, wallet, txid, anchor):
         """Expire before broadcasting, then complete startup under a hold."""
         node = self.nodes[0]
-        assert_equal(wallet.getpowmininginfo()["enabled"], False)
+        assert_equal(get_pow_mining_info(wallet)["enabled"], False)
         wallet_name = wallet.getwalletinfo()["walletname"]
         self._advance_past_mempool_entry_time(node, txid)
         self.restart_node(0, extra_args=[*self.base_args, "-mempoolexpiry=0", "-walletbroadcast=0", f"-mocktime={self.mock_time}"])
@@ -144,7 +145,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         same_tip = node.getbestblockhash()
         claims_before = self._claim_txids(wallet)
         transactions_before = {entry["txid"] for entry in wallet.listtransactions("*", 1000, 0, True)}
-        submitted_before = wallet.getpowmininginfo()["claims_submitted"]
+        submitted_before = get_pow_mining_info(wallet)["claims_submitted"]
         self._advance_past_mempool_entry_time(node, txid)
         with node.wait_for_debug_log([
             f"Quarantined Gold Rush PoW claim {txid} after expiry mempool removal".encode(),
@@ -161,7 +162,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(wallet.gettransaction(txid)["hex"], raw)
         assert_equal(self._claim_txids(wallet), claims_before)
         assert_equal({entry["txid"] for entry in wallet.listtransactions("*", 1000, 0, True)}, transactions_before)
-        assert_equal(wallet.getpowmininginfo()["claims_submitted"], submitted_before)
+        assert_equal(get_pow_mining_info(wallet)["claims_submitted"], submitted_before)
 
     def _exercise_exact_relay_only(self, wallet, address, funding_address):
         self.log.info("Focused exact-relay lane: same-tip service, cached WAIT, and disabled-broadcast absence")
@@ -182,13 +183,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             "relayed_existing": True, "created_new_claim": False,
         })
         self._expire_and_wait_for_exact_relay(wallet, txid, raw, default_wallet, funding_address)
-        assert_equal(wallet.getpowmininginfo()["enabled"], False)
+        assert_equal(get_pow_mining_info(wallet)["enabled"], False)
         wallet.setpowmining(True, 1, 100)
         try:
-            self.wait_until(lambda: wallet.getpowmininginfo()["mining_gate_action"] == "wait_for_live", timeout=20)
+            self.wait_until(lambda: get_pow_mining_info(wallet)["mining_gate_action"] == "wait_for_live", timeout=20)
             self._expire_and_wait_for_exact_relay(wallet, txid, raw, default_wallet, funding_address)
-            self.wait_until(lambda: wallet.getpowmininginfo()["mining_gate_action"] == "wait_for_live", timeout=20)
-            assert_equal(wallet.getpowmininginfo()["claims_submitted"], 0)
+            self.wait_until(lambda: get_pow_mining_info(wallet)["mining_gate_action"] == "wait_for_live", timeout=20)
+            assert_equal(get_pow_mining_info(wallet)["claims_submitted"], 0)
         finally:
             wallet.setpowmining(False)
         self._advance_past_mempool_entry_time(node, txid)
@@ -197,7 +198,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         wallet = self._load_wallet(BOUNDARY_WALLET)
         node.syncwithvalidationinterfacequeue()
         assert txid not in node.getrawmempool()
-        assert_equal(wallet.getpowmininginfo()["mining_gate_action"], "relay_existing")
+        assert_equal(get_pow_mining_info(wallet)["mining_gate_action"], "relay_existing")
         assert_equal(wallet.gettransaction(txid)["hex"], raw)
         assert_equal(self._claim_txids(wallet), {txid})
         assert not self._is_abandoned(wallet, txid)
@@ -212,12 +213,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         try:
             wallet.setpowmining(True, 1, 100)
             self.wait_until(
-                lambda: wallet.getpowmininginfo()["state"] == "no_spendable_legacy_fee_utxo",
+                lambda: get_pow_mining_info(wallet)["state"] == "no_spendable_legacy_fee_utxo",
                 timeout=20,
             )
             self._wait_for_broadcast_disabled_family_rebound(
                 wallet, funding_address, anchor, {txid},
-                wallet.getpowmininginfo()["claims_submitted"],
+                get_pow_mining_info(wallet)["claims_submitted"],
             )
         finally:
             wallet.setpowmining(False)
@@ -328,7 +329,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         input_locked = False
 
         def worker_group_waits_for_next_tip():
-            info = builtin_race.getpowmininginfo()
+            info = get_pow_mining_info(builtin_race)
             # Fail immediately if a sibling commits a replacement while the
             # group is supposed to retain its exact-tip reservation.
             assert_equal(info["claims_submitted"], 0)
@@ -363,7 +364,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             time.sleep(2)
             assert_equal(node.getbestblockhash(), failed_tip)
             assert_equal(self._claim_txids(builtin_race), claims_before)
-            unlocked_info = builtin_race.getpowmininginfo()
+            unlocked_info = get_pow_mining_info(builtin_race)
             assert_equal(unlocked_info["state"], "claim_in_flight")
             assert_equal(unlocked_info["hashrate"], 0)
             assert_equal(unlocked_info["claims_submitted"], 0)
@@ -425,7 +426,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert advanced_tip != previous_tip
 
         def family_is_rebound_and_deferred():
-            info = wallet.getpowmininginfo()
+            info = get_pow_mining_info(wallet)
             return (
                 len(self._claim_txids(wallet) - claims_before) == 1
                 and info["claim_inventory_tip"] == advanced_tip
@@ -439,7 +440,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             )
 
         self.wait_until(family_is_rebound_and_deferred, timeout=180)
-        info = wallet.getpowmininginfo()
+        info = get_pow_mining_info(wallet)
         assert_equal(info["claims_submitted"], submitted_before)
         assert_equal(info["mining_gate_relay_txid"], ZERO_HASH)
         assert_equal(info["mining_gate_lineage_head_txid"], ZERO_HASH)
@@ -507,7 +508,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for name, wallet in wallets.items():
-                info = wallet.getpowmininginfo()
+                info = get_pow_mining_info(wallet)
                 observed_positive_hash[name] |= info["hashrate"] > 0
                 delta = self._claim_txids(wallet) - claims_before[name]
                 assert len(delta) <= 1, (
@@ -589,7 +590,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
     def _assert_family_liveness_gate(
         self, wallet, expected_action, expected_anchors, can_submit
     ):
-        info = wallet.getpowmininginfo()
+        info = get_pow_mining_info(wallet)
         actual_anchors = self._gate_reserved_anchors(info)
         assert_equal(info["mining_gate_coherent"], True)
         assert_equal(info["mining_gate_database_ambiguous"], False)
@@ -827,7 +828,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
     @staticmethod
     def _assert_claim_inventory(wallet, raw, actionable, resolved, indeterminate, components=None):
-        info = wallet.getpowmininginfo()
+        info = get_pow_mining_info(wallet)
         assert_equal(info["quarantined_claims"], actionable + indeterminate)
         assert_equal(info["raw_quarantined_claims"], raw)
         assert_equal(info["blocking_quarantined_claims"], actionable + indeterminate)
@@ -845,7 +846,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         """Reconstruct one coherent graph despite concurrent wallet maintenance."""
         for attempt in range(5):
             if info is None or attempt:
-                info = wallet.getpowclaimrecoveryinfo(True)
+                info = get_recovery_info(wallet, True)
             try:
                 first_page = GoldRushPowClaimSingleFlightTest._assert_recovery_page_snapshot(
                     wallet, info, page_size
@@ -871,7 +872,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         returned = 0
         while True:
             try:
-                page = wallet.getpowclaimrecoveryinfo(
+                page = get_recovery_info(wallet,
                     True, {"page_size": page_size, "cursor": cursor}
                 )
             except JSONRPCException as error:
@@ -938,9 +939,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         """Compare CLI conversion only across identical independent snapshots."""
         options = {"page_size": page_size}
         for _ in range(5):
-            direct = wallet.getpowclaimrecoveryinfo(True, options)
-            positional = cli.getpowclaimrecoveryinfo(True, options)
-            named = cli.getpowclaimrecoveryinfo(verbose=True, options=options)
+            direct = get_recovery_info(wallet, True, options)
+            positional = get_recovery_info(cli, True, options)
+            named = get_recovery_info(cli, verbose=True, options=options)
             if any(
                 page[field] != direct[field]
                 for page in (positional, named)
@@ -1041,7 +1042,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         validate its shape for this observation without treating its bytes as
         a cross-reconstruction semantic identity.
         """
-        info = wallet.getpowmininginfo()
+        info = get_pow_mining_info(wallet)
         candidate_fingerprint = info[
             "mining_gate_candidate_state_fingerprint"
         ]
@@ -1303,7 +1304,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 self._claim_txids(wallet), claims_before_restart[name]
             )
             assert_equal(
-                wallet.getpowmininginfo()[
+                get_pow_mining_info(wallet)[
                     "mining_gate_reserved_family_anchors"
                 ],
                 reservation_receipts[name],
@@ -1422,12 +1423,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.syncwithvalidationinterfacequeue()
         self.wait_until(
             lambda: (
-                policy.getpowclaimrecoveryinfo(True)["wallet_tip_matches"]
-                and policy.getpowclaimrecoveryinfo(True)["component_details"][0]["stale_depth_known"]
+                get_recovery_info(policy, True)["wallet_tip_matches"]
+                and get_recovery_info(policy, True)["component_details"][0]["stale_depth_known"]
             ),
             timeout=20,
         )
-        automatic_baseline_info = policy.getpowclaimrecoveryinfo(True)
+        automatic_baseline_info = get_recovery_info(policy, True)
         assert_equal(automatic_baseline_info["wallet_tip_matches"], True)
         assert_equal(automatic_baseline_info["active_tip"], node.getbestblockhash())
         assert_equal(
@@ -1443,7 +1444,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(policy_initial_info["policy"]["mode"], "unset")
         assert_equal(policy_initial_info["policy_authoritative"], True)
         assert_equal(policy_initial_info["policy_state_status"], "success")
-        assert_equal(policy_lock.getpowclaimrecoveryinfo()["policy"]["mode"], "unset")
+        assert_equal(get_recovery_info(policy_lock)["policy"]["mode"], "unset")
         automatic_initial_stale_depth = automatic_baseline_info[
             "component_details"
         ][0]["minimum_stale_depth"]
@@ -1463,7 +1464,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(automatic_policy["authoritative_state_available"], True)
         assert_equal(automatic_policy["policy"]["mode"], "automatic")
         assert_equal(automatic_policy["policy"]["automatic_authorized"], True)
-        assert_equal(policy_lock.getpowclaimrecoveryinfo()["policy"]["mode"], "unset")
+        assert_equal(get_recovery_info(policy_lock)["policy"]["mode"], "unset")
 
         automatic_resolution_txid = None
         automatic_running_state = None
@@ -1475,10 +1476,10 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             # spend before another block satisfies the configured delay.
             node.mockscheduler(61)
             self.wait_until(
-                lambda: policy.getpowclaimrecoveryinfo(True)["component_details"][0]["stale_depth_known"],
+                lambda: get_recovery_info(policy, True)["component_details"][0]["stale_depth_known"],
                 timeout=20,
             )
-            same_tip_automatic_info = policy.getpowclaimrecoveryinfo(True)
+            same_tip_automatic_info = get_recovery_info(policy, True)
             assert_equal(same_tip_automatic_info["wallet_tip_matches"], True)
             assert_equal(
                 same_tip_automatic_info["active_tip"],
@@ -1499,20 +1500,20 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             # persist, authorize, and relay the exact resolution bytes.
             self.generateblock(node, output=funding_address, transactions=[])
             self.wait_until(
-                lambda: policy.getpowclaimrecoveryinfo(True)["component_details"][0]["minimum_stale_depth"]
+                lambda: get_recovery_info(policy, True)["component_details"][0]["minimum_stale_depth"]
                 >= automatic_limits["minimum_stale_blocks"],
                 timeout=20,
             )
             node.mockscheduler(61)
             self.wait_until(
-                lambda: policy.getpowclaimrecoveryinfo()["pending_automatic_resolutions"] == 1,
+                lambda: get_recovery_info(policy)["pending_automatic_resolutions"] == 1,
                 timeout=30,
             )
 
             # Keep the miner enabled while its automatic resolution confirms.
             # The confirmed same-script output must release the quarantine gate
             # and return the miner to an active state without operator action.
-            pending_automatic_info = policy.getpowclaimrecoveryinfo(True)
+            pending_automatic_info = get_recovery_info(policy, True)
             pending_resolution_nodes = [
                 graph_node
                 for component in pending_automatic_info["component_details"]
@@ -1535,11 +1536,11 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 timeout=20,
             )
             self.wait_until(
-                lambda: policy.getpowmininginfo()["state"]
+                lambda: get_pow_mining_info(policy)["state"]
                 in {"ready", "hashing", "claim_in_flight"},
                 timeout=20,
             )
-            automatic_running_state = policy.getpowmininginfo()["state"]
+            automatic_running_state = get_pow_mining_info(policy)["state"]
         finally:
             policy.setpowmining(False)
         assert automatic_resolution_txid is not None
@@ -1547,7 +1548,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         # Stop immediately after proving the recovery loop reopened mining so
         # this wallet cannot consume the global QQP2 claim slot used below.
         assert_equal(self._claim_txids(policy), automatic_claim_txids_before)
-        automatic_info = policy.getpowclaimrecoveryinfo(True)
+        automatic_info = get_recovery_info(policy, True)
         assert_equal(automatic_info["automatic_actions_in_window"], 1)
         assert automatic_info["automatic_fee_exposure_in_window"] > 0
         assert_equal(automatic_info["pending_automatic_resolutions"], 0)
@@ -1604,13 +1605,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             lock_started = lock_barrier.setpowmining(True, 1, 100, True)
             assert lock_started["created_payout_key"]
         lock_barrier.walletlock()
-        locked_info = lock_barrier.getpowmininginfo()
+        locked_info = get_pow_mining_info(lock_barrier)
         assert_equal(locked_info["enabled"], True)
         assert_equal(locked_info["state"], "wallet_locked_or_staking_only")
         assert_equal(locked_info["hashrate"], 0)
         time.sleep(2)
         assert_equal(self._claim_txids(lock_barrier), lock_barrier_before)
-        assert_equal(lock_barrier.getpowmininginfo()["claims_submitted"], 0)
+        assert_equal(get_pow_mining_info(lock_barrier)["claims_submitted"], 0)
 
         try:
             # A second barrier after the normal unlock is direct evidence that
@@ -1628,7 +1629,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             # extra telemetry calls here would let a slow sanitizer consume the
             # 1.5-second test delay and enter claim persistence first.
             lock_barrier.walletlock()
-            second_locked_info = lock_barrier.getpowmininginfo()
+            second_locked_info = get_pow_mining_info(lock_barrier)
             assert_equal(second_locked_info["enabled"], True)
             assert_equal(second_locked_info["threads"], 1)
             assert_equal(second_locked_info["cpu_percent"], 100)
@@ -1641,7 +1642,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             )
             time.sleep(2)
             assert_equal(self._claim_txids(lock_barrier), lock_barrier_before)
-            assert_equal(lock_barrier.getpowmininginfo()["claims_submitted"], 0)
+            assert_equal(get_pow_mining_info(lock_barrier)["claims_submitted"], 0)
         finally:
             lock_barrier.setpowmining(False)
 
@@ -1669,7 +1670,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             time.sleep(2)
             assert_equal(self._claim_txids(lock_barrier), lock_barrier_before)
             assert_equal(
-                lock_barrier.getpowmininginfo()["claims_submitted"], 0
+                get_pow_mining_info(lock_barrier)["claims_submitted"], 0
             )
         finally:
             lock_barrier.setpowmining(False)
@@ -1779,7 +1780,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(preview["conflicts_with_revalidating_unbound_proof"], True)
         assert "hex" not in preview
         assert first_txid not in node.getrawmempool()
-        reviewed = manual.getpowclaimrecoveryinfo(True)
+        reviewed = get_recovery_info(manual, True)
         reviewed, first_page = self._assert_recovery_pages(manual, reviewed, page_size=2)
         cursor = first_page["pagination"]["next_cursor"]
         assert_raises_rpc_error(
@@ -1804,7 +1805,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             manual.getpowclaimrecoveryinfo, True, {"cursor": cursor},
         )
         manual.setlabel(manual_address, original_labels[0] if original_labels else "")
-        reviewed = manual.getpowclaimrecoveryinfo(True)
+        reviewed = get_recovery_info(manual, True)
         reviewed_component = next(
             component
             for component in reviewed["component_details"]
@@ -1857,7 +1858,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             ZERO_HASH,
         )
         assert_equal(
-            manual.getpowclaimrecoveryinfo()["pending_manual_resolutions"], 0
+            get_recovery_info(manual)["pending_manual_resolutions"], 0
         )
 
         stale_plan_id = preview["plan_id"]
@@ -1874,7 +1875,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             stale_plan_id,
         )
         assert_equal(
-            manual.getpowclaimrecoveryinfo()["pending_manual_resolutions"], 0
+            get_recovery_info(manual)["pending_manual_resolutions"], 0
         )
         preview = manual.createshadowpowclaimresolution(first_txid)
         resolution = manual.createshadowpowclaimresolution(
@@ -1960,7 +1961,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.setmocktime(self.mock_time)
         manual = self._load_wallet(MANUAL_WALLET)
         policy = self._load_wallet(POLICY_WALLET)
-        restarted_automatic_info = policy.getpowclaimrecoveryinfo(True)
+        restarted_automatic_info = get_recovery_info(policy, True)
         assert_equal(restarted_automatic_info["policy"]["mode"], "automatic")
         assert_equal(restarted_automatic_info["automatic_actions_in_window"], 1)
         assert_equal(restarted_automatic_info["pending_automatic_resolutions"], 0)
@@ -1991,7 +1992,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.syncwithvalidationinterfacequeue()
         assert manual.gettransaction(first_txid)["confirmations"] > 0
         assert manual.gettransaction(resolution_txid)["confirmations"] < 0
-        original_info = manual.getpowmininginfo()
+        original_info = get_pow_mining_info(manual)
         assert_equal(original_info["unresolved_claims"], 0)
         self._assert_claim_inventory(
             manual, raw=0, actionable=0, resolved=0, indeterminate=0, components=0
@@ -2151,7 +2152,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.setmocktime(self.mock_time)
         manual = self._load_wallet(MANUAL_WALLET)
         assert second_resolution_txid not in node.getrawmempool()
-        restarted_cancelled = manual.getpowclaimrecoveryinfo(True)
+        restarted_cancelled = get_recovery_info(manual, True)
         restarted_cancelled_node = next(
             graph_node
             for component in restarted_cancelled["component_details"]
@@ -2212,7 +2213,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(revoked_live["anchor_reserved"], True)
         assert_equal(revoked_live["normal_coin_selection_enabled"], False)
         assert second_resolution_txid in node.getrawmempool()
-        live_cancelled_info = manual.getpowclaimrecoveryinfo(True)
+        live_cancelled_info = get_recovery_info(manual, True)
         live_cancelled_node = next(
             graph_node
             for component in live_cancelled_info["component_details"]
@@ -2230,7 +2231,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.syncwithvalidationinterfacequeue()
         assert manual.gettransaction(second_claim_txid)["confirmations"] < 0
         assert manual.gettransaction(second_resolution_txid)["confirmations"] > 0
-        resolution_info = manual.getpowmininginfo()
+        resolution_info = get_pow_mining_info(manual)
         # `unresolved_claims` is the raw count of wallet-authored,
         # non-confirmed QQSPROOF history, including a conflicted claim whose
         # anchor generation is conclusively resolved. It is not the mining
@@ -2241,7 +2242,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self._assert_claim_inventory(
             manual, raw=1, actionable=0, resolved=1, indeterminate=0, components=1
         )
-        confirmed_recovery_metrics = manual.getpowclaimrecoveryinfo()
+        confirmed_recovery_metrics = get_recovery_info(manual)
         assert_equal(confirmed_recovery_metrics["pending_manual_resolutions"], 0)
         assert_equal(confirmed_recovery_metrics["confirmed_manual_resolutions"], 1)
         assert_equal(
@@ -2264,7 +2265,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self._assert_claim_inventory(
             manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
         )
-        disconnected_recovery_metrics = manual.getpowclaimrecoveryinfo()
+        disconnected_recovery_metrics = get_recovery_info(manual)
         assert_equal(disconnected_recovery_metrics["pending_manual_resolutions"], 1)
         assert_equal(disconnected_recovery_metrics["confirmed_manual_resolutions"], 0)
         assert_equal(
@@ -2278,7 +2279,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self._assert_claim_inventory(
             manual, raw=1, actionable=0, resolved=1, indeterminate=0, components=1
         )
-        restored_recovery_metrics = manual.getpowclaimrecoveryinfo()
+        restored_recovery_metrics = get_recovery_info(manual)
         for field in (
             "pending_manual_resolutions",
             "confirmed_manual_resolutions",
@@ -2344,7 +2345,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         # The first relay throws after the exact bytes are persisted. The
         # worker re-enters the typed gate and relays those same bytes; it must
         # not grind a second proof or consume another fee input.
-        assert_equal(builtin.getpowmininginfo()["claims_submitted"], 0)
+        assert_equal(get_pow_mining_info(builtin)["claims_submitted"], 0)
         assert builtin_fault_txid in node.getrawmempool()
         assert_equal(
             self._claim_txids(builtin) - before_builtin_fault,
@@ -2400,7 +2401,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         failed_resolution_hex = failed_relay_action["hex"]
         assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
         assert failed_resolution_txid not in node.getrawmempool()
-        retained = fault.getpowclaimrecoveryinfo(True)
+        retained = get_recovery_info(fault, True)
         retained_resolution = next(
             graph_node
             for component in retained["component_details"]
@@ -2432,7 +2433,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.setmocktime(self.mock_time)
         fault = self._load_wallet(FAULT_WALLET)
         assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
-        restarted_recovery = fault.getpowclaimrecoveryinfo(True)
+        restarted_recovery = get_recovery_info(fault, True)
         restarted_resolution = next(
             graph_node
             for component in restarted_recovery["component_details"]
@@ -2465,7 +2466,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(node.getrawtransaction(failed_resolution_txid), failed_resolution_hex)
         assert_equal(fault.gettransaction(failed_resolution_txid)["hex"], failed_resolution_hex)
-        assert_equal(fault.getpowclaimrecoveryinfo()["pending_manual_resolutions"], 1)
+        assert_equal(get_recovery_info(fault)["pending_manual_resolutions"], 1)
 
         self.log.info("A stale QQP2 claim refreshes on the same anchor while the next work remains QQP2")
         activation_height = 501
@@ -2542,7 +2543,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             ],
             [untouched_boundary_input],
         )
-        stale_recovery = boundary.getpowclaimrecoveryinfo(True)
+        stale_recovery = get_recovery_info(boundary, True)
         stale_component = next(
             component
             for component in stale_recovery["component_details"]
@@ -2569,7 +2570,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(stale_node["authored_tip_active_branch_bound"], True)
         assert_equal(stale_node["in_mempool"], False)
         assert_equal(stale_node["quarantined"], True)
-        boundary_recovery_before = boundary.getpowclaimrecoveryinfo()
+        boundary_recovery_before = get_recovery_info(boundary)
         assert_equal(boundary_recovery_before["pending_manual_resolutions"], 0)
         assert_equal(boundary_recovery_before["pending_automatic_resolutions"], 0)
         assert_equal(boundary_recovery_before["confirmed_manual_resolutions"], 0)
@@ -2616,7 +2617,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 timeout=180,
             )
             refreshed_claim_txid = next(iter(self._claim_txids(boundary) - before_refresh))
-            info = boundary.getpowmininginfo()
+            info = get_pow_mining_info(boundary)
             assert_equal(info["claims_submitted"], 1)
             assert_equal(info["mining_gate_action"], "wait_for_live")
             assert_equal(info["mining_gate_family_claims"], 2)
@@ -2666,7 +2667,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             refresh_record["qq_shadow_pow_lineage_family"],
             boundary_root_record["qq_shadow_pow_lineage_family"],
         )
-        refreshed_recovery = boundary.getpowclaimrecoveryinfo(True)
+        refreshed_recovery = get_recovery_info(boundary, True)
         refreshed_component = next(
             component
             for component in refreshed_recovery["component_details"]
@@ -2690,7 +2691,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(refreshed_component["ordinary_or_mixed_txids"], [])
         assert_equal(refreshed_component["resolution_txids"], [])
         assert_equal(
-            boundary.getpowclaimrecoveryinfo()["confirmed_resolution_fees"],
+            get_recovery_info(boundary)["confirmed_resolution_fees"],
             Decimal("0"),
         )
         assert not any(
@@ -2706,7 +2707,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             for _ in range(3):
                 previous_tip = node.getbestblockhash()
                 claims_before_tip = self._claim_txids(boundary)
-                submitted_before_tip = boundary.getpowmininginfo()["claims_submitted"]
+                submitted_before_tip = get_pow_mining_info(boundary)["claims_submitted"]
                 self.generateblock(node, output=funding_address, transactions=[])
                 node.syncwithvalidationinterfacequeue()
                 current_tip = node.getbestblockhash()
@@ -2715,7 +2716,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 assert_equal(node.getshadowpowwork()["proof_version"], 2)
 
                 def coherent_live_family():
-                    info = boundary.getpowmininginfo()
+                    info = get_pow_mining_info(boundary)
                     if (
                         info["claim_inventory_tip"] != current_tip
                         or not info["mining_gate_coherent"]
@@ -2725,7 +2726,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                         or info["state"] == "claim_quarantined"
                     ):
                         return False
-                    recovery = boundary.getpowclaimrecoveryinfo(True)
+                    recovery = get_recovery_info(boundary, True)
                     component = next(
                         (
                             item
@@ -2744,7 +2745,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                     return len(live) == 1
 
                 self.wait_until(coherent_live_family, timeout=180)
-                tip_info = boundary.getpowmininginfo()
+                tip_info = get_pow_mining_info(boundary)
                 assert tip_info["state"] != "claim_quarantined"
                 assert_equal(
                     tip_info["mining_gate_action"], "wait_for_live"
@@ -2756,7 +2757,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 assert_equal(tip_info["mining_gate_unsafe_components"], 0)
                 assert_equal(len(tip_info["mining_gate_candidate_state_fingerprint"]), 64)
 
-                tip_recovery = boundary.getpowclaimrecoveryinfo(True)
+                tip_recovery = get_recovery_info(boundary, True)
                 tip_component = next(
                     component
                     for component in tip_recovery["component_details"]
@@ -2800,7 +2801,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 assert claims_before_tip <= claims_after_tip
                 assert len(claims_after_tip - claims_before_tip) <= 1
                 assert_equal(
-                    boundary.getpowmininginfo()["claims_submitted"],
+                    get_pow_mining_info(boundary)["claims_submitted"],
                     submitted_before_tip + len(claims_after_tip - claims_before_tip),
                 )
 
@@ -2827,7 +2828,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             assert_equal(restarted["payout_address"], "")
 
             def fresh_worker_waits_for_live():
-                info = boundary.getpowmininginfo()
+                info = get_pow_mining_info(boundary)
                 return (
                     info["enabled"]
                     and info["state"] == "claim_in_flight"
@@ -2838,7 +2839,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
             self.wait_until(fresh_worker_waits_for_live, timeout=20)
             boundary.setpowmining(False)
-            stopped_barrier = boundary.getpowmininginfo()
+            stopped_barrier = get_pow_mining_info(boundary)
             assert_equal(stopped_barrier["enabled"], False)
             assert_equal(node.getbestblockhash(), same_tip_barrier)
             assert_equal(self._claim_txids(boundary), claims_at_barrier)
@@ -2852,7 +2853,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         finally:
             boundary.setpowmining(False)
 
-        continued_recovery = boundary.getpowclaimrecoveryinfo(True)
+        continued_recovery = get_recovery_info(boundary, True)
         continued_component = next(
             component
             for component in continued_recovery["component_details"]
@@ -2921,12 +2922,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node, boundary, default_wallet = self._expire_with_startup_relay_held(
             boundary, refreshed_claim_txid, boundary_claim_input,
         )
-        relay_gate = boundary.getpowmininginfo()
+        relay_gate = get_pow_mining_info(boundary)
         assert_equal(relay_gate["mining_gate_action"], "relay_existing")
         assert_equal(relay_gate["mining_gate_relay_txid"], refreshed_claim_txid)
         assert_equal(relay_gate["mining_gate_unsafe_claims"], 0)
         assert_equal(relay_gate["mining_gate_unsafe_components"], 0)
-        absent_recovery = boundary.getpowclaimrecoveryinfo(True)
+        absent_recovery = get_recovery_info(boundary, True)
         absent_head = next(
             graph_node
             for component in absent_recovery["component_details"]
@@ -2976,12 +2977,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         boundary.setpowmining(True, 1, 100)
         try:
             self.wait_until(
-                lambda: boundary.getpowmininginfo()["state"]
+                lambda: get_pow_mining_info(boundary)["state"]
                 == "claim_in_flight",
                 timeout=20,
             )
             assert_equal(
-                boundary.getpowmininginfo()["mining_gate_action"],
+                get_pow_mining_info(boundary)["mining_gate_action"],
                 "wait_for_live",
             )
             assert_equal(self._claim_txids(boundary), locked_live_claims)
@@ -3099,7 +3100,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             },
             wallet_txids_before_relay,
         )
-        assert_equal(boundary.getpowmininginfo()["claims_submitted"], 0)
+        assert_equal(get_pow_mining_info(boundary)["claims_submitted"], 0)
 
         # With the miner disabled, removal itself must promptly re-admit the
         # same bytes. A transient absent observation is not a stable contract.
@@ -3107,7 +3108,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             boundary, refreshed_claim_txid, refreshed_raw,
             default_wallet, funding_address,
         )
-        assert_equal(boundary.getpowmininginfo()["enabled"], False)
+        assert_equal(get_pow_mining_info(boundary)["enabled"], False)
         boundary.setpowmining(True, 1, 100)
         try:
             self.wait_until(
@@ -3115,11 +3116,11 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             )
             assert_equal(node.getrawtransaction(refreshed_claim_txid), refreshed_raw)
             self.wait_until(
-                lambda: boundary.getpowmininginfo()["state"] == "claim_in_flight",
+                lambda: get_pow_mining_info(boundary)["state"] == "claim_in_flight",
                 timeout=20,
             )
             assert_equal(
-                boundary.getpowmininginfo()["mining_gate_action"],
+                get_pow_mining_info(boundary)["mining_gate_action"],
                 "wait_for_live",
             )
 
@@ -3131,11 +3132,11 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 default_wallet, funding_address,
             )
             self.wait_until(
-                lambda: boundary.getpowmininginfo()["mining_gate_action"]
+                lambda: get_pow_mining_info(boundary)["mining_gate_action"]
                 == "wait_for_live", timeout=20,
             )
             assert_equal(self._claim_txids(boundary), claims_before_restart_mining)
-            assert_equal(boundary.getpowmininginfo()["claims_submitted"], 0)
+            assert_equal(get_pow_mining_info(boundary)["claims_submitted"], 0)
         finally:
             boundary.setpowmining(False)
 
@@ -3157,7 +3158,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         boundary = self._load_wallet(BOUNDARY_WALLET)
         assert refreshed_claim_txid not in node.getrawmempool()
         assert_equal(
-            boundary.getpowmininginfo()["mining_gate_action"],
+            get_pow_mining_info(boundary)["mining_gate_action"],
             "relay_existing",
         )
 
@@ -3175,14 +3176,14 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         try:
             self.wait_until(
                 lambda: (
-                    boundary.getpowmininginfo()["mining_gate_action"]
+                    get_pow_mining_info(boundary)["mining_gate_action"]
                     == "create_new_anchor"
-                    and boundary.getpowmininginfo()["state"]
+                    and get_pow_mining_info(boundary)["state"]
                     == "no_spendable_legacy_fee_utxo"
                 ),
                 timeout=20,
             )
-            wait_info = boundary.getpowmininginfo()
+            wait_info = get_pow_mining_info(boundary)
             assert_equal(
                 wait_info["mining_gate_action"], "create_new_anchor"
             )
@@ -3236,7 +3237,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 if entry["txid"] == refreshed_claim_txid
             )
             assert_equal(pending_record["qq_shadow_pow_quarantine"], "1")
-            pending_recovery = boundary.getpowclaimrecoveryinfo(True)
+            pending_recovery = get_recovery_info(boundary, True)
             pending_component = next(
                 component
                 for component in pending_recovery["component_details"]
@@ -3276,7 +3277,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         # Stopping clears the worker reservation, not the shared snapshot's
         # family deferral. A deferred aggregate has no selected-head payload;
         # the exact persisted head is established by the wallet records above.
-        stopped_wait = boundary.getpowmininginfo()
+        stopped_wait = get_pow_mining_info(boundary)
         assert stopped_wait["mining_gate_action"] in {
             "relay_existing", "create_new_anchor"
         }
@@ -3307,7 +3308,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(node.getrawtransaction(refreshed_claim_txid), refreshed_raw)
         restarted_head = next(
             graph_node
-            for component in boundary.getpowclaimrecoveryinfo(True)[
+            for component in get_recovery_info(boundary, True)[
                 "component_details"
             ]
             for graph_node in component["nodes"]
@@ -3322,12 +3323,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert "qq_shadow_pow_quarantine" not in restarted_head_record
         assert_equal(
-            boundary.getpowmininginfo()["mining_gate_action"], "wait_for_live"
+            get_pow_mining_info(boundary)["mining_gate_action"], "wait_for_live"
         )
         boundary.setpowmining(True, 1, 100)
         try:
             self.wait_until(
-                lambda: boundary.getpowmininginfo()["state"] == "claim_in_flight",
+                lambda: get_pow_mining_info(boundary)["state"] == "claim_in_flight",
                 timeout=20,
             )
             time.sleep(2)
@@ -3335,7 +3336,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         finally:
             boundary.setpowmining(False)
 
-        final_live_recovery = boundary.getpowclaimrecoveryinfo(True)
+        final_live_recovery = get_recovery_info(boundary, True)
         final_live_component = next(
             component
             for component in final_live_recovery["component_details"]
@@ -3380,7 +3381,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             indeterminate=0,
             components=1,
         )
-        boundary_recovery_confirmed = boundary.getpowclaimrecoveryinfo()
+        boundary_recovery_confirmed = get_recovery_info(boundary)
         for field in (
             "pending_manual_resolutions",
             "pending_automatic_resolutions",
@@ -3414,7 +3415,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         boundary.setpowmining(True, 1, 100)
         try:
             self.wait_until(
-                lambda: boundary.getpowmininginfo()["state"] == "claim_in_flight",
+                lambda: get_pow_mining_info(boundary)["state"] == "claim_in_flight",
                 timeout=20,
             )
             time.sleep(2)
@@ -3438,7 +3439,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             },
         )
         assert_equal(
-            boundary.getpowclaimrecoveryinfo()["confirmed_resolution_fees"],
+            get_recovery_info(boundary)["confirmed_resolution_fees"],
             Decimal("0"),
         )
 
@@ -3517,7 +3518,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             ],
             [untouched_cross_input],
         )
-        cross_stale = cross_boundary.getpowclaimrecoveryinfo(True)
+        cross_stale = get_recovery_info(cross_boundary, True)
         cross_component = next(
             component
             for component in cross_stale["component_details"]
@@ -3577,7 +3578,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             cross_head_txid = next(
                 iter(self._claim_txids(cross_boundary) - cross_before_refresh)
             )
-            cross_gate = cross_boundary.getpowmininginfo()
+            cross_gate = get_pow_mining_info(cross_boundary)
             assert_equal(cross_gate["mining_gate_coherent"], True)
             assert_equal(cross_gate["mining_gate_database_ambiguous"], False)
             assert_equal(cross_gate["mining_gate_unsafe_claims"], 0)
@@ -3625,7 +3626,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             cross_root_record["qq_shadow_pow_lineage_family"],
         )
         assert "qq_shadow_pow_quarantine" not in cross_head_record
-        cross_live = cross_boundary.getpowclaimrecoveryinfo(True)
+        cross_live = get_recovery_info(cross_boundary, True)
         cross_component = next(
             component
             for component in cross_live["component_details"]
@@ -3661,7 +3662,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             [untouched_cross_input],
         )
         assert_equal(
-            cross_boundary.getpowclaimrecoveryinfo()[
+            get_recovery_info(cross_boundary)[
                 "confirmed_resolution_fees"
             ],
             Decimal("0"),
@@ -3707,7 +3708,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             key=lambda outpoint: (outpoint["txid"], outpoint["vout"]),
         )
         assert_equal(
-            boundary.getpowclaimrecoveryinfo()["confirmed_resolution_fees"],
+            get_recovery_info(boundary)["confirmed_resolution_fees"],
             Decimal("0"),
         )
         expected_cross_boundary_unspent = sorted(
@@ -3720,7 +3721,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             key=lambda outpoint: (outpoint["txid"], outpoint["vout"]),
         )
         assert_equal(
-            cross_boundary.getpowclaimrecoveryinfo()[
+            get_recovery_info(cross_boundary)[
                 "confirmed_resolution_fees"
             ],
             Decimal("0"),
@@ -3771,11 +3772,11 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             expected_cross_boundary_unspent,
         )
         assert_equal(
-            boundary.getpowclaimrecoveryinfo()["confirmed_resolution_fees"],
+            get_recovery_info(boundary)["confirmed_resolution_fees"],
             Decimal("0"),
         )
         assert_equal(
-            cross_boundary.getpowclaimrecoveryinfo()[
+            get_recovery_info(cross_boundary)[
                 "confirmed_resolution_fees"
             ],
             Decimal("0"),
@@ -3855,11 +3856,11 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             expected_cross_boundary_unspent,
         )
         assert_equal(
-            boundary.getpowclaimrecoveryinfo()["confirmed_resolution_fees"],
+            get_recovery_info(boundary)["confirmed_resolution_fees"],
             Decimal("0"),
         )
         assert_equal(
-            cross_boundary.getpowclaimrecoveryinfo()[
+            get_recovery_info(cross_boundary)[
                 "confirmed_resolution_fees"
             ],
             Decimal("0"),
@@ -3901,7 +3902,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.setmocktime(self.mock_time)
         cross_boundary = self._load_wallet(CROSS_BOUNDARY_WALLET)
         assert cross_head_txid not in node.getrawmempool()
-        deferred_cross = cross_boundary.getpowmininginfo()
+        deferred_cross = get_pow_mining_info(cross_boundary)
         assert_equal(deferred_cross["mining_gate_action"], "relay_existing")
         assert_equal(
             deferred_cross["mining_gate_reserved_family_anchors"],
@@ -3909,7 +3910,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         cross_claims_before_fallback = self._claim_txids(cross_boundary)
         assert_equal(
-            cross_boundary.getpowmininginfo()["mining_gate_action"],
+            get_pow_mining_info(cross_boundary)["mining_gate_action"],
             "relay_existing",
         )
         fallback = cross_boundary.sendshadowpowclaim(
@@ -3953,7 +3954,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             fallback_records[fallback_txid]["qq_shadow_pow_quarantine"],
             "1",
         )
-        fallback_gate = cross_boundary.getpowmininginfo()
+        fallback_gate = get_pow_mining_info(cross_boundary)
         assert_equal(fallback_gate["mining_gate_coherent"], True)
         assert_equal(fallback_gate["mining_gate_database_ambiguous"], False)
         assert_equal(fallback_gate["mining_gate_unsafe_claims"], 0)
@@ -3968,7 +3969,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 ),
             },
         )
-        fallback_recovery = cross_boundary.getpowclaimrecoveryinfo(True)
+        fallback_recovery = get_recovery_info(cross_boundary, True)
         old_component = next(
             component
             for component in fallback_recovery["component_details"]

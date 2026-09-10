@@ -52,6 +52,25 @@ class GoldRushInfoTest(BitcoinTestFramework):
         self.sync_blocks()
         return hashes
 
+    def _restart_wallet_broadcast(self, enabled, *, reconnect_peer):
+        """Keep expiry observations independent of prompt exact-byte relay."""
+        node = self.nodes[0]
+        loaded_wallets = node.listwallets()
+        self.restart_node(0, extra_args=[
+            *self.extra_args[0],
+            f"-walletbroadcast={int(enabled)}",
+            f"-mocktime={node.mocktime}",
+        ])
+        node = self.nodes[0]
+        for name in loaded_wallets:
+            if name not in node.listwallets():
+                node.loadwallet(name, False)
+        if reconnect_peer:
+            self.connect_nodes(0, 1)
+            self.sync_blocks()
+        node.syncwithvalidationinterfacequeue()
+        return node
+
     @staticmethod
     def _mempool_pow_claims(node):
         claims = []
@@ -770,6 +789,14 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(self._mempool_pow_claims(node), [stale_claim["txid"]])
 
         self.log.info("Expiring QQP3 relay residence after one hour without releasing its input")
+        # Residence expiry does not revoke exact-byte relay authority while
+        # the active-chain clock still permits this proof. Hold wallet
+        # broadcast explicitly so maintenance cannot re-admit it between the
+        # absence and recovery-graph observations below.
+        node = self._restart_wallet_broadcast(False, reconnect_peer=False)
+        wallet = node.get_wallet_rpc(wallet_name)
+        cli_rpc_wallet = node.get_wallet_rpc(cli_wallet_name)
+        assert_equal(node.getrawtransaction(stale_claim["txid"]), stale_claim["hex"])
         claim_entry_time = node.getmempoolentry(stale_claim["txid"])["time"]
         node.setmocktime(claim_entry_time + QQSPROOF_MEMPOOL_TTL_SECONDS + 1)
         node.mockscheduler(60)
@@ -842,9 +869,12 @@ class GoldRushInfoTest(BitcoinTestFramework):
                     self.log.info(
                         "Wallet reload cannot restore relay authority after the active chain clock crosses the schema frontier"
                     )
-                    node.unloadwallet(wallet_name)
-                    node.loadwallet(wallet_name)
+                    # Restore normal broadcast as part of the reload: the
+                    # expired chain-clock authority, not our observation
+                    # hold, must now keep these exact bytes absent.
+                    node = self._restart_wallet_broadcast(True, reconnect_peer=True)
                     wallet = node.get_wallet_rpc(wallet_name)
+                    cli_rpc_wallet = node.get_wallet_rpc(cli_wallet_name)
                     node.syncwithvalidationinterfacequeue()
                     assert stale_claim["txid"] not in node.getrawmempool()
                     self._assert_qqp3_recovery_age(

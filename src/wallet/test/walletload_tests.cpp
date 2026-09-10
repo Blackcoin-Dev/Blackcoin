@@ -9,15 +9,19 @@
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
 #include <kernel/mempool_removal_reason.h>
+#include <rpc/protocol.h>
+#include <rpc/server.h>
 #include <script/solver.h>
 #include <shadow.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
+#include <util/time.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <wallet/claim_maintenance.h>
 #include <wallet/context.h>
 #include <wallet/load.h>
+#include <wallet/rpc/staking.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
 
@@ -53,6 +57,98 @@ struct WalletLoadTestAccess {
 };
 
 BOOST_AUTO_TEST_SUITE(walletload_tests)
+
+BOOST_FIXTURE_TEST_CASE(recovery_status_is_readable_but_nonauthorizing_during_ibd, RegTestingSetup)
+{
+    const CBlockIndex* tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    SetMockTime(tip->GetBlockTime() + 30 * 24 * 60 * 60);
+    BOOST_REQUIRE(!m_node.chain->isReadyToBroadcast());
+    auto wallet = std::make_shared<CWallet>(m_node.chain.get(), "ibd", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+    WITH_LOCK(wallet->cs_wallet, wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash()));
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    BOOST_REQUIRE(AddWallet(context, wallet));
+    const auto rpc = [&](const std::string& method, bool verbose = false) {
+        JSONRPCRequest request;
+        request.context = &context;
+        request.strMethod = method;
+        request.params.setArray();
+        if (verbose) request.params.push_back(true);
+        UniValue result;
+        for (const auto& command : GetStakingRPCCommands()) {
+            if (command.name == method) {
+                BOOST_REQUIRE(command.actor(request, result, /*last_handler=*/true));
+                return result;
+            }
+        }
+        BOOST_FAIL("missing staking RPC: " + method);
+        return result;
+    };
+
+    const auto inventory = wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_CHECK(!inventory.candidate_state_fingerprint.IsNull());
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_CHECK(wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(inventory));
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory));
+        auto stale = inventory;
+        ++stale.wallet_generation;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        ++stale.wallet_processed_height;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        ++stale.claim_ownership_pending_records;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        ++stale.claim_ownership_capacity_work;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        stale.recovery_database_ambiguous = !stale.recovery_database_ambiguous;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        stale.active_tip = tip->GetBlockHash();
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+    }
+    const auto before = rpc("getpowclaimrecoveryinfo", true);
+    BOOST_CHECK(!before["chain_ready"].get_bool());
+    BOOST_CHECK(!before["wallet_tip_matches"].get_bool());
+    BOOST_CHECK(!before["usage_available"].get_bool());
+    const auto mining = rpc("getpowmininginfo");
+    BOOST_CHECK(!mining["claim_inventory_wallet_tip_matches"].get_bool());
+    BOOST_CHECK(!mining["mining_gate_coherent"].get_bool());
+    BOOST_CHECK(!mining["mining_gate_can_submit"].get_bool());
+    BOOST_CHECK_EQUAL(mining["mining_gate_action"].get_str(), "unsafe");
+    BOOST_CHECK(!mining["recovery_usage_available"].get_bool());
+    const auto generation = wallet->GetDatabase().nUpdateCounter.load();
+    for (int i = 0; i < 3; ++i) {
+        BOOST_CHECK_EQUAL(rpc("getpowclaimrecoveryinfo", true).write(), before.write());
+    }
+    BOOST_CHECK_EXCEPTION(rpc("resolveallshadowpowclaims"), UniValue,
+        [](const UniValue& error) { return error["code"].getInt<int>() == RPC_CLIENT_IN_INITIAL_DOWNLOAD; });
+    BOOST_CHECK_EQUAL(wallet->GetDatabase().nUpdateCounter.load(), generation);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.empty()));
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        wallet->MarkShadowPowClaimCandidateStateChangedLocked();
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(inventory));
+    }
+
+    const auto ibd_snapshot = wallet->GetShadowPowClaimRecoveryInventory();
+    SetMockTime(tip->GetBlockTime() + 1);
+    BOOST_REQUIRE(m_node.chain->isReadyToBroadcast());
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(ibd_snapshot));
+    }
+    const auto ready = rpc("getpowclaimrecoveryinfo", true);
+    BOOST_CHECK(ready["chain_ready"].get_bool());
+    BOOST_CHECK(ready["wallet_tip_matches"].get_bool());
+    RemoveWallet(context, wallet, /*load_on_start=*/std::nullopt);
+}
 
 BOOST_FIXTURE_TEST_CASE(wallet_attach_reconciles_presubscription_disconnect, TestChain100Setup)
 {

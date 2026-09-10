@@ -2363,6 +2363,14 @@ public:
     bool ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
         const ShadowPowClaimRecoveryInventory& inventory) const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    /** Read-only status consistency, including a stable non-ready chain.
+     * This does not authorize signing, spending, or relay. */
+    bool ShadowPowClaimRecoveryStatusMatchesCurrentLocked(
+        const ShadowPowClaimRecoveryInventory& inventory) const
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    bool ShadowPowClaimRecoveryInventoryMatchesWalletLocked(
+        const ShadowPowClaimRecoveryInventory& inventory) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Cheap cache key for in-memory claim membership/mempool-state changes
      * that do not necessarily advance the wallet database counter. */
     uint256 GetShadowPowClaimCandidateStateFingerprintLocked() const

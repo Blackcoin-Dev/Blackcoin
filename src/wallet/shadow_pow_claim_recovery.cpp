@@ -831,6 +831,8 @@ ShadowPowClaimRecoveryInventory CWallet::GetShadowPowClaimRecoveryInventory() co
         inventory.wallet_processed_tip = m_last_block_processed;
         inventory.wallet_processed_height = m_last_block_processed_height;
         inventory.wallet_generation = GetDatabase().nUpdateCounter.load();
+        inventory.candidate_state_fingerprint =
+            GetShadowPowClaimCandidateStateFingerprintLocked();
         const bool ownership_epoch_pending =
             m_shadow_pow_claim_ownership_source_generation.load(
                 std::memory_order_acquire) !=
@@ -1882,25 +1884,11 @@ bool CWallet::ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
     const bool signing_safe = tip &&
         IsShadowPowClaimRelayClockSigningSafeLocked(
             wall_time, median_time);
-    const size_t script_manager_work = m_spk_managers.size();
-    const bool script_manager_capacity_exceeded =
-        script_manager_work >
-            SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY;
-    const bool ownership_capacity_exceeded =
-        m_shadow_pow_claim_ownership_capacity_exceeded ||
-        script_manager_capacity_exceeded;
-    const size_t ownership_capacity_work =
-        script_manager_capacity_exceeded
-            ? script_manager_work
-            : m_shadow_pow_claim_ownership_capacity_work;
     return tip && inventory.wallet_tip_matches &&
            tip->GetBlockHash() == inventory.active_tip &&
            tip->nHeight == inventory.active_height &&
            inventory.wallet_processed_tip == inventory.active_tip &&
            inventory.wallet_processed_height == inventory.active_height &&
-           m_last_block_processed == inventory.wallet_processed_tip &&
-           m_last_block_processed_height ==
-               inventory.wallet_processed_height &&
            inventory.relay_clock_high_water ==
                m_shadow_pow_claim_relay_clock_high_water &&
            inventory.legacy_relay_clock_high_water ==
@@ -1916,6 +1904,39 @@ bool CWallet::ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
            (inventory.next_legacy_relay_expiry_wall_time <= 0 ||
             wall_time <
                 inventory.next_legacy_relay_expiry_wall_time) &&
+           ShadowPowClaimRecoveryInventoryMatchesWalletLocked(inventory);
+}
+
+bool CWallet::ShadowPowClaimRecoveryStatusMatchesCurrentLocked(
+    const ShadowPowClaimRecoveryInventory& inventory) const
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_wallet);
+    if (HaveChain() && chain().isReadyToBroadcast()) {
+        return ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory);
+    }
+    // Stable IBD/import status is a wallet-only observation, not an evaluated
+    // proof snapshot. Never accept a previously ready snapshot after readiness
+    // changes, and never use this predicate to authorize spending or relay.
+    return !inventory.wallet_tip_matches && inventory.active_tip.IsNull() &&
+           inventory.active_height == -1 && !inventory.usage_snapshot &&
+           ShadowPowClaimRecoveryInventoryMatchesWalletLocked(inventory);
+}
+
+bool CWallet::ShadowPowClaimRecoveryInventoryMatchesWalletLocked(
+    const ShadowPowClaimRecoveryInventory& inventory) const
+{
+    AssertLockHeld(cs_wallet);
+    const size_t script_manager_work = m_spk_managers.size();
+    const bool script_manager_capacity_exceeded =
+        script_manager_work > SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY;
+    const bool ownership_capacity_exceeded =
+        m_shadow_pow_claim_ownership_capacity_exceeded ||
+        script_manager_capacity_exceeded;
+    const size_t ownership_capacity_work = script_manager_capacity_exceeded
+        ? script_manager_work : m_shadow_pow_claim_ownership_capacity_work;
+    return m_last_block_processed == inventory.wallet_processed_tip &&
+           m_last_block_processed_height == inventory.wallet_processed_height &&
            GetDatabase().nUpdateCounter.load() ==
                inventory.wallet_generation &&
            GetShadowPowClaimCandidateStateFingerprintLocked() ==

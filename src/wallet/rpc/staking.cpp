@@ -4422,6 +4422,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     ShadowPowClaimRecoveryUsage usage;
     ShadowPowClaimRecoveryPolicyMutationResult policy_state;
     bool database_ambiguous{false};
+    bool chain_ready{false};
     inventory = pwallet->GetShadowPowClaimRecoveryInventory();
     {
         // One recursive lock snapshot keeps legacy compatibility fields,
@@ -4433,12 +4434,15 @@ static RPCHelpMan getpowclaimrecoveryinfo()
         if (policy_state.authoritative_state_available) {
             policy = policy_state.authoritative_policy;
         }
-        if (!pwallet->ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+        if (!pwallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(
                 inventory)) {
             throw JSONRPCError(
                 RPC_MISC_ERROR,
                 "wallet or active-chain state changed while evaluating Gold Rush recovery proofs; retry");
         }
+        // Serialize the readiness of the snapshot just validated, not a
+        // second wall-clock-dependent IBD sample taken after that check.
+        chain_ready = inventory.wallet_tip_matches;
         compatibility_inventory =
             BuildShadowPowClaimCompatibilityInventory(inventory);
         usage = pwallet->GetShadowPowClaimRecoveryUsageFromInventoryLocked(
@@ -4454,7 +4458,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
                   ShadowPowClaimRecoveryPolicyMutationStatusName(
                       policy_state.status));
     result.pushKV("policy_state_detail", policy_state.detail);
-    result.pushKV("chain_ready", pwallet->chain().isReadyToBroadcast());
+    result.pushKV("chain_ready", chain_ready);
     result.pushKV("database_outcome_ambiguous", database_ambiguous);
     result.pushKV("active_tip", compatibility_inventory.active_tip.GetHex());
     result.pushKV("active_height", inventory.active_height);
@@ -4831,7 +4835,7 @@ static RPCHelpMan getpowmininginfo()
         pwallet->GetShadowPowClaimRecoveryInventory();
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
-        if (!pwallet->ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+        if (!pwallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(
                 recovery_inventory)) {
             throw JSONRPCError(
                 RPC_MISC_ERROR,

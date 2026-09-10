@@ -508,9 +508,12 @@ class GoldRushV3014SameAnchorMixedTest(BitcoinTestFramework):
             restart_args = [*self.base_args, f"-mocktime={self.mock_time}"]
             if index == CANDIDATE:
                 # Deterministically evict the disconnected carrier before
-                # building the competing branch. The wallet record remains
-                # un-abandoned and is admitted again after the reorg.
-                restart_args.append("-mempoolexpiry=0")
+                # building the competing branch. Disable automatic wallet
+                # relay for this isolated fixture phase: mining-disabled
+                # retained-byte maintenance otherwise restores the eligible
+                # carrier immediately after expiry. The wallet record stays
+                # un-abandoned and P2P admission remains enabled.
+                restart_args.extend(["-mempoolexpiry=0", "-walletbroadcast=0"])
             self.restart_node(
                 index,
                 extra_args=restart_args,
@@ -543,8 +546,17 @@ class GoldRushV3014SameAnchorMixedTest(BitcoinTestFramework):
         ) is None
         entry_time = candidate.getmempoolentry(sibling_txid)["time"]
         self._set_mocktime(max(self.mock_time, entry_time) + 2)
-        candidate_staker.sendtoaddress(
+        expiry_trigger = candidate_staker.sendtoaddress(
             candidate_staking_address, Decimal("0.10000000")
+        )
+        # Wallet broadcasting is disabled only for the competing-branch
+        # phase. Explicitly submit this ordinary transaction to trigger expiry
+        # without authorizing the claimant to refill the local mempool.
+        assert_equal(
+            candidate.sendrawtransaction(
+                candidate_staker.gettransaction(expiry_trigger)["hex"]
+            ),
+            expiry_trigger,
         )
         candidate.syncwithvalidationinterfacequeue()
         self.wait_until(

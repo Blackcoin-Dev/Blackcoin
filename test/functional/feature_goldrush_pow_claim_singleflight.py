@@ -13,11 +13,14 @@ recovery flow or a wallet-scoped, bounded automatic-recovery policy, and its
 durable relay authority must survive restart without changing the signed bytes.
 """
 
+from copy import deepcopy
 from decimal import Decimal
 from threading import Thread
 import time
+import unittest
 from urllib.parse import quote
 
+from test_framework.authproxy import JSONRPCException
 from test_framework.blocktools import COIN, COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error, get_rpc_proxy
@@ -42,6 +45,10 @@ FAMILY_LIVENESS_WALLETS = (
 LIVE_FEE_VALUES = (Decimal("0.991"), Decimal("501.747137"), Decimal("969.818832"))
 ZERO_HASH = "0" * 64
 QQSPROOF = b"QQSPROOF"
+
+
+class RecoverySnapshotChanged(Exception):
+    """Independent reads straddled a valid recovery-snapshot invalidation."""
 
 
 class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
@@ -835,9 +842,22 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
     @staticmethod
     def _assert_recovery_pages(wallet, info=None, page_size=17):
-        """Reconstruct exactly the dedicated graph, never general history."""
-        if info is None:
-            info = wallet.getpowclaimrecoveryinfo(True)
+        """Reconstruct one coherent graph despite concurrent wallet maintenance."""
+        for attempt in range(5):
+            if info is None or attempt:
+                info = wallet.getpowclaimrecoveryinfo(True)
+            try:
+                first_page = GoldRushPowClaimSingleFlightTest._assert_recovery_page_snapshot(
+                    wallet, info, page_size
+                )
+                return info, first_page
+            except RecoverySnapshotChanged:
+                pass
+        raise AssertionError("Recovery pagination did not stabilize within 5 snapshots")
+
+    @staticmethod
+    def _assert_recovery_page_snapshot(wallet, info, page_size):
+        """Never retry a stable-snapshot mismatch or an invalid cursor response."""
         collections = {
             "claim_txid": "claim_txids",
             "root_claim_txid": "root_claim_txids",
@@ -850,10 +870,22 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         first_page = None
         returned = 0
         while True:
-            page = wallet.getpowclaimrecoveryinfo(
-                True, {"page_size": page_size, "cursor": cursor}
-            )
+            try:
+                page = wallet.getpowclaimrecoveryinfo(
+                    True, {"page_size": page_size, "cursor": cursor}
+                )
+            except JSONRPCException as error:
+                if cursor and error.error == {
+                    "code": -8, "message": "recovery-page-cursor-stale"
+                }:
+                    raise RecoverySnapshotChanged from error
+                raise
             if first_page is None:
+                # No cursor binds the separate verbose baseline to page one.
+                # Later pages DO carry that binding and must reject drift,
+                # never silently return records from a different snapshot.
+                if any(page[field] != info[field] for field in ("active_tip", "wallet_generation")):
+                    raise RecoverySnapshotChanged
                 first_page = page
             assert "component_details" not in page
             assert "unanchored_claim_txids" not in page
@@ -902,10 +934,28 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         return first_page
 
     @staticmethod
+    def _assert_recovery_cli_pages(wallet, cli, page_size):
+        """Compare CLI conversion only across identical independent snapshots."""
+        options = {"page_size": page_size}
+        for _ in range(5):
+            direct = wallet.getpowclaimrecoveryinfo(True, options)
+            positional = cli.getpowclaimrecoveryinfo(True, options)
+            named = cli.getpowclaimrecoveryinfo(verbose=True, options=options)
+            if any(
+                page[field] != direct[field]
+                for page in (positional, named)
+                for field in ("active_tip", "wallet_generation")
+            ):
+                continue
+            assert_equal(positional, direct)
+            assert_equal(named, direct)
+            return
+        raise AssertionError("Recovery CLI pagination did not stabilize within 5 snapshots")
+
+    @staticmethod
     def _recovery_semantic_snapshot(wallet):
         """Return restart/rescan-stable policy, graph, and accounting state."""
-        info = wallet.getpowclaimrecoveryinfo(True)
-        GoldRushPowClaimSingleFlightTest._assert_recovery_pages(wallet, info)
+        info, _ = GoldRushPowClaimSingleFlightTest._assert_recovery_pages(wallet)
         component_fields = (
             "anchor",
             "generation_fingerprint",
@@ -1730,7 +1780,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert "hex" not in preview
         assert first_txid not in node.getrawmempool()
         reviewed = manual.getpowclaimrecoveryinfo(True)
-        first_page = self._assert_recovery_pages(manual, reviewed, page_size=2)
+        reviewed, first_page = self._assert_recovery_pages(manual, reviewed, page_size=2)
         cursor = first_page["pagination"]["next_cursor"]
         assert_raises_rpc_error(
             -8, "recovery-page-cursor-stale",
@@ -2079,13 +2129,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         # both positional and named forms. Repeating this restriction-only
         # operation is intentionally idempotent.
         manual_cli = node.cli(f"-rpcwallet={quote(MANUAL_WALLET)}")
-        pagination_options = {"page_size": 2}
-        direct_page = manual.getpowclaimrecoveryinfo(True, pagination_options)
-        assert_equal(manual_cli.getpowclaimrecoveryinfo(True, pagination_options), direct_page)
-        assert_equal(
-            manual_cli.getpowclaimrecoveryinfo(verbose=True, options=pagination_options),
-            direct_page,
-        )
+        self._assert_recovery_cli_pages(manual, manual_cli, page_size=2)
         revoked_cli_positional = manual_cli.revokeshadowpowclaimresolution(
             second_resolution_txid,
             True,
@@ -2207,7 +2251,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 1)
 
         self.log.info("Reorging the resolution never exposes the shared input twice")
-        before_reorg_page = self._assert_recovery_pages(manual, page_size=2)
+        _, before_reorg_page = self._assert_recovery_pages(manual, page_size=2)
         before_reorg_cursor = before_reorg_page["pagination"]["next_cursor"]
         node.invalidateblock(resolution_block)
         self.wait_until(lambda: second_resolution_txid in node.getrawmempool(), timeout=20)
@@ -3954,6 +3998,149 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             },
             untouched_cross_input,
         )
+
+
+class RecoveryPaginationHelperTest(unittest.TestCase):
+    """Pure helper regression: python -m unittest feature_goldrush_pow_claim_singleflight.RecoveryPaginationHelperTest."""
+
+    class Wallet:
+        def __init__(self, script):
+            self.script = deepcopy(script)
+            self.calls = 0
+
+        def getpowclaimrecoveryinfo(self, verbose, options=None):
+            self.calls += 1
+            assert_equal(verbose, True)
+            expected_options, response = self.script.pop(0)
+            assert_equal(options, expected_options)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    @staticmethod
+    def snapshot(generation=1, tip="tip"):
+        component = {
+            "anchor": {"txid": "anchor", "vout": 0},
+            "claim_txids": ["claim"], "root_claim_txids": ["claim"],
+            "resolution_txids": [], "ordinary_or_mixed_txids": [],
+            "nodes": [{"txid": "claim", "kind": "claim"}],
+        }
+        common = {"wallet_generation": generation, "active_tip": tip, "raw_claim_objects": 2}
+        info = {**common, "component_details": [component], "unanchored_claim_txids": ["unanchored"]}
+        anchor = {"anchor_txid": "anchor", "anchor_vout": 0}
+        records = [
+            {**anchor, "kind": "component", "component": component},
+            {**anchor, "kind": "claim_txid", "txid": "claim"},
+            {**anchor, "kind": "root_claim_txid", "txid": "claim"},
+            {**anchor, "kind": "node", "node": component["nodes"][0]},
+            {"kind": "unanchored_claim_txid", "txid": "unanchored"},
+        ]
+        script = [(None, info)]
+        for offset in range(0, len(records), 2):
+            page_records = records[offset:offset + 2]
+            complete = offset + len(page_records) == len(records)
+            pagination = {
+                "snapshot": f"{tip}/{generation}", "total_records": len(records),
+                "offset": offset, "returned_records": len(page_records), "complete": complete,
+            }
+            if not complete:
+                pagination["next_cursor"] = f"cursor-{offset + 2}"
+            script.append((
+                {"page_size": 2, "cursor": f"cursor-{offset}" if offset else ""},
+                {**common, "records": page_records, "pagination": pagination},
+            ))
+        return info, script
+
+    def check_snapshot(self, script, expected, supplied=None):
+        wallet = self.Wallet(script)
+        info, first_page = GoldRushPowClaimSingleFlightTest._assert_recovery_pages(wallet, supplied, page_size=2)
+        self.assertEqual(info, expected)
+        self.assertEqual(first_page["wallet_generation"], expected["wallet_generation"])
+        self.assertEqual(first_page["active_tip"], expected["active_tip"])
+        self.assertEqual(wallet.script, [])
+
+    def test_stable_snapshot_with_and_without_supplied_baseline(self):
+        info, script = self.snapshot()
+        self.check_snapshot(script, info)
+        self.check_snapshot(script[1:], info, supplied=info)
+
+    def test_initial_generation_or_tip_drift_restarts_with_fresh_baseline(self):
+        old, _ = self.snapshot()
+        for kwargs in ({"generation": 2}, {"tip": "next-tip"}):
+            with self.subTest(**kwargs):
+                current, script = self.snapshot(**kwargs)
+                self.check_snapshot([(None, old), script[1], *script], current)
+
+    def test_expected_continuation_staleness_restarts_whole_assembly(self):
+        info, script = self.snapshot()
+        stale = JSONRPCException({"code": -8, "message": "recovery-page-cursor-stale"})
+        self.check_snapshot([*script[:2], (script[2][0], stale), *script], info)
+
+    def test_unexpected_rpc_errors_are_not_retried(self):
+        _, script = self.snapshot()
+        cases = ((1, -8, "recovery-page-cursor-stale"),
+                 (2, -8, "recovery-page-cursor-malformed"),
+                 (2, -5, "recovery-page-cursor-stale"))
+        for index, code, message in cases:
+            with self.subTest(index=index, code=code, message=message):
+                error = JSONRPCException({"code": code, "message": message})
+                wallet = self.Wallet([*script[:index], (script[index][0], error)])
+                with self.assertRaises(JSONRPCException) as raised:
+                    GoldRushPowClaimSingleFlightTest._assert_recovery_pages(wallet, page_size=2)
+                self.assertEqual(raised.exception.error, error.error)
+                self.assertEqual(wallet.calls, index + 1)
+
+    def test_stable_content_corruption_and_silent_cursor_drift_fail(self):
+        for fault in ("count", "record", "offset", "snapshot", "generation", "tip"):
+            with self.subTest(fault=fault):
+                _, script = self.snapshot()
+                page = script[2][1]
+                if fault == "count":
+                    page["raw_claim_objects"] += 1
+                elif fault == "record":
+                    page["records"][0]["txid"] = "corrupt"
+                elif fault == "offset":
+                    page["pagination"]["offset"] += 1
+                elif fault == "snapshot":
+                    page["pagination"]["snapshot"] = "other"
+                elif fault == "generation":
+                    page["wallet_generation"] += 1
+                else:
+                    page["active_tip"] = "other"
+                wallet = self.Wallet(script)
+                with self.assertRaises(AssertionError):
+                    GoldRushPowClaimSingleFlightTest._assert_recovery_pages(wallet, page_size=2)
+                self.assertEqual(wallet.calls, len(script) if fault == "record" else 3)
+
+    def test_repeated_drift_or_staleness_is_bounded(self):
+        old, script = self.snapshot()
+        _, changed = self.snapshot(generation=2)
+        stale = JSONRPCException({"code": -8, "message": "recovery-page-cursor-stale"})
+        for attempt in ([(None, old), changed[1]], [*script[:2], (script[2][0], stale)]):
+            wallet = self.Wallet(attempt * 5)
+            with self.assertRaisesRegex(AssertionError, "did not stabilize within 5 snapshots"):
+                GoldRushPowClaimSingleFlightTest._assert_recovery_pages(wallet, page_size=2)
+            self.assertEqual(wallet.script, [])
+
+    def test_cli_stable_and_drifted_snapshots_preserve_exact_equality(self):
+        _, script = self.snapshot()
+        _, changed = self.snapshot(generation=2)
+        options = {"page_size": 2}
+        old = script[1][1]
+        current = changed[1][1]
+        for drift in (False, True):
+            wallet = self.Wallet([(options, old), (options, current)] if drift else [(options, current)])
+            cli = self.Wallet([(options, current)] * (4 if drift else 2))
+            GoldRushPowClaimSingleFlightTest._assert_recovery_cli_pages(wallet, cli, page_size=2)
+            self.assertEqual(wallet.script, [])
+            self.assertEqual(cli.script, [])
+        corrupt = deepcopy(current)
+        corrupt["records"][1]["txid"] = "corrupt"
+        with self.assertRaises(AssertionError):
+            GoldRushPowClaimSingleFlightTest._assert_recovery_cli_pages(
+                self.Wallet([(options, current)]),
+                self.Wallet([(options, corrupt), (options, current)]), page_size=2,
+            )
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/wallet.h>
+#include <wallet/load.h>
 
 #if defined(HAVE_CONFIG_H)
 #include <config/bitcoin-config.h>
@@ -1124,6 +1125,7 @@ bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet
 
     // Unregister with the validation interface which also drops shared pointers.
     wallet->m_chain_notifications_handler.reset();
+    context.claim_maintenance->Unregister(*wallet);
     LOCK(context.wallets_mutex);
     std::vector<std::shared_ptr<CWallet>>::iterator i = std::find(context.wallets.begin(), context.wallets.end(), wallet);
     if (i == context.wallets.end()) return false;
@@ -1246,6 +1248,7 @@ void PublishRuntimeWallet(
     NotifyWalletLoaded(context, wallet);
     AddWallet(context, wallet);
     wallet->postInitProcess();
+    context.claim_maintenance->Register(wallet);
 }
 
 std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
@@ -3051,6 +3054,15 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
         // https://github.com/bitcoin-core/bitcoin-devwiki/wiki/Wallet-Transaction-Conflict-Tracking
         SyncTransaction(tx, TxStateInactive{});
     }
+    if (reason != MemPoolRemovalReason::BLOCK &&
+        (m_shadow_pow_unconfirmed_claim_txids.count(tx->GetHash()) != 0 ||
+         m_shadow_pow_unconfirmed_implicit_claim_txids.count(tx->GetHash()) != 0 ||
+         m_shadow_pow_unclassified_claim_txids.count(tx->GetHash()) != 0)) {
+        // A single indexed root request, with no parse, descendant walk or
+        // new recovery authority. The executor rechecks exact relay guards.
+        RequestWalletClaimMaintenance(m_claim_maintenance,
+                                      /*resolve=*/false, /*relay=*/true);
+    }
 }
 
 void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& block)
@@ -3146,7 +3158,6 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
 void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
 {
     assert(block.data);
-    bool pending_shadow_repair{false};
     {
     LOCK(cs_wallet);
 
@@ -3245,123 +3256,9 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
         SyncTransaction(tx, TxStateInactive{});
     }
 
-    // Mark every unconfirmed proof pending before evaluating replacements.
-    // Chainstate removes all tip-bound proofs on a disconnect, but its mempool
-    // removal callbacks are queued after BlockDisconnected. This marker lets
-    // the replacement scan recognize a removed newer proof even before that
-    // later callback automatically abandons it.
-    for (auto& [txid, wtx] : mapWallet) {
-        if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx) ||
-            GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) continue;
-        pending_shadow_repair = true;
-        const int observation_height = m_last_block_processed_height;
-        const uint256 observation_tip = m_last_block_processed;
-        UpdateShadowPowClaimRecoveryRecordDurably(
-            txid,
-            [&](CWalletTx& persisted) {
-                return MarkShadowPowClaimQuarantined(
-                    persisted, observation_height, observation_tip);
-            },
-            "mark disconnected-block claim quarantine");
-    }
-
-    // A tip-bound QQSPROOF that became stale and was abandoned can become
-    // valid again if a reorg restores its original parent. Reopen every
-    // abandoned proof package on disconnect; normal mempool validation will
-    // decide whether it is valid for the restored tip, and a later stale-tip
-    // removal can abandon it again. This makes automatic input release
-    // reversible across reorgs.
-    std::vector<uint256> abandoned_shadow_claims;
-    for (const auto& [txid, wtx] : mapWallet) {
-        const auto provenance = wtx.mapValue.find(AUTO_SHADOW_STALE_KEY);
-        if (wtx.isAbandoned() && TransactionHasShadowProof(*wtx.tx) &&
-            provenance != wtx.mapValue.end() && provenance->second == "1") {
-            // Do not resurrect an older automatically abandoned proof after
-            // the user has replaced it. The replacement can be absent from
-            // the current mempool after restart or eviction while still being
-            // the wallet's intended spend. Reopening the old proof would let
-            // insertion-order rebroadcast consume the inputs first.
-            bool has_live_replacement{false};
-            for (const CTxIn& input : wtx.tx->vin) {
-                const auto [first, last] = mapTxSpends.equal_range(input.prevout);
-                for (auto spend = first; spend != last; ++spend) {
-                    if (spend->second == txid) continue;
-                    auto replacement = mapWallet.find(spend->second);
-                    if (replacement == mapWallet.end()) continue;
-                    RefreshMempoolStatus(replacement->second);
-                    UpdatePendingShadowSignalIndex(replacement->second);
-                    const auto automatic = replacement->second.mapValue.find(AUTO_SHADOW_STALE_KEY);
-                    const bool pending_tip_validation =
-                        TransactionHasShadowProof(*replacement->second.tx) &&
-                        automatic != replacement->second.mapValue.end() && automatic->second == "1" &&
-                        !replacement->second.InMempool();
-                    if (!replacement->second.isAbandoned() && !pending_tip_validation) {
-                        has_live_replacement = true;
-                        break;
-                    }
-                }
-                if (has_live_replacement) break;
-            }
-            if (has_live_replacement) continue;
-            abandoned_shadow_claims.push_back(txid);
-        }
-    }
-    for (const uint256& txid : abandoned_shadow_claims) {
-        std::vector<uint256> package;
-        std::set<uint256> todo{txid};
-        std::set<uint256> done;
-        while (!todo.empty()) {
-            const uint256 current = *todo.begin();
-            todo.erase(todo.begin());
-            if (!done.insert(current).second) continue;
-            const auto current_it = mapWallet.find(current);
-            if (current_it == mapWallet.end()) continue;
-            package.push_back(current);
-            for (unsigned int output_index = 0;
-                 output_index < current_it->second.tx->vout.size();
-                 ++output_index) {
-                const auto range = mapTxSpends.equal_range(
-                    COutPoint{current, output_index});
-                for (auto spend = range.first; spend != range.second;
-                     ++spend) {
-                    if (!done.count(spend->second)) todo.insert(spend->second);
-                }
-            }
-        }
-
-        std::vector<uint256> reopened;
-        if (!UpdateShadowPowClaimRecoveryRecordsDurably(
-                package,
-                [](const uint256&, CWalletTx& persisted) {
-                    if (!persisted.isAbandoned()) return false;
-                    const auto manual = persisted.mapValue.find(
-                        MANUAL_SHADOW_ABANDON_KEY);
-                    if (manual != persisted.mapValue.end() &&
-                        manual->second == "1") {
-                        return false;
-                    }
-                    if (TransactionHasShadowProof(*persisted.tx)) {
-                        persisted.mapValue[REORG_SHADOW_RESUBMIT_KEY] = "1";
-                    }
-                    persisted.m_state = TxStateInactive{};
-                    return true;
-                },
-                "reopen disconnected claim package", &reopened)) {
-            continue;
-        }
-        for (const uint256& reopened_txid : reopened) {
-            CWalletTx& reopened_wtx = mapWallet.at(reopened_txid);
-            RefreshLiveUnspentStakeOutpoints(reopened_wtx);
-            RemoveIndexedShadowSolve(reopened_txid);
-            UpdatePendingShadowSignalIndex(reopened_wtx);
-            MarkInputsDirty(reopened_wtx.tx);
-            NotifyTransactionChanged(reopened_txid, CT_UPDATED);
-        }
-    }
-    pending_shadow_repair = pending_shadow_repair || !abandoned_shadow_claims.empty();
-    if (pending_shadow_repair) {
-        m_next_resend = NodeClock::now();
-    }
+    // Retained bytes and indexed anchors remain reserved immediately. Claim
+    // classification, historical repair and relay run on the shared executor;
+    // a disconnect never grants automatic recovery-spend authority.
 
     // Blackcoin - Call to abandon orphaned coinstakes after handling disconnections
     AbandonOrphanedCoinstakes();
@@ -3370,18 +3267,22 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
 
     }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a reorg disconnects a block.
-    if (pending_shadow_repair) {
-        // The periodic wallet scheduler runs once per minute, which is too
-        // slow for a proof that becomes valid only for the restored parent.
-        // Validate and relay it immediately after releasing cs_wallet.
-        RepairStaleShadowTransactions(/*force=*/false);
-        ResubmitWalletTransactions(/*relay=*/true, /*force=*/false);
-    }
+    RequestClaimMaintenance(/*resolve=*/false, /*relay=*/true);
 }
 
 void CWallet::updatedBlockTip()
 {
     m_best_block_time = GetTime();
+    LOCK(cs_wallet);
+    if (!m_shadow_pow_unconfirmed_claim_txids.empty() ||
+        !m_shadow_pow_unconfirmed_implicit_claim_txids.empty() ||
+        !m_shadow_pow_unclassified_claim_txids.empty()) {
+        // A retained proof can become eligible on an ordinary forward tip.
+        // Do not depend on mining enablement or the 12-36 hour resend timer,
+        // and do not revisit inert confirmed claim history on every block.
+        RequestWalletClaimMaintenance(m_claim_maintenance,
+                                      /*resolve=*/false, /*relay=*/true);
+    }
 }
 
 void CWallet::BlockUntilSyncedToCurrentChain() const {
@@ -4838,11 +4739,11 @@ void CWallet::RepairStaleShadowTransactions(bool force)
     }
 }
 
-void CWallet::ResubmitWalletTransactions(bool relay, bool force)
+void CWallet::ResubmitWalletTransactions(bool relay, bool force, bool include_claims)
 {
     int submitted_tx_count = 0;
 
-    if (force) {
+    if (force && include_claims) {
         RepairStaleShadowTransactions(/*force=*/true);
     }
 
@@ -4896,6 +4797,22 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force)
         }
     }
 
+    if (include_claims && RelayRetainedShadowPowClaim(relay)) ++submitted_tx_count;
+
+    if (submitted_tx_count > 0) {
+        WalletLogPrintf("%s: resubmit %u unconfirmed transactions\n", __func__, submitted_tx_count);
+    }
+}
+
+bool CWallet::RelayRetainedShadowPowClaim(bool relay)
+{
+    AssertLockNotHeld(cs_main);
+    AssertLockNotHeld(cs_wallet);
+    {
+        LOCK(cs_wallet);
+        if (!fBroadcastTransactions) return false;
+    }
+    if (!HaveChain() || (relay && !chain().isReadyToBroadcast())) return false;
     ShadowPowClaimRecoveryInventory evaluated_inventory;
     const ShadowPowClaimMiningGate gate =
         GetShadowPowClaimMiningGate(&evaluated_inventory);
@@ -4930,7 +4847,7 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force)
             if (SubmitTxMemoryPoolAndRelay(
                     gate.relay_txid, err_string, relay,
                     &broadcast_guard)) {
-                ++submitted_tx_count;
+                return true;
             } else {
                 WalletLogPrintf(
                     "Deferred Gold Rush PoW claim relay %s: %s\n",
@@ -4938,10 +4855,17 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force)
             }
         }
     }
+    return false;
+}
 
-    if (submitted_tx_count > 0) {
-        WalletLogPrintf("%s: resubmit %u unconfirmed transactions\n", __func__, submitted_tx_count);
+void CWallet::RequestClaimMaintenance(bool resolve, bool relay)
+{
+    std::shared_ptr<WalletClaimMaintenanceSlot> slot;
+    {
+        LOCK(cs_wallet);
+        slot = m_claim_maintenance;
     }
+    RequestWalletClaimMaintenance(slot, resolve, relay);
 }
 
 /** @} */ // end of mapWallet
@@ -4952,10 +4876,11 @@ void MaybeResendWalletTxs(WalletContext& context)
         MaybeAutoDemurrageAttest(*pwallet);
         MaybeAutoShadowSignal(*pwallet);
         MaybeAutoRedelegateQuantumColdStake(*pwallet);
-        pwallet->RepairStaleShadowTransactions(/*force=*/false);
-        pwallet->MaybeAutoResolveShadowPowClaims();
-        if (!pwallet->ShouldResend()) continue;
-        pwallet->ResubmitWalletTransactions(/*relay=*/true, /*force=*/false);
+        const bool resend = pwallet->ShouldResend();
+        pwallet->RequestClaimMaintenance(/*resolve=*/true, /*relay=*/resend);
+        if (!resend) continue;
+        pwallet->ResubmitWalletTransactions(/*relay=*/true, /*force=*/false,
+                                           /*include_claims=*/false);
         pwallet->SetNextResend();
     }
 }

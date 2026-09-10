@@ -6,8 +6,13 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/context.h>
+#include <wallet/load.h>
 
 namespace wallet {
-WalletContext::WalletContext() = default;
-WalletContext::~WalletContext() = default;
+WalletContext::WalletContext() : claim_maintenance(std::make_unique<WalletClaimMaintenance>()) {}
+WalletContext::~WalletContext()
+{
+    // Join before destroying the context's wallet references or chain users.
+    claim_maintenance->Stop();
+}
 } // namespace wallet

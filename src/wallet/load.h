@@ -9,6 +9,9 @@
 #ifndef BITCOIN_WALLET_LOAD_H
 #define BITCOIN_WALLET_LOAD_H
 
+#include <chrono>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -21,6 +24,35 @@ class Chain;
 namespace wallet {
 class CWallet;
 struct WalletContext;
+struct WalletClaimMaintenanceSlot;
+
+/** One coalesced, joined executor for all wallets in a context. Requests never
+ * allocate queue entries or retain wallet ownership. */
+class WalletClaimMaintenance {
+    struct State;
+    std::shared_ptr<State> m_state;
+    explicit WalletClaimMaintenance(std::function<void(CWallet&, bool, bool)> test_pass);
+    bool WaitForCancellationForTesting(
+        const std::shared_ptr<WalletClaimMaintenanceSlot>& slot,
+        std::chrono::milliseconds timeout);
+    friend struct WalletLoadTestAccess;
+    friend struct WalletClaimMaintenanceSlot;
+public:
+    WalletClaimMaintenance();
+    ~WalletClaimMaintenance();
+    WalletClaimMaintenance(const WalletClaimMaintenance&) = delete;
+    WalletClaimMaintenance& operator=(const WalletClaimMaintenance&) = delete;
+    void Start();
+    void Register(const std::shared_ptr<CWallet>& wallet);
+    void Unregister(CWallet& wallet);
+    void Stop();
+    /** Deterministic barrier for callers outside wallet/chain locks. */
+    void Sync();
+};
+
+void RequestWalletClaimMaintenance(
+    const std::shared_ptr<WalletClaimMaintenanceSlot>& slot,
+    bool resolve, bool relay);
 
 //! Responsible for reading and validating the -wallet arguments and verifying the wallet database.
 bool VerifyWallets(WalletContext& context);

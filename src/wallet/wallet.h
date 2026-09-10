@@ -75,6 +75,8 @@ class Wallet;
 }
 namespace wallet {
 class CWallet;
+class WalletClaimMaintenance;
+struct WalletClaimMaintenanceSlot;
 
 enum class WalletCommitStatus {
     ACCEPTED,
@@ -820,6 +822,9 @@ private:
     std::atomic<double> m_scanning_progress{0};
     friend class WalletRescanReserver;
     friend struct WalletLoadTestAccess;
+    friend class WalletClaimMaintenance;
+    std::shared_ptr<WalletClaimMaintenanceSlot> m_claim_maintenance GUARDED_BY(cs_wallet);
+    bool m_claim_maintenance_unregistered GUARDED_BY(cs_wallet){false};
 
     //! the current wallet version: clients below this version are not able to load the wallet
     int nWalletVersion GUARDED_BY(cs_wallet){FEATURE_BASE};
@@ -1533,7 +1538,11 @@ public:
     bool ShouldResend() const;
     /** Validate and repair stale Gold Rush proofs independently of relay policy. */
     void RepairStaleShadowTransactions(bool force);
-    void ResubmitWalletTransactions(bool relay, bool force);
+    void ResubmitWalletTransactions(bool relay, bool force, bool include_claims = true);
+    /** Relay at most one retained proof using the exact typed authorization. */
+    bool RelayRetainedShadowPowClaim(bool relay);
+    /** Coalesce off-notification claim work; never executes inline. */
+    void RequestClaimMaintenance(bool resolve, bool relay);
 
     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
 

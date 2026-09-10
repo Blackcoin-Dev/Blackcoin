@@ -3948,7 +3948,7 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_branch_quarantine_resets_after_reorg, T
     CreateAndProcessBlock(
         {funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
 
-    auto wallet = CreateSyncedWallet(
+    std::shared_ptr<CWallet> wallet = CreateSyncedWallet(
         *m_node.chain,
         WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
                   return Assert(m_node.chainman)->ActiveChain()),
@@ -4081,6 +4081,12 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_branch_quarantine_resets_after_reorg, T
             first_observation_tip.GetHex());
     }
 
+    // Real disconnect notifications request maintenance, but cannot run its
+    // proof classification inline. Start only after the replacement tip and
+    // test classification schedule are ready.
+    WalletClaimMaintenance maintenance;
+    maintenance.Register(wallet);
+    auto notifications = m_node.chain->handleNotifications(wallet);
     CBlockIndex* first_observation_index = WITH_LOCK(
         ::cs_main,
         return Assert(m_node.chainman)->m_blockman.LookupBlockIndex(
@@ -4098,8 +4104,18 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_branch_quarantine_resets_after_reorg, T
     BOOST_REQUIRE(replacement_block.GetHash() != first_observation_tip);
     SyncWithValidationInterfaceQueue();
     sync_wallet_tip();
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->IsSpent(COutPoint{funding_ref->GetHash(), 0}));
+        BOOST_CHECK_EQUAL(wallet->mapWallet.at(claim_ref->GetHash()).mapValue.at(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY), first_observation_tip.GetHex());
+    }
     enable_gold_rush_classification();
-    wallet->RepairStaleShadowTransactions(/*force=*/true);
+    maintenance.Start();
+    maintenance.Sync();
+    notifications.reset();
+    maintenance.Unregister(*wallet);
+    maintenance.Stop();
     restore_production_schedule();
 
     const int replacement_height = WITH_LOCK(

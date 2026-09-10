@@ -56,6 +56,15 @@ quarantined object counts remain audit history and are not cross-version
 health predicates. A safe wait or relay action can truthfully report zero
 instantaneous hashrate.
 
+Claim repair and periodic authorized recovery run on one shared background
+executor instead of the validation-notification scheduler. Work requests are
+coalesced per wallet and serviced in turn. Wallet unload cancels and drains its
+work, and shutdown joins the executor before database flushing. Deferring this
+work does not release retained anchors or grant new recovery-spend authority.
+Tip changes and proof mempool removals request retained-byte reevaluation even
+when mining is disabled and ordinary transaction rebroadcast is not due. These
+wakeups do not request automatic fee-paying recovery.
+
 ## Atomic wallet authority for PoW workers
 
 Wallet spend authority is generation-scoped inside Core. A manual lock, timed
@@ -166,8 +175,9 @@ observers cannot receive a loaded-wallet callback before the wallet's
 registered validation callbacks have caught up.
 The node-startup `LoadWallets`/`StartWallets` sequence remains separate and
 does not acquire this runtime-load barrier. Unloading first unregisters the
-validation handler, so an event still queued at unload cannot call the removed
-wallet and does not delay synchronous unload.
+validation handler, cancels queued claim maintenance, and waits for any active
+bounded pass before removing the wallet. Shutdown joins the shared maintenance
+executor before wallet databases and chain scheduling are stopped.
 
 The attachment phase still uses the inherited wallet-to-chain lock order while
 the wallet is private and unroutable. Published validation and mining paths use

@@ -7,14 +7,24 @@
 
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
+#include <interfaces/handler.h>
+#include <kernel/mempool_removal_reason.h>
+#include <script/solver.h>
+#include <shadow.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
 #include <validation.h>
 #include <validationinterface.h>
+#include <wallet/context.h>
+#include <wallet/load.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <atomic>
+#include <future>
+#include <thread>
 
 namespace wallet {
 
@@ -23,6 +33,21 @@ struct WalletLoadTestAccess {
     {
         std::vector<bilingual_str> warnings;
         return CWallet::AttachChainUnpublished(wallet, chain, /*rescan_required=*/false, error, warnings);
+    }
+    static std::unique_ptr<WalletClaimMaintenance> Maintenance(
+        std::function<void(CWallet&, bool, bool)> pass)
+    {
+        return std::unique_ptr<WalletClaimMaintenance>(new WalletClaimMaintenance(std::move(pass)));
+    }
+    static std::shared_ptr<WalletClaimMaintenanceSlot> Slot(CWallet& wallet)
+    {
+        LOCK(wallet.cs_wallet);
+        return wallet.m_claim_maintenance;
+    }
+    static bool WaitForCancellation(WalletClaimMaintenance& maintenance,
+                                   const std::shared_ptr<WalletClaimMaintenanceSlot>& slot)
+    {
+        return maintenance.WaitForCancellationForTesting(slot, std::chrono::seconds{5});
     }
 };
 
@@ -120,6 +145,224 @@ BOOST_FIXTURE_TEST_CASE(wallet_attach_reconciles_presubscription_disconnect, Tes
     }
     loaded->m_chain_notifications_handler.reset();
     SyncWithValidationInterfaceQueue();
+}
+
+/** The pass owns no wallet/chain locks while blocked. Release on all exits. */
+struct MaintenancePassBarrier {
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> released{release.get_future().share()};
+    bool done{false};
+    void Release()
+    {
+        if (!done) { done = true; release.set_value(); }
+    }
+    ~MaintenancePassBarrier() { Release(); }
+};
+
+BOOST_FIXTURE_TEST_CASE(claim_maintenance_coalesces_and_is_fair, TestingSetup)
+{
+    struct Pass { std::string wallet; bool resolve; bool relay; };
+    std::vector<Pass> passes;
+    std::thread::id worker_thread;
+    std::atomic<bool> changed_thread{false};
+    WalletContext context;
+    // Declared after context: release before context joins on a failed check.
+    MaintenancePassBarrier barrier;
+    auto entered = barrier.entered.get_future();
+    context.claim_maintenance = WalletLoadTestAccess::Maintenance(
+        [&](CWallet& wallet, bool resolve, bool relay) {
+            passes.push_back({wallet.GetName(), resolve, relay});
+            if (passes.size() == 1) {
+                worker_thread = std::this_thread::get_id();
+                barrier.entered.set_value();
+                barrier.released.wait();
+            } else if (worker_thread != std::this_thread::get_id()) {
+                changed_thread = true;
+            }
+        });
+    auto a = std::make_shared<CWallet>(m_node.chain.get(), "a", CreateMockableWalletDatabase());
+    auto b = std::make_shared<CWallet>(m_node.chain.get(), "b", CreateMockableWalletDatabase());
+    auto c = std::make_shared<CWallet>(m_node.chain.get(), "c", CreateMockableWalletDatabase());
+    a->RequestClaimMaintenance(/*resolve=*/true, /*relay=*/true);
+    BOOST_CHECK(!WalletLoadTestAccess::Slot(*a)); // Unpublished has no inline fallback.
+    for (const auto& wallet : {a, b, c}) context.claim_maintenance->Register(wallet);
+    for (int i = 0; i < 100; ++i) a->RequestClaimMaintenance(false, true);
+    BOOST_CHECK(passes.empty()); // Registered startup wallets still do not run early.
+    context.claim_maintenance->Start();
+    BOOST_CHECK(entered.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    for (int i = 0; i < 100; ++i) a->RequestClaimMaintenance(true, true);
+    {
+        LOCK2(::cs_main, a->cs_wallet);
+        BOOST_CHECK(WalletLoadTestAccess::Slot(*a));
+    }
+    barrier.Release();
+    context.claim_maintenance->Sync();
+    BOOST_REQUIRE_EQUAL(passes.size(), 4U);
+    BOOST_CHECK_EQUAL(passes[0].wallet, "a");
+    BOOST_CHECK_EQUAL(passes[1].wallet, "b");
+    BOOST_CHECK_EQUAL(passes[2].wallet, "c");
+    BOOST_CHECK_EQUAL(passes[3].wallet, "a");
+    BOOST_CHECK(!passes[0].resolve && passes[0].relay);
+    BOOST_CHECK(!passes[1].resolve && !passes[1].relay);
+    BOOST_CHECK(!passes[2].resolve && !passes[2].relay);
+    BOOST_CHECK(passes[3].resolve && passes[3].relay);
+    BOOST_CHECK(worker_thread != std::this_thread::get_id());
+    BOOST_CHECK(!changed_thread.load());
+    context.claim_maintenance->Unregister(*a);
+    context.claim_maintenance->Register(a); // Late publication cannot resurrect it.
+    BOOST_CHECK(!WalletLoadTestAccess::Slot(*a));
+    a->RequestClaimMaintenance(true, true);
+    context.claim_maintenance->Sync();
+    BOOST_CHECK_EQUAL(passes.size(), 4U);
+    auto unpublished = std::make_shared<CWallet>(m_node.chain.get(), "unpublished", CreateMockableWalletDatabase());
+    context.claim_maintenance->Unregister(*unpublished);
+    context.claim_maintenance->Register(unpublished);
+    BOOST_CHECK(!WalletLoadTestAccess::Slot(*unpublished));
+}
+
+BOOST_FIXTURE_TEST_CASE(claim_maintenance_tip_and_removal_wake_without_mining_or_resend, TestChain100Setup)
+{
+    std::vector<std::pair<bool, bool>> requests;
+    WalletContext context;
+    context.claim_maintenance = WalletLoadTestAccess::Maintenance(
+        [&](CWallet&, bool resolve, bool relay) { requests.emplace_back(resolve, relay); });
+    auto wallet = std::make_shared<CWallet>(m_node.chain.get(), "events", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+    const CBlockIndex* tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
+    BOOST_REQUIRE(tip && tip->pprev);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash());
+    }
+    wallet->SetBroadcastTransactions(true);
+    wallet->SetNextResend();
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK(!wallet->ShouldResend());
+    context.claim_maintenance->Register(wallet);
+    context.claim_maintenance->Start();
+    context.claim_maintenance->Sync();
+    BOOST_REQUIRE_EQUAL(requests.size(), 1U);
+    auto notifications = m_node.chain->handleNotifications(wallet);
+    const auto tip_event = [&] {
+        GetMainSignals().UpdatedBlockTip(tip, tip->pprev, /*fInitialDownload=*/false);
+        SyncWithValidationInterfaceQueue();
+        context.claim_maintenance->Sync();
+    };
+    tip_event();
+    BOOST_CHECK_EQUAL(requests.size(), 1U); // No claim history, no tip work.
+
+    const COutPoint anchor{m_coinbase_txns.front()->GetHash(), 0};
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0});
+    CMutableTransaction claim_tx;
+    claim_tx.vin.emplace_back(anchor);
+    claim_tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    claim_tx.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const CTransactionRef claim = MakeTransactionRef(claim_tx);
+    BOOST_REQUIRE(TransactionHasShadowProof(*claim));
+    BOOST_REQUIRE(wallet->AddToWallet(
+        claim, TxStateConfirmed{tip->GetBlockHash(), tip->nHeight, 0},
+        [](CWalletTx& wtx, bool) { wtx.fFromMe = true; return true; }));
+    tip_event();
+    BOOST_CHECK_EQUAL(requests.size(), 1U); // Inert lifetime proof history is excluded.
+
+    BOOST_REQUIRE(wallet->AddToWallet(claim, TxStateInMempool{}));
+    CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    SyncWithValidationInterfaceQueue();
+    context.claim_maintenance->Sync();
+    BOOST_REQUIRE_EQUAL(requests.size(), 2U);
+    BOOST_CHECK(!requests.back().first && requests.back().second);
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK(!wallet->ShouldResend());
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->IsSpent(anchor));
+    }
+
+    GetMainSignals().TransactionRemovedFromMempool(claim, MemPoolRemovalReason::EXPIRY, 0);
+    SyncWithValidationInterfaceQueue();
+    context.claim_maintenance->Sync();
+    BOOST_REQUIRE_EQUAL(requests.size(), 3U);
+    BOOST_CHECK(!requests.back().first && requests.back().second);
+    BOOST_CHECK(!wallet->ShouldResend());
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->IsSpent(anchor));
+        BOOST_CHECK(!wallet->mapWallet.at(claim->GetHash()).isAbandoned());
+    }
+    GetMainSignals().TransactionRemovedFromMempool(claim, MemPoolRemovalReason::BLOCK, 1);
+    SyncWithValidationInterfaceQueue();
+    context.claim_maintenance->Sync();
+    BOOST_CHECK_EQUAL(requests.size(), 3U);
+
+    CMutableTransaction ordinary_tx;
+    ordinary_tx.vin.emplace_back(COutPoint{m_coinbase_txns.back()->GetHash(), 0});
+    ordinary_tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    const CTransactionRef ordinary = MakeTransactionRef(ordinary_tx);
+    BOOST_REQUIRE(wallet->AddToWallet(ordinary, TxStateInactive{}));
+    GetMainSignals().TransactionRemovedFromMempool(ordinary, MemPoolRemovalReason::EXPIRY, 2);
+    SyncWithValidationInterfaceQueue();
+    context.claim_maintenance->Sync();
+    BOOST_CHECK_EQUAL(requests.size(), 3U); // Ordinary removal does not request claim work.
+    notifications.reset();
+    context.claim_maintenance->Unregister(*wallet);
+}
+
+BOOST_FIXTURE_TEST_CASE(claim_maintenance_cancel_and_shutdown_join, TestingSetup)
+{
+    for (const bool shutdown : {false, true}) {
+        std::atomic<unsigned> a_calls{0};
+        std::atomic<unsigned> b_calls{0};
+        WalletContext context;
+        MaintenancePassBarrier barrier;
+        auto entered = barrier.entered.get_future();
+        context.claim_maintenance = WalletLoadTestAccess::Maintenance(
+            [&](CWallet& wallet, bool, bool) {
+                if (wallet.GetName() == "a") {
+                    if (++a_calls == 1) {
+                        barrier.entered.set_value();
+                        barrier.released.wait();
+                    }
+                } else {
+                    ++b_calls;
+                }
+            });
+        auto a = std::make_shared<CWallet>(m_node.chain.get(), "a", CreateMockableWalletDatabase());
+        auto b = std::make_shared<CWallet>(m_node.chain.get(), "b", CreateMockableWalletDatabase());
+        context.claim_maintenance->Register(a);
+        context.claim_maintenance->Register(b);
+        const auto a_slot = WalletLoadTestAccess::Slot(*a);
+        const auto b_slot = WalletLoadTestAccess::Slot(*b);
+        context.claim_maintenance->Start();
+        BOOST_CHECK(entered.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+        for (int i = 0; i < 100; ++i) a->RequestClaimMaintenance(true, true);
+        auto stopped = std::async(std::launch::async, [&] {
+            if (shutdown) context.claim_maintenance->Stop();
+            else context.claim_maintenance->Unregister(*a);
+        });
+        BOOST_CHECK(WalletLoadTestAccess::WaitForCancellation(*context.claim_maintenance, a_slot));
+        if (shutdown) {
+            BOOST_CHECK(WalletLoadTestAccess::WaitForCancellation(*context.claim_maintenance, b_slot));
+        }
+        BOOST_CHECK(stopped.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+        {
+            LOCK2(::cs_main, a->cs_wallet); // Drain never retains either lock.
+        }
+        barrier.Release();
+        BOOST_CHECK(stopped.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+        stopped.get();
+        context.claim_maintenance->Sync();
+        BOOST_CHECK_EQUAL(a_calls.load(), 1U);
+        BOOST_CHECK_EQUAL(b_calls.load(), shutdown ? 0U : 1U);
+        a->RequestClaimMaintenance(true, true);
+        context.claim_maintenance->Sync();
+        BOOST_CHECK_EQUAL(a_calls.load(), 1U);
+        const std::weak_ptr<CWallet> weak_a = a;
+        a.reset();
+        BOOST_CHECK(weak_a.expired()); // Neither queued nor completed work owns it.
+        context.claim_maintenance->Stop(); // Repeated shutdown joins are harmless.
+    }
 }
 
 class DummyDescriptor final : public Descriptor {

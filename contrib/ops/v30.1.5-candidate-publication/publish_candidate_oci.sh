@@ -15,12 +15,18 @@ bootstrap_fail()
     printf 'v30.1.5 candidate publication failed: %s\n' "$*" >&2
     exit 1
 }
-[ -f "$BOOTSTRAP_STAT" ] && [ ! -L "$BOOTSTRAP_STAT" ] &&
-    [ -x "$BOOTSTRAP_STAT" ] || bootstrap_fail 'fixed bootstrap stat is unsafe'
-[ -f "$BOOTSTRAP_ENV" ] && [ ! -L "$BOOTSTRAP_ENV" ] &&
-    [ -x "$BOOTSTRAP_ENV" ] || bootstrap_fail 'fixed bootstrap env is unsafe'
-[ -f "$BOOTSTRAP_BASH" ] && [ ! -L "$BOOTSTRAP_BASH" ] &&
-    [ -x "$BOOTSTRAP_BASH" ] || bootstrap_fail 'fixed bootstrap bash is unsafe'
+if [ ! -f "$BOOTSTRAP_STAT" ] || [ -L "$BOOTSTRAP_STAT" ] ||
+    [ ! -x "$BOOTSTRAP_STAT" ]; then
+    bootstrap_fail 'fixed bootstrap stat is unsafe'
+fi
+if [ ! -f "$BOOTSTRAP_ENV" ] || [ -L "$BOOTSTRAP_ENV" ] ||
+    [ ! -x "$BOOTSTRAP_ENV" ]; then
+    bootstrap_fail 'fixed bootstrap env is unsafe'
+fi
+if [ ! -f "$BOOTSTRAP_BASH" ] || [ -L "$BOOTSTRAP_BASH" ] ||
+    [ ! -x "$BOOTSTRAP_BASH" ]; then
+    bootstrap_fail 'fixed bootstrap bash is unsafe'
+fi
 for bootstrap_path in "$BOOTSTRAP_STAT" "$BOOTSTRAP_ENV" "$BOOTSTRAP_BASH"; do
     if bootstrap_metadata=$(
         "$BOOTSTRAP_STAT" -c '%u %g %a' -- "$bootstrap_path" 2>/dev/null
@@ -35,9 +41,10 @@ for bootstrap_path in "$BOOTSTRAP_STAT" "$BOOTSTRAP_ENV" "$BOOTSTRAP_BASH"; do
     bootstrap_rest=${bootstrap_metadata#* }
     bootstrap_gid=${bootstrap_rest%% *}
     bootstrap_mode=${bootstrap_rest#* }
-    [ "$bootstrap_mode" != "$bootstrap_rest" ] &&
-        [ "$bootstrap_uid:$bootstrap_gid" = 0:0 ] ||
+    if [ "$bootstrap_mode" = "$bootstrap_rest" ] ||
+        [ "$bootstrap_uid:$bootstrap_gid" != 0:0 ]; then
         bootstrap_fail 'fixed bootstrap executable is not root-owned'
+    fi
     case "$bootstrap_mode" in
         [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
         *) bootstrap_fail 'fixed bootstrap executable mode is malformed' ;;

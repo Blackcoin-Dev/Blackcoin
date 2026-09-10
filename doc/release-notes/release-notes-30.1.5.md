@@ -83,6 +83,20 @@ that boundary.
 
 ## GUI and operator transparency
 
+Claim input selection uses a bounded wallet-output snapshot outside the global
+chain lock, followed by a short exact-coin checkpoint. The selected output,
+coin time, wallet snapshot, coin-lock state, and applicable staking-reserve and
+claim-family generations are checked again before signing and publication.
+Snapshot drift requires fresh selection; capacity exhaustion never authorizes
+a partially enumerated candidate set. A stale deterministic candidate is
+retired from the warm index so a later invocation can select another safe coin.
+
+Reserve details are refreshed on the GUI wallet worker and cached against the
+chain tip and wallet generations. Lightweight status polling does not wait for
+that scan. Missing or stale reserve details are displayed as unavailable, not
+as zero protected coins. Disabling staking remains nonblocking; enabling a new
+reserve restriction is serialized with claim signing and publication.
+
 Generic wallet-unlock prompts explicitly request temporary normal signing
 authority. Staking-only controls remain explicit. A retained staking-only
 preference while the encrypted wallet is locked is not displayed as an active

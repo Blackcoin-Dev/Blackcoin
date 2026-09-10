@@ -270,6 +270,8 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
                 return;
             }
 
+            m_wallet->refreshPowMiningStakeReserve();
+            if (checkpoint()) { publish(); return; }
             snapshot->pow = m_wallet->getPowMiningInfo();
             if (checkpoint()) { publish(); return; }
             snapshot->migration = m_wallet->getMigrationStatus();

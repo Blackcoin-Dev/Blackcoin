@@ -1312,6 +1312,95 @@ void CWallet::InvalidateShadowPowClaimImplicitOwnershipEntryLocked(
     MarkShadowPowClaimCandidateStateChangedLocked();
 }
 
+void CWallet::ClearShadowPowProofPresenceIndexLocked(const uint256& txid)
+{
+    AssertLockHeld(cs_wallet);
+    const auto erase_reverse = [](const uint256& id, auto& reverse,
+                                  auto& refcounts) {
+        const auto reverse_it = reverse.find(id);
+        if (reverse_it == reverse.end()) return;
+        for (const COutPoint& input : reverse_it->second) {
+            const auto anchors = refcounts.find(input);
+            if (anchors == refcounts.end()) continue;
+            anchors->second.erase(id);
+            if (anchors->second.empty()) refcounts.erase(anchors);
+        }
+        reverse.erase(reverse_it);
+    };
+    erase_reverse(txid, m_shadow_pow_proof_inputs_by_txid,
+                  m_shadow_pow_proof_anchor_txids);
+    erase_reverse(txid, m_shadow_pow_unknown_inputs_by_txid,
+                  m_shadow_pow_unknown_anchor_txids);
+    m_shadow_pow_all_proof_txids.erase(txid);
+    m_shadow_pow_unknown_proof_presence_txids.erase(txid);
+    m_shadow_pow_known_oversized_proof_txids.erase(txid);
+    m_shadow_pow_proof_input_index_pending_txids.erase(txid);
+    m_shadow_pow_proof_input_index_capacity_txids.erase(txid);
+}
+
+void CWallet::SetShadowPowProofPresenceIndexLocked(
+    const CWalletTx& wtx, bool exact_proof, bool unknown,
+    const std::vector<COutPoint>* prevalidated_inputs)
+{
+    AssertLockHeld(cs_wallet);
+    assert(!(exact_proof && unknown));
+    const uint256 txid = wtx.GetHash();
+    ClearShadowPowProofPresenceIndexLocked(txid);
+    if (!wtx.tx || (!exact_proof && !unknown)) return;
+
+    if (exact_proof) {
+        m_shadow_pow_all_proof_txids.insert(txid);
+        if (wtx.tx->GetTotalSize() >
+            SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY) {
+            m_shadow_pow_known_oversized_proof_txids.insert(txid);
+        }
+    } else {
+        m_shadow_pow_unknown_proof_presence_txids.insert(txid);
+    }
+
+    // Unknown/oversized callbacks can run beneath cs_main. Publish only a
+    // pending scalar there; the existing outside-lock classifier supplies a
+    // bounded immutable input vector after revalidation.
+    if (!prevalidated_inputs && unknown) {
+        m_shadow_pow_proof_input_index_pending_txids.insert(txid);
+        return;
+    }
+    const size_t input_count = prevalidated_inputs
+        ? prevalidated_inputs->size() : wtx.tx->vin.size();
+    if (input_count > SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY) {
+        m_shadow_pow_proof_input_index_capacity_txids.insert(txid);
+        return;
+    }
+
+    auto& reverse = exact_proof
+        ? m_shadow_pow_proof_inputs_by_txid
+        : m_shadow_pow_unknown_inputs_by_txid;
+    auto& refcounts = exact_proof
+        ? m_shadow_pow_proof_anchor_txids
+        : m_shadow_pow_unknown_anchor_txids;
+    std::vector<COutPoint> inputs;
+    inputs.reserve(input_count);
+    std::set<COutPoint> unique_inputs;
+    const auto add_input = [&](const COutPoint& outpoint) {
+        if (outpoint.IsNull() ||
+            !unique_inputs.insert(outpoint).second) {
+            return;
+        }
+        inputs.push_back(outpoint);
+        refcounts[outpoint].insert(txid);
+    };
+    if (prevalidated_inputs) {
+        for (const COutPoint& input : *prevalidated_inputs) {
+            add_input(input);
+        }
+    } else {
+        for (const CTxIn& input : wtx.tx->vin) {
+            add_input(input.prevout);
+        }
+    }
+    reverse.emplace(txid, std::move(inputs));
+}
+
 void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
 {
     AssertLockHeld(cs_wallet);
@@ -1357,23 +1446,25 @@ void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
     // state. Normal consensus-sized claims are far below this bound.
     if (wtx.tx->GetTotalSize() >
             SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY) {
+        if (m_shadow_pow_known_oversized_proof_txids.count(txid) == 0) {
+            SetShadowPowProofPresenceIndexLocked(
+                wtx, /*exact_proof=*/false, /*unknown=*/true);
+        }
         m_shadow_pow_claim_txids.erase(txid);
         m_shadow_pow_unconfirmed_claim_txids.erase(txid);
         forget_implicit_ownership();
-        // A confirmed record without explicit local provenance is inert until
-        // an exact disconnect makes it unconfirmed. Avoid letting oversized
-        // confirmed foreign/audit history globally block current authority;
-        // the state-transition callback requeues the exact record before it
-        // can become hot.
-        if (!wtx.isConfirmed() || wtx.fFromMe ||
-            explicit_local_metadata) {
-            m_shadow_pow_unclassified_claim_txids.insert(txid);
-        } else {
-            m_shadow_pow_unclassified_claim_txids.erase(txid);
-        }
+        // Proof presence itself is ownership-independent. Queue every
+        // oversized record, including confirmed incoming records, for the
+        // existing out-of-lock bounded parser. Ordinary records then clear
+        // the unknown bit; proof records retain exact proof presence and are
+        // independently subject to the selection byte/work bound.
+        m_shadow_pow_unclassified_claim_txids.insert(txid);
         return;
     }
-    if (!TransactionHasShadowProof(*wtx.tx)) {
+    const bool has_shadow_proof = TransactionHasShadowProof(*wtx.tx);
+    SetShadowPowProofPresenceIndexLocked(
+        wtx, has_shadow_proof, /*unknown=*/false);
+    if (!has_shadow_proof) {
         m_shadow_pow_claim_txids.erase(txid);
         m_shadow_pow_unclassified_claim_txids.erase(txid);
         forget_implicit_ownership();
@@ -1555,6 +1646,7 @@ void CWallet::RefreshShadowPowClaimOwnershipIndex() const
         size_t tx_bytes{0};
         size_t vin_size{0};
         size_t vout_size{0};
+        std::vector<COutPoint> proof_inputs;
         try {
             // Potentially large ordinary records are inspected only here,
             // with both cs_main and cs_wallet released. Once proven ordinary
@@ -1567,6 +1659,13 @@ void CWallet::RefreshShadowPowClaimOwnershipIndex() const
                 tx_bytes = tx_ref->GetTotalSize();
                 vin_size = tx_ref->vin.size();
                 vout_size = tx_ref->vout.size();
+                if (vin_size <=
+                    SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY) {
+                    proof_inputs.reserve(vin_size);
+                    for (const CTxIn& input : tx_ref->vin) {
+                        proof_inputs.push_back(input.prevout);
+                    }
+                }
             }
         } catch (...) {
             break;
@@ -1589,6 +1688,9 @@ void CWallet::RefreshShadowPowClaimOwnershipIndex() const
         }
         const CTransaction& tx = *tx_ref;
         if (!has_shadow_proof) {
+            wallet.SetShadowPowProofPresenceIndexLocked(
+                current->second, /*exact_proof=*/false,
+                /*unknown=*/false);
             m_shadow_pow_unclassified_claim_txids.erase(txid);
             m_shadow_pow_legacy_local_claim_txids.erase(txid);
             wallet.m_shadow_pow_foreign_claim_txids.erase(txid);
@@ -1604,6 +1706,11 @@ void CWallet::RefreshShadowPowClaimOwnershipIndex() const
             ++classified;
             continue;
         }
+        wallet.SetShadowPowProofPresenceIndexLocked(
+            current->second, /*exact_proof=*/true,
+            /*unknown=*/false,
+            vin_size <= SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY
+                ? &proof_inputs : nullptr);
         const bool work_overflow = vin_size != 0 &&
             manager_work >
                 SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY /
@@ -1666,6 +1773,15 @@ void CWallet::RefreshShadowPowClaimOwnershipIndex() const
 void CWallet::RebuildShadowPowClaimIndexesLocked()
 {
     AssertLockHeld(cs_wallet);
+    m_shadow_pow_all_proof_txids.clear();
+    m_shadow_pow_unknown_proof_presence_txids.clear();
+    m_shadow_pow_known_oversized_proof_txids.clear();
+    m_shadow_pow_proof_inputs_by_txid.clear();
+    m_shadow_pow_proof_anchor_txids.clear();
+    m_shadow_pow_unknown_inputs_by_txid.clear();
+    m_shadow_pow_unknown_anchor_txids.clear();
+    m_shadow_pow_proof_input_index_pending_txids.clear();
+    m_shadow_pow_proof_input_index_capacity_txids.clear();
     m_shadow_pow_claim_txids.clear();
     m_shadow_pow_unconfirmed_claim_txids.clear();
     m_shadow_pow_unclassified_claim_txids.clear();
@@ -3314,6 +3430,8 @@ bool ShadowPowClaimMiningGateSnapshotMatches(
            expected.wallet_generation == current.wallet_generation &&
            expected.candidate_state_fingerprint ==
                current.candidate_state_fingerprint &&
+           expected.suppression_generation ==
+               current.suppression_generation &&
            expected.next_relay_expiry_time ==
                current.next_relay_expiry_time &&
            expected.next_legacy_relay_expiry_wall_time ==
@@ -3707,6 +3825,8 @@ ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
         cached_gate.candidate_state_fingerprint.IsNull() ||
         cached_gate.candidate_state_fingerprint !=
             fresh_gate.candidate_state_fingerprint ||
+        cached_gate.suppression_generation !=
+            fresh_gate.suppression_generation ||
         cached_gate.next_relay_expiry_time !=
             fresh_gate.next_relay_expiry_time ||
         cached_gate.next_legacy_relay_expiry_wall_time !=
@@ -3786,7 +3906,11 @@ CWallet::GetShadowPowClaimMiningGateFromInventoryLocked(
     suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
     suppression.deferred_family_roots =
         &m_shadow_pow_relay_wait_roots;
-    return BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+    ShadowPowClaimMiningGate gate =
+        BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+    gate.suppression_generation =
+        m_shadow_pow_relay_suppression_generation;
+    return gate;
 }
 
 ShadowPowClaimMiningGate
@@ -3800,7 +3924,6 @@ CWallet::DeferShadowPowClaimFamilyForInventoryLocked(
             evaluated_inventory)) {
         return {};
     }
-    m_shadow_pow_relay_reject_inventory = evaluated_inventory;
     ShadowPowClaimRelaySuppression suppression;
     suppression.active_tip = m_shadow_pow_relay_reject_tip;
     suppression.wallet_generation =
@@ -3813,13 +3936,17 @@ CWallet::DeferShadowPowClaimFamilyForInventoryLocked(
         m_shadow_pow_relay_reject_next_legacy_wall_expiry;
     suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
     suppression.deferred_family_roots = &m_shadow_pow_relay_wait_roots;
-    const ShadowPowClaimMiningGate current =
+    ShadowPowClaimMiningGate current =
         BuildShadowPowClaimMiningGateImpl(
             evaluated_inventory, &suppression);
+    current.suppression_generation =
+        m_shadow_pow_relay_suppression_generation;
     if (!ShadowPowClaimDeferrableFamilyIntentMatches(
             deferred_gate, current)) {
         return current;
     }
+    m_shadow_pow_relay_reject_inventory = evaluated_inventory;
+    bool suppression_changed{true};
     if (m_shadow_pow_relay_reject_tip != current.active_tip ||
         m_shadow_pow_relay_reject_wallet_generation !=
             current.wallet_generation ||
@@ -3840,8 +3967,15 @@ CWallet::DeferShadowPowClaimFamilyForInventoryLocked(
             current.next_relay_expiry_time;
         m_shadow_pow_relay_reject_next_legacy_wall_expiry =
             current.next_legacy_relay_expiry_wall_time;
+        suppression_changed = true;
     }
-    m_shadow_pow_relay_wait_roots.insert(current.lineage_root_txid);
+    suppression_changed |=
+        m_shadow_pow_relay_wait_roots.insert(
+            current.lineage_root_txid).second;
+    if (suppression_changed &&
+        ++m_shadow_pow_relay_suppression_generation == 0) {
+        ++m_shadow_pow_relay_suppression_generation;
+    }
     suppression.active_tip = current.active_tip;
     suppression.wallet_generation = current.wallet_generation;
     suppression.candidate_state_fingerprint =
@@ -3850,8 +3984,11 @@ CWallet::DeferShadowPowClaimFamilyForInventoryLocked(
         current.next_relay_expiry_time;
     suppression.next_legacy_relay_expiry_wall_time =
         current.next_legacy_relay_expiry_wall_time;
-    return BuildShadowPowClaimMiningGateImpl(
+    ShadowPowClaimMiningGate result = BuildShadowPowClaimMiningGateImpl(
         evaluated_inventory, &suppression);
+    result.suppression_generation =
+        m_shadow_pow_relay_suppression_generation;
+    return result;
 }
 
 ShadowPowClaimMiningGateAction
@@ -3888,7 +4025,12 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
         LOCK2(::cs_main, cs_wallet);
         if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
                 evaluated_inventory)) {
-            m_shadow_pow_relay_reject_inventory.reset();
+            if (m_shadow_pow_relay_reject_inventory) {
+                m_shadow_pow_relay_reject_inventory.reset();
+                if (++m_shadow_pow_relay_suppression_generation == 0) {
+                    ++m_shadow_pow_relay_suppression_generation;
+                }
+            }
             return false;
         }
         ShadowPowClaimRelaySuppression suppression;
@@ -3905,6 +4047,8 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
         suppression.deferred_family_roots = &m_shadow_pow_relay_wait_roots;
         reviewed_gate = BuildShadowPowClaimMiningGateImpl(
             evaluated_inventory, &suppression);
+        reviewed_gate.suppression_generation =
+            m_shadow_pow_relay_suppression_generation;
         if (!ShadowPowClaimRelayIntentMatches(
                 rejected_gate, reviewed_gate)) {
             return false;
@@ -3958,13 +4102,16 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
         m_shadow_pow_relay_reject_next_legacy_wall_expiry;
     suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
     suppression.deferred_family_roots = &m_shadow_pow_relay_wait_roots;
-    const ShadowPowClaimMiningGate current =
+    ShadowPowClaimMiningGate current =
         BuildShadowPowClaimMiningGateImpl(
             evaluated_inventory, &suppression);
+    current.suppression_generation =
+        m_shadow_pow_relay_suppression_generation;
     if (!ShadowPowClaimRelayIntentMatches(reviewed_gate, current)) {
         return false;
     }
     m_shadow_pow_relay_reject_inventory = evaluated_inventory;
+    bool suppression_changed{true};
     if (m_shadow_pow_relay_reject_tip != current.active_tip ||
         m_shadow_pow_relay_reject_wallet_generation !=
             current.wallet_generation ||
@@ -3985,8 +4132,14 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
             current.next_relay_expiry_time;
         m_shadow_pow_relay_reject_next_legacy_wall_expiry =
             current.next_legacy_relay_expiry_wall_time;
+        suppression_changed = true;
     }
-    m_shadow_pow_relay_reject_txids.insert(current.relay_txid);
+    suppression_changed |=
+        m_shadow_pow_relay_reject_txids.insert(current.relay_txid).second;
+    if (suppression_changed &&
+        ++m_shadow_pow_relay_suppression_generation == 0) {
+        ++m_shadow_pow_relay_suppression_generation;
+    }
     if (reselected_gate) {
         suppression.active_tip = current.active_tip;
         suppression.wallet_generation = current.wallet_generation;
@@ -3996,9 +4149,10 @@ bool CWallet::RecordShadowPowClaimRelayPolicyRejection(
             current.next_relay_expiry_time;
         suppression.next_legacy_relay_expiry_wall_time =
             current.next_legacy_relay_expiry_wall_time;
-        *reselected_gate =
-            BuildShadowPowClaimMiningGateImpl(
-                evaluated_inventory, &suppression);
+        *reselected_gate = BuildShadowPowClaimMiningGateImpl(
+            evaluated_inventory, &suppression);
+        reselected_gate->suppression_generation =
+            m_shadow_pow_relay_suppression_generation;
     }
     return true;
 }
@@ -4012,32 +4166,29 @@ CWallet::DeferShadowPowClaimFamilyForSnapshot(
     LOCK2(::cs_main, cs_wallet);
     const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
     const uint256 active_tip = tip ? tip->GetBlockHash() : uint256{};
-    const uint64_t wallet_generation =
-        GetDatabase().nUpdateCounter.load();
-    const uint256 candidate_state =
-        GetShadowPowClaimCandidateStateFingerprintLocked();
     if (!tip ||
         m_last_block_processed != active_tip ||
         m_last_block_processed_height != tip->nHeight ||
         m_shadow_pow_claim_recovery_db_ambiguous) {
-        m_shadow_pow_relay_reject_inventory.reset();
+        if (m_shadow_pow_relay_reject_inventory) {
+            m_shadow_pow_relay_reject_inventory.reset();
+            if (++m_shadow_pow_relay_suppression_generation == 0) {
+                ++m_shadow_pow_relay_suppression_generation;
+            }
+        }
         return {};
     }
     if (!ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
             evaluated_inventory)) {
-        m_shadow_pow_relay_reject_inventory.reset();
+        if (m_shadow_pow_relay_reject_inventory) {
+            m_shadow_pow_relay_reject_inventory.reset();
+            if (++m_shadow_pow_relay_suppression_generation == 0) {
+                ++m_shadow_pow_relay_suppression_generation;
+            }
+        }
         return {};
     }
-    if (!m_shadow_pow_relay_reject_inventory ||
-        m_shadow_pow_relay_reject_inventory->active_tip != active_tip ||
-        m_shadow_pow_relay_reject_inventory->wallet_generation !=
-            wallet_generation ||
-        m_shadow_pow_relay_reject_inventory
-                ->candidate_state_fingerprint != candidate_state) {
-        m_shadow_pow_relay_reject_inventory = evaluated_inventory;
-    }
-    const ShadowPowClaimRecoveryInventory& inventory =
-        *m_shadow_pow_relay_reject_inventory;
+    const ShadowPowClaimRecoveryInventory& inventory = evaluated_inventory;
     ShadowPowClaimRelaySuppression suppression;
     suppression.active_tip = m_shadow_pow_relay_reject_tip;
     suppression.wallet_generation =
@@ -4051,12 +4202,16 @@ CWallet::DeferShadowPowClaimFamilyForSnapshot(
     suppression.relay_txids = &m_shadow_pow_relay_reject_txids;
     suppression.deferred_family_roots =
         &m_shadow_pow_relay_wait_roots;
-    const ShadowPowClaimMiningGate current =
+    ShadowPowClaimMiningGate current =
         BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+    current.suppression_generation =
+        m_shadow_pow_relay_suppression_generation;
     if (!ShadowPowClaimDeferrableFamilyIntentMatches(
             deferred_gate, current)) {
         return current;
     }
+    m_shadow_pow_relay_reject_inventory = evaluated_inventory;
+    bool suppression_changed{true};
     if (m_shadow_pow_relay_reject_tip != current.active_tip ||
         m_shadow_pow_relay_reject_wallet_generation !=
             current.wallet_generation ||
@@ -4077,9 +4232,14 @@ CWallet::DeferShadowPowClaimFamilyForSnapshot(
             current.next_relay_expiry_time;
         m_shadow_pow_relay_reject_next_legacy_wall_expiry =
             current.next_legacy_relay_expiry_wall_time;
+        suppression_changed = true;
     }
-    m_shadow_pow_relay_wait_roots.insert(
-        current.lineage_root_txid);
+    suppression_changed |= m_shadow_pow_relay_wait_roots.insert(
+        current.lineage_root_txid).second;
+    if (suppression_changed &&
+        ++m_shadow_pow_relay_suppression_generation == 0) {
+        ++m_shadow_pow_relay_suppression_generation;
+    }
     suppression.active_tip = current.active_tip;
     suppression.wallet_generation = current.wallet_generation;
     suppression.candidate_state_fingerprint =
@@ -4088,7 +4248,11 @@ CWallet::DeferShadowPowClaimFamilyForSnapshot(
         current.next_relay_expiry_time;
     suppression.next_legacy_relay_expiry_wall_time =
         current.next_legacy_relay_expiry_wall_time;
-    return BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+    ShadowPowClaimMiningGate result =
+        BuildShadowPowClaimMiningGateImpl(inventory, &suppression);
+    result.suppression_generation =
+        m_shadow_pow_relay_suppression_generation;
+    return result;
 }
 
 uint256 ComputeShadowPowClaimRecoveryPlanId(

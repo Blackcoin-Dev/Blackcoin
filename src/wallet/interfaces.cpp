@@ -2915,7 +2915,7 @@ public:
             // Disabling is intentionally non-blocking for the GUI. The live
             // worker observes this atomic state and idles; wallet unload owns
             // the final stop/join. A later enable reuses the worker.
-            m_wallet->m_enabled_staking = false;
+            m_wallet->SetStakingEnabled(false);
         }
     }
     bool getEnabledStaking() override
@@ -2977,6 +2977,10 @@ public:
         }
         return ok;
     }
+    void refreshPowMiningStakeReserve() override
+    {
+        m_wallet->RefreshShadowPowClaimStakeReserveInfo();
+    }
     WalletPowMiningInfo getPowMiningInfo() override
     {
         ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
@@ -3001,22 +3005,19 @@ public:
         {
             TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
             if (wallet_lock) {
+                if (const auto reserve =
+                        m_wallet->GetCachedShadowPowClaimStakeReserveInfoLocked()) {
+                    info.stake_reserve_available = true;
+                    info.configured_stake_reserve_coins = reserve->configured_reserve_coins;
+                    info.mature_stakeable_legacy_coins = static_cast<int>(
+                        reserve->mature_stakeable_legacy_coins);
+                    info.mature_stakeable_legacy_weight = reserve->mature_stakeable_legacy_weight;
+                    info.reserved_stake_coins = static_cast<int>(reserve->reserved_stake_coins);
+                    info.reserved_stake_weight = reserve->reserved_stake_weight;
+                    info.claim_coins_after_stake_reserve = static_cast<int>(reserve->claim_coins_after_reserve);
+                    info.last_stake_coin_guard = reserve->last_stake_coin_guard;
+                }
                 info.payout_address = m_wallet->m_pow_payout_quantum;
-                const ShadowPowClaimStakeReserveInfo reserve =
-                    m_wallet->GetShadowPowClaimStakeReserveInfoLocked();
-                info.stake_reserve_available = reserve.wallet_tip_matches;
-                info.configured_stake_reserve_coins =
-                    reserve.configured_reserve_coins;
-                info.mature_stakeable_legacy_coins = static_cast<int>(
-                    reserve.mature_stakeable_legacy_coins);
-                info.mature_stakeable_legacy_weight =
-                    reserve.mature_stakeable_legacy_weight;
-                info.reserved_stake_coins = static_cast<int>(
-                    reserve.reserved_stake_coins);
-                info.reserved_stake_weight = reserve.reserved_stake_weight;
-                info.claim_coins_after_stake_reserve = static_cast<int>(
-                    reserve.claim_coins_after_reserve);
-                info.last_stake_coin_guard = reserve.last_stake_coin_guard;
                 const std::vector<CScript> known_scripts =
                     m_wallet->GetOwnedLegacyShadowScripts(MAX_WALLET_SHADOW_SOLVE_REFERENCES);
                 wallet_scripts.insert(known_scripts.begin(), known_scripts.end());

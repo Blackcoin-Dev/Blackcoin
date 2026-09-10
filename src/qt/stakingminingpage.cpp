@@ -4405,21 +4405,25 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         pow_runtime_summary = tr("stopped after an error");
         break;
     }
+    const QString stake_reserve_summary = info.stake_reserve_available
+        ? tr("Stake reserve: %1 coin(s), %2 protected; %3 claim coin(s) remain")
+              .arg(info.reserved_stake_coins)
+              .arg(formatBLK(info.reserved_stake_weight))
+              .arg(info.claim_coins_after_stake_reserve)
+        : tr("Stake reserve: unavailable; refresh wallet mining details.");
     m_staking_summary->setText(tr(
         "<b>Wallet mining snapshot</b><br>"
         "Legacy spendable: %1 &nbsp;|&nbsp; Quantum-controlled: %2<br>"
         "PoS: %3; next active-signal split %4 &nbsp;|&nbsp; PoW: %5; next claim %6<br>"
-        "Stake reserve: %7 coin(s), %8 protected; %9 claim coin(s) remain<br>"
-        "Unlock mode: %10")
+        "%7<br>"
+        "Unlock mode: %8")
         .arg(formatBLK(balances.legacy_balance))
         .arg(formatBLK(balances.quantum_balance))
         .arg(wallet_signal_text)
         .arg(formatBLK(info.pos_estimated_payout_per_signaler))
         .arg(pow_runtime_summary)
         .arg(formatBLK(info.next_claim_payout))
-        .arg(info.reserved_stake_coins)
-        .arg(formatBLK(info.reserved_stake_weight))
-        .arg(info.claim_coins_after_stake_reserve)
+        .arg(stake_reserve_summary)
         .arg(unlock_mode));
 
     const bool autostart_staking = wallet::IsStakingAutostartEnabled();
@@ -4499,10 +4503,12 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
         m_pow_status->setText(tr("PoW mining is enabled but waiting for a confirmed, spendable legacy BLK UTXO to authenticate and pay the next claim fee."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STAKE_RESERVE_PROTECTED) {
-        m_pow_status->setText(tr("PoW mining is enabled but paused to protect %1 mature legacy staking coin(s) (%2). %3 claim input(s) remain after the reserve.")
-            .arg(info.reserved_stake_coins)
-            .arg(formatBLK(info.reserved_stake_weight))
-            .arg(info.claim_coins_after_stake_reserve));
+        m_pow_status->setText(info.stake_reserve_available
+            ? tr("PoW mining is enabled but paused to protect %1 mature legacy staking coin(s) (%2). %3 claim input(s) remain after the reserve.")
+                  .arg(info.reserved_stake_coins)
+                  .arg(formatBLK(info.reserved_stake_weight))
+                  .arg(info.claim_coins_after_stake_reserve)
+            : tr("PoW mining is enabled but paused to protect legacy staking coins. Current reserve details are unavailable; refresh wallet mining details."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
         m_pow_status->setText(tr("PoW mining is enabled but waiting for a normal wallet unlock; locked and staking-only wallets cannot sign claims."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CHAIN_UNAVAILABLE) {

@@ -353,7 +353,11 @@ public:
                               bool allow_new_payout_key = false,
                               bool* created_payout_key = nullptr) = 0;
 
-    //! Read the built-in Gold Rush PoW miner status (config, hashrate, epoch, payout).
+    //! Blocking bounded reserve refresh for WalletWorker, never GUI polling.
+    virtual void refreshPowMiningStakeReserve() = 0;
+
+    //! Read the built-in Gold Rush PoW miner status without blocking. Reserve
+    //! numbers are available only from a still-current worker-refreshed cache.
     virtual WalletPowMiningInfo getPowMiningInfo() = 0;
 
     //! Return this wallet's in-memory Gold Rush PoW claim-recovery choice and
@@ -702,7 +706,7 @@ struct WalletPowMiningInfo
     bool wallet_active_signal{false}; //!< wallet has an active QQSIGNAL entry
     int wallet_blocks_until_solver_expiry{0}; //!< max recent-solver expiry across wallet-owned whitelisted scripts
     bool payout_address_available{true}; //!< false when the wallet lock is busy and the cached address was not read
-    bool stake_reserve_available{false}; //!< one chain/wallet snapshot was acquired
+    bool stake_reserve_available{false}; //!< cached reserve matches the acquired chain/wallet snapshot
     int configured_stake_reserve_coins{0};
     int mature_stakeable_legacy_coins{0};
     CAmount mature_stakeable_legacy_weight{0};

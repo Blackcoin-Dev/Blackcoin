@@ -65,6 +65,9 @@ bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
  * ECDSA/ForkID signature, giving the transaction a txid that cannot be shared
  * with the legacy fork. Native and wrapped witness-only scripts return false. */
 bool IsWalletTxidCommittedMigrationAnchor(const CWallet& wallet, const CScript& script_pub_key);
+/** Whether an output belongs to the optional coin-control source family. */
+bool MatchesCoinControlInputFamily(
+    const CScript& script_pub_key, const CCoinControl& coin_control);
 bool IsWalletProtectedLineageInput(const CWallet& wallet, const COutPoint& outpoint,
                                    const Coin& coin, const Consensus::Params& consensus,
                                    int64_t spend_time, int spend_height);

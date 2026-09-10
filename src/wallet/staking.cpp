@@ -1905,24 +1905,24 @@ void StartStake(CWallet& wallet) {
         // Concurrent/repeated enable requests must not join or replace the
         // running thread. The worker is self-restarting until StopStake sets
         // the closing flag.
-        wallet.m_enabled_staking = true;
+        wallet.SetStakingEnabled(true);
         return;
     }
     if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         wallet.WalletLogPrintf("Wallet can't contain any private keys - staking disabled\n");
-        wallet.m_enabled_staking = false;
+        wallet.SetStakingEnabled(false);
     }
     else if (wallet.IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET)) {
         wallet.WalletLogPrintf("Wallet is blank - staking disabled\n");
-        wallet.m_enabled_staking = false;
+        wallet.SetStakingEnabled(false);
     }
     else if (!WITH_LOCK(wallet.cs_wallet, return wallet.GetKeyPoolSize() || !wallet.ListQuantumKeyInfos().empty())) {
         wallet.WalletLogPrintf("Error: Keypool is empty and no quantum staking keys are available, please add keys or call keypoolrefill and restart the staking thread\n");
-        wallet.m_enabled_staking = false;
+        wallet.SetStakingEnabled(false);
     }
     else {
         wallet.m_stop_staking_thread = false;
-        wallet.m_enabled_staking = true;
+        wallet.SetStakingEnabled(true);
         wallet.PublishStakingTelemetry(
             StakingTelemetryState::STARTING, uint256{}, -1,
             /*worker_running=*/false, "staking worker start requested");
@@ -1933,14 +1933,14 @@ void StartStake(CWallet& wallet) {
 void StopStake(CWallet& wallet) {
     LOCK(wallet.m_staking_thread_mutex);
     if (!wallet.threadStakeMinerGroup) {
-        wallet.m_enabled_staking = false;
+        wallet.SetStakingEnabled(false);
         wallet.PublishStakingTelemetry(
             StakingTelemetryState::DISABLED, uint256{}, -1,
             /*worker_running=*/false, "staking is disabled");
     }
     else {
         wallet.m_stop_staking_thread = true;
-        wallet.m_enabled_staking = false;
+        wallet.SetStakingEnabled(false);
         StakeCoins(wallet, false);
         wallet.threadStakeMinerGroup.reset();
         wallet.m_stop_staking_thread = false;
@@ -2000,6 +2000,7 @@ struct StakeCandidateScanContext
     bool allow_used_addresses;
     bool lineage_active;
     bool final_quantum_lockout;
+    bool spend_state_prevalidated{false};
     std::set<uint256> trusted_parents;
     std::map<uint256, StakeTransactionEligibility> transaction_eligibility;
 };
@@ -2047,7 +2048,9 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
     // The exact live-unspent index should make this redundant. Keep the check
     // as a fail-closed invariant guard if a future wallet mutation path is
     // introduced without an index hook.
-    if (wallet.IsSpent(outpoint)) return false;
+    if (!context.spend_state_prevalidated && wallet.IsSpent(outpoint)) {
+        return false;
+    }
 
     if (context.lineage_active) {
         const Coin& coin = wallet.chain().getCoinsTip().AccessCoin(outpoint);
@@ -2102,6 +2105,76 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
     return true;
 }
 
+BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
+    const CWallet& wallet,
+    const std::vector<BoundedLegacyStakeSource>& sources,
+    const std::set<COutPoint>& protected_rgb_seals,
+    int active_height, int64_t median_time_past,
+    const CCoinControl* coin_control,
+    const CoinFilterParams& params)
+{
+    AssertLockNotHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+
+    BoundedLegacyStakeCandidates result;
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int spend_height = active_height + 1;
+    if (active_height < 0 ||
+        !IsShadowGoldRushRewardActive(
+            consensus, median_time_past, spend_height)) {
+        return result;
+    }
+    const bool allow_used_addresses =
+        !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
+    StakeCandidateScanContext context{
+        coin_control,
+        params,
+        consensus,
+        protected_rgb_seals,
+        std::max(DEFAULT_MIN_DEPTH, consensus.nCoinbaseMaturity),
+        DEFAULT_MAX_DEPTH,
+        spend_height,
+        median_time_past,
+        allow_used_addresses,
+        /*lineage_active=*/false,
+        /*final_quantum_lockout=*/false,
+        /*spend_state_prevalidated=*/true,
+        {},
+        {},
+    };
+    result.candidates.reserve(sources.size());
+    for (const BoundedLegacyStakeSource& source : sources) {
+        const COutPoint& outpoint = source.outpoint;
+        const CWalletTx* wallet_tx = source.wallet_tx;
+        if (!wallet_tx || !wallet_tx->tx ||
+            outpoint.n >= wallet_tx->tx->vout.size()) {
+            continue;
+        }
+        const CScript& script =
+            wallet_tx->tx->vout[outpoint.n].scriptPubKey;
+        if (script.empty() || script.IsUnspendable() ||
+            IsQuantumMigrationScript(script) ||
+            IsQuantumColdStakeScript(script) || IsEUTXOScript(script)) {
+            continue;
+        }
+        // The only next-block maturity exception is a quantum synthetic
+        // payout, already excluded above. This keeps the shared legacy call
+        // chain-free while preserving the authoritative result.
+        if (wallet.IsTxImmature(*wallet_tx)) continue;
+        bool spendable{false};
+        if (!EvaluateStakeCandidate(
+                wallet, outpoint, *wallet_tx, context,
+                spendable) ||
+            !spendable) {
+            continue;
+        }
+        result.candidates.push_back(
+            {outpoint,
+             wallet_tx->tx->vout[outpoint.n].nValue});
+    }
+    return result;
+}
+
 void AvailableCoinsForStaking(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl,
@@ -2138,6 +2211,7 @@ void AvailableCoinsForStaking(const CWallet& wallet,
         allow_used_addresses,
         lineage_active,
         consensus.IsQuantumFinalLockout(spend_time, spend_height),
+        /*spend_state_prevalidated=*/false,
         {},
         {},
     };

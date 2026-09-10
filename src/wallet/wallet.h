@@ -119,8 +119,23 @@ struct ShadowPowClaimInput {
     CTxDestination destination;
     CAmount value{0};
     uint32_t coin_time{0};
+    /** Exact active-chain coin bytes reserved after wallet-only selection.
+     * The commit guard compares both this output and coin_time again before
+     * any wallet record is published. */
+    CTxOut source_output;
+    uint256 selection_tip;
+    int selection_height{-1};
+    uint64_t selection_wallet_generation{0};
+    uint256 selection_candidate_state_fingerprint;
     CScript quantum_payout_script;
     uint64_t coin_lock_generation{0};
+    uint64_t live_output_index_generation{0};
+    uint64_t stake_reserve_generation{0};
+    uint64_t suppression_generation{0};
+    ShadowPowClaimMiningGateAction selection_action{
+        ShadowPowClaimMiningGateAction::UNSAFE};
+    uint256 reserved_family_fingerprint;
+    bool staking_enabled_at_selection{false};
     bool same_anchor_refresh{false};
     uint256 lineage_family_fingerprint;
     uint256 lineage_root_txid;
@@ -142,6 +157,9 @@ static constexpr int DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS{1};
 struct ShadowPowClaimStakeReserveInfo {
     uint256 active_tip;
     uint64_t wallet_generation{0};
+    uint64_t coin_lock_generation{0};
+    uint64_t live_output_index_generation{0};
+    uint64_t stake_reserve_generation{0};
     bool wallet_tip_matches{false};
     bool staking_enabled{false};
     int configured_reserve_coins{DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS};
@@ -151,6 +169,7 @@ struct ShadowPowClaimStakeReserveInfo {
     CAmount reserved_stake_weight{0};
     size_t claim_coins_after_reserve{0};
     bool last_stake_coin_guard{false};
+    bool warm_output_capacity_exceeded{false};
 };
 
 enum class StakingTelemetryState : uint8_t {
@@ -198,6 +217,9 @@ struct StakingTelemetrySnapshot {
 enum class ShadowPowClaimInputSelectionResult {
     SELECTED,
     CHAIN_TIME_UNAVAILABLE,
+    EPOCH_INACTIVE,
+    INPUT_ENUMERATION_CAPACITY,
+    SNAPSHOT_DRIFT,
     NO_ELIGIBLE_INPUT,
     FEE_EXCEEDS_MAX,
     STAKE_RESERVE_PROTECTED,
@@ -234,6 +256,8 @@ struct ShadowPowClaimCommitAuthority {
     int64_t expected_relay_clock_next_transition{0};
     int64_t expected_relay_clock_next_legacy_wall_transition{0};
     int64_t expected_legacy_relay_clock_high_water{0};
+    /** Exact bounded selection carried through signing and publication. */
+    std::optional<ShadowPowClaimInput> selected_input;
 };
 
 /** Active-chain-relative state of one wallet-known quarantined QQSPROOF component. */
@@ -815,8 +839,18 @@ private:
     // lineage, RGB, demurrage, and solvability policy remains authoritative in
     // AvailableCoinsForStaking and is deliberately not cached here.
     std::set<COutPoint> m_live_unspent_stake_outpoints GUARDED_BY(cs_wallet);
+    std::optional<ShadowPowClaimStakeReserveInfo>
+        m_cached_shadow_pow_claim_stake_reserve GUARDED_BY(cs_wallet);
+    /** Every observable live-index membership change advances this value.
+     * Warm scans carry it through the exact one-coin reservation boundary. */
+    uint64_t m_live_unspent_stake_generation GUARDED_BY(cs_wallet){1};
     bool IsSpentForStakeIndex(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RefreshLiveUnspentStakeOutpoint(const COutPoint& outpoint) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Restriction-only repair for an exact chain/wallet mismatch discovered
+     * at the warm-selection checkpoint. This never inserts an outpoint or
+     * changes wallet/DB transaction state. */
+    bool EraseLiveUnspentStakeOutpointForDrift(const COutPoint& outpoint)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RefreshLiveUnspentStakeOutpoints(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecomputeLiveUnspentStakeOutpoints() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RefreshMempoolStatus(CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1003,6 +1037,8 @@ private:
         GUARDED_BY(cs_wallet){0};
     std::set<uint256> m_shadow_pow_relay_reject_txids GUARDED_BY(cs_wallet);
     std::set<uint256> m_shadow_pow_relay_wait_roots GUARDED_BY(cs_wallet);
+    uint64_t m_shadow_pow_relay_suppression_generation
+        GUARDED_BY(cs_wallet){1};
     mutable std::optional<ShadowPowClaimRecoveryInventory>
         m_shadow_pow_relay_reject_inventory GUARDED_BY(cs_wallet);
     // Exact immutable proof contexts already evaluated outside cs_main and
@@ -1030,6 +1066,33 @@ private:
     // held. Runtime graph construction still enforces its own strict work
     // budget before any proof evaluation.
     std::set<uint256> m_shadow_pow_claim_txids GUARDED_BY(cs_wallet);
+    // Ownership-independent proof-presence index. This deliberately includes
+    // confirmed incoming and foreign QQSPROOF carriers so warm ordering and
+    // historical-anchor reservation remain TransactionHasShadowProof-exact.
+    std::set<uint256> m_shadow_pow_all_proof_txids GUARDED_BY(cs_wallet);
+    // Runtime callbacks do not parse records above the per-record byte cap.
+    // Any such record makes proof presence unknown and warm selection returns
+    // a typed capacity result before authorizing a prefix.
+    std::set<uint256> m_shadow_pow_unknown_proof_presence_txids
+        GUARDED_BY(cs_wallet);
+    std::set<uint256> m_shadow_pow_known_oversized_proof_txids
+        GUARDED_BY(cs_wallet);
+    // Complete incremental reverse index for ownership-independent proof
+    // anchors. Lifetime history is never walked or capped by hot selection.
+    std::map<uint256, std::vector<COutPoint>>
+        m_shadow_pow_proof_inputs_by_txid GUARDED_BY(cs_wallet);
+    std::map<COutPoint, std::set<uint256>> m_shadow_pow_proof_anchor_txids
+        GUARDED_BY(cs_wallet);
+    // Unknown oversized records conservatively reserve their input anchors
+    // until the out-of-lock type classifier proves them ordinary or proof.
+    std::map<uint256, std::vector<COutPoint>>
+        m_shadow_pow_unknown_inputs_by_txid GUARDED_BY(cs_wallet);
+    std::map<COutPoint, std::set<uint256>> m_shadow_pow_unknown_anchor_txids
+        GUARDED_BY(cs_wallet);
+    std::set<uint256> m_shadow_pow_proof_input_index_pending_txids
+        GUARDED_BY(cs_wallet);
+    std::set<uint256> m_shadow_pow_proof_input_index_capacity_txids
+        GUARDED_BY(cs_wallet);
     // Hot recovery/mining subset. Confirmed history remains in the lifetime
     // index for ancestry/audit but can never exhaust the runtime graph cap.
     std::set<uint256> m_shadow_pow_unconfirmed_claim_txids
@@ -1571,6 +1634,25 @@ public:
     CAmount m_min_staking_amount{DEFAULT_MIN_STAKING_AMOUNT};
     CAmount m_reserve_balance{DEFAULT_RESERVE_BALANCE};
     std::atomic<bool> m_enabled_staking{false};
+    /** Any effective staking-intent transition invalidates an in-flight claim
+     * selection, even if the boolean later returns to its earlier value. */
+    std::atomic<uint64_t> m_shadow_pow_stake_reserve_generation{1};
+    void SetStakingEnabled(bool enabled)
+    {
+        // Enabling creates a reserve restriction and must serialize with
+        // claim signing and AddToWallet. Disabling only relaxes that policy;
+        // keep it nonblocking for the GUI. A later enable still serializes
+        // and invalidates any work selected before the intervening pulse.
+        UniqueLock<RecursiveMutex> wallet_lock(
+            enabled ? &cs_wallet : nullptr,
+            "cs_wallet", __FILE__, __LINE__);
+        const bool prior = m_enabled_staking.exchange(
+            enabled, std::memory_order_acq_rel);
+        if (prior != enabled) {
+            m_shadow_pow_stake_reserve_generation.fetch_add(
+                1, std::memory_order_acq_rel);
+        }
+    }
     std::atomic<bool> m_stop_staking_thread{false};
     mutable Mutex m_staking_telemetry_mutex;
     StakingTelemetrySnapshot m_staking_telemetry
@@ -1652,6 +1734,63 @@ public:
     const std::set<COutPoint>& GetLiveUnspentStakeOutpoints() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         return m_live_unspent_stake_outpoints;
+    }
+
+    uint64_t GetLiveUnspentStakeGenerationLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_live_unspent_stake_generation;
+    }
+
+    /** Bound the raw wallet-spender domain for one captured source and return
+     * the authoritative IsSpent result while cs_wallet keeps it immutable. */
+    bool GetBoundedWalletSpentStateLocked(
+        const COutPoint& outpoint, size_t work_capacity,
+        size_t& work_used, bool& spent) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    size_t GetScriptPubKeyManCountLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_spk_managers.size();
+    }
+
+    bool IsIndexedShadowPowClaimLocked(const uint256& txid) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_shadow_pow_all_proof_txids.count(txid) != 0;
+    }
+
+    const std::set<uint256>& GetAllShadowPowProofTxidsLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_shadow_pow_all_proof_txids;
+    }
+
+    bool HasUnknownShadowPowProofPresenceLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return !m_shadow_pow_unknown_proof_presence_txids.empty();
+    }
+
+    bool IsUnknownShadowPowProofParentLocked(const uint256& txid) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_shadow_pow_unknown_proof_presence_txids.count(txid) != 0;
+    }
+
+    bool IsShadowPowHistoricalAnchorLocked(const COutPoint& outpoint) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_shadow_pow_proof_anchor_txids.count(outpoint) != 0 ||
+            m_shadow_pow_unknown_anchor_txids.count(outpoint) != 0;
+    }
+
+    bool ShadowPowProofInputIndexUnavailableLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return !m_shadow_pow_proof_input_index_pending_txids.empty() ||
+            !m_shadow_pow_proof_input_index_capacity_txids.empty();
     }
 
     /** O(1) scheduling/diagnostic count which does not expose wallet history. */
@@ -1751,6 +1890,13 @@ public:
     /** Outpoints carrying live RGB single-use-seal or EUTXO state that coin selection and staking
      *  must never auto-select; spending them as plain coin would burn the asset. */
     std::set<COutPoint> GetProtectedRGBSeals() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Build the complete protected RGB/EUTXO outpoint set only when both raw
+     * source domains fit the caller's remaining aggregate work/byte budget.
+     * On overflow `seals` is empty and no prefix is returned. */
+    bool GetBoundedProtectedRGBSeals(
+        size_t work_capacity, size_t byte_capacity,
+        std::set<COutPoint>& seals, size_t& work_used,
+        size_t& bytes_used) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Sync each owned RGB assignment's spent flag to the chain (IsSpent of its seal) so a
      *  reorged-out / abandoned / conflicted transfer no longer desyncs the RGB ledger. */
     void ReconcileRGBAssignments() LOCKS_EXCLUDED(cs_wallet);
@@ -2210,6 +2356,12 @@ public:
     }
     void RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetShadowPowProofPresenceIndexLocked(
+        const CWalletTx& wtx, bool exact_proof, bool unknown,
+        const std::vector<COutPoint>* prevalidated_inputs = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void ClearShadowPowProofPresenceIndexLocked(const uint256& txid)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void InvalidateShadowPowClaimImplicitOwnershipLocked()
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void InvalidateShadowPowClaimImplicitOwnershipEntryLocked(
@@ -2307,8 +2459,8 @@ public:
         const CCoinControl& coin_control,
         ShadowPowClaimInput& selected,
         bilingual_str& error,
-        const ShadowPowClaimMiningGate& mining_gate) const
-        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+        const ShadowPowClaimMiningGate& mining_gate)
+        LOCKS_EXCLUDED(::cs_main, cs_wallet);
     /** Resolve the exact next-block spend time used by v2 mempool admission.
      * Failure is a nonauthorizing pause before proof grinding or signing. */
     bool GetShadowPowClaimNextBlockSpendTimeLocked(int64_t& spend_time) const
@@ -2321,7 +2473,22 @@ public:
         const ShadowPowClaimMiningGate& gate, Coin& coin,
         bilingual_str& error) const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
-    ShadowPowClaimStakeReserveInfo GetShadowPowClaimStakeReserveInfoLocked() const
+    /** Revalidate a bounded selection using one exact coin lookup, without
+     * repeating wallet-wide enumeration at signing or publication. */
+    bool GetShadowPowClaimSelectedCoinLocked(
+        const ShadowPowClaimInput& selected, Coin& coin,
+        bilingual_str& error) const
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    /** Wallet-wide stake/candidate enumeration is performed under cs_wallet
+     * only and bound to short chain snapshots before and after the scan. */
+    ShadowPowClaimStakeReserveInfo GetShadowPowClaimStakeReserveInfo() const
+        LOCKS_EXCLUDED(::cs_main, cs_wallet);
+    /** Explicit blocking worker refresh; lightweight GUI polling only reads
+     * the cached result through its already-acquired try-locks. */
+    void RefreshShadowPowClaimStakeReserveInfo()
+        LOCKS_EXCLUDED(::cs_main, cs_wallet);
+    std::optional<ShadowPowClaimStakeReserveInfo>
+    GetCachedShadowPowClaimStakeReserveInfoLocked() const
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     void MaybeDelayShadowPowClaimSubmissionForTest(const COutPoint& selected_outpoint);
     void MaybeDelayShadowPowClaimCommitForTest(

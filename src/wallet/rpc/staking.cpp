@@ -2123,49 +2123,74 @@ static RPCHelpMan sendshadowpowclaim()
     }
 
     ShadowPowClaimInput selected_input;
+    ShadowPowClaimMiningGate selection_gate;
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
-        const ShadowPowClaimMiningGate mining_gate =
+        selection_gate =
             pwallet->GetShadowPowClaimMiningGateFromInventoryLocked(
                 initial_inventory);
-        if (!mining_gate.MayCreateClaim()) {
+        if (!selection_gate.MayCreateClaim()) {
             throw JSONRPCError(RPC_WALLET_ERROR,
                 "Gold Rush PoW claim creation is paused because the typed mining gate is unsafe, incoherent, or at capacity");
         }
+    }
+    {
+        LOCK(pwallet->cs_wallet);
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, GetAdjustedTimeSeconds());
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
         }
-        bilingual_str selection_error;
-        const ShadowPowClaimInputSelectionResult selection_result = pwallet->SelectShadowPowClaimInput(
-            std::optional<CScript>{target},
-            quantum_payout_script,
-            supplied_proof ? &*supplied_proof : nullptr,
-            coin_control,
-            selected_input,
-            selection_error,
-            mining_gate);
-        if (selection_result == ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX) {
-            throw JSONRPCError(RPC_WALLET_ERROR, selection_error.original);
-        }
-        if (selection_result ==
-            ShadowPowClaimInputSelectionResult::CHAIN_TIME_UNAVAILABLE) {
+    }
+    bilingual_str selection_error;
+    const ShadowPowClaimInputSelectionResult selection_result =
+        pwallet->SelectShadowPowClaimInput(
+            std::optional<CScript>{target}, quantum_payout_script,
+            supplied_proof ? &*supplied_proof : nullptr, coin_control,
+            selected_input, selection_error, selection_gate);
+    if (selection_result == ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX) {
+        throw JSONRPCError(RPC_WALLET_ERROR, selection_error.original);
+    }
+    if (selection_result ==
+        ShadowPowClaimInputSelectionResult::CHAIN_TIME_UNAVAILABLE) {
+        throw JSONRPCError(
+            RPC_VERIFY_REJECTED,
+            selection_error.original.empty()
+                ? "Gold Rush PoW claim creation is waiting for a valid next-block transaction time; no proof, key, fee, or signature was created"
+                : selection_error.original);
+    }
+    if (selection_result ==
+        ShadowPowClaimInputSelectionResult::EPOCH_INACTIVE) {
+        throw JSONRPCError(
+            RPC_VERIFY_REJECTED,
+            selection_error.original.empty()
+                ? "Gold Rush PoW claim creation is inactive at the current chain tip; no wallet outputs were enumerated"
+                : selection_error.original);
+    }
+    if (selection_result ==
+        ShadowPowClaimInputSelectionResult::INPUT_ENUMERATION_CAPACITY) {
+        throw JSONRPCError(
+            RPC_WALLET_ERROR,
+            selection_error.original.empty()
+                ? "Gold Rush PoW claim selection exceeded its bounded warm wallet-output capacity; no proof, key, signature, or fee transaction was created"
+                : selection_error.original);
+    }
+    if (selection_result ==
+        ShadowPowClaimInputSelectionResult::SNAPSHOT_DRIFT) {
+        throw JSONRPCError(
+            RPC_VERIFY_REJECTED,
+            selection_error.original.empty()
+                ? "Gold Rush PoW claim selection changed at its exact coin checkpoint; retry on a fresh bounded snapshot"
+                : selection_error.original);
+    }
+    if (selection_result != ShadowPowClaimInputSelectionResult::SELECTED) {
+        if (selection_gate.MayRefreshSameAnchor()) {
             throw JSONRPCError(
-                RPC_VERIFY_REJECTED,
+                RPC_WALLET_ERROR,
                 selection_error.original.empty()
-                    ? "Gold Rush PoW claim creation is waiting for a valid next-block transaction time; no proof, key, fee, or signature was created"
+                    ? "The selected retained Gold Rush PoW claim family is not currently serviceable"
                     : selection_error.original);
         }
-        if (selection_result != ShadowPowClaimInputSelectionResult::SELECTED) {
-            if (mining_gate.MayRefreshSameAnchor()) {
-                throw JSONRPCError(
-                    RPC_WALLET_ERROR,
-                    selection_error.original.empty()
-                        ? "The selected retained Gold Rush PoW claim family is not currently serviceable"
-                        : selection_error.original);
-            }
-            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable non-dust UTXO found for the target address");
-        }
+        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable non-dust UTXO found for the target address");
     }
     pwallet->MaybeDelayShadowPowClaimSubmissionForTest(selected_input.outpoint);
 
@@ -2287,6 +2312,13 @@ static RPCHelpMan sendshadowpowclaim()
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
         }
         std::map<COutPoint, Coin> coins;
+        Coin selected_coin;
+        bilingual_str selection_checkpoint_error;
+        if (!pwallet->GetShadowPowClaimSelectedCoinLocked(
+                selected_input, selected_coin, selection_checkpoint_error)) {
+            throw JSONRPCError(RPC_VERIFY_REJECTED,
+                               selection_checkpoint_error.original);
+        }
         const auto build_candidate = [&](const COutPoint& outpoint,
                                          const CTxOut& output,
                                          const Coin& input_coin) {
@@ -2353,34 +2385,8 @@ static RPCHelpMan sendshadowpowclaim()
                     RPC_VERIFY_REJECTED,
                     "The current wallet action no longer permits the selected Gold Rush PoW fee anchor");
             }
-            for (const COutput& output :
-                 AvailableCoins(*pwallet, &coin_control).All()) {
-                if (output.outpoint != selected_input.outpoint) continue;
-                if (output.depth <= 0) continue;
-                if (CanonicalizeLegacyStakeScript(
-                        output.txout.scriptPubKey) != selected_input.target) {
-                    continue;
-                }
-                if (ComputeShadowPowClaimLineageFamilyFingerprint(
-                        output.outpoint, output.txout.nValue,
-                        output.txout.scriptPubKey) !=
-                    selected_input.lineage_family_fingerprint) {
-                    continue;
-                }
-                Coin input_coin;
-                if (!pwallet->chain().chainman().ActiveChainstate()
-                         .CoinsTip()
-                         .GetCoin(output.outpoint, input_coin) ||
-                    input_coin.IsSpent() ||
-                    input_coin.nTime != selected_input.coin_time ||
-                    input_coin.nTime > next_block_spend_time) {
-                    continue;
-                }
-                if (build_candidate(
-                        output.outpoint, output.txout, input_coin)) {
-                    break;
-                }
-            }
+            build_candidate(selected_input.outpoint,
+                            selected_coin.out, selected_coin);
         }
 
         if (!claim_tx.vin.empty()) {
@@ -2425,6 +2431,11 @@ static RPCHelpMan sendshadowpowclaim()
                     initial_inventory);
             Coin selected_coin;
             bilingual_str refresh_error;
+            if (!pwallet->GetShadowPowClaimSelectedCoinLocked(
+                    selected_input, selected_coin, refresh_error)) {
+                throw JSONRPCError(RPC_VERIFY_REJECTED,
+                                   refresh_error.original);
+            }
             const bool gate_matches = selected_input.same_anchor_refresh
                 ? pwallet->GetShadowPowClaimRefreshCoinLocked(
                       selected_input, final_mining_gate, selected_coin,
@@ -2500,7 +2511,8 @@ static RPCHelpMan sendshadowpowclaim()
                     final_mining_gate.classification_time,
                     final_mining_gate.next_relay_expiry_time,
                     final_mining_gate.next_legacy_relay_expiry_wall_time,
-                    final_mining_gate.legacy_relay_clock_high_water});
+                    final_mining_gate.legacy_relay_clock_high_water,
+                    selected_input});
         }
     }
 
@@ -4762,8 +4774,8 @@ static RPCHelpMan getpowmininginfo()
             pwallet->GetShadowPowClaimRecoveryUsageFromInventoryLocked(
                 recovery_inventory,
                 recovery_policy.rolling_fee_window_seconds);
-        stake_reserve = pwallet->GetShadowPowClaimStakeReserveInfoLocked();
     }
+    stake_reserve = pwallet->GetShadowPowClaimStakeReserveInfo();
     obj.pushKV("enabled", pow_mining_enabled);
     obj.pushKV("autostart", gArgs.GetBoolArg("-powmining", false));
     obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));

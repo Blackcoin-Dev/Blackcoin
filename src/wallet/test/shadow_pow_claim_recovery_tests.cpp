@@ -2254,7 +2254,6 @@ BOOST_AUTO_TEST_CASE(
     ShadowPowClaimInput independent_selection;
     bilingual_str independent_error;
     {
-        LOCK2(::cs_main, wallet->cs_wallet);
         BOOST_CHECK(wallet->SelectShadowPowClaimInput(
                         CanonicalizeLegacyStakeScript(
                             independent_tx->vout.at(0).scriptPubKey),
@@ -2277,7 +2276,6 @@ BOOST_AUTO_TEST_CASE(
         [&](ShadowPowClaimMiningGate invalid_gate) {
             ShadowPowClaimInput rejected_selection;
             bilingual_str rejected_error;
-            LOCK2(::cs_main, wallet->cs_wallet);
             BOOST_CHECK(
                 wallet->SelectShadowPowClaimInput(
                     CanonicalizeLegacyStakeScript(
@@ -4036,7 +4034,8 @@ BOOST_FIXTURE_TEST_CASE(
     // conflict resolves it.
     BOOST_CHECK(WITH_LOCK(expired->cs_wallet,
                           return expired->IsSpent(expired_anchor)));
-    ShadowPowClaimMiningGate create_new_gate;
+    ShadowPowClaimMiningGate create_new_gate =
+        expired->GetShadowPowClaimMiningGate();
     create_new_gate.action =
         ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR;
     create_new_gate.coherent = true;
@@ -4068,7 +4067,6 @@ BOOST_FIXTURE_TEST_CASE(
     ShadowPowClaimInput historical_selection;
     bilingual_str historical_error;
     {
-        LOCK2(::cs_main, expired->cs_wallet);
         BOOST_CHECK(expired->SelectShadowPowClaimInput(
                         expired_target, payout, nullptr,
                         historical_control, historical_selection,
@@ -4359,7 +4357,6 @@ BOOST_FIXTURE_TEST_CASE(
     ShadowPowClaimInput selected;
     bilingual_str selection_error;
     {
-        LOCK2(::cs_main, wallet->cs_wallet);
         BOOST_CHECK(wallet->SelectShadowPowClaimInput(
                         target, payout, nullptr, control, selected,
                         selection_error, root_gate) ==

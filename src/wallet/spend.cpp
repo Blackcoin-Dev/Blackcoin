@@ -626,7 +626,7 @@ static bool IsDirectQuantumMigrationInputScript(const CScript& script_pub_key)
     return tier && !tier->tiered && !tier->cold_stake;
 }
 
-static bool MatchesCoinControlInputFamily(const CScript& script_pub_key, const CCoinControl& coin_control)
+bool MatchesCoinControlInputFamily(const CScript& script_pub_key, const CCoinControl& coin_control)
 {
     if (!coin_control.m_input_family) return true;
     const bool is_quantum_migration = IsQuantumMigrationScript(script_pub_key);

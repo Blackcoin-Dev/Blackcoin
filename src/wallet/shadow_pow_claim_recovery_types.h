@@ -343,6 +343,10 @@ struct ShadowPowClaimMiningGate
     int active_height{-1};
     uint64_t wallet_generation{0};
     uint256 candidate_state_fingerprint;
+    /** Process-local generation for same-snapshot relay/family suppression.
+     * It closes the interval in which the candidate fingerprint and wallet
+     * database remain unchanged but the selected aggregate action changes. */
+    uint64_t suppression_generation{0};
     int64_t classification_time{0};
     int64_t next_relay_expiry_time{0};
     int64_t next_legacy_relay_expiry_wall_time{0};

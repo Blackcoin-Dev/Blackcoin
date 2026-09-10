@@ -3290,6 +3290,71 @@ BOOST_FIXTURE_TEST_CASE(legacy_shadow_pow_cleanup_is_quarantined_without_rebroad
     }
 }
 
+BOOST_AUTO_TEST_CASE(legacy_cleanup_repair_is_bounded_durable_and_indexed)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    const auto add_record = [&](uint8_t domain, uint32_t index, bool legacy, bool managed) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{domain}, index});
+        tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+        const auto ref = MakeTransactionRef(std::move(tx));
+        BOOST_REQUIRE(wallet.AddToWallet(ref, TxStateInactive{}, [&](CWalletTx& record, bool) {
+            if (legacy) record.mapValue[SHADOW_POW_LEGACY_CLEANUP_FOR_KEY] = uint256::ONE.GetHex();
+            if (managed) record.mapValue[SHADOW_POW_RESOLUTION_SCHEMA_KEY] = "malformed";
+            return true;
+        }));
+        return ref->GetHash();
+    };
+    for (uint32_t index = 0; index < 1024; ++index) add_record(1, index, false, false);
+    std::vector<uint256> legacy;
+    for (uint32_t index = 0; index < SHADOW_POW_CLAIM_OWNERSHIP_SLICE + 6; ++index) {
+        legacy.push_back(add_record(2, index, true, false));
+    }
+    const uint256 managed = add_record(3, 0, true, true);
+
+    CWallet failing(m_node.chain.get(), "", DuplicateMockDatabase(wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(failing.LoadWallet(), DBErrors::LOAD_OK);
+    auto& failed_db = GetMockableDatabase(failing);
+    const MockableData before_failure = failed_db.m_records;
+    failed_db.m_write_calls = 0;
+    failed_db.m_fail_write_at = 2;
+    failing.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK(failing.IsShadowPowClaimRecoveryDatabaseAmbiguous());
+    BOOST_CHECK(failed_db.m_records == before_failure);
+    {
+        LOCK(failing.cs_wallet);
+        for (const uint256& txid : legacy) {
+            BOOST_CHECK(failing.mapWallet.at(txid).mapValue.count("qq_shadow_pow_legacy_cleanup_quarantine") == 0);
+        }
+    }
+
+    auto& database = GetMockableDatabase(wallet);
+    database.m_write_calls = 0;
+    wallet.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK_EQUAL(database.m_write_calls, SHADOW_POW_CLAIM_OWNERSHIP_SLICE);
+    BOOST_CHECK(database.m_last_txn_durable);
+    database.m_write_calls = 0;
+    wallet.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK_EQUAL(database.m_write_calls, 6U);
+    database.m_write_calls = 0;
+    wallet.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK_EQUAL(database.m_write_calls, 0U);
+    {
+        LOCK(wallet.cs_wallet);
+        for (const uint256& txid : legacy) {
+            BOOST_CHECK_EQUAL(wallet.mapWallet.at(txid).mapValue.at("qq_shadow_pow_legacy_cleanup_quarantine"), "1");
+        }
+        BOOST_CHECK(wallet.mapWallet.at(managed).mapValue.count("qq_shadow_pow_legacy_cleanup_quarantine") == 0);
+    }
+    CWallet reloaded(m_node.chain.get(), "", DuplicateMockDatabase(wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    auto& reloaded_db = GetMockableDatabase(reloaded);
+    reloaded_db.m_write_calls = 0;
+    reloaded.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK_EQUAL(reloaded_db.m_write_calls, 0U);
+}
+
 BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_inventory_is_tip_pinned_and_reorg_safe, TestChain100Setup)
 {
     CKey wallet_key;

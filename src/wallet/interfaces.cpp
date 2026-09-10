@@ -222,6 +222,12 @@ interfaces::WalletPowClaimRecoveryNode MakeRecoveryNode(
     out.stale_depth_known = node.stale_depth_known;
     out.resolution_relay_authorized = node.resolution_relay_authorized;
     out.resolution_relay_revoked = node.resolution_relay_revoked;
+    if (node.authorization_receipt) {
+        const auto& receipt = *node.authorization_receipt;
+        out.authorization_receipt = interfaces::WalletPowClaimResolutionAuthorizationReceipt{
+            receipt.plan_id.GetHex(), receipt.active_tip.GetHex(), receipt.active_height,
+            receipt.wallet_generation, receipt.origin};
+    }
     return out;
 }
 
@@ -312,6 +318,7 @@ interfaces::WalletPowClaimRecoveryUsage MakeRecoveryUsage(
     const ShadowPowClaimRecoveryUsage& usage)
 {
     interfaces::WalletPowClaimRecoveryUsage out;
+    out.available = usage.available;
     out.pending_manual = usage.pending_manual;
     out.pending_automatic = usage.pending_automatic;
     out.confirmed_manual = usage.confirmed_manual;

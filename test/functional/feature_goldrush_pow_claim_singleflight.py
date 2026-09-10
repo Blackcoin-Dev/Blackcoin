@@ -577,9 +577,78 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         return info
 
     @staticmethod
+    def _assert_recovery_pages(wallet, info=None, page_size=17):
+        """Reconstruct exactly the dedicated graph, never general history."""
+        if info is None:
+            info = wallet.getpowclaimrecoveryinfo(True)
+        collections = {
+            "claim_txid": "claim_txids",
+            "root_claim_txid": "root_claim_txids",
+            "resolution_txid": "resolution_txids",
+            "ordinary_or_mixed_txid": "ordinary_or_mixed_txids",
+        }
+        components = {}
+        unanchored = []
+        cursor = ""
+        first_page = None
+        returned = 0
+        while True:
+            page = wallet.getpowclaimrecoveryinfo(
+                True, {"page_size": page_size, "cursor": cursor}
+            )
+            if first_page is None:
+                first_page = page
+            assert "component_details" not in page
+            assert "unanchored_claim_txids" not in page
+            for field in ("active_tip", "wallet_generation", "raw_claim_objects"):
+                assert_equal(page[field], info[field])
+            pagination = page["pagination"]
+            assert_equal(pagination["snapshot"], first_page["pagination"]["snapshot"])
+            assert_equal(pagination["total_records"], first_page["pagination"]["total_records"])
+            assert_equal(pagination["offset"], returned)
+            assert_equal(pagination["returned_records"], len(page["records"]))
+            assert len(page["records"]) <= page_size
+            for record in page["records"]:
+                kind = record["kind"]
+                if kind == "unanchored_claim_txid":
+                    unanchored.append(record["txid"])
+                    continue
+                anchor = (record["anchor_txid"], record["anchor_vout"])
+                if kind == "component":
+                    assert anchor not in components
+                    components[anchor] = dict(record["component"])
+                    for field in (*collections.values(), "nodes"):
+                        components[anchor][field] = []
+                elif kind == "node":
+                    components[anchor]["nodes"].append(record["node"])
+                else:
+                    components[anchor][collections[kind]].append(record["txid"])
+            returned += len(page["records"])
+            if pagination["complete"]:
+                assert "next_cursor" not in pagination
+                break
+            cursor = pagination["next_cursor"]
+            assert cursor
+            assert returned < pagination["total_records"]
+        assert_equal(returned, first_page["pagination"]["total_records"])
+        assert_equal(sorted(unanchored), sorted(info["unanchored_claim_txids"]))
+        assert_equal(len(components), len(info["component_details"]))
+        for expected in info["component_details"]:
+            anchor = (expected["anchor"]["txid"], expected["anchor"]["vout"])
+            normalized = dict(expected)
+            for field in collections.values():
+                normalized[field] = sorted(normalized[field])
+                components[anchor][field].sort()
+            normalized["nodes"] = sorted(normalized["nodes"], key=lambda node: node["txid"])
+            components[anchor]["nodes"].sort(key=lambda node: node["txid"])
+            assert_equal(components[anchor], normalized)
+        return first_page
+
+    @staticmethod
     def _recovery_semantic_snapshot(wallet):
         """Return restart/rescan-stable policy, graph, and accounting state."""
         info = wallet.getpowclaimrecoveryinfo(True)
+        GoldRushPowClaimSingleFlightTest._assert_recovery_pages(wallet, info)
         component_fields = (
             "anchor",
             "generation_fingerprint",
@@ -1441,6 +1510,31 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert "hex" not in preview
         assert first_txid not in node.getrawmempool()
         reviewed = manual.getpowclaimrecoveryinfo(True)
+        first_page = self._assert_recovery_pages(manual, reviewed, page_size=2)
+        cursor = first_page["pagination"]["next_cursor"]
+        assert_raises_rpc_error(
+            -8, "recovery-page-cursor-stale",
+            policy_lock.getpowclaimrecoveryinfo, True, {"cursor": cursor},
+        )
+        assert_raises_rpc_error(
+            -8, "recovery-page-cursor-malformed",
+            manual.getpowclaimrecoveryinfo, True, {"cursor": "invalid"},
+        )
+        for page_size in (0, 1001):
+            assert_raises_rpc_error(
+                -8, "recovery-page-size-out-of-range",
+                manual.getpowclaimrecoveryinfo, True, {"page_size": page_size},
+            )
+        # Unrelated durable wallet metadata invalidates an old snapshot; no
+        # recovery action, signature, transaction, or policy change is needed.
+        original_labels = manual.getaddressinfo(manual_address)["labels"]
+        manual.setlabel(manual_address, "pagination-generation-check")
+        assert_raises_rpc_error(
+            -8, "recovery-page-cursor-stale",
+            manual.getpowclaimrecoveryinfo, True, {"cursor": cursor},
+        )
+        manual.setlabel(manual_address, original_labels[0] if original_labels else "")
+        reviewed = manual.getpowclaimrecoveryinfo(True)
         reviewed_component = next(
             component
             for component in reviewed["component_details"]
@@ -1765,6 +1859,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         # both positional and named forms. Repeating this restriction-only
         # operation is intentionally idempotent.
         manual_cli = node.cli(f"-rpcwallet={quote(MANUAL_WALLET)}")
+        pagination_options = {"page_size": 2}
+        direct_page = manual.getpowclaimrecoveryinfo(True, pagination_options)
+        assert_equal(manual_cli.getpowclaimrecoveryinfo(True, pagination_options), direct_page)
+        assert_equal(
+            manual_cli.getpowclaimrecoveryinfo(verbose=True, options=pagination_options),
+            direct_page,
+        )
         revoked_cli_positional = manual_cli.revokeshadowpowclaimresolution(
             second_resolution_txid,
             True,
@@ -1886,9 +1987,16 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 1)
 
         self.log.info("Reorging the resolution never exposes the shared input twice")
+        before_reorg_page = self._assert_recovery_pages(manual, page_size=2)
+        before_reorg_cursor = before_reorg_page["pagination"]["next_cursor"]
         node.invalidateblock(resolution_block)
         self.wait_until(lambda: second_resolution_txid in node.getrawmempool(), timeout=20)
         node.syncwithvalidationinterfacequeue()
+        assert_raises_rpc_error(
+            -8, "recovery-page-cursor-stale",
+            manual.getpowclaimrecoveryinfo, True, {"cursor": before_reorg_cursor},
+        )
+        self._assert_recovery_pages(manual, page_size=2)
         self._assert_claim_inventory(
             manual, raw=1, actionable=1, resolved=0, indeterminate=0, components=1
         )

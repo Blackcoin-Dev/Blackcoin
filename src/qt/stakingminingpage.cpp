@@ -1906,10 +1906,10 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
             .arg(review.quarantined_claim_objects)
             .arg(review.blocking_components)
             .arg(review.resolved_components)
-            .arg(review.usage.pending_manual)
-            .arg(review.usage.pending_automatic)
-            .arg(review.usage.recycled_outputs)
-            .arg(formatBLK(review.usage.confirmed_resolution_fees))
+            .arg(review.usage.available ? QString::number(review.usage.pending_manual) : tr("unavailable"))
+            .arg(review.usage.available ? QString::number(review.usage.pending_automatic) : tr("unavailable"))
+            .arg(review.usage.available ? QString::number(review.usage.recycled_outputs) : tr("unavailable"))
+            .arg(review.usage.available ? formatBLK(review.usage.confirmed_resolution_fees) : tr("unavailable"))
             .arg(review.policy.mode == interfaces::WalletPowClaimRecoveryMode::AUTOMATIC
                      ? tr("automatic fee fallback")
                      : review.policy.mode == interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK
@@ -2029,6 +2029,15 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
                              : QString());
             if (node.resolution_relay_revoked) {
                 node_detail += tr(", local relay authority revoked");
+            }
+            if (node.authorization_receipt) {
+                const auto& receipt = *node.authorization_receipt;
+                node_detail += tr("\nLatest authorization receipt (read-only): plan %1; tip %2; height %3; wallet generation %4; origin %5.")
+                    .arg(QString::fromStdString(receipt.plan_id))
+                    .arg(QString::fromStdString(receipt.active_tip))
+                    .arg(receipt.active_height)
+                    .arg(receipt.wallet_generation)
+                    .arg(QString::fromStdString(receipt.origin));
             }
             node_details.push_back(node_detail);
         }

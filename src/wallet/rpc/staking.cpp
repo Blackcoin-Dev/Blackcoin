@@ -2605,22 +2605,6 @@ static const char* ShadowPowRecoveryNodeKindName(ShadowPowClaimRecoveryNodeKind 
     return "unknown";
 }
 
-static const char* ShadowPowRecoveryActionStatusName(ShadowPowClaimRecoveryActionStatus status)
-{
-    switch (status) {
-    case ShadowPowClaimRecoveryActionStatus::READY: return "ready";
-    case ShadowPowClaimRecoveryActionStatus::REUSE_MANAGED: return "reuse_managed";
-    case ShadowPowClaimRecoveryActionStatus::REUSE_LEGACY: return "reuse_legacy";
-    case ShadowPowClaimRecoveryActionStatus::SIGNED_AND_PERSISTED: return "signed_and_persisted";
-    case ShadowPowClaimRecoveryActionStatus::BROADCAST: return "broadcast";
-    case ShadowPowClaimRecoveryActionStatus::ALREADY_IN_MEMPOOL: return "already_in_mempool";
-    case ShadowPowClaimRecoveryActionStatus::RELAY_DEFERRED: return "relay_deferred";
-    case ShadowPowClaimRecoveryActionStatus::REFUSED: return "refused";
-    case ShadowPowClaimRecoveryActionStatus::FAILED: return "failed";
-    }
-    return "unknown";
-}
-
 static const char* ShadowPowMempoolDispositionName(ShadowPowClaimMempoolDisposition disposition)
 {
     switch (disposition) {
@@ -4378,6 +4362,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic resolutions."},
             {RPCResult::Type::NUM, "confirmed_manual_resolutions", "Confirmed manual resolutions reconstructed from wallet records."},
             {RPCResult::Type::NUM, "confirmed_automatic_resolutions", "Confirmed automatic resolutions reconstructed from wallet records."},
+            {RPCResult::Type::BOOL, "usage_available", "Whether the recovery accounting fields represent a complete exact wallet snapshot. Numeric defaults are not authoritative when false."},
             {RPCResult::Type::STR_AMOUNT, "confirmed_resolution_fees", "Fees paid by confirmed managed resolutions."},
             {RPCResult::Type::NUM, "automatic_actions_in_window", "Automatic actions counted in the current rolling policy window."},
             {RPCResult::Type::STR_AMOUNT, "automatic_fee_exposure_in_window", "Confirmed and pending automatic fee exposure in the rolling policy window."},
@@ -4527,6 +4512,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     result.pushKV("pending_automatic_resolutions", static_cast<uint64_t>(usage.pending_automatic));
     result.pushKV("confirmed_manual_resolutions", static_cast<uint64_t>(usage.confirmed_manual));
     result.pushKV("confirmed_automatic_resolutions", static_cast<uint64_t>(usage.confirmed_automatic));
+    result.pushKV("usage_available", usage.available);
     result.pushKV("confirmed_resolution_fees", ValueFromAmount(usage.confirmed_resolution_fees));
     result.pushKV("automatic_actions_in_window", static_cast<uint64_t>(usage.automatic_actions_in_window));
     result.pushKV("automatic_fee_exposure_in_window", ValueFromAmount(usage.automatic_fee_exposure_in_window));
@@ -4799,6 +4785,7 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::STR_HEX, "mining_gate_relay_txid", "Eligible under-TTL relay claim for the reported gate snapshot, or all-zero when no relay is currently actionable, including while that family is deferred until the next tip."},
             {RPCResult::Type::STR_HEX, "mining_gate_lineage_head_txid", "Selected durable same-anchor lineage head for a family action, or all-zero when no family is selected, including an independent new-anchor fallback that preserves families only in mining_gate_reserved_family_anchors."},
             {RPCResult::Type::STR_HEX, "mining_gate_candidate_state_fingerprint", "Cheap in-memory wallet-claim state key used with tip and database generation to invalidate the cached gate."},
+            {RPCResult::Type::BOOL, "recovery_usage_available", "Whether recovery accounting is complete for the exact wallet snapshot."},
             {RPCResult::Type::NUM, "pending_manual_resolutions", "Persisted unconfirmed manual claim resolutions."},
             {RPCResult::Type::NUM, "pending_automatic_resolutions", "Persisted unconfirmed automatic claim resolutions."},
             {RPCResult::Type::NUM, "claims_auto_resolved", "Confirmed automatic claim resolutions."},
@@ -4968,6 +4955,7 @@ static RPCHelpMan getpowmininginfo()
                mining_gate.lineage_head_txid.GetHex());
     obj.pushKV("mining_gate_candidate_state_fingerprint",
                mining_gate.candidate_state_fingerprint.GetHex());
+    obj.pushKV("recovery_usage_available", recovery_usage.available);
     obj.pushKV("pending_manual_resolutions", static_cast<uint64_t>(recovery_usage.pending_manual));
     obj.pushKV("pending_automatic_resolutions", static_cast<uint64_t>(recovery_usage.pending_automatic));
     obj.pushKV("claims_auto_resolved", static_cast<uint64_t>(recovery_usage.confirmed_automatic));

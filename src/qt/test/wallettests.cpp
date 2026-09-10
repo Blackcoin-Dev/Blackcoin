@@ -1561,6 +1561,20 @@ void TestPowClaimRecoveryManualDialog(
     QVERIFY(revocation.success);
     const auto revoked_interface_review =
         wallet_interface.getPowClaimRecoveryReview(interface_preview);
+    bool saw_authorization_receipt{false};
+    for (const auto& component : revoked_interface_review.components) {
+        for (const auto& graph_node : component.nodes) {
+            if (graph_node.txid != managed_resolution_txid.GetHex()) continue;
+            QVERIFY(graph_node.authorization_receipt.has_value());
+            const auto& receipt = *graph_node.authorization_receipt;
+            QCOMPARE(receipt.plan_id, core_plan.plan_id.GetHex());
+            QCOMPARE(receipt.active_tip, core_plan.active_tip.GetHex());
+            QCOMPARE(receipt.wallet_generation, core_plan.wallet_generation);
+            QCOMPARE(receipt.origin, std::string{"manual"});
+            saw_authorization_receipt = true;
+        }
+    }
+    QVERIFY(saw_authorization_receipt);
     QVERIFY(std::any_of(
         revoked_interface_review.plan.actions.begin(),
         revoked_interface_review.plan.actions.end(), [](const auto& action) {

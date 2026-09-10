@@ -1055,6 +1055,8 @@ private:
     // RPC/GUI/miner reads share one cache fill instead of multiplying Argon2
     // memory use.
     mutable Mutex m_shadow_pow_claim_proof_evaluation_mutex;
+    mutable std::shared_ptr<const ShadowPowClaimRecoveryUsageSnapshot>
+        m_shadow_pow_claim_usage_snapshot GUARDED_BY(cs_wallet);
     // O(1) invalidation signal for in-memory transaction/graph transitions
     // that are not guaranteed to advance the wallet database counter (for
     // example mempool membership). Full inventory construction derives the
@@ -1067,6 +1069,12 @@ private:
     // held. Runtime graph construction still enforces its own strict work
     // budget before any proof evaluation.
     std::set<uint256> m_shadow_pow_claim_txids GUARDED_BY(cs_wallet);
+    // Metadata-presence indexes are independent of claim proof ownership.
+    // Keep malformed and terminal managed records visible to usage accounting.
+    std::set<uint256> m_shadow_pow_managed_resolution_txids GUARDED_BY(cs_wallet);
+    std::set<uint256> m_shadow_pow_legacy_cleanup_pending_txids GUARDED_BY(cs_wallet);
+    std::optional<uint256> m_shadow_pow_legacy_cleanup_repair_cursor GUARDED_BY(cs_wallet);
+    std::optional<uint256> m_shadow_pow_claim_repair_cursor GUARDED_BY(cs_wallet);
     // Ownership-independent proof-presence index. This deliberately includes
     // confirmed incoming and foreign QQSPROOF carriers so warm ordering and
     // historical-anchor reservation remain TransactionHasShadowProof-exact.
@@ -2412,6 +2420,9 @@ public:
     /** Reconstruct policy usage from persisted resolution transactions. */
     ShadowPowClaimRecoveryUsage GetShadowPowClaimRecoveryUsage(
         uint32_t rolling_window_seconds) const;
+    /** Prepare historical accounting with cs_main released. */
+    void PopulateShadowPowClaimRecoveryUsageSnapshot(
+        ShadowPowClaimRecoveryInventory& inventory) const;
     ShadowPowClaimRecoveryUsage
     GetShadowPowClaimRecoveryUsageFromInventoryLocked(
         const ShadowPowClaimRecoveryInventory& inventory,

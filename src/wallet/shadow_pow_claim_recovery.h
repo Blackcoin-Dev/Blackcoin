@@ -9,6 +9,8 @@
 
 namespace wallet {
 
+class CWallet;
+
 /** Stable identity of one confirmed wallet anchor generation. */
 uint256 ComputeShadowPowClaimLineageFamilyFingerprint(
     const COutPoint& anchor, CAmount anchor_amount,
@@ -25,6 +27,13 @@ ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
 
 const char* ShadowPowClaimRecoveryAdoptionStatusName(
     ShadowPowClaimRecoveryAdoptionStatus status);
+
+/** Stable action vocabulary shared by Core audit events and RPC. */
+const char* ShadowPowRecoveryActionStatusName(
+    ShadowPowClaimRecoveryActionStatus status);
+
+/** Test-only barrier after relay review, before guarded wallet reservation. */
+void SetShadowPowClaimRecoveryRelayHookForTesting(void (*hook)(CWallet&));
 
 /** Deterministic snapshot token; transaction signatures are intentionally excluded. */
 uint256 ComputeShadowPowClaimRecoveryPlanId(

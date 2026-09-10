@@ -838,6 +838,15 @@ enum class WalletPowClaimRecoveryRequestMode : uint8_t {
     COMMIT_AND_BROADCAST,
 };
 
+struct WalletPowClaimResolutionAuthorizationReceipt
+{
+    std::string plan_id;
+    std::string active_tip;
+    int active_height{-1};
+    uint64_t wallet_generation{0};
+    std::string origin;
+};
+
 //! One wallet-known node in a claim/conflict/descendant component.
 struct WalletPowClaimRecoveryNode
 {
@@ -859,6 +868,7 @@ struct WalletPowClaimRecoveryNode
     bool stale_depth_known{false};
     bool resolution_relay_authorized{false};
     bool resolution_relay_revoked{false};
+    std::optional<WalletPowClaimResolutionAuthorizationReceipt> authorization_receipt;
 };
 
 //! One transitive claim component rooted at the nearest confirmed wallet UTXO.
@@ -925,6 +935,7 @@ struct WalletPowClaimRecoveryPlan
 
 struct WalletPowClaimRecoveryUsage
 {
+    bool available{false};
     size_t pending_manual{0};
     size_t pending_automatic{0};
     size_t confirmed_manual{0};

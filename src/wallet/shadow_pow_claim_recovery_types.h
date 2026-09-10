@@ -13,6 +13,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -263,8 +264,13 @@ struct ShadowPowClaimRecoveryComponent
     bool stale_depth_known{false};
 };
 
+struct ShadowPowClaimRecoveryUsageSnapshot;
+
 struct ShadowPowClaimRecoveryInventory
 {
+    // Immutable wallet-only accounting; global-lock consumers perform no
+    // historical traversal and use a logarithmic rolling-window lookup.
+    std::shared_ptr<const ShadowPowClaimRecoveryUsageSnapshot> usage_snapshot;
     uint256 active_tip;
     int active_height{-1};
     uint256 wallet_processed_tip;
@@ -744,6 +750,7 @@ struct ShadowPowClaimRecoveryAdoptionResult
 /** Reorg-correct counters reconstructed from durable CWalletTx facts. */
 struct ShadowPowClaimRecoveryUsage
 {
+    bool available{false};
     size_t pending_manual{0};
     size_t pending_automatic{0};
     size_t confirmed_manual{0};
@@ -753,6 +760,18 @@ struct ShadowPowClaimRecoveryUsage
     CAmount automatic_fee_exposure_in_window{0};
     size_t reconciled_descendant_claims{0};
     size_t recycled_outputs{0};
+};
+
+struct ShadowPowClaimRecoveryUsageSnapshot
+{
+    uint64_t wallet_generation{0};
+    uint256 candidate_state_fingerprint;
+    uint256 wallet_processed_tip;
+    int wallet_processed_height{-1};
+    ShadowPowClaimRecoveryUsage totals;
+    std::vector<int64_t> automatic_creation_times;
+    // Leading zero followed by exact cumulative fees in creation-time order.
+    std::vector<CAmount> automatic_fee_prefix;
 };
 
 /**

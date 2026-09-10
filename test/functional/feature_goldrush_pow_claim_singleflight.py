@@ -52,6 +52,11 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             action="store_true",
             help="Run only the exact-input worker-group race after shared funding setup",
         )
+        parser.add_argument(
+            "--exact-relay-only",
+            action="store_true",
+            help="Run only same-tip exact relay and broadcast-disabled absence after shared funding setup",
+        )
 
     def set_test_params(self):
         self.num_nodes = 1
@@ -101,6 +106,95 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         """Advance monotonically beyond an entry before forcing zero-hour expiry."""
         entry_time = node.getmempoolentry(txid)["time"]
         self._set_mocktime(max(self.mock_time, entry_time) + 2)
+
+    def _expire_with_startup_relay_held(self, wallet, txid, anchor):
+        """Expire before broadcasting, then complete startup under a hold."""
+        node = self.nodes[0]
+        assert_equal(wallet.getpowmininginfo()["enabled"], False)
+        wallet_name = wallet.getwalletinfo()["walletname"]
+        self._advance_past_mempool_entry_time(node, txid)
+        self.restart_node(0, extra_args=[*self.base_args, "-mempoolexpiry=0", "-walletbroadcast=0", f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        wallet = self._load_wallet(wallet_name)
+        node.syncwithvalidationinterfacequeue()
+        assert txid not in node.getrawmempool()
+        assert_equal(wallet.lockunspent(False, [anchor], True), True)
+        self.restart_node(0, extra_args=[*self.base_args, "-mempoolexpiry=0", f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        wallet = self._load_wallet(wallet_name)
+        node.syncwithvalidationinterfacequeue()
+        assert txid not in node.getrawmempool()
+        assert anchor in wallet.listlockunspent()
+        # loadwallet returns after synchronous postInit relay; the registered
+        # executor's initial pass is repair-only. UnlockCoin queues no relay.
+        assert_equal(wallet.lockunspent(True, [anchor]), True)
+        return node, wallet, node.get_wallet_rpc(self.default_wallet_name)
+
+    def _expire_and_wait_for_exact_relay(self, wallet, txid, raw, default_wallet, funding_address):
+        """Either shared maintenance or worker zero may service the same bytes."""
+        node = self.nodes[0]
+        old_entry_time = node.getmempoolentry(txid)["time"]
+        same_tip = node.getbestblockhash()
+        claims_before = self._claim_txids(wallet)
+        transactions_before = {entry["txid"] for entry in wallet.listtransactions("*", 1000, 0, True)}
+        submitted_before = wallet.getpowmininginfo()["claims_submitted"]
+        self._advance_past_mempool_entry_time(node, txid)
+        with node.wait_for_debug_log([
+            f"Quarantined Gold Rush PoW claim {txid} after expiry mempool removal".encode(),
+        ], timeout=20):
+            default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
+        node.syncwithvalidationinterfacequeue()
+        self.wait_until(
+            lambda: txid in node.getrawmempool()
+            and node.getmempoolentry(txid)["time"] > old_entry_time,
+            timeout=20,
+        )
+        assert_equal(node.getbestblockhash(), same_tip)
+        assert_equal(node.getrawtransaction(txid), raw)
+        assert_equal(wallet.gettransaction(txid)["hex"], raw)
+        assert_equal(self._claim_txids(wallet), claims_before)
+        assert_equal({entry["txid"] for entry in wallet.listtransactions("*", 1000, 0, True)}, transactions_before)
+        assert_equal(wallet.getpowmininginfo()["claims_submitted"], submitted_before)
+
+    def _exercise_exact_relay_only(self, wallet, address, funding_address):
+        self.log.info("Focused exact-relay lane: same-tip service, cached WAIT, and disabled-broadcast absence")
+        node = self.nodes[0]
+        payout = wallet.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
+        claim = wallet.sendshadowpowclaim(address, payout, 500_000)
+        txid = claim["txid"]
+        raw = wallet.gettransaction(txid)["hex"]
+        anchor = self._claim_input(txid, wallet)
+        self.restart_node(0, extra_args=[*self.base_args, "-mempoolexpiry=0", f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        wallet = self._load_wallet(BOUNDARY_WALLET)
+        default_wallet = node.get_wallet_rpc(self.default_wallet_name)
+        self.wait_until(lambda: txid in node.getrawmempool(), timeout=30)
+        node, wallet, default_wallet = self._expire_with_startup_relay_held(wallet, txid, anchor)
+        assert_equal(wallet.sendshadowpowclaim(address, payout, 1), {
+            "txid": txid, "outcome": "relayed_existing",
+            "relayed_existing": True, "created_new_claim": False,
+        })
+        self._expire_and_wait_for_exact_relay(wallet, txid, raw, default_wallet, funding_address)
+        assert_equal(wallet.getpowmininginfo()["enabled"], False)
+        wallet.setpowmining(True, 1, 100)
+        try:
+            self.wait_until(lambda: wallet.getpowmininginfo()["mining_gate_action"] == "wait_for_live", timeout=20)
+            self._expire_and_wait_for_exact_relay(wallet, txid, raw, default_wallet, funding_address)
+            self.wait_until(lambda: wallet.getpowmininginfo()["mining_gate_action"] == "wait_for_live", timeout=20)
+            assert_equal(wallet.getpowmininginfo()["claims_submitted"], 0)
+        finally:
+            wallet.setpowmining(False)
+        self._advance_past_mempool_entry_time(node, txid)
+        self.restart_node(0, extra_args=[*self.base_args, "-mempoolexpiry=0", "-walletbroadcast=0", f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        wallet = self._load_wallet(BOUNDARY_WALLET)
+        node.syncwithvalidationinterfacequeue()
+        assert txid not in node.getrawmempool()
+        assert_equal(wallet.getpowmininginfo()["mining_gate_action"], "relay_existing")
+        assert_equal(wallet.gettransaction(txid)["hex"], raw)
+        assert_equal(self._claim_txids(wallet), {txid})
+        assert not self._is_abandoned(wallet, txid)
+        assert node.gettxout(anchor["txid"], anchor["vout"], False)
 
     def _load_wallet(self, name):
         node = self.nodes[0]
@@ -953,6 +1047,10 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         policy_lock_inputs = self._fund_live_fee_inputs(default_wallet, policy_lock, policy_lock_address, funding_address)
         builtin_race_inputs = self._fund_live_fee_inputs(default_wallet, builtin_race, builtin_race_address, funding_address)
 
+        assert not (self.options.input_race_only and self.options.exact_relay_only)
+        if self.options.exact_relay_only:
+            self._exercise_exact_relay_only(boundary, boundary_address, funding_address)
+            return
         if self.options.input_race_only:
             self._exercise_exact_input_worker_group_wait(
                 builtin_race, builtin_race_inputs, funding_address
@@ -2668,7 +2766,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             for entry in boundary.listtransactions("*", 1000, 0, True)
         )
 
-        self.log.info("The miner promptly relays an eligible absent head on the same tip")
+        self.log.info("An anchor hold keeps an exact head absent until explicit relay")
         self.restart_node(
             0,
             extra_args=[
@@ -2683,11 +2781,8 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         default_wallet = node.get_wallet_rpc(self.default_wallet_name)
         self.wait_until(lambda: refreshed_claim_txid in node.getrawmempool(), timeout=30)
         assert_equal(node.getrawtransaction(refreshed_claim_txid), refreshed_raw)
-        self._advance_past_mempool_entry_time(node, refreshed_claim_txid)
-        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
-        node.syncwithvalidationinterfacequeue()
-        self.wait_until(
-            lambda: refreshed_claim_txid not in node.getrawmempool(), timeout=20
+        node, boundary, default_wallet = self._expire_with_startup_relay_held(
+            boundary, refreshed_claim_txid, boundary_claim_input,
         )
         relay_gate = boundary.getpowmininginfo()
         assert_equal(relay_gate["mining_gate_action"], "relay_existing")
@@ -2793,10 +2888,10 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
         # The preceding restart proves normal mempool persistence cannot let
         # a wallet-only anchor hold demote a genuinely live family. Now remove
-        # the hold before deliberately expiring the persisted mempool entry:
-        # typed startup relay authority must respect a user lock while the
-        # claim is absent, but may relay these exact bytes once that lock is
-        # durably gone.
+        # the hold and reload the live member, then expire it with broadcast
+        # disabled and hold startup relay to isolate direct-RPC preconditions.
+        # Typed automatic relay must respect that hold; explicit RPC relay
+        # remains available once the lock is durably gone.
         self.restart_node(
             0,
             extra_args=[
@@ -2814,11 +2909,8 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(node.getrawtransaction(refreshed_claim_txid), refreshed_raw)
         assert boundary_claim_input not in boundary.listlockunspent()
-        self._advance_past_mempool_entry_time(node, refreshed_claim_txid)
-        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
-        node.syncwithvalidationinterfacequeue()
-        self.wait_until(
-            lambda: refreshed_claim_txid not in node.getrawmempool(), timeout=20
+        node, boundary, default_wallet = self._expire_with_startup_relay_held(
+            boundary, refreshed_claim_txid, boundary_claim_input,
         )
 
         claims_before_restart_mining = self._claim_txids(boundary)
@@ -2872,18 +2964,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(boundary.getpowmininginfo()["claims_submitted"], 0)
 
-        # Restore the same absent-head precondition so the worker path below
-        # independently proves the same no-new-fee relay behavior.
-        self._advance_past_mempool_entry_time(node, refreshed_claim_txid)
-        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
-        node.syncwithvalidationinterfacequeue()
-        self.wait_until(
-            lambda: refreshed_claim_txid not in node.getrawmempool(), timeout=20
+        # With the miner disabled, removal itself must promptly re-admit the
+        # same bytes. A transient absent observation is not a stable contract.
+        self._expire_and_wait_for_exact_relay(
+            boundary, refreshed_claim_txid, refreshed_raw,
+            default_wallet, funding_address,
         )
-        assert_equal(
-            boundary.getpowmininginfo()["mining_gate_action"],
-            "relay_existing",
-        )
+        assert_equal(boundary.getpowmininginfo()["enabled"], False)
         boundary.setpowmining(True, 1, 100)
         try:
             self.wait_until(
@@ -2899,34 +2986,26 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 "wait_for_live",
             )
 
-            # Removing the just-relayed head without changing the chain tip
-            # must invalidate the cached WAIT state. The running worker loops
-            # back through RELAY_EXISTING and submits the same bytes again.
-            same_tip = node.getbestblockhash()
-            self._advance_past_mempool_entry_time(node, refreshed_claim_txid)
-            with node.wait_for_debug_log(
-                [b"Relayed existing eligible Gold Rush PoW claim"], timeout=20
-            ):
-                default_wallet.sendtoaddress(
-                    funding_address, Decimal("0.10000000")
-                )
-            self.wait_until(
-                lambda: refreshed_claim_txid in node.getrawmempool(), timeout=20
+            # Removal invalidates the cached WAIT state on the same tip.
+            # Worker zero or shared maintenance may win the exact-byte relay;
+            # neither may author another claim or leave the wallet stuck.
+            self._expire_and_wait_for_exact_relay(
+                boundary, refreshed_claim_txid, refreshed_raw,
+                default_wallet, funding_address,
             )
-            assert_equal(node.getbestblockhash(), same_tip)
-            assert_equal(node.getrawtransaction(refreshed_claim_txid), refreshed_raw)
+            self.wait_until(
+                lambda: boundary.getpowmininginfo()["mining_gate_action"]
+                == "wait_for_live", timeout=20,
+            )
             assert_equal(self._claim_txids(boundary), claims_before_restart_mining)
             assert_equal(boundary.getpowmininginfo()["claims_submitted"], 0)
         finally:
             boundary.setpowmining(False)
 
         self.log.info("RPC truthfully reports a bounded next-tip relay wait")
+        # Age the persisted entry, then disable wallet broadcast before
+        # startup expires it. Active maintenance cannot race this absence.
         self._advance_past_mempool_entry_time(node, refreshed_claim_txid)
-        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
-        node.syncwithvalidationinterfacequeue()
-        self.wait_until(
-            lambda: refreshed_claim_txid not in node.getrawmempool(), timeout=20
-        )
         self.restart_node(
             0,
             extra_args=[

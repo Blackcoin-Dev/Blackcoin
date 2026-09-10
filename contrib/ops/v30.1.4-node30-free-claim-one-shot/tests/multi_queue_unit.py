@@ -98,9 +98,9 @@ class ProducerOwnership(unittest.TestCase):
             durable.legacy.queue_file_snapshot(self.path, None, "historical reader")
 
     def test_adapter_does_not_replace_legacy_dependency(self):
-        self.assertIsNot(durable.audit_queue, durable.legacy.audit_queue)
-        self.assertIs(durable.legacy.stable_live_snapshot.__globals__["audit_queue"],
-                      durable.legacy.audit_queue)
+        self.assertIsNot(durable.audit_queue, durable.pinned.legacy.audit_queue)
+        self.assertIs(durable.pinned.legacy.stable_live_snapshot.__globals__["audit_queue"],
+                      durable.pinned.legacy.audit_queue)
 
 
 if __name__ == "__main__":

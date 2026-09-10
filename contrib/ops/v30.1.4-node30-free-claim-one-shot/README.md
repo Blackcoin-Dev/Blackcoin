@@ -1,5 +1,44 @@
 # Installed-v30.1.4 node30 Free-Claim one-shot
 
+## Active QQP3 successor
+
+The durable and edge v3 contracts support the installed mainnet QQP3 regime
+that activated at height 5,993,200. The original QQP2 programs and their
+historical receipts below remain unchanged. Current protocol evidence is in
+`QQP3-PRODUCT-TEST-RECEIPT.json`; older receipt files describe their named
+historical implementations.
+
+The current work must report proof version 3, competing claims active, and
+QQP4 inactive. Mempool availability means fewer than 64 existing QQSPROOF
+carrier transactions. Receipts expose the actual count, limit, and remaining
+capacity. The one-shot still permits one financial call and never retries an
+intent. It does not mine a block or alter node30's ordinary-PoW-disabled role.
+
+QQP3 adds the exact origin height and parent hash to the proof. The fee budget
+is exactly 0.00032300 BLK at 100 atoms/vB against Core's maximum estimate of
+323 vbytes. Preflight requires the matching compressed wallet public key.
+The actual signed transaction may be shorter because of DER signature length.
+The independent raw parser verifies version-2 nonwitness serialization, one
+exact audited input, two exact outputs, canonical DER structure, compressed
+public-key hash, transaction ID, origin binding, actual byte length, and the
+exact input-minus-output fee. This is structural and identity verification;
+the installed node and active chain provide cryptographic signature validation.
+
+Two existing dedicated index containers provide read-only payout evidence.
+Their exact image, roles, runtime identities, synchronized indexes, and
+agreement with node30's active-chain anchor must pass before financial intent.
+Settlement requires the same two observers to agree on one positive indexed
+QQP3 credit for the exact claim, origin, inclusion block, payout, and fee.
+The observer receipts are preserved in the terminal record. Node30 does not
+need a new index or restart.
+
+Run `tests/qqp3_unit.py`, `tests/multi_queue_unit.py`, and
+`tests/test_free_claim_observer.py` for the current focused regression suite.
+The QQP3 suite includes an independently captured public mainnet transaction,
+shorter-DER candidate reconstruction, fee/origin mutations, capacity boundaries,
+positive winner/loser/late payout semantics, compressed-key preflight, and
+sharing the actually validated interpreter identity with historical readers.
+
 This fleet-only package submits exactly one already-queued node30 Free-Claim
 under a separately reviewed owner-only authority. It never starts the recurring
 Free-Claim worker, removes the pause marker, enables ordinary PoW, unlocks a

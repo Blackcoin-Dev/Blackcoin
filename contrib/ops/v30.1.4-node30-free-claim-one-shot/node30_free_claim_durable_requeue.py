@@ -25,11 +25,12 @@ import types
 from typing import Any, NoReturn, Sequence
 
 
-CONTRACT = "installed-v30.1.4-node30-free-claim-durable-requeue/v2"
+CONTRACT = "installed-v30.1.4-node30-free-claim-durable-requeue/v3"
 RECEIPT_SCHEMA = 1
 PRESERVE_PROTOCOL = "preexisting-queue-preservation/v1"
 PINNED_RELATIVE = pathlib.Path("node30_free_claim_rejection_requeue.py")
 PINNED_SHA256 = "66a3ec627214ce60bcd3a96bf49d580aa4957a2dc4a2ba35b7032bf5066c15c8"
+QQP3_SHA256 = "e4d2a9e4b91ac2d506d204b92399c238b8ba79093c676f00d633913b00c65805"
 TEST_TRANSPORT_SHA256S = {
     pinned_hash for pinned_hash in [
         "a41bc2ee67eb00c6849a9cb2fad9f5c5eb7d476b85c0c540d7a330522cfa804a",
@@ -68,8 +69,22 @@ except (OSError, RuntimeError) as exc:
     print(f"FATAL: {exc}", file=sys.stderr)
     raise SystemExit(1)
 
-legacy = pinned.legacy
-Transport = pinned.Transport
+qqp3_path = pathlib.Path(__file__).resolve().with_name("node30_free_claim_qqp3.py")
+if sha256_file(qqp3_path) != QQP3_SHA256:
+    raise RuntimeError("hash-pinned installed QQP3 adapter changed")
+qqp3_spec = importlib.util.spec_from_file_location("node30_free_claim_qqp3", qqp3_path)
+qqp3 = importlib.util.module_from_spec(qqp3_spec)
+qqp3_spec.loader.exec_module(qqp3)
+legacy = qqp3.build_legacy(pinned.legacy, lambda contract: audit_queue(contract))
+class Transport(pinned.Transport):
+    def rpc(self, node: Any, method: str, *params: Any) -> Any:
+        if method != "getblockhash":
+            return super().rpc(node, method, *params)
+        if len(params) != 1 or type(params[0]) is not int or params[0] < 0:
+            legacy.die("observer node30 block-height query is malformed")
+        value = self.run(["exec", node.container, self.runtime.cli_path,
+                          f"-datadir={self.runtime.datadir}", "getblockhash", str(params[0])]).strip()
+        return legacy.require_hex64(value, "node30 active block hash")
 
 
 class GateError(pinned.GateError):
@@ -96,6 +111,11 @@ def base_receipt(kind: str, contract: Any) -> dict[str, Any]:
         "kind": kind,
         "tool_sha256": tool_sha(),
         "pinned_rejection_requeue_tool_sha256": PINNED_SHA256,
+        "qqp3_adapter_sha256": QQP3_SHA256,
+        "maximum_fee_blk": f"{legacy.FEE_CAP:.8f}",
+        "expected_vsize": legacy.EXPECTED_VSIZE,
+        "proof_version": 3,
+        "shadow_proof_limit": qqp3.MEMPOOL_LIMIT,
     })
     return receipt
 
@@ -369,15 +389,15 @@ def durable_snapshot(transport: Any, node: Any, contract: Any,
         die("rejected queue payout differs from the consumed one-shot")
     if payout["address"] in legacy.awarded_snapshot(contract)["records"]:
         die("rejected queue payout is already awarded")
-    if legacy.reconcile_candidates(transport, node, source_intent):
+    if pinned.legacy.reconcile_candidates(transport, node, source_intent):
         die("an exact old-authority transaction appeared; requeue is forbidden")
     fee_input = legacy.fee_input_inventory(transport, node)
-    mempool = pinned.mempool_shadow_inventory(transport, node)
+    mempool = qqp3.mempool_inventory(transport, node, legacy)
     count = mempool.get("shadow_proof_count")
-    if (type(count) is not int or count not in {0, 1} or
-            mempool.get("shadow_proof_limit") != 1 or
-            mempool.get("slot_clear") is not (count == 0)):
-        die("node30 QQP2 one-slot mempool observation is incoherent")
+    if (type(count) is not int or not 0 <= count <= qqp3.MEMPOOL_LIMIT or
+            mempool.get("shadow_proof_limit") != qqp3.MEMPOOL_LIMIT or
+            mempool.get("slot_clear") is not (count < qqp3.MEMPOOL_LIMIT)):
+        die("node30 QQP3 64-proof mempool observation is incoherent")
     return {
         "role": role,
         "source_rejected": source_rejected,
@@ -472,7 +492,7 @@ def audit_command(args: argparse.Namespace) -> None:
             "slot_clear_required_for_requeue": False,
             "observed_shadow_proof_count":
                 snapshot["mempool_observation"]["shadow_proof_count"],
-            "shadow_proof_limit": 1,
+            "shadow_proof_limit": qqp3.MEMPOOL_LIMIT,
             "sendshadowpowclaim_authorized": False,
             "old_authority_retry_authorized": False,
             "new_edge_one_shot_audit_required": True,
@@ -536,7 +556,7 @@ def load_audit(run_dir: pathlib.Path, contract: Any) -> tuple[dict[str, Any], st
             authority.get("slot_clear_required_for_requeue") is not False or
             authority.get("observed_shadow_proof_count") !=
             snapshot.get("mempool_observation", {}).get("shadow_proof_count") or
-            authority.get("shadow_proof_limit") != 1 or
+            authority.get("shadow_proof_limit") != qqp3.MEMPOOL_LIMIT or
             authority.get("sendshadowpowclaim_authorized") is not False or
             authority.get("old_authority_retry_authorized") is not False or
             authority.get("new_edge_one_shot_audit_required") is not True or
@@ -631,8 +651,8 @@ def validate_intent(receipt: Any, contract: Any, audit: dict[str, Any],
             (receipt.get("queue_strategy") == "requeue_rejected_source") or
             receipt.get("preexisting_queue_preserved") is not
             (receipt.get("queue_strategy") == "preserve_existing_queued_item") or
-            type(count) is not int or count not in {0, 1} or
-            observation.get("slot_clear") is not (count == 0) or
+            type(count) is not int or not 0 <= count <= qqp3.MEMPOOL_LIMIT or
+            observation.get("slot_clear") is not (count < qqp3.MEMPOOL_LIMIT) or
             receipt.get("slot_clear_required_for_requeue") is not False or
             receipt.get("candidate_count") != 0 or
             receipt.get("sendshadowpowclaim_authorized") is not False or
@@ -678,8 +698,8 @@ def validate_complete(run_dir: pathlib.Path, receipt: Any, contract: Any,
             (strategy == "requeue_rejected_source") or
             receipt.get("preexisting_queue_preserved") is not
             (strategy == "preserve_existing_queued_item") or
-            type(count) is not int or count not in {0, 1} or
-            observation.get("slot_clear") is not (count == 0) or
+            type(count) is not int or not 0 <= count <= qqp3.MEMPOOL_LIMIT or
+            observation.get("slot_clear") is not (count < qqp3.MEMPOOL_LIMIT) or
             receipt.get("slot_clear_required_for_requeue") is not False or
             receipt.get("sendshadowpowclaim_call_count") != 0 or
             receipt.get("old_authority_retry_authorized") is not False or

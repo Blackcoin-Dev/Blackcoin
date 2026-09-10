@@ -24,10 +24,11 @@ import time
 from typing import Any, NoReturn, Sequence
 
 
-CONTRACT = "installed-v30.1.4-node30-free-claim-edge-one-shot/v2"
+CONTRACT = "installed-v30.1.4-node30-free-claim-edge-one-shot/v3"
 RECEIPT_SCHEMA = 1
 DURABLE_RELATIVE = pathlib.Path("node30_free_claim_durable_requeue.py")
-DURABLE_SHA256 = "f692a9b5873bb9e182da468ee9c84b1d19aafe6544aaa90af9548c3f9bc845b0"
+DURABLE_SHA256 = "19d54e823cc043d2e5fde5ea47b754214d296da18bac528f2d8609964bb43849"
+OBSERVER_SHA256 = "24767329e0bf51e223ea3bf31132c2a57951dd1264f80d40964e3b9a2a992802"
 TEST_TRANSPORT_SHA256S = {
     "a41bc2ee67eb00c6849a9cb2fad9f5c5eb7d476b85c0c540d7a330522cfa804a",
     "8775fbec4c4effdebf75e3569228514e67393ccfbbe178dcdc46d8aa53c4c983",
@@ -71,6 +72,12 @@ except (OSError, RuntimeError) as exc:
 pinned = durable.pinned
 legacy = durable.legacy
 Transport = durable.Transport
+observer_path = pathlib.Path(__file__).resolve().with_name("node30_free_claim_observer.py")
+if sha256_file(observer_path) != OBSERVER_SHA256:
+    raise RuntimeError("hash-pinned dual-index observer changed")
+observer_spec = importlib.util.spec_from_file_location("node30_free_claim_observer", observer_path)
+observer = importlib.util.module_from_spec(observer_spec)
+observer_spec.loader.exec_module(observer)
 
 
 class GateError(legacy.GateError):
@@ -101,6 +108,7 @@ def base_receipt(kind: str, contract: Any) -> dict[str, Any]:
         "kind": kind,
         "tool_sha256": tool_sha(),
         "durable_requeue_tool_sha256": DURABLE_SHA256,
+        "observer_tool_sha256": OBSERVER_SHA256,
         "pinned_rejection_requeue_tool_sha256": durable.PINNED_SHA256,
     })
     return receipt
@@ -191,6 +199,7 @@ def audit_command(args: argparse.Namespace) -> None:
         pause_before = legacy.node30.free_claim_snapshot(contract.retained)
         exact_node, runtime_before = legacy.node30.pin_node(transport, node)
         snapshot = durable.stable_live_snapshot(transport, contract, exact_node)
+        observer_audit = observer.audit_observers(transport, exact_node)
         if (legacy.immutable_queue_item_identity(snapshot["queue"]["item"]) !=
                 legacy.immutable_queue_item_identity(durable_audit["snapshot"]["queue"]["item"])):
             die("edge selected queue differs from durable selection")
@@ -213,6 +222,7 @@ def audit_command(args: argparse.Namespace) -> None:
             "source_authority_sha256": durable_audit["source_authority_sha256"],
             "source_intent_sha256": durable_audit["source_intent_sha256"],
             "snapshot": snapshot,
+            "observer_audit": observer_audit,
             "static_identity": identity,
             "static_identity_sha256": sha256_json(identity),
             "dynamic_fields_excluded_from_authority": [
@@ -235,6 +245,7 @@ def audit_command(args: argparse.Namespace) -> None:
             "runtime_manifest_sha256": contract.sha256,
             "tool_sha256": tool_sha(),
             "durable_requeue_tool_sha256": DURABLE_SHA256,
+            "observer_runtime_identities": observer_audit["runtime_identities"],
             "durable_requeue_complete_sha256":
                 context["durable_requeue_complete_sha256"],
             "static_identity_sha256": receipt["static_identity_sha256"],
@@ -293,7 +304,7 @@ def load_audit(run_dir: pathlib.Path, contract: Any) -> tuple[dict[str, Any], st
         "result", "mutation_performed", "durable_requeue_run",
         "durable_requeue_authority", "durable_requeue_audit_sha256",
         "durable_requeue_authority_sha256", "durable_requeue_complete_sha256",
-        "source_authority_sha256", "source_intent_sha256", "snapshot",
+        "source_authority_sha256", "source_intent_sha256", "snapshot", "observer_audit",
         "static_identity", "static_identity_sha256",
         "dynamic_fields_excluded_from_authority", "watch", "runtime",
         "lock_identities", "required_authority",
@@ -313,6 +324,8 @@ def load_audit(run_dir: pathlib.Path, contract: Any) -> tuple[dict[str, Any], st
             {"max_wait_seconds", "poll_milliseconds", "max_clear_rebinds"} or
             watch.get("max_clear_rebinds") != MAX_CLEAR_REBINDS or
             not isinstance(authority, dict) or
+            authority.get("observer_runtime_identities") !=
+            receipt.get("observer_audit", {}).get("runtime_identities") or
             authority.get("static_identity_sha256") !=
             receipt.get("static_identity_sha256") or
             authority.get("dynamic_tip_rebind_authorized") is not True or
@@ -374,13 +387,14 @@ def current_static_snapshot(contract: Any, audit: dict[str, Any],
 
 def edge_rebind(transport: Any, node: Any, contract: Any,
                 audit: dict[str, Any]) -> dict[str, Any]:
+    observer_now = observer.audit_observers(transport, node)
+    if observer_now["runtime_identities"] != audit["observer_audit"]["runtime_identities"]:
+        die("dual-index observer runtime differs from authorized audit")
     payout = audit["snapshot"]["payout"]
     fee_address = audit["snapshot"]["fee_input"]["address"]
     goldrush = transport.rpc(node, "getgoldrushinfo")
-    if (not isinstance(goldrush, dict) or goldrush.get("active") is not True or
-            goldrush.get("competing_claim_rule_active_next_block") is not False or
-            goldrush.get("qqp4_active_next_block") is not False):
-        die("node30 left the exact active QQP2 reward window")
+    if not durable.qqp3.active_regime(goldrush):
+        die("node30 left the exact active QQP3 reward window")
     raw_work = transport.rpc(
         node, "getshadowpowwork", fee_address, payout["address"])
     immediate = legacy.pre_call_resample(transport, node)
@@ -396,8 +410,8 @@ def edge_rebind(transport: Any, node: Any, contract: Any,
         if str(exc) == "getshadowpowwork is not exact active QQP2 work for the queued payout":
             raise EdgeTransient("tip moved before dynamic work rebind") from exc
         raise
-    mempool = pinned.mempool_shadow_inventory(transport, node)
-    if (mempool["shadow_proof_count"] != 0 or
+    mempool = durable.qqp3.mempool_inventory(transport, node, legacy)
+    if (mempool["shadow_proof_count"] >= durable.qqp3.MEMPOOL_LIMIT or
             mempool["slot_clear"] is not True):
         raise EdgeTransient("shadow-proof slot refilled during dynamic rebind")
     if mempool["chain"] != immediate["chain"]:
@@ -505,7 +519,9 @@ def validate_intent(receipt: Any, contract: Any, audit: dict[str, Any],
             not isinstance(dynamic, dict) or
             set(dynamic) != {"chain", "work", "mempool_clearance",
                              "mempool_observations", "clear_rebind_attempts"} or
-            not isinstance(mempool, dict) or mempool.get("shadow_proof_count") != 0 or
+            not isinstance(mempool, dict) or type(mempool.get("shadow_proof_count")) is not int or
+            not 0 <= mempool["shadow_proof_count"] < durable.qqp3.MEMPOOL_LIMIT or
+            mempool.get("shadow_proof_limit") != durable.qqp3.MEMPOOL_LIMIT or
             mempool.get("slot_clear") is not True or
             mempool.get("chain") != dynamic.get("chain") or
             not isinstance(chain, dict) or set(chain) != {"height", "tip"} or
@@ -620,6 +636,9 @@ def execute_command(args: argparse.Namespace) -> None:
         pause_preflight = legacy.node30.free_claim_snapshot(contract.retained)
         exact_node, runtime_preflight = legacy.node30.pin_node(transport, node)
         preflight = durable.stable_live_snapshot(transport, contract, exact_node)
+        observer_now = observer.audit_observers(transport, exact_node)
+        if observer_now["runtime_identities"] != audit["observer_audit"]["runtime_identities"]:
+            die("dual-index observer changed before vacancy watch")
         if sha256_json(static_identity(preflight)) != audit["static_identity_sha256"]:
             die("edge static identity changed before vacancy watch")
         if (legacy.node30.free_claim_snapshot(contract.retained) != pause_preflight or
@@ -629,9 +648,9 @@ def execute_command(args: argparse.Namespace) -> None:
     observations = 0
     clear_rebinds = 0
     while time.monotonic() < deadline:
-        observation = pinned.mempool_shadow_inventory(transport, exact_node)
+        observation = durable.qqp3.mempool_inventory(transport, exact_node, legacy)
         observations += 1
-        if observation["shadow_proof_count"] != 0:
+        if observation["shadow_proof_count"] >= durable.qqp3.MEMPOOL_LIMIT:
             time.sleep(audit["watch"]["poll_milliseconds"] / 1000)
             continue
         clear_rebinds += 1
@@ -803,6 +822,7 @@ def load_terminal(run_dir: pathlib.Path, contract: Any, audit: dict[str, Any],
         "node30-free-claim-edge-terminal", contract)) | {
             "result", "broadcast_complete_sha256", "txid", "confirmations",
             "blockhash", "active_block_header", "synthetic_payout",
+            "observer_evidence",
             "awarded_ledger", "queue_outcome", "pause_preserved",
             "ordinary_pow_enabled", "pos_active", "recurring_worker_invoked",
             "lock_identities",
@@ -826,6 +846,13 @@ def load_terminal(run_dir: pathlib.Path, contract: Any, audit: dict[str, Any],
             receipt.get("pos_active") is not True or
             receipt.get("recurring_worker_invoked") is not False):
         die("edge terminal receipt is not exact")
+    observed = receipt.get("observer_evidence", {})
+    if (observed.get("result") != "DUAL_INDEX_ACTIVE_CHAIN_QQP3_PAYOUT" or
+            observed.get("read_only") is not True or
+            observed.get("record") != receipt.get("synthetic_payout") or
+            [item.get("runtime") for item in observed.get("observers", [])] !=
+            [item.get("runtime") for item in audit["observer_audit"]["observers"]]):
+        die("terminal dual-index evidence differs from authorized observers")
     legacy.terminal_payout({
         "schema": "blackcoin.shadow.script.v1",
         "scriptPubKey": transaction["payout"]["scriptPubKey"],
@@ -994,8 +1021,10 @@ def monitor_command(args: argparse.Namespace) -> None:
                 type(header.get("confirmations")) is not int or
                 header["confirmations"] < 1):
             die("edge confirmation block is not active")
-        history = transport.rpc(
-            exact_node, "getshadowscript", transaction["payout"]["scriptPubKey"])
+        observed = observer.observe_payout(
+            transport, exact_node, audit["observer_audit"], transaction["payout"]["scriptPubKey"],
+            transaction["identity"]["txid"], 1, header["height"], blockhash)
+        history = observed["history"]
         payout = legacy.terminal_payout(
             history, transaction, blockhash, header["height"], intent)
         awarded = legacy.install_awarded_after(contract, audit)
@@ -1010,6 +1039,7 @@ def monitor_command(args: argparse.Namespace) -> None:
             "txid": transaction["identity"]["txid"],
             "confirmations": confirmations, "blockhash": blockhash,
             "active_block_header": header, "synthetic_payout": payout,
+            "observer_evidence": observed,
             "awarded_ledger": awarded, "queue_outcome": outcome,
             "pause_preserved": True, "ordinary_pow_enabled": False,
             "pos_active": True, "recurring_worker_invoked": False,
@@ -1065,7 +1095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.func(args)
     except (legacy.node30.base.GateError, legacy.node30.GateError,
             legacy.GateError, pinned.GateError, durable.GateError,
-            GateError, OSError, subprocess.TimeoutExpired) as exc:
+            GateError, observer.ObserverError, OSError, subprocess.TimeoutExpired) as exc:
         print(f"FATAL: {exc}", file=sys.stderr)
         return 1
     return 0

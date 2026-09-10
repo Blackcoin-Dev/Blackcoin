@@ -13225,7 +13225,10 @@ ShadowPowClaimSubmitResult CWallet::SubmitShadowPowClaim(
         Coin selected_coin;
         if (!GetShadowPowClaimSelectedCoinLocked(
                 selected_input, selected_coin, error)) {
-            return ShadowPowClaimSubmitResult::FAILED;
+            // The proof owns this exact selection. Preserve the typed input
+            // failure so a new-anchor worker cannot choose a fallback input
+            // on this tip; retained families use their local reselection path.
+            return ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE;
         }
 
         const int64_t current_time = GetAdjustedTimeSeconds();
@@ -13313,10 +13316,7 @@ ShadowPowClaimSubmitResult CWallet::SubmitShadowPowClaim(
     bool signed_claim{false};
     {
         LOCK2(::cs_main, cs_wallet);
-        Coin selected_coin;
-        if (!GetShadowPowClaimSelectedCoinLocked(
-                selected_input, selected_coin, error) ||
-            m_pow_wallet_authority_generation.load(
+        if (m_pow_wallet_authority_generation.load(
                 std::memory_order_acquire) !=
                 expected_wallet_authority_generation ||
             !HasNormalPowMiningWalletAuthorityLocked() ||
@@ -13326,6 +13326,11 @@ ShadowPowClaimSubmitResult CWallet::SubmitShadowPowClaim(
                 error = _("Gold Rush PoW wallet signing authority changed before claim signing.");
             }
             return ShadowPowClaimSubmitResult::FAILED;
+        }
+        Coin selected_coin;
+        if (!GetShadowPowClaimSelectedCoinLocked(
+                selected_input, selected_coin, error)) {
+            return ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE;
         }
         signed_claim = SignTransaction(claim_tx, coins, SIGHASH_DEFAULT, input_errors);
     }
@@ -13360,7 +13365,7 @@ ShadowPowClaimSubmitResult CWallet::SubmitShadowPowClaim(
             Coin selected_coin;
             if (!GetShadowPowClaimSelectedCoinLocked(
                     selected_input, selected_coin, error)) {
-                return ShadowPowClaimSubmitResult::FAILED;
+                return ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE;
             }
             const bool gate_matches = selected_input.same_anchor_refresh
                 ? GetShadowPowClaimRefreshCoinLocked(
@@ -13471,6 +13476,26 @@ ShadowPowClaimSubmitResult CWallet::SubmitShadowPowClaim(
                 if (retained) {
                     WalletLogPrintf("Quarantined Gold Rush PoW claim %s after broadcast failure; its input remains reserved\n",
                                     tx->GetHash().ToString());
+                }
+                if (!retained &&
+                    commit_status == WalletCommitStatus::REJECTED_NOT_ADDED) {
+                    LOCK(cs_wallet);
+                    Coin selected_coin;
+                    bilingual_str selection_error;
+                    if (m_pow_wallet_authority_generation.load(
+                            std::memory_order_acquire) ==
+                            expected_wallet_authority_generation &&
+                        HasNormalPowMiningWalletAuthorityLocked() &&
+                        m_pow_mining_enabled.load(std::memory_order_acquire) &&
+                        !m_stop_pow_mining_thread.load(std::memory_order_acquire) &&
+                        !GetShadowPowClaimSelectedCoinLocked(
+                            selected_input, selected_coin, selection_error)) {
+                        // Publication may have lost its carried selection
+                        // after preflight. Nothing was persisted, so retain
+                        // the same typed retry scope as the signing guards.
+                        error = std::move(selection_error);
+                        return ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE;
+                    }
                 }
                 return retained &&
                                commit_status ==

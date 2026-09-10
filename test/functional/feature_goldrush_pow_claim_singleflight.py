@@ -47,6 +47,11 @@ QQSPROOF = b"QQSPROOF"
 class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser)
+        parser.add_argument(
+            "--input-race-only",
+            action="store_true",
+            help="Run only the exact-input worker-group race after shared funding setup",
+        )
 
     def set_test_params(self):
         self.num_nodes = 1
@@ -180,6 +185,71 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             Decimal(str(utxo["amount"])): {"txid": utxo["txid"], "vout": utxo["vout"]}
             for utxo in utxos
         }
+
+    def _exercise_exact_input_worker_group_wait(self, builtin_race, inputs, funding_address):
+        self.log.info("The complete worker group waits for a new tip after its exact input becomes unavailable")
+        node = self.nodes[0]
+        selected_input = inputs[LIVE_FEE_VALUES[0]]
+        claims_before = self._claim_txids(builtin_race)
+        failed_tip = node.getbestblockhash()
+        input_locked = False
+
+        def worker_group_waits_for_next_tip():
+            info = builtin_race.getpowmininginfo()
+            # Fail immediately if a sibling commits a replacement while the
+            # group is supposed to retain its exact-tip reservation.
+            assert_equal(info["claims_submitted"], 0)
+            return (
+                info["enabled"]
+                and info["threads"] == 2
+                and info["state"] == "claim_in_flight"
+                and info["mining_gate_action"] == "wait_for_next_tip"
+                and info["hashrate"] == 0
+            )
+
+        try:
+            with node.wait_for_debug_log(
+                [b"Gold Rush PoW claim submission test barrier reached"],
+                timeout=180,
+            ):
+                started = builtin_race.setpowmining(True, 2, 100, True)
+                assert started["created_payout_key"]
+            # This must be the first RPC after the barrier: telemetry queries
+            # would consume the injection window on slow instrumented builds.
+            assert_equal(builtin_race.lockunspent(False, [selected_input]), True)
+            input_locked = True
+            self.wait_until(worker_group_waits_for_next_tip, timeout=20)
+            time.sleep(2)
+            assert worker_group_waits_for_next_tip()
+            assert_equal(node.getbestblockhash(), failed_tip)
+            assert_equal(self._claim_txids(builtin_race), claims_before)
+            assert_equal(builtin_race.lockunspent(True, [selected_input]), True)
+            input_locked = False
+            # Unlocking the selected fee input on the same tip must not let a
+            # sibling worker steal the wallet-wide slot and retry early.
+            time.sleep(2)
+            assert_equal(node.getbestblockhash(), failed_tip)
+            assert_equal(self._claim_txids(builtin_race), claims_before)
+            unlocked_info = builtin_race.getpowmininginfo()
+            assert_equal(unlocked_info["state"], "claim_in_flight")
+            assert_equal(unlocked_info["hashrate"], 0)
+            assert_equal(unlocked_info["claims_submitted"], 0)
+            self.generateblock(node, output=funding_address, transactions=[])
+            self.wait_until(
+                lambda: len(self._claim_txids(builtin_race) - claims_before) == 1,
+                timeout=180,
+            )
+            claim = sorted(self._claim_txids(builtin_race) - claims_before)[0]
+        finally:
+            try:
+                builtin_race.setpowmining(False)
+            finally:
+                if input_locked:
+                    assert_equal(builtin_race.lockunspent(True, [selected_input]), True)
+        assert_equal(self._claim_input(claim), selected_input)
+        self.generateblock(node, output=funding_address, transactions=[])
+        self.wait_until(lambda: claim not in node.getrawmempool(), timeout=20)
+        self._assert_generic_abandon_rejected(builtin_race, claim)
 
     def _wait_for_new_quarantined_claim(self, wallet, before, timeout=180):
         self.wait_until(
@@ -883,6 +953,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         policy_lock_inputs = self._fund_live_fee_inputs(default_wallet, policy_lock, policy_lock_address, funding_address)
         builtin_race_inputs = self._fund_live_fee_inputs(default_wallet, builtin_race, builtin_race_address, funding_address)
 
+        if self.options.input_race_only:
+            self._exercise_exact_input_worker_group_wait(
+                builtin_race, builtin_race_inputs, funding_address
+            )
+            return
+
         self.log.info(
             "Two wallets sequentially recover once, then bypass two retained families each"
         )
@@ -1360,56 +1436,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 lock_barrier.lockunspent(True, [lock_barrier_input]), True
             )
 
-        self.log.info("The complete worker group waits for a new tip after its exact input becomes unavailable")
-        builtin_race_before = self._claim_txids(builtin_race)
-        with node.wait_for_debug_log([b"Gold Rush PoW claim submission test barrier reached"], timeout=180):
-            started = builtin_race.setpowmining(True, 2, 100, True)
-            assert started["created_payout_key"]
-        with node.wait_for_debug_log([b"is no longer spendable; retry after the next tip"], timeout=20):
-            assert_equal(builtin_race.lockunspent(False, [builtin_race_inputs[LIVE_FEE_VALUES[0]]]), True)
-        try:
-            def worker_group_waits_for_next_tip():
-                info = builtin_race.getpowmininginfo()
-                return (
-                    info["state"] == "claim_in_flight"
-                    and info["mining_gate_action"] == "wait_for_next_tip"
-                )
-
-            self.wait_until(worker_group_waits_for_next_tip, timeout=10)
-            waiting_info = builtin_race.getpowmininginfo()
-            assert_equal(waiting_info["threads"], 2)
-            assert_equal(waiting_info["hashrate"], 0)
-            time.sleep(2)
-            assert_equal(self._claim_txids(builtin_race), builtin_race_before)
-            assert_equal(builtin_race.getpowmininginfo()["claims_submitted"], 0)
-            assert_equal(
-                builtin_race.lockunspent(
-                    True, [builtin_race_inputs[LIVE_FEE_VALUES[0]]]
-                ),
-                True,
-            )
-            # Unlocking the selected fee input on the same tip must not let a
-            # sibling worker steal the wallet-wide slot and retry early.
-            time.sleep(2)
-            assert_equal(self._claim_txids(builtin_race), builtin_race_before)
-            assert_equal(builtin_race.getpowmininginfo()["claims_submitted"], 0)
-            self.generateblock(node, output=funding_address, transactions=[])
-            self.wait_until(
-                lambda: len(
-                    self._claim_txids(builtin_race) - builtin_race_before
-                )
-                == 1,
-                timeout=180,
-            )
-            builtin_race_claim = sorted(
-                self._claim_txids(builtin_race) - builtin_race_before
-            )[0]
-        finally:
-            builtin_race.setpowmining(False)
-        assert_equal(self._claim_input(builtin_race_claim), builtin_race_inputs[LIVE_FEE_VALUES[0]])
-        self.generateblock(node, output=funding_address, transactions=[])
-        self.wait_until(lambda: builtin_race_claim not in node.getrawmempool(), timeout=20)
-        self._assert_generic_abandon_rejected(builtin_race, builtin_race_claim)
+        self._exercise_exact_input_worker_group_wait(
+            builtin_race, builtin_race_inputs, funding_address
+        )
 
         self.log.info("An ordinary descendant remains a blocker after local abandonment")
         descendant_blocker_payout = descendant_blocker.getnewquantumaddress(

@@ -1938,6 +1938,113 @@ public:
 };
 
 BOOST_FIXTURE_TEST_CASE(
+    shadow_pow_claim_invalidated_selection_preserves_typed_retry_scope,
+    WalletShadowPowQQP2TestingSetup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script =
+        GetScriptForRawPubKey(wallet_key.GetPubKey());
+    const CMutableTransaction funding = MakeDurabilityTestSpend(
+        *m_coinbase_txns[0], /*index=*/0, coinbaseKey, wallet_script);
+    CreateAndProcessBlock(
+        {funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return Assert(m_node.chainman)->ActiveChain()),
+        wallet_key);
+    BOOST_REQUIRE(m_node.chain->isReadyToBroadcast());
+    wallet->m_pow_mining_enabled = true;
+    const COutPoint anchor{funding.GetHash(), 0};
+    const CScript quantum_payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x51)});
+    const auto select_input = [&] {
+        const auto gate = wallet->GetShadowPowClaimMiningGate();
+        CCoinControl control;
+        control.m_allow_other_inputs = false;
+        control.m_avoid_address_reuse = false;
+        ShadowPowClaimInput selected;
+        bilingual_str error;
+        BOOST_REQUIRE(wallet->SelectShadowPowClaimInput(
+            std::nullopt, quantum_payout, nullptr, control, selected,
+            error, gate) == ShadowPowClaimInputSelectionResult::SELECTED);
+        BOOST_REQUIRE(selected.outpoint == anchor);
+        return selected;
+    };
+    ShadowPowClaimInput selected = select_input();
+    ShadowPowWork work;
+    work.valid = true;
+    work.target = selected.target;
+    work.quantum_payout_script = quantum_payout;
+    work.prev_hash = selected.selection_tip;
+    work.height = selected.selection_height + 1;
+    // Only the off-chain proof guard is exercised: every attempt below must
+    // stop before mempool admission. One zero-difficulty nonce keeps this
+    // classification regression independent of mining luck and runtime cost.
+    work.bits = 0;
+    std::vector<unsigned char> proof;
+    BOOST_REQUIRE(GrindShadowPowWork(work, 0, 1, 1, proof));
+    const uint64_t authority =
+        wallet->m_pow_wallet_authority_generation.load();
+    const MockableData durable_before = GetMockableDatabase(*wallet).m_records;
+    const size_t records_before = WITH_LOCK(
+        wallet->cs_wallet, return wallet->mapWallet.size());
+    const auto submit = [&](const ShadowPowClaimInput& input,
+                            uint64_t expected_authority) {
+        bilingual_str error;
+        std::optional<ShadowPowClaimMiningGate> reselection;
+        const auto result = wallet->SubmitShadowPowClaim(
+            input, work, proof, expected_authority, error, &reselection);
+        BOOST_CHECK(!error.original.empty());
+        BOOST_CHECK(!reselection); // New anchors have no family-local fallback.
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,
+                                   return wallet->mapWallet.size()), records_before);
+        BOOST_CHECK(GetMockableDatabase(*wallet).m_records == durable_before);
+        BOOST_CHECK_EQUAL(wallet->m_pow_claims_submitted.load(), 0U);
+        return result;
+    };
+
+    // A stale carried snapshot is an input-scoped refusal, not a generic
+    // failure that releases the worker group's exact-tip reservation.
+    ++selected.selection_wallet_generation;
+    BOOST_CHECK(submit(selected, authority) ==
+                ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE);
+    selected = select_input();
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return wallet->LockCoin(anchor)));
+    BOOST_CHECK(submit(selected, authority) ==
+                ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE);
+    WITH_LOCK(wallet->cs_wallet, wallet->UnlockCoin(anchor));
+
+    // An unrelated signing-authority rejection retains its distinct result.
+    selected = select_input();
+    BOOST_CHECK(submit(selected, authority + 1) ==
+                ShadowPowClaimSubmitResult::FAILED);
+
+    // Repeat after signing at the existing final-publication test barrier.
+    // The callback mutates only the exact input, before the final guard runs.
+    ScopedArgsSettings settings;
+    settings.Force("-qqshadowpowclaimcommitdelaymillis", "1");
+    bool locked_at_commit_barrier{false};
+    {
+        DebugLogHelper barrier("Gold Rush PoW claim final-commit authority test barrier reached",
+            [&](const std::string* line) {
+                if (line && !locked_at_commit_barrier) {
+                    locked_at_commit_barrier = WITH_LOCK(
+                        wallet->cs_wallet, return wallet->LockCoin(anchor));
+                }
+                return true;
+            });
+        BOOST_CHECK(submit(selected, authority) ==
+                    ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE);
+    }
+    BOOST_CHECK(locked_at_commit_barrier);
+    WITH_LOCK(wallet->cs_wallet, wallet->UnlockCoin(anchor));
+    wallet->m_pow_mining_enabled = false;
+}
+
+BOOST_FIXTURE_TEST_CASE(
     shadow_pow_claim_initial_reservation_is_atomic_without_broadcast,
     WalletShadowPowQQP2TestingSetup)
 {

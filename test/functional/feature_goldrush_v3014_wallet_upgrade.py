@@ -6,9 +6,10 @@
 
 The historical daemon authors two ordinary QQP3 claims from distinct confirmed
 wallet anchors and with distinct quantum payouts.  The exact same datadir is
-then opened by the current candidate, which observes their normal mempool
-expiry.  The candidate must treat both authenticated families as safe, relay
-both historical byte strings before authoring anything, and later continue each
+then opened by the current candidate, which expires both saved mempool entries
+under its configured policy.  The candidate must treat both authenticated
+families as safe, relay both historical byte strings before authoring anything,
+and later continue each
 expired family on its exact anchor and payout without paying for a recovery
 transaction.  A temporarily locked selected anchor must defer only that family:
 the independent family progresses on the same tip, and explicitly unlocking
@@ -64,8 +65,8 @@ class GoldRushV3014WalletUpgradeTest(BitcoinTestFramework):
         ]
         # v30.1.4 creates and persists the historical wallet in its normal
         # configuration.  Zero-hour expiry is enabled only after the binary
-        # switch so the candidate owns the durable removal transition under
-        # test.
+        # switch so both saved entries expire during candidate mempool load.
+        # Startup repair may immediately restore an exact eligible root.
         self.extra_args = [[*self.base_args]]
 
     def skip_test_if_missing_module(self):
@@ -211,23 +212,6 @@ class GoldRushV3014WalletUpgradeTest(BitcoinTestFramework):
         assert_equal(len(matches), 1)
         return matches[0]
 
-    def _expire_claims_from_mempool(
-        self, claim_txids, trigger_wallet, trigger_address
-    ):
-        node = self.nodes[0]
-        present = claim_txids.intersection(node.getrawmempool())
-        if present:
-            entry_time = max(
-                node.getmempoolentry(txid)["time"] for txid in present
-            )
-            self._set_mocktime(max(self.mock_time, entry_time) + 2)
-            trigger_wallet.sendtoaddress(trigger_address, Decimal("0.10000000"))
-            node.syncwithvalidationinterfacequeue()
-        self.wait_until(
-            lambda: claim_txids.isdisjoint(node.getrawmempool()), timeout=30
-        )
-        node.syncwithvalidationinterfacequeue()
-
     def _switch_to_candidate(self):
         node = self.nodes[0]
         self.stop_node(0)
@@ -235,14 +219,17 @@ class GoldRushV3014WalletUpgradeTest(BitcoinTestFramework):
         node.args[0] = self.options.bitcoind
         node.cli.binary = self.options.bitcoincli
         node.version = None
-        self.start_node(
-            0,
-            extra_args=[
-                *self.base_args,
-                "-mempoolexpiry=0",
-                f"-mocktime={self.mock_time}",
-            ],
-        )
+        with node.assert_debug_log([
+            "Imported mempool transactions from disk: 0 succeeded, 0 failed, 2 expired",
+        ]):
+            self.start_node(
+                0,
+                extra_args=[
+                    *self.base_args,
+                    "-mempoolexpiry=0",
+                    f"-mocktime={self.mock_time}",
+                ],
+            )
         node.setmocktime(self.mock_time)
 
     @staticmethod
@@ -349,7 +336,7 @@ class GoldRushV3014WalletUpgradeTest(BitcoinTestFramework):
         root_txids = {claim["txid"] for claim in historical}
         assert_equal(len(root_txids), 2)
         assert_equal(root_txids, self._wallet_claim_txids(claimant))
-        assert root_txids.issubset(node.getrawmempool())
+        assert_equal(root_txids, set(node.getrawmempool()))
         for claim in historical:
             claim["anchor"] = self._claim_input(claimant, claim["txid"])
             record = claimant.gettransaction(claim["txid"])
@@ -408,33 +395,29 @@ class GoldRushV3014WalletUpgradeTest(BitcoinTestFramework):
             historical_quantum_inventory,
             historical_quantum_addresses,
         )
+        node.syncwithvalidationinterfacequeue()
 
-        # Mempool persistence carries both exact v30.1.4 byte strings across
-        # the binary switch.  Their ordinary policy expiry must now create the
-        # candidate's durable reservation markers before the aggregate relay
-        # decision is observed.
-        self.wait_until(
-            lambda: root_txids.issubset(node.getrawmempool()), timeout=30
-        )
-        self._expire_claims_from_mempool(
-            root_txids, funding, funding_address
-        )
-        for txid in root_txids:
-            assert_equal(
-                claimant.gettransaction(txid)["qq_shadow_pow_quarantine"],
-                "1",
-            )
+        # The saved entries expired during candidate startup, as asserted by
+        # _switch_to_candidate(). Bounded startup/background maintenance may
+        # already restore exact eligible bytes without mining enabled. Do not
+        # require an all-absent instant that races this permitted servicing.
+        assert_equal(self._wallet_claim_txids(claimant), root_txids)
+        for claim in historical:
+            assert_equal(claimant.gettransaction(claim["txid"])["hex"], claim["hex"])
         relay_gate = claimant.getpowmininginfo()
         assert_equal(relay_gate["mining_gate_coherent"], True)
         assert_equal(relay_gate["mining_gate_database_ambiguous"], False)
         assert_equal(relay_gate["mining_gate_unresolved_components"], 2)
         assert_equal(relay_gate["mining_gate_family_claims"], 2)
-        assert_equal(relay_gate["mining_gate_live_claims"], 0)
+        assert 0 <= relay_gate["mining_gate_live_claims"] <= 2
         assert_equal(relay_gate["mining_gate_eligible_claims"], 2)
         assert_equal(relay_gate["mining_gate_unsafe_claims"], 0)
         assert_equal(relay_gate["mining_gate_unsafe_components"], 0)
-        assert_equal(relay_gate["mining_gate_action"], "relay_existing")
-        assert relay_gate["mining_gate_relay_txid"] in root_txids
+        if relay_gate["mining_gate_live_claims"] < 2:
+            assert_equal(relay_gate["mining_gate_action"], "relay_existing")
+            assert relay_gate["mining_gate_relay_txid"] in root_txids
+        else:
+            assert_equal(relay_gate["mining_gate_action"], "wait_for_live")
 
         upgraded_inventory = claimant.getpowclaimrecoveryinfo(True)
         for claim in historical:
@@ -450,8 +433,7 @@ class GoldRushV3014WalletUpgradeTest(BitcoinTestFramework):
             assert_equal(root["lineage_metadata_present"], False)
             assert_equal(root["proof_version"], 3)
             assert_equal(root["disposition"], "eligible")
-            assert_equal(root["in_mempool"], False)
-            assert_equal(root["quarantined"], True)
+            assert_equal(root["quarantined"], not root["in_mempool"])
 
         self.log.info("Relaying both exact historical byte strings before refresh")
         claims_before_relay = self._wallet_claim_txids(claimant)
@@ -596,9 +578,12 @@ class GoldRushV3014WalletUpgradeTest(BitcoinTestFramework):
                 self._claim_input(claimant, first_refresh_txid),
                 independent_family["anchor"],
             )
+            # The independent family's live member is now the aggregate
+            # single-flight barrier. The locked family remains deferred, but
+            # its local wait must not hide the other family's live claim.
             self.wait_until(
                 lambda: claimant.getpowmininginfo()["mining_gate_action"]
-                == "wait_for_next_tip",
+                == "wait_for_live",
                 timeout=30,
             )
             deferred_gate = claimant.getpowmininginfo()
@@ -621,6 +606,7 @@ class GoldRushV3014WalletUpgradeTest(BitcoinTestFramework):
             locked_deadline = time.monotonic() + 1
             while time.monotonic() < locked_deadline:
                 assert_equal(node.getbestblockhash(), refresh_tip)
+                assert selected_anchor in claimant.listlockunspent()
                 assert_equal(
                     self._wallet_claim_txids(claimant) - roots_before_refresh,
                     {first_refresh_txid},
@@ -628,7 +614,7 @@ class GoldRushV3014WalletUpgradeTest(BitcoinTestFramework):
                 locked_gate = claimant.getpowmininginfo()
                 assert_equal(
                     locked_gate["mining_gate_action"],
-                    "wait_for_next_tip",
+                    "wait_for_live",
                 )
                 assert_equal(locked_gate["claims_submitted"], 1)
                 time.sleep(0.1)

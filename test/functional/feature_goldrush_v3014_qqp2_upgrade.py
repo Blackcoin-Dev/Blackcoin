@@ -596,8 +596,11 @@ class GoldRushV3014QQP2UpgradeTest(BitcoinTestFramework):
         assert_equal(locked_gate["mining_gate_database_ambiguous"], False)
         assert_equal(locked_gate["mining_gate_unsafe_claims"], 0)
         assert_equal(locked_gate["mining_gate_unsafe_components"], 0)
-        assert_equal(locked_gate["mining_gate_action"], "wait_for_next_tip")
-        assert_equal(locked_gate["mining_gate_can_submit"], False)
+        # A held family does not prohibit independent new-anchor work. This
+        # fixture deliberately has no configured payout for that work, and
+        # must not silently create or bind a key to bypass the user hold.
+        assert_equal(locked_gate["mining_gate_action"], "create_new_anchor")
+        assert_equal(locked_gate["mining_gate_can_submit"], True)
 
         self.log.info("Restarting proves the singleton user hold is durable")
         locked_tip = node.getbestblockhash()
@@ -616,25 +619,23 @@ class GoldRushV3014QQP2UpgradeTest(BitcoinTestFramework):
         )
         assert_equal(
             claimant.getpowmininginfo()["mining_gate_action"],
-            "wait_for_next_tip",
+            "create_new_anchor",
         )
         claims_before_worker = self._wallet_claim_txids(claimant)
         assert_equal(claims_before_worker, {root_txid})
-        locked_start = claimant.setpowmining(True, 1, 100)
-        assert_equal(locked_start["created_payout_key"], False)
-        assert_equal(locked_start["payout_address"], "")
-        try:
-            time.sleep(2)
-            locked_worker = claimant.getpowmininginfo()
-            assert_equal(locked_worker["enabled"], True)
-            assert_equal(locked_worker["claims_submitted"], 0)
-            assert_equal(locked_worker["hashrate"], 0)
-            assert_equal(
-                self._wallet_claim_txids(claimant), claims_before_worker
-            )
-            assert_equal(node.getbestblockhash(), locked_tip)
-        finally:
-            claimant.setpowmining(False)
+        assert_raises_rpc_error(
+            -4, "Gold Rush PoW has no existing payout key",
+            claimant.setpowmining, True, 1, 100,
+        )
+        locked_worker = claimant.getpowmininginfo()
+        assert_equal(locked_worker["enabled"], False)
+        assert_equal(locked_worker["claims_submitted"], 0)
+        assert_equal(locked_worker["hashrate"], 0)
+        assert_equal(self._wallet_claim_txids(claimant), claims_before_worker)
+        assert_equal(claimant.getquantumkeyinventory(), historical_quantum_inventory)
+        assert_equal(claimant.listquantumaddresses(), historical_quantum_addresses)
+        assert root_anchor in claimant.listlockunspent()
+        assert_equal(node.getbestblockhash(), locked_tip)
 
         self.log.info("Unlocking restores refresh authority on the unchanged tip")
         assert_equal(claimant.lockunspent(True, [root_anchor]), True)

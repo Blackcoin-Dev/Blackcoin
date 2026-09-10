@@ -4648,51 +4648,59 @@ void CWallet::RepairStaleShadowTransactions(bool force)
     };
     std::map<uint256, RepairUpdate> updates;
     std::vector<uint256> update_txids;
-    WAIT_LOCK(::cs_main, chain_lock);
-    TRY_LOCK(cs_wallet, wallet_lock);
-    if (!wallet_lock || !chain().isReadyToBroadcast() ||
-        !ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory)) return;
-    const std::vector<uint256> candidates = select_slice(
-        m_shadow_pow_unconfirmed_claim_txids,
-        m_shadow_pow_claim_repair_cursor);
-    for (const uint256& txid : candidates) {
-        const CWalletTx& record = mapWallet.at(txid);
-        if (record.isConfirmed() || record.isConflicted()) continue;
-        const auto fact = facts.find(txid);
-        const ShadowPowClaimRecoveryNode* node =
-            fact == facts.end() ? nullptr : fact->second.node;
-        RepairUpdate update;
-        update.in_mempool = chain().isInMempool(txid);
-        if (!force && !record.isAbandoned() && update.in_mempool &&
-            (!node || !node->quarantined)) continue;
-        if (record.isAbandoned()) {
-            // Reopening adds a restriction. Only an authenticated active-chain
-            // spend proves the old anchor generation conclusively resolved.
-            if (fact != facts.end() && fact->second.resolved) continue;
-            update.reopen = true;
-            update.quarantine = true;
+    {
+        LOCK(::cs_main);
+        TRY_LOCK(cs_wallet, wallet_lock);
+        if (!wallet_lock || !chain().isReadyToBroadcast() ||
+            !ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory)) return;
+        const std::vector<uint256> candidates = select_slice(
+            m_shadow_pow_unconfirmed_claim_txids,
+            m_shadow_pow_claim_repair_cursor);
+        for (const uint256& txid : candidates) {
+            const CWalletTx& record = mapWallet.at(txid);
+            if (record.isConfirmed() || record.isConflicted()) continue;
+            const auto fact = facts.find(txid);
+            const ShadowPowClaimRecoveryNode* node =
+                fact == facts.end() ? nullptr : fact->second.node;
+            RepairUpdate update;
+            update.in_mempool = chain().isInMempool(txid);
+            if (!force && !record.isAbandoned() && update.in_mempool &&
+                (!node || !node->quarantined)) continue;
+            if (record.isAbandoned()) {
+                // Reopening adds a restriction. Only an authenticated active-chain
+                // spend proves the old anchor generation conclusively resolved.
+                if (fact != facts.end() && fact->second.resolved) continue;
+                update.reopen = true;
+                update.quarantine = true;
+            }
+            const bool eligible = classification_complete && node &&
+                node->proof_validation_result == ShadowProofValidationResult::VALID &&
+                node->disposition == ShadowPowClaimMempoolDisposition::ELIGIBLE;
+            if (update.in_mempool) {
+                update.clear_quarantine = eligible;
+            } else {
+                update.quarantine = true;
+                const bool observe = classification_complete && node &&
+                    (eligible || IsShadowPowClaimRecoveryObservationEligible(node->disposition));
+                update.reset_branch = observe && !node->stale_depth_known;
+            }
+            if (!update.reopen && !update.quarantine && !update.clear_quarantine) continue;
+            updates.emplace(txid, update);
+            update_txids.push_back(txid);
         }
-        const bool eligible = classification_complete && node &&
-            node->proof_validation_result == ShadowProofValidationResult::VALID &&
-            node->disposition == ShadowPowClaimMempoolDisposition::ELIGIBLE;
-        if (update.in_mempool) {
-            update.clear_quarantine = eligible;
-        } else {
-            update.quarantine = true;
-            const bool observe = classification_complete && node &&
-                (eligible || IsShadowPowClaimRecoveryObservationEligible(node->disposition));
-            update.reset_branch = observe && !node->stale_depth_known;
-        }
-        if (!update.reopen && !update.quarantine && !update.clear_quarantine) continue;
-        updates.emplace(txid, update);
-        update_txids.push_back(txid);
     }
 
     // The exact snapshot above authenticates observations, not spend/relay
     // authority. Each observation stores its tip identity and future readers
-    // reject it after branch drift. Release cs_main before copying records or
-    // committing; cs_wallet still pins the selected records through publication.
-    chain_lock.unlock();
+    // reject it after branch drift. Release both tracked locks in reverse order,
+    // then pin the unchanged wallet snapshot before copying or committing records.
+    TRY_LOCK(cs_wallet, wallet_lock);
+    if (!wallet_lock ||
+        GetDatabase().nUpdateCounter.load() != inventory.wallet_generation ||
+        GetShadowPowClaimCandidateStateFingerprintLocked() !=
+            inventory.candidate_state_fingerprint ||
+        m_last_block_processed != inventory.wallet_processed_tip ||
+        m_last_block_processed_height != inventory.wallet_processed_height) return;
     AssertLockNotHeld(::cs_main);
     std::vector<uint256> changed_txids;
     if (!UpdateShadowPowClaimRecoveryRecordsDurably(

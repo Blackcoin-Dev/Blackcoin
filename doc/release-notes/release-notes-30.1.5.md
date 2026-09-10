@@ -163,6 +163,32 @@ for mining. Persistent PoW consent also states that a locked or staking-only
 wallet retains the configured worker at zero hashrate until a normal unlock
 rather than silently discarding the operator's request.
 
+## Recovery status, receipts, and bounded history
+
+Verbose recovery status supports snapshot-bound pagination. For example,
+`getpowclaimrecoveryinfo true {"page_size":100}` returns at most 100 flat
+records, including separate component headers, nodes, and transaction-list
+memberships. Continue with `pagination.next_cursor` until
+`pagination.complete=true`. Cursors bind the selected wallet, active tip,
+wallet generation, and classified inventory; a stale cursor requires a new
+first page. The existing unpaginated verbose form remains supported.
+
+An explicit exact-plan commit stores a read-only authorization receipt with
+the plan, tip, wallet generation, origin, and exact witness transaction
+identity. The latest receipt remains visible after relay revocation; only a
+new successful authorization replaces it. Older records without a valid
+receipt report it as unavailable without changing their existing authority.
+Core, RPC, and the GUI display the same receipt.
+
+Recovery accounting uses a wallet-indexed snapshot. When `usage_available`
+is false, numeric defaults are not a complete accounting result and cannot
+authorize automatic spending. Non-preview recovery actions and refusals emit
+stable wallet-scoped `pow_claim_recovery_audit v=1` events identifying the
+origin, plan, anchor/component, typed status and reason, fee, and an existing
+transaction identity when applicable. These events contain no raw transaction,
+script, address, or key material; a refusal does not imply that a transaction
+was created.
+
 ## Runtime wallet-load lifecycle
 
 A wallet loaded or created at runtime remains absent from wallet RPC routing,

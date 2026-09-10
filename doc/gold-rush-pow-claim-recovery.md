@@ -327,6 +327,44 @@ Revocation likewise refuses malformed, foreign, legacy, missing,
 unreserved, or database-ambiguous records instead of describing them as
 locally cancelled.
 
+## Complete recovery history and authorization receipts
+
+Dedicated recovery status does not depend on the general transaction-history
+page limit. The existing `getpowclaimrecoveryinfo true` response remains
+available. For bounded responses, supply an options object:
+
+```sh
+blackcoin-cli -rpcwallet=example getpowclaimrecoveryinfo true '{"page_size":100}'
+blackcoin-cli -rpcwallet=example getpowclaimrecoveryinfo true '{"page_size":100,"cursor":"TOKEN_FROM_PREVIOUS_PAGE"}'
+```
+
+`page_size` accepts 1 through 1000. A component header, each node, and each
+transaction-list membership count as separate flat records, so one large
+component cannot bypass the requested record bound. Read `pagination.next_cursor`
+until `pagination.complete` is true. Cursors are opaque and bind the wallet,
+active tip, wallet generation, and deterministic classified inventory. Restart
+at the first page after a stale-cursor error; never combine pages from different
+snapshots. Pagination is read-only and grants no recovery authority.
+
+Managed nodes expose `authorization_receipt` when a valid exact-plan receipt
+is available. It identifies the latest successful explicit authorization's
+plan, tip/height, wallet generation, and origin. Core binds that receipt to the
+exact witness transaction identity. Revoking local relay leaves the receipt
+visible as historical evidence, not current permission. A later successful
+exact-plan authorization replaces it. Missing or malformed older receipt data
+is reported as null and does not reinterpret the record's existing relay
+authority. The GUI uses the same Core receipt in recovery-review details.
+
+Check `usage_available` before interpreting recovery-accounting numbers;
+`getpowmininginfo` exposes the corresponding `recovery_usage_available` flag.
+An unavailable snapshot is not zero usage and cannot authorize automatic
+spending. Non-preview recovery actions and refusals emit stable wallet-scoped
+`pow_claim_recovery_audit v=1` events with typed status/reason, plan and snapshot
+identity, anchor/component, origin, fee, and an existing transaction identity
+when applicable. Read-only preview and successful empty no-op requests do not
+emit action events. No raw transaction, script, address, or key material is
+included.
+
 ## Optional automatic recovery
 
 Automatic recovery is wallet-scoped and off by default. An unset policy or

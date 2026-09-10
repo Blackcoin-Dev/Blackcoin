@@ -99,6 +99,10 @@ claim-family generations are checked again before signing and publication.
 Snapshot drift requires fresh selection; capacity exhaustion never authorizes
 a partially enumerated candidate set. A stale deterministic candidate is
 retired from the warm index so a later invocation can select another safe coin.
+If a built-in worker loses its selected new-anchor input after selection, the
+whole worker group retains that tip's reservation. Unlocking the coin on the
+same tip does not permit an early retry; selection resumes on the next tip.
+Retained families continue to use their independent, family-local retry scope.
 
 Reserve details are refreshed on the GUI wallet worker and cached against the
 chain tip and wallet generations. Lightweight status polling does not wait for

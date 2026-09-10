@@ -5,12 +5,15 @@
 """Build exact, provenance-checked binaries for mixed-version tests."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -24,6 +27,9 @@ SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SEMANTIC_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+\-]*$")
+CHECKPOINT_NAME = ".mixed-version-build-checkpoint.json"
+BUILD_LOCK_NAME = ".mixed-version-build.lock"
+BUILD_PHASES = ("clone", "identity", "depends", "autogen", "configure", "compile", "install")
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+\-]*$")
 PROVENANCE_CONTRACT = "blackcoin-mixed-version-binaries-v2"
 COMPLETE_SELECTION_CONTRACT = "complete-manifest-v1"
@@ -809,6 +815,259 @@ def download_exact_release(source, *, output_dir, build_root, host):
     }
 
 
+def tree_sha256(root, *, exclude=()):
+    """Seal file contents, modes, names and internal links, never following links."""
+    root = root.resolve()
+    digest = hashlib.sha256()
+
+    def inaccessible(error):
+        raise error
+
+    for directory, directories, files in os.walk(root, followlinks=False, onerror=inaccessible):
+        directories.sort()
+        files.sort()
+        for name in sorted(directories + files):
+            path = Path(directory) / name
+            relative = path.relative_to(root).as_posix()
+            if relative in exclude:
+                continue
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                if not path.resolve().is_relative_to(root):
+                    raise RuntimeError(f"retained tree has escaping symlink: {relative}")
+                value = [relative, "link", os.readlink(path)]
+            elif stat.S_ISREG(info.st_mode):
+                value = [relative, "file", stat.S_IMODE(info.st_mode), file_sha256(path)]
+            elif stat.S_ISDIR(info.st_mode):
+                value = [relative, "directory", stat.S_IMODE(info.st_mode)]
+            else:
+                raise RuntimeError(f"retained tree has unsupported file: {relative}")
+            digest.update(json.dumps(value, separators=(",", ":")).encode() + b"\n")
+    return digest.hexdigest()
+
+
+def retained_build_environment():
+    # Do not let undeclared shell variables alter a resumed build. Values are
+    # hashed in the checkpoint, not written there (proxies may contain secrets).
+    allowed = {
+        "PATH", "HOME", "TMPDIR", "SYSTEMROOT", "DEVELOPER_DIR", "SDKROOT",
+        "MACOSX_DEPLOYMENT_TARGET", "CC", "CXX", "AR", "RANLIB", "NM", "LD",
+        "STRIP", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "LIBS",
+        "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIBRARY_PATH",
+        "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        "SOURCE_DATE_EPOCH", "AUTOCONF", "AUTOMAKE", "ACLOCAL", "LIBTOOLIZE",
+    }
+    environment = {key: value for key, value in os.environ.items() if key in allowed}
+    environment.update({"LC_ALL": "C", "LANG": "C", "TZ": "UTC"})
+    return environment
+
+
+def retained_build_inputs(source, *, manifest_digest, build_root, output_dir,
+                          host, environment):
+    tools = {}
+    fingerprints = {}
+
+    def fingerprint(executable):
+        path = Path(executable).resolve()
+        if path.is_relative_to(build_root) or path.is_relative_to(output_dir):
+            raise RuntimeError("build tools must not come from the retained workspace/output")
+        if path not in fingerprints:
+            version = subprocess.run([str(path), "--version"], env=environment,
+                                     text=True, capture_output=True, timeout=30, check=False)
+            fingerprints[path] = [str(path), file_sha256(path), version.returncode,
+                                  (version.stdout + version.stderr)[:8192]]
+        return fingerprints[path]
+
+    commands = {name: name for name in ("sh", "make", "git", "cc", "c++", "clang", "clang++", "ar",
+                 "ranlib", "ld", "nm", "strip", "autoconf", "automake", "autoreconf",
+                 "aclocal", "glibtoolize", "libtoolize", "cmake", "pkg-config",
+                 "python3", "perl", "m4", "bison", "patch", "tar", "xcrun")}
+    for name in ("CC", "CXX", "AR", "RANLIB", "NM", "LD", "STRIP", "AUTOCONF",
+                 "AUTOMAKE", "ACLOCAL", "LIBTOOLIZE"):
+        if environment.get(name):
+            commands[name] = shlex.split(environment[name])[0]
+    for name, command in commands.items():
+        found = shutil.which(command, path=environment.get("PATH"))
+        if found:
+            tools[name] = fingerprint(found)
+    sdk = None
+    if "xcrun" in tools:
+        xcrun = tools["xcrun"][0]
+        sdk_path = Path(run([xcrun, "--show-sdk-path"], capture=True, env=environment).strip()).resolve()
+        sdk = {"path": str(sdk_path)}
+        for name in ("SDKSettings.json", "SDKSettings.plist"):
+            if (sdk_path / name).is_file():
+                sdk[name] = file_sha256(sdk_path / name)
+        for name in ("clang", "clang++", "ld", "ar", "ranlib"):
+            path = Path(run([xcrun, "--find", name], capture=True, env=environment).strip()).resolve()
+            tools["xcrun:" + name] = fingerprint(path)
+    return {
+        "source": source, "manifest_sha256": manifest_digest,
+        "builder_sha256": file_sha256(Path(__file__)), "host": host,
+        "build_root": str(build_root), "output_dir": str(output_dir),
+        "tools": tools, "sdk": sdk,
+        "environment_sha256": hashlib.sha256(json.dumps(
+            environment, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+    }
+
+
+@contextmanager
+def retained_build_lock(build_root):
+    # The checkpoint must never seal another active builder's partial writes.
+    import fcntl
+
+    build_root.mkdir(parents=True, exist_ok=True)
+    path = build_root / BUILD_LOCK_NAME
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "r+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("retained build workspace is already in use") from error
+        yield
+
+
+def read_build_checkpoint(build_root, expected_digest):
+    path = build_root / CHECKPOINT_NAME
+    if not SHA256_RE.fullmatch(expected_digest) or path.is_symlink() or not path.is_file():
+        raise RuntimeError("resume requires the checkpoint digest printed by the prior trusted run")
+    if file_sha256(path) != expected_digest:
+        raise RuntimeError("retained build checkpoint digest mismatch")
+    try:
+        document = json.loads(path.read_text(encoding="utf8"))
+    except (ValueError, OSError) as error:
+        raise RuntimeError("invalid retained build checkpoint") from error
+    if (not isinstance(document, dict) or document.get("schema") != 1
+            or document.get("contract") != "retained-source-build-v1"
+            or type(document.get("next_phase")) is not int
+            or not 0 <= document["next_phase"] <= len(BUILD_PHASES)):
+        raise RuntimeError("unsupported retained build checkpoint")
+    if tree_sha256(build_root, exclude=(CHECKPOINT_NAME, BUILD_LOCK_NAME)) != document.get("workspace_sha256"):
+        raise RuntimeError("retained workspace contents changed since the trusted checkpoint")
+    return document
+
+
+def write_build_checkpoint(build_root, inputs, next_phase):
+    document = {
+        "schema": 1, "contract": "retained-source-build-v1", "inputs": inputs,
+        "next_phase": next_phase,
+        "workspace_sha256": tree_sha256(build_root, exclude=(CHECKPOINT_NAME, BUILD_LOCK_NAME)),
+    }
+    path = build_root / CHECKPOINT_NAME
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf8", dir=build_root,
+                                     delete=False, prefix=".checkpoint-") as temporary:
+        temporary_path = Path(temporary.name)
+        json.dump(document, temporary, indent=2, sort_keys=True)
+        temporary.write("\n")
+        temporary.flush()
+        os.fsync(temporary.fileno())
+    temporary_path.replace(path)
+    digest = file_sha256(path)
+    print(f"Retained build checkpoint SHA256: {digest}", flush=True)
+    print("Resume only with this digest from this trusted run; do not derive it from retained files.", flush=True)
+    return digest
+
+
+def build_source_retained(source, *, build_root, output_dir, host, jobs,
+                          inputs, environment, checkpoint=None):
+    """Resume authenticated compilation state, never adjacent binary provenance."""
+    next_phase = checkpoint["next_phase"] if checkpoint else 0
+    source_dir = safe_child(build_root, source["install_dir"])
+    staging = build_root / ".output-staging"
+    if checkpoint:
+        if checkpoint["inputs"] != inputs:
+            raise RuntimeError("retained build inputs/toolchain changed; workspace preserved")
+        if next_phase:
+            verify_source_checkout(source_dir, source["commit"], require_untracked_clean=False)
+    # A hard interruption cannot leave an old valid seal beside a now-active
+    # partial build. Only a normally returned failed phase creates a new seal.
+    (build_root / CHECKPOINT_NAME).unlink(missing_ok=True)
+    build_environment = dict(environment)
+    if source["identity_contract"] == CLEAN_SOURCE_COMMIT_CONTRACT:
+        build_environment["BITCOIN_GENBUILD_FROZEN_SOURCE_COMMIT"] = source["commit"]
+
+    def identity():
+        verify_source_checkout(source_dir, source["commit"], require_untracked_clean=True)
+        if source_version(source_dir) != source["version"]:
+            raise RuntimeError("source version differs from pinned manifest")
+        if source["identity_contract"] == CLEAN_SOURCE_COMMIT_CONTRACT:
+            header = source_dir / "src" / "obj" / "build.h"
+            header.parent.mkdir(parents=True, exist_ok=True)
+            initial_environment = dict(environment)
+            run([source_dir / "share" / "genbuild.sh", header, source_dir], env=initial_environment)
+            expected = (f'#define BUILD_SOURCE_COMMIT "{source["commit"]}"\n'
+                        '#define BUILD_SOURCE_DIRTY 0\n')
+            if not header.read_text(encoding="utf8").startswith(expected):
+                raise RuntimeError("generated build header does not bind the exact clean source")
+
+    def compile_binaries():
+        # Only the two copied historical executables need fresh links. Preserve
+        # successful objects and libraries, including after a failed make.
+        for name in (source["source_daemon"], source["source_cli"]):
+            (source_dir / "src" / name).unlink(missing_ok=True)
+        run(["make", f"-j{jobs}", "-C", "src", source["source_daemon"], source["source_cli"]],
+            cwd=source_dir, env=build_environment)
+
+    phases = (
+        lambda: clone_exact_source(source, source_dir),
+        identity,
+        lambda: run(["make", f"-j{jobs}", "-C", "depends", f"HOST={host}",
+                     "NO_QT=1", "NO_UPNP=1", "NO_NATPMP=1"], cwd=source_dir, env=build_environment),
+        lambda: run(["./autogen.sh"], cwd=source_dir, env=build_environment),
+        lambda: run(["./configure", f"--prefix={source_dir / 'depends' / host}", "--with-gui=no",
+                     "--disable-tests", "--disable-bench", "--disable-zmq"], cwd=source_dir, env=build_environment),
+        compile_binaries,
+    )
+    try:
+        # Even a failure during installation/identity checking requires freshly
+        # linked executables on retry, never acceptance of the staged binaries.
+        next_phase = min(next_phase, BUILD_PHASES.index("compile"))
+        for index, phase in enumerate(phases):
+            if index >= next_phase:
+                print(f"Historical source build phase: {BUILD_PHASES[index]}", flush=True)
+                phase()
+                next_phase = index + 1
+        verify_source_checkout(source_dir, source["commit"], require_untracked_clean=False)
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir()
+        item = install_built_source(source, source_dir=source_dir, build_root=build_root,
+                                    output_dir=staging, host=host)
+        next_phase = len(BUILD_PHASES)
+        return item, staging
+    except Exception:
+        # No final output/provenance is published by a failed phase. All
+        # successful compilation state remains authenticated by this seal.
+        write_build_checkpoint(build_root, inputs, next_phase)
+        raise
+
+
+def install_built_source(source, *, source_dir, build_root, output_dir, host):
+    destination = safe_child(output_dir, source["install_dir"], "bin")
+    destination.mkdir(parents=True, exist_ok=True)
+    hashes = {}
+    reported_versions = {}
+    source_names = {
+        "blackcoind": source["source_daemon"],
+        "blackcoin-cli": source["source_cli"],
+    }
+    for binary in BINARIES:
+        built_binary = source_dir / "src" / source_names[binary]
+        if built_binary.is_symlink() or not built_binary.is_file():
+            raise RuntimeError(f"missing or symbolic build output {built_binary}")
+        installed_binary = destination / binary
+        shutil.copy2(built_binary, installed_binary)
+        installed_binary.chmod(0o755)
+        hashes[binary] = file_sha256(installed_binary)
+        reported_versions[binary] = verified_binary_version(installed_binary, source, scratch_root=build_root)
+    return {
+        **provenance_source_metadata(source), "host": host, "origin": "source-build",
+        "identity_verified": True, "source_checkout_clean": True,
+        "binaries": hashes, "reported_versions": reported_versions,
+    }
+
+
 def build_source(source, *, build_root, output_dir, host, jobs):
     source_dir = safe_child(build_root, source["install_dir"])
     clone_exact_source(source, source_dir)
@@ -834,33 +1093,16 @@ def build_source(source, *, build_root, output_dir, host, jobs):
     run(["make", f"-j{jobs}"], cwd=source_dir, env=build_environment)
     verify_source_checkout(source_dir, source["commit"], require_untracked_clean=False)
 
-    destination = safe_child(output_dir, source["install_dir"], "bin")
-    destination.mkdir(parents=True, exist_ok=True)
-    hashes = {}
-    reported_versions = {}
-    source_names = {
-        "blackcoind": source["source_daemon"],
-        "blackcoin-cli": source["source_cli"],
-    }
-    for binary in BINARIES:
-        built_binary = source_dir / "src" / source_names[binary]
-        if not built_binary.is_file():
-            raise RuntimeError(f"missing {built_binary}")
-        installed_binary = destination / binary
-        shutil.copy2(built_binary, installed_binary)
-        installed_binary.chmod(0o755)
-        hashes[binary] = file_sha256(installed_binary)
-        reported_versions[binary] = verified_binary_version(
-            installed_binary, source, scratch_root=build_root
-        )
+    return install_built_source(source, source_dir=source_dir, build_root=build_root,
+                                output_dir=output_dir, host=host)
+
+
+def build_provenance(*, host, manifest_digest, selection_contract, requested_versions, built):
     return {
-        **provenance_source_metadata(source),
-        "host": host,
-        "origin": "source-build",
-        "identity_verified": True,
-        "source_checkout_clean": True,
-        "binaries": hashes,
-        "reported_versions": reported_versions,
+        "schema": 1, "contract": PROVENANCE_CONTRACT, "host": host,
+        "manifest_sha256": manifest_digest, "selection_contract": selection_contract,
+        "requested_versions": requested_versions,
+        "built_versions": [item["version"] for item in built], "sources": built,
     }
 
 
@@ -875,6 +1117,10 @@ def main():
     parser.add_argument("--build-root", type=Path, required=True)
     parser.add_argument("--host", default="x86_64-pc-linux-gnu")
     parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
+    parser.add_argument("--preserve-build", action="store_true",
+                        help="Keep one exact source build on failure; print a sealed resume digest")
+    parser.add_argument("--resume-build", metavar="CHECKPOINT_SHA256",
+                        help="Resume only the workspace sealed by this digest from a prior trusted run")
     parser.add_argument(
         "--version",
         dest="requested_versions",
@@ -921,6 +1167,46 @@ def main():
     except ValueError as error:
         parser.error(str(error))
 
+    if args.preserve_build or args.resume_build:
+        if len(selected_sources) != 1:
+            parser.error("preserve/resume requires exactly one selected source version")
+        if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
+            parser.error("preserved builds require an absent or empty output directory")
+        with retained_build_lock(build_root):
+            if not args.resume_build and any(
+                path.name != BUILD_LOCK_NAME for path in build_root.iterdir()
+            ):
+                parser.error("nonempty build workspace requires its prior trusted --resume-build digest")
+            checkpoint = read_build_checkpoint(build_root, args.resume_build) if args.resume_build else None
+            environment = retained_build_environment()
+            inputs = retained_build_inputs(
+                selected_sources[0], manifest_digest=manifest_digest, build_root=build_root,
+                output_dir=output_dir, host=args.host, environment=environment)
+            if checkpoint and checkpoint.get("inputs") != inputs:
+                raise RuntimeError("retained build inputs/toolchain changed; workspace preserved")
+            remote_objects(selected_sources[0])
+            item, staging = build_source_retained(
+                selected_sources[0], build_root=build_root, output_dir=output_dir,
+                host=args.host, jobs=args.jobs, inputs=inputs, environment=environment,
+                checkpoint=checkpoint)
+            provenance = build_provenance(
+                host=args.host, manifest_digest=manifest_digest, selection_contract=selection_contract,
+                requested_versions=requested_versions, built=[item])
+            try:
+                (staging / "provenance.json").write_text(
+                    json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf8")
+                output_dir.parent.mkdir(parents=True, exist_ok=True)
+                if output_dir.exists():
+                    output_dir.rmdir()  # Only the explicitly checked empty destination.
+                staging.replace(output_dir)
+            except Exception:
+                write_build_checkpoint(build_root, inputs, len(BUILD_PHASES))
+                raise
+            (build_root / CHECKPOINT_NAME).unlink(missing_ok=True)
+        print(json.dumps(provenance, indent=2, sort_keys=True))
+        print(f"Preserved source build workspace: {build_root}")
+        return 0
+
     for source in selected_sources:
         remote_objects(source)
 
@@ -960,16 +1246,9 @@ def main():
     finally:
         shutil.rmtree(build_root, ignore_errors=True)
 
-    provenance = {
-        "schema": 1,
-        "contract": PROVENANCE_CONTRACT,
-        "host": args.host,
-        "manifest_sha256": manifest_digest,
-        "selection_contract": selection_contract,
-        "requested_versions": requested_versions,
-        "built_versions": [item["version"] for item in built],
-        "sources": built,
-    }
+    provenance = build_provenance(
+        host=args.host, manifest_digest=manifest_digest, selection_contract=selection_contract,
+        requested_versions=requested_versions, built=built)
     (output_dir / "provenance.json").write_text(
         json.dumps(provenance, indent=2, sort_keys=True) + "\n",
         encoding="utf8",

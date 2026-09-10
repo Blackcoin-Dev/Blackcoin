@@ -1,0 +1,93 @@
+{
+  "schema": 2,
+  "classification": "V30_1_5_CANDIDATE_CANARY_ONLY",
+  "version": "30.1.5",
+  "authorization": {
+    "state": "blocked_pending_final_signed_source_and_green_ci",
+    "dispatch_enabled": false,
+    "temporary_source_pin": true,
+    "core_ci_run_id": null,
+    "core_ci_run_attempt": null,
+    "thread_sanitizer_artifact": null
+  },
+  "source": {
+    "repository": "Blackcoin-Dev/Blackcoin",
+    "commit": "a0695f22740e111d0487a194fb46f1bae05952c5",
+    "tree": "86df040ae5eb8e819e940dd08364bcc177a72195",
+    "immutable_release_ancestor": "13262151077cce3f72d07d17dc7725b2b6a8e1ab",
+    "actor": "Blackcoin-Dev",
+    "signer": "Blackcoin-Dev",
+    "signing_fingerprint": "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70",
+    "configured_version": "30.1.5",
+    "release_candidate": 0,
+    "is_release": true
+  },
+  "core_ci": {
+    "authority_state": "pending_final_pin",
+    "event": "pull_request",
+    "pull_request_number": 49,
+    "head_sha": "a0695f22740e111d0487a194fb46f1bae05952c5",
+    "head_tree": "86df040ae5eb8e819e940dd08364bcc177a72195",
+    "merge_commit_sha": null,
+    "base_sha": "19baffef25af36e177db2975780e0641b59753aa",
+    "base_tree": "f897d758aee1849f02126f0ee3b7a4be9bd3be8c",
+    "repository": "Blackcoin-Dev/Blackcoin",
+    "head_repository": "Blackcoin-Dev/Blackcoin",
+    "workflow_path": ".github/workflows/pr-gate.yml",
+    "workflow_name": "pull-request safety gate",
+    "base_workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869",
+    "source_workflow_blob_sha256": "24c14f2fe4bd7b25de38e71a80bf05efcec00d2b3009c3efd4ad20b90bbda869",
+    "required_checks_app_id": 15368,
+    "required_checks": [
+      "source identity, workflow syntax, and lint",
+      "pinned independent quantum crypto provenance",
+      "pinned native build and unit tests",
+      "measured worst-case quantum crypto resources (Linux x86_64)",
+      "Linux ARM64 native cryptographic vectors and resources",
+      "Linux ARM64 native UBSan block-harness gate",
+      "Build pinned Windows x86_64 vector binaries",
+      "Windows x86_64 native cryptographic vectors and resources",
+      "macOS Intel native cryptographic vectors",
+      "macOS Apple Silicon native cryptographic vectors",
+      "critical Gold Rush, lifecycle, wallet, and recovery tests",
+      "real v26.2, v28.4, v30.1, and candidate interoperability",
+      "complete extended functional suite",
+      "address-undefined-sanitizer consensus and liveness gate",
+      "thread-sanitizer consensus and liveness gate",
+      "source-pinned sanitizer regression smoke"
+    ]
+  },
+  "base_image": {
+    "role": "immutable-v30.1.4-rootfs-and-rollback-only",
+    "repository": "qqblackcoin/blackcoin-v4-gui",
+    "reference": "qqblackcoin/blackcoin-v4-gui@sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2",
+    "manifest_digest": "sha256:7a384dd5f12c15fb41b36868d946007524bebf97650883d533635658641e04a2",
+    "config_digest": "sha256:620146d14a57fe0d5d1fc29a7d913d47787ba924c96ba06eeb1ddbe8efb73909"
+  },
+  "image": {
+    "repository": "qqblackcoin/blackcoin-v4-gui",
+    "tag_template": "30.1.5-candidate-{source12}-ci1",
+    "archive_template": "blackcoin-v4-gui-30.1.5-candidate-{source12}.oci.tar",
+    "os": "linux",
+    "architecture": "amd64",
+    "user": "blackcoin",
+    "entrypoint": [
+      "/home/blackcoin/start-gui.sh"
+    ],
+    "cmd": null,
+    "working_dir": "/home/blackcoin",
+    "healthcheck": null
+  },
+  "artifacts": {
+    "prefix_template": "Blackcoin-30.1.5-candidate-{source12}",
+    "github_artifact_template": "v30.1.5-candidate-linux-x86_64-{source40}-attempt-{attempt}"
+  },
+  "binaries": [
+    "blackcoin-cli",
+    "blackcoin-qt",
+    "blackcoin-tx",
+    "blackcoin-util",
+    "blackcoin-wallet",
+    "blackcoind"
+  ]
+}

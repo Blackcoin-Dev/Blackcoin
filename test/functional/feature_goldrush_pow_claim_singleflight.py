@@ -195,6 +195,38 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(self._claim_txids(wallet), {txid})
         assert not self._is_abandoned(wallet, txid)
         assert node.gettxout(anchor["txid"], anchor["vout"], False)
+        independent_inputs = [
+            {"txid": coin["txid"], "vout": coin["vout"]}
+            for coin in wallet.listunspent(1, 9999999, [address])
+            if (coin["txid"], coin["vout"]) != (anchor["txid"], anchor["vout"])
+        ]
+        assert independent_inputs
+        assert_equal(wallet.lockunspent(False, independent_inputs), True)
+        try:
+            wallet.setpowmining(True, 1, 100)
+            self.wait_until(
+                lambda: wallet.getpowmininginfo()["state"] == "no_spendable_legacy_fee_utxo",
+                timeout=20,
+            )
+            self._wait_for_broadcast_disabled_family_rebound(
+                wallet, funding_address, anchor, {txid},
+                wallet.getpowmininginfo()["claims_submitted"],
+            )
+        finally:
+            wallet.setpowmining(False)
+            assert_equal(wallet.lockunspent(True, independent_inputs), True)
+        claims_before_fallback = self._claim_txids(wallet)
+        fallback = wallet.sendshadowpowclaim(address, payout, 500_000)
+        assert_equal(fallback["outcome"], "created_new_claim")
+        assert_equal(fallback["relayed_existing"], False)
+        assert_equal(fallback["created_new_claim"], True)
+        fallback_txid = fallback["txid"]
+        assert fallback_txid not in claims_before_fallback
+        assert_equal(self._claim_txids(wallet), claims_before_fallback | {fallback_txid})
+        assert self._claim_input(fallback_txid, wallet) != anchor
+        assert txid not in node.getrawmempool()
+        assert fallback_txid not in node.getrawmempool()
+        assert node.gettxout(anchor["txid"], anchor["vout"], False)
 
     def _load_wallet(self, name):
         node = self.nodes[0]
@@ -351,6 +383,67 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             timeout=timeout,
         )
         return sorted(self._quarantined_claim_txids(wallet) - before)[0]
+
+    def _wait_for_broadcast_disabled_family_rebound(
+        self, wallet, funding_address, anchor, claims_before, submitted_before
+    ):
+        """Rebind one retained family with its independent fee coins held."""
+        node = self.nodes[0]
+        previous_tip = node.getbestblockhash()
+        historical_bytes = [
+            wallet.gettransaction(txid)["hex"] for txid in sorted(claims_before)
+        ]
+        quantum_inventory = wallet.getquantumkeyinventory()
+        # QQP2 can revalidate on descendants. Every eligible historical member
+        # must lose eligibility before the worker may sign another sibling;
+        # one arbitrarily chosen next tip is not evidence of that transition.
+        for _ in range(32):
+            self.generateblock(node, output=funding_address, transactions=[])
+            node.syncwithvalidationinterfacequeue()
+            eligibility = [
+                node.testmempoolaccept([raw])[0] for raw in historical_bytes
+            ]
+            if all(
+                not result["allowed"]
+                and result.get("reject-reason") == "shadow-proof-invalid"
+                for result in eligibility
+            ):
+                break
+            assert_equal(self._claim_txids(wallet), claims_before)
+        else:
+            raise AssertionError(
+                "retained QQP2 family remained eligible across 32 descendant tips"
+            )
+        advanced_tip = node.getbestblockhash()
+        assert advanced_tip != previous_tip
+
+        def family_is_rebound_and_deferred():
+            info = wallet.getpowmininginfo()
+            return (
+                len(self._claim_txids(wallet) - claims_before) == 1
+                and info["claim_inventory_tip"] == advanced_tip
+                and info["claim_inventory_wallet_tip_matches"]
+                and info["mining_gate_coherent"]
+                and not info["mining_gate_database_ambiguous"]
+                and info["mining_gate_unsafe_claims"] == 0
+                and info["mining_gate_unsafe_components"] == 0
+                and info["mining_gate_action"] == "create_new_anchor"
+                and info["state"] == "no_spendable_legacy_fee_utxo"
+            )
+
+        self.wait_until(family_is_rebound_and_deferred, timeout=180)
+        info = wallet.getpowmininginfo()
+        assert_equal(info["claims_submitted"], submitted_before)
+        assert_equal(info["mining_gate_relay_txid"], ZERO_HASH)
+        assert_equal(info["mining_gate_lineage_head_txid"], ZERO_HASH)
+        assert_equal(info["mining_gate_reserved_family_anchors"], [anchor])
+        assert_equal(wallet.getquantumkeyinventory(), quantum_inventory)
+        pending_claims = self._claim_txids(wallet) - claims_before
+        assert_equal(len(pending_claims), 1)
+        txid = next(iter(pending_claims))
+        assert txid not in node.getrawmempool()
+        assert_equal(self._claim_input(txid, wallet), anchor)
+        return advanced_tip, txid
 
     def _wait_for_claims_to_become_current_branch_ineligible(
         self, claims, funding_address, max_blocks=32
@@ -3077,54 +3170,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             claims_at_wait = self._claim_txids(boundary)
             submitted_at_wait = wait_info["claims_submitted"]
 
-            # Advance the tip while the worker remains enabled. A still-visible
-            # wait_for_next_tip must be a newly coherent snapshot on the new
-            # tip; the cached old-tip wait is not allowed to survive.
-            with node.wait_for_debug_log(
-                [
-                    b"retained a claim after relay failure",
-                    b"persisted without relay",
-                ],
-                timeout=180,
-            ):
-                self.generateblock(
-                    node, output=funding_address, transactions=[]
+            advanced_tip, refreshed_claim_txid = (
+                self._wait_for_broadcast_disabled_family_rebound(
+                    boundary, funding_address, boundary_claim_input,
+                    claims_at_wait, submitted_at_wait,
                 )
-                node.syncwithvalidationinterfacequeue()
-            advanced_tip = node.getbestblockhash()
-            assert advanced_tip != waiting_tip
-
-            def next_tip_family_is_rebound():
-                info = boundary.getpowmininginfo()
-                new_claims = self._claim_txids(boundary) - claims_at_wait
-                return (
-                    len(new_claims) == 1
-                    and info["claim_inventory_tip"] == advanced_tip
-                    and info["claim_inventory_wallet_tip_matches"]
-                    and info["mining_gate_coherent"]
-                    and not info["mining_gate_database_ambiguous"]
-                    and info["mining_gate_unsafe_claims"] == 0
-                    and info["mining_gate_unsafe_components"] == 0
-                    and info["mining_gate_action"]
-                    in {"relay_existing", "wait_for_next_tip"}
-                    and info["mining_gate_lineage_head_txid"] in new_claims
-                )
-
-            self.wait_until(next_tip_family_is_rebound, timeout=180)
-            advanced_wait = boundary.getpowmininginfo()
-            assert_equal(advanced_wait["claim_inventory_tip"], advanced_tip)
-            assert advanced_wait["state"] != "claim_quarantined"
-            assert advanced_wait["mining_gate_action"] in {
-                "relay_existing",
-                "wait_for_next_tip",
-            }
-            assert_equal(
-                advanced_wait["claims_submitted"], submitted_at_wait
             )
-            pending_claims = self._claim_txids(boundary) - claims_at_wait
-            assert_equal(len(pending_claims), 1)
-            refreshed_claim_txid = advanced_wait["mining_gate_lineage_head_txid"]
-            assert_equal(pending_claims, {refreshed_claim_txid})
             assert refreshed_claim_txid not in node.getrawmempool()
             refreshed_raw = boundary.gettransaction(refreshed_claim_txid)["hex"]
             advanced_decoded = node.decoderawtransaction(refreshed_raw)
@@ -3178,14 +3229,20 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         finally:
             boundary.setpowmining(False)
 
-        # Disabling removes the worker's transient same-tip attempt. The newly
-        # persisted family head remains the only exact relay candidate; it is
-        # never replaced by unrelated bytes while the worker is stopped.
+        # Stopping clears the worker reservation, not the shared snapshot's
+        # family deferral. A deferred aggregate has no selected-head payload;
+        # the exact persisted head is established by the wallet records above.
         stopped_wait = boundary.getpowmininginfo()
-        assert_equal(stopped_wait["mining_gate_action"], "relay_existing")
+        assert stopped_wait["mining_gate_action"] in {
+            "relay_existing", "create_new_anchor"
+        }
         assert_equal(
-            stopped_wait["mining_gate_relay_txid"], refreshed_claim_txid
+            stopped_wait["mining_gate_relay_txid"],
+            refreshed_claim_txid
+            if stopped_wait["mining_gate_action"] == "relay_existing"
+            else ZERO_HASH,
         )
+        assert_equal(self._claim_txids(boundary), claims_before_restart_mining)
         assert_equal(
             stopped_wait["mining_gate_reserved_family_anchors"],
             [boundary_claim_input],
@@ -3785,19 +3842,8 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(node.getrawtransaction(cross_head_txid), cross_head_raw)
         self._advance_past_mempool_entry_time(node, cross_head_txid)
-        default_wallet.sendtoaddress(funding_address, Decimal("0.10000000"))
-        node.syncwithvalidationinterfacequeue()
-        self.wait_until(
-            lambda: cross_head_txid not in node.getrawmempool(), timeout=20
-        )
-        deferred_cross = cross_boundary.getpowmininginfo()
-        assert_equal(deferred_cross["mining_gate_action"], "relay_existing")
-        assert_equal(
-            deferred_cross["mining_gate_reserved_family_anchors"],
-            [cross_anchor],
-        )
-        cross_claims_before_fallback = self._claim_txids(cross_boundary)
-
+        # Establish absence only after disabling automatic relay. Expiring
+        # under normal broadcasting races prompt exact-byte maintenance.
         self.restart_node(
             0,
             extra_args=[
@@ -3811,6 +3857,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.setmocktime(self.mock_time)
         cross_boundary = self._load_wallet(CROSS_BOUNDARY_WALLET)
         assert cross_head_txid not in node.getrawmempool()
+        deferred_cross = cross_boundary.getpowmininginfo()
+        assert_equal(deferred_cross["mining_gate_action"], "relay_existing")
+        assert_equal(
+            deferred_cross["mining_gate_reserved_family_anchors"],
+            [cross_anchor],
+        )
+        cross_claims_before_fallback = self._claim_txids(cross_boundary)
         assert_equal(
             cross_boundary.getpowmininginfo()["mining_gate_action"],
             "relay_existing",

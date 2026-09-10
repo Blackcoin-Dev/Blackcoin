@@ -27,7 +27,7 @@ from typing import Any, NoReturn, Sequence
 CONTRACT = "installed-v30.1.4-node30-free-claim-edge-one-shot/v2"
 RECEIPT_SCHEMA = 1
 DURABLE_RELATIVE = pathlib.Path("node30_free_claim_durable_requeue.py")
-DURABLE_SHA256 = "afb76f1d8a00d7af0778c934518765c6ba6bfacfa33174a85f1ee237d8a43cc5"
+DURABLE_SHA256 = "f692a9b5873bb9e182da468ee9c84b1d19aafe6544aaa90af9548c3f9bc845b0"
 TEST_TRANSPORT_SHA256S = {
     "a41bc2ee67eb00c6849a9cb2fad9f5c5eb7d476b85c0c540d7a330522cfa804a",
     "8775fbec4c4effdebf75e3569228514e67393ccfbbe178dcdc46d8aa53c4c983",

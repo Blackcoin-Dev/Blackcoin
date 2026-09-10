@@ -273,6 +273,11 @@ path replacement or modification during reads. The original one-shot and
 rejection tools remain byte-for-byte unchanged, so their historical receipts
 retain their original stricter ownership contract.
 
+Historical paid records in the done directory additionally permit exactly
+root:gid-100 mode 0640. This done-only reader exception does not permit that
+owner/group pair or mode for ingress queue entries. Paid-record owner, group,
+mode, bytes, and inode remain bound and revalidated through settlement.
+
 `node30_free_claim_edge_one_shot.py audit` requires the completed durable
 selection and exact selected queue inode. It performs the expensive static
 role, storage, wallet, input-set, payout, queue, and receipt validation even if

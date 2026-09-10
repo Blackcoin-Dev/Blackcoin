@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "kind": "node30-free-claim-done-only-historical-paid-owner-test",
+  "status": "PASS",
+  "tested_at": "2026-09-10T03:19:24Z",
+  "prior_tested_commit": "5d7da5e5fb0f610f90f1fd917b4496a75abb5b21",
+  "durable_tool_sha256": "f692a9b5873bb9e182da468ee9c84b1d19aafe6544aaa90af9548c3f9bc845b0",
+  "edge_tool_sha256": "645f386b3e5b43b2ac1dd14d9b3cf29d40eaee81395b600708d13e80095e19f2",
+  "test_driver_sha256": "bbbc0987a29b1c041b1ceae78c245446437bcd922786badb739858f8fc08d6dc",
+  "targeted_unit_tests": 13,
+  "test_result": "OK",
+  "historical_paid_done_owner": {"uid": 0, "gid": 100, "mode": "0640", "nlink": 1},
+  "done_exception_not_available_to_ingress": true,
+  "done_exception_requires_exact_mode": true,
+  "done_identity_binding_unchanged": true,
+  "financial_call_and_reconcile_code_unchanged": true,
+  "legacy_pinned_sources_unchanged": true,
+  "live_contact": false,
+  "wallet_mutation": false,
+  "network_contact": false
+}

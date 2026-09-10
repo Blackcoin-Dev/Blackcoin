@@ -54,6 +54,19 @@ class ProducerOwnership(unittest.TestCase):
             item, _ = durable.queue_file_snapshot(self.path, None, "operator queue")
             self.assertEqual((item["uid"], item["gid"]), (0, 0))
 
+    def test_historical_paid_done_record(self):
+        with self.owner(0, 100, mode=0o640):
+            _, st = durable.ingress_file(self.path, "historical paid done", {0o640}, done_entry=True)
+            self.assertEqual((st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)), (0, 100, 0o640))
+
+    def test_done_owner_exception_does_not_apply_to_ingress(self):
+        with self.owner(0, 100), self.assertRaises(durable.GateError):
+            durable.queue_file_snapshot(self.path, None, "queue cannot use done owner")
+
+    def test_done_owner_exception_requires_exact_mode(self):
+        with self.owner(0, 100), self.assertRaises(durable.GateError):
+            durable.ingress_file(self.path, "wrong done mode", {0o644}, done_entry=True)
+
     def test_wrong_api_group(self):
         with self.owner(99, 0), self.assertRaises(durable.GateError):
             durable.queue_file_snapshot(self.path, None, "wrong group")

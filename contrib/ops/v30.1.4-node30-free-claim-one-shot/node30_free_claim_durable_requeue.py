@@ -166,12 +166,16 @@ def ingress_identity(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def ingress_file(path: pathlib.Path, label: str,
-                 modes: set[int]) -> tuple[bytes, os.stat_result]:
+                 modes: set[int], *, done_entry: bool = False) -> tuple[bytes, os.stat_result]:
     """Bind either historical operator ownership or the exact API producer."""
     if not path.is_absolute() or path.parent.resolve(strict=True) != path.parent:
         die(f"{label} path is not canonical")
     before = path.lstat()
     owners = {(os.geteuid(), os.getegid())} if legacy.test_mode() else {(0, 0), (99, 100)}
+    # The historical paid ledger uses operator-owned group-readable records.
+    # This exception is confined to done-directory readers and exact mode 0640.
+    if done_entry and not legacy.test_mode() and stat.S_IMODE(before.st_mode) == 0o640:
+        owners.add((0, 100))
     if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or
             before.st_nlink != 1 or (before.st_uid, before.st_gid) not in owners or
             stat.S_IMODE(before.st_mode) not in modes or
@@ -246,7 +250,7 @@ def audit_queue(contract: Any) -> dict[str, Any]:
     preserved_done = []
     for entry in done_entries:
         data, st = ingress_file(
-            entry, f"done entry {entry.name}", {0o600, 0o640, 0o644})
+            entry, f"done entry {entry.name}", {0o600, 0o640, 0o644}, done_entry=True)
         if st.st_gid not in {contract.pool_group_gid, os.getegid()}:
             die(f"done entry {entry.name} has an unexpected group")
         preserved_done.append({"basename": entry.name, "sha256": hashlib.sha256(data).hexdigest(),
@@ -340,7 +344,7 @@ def validate_preserved_ingress(contract: Any, queue: dict[str, Any],
         queue_file_snapshot(actual_by_name[name], contract, "new unselected API arrival")
     for item in queue["preserved_done"]:
         path = contract.done_dir / item["basename"]
-        data, st = ingress_file(path, "preserved done item", {item["mode"]})
+        data, st = ingress_file(path, "preserved done item", {item["mode"]}, done_entry=True)
         current = {"basename": path.name, "sha256": hashlib.sha256(data).hexdigest(),
                    "device": st.st_dev, "inode": st.st_ino, "uid": st.st_uid,
                    "gid": st.st_gid, "mode": stat.S_IMODE(st.st_mode), "size": st.st_size}

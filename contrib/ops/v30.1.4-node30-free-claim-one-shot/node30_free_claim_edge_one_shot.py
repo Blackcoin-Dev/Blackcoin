@@ -24,10 +24,10 @@ import time
 from typing import Any, NoReturn, Sequence
 
 
-CONTRACT = "installed-v30.1.4-node30-free-claim-edge-one-shot/v1"
+CONTRACT = "installed-v30.1.4-node30-free-claim-edge-one-shot/v2"
 RECEIPT_SCHEMA = 1
 DURABLE_RELATIVE = pathlib.Path("node30_free_claim_durable_requeue.py")
-DURABLE_SHA256 = "a373139c1c265993b833a577871598cb855b2e812041797de14635aed59571a1"
+DURABLE_SHA256 = "afb76f1d8a00d7af0778c934518765c6ba6bfacfa33174a85f1ee237d8a43cc5"
 TEST_TRANSPORT_SHA256S = {
     "a41bc2ee67eb00c6849a9cb2fad9f5c5eb7d476b85c0c540d7a330522cfa804a",
     "8775fbec4c4effdebf75e3569228514e67393ccfbbe178dcdc46d8aa53c4c983",
@@ -155,6 +155,8 @@ def static_identity(snapshot: dict[str, Any]) -> dict[str, Any]:
             snapshot["role"]["wallet_inventory"], "edge wallet selection"),
         "queue_item": legacy.immutable_queue_item_identity(
             snapshot["queue"]["item"]),
+        "ingress_items": durable.ingress_identity(snapshot["queue"]["ingress_items"]),
+        "preserved_done": snapshot["queue"]["preserved_done"],
         "queue_directory": snapshot["queue"]["queue_directory"],
         "done_directory": snapshot["queue"]["done_directory"],
         "awarded_sha256": snapshot["queue"]["awarded"]["sha256"],
@@ -188,7 +190,12 @@ def audit_command(args: argparse.Namespace) -> None:
     with legacy.node30.mutation_locks(contract.retained) as lock_ids:
         pause_before = legacy.node30.free_claim_snapshot(contract.retained)
         exact_node, runtime_before = legacy.node30.pin_node(transport, node)
-        snapshot = legacy.stable_live_snapshot(transport, contract, exact_node)
+        snapshot = durable.stable_live_snapshot(transport, contract, exact_node)
+        if (legacy.immutable_queue_item_identity(snapshot["queue"]["item"]) !=
+                legacy.immutable_queue_item_identity(durable_audit["snapshot"]["queue"]["item"])):
+            die("edge selected queue differs from durable selection")
+        if durable_audit["snapshot"]["queue_strategy"] == "preserve_existing_queued_item":
+            durable.validate_preserved_ingress(contract, durable_audit["snapshot"]["queue"])
         if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
                 transport.runtime_snapshot(node) != runtime_before):
             die("node30 pause or runtime changed during edge audit")
@@ -349,11 +356,13 @@ def validate_durable_chain(audit: dict[str, Any]) -> None:
 
 def current_static_snapshot(contract: Any, audit: dict[str, Any],
                             immediate: dict[str, Any]) -> dict[str, Any]:
-    queue = legacy.audit_queue(contract)
+    queue = durable.audit_queue(contract)
     return {
         "wallet_selection": legacy.node30.wallet_inventory_identity(
             immediate["wallet_inventory"], "edge current wallet selection"),
         "queue_item": legacy.immutable_queue_item_identity(queue["item"]),
+        "ingress_items": durable.ingress_identity(queue["ingress_items"]),
+        "preserved_done": queue["preserved_done"],
         "queue_directory": queue["queue_directory"],
         "done_directory": queue["done_directory"],
         "awarded_sha256": queue["awarded"]["sha256"],
@@ -541,6 +550,8 @@ def validate_intent(receipt: Any, contract: Any, audit: dict[str, Any],
                 receipt["pre_call_resample"]["wallet_inventory"],
                 "edge intent wallet selection"),
             "queue_item": audit["static_identity"]["queue_item"],
+            "ingress_items": audit["static_identity"]["ingress_items"],
+            "preserved_done": audit["static_identity"]["preserved_done"],
             "queue_directory": audit["static_identity"]["queue_directory"],
             "done_directory": audit["static_identity"]["done_directory"],
             "awarded_sha256": audit["static_identity"]["awarded_sha256"],
@@ -608,7 +619,7 @@ def execute_command(args: argparse.Namespace) -> None:
     with legacy.node30.mutation_locks(contract.retained):
         pause_preflight = legacy.node30.free_claim_snapshot(contract.retained)
         exact_node, runtime_preflight = legacy.node30.pin_node(transport, node)
-        preflight = legacy.stable_live_snapshot(transport, contract, exact_node)
+        preflight = durable.stable_live_snapshot(transport, contract, exact_node)
         if sha256_json(static_identity(preflight)) != audit["static_identity_sha256"]:
             die("edge static identity changed before vacancy watch")
         if (legacy.node30.free_claim_snapshot(contract.retained) != pause_preflight or
@@ -653,7 +664,7 @@ def execute_command(args: argparse.Namespace) -> None:
                         legacy.FEE_RATE_ATOMS_PER_VBYTE)
                 except (legacy.node30.base.GateError, legacy.node30.GateError,
                         OSError, subprocess.TimeoutExpired) as exc:
-                    outcome = legacy.transition_queue(contract, audit, "uncertain")
+                    outcome = durable.transition_queue(contract, audit, "uncertain")
                     publish_unknown(run_dir, contract, intent_sha, str(exc), outcome)
                     raise GateError(
                         "edge response is unknown; authority consumed, never retry") from exc
@@ -672,7 +683,7 @@ def execute_command(args: argparse.Namespace) -> None:
                         transport, edge_node, response, intent)
                 except (legacy.node30.base.GateError, legacy.node30.GateError,
                         OSError, subprocess.TimeoutExpired) as exc:
-                    outcome = legacy.transition_queue(contract, audit, "uncertain")
+                    outcome = durable.transition_queue(contract, audit, "uncertain")
                     invalid = base_receipt(
                         "node30-free-claim-edge-invalid-response", contract)
                     invalid.update({
@@ -686,7 +697,7 @@ def execute_command(args: argparse.Namespace) -> None:
                         run_dir / "invalid-response.json", invalid)
                     raise GateError(
                         "edge RPC returned unprovable bytes; authority consumed") from exc
-                outcome = legacy.transition_queue(contract, audit, "broadcast")
+                outcome = durable.transition_queue(contract, audit, "broadcast")
                 role_after = legacy.node30.role_snapshot(transport, edge_node, False)
                 if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
                         transport.runtime_snapshot(node) != runtime_before or
@@ -852,7 +863,7 @@ def reconcile_command(args: argparse.Namespace) -> None:
     if complete_path.exists() or complete_path.is_symlink():
         complete, digest = load_complete(
             run_dir, contract, audit, audit_sha, authority_sha, intent, intent_sha)
-        state, _ = legacy.current_queue_state(contract, audit)
+        state, _ = durable.current_queue_state(contract, audit)
         if state not in {"broadcast", "confirmed"}:
             die("edge completion has no exact queue outcome")
         print(json.dumps({"result": complete["result"],
@@ -871,7 +882,7 @@ def reconcile_command(args: argparse.Namespace) -> None:
             role["wallet_inventory"], "edge reconciliation")
         candidates = legacy.reconcile_candidates(transport, exact_node, intent)
         if not candidates:
-            state, path = legacy.current_queue_state(contract, audit)
+            state, path = durable.current_queue_state(contract, audit)
             receipt = base_receipt(
                 "node30-free-claim-edge-reconcile-observation", contract)
             receipt.update({
@@ -892,7 +903,7 @@ def reconcile_command(args: argparse.Namespace) -> None:
                              sort_keys=True))
             return
         evidence = candidates[0]
-        outcome = legacy.transition_queue(contract, audit, "broadcast")
+        outcome = durable.transition_queue(contract, audit, "broadcast")
         response_sha = None
         if (run_dir / "rpc-response.json").exists():
             _, response_sha = load_response(run_dir, contract, intent_sha)
@@ -925,7 +936,7 @@ def monitor_command(args: argparse.Namespace) -> None:
     if terminal_path.exists() or terminal_path.is_symlink():
         terminal, terminal_sha = load_terminal(
             run_dir, contract, audit, intent, broadcast, broadcast_sha)
-        if legacy.current_queue_state(contract, audit)[0] != "confirmed":
+        if durable.current_queue_state(contract, audit)[0] != "confirmed":
             die("edge terminal receipt has no exact confirmed queue state")
         legacy.awarded_snapshot(contract, terminal["awarded_ledger"]["after_sha256"])
         legacy.node30.free_claim_snapshot(contract.retained)
@@ -956,7 +967,7 @@ def monitor_command(args: argparse.Namespace) -> None:
                 "broadcast_complete_sha256": broadcast_sha,
                 "txid": transaction["identity"]["txid"],
                 "confirmations": confirmations if type(confirmations) is int else 0,
-                "queue_state": legacy.current_queue_state(contract, audit)[0],
+                "queue_state": durable.current_queue_state(contract, audit)[0],
                 "pause_preserved": True, "retry_authorized": False,
                 "lock_identities": lock_ids,
             })
@@ -988,7 +999,7 @@ def monitor_command(args: argparse.Namespace) -> None:
         payout = legacy.terminal_payout(
             history, transaction, blockhash, header["height"], intent)
         awarded = legacy.install_awarded_after(contract, audit)
-        outcome = legacy.transition_queue(contract, audit, "confirmed")
+        outcome = durable.transition_queue(contract, audit, "confirmed")
         if (legacy.node30.free_claim_snapshot(contract.retained) != pause_before or
                 transport.runtime_snapshot(node) != runtime_before):
             die("node30 changed during edge terminal monitor")

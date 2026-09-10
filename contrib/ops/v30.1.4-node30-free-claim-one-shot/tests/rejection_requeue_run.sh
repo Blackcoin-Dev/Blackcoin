@@ -707,6 +707,12 @@ jq -cn '{attempts:1,ip:"newer-fixture",quantum_address:"qfixtureWitnessV16",
   submitted:"2026-08-14T04:00:00+00:00"}' >"$NEW_QUEUE"
 chmod 0644 "$NEW_QUEUE"
 NEW_QUEUE_SHA=$(sha "$NEW_QUEUE")
+SIBLING_QUEUE="$FLEET2/free-claim/queue/20260904T053945Z-c6c62198.json"
+jq -cn '{attempts:1,ip:"later-fixture",quantum_address:"qLaterUnselectedPayout",
+  submitted:"2026-09-04T05:39:45+00:00"}' >"$SIBLING_QUEUE"
+chmod 0644 "$SIBLING_QUEUE"
+SIBLING_SHA=$(sha "$SIBLING_QUEUE")
+SIBLING_INODE=$(stat -f %i "$SIBLING_QUEUE" 2>/dev/null || stat -c %i "$SIBLING_QUEUE")
 
 DURABLE_RUN="$FLEET2/durable-requeue"
 durable_call "$FLEET2" mempool-blocked audit --source-run "$SOURCE2" \
@@ -720,6 +726,8 @@ assert_jq '.result=="READY_FOR_SEPARATE_DURABLE_QUEUE_AUTHORITY" and
   .mutation_performed==false and .snapshot.candidate_count==0 and
   .snapshot.queue_strategy=="preserve_existing_queued_item" and
   .snapshot.queue.state=="queued" and
+  (.snapshot.queue.ingress_items|length)==2 and
+  .snapshot.queue.item.basename=="20260814T040000Z-cafebabe.json" and
   .snapshot.source_rejected.state=="rejected" and
   .snapshot.mempool_observation.shadow_proof_count==1 and
   .snapshot.mempool_observation.slot_clear==false and
@@ -779,6 +787,7 @@ assert_jq '.result=="DURABLE_QUEUE_SELECTION_COMPLETE_INDEPENDENT_OF_TRANSIENT_S
   .recurring_worker_invoked==false' "$DURABLE_RUN/durable-requeue-complete.json"
 assert_eq "$(sha "$REJECTED2")" "$REJECTED2_SHA"
 assert_eq "$(sha "$NEW_QUEUE")" "$NEW_QUEUE_SHA"
+assert_eq "$(sha "$SIBLING_QUEUE")" "$SIBLING_SHA"
 assert_eq "$(jq -r .send_calls "$FLEET2/state/state.json")" 1
 
 DINT="$DURABLE_RUN/durable-requeue-intent.json"
@@ -858,6 +867,15 @@ assert_fails 'modified financial authority fails before intent' \
     --authority "$EDGE_RUN/bad-authority.json" \
     --authority-sha256 "$(sha "$EDGE_RUN/bad-authority.json")"
 assert_fails 'bad edge authority publishes no intent' test -e "$EDGE_RUN/intent.json"
+mv "$SIBLING_QUEUE" "$FLEET2/sibling.saved"
+cp "$FLEET2/sibling.saved" "$SIBLING_QUEUE"
+chmod 0644 "$SIBLING_QUEUE"
+assert_fails 'unselected inode substitution refuses edge before intent' \
+  edge_call "$FLEET2" edge-happy execute --run-dir "$EDGE_RUN" \
+    --authority "$EDGE_RUN/AUTHORITY.json" --authority-sha256 "$EDGE_AUTH_SHA"
+assert_fails 'sibling substitution publishes no financial intent' test -e "$EDGE_RUN/intent.json"
+rm "$SIBLING_QUEUE"
+mv "$FLEET2/sibling.saved" "$SIBLING_QUEUE"
 edge_call "$FLEET2" edge-blocked-then-clear execute --run-dir "$EDGE_RUN" \
   --authority "$EDGE_RUN/AUTHORITY.json" --authority-sha256 "$EDGE_AUTH_SHA" \
   >"$FLEET2/edge-execute.out"
@@ -874,9 +892,22 @@ assert_jq '.result=="EXACT_DYNAMIC_EDGE_BROADCAST" and
   .recurring_worker_invoked==false and .queue_outcome.state=="broadcast"' \
   "$EDGE_RUN/broadcast-complete.json"
 assert_eq "$(jq -r .send_calls "$FLEET2/state/state.json")" 2
+
+# Neither the unselected API entry nor historical rejection is moved or
+# rewritten by broadcast, pending reconciliation, or terminal settlement.
+assert_eq "$(sha "$SIBLING_QUEUE")" "$SIBLING_SHA"
+assert_eq "$(stat -f %i "$SIBLING_QUEUE" 2>/dev/null || stat -c %i "$SIBLING_QUEUE")" "$SIBLING_INODE"
+assert_eq "$(sha "$REJECTED2")" "$REJECTED2_SHA"
 assert_fails 'consumed edge run can never execute twice' \
   edge_call "$FLEET2" edge-happy execute --run-dir "$EDGE_RUN" \
     --authority "$EDGE_RUN/AUTHORITY.json" --authority-sha256 "$EDGE_AUTH_SHA"
+# Ordinary API arrival during confirmation cannot stall settlement of the
+# consumed call and is never submitted by this one-shot.
+ARRIVAL_QUEUE="$FLEET2/free-claim/queue/20260909T150000Z-cafef00d.json"
+jq -cn '{attempts:1,ip:"arrival-fixture",quantum_address:"qNewArrival",
+  submitted:"2026-09-09T15:00:00+00:00"}' >"$ARRIVAL_QUEUE"
+chmod 0644 "$ARRIVAL_QUEUE"
+ARRIVAL_SHA=$(sha "$ARRIVAL_QUEUE")
 edge_call "$FLEET2" edge-happy monitor --run-dir "$EDGE_RUN" \
   --authority "$EDGE_RUN/AUTHORITY.json" --authority-sha256 "$EDGE_AUTH_SHA" \
   >"$FLEET2/edge-pending.out"
@@ -894,5 +925,9 @@ assert_jq '.result=="CONFIRMED_DYNAMIC_EDGE_QUANTUM_PAYOUT" and
   .pause_preserved==true and .ordinary_pow_enabled==false and
   .pos_active==true and .recurring_worker_invoked==false' "$EDGE_RUN/terminal.json"
 assert_eq "$(jq -r .send_calls "$FLEET2/state/state.json")" 2
+assert_eq "$(sha "$SIBLING_QUEUE")" "$SIBLING_SHA"
+assert_eq "$(stat -f %i "$SIBLING_QUEUE" 2>/dev/null || stat -c %i "$SIBLING_QUEUE")" "$SIBLING_INODE"
+assert_eq "$(sha "$REJECTED2")" "$REJECTED2_SHA"
+assert_eq "$(sha "$ARRIVAL_QUEUE")" "$ARRIVAL_SHA"
 
 printf 'PASS: %d hostile node30 deterministic-rejection/requeue assertions\n' "$COUNT"

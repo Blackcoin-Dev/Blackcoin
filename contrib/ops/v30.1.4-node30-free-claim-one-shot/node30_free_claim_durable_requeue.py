@@ -18,12 +18,14 @@ import importlib.util
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import sys
+import types
 from typing import Any, NoReturn, Sequence
 
 
-CONTRACT = "installed-v30.1.4-node30-free-claim-durable-requeue/v1"
+CONTRACT = "installed-v30.1.4-node30-free-claim-durable-requeue/v2"
 RECEIPT_SCHEMA = 1
 PRESERVE_PROTOCOL = "preexisting-queue-preservation/v1"
 PINNED_RELATIVE = pathlib.Path("node30_free_claim_rejection_requeue.py")
@@ -150,13 +152,200 @@ def source_rejection_and_selection(contract: Any, source_audit: dict[str, Any]
                  "item": rejected},
                 {"state": "rejected", "path": str(paths["rejected"]),
                  "item": rejected}, "requeue_rejected_source")
-    if len(entries) != 1 or legacy.QUEUE_NAME.fullmatch(entries[0].name) is None:
-        die("Free-Claim ingress queue is not empty or one exact canonical item")
-    queued = legacy.audit_queue(contract)
+    queued = audit_queue(contract)
     selected = {"state": "queued", "path": str(entries[0]),
-                "item": queued["item"]}
+                "item": queued["item"], "ingress_items": queued["ingress_items"],
+                "preserved_done": queued["preserved_done"]}
     return ({"state": "rejected", "path": str(paths["rejected"]),
              "item": rejected}, selected, "preserve_existing_queued_item")
+
+
+def ingress_identity(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"basename": item["basename"],
+             **legacy.immutable_queue_item_identity(item)} for item in items]
+
+
+def ingress_file(path: pathlib.Path, label: str,
+                 modes: set[int]) -> tuple[bytes, os.stat_result]:
+    """Bind either historical operator ownership or the exact API producer."""
+    if not path.is_absolute() or path.parent.resolve(strict=True) != path.parent:
+        die(f"{label} path is not canonical")
+    before = path.lstat()
+    owners = {(os.geteuid(), os.getegid())} if legacy.test_mode() else {(0, 0), (99, 100)}
+    if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or
+            before.st_nlink != 1 or (before.st_uid, before.st_gid) not in owners or
+            stat.S_IMODE(before.st_mode) not in modes or
+            path.resolve(strict=True) != path):
+        die(f"{label} is not an exact operator/API-owned single-link regular file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb", buffering=0) as handle:
+        opened = os.fstat(handle.fileno())
+        data = handle.read()
+        closed = os.fstat(handle.fileno())
+    after = path.lstat()
+    fields = ["st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink",
+              "st_size", "st_mtime_ns", "st_ctime_ns"]
+    if any(getattr(before, key) != getattr(cut, key)
+           for cut in [opened, closed, after] for key in fields):
+        die(f"{label} changed while read")
+    return data, after
+
+
+def queue_file_snapshot(path: pathlib.Path, contract: Any, label: str,
+                        expected_sha: str | None = None,
+                        expected_identity: dict[str, Any] | None = None
+                        ) -> tuple[dict[str, Any], bytes]:
+    data, st = ingress_file(path, label, {0o644})
+    digest = hashlib.sha256(data).hexdigest()
+    if expected_sha is not None and digest != expected_sha:
+        die(f"{label} SHA256 changed")
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        die(f"{label} is not valid JSON: {exc}")
+    if (not isinstance(value, dict) or set(value) !=
+            {"attempts", "ip", "quantum_address", "submitted"} or
+            type(value.get("attempts")) is not int or not 1 <= value["attempts"] < 20 or
+            any(not isinstance(value.get(key), str) or not value[key]
+                for key in ["ip", "quantum_address", "submitted"])):
+        die(f"{label} has an unexpected schema")
+    item = {"path": str(path), "basename": path.name, "sha256": digest,
+            "size": len(data), "device": st.st_dev, "inode": st.st_ino,
+            "uid": st.st_uid, "gid": st.st_gid, "mode": "0644",
+            "nlink": st.st_nlink, "record": value}
+    if (expected_identity is not None and
+            legacy.immutable_queue_item_identity(item) !=
+            legacy.immutable_queue_item_identity(expected_identity)):
+        die(f"{label} immutable identity changed")
+    return item, data
+
+
+def audit_queue(contract: Any) -> dict[str, Any]:
+    """Validate the entire queue, then bind its canonical oldest entry.
+
+    Filename UTC timestamp, with the canonical suffix as tie breaker, defines
+    FIFO. No item is copied, moved, hidden, rewritten, or filtered from checks.
+    """
+    storage_before = legacy.current_free_claim_storage(contract)
+    directories = [(contract.root, "Free-Claim root", 0o750),
+                   (contract.queue_dir, "Free-Claim queue", 0o770),
+                   (contract.done_dir, "Free-Claim done directory", 0o750)]
+    stats = [legacy.secure_dir(path, label, mode, contract.pool_group_gid)
+             for path, label, mode in directories]
+    if stats[1].st_dev != stats[2].st_dev:
+        die("queue and done directories are not on one atomic-rename filesystem")
+    entries = sorted(contract.queue_dir.iterdir(), key=lambda item: item.name)
+    if not entries or any(not legacy.QUEUE_NAME.fullmatch(p.name) for p in entries):
+        die("Free-Claim ingress must contain only canonical JSON items")
+    items = [queue_file_snapshot(path, contract, "queued Free-Claim item")[0]
+             for path in entries]
+    payouts = [item["record"]["quantum_address"] for item in items]
+    if len(payouts) != len(set(payouts)):
+        die("Free-Claim ingress contains duplicate payout identities")
+    done_entries = sorted(contract.done_dir.iterdir(), key=lambda item: item.name)
+    preserved_done = []
+    for entry in done_entries:
+        data, st = ingress_file(
+            entry, f"done entry {entry.name}", {0o600, 0o640, 0o644})
+        if st.st_gid not in {contract.pool_group_gid, os.getegid()}:
+            die(f"done entry {entry.name} has an unexpected group")
+        preserved_done.append({"basename": entry.name, "sha256": hashlib.sha256(data).hexdigest(),
+                               "device": st.st_dev, "inode": st.st_ino,
+                               "uid": st.st_uid, "gid": st.st_gid,
+                               "mode": stat.S_IMODE(st.st_mode), "size": st.st_size})
+    if any(entry.name.endswith(".broadcast") for entry in done_entries):
+        die("Free-Claim done directory already has a broadcast marker")
+    for item in items:
+        names = legacy.queue_names(item["basename"])
+        if any((contract.done_dir / names[state]).exists() for state in
+               ["broadcast", "uncertain", "confirmed"]):
+            die("queued Free-Claim outcome path already exists")
+    awarded = legacy.awarded_snapshot(contract)
+    if any(payout in awarded["records"] for payout in payouts):
+        die("queued quantum payout is already in the awarded ledger")
+    for (path, label, mode), prior in zip(directories, stats):
+        current = legacy.secure_dir(path, label, mode, contract.pool_group_gid)
+        if (current.st_dev, current.st_ino) != (prior.st_dev, prior.st_ino):
+            die(f"{label} changed while its state was audited")
+    if sorted(contract.queue_dir.iterdir(), key=lambda p: p.name) != entries:
+        die("Free-Claim ingress membership changed while audited")
+    for path, item in zip(entries, items):
+        queue_file_snapshot(path, contract, "queued Free-Claim item",
+                                   item["sha256"], item)
+    if legacy.current_free_claim_storage(contract) != storage_before:
+        die("Free-Claim storage ancestry changed while its state was audited")
+    result = {}
+    for key, (path, _, mode), st in zip(
+            ["root", "queue_directory", "done_directory"], directories, stats):
+        result[key] = {"path": str(path), "device": st.st_dev, "inode": st.st_ino,
+                       "uid": st.st_uid, "gid": st.st_gid, "mode": f"{mode:04o}"}
+    result.update({"item": items[0], "ingress_items": items,
+                   "preserved_done": preserved_done,
+                   "outcome_names": legacy.queue_names(items[0]["basename"]),
+                   "existing_done_entries": [entry.name for entry in done_entries],
+                   "broadcast_marker_count": 0, "awarded": awarded})
+    return result
+
+
+def stable_live_snapshot(transport: Any, contract: Any, node: Any) -> dict[str, Any]:
+    # Reuse the hash-pinned snapshot bytecode with one explicit queue-reader
+    # dependency. The original module and its historical receipt path are
+    # unchanged; there is no global monkey patch or concurrent shared state.
+    original = legacy.stable_live_snapshot
+    bindings = {**original.__globals__, "audit_queue": audit_queue}
+    adapted = types.FunctionType(original.__code__, bindings, original.__name__,
+                                 original.__defaults__, original.__closure__)
+    return adapted(transport, contract, node)
+
+
+def current_queue_state(contract: Any, audit: dict[str, Any]) -> tuple[str, pathlib.Path]:
+    validate_preserved_ingress(contract, audit["snapshot"]["queue"], allow_new=True)
+    original = legacy.current_queue_state
+    bindings = {**original.__globals__, "queue_file_snapshot": queue_file_snapshot}
+    adapted = types.FunctionType(original.__code__, bindings, original.__name__)
+    return adapted(contract, audit)
+
+
+def transition_queue(contract: Any, audit: dict[str, Any], target: str) -> dict[str, Any]:
+    validate_preserved_ingress(contract, audit["snapshot"]["queue"], allow_new=True)
+    original = legacy.transition_queue
+    bindings = {**original.__globals__, "queue_file_snapshot": queue_file_snapshot,
+                "current_queue_state": current_queue_state}
+    adapted = types.FunctionType(original.__code__, bindings, original.__name__)
+    result = adapted(contract, audit, target)
+    validate_preserved_ingress(contract, audit["snapshot"]["queue"], allow_new=True)
+    return result
+
+
+def validate_preserved_ingress(contract: Any, queue: dict[str, Any],
+                               allow_new: bool = False) -> None:
+    selected = queue["item"]["basename"]
+    expected = [item for item in queue["ingress_items"] if item["basename"] != selected]
+    actual = sorted((p for p in contract.queue_dir.iterdir() if p.name != selected),
+                    key=lambda p: p.name)
+    expected_by_name = {item["basename"]: item for item in expected}
+    actual_by_name = {path.name: path for path in actual}
+    if (not set(expected_by_name) <= set(actual_by_name) or
+            (not allow_new and set(expected_by_name) != set(actual_by_name))):
+        die("unselected Free-Claim ingress membership changed")
+    for name, item in expected_by_name.items():
+        path = actual_by_name[name]
+        queue_file_snapshot(path, contract, "preserved unselected queue item",
+                                   item["sha256"], item)
+    # A new API arrival after intent does not prevent reconciliation of the
+    # consumed financial call. It is never selected or submitted by that run.
+    for name in set(actual_by_name) - set(expected_by_name):
+        if not legacy.QUEUE_NAME.fullmatch(name):
+            die("new ingress arrival is not canonical")
+        queue_file_snapshot(actual_by_name[name], contract, "new unselected API arrival")
+    for item in queue["preserved_done"]:
+        path = contract.done_dir / item["basename"]
+        data, st = ingress_file(path, "preserved done item", {item["mode"]})
+        current = {"basename": path.name, "sha256": hashlib.sha256(data).hexdigest(),
+                   "device": st.st_dev, "inode": st.st_ino, "uid": st.st_uid,
+                   "gid": st.st_gid, "mode": stat.S_IMODE(st.st_mode), "size": st.st_size}
+        if current != item:
+            die("preserved Free-Claim done identity changed")
 
 
 def durable_snapshot(transport: Any, node: Any, contract: Any,
@@ -205,6 +394,8 @@ def stable_identity(snapshot: dict[str, Any]) -> dict[str, Any]:
         "queue_item": legacy.immutable_queue_item_identity(
             snapshot["queue"]["item"]),
         "queue_strategy": snapshot["queue_strategy"],
+        "ingress_items": ingress_identity(snapshot["queue"].get("ingress_items", [])),
+        "preserved_done": snapshot["queue"].get("preserved_done", []),
         "source_rejected_item": legacy.immutable_queue_item_identity(
             snapshot["source_rejected"]["item"]),
         "payout": snapshot["payout"],
@@ -537,6 +728,7 @@ def current_selected_queue(contract: Any, audit: dict[str, Any],
         return {"state": "queued", "path": str(old_queued), "item": item}
     if strategy != "preserve_existing_queued_item":
         die("durable queue strategy is unrecognized")
+    validate_preserved_ingress(contract, audit["snapshot"]["queue"])
     source_rejected, selected, current_strategy = source_rejection_and_selection(
         contract, source_audit)
     if (selected["state"] != "queued" or

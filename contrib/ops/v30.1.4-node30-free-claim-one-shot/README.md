@@ -255,14 +255,23 @@ successor separates durable queue selection from the financial edge.
 `node30_free_claim_durable_requeue.py audit` accepts the exact consumed source
 receipt chain and the definitive rejected inode while the QQP2 slot is either
 occupied or clear. If ingress is empty, its separate nonfinancial authority
-permits only the old rejected-to-queued no-clobber move. If exactly one newer
-canonical item already occupies the paused ingress queue, that item takes
-precedence: the command preserves both the old rejected inode and the newer
-queued inode and publishes a receipt selecting the newer item without a
-filesystem move. More than one ingress item, a changed source lifecycle, an
-awarded payout, an old-authority transaction candidate, a role change, or a
-queue-identity change fails closed. This stage has no `sendshadowpowclaim` call
-site and grants no financial authority.
+permits only the old rejected-to-queued no-clobber move. If canonical items
+already occupy the paused ingress queue, the v2 successor selects the oldest
+UTC filename, with its canonical suffix breaking a timestamp tie. It validates
+and binds every ingress entry, preserving the historical rejected inode and
+all unselected entries. Duplicate queued payout identities, noncanonical
+names, a changed source lifecycle, an awarded payout, an old-authority
+transaction candidate, a role change, or an audited queue identity change
+fails closed. This stage has no `sendshadowpowclaim` call site and grants no
+financial authority.
+
+The v2 queue reader supports the installed API producer's exact uid 99, gid
+100, mode 0644, single-link file contract in addition to historical root:root
+mode-0644 entries. It binds owner, group, bytes, device, inode, mode, and link
+count without chowning API files. Before/opened/after metadata checks reject
+path replacement or modification during reads. The original one-shot and
+rejection tools remain byte-for-byte unchanged, so their historical receipts
+retain their original stricter ownership contract.
 
 `node30_free_claim_edge_one_shot.py audit` requires the completed durable
 selection and exact selected queue inode. It performs the expensive static
@@ -270,6 +279,16 @@ role, storage, wallet, input-set, payout, queue, and receipt validation even if
 the mempool slot is occupied. Its separate owner-only authority binds the exact
 static identity, fee rate, `0.00028700 BLK` cap, watch duration, poll interval,
 and four-attempt clear-edge rebind budget.
+
+The edge v2 authority also binds the complete ingress inventory and existing
+done entries. All audited unselected and historical inodes must remain
+unchanged through execution, reconciliation, and terminal settlement. A new
+canonical API arrival after intent does not prevent settlement of the
+already-consumed call; that run never selects or submits the arrival. A queue
+change before intent requires a fresh static audit. The successor reuses the
+hash-pinned legacy snapshot and lifecycle code with explicit private function
+bindings for its queue reader, leaving the historical modules and receipt
+validation unchanged.
 
 `execute` may be invoked only once for that authority. It first completes a
 locked static preflight, then waits read-only for a natural vacancy. At a clear
@@ -428,6 +447,13 @@ preservation, a fresh post-requeue one-shot audit, occupied-slot and
 premature-authority refusal at the new-authority window, and the exact
 future-authority semantic digest. The companion's AST contains zero
 `sendshadowpowclaim` call sites.
+
+The successor suite also proves oldest-first selection with two queued items,
+immutable sibling preservation through active-chain payout settlement, refusal
+of a substituted sibling inode before intent, and settlement while a third API
+arrival remains queued. `tests/multi_queue_unit.py` tests production API/root
+ownership pairs, wrong owner/group/mode, extra links, opened-inode substitution,
+immutable owner binding, and preservation of the historical reader contract.
 
 This package is offline tooling only. A signed commit is not live financial
 authority. A fresh exact audit and a separate exact mode-0600 authorization are

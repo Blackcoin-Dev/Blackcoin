@@ -15,6 +15,7 @@
 #include <test/util/setup_common.h>
 #include <validation.h>
 #include <validationinterface.h>
+#include <wallet/claim_maintenance.h>
 #include <wallet/context.h>
 #include <wallet/load.h>
 #include <wallet/test/util.h>

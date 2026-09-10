@@ -7,6 +7,7 @@
 
 #include <hash.h>
 #include <util/strencodings.h>
+#include <util/string.h>
 #include <wallet/shadow_pow_claim_recovery_types.h>
 
 #include <algorithm>
@@ -74,7 +75,7 @@ inline ShadowPowRecoveryPage BuildShadowPowRecoveryPage(
         const std::string offset_text = cursor.substr(68);
         const auto offset = ToIntegral<size_t>(offset_text);
         if (!IsHex(cursor_snapshot) || !offset ||
-            std::to_string(*offset) != offset_text ||
+            ToString(*offset) != offset_text ||
             std::any_of(cursor_snapshot.begin(), cursor_snapshot.end(),
                         [](char c) { return c >= 'A' && c <= 'F'; })) {
             page.error = "recovery-page-cursor-malformed";
@@ -149,7 +150,7 @@ inline ShadowPowRecoveryPage BuildShadowPowRecoveryPage(
                         index.begin() + page.offset + count);
     if (page.offset + count < index.size()) {
         page.next_cursor = "v1:" + page.snapshot.GetHex() + ":" +
-                           std::to_string(page.offset + count);
+                           ToString(page.offset + count);
     }
     return page;
 }

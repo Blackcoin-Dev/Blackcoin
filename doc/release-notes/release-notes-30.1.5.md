@@ -231,7 +231,7 @@ open reconstructs the same authenticated family and anchor. A concurrent
 two-version test sends candidate-authored same-anchor bytes through v30.1.4's
 P2P admission path, includes them in a v30.1.4 PoS block, restarts both
 versions, and checks removal and later reinclusion across a competing-branch
-reorganization. Release publication requires the exact-SHA repository gate,
+reorganization. Release publication still requires the exact-SHA repository gate,
 simulated upgrade and rollback coverage, and reproducible final packages.
 A live-wallet canary and separate pre-release canary package are not publication
 prerequisites for v30.1.5. Simulated qualification does not claim that a live

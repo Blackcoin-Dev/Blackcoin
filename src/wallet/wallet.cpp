@@ -6,7 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/wallet.h>
-#include <wallet/load.h>
+#include <wallet/claim_maintenance.h>
 
 #if defined(HAVE_CONFIG_H)
 #include <config/bitcoin-config.h>
@@ -87,7 +87,6 @@
 #include <wallet/db.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/fees.h>
-#include <wallet/receive.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/spend.h>
@@ -11167,7 +11166,6 @@ ShadowPowClaimWarmCandidateSnapshot BuildShadowPowClaimWarmCandidates(
     const bool allow_used_addresses =
         !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE) ||
         !coin_control.m_avoid_address_reuse;
-    std::set<uint256> trusted_parents;
     snapshot.candidates.reserve(source.records.size());
     for (const ShadowPowClaimWarmSourceRecord& record : source.records) {
         const COutPoint& outpoint = record.outpoint;
@@ -11177,11 +11175,11 @@ ShadowPowClaimWarmCandidateSnapshot BuildShadowPowClaimWarmCandidates(
         }
         const CWalletTx& wtx = *record.wallet_tx;
         const int depth = wallet.GetTxDepthInMainChain(wtx);
+        // Positive-depth confirmed transactions are trusted; this selector
+        // never admits zero-confirmation inputs, even when unsafe is enabled.
         if (!wtx.state<TxStateConfirmed>() || depth <= 0 ||
             depth < coin_control.m_min_depth ||
             depth > coin_control.m_max_depth ||
-            (!coin_control.m_include_unsafe_inputs &&
-             !CachedTxIsTrusted(wallet, wtx, trusted_parents)) ||
             // The only next-block-maturity exception is a quantum synthetic
             // payout. Legacy Gold Rush claim inputs follow ordinary maturity.
             wallet.IsTxImmature(wtx) ||

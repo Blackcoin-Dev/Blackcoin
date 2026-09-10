@@ -5,6 +5,7 @@
 #include <wallet/shadow_pow_claim_pagination.h>
 
 #include <test/util/setup_common.h>
+#include <util/string.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -28,17 +29,17 @@ ShadowPowClaimRecoveryInventory PaginationInventory()
     // One component larger than 1000 nodes must not escape the page bound.
     for (size_t family = 0; family < 2; ++family) {
         ShadowPowClaimRecoveryComponent component;
-        component.anchor = COutPoint{uint256S(std::to_string(family + 10)), 0};
-        component.fingerprint = uint256S(std::to_string(family + 20));
+        component.anchor = COutPoint{uint256S(ToString(family + 10)), 0};
+        component.fingerprint = uint256S(ToString(family + 20));
         for (size_t i = 0; i < (family == 0 ? 1007U : 3U); ++i) {
             ShadowPowClaimRecoveryNode node;
-            node.txid = uint256S(std::to_string(family * 2000 + i + 100));
+            node.txid = uint256S(ToString(family * 2000 + i + 100));
             component.nodes.push_back(node);
             component.claim_txids.push_back(node.txid);
         }
         component.root_claim_txids.push_back(component.nodes.front().txid);
-        component.resolution_txids.push_back(uint256S(std::to_string(family + 50)));
-        component.ordinary_or_mixed_txids.push_back(uint256S(std::to_string(family + 60)));
+        component.resolution_txids.push_back(uint256S(ToString(family + 50)));
+        component.ordinary_or_mixed_txids.push_back(uint256S(ToString(family + 60)));
         inventory.components.push_back(std::move(component));
     }
     inventory.unanchored_claim_txids = {uint256S("ffff"), uint256S("fffe")};
@@ -48,8 +49,8 @@ ShadowPowClaimRecoveryInventory PaginationInventory()
 std::string RecordKey(const ShadowPowRecoveryPageRecord& record)
 {
     return (record.component ? record.component->anchor.hash.GetHex() + ":" +
-                                  std::to_string(record.component->anchor.n) : "unanchored") +
-           ":" + std::to_string(static_cast<uint8_t>(record.kind)) + ":" +
+                                  ToString(record.component->anchor.n) : "unanchored") +
+           ":" + ToString(static_cast<unsigned int>(record.kind)) + ":" +
            record.txid.GetHex();
 }
 
@@ -107,7 +108,7 @@ BOOST_AUTO_TEST_CASE(cursor_rejects_wallet_tip_generation_and_classifier_drift)
     BOOST_REQUIRE(!first.next_cursor.empty());
     for (size_t i = 1; i < 31; ++i) {
         BOOST_CHECK_EQUAL(BuildShadowPowRecoveryPage(
-            inventory, "wallet-" + std::to_string(i), 10, first.next_cursor).error,
+            inventory, "wallet-" + ToString(i), 10, first.next_cursor).error,
             "recovery-page-cursor-stale");
     }
     const auto check_stale = [&](const ShadowPowClaimRecoveryInventory& changed) {
@@ -158,7 +159,7 @@ BOOST_AUTO_TEST_CASE(cursor_and_page_bounds_fail_closed)
                           "recovery-page-size-out-of-range");
     }
     BOOST_CHECK_EQUAL(BuildShadowPowRecoveryPage(
-        inventory, "wallet", 10, prefix + std::to_string(first.total_records)).error,
+        inventory, "wallet", 10, prefix + ToString(first.total_records)).error,
         "recovery-page-cursor-out-of-range");
     const auto empty = BuildShadowPowRecoveryPage({}, "wallet", 100);
     BOOST_CHECK(empty.error.empty());

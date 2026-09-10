@@ -17,6 +17,7 @@
 #include <util/string.h>
 #include <util/thread.h>
 #include <util/translation.h>
+#include <wallet/claim_maintenance.h>
 #include <wallet/context.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>

@@ -186,6 +186,7 @@ jobs:
 
   native-build-and-unit:
     name: pinned native build and unit tests
+    needs: policy-and-lint
     if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -314,6 +315,7 @@ jobs:
 
   native-linux-arm64-crypto:
     name: Linux ARM64 native cryptographic vectors and resources
+    needs: policy-and-lint
     if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
@@ -479,6 +481,7 @@ jobs:
 
   windows-crypto-cross-build:
     name: Build pinned Windows x86_64 vector binaries
+    needs: policy-and-lint
     if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 300
@@ -627,6 +630,7 @@ jobs:
 
   native-macos-crypto:
     name: ${{ matrix.name }} native cryptographic vectors
+    needs: policy-and-lint
     if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
@@ -878,6 +882,7 @@ jobs:
 
   sanitizer-gates:
     name: ${{ matrix.name }} consensus and liveness gate
+    needs: policy-and-lint
     if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 480
@@ -974,6 +979,7 @@ jobs:
 
   fuzz-smoke:
     name: source-pinned sanitizer regression smoke
+    needs: policy-and-lint
     if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120

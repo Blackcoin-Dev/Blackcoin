@@ -1226,6 +1226,30 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,
                                         "unsupported native benchmark platform"):
                 generator.native_runner_identity()
+
+    def test_expensive_pr_gate_jobs_require_policy_and_lint(self):
+        workflow = (
+            TOOLS.parent.parent / ".github/workflows/pr-gate.yml"
+        ).read_text(encoding="utf-8")
+        jobs = dict(re.findall(
+            r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)",
+            workflow.split("\njobs:\n", 1)[1],
+        ))
+        for job in (
+            "native-build-and-unit",
+            "native-linux-arm64-crypto",
+            "windows-crypto-cross-build",
+            "native-macos-crypto",
+            "sanitizer-gates",
+            "fuzz-smoke",
+        ):
+            with self.subTest(job=job):
+                self.assertIn(job, jobs)
+                self.assertRegex(jobs[job], r"(?m)^    needs: policy-and-lint$")
+                self.assertNotRegex(
+                    jobs[job], r"(?m)^    if:.*\b(?:always|failure|cancelled)\s*\("
+                )
+
     def test_resource_benchmark_workflow_measures_and_does_not_overclaim(self):
         root = TOOLS.parent.parent
         gate = (root / ".github" / "workflows" / "pr-gate.yml").read_text(

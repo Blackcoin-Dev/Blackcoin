@@ -6,7 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/context.h>
-#include <wallet/load.h>
+#include <wallet/claim_maintenance.h>
 
 namespace wallet {
 WalletContext::WalletContext() : claim_maintenance(std::make_unique<WalletClaimMaintenance>()) {}

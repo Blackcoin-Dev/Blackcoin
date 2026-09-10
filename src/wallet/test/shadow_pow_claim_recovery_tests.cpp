@@ -5279,7 +5279,7 @@ BOOST_AUTO_TEST_CASE(parallel_recovery_authority_isolated_across_31_wallets)
     // 31 node processes, chain builds, keypool generations, and rescans.
     for (size_t i = 0; i < COUNT; ++i) {
         auto wallet = std::make_unique<CWallet>(
-            m_node.chain.get(), "recovery-isolation-" + std::to_string(i),
+            m_node.chain.get(), "recovery-isolation-" + ToString(i),
             DuplicateMockDatabase(seed->GetDatabase()));
         BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
         {

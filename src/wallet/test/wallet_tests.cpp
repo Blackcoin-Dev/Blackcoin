@@ -49,6 +49,7 @@
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
+#include <wallet/claim_maintenance.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
 #include <wallet/load.h>

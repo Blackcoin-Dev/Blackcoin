@@ -25,6 +25,7 @@
 #include <wallet/quantum_stake_ops.h>
 #include <wallet/rpc/util.h>
 #include <wallet/rpc/staking.h>
+#include <wallet/shadow_pow_claim_pagination.h>
 #include <wallet/shadow_pow_claim_recovery.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
@@ -2944,10 +2945,25 @@ static UniValue ShadowPowRecoveryNodeToJSON(const ShadowPowClaimRecoveryNode& no
     result.pushKV("resolution_metadata_valid", node.resolution_metadata_valid);
     result.pushKV("resolution_relay_authorized", node.resolution_relay_authorized);
     result.pushKV("resolution_relay_revoked", node.resolution_relay_revoked);
+    if (node.authorization_receipt) {
+        const auto& receipt = *node.authorization_receipt;
+        UniValue authorization(UniValue::VOBJ);
+        authorization.pushKV("plan_id", receipt.plan_id.GetHex());
+        authorization.pushKV("active_tip", receipt.active_tip.GetHex());
+        authorization.pushKV("active_height", receipt.active_height);
+        authorization.pushKV("wallet_generation", receipt.wallet_generation);
+        authorization.pushKV("origin", receipt.origin);
+        result.pushKV("authorization_receipt", std::move(authorization));
+    } else {
+        // No historical plan is invented for old or malformed audit records.
+        result.pushKV("authorization_receipt", UniValue());
+    }
     return result;
 }
 
-static UniValue ShadowPowRecoveryComponentToJSON(const ShadowPowClaimRecoveryComponent& component)
+static UniValue ShadowPowRecoveryComponentToJSON(
+    const ShadowPowClaimRecoveryComponent& component,
+    bool include_collections = true)
 {
     UniValue result(UniValue::VOBJ);
     UniValue anchor(UniValue::VOBJ);
@@ -2959,10 +2975,12 @@ static UniValue ShadowPowRecoveryComponentToJSON(const ShadowPowClaimRecoveryCom
     result.pushKV("generation_fingerprint", component.generation_fingerprint.GetHex());
     result.pushKV("component_fingerprint", component.fingerprint.GetHex());
     result.pushKV("classification", ShadowPowRecoveryStateName(component.state));
-    result.pushKV("claim_txids", ShadowPowTxidsToJSON(component.claim_txids));
-    result.pushKV("root_claim_txids", ShadowPowTxidsToJSON(component.root_claim_txids));
-    result.pushKV("resolution_txids", ShadowPowTxidsToJSON(component.resolution_txids));
-    result.pushKV("ordinary_or_mixed_txids", ShadowPowTxidsToJSON(component.ordinary_or_mixed_txids));
+    if (include_collections) {
+        result.pushKV("claim_txids", ShadowPowTxidsToJSON(component.claim_txids));
+        result.pushKV("root_claim_txids", ShadowPowTxidsToJSON(component.root_claim_txids));
+        result.pushKV("resolution_txids", ShadowPowTxidsToJSON(component.resolution_txids));
+        result.pushKV("ordinary_or_mixed_txids", ShadowPowTxidsToJSON(component.ordinary_or_mixed_txids));
+    }
     result.pushKV("descendant_claims", static_cast<uint64_t>(component.descendant_claims));
     result.pushKV("minimum_stale_depth", component.minimum_stale_depth);
     result.pushKV("stale_depth_known", component.stale_depth_known);
@@ -2974,9 +2992,42 @@ static UniValue ShadowPowRecoveryComponentToJSON(const ShadowPowClaimRecoveryCom
     result.pushKV("has_revalidating_unbound_proof",
                   component.has_revalidating_unbound_proof);
     result.pushKV("adoption_graph_safe", component.adoption_graph_safe);
-    UniValue nodes(UniValue::VARR);
-    for (const auto& node : component.nodes) nodes.push_back(ShadowPowRecoveryNodeToJSON(node));
-    result.pushKV("nodes", std::move(nodes));
+    if (include_collections) {
+        UniValue nodes(UniValue::VARR);
+        for (const auto& node : component.nodes) nodes.push_back(ShadowPowRecoveryNodeToJSON(node));
+        result.pushKV("nodes", std::move(nodes));
+    }
+    return result;
+}
+
+static UniValue ShadowPowRecoveryPageRecordToJSON(
+    const ShadowPowRecoveryPageRecord& record)
+{
+    using Kind = ShadowPowRecoveryPageRecordKind;
+    UniValue result(UniValue::VOBJ);
+    const char* kind{nullptr};
+    switch (record.kind) {
+    case Kind::COMPONENT: kind = "component"; break;
+    case Kind::NODE: kind = "node"; break;
+    case Kind::CLAIM_TXID: kind = "claim_txid"; break;
+    case Kind::ROOT_CLAIM_TXID: kind = "root_claim_txid"; break;
+    case Kind::RESOLUTION_TXID: kind = "resolution_txid"; break;
+    case Kind::ORDINARY_OR_MIXED_TXID: kind = "ordinary_or_mixed_txid"; break;
+    case Kind::UNANCHORED_CLAIM_TXID: kind = "unanchored_claim_txid"; break;
+    }
+    result.pushKV("kind", kind);
+    if (record.component) {
+        result.pushKV("anchor_txid", record.component->anchor.hash.GetHex());
+        result.pushKV("anchor_vout", record.component->anchor.n);
+    }
+    if (record.kind == Kind::COMPONENT) {
+        result.pushKV("component", ShadowPowRecoveryComponentToJSON(
+            *record.component, /*include_collections=*/false));
+    } else if (record.node) {
+        result.pushKV("node", ShadowPowRecoveryNodeToJSON(*record.node));
+    } else {
+        result.pushKV("txid", record.txid.GetHex());
+    }
     return result;
 }
 
@@ -4276,9 +4327,14 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     return RPCHelpMan{
         "getpowclaimrecoveryinfo",
         "\nReturn this wallet's persisted Gold Rush PoW claim-recovery consent and current component gate.\n"
-        "This RPC never creates, signs, or broadcasts a transaction. Automatic recovery is disabled unless mode is explicitly set to automatic with bounded spending limits; exact-plan manual recovery remains separately authorized per request. Set verbose=true to inspect the complete typed component graph and provenance.\n",
+        "This RPC never creates, signs, or broadcasts a transaction. Automatic recovery is disabled unless mode is explicitly set to automatic with bounded spending limits; exact-plan manual recovery remains separately authorized per request. Set verbose=true to inspect the complete typed component graph and provenance.\n"
+        "For bounded output, supply options with verbose=true. Page records are ordered by anchor, then record kind and transaction id; nodes and every component txid list are separate records. Continue with next_cursor until complete=true. Cursors bind the wallet, active tip, wallet generation, and classified inventory; stale cursors must restart from the first page. Pagination conveys no recovery authority.\n",
         {
             {"verbose", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include complete component, node, provenance, and refusal-classification details."},
+            {"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Enable snapshot-bound pagination instead of unbounded component_details. Requires verbose=true.", {
+                {"page_size", RPCArg::Type::NUM, RPCArg::Default{100}, "Maximum records in this response, from 1 to 1000. A component and each node or txid-list membership consume separate records."},
+                {"cursor", RPCArg::Type::STR, RPCArg::Default{""}, "Opaque next_cursor from the previous page, or empty to begin a snapshot."},
+            }},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::OBJ, "policy", /*optional=*/true, "Authoritative wallet-scoped policy. Omitted when the durable database outcome is ambiguous.", ShadowPowClaimRecoveryPolicyResults()},
@@ -4329,16 +4385,50 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             {RPCResult::Type::NUM, "claims_recycled", "Later claim transactions that spent a confirmed resolution output."},
             {RPCResult::Type::ARR, "component_details", /*optional=*/true, "Complete typed component graph when verbose=true.", {{RPCResult::Type::ELISION, "", ""}}},
             {RPCResult::Type::ARR, "unanchored_claim_txids", /*optional=*/true, "Claim objects that could not be bound to an authenticated confirmed anchor when verbose=true.", {{RPCResult::Type::STR_HEX, "", "Claim transaction id."}}},
+            {RPCResult::Type::ARR, "records", /*optional=*/true, "Bounded ordered component headers, nodes, txid-list memberships, and unanchored txids when options is supplied. The kind field identifies each record; anchor_txid and anchor_vout associate component records.", {{RPCResult::Type::ELISION, "", ""}}},
+            {RPCResult::Type::OBJ, "pagination", /*optional=*/true, "Snapshot and continuation state when options is supplied.", {
+                {RPCResult::Type::STR_HEX, "snapshot", "Wallet-scoped classified inventory fingerprint."},
+                {RPCResult::Type::NUM, "offset", "Zero-based first record index."},
+                {RPCResult::Type::NUM, "returned_records", "Number of records in this response."},
+                {RPCResult::Type::NUM, "total_records", "Number of records in the complete pinned inventory."},
+                {RPCResult::Type::BOOL, "complete", "True when no further records remain."},
+                {RPCResult::Type::STR, "next_cursor", /*optional=*/true, "Continuation token, omitted on the final page."},
+            }},
         }},
         RPCExamples{
             HelpExampleCli("getpowclaimrecoveryinfo", "") +
             HelpExampleCli("getpowclaimrecoveryinfo", "true") +
+            HelpExampleCli("getpowclaimrecoveryinfo", "true '{\"page_size\":100}'") +
             HelpExampleRpc("getpowclaimrecoveryinfo", "true")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
+
+    const bool verbose = !request.params[0].isNull() && request.params[0].get_bool();
+    const bool paginated = !request.params[1].isNull();
+    size_t page_size{100};
+    std::string cursor;
+    if (paginated) {
+        if (!verbose) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "recovery pagination requires verbose=true");
+        }
+        const UniValue& options = request.params[1];
+        RPCTypeCheckObj(options, {{"page_size", UniValue::VNUM},
+                                 {"cursor", UniValue::VSTR}},
+                        /*fAllowNull=*/true, /*fStrict=*/true);
+        if (!options["page_size"].isNull()) {
+            const int64_t requested = options["page_size"].getInt<int64_t>();
+            if (requested < 1 || requested > static_cast<int64_t>(MAX_SHADOW_POW_RECOVERY_PAGE_SIZE)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "recovery-page-size-out-of-range");
+            }
+            page_size = requested;
+        }
+        if (!options["cursor"].isNull()) cursor = options["cursor"].get_str();
+    }
 
     ShadowPowClaimRecoveryPolicy policy =
         DefaultShadowPowClaimRecoveryPolicy();
@@ -4369,8 +4459,6 @@ static RPCHelpMan getpowclaimrecoveryinfo()
         usage = pwallet->GetShadowPowClaimRecoveryUsageFromInventoryLocked(
             inventory, policy.rolling_fee_window_seconds);
     }
-    const bool verbose = !request.params[0].isNull() && request.params[0].get_bool();
-
     UniValue result(UniValue::VOBJ);
     if (policy_state.authoritative_state_available) {
         result.pushKV("policy", ShadowPowClaimRecoveryPolicyToJSON(policy));
@@ -4444,7 +4532,26 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     result.pushKV("automatic_fee_exposure_in_window", ValueFromAmount(usage.automatic_fee_exposure_in_window));
     result.pushKV("reconciled_descendant_claims", static_cast<uint64_t>(usage.reconciled_descendant_claims));
     result.pushKV("claims_recycled", static_cast<uint64_t>(usage.recycled_outputs));
-    if (verbose) {
+    if (paginated) {
+        const auto page = BuildShadowPowRecoveryPage(
+            inventory, pwallet->GetName(), page_size, cursor);
+        if (!page.error.empty()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, page.error);
+        }
+        UniValue records(UniValue::VARR);
+        for (const auto& record : page.records) {
+            records.push_back(ShadowPowRecoveryPageRecordToJSON(record));
+        }
+        result.pushKV("records", std::move(records));
+        UniValue pagination(UniValue::VOBJ);
+        pagination.pushKV("snapshot", page.snapshot.GetHex());
+        pagination.pushKV("offset", static_cast<uint64_t>(page.offset));
+        pagination.pushKV("returned_records", static_cast<uint64_t>(page.records.size()));
+        pagination.pushKV("total_records", static_cast<uint64_t>(page.total_records));
+        pagination.pushKV("complete", page.next_cursor.empty());
+        if (!page.next_cursor.empty()) pagination.pushKV("next_cursor", page.next_cursor);
+        result.pushKV("pagination", std::move(pagination));
+    } else if (verbose) {
         UniValue components(UniValue::VARR);
         for (const auto& component : inventory.components) {
             components.push_back(ShadowPowRecoveryComponentToJSON(component));

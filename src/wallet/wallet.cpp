@@ -1275,8 +1275,8 @@ namespace {
 void PublishRuntimeWallet(
     WalletContext& context, const std::shared_ptr<CWallet>& wallet)
 {
-    // AttachChainUnpublished subscribes before rescanning so it cannot miss
-    // validation events produced while the wallet is attaching. Drain those
+    // AttachChainUnpublished reconciles the pre-subscription interval, then
+    // rescans with validation notifications subscribed. Drain those
     // events before making a runtime-loaded or newly created wallet visible or
     // starting its background workers. No wallet, chain, or context lock is
     // held here, and the wallet is still absent from WalletContext and
@@ -9114,6 +9114,69 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
     // interface.
     walletInstance->m_attaching_chain = true; //ignores chainStateFlushed notifications
     walletInstance->m_chain_notifications_handler = walletInstance->chain().handleNotifications(walletInstance);
+
+    // LoadWallet reconciles saved transactions before subscribing. A block
+    // disconnected after that snapshot has no notification for this wallet,
+    // and rescanning the replacement branch cannot unconfirm transactions
+    // which occur only on the old branch. Close that interval against one
+    // immutable tip after subscribing; queued notifications cover later changes.
+    // Look up each distinct block under a short chain lock, never hold cs_main
+    // while traversing wallet history or writing the database.
+    const CBlockIndex* reconciliation_tip = WITH_LOCK(
+        ::cs_main, return chain.chainman().ActiveChain().Tip());
+    std::map<uint256, std::optional<int>> reconciled_blocks;
+    std::vector<std::pair<CWalletTx*, TxState>> state_updates;
+    for (auto& [_, wtx] : walletInstance->mapWallet) {
+        const auto* confirmed = wtx.state<TxStateConfirmed>();
+        const auto* conflicted = wtx.state<TxStateConflicted>();
+        if (!confirmed && !conflicted) continue;
+        const uint256& block_hash = confirmed ? confirmed->confirmed_block_hash : conflicted->conflicting_block_hash;
+        auto [block, inserted] = reconciled_blocks.try_emplace(block_hash);
+        if (inserted) {
+            const CBlockIndex* index = WITH_LOCK(
+                ::cs_main, return chain.chainman().m_blockman.LookupBlockIndex(block_hash));
+            if (index && reconciliation_tip && index->nHeight <= reconciliation_tip->nHeight &&
+                reconciliation_tip->GetAncestor(index->nHeight) == index) {
+                block->second = index->nHeight;
+            }
+        }
+        if (!block->second) {
+            state_updates.emplace_back(&wtx, TxStateInactive{});
+        } else if (confirmed && confirmed->confirmed_block_height != *block->second) {
+            state_updates.emplace_back(&wtx, TxStateConfirmed{block_hash, *block->second, confirmed->position_in_block});
+        } else if (conflicted && conflicted->conflicting_block_height != *block->second) {
+            state_updates.emplace_back(&wtx, TxStateConflicted{block_hash, *block->second});
+        }
+    }
+    if (!state_updates.empty()) {
+        WalletBatch batch(walletInstance->GetDatabase());
+        const auto fail_reconciliation = [&] {
+            batch.TxnAbort();
+            error = Untranslated("Failed to persist wallet chain reconciliation before publication");
+            return false;
+        };
+        if (!batch.TxnBegin(/*durable=*/true)) return fail_reconciliation();
+        for (const auto& [wtx, state] : state_updates) {
+            CWalletTx persisted{wtx->tx, state};
+            persisted.CopyFrom(*wtx);
+            persisted.m_state = state;
+            if (!batch.WriteTx(persisted)) return fail_reconciliation();
+        }
+        if (!batch.TxnCommit()) return fail_reconciliation();
+        for (const auto& [wtx, state] : state_updates) {
+            wtx->m_state = state;
+            wtx->MarkDirty();
+            for (const CTxIn& input : wtx->tx->vin) {
+                const auto parent = walletInstance->mapWallet.find(input.prevout.hash);
+                if (parent != walletInstance->mapWallet.end()) parent->second.MarkDirty();
+            }
+        }
+        walletInstance->MarkShadowPowClaimCandidateStateChangedLocked();
+        walletInstance->RecomputeShadowSolveIndex();
+        walletInstance->RecomputeConfirmedSyntheticPayoutIndex();
+        walletInstance->RecomputeLiveUnspentStakeOutpoints();
+        walletInstance->RebuildShadowPowClaimIndexesLocked();
+    }
 
     // If rescan_required = true, rescan_height remains equal to 0
     int rescan_height = 0;

@@ -417,6 +417,13 @@ uint256 FingerprintComponent(const uint256& active_tip,
         hasher << node.resolution_created_time;
         hasher << node.resolution_relay_authorized;
         hasher << node.resolution_relay_revoked;
+        hasher << node.authorization_receipt.has_value();
+        if (node.authorization_receipt) {
+            const auto& receipt = *node.authorization_receipt;
+            hasher << receipt.plan_id << receipt.active_tip;
+            hasher << receipt.active_height << receipt.wallet_generation;
+            hasher << receipt.origin;
+        }
     }
     return hasher.GetHash();
 }
@@ -441,7 +448,37 @@ struct ManagedResolutionFacts
     bool relay_authorized{false};
     bool relay_revoked{false};
     CAmount fee{0};
+    std::optional<ShadowPowClaimResolutionAuthorizationReceipt> authorization_receipt;
 };
+
+std::optional<ShadowPowClaimResolutionAuthorizationReceipt>
+ParseResolutionAuthorizationReceipt(const CWalletTx& wtx)
+{
+    const auto& values = wtx.mapValue;
+    const auto schema = values.find(SHADOW_POW_RESOLUTION_AUTH_SCHEMA_KEY);
+    const auto generation = values.find(SHADOW_POW_RESOLUTION_AUTH_GENERATION_KEY);
+    const auto origin = values.find(SHADOW_POW_RESOLUTION_AUTH_ORIGIN_KEY);
+    uint256 witness_hash;
+    ShadowPowClaimResolutionAuthorizationReceipt receipt;
+    if (schema == values.end() || schema->second != "1" ||
+        generation == values.end() || generation->second.size() > 20 ||
+        !ParseUInt64(generation->second, &receipt.wallet_generation) ||
+        ToString(receipt.wallet_generation) != generation->second ||
+        origin == values.end() ||
+        (origin->second != SHADOW_POW_RESOLUTION_ORIGIN_MANUAL &&
+         origin->second != SHADOW_POW_RESOLUTION_ORIGIN_AUTOMATIC) ||
+        !ParseMetadataHash(values, SHADOW_POW_RESOLUTION_AUTH_PLAN_KEY, receipt.plan_id) ||
+        receipt.plan_id.IsNull() ||
+        !ParseMetadataHash(values, SHADOW_POW_RESOLUTION_AUTH_TIP_KEY, receipt.active_tip) ||
+        receipt.active_tip.IsNull() ||
+        !ParseMetadataHeight(values, SHADOW_POW_RESOLUTION_AUTH_HEIGHT_KEY, receipt.active_height) ||
+        !ParseMetadataHash(values, SHADOW_POW_RESOLUTION_AUTH_WTXID_KEY, witness_hash) ||
+        witness_hash != wtx.tx->GetWitnessHash()) {
+        return std::nullopt;
+    }
+    receipt.origin = origin->second;
+    return receipt;
+}
 
 /** Parse and authenticate a managed resolution from durable wallet facts.
  * This deliberately does not depend on a surviving unconfirmed claim being
@@ -519,6 +556,8 @@ bool ParseManagedResolutionFacts(const CWallet& wallet, const CWalletTx& wtx,
         return false;
     }
     facts.fee = anchor_output.nValue - tx.vout.front().nValue;
+    // Unavailable/malformed audit data does not reinterpret legacy authority.
+    facts.authorization_receipt = ParseResolutionAuthorizationReceipt(wtx);
     return facts.fee > 0 && MoneyRange(facts.fee);
 }
 
@@ -2755,6 +2794,7 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
                         managed_facts.relay_authorized;
                     node.resolution_relay_revoked =
                         managed_facts.relay_revoked;
+                    node.authorization_receipt = managed_facts.authorization_receipt;
                     component.has_managed_resolution = true;
                     component.resolution_txids.push_back(txid);
                 } else if (legacy_marker && legacy_nonreplaceable_sequence) {
@@ -4314,6 +4354,25 @@ const char* RecoveryOriginString(ShadowPowClaimRecoveryOrigin origin)
                : SHADOW_POW_RESOLUTION_ORIGIN_MANUAL;
 }
 
+bool StoreResolutionAuthorizationReceipt(
+    mapValue_t& values, const CTransaction& transaction,
+    const ShadowPowClaimRecoveryPlan* plan, std::string& error)
+{
+    if (!plan || plan->plan_id.IsNull() || plan->active_tip.IsNull() ||
+        plan->active_height < 0 || !plan->complete) {
+        error = "relay authorization requires a complete exact-plan receipt";
+        return false;
+    }
+    values[SHADOW_POW_RESOLUTION_AUTH_SCHEMA_KEY] = "1";
+    values[SHADOW_POW_RESOLUTION_AUTH_PLAN_KEY] = plan->plan_id.GetHex();
+    values[SHADOW_POW_RESOLUTION_AUTH_TIP_KEY] = plan->active_tip.GetHex();
+    values[SHADOW_POW_RESOLUTION_AUTH_HEIGHT_KEY] = ToString(plan->active_height);
+    values[SHADOW_POW_RESOLUTION_AUTH_GENERATION_KEY] = ToString(plan->wallet_generation);
+    values[SHADOW_POW_RESOLUTION_AUTH_ORIGIN_KEY] = RecoveryOriginString(plan->origin);
+    values[SHADOW_POW_RESOLUTION_AUTH_WTXID_KEY] = transaction.GetWitnessHash().GetHex();
+    return true;
+}
+
 bool IsResolutionNode(ShadowPowClaimRecoveryNodeKind kind)
 {
     return kind == ShadowPowClaimRecoveryNodeKind::MANAGED_RESOLUTION ||
@@ -4985,7 +5044,8 @@ const char* ShadowPowClaimResolutionRevocationStatusName(
 bool CWallet::PersistNewManagedShadowPowResolution(
     const ShadowPowClaimRecoveryAction& action,
     ShadowPowClaimRecoveryOrigin origin, bool relay_authorized,
-    int active_height, int64_t created_time, std::string& error)
+    int active_height, int64_t created_time, std::string& error,
+    const ShadowPowClaimRecoveryPlan* authorization_plan)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(cs_wallet);
@@ -5028,6 +5088,10 @@ bool CWallet::PersistNewManagedShadowPowResolution(
     metadata[SHADOW_POW_LEGACY_CLEANUP_FOR_KEY] =
         (*std::min_element(action.claim_txids.begin(),
                            action.claim_txids.end())).GetHex();
+    if (relay_authorized && !StoreResolutionAuthorizationReceipt(
+            metadata, *action.transaction, authorization_plan, error)) {
+        return false;
+    }
 
     WalletBatch batch(GetDatabase());
     if (!batch.TxnBegin(/*durable=*/true)) {
@@ -5089,7 +5153,8 @@ bool CWallet::PersistNewManagedShadowPowResolution(
 
 bool CWallet::SetManagedShadowPowResolutionRelayAuthority(
     const uint256& txid, bool authorized,
-    bool explicit_reauthorization, std::string& error)
+    bool explicit_reauthorization, std::string& error,
+    const ShadowPowClaimRecoveryPlan* authorization_plan)
 {
     AssertLockHeld(cs_wallet);
     if (m_shadow_pow_claim_recovery_db_ambiguous ||
@@ -5130,6 +5195,11 @@ bool CWallet::SetManagedShadowPowResolutionRelayAuthority(
         authorized ? "1" : "0";
     persisted.mapValue[SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY] =
         desired_revoked ? "1" : "0";
+    if (authorized && explicit_reauthorization &&
+        !StoreResolutionAuthorizationReceipt(
+            persisted.mapValue, *persisted.tx, authorization_plan, error)) {
+        return false;
+    }
     WalletBatch batch(GetDatabase());
     if (!batch.TxnBegin(/*durable=*/true)) {
         error = "failed to begin durable managed-resolution relay-authority update";
@@ -5150,10 +5220,7 @@ bool CWallet::SetManagedShadowPowResolutionRelayAuthority(
         error = "relay-authority commit outcome is ambiguous; reload the wallet before retrying";
         return false;
     }
-    it->second.mapValue[SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY] =
-        authorized ? "1" : "0";
-    it->second.mapValue[SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY] =
-        desired_revoked ? "1" : "0";
+    it->second.mapValue = std::move(persisted.mapValue);
     it->second.MarkDirty();
     NotifyTransactionChanged(txid, CT_UPDATED);
     return true;
@@ -5706,7 +5773,7 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
                 if (!PersistNewManagedShadowPowResolution(
                         action, effective.origin, commit_authority,
                         result.plan.active_height, created_time,
-                        result.error)) {
+                        result.error, &result.plan)) {
                     // A failed or ambiguous durable commit never authorizes
                     // relay. Reload/retry will discover and reuse exact bytes
                     // if the database committed despite the error.
@@ -5739,7 +5806,7 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
                 if (!SetManagedShadowPowResolutionRelayAuthority(
                         item.transaction->GetHash(), true,
                         /*explicit_reauthorization=*/true,
-                        result.error)) {
+                        result.error, &result.plan)) {
                     result.durable_state_ambiguous =
                         m_shadow_pow_claim_recovery_db_ambiguous;
                     return result;

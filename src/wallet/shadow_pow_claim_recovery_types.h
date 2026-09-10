@@ -86,6 +86,16 @@ inline constexpr char SHADOW_POW_RESOLUTION_RELAY_AUTHORIZED_KEY[]{"qq_shadow_po
 // abandons the transaction or releases its confirmed anchor.  It is cleared
 // only by a fresh exact-plan recovery commit, never by a generic relay callback.
 inline constexpr char SHADOW_POW_RESOLUTION_RELAY_REVOKED_KEY[]{"qq_shadow_pow_resolution_relay_revoked"};
+// Read-only receipt of the latest explicit exact-plan relay authorization.
+// Written atomically with authority, retained on revocation, and never itself
+// consulted to grant relay permission. Older records may have no receipt.
+inline constexpr char SHADOW_POW_RESOLUTION_AUTH_SCHEMA_KEY[]{"qq_shadow_pow_resolution_auth_schema"};
+inline constexpr char SHADOW_POW_RESOLUTION_AUTH_PLAN_KEY[]{"qq_shadow_pow_resolution_auth_plan"};
+inline constexpr char SHADOW_POW_RESOLUTION_AUTH_TIP_KEY[]{"qq_shadow_pow_resolution_auth_tip"};
+inline constexpr char SHADOW_POW_RESOLUTION_AUTH_HEIGHT_KEY[]{"qq_shadow_pow_resolution_auth_height"};
+inline constexpr char SHADOW_POW_RESOLUTION_AUTH_GENERATION_KEY[]{"qq_shadow_pow_resolution_auth_generation"};
+inline constexpr char SHADOW_POW_RESOLUTION_AUTH_ORIGIN_KEY[]{"qq_shadow_pow_resolution_auth_origin"};
+inline constexpr char SHADOW_POW_RESOLUTION_AUTH_WTXID_KEY[]{"qq_shadow_pow_resolution_auth_wtxid"};
 // Older releases use a selected claim txid as this marker's value. New code
 // retains it for downgrade-safe non-rebroadcast behavior while the anchor
 // metadata above is authoritative for idempotency.
@@ -129,6 +139,15 @@ enum class ShadowPowClaimRecoveryNodeKind : uint8_t {
     MANAGED_RESOLUTION,
     LEGACY_RESOLUTION,
     ORDINARY,
+};
+
+struct ShadowPowClaimResolutionAuthorizationReceipt
+{
+    uint256 plan_id;
+    uint256 active_tip;
+    int active_height{-1};
+    uint64_t wallet_generation{0};
+    std::string origin;
 };
 
 struct ShadowPowClaimRecoveryNode
@@ -196,6 +215,7 @@ struct ShadowPowClaimRecoveryNode
     int64_t resolution_created_time{0};
     bool resolution_relay_authorized{false};
     bool resolution_relay_revoked{false};
+    std::optional<ShadowPowClaimResolutionAuthorizationReceipt> authorization_receipt;
 };
 
 struct ShadowPowClaimRecoveryComponent

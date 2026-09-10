@@ -819,6 +819,7 @@ private:
     std::atomic<SteadyClock::time_point> m_scanning_start{SteadyClock::time_point{}};
     std::atomic<double> m_scanning_progress{0};
     friend class WalletRescanReserver;
+    friend struct WalletLoadTestAccess;
 
     //! the current wallet version: clients below this version are not able to load the wallet
     int nWalletVersion GUARDED_BY(cs_wallet){FEATURE_BASE};
@@ -2426,11 +2427,13 @@ public:
     bool PersistNewManagedShadowPowResolution(
         const ShadowPowClaimRecoveryAction& action,
         ShadowPowClaimRecoveryOrigin origin, bool relay_authorized,
-        int active_height, int64_t created_time, std::string& error)
+        int active_height, int64_t created_time, std::string& error,
+        const ShadowPowClaimRecoveryPlan* authorization_plan = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     bool SetManagedShadowPowResolutionRelayAuthority(
         const uint256& txid, bool authorized,
-        bool explicit_reauthorization, std::string& error)
+        bool explicit_reauthorization, std::string& error,
+        const ShadowPowClaimRecoveryPlan* authorization_plan = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Durably cancel this wallet's relay/scheduler authority for exact
      * managed resolution bytes. This restriction-only operation never

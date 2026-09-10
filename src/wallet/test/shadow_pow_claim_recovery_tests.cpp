@@ -7439,6 +7439,45 @@ BOOST_AUTO_TEST_CASE(managed_resolution_relay_revocation_is_durable_restriction_
     BOOST_CHECK(!reauthorized.success);
     BOOST_CHECK(reauthorized.durable_state_changed);
     BOOST_CHECK_EQUAL(reauthorized.relay_authority_granted, 1U);
+    const auto check_receipt = [&](CWallet& receipt_wallet,
+                                   const ShadowPowClaimRecoveryPlan& authorized_plan) {
+        const auto inventory = receipt_wallet.GetShadowPowClaimRecoveryInventory();
+        bool found{false};
+        for (const auto& component : inventory.components) {
+            for (const auto& node : component.nodes) {
+                if (node.txid != resolution_txid) continue;
+                found = true;
+                BOOST_REQUIRE(node.authorization_receipt);
+                const auto& receipt = *node.authorization_receipt;
+                BOOST_CHECK(receipt.plan_id == authorized_plan.plan_id);
+                BOOST_CHECK(receipt.active_tip == authorized_plan.active_tip);
+                BOOST_CHECK_EQUAL(receipt.active_height, authorized_plan.active_height);
+                BOOST_CHECK_EQUAL(receipt.wallet_generation, authorized_plan.wallet_generation);
+                BOOST_CHECK_EQUAL(receipt.origin, "manual");
+            }
+        }
+        BOOST_REQUIRE(found);
+    };
+    check_receipt(*cancelled, fresh);
+    auto receipt_reloaded = load(GetMockableDatabase(*cancelled).m_records);
+    check_receipt(*receipt_reloaded, fresh);
+    // A copied or corrupted receipt cannot report authorization of different
+    // bytes. It also must not reinterpret legacy relay-authority metadata.
+    {
+        LOCK(receipt_reloaded->cs_wallet);
+        auto& record = receipt_reloaded->mapWallet.at(resolution_txid);
+        record.mapValue[SHADOW_POW_RESOLUTION_AUTH_WTXID_KEY] = uint256::ONE.GetHex();
+        receipt_reloaded->MarkShadowPowClaimCandidateStateChangedLocked();
+    }
+    for (const auto& component : receipt_reloaded->GetShadowPowClaimRecoveryInventory().components) {
+        for (const auto& node : component.nodes) {
+            if (node.txid == resolution_txid) {
+                BOOST_CHECK(node.resolution_metadata_valid);
+                BOOST_CHECK(node.resolution_relay_authorized);
+                BOOST_CHECK(!node.authorization_receipt);
+            }
+        }
+    }
     {
         LOCK(cancelled->cs_wallet);
         BOOST_CHECK_EQUAL(cancelled->mapWallet.at(resolution_txid).mapValue.at(
@@ -7494,6 +7533,7 @@ BOOST_AUTO_TEST_CASE(managed_resolution_relay_revocation_is_durable_restriction_
     BOOST_CHECK(idempotent.status ==
                 ShadowPowClaimResolutionRevocationStatus::ALREADY_REVOKED);
     BOOST_CHECK_EQUAL(idempotent.durable_state_changed.value(), false);
+    check_receipt(*cancelled, fresh); // Revocation retains the original receipt.
 
     // Reauthorize once more and snapshot that state for race and database
     // fault paths.

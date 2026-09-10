@@ -3331,6 +3331,7 @@ class ReleaseToolTests(unittest.TestCase):
         merge_shas = (
             "957b41d22c8d96131a0ec87fff1e2f4c20a5caa2",
             "19baffef25af36e177db2975780e0641b59753aa",
+            "e85668ed26ef75d92e234488cbd85e146f6ffd5a",
         )
         merge_metadata = (
             "Blackcoin-Dev\0"
@@ -3355,6 +3356,11 @@ class ReleaseToolTests(unittest.TestCase):
         )
         with mock.patch.object(identity, "git", return_value=untrusted_committer):
             with self.assertRaisesRegex(RuntimeError, "committer is"):
+                identity.verify_commit(merge_shas[-1])
+
+        extra_attribution = merge_metadata + "\nCo-authored-by: Other <other@example.invalid>"
+        with mock.patch.object(identity, "git", return_value=extra_attribution):
+            with self.assertRaisesRegex(RuntimeError, "contributor-attribution trailer"):
                 identity.verify_commit(merge_shas[-1])
 
     def test_windows_payload_inventory_is_exact_and_excludes_test_binary(self):

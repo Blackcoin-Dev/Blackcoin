@@ -1,0 +1,283 @@
+{
+  "repository": "Blackcoin-Dev/Blackcoin",
+  "actor": "Blackcoin-Dev",
+  "source_sha": "1038d1eed8e699580848dcca79de8f0f60430eb6",
+  "tag": "v30.1.5",
+  "tag_object": "3172dd96f7963491e78e6f60f990ee11c65fa125",
+  "control_tag": "v30.1.5-publication-recovery-1",
+  "source_run_id": 34564576294,
+  "source_run_attempt": 2,
+  "source_date_epoch": 1789091346,
+  "version": "30.1.5",
+  "acknowledgement": "V30.1.5-PUBLICATION-RECOVERY-1",
+  "jobs": [
+    {
+      "id": 103189449422,
+      "name": "Resolve and authorize immutable release target",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189449997,
+      "name": "Exact-SHA prerelease or production safety gate / source identity, workflow syntax, and lint",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189450292,
+      "name": "Exact-SHA prerelease or production safety gate / pinned independent quantum crypto provenance",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189450627,
+      "name": "Exact-SHA prerelease or production safety gate / critical Gold Rush, lifecycle, wallet, and recovery tests",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189450764,
+      "name": "Exact-SHA prerelease or production safety gate / macOS Intel native cryptographic vectors",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189450840,
+      "name": "Exact-SHA prerelease or production safety gate / thread-sanitizer consensus and liveness gate",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189450946,
+      "name": "Exact-SHA prerelease or production safety gate / address-undefined-sanitizer consensus and liveness gate",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189450972,
+      "name": "Exact-SHA prerelease or production safety gate / Linux ARM64 native cryptographic vectors and resources",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189451076,
+      "name": "Exact-SHA prerelease or production safety gate / pinned native build and unit tests",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189451098,
+      "name": "Exact-SHA prerelease or production safety gate / Build pinned Windows x86_64 vector binaries",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189451375,
+      "name": "Exact-SHA prerelease or production safety gate / Windows x86_64 native cryptographic vectors and resources",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189451474,
+      "name": "Exact-SHA prerelease or production safety gate / source-pinned sanitizer regression smoke",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189451733,
+      "name": "Exact-SHA prerelease or production safety gate / macOS Apple Silicon native cryptographic vectors",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189451799,
+      "name": "Exact-SHA prerelease or production safety gate / Linux ARM64 native UBSan block-harness gate",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189451864,
+      "name": "Exact-SHA prerelease or production safety gate / complete extended functional suite",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189451912,
+      "name": "Exact-SHA prerelease or production safety gate / real v26.2, v28.4, v30.1, and candidate interoperability",
+      "conclusion": "success"
+    },
+    {
+      "id": 103189451974,
+      "name": "Exact-SHA prerelease or production safety gate / measured worst-case quantum crypto resources (Linux x86_64)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201468868,
+      "name": "Require explicit v30.1.5 signed-source publication acknowledgement",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201468891,
+      "name": "Select build target",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530355,
+      "name": "linux-arm-64-bit (verifier)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530356,
+      "name": "linux-arm-64-bit (primary)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530372,
+      "name": "linux-64-bit (verifier)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530385,
+      "name": "macos-64-bit (primary)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530388,
+      "name": "windows-64-bit (primary)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530396,
+      "name": "macos-arm-64-bit (verifier)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530411,
+      "name": "linux-64-bit (primary)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530466,
+      "name": "macos-64-bit (verifier)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530467,
+      "name": "windows-64-bit (verifier)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103201530475,
+      "name": "macos-arm-64-bit (primary)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103216251165,
+      "name": "Ad-hoc sign and validate macOS Intel-x86_64 (verifier)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103216251188,
+      "name": "Ad-hoc sign and validate macOS Intel-x86_64 (primary)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103216251190,
+      "name": "Ad-hoc sign and validate macOS Apple-Silicon-ARM64 (verifier)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103216251251,
+      "name": "Ad-hoc sign and validate macOS Apple-Silicon-ARM64 (primary)",
+      "conclusion": "success"
+    },
+    {
+      "id": 103216406834,
+      "name": "Require native macOS validation when selected",
+      "conclusion": "success"
+    },
+    {
+      "id": 103216424864,
+      "name": "Verify independent byte-for-byte rebuilds",
+      "conclusion": "success"
+    },
+    {
+      "id": 103216519221,
+      "name": "Publish authorized GitHub release",
+      "conclusion": "failure"
+    }
+  ],
+  "publisher_steps": [
+    {
+      "conclusion": "success",
+      "name": "Set up job"
+    },
+    {
+      "conclusion": "success",
+      "name": "Checkout immutable release source"
+    },
+    {
+      "conclusion": "success",
+      "name": "Download only exact-SHA release assets"
+    },
+    {
+      "conclusion": "success",
+      "name": "Download exact-SHA reproducibility evidence"
+    },
+    {
+      "conclusion": "success",
+      "name": "Install final release verification tools"
+    },
+    {
+      "conclusion": "success",
+      "name": "Assemble exact-SHA signed-source release"
+    },
+    {
+      "conclusion": "success",
+      "name": "Publish GitHub build-provenance attestations"
+    },
+    {
+      "conclusion": "success",
+      "name": "Publish GitHub SBOM attestations"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Create an immutable release at the annotated SSH-signed tag"
+    },
+    {
+      "conclusion": "success",
+      "name": "Post Checkout immutable release source"
+    },
+    {
+      "conclusion": "success",
+      "name": "Complete job"
+    }
+  ],
+  "artifacts": [
+    {
+      "digest": "sha256:f96d4898ea827e0aee4008924024d5bd3adc3ea465e2e9b21e8f64ff680d61c3",
+      "id": 10193115915,
+      "name": "release-30.1.5-reproducibility-1038d1eed8e699580848dcca79de8f0f60430eb6",
+      "size_in_bytes": 330
+    },
+    {
+      "digest": "sha256:78342b3b9433c597805c489dc0f7b44419b614dbe9302a75548483a97fbdcec3",
+      "id": 10193101511,
+      "name": "release-30.1.5-macos-64-bit-primary-1038d1eed8e699580848dcca79de8f0f60430eb6",
+      "size_in_bytes": 39360961
+    },
+    {
+      "digest": "sha256:f23d0cfc33c9289e71ac2cbf9eca87b60c14fb40e22488a57e19494ae42f3eae",
+      "id": 10193095563,
+      "name": "release-30.1.5-macos-arm-64-bit-primary-1038d1eed8e699580848dcca79de8f0f60430eb6",
+      "size_in_bytes": 37190872
+    },
+    {
+      "digest": "sha256:9b7bcc4252a49a3b9134aa6e0beef1340e1fa6ca42fa7d3f2d15e92e13d93606",
+      "id": 10192689189,
+      "name": "release-30.1.5-windows-64-bit-primary-1038d1eed8e699580848dcca79de8f0f60430eb6",
+      "size_in_bytes": 73113927
+    },
+    {
+      "digest": "sha256:9a653673f62e235669283cb03cb5f2225a79da333e0cc886688ac12c9b877e27",
+      "id": 10192618189,
+      "name": "release-30.1.5-linux-arm-64-bit-primary-1038d1eed8e699580848dcca79de8f0f60430eb6",
+      "size_in_bytes": 46805901
+    },
+    {
+      "digest": "sha256:734c0d23824ed0cf6136d116e4192fc004e4a831200ef1e1ce629e2974679782",
+      "id": 10192074689,
+      "name": "release-30.1.5-linux-64-bit-primary-1038d1eed8e699580848dcca79de8f0f60430eb6",
+      "size_in_bytes": 48293218
+    }
+  ],
+  "attestation_ids": [
+    46814847,
+    46814857
+  ]
+}

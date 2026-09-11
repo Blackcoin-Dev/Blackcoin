@@ -3,6 +3,8 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+export LC_ALL=C.UTF-8
+
 # Keep the production sanitizer/compiler policy; narrow only build/test scope.
 # shellcheck source=ci/test/00_setup_env_native_tsan.sh
 source "$(dirname "${BASH_SOURCE[0]}")/00_setup_env_native_tsan.sh"

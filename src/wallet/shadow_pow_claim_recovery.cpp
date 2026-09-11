@@ -2079,15 +2079,9 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
         inventory.claim_inventory_capacity_work = topology_work;
         return true;
     };
-    const auto consume_transaction_work = [&](const CWalletTx& wtx) {
-        if (!wtx.tx) {
-            inventory.recovery_database_ambiguous = true;
-            return false;
-        }
-        const CTransaction& tx = *wtx.tx;
-        const size_t tx_bytes = tx.GetTotalSize();
-        if (tx_bytes > SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY ||
-            tx_bytes > SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY -
+    const auto consume_topology_bytes = [&](size_t bytes) {
+        if (bytes > SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY ||
+            bytes > SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY -
                            std::min(
                                topology_bytes,
                                SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY)) {
@@ -2096,6 +2090,16 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
                 SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1;
             return false;
         }
+        topology_bytes += bytes;
+        return true;
+    };
+    const auto consume_transaction_work = [&](const CWalletTx& wtx) {
+        if (!wtx.tx) {
+            inventory.recovery_database_ambiguous = true;
+            return false;
+        }
+        const CTransaction& tx = *wtx.tx;
+        if (!consume_topology_bytes(tx.GetTotalSize())) return false;
         if (metadata_budgeted_txids.insert(wtx.GetHash()).second &&
             !ConsumeShadowPowClaimMetadataBudget(
                 wtx.mapValue, metadata_entries, metadata_bytes)) {
@@ -2104,7 +2108,6 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
                 SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1;
             return false;
         }
-        topology_bytes += tx_bytes;
         return consume_topology_work(1) &&
             consume_topology_work(tx.vin.size()) &&
             consume_topology_work(tx.vout.size());
@@ -2311,9 +2314,18 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
             }
 
             const CWalletTx& parent = parent_it->second;
-            if (!consume_transaction_work(parent)) return;
             const CTxOut& parent_output = parent.tx->vout[prevout.n];
             if (GetTxDepthInMainChain(parent) > 0) {
+                // A confirmed parent is the ancestry boundary. This path
+                // reads only the referenced output, not the parent's other
+                // inputs/outputs or claim metadata. Charge that exact read
+                // before ownership checks or copying its script. Inactive
+                // ancestors and any parent later visited as a graph node
+                // still consume the complete transaction budget below.
+                if (!consume_topology_work() ||
+                    !consume_topology_bytes(GetSerializeSize(parent_output))) {
+                    return;
+                }
                 terminal.anchor = prevout;
                 // CWallet::IsMine(CTxOut) may perform two script-manager
                 // passes. Charge the worst case before entering it so the
@@ -2333,6 +2345,7 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
                 break;
             }
 
+            if (!consume_transaction_work(parent)) return;
             if (!TransactionHasShadowProof(*parent.tx) ||
                 m_shadow_pow_claim_txids.count(parent.GetHash()) == 0) {
                 terminal.anchor = prevout;

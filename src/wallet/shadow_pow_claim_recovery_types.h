@@ -21,7 +21,11 @@
 /** Strict upper bounds on wallet work performed while cs_main is held. */
 inline constexpr size_t SHADOW_POW_CLAIM_INDEX_CAPACITY{1024};
 inline constexpr size_t SHADOW_POW_CLAIM_OWNERSHIP_SLICE{64};
-inline constexpr size_t SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY{4096};
+// Complete retained-history traversal needs headroom in addition to the hot
+// claim count, including deep branches, sibling conflicts and resolved nodes.
+// Record, aggregate-byte, metadata, index and script-manager bounds remain
+// independent and must still refuse an incomplete inventory.
+inline constexpr size_t SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY{16384};
 inline constexpr size_t SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY{256};
 inline constexpr size_t SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY{8 * 1024 * 1024};
 inline constexpr size_t SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY{1024 * 1024};

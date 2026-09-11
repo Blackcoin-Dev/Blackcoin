@@ -3002,6 +3002,97 @@ static void AddKey(CWallet& wallet, const CKey& key)
     if (!wallet.AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
 }
 
+BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_large_wallet_source_capacity,
+                        WalletShadowPowQQP2TestingSetup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script = GetScriptForRawPubKey(wallet_key.GetPubKey());
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        wallet_key);
+    // Exercise the manager-work budget as well as both former 4096-output
+    // checks. A one-manager fixture would not catch the coupled work limit.
+    while (WITH_LOCK(wallet->cs_wallet,
+                     return wallet->GetScriptPubKeyManCountLocked()) < 8) {
+        CKey extra_key;
+        extra_key.MakeNewKey(/*fCompressed=*/true);
+        AddKey(*wallet, extra_key);
+    }
+    const CBlockIndex* confirmation_block = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain()[1]);
+    BOOST_REQUIRE(confirmation_block);
+    auto add_outputs = [&](uint8_t tag, size_t count) {
+        CMutableTransaction funding;
+        funding.vin.emplace_back(COutPoint{uint256{tag}, 0});
+        funding.vout.assign(count, CTxOut{COIN, wallet_script});
+        const CTransactionRef tx = MakeTransactionRef(std::move(funding));
+        BOOST_REQUIRE(wallet->AddToWallet(
+            tx, TxStateConfirmed{confirmation_block->GetBlockHash(),
+                                 confirmation_block->nHeight, 1}));
+        LOCK(::cs_main);
+        for (uint32_t index = 0; index < tx->vout.size(); ++index) {
+            Assert(m_node.chainman)->ActiveChainstate().CoinsTip().AddCoin(
+                COutPoint{tx->GetHash(), index},
+                Coin{tx->vout[index], confirmation_block->nHeight,
+                     /*coinbase=*/false, /*coinstake=*/false, tx->nTime},
+                /*possible_overwrite=*/false);
+        }
+        return tx->GetHash();
+    };
+    constexpr size_t OUTPUT_COUNT{8192};
+    const uint256 funding = add_outputs(0x71, OUTPUT_COUNT);
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(wallet->cs_wallet,
+                                   return wallet->GetLiveUnspentStakeOutpoints().size()),
+                        OUTPUT_COUNT);
+    wallet->SetStakingEnabled(true);
+    const auto reserve = wallet->GetShadowPowClaimStakeReserveInfo();
+    BOOST_REQUIRE(!reserve.warm_output_capacity_exceeded);
+    BOOST_CHECK(reserve.wallet_tip_matches);
+    BOOST_CHECK_EQUAL(reserve.mature_stakeable_legacy_coins, OUTPUT_COUNT);
+    BOOST_CHECK_EQUAL(reserve.reserved_stake_coins, 1U);
+    BOOST_CHECK_EQUAL(reserve.claim_coins_after_reserve, OUTPUT_COUNT - 1);
+
+    const CScript quantum_payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x51)});
+    CCoinControl control;
+    control.m_allow_other_inputs = false;
+    control.m_avoid_address_reuse = false;
+    control.m_min_depth = 1;
+    ShadowPowClaimInput selected;
+    bilingual_str error;
+    const auto gate = wallet->GetShadowPowClaimMiningGate();
+    BOOST_REQUIRE(gate.MayCreateNewAnchorClaim());
+    BOOST_REQUIRE_MESSAGE(
+        wallet->SelectShadowPowClaimInput(
+            std::nullopt, quantum_payout, nullptr, control, selected, error,
+            gate) == ShadowPowClaimInputSelectionResult::SELECTED,
+        error.original);
+    // Equal-valued outputs reserve the first outpoint for staking. Selection
+    // still checks the exact next coin against the active-chain UTXO set.
+    BOOST_CHECK(selected.outpoint == COutPoint(funding, 1));
+
+    // The expanded source remains bounded: one above 65536 must refuse the
+    // complete snapshot, not truncate it or retain the previous selection.
+    add_outputs(0x72, 65537 - OUTPUT_COUNT);
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(wallet->cs_wallet,
+                                   return wallet->GetLiveUnspentStakeOutpoints().size()),
+                        65537U);
+    const auto oversized = wallet->GetShadowPowClaimStakeReserveInfo();
+    BOOST_CHECK(oversized.warm_output_capacity_exceeded);
+    BOOST_CHECK(!oversized.wallet_tip_matches);
+    BOOST_CHECK_EQUAL(oversized.mature_stakeable_legacy_coins, 0U);
+    BOOST_CHECK_EQUAL(oversized.claim_coins_after_reserve, 0U);
+    BOOST_CHECK(wallet->SelectShadowPowClaimInput(
+                    std::nullopt, quantum_payout, nullptr, control, selected,
+                    error, wallet->GetShadowPowClaimMiningGate()) ==
+                ShadowPowClaimInputSelectionResult::INPUT_ENUMERATION_CAPACITY);
+    BOOST_CHECK(selected.outpoint.IsNull());
+}
+
 BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
                         WalletShadowPowQQP2TestingSetup)
 {

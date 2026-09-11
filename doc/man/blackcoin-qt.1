@@ -470,11 +470,14 @@ Seed wallets whose recovery policy is still unset with an explicit Gold
 Rush PoW claim\-recovery choice: automatic (or 1) or pause\-and\-ask
 (or 0). Default: no seed and no spending authority. A persisted
 wallet choice always wins. Automatic mode requires every
-\fB\-autoresolve\fR* limit below and is standing consent to conflict
-with a disclosed legacy QQP2 proof that is invalid on the pinned
-tip but may validate on a normal descendant; either transaction
-may confirm. Generic transient/local failures and
-future\-origin/future\-version proofs remain refused.
+\fB\-autoresolve\fR* limit below and is separate standing consent for
+fee\-paying conflicts that the component engine classifies as
+conflict\-resolvable, including a disclosed legacy QQP2 proof that
+is invalid on the pinned tip but may validate on a normal
+descendant. The built\-in miner's normal authenticated path
+instead uses exact relay or same\-anchor continuation. Generic
+transient/local failures and future\-origin/future\-version proofs
+remain refused.
 .HP
 \fB\-autoresolvemaxactions=\fR<n>
 .IP
@@ -499,9 +502,9 @@ seconds; required with \fB\-autoresolvefailedclaims\fR=\fI\,automatic\/\fR
 \fB\-autoresolvestaleblocks=\fR<n>
 .IP
 Minimum current\-branch staleness in blocks before automatic recovery may
-act on a conflict\-resolvable claim component, including a
-disclosed legacy QQP2 proof that may revalidate on a normal
-descendant; required with \fB\-autoresolvefailedclaims\fR=\fI\,automatic\/\fR
+act on a conflict\-resolvable component, including a disclosed
+legacy QQP2 proof that may revalidate on a normal descendant;
+required with \fB\-autoresolvefailedclaims\fR=\fI\,automatic\/\fR
 .HP
 \fB\-autostartstaking=\fR<true/false>
 .IP
@@ -579,11 +582,12 @@ Gold Rush PoW claim input selection while staking is enabled
 \fB\-powmining=\fR<true/false>
 .IP
 Auto\-start one built\-in Gold Rush Proof\-of\-Work miner for every eligible
-private\-key wallet loaded by this process (default: false). Each
-wallet uses the configured thread and per\-core CPU limits, must
-be normally unlocked, needs a spendable legacy fee UTXO, and must
-already own a payout key unless \fB\-qqallowautokeycreation\fR=\fI\,1\/\fR was
-separately authorized.
+private\-key wallet loaded by this process (default: false). An
+encrypted wallet starts in a waiting state and resumes
+automatically after a normal (not staking\-only) unlock. Each
+wallet uses the configured thread and per\-core CPU limits, needs
+a spendable legacy fee UTXO, and must already own a payout key
+unless \fB\-qqallowautokeycreation\fR=\fI\,1\/\fR was separately authorized.
 .HP
 \fB\-powminingcpu=\fR<n>
 .IP

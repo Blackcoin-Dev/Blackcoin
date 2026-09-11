@@ -83,6 +83,7 @@ TEST_FRAMEWORK_MODULES = [
     "ripemd160",
     "script",
     "segwit_addr",
+    "wallet_util",
 ]
 
 EXTENDED_SCRIPTS = [
@@ -173,6 +174,8 @@ BASE_SCRIPTS = [
     'feature_goldrush_local_mining_policy.py',
     'feature_goldrush_mixed_version.py',
     'feature_goldrush_v3014_wallet_upgrade.py --descriptors',
+    'feature_goldrush_v3014_qqp2_upgrade.py --descriptors',
+    'feature_goldrush_v3014_same_anchor_mixed.py --descriptors',
     'feature_goldrush_migration_rpc.py',
     'feature_goldrush_coldstake_auto_migration.py',
     'feature_goldrush_coinstatsindex.py',
@@ -611,7 +614,7 @@ def run_tests(*, test_list, src_dir, build_dir, tmpdir, jobs=1, enable_coverage=
     result = unittest.TextTestRunner(verbosity=1, failfast=True).run(test_framework_tests)
     if not result.wasSuccessful():
         logging.debug("Early exiting after failure in TestFramework unit tests")
-        sys.exit(False)
+        sys.exit(1)
 
     flags = ['--cachedir={}'.format(cache_dir)] + args
 
@@ -646,37 +649,44 @@ def run_tests(*, test_list, src_dir, build_dir, tmpdir, jobs=1, enable_coverage=
     test_count = len(test_list)
     all_passed = True
     i = 0
-    while i < test_count:
-        if failfast and not all_passed:
-            break
-        for test_result, testdir, stdout, stderr, skip_reason in job_queue.get_next():
-            test_results.append(test_result)
-            i += 1
-            done_str = "{}/{} - {}{}{}".format(i, test_count, BOLD[1], test_result.name, BOLD[0])
-            if test_result.status == "Passed":
-                logging.debug("%s passed, Duration: %s s" % (done_str, test_result.time))
-            elif test_result.status == "Skipped":
-                logging.debug(f"{done_str} skipped ({skip_reason})")
-            else:
-                all_passed = False
-                print("%s failed, Duration: %s s\n" % (done_str, test_result.time))
-                print(BOLD[1] + 'stdout:\n' + BOLD[0] + stdout + '\n')
-                print(BOLD[1] + 'stderr:\n' + BOLD[0] + stderr + '\n')
-                if combined_logs_len and os.path.isdir(testdir):
-                    # Print the final `combinedlogslen` lines of the combined logs
-                    print('{}Combine the logs and print the last {} lines ...{}'.format(BOLD[1], combined_logs_len, BOLD[0]))
-                    print('\n============')
-                    print('{}Combined log for {}:{}'.format(BOLD[1], testdir, BOLD[0]))
-                    print('============\n')
-                    combined_logs_args = [sys.executable, os.path.join(tests_dir, 'combine_logs.py'), testdir]
-                    if BOLD[0]:
-                        combined_logs_args += ['--color']
-                    combined_logs, _ = subprocess.Popen(combined_logs_args, text=True, stdout=subprocess.PIPE).communicate()
-                    print("\n".join(deque(combined_logs.splitlines(), combined_logs_len)))
+    try:
+        while i < test_count:
+            if failfast and not all_passed:
+                break
+            for test_result, testdir, stdout, stderr, skip_reason in job_queue.get_next():
+                test_results.append(test_result)
+                i += 1
+                done_str = "{}/{} - {}{}{}".format(i, test_count, BOLD[1], test_result.name, BOLD[0])
+                if test_result.status == "Passed":
+                    logging.debug("%s passed, Duration: %s s" % (done_str, test_result.time))
+                elif test_result.status == "Skipped":
+                    logging.debug(f"{done_str} skipped ({skip_reason})")
+                else:
+                    all_passed = False
+                    print("%s failed, Duration: %s s\n" % (done_str, test_result.time))
+                    print(BOLD[1] + 'stdout:\n' + BOLD[0] + stdout + '\n')
+                    print(BOLD[1] + 'stderr:\n' + BOLD[0] + stderr + '\n')
+                    if combined_logs_len and os.path.isdir(testdir):
+                        # Print the final `combinedlogslen` lines of the combined logs
+                        print('{}Combine the logs and print the last {} lines ...{}'.format(BOLD[1], combined_logs_len, BOLD[0]))
+                        print('\n============')
+                        print('{}Combined log for {}:{}'.format(BOLD[1], testdir, BOLD[0]))
+                        print('============\n')
+                        combined_logs_args = [sys.executable, os.path.join(tests_dir, 'combine_logs.py'), testdir]
+                        if BOLD[0]:
+                            combined_logs_args += ['--color']
+                        combined_logs, _ = subprocess.Popen(combined_logs_args, text=True, stdout=subprocess.PIPE).communicate()
+                        print("\n".join(deque(combined_logs.splitlines(), combined_logs_len)))
 
-                if failfast:
-                    logging.debug("Early exiting after test failure")
-                    break
+                    if failfast:
+                        logging.debug("Early exiting after test failure")
+                        break
+    finally:
+        # Child sessions no longer receive the caller's Ctrl-C automatically.
+        # Clean up on fail-fast, exceptions and interruption, but never kill
+        # the runner, its shell, report collectors or unrelated siblings.
+        if not os.getenv("CI_FAILFAST_TEST_LEAVE_DANGLING"):
+            job_queue.kill_remaining()
 
     print_results(test_results, max_len_name, (int(time.time() - start_time)))
 
@@ -693,12 +703,6 @@ def run_tests(*, test_list, src_dir, build_dir, tmpdir, jobs=1, enable_coverage=
         os.rmdir(tmpdir)
 
     all_passed = all_passed and coverage_passed
-
-    # Clean up dangling processes if any. This may only happen with --failfast option.
-    # Killing the process group will also terminate the current process but that is
-    # not an issue
-    if not os.getenv("CI_FAILFAST_TEST_LEAVE_DANGLING") and len(job_queue.jobs):
-        os.killpg(os.getpgid(0), signal.SIGKILL)
 
     sys.exit(not all_passed)
 
@@ -741,6 +745,43 @@ class TestHandler:
         self.jobs = []
         self.use_term_control = use_term_control
 
+    @staticmethod
+    def kill_family(proc):
+        if os.name == 'posix':
+            try:
+                # start_new_session makes the child PID its group ID.
+                # Signal even an exited leader's surviving descendants.
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            # Best effort on Windows: taskkill cannot find an orphaned tree
+            # after its leader has exited.
+            result = subprocess.run(
+                ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode and proc.poll() is None:
+                raise RuntimeError(f"could not terminate test process tree {proc.pid}")
+
+    def kill_remaining(self):
+        """Stop only subprocess families launched by this handler."""
+        errors = []
+        for _, _, proc, _, log_out, log_err in self.jobs:
+            try:
+                self.kill_family(proc)
+                proc.wait(timeout=30)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                errors.append(str(error))
+            finally:
+                log_out.close()
+                log_err.close()
+        self.jobs.clear()
+        self.num_running = 0
+        if errors:
+            raise RuntimeError("test process cleanup failed: " + "; ".join(errors))
+
     def get_next(self):
         while self.num_running < self.num_jobs and self.test_list:
             # Add tests
@@ -758,7 +799,8 @@ class TestHandler:
                               subprocess.Popen([sys.executable, self.tests_dir + test_argv[0]] + test_argv[1:] + self.flags + portseed_arg + tmpdir_arg,
                                                text=True,
                                                stdout=log_stdout,
-                                               stderr=log_stderr),
+                                               stderr=log_stderr,
+                                               start_new_session=(os.name == 'posix')),
                               testdir,
                               log_stdout,
                               log_stderr))
@@ -777,6 +819,8 @@ class TestHandler:
             for job in self.jobs:
                 (name, start_time, proc, testdir, log_out, log_err) = job
                 if proc.poll() is not None:
+                    if not os.getenv("CI_FAILFAST_TEST_LEAVE_DANGLING"):
+                        self.kill_family(proc)
                     log_out.seek(0), log_err.seek(0)
                     [stdout, stderr] = [log_file.read().decode('utf-8') for log_file in (log_out, log_err)]
                     log_out.close(), log_err.close()

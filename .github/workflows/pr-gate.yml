@@ -4,6 +4,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      regression_scope:
+        description: Failure-only diagnostics; full keeps normal release qualification
+        type: choice
+        default: full
+        options: [full, all, native, asan, tsan]
       target_sha:
         description: Full commit SHA to test (defaults to the selected branch)
         required: false
@@ -52,7 +57,7 @@ concurrency:
   # Keep an open pull request's full gate independent from an exact-SHA alpha
   # artifact gate for the same commit. Superseded runs of the same event/mode
   # still cancel normally, while production runs remain non-cancelable.
-  group: safety-gate-${{ github.event_name }}-${{ inputs.release_mode == true && 'release' || 'core' }}-${{ inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
+  group: safety-gate-${{ inputs.regression_scope || 'full' }}-${{ github.event_name }}-${{ inputs.release_mode == true && 'release' || 'core' }}-${{ inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: ${{ inputs.release_mode != true }}
 
 env:
@@ -62,7 +67,7 @@ env:
 
 jobs:
   policy-and-lint:
-    name: source identity, workflow syntax, and lint
+    name: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && 'targeted regression configuration' || 'source identity, workflow syntax, and lint' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -101,9 +106,11 @@ jobs:
         run: git diff --check "$BASE_SHA...$TARGET_SHA"
 
       - name: Verify dependency, advisory, capability, and provenance evidence
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: python3 ci/release/verify_dependency_security.py
 
       - name: Install lint dependencies
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-pip shellcheck
@@ -114,6 +121,16 @@ jobs:
             mypy==1.4.1 \
             pyzmq==25.1.0 \
             vulture==2.6
+
+      - name: Test targeted workflow configuration
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') }}
+        run: |
+          python3 ci/test/test_sanitizer_regression_config.py
+          python3 ci/test/test_regression_workflow.py
+          python3 test/lint/lint-files.py
+          python3 test/lint/lint-shell-locale.py
+          bash -n ci/test/06_script_b.sh ci/test/regression_cache.sh
+          shellcheck -x ci/test/00_setup_env_native_asan_regression.sh ci/test/00_setup_env_native_tsan_regression.sh ci/test/regression_cache.sh
 
       - name: Parse workflow YAML
         run: ruby -e 'require "yaml"; Dir[".github/workflows/*.yml"].each { |path| YAML.parse_file(path) }'
@@ -132,18 +149,27 @@ jobs:
           "$RUNNER_TEMP/actionlint" -color
 
       - name: Test fail-closed release tooling
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: |
           python3 ci/release/test_release_tools.py
           python3 ci/release/test_genbuild_frozen.py
           python3 ci/release/test_shadow_resource_production.py
 
       - name: Test script corpus precondition tooling
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: |
           python3 ci/test/test_verify_script_assets.py
           python3 ci/test/test_sanitizer_report_capture.py
+          python3 ci/test/test_functional_runner_cleanup.py
+          python3 ci/test/test_sanitizer_regression_config.py
+          python3 ci/test/test_regression_workflow.py
           python3 test/fuzz/test_runner_tests.py
+          PYTHONPATH=test/functional python3 -m unittest \
+            feature_goldrush_pow_claim_singleflight.RecoveryPaginationHelperTest \
+            test_framework.wallet_util
 
       - name: Run repository linters
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         shell: bash
         env:
           COMMIT_RANGE: ${{ github.event.pull_request.base.sha || 'f647dc75c9479c03e81414f145a8d233b60959c7' }}..${{ env.TARGET_SHA }}
@@ -154,7 +180,7 @@ jobs:
 
   crypto-source-provenance:
     name: pinned independent quantum crypto provenance
-    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && (inputs.corrective_fast_path != true || github.event_name == 'pull_request') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -185,8 +211,9 @@ jobs:
           retention-days: 30
 
   native-build-and-unit:
-    name: pinned native build and unit tests
-    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
+    name: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && 'targeted native regression binaries' || 'pinned native build and unit tests' }}
+    needs: policy-and-lint
+    if: ${{ (inputs.regression_scope == 'all' || inputs.regression_scope == 'native') || ((inputs.regression_scope == '' || inputs.regression_scope == 'full') && (inputs.corrective_fast_path != true || github.event_name == 'pull_request')) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
@@ -204,7 +231,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             automake bison build-essential cmake gettext gperf libtool \
-            pkg-config python3 python3-zmq
+            pkg-config python3 python3-zmq ccache
+
+      - name: Reuse targeted native compiler and dependency cache
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') }}
+        id: regression-native-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            depends/built
+            .ci/native-ccache
+          key: regression-native-v1-${{ hashFiles('depends/**/*.mk', 'depends/packages/*', 'depends/patches/**/*') }}-${{ github.sha }}
+          restore-keys: regression-native-v1-${{ hashFiles('depends/**/*.mk', 'depends/packages/*', 'depends/patches/**/*') }}-
 
       - name: Build pinned dependencies
         run: |
@@ -212,6 +250,7 @@ jobs:
             HOST="$HOST" NO_QT=1 NO_UPNP=1 NO_NATPMP=1
 
       - name: Configure debug and lock-order build
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: |
           ./autogen.sh
           ./configure \
@@ -221,15 +260,33 @@ jobs:
             --enable-bench \
             --disable-zmq
 
+      - name: Configure targeted debug binaries
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') }}
+        run: |
+          ./autogen.sh
+          ./configure --prefix="$PWD/depends/$HOST" --with-gui=no \
+            --enable-debug --disable-tests --disable-bench --disable-fuzz-binary \
+            --disable-zmq CC='ccache gcc' CXX='ccache g++'
+
       - name: Compile candidate
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: make -j "$MAKEJOBS"
 
+      - name: Compile only regression prerequisites
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') }}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ci/native-ccache
+          CCACHE_MAXSIZE: 1G
+        run: make -C src -j "$MAKEJOBS" blackcoind blackcoin-cli
+
       - name: Provision pinned Blackcoin-compatible script vectors
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         env:
           DIR_UNIT_TEST_DATA: ${{ github.workspace }}/.ci/unit_test_data
         run: ./ci/test/prepare_script_assets.sh
 
       - name: Run unit and utility tests
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         env:
           DIR_UNIT_TEST_DATA: ${{ github.workspace }}/.ci/unit_test_data
           REQUIRE_SCRIPT_ASSETS_TEST: 1
@@ -251,9 +308,18 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Save targeted native cache after success or failure
+        if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && steps.regression-native-cache.outcome == 'success' && steps.regression-native-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            depends/built
+            .ci/native-ccache
+          key: ${{ steps.regression-native-cache.outputs.cache-primary-key }}
+
   resource-benchmarks-linux:
     name: measured worst-case quantum crypto resources (Linux x86_64)
-    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && (inputs.corrective_fast_path != true || github.event_name == 'pull_request') }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -314,7 +380,8 @@ jobs:
 
   native-linux-arm64-crypto:
     name: Linux ARM64 native cryptographic vectors and resources
-    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
+    needs: policy-and-lint
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request') }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     env:
@@ -414,7 +481,7 @@ jobs:
 
   native-linux-arm64-ubsan:
     name: Linux ARM64 native UBSan block-harness gate
-    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request') }}
     needs: native-linux-arm64-crypto
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
@@ -479,7 +546,8 @@ jobs:
 
   windows-crypto-cross-build:
     name: Build pinned Windows x86_64 vector binaries
-    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
+    needs: policy-and-lint
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 300
     env:
@@ -547,7 +615,7 @@ jobs:
 
   native-windows-crypto:
     name: Windows x86_64 native cryptographic vectors and resources
-    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request') }}
     needs: windows-crypto-cross-build
     runs-on: windows-2025
     timeout-minutes: 180
@@ -627,7 +695,8 @@ jobs:
 
   native-macos-crypto:
     name: ${{ matrix.name }} native cryptographic vectors
-    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
+    needs: policy-and-lint
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     strategy:
@@ -720,7 +789,7 @@ jobs:
 
   critical-protocol:
     name: critical Gold Rush, lifecycle, wallet, and recovery tests
-    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && (inputs.corrective_fast_path != true || github.event_name == 'pull_request') }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 240
@@ -787,7 +856,7 @@ jobs:
 
   mixed-version:
     name: real v26.2, v28.4, v30.1, and candidate interoperability
-    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && (inputs.corrective_fast_path != true || github.event_name == 'pull_request') }}
     needs: [policy-and-lint, native-build-and-unit]
     runs-on: ubuntu-22.04
     timeout-minutes: 300
@@ -833,6 +902,12 @@ jobs:
           python3 test/functional/test_runner.py \
             --ci --jobs=1 --failfast --combinedlogslen=2000 \
             feature_goldrush_v3014_wallet_upgrade.py --previous-releases --descriptors
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=2000 \
+            feature_goldrush_v3014_qqp2_upgrade.py --previous-releases --descriptors
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=2000 \
+            feature_goldrush_v3014_same_anchor_mixed.py --previous-releases --descriptors
 
       - name: Upload historical binary provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -843,8 +918,8 @@ jobs:
           retention-days: 30
 
   exhaustive-functional:
-    name: complete extended functional suite
-    if: ${{ (inputs.run_extended_functional == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
+    name: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && 'targeted previously failing functional tests' || 'complete extended functional suite' }}
+    if: ${{ (inputs.regression_scope == 'all' || inputs.regression_scope == 'native') || ((inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.run_extended_functional == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request')) }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 480
@@ -862,44 +937,31 @@ jobs:
           path: .
 
       - name: Restore executable permissions
-        run: chmod +x src/blackcoind src/blackcoin-cli src/blackcoin-tx src/blackcoin-util src/blackcoin-wallet
+        run: find src -maxdepth 1 -type f -name 'blackcoin*' -exec chmod +x {} +
+
+      - name: Run only previously failing functional tests
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') }}
+        run: |
+          python3 test/functional/test_runner.py --ci --jobs=2 --combinedlogslen=2000 \
+            feature_goldrush_pow_claim_singleflight.py rpc_goldrushinfo.py feature_maxtipage.py
 
       - name: Run all default and extended functional tests
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: |
           python3 test/functional/test_runner.py \
             --ci --extended --jobs=4 --combinedlogslen=2000 \
-            --exclude=feature_goldrush_mixed_version.py,feature_goldrush_v3014_wallet_upgrade.py
+            --exclude=feature_goldrush_mixed_version.py,feature_goldrush_v3014_wallet_upgrade.py,feature_goldrush_v3014_qqp2_upgrade.py,feature_goldrush_v3014_same_anchor_mixed.py
 
   sanitizer-gates:
-    name: ${{ matrix.name }} consensus and liveness gate
-    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
+    name: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && format('targeted regression ({0})', matrix.name) || format('{0} consensus and liveness gate', matrix.name) }}
+    needs: policy-and-lint
+    if: ${{ (inputs.regression_scope == 'all' || inputs.regression_scope == 'asan' || inputs.regression_scope == 'tsan') || ((inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 480
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: address-undefined-sanitizer
-            environment: ci/test/00_setup_env_native_asan.sh
-            functional_tests: >-
-              feature_goldrush_shadow_replay.py
-              feature_goldrush_pow_claim_singleflight.py
-              feature_goldrush_pos_signal.py
-              feature_goldrush_pos_multiwallet_stress.py
-              feature_goldrush_pos_signal_recovery.py
-              wallet_pos_multiwallet_staking.py
-              feature_quantum_lifecycle.py
-              feature_quantum_demurrage_height_boundary.py
-              feature_shutdown.py
-          - name: thread-sanitizer
-            environment: ci/test/00_setup_env_native_tsan.sh
-            functional_tests: >-
-              feature_goldrush_pow_claim_singleflight.py
-              feature_goldrush_pos_signal.py
-              feature_goldrush_pos_multiwallet_stress.py
-              feature_goldrush_pos_signal_recovery.py
-              wallet_pos_multiwallet_staking.py
-              feature_shutdown.py
+        include: ${{ fromJSON(inputs.regression_scope == 'asan' && '[{"name":"address-undefined-sanitizer","flavor":"asan","environment":"ci/test/00_setup_env_native_asan.sh","functional_tests":"feature_goldrush_shadow_replay.py feature_goldrush_pow_claim_singleflight.py feature_goldrush_pos_signal.py feature_goldrush_pos_multiwallet_stress.py feature_goldrush_pos_signal_recovery.py wallet_pos_multiwallet_staking.py feature_quantum_lifecycle.py feature_quantum_demurrage_height_boundary.py feature_shutdown.py"}]' || inputs.regression_scope == 'tsan' && '[{"name":"thread-sanitizer","flavor":"tsan","environment":"ci/test/00_setup_env_native_tsan.sh","functional_tests":"feature_goldrush_pow_claim_singleflight.py feature_goldrush_pos_signal.py feature_goldrush_pos_multiwallet_stress.py feature_goldrush_pos_signal_recovery.py wallet_pos_multiwallet_staking.py feature_shutdown.py"}]' || '[{"name":"address-undefined-sanitizer","flavor":"asan","environment":"ci/test/00_setup_env_native_asan.sh","functional_tests":"feature_goldrush_shadow_replay.py feature_goldrush_pow_claim_singleflight.py feature_goldrush_pos_signal.py feature_goldrush_pos_multiwallet_stress.py feature_goldrush_pos_signal_recovery.py wallet_pos_multiwallet_staking.py feature_quantum_lifecycle.py feature_quantum_demurrage_height_boundary.py feature_shutdown.py"},{"name":"thread-sanitizer","flavor":"tsan","environment":"ci/test/00_setup_env_native_tsan.sh","functional_tests":"feature_goldrush_pow_claim_singleflight.py feature_goldrush_pos_signal.py feature_goldrush_pos_multiwallet_stress.py feature_goldrush_pos_signal_recovery.py wallet_pos_multiwallet_staking.py feature_shutdown.py"}]') }}
     steps:
       - name: Checkout immutable candidate
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -911,13 +973,26 @@ jobs:
       - name: Verify exact checkout
         run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
 
+      - name: Restore targeted sanitizer compiler and dependency cache
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') }}
+        id: regression-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .ci/regression-cache
+          key: regression-${{ matrix.flavor }}-v1-${{ hashFiles('ci/test/00_setup_env_native*', 'depends/**/*.mk', 'depends/packages/*', 'depends/patches/**/*') }}-${{ github.sha }}
+          restore-keys: regression-${{ matrix.flavor }}-v1-${{ hashFiles('ci/test/00_setup_env_native*', 'depends/**/*.mk', 'depends/packages/*', 'depends/patches/**/*') }}-
+
+      - name: Restore targeted Docker build cache
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') }}
+        run: ci/test/regression_cache.sh restore ci_native_${{ matrix.flavor }}_regression .ci/regression-cache
+
       - name: Run sanitizer gate with pinned consensus dependencies
         id: sanitizer-gate
         env:
           CI_OS_NAME: linux
-          FILE_ENV: ${{ matrix.environment }}
+          FILE_ENV: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && format('ci/test/00_setup_env_native_{0}_regression.sh', matrix.flavor) || matrix.environment }}
           MAKEJOBS: -j2
-          TEST_RUNNER_EXTRA: ${{ matrix.functional_tests }}
+          TEST_RUNNER_EXTRA: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && 'feature_goldrush_pow_claim_singleflight.py' || matrix.functional_tests }}
         shell: bash
         run: |
           capture_dir=$(mktemp -d \
@@ -957,6 +1032,19 @@ jobs:
           fi
           [[ "$report_ready" = true ]]
 
+      - name: Retain targeted Docker build cache after success or failure
+        if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && steps.regression-cache.outcome == 'success' }}
+        run: |
+          docker stop ci_native_${{ matrix.flavor }}_regression 2>/dev/null || true
+          ci/test/regression_cache.sh save ci_native_${{ matrix.flavor }}_regression .ci/regression-cache
+
+      - name: Save targeted sanitizer compiler and dependency cache
+        if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && steps.regression-cache.outcome == 'success' && steps.regression-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .ci/regression-cache
+          key: ${{ steps.regression-cache.outputs.cache-primary-key }}
+
       - name: Upload exact-source ThreadSanitizer reports
         if: ${{ always() && matrix.name == 'thread-sanitizer' && steps.sanitizer-gate.outputs.report_ready == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -968,7 +1056,8 @@ jobs:
 
   fuzz-smoke:
     name: source-pinned sanitizer regression smoke
-    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
+    needs: policy-and-lint
+    if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

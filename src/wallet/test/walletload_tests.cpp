@@ -5,16 +5,462 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
-#include <wallet/test/util.h>
-#include <wallet/wallet.h>
+#include <consensus/validation.h>
+#include <interfaces/chain.h>
+#include <interfaces/handler.h>
+#include <kernel/mempool_removal_reason.h>
+#include <rpc/protocol.h>
+#include <rpc/server.h>
+#include <script/solver.h>
+#include <shadow.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
+#include <util/time.h>
+#include <validation.h>
+#include <validationinterface.h>
+#include <wallet/claim_maintenance.h>
+#include <wallet/context.h>
+#include <wallet/load.h>
+#include <wallet/rpc/staking.h>
+#include <wallet/test/util.h>
+#include <wallet/wallet.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <atomic>
+#include <future>
+#include <thread>
+
 namespace wallet {
 
+struct WalletLoadTestAccess {
+    static bool Attach(const std::shared_ptr<CWallet>& wallet, interfaces::Chain& chain, bilingual_str& error)
+    {
+        std::vector<bilingual_str> warnings;
+        return CWallet::AttachChainUnpublished(wallet, chain, /*rescan_required=*/false, error, warnings);
+    }
+    static std::unique_ptr<WalletClaimMaintenance> Maintenance(
+        std::function<void(CWallet&, bool, bool)> pass)
+    {
+        return std::unique_ptr<WalletClaimMaintenance>(new WalletClaimMaintenance(std::move(pass)));
+    }
+    static std::shared_ptr<WalletClaimMaintenanceSlot> Slot(CWallet& wallet)
+    {
+        LOCK(wallet.cs_wallet);
+        return wallet.m_claim_maintenance;
+    }
+    static bool WaitForCancellation(WalletClaimMaintenance& maintenance,
+                                   const std::shared_ptr<WalletClaimMaintenanceSlot>& slot)
+    {
+        return maintenance.WaitForCancellationForTesting(slot, std::chrono::seconds{5});
+    }
+};
+
 BOOST_AUTO_TEST_SUITE(walletload_tests)
+
+BOOST_FIXTURE_TEST_CASE(recovery_status_is_readable_but_nonauthorizing_during_ibd, RegTestingSetup)
+{
+    const CBlockIndex* tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    SetMockTime(tip->GetBlockTime() + 30 * 24 * 60 * 60);
+    BOOST_REQUIRE(!m_node.chain->isReadyToBroadcast());
+    auto wallet = std::make_shared<CWallet>(m_node.chain.get(), "ibd", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+    WITH_LOCK(wallet->cs_wallet, wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash()));
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    BOOST_REQUIRE(AddWallet(context, wallet));
+    const auto rpc = [&](const std::string& method, bool verbose = false) {
+        JSONRPCRequest request;
+        request.context = &context;
+        request.strMethod = method;
+        request.params.setArray();
+        if (verbose) request.params.push_back(true);
+        UniValue result;
+        for (const auto& command : GetStakingRPCCommands()) {
+            if (command.name == method) {
+                BOOST_REQUIRE(command.actor(request, result, /*last_handler=*/true));
+                return result;
+            }
+        }
+        BOOST_FAIL("missing staking RPC: " + method);
+        return result;
+    };
+
+    const auto inventory = wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_CHECK(!inventory.candidate_state_fingerprint.IsNull());
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_CHECK(wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(inventory));
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(inventory));
+        auto stale = inventory;
+        ++stale.wallet_generation;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        ++stale.wallet_processed_height;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        ++stale.claim_ownership_pending_records;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        ++stale.claim_ownership_capacity_work;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        stale.recovery_database_ambiguous = !stale.recovery_database_ambiguous;
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+        stale = inventory;
+        stale.active_tip = tip->GetBlockHash();
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(stale));
+    }
+    const auto before = rpc("getpowclaimrecoveryinfo", true);
+    BOOST_CHECK(!before["chain_ready"].get_bool());
+    BOOST_CHECK(!before["wallet_tip_matches"].get_bool());
+    BOOST_CHECK(!before["usage_available"].get_bool());
+    const auto mining = rpc("getpowmininginfo");
+    BOOST_CHECK(!mining["claim_inventory_wallet_tip_matches"].get_bool());
+    BOOST_CHECK(!mining["mining_gate_coherent"].get_bool());
+    BOOST_CHECK(!mining["mining_gate_can_submit"].get_bool());
+    BOOST_CHECK_EQUAL(mining["mining_gate_action"].get_str(), "unsafe");
+    BOOST_CHECK(!mining["recovery_usage_available"].get_bool());
+    const auto generation = wallet->GetDatabase().nUpdateCounter.load();
+    for (int i = 0; i < 3; ++i) {
+        BOOST_CHECK_EQUAL(rpc("getpowclaimrecoveryinfo", true).write(), before.write());
+    }
+    BOOST_CHECK_EXCEPTION(rpc("resolveallshadowpowclaims"), UniValue,
+        [](const UniValue& error) { return error["code"].getInt<int>() == RPC_CLIENT_IN_INITIAL_DOWNLOAD; });
+    BOOST_CHECK_EQUAL(wallet->GetDatabase().nUpdateCounter.load(), generation);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.empty()));
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        wallet->MarkShadowPowClaimCandidateStateChangedLocked();
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(inventory));
+    }
+
+    const auto ibd_snapshot = wallet->GetShadowPowClaimRecoveryInventory();
+    SetMockTime(tip->GetBlockTime() + 1);
+    BOOST_REQUIRE(m_node.chain->isReadyToBroadcast());
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_CHECK(!wallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(ibd_snapshot));
+    }
+    const auto ready = rpc("getpowclaimrecoveryinfo", true);
+    BOOST_CHECK(ready["chain_ready"].get_bool());
+    BOOST_CHECK(ready["wallet_tip_matches"].get_bool());
+    RemoveWallet(context, wallet, /*load_on_start=*/std::nullopt);
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_attach_reconciles_presubscription_disconnect, TestChain100Setup)
+{
+    CBlockIndex* old_tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
+    BOOST_REQUIRE(old_tip && old_tip->pprev);
+    const uint256 old_hash = old_tip->GetBlockHash();
+    const int old_height = old_tip->nHeight;
+    const uint256 funding_block = m_node.chain->getBlockHash(1);
+    const CBlockLocator locator = m_node.chain->getTipLocator();
+    const CTransactionRef funding = m_coinbase_txns.front();
+    const CTransactionRef confirmed = m_coinbase_txns.back();
+
+    CMutableTransaction conflict_tx;
+    conflict_tx.vin.emplace_back(COutPoint{funding->GetHash(), 0});
+    conflict_tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    const CTransactionRef conflicted = MakeTransactionRef(conflict_tx);
+    CMutableTransaction child_tx;
+    child_tx.vin.emplace_back(COutPoint{conflicted->GetHash(), 0});
+    child_tx.vout.emplace_back(COIN / 2, CScript{} << OP_TRUE);
+    const CTransactionRef child = MakeTransactionRef(child_tx);
+
+    CWallet seed(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(seed.cs_wallet);
+        seed.SetLastBlockProcessed(old_height, old_hash);
+        BOOST_REQUIRE(seed.AddToWallet(funding, TxStateConfirmed{funding_block, 1, 0}));
+        auto* record = seed.AddToWallet(confirmed, TxStateConfirmed{old_hash, old_height, 0});
+        BOOST_REQUIRE(record);
+        record->mapValue["comment"] = "preserve wallet history";
+        BOOST_REQUIRE(WalletBatch(seed.GetDatabase()).WriteTx(*record));
+        BOOST_REQUIRE(seed.AddToWallet(conflicted, TxStateConflicted{old_hash, old_height}));
+        BOOST_REQUIRE(seed.AddToWallet(child, TxStateConflicted{old_hash, old_height}));
+        BOOST_REQUIRE(WalletBatch(seed.GetDatabase()).WriteBestBlock(locator));
+    }
+    // Both loads see the old tip. Neither is subscribed when the actual
+    // disconnect is processed and its notification queue is drained.
+    auto loaded = std::make_shared<CWallet>(m_node.chain.get(), "", DuplicateMockDatabase(seed.GetDatabase()));
+    auto failing = std::make_shared<CWallet>(m_node.chain.get(), "", DuplicateMockDatabase(seed.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(loaded->LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE_EQUAL(failing->LoadWallet(), DBErrors::LOAD_OK);
+    BlockValidationState state;
+    BOOST_REQUIRE(m_node.chainman->ActiveChainstate().InvalidateBlock(state, old_tip));
+    SyncWithValidationInterfaceQueue();
+    {
+        LOCK(loaded->cs_wallet);
+        BOOST_CHECK(loaded->mapWallet.at(confirmed->GetHash()).isConfirmed());
+        BOOST_CHECK(loaded->mapWallet.at(conflicted->GetHash()).isConflicted());
+        BOOST_CHECK_EQUAL(loaded->GetLiveUnspentStakeOutpoints().count(COutPoint{funding->GetHash(), 0}), 1U);
+    }
+
+    bilingual_str error;
+    auto& failing_db = GetMockableDatabase(*failing);
+    const MockableData original_records = failing_db.m_records;
+    failing_db.m_fail_commit = true;
+    BOOST_CHECK(!WalletLoadTestAccess::Attach(failing, *m_node.chain, error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(failing_db.m_records == original_records);
+    BOOST_CHECK(failing_db.m_last_txn_durable);
+    {
+        LOCK(failing->cs_wallet);
+        BOOST_CHECK(failing->mapWallet.at(confirmed->GetHash()).isConfirmed());
+        BOOST_CHECK(failing->mapWallet.at(conflicted->GetHash()).isConflicted());
+    }
+    failing->m_chain_notifications_handler.reset();
+
+    error.clear();
+    BOOST_REQUIRE_MESSAGE(WalletLoadTestAccess::Attach(loaded, *m_node.chain, error), error.original);
+    SyncWithValidationInterfaceQueue();
+    {
+        LOCK(loaded->cs_wallet);
+        BOOST_CHECK_EQUAL(loaded->mapWallet.size(), 4U);
+        BOOST_CHECK(loaded->mapWallet.at(funding->GetHash()).isConfirmed());
+        for (const auto& tx : {confirmed, conflicted, child}) {
+            BOOST_CHECK(loaded->mapWallet.at(tx->GetHash()).state<TxStateInactive>());
+        }
+        BOOST_CHECK_EQUAL(loaded->mapWallet.at(confirmed->GetHash()).mapValue.at("comment"), "preserve wallet history");
+        BOOST_CHECK_EQUAL(loaded->GetLiveUnspentStakeOutpoints().count(COutPoint{funding->GetHash(), 0}), 0U);
+        BOOST_CHECK_EQUAL(loaded->GetLastBlockHash(), old_tip->pprev->GetBlockHash());
+    }
+    // No chain pointer: this reload cannot hide a missing durable update by
+    // independently reconciling the old transaction states.
+    CWallet persisted(nullptr, "", DuplicateMockDatabase(loaded->GetDatabase()));
+    BOOST_REQUIRE_EQUAL(persisted.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(persisted.cs_wallet);
+        for (const auto& tx : {confirmed, conflicted, child}) {
+            BOOST_CHECK(persisted.mapWallet.at(tx->GetHash()).state<TxStateInactive>());
+        }
+        BOOST_CHECK_EQUAL(persisted.mapWallet.at(confirmed->GetHash()).mapValue.at("comment"), "preserve wallet history");
+    }
+    loaded->m_chain_notifications_handler.reset();
+    SyncWithValidationInterfaceQueue();
+}
+
+/** The pass owns no wallet/chain locks while blocked. Release on all exits. */
+struct MaintenancePassBarrier {
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> released{release.get_future().share()};
+    bool done{false};
+    void Release()
+    {
+        if (!done) { done = true; release.set_value(); }
+    }
+    ~MaintenancePassBarrier() { Release(); }
+};
+
+BOOST_FIXTURE_TEST_CASE(claim_maintenance_coalesces_and_is_fair, TestingSetup)
+{
+    struct Pass { std::string wallet; bool resolve; bool relay; };
+    std::vector<Pass> passes;
+    std::thread::id worker_thread;
+    std::atomic<bool> changed_thread{false};
+    WalletContext context;
+    // Declared after context: release before context joins on a failed check.
+    MaintenancePassBarrier barrier;
+    auto entered = barrier.entered.get_future();
+    context.claim_maintenance = WalletLoadTestAccess::Maintenance(
+        [&](CWallet& wallet, bool resolve, bool relay) {
+            passes.push_back({wallet.GetName(), resolve, relay});
+            if (passes.size() == 1) {
+                worker_thread = std::this_thread::get_id();
+                barrier.entered.set_value();
+                barrier.released.wait();
+            } else if (worker_thread != std::this_thread::get_id()) {
+                changed_thread = true;
+            }
+        });
+    auto a = std::make_shared<CWallet>(m_node.chain.get(), "a", CreateMockableWalletDatabase());
+    auto b = std::make_shared<CWallet>(m_node.chain.get(), "b", CreateMockableWalletDatabase());
+    auto c = std::make_shared<CWallet>(m_node.chain.get(), "c", CreateMockableWalletDatabase());
+    a->RequestClaimMaintenance(/*resolve=*/true, /*relay=*/true);
+    BOOST_CHECK(!WalletLoadTestAccess::Slot(*a)); // Unpublished has no inline fallback.
+    for (const auto& wallet : {a, b, c}) context.claim_maintenance->Register(wallet);
+    for (int i = 0; i < 100; ++i) a->RequestClaimMaintenance(false, true);
+    BOOST_CHECK(passes.empty()); // Registered startup wallets still do not run early.
+    context.claim_maintenance->Start();
+    BOOST_CHECK(entered.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    for (int i = 0; i < 100; ++i) a->RequestClaimMaintenance(true, true);
+    {
+        LOCK2(::cs_main, a->cs_wallet);
+        BOOST_CHECK(WalletLoadTestAccess::Slot(*a));
+    }
+    barrier.Release();
+    context.claim_maintenance->Sync();
+    BOOST_REQUIRE_EQUAL(passes.size(), 4U);
+    BOOST_CHECK_EQUAL(passes[0].wallet, "a");
+    BOOST_CHECK_EQUAL(passes[1].wallet, "b");
+    BOOST_CHECK_EQUAL(passes[2].wallet, "c");
+    BOOST_CHECK_EQUAL(passes[3].wallet, "a");
+    BOOST_CHECK(!passes[0].resolve && passes[0].relay);
+    BOOST_CHECK(!passes[1].resolve && !passes[1].relay);
+    BOOST_CHECK(!passes[2].resolve && !passes[2].relay);
+    BOOST_CHECK(passes[3].resolve && passes[3].relay);
+    BOOST_CHECK(worker_thread != std::this_thread::get_id());
+    BOOST_CHECK(!changed_thread.load());
+    context.claim_maintenance->Unregister(*a);
+    context.claim_maintenance->Register(a); // Late publication cannot resurrect it.
+    BOOST_CHECK(!WalletLoadTestAccess::Slot(*a));
+    a->RequestClaimMaintenance(true, true);
+    context.claim_maintenance->Sync();
+    BOOST_CHECK_EQUAL(passes.size(), 4U);
+    auto unpublished = std::make_shared<CWallet>(m_node.chain.get(), "unpublished", CreateMockableWalletDatabase());
+    context.claim_maintenance->Unregister(*unpublished);
+    context.claim_maintenance->Register(unpublished);
+    BOOST_CHECK(!WalletLoadTestAccess::Slot(*unpublished));
+}
+
+BOOST_FIXTURE_TEST_CASE(claim_maintenance_tip_and_removal_wake_without_mining_or_resend, TestChain100Setup)
+{
+    std::vector<std::pair<bool, bool>> requests;
+    WalletContext context;
+    context.claim_maintenance = WalletLoadTestAccess::Maintenance(
+        [&](CWallet&, bool resolve, bool relay) { requests.emplace_back(resolve, relay); });
+    auto wallet = std::make_shared<CWallet>(m_node.chain.get(), "events", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+    const CBlockIndex* tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
+    BOOST_REQUIRE(tip && tip->pprev);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash());
+    }
+    wallet->SetBroadcastTransactions(true);
+    wallet->SetNextResend();
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK(!wallet->ShouldResend());
+    context.claim_maintenance->Register(wallet);
+    context.claim_maintenance->Start();
+    context.claim_maintenance->Sync();
+    BOOST_REQUIRE_EQUAL(requests.size(), 1U);
+    auto notifications = m_node.chain->handleNotifications(wallet);
+    const auto tip_event = [&] {
+        GetMainSignals().UpdatedBlockTip(tip, tip->pprev, /*fInitialDownload=*/false);
+        SyncWithValidationInterfaceQueue();
+        context.claim_maintenance->Sync();
+    };
+    tip_event();
+    BOOST_CHECK_EQUAL(requests.size(), 1U); // No claim history, no tip work.
+
+    const COutPoint anchor{m_coinbase_txns.front()->GetHash(), 0};
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0});
+    CMutableTransaction claim_tx;
+    claim_tx.vin.emplace_back(anchor);
+    claim_tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    claim_tx.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const CTransactionRef claim = MakeTransactionRef(claim_tx);
+    BOOST_REQUIRE(TransactionHasShadowProof(*claim));
+    BOOST_REQUIRE(wallet->AddToWallet(
+        claim, TxStateConfirmed{tip->GetBlockHash(), tip->nHeight, 0},
+        [](CWalletTx& wtx, bool) { wtx.fFromMe = true; return true; }));
+    tip_event();
+    BOOST_CHECK_EQUAL(requests.size(), 1U); // Inert lifetime proof history is excluded.
+
+    BOOST_REQUIRE(wallet->AddToWallet(claim, TxStateInMempool{}));
+    CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    SyncWithValidationInterfaceQueue();
+    context.claim_maintenance->Sync();
+    BOOST_REQUIRE_EQUAL(requests.size(), 2U);
+    BOOST_CHECK(!requests.back().first && requests.back().second);
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK(!wallet->ShouldResend());
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->IsSpent(anchor));
+    }
+
+    GetMainSignals().TransactionRemovedFromMempool(claim, MemPoolRemovalReason::EXPIRY, 0);
+    SyncWithValidationInterfaceQueue();
+    context.claim_maintenance->Sync();
+    BOOST_REQUIRE_EQUAL(requests.size(), 3U);
+    BOOST_CHECK(!requests.back().first && requests.back().second);
+    BOOST_CHECK(!wallet->ShouldResend());
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->IsSpent(anchor));
+        BOOST_CHECK(!wallet->mapWallet.at(claim->GetHash()).isAbandoned());
+    }
+    GetMainSignals().TransactionRemovedFromMempool(claim, MemPoolRemovalReason::BLOCK, 1);
+    SyncWithValidationInterfaceQueue();
+    context.claim_maintenance->Sync();
+    BOOST_CHECK_EQUAL(requests.size(), 3U);
+
+    CMutableTransaction ordinary_tx;
+    ordinary_tx.vin.emplace_back(COutPoint{m_coinbase_txns.back()->GetHash(), 0});
+    ordinary_tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    const CTransactionRef ordinary = MakeTransactionRef(ordinary_tx);
+    BOOST_REQUIRE(wallet->AddToWallet(ordinary, TxStateInactive{}));
+    GetMainSignals().TransactionRemovedFromMempool(ordinary, MemPoolRemovalReason::EXPIRY, 2);
+    SyncWithValidationInterfaceQueue();
+    context.claim_maintenance->Sync();
+    BOOST_CHECK_EQUAL(requests.size(), 3U); // Ordinary removal does not request claim work.
+    notifications.reset();
+    context.claim_maintenance->Unregister(*wallet);
+}
+
+BOOST_FIXTURE_TEST_CASE(claim_maintenance_cancel_and_shutdown_join, TestingSetup)
+{
+    for (const bool shutdown : {false, true}) {
+        std::atomic<unsigned> a_calls{0};
+        std::atomic<unsigned> b_calls{0};
+        WalletContext context;
+        MaintenancePassBarrier barrier;
+        auto entered = barrier.entered.get_future();
+        context.claim_maintenance = WalletLoadTestAccess::Maintenance(
+            [&](CWallet& wallet, bool, bool) {
+                if (wallet.GetName() == "a") {
+                    if (++a_calls == 1) {
+                        barrier.entered.set_value();
+                        barrier.released.wait();
+                    }
+                } else {
+                    ++b_calls;
+                }
+            });
+        auto a = std::make_shared<CWallet>(m_node.chain.get(), "a", CreateMockableWalletDatabase());
+        auto b = std::make_shared<CWallet>(m_node.chain.get(), "b", CreateMockableWalletDatabase());
+        context.claim_maintenance->Register(a);
+        context.claim_maintenance->Register(b);
+        const auto a_slot = WalletLoadTestAccess::Slot(*a);
+        const auto b_slot = WalletLoadTestAccess::Slot(*b);
+        context.claim_maintenance->Start();
+        BOOST_CHECK(entered.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+        for (int i = 0; i < 100; ++i) a->RequestClaimMaintenance(true, true);
+        auto stopped = std::async(std::launch::async, [&] {
+            if (shutdown) context.claim_maintenance->Stop();
+            else context.claim_maintenance->Unregister(*a);
+        });
+        BOOST_CHECK(WalletLoadTestAccess::WaitForCancellation(*context.claim_maintenance, a_slot));
+        if (shutdown) {
+            BOOST_CHECK(WalletLoadTestAccess::WaitForCancellation(*context.claim_maintenance, b_slot));
+        }
+        BOOST_CHECK(stopped.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+        {
+            LOCK2(::cs_main, a->cs_wallet); // Drain never retains either lock.
+        }
+        barrier.Release();
+        BOOST_CHECK(stopped.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+        stopped.get();
+        context.claim_maintenance->Sync();
+        BOOST_CHECK_EQUAL(a_calls.load(), 1U);
+        BOOST_CHECK_EQUAL(b_calls.load(), shutdown ? 0U : 1U);
+        a->RequestClaimMaintenance(true, true);
+        context.claim_maintenance->Sync();
+        BOOST_CHECK_EQUAL(a_calls.load(), 1U);
+        const std::weak_ptr<CWallet> weak_a = a;
+        a.reset();
+        BOOST_CHECK(weak_a.expired()); // Neither queued nor completed work owns it.
+        context.claim_maintenance->Stop(); // Repeated shutdown joins are harmless.
+    }
+}
 
 class DummyDescriptor final : public Descriptor {
 private:

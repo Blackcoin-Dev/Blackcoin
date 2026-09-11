@@ -9,6 +9,7 @@
 #ifndef BITCOIN_WALLET_LOAD_H
 #define BITCOIN_WALLET_LOAD_H
 
+#include <memory>
 #include <string>
 #include <vector>
 

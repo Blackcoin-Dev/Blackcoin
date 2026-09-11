@@ -23,6 +23,7 @@ class Wallet;
 
 namespace wallet {
 class CWallet;
+class WalletClaimMaintenance;
 using LoadWalletFn = std::function<void(std::unique_ptr<interfaces::Wallet> wallet)>;
 
 //! WalletContext struct containing references to state shared between CWallet
@@ -43,6 +44,7 @@ struct WalletContext {
     Mutex wallets_mutex;
     std::vector<std::shared_ptr<CWallet>> wallets GUARDED_BY(wallets_mutex);
     std::list<LoadWalletFn> wallet_load_fns GUARDED_BY(wallets_mutex);
+    std::unique_ptr<WalletClaimMaintenance> claim_maintenance;
 
     //! Declare default constructor and destructor that are not inline, so code
     //! instantiating the WalletContext struct doesn't need to #include class

@@ -121,7 +121,6 @@ interfaces::WalletPowClaimRecoveryState MakeRecoveryState(
     case ShadowPowClaimRecoveryState::INDETERMINATE: return Out::INDETERMINATE;
     case ShadowPowClaimRecoveryState::CURRENT_BRANCH_INELIGIBLE: return Out::CURRENT_BRANCH_INELIGIBLE;
     case ShadowPowClaimRecoveryState::TERMINAL_ON_PINNED_TIP: return Out::TERMINAL_ON_PINNED_TIP;
-    case ShadowPowClaimRecoveryState::RETIRED_ON_ACTIVE_BRANCH: return Out::RETIRED_ON_ACTIVE_BRANCH;
     case ShadowPowClaimRecoveryState::RESOLUTION_PENDING: return Out::RESOLUTION_PENDING;
     case ShadowPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN: return Out::RESOLVED_ON_ACTIVE_CHAIN;
     }
@@ -214,7 +213,6 @@ interfaces::WalletPowClaimRecoveryNode MakeRecoveryNode(
     out.in_mempool = node.in_mempool;
     out.quarantined = node.quarantined;
     out.abandoned = node.abandoned;
-    out.expired_locally_retired = node.expired_locally_retired;
     out.expected_shape = node.expected_shape;
     out.wallet_authored = node.wallet_authored;
     out.created_height = node.created_height;
@@ -223,6 +221,13 @@ interfaces::WalletPowClaimRecoveryNode MakeRecoveryNode(
     out.stale_depth = node.stale_depth;
     out.stale_depth_known = node.stale_depth_known;
     out.resolution_relay_authorized = node.resolution_relay_authorized;
+    out.resolution_relay_revoked = node.resolution_relay_revoked;
+    if (node.authorization_receipt) {
+        const auto& receipt = *node.authorization_receipt;
+        out.authorization_receipt = interfaces::WalletPowClaimResolutionAuthorizationReceipt{
+            receipt.plan_id.GetHex(), receipt.active_tip.GetHex(), receipt.active_height,
+            receipt.wallet_generation, receipt.origin};
+    }
     return out;
 }
 
@@ -252,12 +257,9 @@ interfaces::WalletPowClaimRecoveryComponent MakeRecoveryComponent(
     out.anchor_authenticated = component.anchor_authenticated;
     out.anchor_unspent = component.anchor_unspent;
     out.all_claims_explicitly_provenanced = component.all_claims_explicitly_provenanced;
-    out.all_claims_zero_payment_retirable =
-        component.all_claims_zero_payment_retirable;
-    out.all_claims_expired_locally_retired =
-        component.all_claims_expired_locally_retired;
     out.has_revalidating_unbound_proof =
         component.has_revalidating_unbound_proof;
+    out.adoption_graph_safe = component.adoption_graph_safe;
     out.descendant_claims = component.descendant_claims;
     out.minimum_stale_depth = component.minimum_stale_depth;
     out.stale_depth_known = component.stale_depth_known;
@@ -282,6 +284,7 @@ interfaces::WalletPowClaimRecoveryAction MakeRecoveryAction(
     out.persisted = action.persisted;
     out.in_mempool = action.in_mempool;
     out.relay_authorized = action.relay_authorized;
+    out.relay_revoked = action.relay_revoked;
     out.frontier_may_advance = action.frontier_may_advance;
     out.conflicts_with_revalidating_unbound_proof =
         action.conflicts_with_revalidating_unbound_proof;
@@ -315,6 +318,7 @@ interfaces::WalletPowClaimRecoveryUsage MakeRecoveryUsage(
     const ShadowPowClaimRecoveryUsage& usage)
 {
     interfaces::WalletPowClaimRecoveryUsage out;
+    out.available = usage.available;
     out.pending_manual = usage.pending_manual;
     out.pending_automatic = usage.pending_automatic;
     out.confirmed_manual = usage.confirmed_manual;
@@ -1388,7 +1392,17 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
                 tier->unbonding_blocks,
                 unlock_height);
             const CTxDestination unbonding_dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, unbonding_program};
-            wallet.SetAddressBook(unbonding_dest, unbonding_label, AddressPurpose::RECEIVE);
+            if (!wallet.SetAddressBook(
+                    unbonding_dest, unbonding_label,
+                    AddressPurpose::RECEIVE)) {
+                const bilingual_str label_failure =
+                    wallet.IsAddressBookDatabaseAmbiguous()
+                    ? _("The unbonding address-label commit outcome is uncertain. Reload the wallet before retrying; no transaction was created.")
+                    : _("The unbonding address label could not be committed; no transaction was created.");
+                return util::Error{DurableQuantumKeyFailure(
+                    *created_key, "Staking address unbonding",
+                    label_failure)};
+            }
 
             amount = outputs.bonded_amount;
             destination_address = EncodeDestination(unbonding_dest);
@@ -2415,10 +2429,16 @@ public:
     void abortRescan() override { m_wallet->AbortRescan(); }
     bool backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
     std::string getWalletName() override { return m_wallet->GetName(); }
-    util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) override
+    util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label, interfaces::NewDestinationStatus* status) override
     {
         LOCK(m_wallet->cs_wallet);
-        return m_wallet->GetNewDestination(type, label);
+        bool reserved{false};
+        auto result = m_wallet->GetNewDestination(type, label, &reserved);
+        if (status) {
+            *status = reserved ? interfaces::NewDestinationStatus::RESERVED
+                               : interfaces::NewDestinationStatus::NOT_RESERVED;
+        }
+        return result;
     }
     bool getPubKey(const CScript& script, const CKeyID& address, CPubKey& pub_key) override
     {
@@ -2452,6 +2472,10 @@ public:
     bool delAddressBook(const CTxDestination& dest) override
     {
         return m_wallet->DelAddressBook(dest);
+    }
+    bool moveAddressBook(const CTxDestination& old_dest, const CTxDestination& new_dest) override
+    {
+        return m_wallet->MoveAddressBook(old_dest, new_dest);
     }
     bool getAddress(const CTxDestination& dest,
         std::string* name,
@@ -2898,7 +2922,7 @@ public:
             // Disabling is intentionally non-blocking for the GUI. The live
             // worker observes this atomic state and idles; wallet unload owns
             // the final stop/join. A later enable reuses the worker.
-            m_wallet->m_enabled_staking = false;
+            m_wallet->SetStakingEnabled(false);
         }
     }
     bool getEnabledStaking() override
@@ -2960,6 +2984,10 @@ public:
         }
         return ok;
     }
+    void refreshPowMiningStakeReserve() override
+    {
+        m_wallet->RefreshShadowPowClaimStakeReserveInfo();
+    }
     WalletPowMiningInfo getPowMiningInfo() override
     {
         ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
@@ -2984,22 +3012,19 @@ public:
         {
             TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
             if (wallet_lock) {
+                if (const auto reserve =
+                        m_wallet->GetCachedShadowPowClaimStakeReserveInfoLocked()) {
+                    info.stake_reserve_available = true;
+                    info.configured_stake_reserve_coins = reserve->configured_reserve_coins;
+                    info.mature_stakeable_legacy_coins = static_cast<int>(
+                        reserve->mature_stakeable_legacy_coins);
+                    info.mature_stakeable_legacy_weight = reserve->mature_stakeable_legacy_weight;
+                    info.reserved_stake_coins = static_cast<int>(reserve->reserved_stake_coins);
+                    info.reserved_stake_weight = reserve->reserved_stake_weight;
+                    info.claim_coins_after_stake_reserve = static_cast<int>(reserve->claim_coins_after_reserve);
+                    info.last_stake_coin_guard = reserve->last_stake_coin_guard;
+                }
                 info.payout_address = m_wallet->m_pow_payout_quantum;
-                const ShadowPowClaimStakeReserveInfo reserve =
-                    m_wallet->GetShadowPowClaimStakeReserveInfoLocked();
-                info.stake_reserve_available = reserve.wallet_tip_matches;
-                info.configured_stake_reserve_coins =
-                    reserve.configured_reserve_coins;
-                info.mature_stakeable_legacy_coins = static_cast<int>(
-                    reserve.mature_stakeable_legacy_coins);
-                info.mature_stakeable_legacy_weight =
-                    reserve.mature_stakeable_legacy_weight;
-                info.reserved_stake_coins = static_cast<int>(
-                    reserve.reserved_stake_coins);
-                info.reserved_stake_weight = reserve.reserved_stake_weight;
-                info.claim_coins_after_stake_reserve = static_cast<int>(
-                    reserve.claim_coins_after_reserve);
-                info.last_stake_coin_guard = reserve.last_stake_coin_guard;
                 const std::vector<CScript> known_scripts =
                     m_wallet->GetOwnedLegacyShadowScripts(MAX_WALLET_SHADOW_SOLVE_REFERENCES);
                 wallet_scripts.insert(known_scripts.begin(), known_scripts.end());
@@ -3132,8 +3157,6 @@ public:
         review.live_claim_objects = inventory.live_claim_objects;
         review.quarantined_claim_objects = inventory.quarantined_claim_objects;
         review.blocking_components = inventory.blocking_components;
-        review.retired_claim_objects = inventory.retired_claim_objects;
-        review.retired_components = inventory.retired_components;
         review.resolved_components = inventory.resolved_components;
         review.components.reserve(inventory.components.size());
         for (const auto& component : inventory.components) {

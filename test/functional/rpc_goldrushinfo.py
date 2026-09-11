@@ -52,6 +52,25 @@ class GoldRushInfoTest(BitcoinTestFramework):
         self.sync_blocks()
         return hashes
 
+    def _restart_wallet_broadcast(self, enabled, *, reconnect_peer):
+        """Keep expiry observations independent of prompt exact-byte relay."""
+        node = self.nodes[0]
+        loaded_wallets = node.listwallets()
+        self.restart_node(0, extra_args=[
+            *self.extra_args[0],
+            f"-walletbroadcast={int(enabled)}",
+            f"-mocktime={node.mocktime}",
+        ])
+        node = self.nodes[0]
+        for name in loaded_wallets:
+            if name not in node.listwallets():
+                node.loadwallet(name, False)
+        if reconnect_peer:
+            self.connect_nodes(0, 1)
+            self.sync_blocks()
+        node.syncwithvalidationinterfacequeue()
+        return node
+
     @staticmethod
     def _mempool_pow_claims(node):
         claims = []
@@ -150,8 +169,6 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(component["root_claim_txids"], [claim_txid])
         assert_equal(component["resolution_txids"], [])
         assert_equal(component["ordinary_or_mixed_txids"], [])
-        assert_equal(component["all_claims_zero_payment_retirable"], False)
-        assert_equal(component["all_claims_expired_locally_retired"], False)
         assert_equal(len(component["generation_fingerprint"]), 64)
         assert component["generation_fingerprint"] != ZERO_HASH
 
@@ -159,7 +176,6 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(claim_node["in_mempool"], False)
         assert_equal(claim_node["quarantined"], True)
         assert_equal(claim_node["abandoned"], False)
-        assert_equal(claim_node["expired_locally_retired"], False)
         assert_equal(claim_node["lineage_metadata_present"], True)
         assert_equal(claim_node["lineage_metadata_valid"], True)
         assert_equal(claim_node["lineage_root_txid"], claim_txid)
@@ -179,12 +195,6 @@ class GoldRushInfoTest(BitcoinTestFramework):
             record["qq_shadow_pow_lineage_family"],
             component["generation_fingerprint"],
         )
-        assert "qq_shadow_pow_expired_retired" not in record
-        assert "qq_shadow_pow_expired_retired_height" not in record
-        assert "qq_shadow_pow_expired_retired_tip" not in record
-
-        assert_equal(recovery["retired_claim_objects"], 0)
-        assert_equal(recovery["retired_components"], 0)
         assert_equal(recovery["blocking_components"], 1)
         assert_equal(recovery["pending_manual_resolutions"], 0)
         assert_equal(recovery["pending_automatic_resolutions"], 0)
@@ -243,10 +253,9 @@ class GoldRushInfoTest(BitcoinTestFramework):
         wallet_name = "goldrush_pow_builtin"
         strict_wallet_name = "goldrush_pow_interactive_strict"
 
-        # Interactive starts remain strict independently of the retained
-        # startup worker exercised below. SetPowMining stops an existing worker
-        # before validating a fresh interactive request, so this deliberately
-        # uses a separate wallet/lifecycle phase.
+        # Interactive starts remain strict for a wallet without a retained
+        # worker. The startup lifecycle below separately proves that a rejected
+        # reconfiguration preserves an already-enabled waiting worker.
         node.createwallet(wallet_name=strict_wallet_name, load_on_startup=False)
         strict_wallet = node.get_wallet_rpc(strict_wallet_name)
         strict_wallet.getnewquantumaddress("PoW - Quantum Claim Address")
@@ -398,6 +407,33 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(wallet.getwalletinfo()["txcount"], wallet_txcount_before)
             assert_equal(self._wallet_pow_claims(wallet), wallet_claims_before)
 
+            self.log.info(
+                "A rejected locked reconfiguration preserves the startup worker"
+            )
+            assert_raises_rpc_error(
+                -4,
+                "requires an unlocked wallet",
+                wallet.setpowmining,
+                True,
+                2,
+                25,
+            )
+            locked_after_reject = wallet.getpowmininginfo()
+            assert_equal(locked_after_reject["enabled"], True)
+            assert_equal(locked_after_reject["threads"], 1)
+            assert_equal(locked_after_reject["cpu_percent"], 1)
+            assert_equal(
+                locked_after_reject["state"],
+                "wallet_locked_or_staking_only",
+            )
+            assert_equal(locked_after_reject["hashrate"], 0)
+            assert_equal(
+                {entry["address"] for entry in wallet.listquantumaddresses()},
+                quantum_addresses_before,
+            )
+            assert_equal(wallet.getwalletinfo()["txcount"], wallet_txcount_before)
+            assert_equal(self._wallet_pow_claims(wallet), wallet_claims_before)
+
             self.log.info("A staking-only unlock keeps the retained startup worker paused")
             wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, True)
             self.wait_until(
@@ -410,6 +446,33 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(staking_only["cpu_percent"], 1)
             assert_equal(staking_only["state"], "wallet_locked_or_staking_only")
             assert_equal(staking_only["hashrate"], 0)
+            assert_equal(
+                {entry["address"] for entry in wallet.listquantumaddresses()},
+                quantum_addresses_before,
+            )
+            assert_equal(wallet.getwalletinfo()["txcount"], wallet_txcount_before)
+            assert_equal(self._wallet_pow_claims(wallet), wallet_claims_before)
+
+            assert_raises_rpc_error(
+                -4,
+                "normal wallet unlock",
+                wallet.setpowmining,
+                True,
+                2,
+                25,
+            )
+            staking_only_after_reject = wallet.getpowmininginfo()
+            assert_equal(
+                wallet.getwalletinfo()["unlocked_staking_only"], True
+            )
+            assert_equal(staking_only_after_reject["enabled"], True)
+            assert_equal(staking_only_after_reject["threads"], 1)
+            assert_equal(staking_only_after_reject["cpu_percent"], 1)
+            assert_equal(
+                staking_only_after_reject["state"],
+                "wallet_locked_or_staking_only",
+            )
+            assert_equal(staking_only_after_reject["hashrate"], 0)
             assert_equal(
                 {entry["address"] for entry in wallet.listquantumaddresses()},
                 quantum_addresses_before,
@@ -726,6 +789,14 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(self._mempool_pow_claims(node), [stale_claim["txid"]])
 
         self.log.info("Expiring QQP3 relay residence after one hour without releasing its input")
+        # Residence expiry does not revoke exact-byte relay authority while
+        # the active-chain clock still permits this proof. Hold wallet
+        # broadcast explicitly so maintenance cannot re-admit it between the
+        # absence and recovery-graph observations below.
+        node = self._restart_wallet_broadcast(False, reconnect_peer=False)
+        wallet = node.get_wallet_rpc(wallet_name)
+        cli_rpc_wallet = node.get_wallet_rpc(cli_wallet_name)
+        assert_equal(node.getrawtransaction(stale_claim["txid"]), stale_claim["hex"])
         claim_entry_time = node.getmempoolentry(stale_claim["txid"])["time"]
         node.setmocktime(claim_entry_time + QQSPROOF_MEMPOOL_TTL_SECONDS + 1)
         node.mockscheduler(60)
@@ -734,16 +805,6 @@ class GoldRushInfoTest(BitcoinTestFramework):
             timeout=10,
         )
         node.syncwithvalidationinterfacequeue()
-        self._assert_qqp3_recovery_age(
-            wallet, stale_claim["txid"], 0, expect_in_mempool=False
-        )
-
-        self.log.info("Wallet reload does not grant an expired claim a fresh relay lifetime")
-        node.unloadwallet(wallet_name)
-        node.loadwallet(wallet_name)
-        wallet = node.get_wallet_rpc(wallet_name)
-        node.syncwithvalidationinterfacequeue()
-        assert stale_claim["txid"] not in node.getrawmempool()
         self._assert_qqp3_recovery_age(
             wallet, stale_claim["txid"], 0, expect_in_mempool=False
         )
@@ -777,6 +838,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
             wallet, stale_claim["txid"], 2, expect_in_mempool=False
         )
 
+        reloaded_after_logical_expiry = False
         for origin_age in range(3, QQP3_LATE_ORIGIN_WINDOW + 1):
             self.generateblock(
                 node,
@@ -791,6 +853,39 @@ class GoldRushInfoTest(BitcoinTestFramework):
                 origin_age,
                 expect_in_mempool=False,
             )
+            if not reloaded_after_logical_expiry:
+                recovery = wallet.getpowclaimrecoveryinfo(True)
+                component = next(
+                    item
+                    for item in recovery["component_details"]
+                    if stale_claim["txid"] in item["claim_txids"]
+                )
+                claim_node = next(
+                    item
+                    for item in component["nodes"]
+                    if item["txid"] == stale_claim["txid"]
+                )
+                if claim_node["relay_ttl_expired"]:
+                    self.log.info(
+                        "Wallet reload cannot restore relay authority after the active chain clock crosses the schema frontier"
+                    )
+                    # Restore normal broadcast as part of the reload: the
+                    # expired chain-clock authority, not our observation
+                    # hold, must now keep these exact bytes absent.
+                    node = self._restart_wallet_broadcast(True, reconnect_peer=True)
+                    wallet = node.get_wallet_rpc(wallet_name)
+                    cli_rpc_wallet = node.get_wallet_rpc(cli_wallet_name)
+                    node.syncwithvalidationinterfacequeue()
+                    assert stale_claim["txid"] not in node.getrawmempool()
+                    self._assert_qqp3_recovery_age(
+                        wallet,
+                        stale_claim["txid"],
+                        origin_age,
+                        expect_in_mempool=False,
+                    )
+                    reloaded_after_logical_expiry = True
+
+        assert_equal(reloaded_after_logical_expiry, True)
 
         self.log.info("Expiring the lineaged QQP3 origin while preserving its family anchor")
         assert_equal(

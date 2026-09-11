@@ -456,6 +456,9 @@ BOOST_AUTO_TEST_CASE(test_Get)
 static void CreateCreditAndSpend(const FillableSigningProvider& keystore, const CScript& outscript, CTransactionRef& output, CMutableTransaction& input, bool success = true)
 {
     CMutableTransaction outputm;
+    // Keep the two partial-signature fixtures byte-identical even when a slow
+    // sanitizer run crosses a wall-clock second between helper invocations.
+    outputm.nTime = 0;
     outputm.nVersion = 1;
     outputm.vin.resize(1);
     outputm.vin[0].prevout.SetNull();
@@ -466,12 +469,14 @@ static void CreateCreditAndSpend(const FillableSigningProvider& keystore, const 
     DataStream ssout;
     ssout << TX_WITH_WITNESS(outputm);
     ssout >> TX_WITH_WITNESS(output);
+    BOOST_REQUIRE_EQUAL(output->nTime, 0U);
     assert(output->vin.size() == 1);
     assert(output->vin[0] == outputm.vin[0]);
     assert(output->vout.size() == 1);
     assert(output->vout[0] == outputm.vout[0]);
 
     CMutableTransaction inputm;
+    inputm.nTime = 0;
     inputm.nVersion = 1;
     inputm.vin.resize(1);
     inputm.vin[0].prevout.hash = output->GetHash();
@@ -485,6 +490,7 @@ static void CreateCreditAndSpend(const FillableSigningProvider& keystore, const 
     DataStream ssin;
     ssin << TX_WITH_WITNESS(inputm);
     ssin >> TX_WITH_WITNESS(input);
+    BOOST_REQUIRE_EQUAL(input.nTime, 0U);
     assert(input.vin.size() == 1);
     assert(input.vin[0] == inputm.vin[0]);
     assert(input.vout.size() == 1);

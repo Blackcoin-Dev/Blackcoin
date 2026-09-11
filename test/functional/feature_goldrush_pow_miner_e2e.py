@@ -218,9 +218,6 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         assert_equal(record["qq_shadow_pow_lineage_ordinal"], "0")
         assert_equal(len(record["qq_shadow_pow_lineage_family"]), 64)
         assert record["qq_shadow_pow_lineage_family"] != ZERO_HASH
-        assert "qq_shadow_pow_expired_retired" not in record
-        assert "qq_shadow_pow_expired_retired_height" not in record
-        assert "qq_shadow_pow_expired_retired_tip" not in record
         self._assert_no_automatic_claim_cleanup(wallet, txid)
         assert node.gettxout(claim_input["txid"], claim_input["vout"], False) is not None
         assert all(
@@ -243,8 +240,6 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         )
         assert_equal(component["anchor_authenticated"], True)
         assert_equal(component["anchor_unspent"], True)
-        assert_equal(component["all_claims_zero_payment_retirable"], False)
-        assert_equal(component["all_claims_expired_locally_retired"], False)
         assert_equal(component["resolution_txids"], [])
         assert_equal(component["ordinary_or_mixed_txids"], [])
         assert_equal(
@@ -254,14 +249,11 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         assert_equal(claim_node["disposition"], "origin_expired")
         assert_equal(claim_node["quarantined"], True)
         assert_equal(claim_node["abandoned"], False)
-        assert_equal(claim_node["expired_locally_retired"], False)
         assert_equal(claim_node["lineage_metadata_present"], True)
         assert_equal(claim_node["lineage_metadata_valid"], True)
         assert_equal(claim_node["lineage_root_txid"], txid)
         assert_equal(claim_node["lineage_parent_txid"], ZERO_HASH)
         assert_equal(claim_node["lineage_ordinal"], 0)
-        assert_equal(recovery["retired_claim_objects"], 0)
-        assert_equal(recovery["retired_components"], 0)
         assert_equal(recovery["blocking_components"], 1)
         assert_equal(recovery["pending_manual_resolutions"], 0)
         assert_equal(recovery["pending_automatic_resolutions"], 0)

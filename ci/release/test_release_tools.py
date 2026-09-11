@@ -1226,6 +1226,30 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,
                                         "unsupported native benchmark platform"):
                 generator.native_runner_identity()
+
+    def test_expensive_pr_gate_jobs_require_policy_and_lint(self):
+        workflow = (
+            TOOLS.parent.parent / ".github/workflows/pr-gate.yml"
+        ).read_text(encoding="utf-8")
+        jobs = dict(re.findall(
+            r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)",
+            workflow.split("\njobs:\n", 1)[1],
+        ))
+        for job in (
+            "native-build-and-unit",
+            "native-linux-arm64-crypto",
+            "windows-crypto-cross-build",
+            "native-macos-crypto",
+            "sanitizer-gates",
+            "fuzz-smoke",
+        ):
+            with self.subTest(job=job):
+                self.assertIn(job, jobs)
+                self.assertRegex(jobs[job], r"(?m)^    needs: policy-and-lint$")
+                self.assertNotRegex(
+                    jobs[job], r"(?m)^    if:.*\b(?:always|failure|cancelled)\s*\("
+                )
+
     def test_resource_benchmark_workflow_measures_and_does_not_overclaim(self):
         root = TOOLS.parent.parent
         gate = (root / ".github" / "workflows" / "pr-gate.yml").read_text(
@@ -1752,6 +1776,205 @@ class ReleaseToolTests(unittest.TestCase):
                     document["manifest_sha256"],
                     builder.file_sha256(MIXED_VERSION_TOOLS / "sources.json"),
                 )
+
+    def test_mixed_version_retained_build_resumes_only_failed_phase_and_relinks(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        source = builder.load_manifest(MIXED_VERSION_TOOLS / "sources.json")["sources"][-1]
+        for failure in ("compile", "binary-identity"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                output, build_root = root / "output", root / "build"
+                source_dir = build_root / source["install_dir"]
+                commands, links, identities = [], [], []
+                failed = False
+
+                def clone(_source, destination):
+                    (destination / "src").mkdir(parents=True)
+
+                def run(command, **kwargs):
+                    nonlocal failed
+                    command = [str(part) for part in command]
+                    commands.append(command)
+                    if command[0].endswith("genbuild.sh"):
+                        Path(command[1]).write_text(
+                            f'#define BUILD_SOURCE_COMMIT "{source["commit"]}"\n'
+                            '#define BUILD_SOURCE_DIRTY 0\n', encoding="utf8")
+                    if command[:1] == ["make"] and "src" in command:
+                        links.append(command)
+                        object_path = source_dir / "src" / "successful.o"
+                        if len(links) == 1:
+                            object_path.write_bytes(b"successful object retained")
+                        self.assertEqual(object_path.read_bytes(), b"successful object retained")
+                        for name in (source["source_daemon"], source["source_cli"]):
+                            binary = source_dir / "src" / name
+                            self.assertFalse(binary.exists(), "resume must force fresh binary links")
+                            binary.write_bytes(b"fresh binary")
+                        if failure == "compile" and not failed:
+                            failed = True
+                            raise subprocess.CalledProcessError(2, command)
+
+                def identity(binary, _source, **kwargs):
+                    nonlocal failed
+                    identities.append(binary.name)
+                    self.assertEqual(binary.read_bytes(), b"fresh binary")
+                    if failure == "binary-identity" and not failed:
+                        failed = True
+                        raise RuntimeError("identity check failed")
+                    return "verified banner"
+
+                argv = ["builder", "--output", str(output), "--build-root", str(build_root),
+                        "--host", "test-host", "--version", source["version"]]
+                with mock.patch.object(builder, "remote_objects"), \
+                     mock.patch.object(builder, "retained_build_inputs", return_value={"pinned": True}), \
+                     mock.patch.object(builder, "clone_exact_source", side_effect=clone) as cloning, \
+                     mock.patch.object(builder, "verify_source_checkout"), \
+                     mock.patch.object(builder, "source_version", return_value=source["version"]), \
+                     mock.patch.object(builder, "run", side_effect=run), \
+                     mock.patch.object(builder, "verified_binary_version", side_effect=identity), \
+                     mock.patch("builtins.print") as printed:
+                    with mock.patch.object(sys, "argv", argv + ["--preserve-build"]), \
+                         self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                        builder.main()
+                    self.assertFalse(output.exists())
+                    self.assertTrue((source_dir / "src" / "successful.o").is_file())
+                    digests = [call.args[0].split(": ", 1)[1] for call in printed.call_args_list
+                               if call.args and str(call.args[0]).startswith("Retained build checkpoint SHA256:")]
+                    self.assertEqual(len(digests), 1)
+                    checkpoint = builder.read_build_checkpoint(build_root, digests[0])
+                    self.assertEqual(checkpoint["next_phase"], 5 if failure == "compile" else 6)
+                    with mock.patch.object(sys, "argv", argv + ["--resume-build", digests[0]]):
+                        self.assertEqual(builder.main(), 0)
+                    cloning.assert_called_once()
+                self.assertEqual(len(links), 2)
+                self.assertEqual(sum("depends" in command for command in commands), 1)
+                self.assertEqual(sum(command[0] == "./autogen.sh" for command in commands), 1)
+                self.assertEqual(sum(command[0] == "./configure" for command in commands), 1)
+                self.assertEqual(identities[-2:], list(builder.BINARIES))
+                self.assertFalse((build_root / builder.CHECKPOINT_NAME).exists())
+                provenance = json.loads((output / "provenance.json").read_text(encoding="utf8"))
+                self.assertEqual(provenance["built_versions"], [source["version"]])
+                self.assertTrue(provenance["sources"][0]["identity_verified"])
+                for binary in builder.BINARIES:
+                    self.assertEqual(provenance["sources"][0]["binaries"][binary],
+                                     builder.file_sha256(output / source["install_dir"] / "bin" / binary))
+
+    def test_mixed_version_retained_checkpoint_rejects_artifact_or_metadata_tampering(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        for mutation in ("bytes", "mode", "name", "outside-link", "forged-checkpoint"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                workspace = root / "build"
+                workspace.mkdir()
+                artifact = workspace / "object.o"
+                artifact.write_bytes(b"original")
+                with mock.patch("builtins.print"):
+                    digest = builder.write_build_checkpoint(workspace, {"exact": "inputs"}, 5)
+                self.assertEqual(builder.read_build_checkpoint(workspace, digest)["next_phase"], 5)
+                if mutation == "bytes":
+                    artifact.write_bytes(b"changed")
+                elif mutation == "mode":
+                    artifact.chmod(0o700)
+                elif mutation == "name":
+                    artifact.rename(workspace / "renamed.o")
+                elif mutation == "outside-link":
+                    (workspace / "link").symlink_to(root)
+                else:
+                    artifact.write_bytes(b"changed")
+                    with mock.patch("builtins.print"):
+                        builder.write_build_checkpoint(workspace, {"exact": "inputs"}, 5)
+                with self.assertRaisesRegex(RuntimeError, "changed|escaping symlink|digest mismatch"):
+                    builder.read_build_checkpoint(workspace, digest)
+
+    def test_mixed_version_retained_build_rejects_input_drift_before_execution(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "build"
+            workspace.mkdir()
+            inputs = {key: "original" for key in (
+                "source", "manifest_sha256", "builder_sha256", "host", "tools", "sdk",
+                "environment_sha256", "build_root", "output_dir")}
+            with mock.patch("builtins.print"):
+                digest = builder.write_build_checkpoint(workspace, inputs, 5)
+            argv = ["builder", "--output", str(root / "output"), "--build-root", str(workspace),
+                    "--version", "v30.1.4", "--resume-build", digest]
+            for key in inputs:
+                changed = {**inputs, key: "changed"}
+                with self.subTest(key=key), mock.patch.object(sys, "argv", argv), \
+                     mock.patch.object(builder, "retained_build_inputs", return_value=changed), \
+                     mock.patch.object(builder, "remote_objects") as remote, \
+                     mock.patch.object(builder, "build_source_retained") as build:
+                    with self.assertRaisesRegex(RuntimeError, "inputs/toolchain changed"):
+                        builder.main()
+                    remote.assert_not_called()
+                    build.assert_not_called()
+
+    def test_mixed_version_retained_inputs_bind_tools_sdk_and_environment(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            compiler, xcrun, sdk = root / "compiler", root / "xcrun", root / "sdk"
+            compiler.write_bytes(b"compiler original")
+            xcrun.write_bytes(b"sdk selector")
+            sdk.mkdir()
+            settings = sdk / "SDKSettings.json"
+            settings.write_bytes(b"sdk identity")
+            environment = {"PATH": str(root), "CXX": "c++", "CXXFLAGS": "-O2"}
+
+            def which(command, **_kwargs):
+                return {"cc": str(compiler), "c++": str(compiler), "xcrun": str(xcrun)}.get(command)
+
+            def run(command, **_kwargs):
+                return str(sdk if "--show-sdk-path" in command else compiler)
+
+            def inputs():
+                return builder.retained_build_inputs(
+                    {"commit": SOURCE_SHA}, manifest_digest="a" * 64,
+                    build_root=root / "build", output_dir=root / "output",
+                    host="test-host", environment=environment)
+
+            with mock.patch.object(builder.shutil, "which", side_effect=which), \
+                 mock.patch.object(builder, "run", side_effect=run), \
+                 mock.patch.object(builder.subprocess, "run", return_value=
+                                   subprocess.CompletedProcess([], 0, "version 1", "")) as version:
+                original = inputs()
+                self.assertEqual(version.call_count, 2, "fingerprint each resolved executable only once")
+                self.assertEqual(original["tools"]["cc"], original["tools"]["xcrun:clang"])
+                compiler.write_bytes(b"compiler replacement")
+                self.assertNotEqual(inputs()["tools"], original["tools"])
+                settings.write_bytes(b"sdk replacement")
+                self.assertNotEqual(inputs()["sdk"], original["sdk"])
+                environment["CXXFLAGS"] = "-O0"
+                self.assertNotEqual(inputs()["environment_sha256"], original["environment_sha256"])
+                self.assertNotIn("environment", original)
+            with mock.patch.dict(os.environ, {"MAKEFLAGS": "-f hostile.mk", "CXXFLAGS": "-O2"}):
+                filtered = builder.retained_build_environment()
+                self.assertNotIn("MAKEFLAGS", filtered)
+                self.assertEqual(filtered["CXXFLAGS"], "-O2")
+                self.assertEqual(filtered["LC_ALL"], "C")
+
+    def test_mixed_version_retained_build_requires_single_source_and_exclusive_workspace(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "build"
+            argv = ["builder", "--output", str(root / "output"), "--build-root", str(workspace),
+                    "--preserve-build"]
+            with mock.patch.object(sys, "argv", argv), mock.patch("sys.stderr"), \
+                 mock.patch.object(builder, "retained_build_inputs") as inputs:
+                with self.assertRaises(SystemExit):
+                    builder.main()
+                inputs.assert_not_called()
+            with builder.retained_build_lock(workspace):
+                with self.assertRaisesRegex(RuntimeError, "already in use"):
+                    with builder.retained_build_lock(workspace):
+                        self.fail("second builder must not enter an active workspace")
+            (workspace / "untrusted.o").write_bytes(b"untrusted")
+            with mock.patch.object(sys, "argv", argv + ["--version", "v30.1.4"]), \
+                 mock.patch("sys.stderr"), mock.patch.object(builder, "retained_build_inputs") as inputs:
+                with self.assertRaises(SystemExit):
+                    builder.main()
+                inputs.assert_not_called()
 
     def test_mixed_version_subset_provenance_is_exact_and_complete_is_shareable(self):
         builder = load_mixed_version_module("build_previous_releases")
@@ -3331,6 +3554,7 @@ class ReleaseToolTests(unittest.TestCase):
         merge_shas = (
             "957b41d22c8d96131a0ec87fff1e2f4c20a5caa2",
             "19baffef25af36e177db2975780e0641b59753aa",
+            "e85668ed26ef75d92e234488cbd85e146f6ffd5a",
         )
         merge_metadata = (
             "Blackcoin-Dev\0"
@@ -3355,6 +3579,11 @@ class ReleaseToolTests(unittest.TestCase):
         )
         with mock.patch.object(identity, "git", return_value=untrusted_committer):
             with self.assertRaisesRegex(RuntimeError, "committer is"):
+                identity.verify_commit(merge_shas[-1])
+
+        extra_attribution = merge_metadata + "\nCo-authored-by: Other <other@example.invalid>"
+        with mock.patch.object(identity, "git", return_value=extra_attribution):
+            with self.assertRaisesRegex(RuntimeError, "contributor-attribution trailer"):
                 identity.verify_commit(merge_shas[-1])
 
     def test_windows_payload_inventory_is_exact_and_excludes_test_binary(self):

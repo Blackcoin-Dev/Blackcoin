@@ -252,7 +252,10 @@ bool AddressTableModel::setData(const QModelIndex &index, const QVariant &value,
                 editStatus = NO_CHANGES;
                 return false;
             }
-            walletModel->wallet().setAddressBook(curAddress, value.toString().toStdString(), purpose);
+            if (!walletModel->wallet().setAddressBook(curAddress, value.toString().toStdString(), purpose)) {
+                editStatus = ADDRESS_BOOK_FAILURE;
+                return false;
+            }
         } else if(index.column() == Address) {
             CTxDestination newAddress = DecodeDestination(value.toString().toStdString());
             // Refuse to set invalid address, set error status and return false
@@ -278,10 +281,10 @@ bool AddressTableModel::setData(const QModelIndex &index, const QVariant &value,
             // Double-check that we're not overwriting a receiving address
             else if(rec->type == AddressTableEntry::Sending)
             {
-                // Remove old entry
-                walletModel->wallet().delAddressBook(curAddress);
-                // Add new entry with new address
-                walletModel->wallet().setAddressBook(newAddress, value.toString().toStdString(), purpose);
+                if (!walletModel->wallet().moveAddressBook(curAddress, newAddress)) {
+                    editStatus = ADDRESS_BOOK_FAILURE;
+                    return false;
+                }
             }
         }
         return true;
@@ -364,22 +367,39 @@ QString AddressTableModel::addRow(const QString &type, const QString &label, con
         }
 
         // Add entry
-        walletModel->wallet().setAddressBook(DecodeDestination(strAddress), strLabel, wallet::AddressPurpose::SEND);
+        if (!walletModel->wallet().setAddressBook(DecodeDestination(strAddress), strLabel, wallet::AddressPurpose::SEND)) {
+            editStatus = ADDRESS_BOOK_FAILURE;
+            return QString();
+        }
     }
     else if(type == Receive)
     {
         // Generate a new address to associate with given label
-        auto op_dest = walletModel->wallet().getNewDestination(address_type, strLabel);
+        interfaces::NewDestinationStatus generation_status{
+            interfaces::NewDestinationStatus::NOT_RESERVED};
+        auto op_dest = walletModel->wallet().getNewDestination(
+            address_type, strLabel, &generation_status);
         if (!op_dest) {
+            // A label failure happens after a key has already been reserved.
+            // Do not treat it as an unlock failure and generate a second key.
+            if (generation_status ==
+                interfaces::NewDestinationStatus::RESERVED) {
+                editStatus = ADDRESS_BOOK_FAILURE;
+                return QString();
+            }
             WalletModel::UnlockContext ctx(walletModel->requestUnlock());
             if (!ctx.isValid()) {
                 // Unlock wallet failed or was cancelled
                 editStatus = WALLET_UNLOCK_FAILURE;
                 return QString();
             }
-            op_dest = walletModel->wallet().getNewDestination(address_type, strLabel);
+            op_dest = walletModel->wallet().getNewDestination(
+                address_type, strLabel, &generation_status);
             if (!op_dest) {
-                editStatus = KEY_GENERATION_FAILURE;
+                editStatus = generation_status ==
+                        interfaces::NewDestinationStatus::RESERVED
+                    ? ADDRESS_BOOK_FAILURE
+                    : KEY_GENERATION_FAILURE;
                 return QString();
             }
         }
@@ -402,8 +422,7 @@ bool AddressTableModel::removeRows(int row, int count, const QModelIndex &parent
         // Also refuse to remove receiving addresses.
         return false;
     }
-    walletModel->wallet().delAddressBook(DecodeDestination(rec->address.toStdString()));
-    return true;
+    return walletModel->wallet().delAddressBook(DecodeDestination(rec->address.toStdString()));
 }
 
 QString AddressTableModel::labelForAddress(const QString &address) const

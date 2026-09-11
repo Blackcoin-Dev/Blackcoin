@@ -172,7 +172,12 @@ if [[ "${RUN_TIDY}" == "true" ]]; then
   MAYBE_TOKEN="--"
 fi
 
-bash -c "${MAYBE_BEAR} ${MAYBE_TOKEN} make $MAKEJOBS $GOAL" || ( echo "Build failure. Verbose build follows." && make "$GOAL" V=1 ; false )
+if [[ "${CI_REGRESSION_ONLY:-false}" == "true" ]]; then
+  # Preserve the first failure for a targeted fix; do not repeat the build.
+  bash -c "make $MAKEJOBS $GOAL"
+else
+  bash -c "${MAYBE_BEAR} ${MAYBE_TOKEN} make $MAKEJOBS $GOAL" || ( echo "Build failure. Verbose build follows." && make "$GOAL" V=1 ; false )
+fi
 
 bash -c "${PRINT_CCACHE_STATISTICS}"
 du -sh "${DEPENDS_DIR}"/*/

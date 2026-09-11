@@ -225,5 +225,41 @@ BOOST_AUTO_TEST_CASE(db_cursor_prefix_byte_test)
     }
 }
 
+BOOST_AUTO_TEST_CASE(db_erase_prefix_joins_existing_transaction)
+{
+    const MockableData::value_type
+        p{StringData("prefix"), StringData("p")},
+        ps{StringData("prefixsuffix"), StringData("ps")},
+        other{StringData("other"), StringData("other")};
+    for (const auto& database : TestDatabases(m_path_root)) {
+        std::unique_ptr<DatabaseBatch> batch = database->MakeBatch();
+        BOOST_REQUIRE(batch->Write(Span{p.first}, Span{p.second}));
+        BOOST_REQUIRE(batch->Write(Span{ps.first}, Span{ps.second}));
+        BOOST_REQUIRE(batch->Write(Span{other.first}, Span{other.second}));
+
+        // A standalone prefix erase owns and commits its transaction.
+        BOOST_REQUIRE(batch->ErasePrefix(StringBytes("prefix")));
+        CheckPrefix(*batch, StringBytes("prefix"), {});
+        CheckPrefix(*batch, StringBytes("other"), {other});
+
+        BOOST_REQUIRE(batch->Write(Span{p.first}, Span{p.second}));
+        BOOST_REQUIRE(batch->Write(Span{ps.first}, Span{ps.second}));
+
+        // A caller-owned transaction keeps ownership: abort restores the
+        // erased rows and commit removes them.
+        BOOST_REQUIRE(batch->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(batch->ErasePrefix(StringBytes("prefix")));
+        CheckPrefix(*batch, StringBytes("prefix"), {});
+        BOOST_REQUIRE(batch->TxnAbort());
+        CheckPrefix(*batch, StringBytes("prefix"), {p, ps});
+
+        BOOST_REQUIRE(batch->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(batch->ErasePrefix(StringBytes("prefix")));
+        BOOST_REQUIRE(batch->TxnCommit());
+        CheckPrefix(*batch, StringBytes("prefix"), {});
+        CheckPrefix(*batch, StringBytes("other"), {other});
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

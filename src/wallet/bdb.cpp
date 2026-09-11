@@ -897,21 +897,37 @@ bool BerkeleyBatch::HasKey(DataStream&& key)
 
 bool BerkeleyBatch::ErasePrefix(Span<const std::byte> prefix)
 {
-    if (!TxnBegin()) return false;
-    auto cursor{std::make_unique<BerkeleyCursor>(m_database, *this)};
-    // const_cast is safe below even though prefix_key is an in/out parameter,
-    // because we are not using the DB_DBT_USERMEM flag, so BDB will allocate
-    // and return a different output data pointer
-    Dbt prefix_key{const_cast<std::byte*>(prefix.data()), static_cast<uint32_t>(prefix.size())}, prefix_value{};
-    int ret{cursor->dbc()->get(&prefix_key, &prefix_value, DB_SET_RANGE)};
-    for (int flag{DB_CURRENT}; ret == 0; flag = DB_NEXT) {
-        SafeDbt key, value;
-        ret = cursor->dbc()->get(key, value, flag);
-        if (ret != 0 || key.get_size() < prefix.size() || memcmp(key.get_data(), prefix.data(), prefix.size()) != 0) break;
-        ret = cursor->dbc()->del(0);
+    // Prefix erasure is also used by higher-level operations that already own
+    // a transaction. Participate in that transaction instead of attempting a
+    // nested Berkeley transaction, which BerkeleyBatch intentionally rejects.
+    const bool owns_transaction{activeTxn == nullptr};
+    if (owns_transaction && !TxnBegin()) return false;
+
+    int ret{0};
+    try {
+        auto cursor{std::make_unique<BerkeleyCursor>(m_database, *this)};
+        // const_cast is safe below even though prefix_key is an in/out
+        // parameter, because we are not using the DB_DBT_USERMEM flag, so BDB
+        // will allocate and return a different output data pointer.
+        Dbt prefix_key{const_cast<std::byte*>(prefix.data()), static_cast<uint32_t>(prefix.size())}, prefix_value{};
+        ret = cursor->dbc()->get(&prefix_key, &prefix_value, DB_SET_RANGE);
+        for (int flag{DB_CURRENT}; ret == 0; flag = DB_NEXT) {
+            SafeDbt key, value;
+            ret = cursor->dbc()->get(key, value, flag);
+            if (ret != 0 || key.get_size() < prefix.size() || memcmp(key.get_data(), prefix.data(), prefix.size()) != 0) break;
+            ret = cursor->dbc()->del(0);
+        }
+    } catch (...) {
+        if (owns_transaction) TxnAbort();
+        throw;
     }
-    cursor.reset();
-    return TxnCommit() && (ret == 0 || ret == DB_NOTFOUND);
+
+    const bool success{ret == 0 || ret == DB_NOTFOUND};
+    if (!success) {
+        if (owns_transaction) TxnAbort();
+        return false;
+    }
+    return !owns_transaction || TxnCommit();
 }
 
 void BerkeleyDatabase::AddRef()

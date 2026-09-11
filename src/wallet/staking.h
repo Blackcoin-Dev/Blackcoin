@@ -12,6 +12,24 @@
 #include <wallet/wallet.h>
 
 namespace wallet {
+struct BoundedLegacyStakeCandidate
+{
+    COutPoint outpoint;
+    CAmount value{0};
+};
+
+struct BoundedLegacyStakeSource
+{
+    COutPoint outpoint;
+    const CWalletTx* wallet_tx{nullptr};
+};
+
+struct BoundedLegacyStakeCandidates
+{
+    std::vector<BoundedLegacyStakeCandidate> candidates;
+    bool capacity_exceeded{false};
+};
+
 /* Start staking */
 void StartStake(CWallet& wallet);
 
@@ -23,6 +41,19 @@ void AvailableCoinsForStaking(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl = nullptr,
                            const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+/** Evaluate the same authoritative per-output staking predicate for legacy
+ * candidates at an already captured Gold Rush chain tuple. The phase
+ * precondition is checked by the implementation before walking the bounded
+ * wallet index, and no chain view is consulted by the legacy predicate. */
+BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
+    const CWallet& wallet,
+    const std::vector<BoundedLegacyStakeSource>& sources,
+    const std::set<COutPoint>& protected_rgb_seals,
+    int active_height, int64_t median_time_past,
+    const CCoinControl* coin_control = nullptr,
+    const CoinFilterParams& params = {})
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+    LOCKS_EXCLUDED(::cs_main);
 bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet, CAmount& nValueRet)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval,

@@ -23,6 +23,8 @@ BOOST_AUTO_TEST_CASE(CanProvide)
 {
     // Set up wallet and keyman variables.
     CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    // Script imports also persist wallet flags; preserve wallet-before-keystore order.
+    LOCK(wallet.cs_wallet);
     LegacyScriptPubKeyMan& keyman = *wallet.GetOrCreateLegacyScriptPubKeyMan();
 
     // Make a 1 of 2 multisig script
@@ -39,7 +41,7 @@ BOOST_AUTO_TEST_CASE(CanProvide)
     // Verify the p2sh(multisig) script is not recognized until the multisig
     // script is added to the keystore to make it solvable
     BOOST_CHECK(!keyman.CanProvide(p2sh_script, data));
-    keyman.AddCScript(multisig_script);
+    BOOST_REQUIRE(keyman.AddCScript(multisig_script));
     BOOST_CHECK(keyman.CanProvide(p2sh_script, data));
 }
 

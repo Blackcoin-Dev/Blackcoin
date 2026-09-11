@@ -8,33 +8,37 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <future>
 #include <iterator>
 #include <memory>
-#include <stdint.h>
 #include <stdexcept>
+#include <stdint.h>
 #include <string_view>
 #include <thread>
 #include <vector>
 
 #include <addresstype.h>
 #include <chain.h>
+#include <coins.h>
 #include <common/args.h>
 #include <common/settings.h>
 #include <consensus/demurrage.h>
-#include <coins.h>
 #include <crypto/mldsa.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
+#include <logging.h>
 #include <node/blockstorage.h>
 #include <policy/policy.h>
+#include <rpc/protocol.h>
+#include <rpc/request.h>
 #include <rpc/server.h>
 #include <script/solver.h>
 #include <shadow.h>
-#include <support/cleanse.h>
 #include <streams.h>
+#include <support/cleanse.h>
 #include <test/util/logging.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
@@ -45,10 +49,16 @@
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
+#include <wallet/claim_maintenance.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/load.h>
+#ifdef USE_BDB
+#include <wallet/bdb.h>
+#endif
 #include <wallet/quantum_stake_ops.h>
 #include <wallet/receive.h>
+#include <wallet/rpc/util.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
@@ -125,6 +135,32 @@ public:
 
 private:
     common::Settings m_saved;
+};
+
+class ValidationQueueBarrier
+{
+public:
+    ValidationQueueBarrier()
+        : m_release{m_release_promise.get_future().share()}
+    {
+        CallFunctionInValidationInterfaceQueue(
+            [release = m_release] { release.wait(); });
+    }
+
+    ValidationQueueBarrier(const ValidationQueueBarrier&) = delete;
+    ValidationQueueBarrier& operator=(const ValidationQueueBarrier&) = delete;
+
+    ~ValidationQueueBarrier() { Release(); }
+
+    void Release()
+    {
+        if (!m_released.exchange(true)) m_release_promise.set_value();
+    }
+
+private:
+    std::promise<void> m_release_promise;
+    std::shared_future<void> m_release;
+    std::atomic<bool> m_released{false};
 };
 
 // Blackcoin
@@ -291,6 +327,786 @@ BOOST_AUTO_TEST_CASE(coin_lock_batches_publish_only_after_database_commit)
     BOOST_CHECK(listed(mixed_reload).empty());
 }
 
+BOOST_AUTO_TEST_CASE(address_book_updates_publish_only_after_database_commit)
+{
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+    const CTxDestination destination{PKHash(key.GetPubKey())};
+    using State = std::optional<std::pair<std::string, std::optional<AddressPurpose>>>;
+    const auto state = [](const CWallet& wallet, const CTxDestination& dest) -> State {
+        LOCK(wallet.cs_wallet);
+        const CAddressBookData* entry = wallet.FindAddressBookEntry(dest, /*allow_change=*/true);
+        if (!entry || entry->IsChange()) return std::nullopt;
+        return std::make_pair(entry->GetLabel(), entry->purpose);
+    };
+
+    CWallet seed(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(seed.SetAddressBook(destination, "old-label", AddressPurpose::SEND));
+    const MockableData durable_old = GetMockableDatabase(seed).m_records;
+
+    enum class FailureStage { BEGIN, PURPOSE_WRITE, NAME_WRITE, ABORT, COMMIT };
+    for (const FailureStage stage : {FailureStage::BEGIN, FailureStage::PURPOSE_WRITE,
+                                     FailureStage::NAME_WRITE, FailureStage::ABORT,
+                                     FailureStage::COMMIT}) {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_old));
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        size_t notifications{0};
+        auto connection = wallet.NotifyAddressBookChanged.connect(
+            [&](const CTxDestination&, const std::string&, bool, AddressPurpose, ChangeType) { ++notifications; });
+        if (stage == FailureStage::BEGIN) database.m_fail_begin = true;
+        if (stage == FailureStage::PURPOSE_WRITE) database.m_fail_write_at = 0;
+        if (stage == FailureStage::NAME_WRITE) database.m_fail_write_at = 1;
+        if (stage == FailureStage::ABORT) {
+            database.m_fail_write_at = 0;
+            database.m_fail_abort = true;
+        }
+        if (stage == FailureStage::COMMIT) database.m_fail_commit = true;
+
+        BOOST_CHECK(!wallet.SetAddressBook(destination, "new-label", AddressPurpose::RECEIVE));
+        BOOST_CHECK_EQUAL(notifications, 0U);
+        BOOST_CHECK(database.m_records == durable_old);
+        const State current = state(wallet, destination);
+        BOOST_REQUIRE(current);
+        BOOST_CHECK_EQUAL(current->first, "old-label");
+        BOOST_CHECK(current->second == AddressPurpose::SEND);
+        BOOST_CHECK_EQUAL(wallet.IsAddressBookDatabaseAmbiguous(),
+                          stage == FailureStage::ABORT || stage == FailureStage::COMMIT);
+
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        const State reloaded_state = state(reloaded, destination);
+        BOOST_REQUIRE(reloaded_state);
+        BOOST_CHECK_EQUAL(reloaded_state->first, "old-label");
+        BOOST_CHECK(reloaded_state->second == AddressPurpose::SEND);
+        BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
+        connection.disconnect();
+    }
+
+    // Model the other legal interpretation of a false commit result: the
+    // database contains the full new state even though the caller cannot know
+    // that. Memory and observers remain on the old state until reload.
+    CWallet committed_ambiguously(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_old));
+    BOOST_REQUIRE_EQUAL(committed_ambiguously.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& ambiguous_database = GetMockableDatabase(committed_ambiguously);
+    ambiguous_database.m_fail_commit = true;
+    ambiguous_database.m_commit_records_on_failure = true;
+    size_t ambiguous_notifications{0};
+    auto ambiguous_connection = committed_ambiguously.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string&, bool, AddressPurpose, ChangeType) { ++ambiguous_notifications; });
+    BOOST_CHECK(!committed_ambiguously.SetAddressBook(destination, "new-label", AddressPurpose::RECEIVE));
+    BOOST_CHECK_EQUAL(ambiguous_notifications, 0U);
+    BOOST_REQUIRE(state(committed_ambiguously, destination));
+    BOOST_CHECK_EQUAL(state(committed_ambiguously, destination)->first, "old-label");
+    BOOST_REQUIRE(committed_ambiguously.IsAddressBookDatabaseAmbiguous());
+    CWallet ambiguously_reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(ambiguous_database));
+    BOOST_REQUIRE_EQUAL(ambiguously_reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(state(ambiguously_reloaded, destination));
+    BOOST_CHECK_EQUAL(state(ambiguously_reloaded, destination)->first, "new-label");
+    BOOST_CHECK(state(ambiguously_reloaded, destination)->second == AddressPurpose::RECEIVE);
+    BOOST_CHECK(!ambiguously_reloaded.IsAddressBookDatabaseAmbiguous());
+    ambiguous_connection.disconnect();
+
+    CWallet successful(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_old));
+    BOOST_REQUIRE_EQUAL(successful.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& successful_database = GetMockableDatabase(successful);
+    size_t notifications{0};
+    auto connection = successful.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination& notified_destination, const std::string& label,
+            bool is_mine, AddressPurpose purpose, ChangeType status) {
+            BOOST_CHECK(notified_destination == destination);
+            BOOST_CHECK_EQUAL(label, "new-label");
+            BOOST_CHECK(!is_mine);
+            BOOST_CHECK(purpose == AddressPurpose::RECEIVE);
+            BOOST_CHECK(status == CT_UPDATED);
+            BOOST_CHECK_EQUAL(successful_database.m_commit_calls, 1U);
+            ++notifications;
+        });
+    auto throwing_connection = successful.NotifyAddressBookChanged.connect(
+        [](const CTxDestination&, const std::string&, bool,
+           AddressPurpose, ChangeType) {
+            throw std::runtime_error{"observer failure"};
+        });
+    BOOST_REQUIRE(successful.SetAddressBook(destination, "new-label", AddressPurpose::RECEIVE));
+    BOOST_CHECK(!successful_database.m_last_txn_durable);
+    BOOST_CHECK_EQUAL(successful_database.m_write_calls, 2U);
+    BOOST_CHECK_EQUAL(notifications, 1U);
+    CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(successful_database));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    const State reloaded_state = state(reloaded, destination);
+    BOOST_REQUIRE(reloaded_state);
+    BOOST_CHECK_EQUAL(reloaded_state->first, "new-label");
+    BOOST_CHECK(reloaded_state->second == AddressPurpose::RECEIVE);
+    throwing_connection.disconnect();
+    connection.disconnect();
+}
+
+BOOST_AUTO_TEST_CASE(address_book_deletion_is_atomic)
+{
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+    const CTxDestination destination{PKHash(key.GetPubKey())};
+    const auto has_entry = [&](const CWallet& wallet) {
+        LOCK(wallet.cs_wallet);
+        return wallet.FindAddressBookEntry(destination, /*allow_change=*/true) != nullptr;
+    };
+    CWallet seed(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(seed.SetAddressBook(destination, "delete-me", AddressPurpose::SEND));
+    const MockableData durable_entry = GetMockableDatabase(seed).m_records;
+
+    enum class FailureStage { BEGIN, ERASE_DATA, ERASE_PURPOSE, ERASE_NAME, ABORT, COMMIT };
+    for (const FailureStage stage : {
+             FailureStage::BEGIN, FailureStage::ERASE_DATA,
+             FailureStage::ERASE_PURPOSE, FailureStage::ERASE_NAME,
+             FailureStage::ABORT, FailureStage::COMMIT}) {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_entry));
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        if (stage == FailureStage::BEGIN) database.m_fail_begin = true;
+        if (stage >= FailureStage::ERASE_DATA && stage <= FailureStage::ERASE_NAME) {
+            database.m_fail_write_at = static_cast<size_t>(stage) - static_cast<size_t>(FailureStage::ERASE_DATA);
+        }
+        if (stage == FailureStage::ABORT) {
+            database.m_fail_write_at = 0;
+            database.m_fail_abort = true;
+        }
+        if (stage == FailureStage::COMMIT) database.m_fail_commit = true;
+        size_t notifications{0};
+        auto connection = wallet.NotifyAddressBookChanged.connect(
+            [&](const CTxDestination&, const std::string&, bool, AddressPurpose, ChangeType) { ++notifications; });
+        BOOST_CHECK(!wallet.DelAddressBook(destination));
+        BOOST_CHECK(has_entry(wallet));
+        BOOST_CHECK(database.m_records == durable_entry);
+        BOOST_CHECK_EQUAL(notifications, 0U);
+        BOOST_CHECK_EQUAL(wallet.IsAddressBookDatabaseAmbiguous(),
+                          stage == FailureStage::ABORT || stage == FailureStage::COMMIT);
+        CWallet reloaded(
+            /*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_CHECK(has_entry(reloaded));
+        BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
+        connection.disconnect();
+    }
+
+    CWallet committed_ambiguously(
+        /*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_entry));
+    BOOST_REQUIRE_EQUAL(
+        committed_ambiguously.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& ambiguous_database =
+        GetMockableDatabase(committed_ambiguously);
+    ambiguous_database.m_fail_commit = true;
+    ambiguous_database.m_commit_records_on_failure = true;
+    size_t ambiguous_notifications{0};
+    auto ambiguous_connection =
+        committed_ambiguously.NotifyAddressBookChanged.connect(
+            [&](const CTxDestination&, const std::string&, bool,
+                AddressPurpose, ChangeType) {
+                ++ambiguous_notifications;
+            });
+    BOOST_CHECK(!committed_ambiguously.DelAddressBook(destination));
+    BOOST_CHECK(has_entry(committed_ambiguously));
+    BOOST_CHECK_EQUAL(ambiguous_notifications, 0U);
+    BOOST_CHECK(committed_ambiguously.IsAddressBookDatabaseAmbiguous());
+    CWallet ambiguously_reloaded(
+        /*chain=*/nullptr, "", DuplicateMockDatabase(ambiguous_database));
+    BOOST_REQUIRE_EQUAL(
+        ambiguously_reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(!has_entry(ambiguously_reloaded));
+    BOOST_CHECK(!ambiguously_reloaded.IsAddressBookDatabaseAmbiguous());
+    ambiguous_connection.disconnect();
+
+    CWallet successful(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_entry));
+    BOOST_REQUIRE_EQUAL(successful.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(successful.DelAddressBook(destination));
+    BOOST_CHECK(!GetMockableDatabase(successful).m_last_txn_durable);
+    BOOST_CHECK(!has_entry(successful));
+    CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(successful.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(!has_entry(reloaded));
+}
+
+BOOST_AUTO_TEST_CASE(address_book_move_is_atomic)
+{
+    CKey old_key;
+    CKey new_key;
+    old_key.MakeNewKey(/*fCompressed=*/true);
+    new_key.MakeNewKey(/*fCompressed=*/true);
+    const CTxDestination old_destination{PKHash(old_key.GetPubKey())};
+    const CTxDestination new_destination{PKHash(new_key.GetPubKey())};
+    const auto state = [](const CWallet& wallet, const CTxDestination& dest) {
+        LOCK(wallet.cs_wallet);
+        const CAddressBookData* entry = wallet.FindAddressBookEntry(dest, /*allow_change=*/true);
+        return entry && !entry->IsChange()
+            ? std::optional<std::pair<std::string, std::optional<AddressPurpose>>>{{entry->GetLabel(), entry->purpose}}
+            : std::nullopt;
+    };
+
+    CWallet seed(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(seed.SetAddressBook(old_destination, "preserved-label", AddressPurpose::SEND));
+    const MockableData durable_old = GetMockableDatabase(seed).m_records;
+
+    enum class FailureStage { BEGIN, WRITE_PURPOSE, WRITE_NAME, ERASE_DATA, ERASE_PURPOSE, ERASE_NAME, ABORT, COMMIT };
+    for (const FailureStage stage : {
+             FailureStage::BEGIN, FailureStage::WRITE_PURPOSE,
+             FailureStage::WRITE_NAME, FailureStage::ERASE_DATA,
+             FailureStage::ERASE_PURPOSE, FailureStage::ERASE_NAME,
+             FailureStage::ABORT,
+             FailureStage::COMMIT}) {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_old));
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        size_t notifications{0};
+        auto connection = wallet.NotifyAddressBookChanged.connect(
+            [&](const CTxDestination&, const std::string&, bool, AddressPurpose, ChangeType) { ++notifications; });
+        if (stage == FailureStage::BEGIN) database.m_fail_begin = true;
+        if (stage >= FailureStage::WRITE_PURPOSE && stage <= FailureStage::ERASE_NAME) {
+            database.m_fail_write_at = static_cast<size_t>(stage) - static_cast<size_t>(FailureStage::WRITE_PURPOSE);
+        }
+        if (stage == FailureStage::ABORT) {
+            database.m_fail_write_at = 0;
+            database.m_fail_abort = true;
+        }
+        if (stage == FailureStage::COMMIT) database.m_fail_commit = true;
+
+        BOOST_CHECK(!wallet.MoveAddressBook(old_destination, new_destination));
+        BOOST_CHECK_EQUAL(notifications, 0U);
+        BOOST_CHECK(database.m_records == durable_old);
+        BOOST_REQUIRE(state(wallet, old_destination));
+        BOOST_CHECK_EQUAL(state(wallet, old_destination)->first, "preserved-label");
+        BOOST_CHECK(!state(wallet, new_destination));
+        BOOST_CHECK_EQUAL(wallet.IsAddressBookDatabaseAmbiguous(),
+                          stage == FailureStage::ABORT || stage == FailureStage::COMMIT);
+
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_REQUIRE(state(reloaded, old_destination));
+        BOOST_CHECK(!state(reloaded, new_destination));
+        connection.disconnect();
+    }
+
+    CWallet committed_ambiguously(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_old));
+    BOOST_REQUIRE_EQUAL(committed_ambiguously.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& ambiguous_database = GetMockableDatabase(committed_ambiguously);
+    ambiguous_database.m_fail_commit = true;
+    ambiguous_database.m_commit_records_on_failure = true;
+    size_t ambiguous_notifications{0};
+    auto ambiguous_connection = committed_ambiguously.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string&, bool, AddressPurpose, ChangeType) { ++ambiguous_notifications; });
+    BOOST_CHECK(!committed_ambiguously.MoveAddressBook(
+        old_destination, new_destination));
+    BOOST_CHECK_EQUAL(ambiguous_notifications, 0U);
+    BOOST_REQUIRE(state(committed_ambiguously, old_destination));
+    BOOST_CHECK(!state(committed_ambiguously, new_destination));
+    BOOST_REQUIRE(committed_ambiguously.IsAddressBookDatabaseAmbiguous());
+    CWallet ambiguously_reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(ambiguous_database));
+    BOOST_REQUIRE_EQUAL(ambiguously_reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(!state(ambiguously_reloaded, old_destination));
+    BOOST_REQUIRE(state(ambiguously_reloaded, new_destination));
+    BOOST_CHECK_EQUAL(state(ambiguously_reloaded, new_destination)->first, "preserved-label");
+    BOOST_CHECK(!ambiguously_reloaded.IsAddressBookDatabaseAmbiguous());
+    ambiguous_connection.disconnect();
+
+    CWallet successful(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_old));
+    BOOST_REQUIRE_EQUAL(successful.LoadWallet(), DBErrors::LOAD_OK);
+    std::vector<std::pair<CTxDestination, ChangeType>> notifications;
+    auto connection = successful.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination& dest, const std::string&, bool, AddressPurpose, ChangeType status) {
+            BOOST_CHECK_EQUAL(GetMockableDatabase(successful).m_commit_calls, 1U);
+            notifications.emplace_back(dest, status);
+    });
+    size_t throwing_notifications{0};
+    auto throwing_connection = successful.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string&, bool,
+            AddressPurpose, ChangeType status) {
+            ++throwing_notifications;
+            if (status == CT_DELETED) {
+                throw std::runtime_error{"observer failure"};
+            }
+        });
+    BOOST_REQUIRE(successful.MoveAddressBook(old_destination, new_destination));
+    BOOST_CHECK(!GetMockableDatabase(successful).m_last_txn_durable);
+    BOOST_REQUIRE_EQUAL(notifications.size(), 2U);
+    BOOST_CHECK_EQUAL(throwing_notifications, 2U);
+    BOOST_CHECK(notifications[0] == std::make_pair(old_destination, CT_DELETED));
+    BOOST_CHECK(notifications[1] == std::make_pair(new_destination, CT_NEW));
+    BOOST_CHECK(!state(successful, old_destination));
+    BOOST_REQUIRE(state(successful, new_destination));
+    BOOST_CHECK_EQUAL(state(successful, new_destination)->first, "preserved-label");
+    CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(successful.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(!state(reloaded, old_destination));
+    BOOST_REQUIRE(state(reloaded, new_destination));
+    BOOST_CHECK_EQUAL(state(reloaded, new_destination)->first, "preserved-label");
+    BOOST_CHECK(state(reloaded, new_destination)->second == AddressPurpose::SEND);
+    throwing_connection.disconnect();
+    connection.disconnect();
+
+    // A UI may have captured the old entry before another writer changes it.
+    // Move accepts only the destinations and therefore preserves the current
+    // authoritative label and purpose under cs_wallet, not stale UI values.
+    CWallet changed_after_snapshot(
+        /*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_old));
+    BOOST_REQUIRE_EQUAL(
+        changed_after_snapshot.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(changed_after_snapshot.SetAddressBook(
+        old_destination, "authoritative-after-snapshot",
+        AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(changed_after_snapshot.MoveAddressBook(
+        old_destination, new_destination));
+    BOOST_CHECK(!state(changed_after_snapshot, old_destination));
+    BOOST_REQUIRE(state(changed_after_snapshot, new_destination));
+    BOOST_CHECK_EQUAL(
+        state(changed_after_snapshot, new_destination)->first,
+        "authoritative-after-snapshot");
+    BOOST_CHECK(
+        state(changed_after_snapshot, new_destination)->second ==
+        AddressPurpose::RECEIVE);
+
+    CWallet purpose_less(
+        /*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(purpose_less.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(purpose_less.SetAddressBook(
+        old_destination, "purpose-less", std::nullopt));
+    BOOST_REQUIRE(purpose_less.MoveAddressBook(
+        old_destination, new_destination));
+    BOOST_REQUIRE(state(purpose_less, new_destination));
+    BOOST_CHECK(!state(purpose_less, new_destination)->second);
+    CWallet purpose_less_reload(
+        /*chain=*/nullptr, "",
+        DuplicateMockDatabase(purpose_less.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(
+        purpose_less_reload.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(state(purpose_less_reload, new_destination));
+    BOOST_CHECK(!state(purpose_less_reload, new_destination)->second);
+
+    CWallet existing_new(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_old));
+    BOOST_REQUIRE_EQUAL(existing_new.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(existing_new.SetAddressBook(new_destination, "existing", AddressPurpose::SEND));
+    BOOST_CHECK(!existing_new.MoveAddressBook(old_destination, new_destination));
+    BOOST_REQUIRE(state(existing_new, old_destination));
+    BOOST_REQUIRE(state(existing_new, new_destination));
+    BOOST_CHECK_EQUAL(state(existing_new, new_destination)->first, "existing");
+
+    CWallet owned_new(/*chain=*/nullptr, "", CreateMockableWalletDatabase(durable_old));
+    BOOST_REQUIRE_EQUAL(owned_new.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(owned_new.cs_wallet);
+        owned_new.SetupLegacyScriptPubKeyMan();
+        BOOST_REQUIRE(owned_new.GetOrCreateLegacyScriptPubKeyMan()->AddKeyPubKey(new_key, new_key.GetPubKey()));
+    }
+    BOOST_CHECK(!owned_new.MoveAddressBook(old_destination, new_destination));
+    BOOST_REQUIRE(state(owned_new, old_destination));
+    BOOST_CHECK(!state(owned_new, new_destination));
+}
+
+#ifdef USE_BDB
+BOOST_AUTO_TEST_CASE(address_book_delete_and_move_join_berkeley_transaction)
+{
+    const fs::path database_path{m_path_root / "address_book_berkeley"};
+    const auto make_database = [&]() {
+        DatabaseOptions options;
+        DatabaseStatus status;
+        bilingual_str error;
+        auto database = MakeBerkeleyDatabase(database_path, options, status, error);
+        if (!database) throw std::runtime_error(error.original);
+        return database;
+    };
+
+    CKey old_key;
+    CKey moved_key;
+    CKey deleted_key;
+    old_key.MakeNewKey(/*fCompressed=*/true);
+    moved_key.MakeNewKey(/*fCompressed=*/true);
+    deleted_key.MakeNewKey(/*fCompressed=*/true);
+    const CTxDestination old_destination{PKHash(old_key.GetPubKey())};
+    const CTxDestination moved_destination{PKHash(moved_key.GetPubKey())};
+    const CTxDestination deleted_destination{PKHash(deleted_key.GetPubKey())};
+
+    {
+        CWallet wallet(/*chain=*/nullptr, "bdb-address-book", make_database());
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_REQUIRE(wallet.SetAddressBook(
+            old_destination, "move-label", AddressPurpose::SEND));
+        BOOST_REQUIRE(wallet.SetAddressBook(
+            deleted_destination, "delete-label", AddressPurpose::SEND));
+        BOOST_REQUIRE(wallet.MoveAddressBook(
+            old_destination, moved_destination));
+        BOOST_REQUIRE(wallet.DelAddressBook(deleted_destination));
+    }
+
+    CWallet reloaded(/*chain=*/nullptr, "bdb-address-book", make_database());
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(reloaded.cs_wallet);
+        BOOST_CHECK(reloaded.FindAddressBookEntry(
+            old_destination, /*allow_change=*/true) == nullptr);
+        BOOST_CHECK(reloaded.FindAddressBookEntry(
+            deleted_destination, /*allow_change=*/true) == nullptr);
+        const CAddressBookData* moved_entry = reloaded.FindAddressBookEntry(
+            moved_destination, /*allow_change=*/true);
+        BOOST_REQUIRE(moved_entry);
+        BOOST_CHECK_EQUAL(moved_entry->GetLabel(), "move-label");
+        BOOST_CHECK(moved_entry->purpose == AddressPurpose::SEND);
+    }
+}
+#endif
+
+BOOST_AUTO_TEST_CASE(imported_script_labels_use_one_caller_owned_transaction)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    { LOCK(wallet.cs_wallet); wallet.SetupLegacyScriptPubKeyMan(); }
+    CKey first_key;
+    CKey second_key;
+    first_key.MakeNewKey(/*fCompressed=*/true);
+    second_key.MakeNewKey(/*fCompressed=*/true);
+    const CTxDestination first{PKHash(first_key.GetPubKey())};
+    const CTxDestination second{PKHash(second_key.GetPubKey())};
+    const std::set<CScript> scripts{GetScriptForDestination(first), GetScriptForDestination(second)};
+    size_t notifications{0};
+    auto connection = wallet.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string&, bool, AddressPurpose, ChangeType) { ++notifications; });
+    BOOST_REQUIRE(wallet.ImportScriptPubKeys("imported-label", scripts,
+        /*have_solving_data=*/false, /*apply_label=*/true, GetTime()));
+    MockableDatabase& database = GetMockableDatabase(wallet);
+    BOOST_CHECK(!database.m_last_txn_durable);
+    BOOST_CHECK_EQUAL(database.m_write_calls, 4U);
+    BOOST_CHECK_EQUAL(notifications, 2U);
+    CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    for (const CTxDestination& dest : {first, second}) {
+        LOCK(reloaded.cs_wallet);
+        const CAddressBookData* entry = reloaded.FindAddressBookEntry(dest);
+        BOOST_REQUIRE(entry);
+        BOOST_CHECK_EQUAL(entry->GetLabel(), "imported-label");
+    }
+    connection.disconnect();
+
+    // Script persistence intentionally precedes the label transaction. A
+    // label failure must be reported without publishing labels, while reload
+    // still recovers the already-imported watch-only scripts.
+    for (const bool fail_begin : {true, false}) {
+        CWallet failed(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(failed.LoadWallet(), DBErrors::LOAD_OK);
+        {
+            LOCK(failed.cs_wallet);
+            failed.SetupLegacyScriptPubKeyMan();
+        }
+        MockableDatabase& failed_database = GetMockableDatabase(failed);
+        failed_database.m_fail_begin = fail_begin;
+        failed_database.m_fail_commit = !fail_begin;
+        size_t failed_notifications{0};
+        auto failed_connection = failed.NotifyAddressBookChanged.connect(
+            [&](const CTxDestination&, const std::string&, bool,
+                AddressPurpose, ChangeType) {
+                ++failed_notifications;
+            });
+        BOOST_CHECK(!failed.ImportScriptPubKeys(
+            "failed-label", scripts, /*have_solving_data=*/false,
+            /*apply_label=*/true, GetTime()));
+        BOOST_CHECK_EQUAL(failed_notifications, 0U);
+        BOOST_CHECK_EQUAL(failed.IsAddressBookDatabaseAmbiguous(),
+                          !fail_begin);
+        for (const CScript& script : scripts) {
+            BOOST_CHECK(WITH_LOCK(
+                failed.cs_wallet,
+                return failed.IsMine(script) != ISMINE_NO));
+        }
+        BOOST_CHECK(WITH_LOCK(
+            failed.cs_wallet, return failed.m_address_book.empty()));
+
+        failed_database.m_fail_begin = false;
+        failed_database.m_fail_commit = false;
+        CWallet failed_reload(
+            /*chain=*/nullptr, "", DuplicateMockDatabase(failed_database));
+        BOOST_REQUIRE_EQUAL(failed_reload.LoadWallet(), DBErrors::LOAD_OK);
+        for (const CScript& script : scripts) {
+            BOOST_CHECK(WITH_LOCK(
+                failed_reload.cs_wallet,
+                return failed_reload.IsMine(script) != ISMINE_NO));
+        }
+        BOOST_CHECK(WITH_LOCK(
+            failed_reload.cs_wallet,
+            return failed_reload.m_address_book.empty()));
+        BOOST_CHECK(!failed_reload.IsAddressBookDatabaseAmbiguous());
+        failed_connection.disconnect();
+    }
+
+    CWallet applied(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(applied.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(applied.cs_wallet);
+        applied.SetupLegacyScriptPubKeyMan();
+    }
+    MockableDatabase& applied_database = GetMockableDatabase(applied);
+    applied_database.m_fail_commit = true;
+    applied_database.m_commit_records_on_failure = true;
+    size_t applied_notifications{0};
+    auto applied_connection = applied.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string&, bool,
+            AddressPurpose, ChangeType) {
+            ++applied_notifications;
+        });
+    BOOST_CHECK(!applied.ImportScriptPubKeys(
+        "applied-label", scripts, /*have_solving_data=*/false,
+        /*apply_label=*/true, GetTime()));
+    BOOST_CHECK_EQUAL(applied_notifications, 0U);
+    BOOST_CHECK(applied.IsAddressBookDatabaseAmbiguous());
+    BOOST_CHECK(WITH_LOCK(
+        applied.cs_wallet, return applied.m_address_book.empty()));
+    applied_database.m_fail_commit = false;
+    applied_database.m_commit_records_on_failure = false;
+    CWallet applied_reload(
+        /*chain=*/nullptr, "", DuplicateMockDatabase(applied_database));
+    BOOST_REQUIRE_EQUAL(applied_reload.LoadWallet(), DBErrors::LOAD_OK);
+    for (const CTxDestination& dest : {first, second}) {
+        const CAddressBookData* entry = WITH_LOCK(
+            applied_reload.cs_wallet,
+            return applied_reload.FindAddressBookEntry(dest));
+        BOOST_REQUIRE(entry);
+        BOOST_CHECK_EQUAL(entry->GetLabel(), "applied-label");
+    }
+    BOOST_CHECK(!applied_reload.IsAddressBookDatabaseAmbiguous());
+    applied_connection.disconnect();
+}
+
+BOOST_AUTO_TEST_CASE(descriptor_import_reports_durable_partial_label_state)
+{
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+    FlatSigningProvider provider;
+    std::string parse_error;
+    std::unique_ptr<Descriptor> descriptor = Parse(
+        "combo(" + EncodeSecret(key) + ")", provider, parse_error,
+        /*require_checksum=*/false);
+    BOOST_REQUIRE_MESSAGE(descriptor, parse_error);
+    WalletDescriptor wallet_descriptor(
+        std::move(descriptor), /*creation_time=*/1,
+        /*range_start=*/0, /*range_end=*/1, /*next_index=*/0);
+
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    }
+    MockableDatabase& database = GetMockableDatabase(wallet);
+    database.m_fail_write_at = 0;
+    bilingual_str error;
+    ScriptPubKeyMan* failed_manager;
+    {
+        LOCK(wallet.cs_wallet);
+        failed_manager = wallet.AddWalletDescriptor(
+            wallet_descriptor, provider, "descriptor-label",
+            /*internal=*/false, &error);
+    }
+    BOOST_CHECK(failed_manager == nullptr);
+    BOOST_CHECK(error.original.find("descriptor, keys, and script cache were stored") != std::string::npos);
+    BOOST_REQUIRE(WITH_LOCK(
+        wallet.cs_wallet,
+        return wallet.GetDescriptorScriptPubKeyMan(wallet_descriptor) !=
+               nullptr));
+    BOOST_CHECK(WITH_LOCK(
+        wallet.cs_wallet, return wallet.m_address_book.empty()));
+    BOOST_CHECK(!wallet.IsAddressBookDatabaseAmbiguous());
+
+    // The reported partial result is real: reload recovers the descriptor,
+    // but no label from the failed all-or-nothing label transaction.
+    database.m_fail_write_at.reset();
+    CWallet reloaded(
+        /*chain=*/nullptr, "", DuplicateMockDatabase(database));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(reloaded.cs_wallet);
+        BOOST_REQUIRE(
+            reloaded.GetDescriptorScriptPubKeyMan(wallet_descriptor) != nullptr);
+        BOOST_CHECK(reloaded.m_address_book.empty());
+    }
+
+    size_t notifications{0};
+    auto connection = reloaded.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string&, bool,
+            AddressPurpose, ChangeType) { ++notifications; });
+    ScriptPubKeyMan* retried_manager;
+    error.clear();
+    {
+        LOCK(reloaded.cs_wallet);
+        retried_manager = reloaded.AddWalletDescriptor(
+            wallet_descriptor, provider, "descriptor-label",
+            /*internal=*/false, &error);
+        BOOST_REQUIRE(retried_manager);
+    }
+    const auto scripts =
+        static_cast<DescriptorScriptPubKeyMan*>(retried_manager)
+            ->GetScriptPubKeys();
+    BOOST_REQUIRE(!scripts.empty());
+    BOOST_CHECK_EQUAL(notifications, scripts.size());
+    for (const CScript& script : scripts) {
+        CTxDestination destination;
+        if (!ExtractDestination(script, destination)) continue;
+        LOCK(reloaded.cs_wallet);
+        const CAddressBookData* entry =
+            reloaded.FindAddressBookEntry(destination);
+        BOOST_REQUIRE(entry);
+        BOOST_CHECK_EQUAL(entry->GetLabel(), "descriptor-label");
+        BOOST_CHECK(entry->purpose == AddressPurpose::RECEIVE);
+    }
+
+    CWallet final_reload(
+        /*chain=*/nullptr, "", DuplicateMockDatabase(reloaded.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(final_reload.LoadWallet(), DBErrors::LOAD_OK);
+    for (const CScript& script : scripts) {
+        CTxDestination destination;
+        if (!ExtractDestination(script, destination)) continue;
+        LOCK(final_reload.cs_wallet);
+        const CAddressBookData* entry =
+            final_reload.FindAddressBookEntry(destination);
+        BOOST_REQUIRE(entry);
+        BOOST_CHECK_EQUAL(entry->GetLabel(), "descriptor-label");
+    }
+    connection.disconnect();
+
+    // A false commit can mean that the complete label transaction actually
+    // reached disk. Keep memory and observers unpublished, latch ambiguity,
+    // and let reload select the database's authoritative outcome.
+    CWallet ambiguous(
+        /*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(ambiguous.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(ambiguous.cs_wallet);
+        ambiguous.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    }
+    MockableDatabase& ambiguous_database = GetMockableDatabase(ambiguous);
+    ambiguous_database.m_fail_commit = true;
+    ambiguous_database.m_commit_records_on_failure = true;
+    size_t ambiguous_notifications{0};
+    auto ambiguous_connection =
+        ambiguous.NotifyAddressBookChanged.connect(
+            [&](const CTxDestination&, const std::string&, bool,
+                AddressPurpose, ChangeType) { ++ambiguous_notifications; });
+    error.clear();
+    {
+        LOCK(ambiguous.cs_wallet);
+        BOOST_CHECK(ambiguous.AddWalletDescriptor(
+                        wallet_descriptor, provider, "ambiguous-label",
+                        /*internal=*/false, &error) == nullptr);
+    }
+    BOOST_CHECK(error.original.find("commit outcome is uncertain") !=
+                std::string::npos);
+    BOOST_CHECK(ambiguous.IsAddressBookDatabaseAmbiguous());
+    BOOST_CHECK(WITH_LOCK(
+        ambiguous.cs_wallet, return ambiguous.m_address_book.empty()));
+    BOOST_CHECK_EQUAL(ambiguous_notifications, 0U);
+    ambiguous_database.m_fail_commit = false;
+    ambiguous_database.m_commit_records_on_failure = false;
+    CWallet ambiguous_reload(
+        /*chain=*/nullptr, "", DuplicateMockDatabase(ambiguous_database));
+    BOOST_REQUIRE_EQUAL(ambiguous_reload.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(!ambiguous_reload.IsAddressBookDatabaseAmbiguous());
+    BOOST_CHECK(!WITH_LOCK(
+        ambiguous_reload.cs_wallet,
+        return ambiguous_reload.m_address_book.empty()));
+    ambiguous_connection.disconnect();
+}
+
+BOOST_AUTO_TEST_CASE(address_book_ambiguity_blocks_automatic_payout_binding)
+{
+    ScopedArgsSettings args_guard;
+    args_guard.Unset("-qqpowpayoutaddress");
+    args_guard.Unset("-qqpospayoutaddress");
+    args_guard.Unset("-qqallowautokeycreation");
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    auto destination = wallet.GetNewQuantumDestination("PoW - Quantum Claim Address");
+    BOOST_REQUIRE(destination);
+    MockableDatabase& database = GetMockableDatabase(wallet);
+    database.m_fail_commit = true;
+    BOOST_CHECK(!wallet.SetAddressBook(*destination, "uncertain-label", AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(wallet.IsAddressBookDatabaseAmbiguous());
+    bilingual_str error;
+    bool created{true};
+    BOOST_CHECK(!wallet.EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("uncertain database outcome") != std::string::npos);
+    BOOST_CHECK(WITH_LOCK(wallet.cs_wallet, return wallet.m_pow_payout_quantum.empty()));
+    CScript script;
+    std::string address;
+    error.clear();
+    BOOST_CHECK(!wallet.EnsureShadowSignalPayoutAddress(script, address, error, &created));
+    BOOST_CHECK(script.empty());
+    BOOST_CHECK(address.empty());
+    BOOST_CHECK(error.original.find("uncertain database outcome") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(restored_label_failure_does_not_block_transaction_sync)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+
+    CTxDestination destination;
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetupDescriptorScriptPubKeyMans();
+        auto* manager = dynamic_cast<DescriptorScriptPubKeyMan*>(
+            wallet.GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/false));
+        BOOST_REQUIRE(manager);
+        const auto scripts = manager->GetScriptPubKeys();
+        BOOST_REQUIRE(!scripts.empty());
+        BOOST_REQUIRE(ExtractDestination(*scripts.begin(), destination));
+        BOOST_CHECK(wallet.FindAddressBookEntry(destination) == nullptr);
+    }
+
+    size_t notifications{0};
+    auto connection = wallet.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string&, bool,
+            AddressPurpose, ChangeType) { ++notifications; });
+
+    MockableDatabase& database = GetMockableDatabase(wallet);
+    database.m_fail_commit = true;
+    CMutableTransaction transaction;
+    transaction.vin.emplace_back(COutPoint{uint256::ONE, 0});
+    transaction.vout.emplace_back(
+        COIN, GetScriptForDestination(destination));
+    const CTransactionRef transaction_ref =
+        MakeTransactionRef(std::move(transaction));
+
+    BOOST_CHECK_NO_THROW(wallet.transactionAddedToMempool(transaction_ref));
+    BOOST_CHECK(wallet.IsAddressBookDatabaseAmbiguous());
+    BOOST_CHECK_EQUAL(notifications, 0U);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.FindAddressBookEntry(destination) == nullptr);
+        const CWalletTx* wallet_tx = wallet.GetWalletTx(transaction_ref->GetHash());
+        BOOST_REQUIRE(wallet_tx);
+        BOOST_CHECK_EQUAL(
+            CachedTxGetAvailableCredit(wallet, *wallet_tx), COIN);
+        BOOST_CHECK(wallet.GetLiveUnspentStakeOutpoints().count(
+                        COutPoint{transaction_ref->GetHash(), 0}) != 0);
+    }
+
+    // Reload discards the process-local ambiguity latch while retaining the
+    // authoritative transaction and the database's rolled-back label state.
+    database.m_fail_commit = false;
+    CWallet reloaded(
+        m_node.chain.get(), "", DuplicateMockDatabase(database));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
+    {
+        LOCK(reloaded.cs_wallet);
+        BOOST_CHECK(reloaded.FindAddressBookEntry(destination) == nullptr);
+        const CWalletTx* wallet_tx =
+            reloaded.GetWalletTx(transaction_ref->GetHash());
+        BOOST_REQUIRE(wallet_tx);
+        BOOST_CHECK_EQUAL(
+            CachedTxGetAvailableCredit(reloaded, *wallet_tx), COIN);
+    }
+    connection.disconnect();
+}
+
 BOOST_AUTO_TEST_CASE(staking_autostart_requires_and_preserves_explicit_consent)
 {
     ScopedArgsSettings args_guard;
@@ -357,6 +1173,123 @@ BOOST_AUTO_TEST_CASE(hidden_quantum_key_actions_require_consent_without_wallet_d
     BOOST_CHECK(error.original.find("allow_new_quantum_key=true") != std::string::npos);
     BOOST_CHECK_EQUAL(key_count(), keys_before);
     BOOST_CHECK_EQUAL(tx_count(), txs_before);
+}
+
+class TieredUnbondingAddressBookFailureSetup : public TestChain100Setup
+{
+public:
+    TieredUnbondingAddressBookFailureSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-shadowwhitelistheight=99",
+              "-shadowgoldrushstartheight=100",
+              "-shadowgoldrushendheight=100",
+              "-qqgoldrushendheight=100",
+              "-qqmigrationendheight=200",
+              "-qqstaketierheight=101",
+          }}
+    {
+    }
+};
+
+BOOST_FIXTURE_TEST_CASE(
+    tiered_unbonding_label_failure_reports_durable_change_key,
+    TieredUnbondingAddressBookFailureSetup)
+{
+    const auto distinct_key_count = [](const CWallet& wallet) {
+        std::set<std::vector<unsigned char>> public_keys;
+        for (const QuantumKeyInfo& info : WITH_LOCK(
+                 wallet.cs_wallet, return wallet.ListQuantumKeyInfos())) {
+            public_keys.insert(info.public_key);
+        }
+        return public_keys.size();
+    };
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return Assert(m_node.chainman)->ActiveChain()),
+        coinbaseKey);
+
+    constexpr uint32_t UNBONDING_BLOCKS{9450};
+    auto bonded_destination = wallet->GetNewTieredQuantumDestination(
+        "bonded", UNBONDING_BLOCKS);
+    BOOST_REQUIRE(bonded_destination);
+    const auto bonded_key_info = WITH_LOCK(
+        wallet->cs_wallet,
+        return wallet->GetQuantumKeyInfo(*bonded_destination));
+    BOOST_REQUIRE(bonded_key_info);
+
+    const CBlockIndex* confirmation_block = WITH_LOCK(
+        Assert(m_node.chainman)->GetMutex(),
+        return Assert(m_node.chainman)->ActiveChain()[1]);
+    BOOST_REQUIRE(confirmation_block);
+    CMutableTransaction funding;
+    funding.vin.emplace_back(COutPoint{uint256{0x71}, 0});
+    funding.vout.emplace_back(
+        10 * COIN, GetScriptForDestination(*bonded_destination));
+    const CTransactionRef funding_ref =
+        MakeTransactionRef(std::move(funding));
+    BOOST_REQUIRE(wallet->AddToWallet(
+        funding_ref,
+        TxStateConfirmed{confirmation_block->GetBlockHash(),
+                         confirmation_block->nHeight, 1}));
+
+    const size_t keys_before = distinct_key_count(*wallet);
+    const size_t transactions_before = WITH_LOCK(
+        wallet->cs_wallet, return wallet->mapWallet.size());
+    MockableDatabase& database = GetMockableDatabase(*wallet);
+    // GetNewQuantumChangeDestination commits first. Fail the immediately
+    // following unbonding-label transaction without failing durable key
+    // creation itself.
+    database.m_fail_commit_at = database.m_commit_calls + 1;
+
+    auto result = WithdrawTieredStakeAddress(
+        *wallet, EncodeDestination(*bonded_destination),
+        /*require_operator_lock=*/false, "unbonding-label", "withdrawal-label",
+        "test unbond", "test withdrawal", std::nullopt,
+        /*allow_all_outputs=*/false, /*allow_new_quantum_key=*/true);
+    BOOST_CHECK(!result);
+    const std::string failure = util::ErrorString(result).original;
+    BOOST_CHECK(failure.find(
+        "failed after creating durable non-HD ML-DSA key") !=
+        std::string::npos);
+    BOOST_CHECK(failure.find("Back up the wallet now") != std::string::npos);
+    BOOST_CHECK(failure.find("Reload the wallet before retrying") !=
+                std::string::npos);
+    BOOST_CHECK(failure.find("no transaction was created") !=
+                std::string::npos);
+    BOOST_CHECK(wallet->IsAddressBookDatabaseAmbiguous());
+    BOOST_CHECK_EQUAL(
+        distinct_key_count(*wallet),
+        keys_before + 1);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.size()),
+        transactions_before);
+
+    const int spend_height = WITH_LOCK(
+        wallet->cs_wallet, return wallet->GetLastBlockHeight() + 1);
+    const CTxDestination unbonding_destination = WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        QuantumTieredMigrationProgramForPubkey(
+            bonded_key_info->public_key,
+            QUANTUM_TIERED_STATE_UNBONDING,
+            UNBONDING_BLOCKS,
+            static_cast<uint32_t>(spend_height + UNBONDING_BLOCKS))};
+    BOOST_CHECK(WITH_LOCK(
+        wallet->cs_wallet,
+        return wallet->FindAddressBookEntry(
+                   unbonding_destination, /*allow_change=*/true) == nullptr));
+
+    CWallet reloaded(
+        m_node.chain.get(), "", DuplicateMockDatabase(database));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
+    BOOST_CHECK_EQUAL(
+        distinct_key_count(reloaded),
+        keys_before + 1);
+    BOOST_CHECK(WITH_LOCK(
+        reloaded.cs_wallet,
+        return reloaded.FindAddressBookEntry(
+                   unbonding_destination, /*allow_change=*/true) == nullptr));
 }
 
 BOOST_AUTO_TEST_CASE(abandon_unknown_transaction_is_safe)
@@ -1006,6 +1939,113 @@ public:
 };
 
 BOOST_FIXTURE_TEST_CASE(
+    shadow_pow_claim_invalidated_selection_preserves_typed_retry_scope,
+    WalletShadowPowQQP2TestingSetup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript wallet_script =
+        GetScriptForRawPubKey(wallet_key.GetPubKey());
+    const CMutableTransaction funding = MakeDurabilityTestSpend(
+        *m_coinbase_txns[0], /*index=*/0, coinbaseKey, wallet_script);
+    CreateAndProcessBlock(
+        {funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return Assert(m_node.chainman)->ActiveChain()),
+        wallet_key);
+    BOOST_REQUIRE(m_node.chain->isReadyToBroadcast());
+    wallet->m_pow_mining_enabled = true;
+    const COutPoint anchor{funding.GetHash(), 0};
+    const CScript quantum_payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x51)});
+    const auto select_input = [&] {
+        const auto gate = wallet->GetShadowPowClaimMiningGate();
+        CCoinControl control;
+        control.m_allow_other_inputs = false;
+        control.m_avoid_address_reuse = false;
+        ShadowPowClaimInput selected;
+        bilingual_str error;
+        BOOST_REQUIRE(wallet->SelectShadowPowClaimInput(
+            std::nullopt, quantum_payout, nullptr, control, selected,
+            error, gate) == ShadowPowClaimInputSelectionResult::SELECTED);
+        BOOST_REQUIRE(selected.outpoint == anchor);
+        return selected;
+    };
+    ShadowPowClaimInput selected = select_input();
+    ShadowPowWork work;
+    work.valid = true;
+    work.target = selected.target;
+    work.quantum_payout_script = quantum_payout;
+    work.prev_hash = selected.selection_tip;
+    work.height = selected.selection_height + 1;
+    // Only the off-chain proof guard is exercised: every attempt below must
+    // stop before mempool admission. One zero-difficulty nonce keeps this
+    // classification regression independent of mining luck and runtime cost.
+    work.bits = 0;
+    std::vector<unsigned char> proof;
+    BOOST_REQUIRE(GrindShadowPowWork(work, 0, 1, 1, proof));
+    const uint64_t authority =
+        wallet->m_pow_wallet_authority_generation.load();
+    const MockableData durable_before = GetMockableDatabase(*wallet).m_records;
+    const size_t records_before = WITH_LOCK(
+        wallet->cs_wallet, return wallet->mapWallet.size());
+    const auto submit = [&](const ShadowPowClaimInput& input,
+                            uint64_t expected_authority) {
+        bilingual_str error;
+        std::optional<ShadowPowClaimMiningGate> reselection;
+        const auto result = wallet->SubmitShadowPowClaim(
+            input, work, proof, expected_authority, error, &reselection);
+        BOOST_CHECK(!error.original.empty());
+        BOOST_CHECK(!reselection); // New anchors have no family-local fallback.
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,
+                                   return wallet->mapWallet.size()), records_before);
+        BOOST_CHECK(GetMockableDatabase(*wallet).m_records == durable_before);
+        BOOST_CHECK_EQUAL(wallet->m_pow_claims_submitted.load(), 0U);
+        return result;
+    };
+
+    // A stale carried snapshot is an input-scoped refusal, not a generic
+    // failure that releases the worker group's exact-tip reservation.
+    ++selected.selection_wallet_generation;
+    BOOST_CHECK(submit(selected, authority) ==
+                ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE);
+    selected = select_input();
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return wallet->LockCoin(anchor)));
+    BOOST_CHECK(submit(selected, authority) ==
+                ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE);
+    WITH_LOCK(wallet->cs_wallet, wallet->UnlockCoin(anchor));
+
+    // An unrelated signing-authority rejection retains its distinct result.
+    selected = select_input();
+    BOOST_CHECK(submit(selected, authority + 1) ==
+                ShadowPowClaimSubmitResult::FAILED);
+
+    // Repeat after signing at the existing final-publication test barrier.
+    // The callback mutates only the exact input, before the final guard runs.
+    ScopedArgsSettings settings;
+    settings.Force("-qqshadowpowclaimcommitdelaymillis", "1");
+    bool locked_at_commit_barrier{false};
+    {
+        DebugLogHelper barrier("Gold Rush PoW claim final-commit authority test barrier reached",
+            [&](const std::string* line) {
+                if (line && !locked_at_commit_barrier) {
+                    locked_at_commit_barrier = WITH_LOCK(
+                        wallet->cs_wallet, return wallet->LockCoin(anchor));
+                }
+                return true;
+            });
+        BOOST_CHECK(submit(selected, authority) ==
+                    ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE);
+    }
+    BOOST_CHECK(locked_at_commit_barrier);
+    WITH_LOCK(wallet->cs_wallet, wallet->UnlockCoin(anchor));
+    wallet->m_pow_mining_enabled = false;
+}
+
+BOOST_FIXTURE_TEST_CASE(
     shadow_pow_claim_initial_reservation_is_atomic_without_broadcast,
     WalletShadowPowQQP2TestingSetup)
 {
@@ -1059,19 +2099,52 @@ BOOST_FIXTURE_TEST_CASE(
     const uint64_t authority_generation =
         wallet->m_pow_wallet_authority_generation.load(
             std::memory_order_acquire);
+    uint64_t expected_coin_lock_generation{0};
+    const auto current_commit_authority = [&] {
+        const ShadowPowClaimMiningGate gate =
+            wallet->GetShadowPowClaimMiningGate();
+        BOOST_REQUIRE(!gate.candidate_state_fingerprint.IsNull());
+        CCoinControl selection_control;
+        selection_control.m_allow_other_inputs = false;
+        selection_control.m_avoid_address_reuse = false;
+        ShadowPowClaimInput selected_input;
+        bilingual_str selection_error;
+        BOOST_REQUIRE(wallet->SelectShadowPowClaimInput(
+                          claim_target, quantum_payout, nullptr,
+                          selection_control, selected_input,
+                          selection_error, gate) ==
+                      ShadowPowClaimInputSelectionResult::SELECTED);
+        return ShadowPowClaimCommitAuthority{
+            wallet->m_pow_wallet_authority_generation.load(
+                std::memory_order_acquire),
+            /*require_pow_mining_enabled=*/false,
+            expected_coin_lock_generation,
+            anchor,
+            gate.wallet_generation,
+            gate.candidate_state_fingerprint,
+            gate.active_tip,
+            gate.active_height,
+            /*require_relay_clock_authority=*/true,
+            gate.relay_clock_high_water,
+            gate.relay_clock_median_time_past,
+            gate.classification_time,
+            gate.next_relay_expiry_time,
+            gate.next_legacy_relay_expiry_wall_time,
+            gate.legacy_relay_clock_high_water,
+            selected_input};
+    };
     mapValue_t refused_metadata;
     refused_metadata["comment"] = "PoW Claim";
     refused_metadata[SHADOW_POW_CLAIM_AUTHORED_KEY] = "1";
     std::string refused_error;
     WalletCommitStatus refused_status{WalletCommitStatus::ACCEPTED};
+    ShadowPowClaimCommitAuthority refused_authority =
+        current_commit_authority();
+    refused_authority.expected_wallet_authority_generation =
+        authority_generation + 1;
     BOOST_CHECK(!wallet->CommitTransaction(
         claim_ref, std::move(refused_metadata), {}, &refused_error,
-        &refused_status,
-        ShadowPowClaimCommitAuthority{
-            authority_generation + 1,
-            /*require_pow_mining_enabled=*/false,
-            /*expected_coin_lock_generation=*/0,
-            anchor}));
+        &refused_status, refused_authority));
     BOOST_CHECK(refused_status ==
                 WalletCommitStatus::REJECTED_NOT_ADDED);
     BOOST_CHECK_EQUAL(
@@ -1095,16 +2168,13 @@ BOOST_FIXTURE_TEST_CASE(
     stale_state_metadata[SHADOW_POW_CLAIM_AUTHORED_KEY] = "1";
     refused_error.clear();
     refused_status = WalletCommitStatus::ACCEPTED;
+    ShadowPowClaimCommitAuthority stale_state_authority =
+        current_commit_authority();
+    stale_state_authority.expected_candidate_state_fingerprint =
+        wrong_candidate_state;
     BOOST_CHECK(!wallet->CommitTransaction(
         claim_ref, std::move(stale_state_metadata), {}, &refused_error,
-        &refused_status,
-        ShadowPowClaimCommitAuthority{
-            authority_generation,
-            /*require_pow_mining_enabled=*/false,
-            /*expected_coin_lock_generation=*/0,
-            anchor,
-            commit_gate.wallet_generation,
-            wrong_candidate_state}));
+        &refused_status, stale_state_authority));
     BOOST_CHECK(refused_status == WalletCommitStatus::REJECTED_NOT_ADDED);
     BOOST_CHECK_EQUAL(
         refused_error, "wallet-claim-state-changed-before-commit");
@@ -1118,14 +2188,12 @@ BOOST_FIXTURE_TEST_CASE(
     stopped_metadata[SHADOW_POW_CLAIM_AUTHORED_KEY] = "1";
     refused_error.clear();
     refused_status = WalletCommitStatus::ACCEPTED;
+    ShadowPowClaimCommitAuthority stopped_authority =
+        current_commit_authority();
+    stopped_authority.require_pow_mining_enabled = true;
     BOOST_CHECK(!wallet->CommitTransaction(
         claim_ref, std::move(stopped_metadata), {}, &refused_error,
-        &refused_status,
-        ShadowPowClaimCommitAuthority{
-            authority_generation,
-            /*require_pow_mining_enabled=*/true,
-            /*expected_coin_lock_generation=*/0,
-            anchor}));
+        &refused_status, stopped_authority));
     BOOST_CHECK(refused_status ==
                 WalletCommitStatus::REJECTED_NOT_ADDED);
     BOOST_CHECK_EQUAL(
@@ -1139,20 +2207,19 @@ BOOST_FIXTURE_TEST_CASE(
     mapValue_t coin_lock_metadata;
     coin_lock_metadata["comment"] = "PoW Claim";
     coin_lock_metadata[SHADOW_POW_CLAIM_AUTHORED_KEY] = "1";
+    ShadowPowClaimCommitAuthority coin_lock_authority =
+        current_commit_authority();
     {
         LOCK(wallet->cs_wallet);
         BOOST_REQUIRE(wallet->LockCoin(anchor));
+        ++expected_coin_lock_generation;
     }
     refused_error.clear();
     refused_status = WalletCommitStatus::ACCEPTED;
+    BOOST_REQUIRE(expected_coin_lock_generation > 0);
     BOOST_CHECK(!wallet->CommitTransaction(
         claim_ref, std::move(coin_lock_metadata), {}, &refused_error,
-        &refused_status,
-        ShadowPowClaimCommitAuthority{
-            authority_generation,
-            /*require_pow_mining_enabled=*/false,
-            /*expected_coin_lock_generation=*/0,
-            anchor}));
+        &refused_status, coin_lock_authority));
     BOOST_CHECK(refused_status == WalletCommitStatus::REJECTED_NOT_ADDED);
     BOOST_CHECK_EQUAL(
         refused_error,
@@ -1164,7 +2231,54 @@ BOOST_FIXTURE_TEST_CASE(
     {
         LOCK(wallet->cs_wallet);
         BOOST_REQUIRE(wallet->UnlockCoin(anchor));
+        ++expected_coin_lock_generation;
     }
+
+    // A selection must retain its exact source and policy authority until
+    // publication, not merely its transaction-family fingerprint.
+    const auto refuse_stale_selection = [&](
+        ShadowPowClaimCommitAuthority authority) {
+        mapValue_t stale_metadata;
+        stale_metadata["comment"] = "PoW Claim";
+        stale_metadata[SHADOW_POW_CLAIM_AUTHORED_KEY] = "1";
+        std::string error;
+        WalletCommitStatus stale_status{WalletCommitStatus::ACCEPTED};
+        BOOST_CHECK(!wallet->CommitTransaction(
+            claim_ref, std::move(stale_metadata), {}, &error,
+            &stale_status, std::move(authority)));
+        BOOST_CHECK(stale_status == WalletCommitStatus::REJECTED_NOT_ADDED);
+        BOOST_CHECK_EQUAL(
+            error, "wallet-claim-selection-authority-changed-before-commit");
+        BOOST_CHECK(GetMockableDatabase(*wallet).m_records == durable_before);
+        BOOST_CHECK(!WITH_LOCK(wallet->cs_wallet,
+                              return wallet->IsSpent(anchor)));
+    };
+    const auto check_changed_selection = [&](auto mutate) {
+        auto authority = current_commit_authority();
+        BOOST_REQUIRE(authority.selected_input);
+        mutate(*authority.selected_input);
+        refuse_stale_selection(std::move(authority));
+    };
+    check_changed_selection([](auto& input) { --input.source_output.nValue; });
+    check_changed_selection([](auto& input) { input.source_output.scriptPubKey << OP_NOP; });
+    check_changed_selection([](auto& input) { ++input.coin_time; });
+    check_changed_selection([](auto& input) { ++input.live_output_index_generation; });
+    check_changed_selection([](auto& input) { ++input.stake_reserve_generation; });
+    check_changed_selection([](auto& input) { ++input.suppression_generation; });
+    check_changed_selection([](auto& input) {
+        input.staking_enabled_at_selection = !input.staking_enabled_at_selection;
+    });
+    auto missing_selection = current_commit_authority();
+    missing_selection.selected_input.reset();
+    refuse_stale_selection(std::move(missing_selection));
+
+    // An off -> on -> off pulse preserves the final boolean and wallet DB
+    // state, but still revokes work selected under the earlier reserve policy.
+    BOOST_REQUIRE(!wallet->m_enabled_staking.load());
+    auto pulsed_staking = current_commit_authority();
+    wallet->SetStakingEnabled(true);
+    wallet->SetStakingEnabled(false);
+    refuse_stale_selection(std::move(pulsed_staking));
 
     mapValue_t metadata;
     metadata["comment"] = "PoW Claim";
@@ -1180,7 +2294,8 @@ BOOST_FIXTURE_TEST_CASE(
     std::string broadcast_error;
     WalletCommitStatus status{WalletCommitStatus::REJECTED_NOT_ADDED};
     BOOST_REQUIRE(wallet->CommitTransaction(
-        claim_ref, std::move(metadata), {}, &broadcast_error, &status));
+        claim_ref, std::move(metadata), {}, &broadcast_error, &status,
+        current_commit_authority()));
     BOOST_CHECK(status == WalletCommitStatus::ACCEPTED);
     BOOST_CHECK(broadcast_error.empty());
     BOOST_CHECK(!m_node.chain->isInMempool(claim_ref->GetHash()));
@@ -1210,8 +2325,9 @@ BOOST_FIXTURE_TEST_CASE(
 
     // A chain-unspent anchor reserved only by an exact durable QQSPROOF may
     // receive an additional user coin lock. This never makes the anchor
-    // spendable; it only pauses that retained family until the user unlocks
-    // it. Exercise the persistent database path used by lockunspent too.
+    // spendable; it pauses only that retained family while preserving the
+    // option to use a proven-independent anchor. Exercise the persistent
+    // database path used by lockunspent too.
     const ShadowPowClaimRecoveryInventory unlocked_inventory =
         wallet->GetShadowPowClaimRecoveryInventory();
     const auto unlocked_component = std::find_if(
@@ -1298,10 +2414,13 @@ BOOST_FIXTURE_TEST_CASE(
         << " live=" << locked_gate.live_claims
         << " eligible=" << locked_gate.eligible_claims) {
         BOOST_CHECK(locked_gate.action ==
-                    ShadowPowClaimMiningGateAction::WAIT_FOR_NEXT_TIP);
+                    ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR);
     }
     BOOST_CHECK(!locked_gate.ShouldRelayExisting());
-    BOOST_CHECK(!locked_gate.MayCreateClaim());
+    BOOST_CHECK(locked_gate.MayCreateNewAnchorClaim());
+    BOOST_REQUIRE_EQUAL(
+        locked_gate.reserved_family_anchors.size(), 1U);
+    BOOST_CHECK(locked_gate.reserved_family_anchors.front() == anchor);
 
     // A default in-memory unlock changes the candidate snapshot immediately,
     // restores the same safe family action on the same tip, and restores the
@@ -1373,6 +2492,19 @@ BOOST_FIXTURE_TEST_CASE(
             {anchor}, /*lock=*/true, /*persistent=*/true, &lock_error));
     }
 
+    // The hold was validly installed while the claim was quarantined. If the
+    // exact retained bytes later enter the mempool, the quarantine predicate
+    // becomes false but the user's restriction must survive that transition
+    // and any subsequently learned same-anchor spender.
+    BOOST_REQUIRE(wallet->AddToWallet(claim_ref, TxStateInMempool{}));
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->IsLockedCoin(anchor));
+        BOOST_CHECK(!wallet->IsQuarantinedShadowPowClaim(
+            claim_ref->GetHash()));
+        BOOST_CHECK(wallet->IsSpent(anchor));
+    }
+
     // A mixed ordinary wallet spender closes the narrow exception. Unlocking
     // an already installed user lock must nevertheless remain possible after
     // that later reservation appears.
@@ -1385,10 +2517,35 @@ BOOST_FIXTURE_TEST_CASE(
         MakeTransactionRef(std::move(ordinary_spend));
     BOOST_REQUIRE(!TransactionHasShadowProof(*ordinary_ref));
     BOOST_REQUIRE(wallet->AddToWallet(ordinary_ref, TxStateInactive{}));
+    const ShadowPowClaimRecoveryInventory held_inventory =
+        wallet->GetShadowPowClaimRecoveryInventory();
+
+    CWallet held_reload_wallet(
+        m_node.chain.get(), "", DuplicateMockDatabase(wallet->GetDatabase()));
+    BOOST_REQUIRE_EQUAL(held_reload_wallet.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(held_reload_wallet.cs_wallet);
+        held_reload_wallet.SetLastBlockProcessed(
+            unlocked_inventory.wallet_processed_height,
+            unlocked_inventory.wallet_processed_tip);
+        BOOST_CHECK(held_reload_wallet.IsLockedCoin(anchor));
+    }
     {
         LOCK2(::cs_main, wallet->cs_wallet);
+        // Discovering a later conflict must not silently revoke the explicit
+        // persistent hold. The new ordinary spender closes the narrow lock-add
+        // exception, but only an explicit unlock may remove an existing hold.
+        BOOST_CHECK(wallet->IsLockedCoin(anchor));
         BOOST_CHECK(
             !wallet->CanLockQuarantinedShadowPowClaimAnchor(anchor));
+        BOOST_REQUIRE(
+            wallet->ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
+                held_inventory));
+        const auto held_component = std::find_if(
+            held_inventory.components.begin(), held_inventory.components.end(),
+            [&](const auto& component) { return component.anchor == anchor; });
+        BOOST_REQUIRE(held_component != held_inventory.components.end());
+        BOOST_CHECK(held_component->anchor_user_locked);
         std::string lock_error;
         BOOST_REQUIRE(wallet->UpdateLockedCoins(
             {anchor}, /*lock=*/false, /*persistent=*/true, &lock_error));
@@ -1398,6 +2555,7 @@ BOOST_FIXTURE_TEST_CASE(
     // Historical abandoned or conflicted spends do not reserve the
     // active-chain coin and therefore do not defeat this restriction-only
     // lock exception.  The exact quarantined claim still must be present.
+    BOOST_REQUIRE(wallet->AddToWallet(claim_ref, TxStateInactive{}));
     BOOST_REQUIRE(wallet->AbandonTransaction(ordinary_ref->GetHash()));
     {
         LOCK2(::cs_main, wallet->cs_wallet);
@@ -1499,7 +2657,7 @@ BOOST_FIXTURE_TEST_CASE(
 
 BOOST_FIXTURE_TEST_CASE(
     shadow_pow_claim_initial_write_failure_latches_ambiguity,
-    TestChain100Setup)
+    WalletShadowPowQQP2TestingSetup)
 {
     CKey wallet_key;
     wallet_key.MakeNewKey(/*fCompressed=*/true);
@@ -1532,15 +2690,49 @@ BOOST_FIXTURE_TEST_CASE(
 
     baseline_wallet->SetBroadcastTransactions(/*broadcast=*/false);
     MockableDatabase& database = GetMockableDatabase(*baseline_wallet);
-    database.m_pass = false;
     mapValue_t metadata;
     metadata["comment"] = "PoW Claim";
     metadata[SHADOW_POW_CLAIM_AUTHORED_KEY] = "1";
+    const ShadowPowClaimMiningGate commit_gate =
+        baseline_wallet->GetShadowPowClaimMiningGate();
+    BOOST_REQUIRE(!commit_gate.candidate_state_fingerprint.IsNull());
+    const CScript quantum_payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x51)});
+    CCoinControl selection_control;
+    selection_control.m_allow_other_inputs = false;
+    selection_control.m_avoid_address_reuse = false;
+    ShadowPowClaimInput selected_input;
+    bilingual_str selection_error;
+    BOOST_REQUIRE(baseline_wallet->SelectShadowPowClaimInput(
+                      std::nullopt, quantum_payout, nullptr, selection_control,
+                      selected_input, selection_error, commit_gate) ==
+                  ShadowPowClaimInputSelectionResult::SELECTED);
+    const ShadowPowClaimCommitAuthority commit_authority{
+        baseline_wallet->m_pow_wallet_authority_generation.load(
+            std::memory_order_acquire),
+        /*require_pow_mining_enabled=*/false,
+        /*expected_coin_lock_generation=*/0,
+        anchor,
+        commit_gate.wallet_generation,
+        commit_gate.candidate_state_fingerprint,
+        commit_gate.active_tip,
+        commit_gate.active_height,
+        /*require_relay_clock_authority=*/true,
+        commit_gate.relay_clock_high_water,
+        commit_gate.relay_clock_median_time_past,
+        commit_gate.classification_time,
+        commit_gate.next_relay_expiry_time,
+        commit_gate.next_legacy_relay_expiry_wall_time,
+        commit_gate.legacy_relay_clock_high_water,
+        selected_input};
+    database.m_pass = false;
     std::string broadcast_error;
     WalletCommitStatus status{WalletCommitStatus::REJECTED_NOT_ADDED};
     BOOST_CHECK_EXCEPTION(
         baseline_wallet->CommitTransaction(
-            claim_ref, std::move(metadata), {}, &broadcast_error, &status),
+            claim_ref, std::move(metadata), {}, &broadcast_error, &status,
+            commit_authority),
         std::runtime_error,
         HasReason("Wallet db error, transaction commit failed"));
     BOOST_CHECK(status == WalletCommitStatus::REJECTED_NOT_ADDED);
@@ -1623,21 +2815,12 @@ BOOST_FIXTURE_TEST_CASE(
     BOOST_CHECK(!wallet->QuarantineShadowPowClaim(incoming_ref->GetHash()));
     const ShadowPowClaimRecoveryInventory inventory =
         wallet->GetShadowPowClaimRecoveryInventory();
-    const auto component = std::find_if(
-        inventory.components.begin(), inventory.components.end(),
-        [&](const ShadowPowClaimRecoveryComponent& candidate) {
-            return std::find(candidate.claim_txids.begin(),
-                             candidate.claim_txids.end(),
-                             incoming_ref->GetHash()) !=
-                   candidate.claim_txids.end();
-        });
-    BOOST_REQUIRE(component != inventory.components.end());
-    BOOST_CHECK(!component->anchor_authenticated);
-    BOOST_REQUIRE_EQUAL(component->nodes.size(), 1U);
-    BOOST_CHECK(!component->nodes.front().wallet_authored);
-    BOOST_CHECK(!component->nodes.front().wallet_from_me);
-    BOOST_CHECK(component->nodes.front().provenance ==
-                ShadowPowClaimRecoveryProvenance::UNKNOWN);
+    // Foreign carriers remain in mapWallet for ordinary audit/history, but
+    // are intentionally absent from the bounded local-authority inventory.
+    // Otherwise an external sender could exhaust the local claim cap and
+    // pause an unrelated wallet's miner.
+    BOOST_CHECK(inventory.components.empty());
+    BOOST_CHECK_EQUAL(inventory.raw_claim_objects, 0U);
 
     const ShadowPowClaimMiningGate gate =
         wallet->GetShadowPowClaimMiningGate();
@@ -1659,7 +2842,11 @@ BOOST_FIXTURE_TEST_CASE(
         LOCK(wallet->cs_wallet);
         BOOST_CHECK(!wallet->IsQuarantinedShadowPowClaim(
             incoming_ref->GetHash()));
-        wallet->mapWallet.at(incoming_ref->GetHash()).fFromMe = true;
+        CWalletTx& corrupted =
+            wallet->mapWallet.at(incoming_ref->GetHash());
+        corrupted.fFromMe = true;
+        wallet->RefreshShadowPowClaimIndexEntryLocked(corrupted);
+        wallet->MarkShadowPowClaimCandidateStateChangedLocked();
     }
     const ShadowPowClaimMiningGate corrupted_gate =
         wallet->GetShadowPowClaimMiningGate();
@@ -1708,7 +2895,7 @@ BOOST_FIXTURE_TEST_CASE(
 }
 
 BOOST_FIXTURE_TEST_CASE(
-    incoming_shadow_proof_with_wallet_authored_ordinary_descendant_fails_closed,
+    incoming_shadow_proof_with_wallet_authored_ordinary_descendant_remains_audit_only,
     TestChain100Setup)
 {
     auto wallet = CreateSyncedWallet(
@@ -1739,38 +2926,20 @@ BOOST_FIXTURE_TEST_CASE(
 
     const ShadowPowClaimRecoveryInventory inventory =
         wallet->GetShadowPowClaimRecoveryInventory();
-    const auto component = std::find_if(
-        inventory.components.begin(), inventory.components.end(),
-        [&](const ShadowPowClaimRecoveryComponent& candidate) {
-            return std::find(candidate.claim_txids.begin(),
-                             candidate.claim_txids.end(),
-                             incoming_ref->GetHash()) !=
-                   candidate.claim_txids.end();
-        });
-    BOOST_REQUIRE(component != inventory.components.end());
-    const auto ordinary_node = std::find_if(
-        component->nodes.begin(), component->nodes.end(),
-        [&](const ShadowPowClaimRecoveryNode& node) {
-            return node.txid == ordinary_ref->GetHash();
-        });
-    BOOST_REQUIRE(ordinary_node != component->nodes.end());
-    BOOST_CHECK(ordinary_node->kind ==
-                ShadowPowClaimRecoveryNodeKind::ORDINARY);
-    BOOST_CHECK(ordinary_node->wallet_authored);
+    BOOST_CHECK(inventory.components.empty());
+    BOOST_CHECK_EQUAL(inventory.raw_claim_objects, 0U);
 
     const ShadowPowClaimMiningGate gate =
         wallet->GetShadowPowClaimMiningGate();
-    BOOST_CHECK(gate.action == ShadowPowClaimMiningGateAction::UNSAFE);
-    BOOST_CHECK(gate.HasUnsafeClaims());
-    BOOST_CHECK(!gate.MayCreateClaim());
-    BOOST_CHECK_EQUAL(gate.unresolved_components, 1U);
-    BOOST_CHECK_EQUAL(gate.unsafe_components, 1U);
+    BOOST_CHECK(gate.action ==
+                ShadowPowClaimMiningGateAction::CREATE_NEW_ANCHOR);
+    BOOST_CHECK(gate.MayCreateNewAnchorClaim());
+    BOOST_CHECK_EQUAL(gate.unresolved_components, 0U);
+    BOOST_CHECK_EQUAL(gate.unsafe_components, 0U);
 
-    // The compact wallet-tip-mismatch inventory intentionally omits ordinary
-    // graph nodes. A raw retained claim must therefore make payout relevance
-    // unknown until the full graph can be rebuilt; otherwise this exact mixed
-    // wallet could be mistaken for a pure foreign audit-only claim and an
-    // unrelated future payout key could be allocated during startup.
+    // The audit-only classification is stable across a wallet-tip mismatch.
+    // Neither the incoming proof nor an ordinary spend of its received output
+    // authenticates the proof's external input as a local claim anchor.
     const CBlockIndex* tip = WITH_LOCK(
         ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
     BOOST_REQUIRE(tip);
@@ -1787,7 +2956,7 @@ BOOST_FIXTURE_TEST_CASE(
     const ShadowPowClaimRecoveryInventory incoherent =
         wallet->GetShadowPowClaimRecoveryInventory();
     BOOST_CHECK(!incoherent.wallet_tip_matches);
-    BOOST_CHECK_EQUAL(incoherent.raw_claim_objects, 1U);
+    BOOST_CHECK_EQUAL(incoherent.raw_claim_objects, 0U);
     const size_t quantum_keys_before = WITH_LOCK(
         wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size());
     bilingual_str start_error;
@@ -1798,12 +2967,12 @@ BOOST_FIXTURE_TEST_CASE(
             start_error, &created_payout,
             /*allow_new_payout_key=*/true),
         start_error.original);
-    BOOST_CHECK(!created_payout);
+    BOOST_CHECK(created_payout);
     BOOST_CHECK_EQUAL(
         WITH_LOCK(wallet->cs_wallet,
                   return wallet->ListQuantumKeyInfos().size()),
-        quantum_keys_before);
-    BOOST_CHECK(WITH_LOCK(
+        quantum_keys_before + 1);
+    BOOST_CHECK(!WITH_LOCK(
         wallet->cs_wallet, return wallet->m_pow_payout_quantum.empty()));
     wallet->StopPowMining();
 }
@@ -1834,7 +3003,7 @@ static void AddKey(CWallet& wallet, const CKey& key)
 }
 
 BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
-                        TestChain100Setup)
+                        WalletShadowPowQQP2TestingSetup)
 {
     CKey wallet_key;
     wallet_key.MakeNewKey(/*fCompressed=*/true);
@@ -1857,7 +3026,20 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
         BOOST_REQUIRE(wallet->AddToWallet(
             tx, TxStateConfirmed{confirmation_block->GetBlockHash(),
                                  confirmation_block->nHeight, 1}));
-        return COutPoint{tx->GetHash(), 0};
+        const COutPoint outpoint{tx->GetHash(), 0};
+        {
+            LOCK(::cs_main);
+            Assert(m_node.chainman)
+                ->ActiveChainstate()
+                .CoinsTip()
+                .AddCoin(
+                    outpoint,
+                    Coin{tx->vout.at(0), confirmation_block->nHeight,
+                         /*coinbase=*/false, /*coinstake=*/false,
+                         tx->nTime},
+                    /*possible_overwrite=*/false);
+        }
+        return outpoint;
     };
 
     const COutPoint first = add_confirmed_coin(0x41, 10 * COIN);
@@ -1871,11 +3053,12 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
     ShadowPowClaimInput selected;
     bilingual_str error;
 
-    wallet->m_enabled_staking = true;
+    wallet->SetStakingEnabled(true);
+    ShadowPowClaimMiningGate selection_gate =
+        wallet->GetShadowPowClaimMiningGate();
     {
-        LOCK2(::cs_main, wallet->cs_wallet);
         const ShadowPowClaimStakeReserveInfo info =
-            wallet->GetShadowPowClaimStakeReserveInfoLocked();
+            wallet->GetShadowPowClaimStakeReserveInfo();
         BOOST_CHECK(info.wallet_tip_matches);
         BOOST_CHECK_EQUAL(info.configured_reserve_coins, 1);
         BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_coins, 1U);
@@ -1887,42 +3070,62 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
         BOOST_CHECK(
             wallet->SelectShadowPowClaimInput(
                 std::nullopt, quantum_payout, nullptr, control, selected,
-                error) ==
+                error, selection_gate) ==
             ShadowPowClaimInputSelectionResult::STAKE_RESERVE_PROTECTED);
     }
     BOOST_CHECK(error.original.find("protect 1 mature legacy staking coin") !=
                 std::string::npos);
 
+    // The reserve consumes the authoritative staking predicate. A coin below
+    // the wallet's configured staking minimum is not protected and remains a
+    // valid independent Gold Rush fee input.
+    const CAmount original_min_staking_amount =
+        wallet->m_min_staking_amount;
+    wallet->m_min_staking_amount = 11 * COIN;
+    selection_gate = wallet->GetShadowPowClaimMiningGate();
+    {
+        const ShadowPowClaimStakeReserveInfo info =
+            wallet->GetShadowPowClaimStakeReserveInfo();
+        BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_coins, 0U);
+        BOOST_CHECK_EQUAL(info.reserved_stake_coins, 0U);
+        BOOST_CHECK(wallet->SelectShadowPowClaimInput(
+                        std::nullopt, quantum_payout, nullptr, control,
+                        selected, error, selection_gate) ==
+                    ShadowPowClaimInputSelectionResult::SELECTED);
+        BOOST_CHECK(selected.outpoint == first);
+    }
+    wallet->m_min_staking_amount = original_min_staking_amount;
+
     // A protected coin that cannot satisfy fee policy must report the fee
     // failure, not claim that the stake reserve was the deciding blocker.
     const CAmount original_max_fee = wallet->m_default_max_tx_fee;
     wallet->m_default_max_tx_fee = 0;
+    selection_gate = wallet->GetShadowPowClaimMiningGate();
     {
-        LOCK2(::cs_main, wallet->cs_wallet);
         BOOST_CHECK(
             wallet->SelectShadowPowClaimInput(
                 std::nullopt, quantum_payout, nullptr, control, selected,
-                error) ==
+                error, selection_gate) ==
             ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX);
     }
     wallet->m_default_max_tx_fee = original_max_fee;
 
-    wallet->m_enabled_staking = false;
+    wallet->SetStakingEnabled(false);
+    selection_gate = wallet->GetShadowPowClaimMiningGate();
     {
-        LOCK2(::cs_main, wallet->cs_wallet);
         BOOST_CHECK(wallet->SelectShadowPowClaimInput(
                         std::nullopt, quantum_payout, nullptr, control,
-                        selected, error) ==
+                        selected, error, selection_gate) ==
                     ShadowPowClaimInputSelectionResult::SELECTED);
         BOOST_CHECK(selected.outpoint == first);
     }
 
     const COutPoint second = add_confirmed_coin(0x42, 20 * COIN);
-    wallet->m_enabled_staking = true;
+    wallet->SetStakingEnabled(true);
+    selection_gate = wallet->GetShadowPowClaimMiningGate();
     {
-        LOCK2(::cs_main, wallet->cs_wallet);
         const ShadowPowClaimStakeReserveInfo info =
-            wallet->GetShadowPowClaimStakeReserveInfoLocked();
+            wallet->GetShadowPowClaimStakeReserveInfo();
         BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_coins, 2U);
         BOOST_CHECK_EQUAL(info.mature_stakeable_legacy_weight, 30 * COIN);
         BOOST_CHECK_EQUAL(info.reserved_stake_coins, 1U);
@@ -1931,11 +3134,46 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
         BOOST_CHECK(!info.last_stake_coin_guard);
         BOOST_CHECK(wallet->SelectShadowPowClaimInput(
                         std::nullopt, quantum_payout, nullptr, control,
-                        selected, error) ==
+                        selected, error, selection_gate) ==
                     ShadowPowClaimInputSelectionResult::SELECTED);
         BOOST_CHECK(selected.outpoint == first);
         BOOST_CHECK(selected.outpoint != second);
     }
+
+    // Wallet ordering prefers the smaller A, but a stale active-chain A must
+    // not hide the later valid B. One invocation checks only its deterministic
+    // winner, retires a stale index entry, and requires a fresh snapshot before
+    // selecting B. It must not extend the global-lock checkpoint into a scan.
+    wallet->SetStakingEnabled(false);
+    selection_gate = wallet->GetShadowPowClaimMiningGate();
+    Coin stale_first;
+    {
+        LOCK(::cs_main);
+        BOOST_REQUIRE(Assert(m_node.chainman)
+                          ->ActiveChainstate()
+                          .CoinsTip()
+                          .SpendCoin(first, &stale_first));
+    }
+    BOOST_CHECK(wallet->SelectShadowPowClaimInput(
+                    std::nullopt, quantum_payout, nullptr, control,
+                    selected, error, selection_gate) ==
+                ShadowPowClaimInputSelectionResult::SNAPSHOT_DRIFT);
+    BOOST_CHECK(selected.outpoint.IsNull());
+    selection_gate = wallet->GetShadowPowClaimMiningGate();
+    BOOST_CHECK(wallet->SelectShadowPowClaimInput(
+                    std::nullopt, quantum_payout, nullptr, control,
+                    selected, error, selection_gate) ==
+                ShadowPowClaimInputSelectionResult::SELECTED);
+    BOOST_CHECK(selected.outpoint == second);
+    {
+        LOCK(::cs_main);
+        Assert(m_node.chainman)
+            ->ActiveChainstate()
+            .CoinsTip()
+            .AddCoin(first, std::move(stale_first),
+                     /*possible_overwrite=*/false);
+    }
+    wallet->SetStakingEnabled(true);
 
     // Reserve policy and telemetry are wallet-scoped. A second wallet on the
     // same chain cannot inherit the first wallet's enabled state, coins, or
@@ -1957,29 +3195,41 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_preserves_mature_legacy_stake_reserve,
     BOOST_REQUIRE(peer_wallet->AddToWallet(
         peer_tx, TxStateConfirmed{confirmation_block->GetBlockHash(),
                                   confirmation_block->nHeight, 1}));
-    peer_wallet->m_enabled_staking = false;
     {
-        LOCK2(::cs_main, peer_wallet->cs_wallet);
+        LOCK(::cs_main);
+        Assert(m_node.chainman)
+            ->ActiveChainstate()
+            .CoinsTip()
+            .AddCoin(
+                COutPoint{peer_tx->GetHash(), 0},
+                Coin{peer_tx->vout.at(0), confirmation_block->nHeight,
+                     /*coinbase=*/false, /*coinstake=*/false,
+                     peer_tx->nTime},
+                /*possible_overwrite=*/false);
+    }
+    peer_wallet->SetStakingEnabled(false);
+    const ShadowPowClaimMiningGate peer_selection_gate =
+        peer_wallet->GetShadowPowClaimMiningGate();
+    {
         const ShadowPowClaimStakeReserveInfo peer_info =
-            peer_wallet->GetShadowPowClaimStakeReserveInfoLocked();
+            peer_wallet->GetShadowPowClaimStakeReserveInfo();
         BOOST_CHECK(!peer_info.staking_enabled);
         BOOST_CHECK_EQUAL(peer_info.mature_stakeable_legacy_coins, 1U);
         BOOST_CHECK_EQUAL(peer_info.reserved_stake_coins, 0U);
         BOOST_CHECK(peer_wallet->SelectShadowPowClaimInput(
                         std::nullopt, quantum_payout, nullptr, control,
-                        selected, error) ==
+                        selected, error, peer_selection_gate) ==
                     ShadowPowClaimInputSelectionResult::SELECTED);
         BOOST_CHECK(selected.outpoint == COutPoint(peer_tx->GetHash(), 0));
     }
     {
-        LOCK2(::cs_main, wallet->cs_wallet);
         const ShadowPowClaimStakeReserveInfo original_info =
-            wallet->GetShadowPowClaimStakeReserveInfoLocked();
+            wallet->GetShadowPowClaimStakeReserveInfo();
         BOOST_CHECK(original_info.staking_enabled);
         BOOST_CHECK_EQUAL(original_info.reserved_stake_coins, 1U);
         BOOST_CHECK_EQUAL(original_info.reserved_stake_weight, 20 * COIN);
     }
-    wallet->m_enabled_staking = false;
+    wallet->SetStakingEnabled(false);
 }
 
 BOOST_FIXTURE_TEST_CASE(staking_telemetry_does_not_treat_zero_search_interval_as_stopped,
@@ -1996,7 +3246,7 @@ BOOST_FIXTURE_TEST_CASE(staking_telemetry_does_not_treat_zero_search_interval_as
         ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
     BOOST_REQUIRE(tip);
 
-    wallet->m_enabled_staking = true;
+    wallet->SetStakingEnabled(true);
     wallet->m_cached_stake_weight = 10 * COIN;
     wallet->m_cached_stake_weight_height = tip->nHeight;
     wallet->m_last_coin_stake_search_interval = 0;
@@ -2015,7 +3265,7 @@ BOOST_FIXTURE_TEST_CASE(staking_telemetry_does_not_treat_zero_search_interval_as
     BOOST_CHECK_EQUAL(searching.tip_height, tip->nHeight);
     BOOST_CHECK(searching.tip == tip->GetBlockHash());
 
-    wallet->m_enabled_staking = false;
+    wallet->SetStakingEnabled(false);
     const StakingTelemetrySnapshot disabled =
         wallet->GetStakingTelemetrySnapshot();
     BOOST_CHECK(!disabled.enabled);
@@ -2146,6 +3396,71 @@ BOOST_FIXTURE_TEST_CASE(legacy_shadow_pow_cleanup_is_quarantined_without_rebroad
         BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_legacy_cleanup_quarantine"), "1");
         BOOST_CHECK(wallet->IsSpent(cleanup_input));
     }
+}
+
+BOOST_AUTO_TEST_CASE(legacy_cleanup_repair_is_bounded_durable_and_indexed)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    const auto add_record = [&](uint8_t domain, uint32_t index, bool legacy, bool managed) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{domain}, index});
+        tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+        const auto ref = MakeTransactionRef(std::move(tx));
+        BOOST_REQUIRE(wallet.AddToWallet(ref, TxStateInactive{}, [&](CWalletTx& record, bool) {
+            if (legacy) record.mapValue[SHADOW_POW_LEGACY_CLEANUP_FOR_KEY] = uint256::ONE.GetHex();
+            if (managed) record.mapValue[SHADOW_POW_RESOLUTION_SCHEMA_KEY] = "malformed";
+            return true;
+        }));
+        return ref->GetHash();
+    };
+    for (uint32_t index = 0; index < 1024; ++index) add_record(1, index, false, false);
+    std::vector<uint256> legacy;
+    for (uint32_t index = 0; index < SHADOW_POW_CLAIM_OWNERSHIP_SLICE + 6; ++index) {
+        legacy.push_back(add_record(2, index, true, false));
+    }
+    const uint256 managed = add_record(3, 0, true, true);
+
+    CWallet failing(m_node.chain.get(), "", DuplicateMockDatabase(wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(failing.LoadWallet(), DBErrors::LOAD_OK);
+    auto& failed_db = GetMockableDatabase(failing);
+    const MockableData before_failure = failed_db.m_records;
+    failed_db.m_write_calls = 0;
+    failed_db.m_fail_write_at = 2;
+    failing.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK(failing.IsShadowPowClaimRecoveryDatabaseAmbiguous());
+    BOOST_CHECK(failed_db.m_records == before_failure);
+    {
+        LOCK(failing.cs_wallet);
+        for (const uint256& txid : legacy) {
+            BOOST_CHECK(failing.mapWallet.at(txid).mapValue.count("qq_shadow_pow_legacy_cleanup_quarantine") == 0);
+        }
+    }
+
+    auto& database = GetMockableDatabase(wallet);
+    database.m_write_calls = 0;
+    wallet.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK_EQUAL(database.m_write_calls, SHADOW_POW_CLAIM_OWNERSHIP_SLICE);
+    BOOST_CHECK(database.m_last_txn_durable);
+    database.m_write_calls = 0;
+    wallet.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK_EQUAL(database.m_write_calls, 6U);
+    database.m_write_calls = 0;
+    wallet.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK_EQUAL(database.m_write_calls, 0U);
+    {
+        LOCK(wallet.cs_wallet);
+        for (const uint256& txid : legacy) {
+            BOOST_CHECK_EQUAL(wallet.mapWallet.at(txid).mapValue.at("qq_shadow_pow_legacy_cleanup_quarantine"), "1");
+        }
+        BOOST_CHECK(wallet.mapWallet.at(managed).mapValue.count("qq_shadow_pow_legacy_cleanup_quarantine") == 0);
+    }
+    CWallet reloaded(m_node.chain.get(), "", DuplicateMockDatabase(wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    auto& reloaded_db = GetMockableDatabase(reloaded);
+    reloaded_db.m_write_calls = 0;
+    reloaded.RepairStaleShadowTransactions(/*force=*/true);
+    BOOST_CHECK_EQUAL(reloaded_db.m_write_calls, 0U);
 }
 
 BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_inventory_is_tip_pinned_and_reorg_safe, TestChain100Setup)
@@ -2578,6 +3893,18 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_relay_ttl_guard_has_exact_boundaries)
     constexpr int64_t now{2'000'000'000};
     SetMockTime(now);
     m_wallet.SetBroadcastTransactions(/*broadcast=*/true);
+    {
+        LOCK2(::cs_main, m_wallet.cs_wallet);
+        const CBlockIndex* tip =
+            m_wallet.chain().chainman().ActiveChain().Tip();
+        BOOST_REQUIRE(tip);
+        // WalletTestingSetup constructs the wallet before validation
+        // notifications are subscribed, so its processed-tip cursor is
+        // intentionally unset. Make this relay-authority fixture coherent
+        // before building the guarded snapshots below.
+        m_wallet.SetLastBlockProcessed(
+            tip->nHeight, tip->GetBlockHash());
+    }
 
     const auto make_wallet_tx = [&](uint8_t seed, bool shadow_proof,
                                     int64_t received_time) {
@@ -2606,9 +3933,40 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_relay_ttl_guard_has_exact_boundaries)
     };
 
     const auto submit_without_peer_relay = [&](const CTransactionRef& tx) {
+        const ShadowPowClaimRecoveryInventory inventory =
+            m_wallet.GetShadowPowClaimRecoveryInventory();
+        ShadowPowClaimRecoveryBroadcastGuard guard;
+        {
+            LOCK2(::cs_main, m_wallet.cs_wallet);
+            const CBlockIndex* tip =
+                m_wallet.chain().chainman().ActiveChain().Tip();
+            BOOST_REQUIRE(tip);
+            guard.expected_wallet_tip = tip->GetBlockHash();
+            guard.expected_wallet_height = tip->nHeight;
+            guard.expected_wallet_generation =
+                m_wallet.GetDatabase().nUpdateCounter.load();
+            guard.expected_candidate_state_fingerprint =
+                m_wallet.GetShadowPowClaimCandidateStateFingerprintLocked();
+            const auto [schema_high_water, legacy_high_water] =
+                m_wallet.GetShadowPowClaimRelayClockHighWatersForTesting();
+            guard.require_relay_clock_authority = true;
+            guard.expected_relay_clock_high_water =
+                schema_high_water;
+            guard.expected_relay_clock_median_time_past =
+                tip->GetMedianTimePast();
+            guard.expected_relay_clock_classification_time = std::max(
+                schema_high_water,
+                tip->GetMedianTimePast());
+            guard.expected_relay_clock_next_transition =
+                inventory.next_relay_expiry_time;
+            guard.expected_relay_clock_next_legacy_wall_transition =
+                inventory.next_legacy_relay_expiry_wall_time;
+            guard.expected_legacy_relay_clock_high_water =
+                legacy_high_water;
+        }
         std::string error;
         const bool accepted = m_wallet.SubmitTxMemoryPoolAndRelay(
-            tx->GetHash(), error, /*relay=*/false);
+            tx->GetHash(), error, /*relay=*/false, &guard);
         BOOST_CHECK(WITH_LOCK(
             m_wallet.cs_wallet,
             return m_wallet.m_inflight_wallet_broadcasts.empty()));
@@ -2625,6 +3983,12 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_relay_ttl_guard_has_exact_boundaries)
         submit_without_peer_relay(ttl_minus_one);
     BOOST_CHECK_NE(ttl_minus_one_result.second,
                    "shadow-proof-relay-ttl-expired");
+    BOOST_CHECK_NE(ttl_minus_one_result.second,
+                   "shadow-proof-relay-clock-guard-required");
+    BOOST_CHECK_NE(ttl_minus_one_result.second,
+                   "shadow-proof-relay-clock-changed");
+    BOOST_CHECK_NE(ttl_minus_one_result.second,
+                   "recovery-wallet-generation-changed");
 
     // Equality is expired: this stable error must be returned before the
     // transaction is reserved for broadcast.
@@ -2637,15 +4001,17 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_relay_ttl_guard_has_exact_boundaries)
     BOOST_CHECK_EQUAL(exact_ttl_error,
                       "shadow-proof-relay-ttl-expired");
 
-    // A missing receipt time fails closed under the same stable result and
-    // likewise never leaves a broadcast reservation behind.
+    // A released record with no receipt time has no canonical legacy relay
+    // birth. It fails closed as invalid clock metadata, rather than being
+    // conflated with a valid record that reached its exact expiry boundary,
+    // and likewise never leaves a broadcast reservation behind.
     const CTransactionRef missing_time = make_wallet_tx(
         /*seed=*/203, /*shadow_proof=*/true, /*received_time=*/0);
     const auto [missing_time_accepted, missing_time_error] =
         submit_without_peer_relay(missing_time);
     BOOST_CHECK(!missing_time_accepted);
     BOOST_CHECK_EQUAL(missing_time_error,
-                      "shadow-proof-relay-ttl-expired");
+                      "shadow-proof-relay-clock-metadata-invalid");
 
     // The short relay lifetime is specific to QQSPROOF carriers. An ordinary
     // wallet transaction older than that lifetime still reaches normal node
@@ -2690,7 +4056,7 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_branch_quarantine_resets_after_reorg, T
     CreateAndProcessBlock(
         {funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
 
-    auto wallet = CreateSyncedWallet(
+    std::shared_ptr<CWallet> wallet = CreateSyncedWallet(
         *m_node.chain,
         WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
                   return Assert(m_node.chainman)->ActiveChain()),
@@ -2823,6 +4189,12 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_branch_quarantine_resets_after_reorg, T
             first_observation_tip.GetHex());
     }
 
+    // Real disconnect notifications request maintenance, but cannot run its
+    // proof classification inline. Start only after the replacement tip and
+    // test classification schedule are ready.
+    WalletClaimMaintenance maintenance;
+    maintenance.Register(wallet);
+    auto notifications = m_node.chain->handleNotifications(wallet);
     CBlockIndex* first_observation_index = WITH_LOCK(
         ::cs_main,
         return Assert(m_node.chainman)->m_blockman.LookupBlockIndex(
@@ -2840,8 +4212,18 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_branch_quarantine_resets_after_reorg, T
     BOOST_REQUIRE(replacement_block.GetHash() != first_observation_tip);
     SyncWithValidationInterfaceQueue();
     sync_wallet_tip();
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->IsSpent(COutPoint{funding_ref->GetHash(), 0}));
+        BOOST_CHECK_EQUAL(wallet->mapWallet.at(claim_ref->GetHash()).mapValue.at(
+            SHADOW_POW_CLAIM_BRANCH_QUARANTINE_TIP_KEY), first_observation_tip.GetHex());
+    }
     enable_gold_rush_classification();
-    wallet->RepairStaleShadowTransactions(/*force=*/true);
+    maintenance.Start();
+    maintenance.Sync();
+    notifications.reset();
+    maintenance.Unregister(*wallet);
+    maintenance.Stop();
     restore_production_schedule();
 
     const int replacement_height = WITH_LOCK(
@@ -3013,6 +4395,9 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_miner_lifecycle_creates_quantum_payout)
 {
     ScopedArgsSettings args_guard;
     args_guard.Force("-qqallowautokeycreation", "0");
+    auto worker_failure_reset = interfaces::MakeCleanupHandler([] {
+        SetPowMinerWorkerCreationFailureAfterForTesting(-1);
+    });
     bilingual_str error;
     BOOST_CHECK(!m_wallet.SetPowMining(/*enabled=*/true, /*threads=*/1,
                                       /*cpu_percent=*/10, error));
@@ -3021,11 +4406,25 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_miner_lifecycle_creates_quantum_payout)
 
     error.clear();
     bool created_payout_key{false};
-    BOOST_REQUIRE(m_wallet.SetPowMining(
+    SetPowMinerWorkerCreationFailureAfterForTesting(0);
+    BOOST_CHECK(!m_wallet.SetPowMining(
         /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/10, error,
         &created_payout_key, /*allow_new_payout_key=*/true));
+    // Payout persistence precedes thread construction. A failed launch must
+    // therefore report the durable key and backup requirement truthfully,
+    // while leaving the miner disabled because no previous group existed.
     BOOST_CHECK(created_payout_key);
-    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK(error.original.find("could not create its worker threads") !=
+                std::string::npos);
+    BOOST_CHECK(error.original.find("already created and remains") !=
+                std::string::npos);
+    BOOST_CHECK(error.original.find("Back up the wallet now") !=
+                std::string::npos);
+    BOOST_CHECK(error.original.find("existing Gold Rush PoW miner") ==
+                std::string::npos);
+    SetPowMinerWorkerCreationFailureAfterForTesting(-1);
+
     std::string original_payout;
     {
         LOCK(m_wallet.cs_wallet);
@@ -3035,6 +4434,43 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_miner_lifecycle_creates_quantum_payout)
         BOOST_CHECK(IsValidDestination(payout));
         BOOST_CHECK(IsQuantumMigrationDestination(payout));
     }
+
+    error.clear();
+    created_payout_key = true;
+    BOOST_REQUIRE(m_wallet.SetPowMining(
+        /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/10, error,
+        &created_payout_key, /*allow_new_payout_key=*/true));
+    BOOST_CHECK(!created_payout_key);
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+
+    // A partial replacement-group construction failure has the strong
+    // guarantee: its dormant replacement is cancelled, and the exact old
+    // worker-group object plus thread/CPU configuration remain live.
+    auto* const original_group = WITH_LOCK(
+        m_wallet.m_pow_miner_mutex,
+        return m_wallet.threadPowMinerGroup.get());
+    BOOST_REQUIRE(original_group);
+    SetPowMinerWorkerCreationFailureAfterForTesting(1);
+    error.clear();
+    bool reconfigure_created_payout{true};
+    BOOST_CHECK(!m_wallet.SetPowMining(
+        /*enabled=*/true, /*threads=*/2, /*cpu_percent=*/50, error,
+        &reconfigure_created_payout));
+    BOOST_CHECK(!reconfigure_created_payout);
+    BOOST_CHECK(error.original.find("existing Gold Rush PoW miner remains enabled") !=
+                std::string::npos);
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_threads.load(), 1);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_cpu_percent.load(), 10);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup.get()),
+        original_group);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup->size()),
+        1U);
+    SetPowMinerWorkerCreationFailureAfterForTesting(-1);
     m_wallet.StopPowMining();
     BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
 
@@ -3246,6 +4682,43 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_autostart_waits_for_normal_unlock)
     BOOST_CHECK(m_wallet.m_pow_state.load() ==
                 interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
 
+    const size_t startup_key_count = WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size());
+    const uint64_t startup_claims = m_wallet.m_pow_claims_submitted.load();
+    const uint64_t startup_tries = m_wallet.m_pow_total_tries.load();
+    bool rejected_created_payout{true};
+    error.clear();
+    BOOST_CHECK(!m_wallet.SetPowMining(
+        /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/50, error,
+        &rejected_created_payout));
+    BOOST_CHECK(!rejected_created_payout);
+    BOOST_CHECK(error.original.find("requires an unlocked wallet") !=
+                std::string::npos);
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_threads.load(), 2);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_cpu_percent.load(), 1);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup.get()),
+        startup_worker_group);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup->size()),
+        2U);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_claims_submitted.load(), startup_claims);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_total_tries.load(), startup_tries);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.cs_wallet,
+                  return m_wallet.ListQuantumKeyInfos().size()),
+        startup_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+                          m_wallet.cs_wallet,
+                          return m_wallet.m_pow_payout_quantum),
+                      payout);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+
     BOOST_REQUIRE(m_wallet.Unlock(passphrase, /*accept_no_keys=*/false,
                                   /*staking_only=*/true));
     BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
@@ -3264,6 +4737,36 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_autostart_waits_for_normal_unlock)
                           m_wallet.cs_wallet,
                           return m_wallet.m_pow_payout_quantum),
                       payout);
+
+    rejected_created_payout = true;
+    error.clear();
+    BOOST_CHECK(!m_wallet.SetPowMining(
+        /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/50, error,
+        &rejected_created_payout));
+    BOOST_CHECK(!rejected_created_payout);
+    BOOST_CHECK(error.original.find("normal wallet unlock") !=
+                std::string::npos);
+    BOOST_CHECK(m_wallet.m_wallet_unlock_staking_only.load());
+    BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_threads.load(), 2);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_cpu_percent.load(), 1);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.m_pow_miner_mutex,
+                  return m_wallet.threadPowMinerGroup.get()),
+        startup_worker_group);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_claims_submitted.load(), startup_claims);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_total_tries.load(), startup_tries);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.cs_wallet,
+                  return m_wallet.ListQuantumKeyInfos().size()),
+        startup_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+                          m_wallet.cs_wallet,
+                          return m_wallet.m_pow_payout_quantum),
+                      payout);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK(m_wallet.m_pow_state.load() ==
+                interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
 
     // A marker-only GUI transition may narrow an installed key, but it cannot
     // expand staking-only authority. Normal signing authority must come from a
@@ -3361,6 +4864,83 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_autostart_waits_for_normal_unlock)
                              ? m_wallet.threadPowMinerGroup->size()
                              : 0U),
         0U);
+}
+
+BOOST_FIXTURE_TEST_CASE(pow_mining_reserve_cache_and_controls_are_nonblocking,
+                        WalletShadowPowQQP2TestingSetup)
+{
+    std::shared_ptr<CWallet> wallet{CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey).release()};
+    WalletContext wallet_context;
+    wallet_context.chain = m_node.chain.get();
+    auto wallet_interface = interfaces::MakeWallet(wallet_context, wallet);
+
+    BOOST_CHECK(!wallet_interface->getPowMiningInfo().stake_reserve_available);
+    wallet_interface->refreshPowMiningStakeReserve();
+    BOOST_REQUIRE(wallet_interface->getPowMiningInfo().stake_reserve_available);
+    wallet->SetStakingEnabled(true);
+    BOOST_CHECK(!wallet_interface->getPowMiningInfo().stake_reserve_available);
+    wallet_interface->refreshPowMiningStakeReserve();
+    BOOST_REQUIRE(wallet_interface->getPowMiningInfo().stake_reserve_available);
+    const COutPoint coin{m_coinbase_txns.front()->GetHash(), 0};
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return wallet->LockCoin(coin)));
+    BOOST_CHECK(!wallet_interface->getPowMiningInfo().stake_reserve_available);
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return wallet->UnlockCoin(coin)));
+    wallet_interface->refreshPowMiningStakeReserve();
+    BOOST_REQUIRE(wallet_interface->getPowMiningInfo().stake_reserve_available);
+
+    const auto check_contended_getter = [&](RecursiveMutex& mutex) {
+        std::promise<void> held;
+        std::promise<void> release;
+        auto released = release.get_future();
+        std::thread holder([&] {
+            LOCK(mutex);
+            held.set_value();
+            released.wait();
+        });
+        held.get_future().wait();
+        auto read = std::async(std::launch::async, [&] {
+            return wallet_interface->getPowMiningInfo();
+        });
+        const bool returned_without_lock =
+            read.wait_for(std::chrono::seconds{1}) == std::future_status::ready;
+        release.set_value();
+        holder.join();
+        const auto info = read.get();
+        BOOST_CHECK(returned_without_lock);
+        BOOST_CHECK(!info.payout_address_available);
+        BOOST_CHECK(!info.wallet_goldrush_status_available);
+        BOOST_CHECK(!info.stake_reserve_available);
+    };
+    check_contended_getter(::cs_main);
+    check_contended_getter(wallet->cs_wallet);
+
+    // Disable only relaxes reserve policy; it must remain immediate even
+    // while another thread holds the wallet lock. Later enable is serialized.
+    std::promise<void> held;
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        held.set_value();
+        released.wait();
+    });
+    held.get_future().wait();
+    auto disable = std::async(std::launch::async, [&] {
+        wallet_interface->setEnabledStaking(false);
+    });
+    const bool disabled_without_lock =
+        disable.wait_for(std::chrono::seconds{1}) == std::future_status::ready;
+    const bool enabled_before_release = wallet->m_enabled_staking.load();
+    release.set_value();
+    holder.join();
+    disable.get();
+    BOOST_CHECK(disabled_without_lock);
+    BOOST_CHECK(!enabled_before_release);
+    BOOST_CHECK(!wallet_interface->getPowMiningInfo().stake_reserve_available);
 }
 
 BOOST_FIXTURE_TEST_CASE(lifecycle_balance_requires_matching_wallet_and_chain_tips, TestChain100Setup)
@@ -4482,6 +6062,152 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTesti
     BOOST_CHECK(error.original.find("ordinary direct") != std::string::npos);
     BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
 
+    // Address-book fallback must apply the same direct-address predicate as
+    // explicit configuration. A wallet-owned tiered alias resolves to a real
+    // key, but it is not a valid payout script and must never shadow a later
+    // ordinary direct labeled address.
+    args_guard.Unset("-qqpowpayoutaddress");
+    args_guard.Unset("-qqpospayoutaddress");
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_pow_payout_quantum = tiered_address;
+    }
+    error.clear();
+    created = true;
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("ordinary direct") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.m_pow_payout_quantum),
+        tiered_address);
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_pow_payout_quantum.clear();
+    }
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        tiered_dest, "PoW - Quantum Claim Address",
+        AddressPurpose::RECEIVE));
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_pow_payout_quantum.clear();
+    }
+    error.clear();
+    created = true;
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("no existing payout key") !=
+                std::string::npos);
+    BOOST_CHECK(WITH_LOCK(
+        m_wallet.cs_wallet,
+        return m_wallet.m_pow_payout_quantum.empty()));
+
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        owned_dest, "PoW - Quantum Claim Address",
+        AddressPurpose::RECEIVE));
+    error.clear();
+    created = true;
+    BOOST_REQUIRE_MESSAGE(
+        m_wallet.EnsurePowPayoutAddress(error, &created), error.original);
+    BOOST_CHECK(!created);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.cs_wallet,
+                  return m_wallet.m_pow_payout_quantum),
+        owned_address);
+
+    // Multiple valid direct labels are operator-ambiguous. Fail before
+    // publishing a cached address or creating any hidden key.
+    CTxDestination second_direct_dest;
+    {
+        LOCK(m_wallet.cs_wallet);
+        auto second =
+            m_wallet.GetNewQuantumDestination("second direct quantum key");
+        BOOST_REQUIRE(second);
+        second_direct_dest = *second;
+        m_wallet.m_pow_payout_quantum.clear();
+    }
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "Quantum PoW Reward Address",
+        AddressPurpose::RECEIVE));
+    const size_t fallback_key_count = WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size());
+    error.clear();
+    created = true;
+    BOOST_REQUIRE_MESSAGE(
+        m_wallet.EnsurePowPayoutAddress(error, &created), error.original);
+    BOOST_CHECK(!created);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.m_pow_payout_quantum),
+        owned_address);
+
+    // Two different direct addresses carrying the same highest-priority
+    // current label are ambiguous, independent of destination map ordering.
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "PoW - Quantum Claim Address",
+        AddressPurpose::RECEIVE));
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_pow_payout_quantum.clear();
+    }
+    error.clear();
+    created = true;
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("ambiguous") != std::string::npos);
+    BOOST_CHECK(WITH_LOCK(
+        m_wallet.cs_wallet,
+        return m_wallet.m_pow_payout_quantum.empty()));
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()),
+        fallback_key_count);
+
+    // Repeat the fallback proof for PoS. Invalid tiered labels are skipped,
+    // one direct label is accepted, and two direct labels fail without
+    // leaking a partially selected output to the caller.
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        tiered_dest, "PoS - Quantum Stake Address",
+        AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        owned_dest, "PoS - Quantum Stake Address",
+        AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "Quantum PoS Reward Address",
+        AddressPurpose::RECEIVE));
+    payout_script.clear();
+    payout_address.clear();
+    error.clear();
+    created = true;
+    BOOST_REQUIRE_MESSAGE(
+        m_wallet.EnsureShadowSignalPayoutAddress(
+            payout_script, payout_address, error, &created),
+        error.original);
+    BOOST_CHECK(!created);
+    BOOST_CHECK_EQUAL(payout_address, owned_address);
+    BOOST_CHECK(payout_script == GetScriptForDestination(owned_dest));
+
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "PoS - Quantum Stake Address",
+        AddressPurpose::RECEIVE));
+    payout_script.clear();
+    payout_address.clear();
+    error.clear();
+    created = true;
+    BOOST_CHECK(!m_wallet.EnsureShadowSignalPayoutAddress(
+        payout_script, payout_address, error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("ambiguous") != std::string::npos);
+    BOOST_CHECK(payout_script.empty());
+    BOOST_CHECK(payout_address.empty());
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()),
+        fallback_key_count);
+
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        tiered_dest, "tiered binding rejection", AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        owned_dest, "ordinary quantum key", AddressPurpose::RECEIVE));
+    BOOST_REQUIRE(m_wallet.SetAddressBook(
+        second_direct_dest, "second direct quantum key",
+        AddressPurpose::RECEIVE));
     args_guard.Unset("-qqpospayoutaddress");
     payout_script.clear();
     payout_address.clear();
@@ -4495,26 +6221,26 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTesti
     BOOST_CHECK(m_wallet.PrepareAutomaticDemurrageChangeAddress(coin_control, error));
     BOOST_CHECK(std::holds_alternative<CNoDestination>(coin_control.destChange));
     BOOST_CHECK(!coin_control.m_allow_new_quantum_key);
-    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), fallback_key_count);
 
     args_guard.Force("-qqautodemurrageattest", "0");
     {
         LOCK(m_wallet.cs_wallet);
         m_wallet.m_demurrage_last_auto_attest_scan_height = 77;
     }
-    m_wallet.m_enabled_staking = true;
+    m_wallet.SetStakingEnabled(true);
     BOOST_CHECK_EQUAL(MaybeAutoDemurrageAttest(m_wallet), 0);
-    m_wallet.m_enabled_staking = false;
+    m_wallet.SetStakingEnabled(false);
     BOOST_CHECK_EQUAL(
         WITH_LOCK(m_wallet.cs_wallet, return m_wallet.m_demurrage_last_auto_attest_scan_height),
         77);
-    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), fallback_key_count);
 
     // The source-level guard remains fail-closed even if a caller bypasses
     // startup parameter interaction and leaves auto-redelegation enabled.
     args_guard.Force("-qqautoredelegate", "1");
     BOOST_CHECK_EQUAL(MaybeAutoRedelegateQuantumColdStake(m_wallet), 0);
-    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), fallback_key_count);
 }
 
 BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)
@@ -4606,7 +6332,9 @@ BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)
         BOOST_CHECK(reloaded.ListQuantumKeyInfos().empty());
     }
 
-    // A failed durable commit has the same all-or-nothing result.
+    // If a durable commit reports failure, the caller cannot know whether the
+    // backend rolled it back or committed it. Keep memory unpublished and
+    // block every retry until reload establishes the database's actual state.
     {
         CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
         BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
@@ -4617,11 +6345,96 @@ BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)
         BOOST_CHECK(!result);
         BOOST_CHECK(database.m_last_txn_durable);
         BOOST_CHECK(database.m_records == initial_records);
+        BOOST_CHECK(wallet.IsQuantumKeyDatabaseAmbiguous());
+        BOOST_CHECK(wallet.IsAddressBookDatabaseAmbiguous());
+        database.m_fail_commit = false;
+        BOOST_CHECK(!wallet.AddQuantumKey(public_key, private_key, "must-not-retry", GetTime(), /*record_as_receive=*/true));
+        BOOST_CHECK(!wallet.GetNewQuantumDestination("must-not-generate"));
 
         CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
         BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
-        LOCK(reloaded.cs_wallet);
-        BOOST_CHECK(reloaded.ListQuantumKeyInfos().empty());
+        BOOST_CHECK(WITH_LOCK(reloaded.cs_wallet, return reloaded.ListQuantumKeyInfos().empty()));
+        BOOST_CHECK(!reloaded.IsQuantumKeyDatabaseAmbiguous());
+        BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
+    }
+
+    // A write failure whose transaction cannot be aborted is equally
+    // uncertain, even when this mock happens to discard its staged records.
+    {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        database.m_fail_write_at = 0;
+        database.m_fail_abort = true;
+        auto result = wallet.AddQuantumKey(public_key, private_key, "abort-ambiguous", GetTime(), /*record_as_receive=*/true);
+        BOOST_CHECK(!result);
+        BOOST_CHECK(wallet.IsQuantumKeyDatabaseAmbiguous());
+        BOOST_CHECK(wallet.IsAddressBookDatabaseAmbiguous());
+        database.m_fail_write_at.reset();
+        database.m_fail_abort = false;
+        BOOST_CHECK(!wallet.GetNewQuantumDestination("must-not-generate"));
+        BOOST_CHECK_EQUAL(database.m_commit_calls, 0U);
+
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_CHECK(WITH_LOCK(reloaded.cs_wallet, return reloaded.ListQuantumKeyInfos().empty()));
+        BOOST_CHECK(!reloaded.IsQuantumKeyDatabaseAmbiguous());
+        BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
+    }
+
+    // Model the other valid backend outcome: all key and label records are
+    // durable even though commit returned false. Live memory and observers
+    // stay at the old state; reload recovers exactly that one complete key.
+    {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        database.m_fail_commit = true;
+        database.m_commit_records_on_failure = true;
+        size_t notifications{0};
+        auto connection = wallet.NotifyAddressBookChanged.connect(
+            [&](const CTxDestination&, const std::string&, bool, AddressPurpose, ChangeType) { ++notifications; });
+
+        auto result = wallet.AddQuantumKey(public_key, private_key, "committed-ambiguously", GetTime(), /*record_as_receive=*/true);
+        BOOST_CHECK(!result);
+        BOOST_CHECK_EQUAL(notifications, 0U);
+        BOOST_CHECK(WITH_LOCK(wallet.cs_wallet, return wallet.ListQuantumKeyInfos().empty()));
+        BOOST_CHECK(WITH_LOCK(wallet.cs_wallet, return wallet.m_address_book.empty()));
+        BOOST_CHECK(wallet.IsQuantumKeyDatabaseAmbiguous());
+        BOOST_CHECK(wallet.IsAddressBookDatabaseAmbiguous());
+        BOOST_CHECK(!wallet.GetNewQuantumDestination("must-not-generate"));
+        BOOST_CHECK_EQUAL(database.m_commit_calls, 1U);
+
+        bilingual_str error;
+        bool created{true};
+        BOOST_CHECK(!wallet.EnsurePowPayoutAddress(error, &created));
+        BOOST_CHECK(!created);
+        BOOST_CHECK(error.original.find("uncertain database outcome") != std::string::npos);
+        CScript payout_script;
+        std::string payout_address;
+        error.clear();
+        created = true;
+        BOOST_CHECK(!wallet.EnsureShadowSignalPayoutAddress(payout_script, payout_address, error, &created));
+        BOOST_CHECK(!created);
+        BOOST_CHECK(payout_script.empty());
+        BOOST_CHECK(payout_address.empty());
+        BOOST_CHECK(error.original.find("uncertain database outcome") != std::string::npos);
+
+        const CTxDestination destination = WitnessUnknown{
+            QUANTUM_MIGRATION_WITNESS_VERSION,
+            QuantumMigrationProgramForPubkey(public_key)};
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_CHECK_EQUAL(WITH_LOCK(reloaded.cs_wallet, return reloaded.ListQuantumKeyInfos().size()), 1U);
+        BOOST_REQUIRE(WITH_LOCK(reloaded.cs_wallet, return reloaded.GetQuantumKeyInfo(destination).has_value()));
+        const CAddressBookData* entry = WITH_LOCK(
+            reloaded.cs_wallet, return reloaded.FindAddressBookEntry(destination));
+        BOOST_REQUIRE(entry);
+        BOOST_CHECK_EQUAL(entry->GetLabel(), "committed-ambiguously");
+        BOOST_CHECK(entry->purpose == AddressPurpose::RECEIVE);
+        BOOST_CHECK(!reloaded.IsQuantumKeyDatabaseAmbiguous());
+        BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
+        connection.disconnect();
     }
 
     // Once the durable commit reports success, a fresh process view recovers
@@ -4645,6 +6458,469 @@ BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)
         BOOST_CHECK(!info->backup_verified);
         CheckQuantumKeyChallenge(reloaded, destination);
     }
+}
+
+BOOST_AUTO_TEST_CASE(tiered_quantum_key_and_label_are_one_atomic_commit)
+{
+    const auto distinct_key_count = [](const CWallet& wallet) {
+        std::set<std::vector<unsigned char>> public_keys;
+        for (const QuantumKeyInfo& info : WITH_LOCK(
+                 wallet.cs_wallet, return wallet.ListQuantumKeyInfos())) {
+            public_keys.insert(info.public_key);
+        }
+        return public_keys.size();
+    };
+    for (size_t fail_write = 0; fail_write < 5; ++fail_write) {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        const MockableData initial_records = database.m_records;
+        database.m_fail_write_at = fail_write;
+
+        auto failed = wallet.GetNewTieredQuantumDestination("tiered-label", /*unbonding_blocks=*/9450);
+        BOOST_CHECK(!failed);
+        BOOST_CHECK(database.m_records == initial_records);
+        BOOST_CHECK(WITH_LOCK(wallet.cs_wallet, return wallet.ListQuantumKeyInfos().empty()));
+        BOOST_CHECK(WITH_LOCK(wallet.cs_wallet, return wallet.m_address_book.empty()));
+        BOOST_CHECK(!wallet.IsQuantumKeyDatabaseAmbiguous());
+        BOOST_CHECK(!wallet.IsAddressBookDatabaseAmbiguous());
+
+        // Retrying after clearing the injected failure creates exactly one
+        // key and one matching tiered label, not an orphan plus a replacement.
+        database.m_fail_write_at.reset();
+        auto retried = wallet.GetNewTieredQuantumDestination("tiered-label", /*unbonding_blocks=*/9450);
+        BOOST_REQUIRE(retried);
+        BOOST_CHECK_EQUAL(distinct_key_count(wallet), 1U);
+        BOOST_REQUIRE(WITH_LOCK(wallet.cs_wallet, return wallet.FindAddressBookEntry(*retried) != nullptr));
+
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_CHECK_EQUAL(distinct_key_count(reloaded), 1U);
+        BOOST_REQUIRE(WITH_LOCK(reloaded.cs_wallet, return reloaded.FindAddressBookEntry(*retried) != nullptr));
+        const CAddressBookData* reloaded_entry = WITH_LOCK(
+            reloaded.cs_wallet, return reloaded.FindAddressBookEntry(*retried));
+        BOOST_REQUIRE(reloaded_entry);
+        BOOST_CHECK_EQUAL(reloaded_entry->GetLabel(), "tiered-label");
+        BOOST_CHECK(reloaded_entry->purpose == AddressPurpose::RECEIVE);
+    }
+
+    CWallet commit_failure(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(commit_failure.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& commit_database = GetMockableDatabase(commit_failure);
+    const MockableData initial_records = commit_database.m_records;
+    commit_database.m_fail_commit = true;
+    auto failed_commit = commit_failure.GetNewTieredQuantumDestination("tiered-label", /*unbonding_blocks=*/9450);
+    BOOST_CHECK(!failed_commit);
+    BOOST_CHECK(commit_database.m_records == initial_records);
+    BOOST_CHECK(WITH_LOCK(commit_failure.cs_wallet, return commit_failure.ListQuantumKeyInfos().empty()));
+    BOOST_CHECK(WITH_LOCK(commit_failure.cs_wallet, return commit_failure.m_address_book.empty()));
+    BOOST_CHECK(commit_failure.IsQuantumKeyDatabaseAmbiguous());
+    BOOST_CHECK(commit_failure.IsAddressBookDatabaseAmbiguous());
+    commit_database.m_fail_commit = false;
+    BOOST_CHECK(!commit_failure.GetNewTieredQuantumDestination("must-not-retry", /*unbonding_blocks=*/9450));
+    CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(commit_database));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(WITH_LOCK(reloaded.cs_wallet, return reloaded.ListQuantumKeyInfos().empty()));
+    BOOST_CHECK(WITH_LOCK(reloaded.cs_wallet, return reloaded.m_address_book.empty()));
+    BOOST_CHECK(!reloaded.IsQuantumKeyDatabaseAmbiguous());
+    BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
+
+    CWallet abort_failure(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(abort_failure.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& abort_database = GetMockableDatabase(abort_failure);
+    abort_database.m_fail_write_at = 0;
+    abort_database.m_fail_abort = true;
+    BOOST_CHECK(!abort_failure.GetNewTieredQuantumDestination("tiered-abort", /*unbonding_blocks=*/9450));
+    BOOST_CHECK(abort_failure.IsQuantumKeyDatabaseAmbiguous());
+    BOOST_CHECK(abort_failure.IsAddressBookDatabaseAmbiguous());
+    abort_database.m_fail_write_at.reset();
+    abort_database.m_fail_abort = false;
+    BOOST_CHECK(!abort_failure.GetNewTieredQuantumDestination("must-not-retry", /*unbonding_blocks=*/9450));
+
+    CWallet applied_commit(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(applied_commit.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& applied_database = GetMockableDatabase(applied_commit);
+    applied_database.m_fail_commit = true;
+    applied_database.m_commit_records_on_failure = true;
+    size_t notifications{0};
+    auto connection = applied_commit.NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string&, bool, AddressPurpose, ChangeType) { ++notifications; });
+    BOOST_CHECK(!applied_commit.GetNewTieredQuantumDestination("tiered-applied", /*unbonding_blocks=*/9450));
+    BOOST_CHECK_EQUAL(notifications, 0U);
+    BOOST_CHECK(WITH_LOCK(applied_commit.cs_wallet, return applied_commit.ListQuantumKeyInfos().empty()));
+    BOOST_CHECK(WITH_LOCK(applied_commit.cs_wallet, return applied_commit.m_address_book.empty()));
+    BOOST_CHECK(applied_commit.IsQuantumKeyDatabaseAmbiguous());
+    BOOST_CHECK(applied_commit.IsAddressBookDatabaseAmbiguous());
+    applied_database.m_fail_commit = false;
+    applied_database.m_commit_records_on_failure = false;
+    BOOST_CHECK(!applied_commit.GetNewTieredQuantumDestination("must-not-retry", /*unbonding_blocks=*/9450));
+    BOOST_CHECK_EQUAL(applied_database.m_commit_calls, 1U);
+    bilingual_str payout_error;
+    bool created{true};
+    BOOST_CHECK(!applied_commit.EnsurePowPayoutAddress(payout_error, &created));
+    BOOST_CHECK(!created);
+    CScript payout_script;
+    std::string payout_address;
+    payout_error.clear();
+    created = true;
+    BOOST_CHECK(!applied_commit.EnsureShadowSignalPayoutAddress(
+        payout_script, payout_address, payout_error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(payout_script.empty());
+    BOOST_CHECK(payout_address.empty());
+
+    CWallet applied_reload(/*chain=*/nullptr, "", DuplicateMockDatabase(applied_database));
+    BOOST_REQUIRE_EQUAL(applied_reload.LoadWallet(), DBErrors::LOAD_OK);
+    const std::vector<QuantumKeyInfo> infos = WITH_LOCK(
+        applied_reload.cs_wallet, return applied_reload.ListQuantumKeyInfos());
+    BOOST_CHECK_EQUAL(distinct_key_count(applied_reload), 1U);
+    const auto applied_info = std::find_if(
+        infos.begin(), infos.end(), [&](const QuantumKeyInfo& info) {
+            return WITH_LOCK(
+                applied_reload.cs_wallet,
+                const CAddressBookData* entry =
+                    applied_reload.FindAddressBookEntry(info.destination);
+                return entry && entry->GetLabel() == "tiered-applied";);
+        });
+    BOOST_REQUIRE(applied_info != infos.end());
+    const CTxDestination applied_destination = applied_info->destination;
+    const CAddressBookData* applied_entry = WITH_LOCK(
+        applied_reload.cs_wallet, return applied_reload.FindAddressBookEntry(applied_destination));
+    BOOST_REQUIRE(applied_entry);
+    BOOST_CHECK_EQUAL(applied_entry->GetLabel(), "tiered-applied");
+    BOOST_CHECK(applied_entry->purpose == AddressPurpose::RECEIVE);
+    BOOST_CHECK(!applied_reload.IsQuantumKeyDatabaseAmbiguous());
+    BOOST_CHECK(!applied_reload.IsAddressBookDatabaseAmbiguous());
+    connection.disconnect();
+}
+
+BOOST_AUTO_TEST_CASE(quantum_cold_stake_labels_publish_only_after_durable_commit)
+{
+    // Seed a durable wallet-owned ML-DSA key without an address-book row. Both
+    // delegation entry points below can then be exercised from the same exact
+    // database prestate without generating another key.
+    CWallet seed(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    auto key_destination = seed.GetNewQuantumChangeDestination();
+    BOOST_REQUIRE(key_destination);
+    const std::optional<QuantumKeyInfo> key_info = WITH_LOCK(
+        seed.cs_wallet, return seed.GetQuantumKeyInfo(*key_destination));
+    BOOST_REQUIRE(key_info);
+    const std::vector<unsigned char> public_key = key_info->public_key;
+    const std::vector<unsigned char> key_program =
+        QuantumMigrationProgramForPubkey(public_key);
+    BOOST_REQUIRE_EQUAL(key_program.size(), uint256::size());
+    uint256 key_hash;
+    std::copy(key_program.begin(), key_program.end(), key_hash.begin());
+    const MockableData seed_records = GetMockableDatabase(seed).m_records;
+    BOOST_CHECK(WITH_LOCK(seed.cs_wallet, return seed.m_address_book.empty()));
+
+    const CTxDestination direct_destination = WitnessUnknown{
+        QUANTUM_COLDSTAKE_WITNESS_VERSION,
+        QuantumColdStakeProgramForPubkeys(public_key, public_key)};
+    const CTxDestination tiered_destination = WitnessUnknown{
+        QUANTUM_COLDSTAKE_WITNESS_VERSION,
+        QuantumTieredColdStakeProgramForKeyHashes(
+            key_hash, key_hash, QUANTUM_TIERED_STATE_BONDED,
+            /*unbonding_blocks=*/9450, /*unlock_height=*/0)};
+
+    auto exercise = [&](const CTxDestination& expected_destination,
+                        const std::string& label, auto&& add_delegation) {
+        enum class FailureStage {
+            BEGIN,
+            DELEGATION_WRITE,
+            PURPOSE_WRITE,
+            NAME_WRITE,
+            ABORT,
+            COMMIT,
+        };
+        for (const FailureStage stage : {
+                 FailureStage::BEGIN, FailureStage::DELEGATION_WRITE,
+                 FailureStage::PURPOSE_WRITE, FailureStage::NAME_WRITE,
+                 FailureStage::ABORT, FailureStage::COMMIT}) {
+            CWallet wallet(
+                /*chain=*/nullptr, "", CreateMockableWalletDatabase(seed_records));
+            BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+            MockableDatabase& database = GetMockableDatabase(wallet);
+            if (stage == FailureStage::BEGIN) database.m_fail_begin = true;
+            if (stage >= FailureStage::DELEGATION_WRITE &&
+                stage <= FailureStage::NAME_WRITE) {
+                database.m_fail_write_at =
+                    static_cast<size_t>(stage) -
+                    static_cast<size_t>(FailureStage::DELEGATION_WRITE);
+            }
+            if (stage == FailureStage::ABORT) {
+                database.m_fail_write_at = 0;
+                database.m_fail_abort = true;
+            }
+            if (stage == FailureStage::COMMIT) database.m_fail_commit = true;
+            size_t notifications{0};
+            auto connection = wallet.NotifyAddressBookChanged.connect(
+                [&](const CTxDestination&, const std::string&, bool,
+                    AddressPurpose, ChangeType) { ++notifications; });
+
+            BOOST_CHECK(!add_delegation(wallet));
+            BOOST_CHECK_EQUAL(notifications, 0U);
+            BOOST_CHECK(database.m_records == seed_records);
+            BOOST_CHECK(WITH_LOCK(
+                wallet.cs_wallet,
+                return wallet.ListQuantumColdStakeDelegationInfos().empty()));
+            BOOST_CHECK(WITH_LOCK(
+                wallet.cs_wallet,
+                return wallet.FindAddressBookEntry(expected_destination) ==
+                       nullptr));
+            const bool ambiguous = stage == FailureStage::ABORT ||
+                                   stage == FailureStage::COMMIT;
+            BOOST_CHECK_EQUAL(
+                wallet.IsQuantumDelegationDatabaseAmbiguous(), ambiguous);
+            BOOST_CHECK_EQUAL(
+                wallet.IsAddressBookDatabaseAmbiguous(), ambiguous);
+            if (ambiguous) {
+                database.m_fail_write_at.reset();
+                database.m_fail_abort = false;
+                database.m_fail_commit = false;
+                const size_t commit_calls = database.m_commit_calls;
+                BOOST_CHECK(!add_delegation(wallet));
+                BOOST_CHECK_EQUAL(database.m_commit_calls, commit_calls);
+            }
+
+            CWallet reloaded(
+                /*chain=*/nullptr, "", DuplicateMockDatabase(database));
+            BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+            BOOST_CHECK(WITH_LOCK(
+                reloaded.cs_wallet,
+                return reloaded.ListQuantumColdStakeDelegationInfos().empty()));
+            BOOST_CHECK(WITH_LOCK(
+                reloaded.cs_wallet,
+                return reloaded.FindAddressBookEntry(expected_destination) ==
+                       nullptr));
+            BOOST_CHECK(
+                !reloaded.IsQuantumDelegationDatabaseAmbiguous());
+            BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
+            connection.disconnect();
+        }
+
+        // The database may contain the complete delegation and label even
+        // when commit reports false. Do not publish or notify in the live
+        // wallet, and do not permit a retry before reload.
+        CWallet committed_ambiguously(
+            /*chain=*/nullptr, "", CreateMockableWalletDatabase(seed_records));
+        BOOST_REQUIRE_EQUAL(
+            committed_ambiguously.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& ambiguous_database =
+            GetMockableDatabase(committed_ambiguously);
+        ambiguous_database.m_fail_commit = true;
+        ambiguous_database.m_commit_records_on_failure = true;
+        size_t ambiguous_notifications{0};
+        auto ambiguous_connection =
+            committed_ambiguously.NotifyAddressBookChanged.connect(
+                [&](const CTxDestination&, const std::string&, bool,
+                    AddressPurpose, ChangeType) {
+                    ++ambiguous_notifications;
+                });
+        BOOST_CHECK(!add_delegation(committed_ambiguously));
+        BOOST_CHECK_EQUAL(ambiguous_notifications, 0U);
+        BOOST_CHECK(ambiguous_database.m_records != seed_records);
+        BOOST_CHECK(WITH_LOCK(
+            committed_ambiguously.cs_wallet,
+            return committed_ambiguously
+                .ListQuantumColdStakeDelegationInfos()
+                .empty()));
+        BOOST_CHECK(WITH_LOCK(
+            committed_ambiguously.cs_wallet,
+            return committed_ambiguously.FindAddressBookEntry(
+                       expected_destination) == nullptr));
+        BOOST_CHECK(
+            committed_ambiguously
+                .IsQuantumDelegationDatabaseAmbiguous());
+        BOOST_CHECK(
+            committed_ambiguously.IsAddressBookDatabaseAmbiguous());
+        const size_t ambiguous_commit_calls =
+            ambiguous_database.m_commit_calls;
+        ambiguous_database.m_fail_commit = false;
+        ambiguous_database.m_commit_records_on_failure = false;
+        BOOST_CHECK(!add_delegation(committed_ambiguously));
+        BOOST_CHECK_EQUAL(
+            ambiguous_database.m_commit_calls, ambiguous_commit_calls);
+
+        CWallet ambiguous_reload(
+            /*chain=*/nullptr, "", DuplicateMockDatabase(ambiguous_database));
+        BOOST_REQUIRE_EQUAL(
+            ambiguous_reload.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_CHECK_EQUAL(
+            WITH_LOCK(
+                ambiguous_reload.cs_wallet,
+                return ambiguous_reload
+                    .ListQuantumColdStakeDelegationInfos()
+                    .size()),
+            1U);
+        BOOST_REQUIRE(WITH_LOCK(
+            ambiguous_reload.cs_wallet,
+            return ambiguous_reload
+                .GetQuantumColdStakeDelegationInfo(expected_destination)
+                .has_value()));
+        const CAddressBookData* ambiguous_entry = WITH_LOCK(
+            ambiguous_reload.cs_wallet,
+            return ambiguous_reload.FindAddressBookEntry(
+                expected_destination));
+        BOOST_REQUIRE(ambiguous_entry);
+        BOOST_CHECK_EQUAL(ambiguous_entry->GetLabel(), label);
+        BOOST_CHECK(
+            ambiguous_entry->purpose == AddressPurpose::RECEIVE);
+        BOOST_CHECK(
+            !ambiguous_reload.IsQuantumDelegationDatabaseAmbiguous());
+        BOOST_CHECK(!ambiguous_reload.IsAddressBookDatabaseAmbiguous());
+        ambiguous_connection.disconnect();
+
+        CWallet successful(
+            /*chain=*/nullptr, "", CreateMockableWalletDatabase(seed_records));
+        BOOST_REQUIRE_EQUAL(successful.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& successful_database =
+            GetMockableDatabase(successful);
+        size_t notifications{0};
+        auto connection = successful.NotifyAddressBookChanged.connect(
+            [&](const CTxDestination& destination,
+                const std::string& notified_label, bool is_mine,
+                AddressPurpose purpose, ChangeType status) {
+                BOOST_CHECK(destination == expected_destination);
+                BOOST_CHECK_EQUAL(notified_label, label);
+                BOOST_CHECK(is_mine);
+                BOOST_CHECK(purpose == AddressPurpose::RECEIVE);
+                BOOST_CHECK(status == CT_NEW);
+                BOOST_CHECK_EQUAL(successful_database.m_commit_calls, 1U);
+                ++notifications;
+            });
+        auto result = add_delegation(successful);
+        BOOST_REQUIRE(result);
+        BOOST_CHECK(*result == expected_destination);
+        BOOST_CHECK(successful_database.m_last_txn_durable);
+        BOOST_CHECK_EQUAL(successful_database.m_write_calls, 3U);
+        BOOST_CHECK_EQUAL(notifications, 1U);
+        BOOST_CHECK_EQUAL(WITH_LOCK(
+            successful.cs_wallet,
+            return successful.ListQuantumColdStakeDelegationInfos().size()),
+            1U);
+        const CAddressBookData* successful_entry = WITH_LOCK(
+            successful.cs_wallet,
+            return successful.FindAddressBookEntry(expected_destination));
+        BOOST_REQUIRE(successful_entry);
+        BOOST_CHECK_EQUAL(successful_entry->GetLabel(), label);
+        BOOST_CHECK(successful_entry->purpose == AddressPurpose::RECEIVE);
+
+        CWallet successful_reload(
+            /*chain=*/nullptr, "", DuplicateMockDatabase(successful_database));
+        BOOST_REQUIRE_EQUAL(
+            successful_reload.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_CHECK_EQUAL(WITH_LOCK(
+            successful_reload.cs_wallet,
+            return successful_reload
+                .ListQuantumColdStakeDelegationInfos()
+                .size()),
+            1U);
+        BOOST_REQUIRE(WITH_LOCK(
+            successful_reload.cs_wallet,
+            return successful_reload.FindAddressBookEntry(
+                       expected_destination) != nullptr));
+        connection.disconnect();
+    };
+
+    exercise(
+        direct_destination, "direct-delegation",
+        [&](CWallet& wallet) {
+            return wallet.AddQuantumColdStakeDelegation(
+                public_key, public_key, "direct-delegation", GetTime(),
+                /*record_as_receive=*/true,
+                /*unbonding_blocks=*/0, /*tiered=*/false);
+        });
+    exercise(
+        tiered_destination, "tiered-delegation",
+        [&](CWallet& wallet) {
+            return wallet.AddQuantumColdStakeDelegationForKeyHashes(
+                key_hash, key_hash, "tiered-delegation", GetTime(),
+                /*unbonding_blocks=*/9450, /*unlock_height=*/0,
+                QUANTUM_TIERED_STATE_BONDED,
+                /*record_as_receive=*/true);
+        });
+}
+
+BOOST_AUTO_TEST_CASE(unlabeled_quantum_delegation_ambiguity_blocks_retry_until_reload)
+{
+    CWallet seed(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    auto key_destination = seed.GetNewQuantumChangeDestination();
+    BOOST_REQUIRE(key_destination);
+    const std::optional<QuantumKeyInfo> key_info = WITH_LOCK(
+        seed.cs_wallet, return seed.GetQuantumKeyInfo(*key_destination));
+    BOOST_REQUIRE(key_info);
+    const std::vector<unsigned char> public_key = key_info->public_key;
+    const MockableData seed_records = GetMockableDatabase(seed).m_records;
+    const CTxDestination expected_destination = WitnessUnknown{
+        QUANTUM_COLDSTAKE_WITNESS_VERSION,
+        QuantumColdStakeProgramForPubkeys(public_key, public_key)};
+
+    auto add_unlabeled = [&](CWallet& wallet) {
+        return wallet.AddQuantumColdStakeDelegation(
+            public_key, public_key, "ignored-label", GetTime(),
+            /*record_as_receive=*/false,
+            /*unbonding_blocks=*/0, /*tiered=*/false);
+    };
+
+    CWallet abort_failure(
+        /*chain=*/nullptr, "", CreateMockableWalletDatabase(seed_records));
+    BOOST_REQUIRE_EQUAL(abort_failure.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& abort_database = GetMockableDatabase(abort_failure);
+    abort_database.m_fail_write_at = 0;
+    abort_database.m_fail_abort = true;
+    BOOST_CHECK(!add_unlabeled(abort_failure));
+    BOOST_CHECK(
+        abort_failure.IsQuantumDelegationDatabaseAmbiguous());
+    BOOST_CHECK(!abort_failure.IsAddressBookDatabaseAmbiguous());
+    abort_database.m_fail_write_at.reset();
+    abort_database.m_fail_abort = false;
+    BOOST_CHECK(!add_unlabeled(abort_failure));
+    BOOST_CHECK_EQUAL(abort_database.m_commit_calls, 0U);
+
+    CWallet committed_ambiguously(
+        /*chain=*/nullptr, "", CreateMockableWalletDatabase(seed_records));
+    BOOST_REQUIRE_EQUAL(
+        committed_ambiguously.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& ambiguous_database =
+        GetMockableDatabase(committed_ambiguously);
+    ambiguous_database.m_fail_commit = true;
+    ambiguous_database.m_commit_records_on_failure = true;
+    BOOST_CHECK(!add_unlabeled(committed_ambiguously));
+    BOOST_CHECK(ambiguous_database.m_records != seed_records);
+    BOOST_CHECK(WITH_LOCK(
+        committed_ambiguously.cs_wallet,
+        return committed_ambiguously.ListQuantumColdStakeDelegationInfos()
+            .empty()));
+    BOOST_CHECK(WITH_LOCK(
+        committed_ambiguously.cs_wallet,
+        return committed_ambiguously.m_address_book.empty()));
+    BOOST_CHECK(
+        committed_ambiguously.IsQuantumDelegationDatabaseAmbiguous());
+    BOOST_CHECK(!committed_ambiguously.IsAddressBookDatabaseAmbiguous());
+    ambiguous_database.m_fail_commit = false;
+    ambiguous_database.m_commit_records_on_failure = false;
+    BOOST_CHECK(!add_unlabeled(committed_ambiguously));
+    BOOST_CHECK_EQUAL(ambiguous_database.m_commit_calls, 1U);
+
+    CWallet reloaded(
+        /*chain=*/nullptr, "", DuplicateMockDatabase(ambiguous_database));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        reloaded.cs_wallet,
+        return reloaded.ListQuantumColdStakeDelegationInfos().size()),
+        1U);
+    BOOST_REQUIRE(WITH_LOCK(
+        reloaded.cs_wallet,
+        return reloaded
+            .GetQuantumColdStakeDelegationInfo(expected_destination)
+            .has_value()));
+    BOOST_CHECK(WITH_LOCK(
+        reloaded.cs_wallet, return reloaded.m_address_book.empty()));
+    BOOST_CHECK(!reloaded.IsQuantumDelegationDatabaseAmbiguous());
+    BOOST_CHECK(!reloaded.IsAddressBookDatabaseAmbiguous());
 }
 
 BOOST_AUTO_TEST_CASE(QuantumWalletEncryptionUsesCheckedDurabilityBarrier)
@@ -5706,6 +7982,457 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
 
 
     TestUnloadWallet(std::move(wallet));
+}
+
+// Exercise the exact AttachChainUnpublished phase which requires the narrow
+// ThreadSanitizer deadlock suppression. A real block notification is held in
+// the validation queue while a named wallet rescans the same block. The wallet
+// must remain absent from WalletContext and wallet RPC routing until both the
+// rescan and queued callback finish; only then may postInitProcess start the
+// configured real PoW worker.
+BOOST_FIXTURE_TEST_CASE(runtime_loadwallet_attachchain_lifecycle, TestChain100Setup)
+{
+    ScopedArgsSettings args_guard;
+    args_guard.Force("-unsafesqlitesync", "1");
+    args_guard.Force("-autostartstaking", "0");
+    args_guard.Force("-powmining", "0");
+    args_guard.Force("-powminingthreads", "1");
+    args_guard.Force("-powminingcpu", "1");
+    fs::create_directories(gArgs.GetDataDirNet() / "wallets");
+
+    WalletContext context;
+    context.args = &gArgs;
+    context.chain = m_node.chain.get();
+
+    const std::string wallet_name{"attachchain-lifecycle"};
+    DatabaseOptions create_options;
+    ReadDatabaseArgs(gArgs, create_options);
+    create_options.require_create = true;
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    create_options.create_passphrase = SecureString{"attachchain-passphrase"};
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    std::shared_ptr<CWallet> wallet = wallet::CreateWallet(
+        context, wallet_name, /*load_on_start=*/std::nullopt, create_options,
+        status, error, warnings);
+    BOOST_REQUIRE_MESSAGE(wallet, error.original);
+    BOOST_REQUIRE(wallet->IsLocked());
+    const CScript receive_script = GetScriptForDestination(
+        getNewDestination(*wallet, OutputType::BECH32));
+
+    SyncWithValidationInterfaceQueue();
+    BOOST_REQUIRE(RemoveWallet(
+        context, wallet, /*load_on_start=*/std::nullopt));
+    UnloadWallet(std::move(wallet));
+    BOOST_REQUIRE(GetWallets(context).empty());
+
+    // Hold all validation delivery, then produce a real BlockConnected event
+    // for a block which pays the unloaded wallet. AttachChainUnpublished will
+    // subscribe before rescanning it, so releasing this queue later must
+    // deliver a duplicate, harmless AddToWallet update before publication.
+    ValidationQueueBarrier attach_queue;
+
+    const CMutableTransaction block_tx = TestSimpleSpend(
+        *m_coinbase_txns[0], 0, coinbaseKey, receive_script);
+    const CMutableTransaction post_unload_tx = TestSimpleSpend(
+        *m_coinbase_txns[1], 0, coinbaseKey, receive_script);
+    CreateAndProcessBlock(
+        {block_tx}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+
+    std::atomic<bool> validation_caught_up{false};
+    CallFunctionInValidationInterfaceQueue(
+        [&validation_caught_up] { validation_caught_up.store(true); });
+
+    std::promise<void> rescan_release_promise;
+    std::shared_future<void> rescan_release{
+        rescan_release_promise.get_future().share()};
+    std::atomic<bool> rescan_released{false};
+    std::promise<void> rescan_entered_promise;
+    std::future<void> rescan_entered{rescan_entered_promise.get_future()};
+    std::atomic<bool> rescan_entered_signaled{false};
+    std::promise<void> rescan_completed_promise;
+    std::future<void> rescan_completed{rescan_completed_promise.get_future()};
+    std::atomic<bool> rescan_completed_signaled{false};
+    std::promise<void> worker_started_promise;
+    std::future<void> worker_started{worker_started_promise.get_future()};
+    std::atomic<bool> worker_started_signaled{false};
+    std::promise<void> worker_stopped_promise;
+    std::future<void> worker_stopped{worker_stopped_promise.get_future()};
+    std::atomic<bool> worker_stopped_signaled{false};
+    std::atomic<int> block_add_count{0};
+    std::atomic<int> post_unload_add_count{0};
+
+    std::future<std::shared_ptr<CWallet>> load_future;
+    std::atomic<bool> load_notified{false};
+    std::atomic<bool> notified_after_validation{false};
+    std::atomic<bool> notified_after_duplicate{false};
+    std::atomic<bool> notified_before_worker{false};
+    auto load_handler = HandleLoadWallet(
+        context, [&](std::unique_ptr<interfaces::Wallet>) {
+            notified_after_validation.store(validation_caught_up.load());
+            notified_after_duplicate.store(block_add_count.load() >= 2);
+            notified_before_worker.store(!worker_started_signaled.load());
+            load_notified.store(true);
+        });
+
+    const auto signal_once = [](
+                                 std::atomic<bool>& signaled,
+                                 std::promise<void>& promise) {
+        if (!signaled.exchange(true)) promise.set_value();
+    };
+    const std::string wallet_log_prefix{"[" + wallet_name + "] "};
+    const std::string block_add_pattern{
+        wallet_log_prefix + "AddToWallet " + block_tx.GetHash().ToString()};
+    const std::string post_unload_add_pattern{
+        wallet_log_prefix + "AddToWallet " +
+        post_unload_tx.GetHash().ToString()};
+    auto log_connection = LogInstance().PushBackCallback(
+        [&](const std::string& line) {
+            if (line.find(wallet_log_prefix + "Rescan started from block") !=
+                std::string::npos) {
+                signal_once(rescan_entered_signaled, rescan_entered_promise);
+                rescan_release.wait();
+            }
+            if (line.find(wallet_log_prefix + "Rescan completed") !=
+                std::string::npos) {
+                signal_once(
+                    rescan_completed_signaled, rescan_completed_promise);
+            }
+            if (line.find(block_add_pattern) != std::string::npos) {
+                ++block_add_count;
+            }
+            if (line.find(post_unload_add_pattern) != std::string::npos) {
+                ++post_unload_add_count;
+            }
+            if (line.find(
+                    wallet_log_prefix +
+                    "Gold Rush PoW worker 0 started") != std::string::npos) {
+                signal_once(worker_started_signaled, worker_started_promise);
+            }
+            if (line.find(
+                    wallet_log_prefix +
+                    "Gold Rush PoW worker 0 stopped") != std::string::npos) {
+                signal_once(worker_stopped_signaled, worker_stopped_promise);
+            }
+        });
+    auto log_cleanup = interfaces::MakeCleanupHandler(
+        [log_connection] { LogInstance().DeleteCallback(log_connection); });
+
+    const auto release_rescan = [&] {
+        if (!rescan_released.exchange(true)) rescan_release_promise.set_value();
+    };
+    // This guard is declared after the log cleanup and async future so an
+    // assertion cannot strand either callback behind a held logging mutex or
+    // leave the validation scheduler blocked during stack unwinding.
+    auto gate_cleanup = interfaces::MakeCleanupHandler([&] {
+        release_rescan();
+        attach_queue.Release();
+    });
+
+    args_guard.Force("-powmining", "1");
+    DatabaseOptions load_options;
+    ReadDatabaseArgs(gArgs, load_options);
+    load_options.require_existing = true;
+    warnings.clear();
+    error.clear();
+    load_future = std::async(std::launch::async, [&] {
+        return LoadWallet(
+            context, wallet_name, /*load_on_start=*/std::nullopt,
+            load_options, status, error, warnings);
+    });
+
+    // The log callback pauses inside ScanForWalletTransactions while
+    // AttachChainUnpublished still owns this private wallet's cs_wallet. No
+    // WalletContext lookup or default wallet RPC may route to it in this phase.
+    const bool entered_rescan =
+        rescan_entered.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready;
+    const bool attach_still_pending =
+        load_future.wait_for(std::chrono::milliseconds{50}) ==
+        std::future_status::timeout;
+    const bool named_wallet_unroutable =
+        GetWallet(context, wallet_name) == nullptr;
+    const bool no_default_wallet = GetWallets(context).empty();
+    JSONRPCRequest request;
+    request.context = &context;
+    int rpc_error_code{0};
+    try {
+        (void)GetWalletForJSONRPCRequest(request);
+    } catch (const UniValue& rpc_error) {
+        if (rpc_error["code"].isNum()) {
+            rpc_error_code = rpc_error["code"].getInt<int>();
+        }
+    }
+    release_rescan();
+
+    BOOST_CHECK(entered_rescan);
+    BOOST_CHECK(attach_still_pending);
+    BOOST_CHECK(named_wallet_unroutable);
+    BOOST_CHECK(no_default_wallet);
+    BOOST_CHECK_EQUAL(rpc_error_code, RPC_WALLET_NOT_FOUND);
+
+    // AttachChainUnpublished may now finish, but the production runtime-load
+    // boundary must wait for the queued BlockConnected callback before
+    // NotifyWalletLoaded, AddWallet, or postInitProcess can publish or start.
+    const bool completed_rescan =
+        rescan_completed.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready;
+    const bool catchup_still_pending =
+        load_future.wait_for(std::chrono::milliseconds{50}) ==
+        std::future_status::timeout;
+    const bool still_unpublished =
+        GetWallet(context, wallet_name) == nullptr;
+    const bool not_notified_early = !load_notified.load();
+
+    BOOST_CHECK(completed_rescan);
+    BOOST_CHECK(!validation_caught_up.load());
+    BOOST_CHECK(catchup_still_pending);
+    BOOST_CHECK(still_unpublished);
+    BOOST_CHECK(not_notified_early);
+
+    attach_queue.Release();
+    BOOST_REQUIRE(
+        load_future.wait_for(std::chrono::seconds{10}) ==
+        std::future_status::ready);
+    wallet = load_future.get();
+    BOOST_REQUIRE_MESSAGE(wallet, error.original);
+    BOOST_CHECK(
+        worker_started.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+
+    BOOST_CHECK(validation_caught_up.load());
+    BOOST_CHECK(load_notified.load());
+    BOOST_CHECK(notified_after_validation.load());
+    BOOST_CHECK(notified_after_duplicate.load());
+    BOOST_CHECK(notified_before_worker.load());
+    BOOST_CHECK_GE(block_add_count.load(), 2);
+    BOOST_CHECK(GetWallet(context, wallet_name) == wallet);
+    const std::optional<int> height = context.chain->getHeight();
+    BOOST_REQUIRE(height);
+    const uint256 active_tip = context.chain->getBlockHash(*height);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(wallet->mapWallet.count(block_tx.GetHash()), 1U);
+        BOOST_CHECK_EQUAL(wallet->GetLastBlockHash(), active_tip);
+    }
+    BOOST_CHECK(wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK(
+        wallet->m_pow_state.load() ==
+        interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(wallet->m_pow_miner_mutex,
+                  return wallet->threadPowMinerGroup ? wallet->threadPowMinerGroup->size() : 0U),
+        1U);
+
+    wallet->StopPowMining();
+    BOOST_CHECK(
+        worker_stopped.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(wallet->m_pow_miner_mutex,
+                  return wallet->threadPowMinerGroup ? wallet->threadPowMinerGroup->size() : 0U),
+        0U);
+
+    // A blocked validation queue cannot keep an unpublished or unloading
+    // wallet alive. Unregister the handler while a second real BlockConnected
+    // event is queued, and require synchronous unload to finish before that
+    // queue is released. The later event must not call the removed wallet.
+    std::future<bool> unload_future;
+    ValidationQueueBarrier unload_queue;
+    CreateAndProcessBlock(
+        {post_unload_tx}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    std::atomic<bool> post_unload_event_processed{false};
+    CallFunctionInValidationInterfaceQueue([&post_unload_event_processed] {
+        post_unload_event_processed.store(true);
+    });
+    load_handler.reset();
+    unload_future = std::async(
+        std::launch::async,
+        [&, unload_wallet = std::move(wallet)]() mutable {
+            const bool removed = RemoveWallet(
+                context, unload_wallet, /*load_on_start=*/std::nullopt);
+            if (removed) UnloadWallet(std::move(unload_wallet));
+            return removed;
+        });
+    const bool unloaded_while_queue_blocked =
+        unload_future.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready;
+    if (!unloaded_while_queue_blocked) unload_queue.Release();
+    BOOST_REQUIRE(
+        unload_future.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    BOOST_CHECK(unload_future.get());
+    BOOST_CHECK(unloaded_while_queue_blocked);
+    BOOST_CHECK(GetWallets(context).empty());
+    unload_queue.Release();
+    SyncWithValidationInterfaceQueue();
+    BOOST_CHECK(post_unload_event_processed.load());
+    BOOST_CHECK_EQUAL(post_unload_add_count.load(), 0);
+
+    // Startup uses the separate LoadWallets/StartWallets lifecycle. Holding
+    // the validation queue while LoadWallets reopens and rescans this wallet
+    // proves that the new runtime-only catch-up barrier does not widen startup
+    // blocking or start post-init workers early.
+    common::SettingsValue startup_wallets(common::SettingsValue::VARR);
+    startup_wallets.push_back(wallet_name);
+    BOOST_REQUIRE(context.chain->updateRwSetting(
+        "wallet", startup_wallets, /*write=*/false));
+    std::future<bool> startup_load_future;
+    ValidationQueueBarrier startup_queue;
+    startup_load_future = std::async(
+        std::launch::async, [&] { return LoadWallets(context); });
+    const bool startup_load_unblocked =
+        startup_load_future.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready;
+    if (!startup_load_unblocked) startup_queue.Release();
+    BOOST_REQUIRE(
+        startup_load_future.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    BOOST_CHECK(startup_load_future.get());
+    BOOST_CHECK(startup_load_unblocked);
+    wallet = GetWallet(context, wallet_name);
+    BOOST_REQUIRE(wallet);
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK_EQUAL(post_unload_add_count.load(), 1);
+    startup_queue.Release();
+    SyncWithValidationInterfaceQueue();
+    BOOST_REQUIRE(RemoveWallet(
+        context, wallet, /*load_on_start=*/std::nullopt));
+    UnloadWallet(std::move(wallet));
+    common::SettingsValue no_startup_wallets(common::SettingsValue::VARR);
+    BOOST_REQUIRE(context.chain->updateRwSetting(
+        "wallet", no_startup_wallets, /*write=*/false));
+
+    // Runtime creation shares the subscribe-to-publication interval even when
+    // a new wallet has no historical range to rescan. Queue a real block-tip
+    // notification before CreateWallet subscribes; notification delivery
+    // resolves subscribers when it executes, so the new wallet receives it.
+    // The explicit sentinel which follows that event must run before the load
+    // callback and configured post-init worker.
+    const std::string created_wallet_name{
+        "attachchain-created-lifecycle"};
+    std::atomic<bool> create_validation_caught_up{false};
+    std::atomic<bool> create_load_notified{false};
+    std::atomic<bool> create_notified_after_validation{false};
+    std::atomic<bool> create_notified_before_worker{false};
+    std::promise<void> create_worker_started_promise;
+    std::future<void> create_worker_started{
+        create_worker_started_promise.get_future()};
+    std::atomic<bool> create_worker_started_signaled{false};
+    std::promise<void> create_worker_stopped_promise;
+    std::future<void> create_worker_stopped{
+        create_worker_stopped_promise.get_future()};
+    std::atomic<bool> create_worker_stopped_signaled{false};
+    auto create_load_handler = HandleLoadWallet(
+        context, [&](std::unique_ptr<interfaces::Wallet>) {
+            create_notified_after_validation.store(
+                create_validation_caught_up.load());
+            create_notified_before_worker.store(
+                !create_worker_started_signaled.load());
+            create_load_notified.store(true);
+        });
+    const std::string created_log_prefix{
+        "[" + created_wallet_name + "] "};
+    auto create_log_connection = LogInstance().PushBackCallback(
+        [&](const std::string& line) {
+            if (line.find(
+                    created_log_prefix +
+                    "Gold Rush PoW worker 0 started") != std::string::npos) {
+                signal_once(
+                    create_worker_started_signaled,
+                    create_worker_started_promise);
+            }
+            if (line.find(
+                    created_log_prefix +
+                    "Gold Rush PoW worker 0 stopped") != std::string::npos) {
+                signal_once(
+                    create_worker_stopped_signaled,
+                    create_worker_stopped_promise);
+            }
+        });
+    auto create_log_cleanup = interfaces::MakeCleanupHandler(
+        [create_log_connection] {
+            LogInstance().DeleteCallback(create_log_connection);
+        });
+
+    std::future<std::shared_ptr<CWallet>> create_future;
+    ValidationQueueBarrier create_queue;
+    CreateAndProcessBlock(
+        {}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    CallFunctionInValidationInterfaceQueue(
+        [&create_validation_caught_up] {
+            create_validation_caught_up.store(true);
+        });
+    const size_t callbacks_before_create_sync =
+        GetMainSignals().CallbacksPending();
+
+    DatabaseOptions runtime_create_options;
+    ReadDatabaseArgs(gArgs, runtime_create_options);
+    runtime_create_options.require_create = true;
+    runtime_create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    runtime_create_options.create_passphrase =
+        SecureString{"attachchain-created-passphrase"};
+    DatabaseStatus create_status;
+    bilingual_str create_error;
+    std::vector<bilingual_str> create_warnings;
+    create_future = std::async(std::launch::async, [&] {
+        return wallet::CreateWallet(
+            context, created_wallet_name, /*load_on_start=*/std::nullopt,
+            runtime_create_options, create_status, create_error,
+            create_warnings);
+    });
+
+    const auto create_sync_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (GetMainSignals().CallbacksPending() <=
+               callbacks_before_create_sync &&
+           create_future.wait_for(std::chrono::milliseconds{0}) !=
+               std::future_status::ready &&
+           std::chrono::steady_clock::now() < create_sync_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    const bool create_waiting_for_catchup =
+        GetMainSignals().CallbacksPending() > callbacks_before_create_sync;
+    const bool create_still_pending =
+        create_future.wait_for(std::chrono::milliseconds{50}) ==
+        std::future_status::timeout;
+    BOOST_CHECK(create_waiting_for_catchup);
+    BOOST_CHECK(create_still_pending);
+    BOOST_CHECK(!create_validation_caught_up.load());
+    BOOST_CHECK(!create_load_notified.load());
+    BOOST_CHECK(!create_worker_started_signaled.load());
+    BOOST_CHECK(GetWallet(context, created_wallet_name) == nullptr);
+
+    create_queue.Release();
+    BOOST_REQUIRE(
+        create_future.wait_for(std::chrono::seconds{10}) ==
+        std::future_status::ready);
+    wallet = create_future.get();
+    BOOST_REQUIRE_MESSAGE(wallet, create_error.original);
+    BOOST_CHECK(
+        create_worker_started.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    BOOST_CHECK(create_validation_caught_up.load());
+    BOOST_CHECK(create_load_notified.load());
+    BOOST_CHECK(create_notified_after_validation.load());
+    BOOST_CHECK(create_notified_before_worker.load());
+    BOOST_CHECK(GetWallet(context, created_wallet_name) == wallet);
+    BOOST_CHECK(wallet->m_pow_mining_enabled.load());
+
+    wallet->StopPowMining();
+    BOOST_CHECK(
+        create_worker_stopped.wait_for(std::chrono::seconds{5}) ==
+        std::future_status::ready);
+    create_load_handler.reset();
+    BOOST_REQUIRE(RemoveWallet(
+        context, wallet, /*load_on_start=*/std::nullopt));
+    UnloadWallet(std::move(wallet));
+    create_log_cleanup.reset();
+
+    gate_cleanup.reset();
+    log_cleanup.reset();
 }
 
 BOOST_FIXTURE_TEST_CASE(CreateWalletWithoutChain, BasicTestingSetup)

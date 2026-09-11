@@ -213,6 +213,11 @@ void ReceiveCoinsDialog::on_receiveButton_clicked()
                 tr("Could not generate new %1 address").arg(QString::fromStdString(FormatOutputType(address_type))),
                 QMessageBox::Ok, QMessageBox::Ok);
             return;
+        case AddressTableModel::EditStatus::ADDRESS_BOOK_FAILURE:
+            QMessageBox::critical(this, windowTitle(),
+                tr("The new address was generated, but its label could not be committed. Reload the wallet before retrying."),
+                QMessageBox::Ok, QMessageBox::Ok);
+            return;
         // These aren't valid return values for our action
         case AddressTableModel::EditStatus::INVALID_ADDRESS:
         case AddressTableModel::EditStatus::DUPLICATE_ADDRESS:

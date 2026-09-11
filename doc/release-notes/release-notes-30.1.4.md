@@ -41,8 +41,10 @@ Each newly authored carrier stores schema, family, root, and ordinal metadata;
 every non-root refresh also stores its direct parent. The same-anchor mining
 path fails closed on malformed, adopted, mixed, forked, or ambiguous history.
 Strict locally authored unbound QQP2 singletons and exact locally authored
-origin-bound QQP3/QQP4 carriers are not retired merely because an original
-policy window expires. Zero-payment retirement remains narrow and legacy-only.
+origin-bound QQP3/QQP4 carriers keep their inputs reserved even after an
+original policy window expires. v30.1.5 also reopens and quarantines any
+historical release-candidate retirement marker because the retained signed
+bytes can remain valid for direct block inclusion during Gold Rush.
 Separately, fee-paying conflict recovery remains an explicit, default-off path
 under the existing exact manual or bounded automatic consent gates, including
 for `unbound_proof_may_revalidate`; the built-in miner does not invoke that

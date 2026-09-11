@@ -9,6 +9,8 @@
 
 namespace wallet {
 
+class CWallet;
+
 /** Stable identity of one confirmed wallet anchor generation. */
 uint256 ComputeShadowPowClaimLineageFamilyFingerprint(
     const COutPoint& anchor, CAmount anchor_amount,
@@ -26,6 +28,13 @@ ShadowPowClaimMiningGateAction GetShadowPowClaimMiningGateTelemetryAction(
 const char* ShadowPowClaimRecoveryAdoptionStatusName(
     ShadowPowClaimRecoveryAdoptionStatus status);
 
+/** Stable action vocabulary shared by Core audit events and RPC. */
+const char* ShadowPowRecoveryActionStatusName(
+    ShadowPowClaimRecoveryActionStatus status);
+
+/** Test-only barrier after relay review, before guarded wallet reservation. */
+void SetShadowPowClaimRecoveryRelayHookForTesting(void (*hook)(CWallet&));
+
 /** Deterministic snapshot token; transaction signatures are intentionally excluded. */
 uint256 ComputeShadowPowClaimRecoveryPlanId(
     const ShadowPowClaimRecoveryPlan& plan,
@@ -33,6 +42,22 @@ uint256 ComputeShadowPowClaimRecoveryPlanId(
 
 const char* ShadowPowClaimRecoveryPolicyMutationStatusName(
     ShadowPowClaimRecoveryPolicyMutationStatus status);
+
+const char* ShadowPowClaimResolutionRevocationStatusName(
+    ShadowPowClaimResolutionRevocationStatus status);
+
+/** Test-only observability for the wallet recovery evaluator boundary. */
+void ResetShadowPowClaimRecoveryProofEvaluationStatsForTesting();
+uint64_t GetShadowPowClaimRecoveryProofEvaluationCountForTesting();
+uint64_t GetActiveShadowPowClaimRecoveryProofEvaluationsForTesting();
+uint64_t GetShadowPowClaimRecoveryInventoryBuildCountForTesting();
+uint64_t GetShadowPowClaimRecoveryPathVisitCountForTesting();
+uint64_t GetShadowPowClaimRecoveryTopologyVisitCountForTesting();
+uint64_t GetShadowPowClaimCandidateFingerprintMapVisitCountForTesting();
+void SetShadowPowClaimRecoveryProofEvaluationDelayForTesting(int64_t delay_ms);
+void SetShadowPowClaimRecoveryProofEvaluationBudgetForTesting(size_t budget);
+void SetShadowPowClaimRecoveryProofEvaluationCacheCapacityForTesting(
+    size_t capacity);
 
 } // namespace wallet
 

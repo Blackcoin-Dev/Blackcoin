@@ -89,13 +89,13 @@ fail closed. A deterministic relay-policy rejection authorizes a
 sibling only when a fresh full mempool test reproduces the exact low-fee
 rejection on the same tip and wallet snapshot.
 
-Zero-payment local retirement remains only for narrow pre-lineage legacy
-records that cannot be authenticated as a refreshable exact carrier.
-Schema-lineage claims, strict locally authored unbound QQP2 singletons, and
-exact locally authored origin-bound QQP3/QQP4 carriers are never retired merely
-because an original policy window expires. A historical retirement marker on
-such a record is reclassified from current chain and wallet facts before the
-anchor can be reused. Fee-paying conflict recovery remains a separate,
+No claim input is released merely because its mempool or shadow-reward
+eligibility window expires. Expired signed claim bytes can still be included
+directly in a block during Gold Rush, so peer-retained bytes remain a live
+base-chain conflict. Historical release-candidate retirement markers are
+fail-closed input holds: wallet repair atomically reopens and quarantines those
+records unless an active-chain conflict conclusively spent the anchor.
+Fee-paying conflict recovery remains a separate,
 explicit, default-off path under exact manual consent or bounded automatic
 standing consent. The existing recovery engine can authorize that path for a
 component it classifies as conflict-resolvable, including
@@ -177,6 +177,42 @@ continuation is the normal built-in-miner path. Generic transient or
 indeterminate conditions, local state errors, future-origin proofs, and
 future-version proofs remain fail-closed and cannot authorize recovery.
 
+## v30.1.4 compatibility boundary
+
+The regression suite pins the historical daemon and CLI to the checked-in
+v30.1.4 provenance manifest. It exercises an exact wallet and datadir through
+v30.1.4, the candidate, v30.1.4 again, and the candidate again after the
+candidate has written a QQP3 sibling and durable family metadata for a QQP2
+root. The older wallet code can open the database, read both exact transaction
+byte strings, preserve the candidate's unrecognized transaction metadata, and
+perform an ordinary address-book write. Reopening with the candidate restores
+the same family fingerprint, confirmed anchor, target, payout, lineage, and
+zero-recovery-spend result.
+
+The functional harness first leaves its opt-in RPC documentation checker
+enabled and requires v30.1.4 to diagnose the candidate-only response keys.
+It then disables only that diagnostic to model the release default and performs
+the old-version read and write checks. The test never deletes, renames, or
+normalizes the candidate metadata.
+
+That round trip proves wallet-data compatibility; it does not backport the
+typed mining gate. When v30.1.4 sees the quarantined historical member, its
+legacy global quarantine check can keep the built-in PoW worker in
+`claim_quarantined` at zero hashrate even while the candidate recognizes a
+safe live or refreshable member of the same family. Operators must not infer
+candidate PoW liveness from successful rollback startup or wallet readability.
+
+The suite separately runs exact v30.1.4 and the candidate at the same time. A
+candidate-created QQP3 same-anchor carrier is independently accepted and then
+delivered through v30.1.4's transaction P2P path. v30.1.4 includes those exact
+bytes in a PoS block; both versions restart on the byte-identical block. A
+longer competing PoS branch disconnects it, removes the synthetic payout, and
+returns the still-valid carrier for admission before v30.1.4 includes it on
+the winning branch. A final isolated restart reproduces the shared block bytes
+and candidate family state. These assertions cover the protocol-compatible
+transaction, block, restart, and reorganization boundary without claiming that
+v30.1.4 implements candidate-only wallet policy.
+
 ## One shared recovery engine
 
 The Issue #37 release uses one component classifier and one resolver for GUI,
@@ -201,6 +237,18 @@ The resolver separates three authorities:
    A retry reuses those bytes; it does not fee-bump, replace them, or create a
    second resolution for the same anchor generation.
 
+The current headless flow makes both consent boundaries explicit. First call
+`createshadowpowclaimresolution <claim_txid>` to obtain a claim-selector
+preview. Signing requires that exact `plan_id` as `expected_plan_id`. A
+successful signing response then returns `current_plan`, a fresh read-only
+commit preview keyed to the exact signed resolution txid. Pass that nested
+`plan_id` to `commitshadowpowclaimresolution <resolution_txid> true
+<expected_plan_id>`. Calling `commitshadowpowclaimresolution
+<resolution_txid>` without acknowledgement is side-effect-free and provides a
+fresh commit plan after restart or for an authenticated legacy resolution.
+Claim-selector and resolution-selector plans are intentionally not
+interchangeable.
+
 Immediately before signing, persistence, and relay, the engine rechecks the
 active tip, wallet-processed tip, wallet generation, confirmed unspent anchor,
 component fingerprint, fee limits, and exact transaction shape. A changed tip
@@ -219,6 +267,103 @@ Manual recovery is available through the Issue #37 GUI and headless surfaces
 that wrap this engine. Compatibility commands from older releases may remain,
 but their help is authoritative for whether they expose only preview/signing or
 also the separate commit step.
+
+## Local relay-authority revocation
+
+The v30.1.5 candidate can durably cancel this wallet's future relay authority
+for one exact managed resolution without deleting the signed transaction or
+making its anchor spendable:
+
+```bash
+blackcoin-cli -rpcwallet="Wallet Name" \
+  revokeshadowpowclaimresolution "<resolution_txid>" true
+```
+
+The required `true` acknowledges that signed bytes may already exist in this
+node's mempool, a peer, a miner, a log, or a backup. Local revocation cannot
+recall those copies, undo an existing confirmation, or prevent either the
+original claim or the conflicting resolution from confirming. After the
+managed record is authenticated against a wallet with a chain interface, the
+result reports the exact mempool snapshot and `may_still_confirm=true`. It also
+reports whether relay authority was active, whether a new durable state was
+committed, whether a local wallet broadcast is already reserved in flight,
+whether the anchor remains reserved, and the resulting typed mining-gate
+action. Observations that cannot be authenticated are omitted rather than
+reported with default values.
+
+Revocation is restriction-only and does not require a wallet unlock. It writes
+the canonical durable state `relay_authorized=0, relay_revoked=1`; the
+`relay_revoked` bit is a per-transaction tombstone, not the wallet-wide
+automatic-recovery policy. The operation never abandons the transaction,
+erases its signed bytes or metadata, removes it from the mempool, releases or
+unlocks the shared anchor, enables normal coin selection, or enables mining.
+An already-revoked record is an idempotent success. A local wallet broadcast
+already in flight is refused without changing durable authority, so the
+operator can wait for its verdict and retry.
+
+The tombstone survives restart. The recovery scheduler, ordinary wallet relay
+paths, and the successful-`sendrawtransaction` wallet callback cannot promote
+or retry the tombstoned bytes. The raw-transaction RPC is still an explicit
+node-level disclosure mechanism: a caller who possesses the hex can submit it
+again, and revocation cannot make already accepted bytes disappear. Such a
+submission does not clear the wallet tombstone or restore later scheduler
+authority.
+
+Reauthorization requires a new read-only preview for the current chain and
+wallet generation, followed by an explicit exact-plan commit while the wallet
+is normally unlocked. That commit atomically clears the tombstone and grants
+authority only to the same authenticated transaction bytes. A plan created
+before revocation is stale and cannot reauthorize anything. Generic relay
+notifications and persisted-retry paths cannot perform this transition.
+
+Database begin or write failures leave the prior authoritative state in force.
+An indeterminate commit outcome latches recovery closed and reports
+`durable_state_ambiguous=true`; reload the wallet and inspect the exact managed
+record before relying on either the former authority or the requested
+tombstone. Fields whose durable value cannot be known, including
+`durable_state_changed`, `relay_authority_revoked`, and `locally_cancelled`,
+are omitted from that ambiguous receipt rather than serialized as false.
+Revocation likewise refuses malformed, foreign, legacy, missing,
+unreserved, or database-ambiguous records instead of describing them as
+locally cancelled.
+
+## Complete recovery history and authorization receipts
+
+Dedicated recovery status does not depend on the general transaction-history
+page limit. The existing `getpowclaimrecoveryinfo true` response remains
+available. For bounded responses, supply an options object:
+
+```sh
+blackcoin-cli -rpcwallet=example getpowclaimrecoveryinfo true '{"page_size":100}'
+blackcoin-cli -rpcwallet=example getpowclaimrecoveryinfo true '{"page_size":100,"cursor":"TOKEN_FROM_PREVIOUS_PAGE"}'
+```
+
+`page_size` accepts 1 through 1000. A component header, each node, and each
+transaction-list membership count as separate flat records, so one large
+component cannot bypass the requested record bound. Read `pagination.next_cursor`
+until `pagination.complete` is true. Cursors are opaque and bind the wallet,
+active tip, wallet generation, and deterministic classified inventory. Restart
+at the first page after a stale-cursor error; never combine pages from different
+snapshots. Pagination is read-only and grants no recovery authority.
+
+Managed nodes expose `authorization_receipt` when a valid exact-plan receipt
+is available. It identifies the latest successful explicit authorization's
+plan, tip/height, wallet generation, and origin. Core binds that receipt to the
+exact witness transaction identity. Revoking local relay leaves the receipt
+visible as historical evidence, not current permission. A later successful
+exact-plan authorization replaces it. Missing or malformed older receipt data
+is reported as null and does not reinterpret the record's existing relay
+authority. The GUI uses the same Core receipt in recovery-review details.
+
+Check `usage_available` before interpreting recovery-accounting numbers;
+`getpowmininginfo` exposes the corresponding `recovery_usage_available` flag.
+An unavailable snapshot is not zero usage and cannot authorize automatic
+spending. Non-preview recovery actions and refusals emit stable wallet-scoped
+`pow_claim_recovery_audit v=1` events with typed status/reason, plan and snapshot
+identity, anchor/component, origin, fee, and an existing transaction identity
+when applicable. Read-only preview and successful empty no-op requests do not
+emit action events. No raw transaction, script, address, or key material is
+included.
 
 ## Optional automatic recovery
 
@@ -293,10 +438,9 @@ confirms pays its base-chain fee.
 The wallet releases no reservation merely because a claim left the mempool,
 exceeded one hour of relay residence, or exhausted its original
 origin-plus-64 window. It releases only after an active-chain confirmation
-spends the anchor or after the narrow legacy-only retirement described above.
-If the controlling block is disconnected, the wallet reopens and reclassifies
-the component on the new pinned tip and restores any required quarantine. A
-transaction already seen by peers cannot be withdrawn.
+spends the anchor. If the controlling block is disconnected, the wallet
+reopens and reclassifies the component on the new pinned tip and restores any
+required quarantine. A transaction already seen by peers cannot be withdrawn.
 
 ## Operator checks
 

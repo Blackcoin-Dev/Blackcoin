@@ -22,6 +22,10 @@ enum class WalletPowMiningState : uint8_t {
     EPOCH_INACTIVE,
     CLAIM_IN_FLIGHT,
     CLAIM_QUARANTINED,
+    CLAIM_RELAY_CLOCK_PENDING,
+    CLAIM_EVALUATION_PENDING,
+    CLAIM_EVALUATION_CAPACITY,
+    CLAIM_INVENTORY_CAPACITY,
     READY,
     HASHING,
     RUNTIME_ERROR,
@@ -39,6 +43,10 @@ constexpr std::string_view WalletPowMiningStateName(WalletPowMiningState state) 
     case WalletPowMiningState::EPOCH_INACTIVE: return "epoch_inactive";
     case WalletPowMiningState::CLAIM_IN_FLIGHT: return "claim_in_flight";
     case WalletPowMiningState::CLAIM_QUARANTINED: return "claim_quarantined";
+    case WalletPowMiningState::CLAIM_RELAY_CLOCK_PENDING: return "claim_relay_clock_pending";
+    case WalletPowMiningState::CLAIM_EVALUATION_PENDING: return "claim_evaluation_pending";
+    case WalletPowMiningState::CLAIM_EVALUATION_CAPACITY: return "claim_evaluation_capacity";
+    case WalletPowMiningState::CLAIM_INVENTORY_CAPACITY: return "claim_inventory_capacity";
     case WalletPowMiningState::READY: return "ready";
     case WalletPowMiningState::HASHING: return "hashing";
     case WalletPowMiningState::RUNTIME_ERROR: return "error";

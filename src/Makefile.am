@@ -351,6 +351,7 @@ BITCOIN_CORE_H = \
   version.h \
   versionbits.h \
   wallet/bdb.h \
+  wallet/claim_maintenance.h \
   wallet/coincontrol.h \
   wallet/coinselection.h \
   wallet/context.h \
@@ -369,6 +370,7 @@ BITCOIN_CORE_H = \
   wallet/rpc/wallet.h \
   wallet/salvage.h \
   wallet/scriptpubkeyman.h \
+  wallet/shadow_pow_claim_pagination.h \
   wallet/shadow_pow_claim_recovery.h \
   wallet/shadow_pow_claim_recovery_types.h \
   wallet/shadow_pow_claim_recovery_args.h \

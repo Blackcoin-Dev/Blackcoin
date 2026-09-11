@@ -124,7 +124,6 @@ QString recoveryStateText(interfaces::WalletPowClaimRecoveryState state)
     case State::INDETERMINATE: return QObject::tr("Indeterminate — no action");
     case State::CURRENT_BRANCH_INELIGIBLE: return QObject::tr("Ineligible on current branch");
     case State::TERMINAL_ON_PINNED_TIP: return QObject::tr("Terminal on reviewed tip");
-    case State::RETIRED_ON_ACTIVE_BRANCH: return QObject::tr("Expired; retired without payment");
     case State::RESOLUTION_PENDING: return QObject::tr("Resolution pending");
     case State::RESOLVED_ON_ACTIVE_CHAIN: return QObject::tr("Resolved on active chain");
     }
@@ -1893,9 +1892,9 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
         contains_unbound_legacy_proof);
     m_pow_recovery_summary->setText(
         tr("Wallet: %1 | active height: %2 | tip: %3 | plan: %4\n"
-           "%5 claim object(s), %6 live, %7 quarantined; %8 blocking component(s), %9 retired without payment, %10 resolved. "
-           "Persisted recovery facts: %11 manual pending, %12 automatic pending, %13 recycled output(s), %14 total confirmed fees. "
-           "Snapshot policy: %15; minimum stale depth %16 block(s).")
+           "%5 claim object(s), %6 live, %7 quarantined; %8 blocking component(s), %9 resolved. "
+           "Persisted recovery facts: %10 manual pending, %11 automatic pending, %12 recycled output(s), %13 total confirmed fees. "
+           "Snapshot policy: %14; minimum stale depth %15 block(s).")
             .arg(QString::fromStdString(m_wallet_model
                                             ? m_wallet_model->wallet().getWalletName()
                                             : std::string{}))
@@ -1906,12 +1905,11 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
             .arg(review.live_claim_objects)
             .arg(review.quarantined_claim_objects)
             .arg(review.blocking_components)
-            .arg(review.retired_components)
             .arg(review.resolved_components)
-            .arg(review.usage.pending_manual)
-            .arg(review.usage.pending_automatic)
-            .arg(review.usage.recycled_outputs)
-            .arg(formatBLK(review.usage.confirmed_resolution_fees))
+            .arg(review.usage.available ? QString::number(review.usage.pending_manual) : tr("unavailable"))
+            .arg(review.usage.available ? QString::number(review.usage.pending_automatic) : tr("unavailable"))
+            .arg(review.usage.available ? QString::number(review.usage.recycled_outputs) : tr("unavailable"))
+            .arg(review.usage.available ? formatBLK(review.usage.confirmed_resolution_fees) : tr("unavailable"))
             .arg(review.policy.mode == interfaces::WalletPowClaimRecoveryMode::AUTOMATIC
                      ? tr("automatic fee fallback")
                      : review.policy.mode == interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK
@@ -2017,7 +2015,7 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
         QStringList node_details;
         for (const auto& node : component.nodes) {
             provenance.push_back(recoveryProvenanceText(node.provenance));
-            node_details.push_back(
+            QString node_detail =
                 tr("%1 — %2, %3, disposition=%4%5%6%7%8")
                     .arg(shortenHex(node.txid))
                     .arg(recoveryNodeKindText(node.kind))
@@ -2028,7 +2026,20 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
                     .arg(node.abandoned ? tr(", abandoned") : QString())
                     .arg(node.proof_may_revalidate_on_descendant
                              ? tr(", may become eligible on a descendant")
-                             : QString()));
+                             : QString());
+            if (node.resolution_relay_revoked) {
+                node_detail += tr(", local relay authority revoked");
+            }
+            if (node.authorization_receipt) {
+                const auto& receipt = *node.authorization_receipt;
+                node_detail += tr("\nLatest authorization receipt (read-only): plan %1; tip %2; height %3; wallet generation %4; origin %5.")
+                    .arg(QString::fromStdString(receipt.plan_id))
+                    .arg(QString::fromStdString(receipt.active_tip))
+                    .arg(receipt.active_height)
+                    .arg(receipt.wallet_generation)
+                    .arg(QString::fromStdString(receipt.origin));
+            }
+            node_details.push_back(node_detail);
         }
         provenance.removeDuplicates();
         auto* provenance_item = new QTableWidgetItem(provenance.join(QStringLiteral(", ")));
@@ -2058,6 +2069,9 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
         if (action && action->relay_authorized && !action->in_mempool) {
             outcome += tr(" — relay authorized");
         }
+        if (action && action->relay_revoked) {
+            outcome += tr(" — local relay revoked; fresh exact-plan commit required");
+        }
         if (unbound_legacy_proof) {
             outcome += tr(" — original claim may revalidate");
         }
@@ -2070,6 +2084,11 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
         if (action && !action->detail.empty()) {
             if (!outcome_detail.isEmpty()) outcome_detail += QStringLiteral("\n");
             outcome_detail += QString::fromStdString(action->detail);
+        }
+        if (action && action->relay_revoked) {
+            if (!outcome_detail.isEmpty()) outcome_detail += QStringLiteral("\n");
+            outcome_detail += tr(
+                "The signed bytes and shared anchor remain reserved, but this wallet will not retry them. Reauthorization requires a fresh exact-plan commit.");
         }
         if (!outcome_detail.isEmpty()) outcome_item->setToolTip(outcome_detail);
         m_pow_recovery_components->setItem(row, 6, outcome_item);
@@ -2122,6 +2141,7 @@ bool StakingMiningPage::selectedPowClaimRecoveryComponentNeedsAdoption() const
         interfaces::WalletPowClaimRecoveryState::RESOLVED_ON_ACTIVE_CHAIN) {
         return false;
     }
+    if (!component.adoption_graph_safe) return false;
     return std::any_of(
         component.nodes.begin(), component.nodes.end(), [](const auto& node) {
             if (node.kind != interfaces::WalletPowClaimRecoveryNodeKind::CLAIM) {
@@ -3039,9 +3059,11 @@ void StakingMiningPage::abortPendingPowStart(const QString& message)
 {
     m_pow_apply_pending = false;
     m_pow_pending_enabled = false;
+    const bool enabled = m_wallet_model &&
+        m_wallet_model->wallet().getPowMiningInfo().enabled;
     {
         QSignalBlocker blocker(m_pow_enable);
-        m_pow_enable->setChecked(false);
+        m_pow_enable->setChecked(enabled);
     }
     if (m_pow_status) m_pow_status->setText(message);
     refreshControlsEnabled();
@@ -3096,7 +3118,12 @@ void StakingMiningPage::applyPowWithCurrentRecoveryPolicy()
         &created_payout_key);
     m_pow_apply_pending = false;
     if (!ok) {
-        m_pow_enable->setChecked(false);
+        const bool authoritative_enabled =
+            m_wallet_model->wallet().getPowMiningInfo().enabled;
+        {
+            QSignalBlocker blocker(m_pow_enable);
+            m_pow_enable->setChecked(authoritative_enabled);
+        }
         const QString msg = error.empty()
             ? tr("Unable to start Gold Rush PoW mining. Unlock the wallet and check debug.log for details.")
             : QString::fromStdString(error);
@@ -4087,6 +4114,11 @@ void StakingMiningPage::updateStatus()
     // key, so never present a locked wallet as unlocked from the marker alone.
     m_unlock_staking_only->setChecked(staking_only_unlocked);
     m_unlock_quantum_legacy_staking->setChecked(normal_unlocked);
+    // This control is part of the cheap authority view, not the expensive
+    // wallet-detail snapshot. In particular, a cancelled normal-unlock dialog
+    // must immediately clear its optimistic checked state while preserving the
+    // locked wallet's staking-only preference for the next unlock.
+    m_pow_unlock_wallet->setChecked(normal_unlocked);
     const bool actively_searching = staking_info.enabled &&
         staking_info.worker_running && staking_info.eligible &&
         staking_info.state == interfaces::WalletStakingState::SEARCHING;
@@ -4360,6 +4392,18 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     case interfaces::WalletPowMiningState::CLAIM_QUARANTINED:
         pow_runtime_summary = tr("claim family reserved; no safe automatic continuation is currently available");
         break;
+    case interfaces::WalletPowMiningState::CLAIM_RELAY_CLOCK_PENDING:
+        pow_runtime_summary = tr("waiting for a coherent monotonic relay clock");
+        break;
+    case interfaces::WalletPowMiningState::CLAIM_EVALUATION_PENDING:
+        pow_runtime_summary = tr("evaluating retained claim proofs in bounded slices");
+        break;
+    case interfaces::WalletPowMiningState::CLAIM_EVALUATION_CAPACITY:
+        pow_runtime_summary = tr("paused: retained proof contexts exceed the bounded evaluator capacity");
+        break;
+    case interfaces::WalletPowMiningState::CLAIM_INVENTORY_CAPACITY:
+        pow_runtime_summary = tr("paused: retained claim topology exceeds the bounded inventory capacity");
+        break;
     case interfaces::WalletPowMiningState::READY:
         pow_runtime_summary = tr("ready at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1));
         break;
@@ -4370,21 +4414,25 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         pow_runtime_summary = tr("stopped after an error");
         break;
     }
+    const QString stake_reserve_summary = info.stake_reserve_available
+        ? tr("Stake reserve: %1 coin(s), %2 protected; %3 claim coin(s) remain")
+              .arg(info.reserved_stake_coins)
+              .arg(formatBLK(info.reserved_stake_weight))
+              .arg(info.claim_coins_after_stake_reserve)
+        : tr("Stake reserve: unavailable; refresh wallet mining details.");
     m_staking_summary->setText(tr(
         "<b>Wallet mining snapshot</b><br>"
         "Legacy spendable: %1 &nbsp;|&nbsp; Quantum-controlled: %2<br>"
         "PoS: %3; next active-signal split %4 &nbsp;|&nbsp; PoW: %5; next claim %6<br>"
-        "Stake reserve: %7 coin(s), %8 protected; %9 claim coin(s) remain<br>"
-        "Unlock mode: %10")
+        "%7<br>"
+        "Unlock mode: %8")
         .arg(formatBLK(balances.legacy_balance))
         .arg(formatBLK(balances.quantum_balance))
         .arg(wallet_signal_text)
         .arg(formatBLK(info.pos_estimated_payout_per_signaler))
         .arg(pow_runtime_summary)
         .arg(formatBLK(info.next_claim_payout))
-        .arg(info.reserved_stake_coins)
-        .arg(formatBLK(info.reserved_stake_weight))
-        .arg(info.claim_coins_after_stake_reserve)
+        .arg(stake_reserve_summary)
         .arg(unlock_mode));
 
     const bool autostart_staking = wallet::IsStakingAutostartEnabled();
@@ -4430,6 +4478,14 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         recommended_action = tr("PoW is paused because the remaining mature legacy coin is protected for PoS. Add another confirmed mature legacy coin, disable staking, or explicitly set -powclaimreservestakecoins=0 on restart if you accept losing current legacy stake capacity. Core will not split or spend funds automatically.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
         recommended_action = tr("A Gold Rush PoW claim family remains reserved because Core cannot currently prove a safe same-anchor relay or continuation. The wallet will not create an independent fee-input claim. Waiting is safest. To inspect the component or consider a fee-paying conflict, select <b>Review claim recovery...</b>, review Core's exact plan and fee limits, then explicitly acknowledge that plan before Resolve is enabled.");
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_RELAY_CLOCK_PENDING) {
+        recommended_action = tr("Core cannot safely reconcile the host clock with the active-chain time and the wallet's durable claim-relay clock. Correct the system clock or wait for chain time to advance; no key, fee payment, or claim will be created while this check is pending.");
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_EVALUATION_PENDING) {
+        recommended_action = tr("Core is evaluating retained proof contexts outside the wallet and chain locks in bounded slices. Keep the node running; no wallet mutation or recovery payment is needed.");
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_EVALUATION_CAPACITY) {
+        recommended_action = tr("This wallet contains more distinct retained proof contexts than Core's bounded evaluator can cache safely. Mining remains fail-closed without labeling the proofs corrupt. Inspect getpowclaimrecoveryinfo and the retained wallet history before changing it.");
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_INVENTORY_CAPACITY) {
+        recommended_action = tr("This wallet's retained claim graph exceeds Core's bounded inventory topology budget. Mining remains fail-closed without holding the global chain lock for an unbounded graph walk. Inspect getpowclaimrecoveryinfo before changing wallet history.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
         recommended_action = tr("Unlock this wallet normally. Gold Rush PoW claims cannot be signed while the wallet is locked or unlocked for staking only.");
     } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
@@ -4456,10 +4512,12 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
         m_pow_status->setText(tr("PoW mining is enabled but waiting for a confirmed, spendable legacy BLK UTXO to authenticate and pay the next claim fee."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STAKE_RESERVE_PROTECTED) {
-        m_pow_status->setText(tr("PoW mining is enabled but paused to protect %1 mature legacy staking coin(s) (%2). %3 claim input(s) remain after the reserve.")
-            .arg(info.reserved_stake_coins)
-            .arg(formatBLK(info.reserved_stake_weight))
-            .arg(info.claim_coins_after_stake_reserve));
+        m_pow_status->setText(info.stake_reserve_available
+            ? tr("PoW mining is enabled but paused to protect %1 mature legacy staking coin(s) (%2). %3 claim input(s) remain after the reserve.")
+                  .arg(info.reserved_stake_coins)
+                  .arg(formatBLK(info.reserved_stake_weight))
+                  .arg(info.claim_coins_after_stake_reserve)
+            : tr("PoW mining is enabled but paused to protect legacy staking coins. Current reserve details are unavailable; refresh wallet mining details."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
         m_pow_status->setText(tr("PoW mining is enabled but waiting for a normal wallet unlock; locked and staking-only wallets cannot sign claims."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CHAIN_UNAVAILABLE) {
@@ -4472,6 +4530,14 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         m_pow_status->setText(tr("PoW mining is enabled and waiting until the Gold Rush epoch is active."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
         m_pow_status->setText(tr("PoW mining is enabled but paused because Core cannot currently prove a safe same-anchor action for the reserved claim family. The wallet will not create an independent fee-input claim. Waiting is safest. Use Review claim recovery... for Core's exact preview and the explicit fee-paying conflict option, if one is available."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_RELAY_CLOCK_PENDING) {
+        m_pow_status->setText(tr("PoW mining is enabled but waiting for the host clock, active-chain median time, and durable claim-relay clock to become coherent. No key, fee payment, or claim is created in this state."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_EVALUATION_PENDING) {
+        m_pow_status->setText(tr("PoW mining is enabled and evaluating retained Gold Rush proof contexts in bounded lock-free slices. This temporary resource state retries automatically."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_EVALUATION_CAPACITY) {
+        m_pow_status->setText(tr("PoW mining is enabled but fail-closed because this exact wallet snapshot exceeds the bounded retained-proof evaluator capacity. No proof was classified as corrupt by this resource result."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_INVENTORY_CAPACITY) {
+        m_pow_status->setText(tr("PoW mining is enabled but fail-closed because this exact wallet snapshot exceeds the bounded retained-claim topology capacity. No proof was classified as corrupt by this resource result."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT) {
         m_pow_status->setText(tr("PoW mining is enabled and waiting for the active same-anchor claim family to confirm, conflict, relay, or advance to its next-tip continuation decision."));
     } else if (info.enabled && info.epoch_active) {
@@ -5197,6 +5263,16 @@ bool StakingMiningPage::requestNormalUnlock()
     if (!m_wallet_model) return false;
 
     const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getEncryptionStatus();
+    const bool initially_staking_only =
+        m_wallet_model->getWalletUnlockStakingOnly();
+    const auto restore_failed_normal_unlock = [&]() {
+        if (m_wallet_model->getEncryptionStatus() == WalletModel::Unlocked) {
+            m_wallet_model->setWalletLocked(true);
+        }
+        m_wallet_model->setWalletUnlockStakingOnly(initially_staking_only);
+        m_wallet_model->updateStatus();
+        return false;
+    };
     if (encryption_status == WalletModel::NoKeys) {
         return false;
     }
@@ -5223,23 +5299,19 @@ bool StakingMiningPage::requestNormalUnlock()
         AskPassphraseDialog dlg(AskPassphraseDialog::Unlock, this);
         dlg.setModel(m_wallet_model);
         if (dlg.exec() != QDialog::Accepted) {
-            return false;
+            return restore_failed_normal_unlock();
         }
     }
 
     if (m_wallet_model->getEncryptionStatus() != WalletModel::Unlocked) {
-        return false;
+        return restore_failed_normal_unlock();
     }
 
     if (m_wallet_model->getWalletUnlockStakingOnly()) {
         // Accepted must mean the dialog performed an atomic normal unlock. If
         // an unexpected handler left staking-only scope installed, fail closed
         // by locking; never expand authority after the prompt has returned.
-        if (m_wallet_model->getEncryptionStatus() == WalletModel::Unlocked) {
-            m_wallet_model->setWalletLocked(true);
-        }
-        m_wallet_model->updateStatus();
-        return false;
+        return restore_failed_normal_unlock();
     }
     return true;
 }

@@ -829,6 +829,30 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(self._is_abandoned(wallet, txid), False)
 
+    def _wait_for_quarantine_observation(self, wallet, txid, tip):
+        """Review only after asynchronous branch-quarantine metadata is durable."""
+        reviewed = None
+
+        def observation_is_current():
+            nonlocal reviewed
+            info = get_recovery_info(wallet, True)
+            if not info["wallet_tip_matches"] or info["active_tip"] != tip:
+                return False
+            components = [component for component in info["component_details"]
+                          if txid in component["claim_txids"]]
+            if len(components) != 1:
+                return False
+            component = components[0]
+            if not (component["all_claims_quarantined"]
+                    and component["stale_depth_known"]
+                    and component["has_revalidating_unbound_proof"]):
+                return False
+            reviewed = info
+            return True
+
+        self.wait_until(observation_is_current, timeout=20)
+        return reviewed
+
     @staticmethod
     def _assert_claim_inventory(wallet, raw, actionable, resolved, indeterminate, components=None):
         info = get_pow_mining_info(wallet)
@@ -1783,7 +1807,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(preview["conflicts_with_revalidating_unbound_proof"], True)
         assert "hex" not in preview
         assert first_txid not in node.getrawmempool()
-        reviewed = get_recovery_info(manual, True)
+        # The removal callback reserves the claim before the background worker
+        # durably records its branch-relative stale clock. Wait for that one-time
+        # fingerprint transition before reviewing or paginating the component.
+        reviewed = self._wait_for_quarantine_observation(
+            manual, first_txid, quarantine_block
+        )
         reviewed, first_page = self._assert_recovery_pages(manual, reviewed, page_size=2)
         cursor = first_page["pagination"]["next_cursor"]
         assert_raises_rpc_error(
@@ -4020,6 +4049,44 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
             if isinstance(response, Exception):
                 raise response
             return response
+
+    def test_quarantine_review_waits_for_exact_durable_observation(self):
+        known = {
+            "active_tip": "tip", "wallet_tip_matches": True,
+            "component_details": [{
+                "claim_txids": ["claim"], "all_claims_quarantined": True,
+                "stale_depth_known": True, "has_revalidating_unbound_proof": True,
+                "component_fingerprint": "fresh",
+            }],
+        }
+        pending = []
+        for field in ("all_claims_quarantined", "stale_depth_known", "has_revalidating_unbound_proof"):
+            info = deepcopy(known)
+            info["component_details"][0][field] = False
+            pending.append(info)
+        other = deepcopy(pending[1])
+        other["component_details"].insert(0, {
+            **known["component_details"][0], "claim_txids": ["other"],
+        })
+        pending.extend([other, {**known, "active_tip": "other-tip"},
+                        {**known, "wallet_tip_matches": False}])
+        wallet = self.Wallet([(None, info) for info in [*pending, known]])
+
+        def wait_until(predicate, timeout):
+            self.assertEqual(timeout, 20)
+            for _ in pending:
+                self.assertFalse(predicate())
+            self.assertTrue(predicate())
+
+        harness = mock.Mock()
+        harness.wait_until.side_effect = wait_until
+        reviewed = GoldRushPowClaimSingleFlightTest._wait_for_quarantine_observation(
+            harness, wallet, "claim", "tip"
+        )
+        self.assertEqual(reviewed, known)
+        self.assertEqual(wallet.calls, len(pending) + 1)
+        self.assertEqual(wallet.script, [])
+        harness.wait_until.assert_called_once()
 
     def test_indexed_wallet_status_poll_retries_without_advancing_another_tip(self):
         error = JSONRPCException({

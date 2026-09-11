@@ -152,6 +152,7 @@ jobs:
         if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: |
           python3 ci/release/test_release_tools.py
+          python3 ci/release/test_publish_verified_release.py
           python3 ci/release/test_genbuild_frozen.py
           python3 ci/release/test_shadow_resource_production.py
 

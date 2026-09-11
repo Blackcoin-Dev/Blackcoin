@@ -92,7 +92,7 @@ and its fee input stays reserved because another peer can retain and later
 confirm it. Generic `abandontransaction` does not release that reservation.
 Immutable v30.1.4 pauses on actionable or indeterminate quarantined
 components, not merely on the raw number of historical claim objects. The
-v30.1.5 candidate instead follows the complete typed gate and may safely wait,
+v30.1.5 and later follow the complete typed gate and may safely wait,
 relay, or refresh one deterministically selected authenticated wallet-owned
 family while those legacy counts remain nonzero. Multiple safe families are
 serviced without selecting another fee anchor, and a purely incoming foreign
@@ -109,10 +109,10 @@ Rate and fee windows use active-chain median time, and recovery-authorizing
 metadata is published only after durable wallet-database commit. An
 indeterminate database outcome fails closed until wallet reload.
 
-The following behavior belongs to the **v30.1.5 candidate**; it is not part of
+The following behavior was introduced in **v30.1.5**; it is not part of
 the immutable `v30.1.4` tag. For exact
 wallet-authored claims—including a strict unbound QQP2 singleton and
-origin-bound QQP3/QQP4 carriers—the candidate mining path first
+origin-bound QQP3/QQP4 carriers—the mining path first
 relays eligible bytes and then, when necessary, appends a current-policy sibling
 that spends the same confirmed fee anchor. The append-only lineage records
 schema, family, root, and ordinal metadata on each carrier plus the direct
@@ -126,7 +126,7 @@ Conflicting siblings cannot both confirm,
 so the wallet does not consume another coin for each retry. Exact authenticated
 claims are not retired merely because an original policy window expires.
 
-Same-anchor siblings remain `QQSPROOF` claims; this candidate does not change
+Same-anchor siblings remain `QQSPROOF` claims; these releases do not change
 their winner, loser, late-claim, reward, or reimbursement consensus rules.
 Separately, for explicit fee-paying conflict recovery, either the original
 claim or the managed resolution may confirm. A confirmed managed-resolution

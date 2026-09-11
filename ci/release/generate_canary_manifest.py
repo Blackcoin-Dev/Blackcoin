@@ -14,9 +14,9 @@ import sys
 
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-SEMANTIC_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+SEMANTIC_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
 PRERELEASE_LABEL_RE = re.compile(
-    r"^(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-"
+    r"^(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)-"
     r"(?P<channel>alpha|beta)(?P<rc>[1-9][0-9]*)$"
 )
 

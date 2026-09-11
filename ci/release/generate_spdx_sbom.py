@@ -112,8 +112,8 @@ def main():
 
     if not FULL_SHA_RE.fullmatch(args.source_sha):
         raise RuntimeError("source-sha must be a full lowercase commit identifier")
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version):
-        raise RuntimeError("version must have major.minor.patch form")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?", args.version):
+        raise RuntimeError("version must have major.minor.patch[.revision] form")
     if not args.artifacts.is_dir() or not args.depends_packages.is_dir():
         raise RuntimeError("artifact and depends package directories must exist")
 

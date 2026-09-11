@@ -13,11 +13,14 @@ recovery flow or a wallet-scoped, bounded automatic-recovery policy, and its
 durable relay authority must survive restart without changing the signed bytes.
 """
 
+import ast
 from copy import deepcopy
 from decimal import Decimal
+from pathlib import Path
 from threading import Thread
 import time
 import unittest
+from unittest import mock
 from urllib.parse import quote
 
 from test_framework.authproxy import JSONRPCException
@@ -472,7 +475,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                     or accepted.get("reject-reason") != "shadow-proof-invalid"
                 ):
                     continue
-                recovery = subject["wallet"].getpowclaimrecoveryinfo(True)
+                recovery = get_recovery_info(subject["wallet"], True)
                 component = next(
                     component
                     for component in recovery["component_details"]
@@ -4017,6 +4020,38 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
             if isinstance(response, Exception):
                 raise response
             return response
+
+    def test_indexed_wallet_status_poll_retries_without_advancing_another_tip(self):
+        error = JSONRPCException({
+            "code": -1,
+            "message": "wallet or active-chain state changed while evaluating Gold Rush recovery proofs; retry",
+        })
+        info = {"component_details": [{
+            "claim_txids": ["claim"], "classification": "current_branch_ineligible",
+            "anchor_authenticated": True, "anchor_unspent": True,
+            "nodes": [{"txid": "claim", "disposition": "unbound_proof_may_revalidate",
+                       "in_mempool": False, "quarantined": True}],
+        }]}
+        wallet = self.Wallet([(None, error), (None, info)])
+        node = mock.Mock()
+        node.getrawmempool.return_value = []
+        node.testmempoolaccept.return_value = [{"allowed": False, "reject-reason": "shadow-proof-invalid"}]
+        harness = mock.Mock(nodes=[node])
+        GoldRushPowClaimSingleFlightTest._wait_for_claims_to_become_current_branch_ineligible(
+            harness, {"wallet": {"wallet": wallet, "txid": "claim", "hex": "raw"}},
+            "funding", max_blocks=1,
+        )
+        self.assertEqual(wallet.calls, 2)
+        self.assertEqual(wallet.script, [])
+        harness.generateblock.assert_called_once_with(node, output="funding", transactions=[])
+        node.testmempoolaccept.assert_called_once_with(["raw"])
+
+    def test_status_reads_do_not_bypass_snapshot_helpers(self):
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        bypasses = [node.lineno for node in ast.walk(tree)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"getpowclaimrecoveryinfo", "getpowmininginfo"}]
+        self.assertEqual(bypasses, [], "status reads must use the bounded snapshot helpers")
 
     @staticmethod
     def snapshot(generation=1, tip="tip"):

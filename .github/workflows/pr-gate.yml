@@ -141,6 +141,7 @@ jobs:
         run: |
           python3 ci/test/test_verify_script_assets.py
           python3 ci/test/test_sanitizer_report_capture.py
+          python3 ci/test/test_functional_runner_cleanup.py
           python3 test/fuzz/test_runner_tests.py
           PYTHONPATH=test/functional python3 -m unittest \
             feature_goldrush_pow_claim_singleflight.RecoveryPaginationHelperTest \

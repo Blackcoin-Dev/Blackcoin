@@ -105,11 +105,12 @@ std::string FormatSourceIdentity()
 /**
  * Format the subversion field according to BIP 14 spec (https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki)
  */
-std::string FormatSubVersion(const std::string& name, int nClientVersion, const std::vector<std::string>& comments)
+std::string FormatSubVersion(const std::string& name, int nClientVersion, const std::vector<std::string>& comments, unsigned int nClientRevision)
 {
     std::ostringstream ss;
     ss << "/";
     ss << name << ":" << FormatVersion(nClientVersion);
+    if (nClientRevision != 0) ss << "." << nClientRevision;
     if (!comments.empty())
     {
         std::vector<std::string>::const_iterator it(comments.begin());

@@ -14,8 +14,12 @@
 #endif //HAVE_CONFIG_H
 
 // Check that required client information is defined
-#if !defined(CLIENT_VERSION_MAJOR) || !defined(CLIENT_VERSION_MINOR) || !defined(CLIENT_VERSION_BUILD) || !defined(CLIENT_VERSION_IS_RELEASE) || !defined(COPYRIGHT_YEAR)
+#if !defined(CLIENT_VERSION_MAJOR) || !defined(CLIENT_VERSION_MINOR) || !defined(CLIENT_VERSION_BUILD) || !defined(CLIENT_VERSION_REVISION) || !defined(CLIENT_VERSION_STRING) || !defined(CLIENT_VERSION_IS_RELEASE) || !defined(COPYRIGHT_YEAR)
 #error Client version information missing: version is not defined by bitcoin-config.h or in any other way
+#endif
+
+#if CLIENT_VERSION_REVISION < 0 || CLIENT_VERSION_REVISION > 99
+#error Client maintenance revision must be between 0 and 99
 #endif
 
 // Copyright (c) 2009-2022 The Bitcoin Core developers
@@ -33,6 +37,9 @@
 #include <string>
 #include <vector>
 
+// Preserve the historical numeric encoding used by wallet database records and
+// RPC compatibility. The fourth display/package component is deliberately not
+// encoded here; exact builds are distinguished by their version and source ID.
 static const int CLIENT_VERSION =
                              10000 * CLIENT_VERSION_MAJOR
                          +     100 * CLIENT_VERSION_MINOR
@@ -48,7 +55,9 @@ std::string FormatSourceCommit();
 bool IsSourceTreeDirty();
 /** Human-readable source identity for command-line version output. */
 std::string FormatSourceIdentity();
-std::string FormatSubVersion(const std::string& name, int nClientVersion, const std::vector<std::string>& comments);
+/** Format a peer user agent. Historical numeric callers retain three components
+ * unless they explicitly supply a maintenance revision. */
+std::string FormatSubVersion(const std::string& name, int nClientVersion, const std::vector<std::string>& comments, unsigned int nClientRevision = 0);
 
 std::string CopyrightHolders(const std::string& strPrefix);
 

@@ -1798,6 +1798,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self._assert_generic_abandon_rejected(manual, first_txid)
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 0)
         self.log.info("A quarantined claim has a consent-only on-chain resolution path")
+        # The removal callback reserves the claim before the background worker
+        # durably records its branch-relative stale clock. Wait for that one-time
+        # fingerprint transition before planning, reviewing, or paginating it.
+        reviewed = self._wait_for_quarantine_observation(
+            manual, first_txid, quarantine_block
+        )
         preview = manual.createshadowpowclaimresolution(first_txid)
         assert_equal(preview["dry_run"], True)
         assert_equal(preview["broadcast"], False)
@@ -1807,12 +1813,6 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(preview["conflicts_with_revalidating_unbound_proof"], True)
         assert "hex" not in preview
         assert first_txid not in node.getrawmempool()
-        # The removal callback reserves the claim before the background worker
-        # durably records its branch-relative stale clock. Wait for that one-time
-        # fingerprint transition before reviewing or paginating the component.
-        reviewed = self._wait_for_quarantine_observation(
-            manual, first_txid, quarantine_block
-        )
         reviewed, first_page = self._assert_recovery_pages(manual, reviewed, page_size=2)
         cursor = first_page["pagination"]["next_cursor"]
         assert_raises_rpc_error(
@@ -4087,6 +4087,26 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
         self.assertEqual(wallet.calls, len(pending) + 1)
         self.assertEqual(wallet.script, [])
         harness.wait_until.assert_called_once()
+
+    def test_manual_preview_follows_durable_quarantine_observation(self):
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        fixture = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                       and node.name == "GoldRushPowClaimSingleFlightTest")
+        run_test = next(node for node in fixture.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "run_test")
+        calls = [node for node in ast.walk(run_test)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
+        barriers = [node.lineno for node in calls
+                    if node.func.attr == "_wait_for_quarantine_observation"
+                    and len(node.args) == 3 and isinstance(node.args[1], ast.Name)
+                    and node.args[1].id == "first_txid"]
+        previews = [node.lineno for node in calls
+                    if node.func.attr == "createshadowpowclaimresolution"
+                    and node.args and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == "first_txid"]
+        self.assertEqual(len(barriers), 1)
+        self.assertTrue(previews)
+        self.assertLess(barriers[0], min(previews))
 
     def test_indexed_wallet_status_poll_retries_without_advancing_another_tip(self):
         error = JSONRPCException({

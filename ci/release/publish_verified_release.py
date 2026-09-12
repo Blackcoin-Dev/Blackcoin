@@ -68,9 +68,9 @@ def validate_receipt(receipt, repository, source_sha, tag, tag_object, now):
 
 def check_receipt(repository, source_sha, tag):
     validate_identity(repository, source_sha, tag)
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    target = subprocess.check_output(["git", "rev-parse", f"refs/tags/{tag}^{{commit}}"], text=True).strip()
-    tag_object = subprocess.check_output(["git", "rev-parse", f"refs/tags/{tag}^{{tag}}"], text=True).strip()
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, encoding="utf8").strip()
+    target = subprocess.check_output(["git", "rev-parse", f"refs/tags/{tag}^{{commit}}"], text=True, encoding="utf8").strip()
+    tag_object = subprocess.check_output(["git", "rev-parse", f"refs/tags/{tag}^{{tag}}"], text=True, encoding="utf8").strip()
     require(head == source_sha == target, "checkout or annotated tag target differs")
     require(re.fullmatch(r"[0-9a-f]{40}", tag_object), "invalid annotated tag object")
     encoded, encoded_signature = os.environ.get(RECEIPT_ENV, ""), os.environ.get(SIGNATURE_ENV, "")
@@ -135,7 +135,7 @@ def inventory(dist, version, source_sha):
 
 
 def gh_json(endpoint, *options):
-    return read_json(subprocess.check_output(["gh", "api", endpoint, *options], text=True))
+    return read_json(subprocess.check_output(["gh", "api", endpoint, *options], text=True, encoding="utf8"))
 
 
 def verify_remote_tag(repository, tag, tag_object):

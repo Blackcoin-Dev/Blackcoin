@@ -2100,17 +2100,20 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             self._claim_input(second_claim_txid),
             {"txid": descendant_txid, "vout": 0},
         )
-        self.generateblock(
+        second_quarantine_tip = self.generateblock(
             node,
             output=funding_address,
             transactions=[],
-        )
+        )["hash"]
         self.wait_until(lambda: second_claim_txid not in node.getrawmempool(), timeout=20)
         self.wait_until(
             lambda: second_claim_txid in self._quarantined_claim_txids(manual),
             timeout=20,
         )
 
+        self._wait_for_quarantine_observation(
+            manual, second_claim_txid, second_quarantine_tip
+        )
         second_preview = manual.resolveallshadowpowclaims()
         assert_equal(second_preview["action"], "preview")
         assert_equal(second_preview["plan_reusable"], True)
@@ -2415,8 +2418,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         # pinned-tip classification is eligible for the explicit conflict
         # resolver. -walletbroadcast=0 is a real, deterministic relay-failure
         # path: persistence and consent succeed, while wallet relay refuses.
-        self.generateblock(node, output=funding_address, transactions=[])
+        fault_quarantine_tip = self.generateblock(
+            node, output=funding_address, transactions=[]
+        )["hash"]
         node.syncwithvalidationinterfacequeue()
+        self._wait_for_quarantine_observation(
+            fault, first_fault_txid, fault_quarantine_tip
+        )
         failed_relay_preview = fault.resolveallshadowpowclaims()
         assert_equal(failed_relay_preview["actionable_components"], 1)
         assert_equal(failed_relay_preview["refused_components"], 0)
@@ -4108,7 +4116,11 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
                         and node.name == "run_test")
         calls = [node for node in ast.walk(run_test)
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
-        for txid in ("first_txid", "blocker_claim_txid"):
+        for txid, preview_assignment in (
+            ("first_txid", None), ("blocker_claim_txid", None),
+            ("second_claim_txid", "second_preview"),
+            ("first_fault_txid", "failed_relay_preview"),
+        ):
             barriers = [node.lineno for node in calls
                         if node.func.attr == "_wait_for_quarantine_observation"
                         and len(node.args) == 3 and isinstance(node.args[1], ast.Name)
@@ -4123,6 +4135,10 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
                             and isinstance(node.args[2], ast.Attribute)
                             and node.args[2].attr == "createshadowpowclaimresolution"
                             and isinstance(node.args[3], ast.Name) and node.args[3].id == txid)
+            previews.extend(node.lineno for node in ast.walk(run_test)
+                            if isinstance(node, ast.Assign)
+                            and any(isinstance(target, ast.Name) and target.id == preview_assignment
+                                    for target in node.targets))
             self.assertEqual(len(barriers), 1)
             self.assertTrue(previews)
             self.assertLess(barriers[0], min(previews))

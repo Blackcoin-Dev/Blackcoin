@@ -612,6 +612,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         return info
 
     def _commit_claim_resolution(self, wallet, claim_txid):
+        self._wait_for_quarantine_observation(
+            wallet, claim_txid, self.nodes[0].getbestblockhash()
+        )
         preview = wallet.createshadowpowclaimresolution(claim_txid)
         assert_equal(preview["dry_run"], True)
         signed = wallet.createshadowpowclaimresolution(
@@ -1729,9 +1732,16 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert blocker_descendant["complete"]
         blocker_descendant_txid = node.sendrawtransaction(blocker_descendant["hex"])
         assert blocker_descendant_txid in node.getrawmempool()
-        self.generateblock(node, output=funding_address, transactions=[])
+        blocker_quarantine_tip = self.generateblock(
+            node, output=funding_address, transactions=[]
+        )["hash"]
         self.wait_until(lambda: blocker_claim_txid not in node.getrawmempool(), timeout=20)
         self.wait_until(lambda: blocker_descendant_txid not in node.getrawmempool(), timeout=20)
+        # Absence is visible before the claim's durable quarantine observation.
+        # Review that claim state before asserting the independent descendant veto.
+        self._wait_for_quarantine_observation(
+            descendant_blocker, blocker_claim_txid, blocker_quarantine_tip
+        )
         assert_raises_rpc_error(
             -4,
             "has an unresolved wallet descendant",
@@ -4057,6 +4067,8 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
                 "claim_txids": ["claim"], "all_claims_quarantined": True,
                 "stale_depth_known": True, "has_revalidating_unbound_proof": True,
                 "component_fingerprint": "fresh",
+                "classification": "indeterminate", "has_indeterminate_node": True,
+                "ordinary_or_mixed_txids": ["descendant"],
             }],
         }
         pending = []
@@ -4088,7 +4100,7 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
         self.assertEqual(wallet.script, [])
         harness.wait_until.assert_called_once()
 
-    def test_manual_preview_follows_durable_quarantine_observation(self):
+    def test_recovery_previews_follow_durable_quarantine_observation(self):
         tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         fixture = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                        and node.name == "GoldRushPowClaimSingleFlightTest")
@@ -4096,17 +4108,46 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
                         and node.name == "run_test")
         calls = [node for node in ast.walk(run_test)
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
-        barriers = [node.lineno for node in calls
-                    if node.func.attr == "_wait_for_quarantine_observation"
-                    and len(node.args) == 3 and isinstance(node.args[1], ast.Name)
-                    and node.args[1].id == "first_txid"]
-        previews = [node.lineno for node in calls
-                    if node.func.attr == "createshadowpowclaimresolution"
-                    and node.args and isinstance(node.args[0], ast.Name)
-                    and node.args[0].id == "first_txid"]
-        self.assertEqual(len(barriers), 1)
-        self.assertTrue(previews)
-        self.assertLess(barriers[0], min(previews))
+        for txid in ("first_txid", "blocker_claim_txid"):
+            barriers = [node.lineno for node in calls
+                        if node.func.attr == "_wait_for_quarantine_observation"
+                        and len(node.args) == 3 and isinstance(node.args[1], ast.Name)
+                        and node.args[1].id == txid]
+            previews = [node.lineno for node in calls
+                        if node.func.attr == "createshadowpowclaimresolution"
+                        and node.args and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id == txid]
+            previews.extend(node.lineno for node in ast.walk(run_test)
+                            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                            and node.func.id == "assert_raises_rpc_error" and len(node.args) > 3
+                            and isinstance(node.args[2], ast.Attribute)
+                            and node.args[2].attr == "createshadowpowclaimresolution"
+                            and isinstance(node.args[3], ast.Name) and node.args[3].id == txid)
+            self.assertEqual(len(barriers), 1)
+            self.assertTrue(previews)
+            self.assertLess(barriers[0], min(previews))
+
+    def test_resolution_helper_waits_before_preview_and_never_retries_mutations(self):
+        wallet = mock.Mock()
+        wallet.createshadowpowclaimresolution.side_effect = [
+            {"dry_run": True, "plan_id": "plan"},
+            {"dry_run": False, "broadcast": False, "txid": "resolution"},
+        ]
+        wallet.commitshadowpowclaimresolution.side_effect = [
+            {"plan_id": "commit-plan"},
+            {"success": True, "action": "commit_and_broadcast"},
+        ]
+        harness = mock.Mock(nodes=[mock.Mock()])
+        harness.nodes[0].getbestblockhash.return_value = "tip"
+        harness.attach_mock(wallet, "wallet")
+        GoldRushPowClaimSingleFlightTest._commit_claim_resolution(harness, wallet, "claim")
+        self.assertEqual(harness.mock_calls, [
+            mock.call._wait_for_quarantine_observation(wallet, "claim", "tip"),
+            mock.call.wallet.createshadowpowclaimresolution("claim"),
+            mock.call.wallet.createshadowpowclaimresolution("claim", False, True, None, "plan"),
+            mock.call.wallet.commitshadowpowclaimresolution("resolution"),
+            mock.call.wallet.commitshadowpowclaimresolution("resolution", True, "commit-plan"),
+        ])
 
     def test_indexed_wallet_status_poll_retries_without_advancing_another_tip(self):
         error = JSONRPCException({

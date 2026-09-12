@@ -1,0 +1,129 @@
+name: singleflight artifact diagnostic
+# Diagnostic evidence only: this workflow never qualifies or publishes a release.
+on:
+  push:
+    branches: [fix/v30.1.5.1-native-liveness-diagnostic]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full signed commit containing the corrected singleflight test
+        required: true
+        type: string
+      binary_source_sha:
+        description: Full source commit of the previously built native artifact
+        required: true
+        type: string
+        default: 798ef385a2239aedc35bf1466436d05f1c675246
+      artifact_run_id:
+        description: Original pull-request safety gate run containing the artifact
+        required: true
+        type: string
+        default: '34670670435'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  singleflight-diagnostic:
+    if: ${{ github.repository == 'Blackcoin-Dev/Blackcoin' && github.actor == 'Blackcoin-Dev' && github.triggering_actor == 'Blackcoin-Dev' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      TARGET_SHA: ${{ inputs.target_sha || github.sha }}
+      BINARY_SOURCE_SHA: ${{ inputs.binary_source_sha || '798ef385a2239aedc35bf1466436d05f1c675246' }}
+      ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || '34670670435' }}
+    steps:
+      - name: Checkout exact diagnostic source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify signed source and unchanged native inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ && "$BINARY_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARTIFACT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          git diff --exit-code "$BINARY_SOURCE_SHA" "$TARGET_SHA" -- . \
+            ':(exclude).github/workflows/singleflight-artifact-regression.yml' \
+            ':(exclude)test/functional/feature_goldrush_pow_claim_singleflight.py'
+          python3 ci/release/verify_source_identity.py \
+            --base "$BINARY_SOURCE_SHA" --head "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" --require-actor --actor "$GITHUB_ACTOR" \
+            --require-signatures --signing-fingerprint 'SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70'
+          git diff --check "$BINARY_SOURCE_SHA" "$TARGET_SHA"
+
+      - name: Verify original run, successful native build, and unique artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          endpoint="repos/$GITHUB_REPOSITORY/actions/runs/$ARTIFACT_RUN_ID"
+          gh api "$endpoint" | jq -e --arg sha "$BINARY_SOURCE_SHA" \
+            --arg repo "$GITHUB_REPOSITORY" --argjson run "$ARTIFACT_RUN_ID" '
+            .id == $run and .head_sha == $sha and .repository.full_name == $repo and
+            .head_repository.full_name == $repo and .path == ".github/workflows/pr-gate.yml" and
+            .status == "completed" and (.conclusion == "success" or .conclusion == "failure")'
+          gh api --paginate --slurp "$endpoint/jobs?filter=latest&per_page=100" |
+            jq -e --arg sha "$BINARY_SOURCE_SHA" '
+            [.[] | .jobs[] | select(.name == "pinned native build and unit tests")] |
+            length == 1 and .[0].head_sha == $sha and .[0].status == "completed" and
+            .[0].conclusion == "success"'
+          gh api --paginate --slurp "$endpoint/artifacts?per_page=100" |
+            jq -e --arg sha "$BINARY_SOURCE_SHA" --argjson run "$ARTIFACT_RUN_ID" '
+            [.[] | .artifacts[] | select(.name == "safety-gate-native-" + $sha)] |
+            if length == 1 and .[0].expired == false and .[0].size_in_bytes > 0 and
+            .[0].workflow_run.id == $run and .[0].workflow_run.head_sha == $sha and
+            (.[0].digest | test("^sha256:[0-9a-f]{64}$"))
+            then .[0] else error("native artifact identity mismatch") end' > "$RUNNER_TEMP/native-artifact.json"
+          artifact_id=$(jq -er '.id | select(type == "number" and . > 0)' "$RUNNER_TEMP/native-artifact.json")
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$RUNNER_TEMP/native.zip"
+          digest=$(jq -r '.digest | ltrimstr("sha256:")' "$RUNNER_TEMP/native-artifact.json")
+          printf '%s  %s\n' "$digest" "$RUNNER_TEMP/native.zip" | sha256sum --check --strict
+          test "$(stat -c%s "$RUNNER_TEMP/native.zip")" = "$(jq -r .size_in_bytes "$RUNNER_TEMP/native-artifact.json")"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import zipfile
+          expected = {"src/blackcoin" + suffix for suffix in ("d", "-cli", "-tx", "-util", "-wallet")}
+          expected |= {"src/bench/bench_blackcoin", "src/Makefile", "test/config.ini"}
+          with zipfile.ZipFile(Path(os.environ["RUNNER_TEMP"]) / "native.zip") as archive:
+              entries = archive.infolist()
+              names = [entry.filename for entry in entries]
+              if len(names) != len(set(names)) or {entry.filename for entry in entries if not entry.is_dir()} != expected:
+                  raise RuntimeError("native artifact contains missing, unexpected, or duplicate paths")
+              for entry in entries:
+                  if entry.is_dir() and entry.filename not in {"src/", "src/bench/", "test/"}:
+                      raise RuntimeError("unexpected artifact directory")
+                  if stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFDIR if entry.is_dir() else stat.S_IFREG):
+                      raise RuntimeError("artifact symlink or special file rejected")
+              archive.extractall(".")
+          PY
+
+      - name: Verify clean binary identity and report diagnostic scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          chmod +x src/blackcoind src/blackcoin-cli
+          version=$(src/blackcoind --version)
+          grep -Fxq "Source commit: $BINARY_SOURCE_SHA" <<< "$version"
+          if grep -qi dirty <<< "$version"; then exit 1; fi
+          printf '%s\n' "$version"
+          {
+            printf 'Diagnostic test source: %s\n\n' "$TARGET_SHA"
+            printf 'Unchanged native binary source: %s (run %s)\n\n' "$BINARY_SOURCE_SHA" "$ARTIFACT_RUN_ID"
+            printf '%s\n' 'Singleflight regression only; no release qualification, publication, or issue-closing authority.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run only the corrected singleflight fixture
+        run: |
+          python3 test/functional/test_runner.py --ci --jobs=1 --combinedlogslen=2000 \
+            feature_goldrush_pow_claim_singleflight.py

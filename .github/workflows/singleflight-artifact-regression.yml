@@ -1,4 +1,4 @@
-name: singleflight artifact diagnostic
+name: native artifact diagnostic
 # Diagnostic evidence only: this workflow never qualifies or publishes a release.
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       target_sha:
-        description: Full signed commit containing the corrected singleflight test
+        description: Full signed commit containing the corrected regression test
         required: true
         type: string
       binary_source_sha:
@@ -19,6 +19,12 @@ on:
         required: true
         type: string
         default: '34670670435'
+      regression_fixture:
+        description: Run exactly one supported native regression fixture
+        required: true
+        type: choice
+        options: [pow_miner_e2e, singleflight]
+        default: pow_miner_e2e
 
 permissions:
   contents: read
@@ -33,6 +39,7 @@ jobs:
       TARGET_SHA: ${{ inputs.target_sha || github.sha }}
       BINARY_SOURCE_SHA: ${{ inputs.binary_source_sha || '798ef385a2239aedc35bf1466436d05f1c675246' }}
       ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || '34670670435' }}
+      REGRESSION_FIXTURE: ${{ inputs.regression_fixture || 'pow_miner_e2e' }}
     steps:
       - name: Checkout exact diagnostic source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
@@ -50,7 +57,8 @@ jobs:
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           git diff --exit-code "$BINARY_SOURCE_SHA" "$TARGET_SHA" -- . \
             ':(exclude).github/workflows/singleflight-artifact-regression.yml' \
-            ':(exclude)test/functional/feature_goldrush_pow_claim_singleflight.py'
+            ':(exclude)test/functional/feature_goldrush_pow_claim_singleflight.py' \
+            ':(exclude)test/functional/feature_goldrush_pow_miner_e2e.py'
           python3 ci/release/verify_source_identity.py \
             --base "$BINARY_SOURCE_SHA" --head "$TARGET_SHA" \
             --repository "$GITHUB_REPOSITORY" --require-actor --actor "$GITHUB_ACTOR" \
@@ -128,10 +136,22 @@ jobs:
             printf 'Diagnostic test source: %s\n\n' "$TARGET_SHA"
             printf 'Unchanged native binary source: %s (run %s)\n\n' "$BINARY_SOURCE_SHA" "$ARTIFACT_RUN_ID"
             printf 'Native debug artifact metadata: %s; this artifact is not a release package.\n\n' "$metadata"
-            printf '%s\n' 'Singleflight regression only; no release qualification, publication, or issue-closing authority.'
+            printf 'Selected native regression: %s; no release qualification, publication, or issue-closing authority.\n' "$REGRESSION_FIXTURE"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run only the corrected singleflight fixture
+      - name: Run only the selected regression fixture
+        shell: bash
         run: |
+          set -euo pipefail
+          export LC_ALL=C
+          case "$REGRESSION_FIXTURE" in
+            pow_miner_e2e) fixture=feature_goldrush_pow_miner_e2e.py ;;
+            singleflight) fixture=feature_goldrush_pow_claim_singleflight.py ;;
+            *) printf '%s\n' 'Unsupported native regression fixture' >&2; exit 1 ;;
+          esac
+          if [[ "$REGRESSION_FIXTURE" == pow_miner_e2e ]]; then
+            python3 test/functional/test_runner.py --ci --jobs=1 --combinedlogslen=2000 \
+              "$fixture" --randomseed=2819723895823438619
+          fi
           python3 test/functional/test_runner.py --ci --jobs=1 --combinedlogslen=2000 \
-            feature_goldrush_pow_claim_singleflight.py
+            "$fixture"

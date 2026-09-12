@@ -107,19 +107,27 @@ jobs:
               archive.extractall(".")
           PY
 
-      - name: Verify clean binary identity and report diagnostic scope
+      - name: Verify binary source and report diagnostic metadata
         shell: bash
         run: |
           set -euo pipefail
           export LC_ALL=C
           chmod +x src/blackcoind src/blackcoin-cli
           version=$(src/blackcoind --version)
-          grep -Fxq "Source commit: $BINARY_SOURCE_SHA" <<< "$version"
-          if grep -qi dirty <<< "$version"; then exit 1; fi
           printf '%s\n' "$version"
+          # The native debug job adds the pinned, nonignored script corpus
+          # before make check regenerates build.h. Its dirty bit is retained
+          # honestly here; only production packaging requires a clean marker.
+          source_line=$(grep '^Source commit:' <<< "$version")
+          case "$source_line" in
+            "Source commit: $BINARY_SOURCE_SHA") metadata=clean ;;
+            "Source commit: $BINARY_SOURCE_SHA (dirty)") metadata=dirty ;;
+            *) printf '%s\n' 'Native diagnostic source identity mismatch' >&2; exit 1 ;;
+          esac
           {
             printf 'Diagnostic test source: %s\n\n' "$TARGET_SHA"
             printf 'Unchanged native binary source: %s (run %s)\n\n' "$BINARY_SOURCE_SHA" "$ARTIFACT_RUN_ID"
+            printf 'Native debug artifact metadata: %s; this artifact is not a release package.\n\n' "$metadata"
             printf '%s\n' 'Singleflight regression only; no release qualification, publication, or issue-closing authority.'
           } >> "$GITHUB_STEP_SUMMARY"
 

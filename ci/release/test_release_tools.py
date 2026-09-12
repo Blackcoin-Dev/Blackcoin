@@ -3556,6 +3556,7 @@ class ReleaseToolTests(unittest.TestCase):
             "957b41d22c8d96131a0ec87fff1e2f4c20a5caa2",
             "19baffef25af36e177db2975780e0641b59753aa",
             "e85668ed26ef75d92e234488cbd85e146f6ffd5a",
+            "f2c046242c45c6c58ffd5702a3251ca5d5f9f06e",
         )
         merge_metadata = (
             "Blackcoin-Dev\0"

@@ -856,6 +856,42 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self.wait_until(observation_is_current, timeout=20)
         return reviewed
 
+    def _wait_for_live_claim_family(self, wallet, root_txid, tip):
+        """Return the live observations accepted by the bounded liveness wait."""
+        accepted = None
+
+        def family_is_live():
+            nonlocal accepted
+            # Observe the new live claim before sampling the worker. A status
+            # read made before submission cannot establish post-submission liveness.
+            recovery = get_recovery_info(wallet, True)
+            if not recovery["wallet_tip_matches"] or recovery["active_tip"] != tip:
+                return False
+            component = next((item for item in recovery["component_details"]
+                              if root_txid in item["claim_txids"]), None)
+            if component is None:
+                return False
+            live = [node for node in component["nodes"]
+                    if node["kind"] == "claim" and node["in_mempool"]]
+            if len(live) != 1:
+                return False
+            info = get_pow_mining_info(wallet)
+            if (not info["enabled"] or info["state"] != "claim_in_flight"
+                    or info["claim_inventory_tip"] != tip
+                    or not info["claim_inventory_wallet_tip_matches"]
+                    or not info["mining_gate_coherent"]
+                    or info["mining_gate_database_ambiguous"]
+                    or info["mining_gate_unsafe_claims"] != 0
+                    or info["mining_gate_unsafe_components"] != 0
+                    or info["mining_gate_action"] != "wait_for_live"):
+                return False
+            accepted = info, component
+            return True
+
+        self.wait_until(family_is_live, timeout=180)
+        assert accepted is not None
+        return accepted
+
     @staticmethod
     def _assert_claim_inventory(wallet, raw, actionable, resolved, indeterminate, components=None):
         info = get_pow_mining_info(wallet)
@@ -2765,38 +2801,10 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 observed_continuation_tips.add(current_tip)
                 assert_equal(node.getshadowpowwork()["proof_version"], 2)
 
-                def coherent_live_family():
-                    info = get_pow_mining_info(boundary)
-                    if (
-                        info["claim_inventory_tip"] != current_tip
-                        or not info["mining_gate_coherent"]
-                        or info["mining_gate_database_ambiguous"]
-                        or info["mining_gate_unsafe_claims"] != 0
-                        or info["mining_gate_unsafe_components"] != 0
-                        or info["state"] == "claim_quarantined"
-                    ):
-                        return False
-                    recovery = get_recovery_info(boundary, True)
-                    component = next(
-                        (
-                            item
-                            for item in recovery["component_details"]
-                            if boundary_claim_txid in item["claim_txids"]
-                        ),
-                        None,
-                    )
-                    if component is None:
-                        return False
-                    live = [
-                        graph_node
-                        for graph_node in component["nodes"]
-                        if graph_node["kind"] == "claim" and graph_node["in_mempool"]
-                    ]
-                    return len(live) == 1
-
-                self.wait_until(coherent_live_family, timeout=180)
-                tip_info = get_pow_mining_info(boundary)
-                assert tip_info["state"] != "claim_quarantined"
+                tip_info, tip_component = self._wait_for_live_claim_family(
+                    boundary, boundary_claim_txid, current_tip
+                )
+                assert_equal(tip_info["state"], "claim_in_flight")
                 assert_equal(
                     tip_info["mining_gate_action"], "wait_for_live"
                 )
@@ -2807,12 +2815,6 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 assert_equal(tip_info["mining_gate_unsafe_components"], 0)
                 assert_equal(len(tip_info["mining_gate_candidate_state_fingerprint"]), 64)
 
-                tip_recovery = get_recovery_info(boundary, True)
-                tip_component = next(
-                    component
-                    for component in tip_recovery["component_details"]
-                    if boundary_claim_txid in component["claim_txids"]
-                )
                 assert_equal(
                     {
                         "txid": tip_component["anchor"]["txid"],
@@ -4052,6 +4054,87 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
 
 class RecoveryPaginationHelperTest(unittest.TestCase):
+    @staticmethod
+    def live_family_fixture():
+        info = {
+            "enabled": True, "state": "claim_in_flight", "claim_inventory_tip": "tip",
+            "claim_inventory_wallet_tip_matches": True, "mining_gate_coherent": True,
+            "mining_gate_database_ambiguous": False, "mining_gate_unsafe_claims": 0,
+            "mining_gate_unsafe_components": 0, "mining_gate_action": "wait_for_live",
+        }
+        component = {"claim_txids": ["root", "live"],
+                     "nodes": [{"kind": "claim", "in_mempool": True}]}
+        recovery = {"wallet_tip_matches": True, "active_tip": "tip",
+                    "component_details": [component]}
+        return info, component, recovery
+
+    def test_liveness_wait_retains_post_submission_observation(self):
+        info, component, recovery = self.live_family_fixture()
+        wallet = mock.Mock()
+        wallet.getpowclaimrecoveryinfo.side_effect = [recovery, recovery]
+        wallet.getpowmininginfo.side_effect = [
+            {**info, "state": "claim_quarantined"}, info,
+        ]
+
+        def wait_until(predicate, timeout):
+            self.assertEqual(timeout, 180)
+            self.assertFalse(predicate())
+            self.assertTrue(predicate())
+
+        harness = mock.Mock()
+        harness.wait_until.side_effect = wait_until
+        actual_info, actual_component = GoldRushPowClaimSingleFlightTest._wait_for_live_claim_family(
+            harness, wallet, "root", "tip"
+        )
+        self.assertIs(actual_info, info)
+        self.assertIs(actual_component, component)
+        self.assertEqual(wallet.mock_calls, [
+            ("getpowclaimrecoveryinfo", (True,), {}), ("getpowmininginfo", (), {}),
+            ("getpowclaimrecoveryinfo", (True,), {}), ("getpowmininginfo", (), {}),
+        ])
+
+    def test_liveness_wait_rejects_permanent_pause_and_unsafe_or_unpinned_state(self):
+        info, _, recovery = self.live_family_fixture()
+        bad_states = [
+            {**info, key: value} for key, value in (
+                ("enabled", False), ("state", "claim_quarantined"),
+                ("state", "hashing"), ("claim_inventory_tip", "other-tip"),
+                ("claim_inventory_wallet_tip_matches", False),
+                ("mining_gate_coherent", False), ("mining_gate_database_ambiguous", True),
+                ("mining_gate_unsafe_claims", 1), ("mining_gate_unsafe_components", 1),
+                ("mining_gate_action", "refresh_same_anchor"),
+            )
+        ]
+        bad_recoveries = [
+            {**recovery, "wallet_tip_matches": False}, {**recovery, "active_tip": "other-tip"},
+            {**recovery, "component_details": []},
+            {**recovery, "component_details": [{"claim_txids": ["root"], "nodes": []}]},
+            {**recovery, "component_details": [{"claim_txids": ["root"], "nodes": [
+                {"kind": "claim", "in_mempool": True},
+                {"kind": "claim", "in_mempool": True},
+            ]}]},
+        ]
+        for status, inventory in [*[(bad, recovery) for bad in bad_states],
+                                  *[(info, bad) for bad in bad_recoveries]]:
+            with self.subTest(status=status, inventory=inventory):
+                wallet = mock.Mock()
+                wallet.getpowmininginfo.return_value = status
+                wallet.getpowclaimrecoveryinfo.return_value = inventory
+
+                def wait_until(predicate, timeout):
+                    self.assertEqual(timeout, 180)
+                    for _ in range(3):
+                        self.assertFalse(predicate())
+                    raise AssertionError("liveness did not stabilize")
+
+                harness = mock.Mock()
+                harness.wait_until.side_effect = wait_until
+                with self.assertRaisesRegex(AssertionError, "liveness did not stabilize"):
+                    GoldRushPowClaimSingleFlightTest._wait_for_live_claim_family(
+                        harness, wallet, "root", "tip"
+                    )
+                self.assertEqual(wallet.getpowclaimrecoveryinfo.call_count, 3)
+
     """Pure helper regression: python -m unittest feature_goldrush_pow_claim_singleflight.RecoveryPaginationHelperTest."""
 
     class Wallet:

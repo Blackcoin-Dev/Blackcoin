@@ -10928,13 +10928,21 @@ struct ShadowPowClaimStakeReserveSnapshot
 };
 
 /** This scan is intentionally wallet-only. The caller binds it to an exact
- * short chain snapshot before using any result as selection authority. */
-constexpr size_t MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS{4096};
+ * short chain snapshot before using any result as selection authority.
+ * Ordinary wallet outputs must not consume the smaller claim-graph budget
+ * used under cs_main. Keep this complete scan finite (not paginated), at the
+ * same output scale as automatic shadow-signal wallet scans. */
+constexpr size_t MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS{65536};
+// Charge outputs, protected-asset records, and spender edges together, with
+// headroom for spend history even at the output bound. The protected-asset
+// namespace retains its own, smaller preflight below.
+constexpr size_t SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY{
+    MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS * 2};
 // Three fixed predicate passes can each perform two IsMine manager walks plus
 // one solving-provider walk. Final one-input fee sizing performs at most two
 // additional descriptor walks for each caller candidate: eleven total.
 constexpr size_t SHADOW_POW_CLAIM_MANAGER_WORK_CAPACITY{
-    SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY * 64};
+    MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS * 64};
 
 struct ShadowPowClaimWarmCandidate
 {
@@ -11084,9 +11092,9 @@ ShadowPowClaimWarmSourceSnapshot BuildShadowPowClaimWarmSourceSnapshot(
     snapshot.topology_work = protected_work;
     snapshot.parsed_bytes = protected_bytes;
 
-    if (live.size() > SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY -
+    if (live.size() > SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY -
                           std::min(snapshot.topology_work,
-                                   SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY)) {
+                                   SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY)) {
         snapshot.capacity_exceeded = true;
         snapshot.ClearAuthority();
         return snapshot;
@@ -11112,9 +11120,9 @@ ShadowPowClaimWarmSourceSnapshot BuildShadowPowClaimWarmSourceSnapshot(
         }
         const CTxOut& output = it->second.tx->vout[outpoint.n];
         const size_t remaining_work =
-            SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY -
+            SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY -
             std::min(snapshot.topology_work,
-                     SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY);
+                     SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY);
         size_t spender_work{0};
         bool wallet_spent{false};
         if (!wallet.GetBoundedWalletSpentStateLocked(

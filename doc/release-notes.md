@@ -1,10 +1,25 @@
+30.1.5.1 Maintenance Release Notes
+==================================
+
+Blackcoin Core v30.1.5.1 is the corrective successor to immutable v30.1.5.
+It corrects complete retained-history capacity, confirmed-parent referenced-output
+accounting, and wallet-wide PoW source-selection budgets (#54, #55, #56).
+It preserves complete fail-closed inventories, mature stake reserve, wallet
+authority, consensus, and wallet/chain storage formats. See
+`doc/release-notes/release-notes-30.1.5.1.md` for the canonical scope,
+platform version mapping, operator warnings, and validation boundary.
+
+The source is not a public release until its exact signed commit and annotated
+tag pass qualification and its verified immutable assets are published. Until
+then, v30.1.5 remains the latest public release. Local candidate and deployment
+results do not replace public-release qualification.
+
 30.1.5 Maintenance Release Notes
 ================================
 
 Blackcoin Core v30.1.5 is the corrective successor to immutable v30.1.4.
-The source is not a public release until the exact Blackcoin-Dev-signed commit
-and tag complete the mandatory release gate and the resulting artifacts are
-published. Until then, v30.1.4 remains the latest public release.
+This historical release was published from its exact Blackcoin-Dev-signed source
+and tag. The capacity corrections described above are not present in v30.1.5.
 
 v30.1.5 restores built-in Gold Rush PoW progress for strictly authenticated
 same-anchor claim families, retains explicit `-powmining=1` intent across

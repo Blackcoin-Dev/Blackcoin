@@ -490,12 +490,22 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         self.log.info("Ordinary mempool age expiry must not abandon a still tip-valid claim")
         age_txid, _ = self._start_miner_until_claim(age_miner)
         age_hex = node.getrawtransaction(age_txid)
+        age_entry_time = node.getmempoolentry(age_txid)["time"]
         self._bump_mocktime(2 * 60 * 60)
         staker.sendtoaddress(staker_address, Decimal("0.1"))
-        self.wait_until(lambda: age_txid not in node.getrawmempool(), timeout=10)
-        self.wait_until(lambda: not age_miner.gettransaction(age_txid)["trusted"], timeout=10)
+        # The event-driven executor can reaccept these exact, still-valid bytes
+        # before an RPC observes their brief absence. A newer mempool insertion
+        # time proves expiry and reacceptance without requiring that transient.
+        self.wait_until(
+            lambda: node.getrawmempool(True).get(age_txid, {}).get("time", 0) > age_entry_time,
+            timeout=20,
+        )
+        self.wait_until(lambda: age_miner.gettransaction(age_txid)["trusted"], timeout=10)
+        assert_equal(node.getrawtransaction(age_txid), age_hex)
+        assert_equal(self._pow_claim_txids(), [age_txid])
         assert_equal(self._is_abandoned(age_miner, age_txid), False)
         assert "qq_auto_shadow_stale" not in age_miner.gettransaction(age_txid)
+        self._assert_no_automatic_claim_cleanup(age_miner, age_txid)
         assert_equal(node.sendrawtransaction(age_hex), age_txid)
         age_block_hash = self._mine_pos_block_with_claim(staker, age_txid)
         assert age_txid in node.getblock(age_block_hash)["tx"]

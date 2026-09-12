@@ -53,8 +53,8 @@ CURRENT_FINAL_OPERATOR_DOCUMENTS = (
 )
 
 BETA2_RELEASE_CANDIDATE = 2
-FINAL_RELEASE_IDENTITY = (30, 1, 5, 0, True)
-BETA2_RELEASE_IDENTITY = (30, 1, 1, BETA2_RELEASE_CANDIDATE, False)
+FINAL_RELEASE_IDENTITY = (30, 1, 5, 1, 0, True)
+BETA2_RELEASE_IDENTITY = (30, 1, 1, 0, BETA2_RELEASE_CANDIDATE, False)
 
 
 def read_text(root, relative):
@@ -69,12 +69,15 @@ def normalized(text):
 
 def configured_release_identity(configure):
     components = []
-    for name in ("MAJOR", "MINOR", "BUILD", "RC"):
+    for name in ("MAJOR", "MINOR", "BUILD", "REVISION", "RC"):
         match = re.search(
             rf"^define\(_CLIENT_VERSION_{name}, ([0-9]+)\)$",
             configure,
             re.MULTILINE,
         )
+        if match is None and name == "REVISION":
+            components.append(0)
+            continue
         if match is None:
             raise ValueError("configure.ac has malformed Blackcoin Core release identity")
         components.append(int(match.group(1)))
@@ -660,6 +663,7 @@ def check_final_release_identity(root, failures):
         "define(_CLIENT_VERSION_MAJOR, 30)",
         "define(_CLIENT_VERSION_MINOR, 1)",
         "define(_CLIENT_VERSION_BUILD, 5)",
+        "define(_CLIENT_VERSION_REVISION, 1)",
         "define(_CLIENT_VERSION_RC, 0)",
         "define(_CLIENT_VERSION_IS_RELEASE, true)",
     ):
@@ -668,7 +672,7 @@ def check_final_release_identity(root, failures):
             "configure.ac",
             configure,
             fragment,
-            "final v30.1.5 source metadata",
+            "final v30.1.5.1 source metadata",
         )
 
     stale_channel_patterns = (
@@ -687,9 +691,9 @@ def check_final_release_identity(root, failures):
 
     release_notes = read_text(root, "doc/release-notes.md")
     for fragment in (
-        "30.1.5 Maintenance Release Notes",
-        "Blackcoin Core v30.1.5 is the corrective successor to immutable v30.1.4.",
-        "`doc/release-notes/release-notes-30.1.5.md` for the canonical scope",
+        "30.1.5.1 Maintenance Release Notes",
+        "Blackcoin Core v30.1.5.1 is the corrective successor to immutable v30.1.5.",
+        "`doc/release-notes/release-notes-30.1.5.1.md` for the canonical scope",
         "Production release identity",
         "Only the annotated unsigned `v30.1.1` tag enters the production path.",
         "I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES",
@@ -722,15 +726,16 @@ def check_final_release_identity(root, failures):
         "final Windows recovery warning",
     )
 
-    final_notes_relative = "doc/release-notes/release-notes-30.1.5.md"
+    final_notes_relative = "doc/release-notes/release-notes-30.1.5.1.md"
     final_notes = read_text(root, final_notes_relative)
     for fragment in (
-        "# Blackcoin Core 30.1.5",
+        "# Blackcoin Core 30.1.5.1",
         "source commit and annotated tag are SSH-signed by Blackcoin-Dev",
         "This release does not change consensus",
-        "same-anchor lifecycle",
-        "`getpowmininginfo` exposes the coherent typed mining-gate snapshot",
-        "`SubmitShadowPowClaim` enters its persistence and commit path",
+        "complete retained claim histories",
+        "referenced confirmed-parent output",
+        "wallet-wide source selection",
+        "numeric `CLIENT_VERSION` remains `300105`",
         "Release publication still requires the exact-SHA",
     ):
         require_fragment(
@@ -746,14 +751,15 @@ def check_final_release_identity(root, failures):
     release_process_relative = "doc/release-process.md"
     release_process = read_text(root, release_process_relative)
     for fragment in (
-        "release runbook for Blackcoin Core v30.1.5",
-        "annotated `v30.1.5` tag must both be SSH-signed by",
-        "`production-release` acknowledgement is exactly `V30.1.5`",
-        "`doc/release-notes/release-notes-30.1.5.md`",
+        "release runbook for Blackcoin Core v30.1.5.1",
+        "annotated `v30.1.5.1` tag must both be SSH-signed by",
+        "`production-release` acknowledgement is exactly `V30.1.5.1`",
+        "`doc/release-notes/release-notes-30.1.5.1.md`",
         "packages remain without Authenticode signatures",
         "identity-free ad-hoc signatures and are not Developer-ID signed or notarized",
-        "It therefore cannot inherit v30.1.4 release evidence or use the",
-        "corrective fast path. The exact v30.1.5 source must pass the complete",
+        "The exact v30.1.5.1 source must pass the complete",
+        "fresh signed immutable-configuration receipt",
+        "numeric release ID",
         "exact reviewed Blackcoin-Dev-signed source commit",
     ):
         require_fragment(
@@ -761,7 +767,7 @@ def check_final_release_identity(root, failures):
             release_process_relative,
             release_process,
             fragment,
-            "v30.1.5 signed full-gate release policy",
+            "v30.1.5.1 signed full-gate release policy",
         )
 
     beta2_notes_relative = "doc/release-notes/release-notes-30.1.1-beta2.md"
@@ -858,11 +864,11 @@ def check_release_identity(root, failures):
     elif identity == BETA2_RELEASE_IDENTITY:
         check_beta2_release_identity(root, failures)
     else:
-        major, minor, build, rc, is_release = identity
+        major, minor, build, revision, rc, is_release = identity
         failures.append(
-            "configure.ac release identity must be final 30.1.5 RC0/true or "
+            "configure.ac release identity must be final 30.1.5.1 RC0/true or "
             f"replacement Beta 2 30.1.1 RC{BETA2_RELEASE_CANDIDATE}/false; found "
-            f"{major}.{minor}.{build} RC{rc}/{'true' if is_release else 'false'}"
+            f"{major}.{minor}.{build}.{revision} RC{rc}/{'true' if is_release else 'false'}"
         )
 
 

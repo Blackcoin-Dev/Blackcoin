@@ -1,11 +1,64 @@
 # Blackcoin Core release process
 
-This is the release runbook for Blackcoin Core v30.1.5. A successful local
+This is the release runbook for Blackcoin Core v30.1.5.1. A successful local
 build is not release authorization. Production publication is allowed only for
 the exact commit that satisfies the mandatory safety gate and the controls
 below.
 
-## v30.1.5 signed maintenance release
+## v30.1.5.1 signed capacity correction
+
+The scope is #54 (complete retained-history capacity), #55 (confirmed-parent
+referenced-output accounting), and #56 (wallet-wide source-selection budgets).
+Reuse the reviewed wallet corrections and generic focused regression coverage;
+do not incorporate private deployment configuration or fleet topology.
+
+The exact v30.1.5.1 source must pass the complete current-SHA official gate before
+publication. Diagnose and validate a failing component with its targeted tests
+first; do not rerun passing jobs solely because another job failed. The final
+package matrix retains its two isolated builders and exact byte comparison.
+
+The exact source commit and annotated `v30.1.5.1` tag must both be SSH-signed by
+Blackcoin-Dev with the allowlisted key and verified by GitHub. The protected
+`production-release` acknowledgement is exactly `V30.1.5.1`. Source metadata is
+major 30, minor 1, build 5, revision 1, RC0, release=true. Canonical notes are
+`doc/release-notes/release-notes-30.1.5.1.md`. Numeric wallet database version
+semantics remain unchanged. Mac bundle versions follow the documented mapping.
+
+1. Freeze and sign the reviewed public source. Push the branch for the complete
+   pull-request gate, without creating a production tag. Commit bounded changes;
+   never rewrite a source commit after collecting its release evidence.
+2. Resolve or classify every outstanding potentially release-relevant observation
+   before tag authorization. Private operational incidents are not automatically
+   Core defects, but an unclassified observation keeps publication on hold.
+3. Merge without rewriting the exact reviewed Blackcoin-Dev-signed source commit.
+   Verify it is reachable from the default branch. Preserve the prior v30.1.5
+   tag and assets unchanged.
+4. Verify immutable releases using the developer-authenticated API. Record a
+   fresh signed immutable-configuration receipt bound to repository, source SHA,
+   tag, annotated tag object, enabled=true, capture time and expiry. Sign using
+   namespace `blackcoin-immutable-releases` and the allowlisted release key.
+   Maximum validity is 24 hours, covering the final package matrix. Store only
+   base64 receipt/signature in protected environment variables
+   `IMMUTABLE_RELEASE_RECEIPT_B64` and `IMMUTABLE_RELEASE_RECEIPT_SIGNATURE_B64`.
+   No private key or long-lived token is uploaded. Refresh and re-sign the same
+   exact-source observation if it expires before publication; never weaken it.
+5. Verify exact-tag protections and environment admission, then push the signed
+   annotated tag once. The official workflow qualifies and builds the release.
+6. The publisher revalidates the receipt, uses authenticated paginated release
+   inventory to reject an existing draft/release, and uploads one exact draft.
+   It uses the numeric release ID to verify all asset names, sizes, digests,
+   canonical body, source and tag before a single publication update. It then
+   verifies immutable, latest, non-draft, non-prerelease state with unchanged
+   assets and body. GitHub's tag lookup returning 404 does not prove draft absence.
+7. Close #54–56 only after the published release demonstrably contains the fixes
+   and its source/tag/assets have been verified. Record actual job and release
+   receipts, including any publication-only correction; do not call failures green.
+
+No installed-wallet deployment or spending is part of public qualification.
+The previously authorized simulated upgrade/restart/rollback approach remains;
+private canary observations do not authorize another fleet rollout.
+
+## v30.1.5 signed maintenance release (historical)
 
 v30.1.5 changes wallet, staking, mining-policy, telemetry, GUI, RPC, and test
 code. It therefore cannot inherit v30.1.4 release evidence or use the

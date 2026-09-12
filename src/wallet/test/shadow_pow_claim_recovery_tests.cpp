@@ -1360,6 +1360,363 @@ BOOST_AUTO_TEST_CASE(recovery_graph_traversal_is_bounded_and_memoized)
     ResetShadowPowClaimRecoveryProofEvaluationStatsForTesting();
 }
 
+BOOST_AUTO_TEST_CASE(resolved_claim_history_preserves_live_relay_and_refresh_gates)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(chainman.GetMutex(), return chainman.ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const CBlockIndex* root_parent = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChain()[tip->nHeight - 1]);
+    BOOST_REQUIRE(root_parent);
+    const CScript script = m_coinbase_txns.front()->vout.front().scriptPubKey;
+
+    // Generate a regular forest of same-input siblings, with enough ownership
+    // managers to exercise more than transaction-count work. These synthetic
+    // parents have no active coin, modeling already-spent historical anchors.
+    constexpr size_t FAMILIES{32};
+    constexpr size_t SIBLINGS{3};
+    while (WITH_LOCK(wallet->cs_wallet,
+                     return wallet->GetAllScriptPubKeyMans().size()) < 16) {
+        CKey key;
+        key.MakeNewKey(/*fCompressed=*/true);
+        FlatSigningProvider provider;
+        std::string error;
+        auto descriptor = Parse("combo(" + EncodeSecret(key) + ")",
+                                provider, error, /*require_checksum=*/false);
+        BOOST_REQUIRE_MESSAGE(descriptor, error);
+        WalletDescriptor wallet_descriptor(
+            std::move(descriptor), /*creation_time=*/1,
+            /*range_start=*/0, /*range_end=*/1, /*next_index=*/1);
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddWalletDescriptor(
+            wallet_descriptor, provider, "", /*internal=*/false));
+    }
+    for (size_t ordinal = 0; ordinal < FAMILIES; ++ordinal) {
+        CMutableTransaction parent;
+        parent.vin.emplace_back(COutPoint{uint256S("123458"),
+                                         static_cast<uint32_t>(ordinal)});
+        parent.vout.emplace_back(COIN, script);
+        parent.vout.emplace_back(COIN, script);
+        const CTransactionRef parent_tx = MakeTransactionRef(std::move(parent));
+        BOOST_REQUIRE(wallet->AddToWallet(
+            parent_tx, TxStateConfirmed{tip->GetBlockHash(), tip->nHeight, 1}));
+        for (size_t sibling = 0; sibling < SIBLINGS; ++sibling) {
+            const auto claim = MakeRecoveryTestClaim(
+                COutPoint{parent_tx->GetHash(), 0},
+                COIN - 1000 * (sibling + 1), script);
+            AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                                 tip->GetBlockHash(), tip->nHeight,
+                                 tip->GetBlockHash());
+        }
+    }
+    const auto history = wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_REQUIRE(!history.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_EQUAL(history.raw_claim_objects, FAMILIES * SIBLINGS);
+    BOOST_CHECK_EQUAL(history.resolved_components, FAMILIES);
+    BOOST_CHECK(BuildShadowPowClaimMiningGate(history).MayCreateNewAnchorClaim());
+
+    const CTransactionRef anchor_tx = m_coinbase_txns.front();
+    const COutPoint active_anchor{anchor_tx->GetHash(), 0};
+    const CScript target = CanonicalizeLegacyStakeScript(script);
+    const CScript payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x5c)});
+    uint64_t nonce{0};
+    const auto active_claim = MakeCurrentTipIneligibleExactRecoveryTestQQP2Claim(
+        chainman, active_anchor, anchor_tx->vout.front().nValue,
+        /*fee=*/1000, target, payout, nonce);
+    AddRecoveryTestClaim(*wallet, active_claim, tip->nHeight,
+                         root_parent->GetBlockHash(), tip->nHeight,
+                         tip->GetBlockHash());
+    auto inventory = wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_REQUIRE(!inventory.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_LE(inventory.claim_inventory_capacity_work,
+                   SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY);
+    BOOST_CHECK_EQUAL(inventory.raw_claim_objects, FAMILIES * SIBLINGS + 1);
+    BOOST_CHECK_EQUAL(inventory.components.size(), FAMILIES + 1);
+    BOOST_CHECK_EQUAL(inventory.resolved_components, FAMILIES);
+    BOOST_CHECK(BuildShadowPowClaimMiningGate(inventory).action ==
+                ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR);
+
+    // The full history stays present when the active family's externally
+    // evaluated disposition or mempool presence changes. Neither state may
+    // be masked by a partial/capacity inventory or allow another paid claim.
+    const auto active = std::find_if(
+        inventory.components.begin(), inventory.components.end(),
+        [&](const auto& component) { return component.anchor == active_anchor; });
+    BOOST_REQUIRE(active != inventory.components.end());
+    BOOST_REQUIRE_EQUAL(active->nodes.size(), 1U);
+    auto& node = active->nodes.front();
+    node.disposition = ShadowPowClaimMempoolDisposition::ELIGIBLE;
+    node.relay_ttl_expired = false;
+    const auto relay = BuildShadowPowClaimMiningGate(inventory);
+    BOOST_CHECK(relay.action == ShadowPowClaimMiningGateAction::RELAY_EXISTING);
+    BOOST_CHECK(relay.relay_txid == active_claim->GetHash());
+    BOOST_CHECK(!relay.MayCreateClaim());
+    node.in_mempool = true;
+    const auto live = BuildShadowPowClaimMiningGate(inventory);
+    BOOST_CHECK(live.action == ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE);
+    BOOST_CHECK(!live.MayCreateClaim());
+    BOOST_CHECK(!live.ShouldRelayExisting());
+}
+
+BOOST_AUTO_TEST_CASE(expanded_resolved_claim_history_preserves_mining_gates)
+{
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(chainman.GetMutex(), return chainman.ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const CBlockIndex* root_parent = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChain()[tip->nHeight - 1]);
+    BOOST_REQUIRE(root_parent);
+    const CScript script = m_coinbase_txns.front()->vout.front().scriptPubKey;
+    const CScript alternate_script =
+        GetScriptForDestination(PKHash(coinbaseKey.GetPubKey()));
+    while (WITH_LOCK(wallet->cs_wallet,
+                     return wallet->GetAllScriptPubKeyMans().size()) < 16) {
+        CKey key;
+        key.MakeNewKey(/*fCompressed=*/true);
+        FlatSigningProvider provider;
+        std::string error;
+        auto descriptor = Parse("combo(" + EncodeSecret(key) + ")",
+                                provider, error, /*require_checksum=*/false);
+        BOOST_REQUIRE_MESSAGE(descriptor, error);
+        WalletDescriptor wallet_descriptor(
+            std::move(descriptor), /*creation_time=*/1,
+            /*range_start=*/0, /*range_end=*/1, /*next_index=*/1);
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddWalletDescriptor(
+            wallet_descriptor, provider, "", /*internal=*/false));
+    }
+
+    // Generate chains, binary trees and wide sibling fans algorithmically.
+    // Alternate confirmed ordinary/proof winners and owned script forms, so
+    // the complete inventory includes both ancestry and outcome boundaries.
+    // The work floor leaves room for hash-order differences in memoization
+    // while exercising most of the finite budget, not just a flat node count.
+    constexpr size_t FAMILIES{42};
+    constexpr size_t CLAIMS_PER_FAMILY{8};
+    constexpr size_t MIN_TOPOLOGY_WORK{12000};
+    static_assert(MIN_TOPOLOGY_WORK < SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY);
+    for (size_t ordinal = 0; ordinal < FAMILIES; ++ordinal) {
+        const CScript& owned_script = ordinal % 2 ? alternate_script : script;
+        CMutableTransaction parent;
+        parent.vin.emplace_back(COutPoint{uint256S("cafe5678"),
+                                         static_cast<uint32_t>(ordinal)});
+        parent.vout.assign(3, CTxOut{COIN, owned_script});
+        const auto parent_tx = MakeTransactionRef(std::move(parent));
+        BOOST_REQUIRE(wallet->AddToWallet(
+            parent_tx, TxStateConfirmed{tip->GetBlockHash(), tip->nHeight, 1}));
+        const uint32_t anchor_index = static_cast<uint32_t>(ordinal % 3);
+        const COutPoint anchor{parent_tx->GetHash(), anchor_index};
+        std::vector<CTransactionRef> claims;
+        for (size_t index = 0; index < CLAIMS_PER_FAMILY; ++index) {
+            int previous{-1};
+            if (index != 0) {
+                switch (ordinal % 3) {
+                case 0: previous = static_cast<int>(index - 1); break;
+                case 1: previous = static_cast<int>((index - 1) / 2); break;
+                case 2: previous = 0; break;
+                }
+            }
+            BOOST_REQUIRE(previous < static_cast<int>(index));
+            const COutPoint input = previous < 0
+                ? anchor : COutPoint{claims.at(previous)->GetHash(), 0};
+            const CAmount amount = previous < 0
+                ? COIN : claims.at(previous)->vout.front().nValue;
+            const auto claim = MakeRecoveryTestClaim(
+                input, amount - 1000 * (index + 1), owned_script);
+            AddRecoveryTestClaim(*wallet, claim, tip->nHeight,
+                                 tip->GetBlockHash(), tip->nHeight,
+                                 tip->GetBlockHash());
+            claims.push_back(claim);
+        }
+        const int winning_parent = ordinal % 2
+            ? static_cast<int>(CLAIMS_PER_FAMILY - 1) : -1;
+        const COutPoint winning_input = winning_parent < 0
+            ? anchor : COutPoint{claims.at(winning_parent)->GetHash(), 0};
+        const CAmount winning_amount = winning_parent < 0
+            ? COIN : claims.at(winning_parent)->vout.front().nValue;
+        CTransactionRef winner;
+        if (ordinal % 2 == 0) {
+            CMutableTransaction ordinary;
+            ordinary.vin.emplace_back(winning_input);
+            ordinary.vout.emplace_back(winning_amount - 500, owned_script);
+            winner = MakeTransactionRef(std::move(ordinary));
+        } else {
+            winner = MakeRecoveryTestClaim(
+                winning_input, winning_amount - 500, owned_script);
+            AddRecoveryTestClaim(*wallet, winner, tip->nHeight,
+                                 tip->GetBlockHash(), tip->nHeight,
+                                 tip->GetBlockHash());
+        }
+        BOOST_REQUIRE(wallet->AddToWallet(
+            winner, TxStateConfirmed{tip->GetBlockHash(), tip->nHeight, 1},
+            [](CWalletTx& wtx, bool) { wtx.fFromMe = true; return true; }));
+    }
+    const auto history = wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_REQUIRE(!history.claim_ownership_pending);
+    BOOST_REQUIRE(!history.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_GE(history.claim_inventory_capacity_work, MIN_TOPOLOGY_WORK);
+    BOOST_CHECK_LT(history.claim_inventory_capacity_work,
+                   SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY);
+    BOOST_CHECK_EQUAL(history.raw_claim_objects, FAMILIES * CLAIMS_PER_FAMILY);
+    BOOST_CHECK_EQUAL(history.resolved_components, FAMILIES);
+    BOOST_CHECK_EQUAL(history.components.size(), FAMILIES);
+    size_t graph_nodes{0};
+    for (const auto& component : history.components) graph_nodes += component.nodes.size();
+    BOOST_CHECK_EQUAL(graph_nodes, FAMILIES * (CLAIMS_PER_FAMILY + 1));
+    BOOST_CHECK(BuildShadowPowClaimMiningGate(history).MayCreateNewAnchorClaim());
+
+    const auto& anchor_tx = m_coinbase_txns.front();
+    const COutPoint active_anchor{anchor_tx->GetHash(), 0};
+    const CScript target = CanonicalizeLegacyStakeScript(script);
+    const CScript payout = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x5c)});
+    uint64_t nonce{0};
+    const auto active_claim = MakeCurrentTipIneligibleExactRecoveryTestQQP2Claim(
+        chainman, active_anchor, anchor_tx->vout.front().nValue,
+        /*fee=*/1000, target, payout, nonce);
+    AddRecoveryTestClaim(*wallet, active_claim, tip->nHeight,
+                         root_parent->GetBlockHash(), tip->nHeight,
+                         tip->GetBlockHash());
+    auto inventory = wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_REQUIRE(!inventory.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_GE(inventory.claim_inventory_capacity_work, MIN_TOPOLOGY_WORK);
+    BOOST_CHECK_LT(inventory.claim_inventory_capacity_work,
+                   SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY);
+    BOOST_CHECK_EQUAL(inventory.raw_claim_objects,
+                      FAMILIES * CLAIMS_PER_FAMILY + 1);
+    BOOST_CHECK_EQUAL(inventory.components.size(), FAMILIES + 1);
+    BOOST_CHECK_EQUAL(inventory.resolved_components, FAMILIES);
+    BOOST_CHECK(BuildShadowPowClaimMiningGate(inventory).action ==
+                ShadowPowClaimMiningGateAction::REFRESH_SAME_ANCHOR);
+    BOOST_TEST_MESSAGE("expanded history work=" << history.claim_inventory_capacity_work
+                       << "; with active family=" << inventory.claim_inventory_capacity_work);
+
+    // Gate-only disposition changes model an evicted-but-relayable claim and
+    // a live claim. They are not actual relays, broadcasts or mempool writes.
+    const auto active = std::find_if(
+        inventory.components.begin(), inventory.components.end(),
+        [&](const auto& component) { return component.anchor == active_anchor; });
+    BOOST_REQUIRE(active != inventory.components.end());
+    BOOST_REQUIRE_EQUAL(active->nodes.size(), 1U);
+    auto& node = active->nodes.front();
+    node.disposition = ShadowPowClaimMempoolDisposition::ELIGIBLE;
+    node.relay_ttl_expired = false;
+    const auto relay = BuildShadowPowClaimMiningGate(inventory);
+    BOOST_CHECK(relay.action == ShadowPowClaimMiningGateAction::RELAY_EXISTING);
+    BOOST_CHECK(relay.relay_txid == active_claim->GetHash());
+    BOOST_CHECK(!relay.MayCreateClaim());
+    node.in_mempool = true;
+    const auto live = BuildShadowPowClaimMiningGate(inventory);
+    BOOST_CHECK(live.action == ShadowPowClaimMiningGateAction::WAIT_FOR_LIVE);
+    BOOST_CHECK(!live.MayCreateClaim());
+    BOOST_CHECK(!live.ShouldRelayExisting());
+}
+
+BOOST_AUTO_TEST_CASE(confirmed_claim_ancestry_reads_only_the_referenced_output)
+{
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const CScript script = m_coinbase_txns.front()->vout.front().scriptPubKey;
+
+    // The confirmed funding transaction's other outputs are not visited by
+    // ancestry canonicalization. Model a large, already-spent funding parent
+    // in the wallet; only its referenced output authorizes this old family.
+    CMutableTransaction parent;
+    parent.vin.emplace_back(COutPoint{uint256S("123456"), 0});
+    parent.vout.assign(SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1,
+                       CTxOut{COIN, script});
+    const CTransactionRef parent_tx = MakeTransactionRef(parent);
+    BOOST_REQUIRE(wallet->AddToWallet(
+        parent_tx, TxStateConfirmed{tip->GetBlockHash(), tip->nHeight, 1}));
+    const COutPoint anchor{parent_tx->GetHash(), 0};
+    const CTransactionRef claim = MakeRecoveryTestClaim(
+        anchor, COIN - 1000, script);
+    AddRecoveryTestClaim(*wallet, claim, tip->nHeight, tip->GetBlockHash(),
+                         tip->nHeight, tip->GetBlockHash());
+
+    const auto confirmed = wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_REQUIRE(!confirmed.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_EQUAL(confirmed.raw_claim_objects, 1U);
+    BOOST_CHECK_EQUAL(confirmed.resolved_components, 1U);
+    BOOST_CHECK(FindRecoveryComponent(confirmed, anchor).anchor_authenticated);
+    BOOST_CHECK(BuildShadowPowClaimMiningGate(confirmed).MayCreateNewAnchorClaim());
+
+    // The same transaction ceases to be an ancestry boundary after a reorg.
+    // Its complete inactive-parent work must still exceed the original cap.
+    {
+        LOCK(wallet->cs_wallet);
+        auto& wtx = wallet->mapWallet.at(parent_tx->GetHash());
+        wtx.m_state = TxStateInactive{};
+        wtx.MarkDirty();
+        wallet->MarkShadowPowClaimCandidateStateChangedLocked();
+    }
+    const auto inactive = wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_CHECK(inactive.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_EQUAL(inactive.claim_inventory_capacity_work,
+                      SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1);
+    const auto inactive_gate = BuildShadowPowClaimMiningGate(inactive);
+    BOOST_CHECK(!inactive_gate.MayCreateClaim());
+    BOOST_CHECK(!inactive_gate.ShouldRelayExisting());
+    BOOST_CHECK(!inactive_gate.MayRefreshSameAnchor());
+}
+
+BOOST_AUTO_TEST_CASE(confirmed_claim_ancestry_bounds_the_referenced_script)
+{
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const CScript script = m_coinbase_txns.front()->vout.front().scriptPubKey;
+    CMutableTransaction parent;
+    parent.vin.emplace_back(COutPoint{uint256S("123457"), 0});
+    CScript oversized_script;
+    oversized_script.resize(SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY + 1);
+    parent.vout.emplace_back(COIN, oversized_script);
+    const CTransactionRef parent_tx = MakeTransactionRef(std::move(parent));
+    BOOST_REQUIRE(wallet->AddToWallet(
+        parent_tx, TxStateConfirmed{tip->GetBlockHash(), tip->nHeight, 1}));
+    const auto claim = MakeRecoveryTestClaim(
+        COutPoint{parent_tx->GetHash(), 0}, COIN - 1000, script);
+    AddRecoveryTestClaim(*wallet, claim, tip->nHeight, tip->GetBlockHash(),
+                         tip->nHeight, tip->GetBlockHash());
+
+    const auto inventory = wallet->GetShadowPowClaimRecoveryInventory();
+    BOOST_CHECK(inventory.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_EQUAL(inventory.claim_inventory_capacity_work,
+                      SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1);
+    BOOST_CHECK(inventory.components.empty());
+    BOOST_CHECK(!BuildShadowPowClaimMiningGate(inventory).MayCreateClaim());
+}
+
 BOOST_AUTO_TEST_CASE(not_ready_claim_inventory_has_an_aggregate_work_bound)
 {
     CWallet wallet(/*chain=*/nullptr, "",
@@ -1422,6 +1779,63 @@ BOOST_AUTO_TEST_CASE(not_ready_claim_inventory_has_an_aggregate_work_bound)
     BOOST_CHECK(!bounded.claim_inventory_capacity_exceeded);
     BOOST_CHECK_EQUAL(bounded.raw_claim_objects, 8U);
     BOOST_CHECK_EQUAL(bounded.components.size(), 8U);
+}
+
+BOOST_AUTO_TEST_CASE(claim_inventory_work_ceiling_accepts_exact_bound_and_refuses_overflow)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    const CScript script = CScript{} << OP_TRUE;
+    constexpr size_t RECORDS{4};
+    static_assert(SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY % RECORDS == 0);
+    const size_t outputs_per_record =
+        SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY / RECORDS - 2;
+    size_t aggregate_bytes{0};
+    for (size_t index = 0; index < RECORDS; ++index) {
+        const auto small_claim = MakeRecoveryTestClaim(
+            COutPoint{uint256S("cafe1234"), static_cast<uint32_t>(index)},
+            COIN, script);
+        CMutableTransaction claim{*small_claim};
+        claim.vout.resize(outputs_per_record, CTxOut{0, script});
+        const auto tx = MakeTransactionRef(std::move(claim));
+        BOOST_REQUIRE(TransactionHasShadowProof(*tx));
+        BOOST_REQUIRE_LT(tx->GetTotalSize(),
+                         SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY);
+        aggregate_bytes += tx->GetTotalSize();
+        BOOST_REQUIRE(wallet.AddToWallet(
+            tx, TxStateInactive{}, [](CWalletTx& wtx, bool) {
+                wtx.fFromMe = true;
+                return true;
+            }));
+    }
+    BOOST_REQUIRE_LT(aggregate_bytes, SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY);
+    const auto exact = wallet.GetShadowPowClaimRecoveryInventory();
+    BOOST_REQUIRE(!exact.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_EQUAL(exact.claim_inventory_capacity_work,
+                      SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY);
+    BOOST_CHECK_EQUAL(exact.raw_claim_objects, RECORDS);
+    BOOST_CHECK_EQUAL(exact.components.size(), RECORDS);
+
+    // The complete preflight crosses only the work ceiling, not a byte,
+    // metadata, script-manager or record-count limit. No successful prefix
+    // may survive as mining or recovery authority.
+    const auto extra = MakeRecoveryTestClaim(
+        COutPoint{uint256S("cafe1234"), static_cast<uint32_t>(RECORDS)},
+        COIN, script);
+    BOOST_REQUIRE(wallet.AddToWallet(
+        extra, TxStateInactive{}, [](CWalletTx& wtx, bool) {
+            wtx.fFromMe = true;
+            return true;
+        }));
+    const auto over = wallet.GetShadowPowClaimRecoveryInventory();
+    BOOST_REQUIRE(over.claim_inventory_capacity_exceeded);
+    BOOST_CHECK_EQUAL(over.claim_inventory_capacity_work,
+                      SHADOW_POW_CLAIM_TOPOLOGY_WORK_CAPACITY + 1);
+    BOOST_CHECK_EQUAL(over.raw_claim_objects, 0U);
+    BOOST_CHECK(over.components.empty());
+    const auto gate = BuildShadowPowClaimMiningGate(over);
+    BOOST_CHECK(!gate.MayCreateClaim());
+    BOOST_CHECK(!gate.ShouldRelayExisting());
+    BOOST_CHECK(!gate.MayRefreshSameAnchor());
 }
 
 BOOST_AUTO_TEST_CASE(claim_inventory_metadata_namespace_is_bounded)

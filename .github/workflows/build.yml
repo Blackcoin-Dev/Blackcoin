@@ -1,4 +1,4 @@
-name: v30.1.5 signed maintenance release build
+name: v30.1.5.1 signed maintenance release build
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       package_label:
         description: Explicit unpublished prerelease label (must match source RC)
         required: true
-        default: 30.1.5-alpha1
+        default: 30.1.5.1-alpha1
         type: string
       target:
         description: Build target to run (manual runs never publish)
@@ -27,13 +27,13 @@ on:
           - macos-arm-64-bit
   push:
     tags:
-      - 'v30.1.5'
+      - 'v30.1.5.1'
 
 permissions:
   contents: read
 
 concurrency:
-  group: v30.1.5-release-${{ github.ref }}
+  group: v30.1.5.1-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -76,11 +76,17 @@ jobs:
           MAJOR=$(sed -n "s/^define(_CLIENT_VERSION_MAJOR, \([0-9]*\))$/\1/p" configure.ac)
           MINOR=$(sed -n "s/^define(_CLIENT_VERSION_MINOR, \([0-9]*\))$/\1/p" configure.ac)
           BUILD=$(sed -n "s/^define(_CLIENT_VERSION_BUILD, \([0-9]*\))$/\1/p" configure.ac)
+          REVISION=$(sed -n "s/^define(_CLIENT_VERSION_REVISION, \([0-9]*\))$/\1/p" configure.ac)
+          REVISION=${REVISION:-0}
           RC=$(sed -n "s/^define(_CLIENT_VERSION_RC, \([0-9]*\))$/\1/p" configure.ac)
           IS_RELEASE=$(sed -n "s/^define(_CLIENT_VERSION_IS_RELEASE, \(.*\))$/\1/p" configure.ac)
           BASE_VERSION="$MAJOR.$MINOR.$BUILD"
-          test "$BASE_VERSION" = "30.1.5" || {
-            echo "::error::This workflow is locked to the v30.1.5 source line"
+          [[ "$REVISION" =~ ^(0|[1-9][0-9]?)$ ]]
+          if [[ "$REVISION" != "0" ]]; then
+            BASE_VERSION="$BASE_VERSION.$REVISION"
+          fi
+          test "$BASE_VERSION" = "30.1.5.1" || {
+            echo "::error::This workflow is locked to the v30.1.5.1 source line"
             exit 1
           }
           [[ "$RC" =~ ^[0-9]+$ ]]
@@ -105,12 +111,12 @@ jobs:
               echo "::error::The selected workflow_dispatch ref does not resolve to target_sha"
               exit 1
             }
-            [[ "$REQUESTED_PACKAGE_LABEL" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)([1-9][0-9]*)$ ]] || {
-              echo "::error::Manual builds require an explicit major.minor.patch-alphaN or major.minor.patch-betaN package label"
+            [[ "$REQUESTED_PACKAGE_LABEL" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?-(alpha|beta)([1-9][0-9]*)$ ]] || {
+              echo "::error::Manual builds require an explicit source-version-alphaN or source-version-betaN package label"
               exit 1
             }
-            PRERELEASE_CHANNEL="${BASH_REMATCH[1]}"
-            PRERELEASE_NUMBER="${BASH_REMATCH[2]}"
+            PRERELEASE_CHANNEL="${BASH_REMATCH[2]}"
+            PRERELEASE_NUMBER="${BASH_REMATCH[3]}"
             [[ "$RC" =~ ^[1-9][0-9]*$ ]]
             test "$IS_RELEASE" = "false" || {
               echo "::error::Manual prerelease builds require CLIENT_VERSION_IS_RELEASE=false"
@@ -227,7 +233,7 @@ jobs:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
       # Alpha artifacts wait for the core gate. A beta adds native-platform,
       # sanitizer, pinned-fuzz, and complete extended functional evidence.
-      # v30.1.5 changes runtime and wallet behavior, so every exact-SHA
+      # v30.1.5.1 changes runtime and wallet behavior, so every exact-SHA
       # production gate runs against this source. No inherited corrective
       # evidence or fast path is permitted.
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
@@ -786,8 +792,12 @@ jobs:
           test "$(lipo -archs "$binary")" = "$EXPECTED_ARCH"
           file "$binary" | grep -F "Mach-O 64-bit executable $EXPECTED_ARCH"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")" = blackcoin-qt
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$VERSION"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$VERSION"
+          IFS=. read -r version_major version_minor version_build version_revision <<< "$VERSION"
+          bundle_short_version="$version_major.$version_minor.$version_build"
+          bundle_version="$version_major.$version_minor.$((100 * version_build + ${version_revision:-0}))"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$bundle_short_version"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$bundle_version"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :BlackcoinFullVersion' "$plist")" = "$VERSION"
           verify_plist_architecture "$plist"
 
           xattr -cr "$app"
@@ -1104,7 +1114,7 @@ jobs:
           retention-days: 7
 
   signed-final-preflight:
-    name: Require explicit v30.1.5 signed-source publication acknowledgement
+    name: Require explicit v30.1.5.1 signed-source publication acknowledgement
     needs:
       - resolve-target
       - safety-gate
@@ -1118,9 +1128,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected='V30.1.5'
+          expected='V30.1.5.1'
           test "$UNSIGNED_FINAL_ACK" = "$expected" || {
-            echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this v30.1.5 release'
+            echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this v30.1.5.1 release'
             exit 1
           }
 
@@ -1149,12 +1159,19 @@ jobs:
       TAG: ${{ needs.resolve-target.outputs.tag }}
       SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
       UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}
+      IMMUTABLE_RELEASE_RECEIPT_B64: ${{ vars.IMMUTABLE_RELEASE_RECEIPT_B64 }}
+      IMMUTABLE_RELEASE_RECEIPT_SIGNATURE_B64: ${{ vars.IMMUTABLE_RELEASE_RECEIPT_SIGNATURE_B64 }}
     steps:
       - name: Checkout immutable release source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
         with:
           ref: ${{ needs.resolve-target.outputs.target_sha }}
           fetch-depth: 0
+
+      - name: Verify fresh developer-signed immutable configuration receipt
+        run: |
+          python3 ci/release/publish_verified_release.py check-receipt \
+            --repository "$GITHUB_REPOSITORY" --source-sha "$TARGET_SHA" --tag "$TAG"
 
       - name: Download only exact-SHA release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1178,7 +1195,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          expected_ack='V30.1.5'
+          expected_ack='V30.1.5.1'
           test "$UNSIGNED_FINAL_ACK" = "$expected_ack"
           mkdir -p dist
           shopt -s nullglob
@@ -1278,15 +1295,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$TARGET_SHA"
-          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true || {
-            echo '::error::Repository-level immutable releases must be enabled'
-            exit 1
-          }
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release $TAG already exists; production releases are immutable"
-            exit 1
-          fi
-          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft \
-            --verify-tag --title "Blackcoin Core v$VERSION" --notes-file RELEASE_NOTES.md
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          python3 ci/release/publish_verified_release.py publish \
+            --repository "$GITHUB_REPOSITORY" --source-sha "$TARGET_SHA" --tag "$TAG" \
+            --dist dist --notes RELEASE_NOTES.md

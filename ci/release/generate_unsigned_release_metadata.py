@@ -13,13 +13,13 @@ import sys
 
 
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
-EXPECTED_VERSION = "30.1.5"
+EXPECTED_VERSION = "30.1.5.1"
 EXPECTED_ACKNOWLEDGEMENT = f"V{EXPECTED_VERSION}"
 EXPECTED_SSH_SIGNING_FINGERPRINT = (
     "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70"
 )
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
 
 
 def sha256(path):
@@ -69,7 +69,7 @@ def generate_metadata(
 ):
     _require(artifacts.is_dir(), "artifact directory does not exist")
     _require(VERSION_RE.fullmatch(version) is not None,
-             "version must have major.minor.patch form")
+             "version must have major.minor.patch[.revision] form")
     _require(version == EXPECTED_VERSION,
              f"version must match the authorized release: {EXPECTED_VERSION}")
     _require(FULL_SHA_RE.fullmatch(source_sha) is not None,

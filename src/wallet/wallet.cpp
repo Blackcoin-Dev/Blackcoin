@@ -1676,6 +1676,7 @@ bool CWallet::ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase,
 
 void CWallet::chainStateFlushed(ChainstateRole role, const CBlockLocator& loc)
 {
+    LOCK(cs_wallet);
     // Don't update the best block until the chain is attached so that in case of a shutdown,
     // the rescan will be restarted at next startup.
     if (m_attaching_chain || role == ChainstateRole::BACKGROUND) {

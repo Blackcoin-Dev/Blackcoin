@@ -4804,6 +4804,18 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::NUM, "claim_coins_after_stake_reserve", "Confirmed legacy claim inputs left after applying the stake reserve."},
             {RPCResult::Type::BOOL, "last_stake_coin_guard", "Whether the only mature legacy PoS coin is claim-eligible and therefore protected."},
             {RPCResult::Type::BOOL, "stake_reserve_snapshot_available", "Whether the stake-reserve counts match the wallet-processed active tip."},
+            {RPCResult::Type::OBJ, "claim_input_enumeration", "Wallet-only legacy input scan diagnostics, separate from the retained-claim graph budget. These counts never authorize selection.", {
+                {RPCResult::Type::BOOL, "capacity_exceeded", "Whether the complete input snapshot was refused by a capacity or source-integrity guard."},
+                {RPCResult::Type::STR, "capacity_reason", "First failed guard, or none."},
+                {RPCResult::Type::NUM, "capacity_observed", "Observed count at the failed numeric guard, or zero for a nonnumeric guard."},
+                {RPCResult::Type::NUM, "capacity_limit", "Limit at the failed numeric guard, or zero for a nonnumeric guard."},
+                {RPCResult::Type::NUM, "live_outputs", "All wallet-known live outputs, including outputs that cannot be legacy claim inputs."},
+                {RPCResult::Type::NUM, "legacy_source_outputs", "Complete immutable-script legacy source subset before dynamic eligibility checks."},
+                {RPCResult::Type::NUM, "script_managers", "Wallet script managers considered by the bounded scan."},
+                {RPCResult::Type::NUM, "manager_work", "Projected manager visits, when the earlier source and manager-count guards passed."},
+                {RPCResult::Type::NUM, "source_work", "Completed source and protected-asset work before success or refusal."},
+                {RPCResult::Type::NUM, "script_bytes", "Source-script and protected-asset bytes accepted before success or refusal."},
+            }},
         }},
         RPCExamples{
             HelpExampleCli("getpowmininginfo", "")
@@ -4974,6 +4986,19 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("claim_coins_after_stake_reserve", static_cast<uint64_t>(stake_reserve.claim_coins_after_reserve));
     obj.pushKV("last_stake_coin_guard", stake_reserve.last_stake_coin_guard);
     obj.pushKV("stake_reserve_snapshot_available", stake_reserve.wallet_tip_matches);
+    const auto& enumeration = stake_reserve.input_enumeration;
+    UniValue input_enumeration(UniValue::VOBJ);
+    input_enumeration.pushKV("capacity_exceeded", stake_reserve.warm_output_capacity_exceeded);
+    input_enumeration.pushKV("capacity_reason", enumeration.capacity_reason);
+    input_enumeration.pushKV("capacity_observed", static_cast<uint64_t>(enumeration.capacity_observed));
+    input_enumeration.pushKV("capacity_limit", static_cast<uint64_t>(enumeration.capacity_limit));
+    input_enumeration.pushKV("live_outputs", static_cast<uint64_t>(enumeration.live_outputs));
+    input_enumeration.pushKV("legacy_source_outputs", static_cast<uint64_t>(enumeration.legacy_source_outputs));
+    input_enumeration.pushKV("script_managers", static_cast<uint64_t>(enumeration.script_managers));
+    input_enumeration.pushKV("manager_work", static_cast<uint64_t>(enumeration.manager_work));
+    input_enumeration.pushKV("source_work", static_cast<uint64_t>(enumeration.source_work));
+    input_enumeration.pushKV("script_bytes", static_cast<uint64_t>(enumeration.script_bytes));
+    obj.pushKV("claim_input_enumeration", std::move(input_enumeration));
     {
         LOCK(pwallet->cs_wallet);
         obj.pushKV("payout_address", pwallet->m_pow_payout_quantum);

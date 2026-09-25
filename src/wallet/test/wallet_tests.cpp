@@ -3089,7 +3089,7 @@ BOOST_FIXTURE_TEST_CASE(shadow_pow_claim_large_wallet_source_capacity,
         QUANTUM_COLDSTAKE_WITNESS_VERSION,
         QuantumColdStakeProgramForKeyHashes(uint256{1}, uint256{2})}));
     CScript oversized_unspendable;
-    oversized_unspendable.resize(1024 * 1024 + 1, OP_TRUE);
+    oversized_unspendable.resize(1024 * 1024 + 1);
     unrelated.vout.emplace_back(COIN, std::move(oversized_unspendable));
     const size_t unrelated_count = unrelated.vout.size();
     BOOST_REQUIRE(wallet->AddToWallet(

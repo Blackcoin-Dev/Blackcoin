@@ -1163,14 +1163,15 @@ void TestPowClaimRecoveryPolicyControls(
     QVERIFY(recovery);
     QVERIFY(status);
     QVERIFY(refresh);
-    QCOMPARE(recovery->text(), QStringLiteral(
-        "Permit bounded automatic fee-paying conflict recovery as an "
-        "alternative to waiting"));
-    QVERIFY(recovery->toolTip().contains(QStringLiteral("same confirmed anchor")));
-    QVERIFY(recovery->toolTip().contains(QStringLiteral("waits while a member is live")));
+    QCOMPARE(recovery->text(), QStringLiteral("Allow automatic fee-paying conflict recovery"));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("same confirmed input")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("waits for a live claim")));
     QVERIFY(recovery->toolTip().contains(QStringLiteral("no recovery transaction")));
-    QVERIFY(recovery->toolTip().contains(QStringLiteral("ordinary claim fee")));
-    QVERIFY(recovery->toolTip().contains(QStringLiteral("miner could otherwise continue")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("ordinary fee")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("ongoing permission")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("normal mining could continue")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("Fee, rate, and staleness limits apply")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("cannot unlock the wallet or start a disabled miner")));
     QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
     QVERIFY(!recovery->isChecked());
     QVERIFY(status->text().contains(QStringLiteral("6 process-wide")));

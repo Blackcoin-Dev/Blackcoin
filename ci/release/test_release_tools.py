@@ -54,20 +54,22 @@ class ReleaseToolTests(unittest.TestCase):
     def test_manpage_generator_accepts_source_commit_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for relative in (
-                "src/blackcoind",
-                "src/blackcoin-cli",
-                "src/blackcoin-tx",
-                "src/blackcoin-wallet",
-                "src/blackcoin-util",
-                "src/qt/blackcoin-qt",
-            ):
+            source_commit = "0123456789abcdef0123456789abcdef01234567"
+            reported_versions = {
+                "src/blackcoind": "v30.1.5.2rc1-0123456789ab",
+                "src/blackcoin-cli": f"v30.1.5.2rc1-g{source_commit}",
+                "src/blackcoin-tx": "v30.1.5.2rc1-custom",
+                "src/blackcoin-wallet": "v30.1.5.2rc1-0123456789ab-dirty",
+                "src/blackcoin-util": "v30.1.5.2rc1",
+                "src/qt/blackcoin-qt": "v30.1.5.2rc1-0123456789ab",
+            }
+            for relative, reported_version in reported_versions.items():
                 binary = root / relative
                 binary.parent.mkdir(parents=True, exist_ok=True)
                 binary.write_text(
                     "#!/bin/sh\n"
-                    "printf '%s\\n' 'Blackcoin version v30.1.1' "
-                    "'Source commit: 0123456789abcdef0123456789abcdef01234567' "
+                    f"printf '%s\\n' 'Blackcoin version {reported_version}' "
+                    f"'Source commit: {source_commit}' "
                     "'Copyright (C) 2026 Blackcoin Developers'\n",
                     encoding="utf-8",
                 )
@@ -77,10 +79,18 @@ class ReleaseToolTests(unittest.TestCase):
             help2man.write_text(
                 "#!/usr/bin/env python3\n"
                 "from pathlib import Path\n"
+                "import subprocess\n"
                 "import sys\n"
                 "output = Path(sys.argv[sys.argv.index('-o') + 1])\n"
-                "output.write_text('.TH BLACKCOIN 1\\nSource commit: "
-                "0123456789abcdef0123456789abcdef01234567\\n', "
+                "version = next(arg.split('=', 1)[1] for arg in sys.argv "
+                "if arg.startswith('--version-string='))\n"
+                "reported = subprocess.check_output([sys.argv[-1], '--version'], "
+                "text=True).splitlines()[0].split()[-1]\n"
+                "escaped_version = version.replace('-', chr(92) + '-')\n"
+                "escaped_reported = reported.replace('-', chr(92) + '-')\n"
+                "output.write_text('.TH BLACKCOIN 1 ' + escaped_version + "
+                "'\\nBlackcoin version ' + escaped_reported + "
+                "'\\nSource commit: 0123456789abcdef0123456789abcdef01234567\\n', "
                 "encoding='utf-8')\n",
                 encoding="utf-8",
             )
@@ -95,7 +105,7 @@ class ReleaseToolTests(unittest.TestCase):
                 "HELP2MAN": str(help2man),
             })
             script = TOOLS.parent.parent / "contrib/devtools/gen-manpages.py"
-            subprocess.run(
+            result = subprocess.run(
                 [sys.executable, str(script)],
                 check=True,
                 env=environment,
@@ -103,10 +113,22 @@ class ReleaseToolTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            self.assertIn("WARNING: Binaries were built from a dirty tree.", result.stdout)
             generated = sorted(mandir.glob("*.1"))
             self.assertEqual(len(generated), 6)
+            expected_versions = {
+                "blackcoind.1": "v30.1.5.2rc1",
+                "blackcoin-cli.1": "v30.1.5.2rc1",
+                "blackcoin-tx.1": "v30.1.5.2rc1-custom",
+                "blackcoin-wallet.1": "v30.1.5.2rc1-dirty",
+                "blackcoin-util.1": "v30.1.5.2rc1",
+                "blackcoin-qt.1": "v30.1.5.2rc1",
+            }
             for manpage in generated:
-                self.assertNotIn("Source commit:", manpage.read_text(encoding="utf-8"))
+                text = manpage.read_text(encoding="utf-8")
+                self.assertNotIn("Source commit:", text)
+                self.assertIn(expected_versions[manpage.name].replace('-', r'\-'), text)
+                self.assertNotRegex(text, r"v30\.1\.5\.2rc1(?:\\-|-)(?:[0-9a-f]{12,40}|g[0-9a-f]{40})")
 
     def test_tracked_manpages_match_candidate_source_version(self):
         root = TOOLS.parent.parent
@@ -144,6 +166,7 @@ class ReleaseToolTests(unittest.TestCase):
                 self.assertNotIn("v30.1.5.1", text)
                 self.assertNotIn("v30.1.4", text)
                 self.assertNotIn("Source commit:", text)
+                self.assertNotRegex(text, r"v30\.1\.5\.2rc1(?:\\-|-)(?:[0-9a-f]{12,40}|g[0-9a-f]{40}|dirty)")
 
     def test_final_release_requires_signed_source_and_exact_acknowledgement(self):
         workflow = (

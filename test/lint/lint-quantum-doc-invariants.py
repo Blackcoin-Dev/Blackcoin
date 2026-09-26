@@ -54,6 +54,7 @@ CURRENT_FINAL_OPERATOR_DOCUMENTS = (
 
 BETA2_RELEASE_CANDIDATE = 2
 FINAL_RELEASE_IDENTITY = (30, 1, 5, 1, 0, True)
+CANDIDATE_RELEASE_IDENTITY = (30, 1, 5, 2, 1, False)
 BETA2_RELEASE_IDENTITY = (30, 1, 1, 0, BETA2_RELEASE_CANDIDATE, False)
 
 
@@ -657,22 +658,19 @@ def check_release_status(root, failures):
         )
 
 
-def check_final_release_identity(root, failures):
+def check_final_release_identity(root, failures, expected_identity=FINAL_RELEASE_IDENTITY):
     configure = read_text(root, "configure.ac")
-    for fragment in (
-        "define(_CLIENT_VERSION_MAJOR, 30)",
-        "define(_CLIENT_VERSION_MINOR, 1)",
-        "define(_CLIENT_VERSION_BUILD, 5)",
-        "define(_CLIENT_VERSION_REVISION, 1)",
-        "define(_CLIENT_VERSION_RC, 0)",
-        "define(_CLIENT_VERSION_IS_RELEASE, true)",
+    for name, value in zip(
+        ("MAJOR", "MINOR", "BUILD", "REVISION", "RC", "IS_RELEASE"),
+        expected_identity,
     ):
+        fragment = f"define(_CLIENT_VERSION_{name}, {str(value).lower()})"
         require_fragment(
             failures,
             "configure.ac",
             configure,
             fragment,
-            "final v30.1.5.1 source metadata",
+            "release source metadata",
         )
 
     stale_channel_patterns = (
@@ -787,6 +785,80 @@ def check_final_release_identity(root, failures):
         )
 
 
+def check_candidate_release_identity(root, failures):
+    # Keep all v30.1.5.1 and earlier historical assertions while validating
+    # the current source and workflow as a separate, unreleased candidate.
+    check_final_release_identity(root, failures, CANDIDATE_RELEASE_IDENTITY)
+
+    workflow_relative = ".github/workflows/build.yml"
+    workflow = read_text(root, workflow_relative)
+    for fragment in (
+        "name: v30.1.5.2 signed maintenance release build",
+        "default: 30.1.5.2-alpha1",
+        "- 'v30.1.5.2'",
+        "group: v30.1.5.2-release-",
+        'test "$BASE_VERSION" = "30.1.5.2"',
+        "expected='V30.1.5.2'",
+        "expected_ack='V30.1.5.2'",
+        'test "$RC" = "0"',
+        'test "$IS_RELEASE" = "true"',
+        "--require-signatures",
+        "IMMUTABLE_RELEASE_RECEIPT_B64",
+        "verify_reproducible.py",
+    ):
+        require_fragment(
+            failures, workflow_relative, workflow, fragment,
+            "current candidate workflow lock or publication gate",
+        )
+    if "30.1.5.1" in workflow:
+        failures.append(f"{workflow_relative}: stale v30.1.5.1 release lock")
+
+    overview = read_text(root, "doc/release-notes.md")
+    if not overview.startswith("30.1.5.2rc1 Unreleased Candidate Notes\n"):
+        failures.append("doc/release-notes.md: current candidate overview is not first")
+    for fragment in (
+        "legacy claim-input scan",
+        "serializes SQLite wallet",
+        "release=false",
+        "`doc/release-notes/release-notes-30.1.5.2.md`",
+    ):
+        require_fragment(failures, "doc/release-notes.md", overview, fragment,
+                         "current candidate overview")
+
+    candidate_relative = "doc/release-notes/release-notes-30.1.5.2.md"
+    candidate = read_text(root, candidate_relative)
+    for fragment in (
+        "# Blackcoin Core 30.1.5.2rc1 (unreleased candidate)",
+        "`CLIENT_VERSION_IS_RELEASE=false`",
+        "legacy source subset",
+        "SQLite connection",
+        "numeric `CLIENT_VERSION` remains `300105`",
+        "bundle version `30.1.502`",
+        "wallet storage format",
+        "Release qualification is pending.",
+        "[release process](../release-process.md)",
+    ):
+        require_fragment(failures, candidate_relative, candidate, fragment,
+                         "canonical unreleased candidate note")
+
+    process = read_text(root, "doc/release-process.md")
+    for fragment in (
+        "## Current v30.1.5.2rc1 candidate",
+        "unpublished candidate",
+        "RC1, and\n`CLIENT_VERSION_IS_RELEASE=false`",
+        "`V30.1.5.2` acknowledgement",
+        "two isolated builders with byte comparison",
+        "## v30.1.5.1 signed capacity correction (historical)",
+    ):
+        require_fragment(failures, "doc/release-process.md", process, fragment,
+                         "current candidate process or historical heading")
+
+    changelog = read_text(root, "CHANGELOG.md")
+    require_fragment(failures, "CHANGELOG.md", changelog,
+                     "## v30.1.5.2rc1 (unreleased candidate)",
+                     "unreleased candidate entry")
+
+
 def check_beta2_release_identity(root, failures):
     configure = read_text(root, "configure.ac")
     for fragment in (
@@ -861,12 +933,15 @@ def check_release_identity(root, failures):
     identity = configured_release_identity(read_text(root, "configure.ac"))
     if identity == FINAL_RELEASE_IDENTITY:
         check_final_release_identity(root, failures)
+    elif identity == CANDIDATE_RELEASE_IDENTITY:
+        check_candidate_release_identity(root, failures)
     elif identity == BETA2_RELEASE_IDENTITY:
         check_beta2_release_identity(root, failures)
     else:
         major, minor, build, revision, rc, is_release = identity
         failures.append(
-            "configure.ac release identity must be final 30.1.5.1 RC0/true or "
+            "configure.ac release identity must be final 30.1.5.1 RC0/true, "
+            "candidate 30.1.5.2 RC1/false, or "
             f"replacement Beta 2 30.1.1 RC{BETA2_RELEASE_CANDIDATE}/false; found "
             f"{major}.{minor}.{build}.{revision} RC{rc}/{'true' if is_release else 'false'}"
         )

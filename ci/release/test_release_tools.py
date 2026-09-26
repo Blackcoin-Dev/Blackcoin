@@ -108,7 +108,7 @@ class ReleaseToolTests(unittest.TestCase):
             for manpage in generated:
                 self.assertNotIn("Source commit:", manpage.read_text(encoding="utf-8"))
 
-    def test_tracked_manpages_match_final_release_version(self):
+    def test_tracked_manpages_match_candidate_source_version(self):
         root = TOOLS.parent.parent
         configure = (root / "configure.ac").read_text(encoding="utf-8")
         components = []
@@ -121,7 +121,9 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertIsNotNone(match)
             components.append(match.group(1))
         version = ".".join(components)
-        self.assertEqual(version, "30.1.5.1")
+        self.assertEqual(version, "30.1.5.2")
+        self.assertIn("define(_CLIENT_VERSION_RC, 1)", configure)
+        self.assertIn("define(_CLIENT_VERSION_IS_RELEASE, false)", configure)
 
         manpages = sorted((root / "doc" / "man").glob("blackcoin*.1"))
         self.assertEqual(
@@ -138,7 +140,8 @@ class ReleaseToolTests(unittest.TestCase):
         for manpage in manpages:
             with self.subTest(manpage=manpage.name):
                 text = manpage.read_text(encoding="utf-8")
-                self.assertIn(f"v{version}", text)
+                self.assertIn(f"v{version}rc1", text)
+                self.assertNotIn("v30.1.5.1", text)
                 self.assertNotIn("v30.1.4", text)
                 self.assertNotIn("Source commit:", text)
 
@@ -150,9 +153,9 @@ class ReleaseToolTests(unittest.TestCase):
             "UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}",
             workflow,
         )
-        self.assertIn('test "$BASE_VERSION" = "30.1.5.1"', workflow)
-        self.assertIn("expected='V30.1.5.1'", workflow)
-        self.assertIn("expected_ack='V30.1.5.1'", workflow)
+        self.assertIn('test "$BASE_VERSION" = "30.1.5.2"', workflow)
+        self.assertIn("expected='V30.1.5.2'", workflow)
+        self.assertIn("expected_ack='V30.1.5.2'", workflow)
         self.assertIn('NOTES="doc/release-notes/release-notes-$VERSION.md"', workflow)
         self.assertIn("--require-signatures", workflow)
         self.assertIn(f"--signing-fingerprint '{FINGERPRINT}'", workflow)
@@ -3049,7 +3052,7 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertEqual(manifest["prerelease_channel"], "beta")
             self.assertEqual(manifest["source"]["commit"], SOURCE_SHA)
 
-    def test_documentation_lint_preserves_final_and_beta2_identity_modes(self):
+    def test_documentation_lint_preserves_final_candidate_and_beta2_identity_modes(self):
         lint = load_path(
             "lint_quantum_doc_invariants",
             TOOLS.parent.parent / "test" / "lint" / "lint-quantum-doc-invariants.py",
@@ -3061,6 +3064,14 @@ class ReleaseToolTests(unittest.TestCase):
             "define(_CLIENT_VERSION_REVISION, 1)\n"
             "define(_CLIENT_VERSION_RC, 0)\n"
             "define(_CLIENT_VERSION_IS_RELEASE, true)\n"
+        )
+        candidate_configure = (
+            "define(_CLIENT_VERSION_MAJOR, 30)\n"
+            "define(_CLIENT_VERSION_MINOR, 1)\n"
+            "define(_CLIENT_VERSION_BUILD, 5)\n"
+            "define(_CLIENT_VERSION_REVISION, 2)\n"
+            "define(_CLIENT_VERSION_RC, 1)\n"
+            "define(_CLIENT_VERSION_IS_RELEASE, false)\n"
         )
         beta2_configure = (
             "define(_CLIENT_VERSION_MAJOR, 30)\n"
@@ -3074,20 +3085,30 @@ class ReleaseToolTests(unittest.TestCase):
             lint.FINAL_RELEASE_IDENTITY,
         )
         self.assertEqual(
+            lint.configured_release_identity(candidate_configure),
+            lint.CANDIDATE_RELEASE_IDENTITY,
+        )
+        self.assertEqual(
             lint.configured_release_identity(beta2_configure),
             lint.BETA2_RELEASE_IDENTITY,
         )
 
-        for configure, expected in ((final_configure, "final"), (beta2_configure, "beta2")):
+        for configure, expected in (
+            (final_configure, "final"),
+            (candidate_configure, "candidate"),
+            (beta2_configure, "beta2"),
+        ):
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 (root / "configure.ac").write_text(configure, encoding="utf-8")
                 failures = []
                 with mock.patch.object(lint, "check_final_release_identity") as final_check, \
+                     mock.patch.object(lint, "check_candidate_release_identity") as candidate_check, \
                      mock.patch.object(lint, "check_beta2_release_identity") as beta2_check:
                     lint.check_release_identity(root, failures)
                 self.assertEqual(failures, [])
                 self.assertEqual(final_check.call_count, expected == "final")
+                self.assertEqual(candidate_check.call_count, expected == "candidate")
                 self.assertEqual(beta2_check.call_count, expected == "beta2")
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -3104,15 +3125,15 @@ class ReleaseToolTests(unittest.TestCase):
             lint.check_release_identity(root, failures)
             self.assertEqual(len(failures), 1)
             self.assertIn(
-                "final 30.1.5.1 RC0/true or replacement Beta 2 30.1.1 RC2/false",
+                "final 30.1.5.1 RC0/true, candidate 30.1.5.2 RC1/false, or replacement Beta 2 30.1.1 RC2/false",
                 failures[0],
             )
 
     def test_unsigned_final_metadata_is_explicit_and_source_bound(self):
         generator = load_module("generate_unsigned_release_metadata")
         version = generator.EXPECTED_VERSION
-        self.assertEqual(version, "30.1.5.1")
-        self.assertEqual(generator.EXPECTED_ACKNOWLEDGEMENT, "V30.1.5.1")
+        self.assertEqual(version, "30.1.5.2")
+        self.assertEqual(generator.EXPECTED_ACKNOWLEDGEMENT, "V30.1.5.2")
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = Path(temporary)
             required = (
@@ -3278,7 +3299,7 @@ class ReleaseToolTests(unittest.TestCase):
             })
             with self.assertRaisesRegex(
                 RuntimeError,
-                "version must match the authorized release: 30.1.5.1",
+                "version must match the authorized release: 30.1.5.2",
             ):
                 generator.generate_metadata(
                     acknowledgement=generator.EXPECTED_ACKNOWLEDGEMENT,
@@ -3296,7 +3317,7 @@ class ReleaseToolTests(unittest.TestCase):
         workflow = (TOOLS.parent.parent / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("default: 30.1.5.1-alpha1", workflow)
+        self.assertIn("default: 30.1.5.2-alpha1", workflow)
         self.assertIn("CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}", workflow)
         self.assertIn('test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA"', workflow)
         self.assertIn('test "$EVENT_SHA" = "$TARGET_SHA"', workflow)
@@ -3309,9 +3330,9 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('test "$IS_RELEASE" = "false"', workflow)
         self.assertIn('test "$RC" = "0"', workflow)
         self.assertIn('test "$IS_RELEASE" = "true"', workflow)
-        self.assertIn("- 'v30.1.5.1'", workflow)
-        self.assertNotIn("- 'v30.1.5.1-alpha", workflow)
-        self.assertNotIn("- 'v30.1.5.1-beta", workflow)
+        self.assertIn("- 'v30.1.5.2'", workflow)
+        self.assertNotIn("- 'v30.1.5.2-alpha", workflow)
+        self.assertNotIn("- 'v30.1.5.2-beta", workflow)
         self.assertNotIn("30.1.4", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
         self.assertIn("Verify non-macOS binary identity", workflow)
@@ -3333,7 +3354,7 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('metadata["LSArchitecturePriority"] = [os.environ["EXPECTED_ARCH"]]', workflow)
         self.assertIn('verify_plist_architecture "$verified_plist"', workflow)
         self.assertIn(
-            "Require explicit v30.1.5.1 signed-source publication acknowledgement",
+            "Require explicit v30.1.5.2 signed-source publication acknowledgement",
             workflow,
         )
         self.assertIn("--require-signatures", workflow)

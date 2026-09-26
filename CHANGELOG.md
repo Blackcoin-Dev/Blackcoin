@@ -1,5 +1,19 @@
 # Changelog
 
+## v30.1.5.2rc1 (unreleased candidate)
+
+- Limit the wallet's claim-input source budget to legacy outputs that can be
+  considered for claims. Retained reward history and unrelated output records
+  no longer consume that source budget; proof-presence, source-integrity,
+  manager-work, byte, stake-reserve, and selection gates remain fail-closed.
+- Serialize SQLite wallet transaction use across batches and retain explicit
+  transaction ownership, so another connection user cannot enter an active
+  batch transaction.
+- Clean up operator-facing GUI, RPC, and documentation text for the candidate.
+  No consensus rules, numeric wallet version, or wallet storage format change.
+- This entry describes source changes only. The candidate is not published or
+  qualified as a production release.
+
 ## v30.1.1
 
 - Mainnet lifecycle decisions are height-authoritative: Gold Rush is

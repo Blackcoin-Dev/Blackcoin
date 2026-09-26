@@ -1,11 +1,37 @@
 # Blackcoin Core release process
 
+## Current v30.1.5.2rc1 candidate
+
+This runbook's current source line is `30.1.5.2rc1`, an unpublished candidate.
+`configure.ac` records major 30, minor 1, build 5, revision 2, RC1, and
+`CLIENT_VERSION_IS_RELEASE=false`. The numeric `CLIENT_VERSION` remains
+`300105`; macOS short version remains `30.1.5`, bundle version is `30.1.502`,
+and `BlackcoinFullVersion` is `30.1.5.2`. The canonical candidate notes are
+`doc/release-notes/release-notes-30.1.5.2.md`.
+
+Manual alpha or beta package runs must use the exact source SHA and matching
+RC1 label. The default label is `30.1.5.2-alpha1`. These runs do not publish.
+The v30.1.5.2 tag path remains fail-closed while RC1 and release=false are set.
+Before any final tag or production publication, a separately reviewed final
+source must have RC0 and release=true, canonical final notes, the complete
+current-SHA safety gate, a Blackcoin-Dev SSH-signed exact source commit and
+annotated tag, and the protected `V30.1.5.2` acknowledgement. Retain the
+fresh signed immutable-configuration receipt, authenticated inventory and
+numeric release-ID checks, two isolated builders with byte comparison,
+attestations, and one immutable publication. Record actual qualification and
+publication evidence; this candidate has none of those results yet.
+
+The candidate changes the legacy-only claim-input budget and SQLite batch
+transaction ownership, with editorial GUI, RPC, and documentation cleanup.
+It does not change consensus or wallet storage format. Operator validation
+does not require installed-wallet deployment or spending.
+
+## v30.1.5.1 signed capacity correction (historical)
+
 This is the release runbook for Blackcoin Core v30.1.5.1. A successful local
 build is not release authorization. Production publication is allowed only for
 the exact commit that satisfies the mandatory safety gate and the controls
 below.
-
-## v30.1.5.1 signed capacity correction
 
 The scope is #54 (complete retained-history capacity), #55 (confirmed-parent
 referenced-output accounting), and #56 (wallet-wide source-selection budgets).

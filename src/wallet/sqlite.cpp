@@ -139,12 +139,10 @@ SQLiteDatabase::SQLiteDatabase(const fs::path& dir_path, const fs::path& file_pa
         LogPrintf("Using wallet %s\n", m_dir_path);
 
         if (++g_sqlite_count == 1) {
-            // Setup logging
             int ret = sqlite3_config(SQLITE_CONFIG_LOG, ErrorLogCallback, nullptr);
             if (ret != SQLITE_OK) {
                 throw std::runtime_error(strprintf("SQLiteDatabase: Failed to setup error log: %s\n", sqlite3_errstr(ret)));
             }
-            // Force serialized threading mode
             ret = sqlite3_config(SQLITE_CONFIG_SERIALIZED);
             if (ret != SQLITE_OK) {
                 throw std::runtime_error(strprintf("SQLiteDatabase: Failed to configure serialized threading mode: %s\n", sqlite3_errstr(ret)));
@@ -159,7 +157,6 @@ SQLiteDatabase::SQLiteDatabase(const fs::path& dir_path, const fs::path& file_pa
     try {
         Open();
     } catch (const std::runtime_error&) {
-        // If open fails, cleanup this object and rethrow the exception
         Cleanup();
         throw;
     }
@@ -215,7 +212,6 @@ bool SQLiteDatabase::Verify(bilingual_str& error)
         return false;
     }
 
-    // Check the application ID matches our network magic
     auto read_result = ReadPragmaInteger(m_db, "application_id", "the application id", error);
     if (!read_result.has_value()) return false;
     uint32_t app_id = static_cast<uint32_t>(read_result.value());
@@ -225,7 +221,6 @@ bool SQLiteDatabase::Verify(bilingual_str& error)
         return false;
     }
 
-    // Check our schema version
     read_result = ReadPragmaInteger(m_db, "user_version", "sqlite wallet schema version", error);
     if (!read_result.has_value()) return false;
     int32_t user_ver = read_result.value();
@@ -272,7 +267,7 @@ void SQLiteDatabase::Open()
 {
     int flags = SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
     if (m_mock) {
-        flags |= SQLITE_OPEN_MEMORY; // In memory database for mock db
+        flags |= SQLITE_OPEN_MEMORY;
     }
 
     if (m_db == nullptr) {
@@ -289,7 +284,7 @@ void SQLiteDatabase::Open()
         if (ret != SQLITE_OK) {
             throw std::runtime_error(strprintf("SQLiteDatabase: Failed to enable extended result codes: %s\n", sqlite3_errstr(ret)));
         }
-        // Trace SQL statements if tracing is enabled with -debug=walletdb -loglevel=walletdb:trace
+        // Enable SQL tracing with -debug=walletdb -loglevel=walletdb:trace.
         if (LogAcceptCategory(BCLog::WALLETDB, BCLog::Level::Trace)) {
            ret = sqlite3_trace_v2(m_db, SQLITE_TRACE_STMT, TraceSqlCallback, this);
            if (ret != SQLITE_OK) {
@@ -302,10 +297,8 @@ void SQLiteDatabase::Open()
         throw std::runtime_error("SQLiteDatabase: Database opened in readonly mode but read-write permissions are needed");
     }
 
-    // Acquire an exclusive lock on the database
-    // First change the locking mode to exclusive
+    // Keep exclusive locking mode for this connection. BEGIN EXCLUSIVE verifies access now.
     SetPragma(m_db, "locking_mode", "exclusive", "Unable to change database locking mode to exclusive");
-    // Now begin a transaction to acquire the exclusive lock. This lock won't be released until we close because of the exclusive locking mode.
     int ret = sqlite3_exec(m_db, "BEGIN EXCLUSIVE TRANSACTION", nullptr, nullptr, nullptr);
     if (ret != SQLITE_OK) {
         throw std::runtime_error("SQLiteDatabase: Unable to obtain an exclusive lock on the database, is it being used by another instance of " PACKAGE_NAME "?\n");
@@ -319,13 +312,10 @@ void SQLiteDatabase::Open()
     SetPragma(m_db, "fullfsync", "true", "Failed to enable fullfsync");
 
     if (m_use_unsafe_sync) {
-        // Use normal synchronous mode for the journal
         LogPrintf("WARNING SQLite is configured to not wait for data to be flushed to disk. Data loss and corruption may occur.\n");
         SetPragma(m_db, "synchronous", "OFF", "Failed to set synchronous mode to OFF");
     }
 
-    // Make the table for our key-value pairs
-    // First check that the main table exists
     sqlite3_stmt* check_main_stmt{nullptr};
     ret = sqlite3_prepare_v2(m_db, "SELECT name FROM sqlite_master WHERE type='table' AND name='main'", -1, &check_main_stmt, nullptr);
     if (ret != SQLITE_OK) {
@@ -344,19 +334,17 @@ void SQLiteDatabase::Open()
         throw std::runtime_error(strprintf("SQLiteDatabase: Failed to execute statement to check table existence: %s\n", sqlite3_errstr(ret)));
     }
 
-    // Do the db setup things because the table doesn't exist only when we are creating a new wallet
+    // Initialize network and schema identifiers only when creating the table.
     if (!table_exists) {
         ret = sqlite3_exec(m_db, "CREATE TABLE main(key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL)", nullptr, nullptr, nullptr);
         if (ret != SQLITE_OK) {
             throw std::runtime_error(strprintf("SQLiteDatabase: Failed to create new database: %s\n", sqlite3_errstr(ret)));
         }
 
-        // Set the application id
         uint32_t app_id = ReadBE32(Params().MessageStart().data());
         SetPragma(m_db, "application_id", strprintf("%d", static_cast<int32_t>(app_id)),
                   "Failed to set the application id");
 
-        // Set the user version
         SetPragma(m_db, "user_version", strprintf("%d", WALLET_SCHEMA_VERSION),
                   "Failed to set the wallet schema version");
     }
@@ -420,7 +408,6 @@ std::unique_ptr<DatabaseBatch> SQLiteDatabase::MakeBatch(bool flush_on_close)
 SQLiteBatch::SQLiteBatch(SQLiteDatabase& database)
     : m_database(database)
 {
-    // Make sure we have a db handle
     assert(m_database.m_db);
     SQLiteConnectionLock lock(m_database.m_db);
     if (!m_database.m_transaction_poisoned) SetupSQLStatements();
@@ -447,7 +434,6 @@ void SQLiteBatch::Close()
         }
     }
 
-    // Free all of the prepared statements
     const std::vector<std::pair<sqlite3_stmt**, const char*>> statements{
         {&m_read_stmt, "read"},
         {&m_insert_stmt, "insert"},
@@ -473,7 +459,6 @@ bool SQLiteBatch::ReadKey(DataStream&& key, DataStream& value)
     if (m_database.m_transaction_poisoned) return false;
     assert(m_read_stmt);
 
-    // Bind: leftmost parameter in statement is index 1
     if (!BindBlobToStatement(m_read_stmt, 1, key, "key")) return false;
     int res = sqlite3_step(m_read_stmt);
     if (res != SQLITE_ROW) {
@@ -485,7 +470,6 @@ bool SQLiteBatch::ReadKey(DataStream&& key, DataStream& value)
         sqlite3_reset(m_read_stmt);
         return false;
     }
-    // Leftmost column in result is index 0
     value.clear();
     value.write(SpanFromBlob(m_read_stmt, 0));
 
@@ -509,12 +493,9 @@ bool SQLiteBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
         stmt = m_insert_stmt;
     }
 
-    // Bind: leftmost parameter in statement is index 1
-    // Insert index 1 is key, 2 is value
     if (!BindBlobToStatement(stmt, 1, key, "key")) return false;
     if (!BindBlobToStatement(stmt, 2, value, "value")) return false;
 
-    // Execute
     int res = sqlite3_step(stmt);
     sqlite3_clear_bindings(stmt);
     sqlite3_reset(stmt);
@@ -532,10 +513,8 @@ bool SQLiteBatch::ExecStatement(sqlite3_stmt* stmt, Span<const std::byte> blob)
         (m_database.m_transaction_owner && m_database.m_transaction_owner != this)) return false;
     assert(stmt);
 
-    // Bind: leftmost parameter in statement is index 1
     if (!BindBlobToStatement(stmt, 1, blob, "key")) return false;
 
-    // Execute
     int res = sqlite3_step(stmt);
     sqlite3_clear_bindings(stmt);
     sqlite3_reset(stmt);
@@ -562,7 +541,6 @@ bool SQLiteBatch::HasKey(DataStream&& key)
     if (m_database.m_transaction_poisoned) return false;
     assert(m_read_stmt);
 
-    // Bind: leftmost parameter in statement is index 1
     if (!BindBlobToStatement(m_read_stmt, 1, key, "key")) return false;
     int res = sqlite3_step(m_read_stmt);
     sqlite3_clear_bindings(m_read_stmt);
@@ -587,7 +565,6 @@ DatabaseCursor::Status SQLiteCursor::Next(DataStream& key, DataStream& value)
     key.clear();
     value.clear();
 
-    // Leftmost column in result is index 0
     key.write(SpanFromBlob(m_cursor_stmt, 0));
     value.write(SpanFromBlob(m_cursor_stmt, 1));
     return Status::MORE;

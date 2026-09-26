@@ -13,21 +13,21 @@ QString CommonGuide()
     return QObject::tr(R"HTML(
 <hr>
 <h2>Core concepts used throughout this wallet</h2>
-<p><b>Blackcoin V30</b> keeps the legacy Blackcoin chain usable during the transition while upgraded wallets also track quantum-resistant state. The goal is to let old wallets continue to see ordinary chain activity during the preparation period, while upgraded users can create quantum addresses, receive Gold Rush rewards, migrate funds, and prepare for post-quantum staking.</p>
+<p><b>Blackcoin V30</b> keeps the legacy chain usable while upgraded wallets track quantum-resistant state. Upgraded users can create quantum addresses, receive Gold Rush rewards, migrate funds, and prepare for quantum staking.</p>
 
 <h3>There are two value families in the wallet</h3>
 <ul>
 <li><b>Legacy BLK</b> is controlled by the older Blackcoin address and signature system. These coins are still normal chain coins during the transition. Legacy staking continues to help secure the base network.</li>
 <li><b>Quantum BLK</b> is controlled by ML-DSA witness programs. These addresses are intended for Gold Rush rewards, migrated balances, post-quantum sends, and quantum staking workflows.</li>
 </ul>
-<p>The wallet separates these balances because a user should not have to guess which spend path will be used. If a screen says <b>legacy</b>, it means old-style spend authority. If it says <b>quantum</b>, it means the upgraded ML-DSA path.</p>
+<p>The wallet shows these balances separately: <b>legacy</b> uses the older signing path; <b>quantum</b> uses ML-DSA.</p>
 
 <h3>Mainnet schedule</h3>
 <p>Mainnet lifecycle boundaries are height-authoritative. Gold Rush is height 5,950,000 through 6,192,999. The emission-neutral competing-claim rule begins at height 5,993,200. Migration is height 6,193,000 through 6,921,999. Final Lockout and automatic demurrage begin at height 6,922,000. Nominal time forecasts and readiness signalling do not move these boundaries.</p>
 
 <h3>Why Gold Rush uses small legacy-chain control transactions</h3>
-<p>Gold Rush participation is visible on the legacy chain through small control transactions. A PoS signal uses a QQSIGNAL record. A PoW claim uses a QQSPROOF record. These are ordinary fee-paying transactions that old nodes can carry, while upgraded nodes understand the extra meaning and credit quantum rewards.</p>
-<p>Example: a PoW miner finds a valid Argon2id proof. The wallet spends a small legacy UTXO and includes the proof plus the quantum payout address. A staker includes that transaction in a block. Upgraded nodes then credit the quantum reward to the payout address. Legacy nodes simply see a normal transaction with data.</p>
+<p>Gold Rush participation uses small, fee-paying control transactions on the legacy chain: QQSIGNAL for PoS and QQSPROOF for PoW. Legacy nodes carry the transactions; upgraded nodes credit the quantum rewards.</p>
+<p>For example, a PoW miner finds a valid Argon2id proof. The wallet spends a small legacy UTXO in a transaction containing the proof and quantum payout address. A staker includes it in a block. Upgraded nodes credit the reward to that address; legacy nodes see a transaction with data.</p>
 
 <h3>What confirmations mean in these screens</h3>
 <ul>
@@ -35,7 +35,7 @@ QString CommonGuide()
 <li><b>Confirmed</b> means the transaction is in the active chain. More confirmations reduce reorg risk.</li>
 <li><b>Mature</b> means a newly staked or mined output has passed the chain's maturity rule and can be used by the wallet.</li>
 </ul>
-<p>For everyday testing, wait at least several confirmations before judging a staking, mining, migration, or cold-staking setup. A wallet can display a transaction before it is mature enough to be used again.</p>
+<p>Wait several confirmations before assessing a staking, mining, migration, or cold-staking setup. A displayed transaction may still be immature.</p>
 
 <h3>Backups matter more after quantum address creation</h3>
 <p>Every new quantum address, operator key, staking address, or delegation address is wallet-backed non-HD key material and is not derived from the wallet seed. Back up the wallet after creating those addresses. A backup from before a quantum key was created cannot recover the key needed to spend funds sent there.</p>
@@ -54,7 +54,7 @@ QString PosGuide()
 {
     return QObject::tr(R"HTML(
 <h2>Detailed PoS Gold Rush example</h2>
-<p>PoS Gold Rush rewards are designed for wallets that were already meaningful legacy holders at the whitelist snapshot. Eligibility is based on aggregate wallet-address balance at the snapshot, not on one specific 10,000 BLK UTXO.</p>
+<p>PoS Gold Rush eligibility depends on the wallet's aggregate controlled-address balance at the whitelist snapshot, not a single 10,000 BLK UTXO.</p>
 <ol>
 <li>A wallet controls one or more legacy addresses.</li>
 <li>At the whitelist snapshot height, the wallet's controlled addresses are checked for aggregate balance.</li>
@@ -67,7 +67,7 @@ QString PosGuide()
 <p><b>Example C:</b> a wallet receives 20,000 BLK after the snapshot. That may help ordinary staking, but it does not retroactively make the wallet whitelisted for the snapshot-based PoS Gold Rush share.</p>
 
 <h3>Why a normal unlock is needed for PoS Gold Rush</h3>
-<p>Legacy staking-only unlock is intentionally narrow. It lets the wallet create ordinary legacy coinstakes without opening the wallet for spending. A Gold Rush signal is not just a legacy coinstake. It is an extra wallet-authenticated control transaction that links the qualifying activity to a quantum payout address. That requires normal signing authority.</p>
+<p>Legacy staking-only unlock permits ordinary legacy coinstakes without enabling spending. A Gold Rush signal is a separate wallet-authenticated control transaction linking qualifying activity to a quantum payout address. It requires normal signing authority.</p>
 
 <h3>Where PoS rewards go</h3>
 <p>Ordinary staking rewards follow the usual legacy staking path. Gold Rush reward credits go to a quantum payout address. In the transaction list, the upgraded credit should be labeled <b>PoS - Quantum Stake</b> and should show the quantum destination so the user can tell which address received the reward.</p>
@@ -88,7 +88,7 @@ QString PowGuide()
 {
     return QObject::tr(R"HTML(
 <h2>Detailed PoW Gold Rush example</h2>
-<p>Gold Rush PoW is not a separate block chain. It creates claim transactions that are included in ordinary PoS blocks. This gives smaller holders a way to compete for part of the Gold Rush reward schedule without needing 10,000 BLK at the PoS whitelist snapshot.</p>
+<p>Gold Rush PoW does not create a separate chain. Its claims are included in ordinary PoS blocks. Holders can compete for PoW rewards without the 10,000 BLK PoS whitelist balance.</p>
 <ol>
 <li>When mining starts or prepares future new-anchor work, the wallet binds or reuses a wallet-backed quantum payout address. If none exists, the GUI asks before creating a non-HD key; RPC callers must pass explicit one-call key-creation consent.</li>
 <li>A retained claim family preserves its already-authenticated payout. Waiting, relaying, or same-anchor refresh does not allocate an unrelated future-new-anchor key.</li>
@@ -102,9 +102,9 @@ QString PowGuide()
 <p><b>Fee example:</b> if the control transaction is small and the network minimum fee is low, the visible legacy fee can be tiny compared with the quantum reward. The user still needs a small legacy UTXO available so the wallet can anchor the claim.</p>
 
 <h3>Quarantined-claim recovery is an advanced, explicit action</h3>
-<p>A claim that leaves this node's mempool can still be retained and confirmed by a peer. The wallet therefore reserves its exact input and pauses new claims instead of abandoning it on a timer. Waiting for the claim to resolve on chain is the safest default.</p>
-<p>If the claim remains unresolved, open <b>Staking &amp; Mining</b> and select <b>Review claim recovery...</b>. The built-in flow asks Core for an immutable, active-tip-pinned component graph and exact recovery plan. It displays the exact aggregate fee, the maximum fee per resolution, the aggregate batch cap, and any legacy QQP2 revalidation risk before the acknowledgement control is enabled. <b>Wait / take no action</b> is the default. Resolve becomes available only after you explicitly authorize that exact plan; Core then rechecks the plan after a temporary normal unlock, persists the recovery, and handles relay without a separate broadcast command.</p>
-<p>The debug-console recovery RPC remains available as a secondary expert interface for automation and diagnosis, but it enforces the same Core plan binding, fee caps, explicit conflict-risk acknowledgement, and wallet-unlock rules as the GUI. If a conflict confirms, it pays the displayed base-chain fee without a shadow reimbursement. Confirmation is not guaranteed. Never use generic abandonment to release this input.</p>
+<p>A peer may retain and confirm a claim after it leaves this node's mempool. The wallet reserves that claim's input and pauses new claims instead of abandoning it on a timer. Waiting for on-chain resolution is the default.</p>
+<p>If the claim remains unresolved, open <b>Staking &amp; Mining</b> and select <b>Review claim recovery...</b>. Core shows the immutable claim graph and a recovery plan bound to the current chain tip. Before you can acknowledge the plan, the screen shows the total fee, maximum fee per resolution, batch fee cap, and any legacy QQP2 revalidation risk. <b>Wait / take no action</b> is the default. Resolve requires your authorization of that exact plan. After a temporary normal unlock, Core rechecks the plan, persists the recovery, and handles relay without a separate broadcast command.</p>
+<p>The debug-console recovery RPC enforces the same plan binding, fee caps, conflict-risk acknowledgement, and unlock rules. A confirmed conflict pays the displayed base-chain fee without a shadow reimbursement. Confirmation is not guaranteed. Never use generic abandonment to release this input.</p>
 
 <h3>Why the payout must be a quantum address</h3>
 <p>PoW Gold Rush is intended to pull users onto quantum-resistant keys. Paying the reward to a legacy address would defeat the transition goal. The wallet therefore uses a quantum payout address and asks users to back up the wallet after that address exists.</p>

@@ -119,7 +119,7 @@ Fuzzing on a harness compiled with `--with-sanitizers=address,fuzzer,undefined` 
 
 If you find coverage increasing inputs when fuzzing you are highly encouraged to submit them for inclusion in the [`bitcoin-core/qa-assets`](https://github.com/bitcoin-core/qa-assets) repo.
 
-Every single pull request submitted against the Blackcoin repo is automatically tested against all inputs in the [`bitcoin-core/qa-assets`](https://github.com/bitcoin-core/qa-assets) repo. Contributing new coverage increasing inputs is an easy way to help make Blackcoin more robust.
+Each pull request is tested against the inputs in [`bitcoin-core/qa-assets`](https://github.com/bitcoin-core/qa-assets). Contributions that increase coverage can add cases to this test corpus.
 
 ## macOS hints for libFuzzer
 

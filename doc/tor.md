@@ -158,9 +158,9 @@ Add these lines to your `/etc/tor/torrc` (or equivalent config file):
     HiddenServiceDir /var/lib/tor/blackcoin-service/
     HiddenServicePort 15714 127.0.0.1:15715
 
-The directory can be different of course, but virtual port numbers should be equal to
-your blackcoind's P2P listen port (15714 by default), and target addresses and ports
-should be equal to binding address and port for inbound Tor connections (127.0.0.1:15715 by default).
+The directory can vary. Set the virtual port to the node's P2P listen port (15714 by
+default), and set the target address and port to the inbound Tor binding
+(127.0.0.1:15715 by default).
 
     -externalip=X   You can tell the node about its publicly reachable addresses using
                     this option, and this can be an onion address. Given the above
@@ -189,9 +189,9 @@ In a typical situation, where you're only reachable via Tor, this should suffice
 
     ./blackcoind -proxy=127.0.0.1:9050 -externalip=7zvj7a2imdgkdbg4f2dryd5rgtrn7upivr5eeij4cicjh65pooxeshid.onion -listen
 
-(obviously, replace the .onion address with your own). It should be noted that you still
-listen on all devices and another node could establish a clearnet connection, when knowing
-your address. To mitigate this, additionally bind the address of your Tor proxy:
+Replace the example .onion address with your own. The node still listens on all
+devices, so another node that knows your address can connect over clearnet. To
+prevent that, bind the Tor proxy address as well:
 
     ./blackcoind ... -bind=127.0.0.1
 

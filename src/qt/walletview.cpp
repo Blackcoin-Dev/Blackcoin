@@ -267,7 +267,7 @@ void WalletView::backupWallet()
             CClientUIInterface::MSG_ERROR);
         }
     else {
-        Q_EMIT message(tr("Backup Successful"), tr("The wallet data was atomically saved to %1. Any wallet-backed quantum keys were reopened and passed an independent cryptographic signing check before the backup was installed. Keep the file secure; the wallet cannot detect if it is later moved or deleted.").arg(filename),
+        Q_EMIT message(tr("Backup Successful"), tr("Wallet data was atomically saved to %1. Any wallet-backed quantum keys were reopened and passed an independent signing check before the backup was installed. Keep the file secure; the wallet cannot detect if it is moved or deleted later.").arg(filename),
             CClientUIInterface::MSG_INFORMATION);
     }
 }

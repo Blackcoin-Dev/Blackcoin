@@ -307,10 +307,10 @@ void ShadowResourceDialog::buildUi()
     auto* root = new QVBoxLayout(this);
 
     auto* scope = new QLabel(tr(
-        "This page reports a scoped v30.1.1 operating envelope. It is not a "
-        "consensus limit. It never disables validation, networking, staking, "
-        "mining, or the daemon. A full supply scan is optional and returns no "
-        "partial monetary result if it fails or is cancelled."), this);
+        "This page reports v30.1.1 resource limits for diagnostics, not "
+        "consensus limits. It does not disable validation, networking, staking, "
+        "mining, or the daemon. A full supply scan is optional. A failed or "
+        "cancelled scan returns no partial monetary result."), this);
     scope->setObjectName(QStringLiteral("shadowResourceScope"));
     scope->setWordWrap(true);
     root->addWidget(scope);
@@ -517,14 +517,14 @@ void ShadowResourceDialog::updateButtons(
 bool ShadowResourceDialog::confirmUnqualifiedOneCallScan() const
 {
     QMessageBox box{QMessageBox::Warning,
-                    tr("Authorize one scan outside the diagnostic envelope?"),
+                    tr("Authorize one scan outside the reviewed limits?"),
                     tr("This snapshot is outside the reviewed diagnostic "
-                       "height or chainstate-size envelope. No scan has started."),
+                       "height or chainstate-size limits. No scan has started."),
                     QMessageBox::NoButton,
                     const_cast<ShadowResourceDialog*>(this)};
     box.setObjectName(QStringLiteral("shadowResourceConsentDialog"));
     box.setInformativeText(tr(
-        "Authorizing continues this one diagnostic call only. Consent is not "
+        "Authorization applies to this diagnostic scan only. Consent is not "
         "saved, does not suppress warnings, and cannot bypass the 64 GiB "
         "pre-flush reserve, the critical integrity reserve, snapshot checks, "
         "shutdown, cancellation, overflow checks, or absolute work limits."));
@@ -550,7 +550,7 @@ void ShadowResourceDialog::startSupplyScan()
          status.critical_free_space_satisfied);
     if (!hard_scan_preconditions) {
         showScanResult({}, tr(
-            "The hard storage or measurement preconditions are not satisfied. "
+            "Required storage or measurement checks have not passed. "
             "Explicit consent cannot bypass this protection."));
         return;
     }

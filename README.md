@@ -3,11 +3,9 @@
 **Project website and current release status:** [projectblackcoin.org](https://projectblackcoin.org/)
 
 Blackcoin is one of the original pure Proof-of-Stake cryptocurrencies (launched 2014).
-**Quantum Quasar (Protocol V4)** is its post-quantum, participation-first upgrade: it adds
-NIST-standardized quantum-safe signatures, a deterministic migration away from
-quantum-vulnerable legacy outputs, and a set of reward and liveness mechanics designed to
-turn passive holding into active network security, while **rewarding HODLers in full for
-helping secure the chain**.
+**Quantum Quasar (Protocol V4)** adds NIST-standardized quantum-safe signatures, a
+deterministic migration path from quantum-vulnerable legacy outputs, and reward and liveness
+mechanics for staking and mining.
 
 > **New here?** Read the Quantum Quasar White Paper
 > ([PDF](doc/whitepaper-quantum-quasar.pdf) / [Markdown](doc/whitepaper-quantum-quasar.md))

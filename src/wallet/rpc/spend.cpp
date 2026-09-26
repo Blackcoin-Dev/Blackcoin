@@ -558,7 +558,7 @@ RPCHelpMan burnwallet()
 RPCHelpMan optimizeutxoset()
 {
     return RPCHelpMan{"optimizeutxoset",
-                "\nOptimize the UTXO set to maximize PoS yield. Valid only for continuous minting. This resets accumulated coinage. Every output and change uses the required address; the command creates no hidden quantum change key." +
+                "\nOptimize the UTXO set to maximize PoS yield. Valid only for continuous minting. This resets accumulated coinage. The command uses the required address for every output and for change. It does not create a hidden quantum change key." +
         HELP_REQUIRING_PASSPHRASE,
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Required Blackcoin address that receives every new UTXO and any change. For quantum inputs, this must be an existing wallet-owned quantum address."},

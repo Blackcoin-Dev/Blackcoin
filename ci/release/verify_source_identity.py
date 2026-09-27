@@ -79,9 +79,18 @@ PINNED_IDENTITY_EXCEPTIONS = {
         (EXPECTED_NAME, EXPECTED_EMAIL),
         ("GitHub", "noreply@github.com"),
     ),
+    # Exact GitHub-verified PR #57 merge by Blackcoin-Dev. Its immutable
+    # parents are:
+    # f2c046242c45c6c58ffd5702a3251ca5d5f9f06e
+    # bd5dad9aef27aff1f1bff37d6e5464b8305cd3ca
+    "5b06e327997424072d8ed97cf0a2c2ec58dacc72": (
+        (EXPECTED_NAME, EXPECTED_EMAIL),
+        ("GitHub", "noreply@github.com"),
+    ),
 }
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ATTRIBUTION_TRAILER_RE = re.compile(r"^(?:co-authored-by|co-developed-by):", re.IGNORECASE)
+CANONICAL_CODEX_TRAILER = "Co-Authored-By: Codex <noreply@openai.com>"
 TAG_SIGNATURE_MARKERS = (
     "-----BEGIN PGP SIGNATURE-----",
     "-----BEGIN SSH SIGNATURE-----",
@@ -95,7 +104,7 @@ def git(*args):
         check=True,
         text=True,
         stdout=subprocess.PIPE,
-    ).stdout.strip()
+    ).stdout.rstrip("\n")
 
 
 def resolved_commit(value):
@@ -123,9 +132,11 @@ def verify_commit(commit):
         raise RuntimeError(
             f"{commit} committer is {committer_name} <{committer_email}>; expected the release team identity"
         )
-    for line in message.splitlines():
-        if ATTRIBUTION_TRAILER_RE.match(line.strip()):
-            raise RuntimeError(f"{commit} contains an additional contributor-attribution trailer")
+    lines = message.splitlines()
+    attribution = [(index, line) for index, line in enumerate(lines)
+                   if ATTRIBUTION_TRAILER_RE.match(line.strip())]
+    if attribution and attribution != [(len(lines) - 1, CANONICAL_CODEX_TRAILER)]:
+        raise RuntimeError(f"{commit} contains an additional contributor-attribution trailer")
 
 
 def ssh_public_key_fingerprint(encoded_key):

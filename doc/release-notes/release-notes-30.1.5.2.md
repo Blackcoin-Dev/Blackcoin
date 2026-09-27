@@ -1,7 +1,8 @@
-# Blackcoin Core 30.1.5.2rc1 (unreleased candidate)
+# Blackcoin Core 30.1.5.2
 
-This candidate contains two wallet repairs and clearer GUI, RPC help, and
-operator documentation. It is configured with `CLIENT_VERSION_IS_RELEASE=false`.
+This maintenance release contains wallet repairs and clearer GUI, RPC help,
+and operator documentation. Its final source is configured with RC0 and
+`CLIENT_VERSION_IS_RELEASE=true`.
 
 ## Wallet repairs
 
@@ -14,6 +15,8 @@ operator documentation. It is configured with `CLIENT_VERSION_IS_RELEASE=false`.
 - **SQLite batch ownership:** an explicit transaction holds the SQLite connection
   lock for its owning batch. Other batches cannot join that transaction. A
   failed rollback blocks further database access until the wallet is reloaded.
+  SQLite instance counting now occurs only after initialization succeeds, so
+  a failed startup does not prevent a clean retry or final shutdown.
 
 ## Interface and documentation
 
@@ -22,18 +25,18 @@ shorter language. Existing settings and permission requirements are unchanged.
 
 ## Compatibility
 
-The candidate version is `30.1.5.2rc1`. Candidate packages use a
-`30.1.5.2-alpha1` or `30.1.5.2-beta1` label and identify their source commit.
-The numeric `CLIENT_VERSION` remains `300105`. macOS uses short version
+The source version is `30.1.5.2`. The numeric `CLIENT_VERSION` remains
+`300105`. macOS uses short version
 `30.1.5`, bundle version `30.1.502`, and `BlackcoinFullVersion=30.1.5.2`.
 
-This candidate preserves consensus and reward rules, activation heights,
+This release preserves consensus and reward rules, activation heights,
 network protocol, wallet storage format, and chainstate format. Back up wallets before
 upgrading. This maintenance revision requires no reindex or wallet recreation.
 
 ## Release status
 
-Release qualification is pending. Required tests, source signing, reproducible
-builds, and publication controls are listed in the [release process](../release-process.md).
+Production publication requires exact-source tests, source signing, reproducible
+builds, and the controls listed in the [release process](../release-process.md).
+These notes do not assert that qualification or publication has completed.
 Windows packages remain without Authenticode signatures. macOS applications
 use ad-hoc signatures and are not Developer-ID signed or notarized.

@@ -55,6 +55,7 @@ CURRENT_FINAL_OPERATOR_DOCUMENTS = (
 BETA2_RELEASE_CANDIDATE = 2
 FINAL_RELEASE_IDENTITY = (30, 1, 5, 1, 0, True)
 CANDIDATE_RELEASE_IDENTITY = (30, 1, 5, 2, 1, False)
+CURRENT_FINAL_RELEASE_IDENTITY = (30, 1, 5, 2, 0, True)
 BETA2_RELEASE_IDENTITY = (30, 1, 1, 0, BETA2_RELEASE_CANDIDATE, False)
 
 
@@ -859,6 +860,79 @@ def check_candidate_release_identity(root, failures):
                      "unreleased candidate entry")
 
 
+def check_current_final_release_identity(root, failures):
+    # Retain all v30.1.5.1 and earlier historical assertions.
+    check_final_release_identity(root, failures, CURRENT_FINAL_RELEASE_IDENTITY)
+
+    workflow_relative = ".github/workflows/build.yml"
+    workflow = read_text(root, workflow_relative)
+    for fragment in (
+        "name: v30.1.5.2 signed maintenance release build",
+        "- 'v30.1.5.2'",
+        "group: v30.1.5.2-release-",
+        'test "$BASE_VERSION" = "30.1.5.2"',
+        "expected='V30.1.5.2'",
+        "expected_ack='V30.1.5.2'",
+        'test "$RC" = "0"',
+        'test "$IS_RELEASE" = "true"',
+        "--require-signatures",
+        "IMMUTABLE_RELEASE_RECEIPT_B64",
+        "verify_reproducible.py",
+        "RELEASE_NOTES_NOT_FINAL",
+        "unreleased[[:space:]]+candidate|30[.]1[.]5[.]2rc[0-9]+",
+        "Final release notes retain candidate or RC status",
+    ):
+        require_fragment(failures, workflow_relative, workflow, fragment,
+                         "current final workflow lock or publication gate")
+    if "30.1.5.1" in workflow:
+        failures.append(f"{workflow_relative}: stale v30.1.5.1 release lock")
+
+    overview = read_text(root, "doc/release-notes.md")
+    if not overview.startswith("30.1.5.2 Maintenance Release Notes\n"):
+        failures.append("doc/release-notes.md: current final overview is not first")
+    for fragment in (
+        "legacy claim-input scan",
+        "serializes SQLite wallet",
+        "RC0 with `CLIENT_VERSION_IS_RELEASE=true`",
+        "`doc/release-notes/release-notes-30.1.5.2.md`",
+    ):
+        require_fragment(failures, "doc/release-notes.md", overview, fragment,
+                         "current final overview")
+
+    notes_relative = "doc/release-notes/release-notes-30.1.5.2.md"
+    notes = read_text(root, notes_relative)
+    for fragment in (
+        "# Blackcoin Core 30.1.5.2\n",
+        "`CLIENT_VERSION_IS_RELEASE=true`",
+        "legacy source subset",
+        "SQLite connection",
+        "SQLite instance counting now occurs only after initialization succeeds",
+        "numeric `CLIENT_VERSION` remains\n`300105`",
+        "bundle version `30.1.502`",
+        "wallet storage format",
+        "[release process](../release-process.md)",
+    ):
+        require_fragment(failures, notes_relative, notes, fragment,
+                         "canonical final release note")
+    if re.search(r"unreleased\s+candidate|30[.]1[.]5[.]2rc\d+|CLIENT_VERSION_IS_RELEASE=false|release qualification is pending|RELEASE_NOTES_NOT_FINAL", notes, re.IGNORECASE):
+        failures.append(f"{notes_relative}: final notes retain candidate or RC status")
+
+    process = read_text(root, "doc/release-process.md")
+    for fragment in (
+        "## Current v30.1.5.2 signed maintenance release",
+        "RC0, and\n`CLIENT_VERSION_IS_RELEASE=true`",
+        "`V30.1.5.2` acknowledgement",
+        "two isolated builders with byte comparison",
+        "## v30.1.5.1 signed capacity correction (historical)",
+    ):
+        require_fragment(failures, "doc/release-process.md", process, fragment,
+                         "current final process or historical heading")
+
+    changelog = read_text(root, "CHANGELOG.md")
+    require_fragment(failures, "CHANGELOG.md", changelog,
+                     "## v30.1.5.2\n", "final release entry")
+
+
 def check_beta2_release_identity(root, failures):
     configure = read_text(root, "configure.ac")
     for fragment in (
@@ -935,13 +1009,15 @@ def check_release_identity(root, failures):
         check_final_release_identity(root, failures)
     elif identity == CANDIDATE_RELEASE_IDENTITY:
         check_candidate_release_identity(root, failures)
+    elif identity == CURRENT_FINAL_RELEASE_IDENTITY:
+        check_current_final_release_identity(root, failures)
     elif identity == BETA2_RELEASE_IDENTITY:
         check_beta2_release_identity(root, failures)
     else:
         major, minor, build, revision, rc, is_release = identity
         failures.append(
-            "configure.ac release identity must be final 30.1.5.1 RC0/true, "
-            "candidate 30.1.5.2 RC1/false, or "
+            "configure.ac release identity must be historical final 30.1.5.1 RC0/true, "
+            "candidate 30.1.5.2 RC1/false, final 30.1.5.2 RC0/true, or "
             f"replacement Beta 2 30.1.1 RC{BETA2_RELEASE_CANDIDATE}/false; found "
             f"{major}.{minor}.{build}.{revision} RC{rc}/{'true' if is_release else 'false'}"
         )

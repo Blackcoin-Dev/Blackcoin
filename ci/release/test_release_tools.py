@@ -130,7 +130,7 @@ class ReleaseToolTests(unittest.TestCase):
                 self.assertIn(expected_versions[manpage.name].replace('-', r'\-'), text)
                 self.assertNotRegex(text, r"v30\.1\.5\.2rc1(?:\\-|-)(?:[0-9a-f]{12,40}|g[0-9a-f]{40})")
 
-    def test_tracked_manpages_match_candidate_source_version(self):
+    def test_tracked_manpages_match_final_source_version(self):
         root = TOOLS.parent.parent
         configure = (root / "configure.ac").read_text(encoding="utf-8")
         components = []
@@ -144,8 +144,8 @@ class ReleaseToolTests(unittest.TestCase):
             components.append(match.group(1))
         version = ".".join(components)
         self.assertEqual(version, "30.1.5.2")
-        self.assertIn("define(_CLIENT_VERSION_RC, 1)", configure)
-        self.assertIn("define(_CLIENT_VERSION_IS_RELEASE, false)", configure)
+        self.assertIn("define(_CLIENT_VERSION_RC, 0)", configure)
+        self.assertIn("define(_CLIENT_VERSION_IS_RELEASE, true)", configure)
 
         manpages = sorted((root / "doc" / "man").glob("blackcoin*.1"))
         self.assertEqual(
@@ -162,11 +162,12 @@ class ReleaseToolTests(unittest.TestCase):
         for manpage in manpages:
             with self.subTest(manpage=manpage.name):
                 text = manpage.read_text(encoding="utf-8")
-                self.assertIn(f"v{version}rc1", text)
+                self.assertIn(f"v{version}", text)
+                self.assertNotIn(f"v{version}rc", text)
                 self.assertNotIn("v30.1.5.1", text)
                 self.assertNotIn("v30.1.4", text)
                 self.assertNotIn("Source commit:", text)
-                self.assertNotRegex(text, r"v30\.1\.5\.2rc1(?:\\-|-)(?:[0-9a-f]{12,40}|g[0-9a-f]{40}|dirty)")
+                self.assertNotRegex(text, r"v30\.1\.5\.2(?:rc[0-9]+)?(?:\\-|-)(?:[0-9a-f]{12,40}|g[0-9a-f]{40}|dirty)")
 
     def test_final_release_requires_signed_source_and_exact_acknowledgement(self):
         workflow = (
@@ -180,6 +181,8 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("expected='V30.1.5.2'", workflow)
         self.assertIn("expected_ack='V30.1.5.2'", workflow)
         self.assertIn('NOTES="doc/release-notes/release-notes-$VERSION.md"', workflow)
+        self.assertIn("Final release notes retain candidate or RC status", workflow)
+        self.assertIn("unreleased[[:space:]]+candidate|30[.]1[.]5[.]2rc[0-9]+", workflow)
         self.assertIn("--require-signatures", workflow)
         self.assertIn(f"--signing-fingerprint '{FINGERPRINT}'", workflow)
         self.assertNotIn("--require-unsigned-objects", workflow)
@@ -198,6 +201,25 @@ class ReleaseToolTests(unittest.TestCase):
         ):
             with self.subTest(unavailable_credential=unavailable_credential):
                 self.assertNotIn(unavailable_credential, workflow)
+
+    def test_final_release_notes_gate_rejects_candidate_status(self):
+        root = TOOLS.parent.parent
+        workflow = (root / ".github/workflows/build.yml").read_text(encoding="utf-8")
+        pattern = re.search(r"! grep -Eiq '([^']+)' \"\$NOTES\"", workflow)
+        self.assertIsNotNone(pattern)
+        notes = root / "doc/release-notes/release-notes-30.1.5.2.md"
+        self.assertEqual(subprocess.run(["grep", "-Eiq", pattern.group(1), str(notes)]).returncode, 1)
+        for label in (
+            "unreleased candidate", "30.1.5.2rc1",
+            "CLIENT_VERSION_IS_RELEASE=false", "Release qualification is pending",
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                candidate = Path(temporary) / "notes.md"
+                candidate.write_text(f"# Blackcoin Core 30.1.5.2\n{label}\n", encoding="utf-8")
+                self.assertEqual(
+                    subprocess.run(["grep", "-Eiq", pattern.group(1), str(candidate)]).returncode,
+                    0,
+                )
 
     def write_native_binary(self, path, platform, architecture):
         if platform == "linux":
@@ -3075,7 +3097,7 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertEqual(manifest["prerelease_channel"], "beta")
             self.assertEqual(manifest["source"]["commit"], SOURCE_SHA)
 
-    def test_documentation_lint_preserves_final_candidate_and_beta2_identity_modes(self):
+    def test_documentation_lint_preserves_historical_candidate_and_final_identity_modes(self):
         lint = load_path(
             "lint_quantum_doc_invariants",
             TOOLS.parent.parent / "test" / "lint" / "lint-quantum-doc-invariants.py",
@@ -3096,6 +3118,14 @@ class ReleaseToolTests(unittest.TestCase):
             "define(_CLIENT_VERSION_RC, 1)\n"
             "define(_CLIENT_VERSION_IS_RELEASE, false)\n"
         )
+        current_final_configure = (
+            "define(_CLIENT_VERSION_MAJOR, 30)\n"
+            "define(_CLIENT_VERSION_MINOR, 1)\n"
+            "define(_CLIENT_VERSION_BUILD, 5)\n"
+            "define(_CLIENT_VERSION_REVISION, 2)\n"
+            "define(_CLIENT_VERSION_RC, 0)\n"
+            "define(_CLIENT_VERSION_IS_RELEASE, true)\n"
+        )
         beta2_configure = (
             "define(_CLIENT_VERSION_MAJOR, 30)\n"
             "define(_CLIENT_VERSION_MINOR, 1)\n"
@@ -3112,6 +3142,10 @@ class ReleaseToolTests(unittest.TestCase):
             lint.CANDIDATE_RELEASE_IDENTITY,
         )
         self.assertEqual(
+            lint.configured_release_identity(current_final_configure),
+            lint.CURRENT_FINAL_RELEASE_IDENTITY,
+        )
+        self.assertEqual(
             lint.configured_release_identity(beta2_configure),
             lint.BETA2_RELEASE_IDENTITY,
         )
@@ -3119,6 +3153,7 @@ class ReleaseToolTests(unittest.TestCase):
         for configure, expected in (
             (final_configure, "final"),
             (candidate_configure, "candidate"),
+            (current_final_configure, "current_final"),
             (beta2_configure, "beta2"),
         ):
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as temporary:
@@ -3127,11 +3162,13 @@ class ReleaseToolTests(unittest.TestCase):
                 failures = []
                 with mock.patch.object(lint, "check_final_release_identity") as final_check, \
                      mock.patch.object(lint, "check_candidate_release_identity") as candidate_check, \
+                     mock.patch.object(lint, "check_current_final_release_identity") as current_final_check, \
                      mock.patch.object(lint, "check_beta2_release_identity") as beta2_check:
                     lint.check_release_identity(root, failures)
                 self.assertEqual(failures, [])
                 self.assertEqual(final_check.call_count, expected == "final")
                 self.assertEqual(candidate_check.call_count, expected == "candidate")
+                self.assertEqual(current_final_check.call_count, expected == "current_final")
                 self.assertEqual(beta2_check.call_count, expected == "beta2")
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -3148,7 +3185,7 @@ class ReleaseToolTests(unittest.TestCase):
             lint.check_release_identity(root, failures)
             self.assertEqual(len(failures), 1)
             self.assertIn(
-                "final 30.1.5.1 RC0/true, candidate 30.1.5.2 RC1/false, or replacement Beta 2 30.1.1 RC2/false",
+                "historical final 30.1.5.1 RC0/true, candidate 30.1.5.2 RC1/false, final 30.1.5.2 RC0/true, or replacement Beta 2 30.1.1 RC2/false",
                 failures[0],
             )
 
@@ -3594,6 +3631,30 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "committer is"):
                 identity.verify_commit(legacy_sha)
 
+    def test_source_identity_accepts_only_one_canonical_codex_trailer_at_end(self):
+        identity = load_module("verify_source_identity")
+        commit = "0" * 40
+        prefix = (
+            "Blackcoin-Dev\0"
+            "298119138+Blackcoin-Dev@users.noreply.github.com\0"
+            "Blackcoin-Dev\0"
+            "298119138+Blackcoin-Dev@users.noreply.github.com\0"
+        )
+        canonical = identity.CANONICAL_CODEX_TRAILER
+        with mock.patch.object(identity, "git", return_value=prefix + "Release fixes\n\n" + canonical):
+            identity.verify_commit(commit)
+        for message in (
+            "Release fixes\n\n" + canonical + "\n" + canonical,
+            "Release fixes\n\nCo-Authored-By: Other <other@example.invalid>",
+            "Release fixes\n\nCo-authored-by: Codex <noreply@openai.com>",
+            "Release fixes\n\n" + canonical + " ",
+            "Release fixes\n\nCo-Developed-By: Codex <noreply@openai.com>",
+            canonical + "\n\nRelease fixes",
+        ):
+            with self.subTest(message=message), mock.patch.object(identity, "git", return_value=prefix + message):
+                with self.assertRaisesRegex(RuntimeError, "contributor-attribution trailer"):
+                    identity.verify_commit(commit)
+
     def test_source_identity_github_merge_exception_is_sha_pinned(self):
         identity = load_module("verify_source_identity")
         merge_shas = (
@@ -3601,6 +3662,7 @@ class ReleaseToolTests(unittest.TestCase):
             "19baffef25af36e177db2975780e0641b59753aa",
             "e85668ed26ef75d92e234488cbd85e146f6ffd5a",
             "f2c046242c45c6c58ffd5702a3251ca5d5f9f06e",
+            "5b06e327997424072d8ed97cf0a2c2ec58dacc72",
         )
         merge_metadata = (
             "Blackcoin-Dev\0"

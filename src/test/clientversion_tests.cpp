@@ -14,9 +14,9 @@ BOOST_AUTO_TEST_CASE(maintenance_revision_preserves_numeric_compatibility)
     BOOST_CHECK_EQUAL(CLIENT_VERSION_MAJOR, 30);
     BOOST_CHECK_EQUAL(CLIENT_VERSION_MINOR, 1);
     BOOST_CHECK_EQUAL(CLIENT_VERSION_BUILD, 5);
-    BOOST_CHECK_EQUAL(CLIENT_VERSION_REVISION, 1);
-    BOOST_CHECK_EQUAL(CLIENT_VERSION_STRING, "30.1.5.1");
-    BOOST_CHECK_EQUAL(PACKAGE_VERSION, "30.1.5.1");
+    BOOST_CHECK_EQUAL(CLIENT_VERSION_REVISION, 2);
+    BOOST_CHECK_EQUAL(CLIENT_VERSION_STRING, "30.1.5.2");
+    BOOST_CHECK_EQUAL(PACKAGE_VERSION, "30.1.5.2");
     BOOST_CHECK(CLIENT_VERSION_IS_RELEASE);
 }
 
@@ -27,9 +27,9 @@ BOOST_AUTO_TEST_CASE(peer_revision_is_explicit_and_historical_format_is_unchange
                       "/Test:9.99.0(comment1; Comment2)/");
     BOOST_CHECK_EQUAL(FormatSubVersion("Blackcoin", 300105, {}, 0), "/Blackcoin:30.1.5/");
     BOOST_CHECK_EQUAL(FormatSubVersion(CLIENT_NAME, CLIENT_VERSION, {}, CLIENT_VERSION_REVISION),
-                      "/Blackcoin:30.1.5.1/");
+                      "/Blackcoin:30.1.5.2/");
     BOOST_CHECK_EQUAL(FormatSubVersion(CLIENT_NAME, CLIENT_VERSION, {"comment1", "Comment2"}, CLIENT_VERSION_REVISION),
-                      "/Blackcoin:30.1.5.1(comment1; Comment2)/");
+                      "/Blackcoin:30.1.5.2(comment1; Comment2)/");
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 300105, {}, 99), "/Test:30.1.5.99/");
 }
 

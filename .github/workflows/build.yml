@@ -206,6 +206,10 @@ jobs:
               echo "::error::Release notes are still marked non-final"
               exit 1
             }
+            ! grep -Eiq 'unreleased[[:space:]]+candidate|30[.]1[.]5[.]2rc[0-9]+|CLIENT_VERSION_IS_RELEASE=false|release qualification is pending' "$NOTES" || {
+              echo "::error::Final release notes retain candidate or RC status"
+              exit 1
+            }
           fi
 
           {

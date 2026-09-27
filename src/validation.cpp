@@ -1305,10 +1305,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         // check is accomplished later, so we don't bother doing anything about it here, but if our
         // policy changes, we may need to move that check to here instead of removing it wholesale.
         //
-        // Such transactions are clearly not merging any existing packages, so we are only concerned with
-        // ensuring that (a) no package is growing past the package size (not count) limits and (b) we are
-        // not allowing something to effectively use the (below) carve-out spot when it shouldn't be allowed
-        // to.
+        // These transactions do not merge existing packages. Check package size
+        // (not count) limits and prevent reuse of the carve-out slot.
         //
         // To check these we first check if we meet the RBF criteria, above, and increment the descendant
         // limits by the direct conflict and its descendants (as these are recalculated in
@@ -1475,12 +1473,9 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     const uint256& hash = ws.m_hash;
     TxValidationState& state = ws.m_state;
 
-    // Check again against the current block tip's script verification
-    // flags to cache our script execution flags. This is, of course,
-    // useless if the next block has different script flags from the
-    // previous one, but because the cache tracks script flags for us it
-    // will auto-invalidate and we'll just have a few blocks of extra
-    // misses on soft-fork activation.
+    // Check again under the current tip's script flags before caching the result.
+    // The flags are part of the script execution cache key, so changed flags
+    // cause a cache miss and require the scripts to be checked again.
     //
     // This is also useful in case of bugs in the standard flags that cause
     // transactions to pass as valid when they're actually invalid. For
@@ -2426,9 +2421,8 @@ bool InitScriptExecutionCache(size_t max_size_bytes)
  * This involves ECDSA signature checks so can be computationally intensive. This function should
  * only be called after the cheap sanity checks in CheckTxInputs passed.
  *
- * If pvChecks is not nullptr, script checks are pushed onto it instead of being performed inline. Any
- * script checks which are not necessary (eg due to script execution cache hits) are, obviously,
- * not pushed onto pvChecks/run.
+ * If pvChecks is not nullptr, required script checks are queued instead of run inline.
+ * Checks satisfied by cache hits are not queued.
  *
  * Setting cacheSigStore/cacheFullScriptStore to false will remove elements from the corresponding cache
  * which are matched. This is useful for checking blocks where we will likely never need the cache

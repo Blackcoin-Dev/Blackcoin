@@ -280,8 +280,7 @@ class AcceptBlockTest(BitcoinTestFramework):
 
         test_node.send_message(msg_block(block_291))
 
-        # At this point we've sent an obviously-bogus block, wait for full processing
-        # and assume disconnection
+        # Wait for the peer to disconnect after processing the invalid block.
         test_node.wait_for_disconnect()
 
         self.nodes[0].disconnect_p2ps()

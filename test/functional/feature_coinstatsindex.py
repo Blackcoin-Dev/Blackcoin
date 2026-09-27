@@ -225,7 +225,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
             })
             self.block_sanity_check(res7['block_info'])
 
-        self.log.info("Test that the index is robust across restarts")
+        self.log.info("Verify coinstatsindex returns the same muhash after restart")
 
         res8 = index_node.gettxoutsetinfo('muhash')
         self.restart_node(1, extra_args=self.extra_args[1])

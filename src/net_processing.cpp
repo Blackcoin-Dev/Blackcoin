@@ -1677,9 +1677,7 @@ bool PeerManagerImpl::ProcessNetBlock(const std::shared_ptr<const CBlock> pblock
         }
     }
 
-    // Blackcoin ToDo: revert after nodes upgrade to current version
-    // /*
-    // Set nFlags in case of proof of stake block received from an old node
+    // Peers at or below OLD_VERSION require the legacy proof-of-stake flag.
     std::shared_ptr<CBlock> pblock_mutable = std::const_pointer_cast<CBlock>(pblock);
     bool old_client = pfrom.nVersion <= OLD_VERSION;
 
@@ -4414,13 +4412,9 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // headers message). In both cases it's safe to update
         // pindexBestHeaderSent to be our tip.
         //
-        // It is important that we simply reset the BestHeaderSent value here,
-        // and not max(BestHeaderSent, newHeaderSent). We might have announced
-        // the currently-being-connected tip using a compact block, which
-        // resulted in the peer sending a headers request, which we respond to
-        // without the new block. By resetting the BestHeaderSent, we ensure we
-        // will re-announce the new block via headers (or compact blocks again)
-        // in the SendMessages logic.
+        // Reset BestHeaderSent rather than taking max(BestHeaderSent, newHeaderSent).
+        // A compact-block announcement can trigger a headers request before the
+        // new block is included; resetting lets SendMessages announce it again.
         nodestate->pindexBestHeaderSent = pindex ? pindex : m_chainman.ActiveChain().Tip();
         m_connman.PushMessage(&pfrom, msgMaker.Make(NetMsgType::HEADERS, TX_WITH_WITNESS(vHeaders)));
         return;

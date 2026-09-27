@@ -2100,10 +2100,8 @@ public:
     void AbandonOrphanedCoinstakes();
 
     /**
-     * Blocks until the wallet state is up-to-date to /at least/ the current
-     * chain at the time this function is entered
-     * Obviously holding cs_main/cs_wallet when going into this call may cause
-     * deadlock
+     * Blocks until the wallet catches up to the chain tip observed on entry.
+     * Call without cs_main or cs_wallet; holding either lock can deadlock.
      */
     void BlockUntilSyncedToCurrentChain() const LOCKS_EXCLUDED(::cs_main) EXCLUSIVE_LOCKS_REQUIRED(!cs_wallet);
 

@@ -3,42 +3,44 @@
 **Project website and current release status:** [projectblackcoin.org](https://projectblackcoin.org/)
 
 Blackcoin is one of the original pure Proof-of-Stake cryptocurrencies (launched 2014).
-**Quantum Quasar (Protocol V4)** adds NIST-standardized quantum-safe signatures, a
-deterministic migration path from quantum-vulnerable legacy outputs, and reward and liveness
-mechanics for staking and mining.
+**Quantum Quasar (Protocol V4)** adds ML-DSA-44 (FIPS 204) signature verification
+for specified witness paths, a scheduled migration from legacy elliptic-curve
+outputs, and reward and liveness rules for staking and mining.
 
 > **New here?** Read the Quantum Quasar White Paper
 > ([PDF](doc/whitepaper-quantum-quasar.pdf) / [Markdown](doc/whitepaper-quantum-quasar.md))
-> for the complete protocol specification with worked examples, exact consensus constants, and
-> a community playbook. Legacy operators should read the [Transition Guide](TRANSITION_GUIDE.md)
+> for the v30.1.1 protocol overview, worked examples, and listed consensus constants.
+> Legacy operators should read the [Transition Guide](TRANSITION_GUIDE.md)
 > before upgrading. See the [Changelog](CHANGELOG.md) for what shipped in each release.
 
-## What Quantum Quasar delivers
+## Protocol V4 components
 
-- **Quantum-safe signatures.** ML-DSA-44 (FIPS 204) via liboqs as the
+- **ML-DSA-44 witness paths.** ML-DSA-44 (FIPS 204) via liboqs as the
   consensus-verified spending path for quantum migration (witness v16) and
   quantum cold-staking (v14). Witness v15 is frozen and reserved for a future EUTXO
   design, but v30.1.1 provides no supported v15 funding or spending workflow
   because it has no quantum ownership authorization. Consensus rejects v15
   funding and spending from Migration onward.
-- **A bounded, one-click migration.** Gold Rush is followed by a scheduled
-  **18-month** Migration phase in which holders can move legacy elliptic-curve
-  coins into quantum-safe addresses with `migratetoquantum`. Legacy coins
-  remain spendable during Gold Rush, but ordinary quantum funding does not
-  activate until Migration. Final Lockout then closes the legacy spending path.
-- **The Gold Rush.** A 180-day bonus-emission epoch (up to 51,437,700 BLK) paid to holders
-  **through staking and mining**, split 50/50 between native PoS and a light, CPU-friendly
-  Argon2id PoW lane.
+- **Wallet-guided legacy migration.** Gold Rush is followed by a scheduled
+  **18-month** Migration phase in which holders can move eligible legacy
+  elliptic-curve coins to ML-DSA-protected witness-v16 outputs with
+  `migratetoquantum`, subject to wallet, key-backup, fee, and confirmation
+  conditions. Legacy coins remain spendable during Gold Rush, but ordinary
+  quantum funding does not activate until Migration. Final Lockout then closes
+  the legacy spending path.
+- **The Gold Rush.** A 180-day bonus-emission epoch (up to 51,437,700 BLK) paid
+  through eligible staking solves and valid mining claims, split 50/50 between
+  native PoS and an Argon2id PoW lane with a 1 MiB memory parameter.
 - **Liveness demurrage.** Demurrage activates automatically at the first Final
   block. Eligible quantum coins that then remain inactive for more than six
   months slowly decay. Decayed principal is permanently burned when spent and
   is never paid to a miner, staker, treasury, or reward pool. A timely
   direct/tiered-v16 liveness attestation, ordinary spend, or successful cold-stake
   refresh keeps the applicable activity clock current.
-- **Rich quantum staking.** Tiered self-staking, cold staking with owner/staker key
+- **Quantum staking.** Tiered self-staking, cold staking with owner/staker key
   separation, operator bonds, a per-pool decentralization cap, and conditional
   owner-wallet redelegation.
-- **Advanced primitives.** RGB client-side asset commitments plus
+- **RGB and reserved EUTXO interfaces.** RGB client-side asset commitments plus
   inspection-only EUTXO commitment decoding and wallet metadata. Do not fund a
   witness-v15 address in v30.1.1; its creation and spend RPCs intentionally
   fail.

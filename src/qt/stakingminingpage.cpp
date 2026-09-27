@@ -518,13 +518,13 @@ void StakingMiningPage::setupUi()
         tr("<h3>What this page controls</h3>"
            "<p>The dashboard shows staking, Gold Rush, migration, cold-staking, RGB, and EUTXO status. Use the tabs below for actions.</p>"
            "<p>Mainnet uses exact height boundaries: Gold Rush 5,950,000-6,192,999; the emission-neutral competing-claim rule from 5,993,200; Migration 6,193,000-6,921,999; and Final Lockout plus automatic demurrage from 6,922,000. Nominal time forecasts and readiness signalling do not move these boundaries.</p>"
-           "<h3>The safe order</h3>"
-           "<ol>"
-           "<li><b>Keep legacy staking online</b> while Gold Rush runs. Legacy staking secures the base chain and can also produce PoS Gold Rush eligibility.</li>"
-           "<li><b>Use normal wallet unlock for quantum actions.</b> Legacy staking-only unlock is intentionally limited and will not create Gold Rush signal or quantum transactions.</li>"
+           "<h3>Before using these controls</h3>"
+           "<ul>"
+           "<li><b>Legacy staking:</b> if this wallet stakes legacy BLK, keep staking enabled during Gold Rush. Automatic QQSIGNAL submission requires separate consent.</li>"
+           "<li><b>Normal wallet unlock:</b> use it when signing Gold Rush signals or quantum transactions. Legacy staking-only unlock does not permit those transactions.</li>"
            "<li><b>Wait for Gold Rush rewards to unlock.</b> Newly mined Gold Rush quantum rewards remain locked until Gold Rush ends. After maturity and that boundary, the original outputs are ordinary direct quantum funds; no preliminary move is required.</li>"
            "<li><b>Choose a staking mode.</b> Stake locally if you want this machine to secure the network with your coins, run a node if you want to stake delegated cold deposits, or delegate to a verified node if you want owner keys offline.</li>"
-           "</ol>"
+           "</ul>"
            "<h3>Where transactions appear</h3>"
            "<p>Legacy-visible Gold Rush participation is recorded through QQSIGNAL and QQSPROOF control transactions. Quantum rewards are tracked by upgraded nodes as quantum shadow-ledger credits and displayed in the wallet as <b>PoS - Quantum Stake</b> or <b>PoW - Quantum Claim</b>.</p>"),
         dashboardBox);
@@ -4495,9 +4495,9 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     } else if (info.epoch_active && !info.enabled) {
         recommended_action = tr("Gold Rush PoW is available. Start with 1 core at 1% CPU, then increase only if you want more local CPU usage.");
     } else if (!staking && balances.legacy_balance > 0) {
-        recommended_action = tr("Enable staking to secure the network. Whitelisted wallets can also qualify for PoS Gold Rush payouts during the epoch.");
+        recommended_action = tr("If you want this wallet to stake, enable legacy Proof-of-Stake. A whitelisted wallet may also qualify for PoS Gold Rush payouts during the epoch.");
     } else {
-        recommended_action = tr("No urgent action. Review the workflow tabs below for staking, mining, migration, and cold-staking actions.");
+        recommended_action = tr("These checks show no pending staking or mining action. Review the workflow tabs below for optional actions.");
     }
     m_dashboard_action->setText(tr("<b>Recommended next step</b><br>%1").arg(recommended_action));
 

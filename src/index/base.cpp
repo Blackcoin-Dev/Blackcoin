@@ -109,12 +109,8 @@ bool BaseIndex::Init()
         // best chain, we will rewind to the fork point during index sync
         const CBlockIndex* locator_index{m_chainstate->m_blockman.LookupBlockIndex(locator.vHave.at(0))};
         if (!locator_index) {
-            /*
-            // Blackcoin ToDo: that's a temporary workaround for issue https://github.com/CoinBlack/blackcoin-more/issues/22
-            // This addresses blockfilterindex and txindex crash issues but does not help to deal with the coinstatsindex crash
-            // A more robust solution should replace this in the future
-            */
-            // If we couldn't find a block index from the locator, use m_best_header as a fallback
+            // If the locator's top block is missing from the block index, use the
+            // current chain tip as a fallback (https://github.com/CoinBlack/blackcoin-more/issues/22).
             const CBlockIndex* best_header = index_chain.Tip();
             if (best_header) {
                 locator_index = best_header;

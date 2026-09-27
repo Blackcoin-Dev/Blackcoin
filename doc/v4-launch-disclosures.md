@@ -91,17 +91,17 @@ not an exemption. Mainnet configures no exempt scripts. Realized decay is
 permanently burned and cannot become a fee, subsidy, staking reward, treasury
 transfer, shadow credit, or claim reimbursement.
 
-## Closeout findings addressed
+## Launch controls and compatibility checks
 
-The final red-team pass identified six items that were handled before export:
+The V4 implementation and release checks cover these controls:
 
 - shadow emission cap rejection is atomic on connect and symmetric on disconnect;
 - wallet exclusions have consensus backstop tests for raw crafted spends;
 - the historical and post-activation PoW competing-claim rules are explicitly
   disclosed;
 - partially decayed outputs use effective-value accounting in wallet funding.
-- pre-Gold-Rush unknown-witness block behavior, signed transaction wire format,
-  PoS kernel flags, and v30.1.0 block-time provenance were red-team checked
-  against the designated legacy implementation;
+- the compatibility boundary includes pre-Gold-Rush unknown-witness block
+  behavior, signed transaction wire format, PoS kernel flags, and v30.1.0
+  block-time provenance;
 - Final/demurrage activation is height-authoritative and survives restart,
   reorg, and `-reindex-chainstate`.

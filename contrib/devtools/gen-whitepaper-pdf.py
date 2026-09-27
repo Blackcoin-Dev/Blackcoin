@@ -115,7 +115,7 @@ def cover(canv, doc):
     canv.drawCentredString(w/2, h-4.35*inch, "Protocol V4")
     canv.setFont("Helvetica", 11.5)
     canv.setFillColor(colors.HexColor("#cccccc"))
-    canv.drawCentredString(w/2, h-5.15*inch, "A Post-Quantum, Participation-First Evolution of Blackcoin")
+    canv.drawCentredString(w/2, h-5.15*inch, DOC_SUBJECT)
     canv.setFont("Helvetica", 10)
     canv.drawCentredString(w/2, h-5.55*inch, "Technical White Paper")
     canv.setFillColor(GOLD)
@@ -198,9 +198,11 @@ def parse(md_lines):
             i += 1
             continue
         if s.startswith("## "):
-            if s[3:].startswith("A Post-Quantum"):
+            if s[3:] == DOC_SUBJECT:
                 i += 1
                 continue
+            if s == "## Appendix B: Glossary":
+                flow.append(PageBreak())
             txt = inline(s[3:])
             block = [Paragraph(txt, H1),
                      HRFlowable(width="100%", thickness=1.1, color=GOLD, spaceBefore=0, spaceAfter=8)]
@@ -311,7 +313,7 @@ def parse(md_lines):
 # ---------- document metadata ----------
 DOC_TITLE = "Blackcoin Quantum Quasar (Protocol V4): Technical White Paper"
 DOC_AUTHOR = "Quantum Quasar Developers"
-DOC_SUBJECT = "A Post-Quantum, Participation-First Evolution of Blackcoin"
+DOC_SUBJECT = "ML-DSA Spending Paths, Migration, and Participation Rules"
 DOC_KEYWORDS = ("Blackcoin, Quantum Quasar, Protocol V4, ML-DSA-44, post-quantum, "
                 "proof-of-stake, demurrage, Gold Rush, quantum staking")
 DOC_CREATOR = "Blackcoin gen-whitepaper-pdf.py (ReportLab)"

@@ -1,6 +1,6 @@
 # Blackcoin Quantum Quasar (Protocol V4)
 
-## A Post-Quantum, Participation-First Evolution of Blackcoin
+## ML-DSA Spending Paths, Migration, and Participation Rules
 
 **Version 30.1.1, Technical White Paper**
 
@@ -8,99 +8,78 @@
 
 ### Abstract
 
-Blackcoin was one of the first pure Proof-of-Stake (PoS) cryptocurrencies, launched in
-2014. Proof-of-Stake secures a network with coins rather than energy, which makes the
-long-term integrity of the chain depend on two things: the secrecy of the signing keys
-that protect stake, and the willingness of coin holders to actually *use* those keys to
-mint blocks. Both of these are now under pressure. The arrival of cryptographically
-relevant quantum computers threatens every coin that is protected only by elliptic-curve
-(ECDSA/Schnorr) signatures, and the long tail of dormant, never-staked coins slowly
-erodes the active security budget of any PoS chain.
+Blackcoin launched in 2014 as a Proof-of-Stake (PoS) cryptocurrency. Its legacy
+spending paths use elliptic-curve signatures, which are exposed to a sufficiently
+capable quantum computer when the relevant public key is available. PoS block
+production also depends on holders operating eligible staking nodes.
 
-**Quantum Quasar (Protocol V4)** is Blackcoin's answer to both problems at once. It
-introduces a NIST-standardized post-quantum signature scheme (ML-DSA-44) as a
-first-class, consensus-enforced spending path; a time-boxed, deterministic migration
-from legacy elliptic-curve outputs to quantum-safe outputs; and a set of participation
-mechanics, the Gold Rush reward epoch, liveness demurrage, tiered and cold quantum
-staking, and a bounded legacy lockout, that are explicitly designed to convert passive
-holding into active network security **without punishing the holder who is willing to
-participate**.
+**Quantum Quasar (Protocol V4)** introduces the NIST-standardized ML-DSA-44
+signature scheme as a consensus-enforced spending path, a scheduled migration
+from legacy elliptic-curve outputs to ML-DSA-protected outputs, and rules for
+Gold Rush rewards, liveness demurrage, quantum staking, and Final Lockout.
 
-This paper documents the V4 protocol in exhaustive detail: every consensus constant,
-every phase boundary, every reward formula, and the exact wallet workflows and RPC
-commands a user needs. All numbers in this document are taken directly from the
-v30.1.1 release source and are annotated with the file that defines them.
+This paper describes the V4 phase schedule, reward formulas, wallet workflows,
+RPCs, and listed consensus constants, with source references. The numbers and
+source references describe the v30.1.1 release source.
 
 ---
 
 ## Table of Contents
 
-1. [Design Philosophy: Participation Over Passivity](#1-design-philosophy-participation-over-passivity)
+1. [Reward and Activity Rules](#1-reward-and-activity-rules)
 2. [The V4 Timeline: Four Phases](#2-the-v4-timeline-four-phases)
 3. [Post-Quantum Cryptography in Blackcoin](#3-post-quantum-cryptography-in-blackcoin)
 4. [The Gold Rush Reward Epoch](#4-the-gold-rush-reward-epoch)
 5. [Quantum Migration and the Legacy Lockout](#5-quantum-migration-and-the-legacy-lockout)
-6. [Demurrage: Liveness as a Public Good](#6-demurrage-liveness-as-a-public-good)
+6. [Demurrage and Liveness](#6-demurrage-and-liveness)
 7. [Quantum Staking: Tiered, Cold, and Pooled](#7-quantum-staking-tiered-cold-and-pooled)
 8. [Reserved v15 EUTXO Design and RGB](#8-reserved-v15-eutxo-design-and-rgb)
-9. [Full Wallet and RPC Reference](#9-full-wallet-and-rpc-reference)
-10. [Worked Examples and Community Playbook](#10-worked-examples-and-community-playbook)
-11. [Economic Analysis: Why This Increases Participation](#11-economic-analysis-why-this-increases-participation)
+9. [Wallet and RPC Reference](#9-wallet-and-rpc-reference)
+10. [Worked Wallet Examples](#10-worked-wallet-examples)
+11. [Economic Incentives and Participation Conditions](#11-economic-incentives-and-participation-conditions)
 12. [Security Considerations](#12-security-considerations)
 13. [Appendix A: Consensus Constant Reference](#appendix-a-consensus-constant-reference)
 14. [Appendix B: Glossary](#appendix-b-glossary)
 
 ---
 
-## 1. Design Philosophy: Participation Over Passivity
+## 1. Reward and Activity Rules
 
-Every design decision in Quantum Quasar answers a single question: *does this reward the
-people who actively secure the network, and does it give everyone else a clear, fair,
-fully-rewarded path to join them?*
+V4 conditions Gold Rush rewards on qualifying PoS or PoW activity. It also
+applies an inactivity schedule to eligible quantum holdings after Migration and
+closes the legacy ECDSA spending path at Final Lockout. The rules below define
+those conditions and their phase boundaries.
 
-Traditional PoS has a free-rider problem. A large holder can leave coins in a cold
-wallet for years, contribute nothing to block production, and yet retain the full
-economic weight of those coins. Meanwhile the holders who run nodes and mint blocks
-carry the real security burden. Over time this concentrates security into fewer hands and
-leaves the chain vulnerable, because so much of the coin supply is "asleep."
+- **Gold Rush rewards.** Eligible PoS participants must solve and signal within
+  the required window; PoW participants must submit valid claims. Merely
+  holding coins or keeping a node online does not guarantee a reward.
 
-Quantum Quasar is built on the opposite premise: **the network should reward
-participation and slowly reclaim the influence of pure inactivity, while making
-participation cheap, automatic, and profitable for anyone willing to do it.** The three
-pillars below all serve that goal.
-
-- **Full rewards for HODLers who help secure.** The Gold Rush epoch pays a large,
-  deterministic bonus emission to holders, but only through the act of staking (PoS) or
-  mining (PoW). Holding qualifies you; participating pays you. A holder who simply keeps
-  their node online and staking earns their full share.
-
-- **Liveness demurrage instead of dead weight.** After the migration era, quantum
-  holdings that remain inactive for more than six months begin a slow, capped decay.
+- **Liveness demurrage.** After the migration era, eligible quantum
+  holdings that remain inactive for more than six months begin the specified decay.
   Decayed principal is permanently burned when spent; it is never added to transaction fees
-  or paid to a miner or staker. The point is to ensure that keys are alive
-  and that the security weight of the supply reflects who is actually present. For an
+  or paid to a miner or staker. For an
   eligible direct or tiered v16 holding, the wallet can attempt a low-fee liveness
   attestation when staking is enabled, the wallet is normally unlocked, and a safe fee
   input is available. A cold-stake output is also subject to the activity clock; a
   successful coinstake spends and recreates it, resetting that clock.
 
-- **A bounded, well-signposted quantum migration.** Legacy elliptic-curve outputs are the
+- **Scheduled quantum migration.** Legacy elliptic-curve outputs are the
   network's quantum attack surface. Gold Rush keeps ordinary quantum funding disabled so
   the base chain remains legacy-compatible. It is followed by an **18-month Migration
-  phase** in which every holder can move coins into quantum-safe addresses with a one-click
-  wallet operation. Final Lockout then closes the legacy spending path. Legacy value stays
+  phase** in which holders can move eligible legacy coins into ML-DSA-protected
+  addresses with `migratetoquantum`, subject to wallet, backup, fee, and confirmation
+  conditions. Final Lockout then closes the legacy spending path. Legacy value stays
   spendable for the full Gold Rush-plus-Migration schedule, but the migration transaction
   itself must be made during Migration.
 
-The result is a network that trends toward *more* active nodes, *more* distributed
-security, and *more* engaged holders over time, the opposite of the slow ossification
-that afflicts passive-holding chains.
+These rules make Gold Rush rewards conditional on qualifying activity and set
+a height boundary for legacy ECDSA spending.
 
 ---
 
 ## 2. The V4 Timeline: Four Phases
 
-Protocol V4 uses a complete, height-authoritative lifecycle on Blackcoin mainnet. MTP
+Protocol V4 uses a height-authoritative lifecycle on Blackcoin mainnet. MTP
 anchors remain as nominal forecasts and for isolated compatibility tests, but timestamp
 movement cannot advance, delay, skip, or reverse a mainnet phase boundary.
 
@@ -148,16 +127,14 @@ Migration phase. Final Lockout closes the legacy path at height 6,922,000.
 
 ## 3. Post-Quantum Cryptography in Blackcoin
 
-### 3.1 Why elliptic curves are the problem
+### 3.1 Legacy elliptic-curve exposure
 
 Blackcoin's legacy outputs are protected by ECDSA over secp256k1. A sufficiently large
 quantum computer running Shor's algorithm can recover a private key from a public key.
-Any coin whose public key is exposed on-chain, which includes every P2PK coinstake
-output Blackcoin has ever produced, and any address that has spent before, is at risk
-the moment such a machine exists. PoS chains are especially exposed because staking
-continuously publishes public keys.
+Outputs with exposed public keys, including P2PK coinstake outputs, would be
+exposed to such a machine. Staking publishes public keys used by those outputs.
 
-### 3.2 ML-DSA-44: the quantum-safe signing path
+### 3.2 ML-DSA-44 signature verification
 
 V4 introduces **ML-DSA-44** (Module-Lattice Digital Signature Algorithm, the NIST
 FIPS 204 standardization of CRYSTALS-Dilithium at security level 2) as a native,
@@ -171,10 +148,9 @@ problems, which are not known to be broken by quantum algorithms.
 | Secret key | 2,560 bytes |
 | Signature | **2,420 bytes** |
 
-These are large compared to a 33-byte ECDSA public key and ~72-byte signature, the
-price of quantum resistance, which is why V4 places quantum data in the witness (where
-it is discounted) and uses commitment-based addresses so that the large key is only
-revealed at spend time.
+These are larger than a 33-byte ECDSA public key and an approximately 72-byte
+signature. V4 places ML-DSA data in the witness and uses commitment-based
+addresses; the public key is revealed at spend time.
 
 ### 3.3 New witness versions and address types
 
@@ -197,20 +173,17 @@ it.
 
 ### 3.4 Self-test on startup
 
-The node performs an ML-DSA Known-Answer-Test at startup to verify that liboqs is linked
-correctly and produces standard-conformant signatures before it will participate in
-consensus. A build that cannot reproduce the ML-DSA KAT refuses to run, guaranteeing that
-every V4 node validates quantum signatures identically.
+The node performs an ML-DSA Known-Answer-Test at startup to check that liboqs is
+linked and produces the expected signature result before participating in
+consensus. A build that cannot reproduce the KAT refuses to run.
 
 ---
 
 ## 4. The Gold Rush Reward Epoch
 
-The Gold Rush is a six-month, deterministic bonus-emission event that launches V4. Its
-purpose is to **reward existing holders for participating in securing the network at the
-exact moment the network needs maximum participation**, the transition into the quantum
-era. It is not an airdrop to passive wallets; it pays holders through the act of staking
-and mining.
+Gold Rush is a six-month bonus-emission epoch beginning with V4. Its PoS and
+PoW pools credit qualifying staking activity and valid mining claims under
+the rules below. Holding a balance alone does not produce a credit.
 
 ### 4.1 The whitelist snapshot
 
@@ -224,13 +197,11 @@ every node derives an identical whitelist.
   P2PKH identity via `CanonicalizeLegacyStakeScript()` so that a holder who staked with
   raw-pubkey outputs and a holder who used address outputs are treated as one account.
 - The snapshot happens **5,000 blocks (≈ 3.7 days) before** Gold Rush rewards begin at
-  height 5,950,000, giving the network a clean, pre-announced eligibility set that cannot
-  be gamed after the fact.
+  height 5,950,000, fixing the eligibility set before rewards begin.
 
-> **Why 10,000 BLK?** The threshold defines the set of accounts large enough to be
-> meaningful security participants during the transition. Being whitelisted is necessary
-> to earn Gold Rush *credits*, but it does not by itself pay anything, the holder still
-> has to show up and stake.
+> **10,000 BLK threshold.** A canonical target at or above this amount in the
+> snapshot can qualify for Gold Rush PoS credits. The target must also meet the
+> staking and signalling requirements; snapshot membership alone pays nothing.
 
 ### 4.2 The reward schedule
 
@@ -278,18 +249,15 @@ pos_pool_reward = reward − reward/2      (50%)
 pow_pool_reward = reward/2               (50%)
 ```
 
-- **The Proof-of-Stake half** rewards Blackcoin's native stakers. This is the primary,
-  energy-free path and the one most holders will use: keep your node online, stake, and
-  earn.
+- **The Proof-of-Stake half** rewards eligible native stakers that meet the
+  solve and signal requirements.
 - **The Proof-of-Work half** opens a parallel, opt-in participation lane using a
-  deliberately *CPU-friendly, memory-light* Argon2id puzzle
+  specified Argon2id puzzle
   (`SHADOW_ARGON2_TIME_COST = 1`, `SHADOW_ARGON2_MEMORY_KIB = 1024` (1 MiB),
-  `SHADOW_ARGON2_LANES = 1`), so ordinary community members, not just ASIC farms, can
-  contribute and claim.
+  `SHADOW_ARGON2_LANES = 1`). A valid claim is required for a reward.
 
-Rewards accumulate into pools and are drawn by **claims**, not paid blindly to whoever
-found a block, which lets both PoS and PoW participants collect their fair share over the
-epoch.
+Rewards accumulate into pools and are drawn by **claims** under the PoS and PoW
+eligibility rules below.
 
 ### 4.4 Qualifying and claiming: QQSIGNAL and QQSPROOF
 
@@ -300,9 +268,8 @@ transactions carried in OP_RETURN outputs:
   block signals eligibility by broadcasting a QQSIGNAL that references their recent solve.
   "Recent" is defined by the solver-activity window
   `SHADOW_SOLVER_ACTIVITY_SECONDS = 14 days` (`SHADOW_SOLVER_ACTIVITY_WINDOW = 18,900
-  blocks`, `src/shadow.h`). In other words: stake a block, and you have a 14-day window to
-  signal and be credited from the PoS pool. This is the mechanism that ties reward to
-  genuine, ongoing participation rather than to a one-time balance.
+  blocks`, `src/shadow.h`). A qualifying solve and timely valid signal are both
+  required for PoS credit; a snapshot balance alone is insufficient.
 
 - **QQSPROOF (Proof-of-Work side).** A miner grinds an Argon2id proof (magic
   `QQSPROOF`, `src/shadow.cpp`) against the target difficulty, a 12-bit base, ASERT-
@@ -355,27 +322,24 @@ that requires a fresh plan. The full operator model is specified in
 
 ## 5. Quantum Migration and the Legacy Lockout
 
-### 5.1 The problem being solved
+### 5.1 Legacy output exposure
 
-Every legacy Blackcoin output is protected by ECDSA and therefore represents standing
-quantum risk to the whole network, not just to its owner. Leaving that risk open forever
-would mean the chain's security never actually improves, no matter how good the new
-cryptography is. V4 therefore treats migration as a **network-wide, time-boxed public
-project** with a clear deadline.
+Legacy ECDSA spending paths remain exposed when their public keys are available
+to a sufficiently capable quantum computer. V4 sets a finite Migration phase
+and then rejects legacy ECDSA spends at Final Lockout.
 
 ### 5.2 The migration path
 
-Any holder moves coins to safety with a single wallet action,
-`migratetoquantum` (see §9), which sweeps spendable legacy (non-quantum) outputs into a
-fresh **wallet-backed quantum migration (witness v16)** address. The destination ML-DSA
-key is generated and **written to the wallet database before any funds move**, and the
-call refuses to proceed unless that key is confirmed stored, so a migration can never
-send coins to a key the wallet does not hold.
+During Migration, `migratetoquantum` (see §9) can sweep eligible spendable legacy
+outputs to a **wallet-backed witness-v16 migration** address. When the RPC creates
+a new ML-DSA key, it writes the key to the wallet database before constructing
+the migration transaction and refuses the action if storage is not confirmed.
+The caller must account for unlock, fee, backup, and confirmation conditions.
 
 > **Critical backup note.** ML-DSA keys are *not* derived from the wallet's HD seed. After
 > creating a migration address you **must back up the wallet again**, or a restore from an
 > older backup will not recover the migrated funds. The wallet and this paper both flag
-> this at every step.
+> this during the wallet workflow.
 
 During Gold Rush, wallets can create and back up quantum addresses and can dry-run
 migration planning with an existing wallet-backed address. They cannot fund or spend
@@ -384,7 +348,7 @@ ordinary v14/v16 outputs. `migratetoquantum` becomes actionable at Migration hei
 separate authenticated synthetic outputs that remain phase-locked until Gold Rush ends
 and normal maturity is satisfied.
 
-### 5.3 The lockout, and why it is a feature
+### 5.3 Final Lockout and legacy spending
 
 At Final Lockout, **height 6,922,000**, the consensus rule
 `IsQuantumFinalLockout(nTime, nHeight)` (`src/consensus/params.h`, enforced in
@@ -394,33 +358,21 @@ ECDSA-signed spends to be permanently rejected** with `legacy-spend-disabled`. E
 authenticated v14 and v16 paths remain enabled. Witness-v15 funding and spending remain
 rejected with the dedicated EUTXO-disabled rules.
 
-This is deliberately framed as a positive:
-
-- It converts an **unbounded, permanent, network-wide** quantum vulnerability into a
-  **finite, scheduled, individually-avoidable** one. After the deadline, the set of
-  quantum-vulnerable coins can only shrink, never grow.
-- The schedule is **generous and loud:** about six months of Gold Rush preparation plus
-  an 18-month Migration phase, with the exact height deadline visible in the wallet,
-  network status RPCs, and this document.
-- It is **individually avoidable in one click.** A holder who migrates during the
-  540-day Migration phase retains spendable control.
-- It **strengthens every remaining coin.** Once legacy spends are closed, the entire
-  active supply is quantum-safe, which raises the security floor for everyone who
-  participated.
-
-The lockout is the mechanism that guarantees the migration actually completes, rather than
-dragging on forever with a permanently vulnerable dormant tail.
+The scheduled transition provides about six months of Gold Rush preparation
+followed by an 18-month Migration phase. The exact height deadline is visible
+in the wallet, network status RPCs, and this document. Holders must migrate
+eligible legacy outputs during Migration to retain a spendable path after
+Final Lockout. The rule rejects legacy ECDSA spending after the deadline; it
+does not move dormant outputs into ML-DSA-protected outputs.
 
 ---
 
-## 6. Demurrage: Liveness as a Public Good
+## 6. Demurrage and Liveness
 
-Demurrage is the most misunderstood, and most important, participation mechanic in V4.
-This section states plainly what it is and what it is not.
-
-**It is a liveness rule for quantum holdings.** A timely direct-key attestation or an
-activity spend refreshes the clock. Delegation alone does not. Demurrage applies to
-eligible quantum outputs left inactive for **more than six months**.
+Demurrage applies to eligible quantum outputs after more than **six months** of
+inactivity. A qualifying attestation for a direct or tiered v16 key, or a spend
+that recreates the output, refreshes the applicable activity clock. Delegation
+alone does not.
 
 ### 6.1 Exactly which coins are subject
 
@@ -494,10 +446,9 @@ successful coinstake):**
 | 21 | 30.6% |
 | 24 | **0.0%** (locked) |
 
-Note the shape: the first year barely moves (the curve is quadratic, so early decay is
-tiny), and the losses only become material deep into the second year of *total* neglect.
-This is by design, it gives even a careless holder a very long runway, while ensuring that
-genuinely dead coins eventually stop counting as security weight.
+The quadratic curve begins after the six-month grace period and reaches zero
+effective value at 24 months of inactivity. The table gives intermediate
+retained-value examples.
 
 ### 6.4 Keeping eligible holdings at 100%
 
@@ -528,15 +479,15 @@ value are permanently locked and are skipped. The GUI surfaces the same informat
 can request an attestation for an eligible selected address; normal unlock, key, fee, and
 broadcast requirements still apply.
 
-In short, timely participation preserves principal. Any decay realized by a spend is
-destroyed, not redistributed.
+Qualifying activity before decay preserves effective principal. Realized decay
+is burned when an output is spent.
 
 ---
 
 ## 7. Quantum Staking: Tiered, Cold, and Pooled
 
-V4 gives quantum coins a rich set of ways to participate and earn rewards. Participation
-also refreshes activity when it spends and recreates the relevant output.
+V4 supports tiered self-staking and cold staking with owner/staker key separation.
+A successful spend and recreation refreshes the relevant activity clock.
 
 ### 7.1 Tiered self-staking
 
@@ -552,8 +503,7 @@ schedule directly in the witness program (`QuantumStakeTierProgram`,
   withdraw matured funds, the call is state-aware), `getquantumstakeaddressinfo`,
   `listquantumstakeoutputs`.
 
-Longer, more committed locks express stronger participation and are ranked accordingly in
-the pool logic below.
+The pool logic below ranks eligible locks by their encoded lock terms.
 
 ### 7.2 Cold staking: separate the owner key from the staking key
 
@@ -574,12 +524,10 @@ trusted operator's, stakes on their behalf.
 
 Operators who stake on behalf of others post a **30-day operator bond**
 (40,500 blocks, `src/wallet/rpc/staking.cpp`; pool logic in `src/node/quantum_pool.h`),
-which registers a verified commitment other participants can see. To keep the network
-decentralized, a **wallet/policy per-pool cap of 20%**
-(`QUANTUM_POOL_CAP_BPS = 2000`) discourages any single operator from accumulating an
-outsized share of delegated stake. The cap is a *wallet and delegation policy*, not a
-consensus rule, it steers new delegations without changing block validity, so it can be
-tuned by the community without a fork.
+which registers a verified commitment. A **wallet/policy per-pool cap of 20%**
+(`QUANTUM_POOL_CAP_BPS = 2000`) steers new delegations when under-cap operators
+are available. The cap is wallet and delegation policy, not a consensus rule;
+it does not prevent an operator from exceeding that share.
 
 - **RPCs:** `fundquantumoperatorbond`, `withdrawquantumoperatorbond`,
   `getquantumoperatorbondinfo`, `getwalletquantumpoolinfo` (verified value, share in basis
@@ -638,10 +586,10 @@ v15 output spendable. **Do not send BLK to a witness-v15 address in v30.1.1.**
 ### 8.2 RGB, client-side fixed-supply assets
 
 An **RGB commitment** anchors a client-side-validated asset state transition in a
-zero-cost OP_RETURN (`OP_RETURN <RGB1> <32-byte state hash>`, `src/script/solver.cpp`).
-The heavy asset data lives off-chain and is validated by clients against the on-chain
-commitment chain, so Blackcoin can carry fixed-supply tokens and assets without bloating
-the base layer.
+zero-value OP_RETURN output (`OP_RETURN <RGB1> <32-byte state hash>`,
+`src/script/solver.cpp`). Asset data remains off-chain; clients validate it
+against the on-chain commitment chain. The containing transaction still pays
+its applicable fee.
 
 - **Tooling:** `creatergbtransfer`, `acceptrgbconsignment`, `exportrgbconsignment`,
   `importrgbcontract`, `importrgbassignment`, `listrgbassets`, plus raw
@@ -649,11 +597,11 @@ the base layer.
 
 ---
 
-## 9. Full Wallet and RPC Reference
+## 9. Wallet and RPC Reference
 
-Every command below is available from `blackcoin-cli` and the Qt debug console. This is
-the complete Quantum-Quasar-specific surface added on top of the standard Bitcoin/Blackcoin
-RPC set.
+The following RPCs are part of the V4 wallet and node interface. Their
+availability depends on the build, loaded wallet, network phase, and RPC
+requirements described below.
 
 ### 9.1 Chain and schedule
 
@@ -682,7 +630,7 @@ RPC set.
 | `createshadowpowclaimresolution` | Compatibility preview/sign surface; after explicit acknowledgement it returns signed resolution bytes but does not itself broadcast them |
 | `getpowclaimrecoveryinfo` | Inspect the wallet-scoped recovery choice and current component gate without creating, signing, or broadcasting |
 | `setpowclaimrecovery` | Record unset, pause-and-ask, or explicitly bounded automatic recovery policy; never starts mining or creates a transaction |
-| `optimizeutxoset` | Rebuild the UTXO set into equal outputs to maximize PoS yield |
+| `optimizeutxoset` | Restructure eligible wallet outputs for staking under the RPC's fee and safety rules |
 
 The Issue #37 release's additional manual and bulk wrappers, when present in a
 build, use the same component engine and preserve separate preview,
@@ -758,8 +706,8 @@ The Qt wallet adds two dedicated pages:
 - **Staking & Mining**, one place for PoS staking, Gold Rush status, the in-process PoW
   miner, quantum migration, tiered/cold staking, operator bonds, demurrage, RGB, and
   inspection-only EUTXO metadata.
-  Expensive detail panels load on demand behind a **Refresh details** button so the tab
-  opens instantly even on very large wallets.
+  Detail panels load on demand behind a **Refresh details** button, reducing
+  work when the tab first opens.
 - **Account**, a per-family (Legacy / Quantum / Cold-stake / EUTXO) breakdown of every
   output, its state (bonded / unbonding / withdrawable), and demurrage exposure, with CSV
   export. An EUTXO row is a frozen-output warning and inspection surface, not a funding or
@@ -785,18 +733,20 @@ peer acceptance or confirmation, unlocks the wallet, or turns mining on.
 
 ---
 
-## 10. Worked Examples and Community Playbook
+## 10. Worked Wallet Examples
 
-### Example A, The long-term HODLer (recommended path)
+### Example A, A legacy holder preparing to migrate
 
-Alice holds 250,000 BLK and wants zero maintenance.
+Alice holds 250,000 BLK in eligible legacy outputs and plans to migrate.
 
-1. **Before V4:** nothing to do. Keep the coins.
+1. **Before V4:** she verifies wallet access and preserves a current backup.
 2. **During Gold Rush:** she creates and backs up a wallet-backed quantum address. She can
    dry-run migration planning, but does not fund it yet.
-3. **At Migration height 6,193,000 or later:** she runs `migratetoquantum` once. Her coins
-   move to the quantum (v16) address. **She backs up her wallet again** because ML-DSA keys
-   are not in the seed.
+3. **During Migration, beginning at height 6,193,000:** she runs
+   `migratetoquantum` with an existing backed-up wallet-owned address or
+   explicitly authorizes a new key. She checks the transaction outcome and
+   **backs up her wallet again** after creating a key because ML-DSA keys are
+   not in the seed.
 4. **Optional:** she runs `fundquantumcoldstakeaddress` to delegate to a cold-staking
    operator (or her own hot node). Her principal stays owner-controlled and can earn
    staking rewards. Successful coinstakes refresh the output's activity clock.
@@ -807,41 +757,38 @@ Alice holds 250,000 BLK and wants zero maintenance.
    inactivity; delegation alone is not an exemption and cold-stake outputs cannot be
    attested.
 
-Alice prepares during Gold Rush, completes one migration action during Migration, and can
-optionally add a staking workflow.
+Alice prepares an address and backup during Gold Rush, runs migration during
+Migration, and can optionally add a staking workflow.
 
 ### Example B, The active staker during Gold Rush
 
 Bob holds 40,000 BLK (above the 10,000 whitelist threshold) and runs a node.
 
 1. His account is captured in the whitelist snapshot at height 5,945,000.
-2. During Gold Rush he keeps staking. After a qualifying solve, a normally unlocked wallet
-   attempts a QQSIGNAL if that legacy target does not already have an active signal. The
-   confirmed signal remains active for the 14-day window; later solves do not cause one
-   signal per minted block. While active, he shares the PoS pool on top of normal staking
-   rewards.
-3. If he wants to also work the PoW lane, he enables `setpowmining`; the light 1-MiB
-   Argon2id puzzle lets his ordinary CPU submit `sendshadowpowclaim` proofs for a share of
-   the PoW pool.
+2. During Gold Rush he keeps staking. After a qualifying solve, he can submit a
+   QQSIGNAL; an eligible, normally unlocked wallet can attempt this automatically
+   only when optional QQSIGNAL automation is enabled and its payout prerequisites
+   are met. A confirmed signal remains active for the 14-day window. PoS pool
+   credit also depends on the applicable solver and signal rules.
+3. If he wants to use the PoW lane, he enables `setpowmining`. The Argon2id
+   puzzle uses a 1 MiB memory parameter; a valid `sendshadowpowclaim` proof can
+   qualify for the PoW pool under the claim rules.
 4. He migrates during the 18-month Migration phase, before Final height 6,922,000.
 
-Bob is rewarded precisely for the participation he is already doing.
+Bob still needs eligible solves, confirmed signals or claims, and applicable
+fees; operating the node alone does not guarantee a reward.
 
 ### Example C, The forgotten wallet
 
-Carol migrated to a quantum address during Migration and then lost interest, wallet offline.
+Carol migrated to a quantum address during Migration, then left her wallet offline.
 
 - For **six months** after demurrage activates: no effect. 100% retained.
-- At **12 months** of total inactivity: 88.9% retained, still barely touched.
+- At **12 months** of total inactivity: 88.9% retained.
 - If she returns before the terminal **24-month** boundary and submits a valid liveness
   attestation, the clock resets before decay is realized. If she spends first, the spend
   burns the accrued difference and moves only the effective remainder.
 - If she reaches a full **24 months** without qualifying activity, the output reaches zero
-  effective value and becomes permanently unspendable. No miner or staker receives it,
-  and Carol is not charged a transaction fee to clean up a zero-value output.
-
-The design gives Carol a long recovery window while permanently removing terminally
-inactive value from effective supply.
+  effective value and becomes permanently unspendable. No miner or staker receives it.
 
 ### Example D, Running a staking pool
 
@@ -859,38 +806,32 @@ Dan wants to stake on behalf of others.
 
 ---
 
-## 11. Economic Analysis: Why This Increases Participation
+## 11. Economic Incentives and Participation Conditions
 
-Every mechanic in V4 pushes the same direction, toward a larger, more active, more
-distributed set of participants.
+V4 defines reward eligibility, inactivity treatment, and legacy spending by
+phase. These rules change the conditions for earning Gold Rush rewards and
+retaining the effective value of eligible quantum holdings.
 
 - **Gold Rush** front-loads a large, deterministic reward (up to 51,437,700 BLK) at the
-  transition, but pays it *only through staking and mining*. It is the strongest possible
-  incentive to bring nodes online exactly when the network most needs breadth of
-  participation. Holding qualifies; participating pays.
+  transition. Its PoS and PoW pools pay qualifying staking and mining claims
+  under separate eligibility rules.
 
-- **Demurrage** removes the free-rider equilibrium of classic PoS. In a passive-holding
-  chain, dormant coins retain full influence forever. Under V4, inactive quantum principal
-  loses effective value and realized decay is burned. Active stakers receive only the
-  ordinary subsidy and explicit transaction fees; their benefit is liveness participation
-  and the deflationary reduction of effective supply, not a transfer from inactive holders.
+- **Demurrage** reduces the effective value of eligible quantum principal after
+  the inactivity threshold. Realized decay is burned, not transferred to
+  stakers. Active stakers receive the ordinary subsidy and explicit transaction
+  fees under the applicable rules.
 
-- **The legacy lockout** guarantees the migration completes, so the network's security
-  actually improves rather than carrying a permanent vulnerable tail. A fully-migrated
-  supply is a stronger, more valuable supply for everyone who stayed.
+- **Final Lockout** rejects legacy ECDSA spending after the published height.
+  Eligible legacy outputs must be migrated during Migration to remain
+  spendable through an ML-DSA-protected path.
 
 - **Tiered, cold, and pooled staking** lower the barrier to participation: cold delegation
   lets a holder participate without exposing the owner key on a hot node, and conditional
   owner-wallet redelegation can steer stale delegations toward better verified operators.
 
-Across all of these mechanics, the V4 equilibrium points every holder toward the same
-choice. Whether large or small, technical or not, the sensible move is to participate,
-because participation is where the rewards are and where the activity clock is refreshed, and
-where the network's future lies. The "do-nothing" strategy carries the weakest returns,
-yet it remains trivially easy to leave behind.
-
-In summary, Quantum Quasar rewards HODLers in full for helping secure the network, makes
-that help nearly effortless, and burns realized decay rather than redistributing it.
+Participation still depends on wallet availability, eligible outputs, successful
+solves or claims, and applicable fees. The protocol rules do not guarantee
+individual rewards or a market outcome.
 
 ---
 
@@ -900,11 +841,11 @@ that help nearly effortless, and burns realized decay rather than redistributing
   (approximately 720 target days), legacy ECDSA coins remain spendable and therefore
   quantum-exposed. Holders can prepare addresses and backups during Gold Rush, then should
   migrate during the 540-day Migration phase. At Final Lockout the spendable path becomes
-  quantum-only. This is an explicit, bounded trade-off in favor of a fair, no-surprises
-  migration.
+  quantum-only. The published height schedule bounds the period for legacy
+  spending and migration.
 
-- **ML-DSA keys are outside the HD seed.** The single most important operational rule:
-  **back up the wallet after every new quantum address.** A seed phrase alone does not
+- **ML-DSA keys are outside the HD seed.** **Back up the wallet after every new
+  quantum address.** A seed phrase alone does not
   recover ML-DSA-protected funds. The wallet enforces "key stored before funds move" and
   warns at each step, but the backup responsibility is the user's.
 
@@ -937,16 +878,16 @@ that help nearly effortless, and burns realized decay rather than redistributing
   for every such outpoint. Missing runners, capture paths, maturity, or evidence do not
   block publication and must not be represented as a successful live qualification.
 
-- **Consensus compatibility is paramount.** Mainnet's whitelist height (5,945,000), Gold
+- **Consensus compatibility.** Mainnet's whitelist height (5,945,000), Gold
   Rush boundaries (5,950,000 through 6,192,999), Migration boundaries (6,193,000 through
   6,921,999), and Final Lockout height (6,922,000) are consensus rules. The retained
   timestamp anchors are nominal forecasts, not mainnet phase boundaries. Every node that
   wishes to remain on the same chain must use identical height values. Operators upgrading
   or building alternative clients must match them exactly to avoid a chain split.
 
-- **The per-pool cap is policy, not consensus.** It cannot by itself prevent a determined
-  operator from accumulating stake; it only steers the default wallet behavior. Genuine
-  decentralization still depends on delegators choosing diverse operators.
+- **The per-pool cap is policy, not consensus.** It cannot by itself prevent an
+  operator from accumulating stake; it only steers default wallet behavior.
+  Operator distribution also depends on delegators' choices.
 
 ---
 

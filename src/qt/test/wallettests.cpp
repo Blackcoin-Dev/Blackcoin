@@ -71,6 +71,8 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSpinBox>
+#include <QStyle>
+#include <QStyleOptionButton>
 #include <QTableView>
 #include <QTableWidget>
 #include <QTest>
@@ -196,6 +198,20 @@ void WaitForModal(const QString& description, std::function<bool()> action)
     timer->start();
 }
 
+void ClickCheckBoxIndicator(QCheckBox* checkbox)
+{
+    QVERIFY(checkbox);
+    QStyleOptionButton option;
+    option.initFrom(checkbox);
+    option.text = checkbox->text();
+    const QRect indicator = checkbox->style()->subElementRect(
+        QStyle::SE_CheckBoxIndicator, &option, checkbox);
+    QVERIFY(indicator.isValid());
+    QVERIFY(checkbox->rect().contains(indicator.center()));
+    QTest::mouseClick(checkbox, Qt::LeftButton, Qt::NoModifier,
+                      indicator.center());
+}
+
 //! Press a standard button in a modal message box.
 void ConfirmMessageBox(QMessageBox::StandardButton confirm_type,
                        const QString& expected_text = {})
@@ -224,9 +240,10 @@ void ConfirmMessageBox(QMessageBox::StandardButton confirm_type,
 }
 
 void AnswerPowClaimRecoveryConsent(bool enable, bool use_escape = false,
-                                   const QString& expected_wallet = {})
+                                   const QString& expected_wallet = {},
+                                   std::shared_ptr<bool> consent_seen = {})
 {
-    WaitForModal(QStringLiteral("PoW claim recovery consent dialog"), [enable, use_escape, expected_wallet] {
+    WaitForModal(QStringLiteral("PoW claim recovery consent dialog"), [enable, use_escape, expected_wallet, consent_seen] {
         for (QWidget* widget : QApplication::allWidgets()) {
             auto* dialog = qobject_cast<QDialog*>(widget);
             if (!dialog || dialog->objectName() !=
@@ -273,6 +290,7 @@ void AnswerPowClaimRecoveryConsent(bool enable, bool use_escape = false,
                 dialog->reject();
                 return true;
             }
+            if (consent_seen) *consent_seen = true;
             if (use_escape) {
                 QTest::keyClick(dialog, Qt::Key_Escape);
             } else {
@@ -1163,14 +1181,15 @@ void TestPowClaimRecoveryPolicyControls(
     QVERIFY(recovery);
     QVERIFY(status);
     QVERIFY(refresh);
-    QCOMPARE(recovery->text(), QStringLiteral(
-        "Permit bounded automatic fee-paying conflict recovery as an "
-        "alternative to waiting"));
-    QVERIFY(recovery->toolTip().contains(QStringLiteral("same confirmed anchor")));
-    QVERIFY(recovery->toolTip().contains(QStringLiteral("waits while a member is live")));
+    QCOMPARE(recovery->text(), QStringLiteral("Allow automatic fee-paying conflict recovery"));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("same confirmed input")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("waits for a live claim")));
     QVERIFY(recovery->toolTip().contains(QStringLiteral("no recovery transaction")));
-    QVERIFY(recovery->toolTip().contains(QStringLiteral("ordinary claim fee")));
-    QVERIFY(recovery->toolTip().contains(QStringLiteral("miner could otherwise continue")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("ordinary fee")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("ongoing permission")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("normal mining could continue")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("Fee, rate, and staleness limits apply")));
+    QVERIFY(recovery->toolTip().contains(QStringLiteral("cannot unlock the wallet or start a disabled miner")));
     QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
     QVERIFY(!recovery->isChecked());
     QVERIFY(status->text().contains(QStringLiteral("6 process-wide")));
@@ -1178,8 +1197,11 @@ void TestPowClaimRecoveryPolicyControls(
     QVERIFY(status->text().contains(QStringLiteral("no choice recorded")));
 
     // Escape is the safe cancellation path and must not persist consent.
-    AnswerPowClaimRecoveryConsent(/*enable=*/false, /*use_escape=*/true);
-    QTest::mouseClick(recovery, Qt::LeftButton);
+    const auto escape_consent_seen = std::make_shared<bool>(false);
+    AnswerPowClaimRecoveryConsent(/*enable=*/false, /*use_escape=*/true,
+                                  {}, escape_consent_seen);
+    ClickCheckBoxIndicator(recovery);
+    QTRY_VERIFY_WITH_TIMEOUT(*escape_consent_seen, 3000);
     QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 3000);
     QVERIFY(!recovery->isChecked());
     QCOMPARE(wallet_interface.getPowClaimRecoveryPolicy().mode,
@@ -1190,7 +1212,7 @@ void TestPowClaimRecoveryPolicyControls(
     // old or newly selected wallet.
     UnloadWalletDuringPowClaimRecoveryConsent(
         page, wallet_model.getDisplayName());
-    QTest::mouseClick(recovery, Qt::LeftButton);
+    ClickCheckBoxIndicator(recovery);
     QTRY_VERIFY_WITH_TIMEOUT(!recovery->isEnabled(), 3000);
     QCOMPARE(wallet_interface.getPowClaimRecoveryPolicy().mode,
              interfaces::WalletPowClaimRecoveryMode::UNSET);
@@ -1298,7 +1320,7 @@ void TestPowClaimRecoveryPolicyControls(
     wallet::MockableDatabase& database = wallet::GetMockableDatabase(*core_wallet);
     database.m_fail_begin = true;
     ConfirmMessageBox(QMessageBox::Ok);
-    QTest::mouseClick(recovery, Qt::LeftButton);
+    ClickCheckBoxIndicator(recovery);
     QTRY_VERIFY_WITH_TIMEOUT(recovery->isEnabled(), 5000);
     database.m_fail_begin = false;
     QVERIFY(recovery->isChecked());
@@ -1309,7 +1331,7 @@ void TestPowClaimRecoveryPolicyControls(
         Qt::CaseInsensitive));
     // Unchecking records PAUSE_AND_ASK instead of silently erasing the
     // operator's choice or changing any fee bounds.
-    QTest::mouseClick(recovery, Qt::LeftButton);
+    ClickCheckBoxIndicator(recovery);
     QTRY_COMPARE_WITH_TIMEOUT(
         wallet_interface.getPowClaimRecoveryPolicy().mode,
         interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK, 5000);
@@ -1333,7 +1355,7 @@ void TestPowClaimRecoveryPolicyControls(
 
     // Switching wallets while a click's preflight read is queued must cancel
     // the obsolete view request without persisting its intended change.
-    QTest::mouseClick(recovery, Qt::LeftButton);
+    ClickCheckBoxIndicator(recovery);
     active_page.setWalletModel(nullptr);
     qApp->processEvents();
     active_page.setWalletModel(&wallet_model);

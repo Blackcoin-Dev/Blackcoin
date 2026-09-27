@@ -1,11 +1,34 @@
 # Blackcoin Core release process
 
+## Current v30.1.5.2 signed maintenance release
+
+This runbook's current source line is `30.1.5.2`.
+`configure.ac` records major 30, minor 1, build 5, revision 2, RC0, and
+`CLIENT_VERSION_IS_RELEASE=true`. The numeric `CLIENT_VERSION` remains
+`300105`; macOS short version remains `30.1.5`, bundle version is `30.1.502`,
+and `BlackcoinFullVersion` is `30.1.5.2`. The canonical final notes are
+`doc/release-notes/release-notes-30.1.5.2.md`.
+
+The `v30.1.5.2` tag path requires RC0 and release=true, canonical final notes,
+the complete current-SHA safety gate, a Blackcoin-Dev SSH-signed exact source
+commit and annotated tag, and the protected `V30.1.5.2` acknowledgement. Retain the
+fresh signed immutable-configuration receipt, authenticated inventory and
+numeric release-ID checks, two isolated builders with byte comparison,
+attestations, and one immutable publication. Record actual qualification and
+publication evidence before stating that those controls have passed.
+
+This release changes the legacy-only claim-input budget, SQLite batch
+transaction ownership, and failed-startup instance counting, with editorial
+GUI, RPC, and documentation cleanup.
+It does not change consensus or wallet storage format. Operator validation
+does not require installed-wallet deployment or spending.
+
+## v30.1.5.1 signed capacity correction (historical)
+
 This is the release runbook for Blackcoin Core v30.1.5.1. A successful local
 build is not release authorization. Production publication is allowed only for
 the exact commit that satisfies the mandatory safety gate and the controls
 below.
-
-## v30.1.5.1 signed capacity correction
 
 The scope is #54 (complete retained-history capacity), #55 (confirmed-parent
 referenced-output accounting), and #56 (wallet-wide source-selection budgets).

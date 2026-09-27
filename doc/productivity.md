@@ -27,7 +27,7 @@ General
 
 ### Cache compilations with `ccache`
 
-The easiest way to faster compile times is to cache compiles. `ccache` is a way to do so, from its description at the time of writing:
+`ccache` can reduce recompilation time by caching compiler outputs. The project describes it as follows:
 
 > ccache is a compiler cache. It speeds up recompilation by caching the result of previous compilations and detecting when the same compilation is being done again. Supported languages are C, C++, Objective-C and Objective-C++.
 
@@ -72,7 +72,7 @@ make -j"$(($(nproc)+1))"
 
 When rebuilding during development, note that running `make`, without giving a target, will do a lot of work you probably don't need. It will build the GUI (unless you've disabled it) and all the tests (which take much longer to build than the app does).
 
-Obviously, it is important to build and run the tests at appropriate times -- but when you just want a quick compile to check your work, consider picking one or a set of build targets relevant to what you're working on, e.g.:
+Run tests appropriate to the changes. For a quick compile during development, build only the relevant targets, for example:
 
 ```sh
 make src/blackcoind src/blackcoin-cli
@@ -117,7 +117,7 @@ git rebase -i --exec "make check" "$(git merge-base master HEAD)"
 
 -----
 
-This synergizes well with [`ccache`](#cache-compilations-with-ccache) as objects resulting from unchanged code will most likely hit the cache and won't need to be recompiled.
+Unchanged objects can be reused from [`ccache`](#cache-compilations-with-ccache) during these rebases.
 
 You can also set up [upstream refspecs](#reference-prs-easily-with-refspecs) to refer to pull requests easier in the above `git worktree` commands.
 

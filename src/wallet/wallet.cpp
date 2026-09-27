@@ -127,6 +127,14 @@ namespace wallet {
 
 namespace {
 std::atomic<int> g_pow_miner_worker_creation_failure_after_for_testing{-1};
+
+bool IsShadowPowMiningTarget(const CScript& script)
+{
+    return !script.empty() && !script.IsUnspendable() &&
+           !IsQuantumMigrationScript(script) &&
+           !IsQuantumColdStakeScript(script) &&
+           !IsEUTXOScript(script);
+}
 } // namespace
 
 void SetPowMinerWorkerCreationFailureAfterForTesting(int created_workers)
@@ -1668,6 +1676,7 @@ bool CWallet::ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase,
 
 void CWallet::chainStateFlushed(ChainstateRole role, const CBlockLocator& loc)
 {
+    LOCK(cs_wallet);
     // Don't update the best block until the chain is attached so that in case of a shutdown,
     // the rescan will be restarted at next startup.
     if (m_attaching_chain || role == ChainstateRole::BACKGROUND) {
@@ -1919,9 +1928,14 @@ void CWallet::RefreshLiveUnspentStakeOutpoint(const COutPoint& outpoint)
     const auto wallet_tx = mapWallet.find(outpoint.hash);
     const bool known_output = wallet_tx != mapWallet.end() && wallet_tx->second.tx &&
         outpoint.n < wallet_tx->second.tx->vout.size();
-    const bool changed = known_output && !IsSpentForStakeIndex(outpoint)
+    const bool live = known_output && !IsSpentForStakeIndex(outpoint);
+    bool changed = live
         ? m_live_unspent_stake_outpoints.insert(outpoint).second
         : m_live_unspent_stake_outpoints.erase(outpoint) != 0;
+    changed |= live && IsShadowPowMiningTarget(
+                          wallet_tx->second.tx->vout[outpoint.n].scriptPubKey)
+        ? m_live_unspent_legacy_claim_outpoints.insert(outpoint).second
+        : m_live_unspent_legacy_claim_outpoints.erase(outpoint) != 0;
     if (changed && ++m_live_unspent_stake_generation == 0) {
         ++m_live_unspent_stake_generation;
     }
@@ -1931,7 +1945,9 @@ bool CWallet::EraseLiveUnspentStakeOutpointForDrift(
     const COutPoint& outpoint)
 {
     AssertLockHeld(cs_wallet);
-    if (m_live_unspent_stake_outpoints.erase(outpoint) == 0) return false;
+    bool changed = m_live_unspent_stake_outpoints.erase(outpoint) != 0;
+    changed |= m_live_unspent_legacy_claim_outpoints.erase(outpoint) != 0;
+    if (!changed) return false;
     if (++m_live_unspent_stake_generation == 0) {
         ++m_live_unspent_stake_generation;
     }
@@ -1985,15 +2001,23 @@ void CWallet::RecomputeLiveUnspentStakeOutpoints()
 {
     AssertLockHeld(cs_wallet);
     std::set<COutPoint> rebuilt;
+    std::set<COutPoint> legacy_rebuilt;
     for (const auto& [txid, wtx] : mapWallet) {
         if (!wtx.tx) continue;
         for (uint32_t output = 0; output < wtx.tx->vout.size(); ++output) {
             const COutPoint outpoint{txid, output};
-            if (!IsSpentForStakeIndex(outpoint)) rebuilt.insert(outpoint);
+            if (!IsSpentForStakeIndex(outpoint)) {
+                rebuilt.insert(outpoint);
+                if (IsShadowPowMiningTarget(wtx.tx->vout[output].scriptPubKey)) {
+                    legacy_rebuilt.insert(outpoint);
+                }
+            }
         }
     }
-    if (rebuilt != m_live_unspent_stake_outpoints) {
+    if (rebuilt != m_live_unspent_stake_outpoints ||
+        legacy_rebuilt != m_live_unspent_legacy_claim_outpoints) {
         m_live_unspent_stake_outpoints = std::move(rebuilt);
+        m_live_unspent_legacy_claim_outpoints = std::move(legacy_rebuilt);
         if (++m_live_unspent_stake_generation == 0) {
             ++m_live_unspent_stake_generation;
         }
@@ -6267,6 +6291,9 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
         for (uint32_t output = 0; output < it->second.tx->vout.size(); ++output) {
             live_index_changed |=
                 m_live_unspent_stake_outpoints.erase(
+                    COutPoint{hash, output}) != 0;
+            live_index_changed |=
+                m_live_unspent_legacy_claim_outpoints.erase(
                     COutPoint{hash, output}) != 0;
         }
         if (live_index_changed && ++m_live_unspent_stake_generation == 0) {
@@ -10882,14 +10909,6 @@ bool GrindShadowPowWorkInterruptibly(
     return false;
 }
 
-bool IsShadowPowMiningTarget(const CScript& script)
-{
-    return !script.empty() && !script.IsUnspendable() &&
-           !IsQuantumMigrationScript(script) &&
-           !IsQuantumColdStakeScript(script) &&
-           !IsEUTXOScript(script);
-}
-
 bool IsShadowPowClaimConflict(const bilingual_str& error)
 {
     return error.original.find("txn-mempool-conflict") != std::string::npos ||
@@ -10929,9 +10948,9 @@ struct ShadowPowClaimStakeReserveSnapshot
 
 /** This scan is intentionally wallet-only. The caller binds it to an exact
  * short chain snapshot before using any result as selection authority.
- * Ordinary wallet outputs must not consume the smaller claim-graph budget
- * used under cs_main. Keep this complete scan finite (not paginated), at the
- * same output scale as automatic shadow-signal wallet scans. */
+ * Only the maintained immutable-script legacy subset consumes this budget:
+ * quantum rewards and provably unusable outputs cannot be legacy claim or
+ * reserve candidates. Keep this complete scan finite (not paginated). */
 constexpr size_t MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS{65536};
 // Charge outputs, protected-asset records, and spender edges together, with
 // headroom for spend history even at the output bound. The protected-asset
@@ -10982,11 +11001,7 @@ struct ShadowPowClaimWarmSourceSnapshot
     uint64_t source_generation{0};
     uint64_t stake_reserve_generation{0};
     bool staking_enabled{false};
-    size_t source_records{0};
-    size_t topology_work{0};
-    size_t parsed_bytes{0};
-    size_t script_managers{0};
-    size_t manager_visits{0};
+    ShadowPowClaimInputEnumerationInfo input_enumeration;
     bool capacity_exceeded{false};
     bool policy_drift{false};
 
@@ -10995,6 +11010,15 @@ struct ShadowPowClaimWarmSourceSnapshot
         records.clear();
         stake_sources.clear();
         protected_asset_outpoints.clear();
+    }
+
+    void FailCapacity(const char* reason, size_t observed = 0, size_t limit = 0)
+    {
+        capacity_exceeded = true;
+        input_enumeration.capacity_reason = reason;
+        input_enumeration.capacity_observed = observed;
+        input_enumeration.capacity_limit = limit;
+        ClearAuthority();
     }
 };
 
@@ -11043,6 +11067,10 @@ ShadowPowClaimWarmSourceSnapshot BuildShadowPowClaimWarmSourceSnapshot(
             std::memory_order_acquire);
     snapshot.staking_enabled =
         wallet.m_enabled_staking.load(std::memory_order_acquire);
+    auto& diagnostics = snapshot.input_enumeration;
+    diagnostics.live_outputs = wallet.GetLiveUnspentStakeOutpoints().size();
+    diagnostics.legacy_source_outputs = wallet.GetLiveUnspentLegacyClaimOutpoints().size();
+    diagnostics.script_managers = wallet.GetScriptPubKeyManCountLocked();
 
     const Consensus::Params& consensus = Params().GetConsensus();
     if (active_height < 0 ||
@@ -11052,29 +11080,27 @@ ShadowPowClaimWarmSourceSnapshot BuildShadowPowClaimWarmSourceSnapshot(
     }
 
     const std::set<COutPoint>& live =
-        wallet.GetLiveUnspentStakeOutpoints();
-    snapshot.source_records = live.size();
-    snapshot.script_managers =
-        wallet.GetScriptPubKeyManCountLocked();
-    if (snapshot.source_records > MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS ||
-        snapshot.script_managers >
-            SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY ||
-        wallet.ShadowPowProofInputIndexUnavailableLocked()) {
-        snapshot.capacity_exceeded = true;
-        snapshot.ClearAuthority();
+        wallet.GetLiveUnspentLegacyClaimOutpoints();
+    if (live.size() > MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS) {
+        snapshot.FailCapacity("legacy_source_outputs", live.size(),
+                              MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS);
         return snapshot;
     }
-    const bool manager_work_overflow = snapshot.script_managers != 0 &&
-        snapshot.source_records >
-            SHADOW_POW_CLAIM_MANAGER_WORK_CAPACITY /
-                (snapshot.script_managers * 11);
-    snapshot.manager_visits = manager_work_overflow
-        ? SHADOW_POW_CLAIM_MANAGER_WORK_CAPACITY + 1
-        : snapshot.source_records * snapshot.script_managers * 11;
-    if (snapshot.manager_visits >
-        SHADOW_POW_CLAIM_MANAGER_WORK_CAPACITY) {
-        snapshot.capacity_exceeded = true;
-        snapshot.ClearAuthority();
+    if (diagnostics.script_managers > SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY) {
+        snapshot.FailCapacity("script_managers", diagnostics.script_managers,
+                              SHADOW_POW_CLAIM_SCRIPT_MANAGER_CAPACITY);
+        return snapshot;
+    }
+    if (wallet.ShadowPowProofInputIndexUnavailableLocked()) {
+        snapshot.FailCapacity("proof_input_index_unavailable");
+        return snapshot;
+    }
+    // Both factors were bounded above, so this exact work count cannot
+    // overflow and remains useful when diagnosing a refused snapshot.
+    diagnostics.manager_work = live.size() * diagnostics.script_managers * 11;
+    if (diagnostics.manager_work > SHADOW_POW_CLAIM_MANAGER_WORK_CAPACITY) {
+        snapshot.FailCapacity("script_manager_work", diagnostics.manager_work,
+                              SHADOW_POW_CLAIM_MANAGER_WORK_CAPACITY);
         return snapshot;
     }
 
@@ -11085,21 +11111,20 @@ ShadowPowClaimWarmSourceSnapshot BuildShadowPowClaimWarmSourceSnapshot(
             SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY,
             snapshot.protected_asset_outpoints, protected_work,
             protected_bytes)) {
-        snapshot.capacity_exceeded = true;
-        snapshot.ClearAuthority();
+        snapshot.FailCapacity("protected_asset_inventory");
         return snapshot;
     }
-    snapshot.topology_work = protected_work;
-    snapshot.parsed_bytes = protected_bytes;
+    diagnostics.source_work = protected_work;
+    diagnostics.script_bytes = protected_bytes;
 
     if (live.size() > SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY -
-                          std::min(snapshot.topology_work,
+                          std::min(diagnostics.source_work,
                                    SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY)) {
-        snapshot.capacity_exceeded = true;
-        snapshot.ClearAuthority();
+        snapshot.FailCapacity("source_work", diagnostics.source_work + live.size(),
+                              SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY);
         return snapshot;
     }
-    snapshot.topology_work += live.size();
+    diagnostics.source_work += live.size();
 
     // Capture and byte-preflight the complete live source before any script
     // parser, provider lookup, staking predicate, or candidate sort runs.
@@ -11107,42 +11132,45 @@ ShadowPowClaimWarmSourceSnapshot BuildShadowPowClaimWarmSourceSnapshot(
     snapshot.stake_sources.reserve(live.size());
     for (const COutPoint& outpoint : live) {
         if (wallet.IsUnknownShadowPowProofParentLocked(outpoint.hash)) {
-            snapshot.capacity_exceeded = true;
-            snapshot.ClearAuthority();
+            snapshot.FailCapacity("unknown_proof_parent");
             return snapshot;
         }
         const auto it = wallet.mapWallet.find(outpoint.hash);
         if (it == wallet.mapWallet.end() || !it->second.tx ||
             outpoint.n >= it->second.tx->vout.size()) {
-            snapshot.capacity_exceeded = true;
-            snapshot.ClearAuthority();
+            snapshot.FailCapacity("invalid_source_record");
             return snapshot;
         }
         const CTxOut& output = it->second.tx->vout[outpoint.n];
         const size_t remaining_work =
             SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY -
-            std::min(snapshot.topology_work,
+            std::min(diagnostics.source_work,
                      SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY);
         size_t spender_work{0};
         bool wallet_spent{false};
         if (!wallet.GetBoundedWalletSpentStateLocked(
                 outpoint, remaining_work, spender_work,
                 wallet_spent)) {
-            snapshot.capacity_exceeded = true;
-            snapshot.ClearAuthority();
+            // The bounded helper stops at the first excess spender edge.
+            snapshot.FailCapacity("source_work", SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY + 1,
+                                  SHADOW_POW_CLAIM_SOURCE_WORK_CAPACITY);
             return snapshot;
         }
-        snapshot.topology_work += spender_work;
+        diagnostics.source_work += spender_work;
         const size_t script_bytes = output.scriptPubKey.size();
-        if (script_bytes > SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY ||
-            script_bytes > SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY -
-                               std::min(snapshot.parsed_bytes,
-                                        SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY)) {
-            snapshot.capacity_exceeded = true;
-            snapshot.ClearAuthority();
+        if (script_bytes > SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY) {
+            snapshot.FailCapacity("source_record_bytes", script_bytes,
+                                  SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY);
             return snapshot;
         }
-        snapshot.parsed_bytes += script_bytes;
+        if (script_bytes > SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY -
+                               std::min(diagnostics.script_bytes,
+                                        SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY)) {
+            snapshot.FailCapacity("source_script_bytes", diagnostics.script_bytes + script_bytes,
+                                  SHADOW_POW_CLAIM_TOPOLOGY_BYTE_CAPACITY);
+            return snapshot;
+        }
+        diagnostics.script_bytes += script_bytes;
         snapshot.records.push_back({
             outpoint, &it->second, output,
             wallet.IsIndexedShadowPowClaimLocked(outpoint.hash),
@@ -11251,6 +11279,7 @@ ShadowPowClaimStakeReserveSnapshot BuildShadowPowClaimStakeReserveSnapshot(
 
     ShadowPowClaimStakeReserveSnapshot snapshot;
     ShadowPowClaimStakeReserveInfo& info = snapshot.info;
+    info.input_enumeration = source.input_enumeration;
     info.active_tip = active_tip;
     info.wallet_generation = wallet.GetDatabase().nUpdateCounter.load();
     info.live_output_index_generation =
@@ -11827,7 +11856,14 @@ ShadowPowClaimInputSelectionResult CWallet::SelectShadowPowClaimInput(
                     *this, selection_height,
                     selection_median_time_past);
             if (source.capacity_exceeded) {
-                error = _("Gold Rush PoW claim selection exceeded the complete bounded wallet-source capacity; no partial input authority was returned.");
+                error = strprintf(
+                    _("Gold Rush PoW claim input enumeration failed (%s, observed %u, limit %u; live outputs %u, legacy sources %u, script managers %u); no partial input authority was returned."),
+                    source.input_enumeration.capacity_reason,
+                    source.input_enumeration.capacity_observed,
+                    source.input_enumeration.capacity_limit,
+                    source.input_enumeration.live_outputs,
+                    source.input_enumeration.legacy_source_outputs,
+                    source.input_enumeration.script_managers);
                 return ShadowPowClaimInputSelectionResult::INPUT_ENUMERATION_CAPACITY;
             }
             if (source.policy_drift) {
@@ -14109,8 +14145,13 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             }
             if (selection_result ==
                 ShadowPowClaimInputSelectionResult::INPUT_ENUMERATION_CAPACITY) {
+                const WalletPowMiningState prior_state = m_pow_state.load();
+                PublishPowMiningHashrate(0.0);
                 PublishPowMiningWorkerState(
                     WalletPowMiningState::CLAIM_INVENTORY_CAPACITY);
+                if (prior_state != WalletPowMiningState::CLAIM_INVENTORY_CAPACITY) {
+                    WalletLogPrintf("Gold Rush PoW worker %d paused: %s\n", worker_id, error.original);
+                }
                 SleepPowMiner(*this, std::chrono::seconds{5});
                 continue;
             }

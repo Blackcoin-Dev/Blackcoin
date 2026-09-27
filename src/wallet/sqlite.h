@@ -14,6 +14,7 @@ struct bilingual_str;
 
 struct sqlite3_stmt;
 struct sqlite3;
+struct sqlite3_mutex;
 
 namespace wallet {
 class SQLiteDatabase;
@@ -21,6 +22,9 @@ class SQLiteDatabase;
 /** RAII class that provides a database cursor */
 class SQLiteCursor : public DatabaseCursor
 {
+private:
+    SQLiteDatabase& m_database;
+
 public:
     sqlite3_stmt* m_cursor_stmt{nullptr};
     // Copies of the prefix things for the prefix cursor.
@@ -28,9 +32,10 @@ public:
     std::vector<std::byte> m_prefix_range_start;
     std::vector<std::byte> m_prefix_range_end;
 
-    explicit SQLiteCursor() {}
-    explicit SQLiteCursor(std::vector<std::byte> start_range, std::vector<std::byte> end_range)
-        : m_prefix_range_start(std::move(start_range)),
+    explicit SQLiteCursor(SQLiteDatabase& database) : m_database(database) {}
+    explicit SQLiteCursor(SQLiteDatabase& database, std::vector<std::byte> start_range, std::vector<std::byte> end_range)
+        : m_database(database),
+          m_prefix_range_start(std::move(start_range)),
         m_prefix_range_end(std::move(end_range))
     {}
     ~SQLiteCursor() override;
@@ -50,8 +55,12 @@ private:
     sqlite3_stmt* m_delete_stmt{nullptr};
     sqlite3_stmt* m_delete_prefix_stmt{nullptr};
     bool m_durable_txn{false};
+    // Successful TxnBegin retains the recursive FULLMUTEX connection lock.
+    // Only this batch can end the transaction, on the thread that began it.
+    sqlite3_mutex* m_txn_mutex{nullptr};
 
     void SetupSQLStatements();
+    void ReleaseTransaction();
     bool ExecStatement(sqlite3_stmt* stmt, Span<const std::byte> blob);
 
     bool ReadKey(DataStream&& key, DataStream& value) override;
@@ -148,6 +157,11 @@ public:
 
     sqlite3* m_db{nullptr};
     bool m_use_unsafe_sync;
+    // Protected by sqlite3_db_mutex(m_db). An unabortable transaction whose
+    // owner is closing must never become an implicit transaction for another
+    // batch. Poison survives until the database connection is reopened.
+    bool m_transaction_poisoned{false};
+    const SQLiteBatch* m_transaction_owner{nullptr};
 };
 
 std::unique_ptr<SQLiteDatabase> MakeSQLiteDatabase(const fs::path& path, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);

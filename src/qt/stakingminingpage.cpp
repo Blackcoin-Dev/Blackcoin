@@ -516,15 +516,15 @@ void StakingMiningPage::setupUi()
         tr("System"),
         tr("Staking & Mining system guide"),
         tr("<h3>What this page controls</h3>"
-           "<p>This page brings together the new V30 staking, Gold Rush, quantum migration, cold-staking, RGB, and EUTXO inspection surfaces. The dashboard shows the current state first. The tabs below contain actions.</p>"
+           "<p>The dashboard shows staking, Gold Rush, migration, cold-staking, RGB, and EUTXO status. Use the tabs below for actions.</p>"
            "<p>Mainnet uses exact height boundaries: Gold Rush 5,950,000-6,192,999; the emission-neutral competing-claim rule from 5,993,200; Migration 6,193,000-6,921,999; and Final Lockout plus automatic demurrage from 6,922,000. Nominal time forecasts and readiness signalling do not move these boundaries.</p>"
-           "<h3>The safe order</h3>"
-           "<ol>"
-           "<li><b>Keep legacy staking online</b> while Gold Rush runs. Legacy staking secures the base chain and can also produce PoS Gold Rush eligibility.</li>"
-           "<li><b>Use normal wallet unlock for quantum actions.</b> Legacy staking-only unlock is intentionally limited and will not create Gold Rush signal or quantum transactions.</li>"
+           "<h3>Before using these controls</h3>"
+           "<ul>"
+           "<li><b>Legacy staking:</b> if this wallet stakes legacy BLK, keep staking enabled during Gold Rush. Automatic QQSIGNAL submission requires separate consent.</li>"
+           "<li><b>Normal wallet unlock:</b> use it when signing Gold Rush signals or quantum transactions. Legacy staking-only unlock does not permit those transactions.</li>"
            "<li><b>Wait for Gold Rush rewards to unlock.</b> Newly mined Gold Rush quantum rewards remain locked until Gold Rush ends. After maturity and that boundary, the original outputs are ordinary direct quantum funds; no preliminary move is required.</li>"
            "<li><b>Choose a staking mode.</b> Stake locally if you want this machine to secure the network with your coins, run a node if you want to stake delegated cold deposits, or delegate to a verified node if you want owner keys offline.</li>"
-           "</ol>"
+           "</ul>"
            "<h3>Where transactions appear</h3>"
            "<p>Legacy-visible Gold Rush participation is recorded through QQSIGNAL and QQSPROOF control transactions. Quantum rewards are tracked by upgraded nodes as quantum shadow-ledger credits and displayed in the wallet as <b>PoS - Quantum Stake</b> or <b>PoW - Quantum Claim</b>.</p>"),
         dashboardBox);
@@ -540,7 +540,7 @@ void StakingMiningPage::setupUi()
            "<li>Node bonds use a fixed 30-day unbonding period. Delegated funds remain owner-controlled by the delegator wallet.</li>"
            "</ul>"
            "<h3>What the dashboard is telling you</h3>"
-           "<p>The recommended action panel is conservative. It calls out the next action most likely to prevent confusion or blocked transactions, such as waiting for Gold Rush rewards to unlock, unlocking normally for signals, or choosing a cold-staking path.</p>"),
+           "<p>The recommended action panel shows the next step for this wallet, such as waiting for rewards to unlock or unlocking normally to send signals.</p>"),
         dashboardBox);
     dashboard->addWidget(m_dashboard_action, 0, 0, 1, 2);
     dashboard->addLayout(makeGuideRow({systemHelp, safetyHelp}), 1, 0, 1, 2);
@@ -550,7 +550,7 @@ void StakingMiningPage::setupUi()
     dashboard->addWidget(m_dashboard_coldstake, 3, 1);
     m_refresh_button = new QPushButton(tr("Refresh details"), dashboardBox);
     m_refresh_button->setObjectName(QStringLiteral("stakingMiningRefresh"));
-    m_refresh_button->setToolTip(tr("Reload the Gold Rush, migration, cold-staking, and asset panels. These read the whole wallet, so they refresh only when you ask instead of continuously."));
+    m_refresh_button->setToolTip(tr("Reload Gold Rush, migration, cold-staking, and asset details. These panels read the whole wallet and refresh on request."));
     m_refresh_hint = new QLabel(tr("Detail panels load when you press Refresh."), dashboardBox);
     m_refresh_hint->setObjectName(QStringLiteral("stakingMiningRefreshHint"));
     m_refresh_hint->setWordWrap(true);
@@ -614,7 +614,7 @@ void StakingMiningPage::setupUi()
         tr("PoS"),
         tr("Proof-of-Stake and Gold Rush PoS guide"),
         tr("<h3>What ordinary staking does</h3>"
-           "<p>Ordinary Proof-of-Stake keeps the legacy Blackcoin chain moving. During Gold Rush, this wallet can continue producing regular PoS blocks while upgraded nodes also track quantum reward credits.</p>"
+           "<p>Ordinary Proof-of-Stake produces legacy chain blocks. During Gold Rush, upgraded nodes also track quantum reward credits.</p>"
            "<h3>Gold Rush PoS eligibility</h3>"
            "<ul>"
            "<li>The wallet must have at least 10,000 BLK aggregate balance at the whitelist snapshot height.</li>"
@@ -624,17 +624,15 @@ void StakingMiningPage::setupUi()
            "<h3>How payouts work</h3>"
            "<p>Qualified active signalers share the PoS Gold Rush pool. The wallet displays these reward credits as <b>PoS - Quantum Stake</b> and shows the quantum payout address in the transaction list.</p>"
            "<h3>Example</h3>"
-           "<p>If your wallet was whitelisted and solves a PoS block, keep staking enabled, unlock with <b>Quantum and Legacy Staking</b>, and explicitly enable automatic QQSIGNAL if you want the wallet to publish fee-paying signals. The runtime staking switch alone never grants that consent.</p>"),
+           "<p>After a whitelisted wallet solves a PoS block, keep staking enabled and unlock with <b>Quantum and Legacy Staking</b>. To publish fee-paying signals automatically, also enable QQSIGNAL submission. The staking switch alone does not grant that consent.</p>"),
         stakingBox);
     auto* unlockHelp = makeHelpButton(
         tr("Unlock"),
         tr("Unlock modes"),
         tr("<h3>Legacy staking-only unlock</h3>"
-           "<p>This mode is safest for old-style staking because it does not permit ordinary spending. It also does not permit quantum transactions, Gold Rush signals, PoW claim transactions, migration, or cold-staking setup.</p>"
+           "<p>This mode permits ordinary legacy staking without spending. It cannot sign quantum transactions, Gold Rush signals, PoW claims, migration, or cold-staking setup.</p>"
            "<h3>Quantum and Legacy Staking unlock</h3>"
-           "<p>This is a normal wallet unlock. Use it when you want the wallet to stake and also create quantum-related transactions, including QQSIGNAL, QQSPROOF claims, migration, node bonds, and delegation funding.</p>"
-           "<h3>Rule of thumb</h3>"
-           "<p>Use staking-only unlock for passive legacy staking. Use the quantum unlock when you are actively participating in Gold Rush or setting up quantum/cold-staking features.</p>"),
+           "<p>This normal unlock permits staking and quantum transactions, including QQSIGNAL, QQSPROOF claims, migration, node bonds, and delegation funding.</p>"),
         stakingBox);
 
     m_donation_enable = new QCheckBox(tr("Opt in to Quantum Quasar development donations"), stakingBox);
@@ -707,15 +705,14 @@ void StakingMiningPage::setupUi()
     m_allow_auto_key_creation = new QCheckBox(tr("Allow background creation of new non-HD quantum keys"), automationBox);
     m_allow_auto_key_creation->setObjectName(QStringLiteral("automationAllowNewKeys"));
     m_auto_claim_recovery = new QCheckBox(
-        tr("Permit bounded automatic fee-paying conflict recovery as an alternative to waiting"),
+        tr("Allow automatic fee-paying conflict recovery"),
         automationBox);
     m_auto_claim_recovery->setObjectName(QStringLiteral("automationClaimRecovery"));
     m_auto_claim_recovery->setToolTip(tr(
-        "For a coherent authenticated wallet-authored claim family, Core waits while a member is live, relays an eligible absent family member, or appends one current-policy sibling on the same confirmed anchor. "
-        "That normal continuation creates no recovery transaction or recovery fee, although a family member that confirms still pays its ordinary claim fee. "
-        "Separately, this wallet-scoped standing consent permits fee-paying conflict recovery for a component Core classifies as recoverable, including one the miner could otherwise continue. Explicit fee, rate, and staleness limits bound every action. "
-        "Recovery can only unblock an already-enabled miner; it never unlocks this wallet "
-        "and never enables or starts a miner that is off."));
+        "For a verified group of claims created by this wallet, Core waits for a live claim, relays an eligible missing claim, or appends one eligible refreshed claim on the same confirmed input. "
+        "These steps create no recovery transaction or recovery fee; a confirmed claim still pays its ordinary fee. "
+        "This setting gives this wallet ongoing permission for fee-paying conflict recovery of eligible groups, including when normal mining could continue. Fee, rate, and staleness limits apply. "
+        "Recovery can unblock an enabled miner, but cannot unlock the wallet or start a disabled miner."));
     m_automation_status = new QLabel(automationBox);
     m_automation_status->setObjectName(QStringLiteral("automationStatus"));
     configureInfoPanel(m_automation_status);
@@ -736,8 +733,7 @@ void StakingMiningPage::setupUi()
 
     m_pow_enable = new QCheckBox(tr("Enable Gold Rush PoW mining (built-in, no external miner)"), powBox);
     m_pow_enable->setObjectName(QStringLiteral("powEnable"));
-    m_pow_enable->setToolTip(tr("Runs the Argon2id Gold Rush solver inside this wallet. No separate mining "
-                                "program is required. Active only during the Gold Rush epoch."));
+    m_pow_enable->setToolTip(tr("Runs the built-in Argon2id Gold Rush solver. Active only during Gold Rush."));
 
     m_pow_unlock_wallet = new QCheckBox(tr("Unlock wallet for Gold Rush mining"), powBox);
     m_pow_unlock_wallet->setObjectName(QStringLiteral("powUnlockWallet"));
@@ -774,7 +770,7 @@ void StakingMiningPage::setupUi()
     m_pow_recovery_review->setEnabled(false);
     m_pow_recovery_review->setVisible(false);
     m_pow_recovery_review->setToolTip(tr(
-        "Review the wallet's complete claim/conflict graph and a tip-pinned Core recovery preview. "
+        "Review the complete claim/conflict graph and a recovery plan bound to the current chain tip. "
         "Opening this screen never signs, spends, broadcasts, unlocks the wallet, or starts mining."));
 
     m_pow_status = new QLabel(QStringLiteral("-"), powBox);
@@ -794,7 +790,7 @@ void StakingMiningPage::setupUi()
         tr("PoW"),
         tr("Gold Rush Proof-of-Work guide"),
         tr("<h3>What the built-in miner does</h3>"
-           "<p>The Gold Rush PoW miner runs inside the wallet. It searches for Argon2id QQSPROOF claims and submits a small legacy-chain control transaction when it finds one.</p>"
+           "<p>The built-in miner searches for valid Argon2id proofs and submits a fee-paying QQSPROOF transaction for each claim.</p>"
            "<h3>Reward path</h3>"
            "<ol>"
            "<li>The miner finds a valid QQSPROOF.</li>"
@@ -803,7 +799,7 @@ void StakingMiningPage::setupUi()
            "<li>Upgraded nodes credit the reward to the claim's authenticated quantum payout. New-anchor claims use the configured address shown here; retained families preserve their own payout.</li>"
            "</ol>"
            "<h3>CPU controls</h3>"
-           "<p>The default is intentionally conservative: 1 core at 1 percent. Increase cores or percent only if you want this computer to spend more CPU time mining claims.</p>"
+           "<p>The default uses 1 core at 1 percent. Increasing either setting uses more CPU time to search for claims.</p>"
            "<h3>What you will see</h3>"
            "<p>The wallet shows the control transaction fee on the legacy side and the quantum reward as <b>PoW - Quantum Claim</b> when the upgraded ledger credit is accepted.</p>"),
         powBox);
@@ -4499,9 +4495,9 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     } else if (info.epoch_active && !info.enabled) {
         recommended_action = tr("Gold Rush PoW is available. Start with 1 core at 1% CPU, then increase only if you want more local CPU usage.");
     } else if (!staking && balances.legacy_balance > 0) {
-        recommended_action = tr("Enable staking to secure the network. Whitelisted wallets can also qualify for PoS Gold Rush payouts during the epoch.");
+        recommended_action = tr("If you want this wallet to stake, enable legacy Proof-of-Stake. A whitelisted wallet may also qualify for PoS Gold Rush payouts during the epoch.");
     } else {
-        recommended_action = tr("No urgent action. Review the workflow tabs below for staking, mining, migration, and cold-staking actions.");
+        recommended_action = tr("These checks show no pending staking or mining action. Review the workflow tabs below for optional actions.");
     }
     m_dashboard_action->setText(tr("<b>Recommended next step</b><br>%1").arg(recommended_action));
 

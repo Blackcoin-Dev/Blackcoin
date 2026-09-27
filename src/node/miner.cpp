@@ -207,7 +207,6 @@ BlockAssembler::BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool
 
 void ApplyArgsManOptions(const ArgsManager& args, BlockAssembler::Options& options)
 {
-    // Block resource limits
     options.nBlockMaxWeight = args.GetIntArg("-blockmaxweight", options.nBlockMaxWeight);
     if (const auto blockmintxfee{args.GetArg("-blockmintxfee")}) {
         if (const auto parsed{ParseMoney(*blockmintxfee)}) options.blockMinFeeRate = CFeeRate{*parsed};
@@ -401,7 +400,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
                             txCoinStake.nTime, pblock->nTime);
                         return nullptr;
                     }
-                    // Make the coinbase tx empty in case of proof of stake
                     coinbaseTx.vout[0].SetEmpty();
                     coinbaseTx.nTime = pblock->nTime;
                     pblock->vtx.insert(pblock->vtx.begin() + 1, MakeTransactionRef(CTransaction(txCoinStake)));
@@ -441,7 +439,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     if (pFees)
         *pFees = nFees;
 
-    // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
     if (pblock->IsProofOfStake()) {
         // Only v1 carries an authoritative transaction timestamp. A v2
@@ -495,7 +492,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
 void BlockAssembler::onlyUnconfirmed(CTxMemPool::setEntries& testSet)
 {
     for (CTxMemPool::setEntries::iterator iit = testSet.begin(); iit != testSet.end(); ) {
-        // Only test txs not already in the block
         if (inBlock.count(*iit)) {
             testSet.erase(iit++);
         } else {
@@ -1113,7 +1109,6 @@ void PoSMiner(CWallet *pwallet)
             }
 
             if (std::get_if<CNoDestination>(&dest)) {
-                // create mintkey address
                 auto op_dest = pwallet->GetNewDestination(OutputType::LEGACY, label);
                 if (!op_dest)
                     throw std::runtime_error("Error: Keypool ran out, please call keypoolrefill first.");
@@ -1144,11 +1139,9 @@ void PoSMiner(CWallet *pwallet)
                     return;
             }
 
-            // Busy-wait for the network to come online so we don't waste time mining
-            // on an obsolete chain. In regtest mode we expect to fly solo, and the
-            // test schedule branch allows isolated testnets to opt in with
-            // -solostaking (the public-chain transaction statistics used for the
-            // sync estimate are meaningless on a private schedule-override chain).
+            // Wait for peers and initial sync before staking on public chains.
+            // Isolated test schedules can use -solostaking because public-chain
+            // transaction statistics cannot estimate their sync progress.
             const bool solo_staking = Params().MineBlocksOnDemand() ||
                 (Params().IsTestChain() && gArgs.GetBoolArg("-solostaking", node::DEFAULT_SOLO_STAKING));
             if (!solo_staking) {
@@ -1178,9 +1171,6 @@ void PoSMiner(CWallet *pwallet)
                 pwallet, wallet::StakingTelemetryState::SEARCHING,
                 "staking worker is preparing the next search interval");
 
-            //
-            // Create new block
-            //
             bool fPoSCancel{false};
             int64_t pFees{0};
             CBlock *pblock;

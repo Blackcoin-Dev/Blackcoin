@@ -5,6 +5,7 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,21 @@ BINARIES = [
 # Paths to external utilities.
 git = os.getenv('GIT', 'git')
 help2man = os.getenv('HELP2MAN', 'help2man')
+
+# A tracked manual cannot embed the source commit that will change when the
+# manual itself is committed. Strip only build suffixes produced by genbuild.sh
+# (or the full archive commit fallback), leaving other version labels intact.
+GIT_BUILD_SUFFIX = re.compile(
+    r'^(v\d+\.\d+\.\d+(?:\.\d+)?(?:rc\d+)?)-'
+    r'(?:[0-9a-f]{12,40}|g[0-9a-f]{40})(-dirty)?$'
+)
+
+
+def tracked_version(version):
+    match = GIT_BUILD_SUFFIX.fullmatch(version)
+    if match is None:
+        return version
+    return match.group(1) + (match.group(2) or '')
 
 # If not otherwise specified, get top directory from git.
 topdir = os.getenv('TOPDIR')
@@ -79,14 +95,20 @@ with tempfile.NamedTemporaryFile('w', suffix='.h2m') as footer:
     for (abspath, verstr, _) in versions:
         outname = os.path.join(mandir, os.path.basename(abspath) + '.1')
         print(f'Generating {outname}…')
-        subprocess.run([help2man, '-N', '--version-string=' + verstr, '--include=' + footer.name, '-o', outname, abspath], check=True)
+        normalized_version = tracked_version(verstr)
+        subprocess.run([help2man, '-N', '--version-string=' + normalized_version, '--include=' + footer.name, '-o', outname, abspath], check=True)
         # Do not embed an exact Git commit in a tracked generated file: adding
         # that file to the commit would immediately make the embedded identity
         # stale. The installed binary remains the authoritative source for the
         # exact provenance reported by --version.
         with open(outname, encoding='utf-8') as generated:
             manpage = generated.readlines()
+        escaped_version = verstr.replace('-', r'\-')
+        escaped_normalized_version = normalized_version.replace('-', r'\-')
         with open(outname, 'w', encoding='utf-8') as generated:
             generated.writelines(
-                line for line in manpage if not line.startswith('Source commit: ')
+                line.replace(verstr, normalized_version).replace(
+                    escaped_version, escaped_normalized_version
+                )
+                for line in manpage if not line.startswith('Source commit: ')
             )

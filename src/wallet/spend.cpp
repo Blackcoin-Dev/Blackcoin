@@ -775,7 +775,6 @@ util::Result<PreSelectedInputs> FetchSelectedInputs(const CWallet& wallet, const
         int input_bytes = -1;
         CTxOut txout;
         if (auto ptr_wtx = wallet.GetWalletTx(outpoint.hash)) {
-            // Clearly invalid input, fail
             if (ptr_wtx->tx->vout.size() <= outpoint.n) {
                 return util::Error{strprintf(_("Invalid pre-selected input %s"), outpoint.ToString())};
             }
@@ -1352,9 +1351,8 @@ util::Result<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coin
             ordered_filters.push_back({CoinEligibilityFilter(0, 1, 2)});
             ordered_filters.push_back({CoinEligibilityFilter(0, 1, std::min(size_t{4}, max_ancestors/3), std::min(size_t{4}, max_descendants/3))});
             ordered_filters.push_back({CoinEligibilityFilter(0, 1, max_ancestors/2, max_descendants/2)});
-            // If partial groups are allowed, relax the requirement of spending OutputGroups (groups
-            // of UTXOs sent to the same address, which are obviously controlled by a single wallet)
-            // in their entirety.
+            // If partial groups are allowed, permit spending part of an OutputGroup
+            // of UTXOs sent to the same address.
             ordered_filters.push_back({CoinEligibilityFilter(0, 1, max_ancestors-1, max_descendants-1, /*include_partial=*/true)});
             // Try with unsafe inputs if they are allowed. This may spend unconfirmed outputs
             // received from other wallets.
@@ -1462,11 +1460,6 @@ static void DiscourageFeeSniping(CMutableTransaction& tx, FastRandomContext& rng
     // transaction to appear in the next block; we don't want to potentially
     // encourage reorgs by allowing transactions to appear at lower heights
     // than the next block in forks of the best chain.
-    //
-    // Of course, the subsidy is high enough, and transaction volume low
-    // enough, that fee sniping isn't a problem yet, but by implementing a fix
-    // now we ensure code won't be written that makes assumptions about
-    // nLockTime that preclude a fix later.
     if (IsCurrentForAntiFeeSniping(chain, block_hash)) {
         tx.nLockTime = block_height;
 

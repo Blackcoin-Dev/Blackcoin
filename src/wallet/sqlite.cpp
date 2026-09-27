@@ -26,6 +26,25 @@
 namespace wallet {
 static constexpr int32_t WALLET_SCHEMA_VERSION = 0;
 
+/** SQLite's FULLMUTEX lock is recursive. Holding it across an explicit
+ * transaction serializes all connection users without acquiring a new lock
+ * for the whole lifetime of a batch (which may precede wallet locking). */
+class SQLiteConnectionLock
+{
+    sqlite3_mutex* m_mutex;
+
+public:
+    explicit SQLiteConnectionLock(sqlite3* db) : m_mutex(sqlite3_db_mutex(db))
+    {
+        assert(m_mutex);
+        sqlite3_mutex_enter(m_mutex);
+    }
+    ~SQLiteConnectionLock() { if (m_mutex) sqlite3_mutex_leave(m_mutex); }
+    SQLiteConnectionLock(const SQLiteConnectionLock&) = delete;
+    SQLiteConnectionLock& operator=(const SQLiteConnectionLock&) = delete;
+    sqlite3_mutex* Release() { return std::exchange(m_mutex, nullptr); }
+};
+
 static Span<const std::byte> SpanFromBlob(sqlite3_stmt* stmt, int col)
 {
     return {reinterpret_cast<const std::byte*>(sqlite3_column_blob(stmt, col)),
@@ -119,13 +138,11 @@ SQLiteDatabase::SQLiteDatabase(const fs::path& dir_path, const fs::path& file_pa
         LogPrintf("Using SQLite Version %s\n", SQLiteDatabaseVersion());
         LogPrintf("Using wallet %s\n", m_dir_path);
 
-        if (++g_sqlite_count == 1) {
-            // Setup logging
+        if (g_sqlite_count == 0) {
             int ret = sqlite3_config(SQLITE_CONFIG_LOG, ErrorLogCallback, nullptr);
             if (ret != SQLITE_OK) {
                 throw std::runtime_error(strprintf("SQLiteDatabase: Failed to setup error log: %s\n", sqlite3_errstr(ret)));
             }
-            // Force serialized threading mode
             ret = sqlite3_config(SQLITE_CONFIG_SERIALIZED);
             if (ret != SQLITE_OK) {
                 throw std::runtime_error(strprintf("SQLiteDatabase: Failed to configure serialized threading mode: %s\n", sqlite3_errstr(ret)));
@@ -135,12 +152,12 @@ SQLiteDatabase::SQLiteDatabase(const fs::path& dir_path, const fs::path& file_pa
         if (ret != SQLITE_OK) {
             throw std::runtime_error(strprintf("SQLiteDatabase: Failed to initialize SQLite: %s\n", sqlite3_errstr(ret)));
         }
+        ++g_sqlite_count;
     }
 
     try {
         Open();
     } catch (const std::runtime_error&) {
-        // If open fails, cleanup this object and rethrow the exception
         Cleanup();
         throw;
     }
@@ -190,8 +207,12 @@ void SQLiteDatabase::Cleanup() noexcept
 bool SQLiteDatabase::Verify(bilingual_str& error)
 {
     assert(m_db);
+    SQLiteConnectionLock lock(m_db);
+    if (m_transaction_poisoned) {
+        error = _("SQLiteDatabase: Transaction rollback failed; reload the wallet before database access.");
+        return false;
+    }
 
-    // Check the application ID matches our network magic
     auto read_result = ReadPragmaInteger(m_db, "application_id", "the application id", error);
     if (!read_result.has_value()) return false;
     uint32_t app_id = static_cast<uint32_t>(read_result.value());
@@ -201,7 +222,6 @@ bool SQLiteDatabase::Verify(bilingual_str& error)
         return false;
     }
 
-    // Check our schema version
     read_result = ReadPragmaInteger(m_db, "user_version", "sqlite wallet schema version", error);
     if (!read_result.has_value()) return false;
     int32_t user_ver = read_result.value();
@@ -248,10 +268,12 @@ void SQLiteDatabase::Open()
 {
     int flags = SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
     if (m_mock) {
-        flags |= SQLITE_OPEN_MEMORY; // In memory database for mock db
+        flags |= SQLITE_OPEN_MEMORY;
     }
 
     if (m_db == nullptr) {
+        m_transaction_poisoned = false;
+        m_transaction_owner = nullptr;
         if (!m_mock) {
             TryCreateDirectories(fs::PathFromString(m_dir_path));
         }
@@ -263,7 +285,7 @@ void SQLiteDatabase::Open()
         if (ret != SQLITE_OK) {
             throw std::runtime_error(strprintf("SQLiteDatabase: Failed to enable extended result codes: %s\n", sqlite3_errstr(ret)));
         }
-        // Trace SQL statements if tracing is enabled with -debug=walletdb -loglevel=walletdb:trace
+        // Enable SQL tracing with -debug=walletdb -loglevel=walletdb:trace.
         if (LogAcceptCategory(BCLog::WALLETDB, BCLog::Level::Trace)) {
            ret = sqlite3_trace_v2(m_db, SQLITE_TRACE_STMT, TraceSqlCallback, this);
            if (ret != SQLITE_OK) {
@@ -276,10 +298,8 @@ void SQLiteDatabase::Open()
         throw std::runtime_error("SQLiteDatabase: Database opened in readonly mode but read-write permissions are needed");
     }
 
-    // Acquire an exclusive lock on the database
-    // First change the locking mode to exclusive
+    // Keep exclusive locking mode for this connection. BEGIN EXCLUSIVE verifies access now.
     SetPragma(m_db, "locking_mode", "exclusive", "Unable to change database locking mode to exclusive");
-    // Now begin a transaction to acquire the exclusive lock. This lock won't be released until we close because of the exclusive locking mode.
     int ret = sqlite3_exec(m_db, "BEGIN EXCLUSIVE TRANSACTION", nullptr, nullptr, nullptr);
     if (ret != SQLITE_OK) {
         throw std::runtime_error("SQLiteDatabase: Unable to obtain an exclusive lock on the database, is it being used by another instance of " PACKAGE_NAME "?\n");
@@ -293,13 +313,10 @@ void SQLiteDatabase::Open()
     SetPragma(m_db, "fullfsync", "true", "Failed to enable fullfsync");
 
     if (m_use_unsafe_sync) {
-        // Use normal synchronous mode for the journal
         LogPrintf("WARNING SQLite is configured to not wait for data to be flushed to disk. Data loss and corruption may occur.\n");
         SetPragma(m_db, "synchronous", "OFF", "Failed to set synchronous mode to OFF");
     }
 
-    // Make the table for our key-value pairs
-    // First check that the main table exists
     sqlite3_stmt* check_main_stmt{nullptr};
     ret = sqlite3_prepare_v2(m_db, "SELECT name FROM sqlite_master WHERE type='table' AND name='main'", -1, &check_main_stmt, nullptr);
     if (ret != SQLITE_OK) {
@@ -318,19 +335,17 @@ void SQLiteDatabase::Open()
         throw std::runtime_error(strprintf("SQLiteDatabase: Failed to execute statement to check table existence: %s\n", sqlite3_errstr(ret)));
     }
 
-    // Do the db setup things because the table doesn't exist only when we are creating a new wallet
+    // Initialize network and schema identifiers only when creating the table.
     if (!table_exists) {
         ret = sqlite3_exec(m_db, "CREATE TABLE main(key BLOB PRIMARY KEY NOT NULL, value BLOB NOT NULL)", nullptr, nullptr, nullptr);
         if (ret != SQLITE_OK) {
             throw std::runtime_error(strprintf("SQLiteDatabase: Failed to create new database: %s\n", sqlite3_errstr(ret)));
         }
 
-        // Set the application id
         uint32_t app_id = ReadBE32(Params().MessageStart().data());
         SetPragma(m_db, "application_id", strprintf("%d", static_cast<int32_t>(app_id)),
                   "Failed to set the application id");
 
-        // Set the user version
         SetPragma(m_db, "user_version", strprintf("%d", WALLET_SCHEMA_VERSION),
                   "Failed to set the wallet schema version");
     }
@@ -338,6 +353,9 @@ void SQLiteDatabase::Open()
 
 bool SQLiteDatabase::Rewrite(const char* skip)
 {
+    if (!m_db) return false;
+    SQLiteConnectionLock lock(m_db);
+    if (m_transaction_poisoned) return false;
     // Rewrite the database using the VACUUM command: https://sqlite.org/lang_vacuum.html
     int ret = sqlite3_exec(m_db, "VACUUM", nullptr, nullptr, nullptr);
     return ret == SQLITE_OK;
@@ -345,6 +363,9 @@ bool SQLiteDatabase::Rewrite(const char* skip)
 
 bool SQLiteDatabase::Backup(const std::string& dest) const
 {
+    if (!m_db) return false;
+    SQLiteConnectionLock lock(m_db);
+    if (m_transaction_poisoned) return false;
     sqlite3* db_copy;
     int res = sqlite3_open(dest.c_str(), &db_copy);
     if (res != SQLITE_OK) {
@@ -388,24 +409,32 @@ std::unique_ptr<DatabaseBatch> SQLiteDatabase::MakeBatch(bool flush_on_close)
 SQLiteBatch::SQLiteBatch(SQLiteDatabase& database)
     : m_database(database)
 {
-    // Make sure we have a db handle
     assert(m_database.m_db);
-
-    SetupSQLStatements();
+    SQLiteConnectionLock lock(m_database.m_db);
+    if (!m_database.m_transaction_poisoned) SetupSQLStatements();
 }
 
 void SQLiteBatch::Close()
 {
-    // If m_db is in a transaction (i.e. not in autocommit mode), then abort the transaction in progress
-    if (m_database.m_db && sqlite3_get_autocommit(m_database.m_db) == 0) {
+    // A temporary reader or another batch must never abort the owner's
+    // transaction merely because they share the same SQLite connection.
+    if (m_txn_mutex) {
         if (TxnAbort()) {
             LogPrintf("SQLiteBatch: Batch closed unexpectedly without the transaction being explicitly committed or aborted\n");
         } else {
             LogPrintf("SQLiteBatch: Batch closed and failed to abort transaction\n");
+            if (m_txn_mutex) {
+                // The failed rollback left a transaction open. Keep FULL
+                // synchronization unchanged and refuse subsequent access;
+                // releasing the mutex must not expose an orphan transaction.
+                m_database.m_transaction_poisoned = true;
+                m_database.m_transaction_owner = nullptr;
+                m_durable_txn = false;
+                sqlite3_mutex_leave(std::exchange(m_txn_mutex, nullptr));
+            }
         }
     }
 
-    // Free all of the prepared statements
     const std::vector<std::pair<sqlite3_stmt**, const char*>> statements{
         {&m_read_stmt, "read"},
         {&m_insert_stmt, "insert"},
@@ -427,9 +456,10 @@ void SQLiteBatch::Close()
 bool SQLiteBatch::ReadKey(DataStream&& key, DataStream& value)
 {
     if (!m_database.m_db) return false;
+    SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_transaction_poisoned) return false;
     assert(m_read_stmt);
 
-    // Bind: leftmost parameter in statement is index 1
     if (!BindBlobToStatement(m_read_stmt, 1, key, "key")) return false;
     int res = sqlite3_step(m_read_stmt);
     if (res != SQLITE_ROW) {
@@ -441,7 +471,6 @@ bool SQLiteBatch::ReadKey(DataStream&& key, DataStream& value)
         sqlite3_reset(m_read_stmt);
         return false;
     }
-    // Leftmost column in result is index 0
     value.clear();
     value.write(SpanFromBlob(m_read_stmt, 0));
 
@@ -453,6 +482,9 @@ bool SQLiteBatch::ReadKey(DataStream&& key, DataStream& value)
 bool SQLiteBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
 {
     if (!m_database.m_db) return false;
+    SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_transaction_poisoned ||
+        (m_database.m_transaction_owner && m_database.m_transaction_owner != this)) return false;
     assert(m_insert_stmt && m_overwrite_stmt);
 
     sqlite3_stmt* stmt;
@@ -462,12 +494,9 @@ bool SQLiteBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
         stmt = m_insert_stmt;
     }
 
-    // Bind: leftmost parameter in statement is index 1
-    // Insert index 1 is key, 2 is value
     if (!BindBlobToStatement(stmt, 1, key, "key")) return false;
     if (!BindBlobToStatement(stmt, 2, value, "value")) return false;
 
-    // Execute
     int res = sqlite3_step(stmt);
     sqlite3_clear_bindings(stmt);
     sqlite3_reset(stmt);
@@ -480,12 +509,13 @@ bool SQLiteBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
 bool SQLiteBatch::ExecStatement(sqlite3_stmt* stmt, Span<const std::byte> blob)
 {
     if (!m_database.m_db) return false;
+    SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_transaction_poisoned ||
+        (m_database.m_transaction_owner && m_database.m_transaction_owner != this)) return false;
     assert(stmt);
 
-    // Bind: leftmost parameter in statement is index 1
     if (!BindBlobToStatement(stmt, 1, blob, "key")) return false;
 
-    // Execute
     int res = sqlite3_step(stmt);
     sqlite3_clear_bindings(stmt);
     sqlite3_reset(stmt);
@@ -508,9 +538,10 @@ bool SQLiteBatch::ErasePrefix(Span<const std::byte> prefix)
 bool SQLiteBatch::HasKey(DataStream&& key)
 {
     if (!m_database.m_db) return false;
+    SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_transaction_poisoned) return false;
     assert(m_read_stmt);
 
-    // Bind: leftmost parameter in statement is index 1
     if (!BindBlobToStatement(m_read_stmt, 1, key, "key")) return false;
     int res = sqlite3_step(m_read_stmt);
     sqlite3_clear_bindings(m_read_stmt);
@@ -520,6 +551,9 @@ bool SQLiteBatch::HasKey(DataStream&& key)
 
 DatabaseCursor::Status SQLiteCursor::Next(DataStream& key, DataStream& value)
 {
+    if (!m_database.m_db) return Status::FAIL;
+    SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_transaction_poisoned) return Status::FAIL;
     int res = sqlite3_step(m_cursor_stmt);
     if (res == SQLITE_DONE) {
         return Status::DONE;
@@ -532,7 +566,6 @@ DatabaseCursor::Status SQLiteCursor::Next(DataStream& key, DataStream& value)
     key.clear();
     value.clear();
 
-    // Leftmost column in result is index 0
     key.write(SpanFromBlob(m_cursor_stmt, 0));
     value.write(SpanFromBlob(m_cursor_stmt, 1));
     return Status::MORE;
@@ -552,7 +585,9 @@ SQLiteCursor::~SQLiteCursor()
 std::unique_ptr<DatabaseCursor> SQLiteBatch::GetNewCursor()
 {
     if (!m_database.m_db) return nullptr;
-    auto cursor = std::make_unique<SQLiteCursor>();
+    SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_transaction_poisoned) return nullptr;
+    auto cursor = std::make_unique<SQLiteCursor>(m_database);
 
     const char* stmt_text = "SELECT key, value FROM main";
     int res = sqlite3_prepare_v2(m_database.m_db, stmt_text, -1, &cursor->m_cursor_stmt, nullptr);
@@ -567,6 +602,8 @@ std::unique_ptr<DatabaseCursor> SQLiteBatch::GetNewCursor()
 std::unique_ptr<DatabaseCursor> SQLiteBatch::GetNewPrefixCursor(Span<const std::byte> prefix)
 {
     if (!m_database.m_db) return nullptr;
+    SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_transaction_poisoned) return nullptr;
 
     // To get just the records we want, the SQL statement does a comparison of the binary data
     // where the data must be greater than or equal to the prefix, and less than
@@ -587,7 +624,7 @@ std::unique_ptr<DatabaseCursor> SQLiteBatch::GetNewPrefixCursor(Span<const std::
         end_range.clear();
     }
 
-    auto cursor = std::make_unique<SQLiteCursor>(start_range, end_range);
+    auto cursor = std::make_unique<SQLiteCursor>(m_database, start_range, end_range);
     if (!cursor) return nullptr;
 
     const char* stmt_text = end_range.empty() ? "SELECT key, value FROM main WHERE key >= ?" :
@@ -608,7 +645,10 @@ std::unique_ptr<DatabaseCursor> SQLiteBatch::GetNewPrefixCursor(Span<const std::
 
 bool SQLiteBatch::TxnBegin(bool durable)
 {
-    if (!m_database.m_db || sqlite3_get_autocommit(m_database.m_db) == 0) return false;
+    if (!m_database.m_db || m_txn_mutex) return false;
+    SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_transaction_poisoned ||
+        m_database.m_transaction_owner || sqlite3_get_autocommit(m_database.m_db) == 0) return false;
     if (durable && m_database.m_use_unsafe_sync) {
         const int sync_res = sqlite3_exec(m_database.m_db, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr);
         if (sync_res != SQLITE_OK) {
@@ -625,46 +665,70 @@ bool SQLiteBatch::TxnBegin(bool durable)
         return false;
     }
     m_durable_txn = durable;
+    m_database.m_transaction_owner = this;
+    m_txn_mutex = lock.Release();
     return true;
+}
+
+void SQLiteBatch::ReleaseTransaction()
+{
+    assert(m_txn_mutex);
+    assert(m_database.m_transaction_owner == this);
+    assert(sqlite3_get_autocommit(m_database.m_db) != 0);
+    if (m_durable_txn && m_database.m_use_unsafe_sync) {
+        if (sqlite3_exec(m_database.m_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr) != SQLITE_OK) {
+            LogPrintf("SQLiteBatch: Failed to restore unsafe synchronous mode after transaction\n");
+        }
+    }
+    m_durable_txn = false;
+    m_database.m_transaction_owner = nullptr;
+    sqlite3_mutex_leave(std::exchange(m_txn_mutex, nullptr));
 }
 
 bool SQLiteBatch::TxnCommit()
 {
-    if (!m_database.m_db || sqlite3_get_autocommit(m_database.m_db) != 0) return false;
+    if (!m_txn_mutex) return false;
+    if (sqlite3_get_autocommit(m_database.m_db) != 0) {
+        // SQLite may itself roll back on an I/O or constraint failure. Only
+        // the owner releases its lock and durability state in that case.
+        ReleaseTransaction();
+        return false;
+    }
     int res = sqlite3_exec(m_database.m_db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr);
     if (res != SQLITE_OK) {
         LogPrintf("SQLiteBatch: Failed to commit the transaction\n");
         // A failed COMMIT can leave the connection inside the transaction.
         // Explicitly roll it back so partial non-HD key state cannot leak into
         // a later batch and synchronous mode can be restored safely.
-        if (sqlite3_exec(m_database.m_db, "ROLLBACK TRANSACTION", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        if (sqlite3_get_autocommit(m_database.m_db) == 0 &&
+            sqlite3_exec(m_database.m_db, "ROLLBACK TRANSACTION", nullptr, nullptr, nullptr) != SQLITE_OK) {
             LogPrintf("SQLiteBatch: Failed to roll back after commit failure\n");
         }
     }
     const bool committed = res == SQLITE_OK;
-    if (m_durable_txn && m_database.m_use_unsafe_sync) {
-        if (sqlite3_exec(m_database.m_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr) != SQLITE_OK) {
-            LogPrintf("SQLiteBatch: Failed to restore unsafe synchronous mode after durable transaction\n");
-        }
+    if (sqlite3_get_autocommit(m_database.m_db) != 0) {
+        ReleaseTransaction();
     }
-    m_durable_txn = false;
+    // If rollback also failed, retain ownership and the connection lock so
+    // the caller can retry abort. Close will poison an unabortable database.
     return committed;
 }
 
 bool SQLiteBatch::TxnAbort()
 {
-    if (!m_database.m_db || sqlite3_get_autocommit(m_database.m_db) != 0) return false;
+    if (!m_txn_mutex) return false;
+    if (sqlite3_get_autocommit(m_database.m_db) != 0) {
+        ReleaseTransaction();
+        return false;
+    }
     int res = sqlite3_exec(m_database.m_db, "ROLLBACK TRANSACTION", nullptr, nullptr, nullptr);
     if (res != SQLITE_OK) {
         LogPrintf("SQLiteBatch: Failed to abort the transaction\n");
     }
     const bool aborted = res == SQLITE_OK;
-    if (m_durable_txn && m_database.m_use_unsafe_sync) {
-        if (sqlite3_exec(m_database.m_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr) != SQLITE_OK) {
-            LogPrintf("SQLiteBatch: Failed to restore unsafe synchronous mode after abort\n");
-        }
+    if (sqlite3_get_autocommit(m_database.m_db) != 0) {
+        ReleaseTransaction();
     }
-    m_durable_txn = false;
     return aborted;
 }
 

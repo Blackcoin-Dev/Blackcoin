@@ -105,14 +105,6 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
     def _bump_mocktime(self, seconds):
         self._set_mocktime(self.mock_time + seconds)
 
-    def _bump_mocktime_past_tip(self, seconds=2):
-        """Advance the frozen node clock without relying on stale fixture state."""
-        node = self.nodes[0]
-        tip_time = node.getblockheader(node.getbestblockhash())["time"]
-        self._set_mocktime(
-            max(self.mock_time, tip_time, int(time.time())) + seconds
-        )
-
     def _advance_past_mempool_entry_time(self, node, txid):
         """Advance monotonically beyond an entry before forcing zero-hour expiry."""
         entry_time = node.getmempoolentry(txid)["time"]
@@ -502,50 +494,55 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             f"claims did not become retained/current-branch-ineligible: {sorted(pending)}"
         )
 
-    def _wait_for_positive_hash_and_one_new_claim(
+    def _wait_for_one_new_submitted_claim(
         self, wallets, claims_before, timeout=180
     ):
-        """Observe positive hashing and exactly one new wallet claim per miner."""
-        observed_positive_hash = {name: False for name in wallets}
+        """Wait for one submitted proof claim from each current miner run."""
+        submitted = {name: 0 for name in wallets}
         new_claims = {}
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for name, wallet in wallets.items():
                 info = get_pow_mining_info(wallet)
-                observed_positive_hash[name] |= info["hashrate"] > 0
+                submitted[name] = info["claims_submitted"]
+                assert submitted[name] <= 1, (
+                    f"{name} submitted more than one claim in one miner run: "
+                    f"{submitted[name]}"
+                )
                 delta = self._claim_txids(wallet) - claims_before[name]
                 assert len(delta) <= 1, (
                     f"{name} authored more than one claim in one worker iteration: {delta}"
                 )
                 if len(delta) == 1:
-                    new_claims[name] = next(iter(delta))
+                    txid = next(iter(delta))
+                    if new_claims.get(name) != txid:
+                        self._claim_scripts(wallet, txid)
+                        new_claims[name] = txid
+                else:
+                    new_claims.pop(name, None)
             if (
-                all(observed_positive_hash.values())
+                all(count == 1 for count in submitted.values())
                 and len(new_claims) == len(wallets)
             ):
                 return new_claims
             time.sleep(0.02)
         raise AssertionError(
-            "miners did not expose positive hashrate and one bounded claim: "
-            f"positive={observed_positive_hash}, new={new_claims}"
+            "miners did not submit exactly one new proof claim each: "
+            f"submitted={submitted}, new={new_claims}"
         )
 
-    def _observe_positive_hash_without_submission(
+    def _observe_proof_without_submission(
         self, name, wallet, claims_before, expected_anchors, timeout=180
     ):
-        """Stop at the deterministic submit barrier after proving live work."""
+        """Observe a completed proof, then stop before claim submission."""
         node = self.nodes[0]
         with node.wait_for_debug_log(
-            [b"Gold Rush PoW claim submission test barrier reached"],
+            [f"[{name}] Gold Rush PoW claim submission test barrier reached".encode()],
             timeout=timeout,
         ):
             started = wallet.setpowmining(True, 1, 100)
             assert_equal(started["enabled"], True)
             assert_equal(started["created_payout_key"], False)
-            # Hashrate accounting uses the node clock. Advance this fixture's
-            # frozen mock clock before the first batch completes so positive
-            # work is observable without changing the active tip.
-            self._bump_mocktime_past_tip()
         try:
             active = self._assert_family_liveness_gate(
                 wallet,
@@ -557,7 +554,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             wallet.setpowmining(False)
         assert_equal(active["enabled"], True)
         assert active["state"] in {"hashing", "ready", "claim_in_flight"}
-        assert active["hashrate"] > 0
+        assert_equal(active["claims_submitted"], 0)
         assert_equal(
             active["raw_quarantined_claims"], len(expected_anchors) + 1
         )
@@ -579,8 +576,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(stopped["enabled"], False)
         assert_equal(stopped["state"], "disabled")
         assert_equal(stopped["hashrate"], 0)
+        assert_equal(stopped["claims_submitted"], 0)
         self.log.info(
-            f"{name} retained family exposed positive work before deliberate defer"
+            f"{name} retained family reached the proof barrier without submission"
         )
 
     @staticmethod
@@ -689,9 +687,8 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         claims_before = {name: self._claim_txids(wallet)}
         started = wallet.setpowmining(True, 1, 100)
         assert_equal(started["created_payout_key"], False)
-        self._bump_mocktime_past_tip()
         try:
-            current_claim = self._wait_for_positive_hash_and_one_new_claim(
+            current_claim = self._wait_for_one_new_submitted_claim(
                 {name: wallet}, claims_before
             )[name]
         finally:
@@ -748,7 +745,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             )
             assert_equal(service_gate["enabled"], False)
             assert_equal(service_gate["state"], "disabled")
-            self._observe_positive_hash_without_submission(
+            self._observe_proof_without_submission(
                 name,
                 wallet,
                 service_claims,
@@ -777,10 +774,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
             claims_before = {name: self._claim_txids(wallet)}
             wallet.setpowmining(True, 1, 100)
-            self._bump_mocktime_past_tip()
             try:
                 next_claim = (
-                    self._wait_for_positive_hash_and_one_new_claim(
+                    self._wait_for_one_new_submitted_claim(
                         {name: wallet}, claims_before
                     )[name]
                 )

@@ -1,5 +1,21 @@
+30.1.5.2 Maintenance Release Notes
+==================================
+
+This release fixes the legacy claim-input scan, serializes SQLite wallet
+transactions across batches, and corrects SQLite startup instance counting.
+It also simplifies GUI, RPC help, and operator
+documentation. Consensus rules and wallet storage formats are unchanged.
+
+The final source is RC0 with `CLIENT_VERSION_IS_RELEASE=true`. Publication
+requires exact-source qualification and the signed immutable release controls. See
+`doc/release-notes/release-notes-30.1.5.2.md` for changes and compatibility.
+
 30.1.5.1 Maintenance Release Notes
 ==================================
+
+This section records the historical v30.1.5.1 plan and notes. Its statements
+about publication status reflect that release's own qualification boundary,
+not the current v30.1.5.2 source.
 
 Blackcoin Core v30.1.5.1 is the corrective successor to immutable v30.1.5.
 It corrects complete retained-history capacity, confirmed-parent referenced-output

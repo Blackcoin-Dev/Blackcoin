@@ -128,7 +128,7 @@
      <item row="6" column="0" colspan="2">
       <widget class="QCheckBox" name="quantumStakingCheckBox">
        <property name="toolTip">
-        <string>Full unlock: legacy staking plus quantum, Gold Rush, migration, and cold-staking transactions. Required for any quantum action.</string>
+        <string>Full unlock permits legacy staking, creating wallet-backed quantum keys, and signing Gold Rush, migration, quantum-spend, and cold-staking transactions. Viewing balances and receiving funds do not require an unlock.</string>
        </property>
        <property name="text">
         <string>Legacy and Quantum Staking</string>

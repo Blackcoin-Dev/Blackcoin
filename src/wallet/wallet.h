@@ -153,6 +153,21 @@ bool ShadowPowClaimRefreshInputMatchesMiningGate(
 
 static constexpr int DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS{1};
 
+/** Diagnostics from one complete wallet-only claim-input source snapshot.
+ * Counts are observations, never input-selection authority. A nonnumeric
+ * failure has zero observed/limit values. */
+struct ShadowPowClaimInputEnumerationInfo {
+    std::string capacity_reason{"none"};
+    size_t capacity_observed{0};
+    size_t capacity_limit{0};
+    size_t live_outputs{0};
+    size_t legacy_source_outputs{0};
+    size_t script_managers{0};
+    size_t manager_work{0};
+    size_t source_work{0};
+    size_t script_bytes{0};
+};
+
 /** One coherent wallet/chain snapshot of the legacy stake capacity protected
  * from Gold Rush PoW claim input selection. Synthetic quantum rewards are not
  * legacy stake candidates and therefore never enter these counts. */
@@ -172,6 +187,7 @@ struct ShadowPowClaimStakeReserveInfo {
     size_t claim_coins_after_reserve{0};
     bool last_stake_coin_guard{false};
     bool warm_output_capacity_exceeded{false};
+    ShadowPowClaimInputEnumerationInfo input_enumeration;
 };
 
 enum class StakingTelemetryState : uint8_t {
@@ -845,6 +861,10 @@ private:
     // lineage, RGB, demurrage, and solvability policy remains authoritative in
     // AvailableCoinsForStaking and is deliberately not cached here.
     std::set<COutPoint> m_live_unspent_stake_outpoints GUARDED_BY(cs_wallet);
+    // Immutable-script subset of the broad live index. Only scripts excluded
+    // by both legacy staking and claim selection are omitted. Dynamic wallet
+    // policy and ownership are deliberately evaluated by the warm scan.
+    std::set<COutPoint> m_live_unspent_legacy_claim_outpoints GUARDED_BY(cs_wallet);
     std::optional<ShadowPowClaimStakeReserveInfo>
         m_cached_shadow_pow_claim_stake_reserve GUARDED_BY(cs_wallet);
     /** Every observable live-index membership change advances this value.
@@ -1754,6 +1774,11 @@ public:
         return m_live_unspent_stake_outpoints;
     }
 
+    const std::set<COutPoint>& GetLiveUnspentLegacyClaimOutpoints() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_live_unspent_legacy_claim_outpoints;
+    }
+
     uint64_t GetLiveUnspentStakeGenerationLocked() const
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
@@ -2075,10 +2100,8 @@ public:
     void AbandonOrphanedCoinstakes();
 
     /**
-     * Blocks until the wallet state is up-to-date to /at least/ the current
-     * chain at the time this function is entered
-     * Obviously holding cs_main/cs_wallet when going into this call may cause
-     * deadlock
+     * Blocks until the wallet catches up to the chain tip observed on entry.
+     * Call without cs_main or cs_wallet; holding either lock can deadlock.
      */
     void BlockUntilSyncedToCurrentChain() const LOCKS_EXCLUDED(::cs_main) EXCLUSIVE_LOCKS_REQUIRED(!cs_wallet);
 

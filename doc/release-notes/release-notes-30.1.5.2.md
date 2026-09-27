@@ -37,6 +37,5 @@ upgrading. This maintenance revision requires no reindex or wallet recreation.
 
 Production publication requires exact-source tests, source signing, reproducible
 builds, and the controls listed in the [release process](../release-process.md).
-These notes do not assert that qualification or publication has completed.
 Windows packages remain without Authenticode signatures. macOS applications
 use ad-hoc signatures and are not Developer-ID signed or notarized.

@@ -81,6 +81,42 @@ BOOST_AUTO_TEST_CASE(list_databases_top_level_sqlite_wallet)
     BOOST_REQUIRE_EQUAL(wallets.size(), 1U);
     BOOST_CHECK(wallets.front().empty());
 }
+
+BOOST_AUTO_TEST_CASE(sqlite_failed_configuration_does_not_leak_instance_count)
+{
+    // Start without other SQLite users; sqlite3_config must fail after initialize.
+    BOOST_REQUIRE_EQUAL(sqlite3_shutdown(), SQLITE_OK);
+    BOOST_REQUIRE_EQUAL(sqlite3_config(SQLITE_CONFIG_SERIALIZED), SQLITE_OK);
+    struct SQLiteShutdownOnExit {
+        ~SQLiteShutdownOnExit() { sqlite3_shutdown(); }
+    } shutdown_on_exit;
+    BOOST_REQUIRE_EQUAL(sqlite3_initialize(), SQLITE_OK);
+
+    DatabaseOptions options;
+    DatabaseStatus status;
+    bilingual_str error;
+    const fs::path wallet_path = m_path_root / "retry-after-config-failure";
+    auto failed = MakeSQLiteDatabase(wallet_path, options, status, error);
+    BOOST_REQUIRE(!failed);
+    BOOST_CHECK(status == DatabaseStatus::FAILED_LOAD);
+    BOOST_CHECK(error.original.find("Failed to setup error log") != std::string::npos);
+
+    BOOST_REQUIRE_EQUAL(sqlite3_shutdown(), SQLITE_OK);
+    error = {};
+    auto database = MakeSQLiteDatabase(wallet_path, options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    auto batch = database->MakeBatch();
+    BOOST_REQUIRE(batch->Write(std::string{"after-retry"}, 42));
+    int value{0};
+    BOOST_REQUIRE(batch->Read(std::string{"after-retry"}, value));
+    BOOST_CHECK_EQUAL(value, 42);
+    batch.reset();
+    database.reset();
+
+    // If the failed constructor retained a reference, the retry's destructor
+    // left SQLite initialized and configuration is still refused.
+    BOOST_CHECK_EQUAL(sqlite3_config(SQLITE_CONFIG_SERIALIZED), SQLITE_OK);
+}
 #endif
 
 static std::shared_ptr<BerkeleyEnvironment> GetWalletEnv(const fs::path& path, fs::path& database_filename)

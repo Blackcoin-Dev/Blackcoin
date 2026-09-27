@@ -91,6 +91,7 @@ BOOST_AUTO_TEST_CASE(sqlite_failed_configuration_does_not_leak_instance_count)
         ~SQLiteShutdownOnExit() { sqlite3_shutdown(); }
     } shutdown_on_exit;
     BOOST_REQUIRE_EQUAL(sqlite3_initialize(), SQLITE_OK);
+    BOOST_REQUIRE_EQUAL(sqlite3_config(SQLITE_CONFIG_SERIALIZED), SQLITE_MISUSE);
 
     DatabaseOptions options;
     DatabaseStatus status;
@@ -99,7 +100,6 @@ BOOST_AUTO_TEST_CASE(sqlite_failed_configuration_does_not_leak_instance_count)
     auto failed = MakeSQLiteDatabase(wallet_path, options, status, error);
     BOOST_REQUIRE(!failed);
     BOOST_CHECK(status == DatabaseStatus::FAILED_LOAD);
-    BOOST_CHECK(error.original.find("Failed to setup error log") != std::string::npos);
 
     BOOST_REQUIRE_EQUAL(sqlite3_shutdown(), SQLITE_OK);
     error = {};

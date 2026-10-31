@@ -314,7 +314,8 @@ BOOST_AUTO_TEST_CASE(header_replay_compact_counter_equivalence)
     std::map<int, uint32_t> reference;
     uint32_t sequence{0x6d2b79f5};
     for (int turn = 0; turn < 3000; ++turn) {
-        sequence = sequence * 1664525U + 1013904223U;
+        sequence = static_cast<uint32_t>(
+            uint64_t{sequence} * 1664525U + 1013904223U);
         const int first_height = (sequence >> 16) % 73;
         const int last_height = first_height + (sequence % 5);
         CBlockIndex first, last;

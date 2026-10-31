@@ -71,9 +71,9 @@ class Upgrade30153Test(BitcoinTestFramework):
         node.args[0] = binary
         self.start_node(0)
         self._assert_version(revision)
-        for name in self.wallets:
-            if name not in node.listwallets():
-                node.loadwallet(name)
+        # Every tested wallet explicitly requested loading on startup. Check
+        # persistence across revisions before any wallet-specific operation.
+        assert set(self.wallets).issubset(node.listwallets())
 
     def _snapshot(self, name):
         node = self.nodes[0]
@@ -122,7 +122,9 @@ class Upgrade30153Test(BitcoinTestFramework):
         node.createwallet(wallet_name="funding", descriptors=True)
         funding = node.get_wallet_rpc("funding")
         mining_address = funding.getnewaddress("synthetic mining", "legacy")
-        self.generatetoaddress(node, COINBASE_MATURITY + 2, mining_address, sync_fun=self.no_op)
+        # Prepare baseline wallets before funding them. The published GUI can
+        # deadlock when a load callback overlaps a transaction notification;
+        # that sequence has separate candidate regression coverage.
         formats = [("sqlite", True)]
         if self.is_bdb_compiled():
             formats.append(("bdb", False))
@@ -142,7 +144,10 @@ class Upgrade30153Test(BitcoinTestFramework):
             address = wallet.getnewaddress("baseline retained address", "legacy")
             quantum = wallet.getnewquantumaddress("baseline non-HD quantum key")
             assert quantum["stored_in_wallet"]
-            self.wallets[name] = {"addresses": [address], "txids": [funding.sendtoaddress(address, Decimal("10"))]}
+            self.wallets[name] = {"addresses": [address], "txids": []}
+        self.generatetoaddress(node, COINBASE_MATURITY + 2, mining_address, sync_fun=self.no_op)
+        for records in self.wallets.values():
+            records["txids"].append(funding.sendtoaddress(records["addresses"][0], Decimal("10")))
         self.generatetoaddress(node, 1, mining_address, sync_fun=self.no_op)
         expected = {name: self._snapshot(name) for name in self.wallets}
         for snapshot in expected.values():

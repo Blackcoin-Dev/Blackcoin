@@ -27,6 +27,7 @@
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QMutexLocker>
+#include <QPointer>
 #include <QThread>
 #include <QTimer>
 #include <QWindow>
@@ -60,12 +61,25 @@ WalletController::WalletController(ClientModel& client_model, const PlatformStyl
 // available in the header, just forward declared.
 WalletController::~WalletController()
 {
-    // Drain worker-recorded backup notices while this controller's GUI route
-    // still exists. QObject deletes its model children after this destructor.
-    for (WalletModel* wallet_model : getOpenWallets()) wallet_model->join();
+    assert(QThread::currentThread() == thread());
+    m_closing = true;
+    // Disconnect waits for any synchronous Core load callback to finish.
+    // Such callbacks no longer wait for the GUI while holding registry locks.
+    m_handler_load_wallet.reset();
     m_activity_thread->quit();
     m_activity_thread->wait();
     delete m_activity_worker;
+
+    std::vector<WalletModel*> wallets;
+    {
+        QMutexLocker locker(&m_mutex);
+        wallets.swap(m_wallets);
+    }
+    // The controller owns every registered model, including models whose
+    // queued GUI parenting has not run. Drain all backup notices while the
+    // controller route still exists, then delete on the GUI thread.
+    for (WalletModel* wallet_model : wallets) wallet_model->join();
+    for (WalletModel* wallet_model : wallets) delete wallet_model;
 }
 
 std::vector<WalletModel*> WalletController::getOpenWallets() const
@@ -90,37 +104,44 @@ std::map<std::string, bool> WalletController::listWalletDir() const
 
 void WalletController::closeWallet(WalletModel* wallet_model, QWidget* parent)
 {
+    const QPointer<WalletController> guarded_controller{this};
+    const QPointer<WalletModel> guarded_wallet{wallet_model};
     QMessageBox box(parent);
     box.setWindowTitle(tr("Close wallet"));
     box.setText(tr("Are you sure you wish to close the wallet <i>%1</i>?").arg(GUIUtil::HtmlEscape(wallet_model->getDisplayName())));
     box.setStandardButtons(QMessageBox::Yes|QMessageBox::Cancel);
     box.setDefaultButton(QMessageBox::Yes);
-    if (box.exec() != QMessageBox::Yes) return;
+    if (box.exec() != QMessageBox::Yes || !guarded_controller || !guarded_wallet || m_closing) return;
 
-    // First remove wallet from node.
-    wallet_model->wallet().remove();
-    // Now release the model.
-    removeAndDeleteWallet(wallet_model);
+    // First remove wallet from node, without the controller mutex held.
+    guarded_wallet->wallet().remove();
+    if (guarded_wallet) removeAndDeleteWallet(guarded_wallet.data());
 }
 
 void WalletController::closeAllWallets(QWidget* parent)
 {
+    const QPointer<WalletController> guarded_controller{this};
     QMessageBox::StandardButton button = QMessageBox::question(parent, tr("Close all wallets"),
         tr("Are you sure you wish to close all wallets?"),
         QMessageBox::Yes|QMessageBox::Cancel,
         QMessageBox::Yes);
-    if (button != QMessageBox::Yes) return;
+    if (button != QMessageBox::Yes || !guarded_controller || m_closing) return;
 
-    QMutexLocker locker(&m_mutex);
-    for (WalletModel* wallet_model : m_wallets) {
-        wallet_model->wallet().remove();
-        Q_EMIT walletRemoved(wallet_model);
-        delete wallet_model;
+    std::vector<QPointer<WalletModel>> wallets;
+    {
+        QMutexLocker locker(&m_mutex);
+        for (WalletModel* wallet_model : m_wallets) wallets.emplace_back(wallet_model);
     }
-    m_wallets.clear();
+    // Core removal takes the wallet registry mutex. Never hold m_mutex here:
+    // a concurrent Core load callback takes those locks in the opposite order.
+    for (const QPointer<WalletModel>& wallet_model : wallets) {
+        if (!wallet_model) continue;
+        wallet_model->wallet().remove();
+        if (wallet_model) removeAndDeleteWallet(wallet_model.data());
+    }
 }
 
-WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wallet> wallet)
+QPointer<WalletModel> WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wallet> wallet)
 {
     QMutexLocker locker(&m_mutex);
 
@@ -129,7 +150,7 @@ WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wal
         std::string name = wallet->getWalletName();
         for (WalletModel* wallet_model : m_wallets) {
             if (wallet_model->wallet().getWalletName() == name) {
-                return wallet_model;
+                return QPointer<WalletModel>{wallet_model};
             }
         }
     }
@@ -138,6 +159,10 @@ WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wal
     WalletModel* wallet_model = new WalletModel(std::move(wallet), m_client_model, m_platform_style,
                                                 nullptr /* required for the following moveToThread() call */);
 
+    // Guard the model before transferring it to the GUI thread. Queued parent
+    // binding must remain safe if an unload removes the model first.
+    const QPointer<WalletModel> guarded_wallet{wallet_model};
+
     // Move WalletModel object to the thread that created the WalletController
     // object (GUI main thread), instead of the current thread, which could be
     // an outside wallet thread or RPC thread sending a LoadWallet notification.
@@ -145,9 +170,11 @@ WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wal
     // handled on the GUI event loop.
     wallet_model->moveToThread(thread());
     // setParent(parent) must be called in the thread which created the parent object. More details in #18948.
-    QMetaObject::invokeMethod(this, [wallet_model, this] {
-        wallet_model->setParent(this);
-    }, GUIUtil::blockingGUIThreadConnection());
+    // Never wait for the GUI from a Core load callback: that callback holds
+    // the wallet registry mutex, which GUI transaction notifications also use.
+    QMetaObject::invokeMethod(this, [guarded_wallet, this] {
+        if (guarded_wallet) guarded_wallet->setParent(this);
+    }, Qt::AutoConnection);
 
     m_wallets.push_back(wallet_model);
 
@@ -157,17 +184,18 @@ WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wal
     const bool called = QMetaObject::invokeMethod(wallet_model, "startPollBalance");
     assert(called);
 
-    connect(wallet_model, &WalletModel::unload, this, [this, wallet_model] {
+    connect(wallet_model, &WalletModel::unload, this, [this, guarded_wallet] {
+        if (m_closing || !guarded_wallet) return;
         // Defer removeAndDeleteWallet when no modal widget is active.
         // TODO: remove this workaround by removing usage of QDialog::exec.
         if (QApplication::activeModalWidget()) {
-            connect(qApp, &QApplication::focusWindowChanged, wallet_model, [this, wallet_model]() {
-                if (!QApplication::activeModalWidget()) {
-                    removeAndDeleteWallet(wallet_model);
+            connect(qApp, &QApplication::focusWindowChanged, guarded_wallet.data(), [this, guarded_wallet]() {
+                if (guarded_wallet && !QApplication::activeModalWidget()) {
+                    removeAndDeleteWallet(guarded_wallet.data());
                 }
             }, Qt::QueuedConnection);
         } else {
-            removeAndDeleteWallet(wallet_model);
+            removeAndDeleteWallet(guarded_wallet.data());
         }
     }, Qt::QueuedConnection);
 
@@ -182,22 +210,35 @@ WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wal
     // Re-emit coinsSent signal from wallet model.
     connect(wallet_model, &WalletModel::coinsSent, this, &WalletController::coinsSent);
 
-    Q_EMIT walletAdded(wallet_model);
+    locker.unlock();
+    // GUI receivers may query the controller synchronously. Publish only
+    // after releasing its mutex, and suppress queued publication on shutdown.
+    QMetaObject::invokeMethod(this, [this, guarded_wallet] {
+        if (guarded_wallet && !m_closing) Q_EMIT walletAdded(guarded_wallet.data());
+    }, Qt::AutoConnection);
 
-    return wallet_model;
+    // Copy the pre-move guard: GUI publication/unload may already have retired
+    // the model before the worker or activity receives this return value.
+    return guarded_wallet;
 }
 
 void WalletController::removeAndDeleteWallet(WalletModel* wallet_model)
 {
-    // Unregister wallet model.
+    assert(QThread::currentThread() == thread());
+    // Shutdown owns its drained model list, even during a nested warning dialog.
+    if (m_closing) return;
+    // Unregister once, before emitting signals which can re-enter this method.
     {
         QMutexLocker locker(&m_mutex);
-        m_wallets.erase(std::remove(m_wallets.begin(), m_wallets.end(), wallet_model));
+        auto it = std::find(m_wallets.begin(), m_wallets.end(), wallet_model);
+        if (it == m_wallets.end()) return;
+        m_wallets.erase(it);
     }
+    const QPointer<WalletModel> guarded_wallet{wallet_model};
     Q_EMIT walletRemoved(wallet_model);
-    // Currently this can trigger the unload since the model can hold the last
-    // CWallet shared pointer.
-    delete wallet_model;
+    // Direct receivers may already have retired the model or its parent.
+    // Releasing the final model can also release the last CWallet reference.
+    if (guarded_wallet) delete guarded_wallet.data();
 }
 
 WalletControllerActivity::WalletControllerActivity(WalletController* wallet_controller, QWidget* parent_widget)

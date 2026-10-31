@@ -3631,7 +3631,7 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "committer is"):
                 identity.verify_commit(legacy_sha)
 
-    def test_source_identity_accepts_only_one_canonical_codex_trailer_at_end(self):
+    def test_source_identity_attribution_exception_is_limited_to_published_history(self):
         identity = load_module("verify_source_identity")
         commit = "0" * 40
         prefix = (
@@ -3640,9 +3640,16 @@ class ReleaseToolTests(unittest.TestCase):
             "Blackcoin-Dev\0"
             "298119138+Blackcoin-Dev@users.noreply.github.com\0"
         )
-        canonical = identity.CANONICAL_CODEX_TRAILER
-        with mock.patch.object(identity, "git", return_value=prefix + "Release fixes\n\n" + canonical):
+        canonical = identity.LEGACY_ATTRIBUTION_TRAILER
+        with mock.patch.object(identity, "git", return_value=prefix + "Release fixes\n\n" + canonical), \
+                mock.patch.object(identity, "legacy_attribution_commits", return_value=frozenset({commit})):
             identity.verify_commit(commit)
+            with self.assertRaisesRegex(RuntimeError, "contributor-attribution trailer"):
+                identity.verify_commit("1" * 40)
+        with mock.patch.object(identity, "git", return_value=prefix + "Release fixes"), \
+                mock.patch.object(identity, "legacy_attribution_commits") as legacy:
+            identity.verify_commit("1" * 40)
+            legacy.assert_not_called()
         for message in (
             "Release fixes\n\n" + canonical + "\n" + canonical,
             "Release fixes\n\nCo-Authored-By: Other <other@example.invalid>",
@@ -3651,9 +3658,18 @@ class ReleaseToolTests(unittest.TestCase):
             "Release fixes\n\nCo-Developed-By: Codex <noreply@openai.com>",
             canonical + "\n\nRelease fixes",
         ):
-            with self.subTest(message=message), mock.patch.object(identity, "git", return_value=prefix + message):
+            with self.subTest(message=message), mock.patch.object(identity, "git", return_value=prefix + message), \
+                    mock.patch.object(identity, "legacy_attribution_commits", return_value=frozenset({commit})):
                 with self.assertRaisesRegex(RuntimeError, "contributor-attribution trailer"):
                     identity.verify_commit(commit)
+
+    def test_source_identity_historical_attribution_uses_immutable_ancestry(self):
+        identity = load_module("verify_source_identity")
+        with mock.patch.object(identity, "git", return_value="a" * 40 + "\n" + "b" * 40) as command:
+            expected = frozenset({"a" * 40, "b" * 40})
+            self.assertEqual(identity.legacy_attribution_commits(), expected)
+            self.assertEqual(identity.legacy_attribution_commits(), expected)
+            command.assert_called_once_with("rev-list", "5fe9a3dfa9749b70d61da66635fcde0fc107fa64", "--")
 
     def test_source_identity_github_merge_exception_is_sha_pinned(self):
         identity = load_module("verify_source_identity")

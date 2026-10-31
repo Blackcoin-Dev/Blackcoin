@@ -7,6 +7,7 @@
 import argparse
 import base64
 import binascii
+import functools
 import hashlib
 from pathlib import Path
 import re
@@ -90,7 +91,10 @@ PINNED_IDENTITY_EXCEPTIONS = {
 }
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ATTRIBUTION_TRAILER_RE = re.compile(r"^(?:co-authored-by|co-developed-by):", re.IGNORECASE)
-CANONICAL_CODEX_TRAILER = "Co-Authored-By: Codex <noreply@openai.com>"
+# Preserve already published history without permitting attribution exceptions
+# in new commits. This immutable boundary is the v30.1.5.2 source commit.
+LEGACY_ATTRIBUTION_TIP = "5fe9a3dfa9749b70d61da66635fcde0fc107fa64"
+LEGACY_ATTRIBUTION_TRAILER = "Co-Authored-By: Codex <noreply@openai.com>"
 TAG_SIGNATURE_MARKERS = (
     "-----BEGIN PGP SIGNATURE-----",
     "-----BEGIN SSH SIGNATURE-----",
@@ -114,6 +118,11 @@ def resolved_commit(value):
     return commit
 
 
+@functools.lru_cache(maxsize=1)
+def legacy_attribution_commits():
+    return frozenset(git("rev-list", LEGACY_ATTRIBUTION_TIP, "--").splitlines())
+
+
 def verify_commit(commit):
     fields = git("show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce%x00%B", commit).split("\0", 4)
     if len(fields) != 5:
@@ -135,8 +144,10 @@ def verify_commit(commit):
     lines = message.splitlines()
     attribution = [(index, line) for index, line in enumerate(lines)
                    if ATTRIBUTION_TRAILER_RE.match(line.strip())]
-    if attribution and attribution != [(len(lines) - 1, CANONICAL_CODEX_TRAILER)]:
-        raise RuntimeError(f"{commit} contains an additional contributor-attribution trailer")
+    if attribution:
+        if (attribution != [(len(lines) - 1, LEGACY_ATTRIBUTION_TRAILER)] or
+                commit not in legacy_attribution_commits()):
+            raise RuntimeError(f"{commit} contains an additional contributor-attribution trailer")
 
 
 def ssh_public_key_fingerprint(encoded_key):

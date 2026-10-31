@@ -14,7 +14,11 @@
 #include <net.h>
 #include <validationinterface.h>
 
+#include <map>
+
 class AddrMan;
+class BlockValidationState;
+class CBlockIndex;
 class CChainParams;
 class CTxMemPool;
 class ChainstateManager;
@@ -45,6 +49,21 @@ static const unsigned int DEFAULT_HEADER_SPAM_FILTER_IGNORE_PORT = true;
 /** Default for -headerspamfilterduringibd, whether to enable header spam filter during initial block
  download */
 static const unsigned int DEFAULT_HEADER_SPAM_FILTER_DURING_IBD = false;
+
+/** Per-service replay accounting for accepted header heights. */
+class CNodeHeaders
+{
+public:
+    CNodeHeaders();
+    bool addHeaders(const CBlockIndex* first, const CBlockIndex* last);
+    bool updateState(NodeId peer_id, BlockValidationState& state, bool ret);
+
+private:
+    void addPoint(int height);
+    std::map<int, int> points;
+    size_t maxSize;
+    size_t maxAvg;
+};
 
 struct CNodeStateStats {
     int nSyncHeight = -1;

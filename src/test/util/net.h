@@ -21,6 +21,53 @@
 
 struct ConnmanTestMsg : public CConnman {
     using CConnman::CConnman;
+    using CConnman::AddAddrFetch;
+    using CConnman::ProcessAddrFetch;
+
+    void InitAddrFetchTest()
+    {
+        semOutbound = std::make_unique<CSemaphore>(1);
+    }
+
+    void InitReconnectionTest()
+    {
+        semOutbound = std::make_unique<CSemaphore>(1);
+        semAddnode = std::make_unique<CSemaphore>(1);
+        m_max_outbound = nMaxAddnode = 1;
+    }
+
+    CSemaphoreGrant AcquireAddnodePermit()
+    {
+        return CSemaphoreGrant{*semAddnode};
+    }
+
+    void QueueReconnection(CSemaphoreGrant&& grant)
+    {
+        LOCK(m_reconnections_mutex);
+        m_reconnections.push_back({CAddress{}, std::move(grant), "8.8.8.8:15714", ConnectionType::MANUAL, false});
+    }
+
+    void StartConnectionWorker(bool addnode)
+    {
+        if (addnode) {
+            threadOpenAddedConnections = std::thread([this] { ThreadOpenAddedConnections(); });
+        } else {
+            threadOpenConnections = std::thread([this] { ThreadOpenConnections({}); });
+        }
+    }
+
+    using CConnman::PerformReconnections;
+
+    CSemaphoreGrant AcquireOutboundPermit()
+    {
+        return CSemaphoreGrant{*semOutbound};
+    }
+
+    size_t GetAddrFetchCount()
+    {
+        LOCK(m_addr_fetches_mutex);
+        return m_addr_fetches.size();
+    }
 
     void SetPeerConnectTimeout(std::chrono::seconds timeout)
     {

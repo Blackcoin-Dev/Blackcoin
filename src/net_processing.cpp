@@ -191,6 +191,61 @@ static constexpr size_t MAX_ADDR_PROCESSING_TOKEN_BUCKET{MAX_ADDR_TO_SEND};
 /** The compactblocks version we support. See BIP 152. */
 static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
 
+CNodeHeaders::CNodeHeaders()
+    : maxSize(gArgs.GetIntArg("-headerspamfiltermaxsize", DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE)),
+      maxAvg(gArgs.GetIntArg("-headerspamfiltermaxavg", DEFAULT_HEADER_SPAM_FILTER_MAX_AVG))
+{
+}
+
+bool CNodeHeaders::addHeaders(const CBlockIndex* first, const CBlockIndex* last)
+{
+    if (first && last && maxSize && maxAvg) {
+        for (int height = first->nHeight; height <= last->nHeight; ++height) {
+            addPoint(height);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool CNodeHeaders::updateState(NodeId peer_id, BlockValidationState& state, bool ret)
+{
+    const size_t size{points.size()};
+    if (size == 0) return ret;
+
+    size_t nHeaders{0};
+    for (const auto& point : points) {
+        nHeaders += point.second;
+    }
+
+    const double nAvgValue{static_cast<double>(nHeaders) / size};
+    const bool banNode = (nAvgValue >= 1.5 * maxAvg && size >= maxAvg) ||
+                         (nAvgValue >= maxAvg && nHeaders >= maxSize) ||
+                         (nHeaders >= maxSize * 4.1);
+    if (banNode) {
+        points.clear();
+        return state.Invalid(BlockValidationResult::BLOCK_HEADER_SPAM, "header-spam",
+            strprintf("peer %d discouraged/disconnected for header spam (avg=%.2f/%u, headers=%u, max=%u, size=%u)",
+                      peer_id, nAvgValue, maxAvg, nHeaders, maxSize, size));
+    }
+    return ret;
+}
+
+void CNodeHeaders::addPoint(int height)
+{
+    // Replays must increment their retained counter, including the lowest
+    // height when the map is full. Only a new distinct height needs eviction.
+    auto it = points.find(height);
+    if (it != points.end()) {
+        ++it->second;
+        return;
+    }
+    if (points.size() >= maxSize) {
+        points.erase(points.begin());
+    }
+    points.emplace(height, 1);
+}
+
 // Internal stuff
 namespace {
 /** Blocks that are in flight, and that are in the queue to be downloaded. */
@@ -489,94 +544,6 @@ struct CNodeState {
     const bool m_is_inbound;
 
     CNodeState(bool is_inbound) : m_is_inbound(is_inbound) {}
-};
-
-class CNodeHeaders
-{
-public:
-    CNodeHeaders():
-        maxSize(0),
-        maxAvg(0)
-    {
-        maxSize = gArgs.GetIntArg("-headerspamfiltermaxsize", DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE);
-        maxAvg = gArgs.GetIntArg("-headerspamfiltermaxavg", DEFAULT_HEADER_SPAM_FILTER_MAX_AVG);
-    }
-
-    bool addHeaders(const CBlockIndex *pindexFirst, const CBlockIndex *pindexLast)
-    {
-        if(pindexFirst && pindexLast && maxSize && maxAvg)
-        {
-            // Get the begin block index
-            int nBegin = pindexFirst->nHeight;
-
-            // Get the end block index
-            int nEnd = pindexLast->nHeight;
-
-            for(int point = nBegin; point<= nEnd; point++)
-            {
-                addPoint(point);
-            }
-
-            return true;
-        }
-
-        return false;
-    }
-
-    bool updateState(NodeId peer_id, BlockValidationState& state, bool ret)
-    {
-        // No headers
-        size_t size = points.size();
-        if(size == 0)
-            return ret;
-
-        // Compute the number of the received headers
-        size_t nHeaders = 0;
-        for(auto point : points)
-        {
-            nHeaders += point.second;
-        }
-
-        // Compute the average value per height
-        double nAvgValue = (double)nHeaders / size;
-
-        // Flag the peer for the normal discouragement/disconnection path.
-        bool banNode = (nAvgValue >= 1.5 * maxAvg && size >= maxAvg) ||
-                       (nAvgValue >= maxAvg && nHeaders >= maxSize) ||
-                       (nHeaders >= maxSize * 4.1);
-        if(banNode)
-        {
-            points.clear();
-            return state.Invalid(BlockValidationResult::BLOCK_HEADER_SPAM, "header-spam",
-                strprintf("peer %d discouraged/disconnected for header spam (avg=%.2f/%u, headers=%u, max=%u, size=%u)",
-                          peer_id, nAvgValue, maxAvg, nHeaders, maxSize, size));
-        }
-
-        return ret;
-    }
-
-private:
-    void addPoint(int height)
-    {
-        // Erace the last element in the list
-        if(points.size() == maxSize)
-        {
-            points.erase(points.begin());
-        }
-
-        // Add the point to the list
-        int occurrence = 0;
-        auto mi = points.find(height);
-        if (mi != points.end())
-            occurrence = (*mi).second;
-        occurrence++;
-        points[height] = occurrence;
-    }
-
-private:
-    std::map<int,int> points;
-    size_t maxSize;
-    size_t maxAvg;
 };
 
 class PeerManagerImpl final : public PeerManager

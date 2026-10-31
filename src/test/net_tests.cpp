@@ -9,6 +9,7 @@
 #include <clientversion.h>
 #include <common/args.h>
 #include <compat/compat.h>
+#include <consensus/validation.h>
 #include <cstdint>
 #include <net.h>
 #include <net_processing.h>
@@ -18,6 +19,7 @@
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
+#include <test/util/net.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <test/util/validation.h>
@@ -30,8 +32,10 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <condition_variable>
 #include <ios>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -49,6 +53,163 @@ BOOST_AUTO_TEST_CASE(cnode_listen_port)
     BOOST_CHECK(gArgs.SoftSetArg("-port", ToString(altPort)));
     port = GetListenPort();
     BOOST_CHECK(port == altPort);
+}
+
+BOOST_AUTO_TEST_CASE(addr_fetch_retains_pending_work)
+{
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    connman.InitAddrFetchTest();
+
+    // Count attempted destinations without creating sockets or using the network.
+    struct SocketFactoryGuard {
+        decltype(CreateSock) original{CreateSock};
+        ~SocketFactoryGuard() { CreateSock = std::move(original); }
+    } socket_factory_guard;
+    std::vector<CService> attempted;
+    CreateSock = [&attempted](const CService& address) -> std::unique_ptr<Sock> {
+        attempted.push_back(address);
+        return nullptr;
+    };
+
+    connman.AddAddrFetch("8.8.8.8:15714");
+    connman.AddAddrFetch("9.9.9.9:15714");
+    auto occupied{connman.AcquireOutboundPermit()};
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 2U);
+    BOOST_CHECK(attempted.empty());
+
+    connman.SetNetworkActive(false);
+    occupied.Release();
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 2U);
+    BOOST_CHECK(attempted.empty());
+
+    connman.SetNetworkActive(true);
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 1U);
+    BOOST_REQUIRE_EQUAL(attempted.size(), 1U);
+    BOOST_CHECK(attempted[0] == LookupNumeric("8.8.8.8:15714"));
+
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 0U);
+    BOOST_REQUIRE_EQUAL(attempted.size(), 2U);
+    BOOST_CHECK(attempted[1] == LookupNumeric("9.9.9.9:15714"));
+
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(attempted.size(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(reconnections_with_exhausted_permits)
+{
+    // Exercise each real worker independently: either one must be able to
+    // consume a fallback while both permit pools remain exhausted.
+    for (const bool addnode : {false, true}) {
+        ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+        connman.InitReconnectionTest();
+        auto outbound{connman.AcquireOutboundPermit()};
+        auto manual{connman.AcquireAddnodePermit()};
+
+        struct SocketFactoryGuard {
+            decltype(CreateSock) original{CreateSock};
+            ~SocketFactoryGuard() { CreateSock = std::move(original); }
+        } socket_factory_guard;
+        std::mutex mutex;
+        std::condition_variable attempted_cv;
+        unsigned int attempted{0};
+        CreateSock = [&](const CService&) -> std::unique_ptr<Sock> {
+            {
+                std::lock_guard<std::mutex> lock{mutex};
+                ++attempted;
+            }
+            attempted_cv.notify_one();
+            return nullptr;
+        };
+
+        connman.StartConnectionWorker(addnode);
+        // Let the worker reach its first exhausted-permit acquisition before
+        // queueing. No unrelated node or test grant is released to wake it.
+        std::this_thread::sleep_for(750ms);
+        connman.QueueReconnection(addnode ? std::move(manual) : std::move(outbound));
+        bool retried;
+        {
+            std::unique_lock<std::mutex> lock{mutex};
+            retried = attempted_cv.wait_for(lock, 5s, [&] { return attempted != 0; });
+        }
+        connman.Interrupt();
+        connman.StopThreads();
+        BOOST_CHECK_MESSAGE(retried, (addnode ? "addnode fallback stalled" : "automatic fallback stalled"));
+        BOOST_CHECK_EQUAL(attempted, 1U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(reconnections_respect_networkactive_and_interrupt)
+{
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    connman.InitReconnectionTest();
+    struct SocketFactoryGuard {
+        decltype(CreateSock) original{CreateSock};
+        ~SocketFactoryGuard() { CreateSock = std::move(original); }
+    } socket_factory_guard;
+    unsigned int attempted{0};
+    CreateSock = [&](const CService&) -> std::unique_ptr<Sock> {
+        ++attempted;
+        return nullptr;
+    };
+
+    connman.SetNetworkActive(false);
+    connman.QueueReconnection(connman.AcquireOutboundPermit());
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 0U);
+
+    connman.SetNetworkActive(true);
+    connman.QueueReconnection(connman.AcquireOutboundPermit());
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 1U);
+
+    connman.Interrupt();
+    connman.QueueReconnection(connman.AcquireOutboundPermit());
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_filter_at_capacity)
+{
+    const int capacity{static_cast<int>(DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE)};
+    CBlockIndex first, last;
+    first.nHeight = 0;
+    last.nHeight = capacity - 1;
+    CNodeHeaders full_filter;
+    BOOST_REQUIRE(full_filter.addHeaders(&first, &last));
+    BlockValidationState initial_state;
+    BOOST_REQUIRE(full_filter.updateState(0, initial_state, true));
+
+    // Repeating the lowest retained height must reach the same existing spam
+    // threshold as repeating another retained height, without evicting it.
+    unsigned int reference_replays{0};
+    for (const int height : {capacity - 1, capacity / 2, 0}) {
+        CNodeHeaders filter{full_filter};
+        CBlockIndex repeated;
+        repeated.nHeight = height;
+        unsigned int replays{0};
+        BlockValidationState state;
+        while (replays < DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE * 5) {
+            BOOST_REQUIRE(filter.addHeaders(&repeated, &repeated));
+            ++replays;
+            if (!filter.updateState(0, state, true)) break;
+        }
+        BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_HEADER_SPAM);
+        if (reference_replays == 0) reference_replays = replays;
+        BOOST_CHECK_EQUAL(replays, reference_replays);
+    }
+
+    // New distinct heights still evict old entries. Without the bound this
+    // many fresh heights alone would exceed the unchanged total-count limit.
+    CNodeHeaders filter{full_filter};
+    first.nHeight = capacity;
+    last.nHeight = capacity * 6;
+    BOOST_REQUIRE(filter.addHeaders(&first, &last));
+    BlockValidationState bounded_state;
+    BOOST_CHECK(filter.updateState(0, bounded_state, true));
 }
 
 BOOST_AUTO_TEST_CASE(cnode_simple_test)

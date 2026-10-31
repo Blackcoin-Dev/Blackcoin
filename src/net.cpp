@@ -2316,10 +2316,16 @@ void CConnman::DumpAddresses()
 void CConnman::ProcessAddrFetch()
 {
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
+    if (interruptNet || !fNetworkActive) return;
+
+    // Keep discovery work queued until there is capacity to attempt it.
+    CSemaphoreGrant grant(*semOutbound, /*fTry=*/true);
+    if (!grant) return;
+
     std::string strDest;
     {
         LOCK(m_addr_fetches_mutex);
-        if (m_addr_fetches.empty())
+        if (interruptNet || !fNetworkActive || m_addr_fetches.empty())
             return;
         strDest = m_addr_fetches.front();
         m_addr_fetches.pop_front();
@@ -2328,10 +2334,7 @@ void CConnman::ProcessAddrFetch()
     // peer doesn't support it or immediately disconnects us for another reason.
     const bool use_v2transport(GetLocalServices() & NODE_P2P_V2);
     CAddress addr;
-    CSemaphoreGrant grant(*semOutbound, /*fTry=*/true);
-    if (grant) {
-        OpenNetworkConnection(addr, false, std::move(grant), strDest.c_str(), ConnectionType::ADDR_FETCH, use_v2transport);
-    }
+    OpenNetworkConnection(addr, false, std::move(grant), strDest.c_str(), ConnectionType::ADDR_FETCH, use_v2transport);
 }
 
 bool CConnman::GetTryNewOutboundPeer() const
@@ -2473,9 +2476,12 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
 
         PerformReconnections();
 
-        CSemaphoreGrant grant(*semOutbound);
+        // Queued v1 fallbacks retain their permits. Keep draining them even
+        // when every outbound permit is held by a node or queued fallback.
+        CSemaphoreGrant grant(*semOutbound, /*fTry=*/true);
         if (interruptNet)
             return;
+        if (!grant) continue;
 
         const std::unordered_set<Network> fixed_seed_networks{GetReachableEmptyNetworks()};
         if (add_fixed_seeds && !fixed_seed_networks.empty()) {
@@ -2834,7 +2840,9 @@ void CConnman::ThreadOpenAddedConnections()
     AssertLockNotHeld(m_reconnections_mutex);
     while (true)
     {
-        CSemaphoreGrant grant(*semAddnode);
+        // A queued fallback can own the last addnode permit, so do not block
+        // this worker before it can reach PerformReconnections().
+        CSemaphoreGrant grant(*semAddnode, /*fTry=*/true);
         std::vector<AddedNodeInfo> vInfo = GetAddedNodeInfo();
         bool tried = false;
         for (const AddedNodeInfo& info : vInfo) {

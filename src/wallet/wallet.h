@@ -94,6 +94,31 @@ struct WalletPowMiningGrindResult {
     std::chrono::milliseconds elapsed{0};
 };
 
+/** Actual steady-clock durations, in nanoseconds. In-progress periods are
+ * absent. Completed and truncated totals are separate so interrupted duty
+ * waits cannot be presented as completed budget periods. */
+struct WalletPowMiningDutyWorker {
+    uint64_t completed_periods{0};
+    uint64_t completed_work_periods{0};
+    uint64_t completed_active_ns{0};
+    uint64_t completed_explicit_wait_ns{0};
+    uint64_t completed_duty_wait_ns{0};
+    uint64_t completed_successful_hashes{0};
+    uint64_t truncated_periods{0};
+    uint64_t truncated_active_ns{0};
+    uint64_t truncated_explicit_wait_ns{0};
+    uint64_t truncated_duty_wait_ns{0};
+    uint64_t successful_hashes{0};
+};
+
+/** One coherent, bounded snapshot. Reset on each successful new miner start,
+ * retained after stop, and never persisted across process restart. */
+struct WalletPowMiningDutySnapshot {
+    uint64_t session_id{0};
+    int cpu_percent{0};
+    std::vector<WalletPowMiningDutyWorker> workers;
+};
+
 enum class WalletCommitStatus {
     ACCEPTED,
     PERSISTED_PENDING,
@@ -1739,6 +1764,7 @@ public:
     std::atomic<interfaces::WalletPowMiningState> m_pow_state{interfaces::WalletPowMiningState::DISABLED};
     std::vector<interfaces::WalletPowMiningState> m_pow_worker_states GUARDED_BY(cs_wallet);
     std::vector<uint64_t> m_pow_worker_successful_hashes GUARDED_BY(cs_wallet);
+    WalletPowMiningDutySnapshot m_pow_duty_cycle GUARDED_BY(cs_wallet);
     std::atomic<int> m_pow_workers_hashing{0};
     std::atomic<int> m_pow_workers_error{0};
     std::atomic<int> m_pow_threads{1};         // CPU cores / worker threads
@@ -2327,6 +2353,14 @@ public:
         double hashrate,
         std::optional<uint64_t> expected_generation = std::nullopt,
         bool local_error = false);
+    WalletPowMiningDutySnapshot GetPowMiningDutyCycle() const;
+    void ResetPowMiningDutyCycleLocked(size_t workers, int cpu_percent)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RecordPowMiningDutyPeriod(
+        int worker_id, uint64_t session_id, uint64_t authority_generation,
+        std::chrono::nanoseconds elapsed, std::chrono::nanoseconds explicit_wait,
+        std::chrono::nanoseconds duty_wait, bool wait_finished,
+        uint64_t successful_hashes);
     /** Pure work batch plus worker telemetry and interruptible error retry.
      * No input selection, signing or transaction submission. The log deadline
      * belongs to the calling worker and is retained across batches. */

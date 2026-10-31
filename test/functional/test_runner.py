@@ -102,6 +102,8 @@ EXTENDED_SCRIPTS = [
     'feature_30153_upgrade.py --descriptors',
     # Diagnostic observations; no precise OS CPU duty pass threshold.
     'feature_pow_cpu_budget.py --descriptors',
+    # Renew natural jobs and qualify completed duty periods across restart.
+    'feature_pow_cpu_sustained.py --descriptors --workers=2 --cpu-percent=60',
 ]
 
 BASE_SCRIPTS = [

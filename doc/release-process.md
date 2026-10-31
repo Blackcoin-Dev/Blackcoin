@@ -6,7 +6,8 @@ This is an unpublished development candidate. `configure.ac` records major 30,
 minor 1, build 5, revision 3, RC1, and `CLIENT_VERSION_IS_RELEASE=false`.
 The numeric `CLIENT_VERSION` remains `300105`; macOS short version remains
 `30.1.5`, bundle version is `30.1.503`, and `BlackcoinFullVersion` is
-`30.1.5.3rc1`. The canonical development notes are
+`30.1.5.3` (the base revision). The runtime and configured package version
+remain `30.1.5.3rc1`. The canonical development notes are
 `doc/release-notes/release-notes-30.1.5.3.md`.
 
 Manual candidate packages use an explicit `30.1.5.3-alpha1` or

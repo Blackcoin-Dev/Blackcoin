@@ -228,6 +228,144 @@ BOOST_AUTO_TEST_CASE(pow_mining_control_cancelled_after_lock_wait)
     BOOST_CHECK_EQUAL(wallet.m_pow_cpu_percent.load(), 60);
 }
 
+BOOST_AUTO_TEST_CASE(pow_mining_duty_period_completion_and_reset)
+{
+    using namespace std::chrono_literals;
+    CWallet wallet{nullptr, "duty-period-records", CreateMockableWalletDatabase()};
+    wallet.m_pow_mining_enabled = true;
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.ResetPowMiningDutyCycleLocked(256, 60);
+    }
+    const auto initial = wallet.GetPowMiningDutyCycle();
+    BOOST_REQUIRE_EQUAL(initial.workers.size(), 256U);
+    const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+    wallet.RecordPowMiningDutyPeriod(0, initial.session_id, generation,
+        10ms, 4ms, 4ms, true, 7);
+    wallet.RecordPowMiningDutyPeriod(0, initial.session_id, generation,
+        5ms, 2ms, 1ms, false, 2);
+    // Stop wins the wallet lock before publication, including a zero-wait
+    // period. Its hashes remain observable but cannot become completed duty.
+    wallet.m_pow_mining_enabled = false;
+    wallet.RecordPowMiningDutyPeriod(0, initial.session_id, generation,
+        3ms, 1ms, 0ns, true, 3);
+    const auto stopped = wallet.GetPowMiningDutyCycle();
+    const auto& record = stopped.workers[0];
+    BOOST_CHECK_EQUAL(record.completed_periods, 1U);
+    BOOST_CHECK_EQUAL(record.completed_work_periods, 1U);
+    BOOST_CHECK_EQUAL(record.completed_active_ns, 6'000'000U);
+    BOOST_CHECK_EQUAL(record.completed_explicit_wait_ns, 4'000'000U);
+    BOOST_CHECK_EQUAL(record.completed_duty_wait_ns, 4'000'000U);
+    BOOST_CHECK_EQUAL(record.completed_successful_hashes, 7U);
+    BOOST_CHECK_EQUAL(record.truncated_periods, 2U);
+    BOOST_CHECK_EQUAL(record.truncated_active_ns, 5'000'000U);
+    BOOST_CHECK_EQUAL(record.truncated_explicit_wait_ns, 3'000'000U);
+    BOOST_CHECK_EQUAL(record.truncated_duty_wait_ns, 1'000'000U);
+    BOOST_CHECK_EQUAL(record.successful_hashes, 12U);
+    wallet.StopPowMining();
+    BOOST_CHECK_EQUAL(wallet.GetPowMiningDutyCycle().workers[0].truncated_periods, 2U);
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.ResetPowMiningDutyCycleLocked(1, 1);
+    }
+    wallet.m_pow_mining_enabled = true;
+    const auto reset = wallet.GetPowMiningDutyCycle();
+    BOOST_REQUIRE_EQUAL(reset.workers.size(), 1U);
+    BOOST_CHECK_EQUAL(reset.session_id, initial.session_id + 1);
+    BOOST_CHECK_EQUAL(reset.cpu_percent, 1);
+    // A late old-session record cannot enter the new slot, even with the same
+    // signing authority generation. Removed and negative slots are ignored.
+    for (const int worker : {-1, 0, 255, 256}) {
+        wallet.RecordPowMiningDutyPeriod(worker, initial.session_id, generation,
+            1ms, 0ns, 99ms, true, 1);
+    }
+    wallet.RecordPowMiningDutyPeriod(1, reset.session_id, generation,
+        1ms, 0ns, 99ms, true, 1);
+    BOOST_CHECK_EQUAL(wallet.GetPowMiningDutyCycle().workers[0].completed_periods, 0U);
+    wallet.RecordPowMiningDutyPeriod(0, reset.session_id, generation + 1,
+        1ms, 0ns, 99ms, true, 1);
+    BOOST_CHECK_EQUAL(wallet.GetPowMiningDutyCycle().workers[0].truncated_periods, 1U);
+    wallet.RecordPowMiningDutyPeriod(0, reset.session_id, generation,
+        1ms, 0ns, 99ms, true, 0);
+    const auto idle = wallet.GetPowMiningDutyCycle();
+    BOOST_CHECK_EQUAL(idle.workers[0].completed_periods, 1U);
+    BOOST_CHECK_EQUAL(idle.workers[0].completed_work_periods, 0U);
+    BOOST_CHECK_EQUAL(idle.workers[0].completed_successful_hashes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_duty_snapshot_is_coherent)
+{
+    using namespace std::chrono_literals;
+    CWallet wallet{nullptr, "duty-snapshot", CreateMockableWalletDatabase()};
+    wallet.m_pow_mining_enabled = true;
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.ResetPowMiningDutyCycleLocked(2, 60);
+    }
+    const auto initial = wallet.GetPowMiningDutyCycle();
+    const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+    std::atomic<bool> done{false};
+    std::thread writer([&] {
+        for (int count = 0; count < 1000; ++count) {
+            wallet.RecordPowMiningDutyPeriod(0, initial.session_id, generation,
+                7ns, 4ns, 2ns, true, 5);
+        }
+        done = true;
+    });
+    bool coherent{true};
+    do {
+        const auto snapshot = wallet.GetPowMiningDutyCycle();
+        const auto& record = snapshot.workers[0];
+        coherent &= snapshot.session_id == initial.session_id && snapshot.workers.size() == 2 &&
+            record.completed_active_ns == 3 * record.completed_periods &&
+            record.completed_explicit_wait_ns == 4 * record.completed_periods &&
+            record.completed_duty_wait_ns == 2 * record.completed_periods &&
+            record.completed_successful_hashes == 5 * record.completed_periods &&
+            record.completed_work_periods == record.completed_periods &&
+            snapshot.workers[1].completed_periods == 0;
+        std::this_thread::yield();
+    } while (!done.load());
+    writer.join();
+    BOOST_CHECK(coherent);
+    BOOST_CHECK_EQUAL(wallet.GetPowMiningDutyCycle().workers[0].completed_periods, 1000U);
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_duty_real_wait_and_stop)
+{
+    using namespace std::chrono_literals;
+    CWallet wallet{nullptr, "duty-real-wait", CreateMockableWalletDatabase()};
+    wallet.m_pow_mining_enabled = true;
+    wallet.m_pow_cpu_percent = 60;
+    wallet.m_pow_state = interfaces::WalletPowMiningState::READY;
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.ResetPowMiningDutyCycleLocked(1, 60);
+        wallet.m_pow_worker_states.assign(1, interfaces::WalletPowMiningState::READY);
+        wallet.m_pow_worker_successful_hashes.assign(1, 0);
+    }
+    {
+        LOCK(wallet.m_pow_miner_mutex);
+        wallet.threadPowMinerGroup = std::make_unique<std::vector<std::thread>>();
+        wallet.threadPowMinerGroup->emplace_back([&] { wallet.ThreadShadowPoWMiner(0); });
+    }
+    // A wallet without a chain performs a real explicit one-second wait. Its
+    // completed telemetry must measure the actual wait rather than a request.
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (wallet.GetPowMiningDutyCycle().workers[0].completed_periods == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(10ms);
+    }
+    wallet.StopPowMining();
+    const auto snapshot = wallet.GetPowMiningDutyCycle();
+    BOOST_REQUIRE_EQUAL(snapshot.workers.size(), 1U);
+    BOOST_CHECK_GE(snapshot.workers[0].completed_periods, 1U);
+    BOOST_CHECK_GE(snapshot.workers[0].completed_explicit_wait_ns, 900'000'000U);
+    BOOST_CHECK_EQUAL(snapshot.workers[0].completed_work_periods, 0U);
+    BOOST_CHECK_EQUAL(snapshot.workers[0].successful_hashes, 0U);
+    // At most one final in-progress iteration is interrupted by this stop.
+    BOOST_CHECK_LE(snapshot.workers[0].truncated_periods, 1U);
+}
+
 BOOST_AUTO_TEST_CASE(pow_mining_batch_local_error_retry_and_recovery)
 {
     struct ResetFailures {

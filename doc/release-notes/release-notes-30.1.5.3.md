@@ -41,6 +41,12 @@ Release qualification is pending.
   claim preparation. `getpowmininginfo` reports aggregate hashrate and worker
   hashing/error counts. The percentage sets a per-worker active-work duty
   target; host-wide CPU use depends on the workload and worker count.
+- `getpowmininginfo.duty_cycle` reports measured active and wait time for each
+  worker, separating completed periods from interrupted periods. Successful
+  hash counts identify periods containing proof work. The bounded counters
+  reset when a worker group starts and remain available after it stops.
+  Durations use wall time from a steady clock; they do not measure thread CPU
+  time or electrical power.
 - Block-template assembly retains selected outputs and spends in an overlay
   for each package-selection pass, avoiding repeated reconstruction of selected
   transaction state. Rejected packages remain isolated from selected state,
@@ -95,7 +101,8 @@ changes. History scans also check RPC cancellation for each record.
 The source version is `30.1.5.3rc1`; numeric `CLIENT_VERSION` remains
 `300105`.
 macOS uses short version `30.1.5`, bundle version `30.1.503`, and
-`BlackcoinFullVersion=30.1.5.3rc1`.
+`BlackcoinFullVersion=30.1.5.3` (the base revision). The runtime and configured
+package version remain `30.1.5.3rc1`.
 
 This release preserves consensus and reward rules, activation
 heights, wire protocol, wallet storage, and chainstate formats. No reindex or

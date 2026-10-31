@@ -10851,6 +10851,7 @@ static constexpr uint64_t POW_MINER_BATCH_TRIES = 128;
 // callers (including pure-batch tests) retain wallet-scoped publication.
 thread_local int g_pow_miner_worker_id{-1};
 thread_local std::chrono::nanoseconds* g_pow_miner_explicit_wait{nullptr};
+thread_local uint64_t* g_pow_miner_period_hashes{nullptr};
 
 class PowMinerWorkerIdentity {
     const int m_previous{g_pow_miner_worker_id};
@@ -10901,23 +10902,43 @@ bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
  * break and normal batch completion after all iteration locks are released. */
 class PowMinerIterationBudget {
     CWallet& m_wallet;
-    const uint64_t m_generation;
+    uint64_t m_session_id;
+    uint64_t m_generation;
     const std::chrono::steady_clock::time_point m_start{std::chrono::steady_clock::now()};
     std::chrono::nanoseconds m_wait{0};
+    uint64_t m_hashes{0};
 public:
     explicit PowMinerIterationBudget(CWallet& wallet)
-        : m_wallet(wallet), m_generation(wallet.m_pow_wallet_authority_generation.load())
+        : m_wallet(wallet)
     {
+        {
+            LOCK(m_wallet.cs_wallet);
+            m_session_id = m_wallet.m_pow_duty_cycle.session_id;
+            m_generation = m_wallet.m_pow_wallet_authority_generation.load();
+        }
         assert(!g_pow_miner_explicit_wait);
+        assert(!g_pow_miner_period_hashes);
         g_pow_miner_explicit_wait = &m_wait;
+        g_pow_miner_period_hashes = &m_hashes;
     }
     ~PowMinerIterationBudget()
     {
         g_pow_miner_explicit_wait = nullptr;
+        g_pow_miner_period_hashes = nullptr;
+        const auto elapsed = std::chrono::steady_clock::now() - m_start;
         const auto delay = PowMiningAdditionalDelay(
-            std::chrono::steady_clock::now() - m_start, m_wait,
+            elapsed, m_wait,
             m_wallet.m_pow_cpu_percent.load());
-        if (delay.count() > 0) SleepPowMiner(m_wallet, delay, false, m_generation);
+        bool wait_finished{true};
+        std::chrono::nanoseconds duty_wait{0};
+        if (delay.count() > 0) {
+            const auto wait_start = std::chrono::steady_clock::now();
+            wait_finished = SleepPowMiner(m_wallet, delay, false, m_generation);
+            duty_wait = std::chrono::steady_clock::now() - wait_start;
+        }
+        m_wallet.RecordPowMiningDutyPeriod(
+            g_pow_miner_worker_id, m_session_id, m_generation, elapsed, m_wait, duty_wait,
+            wait_finished, m_hashes);
     }
 };
 
@@ -10960,6 +10981,7 @@ WalletPowMiningGrindResult GrindShadowPowWorkInterruptibly(
             return batch;
         }
         batch.successful_hashes += candidate_tries;
+        if (g_pow_miner_period_hashes) *g_pow_miner_period_hashes += candidate_tries;
         if (result == ShadowPowGrindResult::FOUND) {
             data_out = std::move(candidate);
             batch.status = WalletPowMiningGrindStatus::FOUND;
@@ -12542,6 +12564,7 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
             std::memory_order_release);
         m_pow_worker_states.assign(threads, m_pow_state.load());
         m_pow_worker_successful_hashes.assign(threads, 0);
+        ResetPowMiningDutyCycleLocked(threads, cpu_percent);
         m_pow_workers_hashing = 0;
         m_pow_workers_error = 0;
         m_pow_mining_enabled.store(true, std::memory_order_release);
@@ -12611,6 +12634,60 @@ void CWallet::StopPowMiningLocked()
 bool CWallet::IsPowMiningClosing() const
 {
     return (HaveChain() && chain().shutdownRequested()) || m_stop_pow_mining_thread.load();
+}
+
+WalletPowMiningDutySnapshot CWallet::GetPowMiningDutyCycle() const
+{
+    LOCK(cs_wallet);
+    return m_pow_duty_cycle;
+}
+
+void CWallet::ResetPowMiningDutyCycleLocked(size_t workers, int cpu_percent)
+{
+    AssertLockHeld(cs_wallet);
+    assert(workers > 0 && workers <= 256);
+    assert(cpu_percent >= 1 && cpu_percent <= 100);
+    ++m_pow_duty_cycle.session_id;
+    m_pow_duty_cycle.cpu_percent = cpu_percent;
+    m_pow_duty_cycle.workers.assign(workers, {});
+}
+
+void CWallet::RecordPowMiningDutyPeriod(
+    int worker_id, uint64_t session_id, uint64_t authority_generation,
+    std::chrono::nanoseconds elapsed, std::chrono::nanoseconds explicit_wait,
+    std::chrono::nanoseconds duty_wait, bool wait_finished,
+    uint64_t successful_hashes)
+{
+    LOCK(cs_wallet);
+    if (session_id != m_pow_duty_cycle.session_id || worker_id < 0 ||
+        static_cast<size_t>(worker_id) >= m_pow_duty_cycle.workers.size()) return;
+    auto& record = m_pow_duty_cycle.workers[worker_id];
+    const bool completed = wait_finished && !IsPowMiningClosing() &&
+        m_pow_mining_enabled.load() && HasNormalPowMiningWalletAuthorityLocked() &&
+        m_pow_wallet_authority_generation.load() == authority_generation;
+    const auto nonnegative = [](std::chrono::nanoseconds value) {
+        return static_cast<uint64_t>(std::max(value, std::chrono::nanoseconds{0}).count());
+    };
+    const uint64_t active = nonnegative(elapsed - explicit_wait);
+    const uint64_t explicit_ns = nonnegative(explicit_wait);
+    const uint64_t duty_ns = nonnegative(duty_wait);
+    const auto add = [](uint64_t& total, uint64_t value) {
+        total += std::min(value, std::numeric_limits<uint64_t>::max() - total);
+    };
+    add(record.successful_hashes, successful_hashes);
+    if (completed) {
+        add(record.completed_periods, 1);
+        if (successful_hashes != 0) add(record.completed_work_periods, 1);
+        add(record.completed_active_ns, active);
+        add(record.completed_explicit_wait_ns, explicit_ns);
+        add(record.completed_duty_wait_ns, duty_ns);
+        add(record.completed_successful_hashes, successful_hashes);
+    } else {
+        add(record.truncated_periods, 1);
+        add(record.truncated_active_ns, active);
+        add(record.truncated_explicit_wait_ns, explicit_ns);
+        add(record.truncated_duty_wait_ns, duty_ns);
+    }
 }
 
 bool CWallet::HasNormalPowMiningWalletAuthorityLocked() const

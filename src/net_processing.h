@@ -14,6 +14,10 @@
 #include <net.h>
 #include <validationinterface.h>
 
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 
 class AddrMan;
@@ -41,6 +45,8 @@ static const bool DEFAULT_HEADER_SPAM_FILTER = true;
 /** Default for -headerspamfiltermaxsize, maximum size of the list of indexes in the header spam filter.
  *  Match the deployed legacy default to reduce false positives on busy PoS networks. */
 static const unsigned int DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE = 2000;
+/** Hard storage bound, independent of the configured spam threshold. */
+static constexpr size_t MAX_HEADER_SPAM_FILTER_POINTS{2000};
 /** Default for -headerspamfiltermaxavg, maximum average size of an index occurrence in the header spam filter */
 static const unsigned int DEFAULT_HEADER_SPAM_FILTER_MAX_AVG = 10;
 /** Default for -headerspamfilterignoreport, ignore the port in the ip address when looking for header spam,
@@ -55,14 +61,53 @@ class CNodeHeaders
 {
 public:
     CNodeHeaders();
+    CNodeHeaders(size_t max_size, size_t max_avg);
     bool addHeaders(const CBlockIndex* first, const CBlockIndex* last);
     bool updateState(NodeId peer_id, BlockValidationState& state, bool ret);
+    size_t HeightCount() const { return m_size; }
+    uint32_t CountAtHeight(int height) const;
 
 private:
     void addPoint(int height);
-    std::map<int, int> points;
+    // Sorted compact storage with an unconditional per-identity byte bound.
+    std::array<std::pair<int32_t, uint32_t>, MAX_HEADER_SPAM_FILTER_POINTS> points;
+    size_t m_size{0};
     size_t maxSize;
     size_t maxAvg;
+};
+static_assert(sizeof(std::pair<int32_t, uint32_t>) == 8);
+static_assert(sizeof(CNodeHeaders) <= MAX_HEADER_SPAM_FILTER_POINTS * 8 + 64);
+
+/** Bounded replay identities. All callers serialize access under cs_main.
+ * Existing identities survive reconnects; only expired disconnected records
+ * can be removed. No per-message timers or retained per-connection handles.
+ */
+class CServiceHeaderTracker
+{
+public:
+    using Clock = std::chrono::steady_clock;
+    static constexpr size_t MAX_SERVICES{1024};
+    static constexpr size_t INITIATED_RESERVE{64};
+    static constexpr auto RETENTION = std::chrono::hours{1};
+
+    CNodeHeaders* GetOrCreate(const CService& service, bool initiated,
+                             size_t live_connections, Clock::time_point now);
+    static CService Normalize(const CService& service, bool ignore_port);
+    void Connected(const CService& service, Clock::time_point now);
+    void Disconnected(const CService& service, Clock::time_point now);
+    size_t Size() const { return m_records.size(); }
+    size_t GeneralSize() const { return m_general_size; }
+
+private:
+    struct Record {
+        CNodeHeaders headers;
+        size_t live_connections{0};
+        Clock::time_point expires{};
+        bool reserved{false};
+    };
+    std::map<CService, Record> m_records;
+    size_t m_general_size{0};
+    void Expire(Clock::time_point now);
 };
 
 struct CNodeStateStats {

@@ -55,8 +55,10 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <typeinfo>
 
 /** Headers download timeout.
@@ -192,9 +194,14 @@ static constexpr size_t MAX_ADDR_PROCESSING_TOKEN_BUCKET{MAX_ADDR_TO_SEND};
 static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
 
 CNodeHeaders::CNodeHeaders()
-    : maxSize(gArgs.GetIntArg("-headerspamfiltermaxsize", DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE)),
-      maxAvg(gArgs.GetIntArg("-headerspamfiltermaxavg", DEFAULT_HEADER_SPAM_FILTER_MAX_AVG))
+    : CNodeHeaders(gArgs.GetIntArg("-headerspamfiltermaxsize", DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE),
+                   gArgs.GetIntArg("-headerspamfiltermaxavg", DEFAULT_HEADER_SPAM_FILTER_MAX_AVG))
 {
+}
+
+CNodeHeaders::CNodeHeaders(size_t max_size, size_t max_avg) : maxSize{max_size}, maxAvg{max_avg}
+{
+    if (maxSize > MAX_HEADER_SPAM_FILTER_POINTS) throw std::invalid_argument("header spam filter size exceeds storage bound");
 }
 
 bool CNodeHeaders::addHeaders(const CBlockIndex* first, const CBlockIndex* last)
@@ -210,20 +217,17 @@ bool CNodeHeaders::addHeaders(const CBlockIndex* first, const CBlockIndex* last)
 
 bool CNodeHeaders::updateState(NodeId peer_id, BlockValidationState& state, bool ret)
 {
-    const size_t size{points.size()};
+    const size_t size{m_size};
     if (size == 0) return ret;
 
-    size_t nHeaders{0};
-    for (const auto& point : points) {
-        nHeaders += point.second;
-    }
+    uint64_t nHeaders{0};
+    for (size_t i = 0; i < m_size; ++i) nHeaders += points[i].second;
 
     const double nAvgValue{static_cast<double>(nHeaders) / size};
     const bool banNode = (nAvgValue >= 1.5 * maxAvg && size >= maxAvg) ||
                          (nAvgValue >= maxAvg && nHeaders >= maxSize) ||
                          (nHeaders >= maxSize * 4.1);
     if (banNode) {
-        points.clear();
         return state.Invalid(BlockValidationResult::BLOCK_HEADER_SPAM, "header-spam",
             strprintf("peer %d discouraged/disconnected for header spam (avg=%.2f/%u, headers=%u, max=%u, size=%u)",
                       peer_id, nAvgValue, maxAvg, nHeaders, maxSize, size));
@@ -235,15 +239,82 @@ void CNodeHeaders::addPoint(int height)
 {
     // Replays must increment their retained counter, including the lowest
     // height when the map is full. Only a new distinct height needs eviction.
-    auto it = points.find(height);
-    if (it != points.end()) {
-        ++it->second;
+    auto it = std::lower_bound(points.begin(), points.begin() + m_size, height,
+                               [](const auto& point, int value) { return point.first < value; });
+    if (it != points.begin() + m_size && it->first == height) {
+        if (it->second < std::numeric_limits<uint32_t>::max()) ++it->second;
         return;
     }
-    if (points.size() >= maxSize) {
-        points.erase(points.begin());
+    if (m_size >= maxSize) {
+        std::move(points.begin() + 1, points.begin() + m_size, points.begin());
+        --m_size;
     }
-    points.emplace(height, 1);
+    it = std::lower_bound(points.begin(), points.begin() + m_size, height,
+                          [](const auto& point, int value) { return point.first < value; });
+    std::move_backward(it, points.begin() + m_size, points.begin() + m_size + 1);
+    *it = {height, 1};
+    ++m_size;
+}
+
+uint32_t CNodeHeaders::CountAtHeight(int height) const
+{
+    const auto it = std::lower_bound(points.begin(), points.begin() + m_size, height,
+                                     [](const auto& point, int value) { return point.first < value; });
+    return it != points.begin() + m_size && it->first == height ? it->second : 0;
+}
+
+void CServiceHeaderTracker::Expire(Clock::time_point now)
+{
+    for (auto it = m_records.begin(); it != m_records.end();) {
+        if (it->second.live_connections == 0 && now >= it->second.expires) {
+            if (!it->second.reserved) --m_general_size;
+            it = m_records.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+CNodeHeaders* CServiceHeaderTracker::GetOrCreate(const CService& service, bool initiated,
+                                                size_t live_connections, Clock::time_point now)
+{
+    const auto known = m_records.find(service);
+    if (known != m_records.end() && (known->second.live_connections || now < known->second.expires)) return &known->second.headers;
+    // A disconnected expired identity may start afresh, including when its key
+    // is the one being looked up. Active identities never expire.
+    Expire(now);
+    auto it = m_records.find(service);
+    if (it != m_records.end()) return &it->second.headers;
+    const bool reserved = m_general_size >= MAX_SERVICES - INITIATED_RESERVE;
+    if (m_records.size() >= MAX_SERVICES || (reserved && !initiated)) return nullptr;
+    auto [inserted, ok] = m_records.try_emplace(service);
+    assert(ok);
+    auto& record = inserted->second;
+    record.reserved = reserved;
+    record.live_connections = live_connections;
+    record.expires = now + RETENTION;
+    if (!reserved) ++m_general_size;
+    return &record.headers;
+}
+
+CService CServiceHeaderTracker::Normalize(const CService& service, bool ignore_port)
+{
+    return CService(service, ignore_port ? 0 : service.GetPort());
+}
+
+void CServiceHeaderTracker::Connected(const CService& service, Clock::time_point now)
+{
+    Expire(now);
+    const auto it = m_records.find(service);
+    if (it != m_records.end()) ++it->second.live_connections;
+}
+
+void CServiceHeaderTracker::Disconnected(const CService& service, Clock::time_point now)
+{
+    const auto it = m_records.find(service);
+    if (it == m_records.end()) return;
+    assert(it->second.live_connections > 0);
+    if (--it->second.live_connections == 0) it->second.expires = now + RETENTION;
 }
 
 // Internal stuff
@@ -478,6 +549,9 @@ using PeerRef = std::shared_ptr<Peer>;
  * and we're no longer holding the node's locks.
  */
 struct CNodeState {
+    //! Stable normalized header identity, never a handle into expiring storage.
+    CService m_header_service;
+    bool m_header_initiated{false};
     //! The best known block we know this peer has announced.
     const CBlockIndex* pindexBestKnownBlock{nullptr};
     //! The hash of the last unknown block this peer has announced.
@@ -536,6 +610,13 @@ struct CNodeState {
     };
 
     ChainSyncTimeoutState m_chain_sync;
+    /** Actual accepted headers proving an active-chain benchmark; never INV-derived. */
+    const CBlockIndex* m_qq_header{nullptr};
+    const CBlockIndex* m_qq_challenge{nullptr};
+    unsigned int m_qq_challenge_attempts{0};
+    qq::Clock::time_point m_qq_next_challenge{};
+    qq::Clock::time_point m_qq_lag_deadline{};
+
 
     //! Time of last new block announcement
     int64_t m_last_block_announcement{0};
@@ -594,6 +675,7 @@ private:
     void ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seconds time_in_seconds) EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_msgproc_mutex);
 
     /** If we have extra outbound peers, try to disconnect the one with the oldest block announcement */
+    void EvaluateQQPeers(std::chrono::seconds now) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void EvictExtraOutboundPeers(std::chrono::seconds now) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Retrieve unbroadcast transactions from the mempool and reattempt sending to peers */
@@ -724,7 +806,7 @@ private:
      * We don't issue a getheaders message if we have a recent one outstanding.
      * This returns true if a getheaders is actually sent, and false otherwise.
      */
-    bool MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    bool MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer, const uint256& stop = uint256()) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
     /** Potentially fetch blocks from this peer upon receipt of a new headers tip */
     void HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, const CBlockIndex& last_header);
     /** Update peer state based on received headers message */
@@ -767,11 +849,11 @@ private:
     void MaybeSendFeefilter(CNode& node, Peer& peer, std::chrono::microseconds current_time) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
     /** Process net block. */
-    bool ProcessNetBlockHeaders(CNode& node, const std::vector<CBlockHeader>& block, bool min_pow_checked, BlockValidationState& state, bool old_client, const CBlockIndex** ppindex=nullptr);
+    enum class HeaderProcessingResult { ACCEPTED, FAILED, RESOURCE_EXHAUSTED };
+    HeaderProcessingResult ProcessNetBlockHeaders(CNode& node, const std::vector<CBlockHeader>& block, bool min_pow_checked, BlockValidationState& state, bool old_client, const CBlockIndex** ppindex=nullptr);
     bool ProcessNetBlock(const std::shared_ptr<const CBlock> pblock, bool force_processing, bool min_pow_checked, bool* new_block, CNode& node);
 
-    CNodeHeaders& ServiceHeaders(const CService& address) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
-    void CleanAddressHeaders(const CAddress& addr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    CNodeHeaders* ServiceHeaders(const CNode& node) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     FastRandomContext m_rng GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
 
@@ -814,7 +896,7 @@ private:
 
     /** Map maintaining per-node state. */
     std::map<NodeId, CNodeState> m_node_states GUARDED_BY(cs_main);
-    std::map<CService, CNodeHeaders> m_service_headers GUARDED_BY(cs_main);
+    CServiceHeaderTracker m_service_headers GUARDED_BY(cs_main);
 
     /** Get a pointer to a const CNodeState, used when not mutating the CNodeState object. */
     const CNodeState* State(NodeId pnode) const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -1226,24 +1308,23 @@ static bool WitnessConsensusActiveAfter(const CBlockIndex* pindex_prev, const Ch
            IsQuantumWitnessSpendActive(chainman.GetConsensus(), mtp, next_height);
 }
 
-CNodeHeaders& PeerManagerImpl::ServiceHeaders(const CService& address) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
-    unsigned short port =
-            gArgs.GetBoolArg("-headerspamfilterignoreport", DEFAULT_HEADER_SPAM_FILTER_IGNORE_PORT) ? 0 : address.GetPort();
-    CService addr(address, port);
-    return m_service_headers[addr];
-}
-
-void PeerManagerImpl::CleanAddressHeaders(const CAddress& addr) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
-    CSubNet subNet(addr);
-    for (std::map<CService, CNodeHeaders>::iterator it=m_service_headers.begin(); it!=m_service_headers.end();){
-        if(subNet.Match(it->first))
-        {
-            it = m_service_headers.erase(it);
-        }
-        else{
-            it++;
+CNodeHeaders* PeerManagerImpl::ServiceHeaders(const CNode& node)
+{
+    AssertLockHeld(cs_main);
+    const auto* state = State(node.GetId());
+    assert(state);
+    size_t live_connections{0};
+    bool initiated{false};
+    // Count all live node states, including connections that have not sent a
+    // header yet. Finalization decrements once for every such connection.
+    for (const auto& [id, other] : m_node_states) {
+        if (other.m_header_service == state->m_header_service) {
+            ++live_connections;
+            initiated |= other.m_header_initiated;
         }
     }
+    return m_service_headers.GetOrCreate(state->m_header_service, initiated,
+                                         live_connections, CServiceHeaderTracker::Clock::now());
 }
 
 std::chrono::microseconds PeerManagerImpl::NextInvToInbounds(std::chrono::microseconds now,
@@ -1612,22 +1693,37 @@ void PeerManagerImpl::PushNodeVersion(CNode& pnode, const Peer& peer)
     }
 }
 
-bool PeerManagerImpl::ProcessNetBlockHeaders(CNode& pfrom, const std::vector<CBlockHeader>& block, bool min_pow_checked, BlockValidationState& state, bool old_client, const CBlockIndex** ppindex)
+PeerManagerImpl::HeaderProcessingResult PeerManagerImpl::ProcessNetBlockHeaders(CNode& pfrom, const std::vector<CBlockHeader>& block, bool min_pow_checked, BlockValidationState& state, bool old_client, const CBlockIndex** ppindex)
 {
-    const CBlockIndex *pindexFirst = nullptr;
-    bool ret = m_chainman.ProcessNewBlockHeaders(block, min_pow_checked, state, old_client, ppindex, &pindexFirst);
-    if (gArgs.GetBoolArg("-headerspamfilter", DEFAULT_HEADER_SPAM_FILTER))
-    {
-        if (!m_chainman.IsInitialBlockDownload() || (gArgs.GetBoolArg("-headerspamfilterduringibd", DEFAULT_HEADER_SPAM_FILTER_DURING_IBD) && m_chainman.IsInitialBlockDownload()))
-        {
-            LOCK(cs_main);
-            CNodeHeaders& headers = ServiceHeaders(pfrom.addr);
-            const CBlockIndex *pindexLast = ppindex == nullptr ? nullptr : *ppindex;
-            headers.addHeaders(pindexFirst, pindexLast);
-            return headers.updateState(pfrom.GetId(), state, ret);
-        }       
+    const bool filter = gArgs.GetBoolArg("-headerspamfilter", DEFAULT_HEADER_SPAM_FILTER) &&
+        gArgs.GetIntArg("-headerspamfiltermaxsize", DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE) > 0 &&
+        gArgs.GetIntArg("-headerspamfiltermaxavg", DEFAULT_HEADER_SPAM_FILTER_MAX_AVG) > 0 &&
+        (!m_chainman.IsInitialBlockDownload() ||
+         gArgs.GetBoolArg("-headerspamfilterduringibd", DEFAULT_HEADER_SPAM_FILTER_DURING_IBD));
+    if (filter) {
+        LOCK(cs_main);
+        if (!ServiceHeaders(pfrom)) {
+            // Local admission exhaustion is neither invalid consensus data nor
+            // peer misbehavior. Do not validate unaccounted headers or let this
+            // peer qualify as a QQ replacement.
+            pfrom.m_qq_eligible = false;
+            pfrom.fDisconnect = true;
+            LogPrint(BCLog::NET, "header replay accounting capacity exhausted; disconnecting peer=%d without penalty\n", pfrom.GetId());
+            return HeaderProcessingResult::RESOURCE_EXHAUSTED;
+        }
     }
-    return ret;
+    const CBlockIndex *pindexFirst = nullptr;
+    const bool ret = m_chainman.ProcessNewBlockHeaders(block, min_pow_checked, state, old_client, ppindex, &pindexFirst);
+    if (filter) {
+        LOCK(cs_main);
+        // The live node-state reference pins this record across validation.
+        CNodeHeaders* headers = ServiceHeaders(pfrom);
+        assert(headers);
+        const CBlockIndex *pindexLast = ppindex == nullptr ? nullptr : *ppindex;
+        headers->addHeaders(pindexFirst, pindexLast);
+        return headers->updateState(pfrom.GetId(), state, ret) ? HeaderProcessingResult::ACCEPTED : HeaderProcessingResult::FAILED;
+    }
+    return ret ? HeaderProcessingResult::ACCEPTED : HeaderProcessingResult::FAILED;
 }
 
 bool PeerManagerImpl::ProcessNetBlock(const std::shared_ptr<const CBlock> pblock, bool force_processing, bool min_pow_checked, bool* new_block, CNode& pfrom)
@@ -1658,11 +1754,12 @@ bool PeerManagerImpl::ProcessNetBlock(const std::shared_ptr<const CBlock> pblock
     // Process the header before processing the block
     const CBlockIndex *pindex = nullptr;
     BlockValidationState state;
-    if (!ProcessNetBlockHeaders(pfrom, {*pblock_const}, min_pow_checked, state, old_client, &pindex)) {
-        if (state.IsInvalid()) {
+    const auto header_result = ProcessNetBlockHeaders(pfrom, {*pblock_const}, min_pow_checked, state, old_client, &pindex);
+    if (header_result != HeaderProcessingResult::ACCEPTED) {
+        if (header_result == HeaderProcessingResult::FAILED && state.IsInvalid()) {
             MaybePunishNodeForBlock(pfrom.GetId(), state, false, strprintf("Peer %d sent us invalid header\n", pfrom.GetId()));
-            return error("%s: invalid header received", __func__);
         }
+        return false;
     }
 
     {
@@ -1746,6 +1843,11 @@ void PeerManagerImpl::InitializeNode(CNode& node, ServiceFlags our_services)
     {
         LOCK(cs_main);
         m_node_states.emplace_hint(m_node_states.end(), std::piecewise_construct, std::forward_as_tuple(nodeid), std::forward_as_tuple(node.IsInboundConn()));
+        auto* state = State(nodeid);
+        state->m_header_service = CServiceHeaderTracker::Normalize(node.addr,
+            gArgs.GetBoolArg("-headerspamfilterignoreport", DEFAULT_HEADER_SPAM_FILTER_IGNORE_PORT));
+        state->m_header_initiated = !node.IsInboundConn();
+        m_service_headers.Connected(state->m_header_service, CServiceHeaderTracker::Clock::now());
         assert(m_txrequest.Count(nodeid) == 0);
     }
     PeerRef peer = std::make_shared<Peer>(nodeid, our_services);
@@ -1822,6 +1924,7 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
     m_outbound_peers_with_protect_from_disconnect -= state->m_chain_sync.m_protect;
     assert(m_outbound_peers_with_protect_from_disconnect >= 0);
 
+    m_service_headers.Disconnected(state->m_header_service, CServiceHeaderTracker::Clock::now());
     m_node_states.erase(nodeid);
 
     if (m_node_states.empty()) {
@@ -2930,7 +3033,7 @@ bool PeerManagerImpl::IsAncestorOfBestHeaderOrTip(const CBlockIndex* header)
     return false;
 }
 
-bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer)
+bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer, const uint256& stop)
 {
     const CNetMsgMaker msgMaker(pfrom.GetCommonVersion());
 
@@ -2939,7 +3042,7 @@ bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& loc
     // Only allow a new getheaders message to go out if we don't have a recent
     // one already in-flight
     if (current_time - peer.m_last_getheaders_timestamp > HEADERS_RESPONSE_TIME) {
-        m_connman.PushMessage(&pfrom, msgMaker.Make(NetMsgType::GETHEADERS, locator, uint256()));
+        m_connman.PushMessage(&pfrom, msgMaker.Make(NetMsgType::GETHEADERS, locator, stop));
         peer.m_last_getheaders_timestamp = current_time;
         return true;
     }
@@ -2953,6 +3056,7 @@ bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& loc
  */
 void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, const CBlockIndex& last_header)
 {
+    if (pfrom.IsQQProbe()) return;
     const CNetMsgMaker msgMaker(pfrom.GetCommonVersion());
 
     LOCK(cs_main);
@@ -3065,7 +3169,7 @@ void PeerManagerImpl::UpdatePeerStateForReceivedHeaders(CNode& pfrom, Peer& peer
     // Note that outbound block-relay peers are excluded from this protection, and
     // thus always subject to eviction under the bad/lagging chain logic.
     // See ChainSyncTimeoutState.
-    if (!pfrom.fDisconnect && pfrom.IsFullOutboundConn() && nodestate->pindexBestKnownBlock != nullptr) {
+    if (!pfrom.fDisconnect && !pfrom.IsQQProbe() && pfrom.IsFullOutboundConn() && nodestate->pindexBestKnownBlock != nullptr) {
         if (m_outbound_peers_with_protect_from_disconnect < MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT && nodestate->pindexBestKnownBlock->nChainWork >= m_chainman.ActiveChain().Tip()->nChainWork && !nodestate->m_chain_sync.m_protect) {
             LogPrint(BCLog::NET, "Protecting outbound peer=%d from eviction\n", pfrom.GetId());
             nodestate->m_chain_sync.m_protect = true;
@@ -3195,11 +3299,12 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
 
     // Now process all the headers.
     BlockValidationState state;
-    if (!ProcessNetBlockHeaders(pfrom, headers, /*min_pow_checked=*/true, state, pfrom.nVersion <= OLD_VERSION, &pindexLast)) {
-        if (state.IsInvalid()) {
+    const auto header_result = ProcessNetBlockHeaders(pfrom, headers, /*min_pow_checked=*/true, state, pfrom.nVersion <= OLD_VERSION, &pindexLast);
+    if (header_result != HeaderProcessingResult::ACCEPTED) {
+        if (header_result == HeaderProcessingResult::FAILED && state.IsInvalid()) {
             MaybePunishNodeForBlock(pfrom.GetId(), state, via_compact_block, "invalid header received");
-            return;
         }
+        return;
     }
     assert(pindexLast);
 
@@ -3212,6 +3317,15 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
         }
     }
 
+    if (!via_compact_block && (pfrom.m_accepted_services & NODE_QUANTUM_QUASAR)) {
+        LOCK(cs_main);
+        const auto* tip = m_chainman.ActiveChain().Tip();
+        if (!m_chainman.IsInitialBlockDownload() && tip && tip->nHeight > 0 &&
+            pindexLast->nHeight >= tip->nHeight && pindexLast->GetAncestor(tip->nHeight) == tip) {
+            State(pfrom.GetId())->m_qq_header = tip;
+            State(pfrom.GetId())->m_qq_lag_deadline = {};
+        }
+    }
     UpdatePeerStateForReceivedHeaders(pfrom, peer, *pindexLast, received_new_header, nCount == MAX_HEADERS_RESULTS);
 
     // Consider immediately downloading blocks.
@@ -3689,6 +3803,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
 
         pfrom.m_has_all_wanted_services = HasAllDesirableServiceFlags(nServices);
         peer->m_their_services = nServices;
+        pfrom.m_accepted_services = nServices;
         pfrom.SetAddrLocal(addrMe);
         {
             LOCK(pfrom.m_subver_mutex);
@@ -4588,6 +4703,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
 
     if (msg_type == NetMsgType::CMPCTBLOCK)
     {
+        if (pfrom.IsQQProbe()) return;
         // Ignore cmpctblock received while importing
         if (m_chainman.m_blockman.LoadingBlocks()) {
             LogPrint(BCLog::NET, "Unexpected cmpctblock message received from peer %d\n", pfrom.GetId());
@@ -4623,11 +4739,12 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
 
         const CBlockIndex *pindex = nullptr;
         BlockValidationState state;
-        if (!ProcessNetBlockHeaders(pfrom, {cmpctblock.header}, /*min_pow_checked=*/true, state, pfrom.nVersion <= OLD_VERSION, &pindex)) {
-            if (state.IsInvalid()) {
+        const auto header_result = ProcessNetBlockHeaders(pfrom, {cmpctblock.header}, /*min_pow_checked=*/true, state, pfrom.nVersion <= OLD_VERSION, &pindex);
+        if (header_result != HeaderProcessingResult::ACCEPTED) {
+            if (header_result == HeaderProcessingResult::FAILED && state.IsInvalid()) {
                 MaybePunishNodeForBlock(pfrom.GetId(), state, /*via_compact_block=*/true, "invalid header via cmpctblock");
-                return;
             }
+            return;
         }
 
         if (received_new_header) {
@@ -5045,6 +5162,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                     if (ping_time.count() >= 0) {
                         // Let connman know about this successful ping-pong
                         pfrom.PongReceived(ping_time);
+                        pfrom.m_qq_pong = true;
                     } else {
                         // This should never happen
                         sProblem = "Timing mishap";
@@ -5237,9 +5355,8 @@ bool PeerManagerImpl::MaybeDiscourageAndDisconnect(CNode& pnode, Peer& peer)
     LogPrint(BCLog::NET, "Disconnecting and discouraging peer %d!\n", peer.m_id);
     if (m_banman) m_banman->Discourage(pnode.addr);
     m_connman.DisconnectNode(pnode.addr);
-    LOCK(cs_main);
-    // Remove all data from the header spam filter when the address is banned
-    CleanAddressHeaders(pnode.addr);
+    // Retain replay evidence through discouragement and reconnects. FinalizeNode
+    // starts the retention clock when the last connection for this key closes.
     return true;
 }
 
@@ -5377,6 +5494,107 @@ void PeerManagerImpl::ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seco
     }
 }
 
+void PeerManagerImpl::EvaluateQQPeers(std::chrono::seconds now)
+{
+    AssertLockHeld(cs_main);
+    const auto steady_now = qq::Clock::now();
+    const auto* tip = m_chainman.ActiveChain().Tip();
+    const bool usable = tip && tip->nHeight > 0 && !m_chainman.IsInitialBlockDownload();
+    int confirmed = 0, eligible = 0;
+    NodeId candidate = -1;
+    std::shared_ptr<qq::Probe> lease;
+    m_connman.ForEachNode([&](CNode* node) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        const bool qq = node->IsFullOutboundConn() && (node->m_accepted_services & NODE_QUANTUM_QUASAR);
+        auto* state = State(node->GetId());
+        if (qq) ++confirmed;
+        bool current = false;
+        if (qq && usable && state && state->m_qq_header &&
+            m_chainman.ActiveChain().Contains(state->m_qq_header)) {
+            current = state->m_qq_header == tip;
+            if (current) state->m_qq_lag_deadline = {};
+            else {
+                if (state->m_qq_lag_deadline == qq::Clock::time_point{}) state->m_qq_lag_deadline = steady_now + CHAIN_SYNC_TIMEOUT;
+                current = steady_now < state->m_qq_lag_deadline;
+            }
+        } else if (state && state->m_qq_header) {
+            state->m_qq_header = nullptr;
+            state->m_qq_challenge = nullptr;
+        }
+        node->m_qq_eligible = current && node->m_qq_pong && node->m_has_all_wanted_services;
+        if (node->m_qq_eligible && !node->IsQQProbe()) ++eligible;
+        if (node->m_qq_probe && node->m_qq_probe->active) {
+            candidate = node->GetId();
+            lease = node->m_qq_probe;
+        }
+    });
+    std::string constraint;
+    if (!usable) constraint = "chain-not-ready";
+    else if (eligible < m_connman.GetQQTarget() && !m_connman.HasQQProbeHeadroom()) constraint = "no-probe-headroom";
+    if (lease && lease->promoted) {
+        // The victim still owns its grant until DisconnectNodes actually retires it.
+        if (!m_connman.HasNode(lease->retiring_peer)) lease->active = false;
+    } else if (lease) {
+        NodeId victim = -1;
+        int64_t oldest = std::numeric_limits<int64_t>::max();
+        bool candidate_ready = false;
+        m_connman.ForNode(candidate, [&](CNode* node) {
+            candidate_ready = node->m_qq_eligible && now - node->m_connected > MINIMUM_CONNECT_TIME;
+            return false;
+        });
+        if (candidate_ready && !lease->Expired(steady_now) &&
+            m_connman.GetFullOutboundCount() <= m_connman.GetFullOutboundTarget()) {
+            // A normal slot opened during probation. Retain this qualified peer
+            // without retiring another healthy connection.
+            lease->promoted = true;
+            lease->active = false;
+            ++eligible;
+        }
+        if (candidate_ready && !lease->promoted && eligible < m_connman.GetQQTarget()) {
+            m_connman.ForEachNode([&](CNode* node) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_connman.GetNodesMutex()) {
+                auto* state = State(node->GetId());
+                if (!node->IsFullOutboundConn() || node->IsQQProbe() || node->m_qq_eligible || !state ||
+                    state->m_chain_sync.m_protect || !state->vBlocksInFlight.empty() ||
+                    now - node->m_connected <= MINIMUM_CONNECT_TIME ||
+                    !m_connman.MultipleManualOrFullOutboundConns(node->addr.GetNetwork())) return;
+                if (state->m_last_block_announcement < oldest ||
+                    (state->m_last_block_announcement == oldest && node->GetId() > victim)) {
+                    victim = node->GetId(); oldest = state->m_last_block_announcement;
+                }
+            });
+            if (victim != -1) {
+                // cs_main serializes qualification and chain/protection updates. Recheck
+                // candidate and victim together against one nodes snapshot before mutation.
+                LOCK(m_connman.GetNodesMutex());
+                if (m_connman.ForNode(candidate, [&](CNode* node) {
+                    if (!node->m_qq_eligible || node->fDisconnect || lease->Expired(steady_now)) return false;
+                    return m_connman.ForNode(victim, [&](CNode* old) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+                        auto* state = State(old->GetId());
+                        if (!state || old->fDisconnect || old->m_qq_eligible || state->m_chain_sync.m_protect ||
+                            !state->vBlocksInFlight.empty()) return false;
+                        int live_network_peers{0};
+                        m_connman.ForEachNode([&](CNode* peer) {
+                            if ((peer->IsManualConn() || peer->IsFullOutboundConn()) &&
+                                peer->addr.GetNetwork() == old->addr.GetNetwork()) ++live_network_peers;
+                        });
+                        if (live_network_peers < 2) return false;
+                        lease->retiring_peer = victim;
+                        lease->promoted = true;
+                        old->fDisconnect = true;
+                        ++eligible;
+                        LogPrint(BCLog::NET, "QQ replacement: retained peer=%d retiring peer=%d\n", candidate, victim);
+                        return true;
+                    });
+                })) constraint = "retiring-victim";
+            } else constraint = "no-safe-victim";
+        }
+        if (lease->Expired(steady_now) || (candidate_ready && eligible >= m_connman.GetQQTarget() && !lease->promoted)) {
+            m_connman.ForNode(candidate, [&](CNode* node) { node->fDisconnect = true; return true; });
+            constraint = "probe-rejected";
+        }
+    }
+    m_connman.PublishQQStatus(confirmed, eligible, lease && lease->active, constraint);
+}
+
 void PeerManagerImpl::EvictExtraOutboundPeers(std::chrono::seconds now)
 {
     // If we have any extra block-relay-only peers, disconnect the youngest unless
@@ -5426,12 +5644,18 @@ void PeerManagerImpl::EvictExtraOutboundPeers(std::chrono::seconds now)
 
     // Check whether we have too many outbound-full-relay peers
     if (m_connman.GetExtraFullOutboundCount() > 0) {
+        bool pending_qq = false;
+        m_connman.ForEachNode([&](CNode* node) { pending_qq |= node->IsQQProbe(); });
+        // A tagged probe is not an ordinary surplus connection. Its bounded
+        // transaction alone decides whether it displaces a safe legacy peer.
+        if (pending_qq) return;
         // If we have more outbound-full-relay peers than we target, disconnect one.
         // Pick the outbound-full-relay peer that least recently announced
         // us a new block, with ties broken by choosing the more recent
         // connection (higher node id)
         // Protect peers from eviction if we don't have another connection
         // to their network, counting both outbound-full-relay and manual peers.
+        const auto qq_status = m_connman.GetQQStatus();
         NodeId worst_peer = -1;
         int64_t oldest_block_announcement = std::numeric_limits<int64_t>::max();
 
@@ -5440,11 +5664,13 @@ void PeerManagerImpl::EvictExtraOutboundPeers(std::chrono::seconds now)
 
             // Only consider outbound-full-relay peers that are not already
             // marked for disconnection
-            if (!pnode->IsFullOutboundConn() || pnode->fDisconnect) return;
+            if (!pnode->IsFullOutboundConn() || pnode->fDisconnect || pnode->IsQQProbe()) return;
             CNodeState *state = State(pnode->GetId());
             if (state == nullptr) return; // shouldn't be possible, but just in case
             // Don't evict our protected peers
-            if (state->m_chain_sync.m_protect) return;
+            if (state->m_chain_sync.m_protect || !state->vBlocksInFlight.empty() ||
+                now - pnode->m_connected <= MINIMUM_CONNECT_TIME) return;
+            if (pnode->m_qq_eligible && qq_status.eligible <= m_connman.GetQQTarget()) return;
             // If this is the only connection on a particular network that is
             // OUTBOUND_FULL_RELAY or MANUAL, protect it.
             if (!m_connman.MultipleManualOrFullOutboundConns(pnode->addr.GetNetwork())) return;
@@ -5491,6 +5717,7 @@ void PeerManagerImpl::CheckForStaleTipAndEvictPeers()
 
     auto now{GetTime<std::chrono::seconds>()};
 
+    EvaluateQQPeers(now);
     EvictExtraOutboundPeers(now);
 
     if (now > m_stale_tip_check_time) {
@@ -5774,6 +6001,24 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         LOCK(cs_main);
 
         CNodeState &state = *State(pto->GetId());
+        const auto* qq_tip = m_chainman.ActiveChain().Tip();
+        if (pto->IsFullOutboundConn() && (pto->m_accepted_services & NODE_QUANTUM_QUASAR) &&
+            !m_chainman.IsInitialBlockDownload() && qq_tip && qq_tip->nHeight > 0 &&
+            state.m_qq_header != qq_tip) {
+            if (state.m_qq_challenge != qq_tip) {
+                state.m_qq_challenge = qq_tip;
+                state.m_qq_challenge_attempts = 0;
+                state.m_qq_next_challenge = {};
+            }
+            // Permit one delayed retry after a response on a quiet tip. The
+            // ordinary getheaders timeout still applies to unanswered requests.
+            const auto elapsed = qq::Clock::now();
+            if (state.m_qq_challenge_attempts < 2 && elapsed >= state.m_qq_next_challenge &&
+                MaybeSendGetHeaders(*pto, GetLocator(qq_tip->pprev), *peer, qq_tip->GetBlockHash())) {
+                ++state.m_qq_challenge_attempts;
+                state.m_qq_next_challenge = elapsed + qq::RETRY_INTERVAL;
+            }
+        }
 
         // Start block sync
         if (m_chainman.m_best_header == nullptr) {
@@ -6165,7 +6410,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         // Message: getdata (blocks)
         //
         std::vector<CInv> vGetData;
-        if (CanServeBlocks(*peer) && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(*peer)) || !m_chainman.IsInitialBlockDownload()) && state.vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
+        if (!pto->IsQQProbe() && CanServeBlocks(*peer) && ((sync_blocks_and_headers_from_peer && !IsLimitedPeer(*peer)) || !m_chainman.IsInitialBlockDownload()) && state.vBlocksInFlight.size() < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
             std::vector<const CBlockIndex*> vToDownload;
             NodeId staller = -1;
             auto get_inflight_budget = [&state]() {

@@ -209,6 +209,7 @@ BITCOIN_CORE_H = \
   memusage.h \
   merkleblock.h \
   net.h \
+  qq_policy.h \
   net_permissions.h \
   net_processing.h \
   net_types.h \

@@ -5,6 +5,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <banman.h>
+#include <blockencodings.h>
 #include <chainparams.h>
 #include <clientversion.h>
 #include <common/args.h>
@@ -16,6 +18,7 @@
 #include <netaddress.h>
 #include <netbase.h>
 #include <netmessagemaker.h>
+#include <node/blockstorage.h>
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
@@ -37,11 +40,102 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 using namespace std::literals;
 
 BOOST_FIXTURE_TEST_SUITE(net_tests, RegTestingSetup)
+
+BOOST_AUTO_TEST_CASE(qq_capacity_policy)
+{
+    for (const int capacity : {0, 1, 2, 8, 16}) {
+        ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+        CConnman::Options options;
+        options.nMaxConnections = capacity;
+        options.m_max_outbound_full_relay = MAX_OUTBOUND_FULL_RELAY_CONNECTIONS;
+        connman.Init(options);
+        BOOST_CHECK_EQUAL(connman.GetQQTarget(), capacity / 2);
+        options.m_qq_outbound_target = 100;
+        connman.Init(options);
+        BOOST_CHECK_EQUAL(connman.GetQQTarget(), std::max(0, capacity - 1));
+        options.m_qq_outbound_target = 0;
+        connman.Init(options);
+        BOOST_CHECK_EQUAL(connman.GetQQTarget(), 0);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(qq_probe_fallback_deadline)
+{
+    const auto start = qq::Clock::time_point{};
+    auto lease = std::make_shared<qq::Probe>(start);
+    std::weak_ptr<qq::Probe> outstanding{lease};
+    auto fallback = lease;
+    lease.reset();
+    BOOST_CHECK(!outstanding.expired());
+    BOOST_CHECK(!fallback->Expired(start + 119s));
+    BOOST_CHECK(fallback->Expired(start + 120s));
+    BOOST_CHECK(fallback->Expired(start + 24h)); // Resume coalesces elapsed deadlines.
+    fallback.reset();
+    BOOST_CHECK(outstanding.expired());
+}
+
+BOOST_AUTO_TEST_CASE(qq_queued_fallback_expiration_and_batch)
+{
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    connman.InitReconnectionTest();
+    struct SocketFactoryGuard {
+        decltype(CreateSock) original{CreateSock};
+        ~SocketFactoryGuard() { CreateSock = std::move(original); }
+    } socket_factory_guard;
+    unsigned int attempted{0};
+    CreateSock = [&](const CService&) -> std::unique_ptr<Sock> { ++attempted; return nullptr; };
+    auto expired = std::make_shared<qq::Probe>(qq::Clock::now() - qq::PROBE_RESIDENCE);
+    std::weak_ptr<qq::Probe> token = expired;
+    connman.QueueReconnection(connman.AcquireOutboundPermit(), std::move(expired));
+    BOOST_CHECK(!token.expired());
+    connman.PerformReconnections();
+    BOOST_CHECK(token.expired());
+    BOOST_CHECK_EQUAL(attempted, 0U);
+    // Expiration returns the actual semaphore permit exactly once.
+    auto returned = connman.AcquireOutboundPermit();
+    BOOST_CHECK(returned);
+    returned.Release();
+    connman.QueueReconnection({});
+    connman.QueueReconnection({});
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 1U);
+    BOOST_CHECK_EQUAL(connman.GetReconnectionCount(), 1U);
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(qq_transient_fairness)
+{
+    qq::Arbiter arbiter;
+    std::array<bool, qq::Arbiter::CLASSES> due;
+    due.fill(true);
+    for (int cycle = 0; cycle < 100; ++cycle) {
+        std::set<int> served;
+        for (size_t turn = 0; turn < due.size(); ++turn) served.insert(arbiter.Pick(due));
+        BOOST_CHECK_EQUAL(served.size(), due.size());
+    }
+    due.fill(false);
+    BOOST_CHECK_EQUAL(arbiter.Pick(due), -1);
+    due[1] = due[5] = true; // Continuous address discovery cannot starve QQ, or vice versa.
+    for (int turn = 0; turn < 100; ++turn) BOOST_CHECK_EQUAL(arbiter.Pick(due), turn % 2 ? 5 : 1);
+}
+
+BOOST_AUTO_TEST_CASE(addr_fetch_bounded_and_canonical)
+{
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    connman.AddAddrFetch("EXAMPLE.TEST.");
+    connman.AddAddrFetch("example.test");
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 1U);
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchFront(), "EXAMPLE.TEST.");
+    for (size_t i = 0; i < qq::MAX_ADDR_FETCHES * 2; ++i) connman.AddAddrFetch(strprintf("seed%u.test", i));
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), qq::MAX_ADDR_FETCHES);
+}
 
 BOOST_AUTO_TEST_CASE(cnode_listen_port)
 {
@@ -162,7 +256,6 @@ BOOST_AUTO_TEST_CASE(reconnections_respect_networkactive_and_interrupt)
     BOOST_CHECK_EQUAL(attempted, 0U);
 
     connman.SetNetworkActive(true);
-    connman.QueueReconnection(connman.AcquireOutboundPermit());
     connman.PerformReconnections();
     BOOST_CHECK_EQUAL(attempted, 1U);
 
@@ -210,6 +303,250 @@ BOOST_AUTO_TEST_CASE(header_replay_filter_at_capacity)
     BOOST_REQUIRE(filter.addHeaders(&first, &last));
     BlockValidationState bounded_state;
     BOOST_CHECK(filter.updateState(0, bounded_state, true));
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_compact_counter_equivalence)
+{
+    // Compare the compact production counter with an independent ordered-map
+    // reference over overlapping ranges, retained replays, and new low heights.
+    constexpr size_t capacity{17};
+    CNodeHeaders compact{capacity, 1000000};
+    std::map<int, uint32_t> reference;
+    uint32_t sequence{0x6d2b79f5};
+    for (int turn = 0; turn < 3000; ++turn) {
+        sequence = sequence * 1664525U + 1013904223U;
+        const int first_height = (sequence >> 16) % 73;
+        const int last_height = first_height + (sequence % 5);
+        CBlockIndex first, last;
+        first.nHeight = first_height;
+        last.nHeight = last_height;
+        BOOST_REQUIRE(compact.addHeaders(&first, &last));
+        for (int height = first_height; height <= last_height; ++height) {
+            auto known = reference.find(height);
+            if (known != reference.end()) ++known->second;
+            else {
+                if (reference.size() == capacity) reference.erase(reference.begin());
+                reference.emplace(height, 1);
+            }
+        }
+        BOOST_CHECK_EQUAL(compact.HeightCount(), reference.size());
+        for (int height = 0; height < 80; ++height) {
+            const auto known = reference.find(height);
+            BOOST_CHECK_EQUAL(compact.CountAtHeight(height), known == reference.end() ? 0U : known->second);
+        }
+    }
+    BOOST_CHECK_THROW(CNodeHeaders(MAX_HEADER_SPAM_FILTER_POINTS + 1, 10), std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_identity_reserve_and_churn)
+{
+    CServiceHeaderTracker tracker;
+    const auto start = CServiceHeaderTracker::Clock::time_point{};
+    const auto address = [](unsigned int value) {
+        return LookupNumeric(strprintf("23.%u.%u.1", value / 256, value % 256), 15714);
+    };
+    constexpr size_t general = CServiceHeaderTracker::MAX_SERVICES - CServiceHeaderTracker::INITIATED_RESERVE;
+    CBlockIndex repeated;
+    repeated.nHeight = 0;
+    for (size_t i = 0; i < general; ++i) {
+        const auto service = address(i);
+        auto* headers = tracker.GetOrCreate(service, false, 1, start + (i == 0 ? 0s : 60s));
+        BOOST_REQUIRE(headers);
+        if (i == 0) {
+            for (int replay = 0; replay < 3; ++replay) BOOST_REQUIRE(headers->addHeaders(&repeated, &repeated));
+        }
+        tracker.Disconnected(service, start + (i == 0 ? 0s : 60s));
+    }
+    BOOST_CHECK_EQUAL(tracker.GeneralSize(), general);
+    BOOST_CHECK(!tracker.GetOrCreate(address(general), false, 1, start));
+    for (size_t i = general; i < CServiceHeaderTracker::MAX_SERVICES; ++i) {
+        const auto service = address(i);
+        BOOST_REQUIRE(tracker.GetOrCreate(service, true, 1, start + 60s));
+        tracker.Disconnected(service, start + 60s);
+    }
+    // Unknown identities cannot grow storage, evict existing evidence, or
+    // consume unbounded expiry metadata, even under sustained churn.
+    for (unsigned int i = 2000; i < 12000; ++i) {
+        BOOST_CHECK(!tracker.GetOrCreate(address(i), i % 2, 1, start + 30min));
+    }
+    BOOST_CHECK_EQUAL(tracker.Size(), CServiceHeaderTracker::MAX_SERVICES);
+    auto* retained = tracker.GetOrCreate(address(0), false, 0, start + 30min);
+    BOOST_REQUIRE(retained);
+    BOOST_CHECK_EQUAL(retained->CountAtHeight(0), 3U);
+    BOOST_REQUIRE(retained->addHeaders(&repeated, &repeated));
+    BOOST_CHECK_EQUAL(retained->CountAtHeight(0), 4U);
+    // Only one record has expired at this boundary. Exactly one admission
+    // succeeds and every other unexpired identity still occupies its slot.
+    BOOST_REQUIRE(tracker.GetOrCreate(address(12000), false, 1, start + 1h));
+    BOOST_CHECK_EQUAL(tracker.Size(), CServiceHeaderTracker::MAX_SERVICES);
+    BOOST_CHECK_EQUAL(tracker.GeneralSize(), general);
+    BOOST_CHECK(!tracker.GetOrCreate(address(12001), false, 1, start + 1h));
+    BOOST_REQUIRE(tracker.GetOrCreate(address(12001), false, 1, start + 1h + 60s));
+    BOOST_CHECK_EQUAL(tracker.Size(), 2U);
+    BOOST_CHECK_EQUAL(tracker.GeneralSize(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_lifecycle_normalization_and_expiry)
+{
+    CServiceHeaderTracker tracker;
+    const auto start = CServiceHeaderTracker::Clock::time_point{};
+    const auto first = LookupNumeric("23.1.1.1", 15714);
+    const auto second = LookupNumeric("23.1.1.1", 25714);
+    const auto key = CServiceHeaderTracker::Normalize(first, true);
+    BOOST_CHECK(key == CServiceHeaderTracker::Normalize(second, true));
+    BOOST_CHECK(CServiceHeaderTracker::Normalize(first, false) != CServiceHeaderTracker::Normalize(second, false));
+    // Lazy admission sees both already-live connections to the same key.
+    auto* headers = tracker.GetOrCreate(key, true, 2, start);
+    BOOST_REQUIRE(headers);
+    CBlockIndex repeated;
+    repeated.nHeight = 0;
+    BOOST_REQUIRE(headers->addHeaders(&repeated, &repeated));
+    tracker.Disconnected(key, start + 1min);
+    BOOST_REQUIRE(tracker.GetOrCreate(key, false, 1, start + 2h));
+    BOOST_CHECK_EQUAL(tracker.GetOrCreate(key, false, 1, start + 2h)->CountAtHeight(0), 1U);
+    tracker.Disconnected(key, start + 2h);
+    tracker.Connected(key, start + 2h + 59min);
+    headers = tracker.GetOrCreate(key, false, 1, start + 2h + 59min);
+    BOOST_REQUIRE(headers);
+    BOOST_CHECK_EQUAL(headers->CountAtHeight(0), 1U);
+    tracker.Disconnected(key, start + 3h);
+    // Reconnection before expiry resets the disconnected retention deadline.
+    BOOST_CHECK_EQUAL(tracker.GetOrCreate(key, false, 0, start + 3h + 59min)->CountAtHeight(0), 1U);
+    // Connected() removes an expired disconnected record before pinning; the
+    // new lazy admission starts with fresh counters at the retention boundary.
+    tracker.Connected(key, start + 4h);
+    headers = tracker.GetOrCreate(key, false, 1, start + 4h);
+    BOOST_REQUIRE(headers);
+    BOOST_CHECK_EQUAL(headers->CountAtHeight(0), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_threshold_survives_reconnect)
+{
+    CServiceHeaderTracker tracker;
+    const auto start = CServiceHeaderTracker::Clock::time_point{};
+    const auto service = LookupNumeric("23.2.1.1", 15714);
+    auto* headers = tracker.GetOrCreate(service, true, 1, start);
+    BOOST_REQUIRE(headers);
+    CBlockIndex first, last;
+    first.nHeight = 0;
+    last.nHeight = DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE - 1;
+    BOOST_REQUIRE(headers->addHeaders(&first, &last));
+    BlockValidationState state;
+    for (unsigned int i = 0; i < DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE * 5 && !state.IsInvalid(); ++i) {
+        BOOST_REQUIRE(headers->addHeaders(&first, &first));
+        headers->updateState(0, state, true);
+    }
+    BOOST_REQUIRE(state.GetResult() == BlockValidationResult::BLOCK_HEADER_SPAM);
+    const uint32_t evidence = headers->CountAtHeight(0);
+    BOOST_CHECK_GT(evidence, 1U);
+    tracker.Disconnected(service, start);
+    tracker.Connected(service, start + 59min);
+    headers = tracker.GetOrCreate(service, true, 1, start + 59min);
+    BOOST_REQUIRE(headers);
+    BOOST_CHECK_EQUAL(headers->CountAtHeight(0), evidence);
+    BlockValidationState reconnect_state;
+    BOOST_CHECK(!headers->updateState(1, reconnect_state, true));
+    BOOST_CHECK(reconnect_state.GetResult() == BlockValidationResult::BLOCK_HEADER_SPAM);
+    tracker.Disconnected(service, start + 59min);
+    tracker.Connected(service, start + 2h);
+    headers = tracker.GetOrCreate(service, true, 1, start + 2h);
+    BOOST_REQUIRE(headers);
+    BOOST_CHECK_EQUAL(headers->HeightCount(), 0U);
+    BlockValidationState fresh;
+    BOOST_CHECK(headers->updateState(2, fresh, true));
+}
+
+BOOST_FIXTURE_TEST_CASE(header_replay_capacity_message_paths, TestChain100Setup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    if (m_node.chainman->IsInitialBlockDownload()) {
+        static_cast<TestChainstateManager&>(*m_node.chainman).JumpOutOfIbd();
+    }
+    auto banman = std::make_unique<BanMan>(m_args.GetDataDirBase() / "header-capacity-banlist", nullptr, DEFAULT_MISBEHAVING_BANTIME);
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    auto peerman = PeerManager::make(connman, *m_node.addrman, banman.get(), *m_node.chainman, *m_node.mempool, {});
+    CConnman::Options options;
+    options.m_msgproc = peerman.get();
+    connman.Init(options);
+    NodeId next_id{0};
+    const auto address = [](unsigned int value) {
+        return LookupNumeric(strprintf("24.%u.%u.1", value / 256, value % 256), 15714);
+    };
+    const auto make_peer = [&](unsigned int value, uint16_t port = 15714) {
+        const CService endpoint{address(value), port};
+        auto node = std::make_unique<CNode>(next_id++, nullptr, CAddress{endpoint, NODE_NETWORK},
+            0, 0, CAddress{}, "", ConnectionType::INBOUND, false);
+        peerman->InitializeNode(*node, NODE_NETWORK);
+        node->nVersion = PROTOCOL_VERSION;
+        node->SetCommonVersion(PROTOCOL_VERSION);
+        node->fSuccessfullyConnected = true;
+        return node;
+    };
+    std::atomic<bool> interrupt{false};
+    const CNetMsgMaker maker{PROTOCOL_VERSION};
+    const auto deliver = [&](CNode& node, CSerializedNetMsg message) {
+        CDataStream stream{message.data, SER_NETWORK};
+        peerman->ProcessMessage(node, message.m_type, stream, 0us, interrupt);
+    };
+    const CBlockHeader known{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip()->GetBlockHeader())};
+    CBlock header_only;
+    static_cast<CBlockHeader&>(header_only) = known;
+    const auto header_message = [&] { return maker.Make(NetMsgType::HEADERS, TX_WITH_WITNESS(std::vector<CBlock>{header_only})); };
+    // Both connections predate lazy record admission. Filtering is initially
+    // disabled; enabling it must count the second, still-dormant connection.
+    // Neither finalization may underflow or free the other's retained state.
+    const bool original_filter = m_node.args->GetBoolArg("-headerspamfilter", DEFAULT_HEADER_SPAM_FILTER);
+    struct FilterGuard {
+        ArgsManager& args;
+        bool original;
+        ~FilterGuard() { args.ForceSetArg("-headerspamfilter", original ? "1" : "0"); }
+    } filter_guard{*m_node.args, original_filter};
+    m_node.args->ForceSetArg("-headerspamfilter", "0");
+    auto dormant = make_peer(0);
+    auto active = make_peer(0, 25714);
+    deliver(*active, header_message());
+    BOOST_REQUIRE(!active->fDisconnect);
+    m_node.args->ForceSetArg("-headerspamfilter", "1");
+    deliver(*active, header_message());
+    BOOST_REQUIRE(!active->fDisconnect);
+    peerman->FinalizeNode(*active);
+    deliver(*dormant, header_message());
+    BOOST_REQUIRE(!dormant->fDisconnect);
+    peerman->FinalizeNode(*dormant);
+    // Populate actual PeerManager accounting through accepted HEADERS, then
+    // disconnect. No test hook injects records or overrides the capacity.
+    for (size_t i = 0; i < CServiceHeaderTracker::MAX_SERVICES - CServiceHeaderTracker::INITIATED_RESERVE; ++i) {
+        auto node = make_peer(i);
+        deliver(*node, header_message());
+        BOOST_REQUIRE(!node->fDisconnect);
+        peerman->FinalizeNode(*node);
+    }
+    const CBlock candidate = CreateBlock({}, CScript{} << OP_TRUE, m_node.chainman->ActiveChainstate());
+    for (const auto& type : {NetMsgType::HEADERS, NetMsgType::CMPCTBLOCK, NetMsgType::BLOCK}) {
+        auto node = make_peer(10000 + next_id);
+        if (type == NetMsgType::HEADERS) {
+            CBlock header;
+            static_cast<CBlockHeader&>(header) = candidate.GetBlockHeader();
+            deliver(*node, maker.Make(type, TX_WITH_WITNESS(std::vector<CBlock>{header})));
+        } else if (type == NetMsgType::CMPCTBLOCK) {
+            deliver(*node, maker.Make(type, CBlockHeaderAndShortTxIDs{candidate}));
+        } else {
+            deliver(*node, maker.Make(type, TX_WITH_WITNESS(candidate)));
+        }
+        BOOST_CHECK(node->fDisconnect);
+        BOOST_CHECK(!banman->IsDiscouraged(node->addr));
+        BOOST_CHECK(!banman->IsBanned(node->addr));
+        // Resource refusal precedes validation. No caller may fall through to
+        // header/block acceptance, mark a valid block invalid, or dereference
+        // an absent returned block index.
+        BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(candidate.GetHash()) == nullptr));
+        peerman->FinalizeNode(*node);
+    }
+    auto retained = make_peer(0);
+    deliver(*retained, maker.Make(NetMsgType::BLOCK, TX_WITH_WITNESS(candidate)));
+    BOOST_CHECK(!retained->fDisconnect);
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip()->GetBlockHash() == candidate.GetHash()));
+    peerman->FinalizeNode(*retained);
 }
 
 BOOST_AUTO_TEST_CASE(cnode_simple_test)

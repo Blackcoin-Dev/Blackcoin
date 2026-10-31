@@ -558,6 +558,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-proxy=<ip:port>", "Connect through SOCKS5 proxy, set -noproxy to disable (default: disabled)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_ELISION, OptionsCategory::CONNECTION);
     argsman.AddArg("-proxyrandomize", strprintf("Randomize credentials for every proxy connection. This enables Tor stream isolation (default: %u)", DEFAULT_PROXYRANDOMIZE), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-seednode=<ip>", "Connect to a node to retrieve peer addresses, and disconnect. This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-qqoutboundtarget=<n>", "Preferred number of responsive current-chain QQ automatic full-relay peers (default: half of full-relay capacity; explicit values clamp below full capacity; 0 disables pursuit)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-networkactive", "Enable all P2P network activity (default: 1). Can be changed by the setnetworkactive RPC command", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-timeout=<n>", strprintf("Specify socket connection timeout in milliseconds. If an initial attempt to connect is unsuccessful after this amount of time, drop it (minimum: 1, default: %d)", DEFAULT_CONNECT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peertimeout=<n>", strprintf("Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before considering disconnection based on inactivity (minimum: 1, default: %d)", DEFAULT_PEER_CONNECT_TIMEOUT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
@@ -701,7 +702,7 @@ void SetupServerArgs(ArgsManager& argsman)
 
     // Header spam filter
     argsman.AddArg("-headerspamfilter=<n>", strprintf("Use header spam filter (default: %u)", DEFAULT_HEADER_SPAM_FILTER), false, OptionsCategory::OPTIONS);
-    argsman.AddArg("-headerspamfiltermaxsize=<n>", strprintf("Maximum size of the list of indexes in the header spam filter (default: %u)", DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE), false, OptionsCategory::OPTIONS);
+    argsman.AddArg("-headerspamfiltermaxsize=<n>", strprintf("Maximum retained heights per header replay identity, 0-%u (default: %u). Up to 1024 identities retain reconnect history for one disconnected hour; 64 slots are reserved for locally initiated peers", MAX_HEADER_SPAM_FILTER_POINTS, DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE), false, OptionsCategory::OPTIONS);
     argsman.AddArg("-headerspamfiltermaxavg=<n>", strprintf("Maximum average size of an index occurrence in the header spam filter (default: %u)", DEFAULT_HEADER_SPAM_FILTER_MAX_AVG), false, OptionsCategory::OPTIONS);
     argsman.AddArg("-headerspamfilterignoreport=<n>", strprintf("Ignore the port in the ip address when looking for header spam, determine whether or not multiple nodes can be on the same IP (default: %u)", DEFAULT_HEADER_SPAM_FILTER_IGNORE_PORT), false, OptionsCategory::OPTIONS);
     argsman.AddArg("-headerspamfilterduringibd=<n>", strprintf("Enable header spam filter during IBD (default: %u)", DEFAULT_HEADER_SPAM_FILTER_DURING_IBD), false, OptionsCategory::OPTIONS);
@@ -1065,6 +1066,14 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
 
         nLocalServices = ServiceFlags(nLocalServices | NODE_COMPACT_FILTERS);
+    }
+
+    const int64_t header_points = args.GetIntArg("-headerspamfiltermaxsize", DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE);
+    if (header_points < 0 || header_points > static_cast<int64_t>(MAX_HEADER_SPAM_FILTER_POINTS)) {
+        return InitError(strprintf(_("-headerspamfiltermaxsize must be between 0 and %u"), MAX_HEADER_SPAM_FILTER_POINTS));
+    }
+    if (args.GetIntArg("-headerspamfiltermaxavg", DEFAULT_HEADER_SPAM_FILTER_MAX_AVG) < 0) {
+        return InitError(_("-headerspamfiltermaxavg must be nonnegative"));
     }
 
     // If -forcednsseed is set to true, ensure -dnsseed has not been set to false
@@ -2130,6 +2139,10 @@ static bool AppInitMainImpl(NodeContext& node,
     connOptions.nMaxConnections = nMaxConnections;
     connOptions.m_max_outbound_full_relay = std::min(MAX_OUTBOUND_FULL_RELAY_CONNECTIONS, connOptions.nMaxConnections);
     connOptions.m_max_outbound_block_relay = std::min(MAX_BLOCK_RELAY_ONLY_CONNECTIONS, connOptions.nMaxConnections-connOptions.m_max_outbound_full_relay);
+    if (args.IsArgSet("-qqoutboundtarget") && args.GetIntArg("-qqoutboundtarget", 0) < 0) {
+        return InitError(_("-qqoutboundtarget must be nonnegative"));
+    }
+    connOptions.m_qq_outbound_target = args.IsArgSet("-qqoutboundtarget") ? std::min<int64_t>(args.GetIntArg("-qqoutboundtarget", 0), MAX_OUTBOUND_FULL_RELAY_CONNECTIONS) : -1;
     connOptions.nMaxAddnode = MAX_ADDNODE_CONNECTIONS;
     connOptions.nMaxFeeler = MAX_FEELER_CONNECTIONS;
     connOptions.uiInterface = &uiInterface;

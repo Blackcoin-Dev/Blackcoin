@@ -41,10 +41,16 @@ struct ConnmanTestMsg : public CConnman {
         return CSemaphoreGrant{*semAddnode};
     }
 
-    void QueueReconnection(CSemaphoreGrant&& grant)
+    void QueueReconnection(CSemaphoreGrant&& grant, std::shared_ptr<qq::Probe> probe = {})
     {
         LOCK(m_reconnections_mutex);
-        m_reconnections.push_back({CAddress{}, std::move(grant), "8.8.8.8:15714", ConnectionType::MANUAL, false});
+        m_reconnections.push_back({CAddress{}, std::move(grant), "8.8.8.8:15714", probe ? ConnectionType::OUTBOUND_FULL_RELAY : ConnectionType::MANUAL, false, std::move(probe)});
+    }
+
+    size_t GetReconnectionCount()
+    {
+        LOCK(m_reconnections_mutex);
+        return m_reconnections.size();
     }
 
     void StartConnectionWorker(bool addnode)
@@ -67,6 +73,12 @@ struct ConnmanTestMsg : public CConnman {
     {
         LOCK(m_addr_fetches_mutex);
         return m_addr_fetches.size();
+    }
+
+    std::string GetAddrFetchFront()
+    {
+        LOCK(m_addr_fetches_mutex);
+        return m_addr_fetches.front();
     }
 
     void SetPeerConnectTimeout(std::chrono::seconds timeout)

@@ -621,6 +621,22 @@ static RPCHelpMan getnetworkinfo()
                         {RPCResult::Type::NUM, "connections_in", "the number of inbound connections"},
                         {RPCResult::Type::NUM, "connections_out", "the number of outbound connections"},
                         {RPCResult::Type::BOOL, "networkactive", "whether p2p networking is enabled"},
+                        {RPCResult::Type::OBJ, "qqoutbound", "Current-chain QQ connection preference; not future-fork readiness",
+                        {
+                            {RPCResult::Type::NUM, "requested", "Requested preference, -1 means automatic half capacity"},
+                            {RPCResult::Type::NUM, "target", "Effective preference after capacity clamping"},
+                            {RPCResult::Type::NUM, "confirmed", "Accepted QQ VERSION and VERACK automatic full-relay peers"},
+                            {RPCResult::Type::NUM, "eligible", "Retained peers with matching pong and validated current-chain header evidence"},
+                            {RPCResult::Type::NUM, "deficit", "Unfilled eligible preference"},
+                            {RPCResult::Type::BOOL, "pending", "A replacement transaction is in probation or retiring its victim"},
+                            {RPCResult::Type::NUM, "generation", "Qualification snapshot generation"},
+                            {RPCResult::Type::STR, "constraint", "Last observed constraint, or empty"},
+                            {RPCResult::Type::NUM, "candidate_draws", "Weighted addrman draws for replacement probes"},
+                            {RPCResult::Type::NUM, "no_hint_rounds", "Probe selection rounds finding no eligible QQ hint"},
+                            {RPCResult::Type::NUM, "connect_attempts", "Replacement socket connection attempts, including fallback"},
+                            {RPCResult::Type::NUM, "connect_failures", "Replacement socket connection failures"},
+                            {RPCResult::Type::NUM, "dns_rounds", "Discovery rounds requested by QQ deficit"},
+                        }},
                         {RPCResult::Type::ARR, "networks", "information per network",
                         {
                             {RPCResult::Type::OBJ, "", "",
@@ -671,6 +687,22 @@ static RPCHelpMan getnetworkinfo()
     obj.pushKV("timeoffset",    GetTimeOffset());
     if (node.connman) {
         obj.pushKV("networkactive", node.connman->GetNetworkActive());
+        const auto status = node.connman->GetQQStatus();
+        UniValue qq(UniValue::VOBJ);
+        qq.pushKV("requested", status.requested);
+        qq.pushKV("target", status.target);
+        qq.pushKV("confirmed", status.confirmed);
+        qq.pushKV("eligible", status.eligible);
+        qq.pushKV("deficit", status.deficit);
+        qq.pushKV("pending", status.pending);
+        qq.pushKV("generation", status.generation);
+        qq.pushKV("constraint", status.constraint);
+        qq.pushKV("candidate_draws", status.candidate_draws);
+        qq.pushKV("no_hint_rounds", status.no_hint_rounds);
+        qq.pushKV("connect_attempts", status.connect_attempts);
+        qq.pushKV("connect_failures", status.connect_failures);
+        qq.pushKV("dns_rounds", status.dns_rounds);
+        obj.pushKV("qqoutbound", std::move(qq));
         obj.pushKV("connections", node.connman->GetNodeCount(ConnectionDirection::Both));
         obj.pushKV("connections_in", node.connman->GetNodeCount(ConnectionDirection::In));
         obj.pushKV("connections_out", node.connman->GetNodeCount(ConnectionDirection::Out));

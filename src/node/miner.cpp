@@ -512,16 +512,63 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
     return true;
 }
 
+// This overlay belongs to exactly one locked package-selection pass at one
+// candidate header time. Failed packages only write to a child cache and local
+// spend set. Selected outputs and spends are committed by AddToBlock, after
+// every package-level check (including the shadow-proof limit) has passed.
+struct BlockAssembler::TemplateOverlay final : CCoinsViewBacked {
+    CCoinsViewMemPool mempool_view;
+    CCoinsView empty_view;
+    CCoinsViewCache selected_view;
+    std::set<COutPoint> spent_outpoints;
+    const int height;
+    const uint32_t time;
+
+    TemplateOverlay(CCoinsViewCache& coins, const CTxMemPool& mempool,
+                    int next_height, uint32_t candidate_time)
+        : CCoinsViewBacked{&mempool_view}, mempool_view{&coins, mempool},
+          selected_view{&empty_view},
+          height{next_height}, time{candidate_time} {}
+
+    bool GetCoin(const COutPoint& outpoint, Coin& coin) const override
+    {
+        // Retain only selected outputs. Read-through into the mempool must
+        // not accumulate inputs from every rejected candidate in this view.
+        return selected_view.GetCoin(outpoint, coin) ||
+               mempool_view.GetCoin(outpoint, coin);
+    }
+
+    void AddOutputs(CCoinsViewCache& view, const CTransaction& tx) const
+    {
+        // Legacy timestamps already have their authoritative mempool value.
+        // Version-2 outputs acquire this immutable candidate header time.
+        if (tx.nVersion >= 2 && !tx.IsCoinBase() && !tx.IsCoinStake()) {
+            AddCoins(view, tx, height, /*check=*/true, time);
+        }
+    }
+
+    void Include(const CTransaction& tx)
+    {
+        AddOutputs(selected_view, tx);
+        for (const CTxIn& input : tx.vin) {
+            if (!input.prevout.IsNull()) spent_outpoints.insert(input.prevout);
+        }
+    }
+};
+
 // Perform transaction-level checks before adding to block:
 // - transaction finality (locktime)
 // - premature witness (in case segwit transactions are added to mempool before
 //   segwit activation)
 // - transaction timestamp limit
-bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime)
+bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime, TemplateOverlay& overlay)
 {
     CBlockIndex* tip{Assert(m_chainstate.m_chain.Tip())};
-    CCoinsViewMemPool view_mempool{&m_chainstate.CoinsTip(), *Assert(m_mempool)};
-    CCoinsViewCache package_view{&view_mempool};
+    CCoinsViewMemPool& view_mempool{overlay.mempool_view};
+    // GetCoin tracks non-base outpoints even for rejected candidates. That
+    // bookkeeping belongs to this package, not the full selection pass.
+    view_mempool.Reset();
+    CCoinsViewCache package_view{&overlay};
     const int next_height{tip->nHeight + 1};
     const int64_t next_block_mtp{tip->GetMedianTimePast()};
     std::set<COutPoint> spent_outpoints;
@@ -541,32 +588,11 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
         final_lockout_flags |= SCRIPT_VERIFY_QUANTUM_STAKE_TIERS;
     }
 
-    // CCoinsViewMemPool intentionally gives a version-2 mempool output a
-    // non-authoritative zero timestamp: it has not yet been assigned a block
-    // header time. A template, however, is evaluating a concrete candidate
-    // header. Overlay every v2 output in its ancestor closure at that exact
-    // candidate time before checking any input. Prepopulating both already
-    // selected transactions and this candidate package keeps the result
-    // independent of the container's iteration order and avoids changing the
-    // global CCoinsViewMemPool semantics.
-    const auto overlay_v2_outputs = [&](const CTransaction& candidate_tx) {
-        if (candidate_tx.nVersion >= 2 &&
-            !candidate_tx.IsCoinBase() && !candidate_tx.IsCoinStake()) {
-            AddCoins(package_view, candidate_tx, next_height,
-                     /*check=*/true, nTime);
-        }
-    };
-    for (CTxMemPool::txiter selected : inBlock) {
-        overlay_v2_outputs(selected->GetTx());
-    }
+    // Prepopulate the whole candidate closure before checking inputs so
+    // iterator order cannot change timestamp checks. Previously selected
+    // outputs already carry this candidate time in the parent overlay.
     for (CTxMemPool::txiter candidate : package) {
-        overlay_v2_outputs(candidate->GetTx());
-    }
-
-    for (CTxMemPool::txiter selected : inBlock) {
-        for (const CTxIn& txin : selected->GetTx().vin) {
-            if (!txin.prevout.IsNull()) spent_outpoints.insert(txin.prevout);
-        }
+        overlay.AddOutputs(package_view, candidate->GetTx());
     }
 
     for (CTxMemPool::txiter it : package) {
@@ -576,6 +602,7 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
         }
         for (const CTxIn& txin : tx.vin) {
             if (txin.prevout.IsNull() || attestation_targets.count(txin.prevout) ||
+                overlay.spent_outpoints.count(txin.prevout) ||
                 !spent_outpoints.insert(txin.prevout).second) {
                 return false;
             }
@@ -613,7 +640,8 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
             return false;
         }
         for (const Consensus::DemurrageAttestation& attestation : demurrage_attestations) {
-            if (spent_outpoints.count(attestation.target_outpoint)) return false;
+            if (overlay.spent_outpoints.count(attestation.target_outpoint) ||
+                spent_outpoints.count(attestation.target_outpoint)) return false;
             attestation_targets.insert(attestation.target_outpoint);
         }
         if (!Consensus::CheckDemurrageAttestations(tx, package_view, chainparams.GetConsensus(), next_height,
@@ -662,7 +690,7 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
     return true;
 }
 
-void BlockAssembler::AddToBlock(CTxMemPool::txiter iter)
+void BlockAssembler::AddToBlock(CTxMemPool::txiter iter, TemplateOverlay& overlay)
 {
     const CTransaction& tx = iter->GetTx();
     const auto fee_it = m_next_block_fees.find(tx.GetHash());
@@ -678,6 +706,7 @@ void BlockAssembler::AddToBlock(CTxMemPool::txiter iter)
     nBlockSigOpsCost += iter->GetSigOpCost();
     nFees += next_block_fee;
     inBlock.insert(iter);
+    overlay.Include(tx);
     for (const Consensus::DemurrageAttestation& attestation : Consensus::ExtractDemurrageAttestations(tx)) {
         m_demurrage_attestation_keys.insert(attestation.pubkey_hash);
         m_demurrage_attestation_targets.insert(attestation.target_outpoint);
@@ -747,6 +776,8 @@ void BlockAssembler::addPackageTxs(const CTxMemPool& mempool, int& nPackagesSele
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(mempool.cs);
+
+    TemplateOverlay overlay{m_chainstate.CoinsTip(), mempool, nHeight, nTime};
 
     // mapModifiedTx will store sorted packages after they are modified
     // because some of their txs are already in the block
@@ -854,7 +885,7 @@ void BlockAssembler::addPackageTxs(const CTxMemPool& mempool, int& nPackagesSele
         ancestors.insert(iter);
 
         // Test if all tx's are Final
-        if (!TestPackageTransactions(ancestors, nTime)) {
+        if (!TestPackageTransactions(ancestors, nTime, overlay)) {
             if (fUsingModified) {
                 mapModifiedTx.get<ancestor_score>().erase(modit);
                 failedTx.insert(iter);
@@ -896,7 +927,7 @@ void BlockAssembler::addPackageTxs(const CTxMemPool& mempool, int& nPackagesSele
         }
 
         for (size_t i = 0; i < sortedEntries.size(); ++i) {
-            AddToBlock(sortedEntries[i]);
+            AddToBlock(sortedEntries[i], overlay);
             // Erase from the modified set, if present
             mapModifiedTx.erase(sortedEntries[i]);
         }

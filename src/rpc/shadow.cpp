@@ -1535,13 +1535,13 @@ RPCHelpMan getquantumwitnessinventory()
 
             node::NodeContext& node = EnsureAnyNodeContext(request.context);
             ChainstateManager& chainman = EnsureChainman(node);
-            Chainstate& chainstate = chainman.ActiveChainstate();
             const Consensus::Params& consensus = chainman.GetConsensus();
             const CBlockIndex* snapshot_tip{nullptr};
             std::unique_ptr<CCoinsViewCursor> cursor;
             std::unique_ptr<CCoinsViewCursor> marker_cursor;
             {
                 LOCK(cs_main);
+                Chainstate& chainstate = chainman.ActiveChainstate();
                 chainstate.ForceFlushStateToDisk();
                 CCoinsView& coins_db = chainstate.CoinsDB();
                 snapshot_tip = CHECK_NONFATAL(chainstate.m_blockman.LookupBlockIndex(coins_db.GetBestBlock()));
@@ -1567,15 +1567,37 @@ RPCHelpMan getquantumwitnessinventory()
             MuHash3072 utxo_muhash;
             uint64_t utxo_count{0};
 
+            // Cancellation already runs for every coin. Also stop an obsolete
+            // scan before another full UTXO pass finishes after a tip change.
+            // Keep cs_main ownership short and outside index callbacks.
+            uint64_t coins_since_tip_check{0};
+            uint64_t scanned_coins{0};
+            const auto check_snapshot_tip = [&] {
+                LOCK(cs_main);
+                if (chainman.ActiveChain().Tip() != snapshot_tip) {
+                    LogPrint(BCLog::RPC, "Witness inventory scan stopped at obsolete tip after %u coins\n", scanned_coins);
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        "Active chain changed during the witness-inventory snapshot; retry the request");
+                }
+            };
+
+            MaybeDelayShadowRPCSnapshot("getquantumwitnessinventory/scan",
+                                        snapshot_tip->nHeight, snapshot_tip->GetBlockHash());
             COutPoint outpoint;
             Coin coin;
             while (cursor->Valid()) {
                 node.rpc_interruption_point();
+                if (++coins_since_tip_check == 1024) {
+                    check_snapshot_tip();
+                    coins_since_tip_check = 0;
+                }
                 if (!cursor->GetKey(outpoint) || !cursor->GetValue(coin)) {
                     throw JSONRPCError(
                         RPC_INTERNAL_ERROR,
                         "Unable to read the immutable witness-inventory UTXO snapshot");
                 }
+                ++scanned_coins;
                 const bool authenticated_internal_marker = coin.out.nValue == 0 &&
                     (IsAuthenticatedShadowMarkerOutpoint(outpoint, coin, snapshot_tip) ||
                      Consensus::IsAuthenticatedDemurrageStateOutpoint(outpoint, coin, snapshot_tip));
@@ -1693,6 +1715,7 @@ RPCHelpMan getquantumwitnessinventory()
                 }
                 cursor->Next();
             }
+            check_snapshot_tip();
             uint256 utxo_muhash_commitment;
             utxo_muhash.Finalize(utxo_muhash_commitment);
 
@@ -1750,6 +1773,7 @@ RPCHelpMan getquantumwitnessinventory()
                 const bool history_ok = g_shadow_index->ForEachQuantumWitnessOutput(
                     static_cast<size_t>(max_history_records),
                     [&](const QuantumWitnessIndexRecord& stored) {
+                        node.rpc_interruption_point();
                         const CBlockIndex* origin = snapshot_tip->GetAncestor(stored.origin_height);
                         if (!origin || origin->GetBlockHash() != stored.origin_block_hash) {
                             ++history_stale_records;

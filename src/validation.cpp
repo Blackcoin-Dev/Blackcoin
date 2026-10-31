@@ -7597,11 +7597,14 @@ bool Chainstate::ResizeCoinsCaches(size_t coinstip_size, size_t coinsdb_size)
     }
     size_t old_coinstip_size = m_coinstip_cache_size_bytes;
     m_coinstip_cache_size_bytes = coinstip_size;
-    m_coinsdb_cache_size_bytes = coinsdb_size;
-    CoinsDB().ResizeCache(coinsdb_size);
-
-    LogPrintf("[%s] resized coinsdb cache to %.1f MiB\n",
-        this->ToString(), coinsdb_size * (1.0 / 1024 / 1024));
+    if (CoinsDB().ResizeCache(coinsdb_size)) {
+        m_coinsdb_cache_size_bytes = coinsdb_size;
+        LogPrintf("[%s] resized coinsdb cache to %.1f MiB\n",
+            this->ToString(), coinsdb_size * (1.0 / 1024 / 1024));
+    } else {
+        LogPrintf("[%s] deferred coinsdb cache resize to %.1f MiB while cursors are active\n",
+            this->ToString(), coinsdb_size * (1.0 / 1024 / 1024));
+    }
     LogPrintf("[%s] resized coinstip cache to %.1f MiB\n",
         this->ToString(), coinstip_size * (1.0 / 1024 / 1024));
 

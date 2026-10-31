@@ -413,6 +413,8 @@ StakingMiningPage::StakingMiningPage(const PlatformStyle* platformStyle, QWidget
 
 StakingMiningPage::~StakingMiningPage()
 {
+    if (m_pow_control_current) m_pow_control_current->store(false, std::memory_order_release);
+    if (m_wallet_model && m_pow_control_request) m_wallet_model->cancelPowMiningControl(m_pow_control_request);
     if (m_pow_recovery_view_current) {
         m_pow_recovery_view_current->store(false, std::memory_order_release);
     }
@@ -752,8 +754,7 @@ void StakingMiningPage::setupUi()
     m_pow_percent->setRange(1, 100);
     m_pow_percent->setValue(1);
     m_pow_percent->setSuffix(QStringLiteral(" %"));
-    m_pow_percent->setToolTip(tr("CPU utilization target per core, 1..100%. Each worker runs an Argon2id try, "
-                                 "then sleeps to hold this duty cycle."));
+    m_pow_percent->setToolTip(tr("CPU duty target per worker, 1..100%. Recovery, selection, proof work and claim preparation all count toward the budget. Short work bursts and lock waits can affect observed utilization."));
 
     m_pow_payout = new QLineEdit(powBox);
     m_pow_payout->setObjectName(QStringLiteral("powPayout"));
@@ -1399,8 +1400,10 @@ void StakingMiningPage::onAutomationToggled(QCheckBox* control, const std::strin
 
     m_client_model->node().updateRwSetting(setting, enabled);
     if (setting == "powmining" && enabled) {
-        m_client_model->node().updateRwSetting("powminingthreads", m_pow_cores ? m_pow_cores->value() : 1);
-        m_client_model->node().updateRwSetting("powminingcpu", m_pow_percent ? m_pow_percent->value() : 1);
+        if (!m_client_model->node().isSettingIgnored("powminingthreads"))
+            m_client_model->node().updateRwSetting("powminingthreads", m_pow_cores ? m_pow_cores->value() : 1);
+        if (!m_client_model->node().isSettingIgnored("powminingcpu"))
+            m_client_model->node().updateRwSetting("powminingcpu", m_pow_percent ? m_pow_percent->value() : 1);
     }
     refreshAutomationControls();
 }
@@ -2750,6 +2753,10 @@ void StakingMiningPage::refreshAutomationControls()
 
 void StakingMiningPage::setWalletModel(WalletModel* walletModel)
 {
+    if (m_pow_control_current) m_pow_control_current->store(false, std::memory_order_release);
+    if (m_wallet_model && m_pow_control_request) m_wallet_model->cancelPowMiningControl(m_pow_control_request);
+    m_pow_control_request = 0;
+    m_pow_control_current = std::make_shared<std::atomic<bool>>(true);
     const bool ambiguous_for_selected_wallet = walletModel &&
         m_claim_recovery_policy_ambiguous_wallet == walletModel;
     if (m_pow_recovery_view_current) {
@@ -2796,6 +2803,12 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
     m_detail_request_in_flight = 0;
     m_pow_apply_pending = false;
     m_pow_settings_dirty = false;
+    {
+        QSignalBlocker cores_blocker(m_pow_cores);
+        QSignalBlocker percent_blocker(m_pow_percent);
+        m_pow_cores->setValue(std::clamp<int64_t>(gArgs.GetIntArg("-powminingthreads", 1), 1, 256));
+        m_pow_percent->setValue(std::clamp<int64_t>(gArgs.GetIntArg("-powminingcpu", 1), 1, 100));
+    }
     m_operator_registry_loaded = false;
     m_operator_registry_refresh_seconds = 0;
     m_operator_last_action_status.clear();
@@ -2817,6 +2830,8 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
         PowClaimRecoveryOperationPurpose::REVIEW;
 
     if (m_wallet_model) {
+        connect(m_wallet_model, &WalletModel::powMiningControlReady,
+                this, &StakingMiningPage::onPowMiningControlReady);
         connect(m_wallet_model, &WalletModel::stakingMiningSnapshotReady,
                 this, &StakingMiningPage::onStakingMiningSnapshotReady);
         connect(m_wallet_model, &WalletModel::powClaimRecoveryPolicyReady,
@@ -2995,20 +3010,19 @@ void StakingMiningPage::onPowUnlockWalletToggled(bool enabled)
             return;
         }
     } else {
-        if (m_wallet_model->wallet().getPowMiningInfo().enabled) {
-            std::string ignored_error;
-            m_wallet_model->wallet().setPowMining(false, m_pow_cores->value(), m_pow_percent->value(), ignored_error);
-        }
-        if (m_wallet_model->getEncryptionStatus() == WalletModel::Unlocked) {
-            if (!m_wallet_model->setWalletLocked(true) ||
-                m_wallet_model->getEncryptionStatus() != WalletModel::Locked) {
-                m_wallet_model->updateStatus();
-                updateStatus();
-                return;
-            }
-        }
-        m_wallet_model->setWalletUnlockStakingOnly(false);
-        m_wallet_model->updateStatus();
+        if (m_pow_apply_pending) return;
+        WalletModel::PowMiningControlRequest request;
+        request.generation = m_wallet_generation;
+        request.threads = m_pow_cores->value();
+        request.cpu_percent = m_pow_percent->value();
+        request.lock_wallet = true;
+        request.view_current = m_pow_control_current;
+        m_pow_apply_pending = true;
+        m_pow_pending_enabled = false;
+        m_pow_status->setText(tr("Stopping mining and locking the wallet..."));
+        m_pow_control_request = m_wallet_model->requestPowMiningControl(std::move(request));
+        refreshControlsEnabled();
+        return;
     }
 
     updateStatus();
@@ -3021,7 +3035,7 @@ void StakingMiningPage::onPowSettingsChanged(int)
     if (m_pow_enable->isChecked()) {
         m_pow_status->setText(tr("PoW miner settings changed. Click Apply to update the miner."));
     } else {
-        m_pow_status->setText(tr("Enable Gold Rush PoW mining to use these settings."));
+        m_pow_status->setText(tr("Click Apply to save these resource settings. Startup mining consent is controlled separately."));
     }
     refreshControlsEnabled();
 }
@@ -3068,6 +3082,15 @@ void StakingMiningPage::abortPendingPowStart(const QString& message)
 void StakingMiningPage::applyPowWithCurrentRecoveryPolicy()
 {
     if (m_updating || !m_wallet_model || m_pow_apply_pending) return;
+    const QPointer<StakingMiningPage> originating_page{this};
+    const QPointer<WalletModel> originating_wallet = m_wallet_model;
+    const uint64_t generation = m_wallet_generation;
+    const auto view_current = m_pow_control_current;
+    const auto still_current = [&] {
+        return originating_page && originating_wallet && originating_wallet == m_wallet_model &&
+            generation == m_wallet_generation && view_current &&
+            view_current->load(std::memory_order_acquire);
+    };
     const bool enabled = m_pow_enable->isChecked();
     const int cores = m_pow_cores->value();
     const int percent = m_pow_percent->value();
@@ -3087,59 +3110,68 @@ void StakingMiningPage::applyPowWithCurrentRecoveryPolicy()
             body.prepend(tr(
                 "Staking protection is active: this wallet has one mature legacy staking coin, and Core will reserve it from PoW claims. The miner may start but remain paused until another eligible claim input exists. No coin will be split, generated, or spent automatically.\n\n"));
         }
-        if (!confirmBroadcast(this, tr("Start Gold Rush PoW mining"), body)) {
+        const bool approved = confirmBroadcast(this, tr("Start Gold Rush PoW mining"), body);
+        if (!still_current()) return;
+        if (!approved) {
             abortPendingPowStart(tr("Gold Rush PoW mining was not started."));
             return;
         }
     }
 
-    if (enabled && !requestNormalUnlock()) {
+    if (!still_current()) return;
+    const bool unlocked = !enabled || requestNormalUnlock();
+    if (!still_current()) return;
+    if (!unlocked) {
         abortPendingPowStart(tr("Gold Rush PoW mining requires a normal wallet unlock."));
         return;
     }
-
     m_pow_apply_pending = true;
     m_pow_pending_enabled = enabled;
     m_pow_status->setText(enabled ? tr("Starting Gold Rush PoW mining...") : tr("Stopping Gold Rush PoW mining..."));
     refreshControlsEnabled();
 
-    std::string error;
-    bool created_payout_key{false};
-    // The immediately preceding confirmation explicitly covers creation of a
-    // new non-HD payout key. Reconfiguration of an already-running miner does
-    // not grant any additional key-creation consent.
-    const bool ok = m_wallet_model->wallet().setPowMining(
-        enabled, cores, percent, error,
-        /*allow_new_payout_key=*/enabled && !current_info.enabled,
-        &created_payout_key);
+    WalletModel::PowMiningControlRequest request;
+    request.generation = m_wallet_generation;
+    request.enabled = enabled;
+    request.threads = cores;
+    request.cpu_percent = percent;
+    request.view_current = m_pow_control_current;
+    // The confirmed start alone grants one-call payout-key consent.
+    request.allow_new_payout_key = enabled && !current_info.enabled;
+    m_pow_control_request = m_wallet_model->requestPowMiningControl(std::move(request));
+}
+
+void StakingMiningPage::onPowMiningControlReady(quint64 request_id, quint64 generation)
+{
+    if (!m_wallet_model || request_id != m_pow_control_request || generation != m_wallet_generation) return;
+    const auto result = m_wallet_model->takePowMiningControlResult(request_id);
+    if (!result) return;
+    m_pow_control_request = 0;
     m_pow_apply_pending = false;
-    if (!ok) {
-        const bool authoritative_enabled =
-            m_wallet_model->wallet().getPowMiningInfo().enabled;
-        {
-            QSignalBlocker blocker(m_pow_enable);
-            m_pow_enable->setChecked(authoritative_enabled);
-        }
-        const QString msg = error.empty()
-            ? tr("Unable to start Gold Rush PoW mining. Unlock the wallet and check debug.log for details.")
-            : QString::fromStdString(error);
-        m_pow_status->setText(msg);
-        if (enabled) QMessageBox::warning(this, tr("Gold Rush PoW mining"), msg);
-        refreshControlsEnabled();
-        return;
+    {
+        QSignalBlocker blocker(m_pow_enable);
+        m_pow_enable->setChecked(result->info.enabled);
     }
-    m_pow_settings_dirty = false;
-    m_pow_status->setText(enabled
-        ? tr("Gold Rush PoW mining is enabled with %1 core(s) at %2% target duty cycle. Press Refresh details for the configured new-anchor payout and live statistics.")
-              .arg(cores)
-              .arg(percent)
-        : tr("Gold Rush PoW mining is off."));
-    if (created_payout_key) {
-        const QString backup_warning = tr("A new non-HD quantum PoW payout key was created and stored in this wallet. It is not recoverable from the wallet seed. Back up this wallet now before relying on mined rewards.");
-        m_pow_status->setText(m_pow_status->text() + tr(" ") + backup_warning);
+    QString message;
+    if (result->success) {
+        m_pow_settings_dirty = false;
+        message = result->info.enabled
+            ? tr("Gold Rush PoW mining is enabled with %1 core(s) at %2% target duty cycle. Press Refresh details for the configured new-anchor payout and live statistics.")
+                .arg(result->request.threads).arg(result->request.cpu_percent)
+            : tr("Gold Rush PoW mining is off.");
+        if (!result->error.empty()) message += tr(" ") + QString::fromStdString(result->error);
+    } else {
+        message = result->cancelled ? tr("Gold Rush PoW miner control was cancelled.")
+            : QString::fromStdString(result->error);
+        if (message.isEmpty()) message = tr("Unable to configure Gold Rush PoW mining. Check debug.log for details.");
     }
+    if (result->created_payout_key) {
+        message += tr(" A new non-HD quantum PoW payout key was created and stored in this wallet. It is not recoverable from the wallet seed. Back up this wallet now before relying on mined rewards.");
+    }
+    m_pow_status->setText(message);
     refreshControlsEnabled();
 }
+
 
 void StakingMiningPage::onCopyPayoutAddress()
 {
@@ -4292,11 +4324,9 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         m_pow_unlock_wallet->setChecked(normal_unlocked);
         if (!m_pow_settings_dirty) {
             const int display_threads = info.enabled && info.threads > 0
-                ? info.threads
-                : 1;
+                ? info.threads : std::clamp<int64_t>(gArgs.GetIntArg("-powminingthreads", 1), 1, 256);
             const int display_percent = info.enabled && info.cpu_percent > 0
-                ? info.cpu_percent
-                : 1;
+                ? info.cpu_percent : std::clamp<int64_t>(gArgs.GetIntArg("-powminingcpu", 1), 1, 100);
             if (!m_pow_cores->hasFocus()) m_pow_cores->setValue(display_threads);
             if (!m_pow_percent->hasFocus()) m_pow_percent->setValue(display_percent);
         }
@@ -4407,7 +4437,10 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         pow_runtime_summary = tr("hashing at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1));
         break;
     case interfaces::WalletPowMiningState::RUNTIME_ERROR:
-        pow_runtime_summary = tr("stopped after an error");
+        pow_runtime_summary = info.enabled
+            ? tr("%1 worker(s) retrying after an error; %2 worker(s) hashing at %3 tries/s")
+                .arg(info.workers_error).arg(info.workers_hashing).arg(QString::number(info.hashrate, 'f', 1))
+            : tr("stopped after an error");
         break;
     }
     const QString stake_reserve_summary = info.stake_reserve_available
@@ -4485,7 +4518,10 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
         recommended_action = tr("Unlock this wallet normally. Gold Rush PoW claims cannot be signed while the wallet is locked or unlocked for staking only.");
     } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
-        recommended_action = tr("The Gold Rush PoW worker stopped after an error. Review debug.log, correct the reported problem, and restart the miner.");
+        recommended_action = info.enabled
+            ? tr("%1 Gold Rush PoW worker(s) are retrying after a local error; %2 worker(s) are hashing. Review debug.log if errors continue.")
+                .arg(info.workers_error).arg(info.workers_hashing)
+            : tr("The Gold Rush PoW worker stopped after an error. Review debug.log, correct the reported problem, and restart the miner.");
     } else if (info.epoch_active && info.wallet_recent_solve_qualified && !info.wallet_active_signal && !auto_qqsignal) {
         recommended_action = tr("This wallet has a recent PoS solve. Enable <b>Automatically submit eligible fee-paying QQSIGNAL transactions</b> below if you consent to signal automatically, or use the sendshadowsignal RPC manually.");
     } else if (info.epoch_active && info.wallet_whitelisted_scripts > 0 && !normal_signing_available) {
@@ -4521,7 +4557,10 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STARTING) {
         m_pow_status->setText(tr("PoW mining is starting and checking wallet and chain readiness."));
     } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
-        m_pow_status->setText(tr("PoW mining stopped after an error. Review debug.log before restarting the miner."));
+        m_pow_status->setText(info.enabled
+            ? tr("PoW mining remains enabled: %1 worker(s) retrying after a local error, %2 worker(s) hashing at %3 tries/s. Review debug.log if errors continue.")
+                .arg(info.workers_error).arg(info.workers_hashing).arg(QString::number(info.hashrate, 'f', 1))
+            : tr("PoW mining stopped after an error. Review debug.log before restarting the miner."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::EPOCH_INACTIVE) {
         m_pow_status->setText(tr("PoW mining is enabled and waiting until the Gold Rush epoch is active."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
@@ -5139,7 +5178,7 @@ void StakingMiningPage::refreshControlsEnabled()
     const WalletModel::EncryptionStatus encryption_status = has_wallet
         ? m_wallet_model->getCachedEncryptionStatus()
         : WalletModel::NoKeys;
-    const bool tune = has_wallet && m_pow_enable->isChecked();
+    const bool tune = has_wallet;
     m_staking_enable->setEnabled(has_wallet);
     m_unlock_staking_only->setEnabled(has_wallet &&
                                       encryption_status != WalletModel::NoKeys &&
@@ -5256,54 +5295,63 @@ bool StakingMiningPage::requestStakingOnlyUnlock()
 
 bool StakingMiningPage::requestNormalUnlock()
 {
-    if (!m_wallet_model) return false;
+    const QPointer<WalletModel> expected_wallet = m_wallet_model;
+    const QPointer<StakingMiningPage> expected_page{this};
+    const uint64_t generation = m_wallet_generation;
+    if (!expected_wallet) return false;
 
-    const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getEncryptionStatus();
+    const WalletModel::EncryptionStatus encryption_status = expected_wallet->getCachedEncryptionStatus();
     const bool initially_staking_only =
-        m_wallet_model->getWalletUnlockStakingOnly();
+        expected_wallet->getWalletUnlockStakingOnly();
     const auto restore_failed_normal_unlock = [&]() {
-        if (m_wallet_model->getEncryptionStatus() == WalletModel::Unlocked) {
-            m_wallet_model->setWalletLocked(true);
+        if (!expected_wallet) return false;
+        if (expected_wallet->getEncryptionStatus() == WalletModel::Unlocked) {
+            expected_wallet->setWalletLocked(true);
         }
-        m_wallet_model->setWalletUnlockStakingOnly(initially_staking_only);
-        m_wallet_model->updateStatus();
+        expected_wallet->setWalletUnlockStakingOnly(initially_staking_only);
+        expected_wallet->updateStatus();
         return false;
     };
     if (encryption_status == WalletModel::NoKeys) {
         return false;
     }
-    if (encryption_status == WalletModel::Unencrypted) {
+    if (encryption_status == WalletModel::Unencrypted ||
+        (encryption_status == WalletModel::Unlocked && !initially_staking_only)) {
+        // Core rechecks actual authority on WalletWorker. A stale GUI cache
+        // cannot authorize mining, and a busy wallet lock cannot freeze Apply.
         return true;
     }
 
-    if (m_wallet_model->getWalletUnlockStakingOnly()) {
+    if (expected_wallet->getWalletUnlockStakingOnly()) {
         if (encryption_status == WalletModel::Unlocked) {
             // Revoke the staking-only key first. Clearing the scope marker
             // while the key is still installed would briefly grant normal
             // PoW/transaction signing authority before the passphrase prompt.
-            if (!m_wallet_model->setWalletLocked(true) ||
-                m_wallet_model->getEncryptionStatus() != WalletModel::Locked) {
-                m_wallet_model->updateStatus();
+            if (!expected_wallet->setWalletLocked(true) ||
+                expected_wallet->getEncryptionStatus() != WalletModel::Locked) {
+                expected_wallet->updateStatus();
                 return false;
             }
         }
-        m_wallet_model->setWalletUnlockStakingOnly(false);
-        m_wallet_model->updateStatus();
+        expected_wallet->setWalletUnlockStakingOnly(false);
+        expected_wallet->updateStatus();
     }
 
-    if (m_wallet_model->getEncryptionStatus() == WalletModel::Locked) {
+    if (expected_wallet->getEncryptionStatus() == WalletModel::Locked) {
         AskPassphraseDialog dlg(AskPassphraseDialog::Unlock, this);
-        dlg.setModel(m_wallet_model);
-        if (dlg.exec() != QDialog::Accepted) {
+        dlg.setModel(expected_wallet);
+        const bool accepted = dlg.exec() == QDialog::Accepted;
+        if (!expected_page || !expected_wallet || expected_wallet != m_wallet_model ||
+            generation != m_wallet_generation || !accepted) {
             return restore_failed_normal_unlock();
         }
     }
 
-    if (m_wallet_model->getEncryptionStatus() != WalletModel::Unlocked) {
+    if (expected_wallet->getEncryptionStatus() != WalletModel::Unlocked) {
         return restore_failed_normal_unlock();
     }
 
-    if (m_wallet_model->getWalletUnlockStakingOnly()) {
+    if (expected_wallet->getWalletUnlockStakingOnly()) {
         // Accepted must mean the dialog performed an atomic normal unlock. If
         // an unexpected handler left staking-only scope installed, fail closed
         // by locking; never expand authority after the prompt has returned.

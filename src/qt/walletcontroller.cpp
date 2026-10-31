@@ -14,6 +14,7 @@
 #include <external_signer.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
+#include <node/interface_ui.h>
 #include <util/string.h>
 #include <util/threadnames.h>
 #include <util/translation.h>
@@ -59,6 +60,9 @@ WalletController::WalletController(ClientModel& client_model, const PlatformStyl
 // available in the header, just forward declared.
 WalletController::~WalletController()
 {
+    // Drain worker-recorded backup notices while this controller's GUI route
+    // still exists. QObject deletes its model children after this destructor.
+    for (WalletModel* wallet_model : getOpenWallets()) wallet_model->join();
     m_activity_thread->quit();
     m_activity_thread->wait();
     delete m_activity_worker;
@@ -166,6 +170,14 @@ WalletModel* WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wal
             removeAndDeleteWallet(wallet_model);
         }
     }, Qt::QueuedConnection);
+
+    // Critical backup warnings must survive WalletView removal during unload.
+    connect(wallet_model, &WalletModel::powPayoutKeyCreated, this,
+        [this](const QString& wallet_name) {
+            Q_EMIT walletBackupWarning(tr("Back up wallet %1").arg(wallet_name),
+                tr("A new non-HD quantum PoW payout key was created. It is not recoverable from the wallet seed. Back up this wallet now before relying on mined rewards."),
+                CClientUIInterface::MSG_WARNING);
+        });
 
     // Re-emit coinsSent signal from wallet model.
     connect(wallet_model, &WalletModel::coinsSent, this, &WalletController::coinsSent);

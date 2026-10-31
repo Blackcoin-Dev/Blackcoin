@@ -74,6 +74,8 @@ public:
 Q_SIGNALS:
     void walletAdded(WalletModel* wallet_model);
     void walletRemoved(WalletModel* wallet_model);
+    /** Critical wallet notice whose recipient outlives individual views. */
+    void walletBackupWarning(const QString& title, const QString& message, unsigned int style);
 
     void coinsSent(WalletModel* wallet_model, SendCoinsRecipient recipient, QByteArray transaction);
 

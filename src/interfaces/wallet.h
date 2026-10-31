@@ -351,7 +351,8 @@ public:
     //! Returns false (and fills `error`) if PoW mining cannot be configured (e.g. wallet locked).
     virtual bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
                               bool allow_new_payout_key = false,
-                              bool* created_payout_key = nullptr) = 0;
+                              bool* created_payout_key = nullptr,
+                              const std::function<bool()>& cancelled = {}) = 0;
 
     //! Blocking bounded reserve refresh for WalletWorker, never GUI polling.
     virtual void refreshPowMiningStakeReserve() = 0;
@@ -682,7 +683,9 @@ struct WalletPowMiningInfo
     bool enabled{false};            //!< whether in-process PoW mining is currently requested
     WalletPowMiningState state{WalletPowMiningState::DISABLED}; //!< bounded worker readiness/waiting state
     int threads{0};                 //!< worker threads (CPU cores) configured
-    int cpu_percent{0};             //!< per-core CPU duty-cycle target, 1..100
+    int cpu_percent{0};             //!< per-worker total active-work duty target, 1..100
+    int workers_hashing{0};         //!< workers currently inside a proof batch
+    int workers_error{0};           //!< workers in a local-error retry state
     double hashrate{0.0};           //!< Argon2id tries per second (aggregate)
     int current_height{-1};         //!< active-chain tip used for Gold Rush state, or -1 if unavailable
     bool epoch_active{false};       //!< whether the Gold Rush reward window is currently open

@@ -4733,7 +4733,9 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether process-wide background automation may create new non-HD keys in loaded wallets."},
             {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, claim_evaluation_pending, claim_evaluation_capacity, ready, hashing, or error."},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
-            {RPCResult::Type::NUM, "cpu_percent", "Per-core CPU duty-cycle target."},
+            {RPCResult::Type::NUM, "cpu_percent", "Per-worker active-work duty target, including selection and proof preparation. Explicit waits count toward the idle period."},
+            {RPCResult::Type::NUM, "workers_hashing", "Workers currently inside a proof batch."},
+            {RPCResult::Type::NUM, "workers_error", "Workers in a local-error retry state."},
             {RPCResult::Type::NUM, "hashrate", "Aggregate Argon2id tries per second."},
             {RPCResult::Type::NUM, "current_height", "Active-chain tip used to evaluate Gold Rush state, or -1 if unavailable."},
             {RPCResult::Type::NUM, "shadow_reward_next_height", "Next block height evaluated for a shadow-ledger reward, or 0 if the chain tip is unavailable."},
@@ -4893,6 +4895,8 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pow_mining_state)));
     obj.pushKV("threads", pwallet->m_pow_threads.load());
     obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
+    obj.pushKV("workers_hashing", pwallet->m_pow_workers_hashing.load());
+    obj.pushKV("workers_error", pwallet->m_pow_workers_error.load());
     obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());
     obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
     obj.pushKV("unresolved_claims",

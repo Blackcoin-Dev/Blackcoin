@@ -103,6 +103,7 @@ private Q_SLOTS:
     void onPowClaimRecoveryAdopt();
     void updateStatus();
     void onStakingMiningSnapshotReady(quint64 request_id, quint64 generation);
+    void onPowMiningControlReady(quint64 request_id, quint64 generation);
     void onPowClaimRecoveryPolicyReady(quint64 request_id, quint64 generation);
     void onPowClaimRecoveryOperationReady(quint64 request_id, quint64 generation);
 
@@ -113,6 +114,8 @@ private:
     QTimer* m_timer{nullptr};
     bool m_updating{false}; // guard against re-entrant control->slot->control loops
     bool m_pow_apply_pending{false};
+    uint64_t m_pow_control_request{0};
+    std::shared_ptr<std::atomic<bool>> m_pow_control_current;
     bool m_pow_pending_enabled{false};
     bool m_pow_settings_dirty{false};
     bool m_operator_registry_loaded{false};

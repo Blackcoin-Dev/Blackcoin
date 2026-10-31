@@ -2972,12 +2972,13 @@ public:
         return info;
     }
     bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
-                      bool allow_new_payout_key, bool* created_payout_key) override
+                      bool allow_new_payout_key, bool* created_payout_key,
+                      const std::function<bool()>& cancelled) override
     {
         bilingual_str werror;
         const bool ok = m_wallet->SetPowMining(
             enabled, threads, cpu_percent, werror, created_payout_key,
-            allow_new_payout_key);
+            allow_new_payout_key, /*wait_for_normal_unlock=*/false, cancelled);
         if (!ok) {
             error = werror.original;
             m_wallet->WalletLogPrintf("Gold Rush PoW miner configuration failed: %s\n", werror.original);
@@ -2996,6 +2997,8 @@ public:
         info.state = m_wallet->m_pow_state;
         info.threads = m_wallet->m_pow_threads;
         info.cpu_percent = m_wallet->m_pow_cpu_percent;
+        info.workers_hashing = m_wallet->m_pow_workers_hashing;
+        info.workers_error = m_wallet->m_pow_workers_error;
         info.hashrate = m_wallet->m_pow_hashrate;
         info.claims_submitted = m_wallet->m_pow_claims_submitted;
         info.shadow_whitelist_height = SHADOW_WHITELIST_HEIGHT;

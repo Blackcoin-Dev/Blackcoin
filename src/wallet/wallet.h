@@ -1737,6 +1737,10 @@ public:
     // GUI "Staking & Mining" tab / setpowmining RPC; the in-process Argon2id solver reads these.
     std::atomic<bool> m_pow_mining_enabled{false};
     std::atomic<interfaces::WalletPowMiningState> m_pow_state{interfaces::WalletPowMiningState::DISABLED};
+    std::vector<interfaces::WalletPowMiningState> m_pow_worker_states GUARDED_BY(cs_wallet);
+    std::vector<uint64_t> m_pow_worker_successful_hashes GUARDED_BY(cs_wallet);
+    std::atomic<int> m_pow_workers_hashing{0};
+    std::atomic<int> m_pow_workers_error{0};
     std::atomic<int> m_pow_threads{1};         // CPU cores / worker threads
     std::atomic<int> m_pow_cpu_percent{1};     // per-core CPU duty-cycle target, 1..100
     std::atomic<double> m_pow_hashrate{0.0};   // aggregate Argon2id tries/s reported by the solver
@@ -2302,7 +2306,8 @@ public:
     // -powmining=1 consent. Interactive callers must retain the strict default.
     bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
                       bool* created_payout = nullptr, bool allow_new_payout_key = false,
-                      bool wait_for_normal_unlock = false);
+                      bool wait_for_normal_unlock = false,
+                      const std::function<bool()>& cancelled = {});
     void StopPowMining();
     void StopPowMiningLocked()
         EXCLUSIVE_LOCKS_REQUIRED(m_pow_recovery_authority_mutex);
@@ -2320,7 +2325,8 @@ public:
         std::optional<uint64_t> expected_generation = std::nullopt);
     bool PublishPowMiningHashrate(
         double hashrate,
-        std::optional<uint64_t> expected_generation = std::nullopt);
+        std::optional<uint64_t> expected_generation = std::nullopt,
+        bool local_error = false);
     /** Pure work batch plus worker telemetry and interruptible error retry.
      * No input selection, signing or transaction submission. The log deadline
      * belongs to the calling worker and is retained across batches. */
@@ -2336,7 +2342,8 @@ public:
         CTxDestination& destination,
         bilingual_str& error) const;
     bool EnsurePowPayoutAddress(bilingual_str& error, bool* created = nullptr,
-                                bool allow_new_key = false);
+                                bool allow_new_key = false,
+                                const std::function<bool()>& cancelled = {});
     bool EnsureShadowSignalPayoutAddress(
         CScript& payout_script,
         std::string& payout_address,

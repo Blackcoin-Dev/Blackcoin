@@ -8,6 +8,8 @@
 #include <test/util/setup_common.h>
 #include <chainparams.h>
 #include <clientversion.h>
+#include <crypto/mldsa.h>
+#include <hash.h>
 #include <streams.h>
 #include <uint256.h>
 #include <wallet/shadow_pow_claim_recovery.h>
@@ -37,6 +39,108 @@ BOOST_AUTO_TEST_CASE(walletdb_readkeyvalue)
     CDataStream ssValue(SER_DISK);
     uint256 dummy;
     BOOST_CHECK_THROW(ssValue >> dummy, std::ios_base::failure);
+}
+
+BOOST_AUTO_TEST_CASE(quantum_key_record_format_compatibility)
+{
+    std::vector<unsigned char> public_key, generated_private_key;
+    BOOST_REQUIRE(ML_DSA::KeyGen(public_key, generated_private_key));
+    const CKeyingMaterial private_key(generated_private_key.begin(), generated_private_key.end());
+    CKeyMetadata metadata{123456789};
+    metadata.hdKeypath = "m/44'/0'/7'";
+    metadata.key_origin.path = {0x8000002c, 0x80000000, 0x80000007};
+    metadata.has_key_origin = true;
+
+    // Independently reproduce the preexisting ordinary-vector/nested-pair
+    // encoding and concatenated checksum, rather than reusing the new writer.
+    std::vector<unsigned char> concatenated{public_key};
+    concatenated.insert(concatenated.end(), generated_private_key.begin(), generated_private_key.end());
+    DataStream legacy_value;
+    legacy_value << std::make_pair(std::make_pair(generated_private_key, metadata), Hash(concatenated));
+    const SerializeData expected_value{legacy_value.begin(), legacy_value.end()};
+    DataStream key;
+    key << std::make_pair(DBKeys::QUANTUM_KEY, public_key);
+    const SerializeData expected_key{key.begin(), key.end()};
+
+    auto database = CreateMockableWalletDatabase();
+    auto& mock = dynamic_cast<MockableDatabase&>(*database);
+    WalletBatch batch{*database, /*flush_on_close=*/false};
+    BOOST_REQUIRE(batch.WriteQuantumKey(public_key, private_key, metadata));
+    BOOST_REQUIRE_EQUAL(mock.m_records.size(), 1U);
+    BOOST_CHECK(mock.m_records.begin()->first == expected_key);
+    BOOST_CHECK(mock.m_records.begin()->second == expected_value);
+    BOOST_CHECK(!batch.WriteQuantumKey(public_key, private_key, metadata));
+    BOOST_CHECK(mock.m_records.begin()->second == expected_value);
+
+    auto failing_database = CreateMockableWalletDatabase();
+    auto& failing_mock = dynamic_cast<MockableDatabase&>(*failing_database);
+    failing_mock.m_fail_write_at = 0;
+    WalletBatch failing_batch{*failing_database, /*flush_on_close=*/false};
+    BOOST_CHECK(!failing_batch.WriteQuantumKey(public_key, private_key, metadata));
+    BOOST_CHECK(failing_mock.m_records.empty());
+
+    // A legacy record still loads with its original key bytes and creation time.
+    CWallet wallet{m_node.chain.get(), "legacy-quantum-key", CreateMockableWalletDatabase()};
+    DataStream public_key_stream;
+    public_key_stream << public_key;
+    std::string error;
+    BOOST_REQUIRE(LoadQuantumKey(&wallet, public_key_stream, legacy_value, error));
+    BOOST_CHECK(error.empty());
+    LOCK(wallet.cs_wallet);
+    const auto witness_program = QuantumMigrationProgramForPubkey(public_key);
+    std::vector<unsigned char> loaded_public_key;
+    CKeyingMaterial loaded_private_key;
+    bilingual_str key_error;
+    BOOST_REQUIRE(wallet.GetQuantumKey(witness_program, loaded_public_key, loaded_private_key, key_error));
+    BOOST_CHECK(loaded_public_key == public_key);
+    BOOST_CHECK(loaded_private_key == private_key);
+    const auto info = wallet.GetQuantumKeyInfo(WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, witness_program});
+    BOOST_REQUIRE(info);
+    BOOST_CHECK_EQUAL(info->creation_time, metadata.nCreateTime);
+}
+
+BOOST_AUTO_TEST_CASE(quantum_key_record_malformed_and_truncated)
+{
+    // Synthetic bytes only: malformed records must fail before installing a key.
+    const std::vector<unsigned char> public_key(ML_DSA::PUBLICKEY_BYTES, 0x5a);
+    const std::vector<unsigned char> private_key(ML_DSA::SECRETKEY_BYTES, 0xa5);
+    const CKeyMetadata metadata{123456789};
+    std::vector<unsigned char> concatenated{public_key};
+    concatenated.insert(concatenated.end(), private_key.begin(), private_key.end());
+    DataStream encoded;
+    encoded << std::make_pair(std::make_pair(private_key, metadata), Hash(concatenated));
+    const SerializeData complete{encoded.begin(), encoded.end()};
+    CWallet wallet{m_node.chain.get(), "malformed-quantum-key", CreateMockableWalletDatabase()};
+    const auto check_rejected = [&](const SerializeData& bytes) {
+        DataStream key_stream;
+        key_stream << public_key;
+        DataStream value_stream{bytes};
+        std::string error;
+        BOOST_CHECK(!LoadQuantumKey(&wallet, key_stream, value_stream, error));
+        BOOST_CHECK(!error.empty());
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.ListQuantumKeyInfos().empty());
+    };
+
+    // Exercise unwinding during private-key, metadata and checksum decoding,
+    // including every incomplete checksum after a fully decoded private key.
+    for (size_t length = 0; length < complete.size(); ++length) {
+        BOOST_TEST_CONTEXT("truncated record length " << length) {
+            check_rejected(SerializeData{complete.begin(), complete.begin() + length});
+        }
+    }
+    SerializeData bad_checksum{complete};
+    bad_checksum.back() ^= std::byte{1};
+    check_rejected(bad_checksum);
+
+    DataStream malformed_metadata;
+    malformed_metadata << private_key << metadata.nVersion << metadata.nCreateTime;
+    // Noncanonical CompactSize for the HD key path, after the private key.
+    malformed_metadata << uint8_t{253} << uint16_t{0};
+    check_rejected(SerializeData{malformed_metadata.begin(), malformed_metadata.end()});
+
+    // A complete checksum does not make a mismatched synthetic key pair valid.
+    check_rejected(complete);
 }
 
 BOOST_AUTO_TEST_CASE(shadow_pow_claim_relay_clock_storage_is_exact_and_fail_closed)

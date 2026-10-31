@@ -1369,7 +1369,8 @@ static RPCHelpMan getwalletquantumpoolinfo()
     LOCK(cs_main);
     ChainstateManager& chainman = pwallet->chain().chainman();
     const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-    const CAmount total = node::ComputeQuantumColdStakeTotal(view);
+    const node::QuantumPoolShareCalculator pool_shares{view};
+    const CAmount total = pool_shares.TotalColdStake();
 
     for (const auto& [staker_hash, claims] : local_claims) {
         node::UpsertQuantumPoolClaims(staker_hash, claims);
@@ -1392,7 +1393,7 @@ static RPCHelpMan getwalletquantumpoolinfo()
 
     UniValue entries(UniValue::VARR);
     for (const uint256& staker_hash : node::ListQuantumPoolOperators()) {
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
         entries.push_back(QuantumPoolOperatorToJSON(share));
     }
 
@@ -5148,8 +5149,9 @@ static RPCHelpMan getquantumredelegationinfo()
         const CBlockIndex* tip = chainman.ActiveChain().Tip();
         current_height = tip ? tip->nHeight : 0;
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
+        const node::QuantumPoolShareCalculator pool_shares{view};
         for (const uint256& staker_hash : node::ListQuantumPoolOperators()) {
-            const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+            const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
             QuantumRedelegationCandidate candidate;
             candidate.staker_pubkey_hash = staker_hash;
             candidate.staker_pubkey = share.operator_share.staker_pubkey;

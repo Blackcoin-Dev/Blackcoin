@@ -3414,11 +3414,12 @@ static RPCHelpMan getquantumpoolinfo()
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     LOCK(cs_main);
     const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-    const CAmount total = node::ComputeQuantumColdStakeTotal(view);
+    const node::QuantumPoolShareCalculator pool_shares{view};
+    const CAmount total = pool_shares.TotalColdStake();
 
     UniValue entries(UniValue::VARR);
     for (const uint256& staker_hash : operators) {
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
         entries.push_back(QuantumPoolOperatorShareToJSON(share, requested_staker ? prospective_amount : 0));
     }
 

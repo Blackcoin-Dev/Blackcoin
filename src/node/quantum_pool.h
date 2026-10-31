@@ -11,6 +11,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,23 @@ struct QuantumPoolShare
     QuantumPoolOperatorShare operator_share;
 };
 
+/** Reuse one cold-stake denominator within a caller-synchronized coins view.
+ * Construct inside the existing chainstate lock and destroy before releasing it
+ * or mutating the view. Claims and operator commitments are still verified by
+ * live point lookups; only the denominator is cached, lazily, for this operation.
+ */
+class QuantumPoolShareCalculator
+{
+    const CCoinsView& m_view;
+    mutable std::optional<CAmount> m_total_coldstake;
+
+public:
+    explicit QuantumPoolShareCalculator(const CCoinsView& view) : m_view(view) {}
+    CAmount TotalColdStake() const;
+    QuantumPoolShare ComputeShare(const uint256& staker_pubkey_hash, const std::vector<QuantumPoolClaim>& claims) const;
+    bool HasUnderCapCandidate(CAmount inflow, const std::vector<uint256>& excluded_staker_hashes = {}) const;
+};
+
 uint256 QuantumPoolHashPubKey(const std::vector<unsigned char>& pubkey);
 CScript QuantumPoolScriptForClaim(const QuantumPoolClaim& claim);
 CScript QuantumPoolOperatorCommitmentScript(const std::vector<unsigned char>& staker_pubkey);
@@ -71,8 +89,6 @@ void ClearQuantumPoolRegistry();
 void UpsertQuantumPoolClaims(const uint256& staker_pubkey_hash, std::vector<QuantumPoolClaim> claims);
 void UpsertQuantumPoolOperator(const uint256& staker_pubkey_hash, std::vector<unsigned char> staker_pubkey, std::vector<QuantumPoolClaim> claims, bool operator_commitment_verified = false, COutPoint operator_commitment_outpoint = {});
 std::vector<QuantumPoolClaim> GetQuantumPoolClaims(const uint256& staker_pubkey_hash);
-std::vector<unsigned char> GetQuantumPoolOperatorPubKey(const uint256& staker_pubkey_hash);
-bool IsQuantumPoolOperatorCommitmentVerified(const uint256& staker_pubkey_hash);
 std::vector<uint256> ListQuantumPoolOperators();
 
 } // namespace node

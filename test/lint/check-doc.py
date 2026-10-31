@@ -20,11 +20,12 @@ FOLDER_GREP = 'src'
 FOLDER_TEST = 'src/test/'
 REGEX_ARG = r'\b(?:GetArg|GetArgs|GetBoolArg|GetIntArg|GetPathArg|IsArgSet|get_net)\("(-[^"]+)"'
 REGEX_DOC = r'AddArg\("(-[^"=]+?)(?:=|")'
-CMD_ROOT_DIR = '$(git rev-parse --show-toplevel)/{}'.format(FOLDER_GREP)
-CMD_GREP_ARGS = r"git grep --perl-regexp '{}' -- {} ':(exclude){}'".format(REGEX_ARG, CMD_ROOT_DIR, FOLDER_TEST)
-CMD_GREP_WALLET_ARGS = r"git grep --function-context 'void WalletInit::AddWalletOptions' -- {} | grep AddArg".format(CMD_ROOT_DIR)
-CMD_GREP_WALLET_HIDDEN_ARGS = r"git grep --function-context 'void DummyWalletInit::AddWalletOptions' -- {}".format(CMD_ROOT_DIR)
-CMD_GREP_DOCS = r"git grep --perl-regexp '{}' {}".format(REGEX_DOC, CMD_ROOT_DIR)
+ROOT_DIR = check_output(['git', 'rev-parse', '--show-toplevel'], text=True, encoding='utf8').strip()
+GIT_GREP = ['git', '-C', ROOT_DIR, 'grep']
+CMD_GREP_ARGS = GIT_GREP + ['--perl-regexp', REGEX_ARG, '--', FOLDER_GREP, f':(exclude){FOLDER_TEST}']
+CMD_GREP_WALLET_ARGS = GIT_GREP + ['--function-context', 'void WalletInit::AddWalletOptions', '--', FOLDER_GREP]
+CMD_GREP_WALLET_HIDDEN_ARGS = GIT_GREP + ['--function-context', 'void DummyWalletInit::AddWalletOptions', '--', FOLDER_GREP]
+CMD_GREP_DOCS = GIT_GREP + ['--perl-regexp', REGEX_DOC, '--', FOLDER_GREP]
 # list unsupported, deprecated and duplicate args as they need no documentation
 SET_DOC_OPTIONAL = set([
     '-h',
@@ -37,8 +38,8 @@ SET_DOC_OPTIONAL = set([
 
 
 def lint_missing_argument_documentation():
-    used = check_output(CMD_GREP_ARGS, shell=True).decode('utf8').strip()
-    docd = check_output(CMD_GREP_DOCS, shell=True).decode('utf8').strip()
+    used = check_output(CMD_GREP_ARGS, text=True, encoding='utf8').strip()
+    docd = check_output(CMD_GREP_DOCS, text=True, encoding='utf8').strip()
 
     args_used = set(re.findall(re.compile(REGEX_ARG), used))
     args_docd = set(re.findall(re.compile(REGEX_DOC), docd)).union(SET_DOC_OPTIONAL)
@@ -56,8 +57,8 @@ def lint_missing_argument_documentation():
 
 
 def lint_missing_hidden_wallet_args():
-    wallet_args = check_output(CMD_GREP_WALLET_ARGS, shell=True).decode('utf8').strip()
-    wallet_hidden_args = check_output(CMD_GREP_WALLET_HIDDEN_ARGS, shell=True).decode('utf8').strip()
+    wallet_args = check_output(CMD_GREP_WALLET_ARGS, text=True, encoding='utf8').strip()
+    wallet_hidden_args = check_output(CMD_GREP_WALLET_HIDDEN_ARGS, text=True, encoding='utf8').strip()
 
     wallet_args = set(re.findall(re.compile(REGEX_DOC), wallet_args))
     wallet_hidden_args = set(re.findall(re.compile(r'    "([^"=]+)'), wallet_hidden_args))

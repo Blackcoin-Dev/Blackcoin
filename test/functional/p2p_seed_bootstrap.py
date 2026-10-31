@@ -45,6 +45,7 @@ class SeedBootstrapTest(BitcoinTestFramework):
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
         ready = threading.Event()
+
         def registered(address, actual_port):
             self.proxy.routes[destination] = (address, actual_port, peer)
             ready.set()

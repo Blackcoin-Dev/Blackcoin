@@ -1,5 +1,26 @@
 # Changelog
 
+## v30.1.5.3rc1 (DEVELOPMENT, unreleased candidate)
+
+- Prefer qualified current-chain QQ peers in automatic outbound connections,
+  targeting eight of sixteen full-relay slots by default. Add a clamped
+  `-qqoutboundtarget` setting, bounded replacement probes, DNS recovery, and
+  `getnetworkinfo` discovery diagnostics.
+- Bound header replay tracking to 2,000 heights per identity and 1,024 identities,
+  reserve 64 identity slots for locally initiated peers, and expire disconnected
+  history after one hour. Reject invalid tracking limits at startup.
+- Run mining controls and detail refreshes on the wallet worker thread with
+  cancellation. Persist PoW resource preferences independently of autostart;
+  account for whole-iteration duty and report aggregate worker diagnostics.
+- Reuse selected transaction state during block-template assembly. The recorded
+  synthetic fixture measured 16.9-fold and 287-fold assembly speedups at 1,000
+  and 12,000 transactions, respectively; these are not application-wide results.
+- Preserve UTXO cursor snapshots across database lifetimes, defer database cache
+  resizing while cursors are active, and stop obsolete witness inventory scans
+  early. Check cancellation before further expensive wallet inventory work.
+- Preserve numeric client version, consensus, activation heights, wallet storage,
+  and chainstate formats. Final release qualification is pending.
+
 ## v30.1.5.2
 
 - Limit the wallet's claim-input source budget to legacy outputs that can be

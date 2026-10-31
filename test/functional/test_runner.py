@@ -98,6 +98,10 @@ EXTENDED_SCRIPTS = [
     'feature_quantum_integration_soak.py',
     'feature_quantum_demurrage_soak.py',
     'feature_dbcrash.py',
+    # Requires an explicit independently built 30.1.5.2 baseline daemon.
+    'feature_30153_upgrade.py --descriptors',
+    # Diagnostic observations; no precise OS CPU duty pass threshold.
+    'feature_pow_cpu_budget.py --descriptors',
 ]
 
 BASE_SCRIPTS = [

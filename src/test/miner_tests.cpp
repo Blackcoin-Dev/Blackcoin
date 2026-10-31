@@ -819,9 +819,11 @@ BOOST_AUTO_TEST_CASE(template_overlay_independent_packages)
     SetMockTime(*candidate_time);
     std::vector<size_t> counts{16, 256};
     if (const char* count{std::getenv("BLACKCOIN_TEMPLATE_BENCH_COUNT")}) {
-        counts = {static_cast<size_t>(std::stoull(count))};
-        BOOST_REQUIRE_GE(counts[0], 1U);
-        BOOST_REQUIRE_LE(counts[0], 12000U);
+        uint64_t parsed_count{0};
+        BOOST_REQUIRE(ParseUInt64(count, &parsed_count));
+        BOOST_REQUIRE_GE(parsed_count, 1U);
+        BOOST_REQUIRE_LE(parsed_count, 12000U);
+        counts = {static_cast<size_t>(parsed_count)};
     }
     const CScript script{CScript() << OP_TRUE};
     for (const size_t count : counts) {

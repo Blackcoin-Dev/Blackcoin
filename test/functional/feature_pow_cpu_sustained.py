@@ -215,7 +215,102 @@ class SustainedPowCpuTest(GoldRushPowMinerE2ETest):
             "Insufficient sustained natural claims; no duty/recovery pass inferred", summary)
         assert summary["duty_validation"]["status"] == "completed_periods_passed", summary
 
-    def _restart_from_persisted_config(self, payout):
+    def _prepare_initial_restart_claim(self, wallet, payout):
+        # Setup's nodes are already connected. Require processed handshakes
+        # before starting genuine work, so initial INV timing is established.
+        self.wait_until(lambda: all(any(
+            peer["version"] != 0 and peer["bytesrecv_per_msg"].get("pong", 0) >= 29
+            for peer in node.getpeerinfo()) for node in self.nodes), timeout=30)
+        assert_equal(wallet.settxfee(SYNTHETIC_PAY_TX_FEE), True)
+        started = wallet.setpowmining(True, self.options.workers,
+                                     self.options.cpu_percent, False)
+        assert isinstance(started, dict)
+        assert_equal(started["enabled"], True)
+        assert_equal(started["threads"], self.options.workers)
+        assert_equal(started["cpu_percent"], self.options.cpu_percent)
+        assert_equal(started["created_payout_key"], False)
+        assert_equal(started["payout_address"], payout)
+        self._event("initial_connected_miner_started", result=started,
+                    configured_paytxfee_blk_per_kvb=SYNTHETIC_PAY_TX_FEE)
+        return self._wait_for_natural_restart_claim()
+
+    def _stop_current_miner(self):
+        # A failed restart assertion can leave the caller's old wallet proxy
+        # behind. Resolve the current node/cookie at cleanup time instead.
+        self.nodes[0].get_wallet_rpc("pow_sustained").setpowmining(False)
+
+    def _wait_for_natural_restart_claim(self):
+        # Exercise recovery with genuine work left in the mempool. Do not
+        # author a claim directly or weaken the target to arrange the boundary.
+        started = time.monotonic()
+        boundary_clock = self.mock_time
+        # The 1% qualification lane uses 600-second work windows; an idle
+        # interval can exceed one minute without indicating failed mining.
+        # Retain a finite bound and follow any longer configured window.
+        timeout = (max(600, self.options.sustained_seconds, self.options.recovery_seconds)
+                   if self.options.cpu_percent == 1 else 60)
+        while time.monotonic() - started < timeout:
+            claims = self._pow_claim_txids()
+            if claims:
+                # Keep the genuine claim unconfirmed across restart, but let
+                # ordinary P2P relay finish before interrupting its initial INV.
+                # Reload rebroadcast timers are a separate qualification scope.
+                claim = claims[0]
+                self._wait_for_claim_relay(claim)
+                self._event("restart_boundary_pending_claim", txid=claim,
+                            relayed_before_restart=True)
+                return claim
+            self._set_mocktime(max(self.mock_time, boundary_clock +
+                                   int(time.monotonic() - started) + 1))
+            time.sleep(0.2)
+        raise AssertionError("No natural claim available for the bounded restart boundary")
+
+    def _wait_for_restart_payout(self, wallet, staker, payout, pending_claim=None):
+        # Enabled is a worker-launch state. A retained live family intentionally
+        # leaves the future new-anchor payout unbound until that family clears.
+        deadline = time.monotonic() + 120
+        confirmed = []
+        first_observation = True
+        while time.monotonic() < deadline:
+            info = self._get_info(wallet)
+            if first_observation:
+                self._event("restart_readiness_observed", payout_address=info["payout_address"],
+                            pending_claim=pending_claim,
+                            telemetry=PowCpuBudgetTest._telemetry(info))
+                first_observation = False
+            assert_equal(info["enabled"], True)
+            assert_equal(info["threads"], self.options.workers)
+            assert_equal(info["cpu_percent"], self.options.cpu_percent)
+            assert_equal(info["autostart"], True)
+            assert_equal(info["workers_error"], 0)
+            if info["payout_address"]:
+                assert_equal(info["payout_address"], payout)
+            pending_confirmed = (pending_claim is None or any(
+                claim["txid"] == pending_claim for claim in confirmed))
+            if info["payout_address"] and pending_confirmed:
+                self._event("restart_payout_bound", payout=payout,
+                            readiness_confirmations=confirmed,
+                            telemetry=PowCpuBudgetTest._telemetry(info))
+                return info
+            claims = self._pow_claim_txids()
+            if not pending_confirmed:
+                assert pending_claim in claims, "Restored restart claim must remain live until natural confirmation"
+                claims = [pending_claim]
+            if claims:
+                assert len(confirmed) < 2, "Restart readiness exceeded its natural-claim safety cap"
+                claim = claims[0]
+                self._wait_for_claim_relay(claim)
+                block = self._mine_pos_block_with_claim(staker, claim)
+                self.sync_blocks(timeout=30)
+                assert claim in self.nodes[0].getblock(block)["tx"]
+                assert wallet.gettransaction(claim)["confirmations"] > 0
+                confirmed.append({"txid": claim, "block": block})
+                self._event("restart_pending_claim_confirmed", txid=claim, block=block)
+            else:
+                time.sleep(0.2)
+        raise AssertionError("Configured payout did not bind after bounded natural restart recovery")
+
+    def _restart_from_persisted_config(self, payout, staker, pending_claim=None):
         node = self.nodes[0]
         previous = node.process.pid
         self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={self.mock_time}"])
@@ -223,7 +318,10 @@ class SustainedPowCpuTest(GoldRushPowMinerE2ETest):
         self.sync_blocks(timeout=30)
         wallet = node.get_wallet_rpc("pow_sustained")
         self.wait_until(lambda: self._get_info(wallet)["enabled"], timeout=30)
-        info = self._get_info(wallet)
+        if pending_claim is not None:
+            assert pending_claim in self._pow_claim_txids(), "Restart must preserve the natural pending claim"
+            self._event("restart_pending_claim_restored", txid=pending_claim)
+        info = self._wait_for_restart_payout(wallet, staker, payout, pending_claim)
         assert_equal(info["threads"], self.options.workers)
         assert_equal(info["cpu_percent"], self.options.cpu_percent)
         assert_equal(info["payout_address"], payout)
@@ -298,13 +396,16 @@ class SustainedPowCpuTest(GoldRushPowMinerE2ETest):
         self._event("config_persisted", workers=self.options.workers,
                     cpu_percent=self.options.cpu_percent, payout=payout)
         try:
+            self.phase = "initial_autostart_preparation"
+            pending_claim = self._prepare_initial_restart_claim(wallet, payout)
             self.phase = "initial_autostart"
-            wallet = self._restart_from_persisted_config(payout)
+            wallet = self._restart_from_persisted_config(payout, staker, pending_claim)
             self.phase = "sustained_before_restart"
             self.phase_mock = self.mock_time
             self._phase(wallet, staker, self.options.sustained_seconds)
             self.phase = "recovery_restart"
-            wallet = self._restart_from_persisted_config(payout)
+            pending_claim = self._wait_for_natural_restart_claim()
+            wallet = self._restart_from_persisted_config(payout, staker, pending_claim)
             self.phase = "sustained_after_restart"
             self.phase_mock = self.mock_time
             self._phase(wallet, staker, self.options.recovery_seconds)
@@ -316,7 +417,7 @@ class SustainedPowCpuTest(GoldRushPowMinerE2ETest):
             raise
         finally:
             for label, stop in (("staker", lambda: staker.staking(False)),
-                                ("miner", lambda: wallet.setpowmining(False))):
+                                ("miner", self._stop_current_miner)):
                 try:
                     stop()
                 except Exception as error:

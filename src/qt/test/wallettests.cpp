@@ -1930,8 +1930,6 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     // The Staking & Mining page uses a separate normal-unlock helper. A
     // cancelled dialog must preserve the same locked staking-only preference
     // as the generic WalletModel path.
-    QVERIFY(model.setWalletLocked(false, passphrase,
-                                  /*staking_only=*/true));
     {
         StakingMiningPage unlock_page(platform_style);
         unlock_page.setClientModel(mini_gui.clientModel.get());
@@ -1943,8 +1941,15 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isVisible(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isEnabled(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!pow_unlock->isChecked(), 5000);
+        QCOMPARE(model.getCachedEncryptionStatus(), WalletModel::Locked);
+        QVERIFY(model.setWalletLocked(false, passphrase,
+                                      /*staking_only=*/true));
+        // No event processing between this Core unlock and the click: force
+        // the presentation cache to lag while an actual staking-only key exists.
+        QCOMPARE(model.getCachedEncryptionStatus(), WalletModel::Locked);
         QCOMPARE(model.getEncryptionStatus(), WalletModel::Unlocked);
         QVERIFY(model.getWalletUnlockStakingOnly());
+        QVERIFY(!wallet->HasNormalPowMiningWalletAuthority());
         bool normal_unlock_rejected{false};
         WaitForModal(QStringLiteral("normal wallet unlock dialog"), [&normal_unlock_rejected] {
             QWidget* modal = QApplication::activeModalWidget();

@@ -36,6 +36,9 @@ Release qualification is pending.
 - Expensive mining controls and staking/mining detail refreshes run on the
   wallet worker thread with cooperative cancellation. Wallet-scoped consent
   and unlock requirements remain enforced.
+- Explicit normal-unlock actions read current wallet encryption state so a
+  delayed display update cannot suppress the passphrase prompt after a
+  staking-only unlock. Cancellation preserves the restricted unlock preference.
 - PoW worker-count and duty preferences persist independently of autostart.
   Duty accounting covers the whole worker iteration, including template and
   claim preparation. `getpowmininginfo` reports aggregate hashrate and worker

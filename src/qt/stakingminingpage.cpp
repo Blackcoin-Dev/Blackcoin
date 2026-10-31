@@ -5300,7 +5300,17 @@ bool StakingMiningPage::requestNormalUnlock()
     const uint64_t generation = m_wallet_generation;
     if (!expected_wallet) return false;
 
-    const WalletModel::EncryptionStatus encryption_status = expected_wallet->getCachedEncryptionStatus();
+    // Explicit unlock actions require current Core state. The presentation
+    // cache can still say Locked immediately after a staking-only unlock.
+    // Refuse a busy snapshot instead of blocking the GUI or trusting that cache.
+    interfaces::WalletEncryptionStatus authority;
+    if (!expected_wallet->wallet().tryGetEncryptionStatus(authority)) {
+        expected_wallet->updateStatus();
+        return false;
+    }
+    const WalletModel::EncryptionStatus encryption_status = !authority.encrypted
+        ? (authority.private_keys_disabled ? WalletModel::NoKeys : WalletModel::Unencrypted)
+        : (authority.locked ? WalletModel::Locked : WalletModel::Unlocked);
     const bool initially_staking_only =
         expected_wallet->getWalletUnlockStakingOnly();
     const auto restore_failed_normal_unlock = [&]() {
@@ -5317,8 +5327,7 @@ bool StakingMiningPage::requestNormalUnlock()
     }
     if (encryption_status == WalletModel::Unencrypted ||
         (encryption_status == WalletModel::Unlocked && !initially_staking_only)) {
-        // Core rechecks actual authority on WalletWorker. A stale GUI cache
-        // cannot authorize mining, and a busy wallet lock cannot freeze Apply.
+        // Core rechecks authority again on WalletWorker before mining work.
         return true;
     }
 

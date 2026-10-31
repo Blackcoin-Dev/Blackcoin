@@ -259,12 +259,15 @@ class ConfArgsTest(BitcoinTestFramework):
         with self.nodes[0].assert_debug_log(
                 expected_msgs=[
                     "Loaded 0 addresses from peers.dat",
-                    "0 addresses found from DNS seeds",
+                    "DNS discovery round: providers=1 qq_deficit=1 outage=1",
                     "opencon thread start",  # Ensure ThreadOpenConnections::start time is properly set
                 ],
                 timeout=10,
         ):
             self.start_node(0, extra_args=['-dnsseed=1', '-fixedseeds=1', f'-mocktime={start}'])
+        # The completed discovery round replaces the old aggregate count log.
+        # Preserve the empty-seed-result assertion against actual addrman state.
+        util.assert_equal(self.nodes[0].getnodeaddresses(), [])
         with self.nodes[0].assert_debug_log(expected_msgs=[
                 "Adding fixed seeds as 60 seconds have passed and addrman is empty",
         ]):

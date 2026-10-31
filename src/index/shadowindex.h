@@ -289,6 +289,8 @@ struct QuantumWitnessIndexRecord {
  */
 class ShadowIndex final : public BaseIndex
 {
+    friend struct ShadowIndexTestAccess;
+
 protected:
     class DB;
 
@@ -297,6 +299,8 @@ private:
     ShadowIndexEventCallback m_event_callback;
     std::atomic<uint64_t> m_revision{0};
     bool m_event_stream_suppressed{false};
+    /** Test-only interruption after a committed rewind batch, before BaseIndex commits. */
+    std::function<void()> m_after_rewind_batch_for_testing;
 
     bool BuildBlockEvent(const CBlock& block, const CBlockIndex* pindex,
                          ShadowIndexBlockEvent& event) const;

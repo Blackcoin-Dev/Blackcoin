@@ -1529,7 +1529,9 @@ bool ShadowIndex::CustomRewind(const interfaces::BlockKey& current_tip,
         return error("%s: unexpected shadowindex custom tip below reward start", __func__);
     }
 
-    std::vector<interfaces::BlockKey> disconnected;
+    // Block-index ancestry is immutable; retain it to construct a locator for
+    // the exact disconnected branch's parent, even when it is no longer active.
+    std::vector<const CBlockIndex*> disconnected;
     {
         LOCK(cs_main);
         const CBlockIndex* current = m_chainstate->m_blockman.LookupBlockIndex(current_tip.hash);
@@ -1539,16 +1541,15 @@ bool ShadowIndex::CustomRewind(const interfaces::BlockKey& current_tip,
             return error("%s: invalid shadowindex rewind range", __func__);
         }
         while (current != stop) {
-            disconnected.push_back({current->GetBlockHash(), current->nHeight});
+            disconnected.push_back(current);
             current = current->pprev;
         }
     }
 
-    for (size_t i = 0; i < disconnected.size(); ++i) {
-        const interfaces::BlockKey& disconnected_block = disconnected[i];
-        const interfaces::BlockKey parent = i + 1 < disconnected.size()
-            ? disconnected[i + 1]
-            : new_tip;
+    for (const CBlockIndex* block_index : disconnected) {
+        const interfaces::BlockKey disconnected_block{block_index->GetBlockHash(), block_index->nHeight};
+        const CBlockIndex* parent_index = block_index->pprev;
+        const interfaces::BlockKey parent{parent_index->GetBlockHash(), parent_index->nHeight};
         const uint256& block_hash = disconnected_block.hash;
         CDBBatch batch(*m_db);
         bool has_writes{false};
@@ -1624,7 +1625,15 @@ bool ShadowIndex::CustomRewind(const interfaces::BlockKey& current_tip,
             }
             has_writes = true;
         }
-        if (has_writes && !m_db->WriteBatch(batch)) return false;
+        if (has_writes) {
+            // Undo, the custom tip (including its reward-boundary erase), and
+            // BaseIndex's restart point must advance in the same atomic batch.
+            // A crash or failed final BaseIndex::Commit can then resume from
+            // this exact parent without pointing at records already removed.
+            m_db->WriteBestBlock(batch, GetLocator(parent_index));
+            if (!m_db->WriteBatch(batch)) return false;
+            if (m_after_rewind_batch_for_testing) m_after_rewind_batch_for_testing();
+        }
     }
     return true;
 }

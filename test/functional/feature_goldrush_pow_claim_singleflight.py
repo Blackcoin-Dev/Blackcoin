@@ -376,8 +376,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 if input_locked:
                     assert_equal(builtin_race.lockunspent(True, [selected_input]), True)
         assert_equal(self._claim_input(claim), selected_input)
-        self.generateblock(node, output=funding_address, transactions=[])
-        self.wait_until(lambda: claim not in node.getrawmempool(), timeout=20)
+        # A historical QQP2 proof can also validate against a descendant tip.
+        # Observe actual retained/ineligible state before testing abandonment.
+        self._wait_for_claims_to_become_current_branch_ineligible(
+            {"worker_group": {"wallet": builtin_race, "txid": claim,
+                              "hex": builtin_race.gettransaction(claim)["hex"]}},
+            funding_address,
+        )
         self._assert_generic_abandon_rejected(builtin_race, claim)
 
     def _wait_for_new_quarantined_claim(self, wallet, before, timeout=180):

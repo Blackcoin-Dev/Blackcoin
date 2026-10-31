@@ -40,6 +40,11 @@ class ReorgsRestoreTest(BitcoinTestFramework):
         # Send a tx from which to conflict outputs later
         txid_conflict_from = self.nodes[0].sendtoaddress(self.nodes[0].getnewaddress(), Decimal("10"))
         self.generate(self.nodes[0], 1)
+        # Preserve the exact conflict input while the unrelated self-send
+        # below selects its own coins.
+        nA = next(tx_out["vout"] for tx_out in self.nodes[0].gettransaction(txid_conflict_from)["details"] if tx_out["amount"] == Decimal("10"))
+        conflict_input = {"txid": txid_conflict_from, "vout": nA}
+        assert_equal(self.nodes[0].lockunspent(False, [conflict_input]), True)
 
         # Disconnect node1 from others to reorg its chain later
         self.disconnect_nodes(0, 1)
@@ -55,9 +60,9 @@ class ReorgsRestoreTest(BitcoinTestFramework):
 
         # Disconnect node0 from node2 to broadcast a conflict on their respective chains
         self.disconnect_nodes(0, 2)
-        nA = next(tx_out["vout"] for tx_out in self.nodes[0].gettransaction(txid_conflict_from)["details"] if tx_out["amount"] == Decimal("10"))
-        inputs = []
-        inputs.append({"txid": txid_conflict_from, "vout": nA})
+        assert self.nodes[0].gettxout(txid_conflict_from, nA) is not None
+        assert_equal(self.nodes[0].lockunspent(True, [conflict_input]), True)
+        inputs = [conflict_input]
         outputs_1 = {}
         outputs_2 = {}
 

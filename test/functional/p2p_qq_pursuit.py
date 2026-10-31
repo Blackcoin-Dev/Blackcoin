@@ -22,6 +22,7 @@ from test_framework.util import assert_equal
 class LocalRoute(socketserver.BaseRequestHandler):
     def handle(self):
         upstream = None
+        lease_peer = None
         try:
             client = self.request
             ver, count = recvall(client, 2)
@@ -39,10 +40,20 @@ class LocalRoute(socketserver.BaseRequestHandler):
             if hasattr(self.server, "requests"):
                 self.server.requests.append((destination, port))
             route = self.server.routes.get(destination)
-            if route is None or route[2].used:
+            if route is None:
+                available = False
+            elif callable(getattr(route[2], "acquire_route", None)):
+                available = route[2].acquire_route()
+                if available:
+                    lease_peer = route[2]
+            else:
+                # p2p_seed_bootstrap imports this proxy with single-use seeds.
+                available = not route[2].used
+                if available:
+                    route[2].used = True
+            if not available:
                 client.sendall(b"\x05\x04\x00\x01" + bytes(6))
                 return
-            route[2].used = True
             upstream = socket.create_connection(route[:2], timeout=5)
             client.sendall(b"\x05\x00\x00\x01" + bytes(6))
             client.settimeout(None)
@@ -59,6 +70,8 @@ class LocalRoute(socketserver.BaseRequestHandler):
         finally:
             if upstream:
                 upstream.close()
+            if lease_peer is not None:
+                lease_peer.release_route()
 
 
 class LocalProxy(socketserver.ThreadingTCPServer):
@@ -70,9 +83,66 @@ class QuietPeer(P2PInterface):
     def __init__(self, header, empty_first=False):
         super().__init__()
         self.header = header
-        self.used = False
         self.empty_first = empty_first
         self.benchmark_challenges = []
+        self._route_lock = threading.Lock()
+        self._route_enabled = True
+        self._route_active = False
+        self._route_ready = False
+        self._reconnect = None
+        self.connection_count = 0
+
+    def configure_reconnect(self, net, timeout_factor, services, port, registered):
+        self._reconnect = (net, timeout_factor, services, port, registered)
+        self._prepare_session()
+
+    def _prepare_session(self):
+        # P2PInterface and NetworkThread listeners are single-session objects:
+        # reset handshake/message state and re-register before admitting a retry.
+        P2PInterface.__init__(self)
+        self.benchmark_challenges = []
+        net, timeout_factor, services, _port, _registered = self._reconnect
+        self.peer_connect_helper("0", 0, net, timeout_factor)
+        self.peer_connect_send_version(services)
+
+    def route_ready(self):
+        with self._route_lock:
+            self._route_ready = self._route_enabled
+
+    def acquire_route(self):
+        with self._route_lock:
+            if not self._route_enabled or self._route_active or not self._route_ready:
+                return False
+            self._route_active = True
+            return True
+
+    def release_route(self):
+        with self._route_lock:
+            self._route_active = False
+
+    def on_open(self):
+        with self._route_lock:
+            self._route_ready = False
+            self.connection_count += 1
+            enabled = self._route_enabled
+        if not enabled:
+            self._transport.abort()
+
+    def on_close(self):
+        with self._route_lock:
+            self._route_ready = False
+            enabled = self._route_enabled
+        if enabled and self._reconnect is not None:
+            self._prepare_session()
+            _net, _timeout_factor, _services, port, registered = self._reconnect
+            NetworkThread.listen(self, registered, port=port)
+
+    def retire(self):
+        # An intentional removal stays unavailable; transport failures do not.
+        with self._route_lock:
+            self._route_enabled = False
+            self._route_ready = False
+        self.peer_disconnect()
 
     def on_getheaders(self, message):
         if message.hashstop:
@@ -110,8 +180,6 @@ class QQPursuitTest(BitcoinTestFramework):
     def endpoint(self, ip, header, qq=False, empty_first=False):
         peer = QuietPeer(header, empty_first=empty_first)
         peer.fixture_ip = ip
-        peer.peer_connect_helper("0", 0, self.chain, self.options.timeout_factor)
-        peer.peer_connect_send_version(NODE_NETWORK | (NODE_QUANTUM_QUASAR if qq else 0))
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
@@ -119,7 +187,11 @@ class QQPursuitTest(BitcoinTestFramework):
 
         def registered(address, actual_port):
             self.proxy.routes[ip] = (address, actual_port, peer)
+            peer.route_ready()
             ready.set()
+        peer.configure_reconnect(self.chain, self.options.timeout_factor,
+                                 NODE_NETWORK | (NODE_QUANTUM_QUASAR if qq else 0),
+                                 port, registered)
         NetworkThread.listen(peer, registered, port=port)
         assert ready.wait(5)
         return peer
@@ -160,6 +232,7 @@ class QQPursuitTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
         peers = []
+        qq_peers = []
         try:
             node.setmocktime(int(time.time()))
             self.generate(node, 1)
@@ -186,7 +259,6 @@ class QQPursuitTest(BitcoinTestFramework):
             full_ips = {p["addr"].split(":")[0] for p in node.getpeerinfo() if p["connection_type"] == "outbound-full-relay"}
             publisher = next(p for p in peers if p.is_connected and p.fixture_ip in full_ips)
             advertised = []
-            qq_peers = []
             for i in range(self.target + 1):
                 ip = f"24.{i + 1}.0.1"
                 qq_peers.append(self.endpoint(ip, header, qq=True, empty_first=(i == 0)))
@@ -214,7 +286,7 @@ class QQPursuitTest(BitcoinTestFramework):
             protected = {peer_id for peer_id in original if f"Protecting outbound peer={peer_id} from eviction" in log}
             assert_equal(len(protected), 4)
             assert protected.issubset({p["id"] for p in current})
-            qq_peers[0].peer_disconnect()
+            qq_peers[0].retire()
             self.wait_until(lambda: not qq_peers[0].is_connected)
             self.evaluate()
             assert_equal(node.getnetworkinfo()["qqoutbound"]["deficit"], 1)
@@ -229,6 +301,8 @@ class QQPursuitTest(BitcoinTestFramework):
             assert_equal(sum(p["connection_type"] == "outbound-full-relay" for p in node.getpeerinfo()), 16)
             assert protected.issubset({p["id"] for p in node.getpeerinfo()})
         finally:
+            for peer in peers + qq_peers:
+                peer.retire()
             node.setnetworkactive(False)
             self.proxy.shutdown()
             self.proxy.server_close()

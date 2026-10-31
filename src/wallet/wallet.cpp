@@ -10848,10 +10848,11 @@ namespace {
 static constexpr uint64_t POW_MINER_BATCH_TRIES = 128;
 
 bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
-                   bool allow_locked_wait = false)
+                   bool allow_locked_wait = false,
+                   std::optional<uint64_t> expected_generation = std::nullopt)
 {
-    const uint64_t authority_generation =
-        wallet.m_pow_wallet_authority_generation.load(std::memory_order_acquire);
+    const uint64_t authority_generation = expected_generation.value_or(
+        wallet.m_pow_wallet_authority_generation.load(std::memory_order_acquire));
     if (!allow_locked_wait &&
         wallet.m_pow_state.load(std::memory_order_acquire) ==
             WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
@@ -10872,14 +10873,17 @@ bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
     return true;
 }
 
-bool GrindShadowPowWorkInterruptibly(
+WalletPowMiningGrindResult GrindShadowPowWorkInterruptibly(
     CWallet& wallet, const ShadowPowWork& work, uint64_t start_nonce,
     uint64_t nonce_step, uint64_t max_tries, uint64_t authority_generation,
-    std::vector<unsigned char>& data_out, uint64_t* tries_done)
+    std::vector<unsigned char>& data_out)
 {
+    WalletPowMiningGrindResult batch;
     data_out.clear();
-    if (tries_done) *tries_done = 0;
-    if (nonce_step == 0 || max_tries == 0) return false;
+    if (nonce_step == 0 || max_tries == 0) {
+        batch.status = WalletPowMiningGrindStatus::INVALID_WORK;
+        return batch;
+    }
 
     uint64_t nonce = start_nonce;
     for (uint64_t tries = 0; tries < max_tries; ++tries) {
@@ -10889,7 +10893,7 @@ bool GrindShadowPowWorkInterruptibly(
                 std::memory_order_acquire) != authority_generation ||
             wallet.m_pow_state.load(std::memory_order_acquire) ==
                 WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
-            return false;
+            return batch;
         }
 
         std::vector<unsigned char> candidate;
@@ -10897,16 +10901,27 @@ bool GrindShadowPowWorkInterruptibly(
         const ShadowPowGrindResult result = GrindShadowPowWorkDetailed(
             work, nonce, nonce_step, /*max_tries=*/1, candidate,
             &candidate_tries);
-        if (tries_done) *tries_done += candidate_tries;
+        // The detailed API counts attempted calls, including a local failure.
+        // Only FOUND/EXHAUSTED completed this single hash successfully.
+        if (result == ShadowPowGrindResult::LOCAL_INTERNAL_ERROR) {
+            batch.status = WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR;
+            return batch;
+        }
+        if (result == ShadowPowGrindResult::INVALID_WORK) {
+            batch.status = WalletPowMiningGrindStatus::INVALID_WORK;
+            return batch;
+        }
+        batch.successful_hashes += candidate_tries;
         if (result == ShadowPowGrindResult::FOUND) {
             data_out = std::move(candidate);
-            return true;
+            batch.status = WalletPowMiningGrindStatus::FOUND;
+            return batch;
         }
-        if (result != ShadowPowGrindResult::EXHAUSTED) return false;
         if (std::numeric_limits<uint64_t>::max() - nonce < nonce_step) break;
         nonce += nonce_step;
     }
-    return false;
+    batch.status = WalletPowMiningGrindStatus::EXHAUSTED;
+    return batch;
 }
 
 bool IsShadowPowClaimConflict(const bilingual_str& error)
@@ -13621,9 +13636,80 @@ static WalletPowMiningState ShadowPowMiningStateForGate(
     return WalletPowMiningState::CLAIM_IN_FLIGHT;
 }
 
+WalletPowMiningGrindResult CWallet::RunShadowPowMiningBatch(
+    const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step,
+    uint64_t max_tries, uint64_t authority_generation,
+    std::vector<unsigned char>& proof, int worker_id,
+    std::chrono::steady_clock::time_point& next_error_log)
+{
+    proof.clear();
+    if (!PublishPowMiningWorkerState(WalletPowMiningState::HASHING,
+                                    authority_generation)) {
+        return {};
+    }
+    const auto batch_start = std::chrono::steady_clock::now();
+    auto result = GrindShadowPowWorkInterruptibly(
+        *this, work, start_nonce, nonce_step, max_tries,
+        authority_generation, proof);
+    result.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - batch_start);
+    if (result.status == WalletPowMiningGrindStatus::CANCELLED ||
+        !HasNormalPowMiningWalletAuthority(authority_generation)) {
+        proof.clear();
+        PublishPowMiningHashrate(0.0, authority_generation);
+        result.status = WalletPowMiningGrindStatus::CANCELLED;
+        return result;
+    }
+
+    if (result.successful_hashes > 0) {
+        const uint64_t total_tries = m_pow_total_tries.fetch_add(
+            result.successful_hashes) + result.successful_hashes;
+        const int64_t now_ms = GetTime<std::chrono::milliseconds>().count();
+        const int64_t start_ms = m_pow_hashrate_start_ms.load();
+        if (start_ms > 0 && now_ms > start_ms) {
+            PublishPowMiningHashrate(
+                (static_cast<double>(total_tries) * 1000.0) /
+                    static_cast<double>(now_ms - start_ms),
+                authority_generation);
+        }
+    }
+
+    if (result.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR ||
+        result.status == WalletPowMiningGrindStatus::INVALID_WORK) {
+        PublishPowMiningHashrate(0.0, authority_generation);
+        if (!PublishPowMiningWorkerState(WalletPowMiningState::RUNTIME_ERROR,
+                                         authority_generation)) {
+            result.status = WalletPowMiningGrindStatus::CANCELLED;
+            return result;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_error_log) {
+            WalletLogPrintf(
+                "Gold Rush PoW worker %d paused: %s; retrying after 1 second\n",
+                worker_id,
+                result.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR
+                    ? "local Argon2 proof evaluation failed"
+                    : "invalid proof work");
+            next_error_log = now + std::chrono::seconds{30};
+        }
+        // Independent of CPU target and measured batch duration: a fast local
+        // failure must not immediately repeat selection and Argon2 evaluation.
+        if (!SleepPowMiner(*this, std::chrono::seconds{1},
+                           /*allow_locked_wait=*/false,
+                           authority_generation)) {
+            result.status = WalletPowMiningGrindStatus::CANCELLED;
+        }
+        return result;
+    }
+    PublishPowMiningWorkerState(WalletPowMiningState::READY,
+                                authority_generation);
+    return result;
+}
+
 void CWallet::ThreadShadowPoWMiner(int worker_id)
 {
     WalletLogPrintf("Gold Rush PoW worker %d started\n", worker_id);
+    std::chrono::steady_clock::time_point next_grind_error_log{};
     while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
         bilingual_str error;
         const uint64_t loop_authority_generation =
@@ -14287,36 +14373,24 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             continue;
         }
         if (should_grind) {
-            if (!PublishPowMiningWorkerState(
-                    WalletPowMiningState::HASHING,
-                    loop_authority_generation)) {
+            const auto result = RunShadowPowMiningBatch(
+                work, nonce_start, 1, POW_MINER_BATCH_TRIES,
+                loop_authority_generation, proof, worker_id,
+                next_grind_error_log);
+            if (result.status == WalletPowMiningGrindStatus::CANCELLED ||
+                result.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR ||
+                result.status == WalletPowMiningGrindStatus::INVALID_WORK) {
                 continue;
             }
-            const auto batch_start = std::chrono::steady_clock::now();
-            proof_found = GrindShadowPowWorkInterruptibly(
-                *this, work, nonce_start, 1, POW_MINER_BATCH_TRIES,
-                loop_authority_generation, proof, &tries_done);
-            batch_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - batch_start);
-            PublishPowMiningWorkerState(WalletPowMiningState::READY,
-                                        loop_authority_generation);
+            proof_found = result.status == WalletPowMiningGrindStatus::FOUND;
+            tries_done = result.successful_hashes;
+            batch_elapsed = result.elapsed;
         }
 
         if (!HasNormalPowMiningWalletAuthority(
                 loop_authority_generation)) {
             PublishPowMiningHashrate(0.0);
             continue;
-        }
-
-        if (tries_done > 0) {
-            const uint64_t total_tries = m_pow_total_tries.fetch_add(tries_done) + tries_done;
-            const int64_t now_ms = GetTime<std::chrono::milliseconds>().count();
-            const int64_t start_ms = m_pow_hashrate_start_ms.load();
-            if (start_ms > 0 && now_ms > start_ms) {
-                PublishPowMiningHashrate(
-                    (static_cast<double>(total_tries) * 1000.0) /
-                        static_cast<double>(now_ms - start_ms),
-                    loop_authority_generation);
-            }
         }
 
         if (proof_found) {

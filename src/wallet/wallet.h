@@ -43,6 +43,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -77,6 +78,21 @@ namespace wallet {
 class CWallet;
 class WalletClaimMaintenance;
 struct WalletClaimMaintenanceSlot;
+
+enum class WalletPowMiningGrindStatus {
+    FOUND,
+    EXHAUSTED,
+    INVALID_WORK,
+    LOCAL_INTERNAL_ERROR,
+    CANCELLED,
+};
+
+struct WalletPowMiningGrindResult {
+    WalletPowMiningGrindStatus status{WalletPowMiningGrindStatus::CANCELLED};
+    /** Completed proof-hash evaluations, excluding a failed Argon2 call. */
+    uint64_t successful_hashes{0};
+    std::chrono::milliseconds elapsed{0};
+};
 
 enum class WalletCommitStatus {
     ACCEPTED,
@@ -2305,6 +2321,14 @@ public:
     bool PublishPowMiningHashrate(
         double hashrate,
         std::optional<uint64_t> expected_generation = std::nullopt);
+    /** Pure work batch plus worker telemetry and interruptible error retry.
+     * No input selection, signing or transaction submission. The log deadline
+     * belongs to the calling worker and is retained across batches. */
+    WalletPowMiningGrindResult RunShadowPowMiningBatch(
+        const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step,
+        uint64_t max_tries, uint64_t authority_generation,
+        std::vector<unsigned char>& proof, int worker_id,
+        std::chrono::steady_clock::time_point& next_error_log);
     void ThreadShadowPoWMiner(int worker_id);
     QuantumAddressBindingResult ResolveConfiguredQuantumAddress(
         const std::string& option,

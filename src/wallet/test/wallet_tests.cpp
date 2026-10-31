@@ -172,6 +172,129 @@ static_assert(DEFAULT_TRANSACTION_MINFEE >= DEFAULT_MIN_RELAY_TX_FEE, "wallet mi
 
 BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
 
+BOOST_AUTO_TEST_CASE(pow_mining_batch_local_error_retry_and_recovery)
+{
+    struct ResetFailures {
+        ~ResetFailures() { ClearShadowArgon2FailuresForTesting(); }
+    } reset_failures;
+    ShadowPowWork work;
+    work.valid = true;
+    work.target = CScript{} << OP_TRUE;
+    work.quantum_payout_script = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x5a)});
+    work.bits = 0; // First successful evaluation finds a proof without a claim.
+
+    for (const int cpu_percent : {1, 100}) {
+        BOOST_TEST_CONTEXT("CPU target " << cpu_percent) {
+            CWallet wallet{nullptr, "synthetic-pow-batch", CreateMockableWalletDatabase()};
+            wallet.m_pow_mining_enabled = true;
+            wallet.m_pow_cpu_percent = cpu_percent;
+            wallet.m_pow_state = interfaces::WalletPowMiningState::READY;
+            wallet.m_pow_total_tries = 17;
+            wallet.m_pow_hashrate = 42.0;
+            wallet.m_pow_hashrate_start_ms = GetTime<std::chrono::milliseconds>().count() - 1000;
+            const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+            std::chrono::steady_clock::time_point next_error_log{};
+            std::vector<unsigned char> proof;
+            int error_logs{0};
+            DebugLogHelper log_counter{"local Argon2 proof evaluation failed",
+                [&](const std::string* line) {
+                    if (line) ++error_logs;
+                    return false; // Observe every matching log in this scope.
+                }};
+            ResetShadowArgon2EvaluationCountForTesting();
+            SetShadowArgon2FailuresForTesting(2);
+            const auto started = std::chrono::steady_clock::now();
+            for (uint64_t attempt = 1; attempt <= 2; ++attempt) {
+                const auto result = wallet.RunShadowPowMiningBatch(
+                    work, 0, 1, 128, generation, proof, 0, next_error_log);
+                BOOST_CHECK(result.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR);
+                BOOST_CHECK_EQUAL(result.successful_hashes, 0U);
+                BOOST_CHECK_EQUAL(wallet.m_pow_total_tries.load(), 17U);
+                BOOST_CHECK_EQUAL(wallet.m_pow_hashrate.load(), 0.0);
+                BOOST_CHECK(wallet.m_pow_state.load() == interfaces::WalletPowMiningState::RUNTIME_ERROR);
+                BOOST_CHECK(proof.empty());
+                BOOST_CHECK_EQUAL(GetShadowArgon2EvaluationCountForTesting(), attempt);
+                BOOST_CHECK_EQUAL(error_logs, 1);
+                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started);
+                BOOST_CHECK_GE(waited.count(), static_cast<int64_t>(attempt * 900));
+            }
+
+            ClearShadowArgon2FailuresForTesting();
+            const auto resumed = wallet.RunShadowPowMiningBatch(
+                work, 0, 1, 128, generation, proof, 0, next_error_log);
+            BOOST_CHECK(resumed.status == WalletPowMiningGrindStatus::FOUND);
+            BOOST_CHECK_EQUAL(resumed.successful_hashes, 1U);
+            BOOST_CHECK_EQUAL(wallet.m_pow_total_tries.load(), 18U);
+            BOOST_CHECK_GT(wallet.m_pow_hashrate.load(), 0.0);
+            BOOST_CHECK(wallet.m_pow_state.load() == interfaces::WalletPowMiningState::READY);
+            BOOST_CHECK(!proof.empty());
+            BOOST_CHECK_EQUAL(GetShadowArgon2EvaluationCountForTesting(), 3U);
+            BOOST_CHECK_EQUAL(error_logs, 1);
+            BOOST_CHECK(wallet.mapWallet.empty());
+            BOOST_CHECK_EQUAL(wallet.m_pow_claims_submitted.load(), 0);
+            wallet.m_pow_mining_enabled = false;
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_batch_error_backoff_is_interruptible)
+{
+    struct ResetFailures {
+        ~ResetFailures() { ClearShadowArgon2FailuresForTesting(); }
+    } reset_failures;
+    ShadowPowWork work;
+    work.valid = true;
+    work.target = CScript{} << OP_TRUE;
+    work.quantum_payout_script = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x5a)});
+    enum class Cancel { DISABLE, CLOSE, AUTHORITY, STAKING_ONLY };
+    for (const auto cancel : {Cancel::DISABLE, Cancel::CLOSE,
+                              Cancel::AUTHORITY, Cancel::STAKING_ONLY}) {
+        CWallet wallet{nullptr, "cancel-pow-batch", CreateMockableWalletDatabase()};
+        wallet.m_pow_mining_enabled = true;
+        wallet.m_pow_state = interfaces::WalletPowMiningState::READY;
+        const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+        std::chrono::steady_clock::time_point next_error_log{};
+        std::vector<unsigned char> proof;
+        ResetShadowArgon2EvaluationCountForTesting();
+        SetShadowArgon2FailuresForTesting();
+        auto batch = std::async(std::launch::async, [&] {
+            return wallet.RunShadowPowMiningBatch(
+                work, 0, 1, 128, generation, proof, 0, next_error_log);
+        });
+        // Observe the actual production error/backoff path before cancelling.
+        for (int wait = 0; wait < 500 &&
+             wallet.m_pow_state.load() != interfaces::WalletPowMiningState::RUNTIME_ERROR; ++wait) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        BOOST_CHECK(wallet.m_pow_state.load() == interfaces::WalletPowMiningState::RUNTIME_ERROR);
+        BOOST_CHECK(batch.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+        const auto cancelled_at = std::chrono::steady_clock::now();
+        switch (cancel) {
+        case Cancel::DISABLE: wallet.m_pow_mining_enabled = false; break;
+        case Cancel::CLOSE: wallet.m_stop_pow_mining_thread = true; break;
+        case Cancel::AUTHORITY: ++wallet.m_pow_wallet_authority_generation; break;
+        case Cancel::STAKING_ONLY: wallet.SetWalletUnlockStakingOnly(true); break;
+        }
+        BOOST_CHECK(batch.wait_for(std::chrono::milliseconds{700}) == std::future_status::ready);
+        const auto result = batch.get();
+        BOOST_CHECK(result.status == WalletPowMiningGrindStatus::CANCELLED);
+        const auto cancel_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - cancelled_at);
+        BOOST_CHECK_LT(cancel_wait.count(), 700);
+        BOOST_CHECK_EQUAL(GetShadowArgon2EvaluationCountForTesting(), 1U);
+        BOOST_CHECK_EQUAL(wallet.m_pow_total_tries.load(), 0U);
+        BOOST_CHECK_EQUAL(wallet.m_pow_hashrate.load(), 0.0);
+        BOOST_CHECK(wallet.mapWallet.empty());
+        BOOST_CHECK(proof.empty());
+        wallet.m_pow_mining_enabled = false;
+    }
+}
+
 BOOST_AUTO_TEST_CASE(coin_lock_batches_publish_only_after_database_commit)
 {
     uint256 first_hash;

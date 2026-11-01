@@ -183,13 +183,15 @@ void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_ty
     });
 }
 
-void WaitForModal(const QString& description, std::function<bool()> action)
+void WaitForModal(const QString& description, std::function<bool()> action,
+                  std::function<void()> timeout_action = {})
 {
     auto* timer = new QTimer(qApp);
     timer->setInterval(10);
     timer->setSingleShot(false);
     QObject::connect(timer, &QTimer::timeout, timer,
-                     [timer, description, action = std::move(action), attempts = 0]() mutable {
+                     [timer, description, action = std::move(action),
+                      timeout_action = std::move(timeout_action), attempts = 0]() mutable {
         if (action()) {
             timer->stop();
             timer->deleteLater();
@@ -200,7 +202,9 @@ void WaitForModal(const QString& description, std::function<bool()> action)
         QTest::qFail(
             QStringLiteral("Timed out waiting for %1").arg(description).toUtf8().constData(),
             __FILE__, __LINE__);
-        if (auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget())) {
+        if (timeout_action) {
+            timeout_action();
+        } else if (auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget())) {
             dialog->reject();
         }
         timer->stop();
@@ -225,29 +229,37 @@ void ClickCheckBoxIndicator(QCheckBox* checkbox)
 
 //! Press a standard button in a modal message box.
 void ConfirmMessageBox(QMessageBox::StandardButton confirm_type,
-                       const QString& expected_text = {})
+                       const QString& expected_text = {},
+                       const QString& expected_title = {})
 {
-    WaitForModal(QStringLiteral("message box"), [confirm_type, expected_text]() {
-        for (QWidget* widget : QApplication::topLevelWidgets()) {
-            if (auto* dialog = qobject_cast<QMessageBox*>(widget)) {
-                if (!expected_text.isEmpty() &&
-                    !dialog->text().contains(expected_text)) {
-                    QTest::qFail(
-                        QStringLiteral("Message box omitted required disclosure: %1; actual: %2")
-                            .arg(expected_text, dialog->text())
-                            .toUtf8().constData(),
-                        __FILE__, __LINE__);
-                    dialog->reject();
-                    return true;
-                }
-                if (QAbstractButton* button = dialog->button(confirm_type)) {
-                    button->click();
-                    return true;
-                }
-            }
+    const auto expected_dialog = [expected_text, expected_title]() -> QMessageBox* {
+        auto* dialog = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+        if (!dialog || !dialog->isVisible()) return nullptr;
+        if (!expected_title.isEmpty()) {
+#ifdef Q_OS_MAC
+            // Qt intentionally ignores QMessageBox titles on macOS. Still require
+            // the platform's empty title and the caller's identifying body text.
+            if (!dialog->windowTitle().isEmpty() || expected_text.isEmpty()) return nullptr;
+#else
+            if (dialog->windowTitle() != expected_title) return nullptr;
+#endif
         }
-        return false;
-    });
+        if (!expected_text.isEmpty() && !dialog->text().contains(expected_text)) return nullptr;
+        return dialog;
+    };
+    WaitForModal(QStringLiteral("visible active message box %1").arg(expected_title),
+        [confirm_type, expected_dialog]() {
+            auto* dialog = expected_dialog();
+            if (!dialog) return false;
+            QAbstractButton* button = dialog->button(confirm_type);
+            if (!button || !button->isEnabled()) return false;
+            button->click();
+            return true;
+        },
+        [expected_dialog]() {
+            // Never dismiss an unrelated active prompt after a failed match.
+            if (auto* dialog = expected_dialog()) dialog->reject();
+        });
 }
 
 void AnswerPowClaimRecoveryConsent(bool enable, bool use_escape = false,
@@ -1025,7 +1037,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     const bool staking_only_before_policy = walletModel.getWalletUnlockStakingOnly();
     AnswerInitialPowClaimRecoveryChoice(
         InitialPowClaimRecoveryChoice::PAUSE_AND_ASK);
-    ConfirmMessageBox(QMessageBox::Yes);
+    ConfirmMessageBox(QMessageBox::Yes,
+        QStringLiteral("This will start the built-in Gold Rush PoW miner"),
+        QStringLiteral("Start Gold Rush PoW mining"));
     pow_enable->click();
     QTRY_COMPARE_WITH_TIMEOUT(
         walletModel.wallet().getPowClaimRecoveryPolicy().mode,
@@ -1132,7 +1146,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     auto stop_before_schedule_restore = interfaces::MakeCleanupHandler(
         [core_wallet] { core_wallet->StopPowMining(); });
 
-    ConfirmMessageBox(QMessageBox::Yes);
+    ConfirmMessageBox(QMessageBox::Yes,
+        QStringLiteral("This will start the built-in Gold Rush PoW miner"),
+        QStringLiteral("Start Gold Rush PoW mining"));
     pow_enable->click();
     const auto locked_input_wait_diagnostic = [&] {
         const interfaces::WalletPowMiningInfo current = walletModel.wallet().getPowMiningInfo();
@@ -3080,43 +3096,61 @@ void TestWalletCallbackUnloadBeforeParentDelivery(interfaces::Node& node, const 
 void TestWalletAddedAllowsSynchronousRegistryRead(interfaces::Node& node, const PlatformStyle* style)
 {
     WalletCallbackTestWatchdog watchdog;
-    MiniGUI gui(node, style);
-    WalletController controller(*gui.clientModel, style, nullptr);
-    auto& context = *node.walletLoader().context();
-    auto wallet = CallbackTestWallet(node, "callback-added-reentry");
-    QVERIFY(wallet);
-    bool entered{false};
-    size_t count{0};
-    QObject::connect(&controller, &WalletController::walletAdded, &controller,
-        [&](WalletModel*) { entered = true; count = controller.getOpenWallets().size(); }, Qt::DirectConnection);
-    QVERIFY(controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet)));
-    QVERIFY(entered);
-    QCOMPARE(count, size_t{1});
+    std::weak_ptr<CWallet> weak;
+    {
+        MiniGUI gui(node, style);
+        WalletController controller(*gui.clientModel, style, nullptr);
+        auto& context = *node.walletLoader().context();
+        auto wallet = CallbackTestWallet(node, "callback-added-reentry");
+        QVERIFY(wallet);
+        weak = wallet;
+        // CWallet::Create subscribes before publication; even this unregistered
+        // mock must drop its validation subscription to break the shared cycle.
+        auto cleanup = interfaces::MakeCleanupHandler([&] { RemoveWallet(context, wallet, std::nullopt); });
+        bool entered{false};
+        size_t count{0};
+        QObject::connect(&controller, &WalletController::walletAdded, &controller,
+            [&](WalletModel*) { entered = true; count = controller.getOpenWallets().size(); }, Qt::DirectConnection);
+        QVERIFY(controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet)));
+        QVERIFY(entered);
+        QCOMPARE(count, size_t{1});
+    }
+    SyncWithValidationInterfaceQueue();
+    QVERIFY2(weak.expired(), "Callback test wallet retained its validation subscription");
 }
 
 void TestWalletAddedMayRetireModelBeforeReturn(interfaces::Node& node, const PlatformStyle* style)
 {
     WalletCallbackTestWatchdog watchdog;
-    MiniGUI gui(node, style);
-    WalletController controller(*gui.clientModel, style, nullptr);
-    auto& context = *node.walletLoader().context();
-    auto wallet = CallbackTestWallet(node, "callback-retire-during-added");
-    QVERIFY(wallet);
-    QPointer<WalletModel> announced;
-    bool unload_invoked{false};
-    QObject::connect(&controller, &WalletController::walletAdded, &controller,
-        [&](WalletModel* model) {
-            announced = model;
-            unload_invoked = QMetaObject::invokeMethod(model, "unload", Qt::DirectConnection);
-            // Deliver the real queued controller unload route before the
-            // creation/publication call returns to its activity caller.
-            QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
-        }, Qt::DirectConnection);
-    QPointer<WalletModel> returned = controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet));
-    QVERIFY(unload_invoked);
-    QVERIFY(announced.isNull());
-    QVERIFY(returned.isNull());
-    QVERIFY(controller.getOpenWallets().empty());
+    std::weak_ptr<CWallet> weak;
+    {
+        MiniGUI gui(node, style);
+        WalletController controller(*gui.clientModel, style, nullptr);
+        auto& context = *node.walletLoader().context();
+        auto wallet = CallbackTestWallet(node, "callback-retire-during-added");
+        QVERIFY(wallet);
+        weak = wallet;
+        // CWallet::Create subscribes before publication; even this unregistered
+        // mock must drop its validation subscription to break the shared cycle.
+        auto cleanup = interfaces::MakeCleanupHandler([&] { RemoveWallet(context, wallet, std::nullopt); });
+        QPointer<WalletModel> announced;
+        bool unload_invoked{false};
+        QObject::connect(&controller, &WalletController::walletAdded, &controller,
+            [&](WalletModel* model) {
+                announced = model;
+                unload_invoked = QMetaObject::invokeMethod(model, "unload", Qt::DirectConnection);
+                // Deliver the real queued controller unload route before the
+                // creation/publication call returns to its activity caller.
+                QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+            }, Qt::DirectConnection);
+        QPointer<WalletModel> returned = controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet));
+        QVERIFY(unload_invoked);
+        QVERIFY(announced.isNull());
+        QVERIFY(returned.isNull());
+        QVERIFY(controller.getOpenWallets().empty());
+    }
+    SyncWithValidationInterfaceQueue();
+    QVERIFY2(weak.expired(), "Callback test wallet retained its validation subscription");
 }
 
 void TestCloseAllWalletsCallbackLockOrder(interfaces::Node& node, const PlatformStyle* style)
@@ -3191,8 +3225,46 @@ void TestCloseAllWalletsCallbackLockOrder(interfaces::Node& node, const Platform
     QCOMPARE(controller.getOpenWallets().size(), size_t{1}); // New concurrent wallet was outside the close snapshot.
 }
 
+// A hidden prior box must never consume a waiter for an async question.
+// The exact owned real box is rejected after 2s on the old-helper negative path.
+void TestMessageBoxWaitsForVisibleActiveQuestion()
+{
+    const QString title = QStringLiteral("Delayed confirmation regression");
+    const QString body = QStringLiteral("Expected delayed question for confirmation regression");
+    QMessageBox hidden(QMessageBox::Question, title, body,
+                       QMessageBox::Yes | QMessageBox::No);
+    QSignalSpy hidden_finished(&hidden, &QDialog::finished);
+    QVERIFY(!hidden.isVisible());
+    QPointer<QMessageBox> real;
+    bool finished{false};
+    bool actual_yes_clicked{false};
+    int result{QDialog::Rejected};
+    QTimer cleanup;
+    cleanup.setSingleShot(true);
+    QObject::connect(&cleanup, &QTimer::timeout, &cleanup, [&] {
+        if (real) real->reject(); // Only this regression's exact owned dialog.
+    });
+    cleanup.start(2000);
+    ConfirmMessageBox(QMessageBox::Yes, body, title);
+    QTimer::singleShot(50, &cleanup, [&] {
+        QMessageBox question(QMessageBox::Question, title, body,
+                             QMessageBox::Yes | QMessageBox::No);
+        real = &question;
+        result = question.exec();
+        actual_yes_clicked = question.clickedButton() == question.button(QMessageBox::Yes);
+        finished = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(finished, 3000);
+    cleanup.stop();
+    QCOMPARE(hidden_finished.count(), 0);
+    QCOMPARE(result, int{QMessageBox::Yes});
+    QVERIFY(actual_yes_clicked);
+    QVERIFY(real.isNull());
+}
+
 void TestWalletControllerCallbacks(interfaces::Node& node)
 {
+    TestMessageBoxWaitsForVisibleActiveQuestion();
     // Explicitly enable a private settings path: closeAllWallets removes startup
     // settings through the real backend; -nosettings would invalidate that API.
     TestingSetup test{ChainType::REGTEST, {"-settings=wallet-callback-tests.json", "-staking=0", "-powmining=0"}};

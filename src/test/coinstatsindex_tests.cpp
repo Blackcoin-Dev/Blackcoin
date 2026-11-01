@@ -4,6 +4,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <addresstype.h>
 #include <chainparams.h>
 #include <common/args.h>
 #include <consensus/consensus.h>
@@ -23,7 +24,27 @@
 #include <boost/test/unit_test.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <limits>
+#include <memory>
+#include <utility>
+#include <vector>
+
+/** Exercise the exact custom/base commit boundary without a process-timing race. */
+struct ShadowIndexTestAccess
+{
+    static void SetRewindBatchHook(ShadowIndex& index, std::function<void()> hook)
+    {
+        index.m_after_rewind_batch_for_testing = std::move(hook);
+    }
+
+    static bool Rewind(ShadowIndex& index, const CBlockIndex* from, const CBlockIndex* to)
+    {
+        return index.CustomRewind({from->GetBlockHash(), from->nHeight}, {to->GetBlockHash(), to->nHeight});
+    }
+
+    static CDBWrapper& Database(ShadowIndex& index) { return index.GetDB(); }
+};
 
 namespace {
 
@@ -42,9 +63,190 @@ public:
     }
 };
 
+struct RawIndexBytes
+{
+    std::vector<std::byte> bytes;
+
+    template <typename Stream>
+    void Unserialize(Stream& stream)
+    {
+        bytes.resize(stream.size());
+        stream.read(bytes);
+    }
+};
+
+using IndexRows = std::vector<std::pair<std::vector<std::byte>, std::vector<std::byte>>>;
+
+IndexRows ReadIndexRows(ShadowIndex& index)
+{
+    IndexRows rows;
+    std::unique_ptr<CDBIterator> iterator{ShadowIndexTestAccess::Database(index).NewIterator()};
+    for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+        RawIndexBytes key, value;
+        BOOST_REQUIRE(iterator->GetKey(key));
+        BOOST_REQUIRE(iterator->GetValue(value));
+        rows.emplace_back(std::move(key.bytes), std::move(value.bytes));
+    }
+    return rows;
+}
+
+struct InterruptedShadowRewind {};
+
+class ShadowIndexRewindTestingSetup : public BoundedShadowIndexTestingSetup
+{
+public:
+    void CheckInterruptedRewind(int disconnect_count, size_t stop_after)
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        Chainstate& chainstate = chainman.ActiveChainstate();
+        // Nonempty historical witness records make the undo comparison cover
+        // both custom state families. Version 2 outputs need no spending key.
+        const CScript old_script = GetScriptForDestination(WitnessUnknown{2, std::vector<unsigned char>(32, 0x71)});
+        const CScript alternate_script = GetScriptForDestination(WitnessUnknown{2, std::vector<unsigned char>(32, 0x72)});
+        std::vector<CBlock> old_blocks;
+        for (int i = 0; i < 3; ++i) old_blocks.push_back(CreateAndProcessBlock({}, old_script));
+        const CBlockIndex* old_tip = WITH_LOCK(cs_main, return chainstate.m_chain.Tip());
+        BOOST_REQUIRE_EQUAL(old_tip->nHeight, SHADOW_REWARD_START_HEIGHT + 2);
+        const CBlockIndex* fork = old_tip->GetAncestor(old_tip->nHeight - disconnect_count);
+        const CBlockIndex* persisted_parent = old_tip->GetAncestor(old_tip->nHeight - static_cast<int>(stop_after));
+        BOOST_REQUIRE(fork != nullptr);
+        BOOST_REQUIRE(persisted_parent != nullptr);
+
+        CBlockLocator persisted_locator;
+        {
+            ShadowIndex index{interfaces::MakeChain(m_node), 1 << 20};
+            BOOST_REQUIRE(index.Init());
+            BOOST_REQUIRE(index.StartBackgroundSync());
+            IndexWaitSynced(index);
+            SyncWithValidationInterfaceQueue();
+            index.Stop(); // No live notifications or final BaseIndex commit during the failpoint.
+            CBlockLocator before;
+            BOOST_REQUIRE(ShadowIndexTestAccess::Database(index).Read(uint8_t{'B'}, before));
+            BOOST_REQUIRE(!before.IsNull());
+            BOOST_REQUIRE(before.vHave.front() == old_tip->GetBlockHash());
+
+            CBlockIndex* invalidated = WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(old_blocks[3 - disconnect_count].GetHash()));
+            BOOST_REQUIRE(invalidated != nullptr);
+            BlockValidationState state;
+            BOOST_REQUIRE(chainstate.InvalidateBlock(state, invalidated));
+            BOOST_REQUIRE_MESSAGE(state.IsValid(), state.ToString());
+            for (int i = 0; i < disconnect_count; ++i) CreateAndProcessBlock({}, alternate_script);
+            SyncWithValidationInterfaceQueue();
+
+            size_t committed_batches{0};
+            ShadowIndexTestAccess::SetRewindBatchHook(index, [&] {
+                if (++committed_batches == stop_after) throw InterruptedShadowRewind{};
+            });
+            BOOST_CHECK_THROW(ShadowIndexTestAccess::Rewind(index, old_tip, fork), InterruptedShadowRewind);
+            BOOST_CHECK_EQUAL(committed_batches, stop_after);
+            // The in-memory BaseIndex state has not advanced through Rewind's
+            // final Commit. The persisted locator must already match the undo.
+            BOOST_CHECK(index.GetSummary().best_block_hash == old_tip->GetBlockHash());
+            BOOST_REQUIRE(ShadowIndexTestAccess::Database(index).Read(uint8_t{'B'}, persisted_locator));
+            BOOST_REQUIRE(!persisted_locator.IsNull());
+            BOOST_CHECK(persisted_locator.vHave == GetLocator(persisted_parent).vHave);
+            if (persisted_parent->nHeight >= SHADOW_REWARD_START_HEIGHT) {
+                std::pair<uint256, int32_t> custom_tip;
+                BOOST_REQUIRE(ShadowIndexTestAccess::Database(index).Read(uint8_t{'T'}, custom_tip));
+                BOOST_CHECK(custom_tip.first == persisted_parent->GetBlockHash());
+                BOOST_CHECK_EQUAL(custom_tip.second, persisted_parent->nHeight);
+            } else {
+                BOOST_CHECK(!ShadowIndexTestAccess::Database(index).Exists(uint8_t{'T'}));
+            }
+            ShadowIndexBlockRecord removed;
+            BOOST_CHECK(!index.LookupBlock(old_tip->GetBlockHash(), removed));
+        }
+
+        // Recreating the old inconsistent locator must still fail closed,
+        // including the missing-custom-tip case at the reward boundary.
+        // Recovery succeeds because the atomic batch prevents this mismatch,
+        // rather than because CustomInit accepts a corrupt restart point.
+        const auto write_locator = [&](const CBlockLocator& locator) {
+            CDBWrapper db({.path = gArgs.GetDataDirNet() / "indexes" / "shadow", .cache_bytes = 1 << 20});
+            BOOST_REQUIRE(db.Write(uint8_t{'B'}, locator));
+        };
+        write_locator(GetLocator(old_tip));
+        {
+            ShadowIndex inconsistent{interfaces::MakeChain(m_node), 1 << 20};
+            BOOST_CHECK(!inconsistent.Init());
+            inconsistent.Stop();
+        }
+        write_locator(persisted_locator);
+
+        IndexRows recovered_rows;
+        ShadowIndexSupply recovered_supply;
+        size_t recovered_transactions{0}, recovered_witness_outputs{0};
+        const uint256 active_tip = WITH_LOCK(cs_main, return chainstate.m_chain.Tip()->GetBlockHash());
+        {
+            ShadowIndex recovered{interfaces::MakeChain(m_node), 1 << 20};
+            BOOST_REQUIRE(recovered.Init());
+            BOOST_CHECK(recovered.GetSummary().best_block_hash == persisted_parent->GetBlockHash());
+            BOOST_REQUIRE(recovered.StartBackgroundSync());
+            IndexWaitSynced(recovered);
+            SyncWithValidationInterfaceQueue();
+            recovered.Stop();
+            BOOST_CHECK(recovered.GetSummary().best_block_hash == active_tip);
+            BOOST_REQUIRE(recovered.LookupSupply(active_tip, recovered_supply));
+            bool complete{false};
+            BOOST_REQUIRE(recovered.ForEachTransaction(1000, [](const auto&) { return true; }, recovered_transactions, complete));
+            BOOST_CHECK(complete);
+            BOOST_REQUIRE(recovered.ForEachQuantumWitnessOutput(1000, [](const auto&) { return true; }, recovered_witness_outputs, complete));
+            BOOST_CHECK(complete);
+            BOOST_CHECK_GT(recovered_witness_outputs, 0U);
+            for (size_t i = old_blocks.size() - disconnect_count; i < old_blocks.size(); ++i) {
+                ShadowIndexBlockRecord removed;
+                BOOST_CHECK(!recovered.LookupBlock(old_blocks[i].GetHash(), removed));
+            }
+            recovered_rows = ReadIndexRows(recovered);
+        }
+
+        // A fresh index over the resulting active branch must match every key
+        // and serialized value, including supply, transactions, witness undo,
+        // script rows, block records, custom tip and the full block locator.
+        ShadowIndex clean{interfaces::MakeChain(m_node), 1 << 20, /*memory=*/true, /*wipe=*/true};
+        BOOST_REQUIRE(clean.Init());
+        BOOST_REQUIRE(clean.StartBackgroundSync());
+        IndexWaitSynced(clean);
+        SyncWithValidationInterfaceQueue();
+        clean.Stop();
+        BOOST_CHECK(ReadIndexRows(clean) == recovered_rows);
+        ShadowIndexSupply clean_supply;
+        BOOST_REQUIRE(clean.LookupSupply(active_tip, clean_supply));
+        BOOST_CHECK_EQUAL(clean_supply.issued_count, recovered_supply.issued_count);
+        BOOST_CHECK_EQUAL(clean_supply.issued_nominal, recovered_supply.issued_nominal);
+        BOOST_CHECK_EQUAL(clean_supply.spent_count, recovered_supply.spent_count);
+        BOOST_CHECK_EQUAL(clean_supply.spent_nominal, recovered_supply.spent_nominal);
+        BOOST_CHECK_EQUAL(clean_supply.spent_effective, recovered_supply.spent_effective);
+        BOOST_CHECK_EQUAL(clean_supply.spent_decayed, recovered_supply.spent_decayed);
+        size_t clean_transactions{0}, clean_witness_outputs{0};
+        bool complete{false};
+        BOOST_REQUIRE(clean.ForEachTransaction(1000, [](const auto&) { return true; }, clean_transactions, complete));
+        BOOST_CHECK(complete);
+        BOOST_CHECK_EQUAL(clean_transactions, recovered_transactions);
+        BOOST_REQUIRE(clean.ForEachQuantumWitnessOutput(1000, [](const auto&) { return true; }, clean_witness_outputs, complete));
+        BOOST_CHECK(complete);
+        BOOST_CHECK_EQUAL(clean_witness_outputs, recovered_witness_outputs);
+    }
+};
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(coinstatsindex_tests)
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_interrupted_single_block_rewind_recovers, ShadowIndexRewindTestingSetup)
+{
+    CheckInterruptedRewind(/*disconnect_count=*/1, /*stop_after=*/1);
+}
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_interrupted_multi_block_rewind_recovers, ShadowIndexRewindTestingSetup)
+{
+    CheckInterruptedRewind(/*disconnect_count=*/3, /*stop_after=*/1);
+}
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_interrupted_reward_boundary_rewind_recovers, ShadowIndexRewindTestingSetup)
+{
+    CheckInterruptedRewind(/*disconnect_count=*/3, /*stop_after=*/3);
+}
 
 BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds, TestChain100Setup)
 {

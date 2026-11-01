@@ -822,36 +822,6 @@ CoinStatsHashType ParseHashType(const std::string& hash_type_input)
     }
 }
 
-/**
- * Calculate statistics about the unspent transaction output set
- *
- * @param[in] index_requested Signals if the coinstatsindex should be used (when available).
- */
-static std::optional<kernel::CCoinsStats> GetUTXOStats(CCoinsView* view, node::BlockManager& blockman,
-                                                       kernel::CoinStatsHashType hash_type,
-                                                       const std::function<void()>& interruption_point = {},
-                                                       const CBlockIndex* pindex = nullptr,
-                                                       bool index_requested = true)
-{
-    // Use CoinStatsIndex if it is requested and available and a hash_type of Muhash or None was requested
-    if ((hash_type == kernel::CoinStatsHashType::MUHASH || hash_type == kernel::CoinStatsHashType::NONE) && g_coin_stats_index && index_requested) {
-        if (pindex) {
-            return g_coin_stats_index->LookUpStats(*pindex);
-        } else {
-            CBlockIndex& block_index = *CHECK_NONFATAL(WITH_LOCK(::cs_main, return blockman.LookupBlockIndex(view->GetBestBlock())));
-            return g_coin_stats_index->LookUpStats(block_index);
-        }
-    }
-
-    // If the coinstats index isn't requested or is otherwise not usable, the
-    // pindex should either be null or equal to the view's best block. This is
-    // because without the coinstats index we can only get coinstats about the
-    // best block.
-    CHECK_NONFATAL(!pindex || pindex->GetBlockHash() == view->GetBestBlock());
-
-    return kernel::ComputeUTXOStats(hash_type, view, blockman, interruption_point);
-}
-
 static RPCHelpMan gettxoutsetinfo()
 {
     return RPCHelpMan{"gettxoutsetinfo",
@@ -911,19 +881,26 @@ static RPCHelpMan gettxoutsetinfo()
     const CBlockIndex* pindex{nullptr};
     const CoinStatsHashType hash_type{request.params[0].isNull() ? CoinStatsHashType::HASH_SERIALIZED : ParseHashType(request.params[0].get_str())};
     bool index_requested = request.params[2].isNull() || request.params[2].get_bool();
+    const bool use_index = index_requested && g_coin_stats_index &&
+        (hash_type == CoinStatsHashType::MUHASH || hash_type == CoinStatsHashType::NONE);
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
     ChainstateManager& chainman = EnsureChainman(node);
-    Chainstate& active_chainstate = chainman.ActiveChainstate();
-    active_chainstate.ForceFlushStateToDisk();
 
-    CCoinsView* coins_view;
-    BlockManager* blockman;
+    std::optional<kernel::UTXOStatsSnapshot> snapshot;
     {
         LOCK(::cs_main);
-        coins_view = &active_chainstate.CoinsDB();
-        blockman = &active_chainstate.m_blockman;
-        pindex = blockman->LookupBlockIndex(coins_view->GetBestBlock());
+        Chainstate& active_chainstate = chainman.ActiveChainstate();
+        active_chainstate.ForceFlushStateToDisk();
+        CCoinsViewDB& coins_view = active_chainstate.CoinsDB();
+        if (use_index) {
+            pindex = CHECK_NONFATAL(active_chainstate.m_blockman.LookupBlockIndex(coins_view.GetBestBlock()));
+        } else {
+            // Capture the owning cursor and metadata together. Only this
+            // snapshot survives index synchronization and the unlocked scan.
+            snapshot.emplace(kernel::CaptureUTXOStats(coins_view, active_chainstate.m_blockman));
+            pindex = snapshot->block_index;
+        }
     }
 
     if (!request.params[1].isNull()) {
@@ -953,7 +930,9 @@ static RPCHelpMan gettxoutsetinfo()
         }
     }
 
-    const std::optional<CCoinsStats> maybe_stats = GetUTXOStats(coins_view, *blockman, hash_type, node.rpc_interruption_point, pindex, index_requested);
+    const std::optional<CCoinsStats> maybe_stats = use_index
+        ? g_coin_stats_index->LookUpStats(*pindex)
+        : kernel::ComputeUTXOStats(hash_type, std::move(*snapshot), node.rpc_interruption_point);
     if (maybe_stats.has_value()) {
         const CCoinsStats& stats = maybe_stats.value();
         ret.pushKV("height", (int64_t)stats.nHeight);
@@ -976,7 +955,7 @@ static RPCHelpMan gettxoutsetinfo()
 
             CCoinsStats prev_stats{};
             if (pindex->nHeight > 0) {
-                const std::optional<CCoinsStats> maybe_prev_stats = GetUTXOStats(coins_view, *blockman, hash_type, node.rpc_interruption_point, pindex->pprev, index_requested);
+                const std::optional<CCoinsStats> maybe_prev_stats = g_coin_stats_index->LookUpStats(*pindex->pprev);
                 if (!maybe_prev_stats) {
                     throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read UTXO set");
                 }
@@ -1437,7 +1416,6 @@ static RPCHelpMan getcirculatingsupply()
 {
     NodeContext& node = EnsureAnyNodeContext(request.context);
     ChainstateManager& chainman = EnsureChainman(node);
-    Chainstate& active_chainstate = chainman.ActiveChainstate();
     const Consensus::Params& consensus = chainman.GetConsensus();
     const bool allow_unqualified_resource_scan =
         !request.params[0].isNull() && request.params[0].get_bool();
@@ -1552,6 +1530,7 @@ static RPCHelpMan getcirculatingsupply()
     std::unique_ptr<CCoinsViewCursor> attestation_cursor;
     {
         LOCK(::cs_main);
+        Chainstate& active_chainstate = chainman.ActiveChainstate();
         BlockValidationState flush_state;
         if (!active_chainstate.FlushStateToDisk(
                 flush_state, FlushStateMode::ALWAYS)) {
@@ -3414,11 +3393,12 @@ static RPCHelpMan getquantumpoolinfo()
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     LOCK(cs_main);
     const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-    const CAmount total = node::ComputeQuantumColdStakeTotal(view);
+    const node::QuantumPoolShareCalculator pool_shares{view};
+    const CAmount total = pool_shares.TotalColdStake();
 
     UniValue entries(UniValue::VARR);
     for (const uint256& staker_hash : operators) {
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
         entries.push_back(QuantumPoolOperatorShareToJSON(share, requested_staker ? prospective_amount : 0));
     }
 
@@ -4034,9 +4014,13 @@ static RPCHelpMan scantxoutset()
             ChainstateManager& chainman = EnsureChainman(node);
             LOCK(cs_main);
             Chainstate& active_chainstate = chainman.ActiveChainstate();
-            active_chainstate.ForceFlushStateToDisk();
+            BlockValidationState flush_state;
+            if (!active_chainstate.FlushStateToDisk(flush_state, FlushStateMode::ALWAYS)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                    strprintf("Unable to flush UTXO set: %s", flush_state.ToString()));
+            }
             pcursor = CHECK_NONFATAL(active_chainstate.CoinsDB().Cursor());
-            tip = CHECK_NONFATAL(active_chainstate.m_chain.Tip());
+            tip = CHECK_NONFATAL(active_chainstate.m_blockman.LookupBlockIndex(pcursor->GetBestBlock()));
         }
         bool res = FindScriptPubKey(g_scan_progress, g_should_abort_scan, count, pcursor.get(), needles, coins, node.rpc_interruption_point);
         result.pushKV("success", res);
@@ -4453,7 +4437,7 @@ static RPCHelpMan dumptxoutset()
     }
 
     UniValue result = CreateUTXOSnapshot(
-        node, node.chainman->ActiveChainstate(), afile, path, temppath);
+        node, afile, path, temppath);
     fs::rename(temppath, path);
 
     result.pushKV("path", path.u8string());
@@ -4464,7 +4448,6 @@ static RPCHelpMan dumptxoutset()
 
 UniValue CreateUTXOSnapshot(
     NodeContext& node,
-    Chainstate& chainstate,
     AutoFile& afile,
     const fs::path& path,
     const fs::path& temppath)
@@ -4488,6 +4471,7 @@ UniValue CreateUTXOSnapshot(
         //
         LOCK(::cs_main);
 
+        Chainstate& chainstate = node.chainman->ActiveChainstate();
         if (chainstate.m_chain.Height() >= SHADOW_WHITELIST_HEIGHT) {
             throw JSONRPCError(RPC_MISC_ERROR,
                 "Quantum Quasar post-whitelist snapshots require a versioned authenticated shadow-state section");
@@ -4495,7 +4479,7 @@ UniValue CreateUTXOSnapshot(
 
         chainstate.ForceFlushStateToDisk();
 
-        maybe_stats = GetUTXOStats(&chainstate.CoinsDB(), chainstate.m_blockman, CoinStatsHashType::HASH_SERIALIZED, node.rpc_interruption_point);
+        maybe_stats = kernel::ComputeUTXOStats(CoinStatsHashType::HASH_SERIALIZED, &chainstate.CoinsDB(), chainstate.m_blockman, node.rpc_interruption_point);
         if (!maybe_stats) {
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read UTXO set");
         }

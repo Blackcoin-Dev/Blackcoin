@@ -758,6 +758,10 @@ void BitcoinGUI::setWalletController(WalletController* wallet_controller, bool s
 
     GUIUtil::ExceptionSafeConnect(wallet_controller, &WalletController::walletAdded, this, &BitcoinGUI::addWallet);
     connect(wallet_controller, &WalletController::walletRemoved, this, &BitcoinGUI::removeWallet);
+    connect(wallet_controller, &WalletController::walletBackupWarning, this,
+        [this](const QString& title, const QString& body, unsigned int style) {
+            message(title, body, style);
+        });
     connect(wallet_controller, &WalletController::destroyed, this, [this] {
         // wallet_controller gets destroyed manually, but it leaves our member copy dangling
         m_wallet_controller = nullptr;

@@ -26,6 +26,9 @@
 
 #include <test/util/setup_common.h>
 
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
 #include <limits>
 #include <memory>
 
@@ -802,6 +805,162 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
     SetMockTime(MinerTestMockTime());
 
     TestPrioritisedMining(scriptPubKey, txFirst);
+}
+
+// Optional operation-size override supports the same fixture on baseline and
+// candidate builds. Timing is diagnostic; assertions verify template contents.
+BOOST_AUTO_TEST_CASE(template_overlay_independent_packages)
+{
+    LOCK(cs_main);
+    Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+    CBlockIndex* const tip{Assert(chainstate.m_chain.Tip())};
+    const auto candidate_time{GetNextBlockHeaderTime(chainstate, tip, tip->GetMedianTimePast())};
+    BOOST_REQUIRE(candidate_time);
+    SetMockTime(*candidate_time);
+    std::vector<size_t> counts{16, 256};
+    if (const char* count{std::getenv("BLACKCOIN_TEMPLATE_BENCH_COUNT")}) {
+        uint64_t parsed_count{0};
+        BOOST_REQUIRE(ParseUInt64(count, &parsed_count));
+        BOOST_REQUIRE_GE(parsed_count, 1U);
+        BOOST_REQUIRE_LE(parsed_count, 12000U);
+        counts = {static_cast<size_t>(parsed_count)};
+    }
+    const CScript script{CScript() << OP_TRUE};
+    for (const size_t count : counts) {
+        CTxMemPool mempool{MemPoolOptionsForTest(m_node)};
+        TestMemPoolEntryHelper entry;
+        std::set<uint256> expected;
+        for (size_t i{0}; i < count; ++i) {
+            // Fixed source identifiers make both workload and txid output
+            // reproducible across baseline/candidate runs.
+            uint256 source_hash;
+            source_hash.begin()[0] = i & 0xff;
+            source_hash.begin()[1] = (i >> 8) & 0xff;
+            source_hash.begin()[31] = 0x73;
+            const COutPoint source{source_hash, 0};
+            chainstate.CoinsTip().AddCoin(source,
+                Coin{CTxOut{10 * COIN, script}, tip->nHeight, false, false,
+                     static_cast<uint32_t>(*candidate_time - 1)}, true);
+            CMutableTransaction tx;
+            tx.nVersion = 2;
+            tx.vin.emplace_back(source);
+            constexpr CAmount fee{10'000};
+            tx.vout.emplace_back(10 * COIN - fee, script);
+            expected.insert(tx.GetHash());
+            LOCK(mempool.cs);
+            mempool.addUnchecked(entry.Fee(fee).Time(Now<NodeSeconds>()).FromTx(tx));
+        }
+        BlockAssembler::Options options;
+        options.nBlockMaxWeight = MAX_BLOCK_WEIGHT;
+        BlockAssembler assembler{chainstate, &mempool, options};
+        const auto begin{std::chrono::steady_clock::now()};
+        const std::clock_t cpu_begin{std::clock()};
+        const auto block_template{assembler.CreateNewBlock(script)};
+        const auto cpu_ticks{std::clock() - cpu_begin};
+        const double elapsed_ms{std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count()};
+        BOOST_REQUIRE(block_template);
+        std::set<uint256> actual;
+        for (size_t i{1}; i < block_template->block.vtx.size(); ++i) {
+            actual.insert(block_template->block.vtx[i]->GetHash());
+        }
+        BOOST_CHECK(actual == expected);
+        BOOST_CHECK_EQUAL(block_template->block.vtx.size(), count + 1);
+        BOOST_CHECK_EQUAL(block_template->vTxFees[0], -10'000 * static_cast<CAmount>(count));
+        BOOST_TEST_MESSAGE("template-overlay-benchmark count=" << count
+            << " elapsed_ms=" << elapsed_ms
+            << " process_cpu_ms=" << (1000.0 * cpu_ticks / CLOCKS_PER_SEC)
+            << " template_hash=" << block_template->block.GetHash().GetHex());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(template_overlay_rejected_package_and_view_reset)
+{
+    LOCK(cs_main);
+    Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+    CBlockIndex* const tip{Assert(chainstate.m_chain.Tip())};
+    const auto candidate_time{GetNextBlockHeaderTime(chainstate, tip, tip->GetMedianTimePast())};
+    BOOST_REQUIRE(candidate_time);
+    SetMockTime(*candidate_time);
+
+    CTxMemPool mempool{MemPoolOptionsForTest(m_node)};
+    TestMemPoolEntryHelper entry;
+    constexpr CAmount value{10 * COIN};
+    const CScript script{CScript() << OP_TRUE};
+    const COutPoint selected_source{InsecureRand256(), 0};
+    const COutPoint rejected_source{InsecureRand256(), 0};
+    const auto add_source = [&](const COutPoint& source) {
+        chainstate.CoinsTip().AddCoin(source,
+            Coin{CTxOut{value, script}, tip->nHeight, false, false,
+                 static_cast<uint32_t>(*candidate_time - 1)}, false);
+    };
+    add_source(selected_source);
+    add_source(rejected_source);
+
+    const auto make_tx = [&](const COutPoint& source, CAmount amount, CAmount fee) {
+        CMutableTransaction tx;
+        tx.nVersion = 2;
+        tx.vin.emplace_back(source);
+        tx.vout.emplace_back(amount - fee, script);
+        return tx;
+    };
+    // Select this parent before testing the rejected package below. Its
+    // timestamp must remain authoritative for later, separate child packages.
+    const CMutableTransaction selected{make_tx(selected_source, value, 100'000)};
+    const CMutableTransaction selected_child{
+        make_tx(COutPoint{selected.GetHash(), 0}, selected.vout[0].nValue, 3'000)};
+    // The invalid high-fee child causes a package rejection after its valid
+    // parent and outputs were overlaid. The parent must remain selectable.
+    const CMutableTransaction recovered{make_tx(rejected_source, value, 1'000)};
+    CMutableTransaction invalid{make_tx(COutPoint{recovered.GetHash(), 0},
+                                      recovered.vout[0].nValue, 50'000)};
+    invalid.vin.emplace_back(COutPoint{InsecureRand256(), 0});
+    CMutableTransaction stale_child{make_tx(COutPoint{selected.GetHash(), 0},
+                                          selected.vout[0].nValue, 10'000)};
+    stale_child.nVersion = 1;
+    stale_child.nTime = *candidate_time - 1;
+    // Even though a conflicting candidate rejects, it cannot erase the spend
+    // protection committed when the first parent was actually selected.
+    const CMutableTransaction conflict{make_tx(selected_source, value, 5'000)};
+    {
+        LOCK(mempool.cs);
+        for (const auto& [tx, fee] : std::vector<std::pair<CMutableTransaction, CAmount>>{
+                 {selected, 100'000}, {selected_child, 3'000}, {recovered, 1'000},
+                 {invalid, 50'000}, {stale_child, 10'000}, {conflict, 5'000}}) {
+            mempool.addUnchecked(entry.Fee(fee).Time(Now<NodeSeconds>()).FromTx(tx));
+        }
+    }
+    BlockAssembler::Options options;
+    options.blockMinFeeRate = CFeeRate{1};
+    BlockAssembler assembler{chainstate, &mempool, options};
+    const auto check_template = [&](const CBlockTemplate& block_template, bool source_available) {
+        std::set<uint256> actual;
+        for (size_t i{1}; i < block_template.block.vtx.size(); ++i) {
+            actual.insert(block_template.block.vtx[i]->GetHash());
+        }
+        std::set<uint256> expected{recovered.GetHash()};
+        if (source_available) {
+            expected.insert(selected.GetHash());
+            expected.insert(selected_child.GetHash());
+        }
+        BOOST_CHECK(actual == expected);
+    };
+    const auto first{assembler.CreateNewBlock(script)};
+    BOOST_REQUIRE(first);
+    check_template(*first, true);
+    // Reuse the same assembler after a chain-view change and restoration.
+    // No selected coin/spend overlay may survive a template attempt.
+    Coin removed;
+    BOOST_REQUIRE(chainstate.CoinsTip().SpendCoin(selected_source, &removed));
+    const auto without_source{assembler.CreateNewBlock(script)};
+    BOOST_REQUIRE(without_source);
+    check_template(*without_source, false);
+    chainstate.CoinsTip().AddCoin(selected_source, std::move(removed), false);
+    const auto restored{assembler.CreateNewBlock(script)};
+    BOOST_REQUIRE(restored);
+    check_template(*restored, true);
+    BOOST_CHECK(first->vTxFees == restored->vTxFees);
+    BOOST_CHECK_EQUAL(first->block.GetHash(), restored->block.GetHash());
 }
 
 BOOST_AUTO_TEST_CASE(mempool_check_handles_v2_parent_legacy_child_timestamp_conflict)

@@ -1257,6 +1257,13 @@ class CMerkleBlock:
         r += self.txn.serialize()
         return r
 
+    def deserialize_pos_marker(self, f):
+        self.header.deserialize_pos_marker(f)
+        self.txn.deserialize(f)
+
+    def serialize_pos_marker(self):
+        return self.header.serialize_pos_marker() + self.txn.serialize()
+
     def __repr__(self):
         return "CMerkleBlock(header=%s, txn=%s)" % (repr(self.header), repr(self.txn))
 
@@ -1708,10 +1715,12 @@ class msg_merkleblock:
             self.merkleblock = merkleblock
 
     def deserialize(self, f):
-        self.merkleblock.deserialize(f)
+        # The Python P2P peer advertises 70016, which uses SER_POSMARKER.
+        # Keep CMerkleBlock default serialization unchanged for RPC proofs.
+        self.merkleblock.deserialize_pos_marker(f)
 
     def serialize(self):
-        return self.merkleblock.serialize()
+        return self.merkleblock.serialize_pos_marker()
 
     def __repr__(self):
         return "msg_merkleblock(merkleblock=%s)" % (repr(self.merkleblock))
@@ -2076,3 +2085,34 @@ class TestFrameworkScript(unittest.TestCase):
         check_addrv2("2bqghnldu6mcug4pikzprwhtjjnsyederctvci6klcwzepnjd46ikjyd.onion", CAddress.NET_TORV3)
         check_addrv2("255fhcp6ajvftnyo7bwz3an3t4a4brhopm3bamyh2iu5r3gnr2rq.b32.i2p", CAddress.NET_I2P)
         check_addrv2("fc32:17ea:e415:c3bf:9808:149d:b5a2:c9aa", CAddress.NET_CJDNS)
+
+
+class TestFrameworkMerkleBlock(unittest.TestCase):
+    def test_modern_network_and_legacy_rpc_proof_modes(self):
+        # Captured from a real 70016 regtest peer: 84-byte header plus tree.
+        payload = bytes.fromhex(
+            "0000003097d53c283c154d0bfdbc10ca83e4c2015de915e7ab0bfda605aba69e92e6346e650ec21d"
+            "3e41718b480cca4475b688385246b545af3c3c3988f38de2c308fbc97590e56affff7f2001000000"
+            "000000000100000001650ec21d3e41718b480cca4475b688385246b545af3c3c3988f38de2c308fb"
+            "c90100"
+        )
+        message = msg_merkleblock()
+        stream = BytesIO(payload)
+        message.deserialize(stream)
+        self.assertEqual(stream.read(), b"")
+        self.assertEqual(message.merkleblock.header.nFlags, 0)
+        self.assertEqual(message.merkleblock.txn.nTransactions, 1)
+        self.assertEqual(message.merkleblock.txn.vHash,
+                         [message.merkleblock.header.hashMerkleRoot])
+        self.assertEqual(message.serialize(), payload)
+
+        # gettxoutproof and explicit legacy proofs keep the 80-byte header.
+        legacy_payload = payload[:80] + payload[84:]
+        legacy = CMerkleBlock()
+        stream = BytesIO(legacy_payload)
+        legacy.deserialize(stream)
+        self.assertEqual(stream.read(), b"")
+        self.assertEqual(legacy.serialize(), legacy_payload)
+        self.assertEqual(legacy.header.rehash(), message.merkleblock.header.rehash())
+        self.assertEqual(legacy.txn.nTransactions, 1)
+        self.assertEqual(legacy.txn.vHash, message.merkleblock.txn.vHash)

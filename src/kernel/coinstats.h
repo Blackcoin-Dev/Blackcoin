@@ -8,15 +8,20 @@
 #ifndef BITCOIN_KERNEL_COINSTATS_H
 #define BITCOIN_KERNEL_COINSTATS_H
 
+#include <coins.h>
 #include <consensus/amount.h>
 #include <crypto/muhash.h>
+#include <kernel/cs_main.h>
 #include <streams.h>
+#include <sync.h>
 #include <uint256.h>
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 
+class CBlockIndex;
 class CCoinsView;
 class Coin;
 class COutPoint;
@@ -79,6 +84,25 @@ bool IsQuantumQuasarInternalMarkerScript(const CScript& script_pub_key);
 void ApplyCoinHash(MuHash3072& muhash, const COutPoint& outpoint, const Coin& coin);
 void RemoveCoinHash(MuHash3072& muhash, const COutPoint& outpoint, const Coin& coin);
 
+/** Move-only scan input captured while the source view is protected by cs_main.
+ * The cursor owns its database lifetime. The block manager owning block_index
+ * must outlive the scan; its block index and ancestry provide marker provenance.
+ */
+struct UTXOStatsSnapshot {
+    std::unique_ptr<CCoinsViewCursor> cursor;
+    const CBlockIndex* block_index{nullptr};
+    uint64_t disk_size{0};
+};
+
+UTXOStatsSnapshot CaptureUTXOStats(CCoinsView& view, node::BlockManager& blockman) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+//! Consume a captured snapshot without accessing its originating view.
+std::optional<CCoinsStats> ComputeUTXOStats(CoinStatsHashType hash_type, UTXOStatsSnapshot snapshot, const std::function<void()>& interruption_point = {});
+
+/** Capture under cs_main, then scan. The caller must keep view alive until
+ * capture completes; acquiring cs_main here does not pin a previously obtained
+ * raw view pointer. Callers crossing an unlocked boundary should capture first.
+ */
 std::optional<CCoinsStats> ComputeUTXOStats(CoinStatsHashType hash_type, CCoinsView* view, node::BlockManager& blockman, const std::function<void()>& interruption_point = {});
 } // namespace kernel
 

@@ -52,20 +52,24 @@ struct CoinEntry {
 CCoinsViewDB::CCoinsViewDB(DBParams db_params, CoinsViewOptions options) :
     m_db_params{std::move(db_params)},
     m_options{std::move(options)},
-    m_db{std::make_unique<CDBWrapper>(m_db_params)} { }
+    m_db{std::make_shared<CDBWrapper>(m_db_params)} { }
 
-void CCoinsViewDB::ResizeCache(size_t new_cache_size)
+bool CCoinsViewDB::ResizeCache(size_t new_cache_size)
 {
     // We can't do this operation with an in-memory DB since we'll lose all the coins upon
     // reset.
-    if (!m_db_params.memory_only) {
-        // Have to do a reset first to get the original `m_db` state to release its
-        // filesystem lock.
-        m_db.reset();
-        m_db_params.cache_bytes = new_cache_size;
-        m_db_params.wipe_data = false;
-        m_db = std::make_unique<CDBWrapper>(m_db_params);
-    }
+    if (m_db_params.memory_only || new_cache_size == m_db_params.cache_bytes) return true;
+
+    // Cursors retain both the wrapper and its LevelDB iterators. Do not reopen
+    // until they are gone, so their snapshots and the filesystem lock stay valid.
+    if (m_db.use_count() > 1) return false;
+
+    // Have to do a reset first to release the original filesystem lock.
+    m_db.reset();
+    m_db_params.cache_bytes = new_cache_size;
+    m_db_params.wipe_data = false;
+    m_db = std::make_shared<CDBWrapper>(m_db_params);
+    return true;
 }
 
 bool CCoinsViewDB::GetCoin(const COutPoint &outpoint, Coin &coin) const {
@@ -163,8 +167,8 @@ class CCoinsViewDBCursor: public CCoinsViewCursor
 public:
     // Prefer using CCoinsViewDB::Cursor() since we want to perform some
     // cache warmup on instantiation.
-    CCoinsViewDBCursor(CDBIterator* pcursorIn, const uint256&hashBlockIn):
-        CCoinsViewCursor(hashBlockIn), pcursor(pcursorIn) {}
+    CCoinsViewDBCursor(std::shared_ptr<CDBWrapper> db, const uint256& hashBlockIn):
+        CCoinsViewCursor(hashBlockIn), m_db{std::move(db)}, pcursor{m_db->NewIterator()} {}
     ~CCoinsViewDBCursor() = default;
 
     bool GetKey(COutPoint &key) const override;
@@ -175,6 +179,9 @@ public:
     void Next() override;
 
 private:
+    // Destruction is in reverse declaration order: release the iterator before
+    // the database it references, even if the originating view was destroyed.
+    std::shared_ptr<CDBWrapper> m_db;
     std::unique_ptr<CDBIterator> pcursor;
     std::pair<char, COutPoint> keyTmp;
 
@@ -183,11 +190,7 @@ private:
 
 std::unique_ptr<CCoinsViewCursor> CCoinsViewDB::Cursor() const
 {
-    auto i = std::make_unique<CCoinsViewDBCursor>(
-        const_cast<CDBWrapper&>(*m_db).NewIterator(), GetBestBlock());
-    /* It seems that there are no "const iterators" for LevelDB.  Since we
-       only need read operations on it, use a const-cast to get around
-       that restriction.  */
+    auto i = std::make_unique<CCoinsViewDBCursor>(m_db, GetBestBlock());
     i->pcursor->Seek(DB_COIN);
     // Cache key of first record
     if (i->pcursor->Valid()) {

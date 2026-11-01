@@ -1500,8 +1500,8 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
         }
 
         const CCoinsViewCache& view = wallet.chain().chainman().ActiveChainstate().CoinsTip();
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(
-            view,
+        const node::QuantumPoolShareCalculator pool_shares{view};
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(
             delegation->staker_pubkey_hash,
             node::GetQuantumPoolClaims(delegation->staker_pubkey_hash));
         const bool would_exceed_cap = node::WouldQuantumPoolExceedCap(
@@ -1509,7 +1509,7 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
             share.operator_share.verified_value,
             amount);
         const bool cap_filter_unlocked = would_exceed_cap &&
-            !node::HasQuantumPoolUnderCapCandidate(view, amount, {delegation->staker_pubkey_hash});
+            !pool_shares.HasUnderCapCandidate(amount, {delegation->staker_pubkey_hash});
         if (would_exceed_cap && !cap_filter_unlocked) {
             return util::Error{strprintf(
                 _("Error: This delegation would push the selected cold-staking node above the 20%% wallet-policy cap. Select an under-cap verified node or retry only if every verified node is over cap. Current selected node share: %d bps."),
@@ -2972,12 +2972,13 @@ public:
         return info;
     }
     bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
-                      bool allow_new_payout_key, bool* created_payout_key) override
+                      bool allow_new_payout_key, bool* created_payout_key,
+                      const std::function<bool()>& cancelled) override
     {
         bilingual_str werror;
         const bool ok = m_wallet->SetPowMining(
             enabled, threads, cpu_percent, werror, created_payout_key,
-            allow_new_payout_key);
+            allow_new_payout_key, /*wait_for_normal_unlock=*/false, cancelled);
         if (!ok) {
             error = werror.original;
             m_wallet->WalletLogPrintf("Gold Rush PoW miner configuration failed: %s\n", werror.original);
@@ -2996,6 +2997,8 @@ public:
         info.state = m_wallet->m_pow_state;
         info.threads = m_wallet->m_pow_threads;
         info.cpu_percent = m_wallet->m_pow_cpu_percent;
+        info.workers_hashing = m_wallet->m_pow_workers_hashing;
+        info.workers_error = m_wallet->m_pow_workers_error;
         info.hashrate = m_wallet->m_pow_hashrate;
         info.claims_submitted = m_wallet->m_pow_claims_submitted;
         info.shadow_whitelist_height = SHADOW_WHITELIST_HEIGHT;
@@ -3306,7 +3309,8 @@ public:
 
         ChainstateManager& chainman = m_wallet->chain().chainman();
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-        result.total_coldstake = node::ComputeQuantumColdStakeTotal(view);
+        const node::QuantumPoolShareCalculator pool_shares{view};
+        result.total_coldstake = pool_shares.TotalColdStake();
         result.cap_bps = node::QUANTUM_POOL_CAP_BPS;
 
         for (const auto& [staker_hash, claims] : local_claims) {
@@ -3329,7 +3333,7 @@ public:
         const std::vector<uint256> operators = node::ListQuantumPoolOperators();
         result.operators.reserve(operators.size());
         for (const uint256& staker_hash : operators) {
-            const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+            const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
 
             WalletQuantumPoolOperatorInfo entry;
             entry.staking_pubkey_hash = share.operator_share.staker_pubkey_hash.GetHex();

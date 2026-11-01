@@ -9,6 +9,8 @@
 #ifndef BITCOIN_NET_H
 #define BITCOIN_NET_H
 
+#include <qq_policy.h>
+
 #include <bip324.h>
 #include <chainparams.h>
 #include <common/bloom.h>
@@ -738,6 +740,13 @@ public:
     }
     /** fSuccessfullyConnected is set to true on receiving VERACK from the peer. */
     std::atomic_bool fSuccessfullyConnected{false};
+    /** Accepted VERSION only; addr services remain an untrusted selection hint. */
+    std::atomic<ServiceFlags> m_accepted_services{NODE_NONE};
+    std::atomic_bool m_qq_pong{false};
+    std::atomic_bool m_qq_eligible{false};
+    /** Set before publication, immutable across this node's lifetime. */
+    std::shared_ptr<qq::Probe> m_qq_probe;
+    bool IsQQProbe() const { return m_qq_probe && !m_qq_probe->promoted; }
     // Setting fDisconnect to true will cause the node to be disconnected the
     // next time DisconnectNodes() runs
     std::atomic_bool fDisconnect{false};
@@ -1047,6 +1056,7 @@ public:
         ServiceFlags nLocalServices = NODE_NONE;
         int nMaxConnections = 0;
         int m_max_outbound_full_relay = 0;
+        int m_qq_outbound_target{-1};
         int m_max_outbound_block_relay = 0;
         int nMaxAddnode = 0;
         int nMaxFeeler = 0;
@@ -1079,6 +1089,9 @@ public:
         nMaxConnections = connOptions.nMaxConnections;
         m_max_outbound_full_relay = std::min(connOptions.m_max_outbound_full_relay, connOptions.nMaxConnections);
         m_max_outbound_block_relay = connOptions.m_max_outbound_block_relay;
+        m_qq_requested_target = connOptions.m_qq_outbound_target;
+        m_qq_target = qq::EffectiveTarget(m_qq_requested_target, m_max_outbound_full_relay);
+        PublishQQStatus(0, 0, false, "initializing");
         m_use_addrman_outgoing = connOptions.m_use_addrman_outgoing;
         nMaxAddnode = connOptions.nMaxAddnode;
         nMaxFeeler = connOptions.nMaxFeeler;
@@ -1125,11 +1138,11 @@ public:
     bool GetNetworkActive() const { return fNetworkActive; };
     bool GetUseAddrmanOutgoing() const { return m_use_addrman_outgoing; };
     void SetNetworkActive(bool active);
-    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, std::shared_ptr<qq::Probe> qq_probe = {}) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
     bool CheckIncomingNonce(uint64_t nonce);
 
-    // alias for thread safety annotations only, not defined
-    RecursiveMutex& GetNodesMutex() const LOCK_RETURNED(m_nodes_mutex);
+    // Shared transaction lock for qualification/replacement and eviction.
+    RecursiveMutex& GetNodesMutex() const LOCK_RETURNED(m_nodes_mutex) { return m_nodes_mutex; }
 
     bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func);
 
@@ -1185,8 +1198,65 @@ public:
     // in cases where some outbound connections are not yet fully connected, or
     // not yet fully disconnected.
     int GetExtraFullOutboundCount() const;
+    int GetFullOutboundCount() const;
     // Count the number of block-relay-only peers we have over our limit.
     int GetExtraBlockRelayCount() const;
+
+    struct QQStatus {
+        int requested{-1};
+        int target{0};
+        int confirmed{0};
+        int eligible{0};
+        int deficit{0};
+        bool pending{false};
+        uint64_t generation{0};
+        std::string constraint;
+        uint64_t candidate_draws{0};
+        uint64_t no_hint_rounds{0};
+        uint64_t connect_attempts{0};
+        uint64_t connect_failures{0};
+        uint64_t dns_rounds{0};
+    };
+    int GetQQTarget() const { return m_qq_target; }
+    int GetFullOutboundTarget() const { return m_max_outbound_full_relay; }
+    QQStatus GetQQStatus() const
+    {
+        LOCK(m_qq_status_mutex);
+        auto status = m_qq_status;
+        const auto lease = m_qq_probe_lease.lock();
+        status.pending = lease && lease->active;
+        return status;
+    }
+    bool HasQQProbeHeadroom() const { return nMaxConnections > m_max_outbound_full_relay + m_max_outbound_block_relay; }
+    void TrackQQProbe(const std::shared_ptr<qq::Probe>& lease) { LOCK(m_qq_status_mutex); m_qq_probe_lease = lease; }
+    void PublishQQStatus(int confirmed, int eligible, bool pending, const std::string& constraint)
+    {
+        LOCK(m_qq_status_mutex);
+        m_qq_status.requested = m_qq_requested_target;
+        m_qq_status.target = m_qq_target;
+        m_qq_status.confirmed = confirmed;
+        m_qq_status.eligible = eligible;
+        m_qq_status.deficit = std::max(0, m_qq_target - eligible);
+        m_qq_status.pending = pending;
+        ++m_qq_status.generation;
+        m_qq_status.constraint = constraint;
+    }
+    void RecordQQSelection(int draws, bool matched)
+    {
+        LOCK(m_qq_status_mutex);
+        m_qq_status.candidate_draws += std::min(draws, qq::MAX_CANDIDATE_DRAWS);
+        if (!matched) ++m_qq_status.no_hint_rounds;
+    }
+    void RecordQQConnect(bool failed)
+    {
+        LOCK(m_qq_status_mutex);
+        ++m_qq_status.connect_attempts;
+        if (failed) ++m_qq_status.connect_failures;
+    }
+    void RecordQQDNSRound() { LOCK(m_qq_status_mutex); ++m_qq_status.dns_rounds; }
+    /** Includes disconnecting nodes until their socket/grant has retired. */
+    bool HasNode(NodeId id) const { LOCK(m_nodes_mutex); for (const auto* node : m_nodes) if (node->GetId() == id) return true; return false; }
+
 
     bool AddNode(const AddedNodeParams& add) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex);
     bool RemoveAddedNode(const std::string& node) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex);
@@ -1472,6 +1542,12 @@ private:
 
     // How many full-relay (tx, block, addr) outbound peers we want
     int m_max_outbound_full_relay;
+    int m_qq_requested_target{-1};
+    int m_qq_target{0};
+    mutable Mutex m_qq_status_mutex;
+    QQStatus m_qq_status GUARDED_BY(m_qq_status_mutex);
+    std::weak_ptr<qq::Probe> m_qq_probe_lease GUARDED_BY(m_qq_status_mutex);
+
 
     // How many block-relay only outbound peers we want
     // We do not relay tx or addr messages with these peers
@@ -1568,6 +1644,7 @@ private:
         std::string destination;
         ConnectionType conn_type;
         bool use_v2transport;
+        std::shared_ptr<qq::Probe> qq_probe;
     };
 
     /**

@@ -1369,7 +1369,8 @@ static RPCHelpMan getwalletquantumpoolinfo()
     LOCK(cs_main);
     ChainstateManager& chainman = pwallet->chain().chainman();
     const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-    const CAmount total = node::ComputeQuantumColdStakeTotal(view);
+    const node::QuantumPoolShareCalculator pool_shares{view};
+    const CAmount total = pool_shares.TotalColdStake();
 
     for (const auto& [staker_hash, claims] : local_claims) {
         node::UpsertQuantumPoolClaims(staker_hash, claims);
@@ -1392,7 +1393,7 @@ static RPCHelpMan getwalletquantumpoolinfo()
 
     UniValue entries(UniValue::VARR);
     for (const uint256& staker_hash : node::ListQuantumPoolOperators()) {
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
         entries.push_back(QuantumPoolOperatorToJSON(share));
     }
 
@@ -4732,7 +4733,29 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether process-wide background automation may create new non-HD keys in loaded wallets."},
             {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, claim_evaluation_pending, claim_evaluation_capacity, ready, hashing, or error."},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
-            {RPCResult::Type::NUM, "cpu_percent", "Per-core CPU duty-cycle target."},
+            {RPCResult::Type::NUM, "cpu_percent", "Per-worker active-work duty target, including selection and proof preparation. Explicit waits count toward the idle period."},
+            {RPCResult::Type::NUM, "workers_hashing", "Workers currently inside a proof batch."},
+            {RPCResult::Type::NUM, "workers_error", "Workers in a local-error retry state."},
+            {RPCResult::Type::OBJ, "duty_cycle", "Coherent bounded telemetry for the last successful miner start. Reset on a new start/reconfiguration or process restart; retained after stop. In-progress periods are omitted. Durations are actual steady-clock nanoseconds, not thread CPU time or host power. Telemetry publication occurs outside the budgeted interval.", {
+                {RPCResult::Type::NUM, "session_id", "Process-local start sequence; zero before the first successful start."},
+                {RPCResult::Type::NUM, "cpu_percent", "Per-worker target for this telemetry session."},
+                {RPCResult::Type::ARR, "workers", "One record per configured worker, at most 256.", {
+                    {RPCResult::Type::OBJ, "", "", {
+                        {RPCResult::Type::NUM, "worker", "Zero-based worker slot."},
+                        {RPCResult::Type::NUM, "completed_periods", "Iterations whose required wait finished with current mining authority."},
+                        {RPCResult::Type::NUM, "completed_work_periods", "Completed periods containing successful proof-hash evaluations."},
+                        {RPCResult::Type::NUM, "completed_active_ns", "Completed elapsed time excluding measured explicit and duty waits; includes selection and lock waits."},
+                        {RPCResult::Type::NUM, "completed_explicit_wait_ns", "Actual explicit waits inside completed iterations."},
+                        {RPCResult::Type::NUM, "completed_duty_wait_ns", "Actual compensating waits after completed iterations."},
+                        {RPCResult::Type::NUM, "completed_successful_hashes", "Successful evaluations in completed periods."},
+                        {RPCResult::Type::NUM, "truncated_periods", "Periods interrupted by stop, shutdown, authority change or incomplete wait."},
+                        {RPCResult::Type::NUM, "truncated_active_ns", "Active time in truncated periods, excluded from completed totals."},
+                        {RPCResult::Type::NUM, "truncated_explicit_wait_ns", "Actual explicit waits in truncated periods."},
+                        {RPCResult::Type::NUM, "truncated_duty_wait_ns", "Actual compensating wait before interruption."},
+                        {RPCResult::Type::NUM, "successful_hashes", "Successful evaluations in all recorded periods, including truncated periods; failed calls and in-progress periods are excluded."},
+                    }},
+                }},
+            }},
             {RPCResult::Type::NUM, "hashrate", "Aggregate Argon2id tries per second."},
             {RPCResult::Type::NUM, "current_height", "Active-chain tip used to evaluate Gold Rush state, or -1 if unavailable."},
             {RPCResult::Type::NUM, "shadow_reward_next_height", "Next block height evaluated for a shadow-ledger reward, or 0 if the chain tip is unavailable."},
@@ -4892,6 +4915,32 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pow_mining_state)));
     obj.pushKV("threads", pwallet->m_pow_threads.load());
     obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
+    obj.pushKV("workers_hashing", pwallet->m_pow_workers_hashing.load());
+    obj.pushKV("workers_error", pwallet->m_pow_workers_error.load());
+    const WalletPowMiningDutySnapshot duty_snapshot = pwallet->GetPowMiningDutyCycle();
+    UniValue duty(UniValue::VOBJ);
+    duty.pushKV("session_id", duty_snapshot.session_id);
+    duty.pushKV("cpu_percent", duty_snapshot.cpu_percent);
+    UniValue duty_workers(UniValue::VARR);
+    for (size_t index = 0; index < duty_snapshot.workers.size(); ++index) {
+        const auto& record = duty_snapshot.workers[index];
+        UniValue worker(UniValue::VOBJ);
+        worker.pushKV("worker", static_cast<uint64_t>(index));
+        worker.pushKV("completed_periods", record.completed_periods);
+        worker.pushKV("completed_work_periods", record.completed_work_periods);
+        worker.pushKV("completed_active_ns", record.completed_active_ns);
+        worker.pushKV("completed_explicit_wait_ns", record.completed_explicit_wait_ns);
+        worker.pushKV("completed_duty_wait_ns", record.completed_duty_wait_ns);
+        worker.pushKV("completed_successful_hashes", record.completed_successful_hashes);
+        worker.pushKV("truncated_periods", record.truncated_periods);
+        worker.pushKV("truncated_active_ns", record.truncated_active_ns);
+        worker.pushKV("truncated_explicit_wait_ns", record.truncated_explicit_wait_ns);
+        worker.pushKV("truncated_duty_wait_ns", record.truncated_duty_wait_ns);
+        worker.pushKV("successful_hashes", record.successful_hashes);
+        duty_workers.push_back(std::move(worker));
+    }
+    duty.pushKV("workers", std::move(duty_workers));
+    obj.pushKV("duty_cycle", std::move(duty));
     obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());
     obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
     obj.pushKV("unresolved_claims",
@@ -5148,8 +5197,9 @@ static RPCHelpMan getquantumredelegationinfo()
         const CBlockIndex* tip = chainman.ActiveChain().Tip();
         current_height = tip ? tip->nHeight : 0;
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
+        const node::QuantumPoolShareCalculator pool_shares{view};
         for (const uint256& staker_hash : node::ListQuantumPoolOperators()) {
-            const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+            const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
             QuantumRedelegationCandidate candidate;
             candidate.staker_pubkey_hash = staker_hash;
             candidate.staker_pubkey = share.operator_share.staker_pubkey;

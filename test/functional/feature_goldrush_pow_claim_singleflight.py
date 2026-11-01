@@ -376,8 +376,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 if input_locked:
                     assert_equal(builtin_race.lockunspent(True, [selected_input]), True)
         assert_equal(self._claim_input(claim), selected_input)
-        self.generateblock(node, output=funding_address, transactions=[])
-        self.wait_until(lambda: claim not in node.getrawmempool(), timeout=20)
+        # A historical QQP2 proof can also validate against a descendant tip.
+        # Observe actual retained/ineligible state before testing abandonment.
+        self._wait_for_claims_to_become_current_branch_ineligible(
+            {"worker_group": {"wallet": builtin_race, "txid": claim,
+                              "hex": builtin_race.gettransaction(claim)["hex"]}},
+            funding_address,
+        )
         self._assert_generic_abandon_rejected(builtin_race, claim)
 
     def _wait_for_new_quarantined_claim(self, wallet, before, timeout=180):
@@ -494,16 +499,56 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             f"claims did not become retained/current-branch-ineligible: {sorted(pending)}"
         )
 
+    @staticmethod
+    def _claim_liveness_sample(info):
+        # Bounded failure-only evidence from the status RPC already polled.
+        # In-progress duty periods are omitted by the RPC; hashes are a lower
+        # bound, not proof that a worker did no work during a long batch.
+        fields = (
+            "enabled", "state", "threads", "cpu_percent", "workers_hashing",
+            "workers_error", "hashrate", "claims_submitted", "epoch_active",
+            "current_height", "mining_gate_action", "mining_gate_can_submit",
+            "mining_gate_coherent", "mining_gate_database_ambiguous",
+            "mining_gate_live_claims", "mining_gate_eligible_claims",
+            "mining_gate_unresolved_components", "mining_gate_unsafe_claims",
+            "raw_quarantined_claims", "blocking_quarantined_claims",
+            "indeterminate_quarantined_claims",
+        )
+        sample = {key: info[key] for key in fields if key in info}
+        duty = info.get("duty_cycle", {})
+        workers = duty.get("workers", [])
+        worker_fields = (
+            "worker", "completed_periods", "completed_work_periods",
+            "completed_successful_hashes", "successful_hashes",
+            "completed_active_ns", "completed_explicit_wait_ns",
+            "completed_duty_wait_ns", "truncated_periods",
+        )
+        sample["duty_cycle"] = {
+            "session_id": duty.get("session_id"),
+            "cpu_percent": duty.get("cpu_percent"),
+            "worker_count": len(workers),
+            "workers": [
+                {key: worker[key] for key in worker_fields if key in worker}
+                for worker in workers[:4]
+            ],
+        }
+        return sample
+
     def _wait_for_one_new_submitted_claim(
         self, wallets, claims_before, timeout=180
     ):
         """Wait for one submitted proof claim from each current miner run."""
         submitted = {name: 0 for name in wallets}
         new_claims = {}
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
+        first_samples, last_samples = {}, {}
         while time.monotonic() < deadline:
             for name, wallet in wallets.items():
                 info = get_pow_mining_info(wallet)
+                sample = self._claim_liveness_sample(info)
+                first_samples.setdefault(name, sample)
+                last_samples[name] = sample
                 submitted[name] = info["claims_submitted"]
                 assert submitted[name] <= 1, (
                     f"{name} submitted more than one claim in one miner run: "
@@ -528,7 +573,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             time.sleep(0.02)
         raise AssertionError(
             "miners did not submit exactly one new proof claim each: "
-            f"submitted={submitted}, new={new_claims}"
+            f"submitted={submitted}, new={new_claims}; "
+            f"elapsed={time.monotonic() - started:.3f}s, "
+            f"first_status={first_samples}, last_status={last_samples}"
         )
 
     def _observe_proof_without_submission(

@@ -304,7 +304,9 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
     def _assert_shadow_snapshot_aba_retry(self, rpc_name, rpc_args, claim_block_hash, parent_hash):
         """Force an equal-tip ABA reorg after snapshot capture and require retry."""
         node = self.nodes[1]
-        barrier = f"Shadow RPC snapshot race barrier reached: rpc={rpc_name}"
+        # Match the complete RPC token. The witness-inventory /scan barrier
+        # precedes history revision capture and must not trigger this ABA test.
+        barrier = f"Shadow RPC snapshot race barrier reached: rpc={rpc_name} "
         log_offset = node.debug_log_size(encoding="utf-8")
         outcome = []
 

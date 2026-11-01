@@ -98,6 +98,12 @@ EXTENDED_SCRIPTS = [
     'feature_quantum_integration_soak.py',
     'feature_quantum_demurrage_soak.py',
     'feature_dbcrash.py',
+    # Requires an explicit independently built 30.1.5.2 baseline daemon.
+    'feature_30153_upgrade.py --descriptors',
+    # Diagnostic observations; no precise OS CPU duty pass threshold.
+    'feature_pow_cpu_budget.py --descriptors',
+    # Renew natural jobs and qualify completed duty periods across restart.
+    'feature_pow_cpu_sustained.py --descriptors --workers=2 --cpu-percent=60',
 ]
 
 BASE_SCRIPTS = [
@@ -180,6 +186,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_coldstake_auto_migration.py',
     'feature_goldrush_coinstatsindex.py',
     'feature_shadowindex_claim_boundary.py',
+    'feature_witness_inventory_performance.py',
     'feature_goldrush_reorg.py',
     'feature_goldrush_schedule_controls.py',
     'feature_quantum_lifecycle.py',
@@ -393,6 +400,9 @@ BASE_SCRIPTS = [
     'feature_assumeutxo.py',
     'p2p_dos_header_tree.py',
     'p2p_add_connections.py',
+    'p2p_qq_outbound.py',
+    'p2p_qq_pursuit.py',
+    'p2p_seed_bootstrap.py',
     'feature_bind_port_discover.py',
     'p2p_unrequested_blocks.py',
     'p2p_message_capture.py',

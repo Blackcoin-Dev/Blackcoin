@@ -19,12 +19,14 @@
 #include <qt/transactiontablemodel.h>
 
 #include <common/args.h> // for GetBoolArg
+#include <common/settings.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <key_io.h>
 #include <node/interface_ui.h>
 #include <psbt.h>
 #include <util/translation.h>
+#include <univalue.h>
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h> // for CRecipient
 
@@ -368,6 +370,121 @@ std::shared_ptr<const WalletModel::StakingMiningSnapshot> WalletModel::takeStaki
         return {};
     }
     return std::exchange(m_completed_staking_snapshot, {});
+}
+
+uint64_t WalletModel::requestPowMiningControl(PowMiningControlRequest request)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (++m_pow_mining_control_sequence == 0) ++m_pow_mining_control_sequence;
+    request.request_id = m_pow_mining_control_sequence;
+    request.wallet_name = m_wallet->getWalletName();
+    const auto cancel = std::make_shared<std::atomic<bool>>(false);
+    m_pow_mining_control_cancels.emplace(request.request_id, cancel);
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel] {
+        auto result = std::make_shared<PowMiningControlResult>();
+        result->request = request;
+        const auto cancelled = [this, request, cancel] {
+            return cancel->load(std::memory_order_acquire) ||
+                (request.view_current && !request.view_current->load(std::memory_order_acquire)) ||
+                m_node.shutdownRequested();
+        };
+        try {
+            if (cancelled()) {
+                result->cancelled = true;
+            } else if (request.threads < 1 || request.threads > 256 ||
+                       request.cpu_percent < 1 || request.cpu_percent > 100) {
+                result->error = "Invalid miner resource preferences";
+            } else {
+                result->core_entered = true;
+                result->success = m_wallet->setPowMining(
+                    request.enabled, request.threads, request.cpu_percent,
+                    result->error, request.allow_new_payout_key,
+                    &result->created_payout_key, cancelled);
+                // A completed mutation remains a completed mutation when its
+                // originating view disappears. Cancellation never rolls back
+                // a durable payout key or a committed worker replacement.
+                result->cancelled = !result->success && cancelled();
+                if (result->success && request.lock_wallet) {
+                    result->success = m_wallet->lock();
+                    if (!result->success) result->error = "Unable to lock the wallet after stopping mining";
+                }
+                if (result->success && !request.lock_wallet) {
+                    const bool save_threads = !m_node.isSettingIgnored("powminingthreads");
+                    const bool save_cpu = !m_node.isSettingIgnored("powminingcpu");
+                    if (save_threads || save_cpu) {
+                        // Write the pair together, independently of startup
+                        // consent. Node's void update API cannot report disk
+                        // failure, so use the checked settings writer here.
+                        gArgs.LockSettings([&](common::Settings& settings) {
+                            if (save_threads) settings.rw_settings["powminingthreads"] = request.threads;
+                            if (save_cpu) settings.rw_settings["powminingcpu"] = request.cpu_percent;
+                        });
+                        result->preferences_saved = gArgs.WriteSettingsFile();
+                        if (!result->preferences_saved) result->error = "Mining control succeeded, but resource preferences could not be saved";
+                    } else {
+                        result->preferences_saved = true;
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            result->error = e.what();
+        } catch (...) {
+            result->error = "Unknown error while configuring Gold Rush PoW mining";
+        }
+        if (result->created_payout_key) {
+            std::lock_guard<std::mutex> lock{m_pow_payout_warning_mutex};
+            m_pending_pow_payout_warnings.emplace(request.request_id, request.wallet_name);
+        }
+        result->info = m_wallet->getPowMiningInfo();
+        QMetaObject::invokeMethod(this, [this, result] {
+            QPointer<WalletModel> still_alive{this};
+            publishPendingPowPayoutWarnings();
+            if (!still_alive) return;
+            m_pow_mining_control_cancels.erase(result->request.request_id);
+            if (!result->request.view_current || result->request.view_current->load(std::memory_order_acquire)) {
+                m_completed_pow_mining_controls.emplace(result->request.request_id, result);
+                // Completed reads are retained until consumed, with a fixed
+                // ceiling for clients which disappear without taking them.
+                while (m_completed_pow_mining_controls.size() > 32) m_completed_pow_mining_controls.erase(m_completed_pow_mining_controls.begin());
+                Q_EMIT powMiningControlReady(result->request.request_id, result->request.generation);
+                if (!still_alive) return;
+            }
+            updateStatus();
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
+    assert(invoked);
+    return request.request_id;
+}
+
+void WalletModel::publishPendingPowPayoutWarnings()
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    std::map<uint64_t, std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock{m_pow_payout_warning_mutex};
+        pending.swap(m_pending_pow_payout_warnings);
+    }
+    QPointer<WalletModel> still_alive{this};
+    for (const auto& warning : pending) {
+        Q_EMIT powPayoutKeyCreated(QString::fromStdString(warning.second));
+        if (!still_alive) return;
+    }
+}
+
+void WalletModel::cancelPowMiningControl(uint64_t request_id)
+{
+    const auto it = m_pow_mining_control_cancels.find(request_id);
+    if (it != m_pow_mining_control_cancels.end()) it->second->store(true, std::memory_order_release);
+    m_completed_pow_mining_controls.erase(request_id);
+}
+
+std::shared_ptr<const WalletModel::PowMiningControlResult> WalletModel::takePowMiningControlResult(uint64_t request_id)
+{
+    const auto it = m_completed_pow_mining_controls.find(request_id);
+    if (it == m_completed_pow_mining_controls.end()) return {};
+    auto result = it->second;
+    m_completed_pow_mining_controls.erase(it);
+    return result;
 }
 
 uint64_t WalletModel::requestPowClaimRecoveryPolicy(PowClaimRecoveryPolicyRequest request)
@@ -1423,6 +1540,9 @@ void WalletModel::join()
         timer->stop();
 
     cancelStakingMiningSnapshot();
+    for (const auto& entry : m_pow_mining_control_cancels) {
+        entry.second->store(true, std::memory_order_release);
+    }
     for (const auto& entry : m_pow_claim_recovery_policy_cancels) {
         entry.second->store(true, std::memory_order_release);
     }
@@ -1452,6 +1572,11 @@ void WalletModel::join()
         // pointer when join() is called again during WalletModel destruction.
         worker = nullptr;
     }
+
+    // The queued completion may never run during unload. Critical backup
+    // receipts are recorded by the worker and drained before model destruction;
+    // WalletController forwards them independently of the deleted WalletView.
+    publishPendingPowPayoutWarnings();
 
     // A worker result normally performs this restoration on the GUI thread.
     // join() may prevent that queued publication from running, so restore all

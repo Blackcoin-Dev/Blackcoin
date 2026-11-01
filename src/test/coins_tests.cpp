@@ -8,6 +8,9 @@
 #include <addresstype.h>
 #include <clientversion.h>
 #include <coins.h>
+#include <kernel/coinstats.h>
+#include <node/blockstorage.h>
+#include <shadow.h>
 #include <streams.h>
 #include <test/util/poolresourcetester.h>
 #include <test/util/random.h>
@@ -16,6 +19,7 @@
 #include <uint256.h>
 #include <undo.h>
 #include <util/strencodings.h>
+#include <validation.h>
 
 #include <map>
 #include <limits>
@@ -1194,6 +1198,270 @@ BOOST_AUTO_TEST_CASE(cursor_exact_lookup_preserves_immutable_snapshot)
     BOOST_CHECK(!current->GetValueAt(first, found));
     BOOST_REQUIRE(current->GetValueAt(later, found));
     BOOST_CHECK(found.out == later_coin.out);
+}
+
+BOOST_AUTO_TEST_CASE(cursor_defers_database_cache_resize)
+{
+    LOCK(cs_main);
+    constexpr size_t initial_cache{1 << 20};
+    constexpr size_t resized_cache{2 << 20};
+    CCoinsViewDB base{{.path = m_args.GetDataDirBase() / "cursor-resize",
+                      .cache_bytes = initial_cache, .wipe_data = true, .obfuscate = true}, {}};
+    const COutPoint first{uint256{1}, 0};
+    const COutPoint second{uint256{2}, 0};
+    const COutPoint later{uint256{3}, 0};
+    const Coin first_coin{CTxOut{11, CScript{} << OP_1}, 10, false, false, 100};
+    const Coin second_coin{CTxOut{22, CScript{} << OP_2}, 11, false, true, 101};
+    const Coin later_coin{CTxOut{33, CScript{} << OP_3}, 12, true, false, 102};
+    {
+        CCoinsViewCache initial{&base, true};
+        initial.AddCoin(first, Coin{first_coin}, false);
+        initial.AddCoin(second, Coin{second_coin}, false);
+        initial.SetBestBlock(uint256::ONE);
+        BOOST_REQUIRE(initial.Flush());
+    }
+
+    auto first_snapshot = base.Cursor();
+    auto second_snapshot = base.Cursor();
+    BOOST_REQUIRE(first_snapshot);
+    BOOST_REQUIRE(second_snapshot);
+    // An unchanged cache needs no reopen, even while snapshots are alive.
+    BOOST_CHECK(base.ResizeCache(initial_cache));
+    BOOST_CHECK(!base.ResizeCache(resized_cache));
+
+    // Deferring cache maintenance must not prevent writes or change existing
+    // snapshots, including the best block captured alongside each iterator.
+    {
+        CCoinsViewCache mutation{&base, true};
+        BOOST_REQUIRE(mutation.SpendCoin(first));
+        mutation.AddCoin(later, Coin{later_coin}, false);
+        mutation.SetBestBlock(uint256{2});
+        BOOST_REQUIRE(mutation.Flush());
+    }
+    Coin found;
+    for (auto* const snapshot : {first_snapshot.get(), second_snapshot.get()}) {
+        BOOST_CHECK(snapshot->GetBestBlock() == uint256::ONE);
+        BOOST_REQUIRE(snapshot->GetValueAt(first, found));
+        BOOST_CHECK(found.out == first_coin.out);
+        BOOST_CHECK_EQUAL(found.nTime, first_coin.nTime);
+        BOOST_REQUIRE(snapshot->GetValueAt(second, found));
+        BOOST_CHECK(found.out == second_coin.out);
+        BOOST_CHECK(found.IsCoinStake());
+        BOOST_CHECK(!snapshot->GetValueAt(later, found));
+    }
+
+    auto current = base.Cursor();
+    BOOST_REQUIRE(current);
+    BOOST_CHECK(current->GetBestBlock() == uint256{2});
+    BOOST_CHECK(!current->GetValueAt(first, found));
+    BOOST_REQUIRE(current->GetValueAt(later, found));
+    BOOST_CHECK(found.out == later_coin.out);
+
+    first_snapshot.reset();
+    BOOST_CHECK(!base.ResizeCache(resized_cache));
+    BOOST_REQUIRE(second_snapshot->GetValueAt(first, found));
+    BOOST_CHECK(found.out == first_coin.out);
+    second_snapshot.reset();
+    BOOST_CHECK(!base.ResizeCache(resized_cache));
+    BOOST_REQUIRE(current->GetValueAt(later, found));
+    current.reset();
+
+    // The same request succeeds once every iterator has released the wrapper.
+    // Reopening also must clear the original wipe_data request and retain writes.
+    BOOST_REQUIRE(base.ResizeCache(resized_cache));
+    BOOST_CHECK(base.GetBestBlock() == uint256{2});
+    BOOST_CHECK(!base.HaveCoin(first));
+    BOOST_REQUIRE(base.GetCoin(second, found));
+    BOOST_CHECK(found.out == second_coin.out);
+    BOOST_CHECK(found.IsCoinStake());
+    BOOST_REQUIRE(base.GetCoin(later, found));
+    BOOST_CHECK(found.out == later_coin.out);
+    BOOST_CHECK_EQUAL(found.nTime, later_coin.nTime);
+    BOOST_CHECK(found.IsCoinBase());
+    auto reopened = base.Cursor();
+    BOOST_REQUIRE(reopened->GetValueAt(later, found));
+    BOOST_CHECK(found.out == later_coin.out);
+    BOOST_CHECK(base.ResizeCache(resized_cache));
+    BOOST_CHECK(!base.ResizeCache(initial_cache));
+}
+
+BOOST_AUTO_TEST_CASE(cursor_owns_database_after_view_destruction)
+{
+    LOCK(cs_main);
+    const COutPoint outpoint{uint256::ONE, 0};
+    const Coin expected{CTxOut{42, CScript{} << OP_1}, 10, false, true, 123};
+    for (const bool memory_only : {false, true}) {
+        const fs::path path{m_args.GetDataDirBase() / (memory_only ? "cursor-owner-memory" : "cursor-owner-disk")};
+        std::unique_ptr<CCoinsViewCursor> snapshot;
+        std::unique_ptr<CCoinsViewCursor> other_snapshot;
+        {
+            CCoinsViewDB base{{.path = path, .cache_bytes = 1 << 20,
+                              .memory_only = memory_only, .obfuscate = true}, {}};
+            {
+                CCoinsViewCache initial{&base, true};
+                initial.AddCoin(outpoint, Coin{expected}, false);
+                initial.SetBestBlock(uint256::ONE);
+                BOOST_REQUIRE(initial.Flush());
+            }
+            snapshot = base.Cursor();
+            other_snapshot = base.Cursor();
+            BOOST_REQUIRE(snapshot);
+            BOOST_REQUIRE(other_snapshot);
+            // In-memory resizing remains a no-op so it cannot erase coins.
+            BOOST_CHECK_EQUAL(base.ResizeCache(2 << 20), memory_only);
+        }
+
+        Coin found;
+        COutPoint key;
+        BOOST_CHECK(snapshot->GetBestBlock() == uint256::ONE);
+        BOOST_REQUIRE(snapshot->Valid());
+        BOOST_REQUIRE(snapshot->GetKey(key));
+        BOOST_CHECK(key == outpoint);
+        BOOST_REQUIRE(snapshot->GetValue(found));
+        BOOST_CHECK(found.out == expected.out);
+        BOOST_CHECK_EQUAL(found.nTime, expected.nTime);
+        BOOST_CHECK(found.IsCoinStake());
+        snapshot->Next();
+        BOOST_CHECK(!snapshot->Valid());
+        BOOST_CHECK(!snapshot->GetKey(key));
+        BOOST_REQUIRE(snapshot->GetValueAt(outpoint, found));
+        snapshot.reset();
+
+        BOOST_REQUIRE(other_snapshot->GetValueAt(outpoint, found));
+        BOOST_CHECK(found.out == expected.out);
+        other_snapshot.reset();
+        if (!memory_only) {
+            // The last cursor releases LevelDB's filesystem lock as well.
+            CCoinsViewDB reopened{{.path = path, .cache_bytes = 2 << 20, .obfuscate = true}, {}};
+            BOOST_REQUIRE(reopened.GetCoin(outpoint, found));
+            BOOST_CHECK(found.out == expected.out);
+            BOOST_CHECK_EQUAL(found.nTime, expected.nTime);
+        }
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(utxo_stats_snapshot_survives_view_changes, TestingSetup)
+{
+    auto& chainman = *Assert(m_node.chainman);
+    const CBlockIndex* tip = WITH_LOCK(cs_main, return chainman.ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const COutPoint first{uint256{1}, 0};
+    const COutPoint later{uint256{2}, 0};
+    const COutPoint user_marker{uint256{3}, 0};
+    const Coin first_coin{CTxOut{11, CScript{} << OP_1}, 0, false, false, 100};
+    const CScript marker_script = CScript{} << OP_FALSE << OP_RETURN
+        << std::vector<unsigned char>{'Q', 'Q', 'P', 'O', 'O', 'L'};
+    const Coin marker_coin{CTxOut{0, marker_script}, tip->nHeight, true, false,
+                           static_cast<uint32_t>(tip->GetBlockTime())};
+    const Coin user_marker_coin{CTxOut{0, marker_script}, 0, false, false, 100};
+
+    for (const auto hash_type : {kernel::CoinStatsHashType::HASH_SERIALIZED,
+                                 kernel::CoinStatsHashType::MUHASH,
+                                 kernel::CoinStatsHashType::NONE}) {
+        const char* name = hash_type == kernel::CoinStatsHashType::HASH_SERIALIZED ? "stats-serialized" :
+            hash_type == kernel::CoinStatsHashType::MUHASH ? "stats-muhash" : "stats-none";
+        auto base = std::make_unique<CCoinsViewDB>(DBParams{
+            .path = m_args.GetDataDirBase() / name, .cache_bytes = 1 << 20,
+            .obfuscate = true}, CoinsViewOptions{});
+        {
+            LOCK(cs_main);
+            CCoinsViewCache initial{base.get(), true};
+            initial.AddCoin(first, Coin{first_coin}, false);
+            initial.AddCoin(user_marker, Coin{user_marker_coin}, false);
+            initial.AddCoin(ShadowReplayStateOutpointForTesting(), Coin{marker_coin}, false);
+            initial.SetBestBlock(tip->GetBlockHash());
+            BOOST_REQUIRE(initial.Flush());
+        }
+        const auto expected = kernel::ComputeUTXOStats(hash_type, base.get(), chainman.m_blockman);
+        BOOST_REQUIRE(expected);
+        // Keep the user output with marker-shaped script; exclude only the
+        // authenticated internal state using the captured branch's metadata.
+        BOOST_CHECK_EQUAL(expected->coins_count, 2U);
+        BOOST_REQUIRE(expected->total_amount);
+        BOOST_CHECK_EQUAL(*expected->total_amount, 11);
+        if (hash_type == kernel::CoinStatsHashType::MUHASH) {
+            MuHash3072 muhash;
+            kernel::ApplyCoinHash(muhash, first, first_coin);
+            kernel::ApplyCoinHash(muhash, user_marker, user_marker_coin);
+            uint256 hash;
+            muhash.Finalize(hash);
+            BOOST_CHECK(expected->hashSerialized == hash);
+        }
+
+        auto snapshot = WITH_LOCK(cs_main, return kernel::CaptureUTXOStats(*base, chainman.m_blockman));
+        const uint64_t captured_disk_size = snapshot.disk_size;
+        {
+            LOCK(cs_main);
+            BOOST_CHECK(!base->ResizeCache(2 << 20));
+            CCoinsViewCache mutation{base.get(), true};
+            BOOST_REQUIRE(mutation.SpendCoin(first));
+            mutation.AddCoin(later, Coin{CTxOut{99, CScript{} << OP_2}, 1, false, false, 101}, false);
+            mutation.SetBestBlock(uint256{4});
+            BOOST_REQUIRE(mutation.Flush());
+        }
+
+        size_t interruptions{0};
+        const auto actual = kernel::ComputeUTXOStats(hash_type, std::move(snapshot), [&] {
+            AssertLockNotHeld(cs_main);
+            ++interruptions;
+            if (base) {
+                LOCK(cs_main);
+                base.reset();
+            }
+        });
+        BOOST_REQUIRE(actual);
+        BOOST_CHECK_GT(interruptions, 0U);
+        BOOST_CHECK(!base);
+        BOOST_CHECK_EQUAL(actual->nHeight, tip->nHeight);
+        BOOST_CHECK(actual->hashBlock == tip->GetBlockHash());
+        BOOST_CHECK(actual->hashSerialized == expected->hashSerialized);
+        BOOST_CHECK_EQUAL(actual->nTransactions, expected->nTransactions);
+        BOOST_CHECK_EQUAL(actual->nTransactionOutputs, expected->nTransactionOutputs);
+        BOOST_CHECK_EQUAL(actual->coins_count, expected->coins_count);
+        BOOST_CHECK_EQUAL(actual->nBogoSize, expected->nBogoSize);
+        BOOST_CHECK_EQUAL(actual->nDiskSize, captured_disk_size);
+        BOOST_REQUIRE(actual->total_amount);
+        BOOST_CHECK_EQUAL(*actual->total_amount, *expected->total_amount);
+
+        // The consumed snapshot released its final owner when the scan ended.
+        CCoinsViewDB reopened{{.path = m_args.GetDataDirBase() / name, .cache_bytes = 2 << 20,
+                              .obfuscate = true}, {}};
+        Coin found;
+        BOOST_CHECK(!reopened.HaveCoin(first));
+        BOOST_REQUIRE(reopened.GetCoin(later, found));
+        BOOST_CHECK_EQUAL(found.out.nValue, 99);
+        BOOST_CHECK(reopened.GetBestBlock() == uint256{4});
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(utxo_stats_wrapper_does_not_revisit_destroyed_view, TestingSetup)
+{
+    auto& chainman = *Assert(m_node.chainman);
+    const CBlockIndex* tip = WITH_LOCK(cs_main, return chainman.ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    auto base = std::make_unique<CCoinsViewDB>(DBParams{
+        .path = "stats-wrapper", .cache_bytes = 1 << 20, .memory_only = true,
+        .obfuscate = true}, CoinsViewOptions{});
+    {
+        LOCK(cs_main);
+        CCoinsViewCache initial{base.get(), true};
+        initial.AddCoin(COutPoint{uint256::ONE, 0}, Coin{CTxOut{42, CScript{} << OP_1}, 0, false, false, 100}, false);
+        initial.SetBestBlock(tip->GetBlockHash());
+        BOOST_REQUIRE(initial.Flush());
+    }
+
+    const auto stats = kernel::ComputeUTXOStats(kernel::CoinStatsHashType::MUHASH,
+        base.get(), chainman.m_blockman, [&] {
+            AssertLockNotHeld(cs_main);
+            LOCK(cs_main);
+            base.reset();
+        });
+    BOOST_REQUIRE(stats);
+    BOOST_CHECK(!base);
+    BOOST_CHECK(stats->hashBlock == tip->GetBlockHash());
+    BOOST_CHECK_EQUAL(stats->coins_count, 1U);
+    BOOST_REQUIRE(stats->total_amount);
+    BOOST_CHECK_EQUAL(*stats->total_amount, 42);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

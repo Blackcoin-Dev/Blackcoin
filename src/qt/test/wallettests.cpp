@@ -7,8 +7,11 @@
 
 #include <addresstype.h>
 #include <core_io.h>
+#include <common/args.h>
+#include <common/settings.h>
 #include <crypto/mldsa.h>
 #include <wallet/coincontrol.h>
+#include <wallet/context.h>
 #include <interfaces/chain.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
@@ -32,6 +35,7 @@
 #include <qt/utilitydialog.h>
 #include <qt/walletview.h>
 #include <qt/walletmodel.h>
+#include <qt/walletcontroller.h>
 #include <rpc/client.h>
 #include <rpc/protocol.h>
 #include <rpc/server.h>
@@ -43,6 +47,7 @@
 #include <util/string.h>
 #include <validation.h>
 #include <validationinterface.h>
+#include <univalue.h>
 #include <wallet/test/util.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
@@ -53,6 +58,8 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <exception>
+#include <stdexcept>
 #include <future>
 #include <map>
 #include <memory>
@@ -65,6 +72,8 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
+#include <QCoreApplication>
+#include <QMessageBox>
 #include <QLabel>
 #include <QLineEdit>
 #include <QObject>
@@ -84,6 +93,8 @@
 #include <QDialog>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QEvent>
+#include <QPointer>
 #include <QSignalSpy>
 
 using wallet::AddWallet;
@@ -172,13 +183,15 @@ void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_ty
     });
 }
 
-void WaitForModal(const QString& description, std::function<bool()> action)
+void WaitForModal(const QString& description, std::function<bool()> action,
+                  std::function<void()> timeout_action = {})
 {
     auto* timer = new QTimer(qApp);
     timer->setInterval(10);
     timer->setSingleShot(false);
     QObject::connect(timer, &QTimer::timeout, timer,
-                     [timer, description, action = std::move(action), attempts = 0]() mutable {
+                     [timer, description, action = std::move(action),
+                      timeout_action = std::move(timeout_action), attempts = 0]() mutable {
         if (action()) {
             timer->stop();
             timer->deleteLater();
@@ -189,7 +202,9 @@ void WaitForModal(const QString& description, std::function<bool()> action)
         QTest::qFail(
             QStringLiteral("Timed out waiting for %1").arg(description).toUtf8().constData(),
             __FILE__, __LINE__);
-        if (auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget())) {
+        if (timeout_action) {
+            timeout_action();
+        } else if (auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget())) {
             dialog->reject();
         }
         timer->stop();
@@ -214,29 +229,37 @@ void ClickCheckBoxIndicator(QCheckBox* checkbox)
 
 //! Press a standard button in a modal message box.
 void ConfirmMessageBox(QMessageBox::StandardButton confirm_type,
-                       const QString& expected_text = {})
+                       const QString& expected_text = {},
+                       const QString& expected_title = {})
 {
-    WaitForModal(QStringLiteral("message box"), [confirm_type, expected_text]() {
-        for (QWidget* widget : QApplication::topLevelWidgets()) {
-            if (auto* dialog = qobject_cast<QMessageBox*>(widget)) {
-                if (!expected_text.isEmpty() &&
-                    !dialog->text().contains(expected_text)) {
-                    QTest::qFail(
-                        QStringLiteral("Message box omitted required disclosure: %1; actual: %2")
-                            .arg(expected_text, dialog->text())
-                            .toUtf8().constData(),
-                        __FILE__, __LINE__);
-                    dialog->reject();
-                    return true;
-                }
-                if (QAbstractButton* button = dialog->button(confirm_type)) {
-                    button->click();
-                    return true;
-                }
-            }
+    const auto expected_dialog = [expected_text, expected_title]() -> QMessageBox* {
+        auto* dialog = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+        if (!dialog || !dialog->isVisible()) return nullptr;
+        if (!expected_title.isEmpty()) {
+#ifdef Q_OS_MAC
+            // Qt intentionally ignores QMessageBox titles on macOS. Still require
+            // the platform's empty title and the caller's identifying body text.
+            if (!dialog->windowTitle().isEmpty() || expected_text.isEmpty()) return nullptr;
+#else
+            if (dialog->windowTitle() != expected_title) return nullptr;
+#endif
         }
-        return false;
-    });
+        if (!expected_text.isEmpty() && !dialog->text().contains(expected_text)) return nullptr;
+        return dialog;
+    };
+    WaitForModal(QStringLiteral("visible active message box %1").arg(expected_title),
+        [confirm_type, expected_dialog]() {
+            auto* dialog = expected_dialog();
+            if (!dialog) return false;
+            QAbstractButton* button = dialog->button(confirm_type);
+            if (!button || !button->isEnabled()) return false;
+            button->click();
+            return true;
+        },
+        [expected_dialog]() {
+            // Never dismiss an unrelated active prompt after a failed match.
+            if (auto* dialog = expected_dialog()) dialog->reject();
+        });
 }
 
 void AnswerPowClaimRecoveryConsent(bool enable, bool use_escape = false,
@@ -1014,7 +1037,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     const bool staking_only_before_policy = walletModel.getWalletUnlockStakingOnly();
     AnswerInitialPowClaimRecoveryChoice(
         InitialPowClaimRecoveryChoice::PAUSE_AND_ASK);
-    ConfirmMessageBox(QMessageBox::Yes);
+    ConfirmMessageBox(QMessageBox::Yes,
+        QStringLiteral("This will start the built-in Gold Rush PoW miner"),
+        QStringLiteral("Start Gold Rush PoW mining"));
     pow_enable->click();
     QTRY_COMPARE_WITH_TIMEOUT(
         walletModel.wallet().getPowClaimRecoveryPolicy().mode,
@@ -1099,10 +1124,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
         "does not alter a retained family's authenticated payout")));
 
     pow_enable->click();
-    qApp->processEvents();
-    QVERIFY(!walletModel.wallet().getPowMiningInfo().enabled);
-    QCOMPARE(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED);
-    QCOMPARE(pow_status->text(), QString("Gold Rush PoW mining is off."));
+    QTRY_VERIFY_WITH_TIMEOUT(!walletModel.wallet().getPowMiningInfo().enabled, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(pow_status->text(), QString("Gold Rush PoW mining is off."), 5000);
 
     {
         LOCK2(::cs_main, core_wallet->cs_wallet);
@@ -1122,7 +1146,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     auto stop_before_schedule_restore = interfaces::MakeCleanupHandler(
         [core_wallet] { core_wallet->StopPowMining(); });
 
-    ConfirmMessageBox(QMessageBox::Yes);
+    ConfirmMessageBox(QMessageBox::Yes,
+        QStringLiteral("This will start the built-in Gold Rush PoW miner"),
+        QStringLiteral("Start Gold Rush PoW mining"));
     pow_enable->click();
     const auto locked_input_wait_diagnostic = [&] {
         const interfaces::WalletPowMiningInfo current = walletModel.wallet().getPowMiningInfo();
@@ -1148,8 +1174,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(!pow_dashboard->text().contains(QString("running at 0")));
 
     pow_enable->click();
-    qApp->processEvents();
-    QCOMPARE(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED);
+    QTRY_COMPARE_WITH_TIMEOUT(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED, 5000);
 }
 
 void TestPowClaimRecoveryPolicyControls(
@@ -1926,8 +1951,6 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     // The Staking & Mining page uses a separate normal-unlock helper. A
     // cancelled dialog must preserve the same locked staking-only preference
     // as the generic WalletModel path.
-    QVERIFY(model.setWalletLocked(false, passphrase,
-                                  /*staking_only=*/true));
     {
         StakingMiningPage unlock_page(platform_style);
         unlock_page.setClientModel(mini_gui.clientModel.get());
@@ -1939,8 +1962,15 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isVisible(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isEnabled(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!pow_unlock->isChecked(), 5000);
+        QCOMPARE(model.getCachedEncryptionStatus(), WalletModel::Locked);
+        QVERIFY(model.setWalletLocked(false, passphrase,
+                                      /*staking_only=*/true));
+        // No event processing between this Core unlock and the click: force
+        // the presentation cache to lag while an actual staking-only key exists.
+        QCOMPARE(model.getCachedEncryptionStatus(), WalletModel::Locked);
         QCOMPARE(model.getEncryptionStatus(), WalletModel::Unlocked);
         QVERIFY(model.getWalletUnlockStakingOnly());
+        QVERIFY(!wallet->HasNormalPowMiningWalletAuthority());
         bool normal_unlock_rejected{false};
         WaitForModal(QStringLiteral("normal wallet unlock dialog"), [&normal_unlock_rejected] {
             QWidget* modal = QApplication::activeModalWidget();
@@ -2728,6 +2758,602 @@ void TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(interfaces::Node& node,
              qPrintable(QStringLiteral("Staking page heartbeat waited %1 ms for cs_wallet").arg(heartbeat_elapsed_ms)));
 }
 
+void TestPowMiningAsyncControlLifecycle(interfaces::Node& node, const PlatformStyle* style)
+{
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](common::Settings& settings) {
+        saved_settings = settings;
+        for (const auto* key : {"powminingthreads", "powminingcpu"}) {
+            settings.forced_settings.erase(key);
+            settings.command_line_options.erase(key);
+            for (auto& section : settings.ro_config) section.second.erase(key);
+        }
+        settings.rw_settings["powmining"] = false;
+    });
+    auto restore = interfaces::MakeCleanupHandler([&] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.WriteSettingsFile();
+    });
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-pow-control-a", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    MiniGUI gui(node, style);
+    gui.initModelForWallet(node, wallet, style);
+    WalletModel& model = *gui.walletModel;
+    QSignalSpy ready(&model, &WalletModel::powMiningControlReady);
+    auto token = std::make_shared<std::atomic<bool>>(true);
+    WalletModel::PowMiningControlRequest request;
+    request.generation = 73;
+    request.threads = 2;
+    request.cpu_percent = 60;
+    request.view_current = token;
+
+    // A stop blocked joining an existing worker must leave Qt timers running.
+    std::promise<void> release_worker;
+    auto worker_release = release_worker.get_future().share();
+    wallet->m_pow_mining_enabled = true;
+    wallet->threadPowMinerGroup = std::make_unique<std::vector<std::thread>>();
+    wallet->threadPowMinerGroup->emplace_back([worker_release] { worker_release.wait(); });
+    QElapsedTimer dispatch;
+    dispatch.start();
+    const auto stopped_id = model.requestPowMiningControl(request);
+    const auto dispatch_ms = dispatch.elapsed();
+    int ticks{0};
+    QTimer heartbeat;
+    QObject::connect(&heartbeat, &QTimer::timeout, &model, [&] { ++ticks; });
+    heartbeat.start(1);
+    QTest::qWait(75);
+    const bool joining = !wallet->m_pow_mining_enabled.load() && ready.count() == 0;
+    const int ticks_during_join = ticks;
+    release_worker.set_value();
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+    const auto stopped = model.takePowMiningControlResult(stopped_id);
+    QVERIFY(stopped);
+    QVERIFY(stopped->success);
+    QVERIFY(stopped->preferences_saved);
+    QCOMPARE(stopped->request.generation, uint64_t{73});
+    QCOMPARE(stopped->request.wallet_name, std::string{"qt-pow-control-a"});
+    QVERIFY(dispatch_ms < 100);
+    QVERIFY(joining);
+    QVERIFY(ticks_during_join > 5);
+    QVERIFY(!gArgs.GetBoolArg("-powmining", false));
+    QCOMPARE(gArgs.GetIntArg("-powminingthreads", 1), int64_t{2});
+    QCOMPARE(gArgs.GetIntArg("-powminingcpu", 1), int64_t{60});
+    // Reload settings from the fixture's disk, as a process restart would.
+    gArgs.LockSettings([](common::Settings& settings) { settings.rw_settings.clear(); });
+    QVERIFY(gArgs.ReadSettingsFile());
+    QCOMPARE(gArgs.GetIntArg("-powminingthreads", 1), int64_t{2});
+    QCOMPARE(gArgs.GetIntArg("-powminingcpu", 1), int64_t{60});
+    QVERIFY(!gArgs.GetBoolArg("-powmining", false));
+    // Recreating the page must show saved resources before a detail refresh.
+    {
+        StakingMiningPage recreated(style);
+        recreated.setClientModel(gui.clientModel.get());
+        recreated.setWalletModel(&model);
+        QCOMPARE(recreated.findChild<QSpinBox*>("powCores")->value(),
+                 std::min(2, recreated.findChild<QSpinBox*>("powCores")->maximum()));
+        QCOMPARE(recreated.findChild<QSpinBox*>("powPercent")->value(), 60);
+        QVERIFY(recreated.findChild<QPushButton*>("powApply")->isEnabled());
+    }
+    auto wallet_b = std::make_shared<CWallet>(node.context()->chain.get(), "qt-pow-control-b", CreateMockableWalletDatabase());
+    QCOMPARE(wallet_b->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    MiniGUI gui_b(node, style);
+    gui_b.initModelForWallet(node, wallet_b, style);
+    WalletModel& model_b = *gui_b.walletModel;
+    QSignalSpy ready_b(&model_b, &WalletModel::powMiningControlReady);
+
+    // Queued control cancellation at an actual Core lifecycle lock cannot
+    // apply a superseded resource selection or cross to another wallet.
+    std::promise<void> held;
+    std::promise<void> release;
+    auto release_future = release.get_future().share();
+    std::thread holder([&] {
+        LOCK(wallet->m_pow_recovery_authority_mutex);
+        held.set_value();
+        release_future.wait();
+    });
+    held.get_future().wait();
+    request.threads = 3;
+    const auto cancelled_id = model.requestPowMiningControl(request);
+    auto request_b = request;
+    request_b.threads = 2;
+    const auto other_wallet_id = model_b.requestPowMiningControl(request_b);
+    for (int wait = 0; wait < 100 && ready_b.count() == 0; ++wait) QTest::qWait(10);
+    const bool other_wallet_completed_independently = ready_b.count() == 1;
+    model.cancelPowMiningControl(cancelled_id);
+    const int before = ticks;
+    QTest::qWait(30);
+    const int during_lock = ticks - before;
+    release.set_value();
+    holder.join();
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 2, 5000);
+    const auto cancelled = model.takePowMiningControlResult(cancelled_id);
+    QVERIFY(cancelled);
+    QVERIFY(cancelled->cancelled);
+    QVERIFY(!cancelled->success);
+    QVERIFY(during_lock > 2);
+    QVERIFY(other_wallet_completed_independently);
+    const auto other_wallet_result = model_b.takePowMiningControlResult(other_wallet_id);
+    QVERIFY(other_wallet_result);
+    QVERIFY(other_wallet_result->success);
+    QCOMPARE(other_wallet_result->request.wallet_name, std::string{"qt-pow-control-b"});
+    QCOMPARE(gArgs.GetIntArg("-powminingthreads", 1), int64_t{2});
+
+    // A removed view receives no completion. A later request is a worker
+    // barrier and proves the stale request was consumed before the assertion.
+    token->store(false);
+    model.requestPowMiningControl(request);
+    request.view_current = std::make_shared<std::atomic<bool>>(true);
+    request.threads = 2;
+    ++request.generation;
+    const auto barrier_id = model.requestPowMiningControl(request);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 3, 5000);
+    QVERIFY(model.takePowMiningControlResult(barrier_id)->success);
+
+    // CLI resource overrides retain precedence and their saved preferences.
+    gArgs.LockSettings([](common::Settings& settings) {
+        settings.command_line_options["powminingthreads"] = {common::SettingsValue{7}};
+        settings.command_line_options["powminingcpu"] = {common::SettingsValue{35}};
+    });
+    const auto cli_id = model.requestPowMiningControl(request);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 4, 5000);
+    QVERIFY(model.takePowMiningControlResult(cli_id)->success);
+    QCOMPARE(gArgs.GetIntArg("-powminingthreads", 1), int64_t{7});
+    QCOMPARE(gArgs.GetIntArg("-powminingcpu", 1), int64_t{35});
+    gArgs.LockSettings([](common::Settings& settings) {
+        QCOMPARE(settings.rw_settings.at("powminingthreads").getInt<int>(), 2);
+        QCOMPARE(settings.rw_settings.at("powminingcpu").getInt<int>(), 60);
+    });
+    heartbeat.stop();
+}
+
+// Containment only: synchronization below uses promises, never elapsed-time races.
+class WalletCallbackTestWatchdog {
+    std::promise<void> m_done;
+    std::thread m_thread;
+public:
+    WalletCallbackTestWatchdog() : m_thread([done = m_done.get_future()]() mutable {
+        if (done.wait_for(std::chrono::seconds{20}) != std::future_status::ready) {
+            qFatal("Wallet callback regression exceeded its cleanup deadline");
+        }
+    }) {}
+    ~WalletCallbackTestWatchdog() { m_done.set_value(); m_thread.join(); }
+};
+
+std::shared_ptr<CWallet> CallbackTestWallet(interfaces::Node& node, const std::string& name)
+{
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CWallet::Create(*node.walletLoader().context(), name,
+        CreateMockableWalletDatabase(), wallet::WALLET_FLAG_DESCRIPTORS |
+        wallet::WALLET_FLAG_BLANK_WALLET | wallet::WALLET_FLAG_DISABLE_PRIVATE_KEYS,
+        error, warnings);
+    if (wallet) SyncRecoveryReviewWalletTip(wallet, node);
+    return wallet;
+}
+
+// Mirrors the real NotifyWalletLoaded -> AddWallet publication order, without
+// starting miners, writing load-on-start settings, or processing any GUI event.
+bool PublishCallbackWithoutGui(WalletContext& context, WalletController* controller,
+                               const std::shared_ptr<CWallet>& wallet)
+{
+    std::promise<void> started, returned;
+    auto entered = started.get_future();
+    auto done = returned.get_future();
+    std::exception_ptr error;
+    std::thread notifier([&] {
+        started.set_value();
+        try {
+            wallet::NotifyWalletLoaded(context, wallet);
+            AddWallet(context, wallet);
+        } catch (...) { error = std::current_exception(); }
+        returned.set_value();
+    });
+    if (entered.wait_for(std::chrono::seconds{5}) != std::future_status::ready) {
+        qFatal("Notifier did not enter the controlled callback test");
+    }
+    const bool returned_without_gui = done.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    if (!returned_without_gui && controller) {
+        // Old-source negative cleanup: deliver only its parenting call. The
+        // earlier transaction/registry event targets another receiver and must
+        // remain queued until the notifier has released wallets_mutex.
+        QElapsedTimer cleanup;
+        cleanup.start();
+        while (done.wait_for(std::chrono::milliseconds{0}) != std::future_status::ready && cleanup.elapsed() < 5000) {
+            QCoreApplication::sendPostedEvents(controller, QEvent::MetaCall);
+            std::this_thread::yield();
+        }
+    }
+    if (done.wait_for(std::chrono::seconds{5}) != std::future_status::ready) {
+        qFatal("Notifier did not finish after selective old-source cleanup");
+    }
+    notifier.join();
+    return returned_without_gui && !error;
+}
+
+void TestWalletLoadCallbackTransactionInterleaving(interfaces::Node& node, const PlatformStyle* style, bool& passed)
+{
+    WalletCallbackTestWatchdog watchdog;
+    MiniGUI gui(node, style);
+    WalletController controller(*gui.clientModel, style, nullptr);
+    auto& context = *node.walletLoader().context();
+    auto first = CallbackTestWallet(node, "callback-first");
+    auto second = CallbackTestWallet(node, "callback-second");
+    QVERIFY(first && second);
+    auto cleanup = interfaces::MakeCleanupHandler([&] {
+        RemoveWallet(context, first, std::nullopt);
+        RemoveWallet(context, second, std::nullopt);
+    });
+    QVERIFY(AddWallet(context, first));
+    QVERIFY(controller.getOrCreateWallet(interfaces::MakeWallet(context, first)));
+    QObject transaction_receiver;
+    bool transaction_finished{false};
+    size_t transaction_wallet_count{0};
+    int added{0};
+    QObject::connect(&controller, &WalletController::walletAdded, &transaction_receiver,
+        [&](WalletModel*) { ++added; }, Qt::QueuedConnection);
+    // This is the actual blocking operation in incomingTransaction's named
+    // stack, queued before the loader posts any GUI-parenting/publication work.
+    QVERIFY(QMetaObject::invokeMethod(&transaction_receiver, [&] {
+        transaction_wallet_count = node.walletLoader().getWallets().size();
+        transaction_finished = true;
+    }, Qt::QueuedConnection));
+    const bool nonblocking = PublishCallbackWithoutGui(context, &controller, second);
+    // Always drain/join before reporting the old-source failure.
+    qApp->processEvents();
+    QVERIFY2(nonblocking, "NotifyWalletLoaded waited for GUI event service while holding wallets_mutex");
+    QTRY_VERIFY_WITH_TIMEOUT(transaction_finished, 5000);
+    QCOMPARE(transaction_wallet_count, size_t{2});
+    QTRY_COMPARE_WITH_TIMEOUT(added, 1, 5000);
+    QCOMPARE(controller.getOpenWallets().size(), size_t{2});
+    for (auto* model : controller.getOpenWallets()) {
+        QCOMPARE(model->thread(), controller.thread());
+        QCOMPARE(model->parent(), static_cast<QObject*>(&controller));
+    }
+    // A second callback and the activity's normal direct acquisition deduplicate.
+    QVERIFY(PublishCallbackWithoutGui(context, &controller, second));
+    qApp->processEvents();
+    QCOMPARE(controller.getOpenWallets().size(), size_t{2});
+    QCOMPARE(added, 1);
+    passed = true;
+}
+
+void TestWalletCallbackPendingParentDestruction(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    MiniGUI gui(node, style);
+    auto& context = *node.walletLoader().context();
+    const auto registrations = WITH_LOCK(context.wallets_mutex, return context.wallet_load_fns.size());
+    auto controller = std::make_unique<WalletController>(*gui.clientModel, style, nullptr);
+    auto wallet = CallbackTestWallet(node, "callback-pending-destroy");
+    QVERIFY(wallet);
+    auto cleanup = interfaces::MakeCleanupHandler([&] { RemoveWallet(context, wallet, std::nullopt); });
+    QVERIFY(PublishCallbackWithoutGui(context, controller.get(), wallet));
+    const auto models = controller->getOpenWallets();
+    QCOMPARE(models.size(), size_t{1});
+    QPointer<WalletModel> model{models.front()};
+    QVERIFY(!model->parent()); // GUI queue is deliberately still withheld.
+    controller.reset();
+    QVERIFY(model.isNull());
+    QCOMPARE(WITH_LOCK(context.wallets_mutex, return context.wallet_load_fns.size()), registrations);
+    qApp->processEvents(); // Canceled parenting/publication cannot use raw pointers.
+    // Real notification after teardown must find no old raw-this callback.
+    QVERIFY(PublishCallbackWithoutGui(context, nullptr, wallet));
+    qApp->processEvents();
+    QVERIFY(model.isNull());
+}
+
+void TestWalletCallbackUnloadBeforeParentDelivery(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    MiniGUI gui(node, style);
+    auto controller = std::make_unique<WalletController>(*gui.clientModel, style, nullptr);
+    auto& context = *node.walletLoader().context();
+    auto wallet = CallbackTestWallet(node, "callback-pending-unload");
+    QVERIFY(wallet);
+    auto cleanup = interfaces::MakeCleanupHandler([&] { if (wallet) RemoveWallet(context, wallet, std::nullopt); });
+    QVERIFY(PublishCallbackWithoutGui(context, controller.get(), wallet));
+    const auto models = controller->getOpenWallets();
+    QCOMPARE(models.size(), size_t{1});
+    QPointer<WalletModel> model{models.front()};
+    QVERIFY(!model->parent());
+    QVERIFY(RemoveWallet(context, wallet, std::nullopt));
+    std::weak_ptr<CWallet> weak{wallet};
+    std::promise<void> unload_intent, unloaded;
+    auto intent = unload_intent.get_future();
+    auto done = unloaded.get_future();
+    boost::signals2::scoped_connection notice;
+    notice = wallet->NotifyUnload.connect([&] {
+        // The real CWallet deleter requires every notification hook removed.
+        // Retire this test observer before publishing the unload barrier.
+        notice.disconnect();
+        unload_intent.set_value();
+    });
+    std::thread unloader([wallet = std::move(wallet), &unloaded]() mutable {
+        wallet::UnloadWallet(std::move(wallet));
+        unloaded.set_value();
+    });
+    // The unload signal must happen before any parenting event is delivered.
+    const bool notified = intent.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    QElapsedTimer wait;
+    wait.start();
+    while (done.wait_for(std::chrono::milliseconds{0}) != std::future_status::ready && wait.elapsed() < 5000) {
+        qApp->processEvents();
+        std::this_thread::yield();
+    }
+    const bool completed = done.wait_for(std::chrono::milliseconds{0}) == std::future_status::ready;
+    // A broken queued-callback implementation must still release its payload
+    // before the test reports failure and joins the real UnloadWallet worker.
+    if (!completed) controller.reset();
+    if (done.wait_for(std::chrono::seconds{5}) != std::future_status::ready) qFatal("Wallet unload test could not clean up");
+    unloader.join();
+    QVERIFY(notified);
+    QVERIFY2(completed, "Unload was missed before pending GUI parenting was delivered");
+    QVERIFY(model.isNull());
+    QVERIFY(weak.expired());
+    QVERIFY(controller->getOpenWallets().empty());
+}
+
+void TestWalletAddedAllowsSynchronousRegistryRead(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    std::weak_ptr<CWallet> weak;
+    {
+        MiniGUI gui(node, style);
+        WalletController controller(*gui.clientModel, style, nullptr);
+        auto& context = *node.walletLoader().context();
+        auto wallet = CallbackTestWallet(node, "callback-added-reentry");
+        QVERIFY(wallet);
+        weak = wallet;
+        // CWallet::Create subscribes before publication; even this unregistered
+        // mock must drop its validation subscription to break the shared cycle.
+        auto cleanup = interfaces::MakeCleanupHandler([&] { RemoveWallet(context, wallet, std::nullopt); });
+        bool entered{false};
+        size_t count{0};
+        QObject::connect(&controller, &WalletController::walletAdded, &controller,
+            [&](WalletModel*) { entered = true; count = controller.getOpenWallets().size(); }, Qt::DirectConnection);
+        QVERIFY(controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet)));
+        QVERIFY(entered);
+        QCOMPARE(count, size_t{1});
+    }
+    SyncWithValidationInterfaceQueue();
+    QVERIFY2(weak.expired(), "Callback test wallet retained its validation subscription");
+}
+
+void TestWalletAddedMayRetireModelBeforeReturn(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    std::weak_ptr<CWallet> weak;
+    {
+        MiniGUI gui(node, style);
+        WalletController controller(*gui.clientModel, style, nullptr);
+        auto& context = *node.walletLoader().context();
+        auto wallet = CallbackTestWallet(node, "callback-retire-during-added");
+        QVERIFY(wallet);
+        weak = wallet;
+        // CWallet::Create subscribes before publication; even this unregistered
+        // mock must drop its validation subscription to break the shared cycle.
+        auto cleanup = interfaces::MakeCleanupHandler([&] { RemoveWallet(context, wallet, std::nullopt); });
+        QPointer<WalletModel> announced;
+        bool unload_invoked{false};
+        QObject::connect(&controller, &WalletController::walletAdded, &controller,
+            [&](WalletModel* model) {
+                announced = model;
+                unload_invoked = QMetaObject::invokeMethod(model, "unload", Qt::DirectConnection);
+                // Deliver the real queued controller unload route before the
+                // creation/publication call returns to its activity caller.
+                QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+            }, Qt::DirectConnection);
+        QPointer<WalletModel> returned = controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet));
+        QVERIFY(unload_invoked);
+        QVERIFY(announced.isNull());
+        QVERIFY(returned.isNull());
+        QVERIFY(controller.getOpenWallets().empty());
+    }
+    SyncWithValidationInterfaceQueue();
+    QVERIFY2(weak.expired(), "Callback test wallet retained its validation subscription");
+}
+
+void TestCloseAllWalletsCallbackLockOrder(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    MiniGUI gui(node, style);
+    auto& context = *node.walletLoader().context();
+    auto first = CallbackTestWallet(node, "callback-close-first");
+    auto second = CallbackTestWallet(node, "callback-close-second");
+    QVERIFY(first && second);
+    std::promise<void> callback_entered, remove_entered, probe_done, marker_finished, notification_done;
+    auto entered = callback_entered.get_future();
+    const auto removing = remove_entered.get_future().share();
+    const auto probed = probe_done.get_future().share();
+    const auto marker = marker_finished.get_future().share();
+    auto notification = notification_done.get_future();
+    std::atomic<bool> queried{false};
+    std::exception_ptr notification_error;
+    // Register before the controller: this callback owns wallets_mutex before
+    // GUI close-all reaches its real RemoveWallet cleanup boundary.
+    auto gate = wallet::HandleLoadWallet(context, [&](std::unique_ptr<interfaces::Wallet>) {
+        callback_entered.set_value();
+        removing.wait();
+        const bool accessible = probed.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+        marker_finished.set_value();
+        if (!accessible) throw std::runtime_error("controller mutex held across Core wallet removal");
+    });
+    WalletController controller(*gui.clientModel, style, nullptr);
+    auto cleanup = interfaces::MakeCleanupHandler([&] {
+        RemoveWallet(context, first, std::nullopt);
+        RemoveWallet(context, second, std::nullopt);
+    });
+    QVERIFY(AddWallet(context, first));
+    QPointer<WalletModel> first_model{controller.getOrCreateWallet(interfaces::MakeWallet(context, first))};
+    QVERIFY(first_model);
+    int removed{0};
+    QObject::connect(&controller, &WalletController::walletRemoved, &controller,
+        [&](WalletModel*) { ++removed; }, Qt::DirectConnection);
+    first->m_chain_notifications_handler = interfaces::MakeCleanupHandler([&] {
+        // RemoveWallet resets this handler before it acquires wallets_mutex.
+        remove_entered.set_value();
+        first->NotifyUnload();
+        first->NotifyUnload(); // queued duplicates must not delete twice later.
+        marker.wait();
+    });
+    std::thread probe([&] {
+        removing.wait();
+        (void)controller.getOpenWallets();
+        queried.store(true);
+        probe_done.set_value();
+    });
+    std::thread notifier([&] {
+        try { wallet::NotifyWalletLoaded(context, second); AddWallet(context, second); }
+        catch (...) { notification_error = std::current_exception(); }
+        notification_done.set_value();
+    });
+    if (entered.wait_for(std::chrono::seconds{5}) != std::future_status::ready) qFatal("Close-all callback did not enter");
+    // Use the existing bounded helper to click the actual standard button;
+    // QMessageBox::question resolves clickedButton, not QDialog's result alone.
+    ConfirmMessageBox(QMessageBox::Yes);
+    controller.closeAllWallets();
+    if (notification.wait_for(std::chrono::seconds{5}) != std::future_status::ready) qFatal("Close-all notifier did not release after controlled failure");
+    notifier.join();
+    probe.join();
+    // On old lock-order failure, return before delivering its known dangling
+    // duplicate unload callbacks; controller destruction cancels those events.
+    QVERIFY2(!notification_error, "GUI held controller mutex while Core wallet removal waited for callback registry");
+    qApp->processEvents();
+    QVERIFY(queried.load());
+    QVERIFY(first_model.isNull());
+    QCOMPARE(removed, 1);
+    QCOMPARE(controller.getOpenWallets().size(), size_t{1}); // New concurrent wallet was outside the close snapshot.
+}
+
+// A hidden prior box must never consume a waiter for an async question.
+// The exact owned real box is rejected after 2s on the old-helper negative path.
+void TestMessageBoxWaitsForVisibleActiveQuestion()
+{
+    const QString title = QStringLiteral("Delayed confirmation regression");
+    const QString body = QStringLiteral("Expected delayed question for confirmation regression");
+    QMessageBox hidden(QMessageBox::Question, title, body,
+                       QMessageBox::Yes | QMessageBox::No);
+    QSignalSpy hidden_finished(&hidden, &QDialog::finished);
+    QVERIFY(!hidden.isVisible());
+    QPointer<QMessageBox> real;
+    bool finished{false};
+    bool actual_yes_clicked{false};
+    int result{QDialog::Rejected};
+    QTimer cleanup;
+    cleanup.setSingleShot(true);
+    QObject::connect(&cleanup, &QTimer::timeout, &cleanup, [&] {
+        if (real) real->reject(); // Only this regression's exact owned dialog.
+    });
+    cleanup.start(2000);
+    ConfirmMessageBox(QMessageBox::Yes, body, title);
+    QTimer::singleShot(50, &cleanup, [&] {
+        QMessageBox question(QMessageBox::Question, title, body,
+                             QMessageBox::Yes | QMessageBox::No);
+        real = &question;
+        result = question.exec();
+        actual_yes_clicked = question.clickedButton() == question.button(QMessageBox::Yes);
+        finished = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(finished, 3000);
+    cleanup.stop();
+    QCOMPARE(hidden_finished.count(), 0);
+    QCOMPARE(result, int{QMessageBox::Yes});
+    QVERIFY(actual_yes_clicked);
+    QVERIFY(real.isNull());
+}
+
+void TestWalletControllerCallbacks(interfaces::Node& node)
+{
+    TestMessageBoxWaitsForVisibleActiveQuestion();
+    // Explicitly enable a private settings path: closeAllWallets removes startup
+    // settings through the real backend; -nosettings would invalidate that API.
+    TestingSetup test{ChainType::REGTEST, {"-settings=wallet-callback-tests.json", "-staking=0", "-powmining=0"}};
+    auto* previous = node.context();
+    auto restore = interfaces::MakeCleanupHandler([&] { node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = loader.get();
+    node.setContext(&test.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    bool callback_passed{false};
+    TestWalletLoadCallbackTransactionInterleaving(node, style.get(), callback_passed);
+    if (!callback_passed) return; // Baseline failure already recorded and cleaned up.
+    TestWalletCallbackPendingParentDestruction(node, style.get());
+    TestWalletCallbackUnloadBeforeParentDelivery(node, style.get());
+    TestWalletAddedAllowsSynchronousRegistryRead(node, style.get());
+    TestWalletAddedMayRetireModelBeforeReturn(node, style.get());
+    TestCloseAllWalletsCallbackLockOrder(node, style.get());
+}
+
+void TestPowMiningBackupWarningSurvivesUnload(interfaces::Node& node, const PlatformStyle* style)
+{
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-pow-backup-unload", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    SyncRecoveryReviewWalletTip(wallet, node);
+    MiniGUI gui(node, style);
+    WalletController controller(*gui.clientModel, style, nullptr);
+    WalletContext& context = *node.walletLoader().context();
+    AddWallet(context, wallet);
+    QPointer<WalletModel> model = controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet));
+    RemoveWallet(context, wallet, std::nullopt);
+    auto view = std::make_unique<WalletView>(model, style, nullptr);
+    QObject::connect(&controller, &WalletController::walletRemoved, &controller,
+        [&](WalletModel*) { view.reset(); });
+    // This receiver represents the longer-lived GUI connection, rather than
+    // spying on the model signal whose actual forwarder is deleted first.
+    QObject surviving_gui;
+    int notices{0};
+    bool delivered_after_view_removal{false};
+    QString delivered_title;
+    QObject::connect(&controller, &WalletController::walletBackupWarning, &surviving_gui,
+        [&](const QString& title, const QString&, unsigned int) {
+            ++notices;
+            delivered_after_view_removal = !view;
+            delivered_title = title;
+        });
+    std::promise<void> key_committed;
+    std::promise<void> release_key_notification;
+    const auto release = release_key_notification.get_future().share();
+    boost::signals2::scoped_connection observer(wallet->NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string& label, bool, wallet::AddressPurpose, ChangeType) {
+            if (label == "PoW - Quantum Claim Address") {
+                key_committed.set_value();
+                release.wait();
+            }
+        }));
+    auto reset_worker_failure = interfaces::MakeCleanupHandler([] {
+        wallet::SetPowMinerWorkerCreationFailureAfterForTesting(-1);
+    });
+    wallet::SetPowMinerWorkerCreationFailureAfterForTesting(0);
+    WalletModel::PowMiningControlRequest request;
+    request.enabled = true;
+    request.allow_new_payout_key = true;
+    model->requestPowMiningControl(request);
+    // Keep the GUI queue paused: no queued completion may deliver the warning
+    // before the real controller removes its view and destroys its model.
+    const bool committed = key_committed.get_future().wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+    if (!committed) {
+        release_key_notification.set_value();
+        model->join();
+        QVERIFY2(committed, "Miner control did not reach a committed payout key");
+    }
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{30});
+        release_key_notification.set_value();
+    });
+    QMetaObject::invokeMethod(model, "unload", Qt::DirectConnection);
+    QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+    releaser.join();
+    QVERIFY(!model);
+    QVERIFY(!view);
+    QCOMPARE(notices, 1);
+    QVERIFY(delivered_after_view_removal);
+    QVERIFY(delivered_title.contains(QStringLiteral("qt-pow-backup-unload")));
+    qApp->processEvents();
+    QCOMPARE(notices, 1);
+    QCOMPARE(wallet->m_pow_claims_submitted.load(), int64_t{0});
+    QCOMPARE(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{1});
+}
+
 void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const PlatformStyle* platformStyle)
 {
     auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-staking-async-refresh", CreateMockableWalletDatabase());
@@ -2918,6 +3544,11 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     SendCoinsDialog& sendCoinsDialog = mini_gui.sendCoinsDialog;
 
     const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
+    if (lane == QStringLiteral("miner-control")) {
+        TestPowMiningAsyncControlLifecycle(node, platformStyle.get());
+        TestPowMiningBackupWarningSurvivesUnload(node, platformStyle.get());
+        return;
+    }
     if (lane != QStringLiteral("recovery-ui")) TestStakingMiningPageControls(mini_gui, wallet, platformStyle.get());
     if (lane == QStringLiteral("pow-controls")) return;
     TestPowClaimRecoveryPolicyControls(node, mini_gui, wallet, platformStyle.get());
@@ -2933,6 +3564,8 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
         node, wallet, platformStyle.get());
     TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(node, platformStyle.get());
     TestStakingMiningAsyncRefreshLifecycle(node, platformStyle.get());
+    TestPowMiningAsyncControlLifecycle(node, platformStyle.get());
+    TestPowMiningBackupWarningSurvivesUnload(node, platformStyle.get());
 
     // Update walletModel cached balance which will trigger an update for the 'labelBalance' QLabel.
     walletModel.pollBalanceChanged();
@@ -3164,7 +3797,7 @@ void TestGUI(interfaces::Node& node)
     TestGUI(node, desc_wallet);
 
     const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
-    if (lane == QStringLiteral("pow-controls")) return;
+    if (lane == QStringLiteral("pow-controls") || lane == QStringLiteral("miner-control")) return;
     if (lane == QStringLiteral("recovery-ui")) {
         const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
         TestPowClaimRecoveryManualDialog(node, test.coinbaseKey, style.get());
@@ -3341,8 +3974,8 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
 void WalletTests::walletTests()
 {
     const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
-    QVERIFY2(lane.isEmpty() || lane == QStringLiteral("pow-controls") || lane == QStringLiteral("recovery-ui"),
-             "Unknown BLACKCOIN_QT_WALLET_TEST; expected pow-controls or recovery-ui");
+    QVERIFY2(lane.isEmpty() || lane == QStringLiteral("pow-controls") || lane == QStringLiteral("recovery-ui") || lane == QStringLiteral("miner-control") || lane == QStringLiteral("wallet-load-callbacks"),
+             "Unknown BLACKCOIN_QT_WALLET_TEST; expected pow-controls, recovery-ui, miner-control or wallet-load-callbacks");
     if (!lane.isEmpty()) qInfo("FILTERED WalletTests lane: %s (not the full wallet GUI suite)", qPrintable(lane));
 #ifdef Q_OS_MACOS
     if (QApplication::platformName() == "minimal") {
@@ -3355,6 +3988,10 @@ void WalletTests::walletTests()
         return;
     }
 #endif
+    if (lane.isEmpty() || lane == QStringLiteral("wallet-load-callbacks")) {
+        TestWalletControllerCallbacks(m_node);
+        if (lane == QStringLiteral("wallet-load-callbacks")) return;
+    }
     TestGUI(m_node);
     if (!lane.isEmpty()) return;
     TestQuantumFundingControlsFollowReorg(m_node);

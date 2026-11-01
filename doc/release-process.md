@@ -1,6 +1,36 @@
 # Blackcoin Core release process
 
-## Current v30.1.5.2 signed maintenance release
+## Current v30.1.5.3rc1 DEVELOPMENT candidate
+
+This is an unpublished development candidate. `configure.ac` records major 30,
+minor 1, build 5, revision 3, RC1, and `CLIENT_VERSION_IS_RELEASE=false`.
+The numeric `CLIENT_VERSION` remains `300105`; macOS short version remains
+`30.1.5`, bundle version is `30.1.503`, and `BlackcoinFullVersion` is
+`30.1.5.3` (the base revision). The runtime and configured package version
+remain `30.1.5.3rc1`. The canonical development notes are
+`doc/release-notes/release-notes-30.1.5.3.md`.
+
+Manual candidate packages use an explicit `30.1.5.3-alpha1` or
+`30.1.5.3-beta1` label bound to the exact source SHA. Such builds do not publish
+a release. The future `v30.1.5.3` production path remains blocked until RC0,
+release=true, final canonical notes, the complete exact-source safety gate,
+a Blackcoin-Dev SSH-signed source commit and annotated tag, and protected
+`V30.1.5.3` acknowledgement are present. Retain the signed immutable-configuration
+receipt, authenticated release inventory and numeric release-ID checks,
+two isolated builders with byte comparison, attestations, and immutable
+publication verification. A version transition is not evidence of those results.
+
+Qualify the final exact source and artifacts across the native platform matrix,
+pinned Berkeley DB legacy-wallet support, sanitizers and fuzzing, mixed-version
+compatibility, restart and long-running resource behavior. Record actual test
+results and the selected artifact digests. Source changes, focused fixtures, and
+template-only measurements do not replace those checks. MacBook Air live-wallet
+resource observations and any seed or fleet operations require their own actual
+evidence; this runbook records no deployment or operational completion.
+
+The sections below preserve historical release controls and evidence boundaries.
+
+## v30.1.5.2 signed maintenance release (historical)
 
 This runbook's current source line is `30.1.5.2`.
 `configure.ac` records major 30, minor 1, build 5, revision 2, RC0, and

@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -134,6 +135,32 @@ public:
         std::string operator_query_address;
         std::string selected_coldstake_query_address;
     };
+
+    /** Serialized miner control; consent belongs to this exact view token. */
+    struct PowMiningControlRequest {
+        uint64_t request_id{0};
+        uint64_t generation{0};
+        std::string wallet_name;
+        bool enabled{false};
+        int threads{1};
+        int cpu_percent{1};
+        bool allow_new_payout_key{false};
+        bool lock_wallet{false};
+        std::shared_ptr<std::atomic<bool>> view_current;
+    };
+    struct PowMiningControlResult {
+        PowMiningControlRequest request;
+        bool success{false};
+        bool cancelled{false};
+        bool core_entered{false};
+        bool created_payout_key{false};
+        bool preferences_saved{false};
+        std::string error;
+        interfaces::WalletPowMiningInfo info;
+    };
+    uint64_t requestPowMiningControl(PowMiningControlRequest request);
+    void cancelPowMiningControl(uint64_t request_id);
+    std::shared_ptr<const PowMiningControlResult> takePowMiningControlResult(uint64_t request_id);
 
     /** One wallet-scoped recovery-policy read or durable update. */
     struct PowClaimRecoveryPolicyRequest
@@ -378,6 +405,12 @@ private:
     std::shared_ptr<std::atomic<bool>> m_staking_snapshot_cancel;
     uint64_t m_staking_snapshot_request_id{0};
     std::shared_ptr<const StakingMiningSnapshot> m_completed_staking_snapshot;
+    void publishPendingPowPayoutWarnings();
+    std::mutex m_pow_payout_warning_mutex;
+    std::map<uint64_t, std::string> m_pending_pow_payout_warnings;
+    uint64_t m_pow_mining_control_sequence{0};
+    std::map<uint64_t, std::shared_ptr<std::atomic<bool>>> m_pow_mining_control_cancels;
+    std::map<uint64_t, std::shared_ptr<const PowMiningControlResult>> m_completed_pow_mining_controls;
     uint64_t m_pow_claim_recovery_policy_request_sequence{0};
     std::map<uint64_t, std::shared_ptr<std::atomic<bool>>> m_pow_claim_recovery_policy_cancels;
     std::map<uint64_t, std::shared_ptr<const PowClaimRecoveryPolicyResult>> m_completed_pow_claim_recovery_policy_results;
@@ -447,6 +480,9 @@ Q_SIGNALS:
 
     /** Emitted on the GUI thread after a worker request completes or cancels. */
     void stakingMiningSnapshotReady(quint64 request_id, quint64 generation);
+    void powMiningControlReady(quint64 request_id, quint64 generation);
+    /** Critical backup notice, forwarded by WalletController beyond view lifetime. */
+    void powPayoutKeyCreated(const QString& wallet_name);
     /** Emitted on the GUI thread after a wallet recovery-policy request. */
     void powClaimRecoveryPolicyReady(quint64 request_id, quint64 generation);
     /** Emitted after a recovery review/execution/adoption operation. */

@@ -10,7 +10,9 @@
 from decimal import Decimal
 from enum import Enum
 import http.client
+from io import BytesIO
 import json
+import struct
 import typing
 import urllib.parse
 
@@ -18,6 +20,11 @@ import urllib.parse
 from test_framework.messages import (
     BLOCK_HEADER_SIZE,
     COIN,
+    COutPoint,
+    CTxOut,
+    deser_compact_size,
+    deser_string,
+    ser_vector,
 )
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -95,6 +102,33 @@ class RESTTest (BitcoinTestFramework):
 
         return None
 
+    def test_getutxos_post(self, outpoints, check_mempool, expected_bitmap):
+        uri = '/getutxos/' + ('checkmempool/' if check_mempool else '')
+        uri += '/'.join(f'{txid}-{n}' for txid, n in outpoints)
+        expected = self.test_rest_request(uri)
+        assert_equal(expected['bitmap'], expected_bitmap)
+
+        # COutPoint serializes transaction hashes in wire (little-endian) order.
+        request = bytes([check_mempool]) + ser_vector([COutPoint(int(txid, 16), n) for txid, n in outpoints])
+        binary = self.test_rest_request('/getutxos', http_method='POST', req_type=ReqType.BIN, body=request, ret_type=RetType.BYTES)
+        hex_response = self.test_rest_request('/getutxos', http_method='POST', req_type=ReqType.HEX, body=request.hex(), ret_type=RetType.BYTES)
+        assert_equal(bytes.fromhex(hex_response.decode()), binary)
+
+        response = BytesIO(binary)
+        assert_equal(struct.unpack('<i', response.read(4))[0], expected['chainHeight'])
+        assert_equal(response.read(32)[::-1].hex(), expected['chaintipHash'])
+        bitmap = sum((bit == '1') << i for i, bit in enumerate(expected_bitmap))
+        assert_equal(deser_string(response), bitmap.to_bytes((len(outpoints) + 7) // 8, 'little'))
+        assert_equal(deser_compact_size(response), len(expected['utxos']))
+        for utxo in expected['utxos']:
+            assert_equal(struct.unpack('<I', response.read(4))[0], 0)  # Legacy transaction version placeholder.
+            assert_equal(struct.unpack('<I', response.read(4))[0], utxo['height'])
+            output = CTxOut()
+            output.deserialize(response)
+            assert_equal(output.nValue, int(utxo['value'] * COIN))
+            assert_equal(output.scriptPubKey.hex(), utxo['scriptPubKey']['hex'])
+        assert_equal(response.read(), b'')
+
     def run_test(self):
         self.url = urllib.parse.urlparse(self.nodes[0].url)
         self.wallet = MiniWallet(self.nodes[0])
@@ -158,19 +192,9 @@ class RESTTest (BitcoinTestFramework):
         assert_equal(len(json_obj['utxos']), 1)
         assert_equal(json_obj['bitmap'], "10")
 
-        self.log.info("Query the TXOs using the /getutxos URI with a binary response")
-
-        bin_request = b'\x01\x02'
-        for txid, n in [spending, spent]:
-            bin_request += bytes.fromhex(txid)
-            bin_request += n.to_bytes(4, 'little')
-
-        bin_response = self.test_rest_request("/getutxos", http_method='POST', req_type=ReqType.BIN, body=bin_request, ret_type=RetType.BYTES)
-        chain_height = int.from_bytes(bin_response[0:4], 'little')
-        response_hash = bin_response[4:36][::-1].hex()
-
-        assert_equal(bb_hash, response_hash)  # check if getutxo's chaintip during calculation was fine
-        assert_equal(chain_height, 201)  # chain height must be 201 (pre-mined chain [200] + generated block [1])
+        self.log.info("Query the TXOs using binary and hex POST bodies")
+        for check_mempool in (False, True):
+            self.test_getutxos_post([spending, spent], check_mempool, '10')
 
         self.log.info("Test the /getutxos URI with and without /checkmempool")
         # Create a transaction, check that it's found with /checkmempool, but
@@ -198,6 +222,10 @@ class RESTTest (BitcoinTestFramework):
         json_obj = self.test_rest_request(f"/getutxos/checkmempool/{spent[0]}-{spent[1]}")
         assert_equal(len(json_obj['utxos']), 0)
 
+        # The two flags must select different outputs while the spend is unconfirmed.
+        self.test_getutxos_post([spending, spent], False, '01')
+        self.test_getutxos_post([spending, spent], True, '10')
+
         self.generate(self.nodes[0], 1)
 
         json_obj = self.test_rest_request(f"/getutxos/{spending[0]}-{spending[1]}")
@@ -206,10 +234,25 @@ class RESTTest (BitcoinTestFramework):
         json_obj = self.test_rest_request(f"/getutxos/checkmempool/{spending[0]}-{spending[1]}")
         assert_equal(len(json_obj['utxos']), 1)
 
+        for check_mempool in (False, True):
+            self.test_getutxos_post([spending, spent], check_mempool, '10')
+
         # Do some invalid requests
         self.test_rest_request("/getutxos", http_method='POST', req_type=ReqType.JSON, body='{"checkmempool', status=400, ret_type=RetType.OBJ)
         self.test_rest_request("/getutxos", http_method='POST', req_type=ReqType.BIN, body='{"checkmempool', status=400, ret_type=RetType.OBJ)
         self.test_rest_request("/getutxos/checkmempool", http_method='POST', req_type=ReqType.JSON, status=400, ret_type=RetType.OBJ)
+
+        outpoint = COutPoint(int(spending[0], 16), spending[1]).serialize()
+        for check_mempool in (False, True):
+            for malformed in (
+                bytes([check_mempool]),  # Missing outpoint count.
+                bytes([check_mempool, 1]) + outpoint[:-1],  # Truncated outpoint.
+                bytes([check_mempool, 253, 1, 0]) + outpoint,  # Noncanonical CompactSize count.
+            ):
+                for req_type in (ReqType.BIN, ReqType.HEX):
+                    body = malformed if req_type == ReqType.BIN else malformed.hex()
+                    response = self.test_rest_request('/getutxos', http_method='POST', req_type=req_type, body=body, status=400, ret_type=RetType.BYTES)
+                    assert_equal(response.decode().strip(), 'Parse error')
 
         # Test limits
         long_uri = '/'.join([f"{txid}-{n_}" for n_ in range(20)])

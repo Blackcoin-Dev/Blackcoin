@@ -209,6 +209,7 @@ BITCOIN_CORE_H = \
   memusage.h \
   merkleblock.h \
   net.h \
+  qq_policy.h \
   net_permissions.h \
   net_processing.h \
   net_types.h \
@@ -361,6 +362,7 @@ BITCOIN_CORE_H = \
   wallet/external_signer_scriptpubkeyman.h \
   wallet/fees.h \
   wallet/load.h \
+  wallet/pow_mining_duty_cycle.h \
   wallet/quantum_stake_ops.h \
   wallet/qq_development_donation.h \
   wallet/receive.h \

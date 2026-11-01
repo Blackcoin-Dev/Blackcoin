@@ -125,12 +125,12 @@ bool IsDemurrageLockedStakeCandidate(const CWallet& wallet, const COutPoint& out
         latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt).locked;
 }
 
-bool HasUnderCapRedelegationAlternative(const CCoinsViewCache& view, const uint256& source_staker_hash, const uint256& target_staker_hash, CAmount delegation_amount)
+bool HasUnderCapRedelegationAlternative(const node::QuantumPoolShareCalculator& pool_shares, const uint256& source_staker_hash, const uint256& target_staker_hash, CAmount delegation_amount)
 {
     std::vector<QuantumRedelegationCandidate> candidates;
     for (const uint256& staker_hash : node::ListQuantumPoolOperators()) {
         if (staker_hash == source_staker_hash || staker_hash == target_staker_hash) continue;
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
         QuantumRedelegationCandidate candidate;
         candidate.staker_pubkey_hash = staker_hash;
         candidate.staker_pubkey = share.operator_share.staker_pubkey;
@@ -1245,7 +1245,8 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     {
         LOCK(cs_main);
         const CCoinsViewCache& view = wallet.chain().getCoinsTip();
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, target_staker_hash, node::GetQuantumPoolClaims(target_staker_hash));
+        const node::QuantumPoolShareCalculator pool_shares{view};
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(target_staker_hash, node::GetQuantumPoolClaims(target_staker_hash));
         if (options.require_verified_operator && !share.operator_share.operator_commitment_verified) {
             error = _("Target Quantum cold-stake operator commitment is not verified in the local registry");
             return false;
@@ -1261,7 +1262,7 @@ bool CreateQuantumColdStakeRedelegationTransaction(
         }
         projected_operator_value += input_amount;
         const bool would_exceed_cap = node::WouldQuantumPoolExceedCap(share.total_coldstake, projected_operator_value, 0);
-        const bool has_under_cap_alternative = would_exceed_cap && HasUnderCapRedelegationAlternative(view, source_staker_hash, target_staker_hash, input_amount);
+        const bool has_under_cap_alternative = would_exceed_cap && HasUnderCapRedelegationAlternative(pool_shares, source_staker_hash, target_staker_hash, input_amount);
         if (options.enforce_pool_cap && would_exceed_cap && has_under_cap_alternative) {
             error = _("Target Quantum cold-stake pool cap would be exceeded by this redelegation");
             return false;
@@ -1320,7 +1321,8 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     {
         LOCK(cs_main);
         const CCoinsViewCache& view = wallet.chain().getCoinsTip();
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, target_staker_hash, node::GetQuantumPoolClaims(target_staker_hash));
+        const node::QuantumPoolShareCalculator pool_shares{view};
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(target_staker_hash, node::GetQuantumPoolClaims(target_staker_hash));
         if (options.require_verified_operator && !share.operator_share.operator_commitment_verified) {
             return fail_after_created_key(_("Target Quantum cold-stake operator commitment is not verified in the local registry"));
         }
@@ -1337,7 +1339,7 @@ bool CreateQuantumColdStakeRedelegationTransaction(
         post_operator_value += output_amount;
         const CAmount post_total_coldstake = share.total_coldstake - input_amount + output_amount;
         const bool would_exceed_cap = node::WouldQuantumPoolExceedCap(post_total_coldstake, post_operator_value, 0);
-        const bool cap_filter_unlocked = would_exceed_cap && !HasUnderCapRedelegationAlternative(view, source_staker_hash, target_staker_hash, output_amount);
+        const bool cap_filter_unlocked = would_exceed_cap && !HasUnderCapRedelegationAlternative(pool_shares, source_staker_hash, target_staker_hash, output_amount);
         if (would_exceed_cap && options.enforce_pool_cap && !cap_filter_unlocked) {
             return fail_after_created_key(_("Target Quantum cold-stake pool cap would be exceeded by this redelegation"));
         }
@@ -1814,10 +1816,11 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
         {
             LOCK(cs_main);
             const CCoinsViewCache& view = wallet.chain().getCoinsTip();
-            const node::QuantumPoolShare current_share = node::ComputeQuantumPoolShare(view, source.staker_pubkey_hash, node::GetQuantumPoolClaims(source.staker_pubkey_hash));
+            const node::QuantumPoolShareCalculator pool_shares{view};
+            const node::QuantumPoolShare current_share = pool_shares.ComputeShare(source.staker_pubkey_hash, node::GetQuantumPoolClaims(source.staker_pubkey_hash));
             total_coldstake = current_share.total_coldstake;
             for (const uint256& staker_hash : node::ListQuantumPoolOperators()) {
-                const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+                const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
                 QuantumRedelegationCandidate candidate;
                 candidate.staker_pubkey_hash = staker_hash;
                 candidate.staker_pubkey = share.operator_share.staker_pubkey;

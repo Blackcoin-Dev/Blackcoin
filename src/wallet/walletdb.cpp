@@ -172,21 +172,12 @@ bool WalletBatch::WriteCryptedKey(const CPubKey& vchPubKey,
 
 bool WalletBatch::WriteQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const CKeyMetadata& keyMeta)
 {
-    std::vector<unsigned char> private_key_bytes(private_key.begin(), private_key.end());
-
-    std::vector<unsigned char> key_material;
-    key_material.reserve(public_key.size() + private_key_bytes.size());
-    key_material.insert(key_material.end(), public_key.begin(), public_key.end());
-    key_material.insert(key_material.end(), private_key_bytes.begin(), private_key_bytes.end());
-
-    const bool written = WriteIC(std::make_pair(DBKeys::QUANTUM_KEY, public_key), std::make_pair(std::make_pair(private_key_bytes, keyMeta), Hash(key_material)), false);
-    if (!private_key_bytes.empty()) {
-        memory_cleanse(private_key_bytes.data(), private_key_bytes.size());
-    }
-    if (!key_material.empty()) {
-        memory_cleanse(key_material.data(), key_material.size());
-    }
-    return written;
+    // Reference the secure key material without creating plaintext copies. Pair
+    // serialization preserves the existing ((private key, metadata), checksum) format.
+    const std::pair<const CKeyingMaterial&, const CKeyMetadata&> payload{private_key, keyMeta};
+    const uint256 checksum = Hash(public_key, private_key);
+    const std::pair<const decltype(payload)&, const uint256&> value{payload, checksum};
+    return WriteIC(std::make_pair(DBKeys::QUANTUM_KEY, public_key), value, false);
 }
 
 bool WalletBatch::WriteCryptedQuantumKey(const std::vector<unsigned char>& public_key, const std::vector<unsigned char>& crypted_private_key, const CKeyMetadata& keyMeta)
@@ -754,34 +745,19 @@ bool LoadQuantumKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, st
         std::vector<unsigned char> public_key;
         ssKey >> public_key;
 
-        std::pair<std::vector<unsigned char>, CKeyMetadata> payload;
+        // The allocator cleanses the private key on every exit, including a
+        // deserialization exception in the metadata or checksum that follows it.
+        std::pair<CKeyingMaterial, CKeyMetadata> payload;
         uint256 checksum;
         ssValue >> payload;
         ssValue >> checksum;
 
-        std::vector<unsigned char> key_material;
-        key_material.reserve(public_key.size() + payload.first.size());
-        key_material.insert(key_material.end(), public_key.begin(), public_key.end());
-        key_material.insert(key_material.end(), payload.first.begin(), payload.first.end());
-        if (Hash(key_material) != checksum) {
-            if (!payload.first.empty()) {
-                memory_cleanse(payload.first.data(), payload.first.size());
-            }
-            if (!key_material.empty()) {
-                memory_cleanse(key_material.data(), key_material.size());
-            }
+        if (Hash(public_key, payload.first) != checksum) {
             strErr = "Error reading wallet database: ML-DSA public/private key corrupt";
             return false;
         }
 
-        CKeyingMaterial private_key(payload.first.begin(), payload.first.end());
-        if (!payload.first.empty()) {
-            memory_cleanse(payload.first.data(), payload.first.size());
-        }
-        if (!key_material.empty()) {
-            memory_cleanse(key_material.data(), key_material.size());
-        }
-        if (!pwallet->LoadQuantumKey(public_key, private_key, payload.second.nCreateTime)) {
+        if (!pwallet->LoadQuantumKey(public_key, payload.first, payload.second.nCreateTime)) {
             strErr = "Error reading wallet database: CWallet::LoadQuantumKey failed";
             return false;
         }

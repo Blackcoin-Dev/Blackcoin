@@ -79,12 +79,12 @@ std::vector<std::string> Resolve(const std::string& hostname, const TransportOpt
         if (!result.complete) std::this_thread::sleep_for(std::chrono::milliseconds{10});
     }
     if (!result.complete && query) {
-        // libevent invokes the cancellation callback before the query is freed.
         evdns_getaddrinfo_cancel(query);
         result.failed = true;
     }
-    // Free all resolver state while callback context is still alive, including
-    // implementations that defer cancellation completion until base teardown.
+    // Cancellation queues callbacks that still use the resolver and result.
+    // Drain them without waiting for network activity before freeing either.
+    event_base_loop(base.get(), EVLOOP_NONBLOCK);
     dns.reset();
     base.reset();
     if (cancelled() || Clock::now() >= deadline || !result.complete || result.failed) return {};

@@ -499,28 +499,33 @@ BOOST_AUTO_TEST_CASE(total_deadline_and_cancellation_during_transport_stages)
 
 BOOST_AUTO_TEST_CASE(direct_dns_total_deadline_and_cancellation)
 {
-    for (const bool cancel : {false, true}) {
-        TestSocket dns{static_cast<SOCKET>(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP))};
-        BOOST_REQUIRE(dns.Descriptor() != INVALID_SOCKET && dns.SetNonBlocking());
-        sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        BOOST_REQUIRE_EQUAL(dns.Bind(reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
-        socklen_t length{sizeof(address)};
-        BOOST_REQUIRE_EQUAL(dns.GetSockName(reinterpret_cast<sockaddr*>(&address), &length), 0);
-        LocalTLS server{Reply()};
-        auto endpoint = server.Endpoint();
-        endpoint.numeric_addresses.clear();
-        endpoint.hostname = "seed.bootstrap.test";
-        endpoint.dns_server = "127.0.0.1:" + ToString(ntohs(address.sin_port));
-        endpoint.timeout = std::chrono::milliseconds{250};
-        const auto start = TestClock::now();
-        auto result = httpsseed::test::Fetch(Options(), [&] { return cancel && TestClock::now() - start >= std::chrono::milliseconds{75}; }, endpoint);
-        const auto elapsed = TestClock::now() - start;
-        BOOST_CHECK(!result.success);
-        BOOST_CHECK(elapsed < std::chrono::milliseconds{750});
-        if (!cancel) BOOST_CHECK(elapsed >= std::chrono::milliseconds{200});
-        std::array<char, 1024> query{};
-        BOOST_CHECK(dns.Recv(query.data(), query.size(), 0) > 0);
-        BOOST_CHECK_EQUAL(server.connections.load(), 0U);
+    for (const auto& families : {std::pair{true, false}, std::pair{false, true}, std::pair{true, true}}) {
+        for (const bool cancel : {false, true}) {
+            TestSocket dns{static_cast<SOCKET>(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP))};
+            BOOST_REQUIRE(dns.Descriptor() != INVALID_SOCKET && dns.SetNonBlocking());
+            sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            BOOST_REQUIRE_EQUAL(dns.Bind(reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+            socklen_t length{sizeof(address)};
+            BOOST_REQUIRE_EQUAL(dns.GetSockName(reinterpret_cast<sockaddr*>(&address), &length), 0);
+            LocalTLS server{Reply()};
+            auto endpoint = server.Endpoint();
+            endpoint.numeric_addresses.clear();
+            endpoint.hostname = "seed.bootstrap.test";
+            endpoint.dns_server = "127.0.0.1:" + ToString(ntohs(address.sin_port));
+            endpoint.timeout = std::chrono::milliseconds{250};
+            auto options = Options();
+            options.ipv4 = families.first;
+            options.ipv6 = families.second;
+            const auto start = TestClock::now();
+            auto result = httpsseed::test::Fetch(options, [&] { return cancel && TestClock::now() - start >= std::chrono::milliseconds{75}; }, endpoint);
+            const auto elapsed = TestClock::now() - start;
+            BOOST_CHECK(!result.success);
+            BOOST_CHECK(elapsed < std::chrono::milliseconds{750});
+            if (!cancel) BOOST_CHECK(elapsed >= std::chrono::milliseconds{200});
+            std::array<char, 1024> query{};
+            BOOST_CHECK(dns.Recv(query.data(), query.size(), 0) > 0);
+            BOOST_CHECK_EQUAL(server.connections.load(), 0U);
+        }
     }
 }
 

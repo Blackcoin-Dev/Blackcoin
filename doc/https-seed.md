@@ -11,8 +11,16 @@ Normal P2P checks remain authoritative, and existing QQ pursuit limits remain.
 `-dns=0`, any `-connect` setting including `-connect=0`, `-maxconnections=0`,
 `-networkactive=0`, non-mainnet networks, and `onlynet` configurations that exclude
 both IPv4 and IPv6. HTTPS failure does not disable existing discovery or erase
-addresses. Healthy connections suppress unnecessary requests; outages and QQ
-deficits use a steady-clock cooldown of 30 minutes plus up to 299 seconds jitter.
+addresses. On mainnet both the existing blackcoin.nl DNS sources and this HTTPS
+source perform independent startup and refresh rounds, including when peers are
+healthy. One source's success cannot suppress the other. Each uses a steady-clock
+cooldown of 30 minutes plus up to 299 seconds jitter. The initial addrman-based
+startup delay remains. DNS always requests legacy-compatible desirable services,
+with a separate bounded QQ-filtered lookup when there is a QQ deficit. A missing
+base filter response resolves the plain hostname and adds its results as untrusted
+legacy service hints without a QQ flag. With a name proxy, DNS uses only the
+existing proxied P2P address fetch. DNS hints keep the chain's default P2P port; the HTTPS route
+preserves published nondefault ports.
 Sleep/wake and network toggles do not reset that cooldown.
 
 The configured Core proxy controls routing. A SOCKS hostname proxy resolves the

@@ -672,6 +672,11 @@ public:
     ~WorkerRun() { Stop(); }
 };
 
+struct DNSLookupScope {
+    DNSLookupFn previous{g_dns_lookup};
+    ~DNSLookupScope() { g_dns_lookup = std::move(previous); }
+};
+
 void PrepareWorker(ConnmanTestMsg& connman, node::NodeContext& node)
 {
     gArgs.ForceSetArg("-dnsseed", "1");
@@ -882,6 +887,124 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_regtest_gate_stays_closed, RegTestingSetu
     WorkerRun worker{connman, gate, hooks};
     BOOST_REQUIRE(gate.Step(86400));
     BOOST_CHECK_EQUAL(fetches.load(), 0U);
+    BOOST_CHECK_EQUAL(m_node.addrman->Size(), 0U);
+}
+
+void PairedWorkerRace(node::NodeContext& node, bool dns_first)
+{
+    auto& connman = static_cast<ConnmanTestMsg&>(*node.connman);
+    PrepareWorker(connman, node);
+    // Simulate two occupied full-relay slots and a satisfied QQ target.
+    for (int i = 0; i < 2; ++i) {
+        auto* peer = new CNode{i, nullptr, CAddress{LookupNumeric("11.1.1.1", 15714), NODE_NETWORK},
+            0, 0, CAddress{}, "", ConnectionType::OUTBOUND_FULL_RELAY, false};
+        peer->fSuccessfullyConnected = true;
+        connman.AddTestNode(*peer);
+    }
+    connman.PublishQQStatus(1, 1, false, "");
+    const auto cached = LookupNumeric("1.1.1.1", 15714);
+    const auto dns_ip = LookupNumeric("9.9.9.9", 15714);
+    CNetAddr source;
+    BOOST_REQUIRE(source.SetInternal("cached-test"));
+    BOOST_REQUIRE(node.addrman->Add({CAddress{cached, NODE_NETWORK}}, source));
+    DNSLookupScope lookup_scope;
+    std::atomic<unsigned> base{0}, plain{0}, qq{0}, https{0};
+    g_dns_lookup = [&](const std::string& host, bool) -> std::vector<CNetAddr> {
+        if (host.rfind("x1000001.", 0) == 0) { ++qq; return {}; }
+        if (host.rfind("x1.", 0) == 0) {
+            ++base;
+            return dns_first ? std::vector<CNetAddr>{} : std::vector<CNetAddr>{dns_ip};
+        }
+        ++plain;
+        if (base > 6) return {}; // Empty DNS round must not suppress HTTPS.
+        return {dns_ip};
+    };
+    WorkerGate dg{connman}, hg{connman};
+    httpsseed::WorkerHooks dh, hh;
+    dh.now = [&] { return dg.Now(); }; dh.wait = [&] { return dg.Wait(); };
+    hh.now = [&] { return hg.Now(); }; hh.wait = [&] { return hg.Wait(); };
+    hh.fetch = [&](const auto&, const auto&) {
+        const auto attempt = ++https;
+        if (!dns_first && attempt == 1) return httpsseed::FetchResult{true, "invalid", {}};
+        if (!dns_first && attempt == 2) return httpsseed::FetchResult{false, {}, "fixture failure"};
+        auto doc = Document();
+        return httpsseed::FetchResult{true, doc.write(), {}};
+    };
+    connman.StartDNSForTest(dh);
+    WorkerRun workers{connman, hg, hh};
+    BOOST_REQUIRE(Eventually([&] { return dg.waits > 0; }));
+    BOOST_REQUIRE(dg.Step(10));
+    BOOST_REQUIRE(hg.Step(10));
+    BOOST_CHECK_EQUAL(base.load(), 0U);
+    BOOST_CHECK_EQUAL(https.load(), 0U);
+    if (dns_first) {
+        BOOST_REQUIRE(dg.Step(1));
+        BOOST_REQUIRE(hg.Step(1));
+    } else {
+        BOOST_REQUIRE(hg.Step(1));
+        BOOST_REQUIRE(dg.Step(1));
+    }
+    BOOST_CHECK_EQUAL(base.load(), 3U);
+    BOOST_CHECK_EQUAL(plain.load(), dns_first ? 3U : 0U);
+    BOOST_CHECK_EQUAL(qq.load(), 0U);
+    BOOST_CHECK_EQUAL(https.load(), 1U);
+    auto found = node.addrman->GetAddr(0, 0, std::nullopt);
+    const auto hint = std::find_if(found.begin(), found.end(), [&](const auto& a) { return a == dns_ip; });
+    BOOST_REQUIRE(hint != found.end());
+    BOOST_CHECK_EQUAL(hint->GetPort(), 15714);
+    BOOST_CHECK_EQUAL(hint->nServices, NODE_NETWORK);
+    BOOST_REQUIRE(dg.Step(1799));
+    BOOST_REQUIRE(hg.Step(1799));
+    BOOST_CHECK_EQUAL(base.load(), 3U);
+    BOOST_CHECK_EQUAL(https.load(), 1U);
+    // Only DNS is due; the HTTPS clock remains unchanged.
+    connman.PublishQQStatus(0, 0, false, "");
+    BOOST_REQUIRE(dg.Step(501));
+    BOOST_CHECK_EQUAL(base.load(), 6U);
+    BOOST_CHECK_EQUAL(plain.load(), dns_first ? 6U : 0U);
+    BOOST_CHECK_EQUAL(qq.load(), 3U);
+    BOOST_CHECK_EQUAL(https.load(), 1U);
+    BOOST_REQUIRE(hg.Step(501));
+    BOOST_CHECK_EQUAL(https.load(), 2U);
+    connman.SetNetworkActive(false);
+    BOOST_REQUIRE(dg.Step(2300));
+    BOOST_REQUIRE(hg.Step(2300));
+    BOOST_CHECK_EQUAL(base.load(), 6U);
+    BOOST_CHECK_EQUAL(https.load(), 2U);
+    connman.SetNetworkActive(true);
+    BOOST_REQUIRE(hg.Step());
+    BOOST_REQUIRE(dg.Step());
+    BOOST_CHECK_EQUAL(base.load(), 9U);
+    BOOST_CHECK_EQUAL(https.load(), 3U);
+    workers.Stop();
+    connman.ClearTestNodes();
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_paired_workers_dns_first, TestingSetup) { PairedWorkerRace(m_node, true); }
+BOOST_FIXTURE_TEST_CASE(actual_paired_workers_https_first, TestingSetup) { PairedWorkerRace(m_node, false); }
+
+BOOST_FIXTURE_TEST_CASE(actual_dns_discards_response_after_network_toggle, TestingSetup)
+{
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    PrepareWorker(connman, m_node);
+    const auto ip = LookupNumeric("9.9.9.9", 15714);
+    DNSLookupScope lookup_scope;
+    std::atomic<unsigned> queries{0};
+    g_dns_lookup = [&](const std::string&, bool) -> std::vector<CNetAddr> {
+        ++queries;
+        connman.SetNetworkActive(false);
+        connman.SetNetworkActive(true);
+        return {ip};
+    };
+    WorkerGate dg{connman}, hg{connman};
+    httpsseed::WorkerHooks dh, hh;
+    dh.now = [&] { return dg.Now(); }; dh.wait = [&] { return dg.Wait(); };
+    hh.now = [&] { return hg.Now(); }; hh.wait = [&] { return hg.Wait(); };
+    connman.StartDNSForTest(dh);
+    WorkerRun workers{connman, hg, hh};
+    BOOST_REQUIRE(Eventually([&] { return dg.waits > 0; }));
+    BOOST_REQUIRE(dg.Step());
+    BOOST_CHECK_EQUAL(queries.load(), 1U);
     BOOST_CHECK_EQUAL(m_node.addrman->Size(), 0U);
 }
 BOOST_AUTO_TEST_SUITE_END()

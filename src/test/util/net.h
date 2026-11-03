@@ -31,6 +31,13 @@ struct ConnmanTestMsg : public CConnman {
         threadHTTPSAddressSeed = std::thread([this] { ThreadHTTPSAddressSeed(); });
     }
 
+    void StartDNSForTest(const httpsseed::WorkerHooks& hooks)
+    {
+        m_dns_seed_test_hooks = &hooks;
+        interruptNet.reset();
+        threadDNSAddressSeed = std::thread([this] { ThreadDNSAddressSeed(); });
+    }
+
     bool HTTPSInterruptedForTest() const { return bool{interruptNet}; }
 
     void StartHTTPSAutomaticConnectionsForTest()
@@ -51,6 +58,7 @@ struct ConnmanTestMsg : public CConnman {
         Interrupt();
         StopThreads();
         m_https_seed_test_hooks = nullptr;
+        m_dns_seed_test_hooks = nullptr;
     }
 
     void InitAddrFetchTest()

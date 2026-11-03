@@ -1712,6 +1712,7 @@ private:
 
     // Test fixture is the sole installer; production always leaves this null.
     const httpsseed::WorkerHooks* m_https_seed_test_hooks{nullptr};
+    const httpsseed::WorkerHooks* m_dns_seed_test_hooks{nullptr};
 
     friend struct ConnmanTestMsg;
 };

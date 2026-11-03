@@ -20,6 +20,8 @@ define $(package)_set_vars
   $(package)_config_opts+=--disable-http-auth --disable-basic-auth --disable-bearer-auth --disable-digest-auth --disable-kerberos-auth --disable-negotiate-auth --disable-ntlm --disable-aws --disable-httpsig --disable-sspi --without-gssapi --disable-gssapi-apple --without-libgsasl --without-libssh --without-libssh2
   $(package)_config_opts+=--disable-cookies --disable-netrc --disable-alt-svc --disable-hsts --disable-unix-sockets
   $(package)_config_opts+=--disable-docs --disable-manual --disable-libcurl-option --disable-dependency-tracking --without-zsh-functions-dir --without-fish-functions-dir
+  # curl's OpenSSL probes need the private platform libraries of our static build.
+  $(package)_config_env=PKG_CONFIG="pkg-config --static"
   $(package)_build_env=ZERO_AR_DATE=1
   $(package)_cppflags_mingw32=-DCURL_STATICLIB -D_WIN32_WINNT=0x0601
 endef

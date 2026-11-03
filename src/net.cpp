@@ -2218,7 +2218,6 @@ void CConnman::ThreadHTTPSAddressSeed()
         next_round += addrman.Size() >= DNSSEEDS_DELAY_PEER_THRESHOLD ?
             std::chrono::seconds{DNSSEEDS_DELAY_MANY_PEERS} : DNSSEEDS_DELAY_FEW_PEERS;
     }
-    bool startup{true};
     while (!interruptNet) {
         if (!(hooks && hooks->wait ? hooks->wait() : interruptNet.sleep_for(1s))) return;
         const bool ipv4 = g_reachable_nets.Contains(NET_IPV4);
@@ -2233,11 +2232,8 @@ void CConnman::ThreadHTTPSAddressSeed()
         int connected{0};
         ForEachNode([&](CNode* node) { if (node->IsFullOutboundConn()) ++connected; });
         const bool deficit = GetQQStatus().deficit > 0;
-        if (connected > 0 && !deficit && (!startup || connected >= 2)) {
-            startup = false;
-            continue;
-        }
-        startup = false;
+        // Each provider owns its startup and refresh rounds. Healthy peers,
+        // including peers found by DNS, must not suppress this source.
         next_round = now + qq::DNS_COOLDOWN + std::chrono::seconds{rng.randrange(300)};
         httpsseed::TransportOptions options;
         options.ipv4 = ipv4;
@@ -2293,7 +2289,10 @@ void CConnman::ThreadHTTPSAddressSeed()
 void CConnman::ThreadDNSAddressSeed()
 {
     FastRandomContext rng;
-    auto next_round = qq::Clock::now();
+    const auto* hooks = m_dns_seed_test_hooks;
+    const auto worker_now = [&] { return hooks && hooks->now ? hooks->now() : qq::Clock::now(); };
+    auto next_round = worker_now();
+    const bool independent_mainnet = m_params.GetChainType() == ChainType::MAIN;
     const bool forced = gArgs.GetBoolArg("-forcednsseed", DEFAULT_FORCEDNSSEED);
     if (addrman.Size() && !forced) {
         const auto delay = addrman.Size() >= DNSSEEDS_DELAY_PEER_THRESHOLD ? DNSSEEDS_DELAY_MANY_PEERS : DNSSEEDS_DELAY_FEW_PEERS;
@@ -2302,17 +2301,18 @@ void CConnman::ThreadDNSAddressSeed()
     }
     bool startup = true;
     while (!interruptNet) {
-        if (!interruptNet.sleep_for(1s)) return;
+        if (!(hooks && hooks->wait ? hooks->wait() : interruptNet.sleep_for(1s))) return;
         if (!fNetworkActive || !m_use_addrman_outgoing ||
-            !gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED)) continue;
-        const auto now = qq::Clock::now();
+            !gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED) ||
+            (independent_mainnet && nMaxConnections <= 0)) continue;
+        const auto now = worker_now();
         if (now < next_round) continue;
         const auto status = GetQQStatus();
         int connected = 0;
         ForEachNode([&](CNode* node) { if (node->IsFullOutboundConn()) ++connected; });
         const bool deficit = status.deficit > 0;
         const bool outage = connected == 0;
-        if (!(startup && forced) && !outage && !deficit && (!startup || connected >= 2)) {
+        if (!independent_mainnet && !(startup && forced) && !outage && !deficit && (!startup || connected >= 2)) {
             if (startup) LogPrint(BCLog::NET, "P2P peers available. Skipped DNS seeding.\n");
             startup = false;
             continue;
@@ -2321,12 +2321,15 @@ void CConnman::ThreadDNSAddressSeed()
         next_round = now + qq::DNS_COOLDOWN + std::chrono::seconds{rng.randrange(300)};
         startup = false;
         if (deficit) RecordQQDNSRound();
+        const auto generation = m_https_seed_generation.load();
+        const auto cancelled = [&] { return interruptNet || !fNetworkActive || !m_use_addrman_outgoing ||
+            !gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED) ||
+            (independent_mainnet && m_https_seed_generation.load() != generation); };
         auto seeds = m_params.DNSSeeds();
         Shuffle(seeds.begin(), seeds.end(), rng);
         size_t queried = 0;
         for (const auto& seed : seeds) {
-            if (queried >= DNSSEEDS_TO_QUERY_AT_ONCE || interruptNet || !fNetworkActive ||
-                !m_use_addrman_outgoing || !gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED)) break;
+            if (queried >= DNSSEEDS_TO_QUERY_AT_ONCE || cancelled()) break;
             LogPrint(BCLog::NET, "Loading addresses from DNS seed %s\n", seed);
             // Name-proxy mode never performs local seed resolution, including QQ filters.
             if (HaveNameProxy()) {
@@ -2336,25 +2339,45 @@ void CConnman::ThreadDNSAddressSeed()
             }
             // Do not leak direct seed queries in privacy-only configurations.
             if (!g_reachable_nets.Contains(NET_IPV4) && !g_reachable_nets.Contains(NET_IPV6)) break;
-            const auto services = ServiceFlags(GetDesirableServiceFlags(NODE_NONE) |
-                                               (deficit ? NODE_QUANTUM_QUASAR : NODE_NONE));
-            const auto host = strprintf("x%x.%s", services, seed);
-            CNetAddr source;
-            if (!source.SetInternal(host)) continue;
             ++queried;
-            // -dns controls destination lookup; explicit -dnsseed controls this resolver.
-            // System resolution may block, but no Core lock is held here.
-            const auto addresses = LookupHost(host, 256, true);
-            if (interruptNet || !fNetworkActive || !m_use_addrman_outgoing) break;
-            std::vector<CAddress> addrs;
-            for (const auto& ip : addresses) {
-                if (!g_reachable_nets.Contains(ip)) continue;
-                CAddress addr{CService(ip, m_params.GetDefaultPort()), services};
-                addr.nTime = rng.rand_uniform_delay(Now<NodeSeconds>() - 3 * 24h, -4 * 24h);
-                addrs.push_back(addr);
+            const auto base_services = GetDesirableServiceFlags(NODE_NONE);
+            const auto query = [&](const std::string& host, ServiceFlags services) {
+                CNetAddr source;
+                if (!source.SetInternal(host)) return false;
+                // -dns controls destination lookup; explicit -dnsseed controls
+                // this resolver. No Core lock is held during system resolution.
+                const auto addresses = LookupHost(host, 256, true);
+                if (cancelled()) return false;
+                std::vector<CAddress> addrs;
+                for (const auto& ip : addresses) {
+                    if (!g_reachable_nets.Contains(ip)) continue;
+                    CAddress addr{CService(ip, m_params.GetDefaultPort()), services};
+                    addr.nTime = rng.rand_uniform_delay(Now<NodeSeconds>() - 3 * 24h, -4 * 24h);
+                    addrs.push_back(addr);
+                }
+                if (!addrs.empty()) {
+                    LOCK(m_https_seed_mutex);
+                    if (cancelled()) return false;
+                    addrman.Add(addrs, source);
+                }
+                return !addrs.empty();
+            };
+            if (independent_mainnet) {
+                // Always retain legacy-compatible discovery. QQ-filter misses
+                // cannot replace or starve the base source. The plain hostname
+                // is a legacy fallback when the service-filtered seed is empty.
+                const bool base_found = query(strprintf("x%x.%s", base_services, seed), base_services);
+                if (cancelled()) break;
+                if (!base_found) query(seed, base_services);
+                if (cancelled()) break;
+                if (deficit) {
+                    const auto qq_services = ServiceFlags(base_services | NODE_QUANTUM_QUASAR);
+                    query(strprintf("x%x.%s", qq_services, seed), qq_services);
+                }
+            } else {
+                const auto services = ServiceFlags(base_services | (deficit ? NODE_QUANTUM_QUASAR : NODE_NONE));
+                if (!query(strprintf("x%x.%s", services, seed), services) && !interruptNet && fNetworkActive && m_use_addrman_outgoing) AddAddrFetch(seed);
             }
-            if (!addrs.empty()) addrman.Add(addrs, source);
-            else AddAddrFetch(seed); // Base P2P fetch carries no fabricated QQ service bit.
         }
         LogPrint(BCLog::NET, "DNS discovery round: providers=%u qq_deficit=%d outage=%d\n", queried, deficit, outage);
     }

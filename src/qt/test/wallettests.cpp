@@ -1290,6 +1290,16 @@ void TestPowClaimRecoveryPolicyControls(
     QTRY_VERIFY_WITH_TIMEOUT(second_result != nullptr, 5000);
     QVERIFY(second_result->success);
     QVERIFY(!second_result->cancelled);
+    QVERIFY(!second_result->mutation.detail.empty());
+    QVERIFY(second_result->error.empty());
+    second_result.reset();
+    second_request.operation = WalletModel::PowClaimRecoveryPolicyRequest::Operation::SET_POLICY;
+    second_request.policy = wallet_interface.getPowClaimRecoveryPolicy();
+    second_id = wallet_model.requestPowClaimRecoveryPolicy(second_request);
+    QTRY_VERIFY_WITH_TIMEOUT(second_result != nullptr, 5000);
+    QVERIFY(second_result->success);
+    QVERIFY(!second_result->mutation.detail.empty());
+    QVERIFY(second_result->error.empty());
     if (first_result) QCOMPARE(first_result->request.request_id, first_id);
     QObject::disconnect(request_connection);
 
@@ -2453,6 +2463,7 @@ void TestPowClaimRecoveryAmbiguousDatabaseDisablesActions(
     QVERIFY(policy_result->mutation.durable_state_ambiguous);
     QVERIFY(!policy_result->mutation.authoritative_state_available);
     QVERIFY(!policy_result->policy_available);
+    QVERIFY(!policy_result->error.empty() && policy_result->error == policy_result->mutation.detail);
 
     policy_result.reset();
     WalletModel::PowClaimRecoveryPolicyRequest policy_read;
@@ -2466,6 +2477,7 @@ void TestPowClaimRecoveryAmbiguousDatabaseDisablesActions(
     QVERIFY(!policy_result->success);
     QVERIFY(policy_result->mutation.durable_state_ambiguous);
     QVERIFY(!policy_result->policy_available);
+    QVERIFY(!policy_result->error.empty() && policy_result->error == policy_result->mutation.detail);
     QObject::disconnect(policy_ready);
 
     // Adoption uses the same typed distinction: ambiguity is not collapsed

@@ -580,7 +580,7 @@ uint64_t WalletModel::requestPowClaimRecoveryPolicy(PowClaimRecoveryPolicyReques
                     m_wallet->setPowClaimRecoveryPolicyDetailed(request.policy);
                 result->authoritative_state_checked = true;
                 result->success = result->mutation.success;
-                result->error = result->mutation.detail;
+                if (!result->success) result->error = result->mutation.detail;
                 result->policy_available =
                     result->mutation.authoritative_state_available;
                 if (result->policy_available) {
@@ -592,7 +592,7 @@ uint64_t WalletModel::requestPowClaimRecoveryPolicy(PowClaimRecoveryPolicyReques
                     m_wallet->getPowClaimRecoveryPolicyState();
                 result->authoritative_state_checked = true;
                 result->success = result->mutation.success;
-                result->error = result->mutation.detail;
+                if (!result->success) result->error = result->mutation.detail;
                 result->policy_available =
                     result->mutation.authoritative_state_available;
                 if (result->policy_available) {

@@ -103,7 +103,19 @@ jobs:
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || 'f647dc75c9479c03e81414f145a8d233b60959c7' }}
-        run: git diff --check "$BASE_SHA...$TARGET_SHA"
+        run: |
+          python3 - <<'PYLICENSE'
+          import hashlib
+          import os
+          from pathlib import Path
+          from subprocess import check_output
+          path = Path("share/httpsseed/LICENSE-MPL-2.0.txt")
+          expected = "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85"
+          committed = check_output(["git", "show", os.environ["TARGET_SHA"] + ":" + path.as_posix()])
+          if any(hashlib.sha256(data).hexdigest() != expected for data in (committed, path.read_bytes())):
+              raise SystemExit("Upstream MPL license bytes changed; whitespace exception refused")
+          PYLICENSE
+          git diff --check "$BASE_SHA...$TARGET_SHA" -- . ':(exclude)share/httpsseed/LICENSE-MPL-2.0.txt'
 
       - name: Verify dependency, advisory, capability, and provenance evidence
         if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}

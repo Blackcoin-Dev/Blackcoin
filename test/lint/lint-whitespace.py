@@ -12,11 +12,13 @@
 # We can't run this check unless we know the commit range for the PR.
 
 import argparse
+import hashlib
 import os
 import re
 import sys
 
-from subprocess import check_output
+from pathlib import Path
+from subprocess import CalledProcessError, DEVNULL, check_output
 
 EXCLUDED_DIRS = ["depends/patches/",
                  "contrib/guix/patches/",
@@ -74,8 +76,27 @@ def report_diff(selection):
             print(line)
 
 
+def pinned_upstream_exclusions(commit_range):
+    """Preserve the exact upstream license, including its original trailing space."""
+    path = Path("share/httpsseed/LICENSE-MPL-2.0.txt")
+    if not path.exists():
+        return []
+    expected = "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85"
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        raise RuntimeError("Upstream MPL license bytes changed; whitespace exception refused")
+    if ".." in commit_range:
+        head = commit_range.rsplit("..", 1)[-1] or "HEAD"
+        try:
+            committed = check_output(["git", "show", head + ":" + path.as_posix()], stderr=DEVNULL)
+        except CalledProcessError:
+            return []
+        if hashlib.sha256(committed).hexdigest() != expected:
+            raise RuntimeError("Committed MPL license bytes changed; whitespace exception refused")
+    return [":(exclude)" + path.as_posix()]
+
+
 def get_diff(commit_range, check_only_code):
-    exclude_args = [":(exclude)" + dir for dir in EXCLUDED_DIRS]
+    exclude_args = [":(exclude)" + dir for dir in EXCLUDED_DIRS] + pinned_upstream_exclusions(commit_range)
 
     if check_only_code:
         what_files = ["*.cpp", "*.h", "*.md", "*.py", "*.sh"]

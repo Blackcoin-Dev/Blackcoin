@@ -16,6 +16,7 @@ durable relay authority must survive restart without changing the signed bytes.
 import ast
 from copy import deepcopy
 from decimal import Decimal
+import json
 from pathlib import Path
 from threading import Thread
 import time
@@ -899,6 +900,44 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self.wait_until(observation_is_current, timeout=20)
         return reviewed
 
+    def _wait_for_automatic_resolution(self, wallet, node, claim_txid, tip):
+        """Return one complete, tip-bound observation and its relayed resolution."""
+        last = None
+        accepted = None
+        blockers = (
+            "claim_ownership_pending", "claim_ownership_capacity_exceeded",
+            "claim_inventory_capacity_exceeded", "proof_evaluation_budget_exhausted",
+            "proof_evaluation_capacity_exceeded", "proof_evaluation_retryable_local_failure",
+            "proof_evaluation_retryable_local_state",
+        )
+
+        def ready():
+            nonlocal last, accepted
+            info = get_recovery_info(wallet, True)
+            last = info
+            if (not info["usage_available"] or not info["wallet_tip_matches"]
+                    or info["active_tip"] != tip or any(info[key] for key in blockers)
+                    or info["pending_automatic_resolutions"] != 1):
+                return False
+            components = [c for c in info["component_details"] if claim_txid in c["claim_txids"]]
+            nodes = [(c, n) for c in info["component_details"] for n in c["nodes"]
+                     if n["kind"] == "managed_resolution"]
+            if len(components) != 1 or len(nodes) != 1 or nodes[0][0] is not components[0]:
+                return False
+            resolution = nodes[0][1]
+            txid = resolution["txid"]
+            if not resolution["resolution_relay_authorized"] or txid not in node.getrawmempool():
+                return False
+            accepted = info, txid
+            return True
+
+        try:
+            self.wait_until(ready, timeout=30)
+        except AssertionError:
+            self.log.error("Automatic resolution did not stabilize; last snapshot: %s", json.dumps(last, default=str))
+            raise
+        return accepted
+
     def _wait_for_live_claim_family(self, wallet, root_txid, tip):
         """Return the live observations accepted by the bounded liveness wait."""
         accepted = None
@@ -1608,31 +1647,20 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             # active-branch blocks, then let the next scheduler pass create,
             # persist, authorize, and relay the exact resolution bytes.
             self.generateblock(node, output=funding_address, transactions=[])
+            automatic_recovery_tip = node.getbestblockhash()
             self.wait_until(
                 lambda: get_recovery_info(policy, True)["component_details"][0]["minimum_stale_depth"]
                 >= automatic_limits["minimum_stale_blocks"],
                 timeout=20,
             )
             node.mockscheduler(61)
-            self.wait_until(
-                lambda: get_recovery_info(policy)["pending_automatic_resolutions"] == 1,
-                timeout=30,
+            pending_automatic_info, automatic_resolution_txid = self._wait_for_automatic_resolution(
+                policy, node, policy_claim["txid"], automatic_recovery_tip
             )
 
             # Keep the miner enabled while its automatic resolution confirms.
             # The confirmed same-script output must release the quarantine gate
             # and return the miner to an active state without operator action.
-            pending_automatic_info = get_recovery_info(policy, True)
-            pending_resolution_nodes = [
-                graph_node
-                for component in pending_automatic_info["component_details"]
-                for graph_node in component["nodes"]
-                if graph_node["kind"] == "managed_resolution"
-            ]
-            assert_equal(len(pending_resolution_nodes), 1)
-            automatic_resolution_txid = pending_resolution_nodes[0]["txid"]
-            assert_equal(pending_resolution_nodes[0]["resolution_relay_authorized"], True)
-            assert automatic_resolution_txid in node.getrawmempool()
             automatic_resolution_block = self.generateblock(
                 node,
                 output=funding_address,
@@ -2142,20 +2170,59 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.setmocktime(self.mock_time)
         manual = self._load_wallet(MANUAL_WALLET)
         stake_height = node.getblockcount()
+        stake_tip = node.getbestblockhash()
+        claim_outpoint = (first_txid, 0)
+        claim_utxo = node.gettxout(*claim_outpoint)
+        assert claim_utxo is not None
+        assert_equal(claim_utxo["value"], claim_change)
+        claim_script = claim_utxo["scriptPubKey"]["hex"]
+        assert_equal(node.gettxout(*claim_outpoint, False)["scriptPubKey"]["hex"], claim_script)
+        stake_mempool = set(node.getrawmempool())
         expected_stake_weight = int(claim_change * COIN)
+        weight_observed = False
+
+        def stake_evidence():
+            nonlocal weight_observed
+            info = manual.getstakinginfo()
+            weight_observed = (info["weight_cache_height"] == stake_height and
+                               info["weight"] == expected_stake_weight)
+            return weight_observed or node.getblockcount() > stake_height
+
         manual.staking(True)
         try:
             self._bump_mocktime(16)
-            self.wait_until(
-                lambda: (
-                    manual.getstakinginfo()["weight_cache_height"] == stake_height
-                    and manual.getstakinginfo()["weight"] == expected_stake_weight
-                ),
-                timeout=20,
-            )
+            self.wait_until(stake_evidence, timeout=20)
         finally:
             manual.staking(False)
+        # A successful kernel can win before the RPC stops the worker. Verify
+        # any new blocks are PoS descendants of the scan tip, then disconnect
+        # them so the claim output remains available for the next test.
+        if node.getblockcount() > stake_height:
+            assert_equal(node.getblockhash(stake_height), stake_tip)
+            first_stake = node.getblockhash(stake_height + 1)
+            claim_staked = False
+            for height in range(stake_height + 1, node.getblockcount() + 1):
+                block = node.getblock(node.getblockhash(height), 2)
+                assert_equal(block["flags"], "proof-of-stake")
+                claim_staked |= any((vin.get("txid"), vin.get("vout")) == claim_outpoint
+                                    for vin in block["tx"][1]["vin"])
+            assert claim_staked
+            node.invalidateblock(first_stake)
+            node.syncwithvalidationinterfacequeue()
+        else:
+            assert weight_observed
+        assert_equal(node.getbestblockhash(), stake_tip)
         assert_equal(node.getblockcount(), stake_height)
+        for include_mempool in (False, True):
+            restored = node.gettxout(*claim_outpoint, include_mempool)
+            assert restored is not None
+            assert_equal(restored["value"], claim_change)
+            assert_equal(restored["scriptPubKey"]["hex"], claim_script)
+        matching_unspent = [u for u in manual.listunspent(1, 9999999, [manual_address])
+                            if (u["txid"], u["vout"]) == claim_outpoint]
+        assert_equal(len(matching_unspent), 1)
+        assert_equal(matching_unspent[0]["amount"], claim_change)
+        assert_equal(set(node.getrawmempool()), stake_mempool)
 
         self.log.info("The clean confirmed claim can fund an ordinary descendant and a new claim")
         descendant = manual.signrawtransactionwithwallet(node.createrawtransaction(
@@ -4097,6 +4164,81 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
 
 class RecoveryPaginationHelperTest(unittest.TestCase):
+    def test_automatic_resolution_waits_for_one_coherent_authorized_node(self):
+        component = {"claim_txids": ["claim"], "nodes": [
+            {"kind": "managed_resolution", "txid": "resolution", "resolution_relay_authorized": True},
+        ]}
+        good = {"usage_available": True, "wallet_tip_matches": True, "active_tip": "tip",
+                "pending_automatic_resolutions": 1, "component_details": [component],
+                "claim_ownership_pending": False, "claim_ownership_capacity_exceeded": False,
+                "claim_inventory_capacity_exceeded": False, "proof_evaluation_budget_exhausted": False,
+                "proof_evaluation_capacity_exceeded": False, "proof_evaluation_retryable_local_failure": False,
+                "proof_evaluation_retryable_local_state": False}
+        delayed = {**good, "component_details": []}
+        wrong_claim = {**good, "component_details": [{**component, "claim_txids": ["other"]}]}
+        unauthorized = {**good, "component_details": [{**component, "nodes": [
+            {**component["nodes"][0], "resolution_relay_authorized": False}]}]}
+        duplicate = {**good, "component_details": [{**component, "nodes": component["nodes"] * 2}]}
+        failures = [delayed, {**good, "active_tip": "wrong"}, wrong_claim, unauthorized,
+                    duplicate, {**good, "usage_available": False},
+                    {**good, "claim_ownership_pending": True},
+                    {**good, "claim_inventory_capacity_exceeded": True},
+                    {**good, "proof_evaluation_budget_exhausted": True},
+                    {**good, "pending_automatic_resolutions": 0}]
+        node = mock.Mock()
+        node.getrawmempool.return_value = ["resolution"]
+        harness = mock.Mock()
+
+        def wait_until(predicate, timeout):
+            self.assertEqual(timeout, 30)
+            for _ in failures:
+                self.assertFalse(predicate())
+            self.assertTrue(predicate())
+
+        harness.wait_until.side_effect = wait_until
+        with mock.patch(__name__ + ".get_recovery_info", side_effect=[*failures, good]) as read:
+            snapshot, txid = GoldRushPowClaimSingleFlightTest._wait_for_automatic_resolution(
+                harness, mock.Mock(), node, "claim", "tip")
+        self.assertIs(snapshot, good)
+        self.assertEqual(txid, "resolution")
+        self.assertEqual(read.call_count, len(failures) + 1)
+
+    def test_automatic_resolution_requires_mempool_presence(self):
+        info = {"usage_available": True, "wallet_tip_matches": True, "active_tip": "tip",
+                "pending_automatic_resolutions": 1, "component_details": [{"claim_txids": ["claim"],
+                    "nodes": [{"kind": "managed_resolution", "txid": "r", "resolution_relay_authorized": True}]}],
+                "claim_ownership_pending": False, "claim_ownership_capacity_exceeded": False,
+                "claim_inventory_capacity_exceeded": False, "proof_evaluation_budget_exhausted": False,
+                "proof_evaluation_capacity_exceeded": False, "proof_evaluation_retryable_local_failure": False,
+                "proof_evaluation_retryable_local_state": False}
+        node = mock.Mock()
+        node.getrawmempool.side_effect = [[], ["r"]]
+        harness = mock.Mock()
+
+        def wait_until(predicate, timeout):
+            self.assertFalse(predicate())
+            self.assertTrue(predicate())
+        harness.wait_until.side_effect = wait_until
+        with mock.patch(__name__ + ".get_recovery_info", return_value=info):
+            self.assertEqual(GoldRushPowClaimSingleFlightTest._wait_for_automatic_resolution(
+                harness, mock.Mock(), node, "claim", "tip"), (info, "r"))
+
+    def test_automatic_resolution_timeout_reports_last_snapshot(self):
+        info = {"usage_available": False, "wallet_tip_matches": True, "active_tip": "tip"}
+        harness = mock.Mock()
+
+        def wait_until(predicate, timeout):
+            self.assertFalse(predicate())
+            raise AssertionError("bounded timeout")
+
+        harness.wait_until.side_effect = wait_until
+        with mock.patch(__name__ + ".get_recovery_info", return_value=info):
+            with self.assertRaisesRegex(AssertionError, "bounded timeout"):
+                GoldRushPowClaimSingleFlightTest._wait_for_automatic_resolution(
+                    harness, mock.Mock(), mock.Mock(), "claim", "tip")
+        harness.log.error.assert_called_once_with(
+            "Automatic resolution did not stabilize; last snapshot: %s", json.dumps(info, default=str))
+
     @staticmethod
     def live_family_fixture():
         info = {

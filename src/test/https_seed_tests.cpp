@@ -139,6 +139,34 @@ BOOST_AUTO_TEST_CASE(json_encoding_duplicates_and_depth)
     }
 }
 
+BOOST_AUTO_TEST_CASE(utf8_multibyte_boundaries)
+{
+    const auto valid = Document().write();
+    for (const std::string text : {
+             std::string("\xc2\x80", 2), std::string("\xdf\xbf", 2),
+             std::string("\xe0\xa0\x80", 3), std::string("\xed\x9f\xbf", 3),
+             std::string("\xee\x80\x80", 3), std::string("\xef\xbf\xbf", 3),
+             std::string("\xf0\x90\x80\x80", 4), std::string("\xf4\x8f\xbf\xbf", 4)}) {
+        auto body = valid; body.insert(1, "\"ignored\":\"" + text + "\",");
+        BOOST_CHECK(Parse(body).valid);
+    }
+    for (const std::string text : {
+             std::string("\xe0\x80\x80", 3), std::string("\xf0\x80\x80\x80", 4),
+             std::string("\xed\xbf\xbf", 3), std::string("\xe2\x28\xa1", 3),
+             std::string("\xf0\x90\x80\x41", 4)}) {
+        auto body = valid; body.insert(1, "\"ignored\":\"" + text + "\",");
+        const auto result = Parse(body);
+        BOOST_CHECK(!result.valid);
+        BOOST_CHECK_EQUAL(result.error, "encoding-or-depth");
+    }
+    for (const std::string text : {std::string("\xc2", 1), std::string("\xe2\x82", 2),
+                                   std::string("\xf0\x90\x80", 3)}) {
+        const auto result = Parse(valid + text);
+        BOOST_CHECK(!result.valid);
+        BOOST_CHECK_EQUAL(result.error, "encoding-or-depth");
+    }
+}
+
 BOOST_AUTO_TEST_CASE(addresses_ports_families_exclusions_and_diversity)
 {
     for (const std::string address : {"127.0.0.1", "10.0.0.1", "100.64.0.1", "192.0.2.1", "224.0.0.1", "::1", "::ffff:8.8.8.8", "2002:808:808::1", "2001::1", "2606:4700:4700::1111%en0", "2606:4700:4700:0:0:0:0:1111", "dns.example", "8.8.8.08"}) {

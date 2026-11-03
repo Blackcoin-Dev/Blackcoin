@@ -27,7 +27,8 @@ bool ValidUTF8(std::string_view input)
         else if (first >= 0xf0 && first <= 0xf4) { remaining = 3; value = first & 0x07; minimum = 0x10000; }
         else return false;
         if (input.size() - i < remaining) return false;
-        while (remaining--) {
+        while (remaining > 0) {
+            --remaining;
             const auto next = static_cast<unsigned char>(input[i++]);
             if ((next & 0xc0) != 0x80) return false;
             value = (value << 6) | (next & 0x3f);

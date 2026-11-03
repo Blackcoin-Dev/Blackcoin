@@ -20,6 +20,8 @@
 #include <consensus/consensus.h>
 #include <crypto/sha256.h>
 #include <i2p.h>
+#include <https_seed_client.h>
+#include <net_https_seed.h>
 #include <logging.h>
 #include <memusage.h>
 #include <net_permissions.h>
@@ -2206,6 +2208,88 @@ void CConnman::WakeMessageHandler()
     condMsgProc.notify_one();
 }
 
+void CConnman::ThreadHTTPSAddressSeed()
+{
+    FastRandomContext rng;
+    const auto* hooks = m_https_seed_test_hooks;
+    const auto worker_now = [&] { return hooks && hooks->now ? hooks->now() : qq::Clock::now(); };
+    auto next_round = worker_now();
+    if (addrman.Size()) {
+        next_round += addrman.Size() >= DNSSEEDS_DELAY_PEER_THRESHOLD ?
+            std::chrono::seconds{DNSSEEDS_DELAY_MANY_PEERS} : DNSSEEDS_DELAY_FEW_PEERS;
+    }
+    bool startup{true};
+    while (!interruptNet) {
+        if (!(hooks && hooks->wait ? hooks->wait() : interruptNet.sleep_for(1s))) return;
+        const bool ipv4 = g_reachable_nets.Contains(NET_IPV4);
+        const bool ipv6 = g_reachable_nets.Contains(NET_IPV6);
+        httpsseed::Policy policy{m_params.GetChainType() == ChainType::MAIN,
+            m_https_seed_enabled, gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED),
+            gArgs.GetBoolArg("-dns", DEFAULT_NAME_LOOKUP), m_use_addrman_outgoing,
+            fNetworkActive, nMaxConnections, ipv4, ipv6};
+        if (!httpsseed::Enabled(policy)) continue;
+        const auto now = worker_now();
+        if (now < next_round) continue;
+        int connected{0};
+        ForEachNode([&](CNode* node) { if (node->IsFullOutboundConn()) ++connected; });
+        const bool deficit = GetQQStatus().deficit > 0;
+        if (connected > 0 && !deficit && (!startup || connected >= 2)) {
+            startup = false;
+            continue;
+        }
+        startup = false;
+        next_round = now + qq::DNS_COOLDOWN + std::chrono::seconds{rng.randrange(300)};
+        httpsseed::TransportOptions options;
+        options.ipv4 = ipv4;
+        options.ipv6 = ipv6;
+        options.user_agent = "Blackcoin-Core/" + FormatFullVersion() + " HTTPSSeed/1";
+        Proxy proxy, proxy4, proxy6;
+        if (GetNameProxy(proxy)) {
+            options.proxy = proxy;
+        } else {
+            const bool via4 = ipv4 && GetProxy(NET_IPV4, proxy4);
+            const bool via6 = ipv6 && GetProxy(NET_IPV6, proxy6);
+            // Do not invent a direct route for an ambiguous proxy topology.
+            if (ipv4 && ipv6 && (via4 != via6 || (via4 &&
+                (proxy4.proxy != proxy6.proxy || proxy4.randomize_credentials != proxy6.randomize_credentials)))) {
+                LogPrint(BCLog::NET, "HTTPS discovery skipped: mixed proxy routes\n");
+                continue;
+            }
+            if (via4 || via6) options.proxy = via4 ? proxy4 : proxy6;
+        }
+        policy.explicit_onlynet = gArgs.IsArgSet("-onlynet");
+        policy.hostname_proxy = options.proxy.has_value();
+        if (!httpsseed::Enabled(policy)) {
+            LogPrint(BCLog::NET, "HTTPS discovery skipped: proxy cannot enforce explicit origin IP family\n");
+            continue;
+        }
+        const auto generation = m_https_seed_generation.load();
+        const auto cancelled = [&] { return interruptNet || !fNetworkActive ||
+            m_https_seed_generation.load() != generation; };
+        const auto response = hooks && hooks->fetch ? hooks->fetch(options, cancelled) : httpsseed::Fetch(options, cancelled);
+        if (!response.success) {
+            LogPrint(BCLog::NET, "HTTPS discovery failed: %s\n", response.error);
+            continue;
+        }
+        const auto parsed = httpsseed::Parse(response.body, TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()),
+            m_netgroupman, ipv4, ipv6, [](const CNetAddr& address) { return IsLocal(CService{address, 0}); });
+        if (!parsed.valid) {
+            LogPrint(BCLog::NET, "HTTPS discovery rejected: %s\n", parsed.error);
+            continue;
+        }
+        CNetAddr source;
+        if (!source.SetInternal("httpsseed.projectblackcoin.org/v1")) continue;
+        {
+            LOCK(m_https_seed_mutex);
+            if (cancelled()) continue;
+            // Only address hints enter addrman. Live QQ state is P2P-owned.
+            addrman.Add(parsed.peers, source);
+        }
+        LogPrint(BCLog::NET, "HTTPS discovery round: hints=%u qq_deficit=%d outage=%d\n",
+            parsed.peers.size(), deficit, connected == 0);
+    }
+}
+
 void CConnman::ThreadDNSAddressSeed()
 {
     FastRandomContext rng;
@@ -3117,13 +3201,13 @@ void Discover()
 void CConnman::SetNetworkActive(bool active)
 {
     LogPrintf("%s: %s\n", __func__, active);
-
-    if (fNetworkActive == active) {
-        return;
+    {
+        LOCK(m_https_seed_mutex);
+        if (fNetworkActive == active) return;
+        // A quick false->true toggle must still invalidate the older transfer.
+        ++m_https_seed_generation;
+        fNetworkActive = active;
     }
-
-    fNetworkActive = active;
-
     if (m_client_interface) {
         m_client_interface->NotifyNetworkActiveChanged(fNetworkActive);
     }
@@ -3270,6 +3354,14 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
     else
         threadDNSAddressSeed = std::thread(&util::TraceThread, "dnsseed", [this] { ThreadDNSAddressSeed(); });
 
+    if (m_https_seed_enabled && m_params.GetChainType() == ChainType::MAIN && m_use_addrman_outgoing && nMaxConnections > 0) {
+        if (httpsseed::InitializeTransport()) {
+            threadHTTPSAddressSeed = std::thread(&util::TraceThread, "httpsseed", [this] { ThreadHTTPSAddressSeed(); });
+        } else {
+            LogPrintf("HTTPS discovery unavailable: TLS transport initialization failed\n");
+        }
+    }
+
     // Initiate manual connections
     threadOpenAddedConnections = std::thread(&util::TraceThread, "addcon", [this] { ThreadOpenAddedConnections(); });
 
@@ -3351,6 +3443,8 @@ void CConnman::StopThreads()
         threadOpenConnections.join();
     if (threadOpenAddedConnections.joinable())
         threadOpenAddedConnections.join();
+    if (threadHTTPSAddressSeed.joinable())
+        threadHTTPSAddressSeed.join();
     if (threadDNSAddressSeed.joinable())
         threadDNSAddressSeed.join();
     if (threadSocketHandler.joinable())

@@ -107,7 +107,9 @@ jobs:
 
       - name: Verify dependency, advisory, capability, and provenance evidence
         if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
-        run: python3 ci/release/verify_dependency_security.py
+        run: |
+          python3 ci/release/verify_dependency_security.py
+          python3 share/httpsseed/generate_header.py --check
 
       - name: Install lint dependencies
         if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
@@ -231,7 +233,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            automake bison build-essential cmake gettext gperf libtool \
+            automake bison build-essential cmake gettext gperf perl libtool \
             pkg-config python3 python3-zmq ccache
 
       - name: Reuse targeted native compiler and dependency cache
@@ -410,7 +412,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            automake bison build-essential cmake gettext gperf libtool \
+            automake bison build-essential cmake gettext gperf perl libtool \
             pkg-config python3
 
       - name: Restore pinned native dependency cache
@@ -436,7 +438,7 @@ jobs:
         run: |
           set -euo pipefail
           make -C src -j "$MAKEJOBS" test/test_blackcoin bench/bench_blackcoin
-          for suite in dbwrapper_tests crypto_hardening_tests demurrage_tests shadow_tests; do
+          for suite in dbwrapper_tests crypto_hardening_tests demurrage_tests shadow_tests https_seed_tests net_tests netbase_tests addrman_tests; do
             src/test/test_blackcoin --run_test="$suite" --log_level=test_suite
           done
 
@@ -506,7 +508,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            automake bison build-essential cmake gettext gperf libtool \
+            automake bison build-essential cmake gettext gperf perl libtool \
             pkg-config python3
 
       - name: Restore pinned native dependency cache
@@ -567,7 +569,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            automake bison build-essential cmake gettext gperf libtool \
+            automake bison build-essential cmake gettext gperf perl libtool \
             pkg-config python3 g++-mingw-w64-x86-64-posix
 
       - name: Build pinned Windows dependencies
@@ -652,7 +654,7 @@ jobs:
             --source-sha "$TARGET_SHA" \
             --repository "$GITHUB_REPOSITORY" \
             --expected-manifest ci/scratch/windows-native-inputs.json
-          for suite in dbwrapper_tests crypto_hardening_tests demurrage_tests shadow_tests; do
+          for suite in dbwrapper_tests crypto_hardening_tests demurrage_tests shadow_tests https_seed_tests net_tests netbase_tests addrman_tests; do
             src/test/test_blackcoin.exe \
               --run_test="$suite" --log_level=test_suite
           done
@@ -744,7 +746,7 @@ jobs:
       - name: Compile and run cryptographic and monetary vectors
         run: |
           make -C src -j 2 test/test_blackcoin bench/bench_blackcoin
-          for suite in crypto_hardening_tests demurrage_tests shadow_tests; do
+          for suite in crypto_hardening_tests demurrage_tests shadow_tests https_seed_tests net_tests netbase_tests addrman_tests; do
             src/test/test_blackcoin --run_test="$suite" --log_level=test_suite
           done
 
@@ -881,7 +883,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            automake bison build-essential cmake gettext gperf libtool \
+            automake bison build-essential cmake gettext gperf perl libtool \
             pkg-config python3 python3-zmq
 
       - name: Build and verify historical binaries

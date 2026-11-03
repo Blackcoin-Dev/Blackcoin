@@ -24,6 +24,35 @@ struct ConnmanTestMsg : public CConnman {
     using CConnman::AddAddrFetch;
     using CConnman::ProcessAddrFetch;
 
+    void StartHTTPSForTest(const httpsseed::WorkerHooks& hooks)
+    {
+        m_https_seed_test_hooks = &hooks;
+        interruptNet.reset();
+        threadHTTPSAddressSeed = std::thread([this] { ThreadHTTPSAddressSeed(); });
+    }
+
+    bool HTTPSInterruptedForTest() const { return bool{interruptNet}; }
+
+    void StartHTTPSAutomaticConnectionsForTest()
+    {
+        semOutbound = std::make_unique<CSemaphore>(m_max_outbound);
+        threadOpenConnections = std::thread([this] { ThreadOpenConnections({}); });
+    }
+
+    CNode* FindHTTPSNodeForTest(const std::string& endpoint)
+    {
+        LOCK(m_nodes_mutex);
+        for (auto* node : m_nodes) if (node->addr.ToStringAddrPort() == endpoint) return node;
+        return nullptr;
+    }
+
+    void StopHTTPSForTest()
+    {
+        Interrupt();
+        StopThreads();
+        m_https_seed_test_hooks = nullptr;
+    }
+
     void InitAddrFetchTest()
     {
         semOutbound = std::make_unique<CSemaphore>(1);

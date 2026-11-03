@@ -19,6 +19,8 @@ You can find installation instructions in the `build-*.md` file for your platfor
 | --- | --- | --- | --- | --- |
 | [Boost](../depends/packages/boost.mk) | [link](https://www.boost.org/users/download/) | [1.81.0](https://github.com/bitcoin/bitcoin/pull/26557) | [1.64.0](https://github.com/bitcoin/bitcoin/pull/22320) | No |
 | [libevent](../depends/packages/libevent.mk) | [link](https://github.com/libevent/libevent/releases) | [2.1.12-stable](https://github.com/bitcoin/bitcoin/pull/21991) | [2.1.8](https://github.com/bitcoin/bitcoin/pull/24681) | No |
+| [libcurl](../depends/packages/curl.mk) (node HTTPS bootstrap) | [link](https://curl.se/download.html) | 8.23.0 | 7.77.0 API floor | No (static in depends) |
+| [OpenSSL](../depends/packages/openssl.mk) (libcurl TLS backend) | [link](https://openssl-library.org/source/) | 3.5.9 LTS | 3.5.9 for pinned builds | No (static in depends) |
 | glibc | [link](https://www.gnu.org/software/libc/) | N/A | [2.27](https://github.com/bitcoin/bitcoin/pull/27029) | Yes |
 | Linux Kernel | [link](https://www.kernel.org/) | N/A | [3.17.0](https://github.com/bitcoin/bitcoin/pull/27699) | Yes |
 
@@ -48,3 +50,16 @@ You can find installation instructions in the `build-*.md` file for your platfor
 | --- | --- | --- | --- | --- |
 | [Berkeley DB](../depends/packages/bdb.mk) (legacy wallet) | [link](https://www.oracle.com/technetwork/database/database-technologies/berkeleydb/downloads/index.html) | 4.8.30 | 4.8.x | No |
 | [SQLite](../depends/packages/sqlite.mk) | [link](https://sqlite.org) | [3.38.5](https://github.com/bitcoin/bitcoin/pull/25378) | [3.7.17](https://github.com/bitcoin/bitcoin/pull/19077) | No |
+
+Node builds (daemon, Qt, tests, benchmarks and fuzz targets) require libcurl with
+OpenSSL. RPC-only CLI builds do not require libcurl. Release builds use the
+pinned static `curl` and `openssl` recipes on Linux, macOS and Windows; Perl
+5.10 or newer is a build tool for OpenSSL. The 7.77.0 curl floor identifies the
+embedded-CA API, not a recommended security baseline for host libraries.
+
+The HTTPS seed trust store is the checked-in Mozilla snapshot in
+`share/httpsseed/ca-bundle.pem`, embedded byte-for-byte in `src/httpsseed_ca.h`.
+Its dated upstream URL, SHA-256, licenses and maintenance procedure are in
+[share/httpsseed/README.md](../share/httpsseed/README.md). The depends curl has
+no default CA file/directory or native trust fallback, no threaded resolver,
+no compression, and only HTTP/HTTPS protocols plus SOCKS proxy support.

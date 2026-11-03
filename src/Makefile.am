@@ -209,6 +209,9 @@ BITCOIN_CORE_H = \
   memusage.h \
   merkleblock.h \
   net.h \
+  net_https_seed.h \
+  https_seed_client.h \
+  httpsseed_ca.h \
   qq_policy.h \
   net_permissions.h \
   net_processing.h \
@@ -402,7 +405,7 @@ libbitcoin_util_a-clientversion.$(OBJEXT): obj/build.h
 bitcoind-res.$(OBJEXT): obj/build.h
 
 # node #
-libbitcoin_node_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(LEVELDB_CPPFLAGS) $(BOOST_CPPFLAGS) $(MINIUPNPC_CPPFLAGS) $(NATPMP_CPPFLAGS) $(EVENT_CFLAGS) $(EVENT_PTHREADS_CFLAGS)
+libbitcoin_node_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(LEVELDB_CPPFLAGS) $(BOOST_CPPFLAGS) $(MINIUPNPC_CPPFLAGS) $(NATPMP_CPPFLAGS) $(EVENT_CFLAGS) $(EVENT_PTHREADS_CFLAGS) $(CURL_CFLAGS)
 libbitcoin_node_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 libbitcoin_node_a_SOURCES = \
   addrdb.cpp \
@@ -436,6 +439,8 @@ libbitcoin_node_a_SOURCES = \
   kernel/mempool_removal_reason.cpp \
   mapport.cpp \
   net.cpp \
+  net_https_seed.cpp \
+  https_seed_client.cpp \
   net_processing.cpp \
   netgroup.cpp \
   node/abort.cpp \
@@ -859,7 +864,7 @@ blackcoin_bin_ldadd = \
   $(LIBMEMENV) \
   $(LIBSECP256K1)
 
-blackcoin_bin_ldadd += $(BDB_LIBS) $(MINIUPNPC_LIBS) $(NATPMP_LIBS) $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(ZMQ_LIBS) $(SQLITE_LIBS) $(LIBOQS_LIBS)
+blackcoin_bin_ldadd += $(CURL_LIBS) $(BDB_LIBS) $(MINIUPNPC_LIBS) $(NATPMP_LIBS) $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(ZMQ_LIBS) $(SQLITE_LIBS) $(LIBOQS_LIBS)
 
 blackcoind_SOURCES = $(blackcoin_daemon_sources) init/bitcoind.cpp
 blackcoind_CPPFLAGS = $(blackcoin_bin_cppflags)
@@ -938,7 +943,8 @@ blackcoin_wallet_LDADD = \
   $(LIBSECP256K1) \
   $(BDB_LIBS) \
   $(SQLITE_LIBS) \
-  $(LIBOQS_LIBS)
+  $(LIBOQS_LIBS) \
+  $(CURL_LIBS)
 
 if TARGET_WINDOWS
 blackcoin_wallet_SOURCES += bitcoin-wallet-res.rc

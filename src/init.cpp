@@ -535,6 +535,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-dns", strprintf("Allow DNS lookups for -addnode, -seednode and -connect (default: %u)", DEFAULT_NAME_LOOKUP), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-dnsseed", strprintf("Query for peer addresses via DNS lookup, if low on addresses (default: %u unless -connect used or -maxconnections=0)", DEFAULT_DNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-externalip=<ip>", "Specify your own public address", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-httpsseed", "Fetch bounded peer hints from the mainnet HTTPS directory (default: 1; disabled by -dnsseed=0, -dns=0, -connect, -maxconnections=0 or non-IP-only networks)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-fixedseeds", strprintf("Allow fixed seeds if DNS seeds don't provide peers (default: %u)", DEFAULT_FIXEDSEEDS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-forcednsseed", strprintf("Always query for peer addresses via DNS lookup (default: %u)", DEFAULT_FORCEDNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listen", strprintf("Accept connections from outside (default: %u if no -proxy, -connect or -maxconnections=0)", DEFAULT_LISTEN), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -2244,6 +2245,7 @@ static bool AppInitMainImpl(NodeContext& node,
     }
 
     connOptions.vSeedNodes = args.GetArgs("-seednode");
+    connOptions.m_https_seed = args.GetBoolArg("-httpsseed", true);
 
     // Initiate outbound connections unless connect=0
     connOptions.m_use_addrman_outgoing = !args.IsArgSet("-connect");

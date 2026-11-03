@@ -50,6 +50,8 @@
 #include <unordered_set>
 #include <vector>
 
+namespace httpsseed { struct WorkerHooks; }
+
 class AddrMan;
 class BanMan;
 class CChainParams;
@@ -1076,6 +1078,7 @@ public:
         /// we should bind on `0.0.0.0` (IPv4) and `::` (IPv6).
         bool bind_on_any;
         bool m_use_addrman_outgoing = true;
+        bool m_https_seed{true};
         std::vector<std::string> m_specified_outgoing;
         std::vector<std::string> m_added_nodes;
         bool m_i2p_accept_incoming;
@@ -1093,6 +1096,7 @@ public:
         m_qq_target = qq::EffectiveTarget(m_qq_requested_target, m_max_outbound_full_relay);
         PublishQQStatus(0, 0, false, "initializing");
         m_use_addrman_outgoing = connOptions.m_use_addrman_outgoing;
+        m_https_seed_enabled = connOptions.m_https_seed;
         nMaxAddnode = connOptions.nMaxAddnode;
         nMaxFeeler = connOptions.nMaxFeeler;
         m_max_outbound = m_max_outbound_full_relay + m_max_outbound_block_relay + nMaxFeeler;
@@ -1396,6 +1400,7 @@ private:
     void SocketHandlerListening(const Sock::EventsPerSock& events_per_sock);
 
     void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex);
+    void ThreadHTTPSAddressSeed() EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_https_seed_mutex);
     void ThreadDNSAddressSeed() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_nodes_mutex);
 
     uint64_t CalculateKeyedNetGroup(const CAddress& ad) const;
@@ -1593,6 +1598,11 @@ private:
      */
     std::unique_ptr<i2p::sam::Session> m_i2p_sam_session;
 
+    // Serialize network disable with final directory admission; never held during I/O.
+    Mutex m_https_seed_mutex;
+    std::atomic<uint64_t> m_https_seed_generation{0};
+    bool m_https_seed_enabled{false};
+    std::thread threadHTTPSAddressSeed;
     std::thread threadDNSAddressSeed;
     std::thread threadSocketHandler;
     std::thread threadOpenAddedConnections;
@@ -1699,6 +1709,9 @@ private:
     };
 
     const CChainParams& m_params;
+
+    // Test fixture is the sole installer; production always leaves this null.
+    const httpsseed::WorkerHooks* m_https_seed_test_hooks{nullptr};
 
     friend struct ConnmanTestMsg;
 };

@@ -369,7 +369,7 @@ jobs:
       - name: Install packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends make automake cmake curl g++ libtool gperf binutils-gold bsdmainutils pkg-config python3 patch bison lbzip2 xz-utils libxml2-utils gettext xutils-dev
+          sudo apt-get install -y --no-install-recommends make automake cmake curl g++ perl libtool gperf binutils-gold bsdmainutils pkg-config python3 patch bison lbzip2 xz-utils libxml2-utils gettext xutils-dev
           sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
           if command -v pkg-config >/dev/null && ! command -v "${{ matrix.host }}-pkg-config" >/dev/null; then
             sudo ln -s "$(command -v pkg-config)" "/usr/local/bin/${{ matrix.host }}-pkg-config"

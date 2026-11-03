@@ -9,9 +9,33 @@
   },
   "package_index_recipe": {
     "path": "depends/packages/packages.mk",
-    "sha256": "1cfa8f7fd8a23a35b55ee0b2fd4ed0ed7852a2c9e34bc2ff60d837efa0436e1c"
+    "sha256": "46945410b68892c96f28ab611ffab1ad8af35baf600f83c2c3e52254506a08f4"
   },
   "dependencies": [
+    {
+      "package": "curl",
+      "recipe": "depends/packages/curl.mk",
+      "recipe_sha256": "d9767e62a43a1f886334e65b97ec0f09b04903180967af652b4e75489c14f98d",
+      "version": "8.23.0",
+      "sources": [
+        {
+          "url": "https://curl.se/download/curl-8.23.0.tar.xz",
+          "sha256": "8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5"
+        }
+      ]
+    },
+    {
+      "package": "openssl",
+      "recipe": "depends/packages/openssl.mk",
+      "recipe_sha256": "2c45bc544ccd55367af3906deb3b845b2630fd284ffb1266a288167a0bb3df95",
+      "version": "3.5.9",
+      "sources": [
+        {
+          "url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+          "sha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+        }
+      ]
+    },
     {
       "package": "bdb",
       "recipe": "depends/packages/bdb.mk",
@@ -294,6 +318,18 @@
     }
   ],
   "dependency_delta": [
+    {
+      "package": "curl",
+      "v30_1_0": "not-built",
+      "active_legacy": null,
+      "candidate": "8.23.0"
+    },
+    {
+      "package": "openssl",
+      "v30_1_0": "not-built",
+      "active_legacy": null,
+      "candidate": "3.5.9"
+    },
     {"package": "bdb", "v30_1_0": "6.2.38", "active_legacy": "6.2.38", "candidate": "6.2.38"},
     {"package": "boost", "v30_1_0": "1.81.0", "active_legacy": "1.81.0", "candidate": "1.81.0"},
     {"package": "capnp", "v30_1_0": "0.7.0", "active_legacy": "1.0.1", "candidate": "0.7.1"},
@@ -372,6 +408,41 @@
     }
   ],
   "build_constraints": {
+    "curl": {
+      "required": [
+        "$(package)_dependencies=openssl",
+        "--disable-shared",
+        "--with-openssl=$(host_prefix)",
+        "--disable-threaded-resolver",
+        "--disable-ares",
+        "--without-ca-bundle",
+        "--without-ca-path",
+        "--without-ca-fallback",
+        "--disable-ca-native",
+        "--disable-openssl-auto-load-config",
+        "--without-zlib",
+        "--without-brotli",
+        "--without-zstd",
+        "--without-nghttp2",
+        "--without-nghttp3",
+        "--disable-doh",
+        "--disable-ftp",
+        "--disable-file",
+        "--disable-alt-svc",
+        "--disable-hsts"
+      ]
+    },
+    "openssl": {
+      "required": [
+        "no-shared",
+        "no-module",
+        "no-dso",
+        "no-engine",
+        "no-autoload-config",
+        "no-pinshared",
+        "no-zlib"
+      ]
+    },
     "liboqs": {
       "required": [
         "-DBUILD_SHARED_LIBS=OFF",
@@ -398,6 +469,20 @@
     }
   },
   "dependency_advisories": [
+    {
+      "id": "CVE-2026-92392",
+      "package": "curl",
+      "disposition": "mitigated",
+      "reason": "Pinned curl 8.23.0 contains the upstream fix; HTTP/2 is also excluded from the bootstrap curl build. Security table and current release checked 2026-11-03 UTC.",
+      "source": "https://curl.se/docs/CVE-2026-92392.html"
+    },
+    {
+      "id": "CVE-2026-35189",
+      "package": "openssl",
+      "disposition": "mitigated",
+      "reason": "Pinned OpenSSL 3.5.9 includes the upstream fix. Current 3.5 LTS release and published security notices checked 2026-11-03 UTC.",
+      "source": "https://openssl-library.org/news/vulnerabilities/#CVE-2026-35189"
+    },
     {"id": "CVE-2022-46149", "package": "native_capnp", "disposition": "mitigated", "reason": "0.7.1 is the fixed 0.7-series release.", "source": "https://capnproto.org/news/2022-11-30-CVE-2022-46149-security-advisory.html"},
     {"id": "CVE-2024-52917", "package": "miniupnpc", "disposition": "mitigated", "reason": "The infinite-loop fix predates pinned 2.3.3.", "source": "https://bitcoincore.org/en/2024/07/31/disclose-upnp-oom/"},
     {"id": "GHSA-qq65-x72m-9wr8,GHSA-4p5v-h92w-6wxw,GHSA-wfr2-29gj-5w87,GHSA-25wp-cf8g-938m,GHSA-fc3w-qxf5-7hp6", "package": "zeromq", "disposition": "mitigated", "reason": "All five upstream advisories list 4.3.3 as patched; the pin is 4.3.5.", "source": "https://github.com/zeromq/libzmq/security/advisories"},
@@ -454,5 +539,13 @@
     "restored_count": 664,
     "excluded_count": 11,
     "ambiguous_count": 641
+  },
+  "httpsseed_tls_review": {
+    "date": "2026-11-03",
+    "provenance": "share/httpsseed/provenance.json",
+    "curl_security": "https://curl.se/docs/security.html",
+    "openssl_security": "https://openssl-library.org/news/vulnerabilities/",
+    "ca_bundle_sha256": "796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe",
+    "note": "New native bootstrap closure; optional Qt TLS remains disabled. Recipes disable default CA paths, native trust, threaded DNS and automatic OpenSSL configuration. Cross-target qualification remains separately required."
   }
 }

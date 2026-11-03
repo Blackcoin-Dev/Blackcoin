@@ -48,7 +48,7 @@ See [dependencies.md](dependencies.md) for a complete overview.
 To install, run the following from your terminal:
 
 ``` bash
-brew install automake libtool boost pkg-config libevent
+brew install automake libtool boost pkg-config libevent curl openssl@3
 ```
 
 Blackcoin V4 release binaries must use the pinned `liboqs` build supplied by
@@ -273,3 +273,18 @@ tail -f $HOME/Library/Application\ Support/Blackcoin/debug.log
 ./src/blackcoin-cli help      # Outputs a list of RPC commands when the daemon is running.
 ./src/qt/blackcoin-qt -server # Starts the blackcoin-qt server mode, allows blackcoin-cli control
 ```
+
+### Native HTTPS bootstrap dependencies
+
+Release builds use the static `curl` and `openssl` packages in `depends`, on
+both Intel and Apple Silicon. They are required for daemon and Qt node builds.
+OpenSSL uses the system Perl (5.10 or newer); no QtNetwork TLS dependency is
+introduced. For local builds using Homebrew dependencies, prefer its
+OpenSSL-backed curl over the Apple system curl:
+
+```sh
+export PKG_CONFIG_PATH="$(brew --prefix curl)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+```
+
+The reviewed CA snapshot is compiled into the binary. See
+[trust maintenance](../share/httpsseed/README.md).

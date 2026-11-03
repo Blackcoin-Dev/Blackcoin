@@ -1632,6 +1632,37 @@ if test x$use_libevent = xyes; then
   CXXFLAGS="$TEMP_CXXFLAGS"
 fi
 
+dnl Native HTTPS bootstrap is shared by the daemon and optional Qt node.
+dnl RPC-only CLI builds do not gain this dependency. Static pkg-config includes
+dnl OpenSSL and platform transitive libraries, also when cross-compiling.
+if test "$build_bitcoind$bitcoin_enable_qt$enable_fuzz_binary$use_tests$use_bench" != "nonononono"; then
+  PKG_CHECK_MODULES_STATIC([CURL], [libcurl >= 7.77.0], [], [AC_MSG_ERROR([libcurl >= 7.77.0 with the OpenSSL backend is required for node HTTPS bootstrap. Build the pinned depends curl/OpenSSL packages.])])
+  TEMP_CPPFLAGS="$CPPFLAGS"
+  TEMP_LIBS="$LIBS"
+  CPPFLAGS="$CPPFLAGS $CURL_CFLAGS"
+  LIBS="$CURL_LIBS $LIBS"
+  AC_MSG_CHECKING([for libcurl embedded CA and cancellable multi APIs])
+  AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+    #include <curl/curl.h>
+  ]], [[
+    CURL* easy = curl_easy_init();
+    CURLM* multi = curl_multi_init();
+    curl_blob ca = {nullptr, 0, CURL_BLOB_COPY};
+    curl_easy_setopt(easy, CURLOPT_CAINFO_BLOB, &ca);
+    curl_easy_setopt(easy, CURLOPT_RESOLVE, nullptr);
+    curl_easy_setopt(easy, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
+    int ready = 0;
+    curl_multi_poll(multi, nullptr, 0, 0, &ready);
+    curl_multi_cleanup(multi);
+    curl_easy_cleanup(easy);
+  ]])], [AC_MSG_RESULT([yes])], [AC_MSG_ERROR([libcurl lacks required HTTPS bootstrap APIs or static transitive link libraries])])
+  CPPFLAGS="$TEMP_CPPFLAGS"
+  LIBS="$TEMP_LIBS"
+  if test "$suppress_external_warnings" != "no"; then
+    CURL_CFLAGS=SUPPRESS_WARNINGS($CURL_CFLAGS)
+  fi
+fi
+
 dnl QR Code encoding library check
 
 if test "$use_qr" != "no"; then

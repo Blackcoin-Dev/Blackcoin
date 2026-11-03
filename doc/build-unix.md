@@ -48,7 +48,7 @@ Build requirements:
 
 Now, you can either build from self-compiled [depends](#dependencies) or install the required dependencies:
 
-    sudo apt-get install libevent-dev libboost-dev
+    sudo apt-get install libevent-dev libboost-dev libcurl4-openssl-dev perl
 
 SQLite is required for the descriptor wallet:
 
@@ -105,7 +105,7 @@ Build requirements:
 
 Now, you can either build from self-compiled [depends](#dependencies) or install the required dependencies:
 
-    sudo dnf install libevent-devel boost-devel openssl-devel
+    sudo dnf install libevent-devel boost-devel libcurl-devel openssl-devel perl
 
 SQLite is required for the descriptor wallet:
 
@@ -222,7 +222,7 @@ Setup and Build Example: Arch Linux
 -----------------------------------
 This example lists the steps necessary to setup and build a command line only distribution of the latest changes on Arch Linux:
 
-    pacman --sync --needed autoconf automake boost gcc git libevent libtool make pkgconf python sqlite
+    pacman --sync --needed autoconf automake boost gcc git libevent curl openssl perl libtool make pkgconf python sqlite
     git clone https://github.com/CoinBlack/blackcoin-more.git
     cd blackcoin-more/
     ./autogen.sh
@@ -231,3 +231,19 @@ This example lists the steps necessary to setup and build a command line only di
     ./src/blackcoind
 
 If you intend to work with legacy Berkeley DB wallets, see [Berkeley DB](#berkeley-db) section.
+
+### Native HTTPS bootstrap dependencies
+
+Release and reproducible node builds use the pinned static curl/OpenSSL closure:
+
+```sh
+make -C depends HOST="$(depends/config.guess)" NO_QT=1
+./configure --prefix="$PWD/depends/$(depends/config.guess)" --with-gui=no
+```
+
+Omit `NO_QT=1` and `--with-gui=no` for the optional GUI. OpenSSL requires Perl
+5.10 or newer at build time. For local development, the distribution's current
+OpenSSL-backed libcurl development package may be used; an API version of at
+least 7.77.0 is required. Release binaries must use the depends pins. The trust
+snapshot is compiled into the node; builds and installed nodes do not download
+a trust store. See [trust maintenance](../share/httpsseed/README.md).

@@ -15,7 +15,7 @@
     {
       "package": "curl",
       "recipe": "depends/packages/curl.mk",
-      "recipe_sha256": "d9767e62a43a1f886334e65b97ec0f09b04903180967af652b4e75489c14f98d",
+      "recipe_sha256": "59dc16174a2ef6471b0bb5414f53aa70e58789f2fe6c2106b1b89ef951165fab",
       "version": "8.23.0",
       "sources": [
         {

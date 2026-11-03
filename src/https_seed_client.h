@@ -32,6 +32,14 @@ bool InitializeTransport();
 bool SupportedBackend(uint32_t version, bool has_tls, std::string_view backend);
 FetchResult Fetch(const TransportOptions& options, const Cancel& cancelled);
 
+/** Friend-only worker seam. Installed before a test thread starts and removed
+ * after join. No production argument, RPC, network or trust override selects it. */
+struct WorkerHooks {
+    std::function<std::chrono::steady_clock::time_point()> now;
+    std::function<bool()> wait;
+    std::function<FetchResult(const TransportOptions&, const Cancel&)> fetch;
+};
+
 namespace test {
 /** C++ harness injection only. Production has no URL/CA/deadline override argument. */
 struct Endpoint {
@@ -46,4 +54,4 @@ struct Endpoint {
 FetchResult Fetch(const TransportOptions& options, const Cancel& cancelled, const Endpoint& endpoint);
 } // namespace test
 } // namespace httpsseed
-#endif
+#endif // BITCOIN_HTTPS_SEED_CLIENT_H

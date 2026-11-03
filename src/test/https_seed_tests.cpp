@@ -6,6 +6,7 @@
 #include <netmessagemaker.h>
 #include <test/util/net.h>
 #include <util/time.h>
+#include <util/string.h>
 #include <version.h>
 #include <net_https_seed.h>
 #include <netgroup.h>
@@ -366,7 +367,7 @@ public:
 };
 std::string Reply(const std::string& body = "{}")
 {
-    return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+    return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + ToString(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
 }
 httpsseed::TransportOptions Options()
 {
@@ -481,7 +482,7 @@ BOOST_AUTO_TEST_CASE(direct_dns_total_deadline_and_cancellation)
         auto endpoint = server.Endpoint();
         endpoint.numeric_addresses.clear();
         endpoint.hostname = "seed.bootstrap.test";
-        endpoint.dns_server = "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+        endpoint.dns_server = "127.0.0.1:" + ToString(ntohs(address.sin_port));
         endpoint.timeout = std::chrono::milliseconds{250};
         const auto start = TestClock::now();
         auto result = httpsseed::test::Fetch(Options(), [&] { return cancel && TestClock::now() - start >= std::chrono::milliseconds{75}; }, endpoint);
@@ -521,7 +522,7 @@ public:
 BOOST_AUTO_TEST_CASE(environment_cannot_override_core_proxy_policy)
 {
     LocalTLS unwanted{Reply(), false, false, true};
-    const std::string poison = "socks5h://127.0.0.1:" + std::to_string(unwanted.port);
+    const std::string poison = "socks5h://127.0.0.1:" + ToString(unwanted.port);
     ScopedEnvironment https_proxy{"HTTPS_PROXY", poison}, all_proxy{"ALL_PROXY", poison};
     ScopedEnvironment no_proxy{"NO_PROXY", "*"}, no_proxy_lower{"no_proxy", "*"};
     LocalTLS direct{Reply()};
@@ -738,7 +739,7 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_https_addrman_automatic_peer, TestingSetu
     SocketFactoryScope factory;
     std::atomic<unsigned> correct_attempts{0}, unexpected_attempts{0}, fetches{0};
     CreateSock = [&](const CService& address) -> std::unique_ptr<Sock> {
-        if (address.ToStringAddrPort() != "8.8.8.8:" + std::to_string(port)) { ++unexpected_attempts; return nullptr; }
+        if (address.ToStringAddrPort() != "8.8.8.8:" + ToString(port)) { ++unexpected_attempts; return nullptr; }
         ++correct_attempts;
         return std::make_unique<RedirectSocket>(port);
     };
@@ -756,7 +757,7 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_https_addrman_automatic_peer, TestingSetu
     connman.StartHTTPSAutomaticConnectionsForTest();
     CNode* learned{nullptr};
     BOOST_REQUIRE(Eventually([&] {
-        learned = connman.FindHTTPSNodeForTest("8.8.8.8:" + std::to_string(port));
+        learned = connman.FindHTTPSNodeForTest("8.8.8.8:" + ToString(port));
         return learned != nullptr;
     }));
     BOOST_CHECK(correct_attempts > 0);

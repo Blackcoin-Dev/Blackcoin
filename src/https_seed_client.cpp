@@ -7,6 +7,7 @@
 #include <net_https_seed.h>
 #include <random.h>
 #include <util/strencodings.h>
+#include <util/string.h>
 
 #include <curl/curl.h>
 #include <event2/dns.h>
@@ -116,7 +117,7 @@ std::string LowerTrim(std::string_view text)
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
     while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' || text.back() == '\n')) text.remove_suffix(1);
     std::string lower{text};
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return ToLower(c); });
     return lower;
 }
 
@@ -175,7 +176,7 @@ FetchResult FetchConfigured(const TransportOptions& options, const Cancel& cance
     if (!easy || !multi) return fail("allocation");
     std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> resolution{nullptr, curl_slist_free_all};
     if (!options.proxy) {
-        std::string mapping = endpoint.hostname + ':' + std::to_string(endpoint.port) + ':';
+        std::string mapping = endpoint.hostname + ':' + ToString(endpoint.port) + ':';
         for (size_t i = 0; i < addresses.size(); ++i) {
             // For tests loopback is intentional; production resolver already screened routability.
             in_addr v4{};
@@ -191,7 +192,7 @@ FetchResult FetchConfigured(const TransportOptions& options, const Cancel& cance
     }
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
     if (remaining <= 0) return fail("deadline");
-    const std::string url = "https://" + endpoint.hostname + ':' + std::to_string(endpoint.port) + endpoint.path;
+    const std::string url = "https://" + endpoint.hostname + ':' + ToString(endpoint.port) + endpoint.path;
     const std::string ca{endpoint.ca_bundle};
     curl_blob blob{const_cast<char*>(ca.data()), ca.size(), CURL_BLOB_COPY};
     Transfer transfer{cancelled, deadline, {}, 0, false, false, false};

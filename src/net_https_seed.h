@@ -3,7 +3,6 @@
 #ifndef BITCOIN_NET_HTTPS_SEED_H
 #define BITCOIN_NET_HTTPS_SEED_H
 
-#include <https_seed_client.h>
 #include <netaddress.h>
 #include <protocol.h>
 
@@ -46,12 +45,5 @@ ParseResult Parse(std::string_view body, int64_t now, const NetGroupManager& gro
                   const std::function<bool(const CNetAddr&)>& excluded = {});
 /** Canonical numeric public IP only; mapped/transition/scoped addresses are rejected. */
 bool ParsePublicAddress(std::string_view text, CNetAddr& address);
-/** Friend-only worker seam. Installed before a test thread starts and removed
- * after join. No production argument, RPC, network or trust override selects it. */
-struct WorkerHooks {
-    std::function<std::chrono::steady_clock::time_point()> now;
-    std::function<bool()> wait;
-    std::function<FetchResult(const TransportOptions&, const Cancel&)> fetch;
-};
 } // namespace httpsseed
-#endif
+#endif // BITCOIN_NET_HTTPS_SEED_H

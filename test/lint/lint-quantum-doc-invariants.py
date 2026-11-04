@@ -56,7 +56,7 @@ BETA2_RELEASE_CANDIDATE = 2
 FINAL_RELEASE_IDENTITY = (30, 1, 5, 1, 0, True)
 CANDIDATE_RELEASE_IDENTITY = (30, 1, 5, 2, 1, False)
 CURRENT_FINAL_RELEASE_IDENTITY = (30, 1, 5, 2, 0, True)
-DEVELOPMENT_RELEASE_IDENTITY = (30, 1, 5, 3, 1, False)
+DEVELOPMENT_RELEASE_BASE = (30, 1, 5, 3)
 BETA2_RELEASE_IDENTITY = (30, 1, 1, 0, BETA2_RELEASE_CANDIDATE, False)
 
 
@@ -934,9 +934,18 @@ def check_current_final_release_identity(root, failures):
                      "## v30.1.5.2\n", "final release entry")
 
 
+def is_development_release_identity(identity):
+    return identity[:4] == DEVELOPMENT_RELEASE_BASE and identity[4] > 0 and identity[5] is False
+
+
 def check_development_release_identity(root, failures):
     # Preserve historical source identities and notes; qualify this source separately.
-    check_final_release_identity(root, failures, DEVELOPMENT_RELEASE_IDENTITY)
+    identity = configured_release_identity(read_text(root, "configure.ac"))
+    if not is_development_release_identity(identity):
+        failures.append("configure.ac development identity requires 30.1.5.3 positive RC/false")
+        return
+    version = ".".join(map(str, identity[:4])) + f"rc{identity[4]}"
+    check_final_release_identity(root, failures, identity)
     workflow_relative = ".github/workflows/build.yml"
     workflow = read_text(root, workflow_relative)
     for fragment in (
@@ -962,7 +971,7 @@ def check_development_release_identity(root, failures):
         failures.append(f"{workflow_relative}: stale v30.1.5.2 release lock")
 
     overview = read_text(root, "doc/release-notes.md")
-    if not overview.startswith("30.1.5.3rc1 DEVELOPMENT Candidate Notes\n"):
+    if not overview.startswith(f"{version} DEVELOPMENT Candidate Notes\n"):
         failures.append("doc/release-notes.md: development candidate overview is not first")
     for relative, fragments in (
         ("doc/release-notes.md", (
@@ -971,7 +980,7 @@ def check_development_release_identity(root, failures):
             "30.1.5.2 Maintenance Release Notes",
         )),
         ("doc/release-notes/release-notes-30.1.5.3.md", (
-            "# Blackcoin Core 30.1.5.3rc1 (DEVELOPMENT, unreleased candidate)",
+            f"# Blackcoin Core {version} (DEVELOPMENT, unreleased candidate)",
             "RELEASE_NOTES_NOT_FINAL",
             "`CLIENT_VERSION_IS_RELEASE=false`",
             "Release qualification is pending.",
@@ -982,12 +991,12 @@ def check_development_release_identity(root, failures):
             "[release process](../release-process.md)",
         )),
         ("doc/release-process.md", (
-            "## Current v30.1.5.3rc1 DEVELOPMENT candidate",
+            f"## Current v{version} DEVELOPMENT candidate",
             "`V30.1.5.3` acknowledgement",
             "two isolated builders with byte comparison",
             "## v30.1.5.2 signed maintenance release (historical)",
         )),
-        ("CHANGELOG.md", ("## v30.1.5.3rc1 (DEVELOPMENT, unreleased candidate)",)),
+        ("CHANGELOG.md", (f"## v{version} (DEVELOPMENT, unreleased candidate)",)),
     ):
         text = read_text(root, relative)
         for fragment in fragments:
@@ -1073,7 +1082,7 @@ def check_release_identity(root, failures):
         check_candidate_release_identity(root, failures)
     elif identity == CURRENT_FINAL_RELEASE_IDENTITY:
         check_current_final_release_identity(root, failures)
-    elif identity == DEVELOPMENT_RELEASE_IDENTITY:
+    elif is_development_release_identity(identity):
         check_development_release_identity(root, failures)
     elif identity == BETA2_RELEASE_IDENTITY:
         check_beta2_release_identity(root, failures)
@@ -1082,7 +1091,7 @@ def check_release_identity(root, failures):
         failures.append(
             "configure.ac release identity must be historical final 30.1.5.1 RC0/true, "
             "candidate 30.1.5.2 RC1/false, final 30.1.5.2 RC0/true, "
-            "development 30.1.5.3 RC1/false, or "
+            "development 30.1.5.3 positive RC/false, or "
             f"replacement Beta 2 30.1.1 RC{BETA2_RELEASE_CANDIDATE}/false; found "
             f"{major}.{minor}.{build}.{revision} RC{rc}/{'true' if is_release else 'false'}"
         )

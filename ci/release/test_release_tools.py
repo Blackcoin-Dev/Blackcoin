@@ -5,6 +5,7 @@
 """Regression tests for fail-closed release metadata and identity tooling."""
 
 import copy
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -144,9 +145,11 @@ class ReleaseToolTests(unittest.TestCase):
             components.append(match.group(1))
         version = ".".join(components)
         self.assertEqual(version, "30.1.5.3")
-        self.assertIn("define(_CLIENT_VERSION_RC, 1)", configure)
+        rc = re.search(r"^define\(_CLIENT_VERSION_RC, ([0-9]+)\)$", configure, re.MULTILINE)
+        self.assertIsNotNone(rc)
+        self.assertGreater(int(rc.group(1)), 0)
         self.assertIn("define(_CLIENT_VERSION_IS_RELEASE, false)", configure)
-        version += "rc1"
+        version += f"rc{rc.group(1)}"
 
         manpages = sorted((root / "doc" / "man").glob("blackcoin*.1"))
         self.assertEqual(
@@ -163,12 +166,82 @@ class ReleaseToolTests(unittest.TestCase):
         for manpage in manpages:
             with self.subTest(manpage=manpage.name):
                 text = manpage.read_text(encoding="utf-8")
-                self.assertIn(f"v{version}", text)
+                header = next(line for line in text.splitlines() if line.startswith(".TH "))
+                self.assertRegex(header, rf'"[^"\n]+ v{re.escape(version)}"(?:\s|$)')
+                self.assertEqual(set(re.findall(r"\bv30[.]1[.]5[.]3rc[0-9]+\b", text)), {f"v{version}"})
                 self.assertNotIn(f"v{version}rc", text)
                 self.assertNotIn("v30.1.5.1", text)
                 self.assertNotIn("v30.1.4", text)
                 self.assertNotIn("Source commit:", text)
                 self.assertNotRegex(text, rf"{re.escape('v' + version)}(?:\\-|-)(?:[0-9a-f]{{12,40}}|g[0-9a-f]{{40}}|dirty)")
+
+    def test_development_identity_rejects_invalid_candidate_modes(self):
+        lint = load_path("lint_candidate_negative", TOOLS.parent.parent / "test" / "lint" / "lint-quantum-doc-invariants.py")
+        template = (
+            "define(_CLIENT_VERSION_MAJOR, 30)\n"
+            "define(_CLIENT_VERSION_MINOR, 1)\n"
+            "define(_CLIENT_VERSION_BUILD, 5)\n"
+            "define(_CLIENT_VERSION_REVISION, {revision})\n"
+            "define(_CLIENT_VERSION_RC, {rc})\n"
+            "define(_CLIENT_VERSION_IS_RELEASE, {release})\n"
+        )
+        for revision, rc, release in ((3, 0, "false"), (3, 2, "true"), (4, 2, "false")):
+            with self.subTest(revision=revision, rc=rc, release=release), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "configure.ac").write_text(template.format(revision=revision, rc=rc, release=release), encoding="utf-8")
+                failures = []
+                lint.check_release_identity(root, failures)
+                self.assertEqual(len(failures), 1)
+                self.assertIn("positive RC/false", failures[0])
+        for rc in (1, 2, 3):
+            with self.subTest(valid_rc=rc), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "configure.ac").write_text(template.format(revision=3, rc=rc, release="false"), encoding="utf-8")
+                failures = []
+                with mock.patch.object(lint, "check_development_release_identity") as development:
+                    lint.check_release_identity(root, failures)
+                self.assertEqual(failures, [])
+                development.assert_called_once_with(root, failures)
+
+    def test_tracked_manpages_reject_wrong_or_prefix_candidate_version(self):
+        original_tools = TOOLS
+        configure = (TOOLS.parent.parent / "configure.ac").read_text(encoding="utf-8")
+        rc = re.search(r"^define\(_CLIENT_VERSION_RC, ([0-9]+)\)$", configure, re.MULTILINE)
+        self.assertIsNotNone(rc)
+        current_rc = int(rc.group(1))
+        current_version = f"30.1.5.3rc{current_rc}"
+        # Execute the complete checker for both current and a consistent later RC.
+        # This catches fixture assumptions that merely mocking dispatch would miss.
+        for fixture_rc in (current_rc, current_rc + 1):
+            with self.subTest(valid_rc=fixture_rc), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                fixture_version = f"30.1.5.3rc{fixture_rc}"
+                fixture_configure = re.sub(
+                    r"^define\(_CLIENT_VERSION_RC, [0-9]+\)$",
+                    f"define(_CLIENT_VERSION_RC, {fixture_rc})",
+                    configure, flags=re.MULTILINE,
+                )
+                (root / "configure.ac").write_text(fixture_configure, encoding="utf-8")
+                (root / "ci" / "release").mkdir(parents=True)
+                (root / "doc" / "man").mkdir(parents=True)
+                for source in (original_tools.parent.parent / "doc" / "man").glob("blackcoin*.1"):
+                    text = source.read_text(encoding="utf-8").replace(current_version, fixture_version)
+                    (root / "doc" / "man" / source.name).write_text(text, encoding="utf-8")
+                with mock.patch.dict(globals(), {"TOOLS": root / "ci" / "release"}):
+                    self.test_tracked_manpages_match_development_source_version()
+                    cli = root / "doc" / "man" / "blackcoin-cli.1"
+                    correct = cli.read_text(encoding="utf-8")
+                    other_rc = fixture_rc - 1 if fixture_rc > 1 else fixture_rc + 1
+                    for mismatch in (f"30.1.5.3rc{other_rc}", f"{fixture_version}0"):
+                        # Keep the body correct: only the header is mismatched.
+                        lines = [line.replace(fixture_version, mismatch) if line.startswith(".TH ") else line
+                                 for line in correct.splitlines(keepends=True)]
+                        cli.write_text("".join(lines), encoding="utf-8")
+                        with self.subTest(invalid_version=mismatch), \
+                             mock.patch.object(self, "subTest", return_value=contextlib.nullcontext()):
+                            with self.assertRaises(AssertionError):
+                                self.test_tracked_manpages_match_development_source_version()
+                    cli.write_text(correct, encoding="utf-8")
 
     def test_final_release_requires_signed_source_and_exact_acknowledgement(self):
         workflow = (
@@ -3192,7 +3265,7 @@ class ReleaseToolTests(unittest.TestCase):
             lint.check_release_identity(root, failures)
             self.assertEqual(len(failures), 1)
             self.assertIn(
-                "historical final 30.1.5.1 RC0/true, candidate 30.1.5.2 RC1/false, final 30.1.5.2 RC0/true, development 30.1.5.3 RC1/false, or replacement Beta 2 30.1.1 RC2/false",
+                "historical final 30.1.5.1 RC0/true, candidate 30.1.5.2 RC1/false, final 30.1.5.2 RC0/true, development 30.1.5.3 positive RC/false, or replacement Beta 2 30.1.1 RC2/false",
                 failures[0],
             )
 

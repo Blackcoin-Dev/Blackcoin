@@ -1,6 +1,9 @@
 # Changelog
 
-## v30.1.5.3rc1 (DEVELOPMENT, unreleased candidate)
+## v30.1.5.3rc2 (DEVELOPMENT, unreleased candidate)
+
+- After two QQ-hint attempts during an outage, reserve a bounded search for a
+  legacy candidate; retain QQ-only fallback and existing connection policies.
 
 - Prefer qualified current-chain QQ peers in automatic outbound connections,
   targeting eight of sixteen full-relay slots by default. Add a clamped

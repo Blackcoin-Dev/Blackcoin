@@ -194,6 +194,11 @@ if [ -n "$USE_VALGRIND" ]; then
   "${BASE_ROOT_DIR}/ci/test/wrap-valgrind.sh"
 fi
 
+if [[ "${CI_NETWORK_REGRESSION:-false}" == "true" ]]; then
+  LD_LIBRARY_PATH="${DEPENDS_DIR}/${HOST}/lib" \
+    "${BASE_ROOT_DIR}/ci/test/run_network_regression.sh" src/test/test_blackcoin
+fi
+
 if [ "$RUN_UNIT_TESTS" = "true" ]; then
   bash -c "${TEST_RUNNER_ENV} REQUIRE_SCRIPT_ASSETS_TEST=1 DIR_UNIT_TEST_DATA=${DIR_UNIT_TEST_DATA} LD_LIBRARY_PATH=${DEPENDS_DIR}/${HOST}/lib make $MAKEJOBS check VERBOSE=1"
 fi

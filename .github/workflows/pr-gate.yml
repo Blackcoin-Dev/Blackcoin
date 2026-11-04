@@ -9,6 +9,11 @@ on:
         type: choice
         default: full
         options: [full, all, native, asan, tsan]
+      regression_profile:
+        description: Diagnostic selection only; full qualification is unchanged
+        type: choice
+        default: functional
+        options: [functional, bootstrap-units]
       target_sha:
         description: Full commit SHA to test (defaults to the selected branch)
         required: false
@@ -57,7 +62,7 @@ concurrency:
   # Keep an open pull request's full gate independent from an exact-SHA alpha
   # artifact gate for the same commit. Superseded runs of the same event/mode
   # still cancel normally, while production runs remain non-cancelable.
-  group: safety-gate-${{ inputs.regression_scope || 'full' }}-${{ github.event_name }}-${{ inputs.release_mode == true && 'release' || 'core' }}-${{ inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
+  group: safety-gate-${{ inputs.regression_scope || 'full' }}-${{ inputs.regression_profile || 'functional' }}-${{ github.event_name }}-${{ inputs.release_mode == true && 'release' || 'core' }}-${{ inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: ${{ inputs.release_mode != true }}
 
 env:
@@ -141,6 +146,7 @@ jobs:
         run: |
           python3 ci/test/test_sanitizer_regression_config.py
           python3 ci/test/test_regression_workflow.py
+          python3 ci/test/test_network_regression.py
           python3 test/lint/lint-files.py
           python3 test/lint/lint-shell-locale.py
           bash -n ci/test/06_script_b.sh ci/test/regression_cache.sh
@@ -178,6 +184,7 @@ jobs:
           python3 ci/test/test_functional_runner_cleanup.py
           python3 ci/test/test_sanitizer_regression_config.py
           python3 ci/test/test_regression_workflow.py
+          python3 ci/test/test_network_regression.py
           python3 test/fuzz/test_runner_tests.py
           PYTHONPATH=test/functional python3 -m unittest \
             feature_goldrush_pow_claim_singleflight.RecoveryPaginationHelperTest \
@@ -276,11 +283,19 @@ jobs:
             --disable-zmq
 
       - name: Configure targeted debug binaries
-        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') }}
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && inputs.regression_profile != 'bootstrap-units' }}
         run: |
           ./autogen.sh
           ./configure --prefix="$PWD/depends/$HOST" --with-gui=no \
             --enable-debug --disable-tests --disable-bench --disable-fuzz-binary \
+            --disable-zmq CC='ccache gcc' CXX='ccache g++'
+
+      - name: Configure bootstrap unit binaries
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && inputs.regression_profile == 'bootstrap-units' }}
+        run: |
+          ./autogen.sh
+          ./configure --prefix="$PWD/depends/$HOST" --with-gui=no \
+            --enable-debug --enable-tests --disable-bench --disable-fuzz-binary \
             --disable-zmq CC='ccache gcc' CXX='ccache g++'
 
       - name: Compile candidate
@@ -292,7 +307,28 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ci/native-ccache
           CCACHE_MAXSIZE: 1G
-        run: make -C src -j "$MAKEJOBS" blackcoind blackcoin-cli
+          REGRESSION_PROFILE: ${{ inputs.regression_profile || 'functional' }}
+        run: |
+          if [[ "$REGRESSION_PROFILE" == bootstrap-units ]]; then
+            make -C src -j "$MAKEJOBS" test/test_blackcoin
+          else
+            make -C src -j "$MAKEJOBS" blackcoind blackcoin-cli
+          fi
+
+      - name: Run bootstrap unit suites together
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && inputs.regression_profile == 'bootstrap-units' }}
+        env:
+          NETWORK_REGRESSION_LOG: ${{ github.workspace }}/.ci/bootstrap-units.log
+        run: ci/test/run_network_regression.sh src/test/test_blackcoin
+
+      - name: Retain bootstrap unit result
+        if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && inputs.regression_profile == 'bootstrap-units' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bootstrap-units-native-${{ env.TARGET_SHA }}-attempt-${{ github.run_attempt }}
+          path: .ci/bootstrap-units.log
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Provision pinned Blackcoin-compatible script vectors
         if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
@@ -308,6 +344,7 @@ jobs:
         run: make -j "$MAKEJOBS" check
 
       - name: Upload exact test binaries
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') || inputs.regression_profile != 'bootstrap-units' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: safety-gate-native-${{ env.TARGET_SHA }}
@@ -934,7 +971,7 @@ jobs:
 
   exhaustive-functional:
     name: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && 'targeted previously failing functional tests' || 'complete extended functional suite' }}
-    if: ${{ (inputs.regression_scope == 'all' || inputs.regression_scope == 'native') || ((inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.run_extended_functional == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request')) }}
+    if: ${{ ((inputs.regression_scope == 'all' || inputs.regression_scope == 'native') && inputs.regression_profile != 'bootstrap-units') || ((inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.run_extended_functional == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request')) }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 480
@@ -1005,6 +1042,7 @@ jobs:
         id: sanitizer-gate
         env:
           CI_OS_NAME: linux
+          CI_NETWORK_REGRESSION: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && inputs.regression_profile == 'bootstrap-units' }}
           FILE_ENV: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && format('ci/test/00_setup_env_native_{0}_regression.sh', matrix.flavor) || matrix.environment }}
           MAKEJOBS: -j2
           TEST_RUNNER_EXTRA: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && 'feature_goldrush_pow_claim_singleflight.py' || matrix.functional_tests }}
@@ -1017,14 +1055,28 @@ jobs:
           [[ ! -e "$report_log" && ! -L "$report_log" ]]
           printf 'report_log=%s\n' "$report_log" >> "$GITHUB_OUTPUT"
           set +e
-          ./ci/test_run_all.sh 2>&1 |
-            python3 ci/test/extract_sanitizer_reports.py \
-              --output "$report_log" \
-              --target-sha "$TARGET_SHA" \
-              --sanitizer '${{ matrix.name }}'
-          pipeline_status=("${PIPESTATUS[@]}")
-          test_status="${pipeline_status[0]}"
-          extractor_status="${pipeline_status[1]}"
+          capture_status=0
+          if [[ "$CI_NETWORK_REGRESSION" == true ]]; then
+            mkdir -p .ci
+            ./ci/test_run_all.sh 2>&1 |
+              tee '.ci/bootstrap-units-${{ matrix.flavor }}.log' |
+              python3 ci/test/extract_sanitizer_reports.py \
+                --output "$report_log" --target-sha "$TARGET_SHA" \
+                --sanitizer '${{ matrix.name }}'
+            pipeline_status=("${PIPESTATUS[@]}")
+            test_status="${pipeline_status[0]}"
+            capture_status="${pipeline_status[1]}"
+            extractor_status="${pipeline_status[2]}"
+          else
+            ./ci/test_run_all.sh 2>&1 |
+              python3 ci/test/extract_sanitizer_reports.py \
+                --output "$report_log" \
+                --target-sha "$TARGET_SHA" \
+                --sanitizer '${{ matrix.name }}'
+            pipeline_status=("${PIPESTATUS[@]}")
+            test_status="${pipeline_status[0]}"
+            extractor_status="${pipeline_status[1]}"
+          fi
           report_ready=false
           if [[ "$extractor_status" -eq 0 || "$extractor_status" -eq 74 ]] &&
              [[ -f "$report_log" && ! -L "$report_log" && -O "$report_log" ]] &&
@@ -1042,10 +1094,22 @@ jobs:
           if [[ "$test_status" -ne 0 ]]; then
             exit "$test_status"
           fi
+          if [[ "$capture_status" -ne 0 ]]; then
+            exit "$capture_status"
+          fi
           if [[ "$extractor_status" -ne 0 ]]; then
             exit "$extractor_status"
           fi
           [[ "$report_ready" = true ]]
+
+      - name: Retain bootstrap sanitizer full log
+        if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && inputs.regression_profile == 'bootstrap-units' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bootstrap-units-${{ matrix.flavor }}-${{ env.TARGET_SHA }}-attempt-${{ github.run_attempt }}
+          path: .ci/bootstrap-units-${{ matrix.flavor }}.log
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Retain targeted Docker build cache after success or failure
         if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && steps.regression-cache.outcome == 'success' }}
@@ -1061,7 +1125,7 @@ jobs:
           key: ${{ steps.regression-cache.outputs.cache-primary-key }}
 
       - name: Upload exact-source ThreadSanitizer reports
-        if: ${{ always() && matrix.name == 'thread-sanitizer' && steps.sanitizer-gate.outputs.report_ready == 'true' }}
+        if: ${{ always() && (matrix.name == 'thread-sanitizer' || ((inputs.regression_scope != '' && inputs.regression_scope != 'full') && inputs.regression_profile == 'bootstrap-units')) && steps.sanitizer-gate.outputs.report_ready == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sanitizer-reports-${{ matrix.name }}-${{ env.TARGET_SHA }}-attempt-${{ github.run_attempt }}

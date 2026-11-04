@@ -20,3 +20,10 @@ export RUN_FUNCTIONAL_TESTS=true
 export RUN_FUZZ_TESTS=false
 export CI_REGRESSION_ONLY=true
 export CCACHE_MAXSIZE=1G
+
+# Reuse the parent compiler/instrumentation; select one shared-state C++ run.
+if [[ "${CI_NETWORK_REGRESSION:-false}" == "true" ]]; then
+  export BITCOIN_CONFIG="${BITCOIN_CONFIG} --enable-tests"
+  export GOAL="-C src test/test_blackcoin"
+  export RUN_FUNCTIONAL_TESTS=false
+fi

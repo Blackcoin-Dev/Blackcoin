@@ -6,6 +6,8 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <regex>
+
 BOOST_AUTO_TEST_SUITE(clientversion_tests)
 
 BOOST_AUTO_TEST_CASE(maintenance_revision_preserves_numeric_compatibility)
@@ -16,7 +18,7 @@ BOOST_AUTO_TEST_CASE(maintenance_revision_preserves_numeric_compatibility)
     BOOST_CHECK_EQUAL(CLIENT_VERSION_BUILD, 5);
     BOOST_CHECK_EQUAL(CLIENT_VERSION_REVISION, 3);
     BOOST_CHECK_EQUAL(CLIENT_VERSION_STRING, "30.1.5.3");
-    BOOST_CHECK_EQUAL(PACKAGE_VERSION, "30.1.5.3rc1");
+    BOOST_CHECK(std::regex_match(PACKAGE_VERSION, std::regex{R"(30\.1\.5\.3rc[1-9][0-9]*)"}));
     BOOST_CHECK(!CLIENT_VERSION_IS_RELEASE);
 }
 

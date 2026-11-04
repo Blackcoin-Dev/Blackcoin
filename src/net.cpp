@@ -406,8 +406,9 @@ static CAddress GetBindAddress(const Sock& sock)
     return addr_bind;
 }
 
-CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport)
+CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool& attempted)
 {
+    attempted = false;
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
     assert(conn_type != ConnectionType::INBOUND);
 
@@ -499,7 +500,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                 return nullptr;
             }
             connected = ConnectThroughProxy(proxy, addrConnect.ToStringAddr(), addrConnect.GetPort(),
-                                            *sock, nConnectTimeout, proxyConnectionFailed);
+                                            *sock, nConnectTimeout, proxyConnectionFailed, &attempted);
         } else {
             // no proxy needed (none set for target network)
             sock = CreateSock(addrConnect);
@@ -507,8 +508,9 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                 return nullptr;
             }
             connected = ConnectSocketDirectly(addrConnect, *sock, nConnectTimeout,
-                                              conn_type == ConnectionType::MANUAL);
+                                              conn_type == ConnectionType::MANUAL, &attempted);
         }
+        if (proxyConnectionFailed) attempted = false;
         if (!proxyConnectionFailed) {
             // If a connection to the node was attempted, and failure (if any) is not caused by a problem connecting to
             // the proxy, mark this as an attempt.
@@ -2552,6 +2554,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
     qq::Arbiter transient_arbiter;
     std::weak_ptr<qq::Probe> outstanding_qq;
     bool recovery_addr_fetch_turn{true};
+    unsigned bootstrap_qq_attempts{0};
     auto next_qq_probe = qq::Clock::now();
     const bool use_seednodes{gArgs.IsArgSet("-seednode")};
 
@@ -2622,13 +2625,17 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         // Only connect out to one peer per ipv4/ipv6 network group (/16 for IPv4).
         int nOutboundFullRelay = 0;
         int nOutboundBlockRelay = 0;
+        bool baseline_connected{false};
         int outbound_privacy_network_peers = 0;
         std::set<std::vector<unsigned char>> outbound_ipv46_peer_netgroups;
 
         {
             LOCK(m_nodes_mutex);
             for (const CNode* pnode : m_nodes) {
-                if (pnode->IsFullOutboundConn()) nOutboundFullRelay++;
+                if (pnode->IsFullOutboundConn()) {
+                    nOutboundFullRelay++;
+                    baseline_connected |= pnode->fSuccessfullyConnected && !pnode->fDisconnect;
+                }
                 if (pnode->IsBlockOnlyConn()) nOutboundBlockRelay++;
 
                 // Make sure our persistent outbound slots to ipv4/ipv6 peers belong to different netgroups.
@@ -2671,6 +2678,8 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         const auto steady_now = qq::Clock::now();
         const auto pending = outstanding_qq.lock();
         const bool qq_deficit = qq_status.deficit > 0;
+        if (baseline_connected || !qq_deficit) bootstrap_qq_attempts = 0;
+        const bool recover_legacy = !baseline_connected && qq_deficit && bootstrap_qq_attempts >= 2;
         const bool qq_probe_allowed = HasQQProbeHeadroom() &&
             qq_status.constraint != "chain-not-ready" && qq_status.constraint != "initializing";
         bool qq_probe = false;
@@ -2749,6 +2758,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
 
         const auto current_time{NodeClock::now()};
         int nTries = 0;
+        CAddress qq_recovery_fallback;
         while (!interruptNet)
         {
             if (anchor && !m_anchors.empty()) {
@@ -2843,11 +2853,19 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 continue;
             }
 
-            if (prefer_qq && (qq_probe || nTries <= qq::MAX_CANDIDATE_DRAWS / 2) && !(addr.nServices & NODE_QUANTUM_QUASAR)) continue;
+            // During an outage, bound consecutive actual QQ-hint attempts,
+            // not just raw draws. Keep a fully checked fallback for QQ-only pools.
+            if (recover_legacy && conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !qq_probe) {
+                if (addr.nServices & NODE_QUANTUM_QUASAR) {
+                    if (!qq_recovery_fallback.IsValid()) qq_recovery_fallback = addr;
+                    continue;
+                }
+            } else if (prefer_qq && (qq_probe || nTries <= qq::MAX_CANDIDATE_DRAWS / 2) && !(addr.nServices & NODE_QUANTUM_QUASAR)) continue;
             addrConnect = addr;
             break;
         }
 
+        if (!addrConnect.IsValid() && qq_recovery_fallback.IsValid()) addrConnect = qq_recovery_fallback;
         if (qq_probe) RecordQQSelection(nTries, addrConnect.IsValid());
         if (addrConnect.IsValid()) {
             if (fFeeler) {
@@ -2873,7 +2891,12 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 outstanding_qq = probe;
                 TrackQQProbe(probe);
             }
-            OpenNetworkConnection(addrConnect, count_failures, std::move(grant), /*strDest=*/nullptr, conn_type, use_v2transport, std::move(probe));
+            bool attempted{false};
+            OpenNetworkConnection(addrConnect, count_failures, std::move(grant), /*strDest=*/nullptr, conn_type, use_v2transport, std::move(probe), &attempted);
+            if (attempted && prefer_qq && conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !qq_probe) {
+                bootstrap_qq_attempts = (addrConnect.nServices & NODE_QUANTUM_QUASAR) ?
+                    std::min(bootstrap_qq_attempts + 1, 2U) : 0;
+            }
         }
     }
 }
@@ -2979,8 +3002,9 @@ void CConnman::ThreadOpenAddedConnections()
 }
 
 // if successful, this moves the passed grant to the constructed node
-void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char *pszDest, ConnectionType conn_type, bool use_v2transport, std::shared_ptr<qq::Probe> qq_probe)
+void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char *pszDest, ConnectionType conn_type, bool use_v2transport, std::shared_ptr<qq::Probe> qq_probe, bool* attempted)
 {
+    if (attempted) *attempted = false;
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
     assert(conn_type != ConnectionType::INBOUND);
 
@@ -3001,7 +3025,9 @@ void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFai
     } else if (FindNode(std::string(pszDest)))
         return;
 
-    CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport);
+    bool connection_attempted{false};
+    CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport, connection_attempted);
+    if (attempted) *attempted = connection_attempted;
     if (qq_probe) RecordQQConnect(pnode == nullptr);
 
     if (!pnode)

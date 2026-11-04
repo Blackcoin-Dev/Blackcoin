@@ -259,7 +259,8 @@ extern std::function<std::unique_ptr<Sock>(const CService&)> CreateSock;
  *
  * @returns Whether or not a connection was successfully made.
  */
-bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nTimeout, bool manual_connection);
+// Optional attempted output is set immediately before Sock::Connect.
+bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nTimeout, bool manual_connection, bool* attempted = nullptr);
 
 /**
  * Connect to a specified destination service through a SOCKS5 proxy by first
@@ -276,7 +277,8 @@ bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nT
  *
  * @returns Whether or not the operation succeeded.
  */
-bool ConnectThroughProxy(const Proxy& proxy, const std::string& strDest, uint16_t port, const Sock& sock, int nTimeout, bool& outProxyConnectionFailed);
+// Optional attempted output excludes proxy TCP/greeting/authentication failures.
+bool ConnectThroughProxy(const Proxy& proxy, const std::string& strDest, uint16_t port, const Sock& sock, int nTimeout, bool& outProxyConnectionFailed, bool* attempted = nullptr);
 
 void InterruptSocks5(bool interrupt);
 
@@ -298,7 +300,8 @@ void InterruptSocks5(bool interrupt);
  * @see <a href="https://www.ietf.org/rfc/rfc1928.txt">RFC1928: SOCKS Protocol
  *      Version 5</a>
  */
-bool Socks5(const std::string& strDest, uint16_t port, const ProxyCredentials* auth, const Sock& socket);
+// Optional attempted output is set only after sending a complete CONNECT request.
+bool Socks5(const std::string& strDest, uint16_t port, const ProxyCredentials* auth, const Sock& socket, bool* attempted = nullptr);
 
 /**
  * Determine if a port is "bad" from the perspective of attempting to connect

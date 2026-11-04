@@ -333,8 +333,9 @@ static std::string Socks5ErrorString(uint8_t err)
     }
 }
 
-bool Socks5(const std::string& strDest, uint16_t port, const ProxyCredentials* auth, const Sock& sock)
+bool Socks5(const std::string& strDest, uint16_t port, const ProxyCredentials* auth, const Sock& sock, bool* attempted)
 {
+    if (attempted) *attempted = false;
     IntrRecvError recvr;
     LogPrint(BCLog::NET, "SOCKS5 connecting %s\n", strDest);
     if (strDest.size() > 255) {
@@ -403,6 +404,9 @@ bool Socks5(const std::string& strDest, uint16_t port, const ProxyCredentials* a
     if (ret != (ssize_t)vSocks5.size()) {
         return error("Error sending to proxy");
     }
+    // Only a complete destination CONNECT request is a target attempt.
+    // Proxy TCP, greeting and authentication failures do not spend that budget.
+    if (attempted) *attempted = true;
     uint8_t pchRet2[4];
     if ((recvr = InterruptibleRecv(pchRet2, 4, g_socks5_recv_timeout, sock)) != IntrRecvError::OK) {
         if (recvr == IntrRecvError::Timeout) {
@@ -513,8 +517,9 @@ static void LogConnectFailure(bool manual_connection, const char* fmt, const Arg
     }
 }
 
-bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nTimeout, bool manual_connection)
+bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nTimeout, bool manual_connection, bool* attempted)
 {
+    if (attempted) *attempted = false;
     // Create a sockaddr from the specified service.
     struct sockaddr_storage sockaddr;
     socklen_t len = sizeof(sockaddr);
@@ -524,6 +529,7 @@ bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nT
     }
 
     // Connect to the addrConnect service on the hSocket socket.
+    if (attempted) *attempted = true;
     if (sock.Connect(reinterpret_cast<struct sockaddr*>(&sockaddr), len) == SOCKET_ERROR) {
         int nErr = WSAGetLastError();
         // WSAEINVAL is here because some legacy version of winsock uses it
@@ -624,8 +630,9 @@ bool IsProxy(const CNetAddr &addr) {
     return false;
 }
 
-bool ConnectThroughProxy(const Proxy& proxy, const std::string& strDest, uint16_t port, const Sock& sock, int nTimeout, bool& outProxyConnectionFailed)
+bool ConnectThroughProxy(const Proxy& proxy, const std::string& strDest, uint16_t port, const Sock& sock, int nTimeout, bool& outProxyConnectionFailed, bool* attempted)
 {
+    if (attempted) *attempted = false;
     // first connect to proxy server
     if (!ConnectSocketDirectly(proxy.proxy, sock, nTimeout, true)) {
         outProxyConnectionFailed = true;
@@ -636,11 +643,11 @@ bool ConnectThroughProxy(const Proxy& proxy, const std::string& strDest, uint16_
         ProxyCredentials random_auth;
         static std::atomic_int counter(0);
         random_auth.username = random_auth.password = strprintf("%i", counter++);
-        if (!Socks5(strDest, port, &random_auth, sock)) {
+        if (!Socks5(strDest, port, &random_auth, sock, attempted)) {
             return false;
         }
     } else {
-        if (!Socks5(strDest, port, nullptr, sock)) {
+        if (!Socks5(strDest, port, nullptr, sock, attempted)) {
             return false;
         }
     }

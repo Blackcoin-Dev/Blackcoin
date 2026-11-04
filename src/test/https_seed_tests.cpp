@@ -825,6 +825,325 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_https_addrman_automatic_peer, TestingSetu
     BOOST_CHECK_EQUAL(connman.GetQQStatus().eligible, 0);
 }
 
+namespace {
+void PreparePersistedBootstrap(node::NodeContext& node, bool legacy = true, int qq_target = 8)
+{
+    // Actual deterministic addrman and actual Connman/PeerManager, not a selector mock.
+    node.peerman.reset();
+    node.connman.reset();
+    node.addrman = std::make_unique<AddrMan>(*node.netgroupman, true, 0);
+    node.connman = std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *node.addrman, *node.netgroupman, Params());
+    PeerManager::Options peer_options;
+    peer_options.deterministic_rng = true;
+    node.peerman = PeerManager::make(*node.connman, *node.addrman, node.banman.get(), *node.chainman, *node.mempool, peer_options);
+    auto& connman = static_cast<ConnmanTestMsg&>(*node.connman);
+    PrepareWorker(connman, node);
+    CConnman::Options options;
+    options.nMaxConnections = 125;
+    options.m_max_outbound_full_relay = 16;
+    options.m_qq_outbound_target = qq_target;
+    options.m_msgproc = node.peerman.get();
+    options.m_banman = node.banman.get();
+    options.nLocalServices = NODE_NETWORK;
+    options.nSendBufferMaxSize = options.nReceiveFloodSize = 1024 * 1024;
+    connman.Init(options);
+    connman.PublishQQStatus(0, 0, false, "chain-not-ready");
+    for (unsigned i = 0; node.addrman->Size() < 6446 && i < 30000; ++i) {
+        const bool qq = !legacy || i % 10 != 0;
+        const auto address = LookupNumeric(strprintf("11.%u.%u.1", i / 256, i % 256), qq ? 46005 : 15714);
+        CAddress entry{address, ServiceFlags(NODE_NETWORK | (qq ? NODE_QUANTUM_QUASAR : NODE_NONE))};
+        entry.nTime = NodeSeconds{std::chrono::seconds{NOW - (qq ? 60 * 86400 : 60)}};
+        const auto source = LookupNumeric(strprintf("12.%u.%u.1", i / 256, i % 256), 15714);
+        node.addrman->Add({entry}, source);
+    }
+    BOOST_REQUIRE_EQUAL(node.addrman->Size(), 6446U);
+}
+
+class RefusedBootstrapSocket : public Sock {
+    const std::function<void()> attempted;
+public:
+    explicit RefusedBootstrapSocket(std::function<void()> callback) : Sock{INVALID_SOCKET}, attempted{std::move(callback)} {}
+    int Connect(const sockaddr*, socklen_t) const override
+    {
+        attempted(); // Observe the actual socket Connect boundary, not CreateSock/selection.
+        errno = ECONNREFUSED;
+        return SOCKET_ERROR;
+    }
+};
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_persisted_qq_pool_bootstrap_attempt_fairness, TestingSetup)
+{
+    PreparePersistedBootstrap(m_node);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    SocketFactoryScope factory;
+    std::mutex mutex;
+    std::vector<bool> attempts;
+    CreateSock = [&](const CService& address) -> std::unique_ptr<Sock> {
+        const bool qq = address.GetPort() == 46005;
+        return std::make_unique<RefusedBootstrapSocket>([&, qq] {
+            std::lock_guard<std::mutex> lock{mutex};
+            attempts.push_back(qq);
+            if (attempts.size() == 9) connman.Interrupt();
+        });
+    };
+    connman.StartHTTPSAutomaticConnectionsForTest();
+    const bool completed = Eventually([&] { std::lock_guard<std::mutex> lock{mutex}; return attempts.size() >= 9; }, std::chrono::seconds{10});
+    connman.StopHTTPSForTest();
+    BOOST_REQUIRE(completed);
+    BOOST_REQUIRE_EQUAL(attempts.size(), 9U);
+    std::string observed;
+    for (bool qq : attempts) observed += qq ? 'Q' : 'L';
+    BOOST_TEST_MESSAGE("Actual socket-attempt classes: " << observed);
+    BOOST_CHECK_MESSAGE(std::find(attempts.begin(), attempts.begin() + 3, false) != attempts.begin() + 3,
+                        "A legacy attempt must receive an opportunity after at most two QQ-hint attempts: " << observed);
+    for (size_t offset = 0; offset < attempts.size(); offset += 3) {
+        BOOST_CHECK(std::find(attempts.begin() + offset, attempts.begin() + offset + 3, false) != attempts.begin() + offset + 3);
+    }
+    BOOST_CHECK_EQUAL(connman.GetQQTarget(), 8);
+    BOOST_CHECK_EQUAL(connman.GetQQStatus().connect_attempts, 0U); // Ordinary attempts are not QQ probes.
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_target_zero_does_not_force_legacy, TestingSetup)
+{
+    PreparePersistedBootstrap(m_node, true, 0);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    SocketFactoryScope factory;
+    std::mutex mutex;
+    std::vector<bool> attempts;
+    CreateSock = [&](const CService& address) -> std::unique_ptr<Sock> {
+        const bool qq = address.GetPort() == 46005;
+        return std::make_unique<RefusedBootstrapSocket>([&, qq] {
+            std::lock_guard<std::mutex> lock{mutex};
+            attempts.push_back(qq);
+            if (attempts.size() == 9) connman.Interrupt();
+        });
+    };
+    connman.StartHTTPSAutomaticConnectionsForTest();
+    const bool completed = Eventually([&] { std::lock_guard<std::mutex> lock{mutex}; return attempts.size() >= 9; }, std::chrono::seconds{10});
+    connman.StopHTTPSForTest();
+    BOOST_REQUIRE(completed);
+    std::string observed;
+    for (bool qq : attempts) observed += qq ? 'Q' : 'L';
+    BOOST_TEST_MESSAGE("Policy-off actual socket-attempt classes: " << observed);
+    // This deterministic QQ-rich pool must not be rewritten into QQL cycles
+    // when the caller explicitly disabled QQ pursuit.
+    BOOST_REQUIRE(attempts.size() >= 3);
+    BOOST_CHECK(attempts[0] && attempts[1] && attempts[2]);
+    BOOST_CHECK_EQUAL(connman.GetQQTarget(), 0);
+}
+
+namespace {
+class BootstrapProxySocket : public Sock {
+    const std::vector<uint8_t> responses;
+    const bool fail_connect_send;
+    mutable size_t offset{0};
+public:
+    mutable unsigned tcp_attempts{0}, target_requests{0};
+    BootstrapProxySocket(std::vector<uint8_t> data, bool fail = false) : Sock{INVALID_SOCKET}, responses{std::move(data)}, fail_connect_send{fail} {}
+    int Connect(const sockaddr*, socklen_t) const override { ++tcp_attempts; return 0; }
+    ssize_t Send(const void* data, size_t length, int) const override
+    {
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        if (length > 3 && bytes[0] == 5 && bytes[1] == 1) {
+            if (fail_connect_send) return 0;
+            ++target_requests;
+        }
+        return length;
+    }
+    ssize_t Recv(void* data, size_t length, int) const override
+    {
+        const auto count = std::min(length, responses.size() - offset);
+        std::memcpy(data, responses.data() + offset, count);
+        offset += count;
+        return count;
+    }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(bootstrap_proxy_target_attempt_boundary)
+{
+    InterruptSocks5(false); // Earlier owned-worker Stop cancels SOCKS globally, as Start resets it.
+    const Proxy proxy{LookupNumeric("127.0.0.1", 9050), false};
+    // Failed greeting or failed CONNECT send is not a destination attempt.
+    for (bool partial : {false, true}) {
+        BootstrapProxySocket socket{partial ? std::vector<uint8_t>{5, 0} : std::vector<uint8_t>{4, 0}, partial};
+        bool proxy_failed{false}, attempted{true};
+        BOOST_CHECK(!ConnectThroughProxy(proxy, "8.8.8.8", 15714, socket, 100, proxy_failed, &attempted));
+        BOOST_CHECK_EQUAL(socket.tcp_attempts, 1U);
+        BOOST_CHECK_EQUAL(socket.target_requests, 0U);
+        BOOST_CHECK(!attempted);
+    }
+    BootstrapProxySocket refused{{5, 0, 5, 5, 0, 1}};
+    bool proxy_failed{false}, attempted{false};
+    BOOST_CHECK(!ConnectThroughProxy(proxy, "8.8.8.8", 15714, refused, 100, proxy_failed, &attempted));
+    BOOST_CHECK(attempted);
+    BOOST_CHECK_EQUAL(refused.target_requests, 1U);
+    const ProxyCredentials auth{"fixture", "fixture"};
+    BootstrapProxySocket bad_auth{{5, 2, 1, 1}};
+    attempted = true;
+    BOOST_CHECK(!Socks5("8.8.8.8", 15714, &auth, bad_auth, &attempted));
+    BOOST_CHECK(!attempted);
+    BOOST_CHECK_EQUAL(bad_auth.target_requests, 0U);
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_qq_only_pool_keeps_attempting, TestingSetup)
+{
+    PreparePersistedBootstrap(m_node, false);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    SocketFactoryScope factory;
+    std::atomic<unsigned> attempts{0};
+    CreateSock = [&](const CService&) -> std::unique_ptr<Sock> {
+        return std::make_unique<RefusedBootstrapSocket>([&] { if (++attempts == 6) connman.Interrupt(); });
+    };
+    connman.StartHTTPSAutomaticConnectionsForTest();
+    const bool completed = Eventually([&] { return attempts >= 6; }, std::chrono::seconds{10});
+    connman.StopHTTPSForTest();
+    BOOST_REQUIRE(completed);
+    BOOST_CHECK_EQUAL(attempts.load(), 6U);
+    BOOST_CHECK_EQUAL(connman.GetQQTarget(), 8);
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_socket_creation_is_not_attempt, TestingSetup)
+{
+    PreparePersistedBootstrap(m_node);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    SocketFactoryScope factory;
+    unsigned rejected{0};
+    std::mutex mutex;
+    std::vector<bool> attempts;
+    CreateSock = [&](const CService& address) -> std::unique_ptr<Sock> {
+        if (rejected < 2) { ++rejected; return nullptr; }
+        const bool qq = address.GetPort() == 46005;
+        return std::make_unique<RefusedBootstrapSocket>([&, qq] {
+            std::lock_guard<std::mutex> lock{mutex};
+            attempts.push_back(qq);
+            if (attempts.size() == 3) connman.Interrupt();
+        });
+    };
+    connman.StartHTTPSAutomaticConnectionsForTest();
+    const bool completed = Eventually([&] { std::lock_guard<std::mutex> lock{mutex}; return attempts.size() >= 3; }, std::chrono::seconds{10});
+    connman.StopHTTPSForTest();
+    BOOST_REQUIRE(completed);
+    BOOST_REQUIRE_EQUAL(attempts.size(), 3U);
+    BOOST_CHECK_EQUAL(rejected, 2U);
+    BOOST_CHECK(attempts[0] && attempts[1] && !attempts[2]);
+}
+
+namespace {
+class RecordingBootstrapSocket : public RedirectSocket {
+    const std::function<void()> attempted;
+public:
+    RecordingBootstrapSocket(uint16_t target, std::function<void()> callback) : RedirectSocket{target}, attempted{std::move(callback)} {}
+    int Connect(const sockaddr* address, socklen_t length) const override
+    {
+        const int result = RedirectSocket::Connect(address, length);
+        const int error = errno;
+        attempted();
+        errno = error;
+        return result;
+    }
+};
+
+void CompleteBootstrapHandshake(ConnmanTestMsg& connman, node::NodeContext& node, CNode& peer)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    connman.FlushSendBuffer(peer);
+    const CNetMsgMaker messages{0};
+    auto version = messages.Make(NetMsgType::VERSION, PROTOCOL_VERSION,
+        Using<CustomUintFormatter<8>>(ServiceFlags{NODE_NETWORK}), int64_t{NOW},
+        int64_t{}, CNetAddr::V1(CService{}), int64_t{}, CNetAddr::V1(CService{}),
+        uint64_t{1}, std::string{}, int32_t{}, true);
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, std::move(version)));
+    connman.ProcessMessagesOnce(peer);
+    node.peerman->SendMessages(&peer);
+    connman.FlushSendBuffer(peer);
+    BOOST_REQUIRE(!peer.fDisconnect);
+    BOOST_REQUIRE(connman.ReceiveMsgFrom(peer, messages.Make(NetMsgType::VERACK)));
+    connman.ProcessMessagesOnce(peer);
+    BOOST_REQUIRE(peer.fSuccessfullyConnected);
+}
+
+void BootstrapHandshakeReset(node::NodeContext& node, bool handshake)
+{
+    PreparePersistedBootstrap(node);
+    auto& connman = static_cast<ConnmanTestMsg&>(*node.connman);
+    TestSocket listener{static_cast<SOCKET>(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP))};
+    sockaddr_in local{}; local.sin_family = AF_INET; local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    BOOST_REQUIRE(listener.SetNonBlocking());
+    BOOST_REQUIRE_EQUAL(listener.Bind(reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+    BOOST_REQUIRE_EQUAL(listener.Listen(1), 0);
+    socklen_t size{sizeof(local)};
+    BOOST_REQUIRE_EQUAL(listener.GetSockName(reinterpret_cast<sockaddr*>(&local), &size), 0);
+    SocketFactoryScope factory;
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::vector<bool> attempts;
+    std::string legacy_endpoint;
+    bool released{false}, pause_timed_out{false};
+    std::unique_ptr<TestSocket> accepted;
+    struct StopOnExit {
+        ConnmanTestMsg& connman;
+        std::mutex& mutex;
+        std::condition_variable& condition;
+        bool& released;
+        ~StopOnExit()
+        {
+            { std::lock_guard<std::mutex> lock{mutex}; released = true; }
+            condition.notify_all();
+            connman.StopHTTPSForTest();
+        }
+    } stop_on_exit{connman, mutex, condition, released};
+    const auto record = [&](bool qq) {
+        std::unique_lock<std::mutex> lock{mutex};
+        attempts.push_back(qq);
+        if (attempts.size() == 5) {
+            if (!condition.wait_for(lock, std::chrono::seconds{5}, [&] { return released; })) pause_timed_out = true;
+        }
+        if (attempts.size() == 6) connman.Interrupt();
+    };
+    CreateSock = [&](const CService& address) -> std::unique_ptr<Sock> {
+        const bool qq = address.GetPort() == 46005;
+        if (!qq && legacy_endpoint.empty()) {
+            legacy_endpoint = address.ToStringAddrPort();
+            return std::make_unique<RecordingBootstrapSocket>(ntohs(local.sin_port), [&, qq] { record(qq); });
+        }
+        return std::make_unique<RefusedBootstrapSocket>([&, qq] { record(qq); });
+    };
+    connman.StartHTTPSAutomaticConnectionsForTest();
+    const bool paused = Eventually([&] { std::lock_guard<std::mutex> lock{mutex}; return attempts.size() == 5; }, std::chrono::seconds{10});
+    if (paused) {
+        auto* peer = connman.FindHTTPSNodeForTest(legacy_endpoint);
+        BOOST_REQUIRE(peer != nullptr);
+        BOOST_CHECK(!peer->fSuccessfullyConnected); // A socket alone must not retire outage fairness.
+        const SOCKET peer_fd = static_cast<SOCKET>(accept(listener.Descriptor(), nullptr, nullptr));
+        BOOST_REQUIRE(peer_fd != INVALID_SOCKET);
+        accepted = std::make_unique<TestSocket>(peer_fd);
+        if (handshake) CompleteBootstrapHandshake(connman, node, *peer);
+    }
+    { std::lock_guard<std::mutex> lock{mutex}; released = true; }
+    condition.notify_all();
+    const bool completed = Eventually([&] { std::lock_guard<std::mutex> lock{mutex}; return attempts.size() >= 6; }, std::chrono::seconds{10});
+    connman.StopHTTPSForTest();
+    BOOST_REQUIRE(paused && completed);
+    BOOST_REQUIRE_EQUAL(attempts.size(), 6U);
+    BOOST_CHECK(!pause_timed_out);
+    BOOST_CHECK(attempts[0] && attempts[1] && !attempts[2] && attempts[3] && attempts[4]);
+    BOOST_CHECK_EQUAL(attempts[5], handshake);
+    BOOST_CHECK_EQUAL(connman.GetQQTarget(), 8);
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_socket_without_handshake_keeps_recovery, TestingSetup)
+{
+    BootstrapHandshakeReset(m_node, false);
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_completed_handshake_retires_recovery, TestingSetup)
+{
+    BootstrapHandshakeReset(m_node, true);
+}
+
 BOOST_FIXTURE_TEST_CASE(actual_connman_toggle_discards_completed_old_response, TestingSetup)
 {
     auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);

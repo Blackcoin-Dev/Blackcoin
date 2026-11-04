@@ -1142,7 +1142,8 @@ public:
     bool GetNetworkActive() const { return fNetworkActive; };
     bool GetUseAddrmanOutgoing() const { return m_use_addrman_outgoing; };
     void SetNetworkActive(bool active);
-    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, std::shared_ptr<qq::Probe> qq_probe = {}) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    // attempted reports direct TCP or a full SOCKS destination CONNECT, not I2P SAM.
+    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, std::shared_ptr<qq::Probe> qq_probe = {}, bool* attempted = nullptr) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
     bool CheckIncomingNonce(uint64_t nonce);
 
     // Shared transaction lock for qualification/replacement and eviction.
@@ -1416,7 +1417,7 @@ private:
     bool AlreadyConnectedToAddress(const CAddress& addr);
 
     bool AttemptToEvictConnection();
-    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool& attempted) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
     void AddWhitelistPermissionFlags(NetPermissionFlags& flags, const CNetAddr &addr) const;
 
     void DeleteNode(CNode* pnode);

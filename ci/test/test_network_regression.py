@@ -175,7 +175,7 @@ class NetworkRegressionTests(unittest.TestCase):
             with self.subTest(flavor=flavor):
                 parent = config.profile(flavor)
                 command = f'source ci/test/00_setup_env_native_{flavor}_regression.sh; printf "%s\\n" "$BITCOIN_CONFIG" "$DEP_OPTS" "$GOAL" "$RUN_FUNCTIONAL_TESTS"'
-                output = subprocess.check_output(["bash", "-c", command], cwd=ROOT, text=True,
+                output = subprocess.check_output(["bash", "-c", command], cwd=ROOT, text=True, encoding="utf8",
                     env={"PATH": os.environ["PATH"], "CI_NETWORK_REGRESSION": "true", "CIRRUS_CI": "false",
                          "REGRESSION_PROFILE": "efficiency-units"}).splitlines()
                 self.assertTrue(output[0].startswith(parent["BITCOIN_CONFIG"] + " "))

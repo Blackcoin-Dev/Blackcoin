@@ -27,6 +27,9 @@ class LocalRoute(socketserver.BaseRequestHandler):
             client = self.request
             ver, count = recvall(client, 2)
             assert ver == 5 and 0 in recvall(client, count)
+            if getattr(self.server, "reject_next_greeting", False):
+                self.server.reject_next_greeting = False
+                return
             client.sendall(b"\x05\x00")
             ver, cmd, _, kind = recvall(client, 4)
             assert ver == 5 and cmd == 1
@@ -158,15 +161,18 @@ class QQPursuitTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.disable_autoconnect = False
-        self.extra_args = [["-networkactive=0", "-dnsseed=0", "-fixedseeds=0", "-onlynet=ipv4", "-maxconnections=19", "-v2transport=0", "-debug=net"]]
+        max_connections = 3 if self.options.legacy_replenishment else 19
+        self.extra_args = [["-networkactive=0", "-dnsseed=0", "-fixedseeds=0", "-onlynet=ipv4", f"-maxconnections={max_connections}", "-v2transport=0", "-debug=net"]]
 
-        self.target = self.options.qq_target
+        self.target = 2 if self.options.legacy_replenishment else self.options.qq_target
         if self.target != 8:
             self.extra_args[0].append(f"-qqoutboundtarget={self.target}")
 
     def add_options(self, parser):
         parser.add_argument("--qq-target", type=int, choices=[2, 8], default=8,
                             help="Use the actual default-eight policy, or a shorter explicit target-two run")
+        parser.add_argument("--legacy-replenishment", action="store_true",
+                            help="Exercise automatic legacy recovery after reaching the QQ target")
 
     def setup_network(self):
         self.proxy = LocalProxy(("127.0.0.1", 0), LocalRoute)
@@ -229,7 +235,96 @@ class QQPursuitTest(BitcoinTestFramework):
             time.sleep(1)
         raise AssertionError(f"QQ target not reached: {node.getnetworkinfo()['qqoutbound']}")
 
+    def test_legacy_replenishment(self):
+        node = self.nodes[0]
+        self.proxy.requests = []
+        peers = []
+        try:
+            node.setmocktime(int(time.time()))
+            self.generate(node, 1)
+            header = from_hex(CBlockHeader(), node.getblockheader(node.getbestblockhash(), False))
+            peers = [self.endpoint(f"25.{i}.0.1", header, qq=i > 1) for i in range(1, 4)]
+            legacy, *qq_peers = peers
+            for peer in peers:
+                assert node.addpeeraddress(peer.fixture_ip, 15714, True)["success"]
+            node.setnetworkactive(True)
+            for peer in peers:
+                self.wait_until(lambda: peer.is_connected)
+                peer.wait_for_verack()
+                peer.sync_with_ping()
+
+            def full_relay_ids():
+                return {p["addr"]: p["id"] for p in node.getpeerinfo()
+                        if p["connection_type"] == "outbound-full-relay"}
+
+            def qualified_target():
+                self.evaluate()
+                return node.getnetworkinfo()["qqoutbound"]["eligible"] == self.target
+
+            self.wait_until(qualified_target)
+            original = full_relay_ids()
+            legacy_addr = f"{legacy.fixture_ip}:15714"
+            assert_equal(len(original), 3)
+            assert_equal(node.getnetworkinfo()["qqoutbound"]["deficit"], 0)
+            candidate = self.endpoint("25.4.0.1", header, qq=True)
+            peers.append(candidate)
+            address = CAddress()
+            address.ip, address.port = candidate.fixture_ip, 15714
+            address.time = node.mocktime
+            address.nServices = NODE_NETWORK | NODE_QUANTUM_QUASAR
+            announcement = msg_addr()
+            announcement.addrs = [address]
+            qq_peers[0].send_and_ping(announcement)
+            self.wait_until(lambda: any(entry["address"] == address.ip for entry in node.getnodeaddresses(0)))
+
+            for reject_greeting in (False, True):
+                # Also exercise a SOCKS greeting failure before a destination
+                # request. It must not consume the legacy-first turn.
+                start = len(self.proxy.requests)
+                old_id = full_relay_ids()[legacy_addr]
+                reconnect_count = legacy.connection_count + 1
+                self.proxy.reject_next_greeting = reject_greeting
+                legacy.peer_disconnect()
+                self.wait_until(lambda: len(self.proxy.requests) > start)
+                self.log.info("First destination after legacy loss: %s", self.proxy.requests[start])
+                assert_equal(self.proxy.requests[start], (legacy.fixture_ip, 15714))
+                assert not self.proxy.reject_next_greeting
+                self.wait_until(lambda: legacy.connection_count == reconnect_count)
+                legacy.wait_for_verack()
+                legacy.sync_with_ping()
+                self.wait_until(lambda: full_relay_ids().get(legacy_addr) not in {None, old_id})
+                self.wait_until(qualified_target)
+                assert_equal({a: i for a, i in full_relay_ids().items() if a != legacy_addr},
+                             {a: i for a, i in original.items() if a != legacy_addr})
+                # Keep the reconnected relay up through the open-connection
+                # worker's 500 ms polling cycle before the next deliberate loss.
+                time.sleep(1)
+
+            # The legacy address remains in addrman but stops accepting dials.
+            # A stale hint must yield to the reachable QQ candidate.
+            start = len(self.proxy.requests)
+            legacy.retire()
+            self.wait_until(lambda: candidate.is_connected)
+            candidate.wait_for_verack()
+            candidate.sync_with_ping()
+            self.wait_until(lambda: f"{candidate.fixture_ip}:15714" in full_relay_ids())
+            self.log.info("Destinations with a stale legacy hint: %s", self.proxy.requests[start:])
+            assert_equal(self.proxy.requests[start:start + 2],
+                         [(legacy.fixture_ip, 15714), (candidate.fixture_ip, 15714)])
+            assert_equal(len(full_relay_ids()), 3)
+            assert_equal(node.getnetworkinfo()["qqoutbound"]["deficit"], 0)
+        finally:
+            for peer in peers:
+                peer.retire()
+            node.setnetworkactive(False)
+            self.proxy.shutdown()
+            self.proxy.server_close()
+            self.proxy_thread.join(timeout=5)
+
     def run_test(self):
+        if self.options.legacy_replenishment:
+            self.test_legacy_replenishment()
+            return
         node = self.nodes[0]
         peers = []
         qq_peers = []

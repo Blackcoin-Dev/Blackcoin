@@ -350,21 +350,7 @@ void TransactionView::exportClicked()
     if (filename.isNull())
         return;
 
-    CSVModelWriter writer(filename);
-
-    // name, column, role
-    writer.setModel(transactionProxyModel);
-    writer.addColumn(tr("Confirmed"), 0, TransactionTableModel::ConfirmedRole);
-    if (model->wallet().haveWatchOnly())
-        writer.addColumn(tr("Watch-only"), TransactionTableModel::Watchonly);
-    writer.addColumn(tr("Date"), 0, TransactionTableModel::DateRole);
-    writer.addColumn(tr("Type"), TransactionTableModel::Type, Qt::EditRole);
-    writer.addColumn(tr("Label"), 0, TransactionTableModel::LabelRole);
-    writer.addColumn(tr("Address"), 0, TransactionTableModel::AddressRole);
-    writer.addColumn(BitcoinUnits::getAmountColumnTitle(model->getOptionsModel()->getDisplayUnit()), 0, TransactionTableModel::FormattedAmountRole);
-    writer.addColumn(tr("ID"), 0, TransactionTableModel::TxHashRole);
-
-    if(!writer.write()) {
+    if (!exportTransactions(filename)) {
         Q_EMIT message(tr("Exporting Failed"), tr("There was an error trying to save the transaction history to %1.").arg(filename),
             CClientUIInterface::MSG_ERROR);
     }
@@ -372,6 +358,28 @@ void TransactionView::exportClicked()
         Q_EMIT message(tr("Exporting Successful"), tr("The transaction history was successfully saved to %1.").arg(filename),
             CClientUIInterface::MSG_INFORMATION);
     }
+}
+
+bool TransactionView::exportTransactions(const QString& filename)
+{
+    if (!model || !model->getOptionsModel() || !transactionProxyModel) return false;
+
+    const auto export_model = transactionProxyModel->makeExportModel();
+    CSVModelWriter writer(filename);
+
+    // name, column, role
+    writer.setModel(export_model.get());
+    writer.addColumn(tr("Confirmed"), 0, TransactionTableModel::ConfirmedRole);
+    if (model->wallet().haveWatchOnly())
+        writer.addColumn(tr("Watch-only"), TransactionTableModel::Watchonly);
+    writer.addColumn(tr("Date"), 0, TransactionTableModel::DateRole);
+    writer.addColumn(tr("Type"), TransactionTableModel::Type, Qt::EditRole);
+    writer.addColumn(tr("Label"), 0, TransactionTableModel::ExportLabelRole);
+    writer.addColumn(tr("Address"), 0, TransactionTableModel::AddressRole);
+    writer.addColumn(BitcoinUnits::getAmountColumnTitle(model->getOptionsModel()->getDisplayUnit()), 0, TransactionTableModel::FormattedAmountRole);
+    writer.addColumn(tr("ID"), 0, TransactionTableModel::TxHashRole);
+
+    return writer.write();
 }
 
 void TransactionView::contextualMenu(const QPoint &point)
@@ -386,7 +394,7 @@ void TransactionView::contextualMenu(const QPoint &point)
     hash.SetHex(selection.at(0).data(TransactionTableModel::TxHashRole).toString().toStdString());
     abandonAction->setEnabled(model->wallet().transactionCanBeAbandoned(hash));
     copyAddressAction->setEnabled(GUIUtil::hasEntryData(transactionView, 0, TransactionTableModel::AddressRole));
-    copyLabelAction->setEnabled(GUIUtil::hasEntryData(transactionView, 0, TransactionTableModel::LabelRole));
+    copyLabelAction->setEnabled(GUIUtil::hasEntryData(transactionView, 0, TransactionTableModel::ExportLabelRole));
 
     if (index.isValid()) {
         GUIUtil::PopupMenu(contextMenu, transactionView->viewport()->mapToGlobal(point));
@@ -416,7 +424,7 @@ void TransactionView::copyAddress()
 
 void TransactionView::copyLabel()
 {
-    GUIUtil::copyEntryData(transactionView, 0, TransactionTableModel::LabelRole);
+    GUIUtil::copyEntryData(transactionView, 0, TransactionTableModel::ExportLabelRole);
 }
 
 void TransactionView::copyAmount()

@@ -24,6 +24,8 @@
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
 
+#include <algorithm>
+#include <limits>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
@@ -1293,6 +1295,54 @@ BOOST_AUTO_TEST_CASE(muhash_tests)
     uint256 out4;
     overflowchk.Finalize(out4);
     BOOST_CHECK_EQUAL(HexStr(out4), "3a31e6903aff0de9f62f9a9f7f8b861de76ce2cda09822b90014319ae5dc2271");
+}
+
+BOOST_AUTO_TEST_CASE(muhash_divide_identity_reduces_numerator)
+{
+    constexpr auto max_limb = std::numeric_limits<Num3072::limb_t>::max();
+    constexpr Num3072::limb_t prime_diff{1103717};
+    Num3072 modulus;
+    std::fill_n(modulus.limbs, Num3072::LIMBS, max_limb);
+    modulus.limbs[0] -= prime_diff - 1;
+    Num3072 modulus_plus_one = modulus;
+    ++modulus_plus_one.limbs[0];
+    const Num3072 one;
+    Num3072 high_limb_denominator = one;
+    high_limb_denominator.limbs[Num3072::LIMBS - 1] = 1;
+
+    const auto check_limbs = [](const Num3072& actual, const Num3072& expected) {
+        BOOST_CHECK_EQUAL_COLLECTIONS(actual.limbs, actual.limbs + Num3072::LIMBS,
+                                      expected.limbs, expected.limbs + Num3072::LIMBS);
+    };
+
+    for (const auto& identity : {one, modulus_plus_one}) {
+        Num3072 reduced = modulus;
+        reduced.Divide(identity);
+        Num3072 zero;
+        zero.limbs[0] = 0;
+        check_limbs(reduced, zero);
+
+        reduced = modulus_plus_one;
+        reduced.Divide(identity);
+        check_limbs(reduced, one);
+
+        Num3072 max_num;
+        std::fill_n(max_num.limbs, Num3072::LIMBS, max_limb);
+        max_num.Divide(identity);
+        Num3072 expected;
+        expected.limbs[0] = prime_diff - 1;
+        check_limbs(max_num, expected);
+    }
+
+    // A low limb of one is insufficient when another limb is nonzero.
+    Num3072 inverse = one;
+    inverse.Divide(high_limb_denominator);
+    inverse.Multiply(high_limb_denominator);
+    check_limbs(inverse, one);
+
+    Num3072 aliased = modulus_plus_one;
+    aliased.Divide(aliased);
+    check_limbs(aliased, one);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

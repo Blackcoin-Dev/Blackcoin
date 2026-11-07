@@ -8,8 +8,10 @@
 #include <consensus/amount.h>
 
 #include <QDateTime>
+#include <QHash>
 #include <QSortFilterProxyModel>
 
+#include <memory>
 #include <optional>
 
 /** Filter the transaction list according to pre-specified rules. */
@@ -42,6 +44,10 @@ public:
     void setMinAmount(const CAmount& minimum);
     void setWatchOnlyFilter(WatchOnlyFilter filter);
 
+    /** Snapshot the current filters for synchronous CSV writing, with authoritative labels. */
+    std::unique_ptr<TransactionFilterProxy> makeExportModel() const;
+    QVariant data(const QModelIndex& index, int role) const override;
+
     /** Set whether to show conflicted transactions. */
     void setShowInactive(bool showInactive);
 
@@ -49,6 +55,10 @@ protected:
     bool filterAcceptsRow(int source_row, const QModelIndex & source_parent) const override;
 
 private:
+    QString labelForFilter(const QModelIndex& source_index) const;
+
+    bool m_export_model{false};
+    mutable QHash<int, QString> m_export_labels;
     std::optional<QDateTime> dateFrom;
     std::optional<QDateTime> dateTo;
     QString m_search_string;

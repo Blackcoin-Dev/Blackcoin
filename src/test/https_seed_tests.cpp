@@ -1064,7 +1064,7 @@ void CompleteBootstrapHandshake(ConnmanTestMsg& connman, node::NodeContext& node
     BOOST_REQUIRE(peer.fSuccessfullyConnected);
 }
 
-void BootstrapHandshakeReset(node::NodeContext& node, bool handshake)
+void LegacyReplenishmentAfterBootstrap(node::NodeContext& node, bool handshake)
 {
     PreparePersistedBootstrap(node);
     auto& connman = static_cast<ConnmanTestMsg&>(*node.connman);
@@ -1072,16 +1072,16 @@ void BootstrapHandshakeReset(node::NodeContext& node, bool handshake)
     sockaddr_in local{}; local.sin_family = AF_INET; local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     BOOST_REQUIRE(listener.SetNonBlocking());
     BOOST_REQUIRE_EQUAL(listener.Bind(reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
-    BOOST_REQUIRE_EQUAL(listener.Listen(1), 0);
+    BOOST_REQUIRE_EQUAL(listener.Listen(2), 0);
     socklen_t size{sizeof(local)};
     BOOST_REQUIRE_EQUAL(listener.GetSockName(reinterpret_cast<sockaddr*>(&local), &size), 0);
     SocketFactoryScope factory;
     std::mutex mutex;
     std::condition_variable condition;
     std::vector<bool> attempts;
-    std::string legacy_endpoint;
+    std::vector<std::string> legacy_endpoints;
     bool released{false}, pause_timed_out{false};
-    std::unique_ptr<TestSocket> accepted;
+    std::vector<std::unique_ptr<TestSocket>> accepted;
     struct StopOnExit {
         ConnmanTestMsg& connman;
         std::mutex& mutex;
@@ -1104,8 +1104,8 @@ void BootstrapHandshakeReset(node::NodeContext& node, bool handshake)
     };
     CreateSock = [&](const CService& address) -> std::unique_ptr<Sock> {
         const bool qq = address.GetPort() == 46005;
-        if (!qq && legacy_endpoint.empty()) {
-            legacy_endpoint = address.ToStringAddrPort();
+        if (!qq && legacy_endpoints.size() < 2) {
+            legacy_endpoints.push_back(address.ToStringAddrPort());
             return std::make_unique<RecordingBootstrapSocket>(ntohs(local.sin_port), [&, qq] { record(qq); });
         }
         return std::make_unique<RefusedBootstrapSocket>([&, qq] { record(qq); });
@@ -1113,12 +1113,13 @@ void BootstrapHandshakeReset(node::NodeContext& node, bool handshake)
     connman.StartHTTPSAutomaticConnectionsForTest();
     const bool paused = Eventually([&] { std::lock_guard<std::mutex> lock{mutex}; return attempts.size() == 5; }, std::chrono::seconds{10});
     if (paused) {
-        auto* peer = connman.FindHTTPSNodeForTest(legacy_endpoint);
+        BOOST_REQUIRE(!legacy_endpoints.empty());
+        auto* peer = connman.FindHTTPSNodeForTest(legacy_endpoints.front());
         BOOST_REQUIRE(peer != nullptr);
         BOOST_CHECK(!peer->fSuccessfullyConnected); // A socket alone must not retire outage fairness.
         const SOCKET peer_fd = static_cast<SOCKET>(accept(listener.Descriptor(), nullptr, nullptr));
         BOOST_REQUIRE(peer_fd != INVALID_SOCKET);
-        accepted = std::make_unique<TestSocket>(peer_fd);
+        accepted.push_back(std::make_unique<TestSocket>(peer_fd));
         if (handshake) CompleteBootstrapHandshake(connman, node, *peer);
     }
     { std::lock_guard<std::mutex> lock{mutex}; released = true; }
@@ -1129,19 +1130,37 @@ void BootstrapHandshakeReset(node::NodeContext& node, bool handshake)
     BOOST_REQUIRE_EQUAL(attempts.size(), 6U);
     BOOST_CHECK(!pause_timed_out);
     BOOST_CHECK(attempts[0] && attempts[1] && !attempts[2] && attempts[3] && attempts[4]);
-    BOOST_CHECK_EQUAL(attempts[5], handshake);
+    std::string observed;
+    for (const bool qq : attempts) observed += qq ? 'Q' : 'L';
+    BOOST_TEST_MESSAGE("Actual socket-attempt classes during relay replenishment: " << observed);
+    BOOST_REQUIRE_MESSAGE(!attempts[5], "Two QQ-hinted attempts must give the next legacy peer a turn even after a full-relay handshake: " << observed);
+    BOOST_REQUIRE_EQUAL(legacy_endpoints.size(), 2U);
+    auto* replenished = connman.FindHTTPSNodeForTest(legacy_endpoints.back());
+    BOOST_REQUIRE(replenished);
+    BOOST_CHECK(replenished->IsFullOutboundConn());
+    BOOST_CHECK(!replenished->IsQQProbe());
+    const SOCKET peer_fd = static_cast<SOCKET>(accept(listener.Descriptor(), nullptr, nullptr));
+    BOOST_REQUIRE(peer_fd != INVALID_SOCKET);
+    accepted.push_back(std::make_unique<TestSocket>(peer_fd));
+    // StopThreads interrupts message processing too. The new persistent
+    // socket is observable here; the first peer exercised actual VERSION/VERACK.
+    BOOST_CHECK(!replenished->fDisconnect);
+    auto* first = connman.FindHTTPSNodeForTest(legacy_endpoints.front());
+    BOOST_REQUIRE(first);
+    BOOST_CHECK_EQUAL(first->fSuccessfullyConnected.load(), handshake);
+    BOOST_CHECK(!first->fDisconnect);
     BOOST_CHECK_EQUAL(connman.GetQQTarget(), 8);
 }
 } // namespace
 
 BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_socket_without_handshake_keeps_recovery, TestingSetup)
 {
-    BootstrapHandshakeReset(m_node, false);
+    LegacyReplenishmentAfterBootstrap(m_node, false);
 }
 
-BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_completed_handshake_retires_recovery, TestingSetup)
+BOOST_FIXTURE_TEST_CASE(actual_connman_replenishes_legacy_after_a_completed_handshake, TestingSetup)
 {
-    BootstrapHandshakeReset(m_node, true);
+    LegacyReplenishmentAfterBootstrap(m_node, true);
 }
 
 BOOST_FIXTURE_TEST_CASE(actual_connman_toggle_discards_completed_old_response, TestingSetup)

@@ -1074,6 +1074,7 @@ void WalletModel::updateTransaction()
 void WalletModel::updateAddressBook(const QString &address, const QString &label,
         bool isMine, wallet::AddressPurpose purpose, int status)
 {
+    transactionTableModel->invalidateAddressLabel(address);
     if(addressTableModel)
         addressTableModel->updateEntry(address, label, isMine, purpose, status);
 }

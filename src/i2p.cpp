@@ -215,8 +215,10 @@ bool Session::Accept(Connection& conn)
     return false;
 }
 
-bool Session::Connect(const CService& to, Connection& conn, bool& proxy_error)
+bool Session::Connect(const CService& to, Connection& conn, bool& proxy_error, bool* attempted)
 {
+    if (attempted) *attempted = false;
+
     // Refuse connecting to arbitrary ports. We don't specify any destination port to the SAM proxy
     // when connecting (SAM 3.1 does not use ports) and it forces/defaults it to I2P_SAM31_PORT.
     if (to.GetPort() != I2P_SAM31_PORT) {
@@ -246,7 +248,7 @@ bool Session::Connect(const CService& to, Connection& conn, bool& proxy_error)
 
         const Reply& connect_reply = SendRequestAndGetReply(
             *sock, strprintf("STREAM CONNECT ID=%s DESTINATION=%s SILENT=false", session_id, dest),
-            false);
+            /*check_result_ok=*/false, attempted);
 
         const std::string& result = connect_reply.Get("RESULT");
 
@@ -293,9 +295,11 @@ void Session::Log(const std::string& fmt, const Args&... args) const
 
 Session::Reply Session::SendRequestAndGetReply(const Sock& sock,
                                                const std::string& request,
-                                               bool check_result_ok) const
+                                               bool check_result_ok,
+                                               bool* request_sent) const
 {
     sock.SendComplete(request + "\n", MAX_WAIT_FOR_IO, *m_interrupt);
+    if (request_sent) *request_sent = true;
 
     Reply reply;
 

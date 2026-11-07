@@ -2501,6 +2501,13 @@ public:
         }
         return true;
     }
+    std::optional<std::string> tryGetAddressLabel(const CTxDestination& dest) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) return std::nullopt;
+        const auto* entry = m_wallet->FindAddressBookEntry(dest, /*allow_change=*/false);
+        return entry ? entry->GetLabel() : std::string{};
+    }
     std::vector<WalletAddress> getAddresses() const override
     {
         LOCK(m_wallet->cs_wallet);
@@ -2606,14 +2613,15 @@ public:
         }
         return {};
     }
-    WalletTx getWalletTx(const uint256& txid) override
+    bool tryGetWalletTx(const uint256& txid, WalletTx& tx) override
     {
-        LOCK(m_wallet->cs_wallet);
-        auto mi = m_wallet->mapWallet.find(txid);
-        if (mi != m_wallet->mapWallet.end()) {
-            return MakeWalletTx(*m_wallet, mi->second);
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) {
+            return false;
         }
-        return {};
+        const auto it = m_wallet->mapWallet.find(txid);
+        tx = it != m_wallet->mapWallet.end() ? MakeWalletTx(*m_wallet, it->second) : WalletTx{};
+        return true;
     }
     std::set<WalletTx> getWalletTxs() override
     {

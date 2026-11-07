@@ -8,16 +8,23 @@ set -euo pipefail
 
 [[ $# == 1 && -x "$1" ]]
 [[ "${TARGET_SHA:?exact source SHA required}" =~ ^[0-9a-f]{40}$ ]]
-log=${NETWORK_REGRESSION_LOG:-${BASE_SCRATCH_DIR:-.}/bootstrap-units.log}
+profile=${REGRESSION_PROFILE:-bootstrap-units}
+suites=clientversion_tests,https_seed_tests,net_tests
+case "$profile" in
+  bootstrap-units) ;;
+  performance-units) suites+=,crypto_tests,shadow_tests,i2p_tests ;;
+  *) printf 'Unsupported focused unit profile: %s\n' "$profile" >&2; exit 64 ;;
+esac
+log=${NETWORK_REGRESSION_LOG:-${BASE_SCRATCH_DIR:-.}/$profile.log}
 mkdir -p -- "$(dirname "$log")"
 # One process preserves Boost suite ordering/shared state and sanitizer behavior.
 # This is diagnostic evidence only, never a replacement for the full gate.
 set +e
 {
   printf 'target_sha=%s\n' "$TARGET_SHA"
-  printf 'profile=bootstrap-units\nsuites=clientversion_tests,https_seed_tests,net_tests\n'
+  printf 'profile=%s\nsuites=%s\n' "$profile" "$suites"
   sha256sum "$1" || exit "$?"
-  "$1" --run_test=clientversion_tests,https_seed_tests,net_tests \
+  "$1" --run_test="$suites" \
     --catch_system_errors=no --log_level=test_suite --report_level=detailed
 } 2>&1 | tee "$log"
 status=("${PIPESTATUS[@]}")

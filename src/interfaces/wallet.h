@@ -172,6 +172,10 @@ public:
         wallet::isminetype* is_mine,
         wallet::AddressPurpose* purpose) = 0;
 
+    //! Get the address label without waiting. A disengaged result means the wallet is busy.
+    //! A missing or unlabeled address returns an empty string.
+    virtual std::optional<std::string> tryGetAddressLabel(const CTxDestination& dest) = 0;
+
     //! Get wallet address list.
     virtual std::vector<WalletAddress> getAddresses() const = 0;
 
@@ -217,8 +221,9 @@ public:
     //! Get a transaction.
     virtual CTransactionRef getTx(const uint256& txid) = 0;
 
-    //! Get transaction information.
-    virtual WalletTx getWalletTx(const uint256& txid) = 0;
+    //! Get transaction information without waiting for the wallet lock.
+    //! Returns false on lock contention, or true with an empty tx if the hash is absent.
+    virtual bool tryGetWalletTx(const uint256& txid, WalletTx& tx) = 0;
 
     //! Get list of all wallet transactions.
     virtual std::set<WalletTx> getWalletTxs() = 0;

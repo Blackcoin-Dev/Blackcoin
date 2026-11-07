@@ -74,6 +74,8 @@ public:
         StatusRole,
         /** Unprocessed icon */
         RawDecorationRole,
+        /** Current wallet label for explicit copy/export operations. */
+        ExportLabelRole,
     };
 
     int rowCount(const QModelIndex &parent) const override;
@@ -82,20 +84,21 @@ public:
     QVariant headerData(int section, Qt::Orientation orientation, int role) const override;
     QModelIndex index(int row, int column, const QModelIndex & parent = QModelIndex()) const override;
     bool processingQueuedTransactions() const { return fProcessingQueuedTransactions; }
+    void invalidateAddressLabel(const QString& address);
 
 private:
     WalletModel *walletModel;
     std::unique_ptr<interfaces::Handler> m_handler_transaction_changed;
     std::unique_ptr<interfaces::Handler> m_handler_show_progress;
     QStringList columns;
-    TransactionTablePriv *priv;
+    std::shared_ptr<TransactionTablePriv> priv;
     bool fProcessingQueuedTransactions{false};
     const PlatformStyle *platformStyle;
 
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
 
-    QString lookupAddress(const std::string &address, bool tooltip) const;
+    QString lookupAddress(const TransactionRecord& record, bool tooltip) const;
     QVariant addressColor(const TransactionRecord *wtx) const;
     QString formatTxStatus(const TransactionRecord *wtx) const;
     QString formatTxDate(const TransactionRecord *wtx) const;
@@ -110,14 +113,10 @@ private:
     QVariant txAddressDecoration(const TransactionRecord *wtx) const;
 
 public Q_SLOTS:
-    /* New transaction, or transaction changed status */
-    void updateTransaction(const QString &hash, int status, bool showTransaction);
     void updateConfirmations();
     void updateDisplayUnit();
     /** Updates the column title to "Amount (DisplayUnit)" and emits headerDataChanged() signal for table headers to react. */
     void updateAmountColumnTitle();
-    /* Needed to update fProcessingQueuedTransactions through a QueuedConnection */
-    void setProcessingQueuedTransactions(bool value) { fProcessingQueuedTransactions = value; }
 
     friend class TransactionTablePriv;
 };

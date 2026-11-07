@@ -30,6 +30,7 @@
 #include <qt/sendcoinsdialog.h>
 #include <qt/sendcoinsentry.h>
 #include <qt/stakingminingpage.h>
+#include <qt/transactionfilterproxy.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionview.h>
 #include <qt/utilitydialog.h>
@@ -51,6 +52,7 @@
 #include <wallet/test/util.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 
 #include <clientversion.h>
 
@@ -73,6 +75,8 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QFile>
+#include <QMenu>
 #include <QMessageBox>
 #include <QLabel>
 #include <QLineEdit>
@@ -84,6 +88,7 @@
 #include <QStyleOptionButton>
 #include <QTableView>
 #include <QTableWidget>
+#include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -3489,6 +3494,370 @@ void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const Platfo
              qPrintable(QStringLiteral("Page destruction waited %1 ms for full refresh").arg(destroy_elapsed_ms)));
 }
 
+void TestTransactionTableResponsiveUnderWalletLock(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    auto gui = std::make_unique<MiniGUI>(node, style.get());
+    gui->initModelForWallet(node, wallet, style.get());
+    auto* table = gui->walletModel->getTransactionTableModel();
+    const int initial_rows = table->rowCount({});
+    const auto destination = wallet->GetNewDestination(OutputType::BECH32, "test label");
+    QVERIFY(destination);
+
+    std::vector<CTransactionRef> transactions;
+    constexpr int SCANNED_TRANSACTIONS{36};
+    for (int i = 0; i <= SCANNED_TRANSACTIONS; ++i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{1}, static_cast<uint32_t>(i)});
+        tx.vout.emplace_back(COIN, GetScriptForDestination(*destination));
+        transactions.push_back(MakeTransactionRef(std::move(tx)));
+    }
+    qApp->processEvents();
+
+    std::vector<std::pair<QString, bool>> inserted;
+    int rows_at_removal{-1};
+    int inserts_before_next_event{-1};
+    QObject::connect(table, &TransactionTableModel::rowsInserted, table, [&](const QModelIndex& parent, int first, int) {
+        inserted.emplace_back(table->index(first, 0, parent).data(TransactionTableModel::TxHashRole).toString(),
+                              table->processingQueuedTransactions());
+        if (inserted.size() == 1) {
+            QMetaObject::invokeMethod(table, [&] { inserts_before_next_event = int(inserted.size()); }, Qt::QueuedConnection);
+        }
+    });
+    QObject::connect(table, &TransactionTableModel::rowsRemoved, table, [&] { rows_at_removal = int(inserted.size()); });
+
+    std::promise<bool> notification_sent;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    wallet->ShowProgress("scan", 0);
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        bool ok{true};
+        for (int i = 0; i < SCANNED_TRANSACTIONS; ++i) {
+            if (!wallet->AddToWallet(transactions[i], wallet::TxStateInactive{})) ok = false;
+        }
+        std::vector<uint256> remove{transactions.front()->GetHash()};
+        std::vector<uint256> removed;
+        wallet->NotifyTransactionChanged(remove.front(), CT_UPDATED);
+        if (wallet->ZapSelectTx(remove, removed) != wallet::DBErrors::LOAD_OK ||
+            !wallet->AddToWallet(transactions.front(), wallet::TxStateInactive{})) {
+            ok = false;
+        }
+        // An absent transaction must be consumed as well. A later update must still run.
+        wallet->NotifyTransactionChanged(uint256{0x42}, CT_UPDATED);
+        if (!wallet->AddToWallet(transactions.back(), wallet::TxStateInactive{})) ok = false;
+        notification_sent.set_value(ok);
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+    });
+    const bool added = notification_sent.get_future().get();
+    wallet->ShowProgress("scan", 100);
+
+    QEventLoop loop;
+    QElapsedTimer timer;
+    timer.start();
+    int rows_at_heartbeat{-1};
+    QTimer::singleShot(0, &loop, [&] {
+        rows_at_heartbeat = table->rowCount({});
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    const qint64 elapsed_ms = timer.elapsed();
+    holder.join();
+
+    QVERIFY(added);
+    qInfo("Transaction notification heartbeat: %lld ms", static_cast<long long>(elapsed_ms));
+    QVERIFY2(heartbeat_during_lock, "Queued transaction notification blocked the GUI until the wallet lock was released");
+    QCOMPARE(rows_at_heartbeat, initial_rows);
+    QTRY_COMPARE_WITH_TIMEOUT(inserted.size(), transactions.size() + 1, 5000);
+    QCOMPARE(table->rowCount({}), initial_rows + int(transactions.size()));
+    QCOMPARE(rows_at_removal, SCANNED_TRANSACTIONS);
+    QVERIFY(inserts_before_next_event > 0 && inserts_before_next_event < SCANNED_TRANSACTIONS);
+    for (int i = 0; i < SCANNED_TRANSACTIONS; ++i) {
+        QCOMPARE(inserted[i].first, QString::fromStdString(transactions[i]->GetHash().ToString()));
+        // The last 10 scan notifications include the removal, reinsert, and updates.
+        QCOMPARE(inserted[i].second, i < SCANNED_TRANSACTIONS + 5 - 10);
+    }
+    QCOMPARE(inserted[SCANNED_TRANSACTIONS].first, QString::fromStdString(transactions.front()->GetHash().ToString()));
+    QCOMPARE(inserted.back().first, QString::fromStdString(transactions.back()->GetHash().ToString()));
+    QVERIFY(!inserted[SCANNED_TRANSACTIONS].second);
+    QVERIFY(!inserted.back().second);
+    const QModelIndex row = FindTx(*table, transactions.front()->GetHash());
+    QVERIFY(row.isValid());
+    QCOMPARE(row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("test label"));
+
+    // An uncontended burst also shares the turn budget.
+    inserted.clear();
+    inserts_before_next_event = -1;
+    for (int i = 0; i < SCANNED_TRANSACTIONS; ++i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{2}, static_cast<uint32_t>(i)});
+        tx.vout.emplace_back(COIN, GetScriptForDestination(*destination));
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(tx)), wallet::TxStateInactive{}));
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(inserted.size(), size_t{SCANNED_TRANSACTIONS}, 5000);
+    QVERIFY(inserts_before_next_event > 0 && inserts_before_next_event < SCANNED_TRANSACTIONS);
+    qInfo("Uncontended burst yielded after %d inserts", inserts_before_next_event);
+
+    // Destroy a model with a retry pending while another thread still holds the wallet.
+    std::promise<void> queued;
+    std::promise<void> release;
+    auto wait_for_release = release.get_future();
+    bool destroyed_during_lock{false};
+    std::thread shutdown_holder([&] {
+        LOCK(wallet->cs_wallet);
+        wallet->NotifyTransactionChanged(transactions.back()->GetHash(), CT_UPDATED);
+        queued.set_value();
+        destroyed_during_lock = wait_for_release.wait_for(750ms) == std::future_status::ready;
+    });
+    queued.get_future().wait();
+    QCoreApplication::sendPostedEvents(table, QEvent::MetaCall);
+    QPointer<TransactionTableModel> pending_table{table};
+    gui.reset();
+    release.set_value();
+    shutdown_holder.join();
+
+    QVERIFY(destroyed_during_lock);
+    QVERIFY(pending_table.isNull());
+    QTest::qWait(75);
+}
+
+void TestTransactionLabelsResponsiveUnderWalletLock(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    const auto receive = wallet->GetNewDestination(OutputType::BECH32, "receiver");
+    QVERIFY(receive);
+    const CTxDestination send = WitnessV0KeyHash{};
+    QVERIFY(wallet->SetAddressBook(send, "recipient", wallet::AddressPurpose::SEND));
+    CMutableTransaction incoming;
+    incoming.vin.emplace_back(COutPoint{uint256{1}, 0});
+    incoming.vout.emplace_back(2 * COIN, GetScriptForDestination(*receive));
+    const auto received_tx = MakeTransactionRef(std::move(incoming));
+    QVERIFY(wallet->AddToWallet(received_tx, wallet::TxStateInactive{}));
+    CMutableTransaction outgoing;
+    outgoing.vin.emplace_back(COutPoint{received_tx->GetHash(), 0});
+    outgoing.vout.emplace_back(COIN, GetScriptForDestination(send));
+    const auto sent_tx = MakeTransactionRef(std::move(outgoing));
+    QVERIFY(wallet->AddToWallet(sent_tx, wallet::TxStateInactive{}));
+
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    OptionsModel options(node);
+    bilingual_str error;
+    QVERIFY(options.Init(error));
+    ClientModel client(node, &options);
+    auto model = std::make_unique<WalletModel>(
+        interfaces::MakeWallet(*node.walletLoader().context(), wallet), client, style.get());
+    // The visible address book can omit bech32 addresses.
+    model->refresh(/*pk_hash_only=*/true);
+    auto* table = model->getTransactionTableModel();
+    const QModelIndex received_row = FindTx(*table, received_tx->GetHash());
+    const QModelIndex sent_row = FindTx(*table, sent_tx->GetHash());
+    QVERIFY(received_row.isValid());
+    QVERIFY(sent_row.isValid());
+
+    std::promise<void> locked;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+    });
+    locked.get_future().wait();
+
+    QSignalSpy repaint(table, &TransactionTableModel::dataChanged);
+    QEventLoop loop;
+    QElapsedTimer timer;
+    timer.start();
+    QString label_during_lock;
+    QMetaObject::invokeMethod(&loop, [&] {
+        const auto address = table->index(received_row.row(), TransactionTableModel::ToAddress);
+        address.data(Qt::DisplayRole);
+        label_during_lock = received_row.data(TransactionTableModel::LabelRole).toString();
+    }, Qt::QueuedConnection);
+    QTimer::singleShot(0, &loop, [&] {
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    const qint64 elapsed_ms = timer.elapsed();
+    holder.join();
+
+    qInfo("Transaction label paint heartbeat: %lld ms", static_cast<long long>(elapsed_ms));
+    QVERIFY2(heartbeat_during_lock, "Transaction label rendering blocked the GUI until the wallet lock was released");
+    QVERIFY(label_during_lock.isEmpty());
+    QTRY_VERIFY_WITH_TIMEOUT(repaint.count() > 0, 5000);
+    QCOMPARE(received_row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("receiver"));
+    {
+        TransactionView export_view(style.get());
+        export_view.setModel(model.get());
+        auto* view = export_view.findChild<QTableView*>();
+        QVERIFY(view);
+        auto* proxy = qobject_cast<TransactionFilterProxy*>(view->model());
+        QVERIFY(proxy);
+        QTemporaryDir output;
+        QVERIFY(output.isValid());
+        const auto check_csv = [&](const QString& path, const QByteArray& label) {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const auto lines = file.readAll().trimmed().split('\n');
+            QCOMPARE(lines.size(), 2);
+            QVERIFY(lines.back().contains(label));
+            QVERIFY(lines.back().contains(QByteArray::fromStdString(sent_tx->GetHash().ToString())));
+        };
+
+        // Force a search to encounter a cold address label while the wallet is busy.
+        std::promise<void> export_locked;
+        std::thread export_holder([&] {
+            LOCK(wallet->cs_wallet);
+            export_locked.set_value();
+            std::this_thread::sleep_for(250ms);
+        });
+        export_locked.get_future().wait();
+        proxy->setSearchString(QStringLiteral("recipient"));
+        const int cold_rows = proxy->rowCount();
+        const QString cold_path = output.filePath(QStringLiteral("cold.csv"));
+        const bool cold_written = export_view.exportTransactions(cold_path);
+        export_holder.join();
+        QCOMPARE(cold_rows, 0);
+        QVERIFY(cold_written);
+        check_csv(cold_path, "recipient");
+
+        // The detached export leaves the live label pending. The context menu
+        // should still offer Copy Label for that selected transaction.
+        proxy->setSearchString({});
+        view->selectRow(proxy->mapFromSource(sent_row).row());
+        QVERIFY(sent_row.data(TransactionTableModel::LabelRole).toString().isEmpty());
+        auto* menu = export_view.findChild<QMenu*>(QStringLiteral("contextMenu"));
+        QVERIFY(menu);
+        const auto actions = menu->actions();
+        const auto copy_label = std::find_if(actions.cbegin(), actions.cend(), [](const QAction* action) {
+            return action->text() == TransactionView::tr("Copy &label");
+        });
+        QVERIFY(copy_label != actions.cend());
+        QVERIFY(QMetaObject::invokeMethod(&export_view, "contextualMenu", Qt::DirectConnection, Q_ARG(QPoint, QPoint(-1, -1))));
+        QVERIFY((*copy_label)->isEnabled());
+
+        proxy->setSearchString(QStringLiteral("recipient"));
+        QTRY_COMPARE_WITH_TIMEOUT(proxy->rowCount(), 1, 5000);
+        QCOMPARE(sent_row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("recipient"));
+        proxy->setSearchString(QStringLiteral("csv-match"));
+        QCOMPARE(proxy->rowCount(), 0);
+        repaint.clear();
+        QVERIFY(wallet->SetAddressBook(send, "csv-match", wallet::AddressPurpose::SEND));
+        QCOMPARE(proxy->rowCount(), 0);
+        const QString stale_path = output.filePath(QStringLiteral("stale.csv"));
+        QVERIFY(export_view.exportTransactions(stale_path));
+        check_csv(stale_path, "csv-match");
+        QCOMPARE(proxy->rowCount(), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(proxy->rowCount(), 1, 5000);
+        QVERIFY(!repaint.isEmpty());
+        for (const auto& change : repaint) {
+            QCOMPARE(qvariant_cast<QModelIndex>(change.at(0)).row(), sent_row.row());
+            QCOMPARE(qvariant_cast<QModelIndex>(change.at(1)).row(), sent_row.row());
+        }
+    }
+
+
+    QVERIFY(wallet->SetAddressBook(send, "renamed", wallet::AddressPurpose::SEND));
+    QTRY_COMPARE_WITH_TIMEOUT(sent_row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("renamed"), 5000);
+    QVERIFY(wallet->DelAddressBook(send));
+    QTRY_VERIFY_WITH_TIMEOUT(sent_row.data(TransactionTableModel::LabelRole).toString().isEmpty(), 5000);
+    QVERIFY(wallet->SetAddressBook(send, "restored", wallet::AddressPurpose::SEND));
+    wallet->NotifyAddressBookChanged(send, "stale payload", /*is_mine=*/false, wallet::AddressPurpose::SEND, CT_UPDATED);
+    QTRY_COMPARE_WITH_TIMEOUT(sent_row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("restored"), 5000);
+    QVERIFY(sent_row.data(TransactionTableModel::TxPlainTextRole).toString().contains(QStringLiteral("(restored)")));
+    QCOMPARE(sent_row.data(TransactionTableModel::ExportLabelRole).toString(), QStringLiteral("restored"));
+
+    // Reacquire the wallet mutex after the row snapshot but before the real
+    // WalletView rowsInserted handler reads the transaction label.
+    QVERIFY(!node.isInitialBlockDownload());
+    {
+        std::promise<void> start_relock;
+        auto wait_for_relock = start_relock.get_future();
+        std::promise<void> relocked;
+        auto wait_for_lock = relocked.get_future();
+        std::promise<void> insertion_heartbeat;
+        auto wait_for_insertion_heartbeat = insertion_heartbeat.get_future();
+        bool lock_reacquired{false};
+        bool insertion_heartbeat_during_lock{false};
+        QEventLoop insertion_loop;
+        QObject::connect(table, &TransactionTableModel::rowsInserted, &insertion_loop, [&] {
+            start_relock.set_value();
+            lock_reacquired = wait_for_lock.wait_for(1500ms) == std::future_status::ready;
+            if (!lock_reacquired) {
+                insertion_loop.quit();
+                return;
+            }
+            QTimer::singleShot(0, &insertion_loop, [&] {
+                insertion_heartbeat.set_value();
+                insertion_loop.quit();
+            });
+        });
+        WalletView view(model.get(), style.get(), nullptr);
+        view.setClientModel(&client);
+        QSignalSpy notifications(&view, &WalletView::incomingTransaction);
+
+        CMutableTransaction next;
+        next.vin.emplace_back(COutPoint{uint256{2}, 0});
+        next.vout.emplace_back(COIN, GetScriptForDestination(*receive));
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(next)), wallet::TxStateInactive{}));
+        std::thread locker([&] {
+            if (wait_for_relock.wait_for(1500ms) != std::future_status::ready) return;
+            LOCK(wallet->cs_wallet);
+            relocked.set_value();
+            insertion_heartbeat_during_lock = wait_for_insertion_heartbeat.wait_for(750ms) == std::future_status::ready;
+        });
+        QTimer::singleShot(2500, &insertion_loop, &QEventLoop::quit);
+        insertion_loop.exec();
+        locker.join();
+        QVERIFY2(lock_reacquired, "Wallet lock reacquisition handshake timed out");
+        QVERIFY2(insertion_heartbeat_during_lock, "WalletView blocked the GUI when the wallet lock was reacquired after row insertion");
+        QCOMPARE(notifications.count(), 1);
+        QCOMPARE(notifications.at(0).at(5).toString(), QStringLiteral("receiver"));
+    }
+
+
+    // Removing an observed transaction retires its label dependency. A
+    // reinserted transaction reads the updated label using its new row index.
+    std::vector<uint256> remove{sent_tx->GetHash()};
+    std::vector<uint256> removed;
+    const auto zap = WITH_LOCK(wallet->cs_wallet, return wallet->ZapSelectTx(remove, removed));
+    QCOMPARE(zap, wallet::DBErrors::LOAD_OK);
+    QTRY_VERIFY_WITH_TIMEOUT(!FindTx(*table, sent_tx->GetHash()).isValid(), 5000);
+    repaint.clear();
+    QVERIFY(wallet->SetAddressBook(send, "after removal", wallet::AddressPurpose::SEND));
+    QTest::qWait(75);
+    QVERIFY(repaint.isEmpty());
+    QVERIFY(wallet->AddToWallet(sent_tx, wallet::TxStateInactive{}));
+    QTRY_VERIFY_WITH_TIMEOUT(FindTx(*table, sent_tx->GetHash()).isValid(), 5000);
+    QCOMPARE(FindTx(*table, sent_tx->GetHash()).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("after removal"));
+
+    std::promise<bool> changed;
+    std::promise<void> release;
+    auto wait_for_release = release.get_future();
+    bool destroyed_during_lock{false};
+    std::thread shutdown_holder([&] {
+        LOCK(wallet->cs_wallet);
+        changed.set_value(wallet->SetAddressBook(*receive, "changed", wallet::AddressPurpose::RECEIVE));
+        destroyed_during_lock = wait_for_release.wait_for(750ms) == std::future_status::ready;
+    });
+    const bool change_ok = changed.get_future().get();
+    QCoreApplication::sendPostedEvents(model.get(), QEvent::MetaCall);
+    QCoreApplication::processEvents();
+    QPointer<TransactionTableModel> pending_table{table};
+    model.reset();
+    release.set_value();
+    shutdown_holder.join();
+    QVERIFY(change_ok);
+    QVERIFY(destroyed_during_lock);
+    QVERIFY(pending_table.isNull());
+    QTest::qWait(75);
+}
+
 void TestWalletPagesScale(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
 {
     TransactionView& transaction_view = mini_gui.transactionView;
@@ -3804,11 +4173,21 @@ void TestGUI(interfaces::Node& node)
     wallet_loader->registerRpcs();
     node.setContext(&test.m_node);
 
+    const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
+    if (lane.isEmpty() || lane == QStringLiteral("transaction-contention")) {
+        TestTransactionTableResponsiveUnderWalletLock(node, SetupDescriptorsWallet(node, test));
+        if (lane == QStringLiteral("transaction-contention")) return;
+    }
+
+    if (lane.isEmpty() || lane == QStringLiteral("transaction-label-contention")) {
+        TestTransactionLabelsResponsiveUnderWalletLock(node, SetupDescriptorsWallet(node, test));
+        if (lane == QStringLiteral("transaction-label-contention")) return;
+    }
+
     // "Full" GUI tests, use descriptor wallet
     const std::shared_ptr<CWallet>& desc_wallet = SetupDescriptorsWallet(node, test);
     TestGUI(node, desc_wallet);
 
-    const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
     if (lane == QStringLiteral("pow-controls") || lane == QStringLiteral("miner-control")) return;
     if (lane == QStringLiteral("recovery-ui")) {
         const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
@@ -3986,8 +4365,8 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
 void WalletTests::walletTests()
 {
     const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
-    QVERIFY2(lane.isEmpty() || lane == QStringLiteral("pow-controls") || lane == QStringLiteral("recovery-ui") || lane == QStringLiteral("miner-control") || lane == QStringLiteral("wallet-load-callbacks"),
-             "Unknown BLACKCOIN_QT_WALLET_TEST; expected pow-controls, recovery-ui, miner-control or wallet-load-callbacks");
+    QVERIFY2(lane.isEmpty() || lane == QStringLiteral("pow-controls") || lane == QStringLiteral("recovery-ui") || lane == QStringLiteral("miner-control") || lane == QStringLiteral("wallet-load-callbacks") || lane == QStringLiteral("transaction-contention") || lane == QStringLiteral("transaction-label-contention"),
+             "Unknown BLACKCOIN_QT_WALLET_TEST");
     if (!lane.isEmpty()) qInfo("FILTERED WalletTests lane: %s (not the full wallet GUI suite)", qPrintable(lane));
 #ifdef Q_OS_MACOS
     if (QApplication::platformName() == "minimal") {

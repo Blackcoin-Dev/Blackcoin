@@ -39,6 +39,7 @@ public:
     ~TransactionView();
 
     void setModel(WalletModel *model);
+    bool exportTransactions(const QString& filename);
 
     // Date ranges for filter
     enum DateEnum

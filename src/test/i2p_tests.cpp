@@ -18,6 +18,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 
 /// Save the log level and the value of CreateSock and restore them when the test ends.
 class EnvTestingSetup : public BasicTestingSetup
@@ -43,7 +44,91 @@ private:
     const std::function<std::unique_ptr<Sock>(const CService&)> m_create_sock_orig;
 };
 
+namespace {
+class SamConnectSock : public StaticContentsSock
+{
+public:
+    SamConnectSock(const std::string& replies, CThreadInterrupt& interrupt, std::string& stream_request, bool partial_stream)
+        : StaticContentsSock{replies}, m_interrupt{interrupt}, m_stream_request{stream_request}, m_partial_stream{partial_stream}
+    {
+    }
+
+    ssize_t Send(const void* data, size_t size, int flags) const override
+    {
+        const std::string_view message{static_cast<const char*>(data), size};
+        if (message.substr(0, 15) != "STREAM CONNECT ") return StaticContentsSock::Send(data, size, flags);
+        if (m_partial_stream) {
+            --size;
+            m_interrupt();
+        }
+        m_stream_request.assign(message.substr(0, size));
+        return size;
+    }
+
+private:
+    CThreadInterrupt& m_interrupt;
+    std::string& m_stream_request;
+    const bool m_partial_stream;
+};
+} // namespace
+
 BOOST_FIXTURE_TEST_SUITE(i2p_tests, EnvTestingSetup)
+
+BOOST_AUTO_TEST_CASE(connect_destination_attempt_boundary)
+{
+    const std::string hello{"HELLO REPLY RESULT=OK VERSION=3.1\n"};
+    const std::string naming{"NAMING REPLY RESULT=OK VALUE=mock-destination\n"};
+    CNetAddr destination;
+    BOOST_REQUIRE(destination.SetSpecial(std::string(52, 'a') + ".b32.i2p"));
+    const CService proxy{in6_addr(IN6ADDR_LOOPBACK_INIT), 7656};
+
+    struct Scenario {
+        const char* name;
+        std::string replies;
+        bool success{false};
+        bool attempted{false};
+        bool proxy_error{true};
+        bool partial_stream{false};
+        uint16_t port{I2P_SAM31_PORT};
+    };
+    for (const auto& scenario : std::vector<Scenario>{
+             {.name = "invalid port", .replies = "", .proxy_error = false, .port = 1},
+             {.name = "HELLO failure", .replies = "HELLO REPLY RESULT=I2P_ERROR\n"},
+             {.name = "NAMING failure", .replies = hello + "NAMING REPLY RESULT=KEY_NOT_FOUND\n"},
+             {.name = "partial STREAM CONNECT", .replies = hello + naming, .partial_stream = true},
+             {.name = "destination refusal", .replies = hello + naming + "STREAM STATUS RESULT=CANT_REACH_PEER\n", .attempted = true, .proxy_error = false},
+             {.name = "destination timeout", .replies = hello + naming + "STREAM STATUS RESULT=TIMEOUT\n", .attempted = true, .proxy_error = false},
+             {.name = "proxy error after send", .replies = hello + naming + "STREAM STATUS RESULT=I2P_ERROR\n", .attempted = true},
+             {.name = "EOF after send", .replies = hello + naming, .attempted = true},
+             {.name = "success", .replies = hello + naming + "STREAM STATUS RESULT=OK\n", .success = true, .attempted = true},
+         }) {
+        BOOST_TEST_CONTEXT(scenario.name)
+        {
+            unsigned sockets{0};
+            std::string stream_request;
+            CThreadInterrupt interrupt;
+            CreateSock = [&](const CService& address) -> std::unique_ptr<Sock> {
+                BOOST_CHECK(address == proxy);
+                if (++sockets == 1) {
+                    // A synthetic 387-byte destination with an empty certificate.
+                    return std::make_unique<StaticContentsSock>(hello + "SESSION STATUS RESULT=OK DESTINATION=" + std::string(516, 'A') + "\n");
+                }
+                return std::make_unique<SamConnectSock>(scenario.replies, interrupt, stream_request, scenario.partial_stream);
+            };
+            i2p::sam::Session session(proxy, &interrupt);
+            i2p::Connection conn;
+            bool proxy_error{false};
+            bool attempted{true};
+            BOOST_CHECK_EQUAL(session.Connect(CService{destination, scenario.port}, conn, proxy_error, &attempted), scenario.success);
+            BOOST_CHECK_EQUAL(attempted, scenario.attempted);
+            BOOST_CHECK_EQUAL(!stream_request.empty() && stream_request.back() == '\n', scenario.attempted);
+            BOOST_CHECK_EQUAL(static_cast<bool>(conn.sock), scenario.success);
+            BOOST_CHECK_EQUAL(sockets, scenario.port == I2P_SAM31_PORT ? 2U : 0U);
+            if (scenario.partial_stream) BOOST_CHECK(!stream_request.empty());
+            if (!scenario.success) BOOST_CHECK_EQUAL(proxy_error, scenario.proxy_error);
+        }
+    }
+}
 
 BOOST_AUTO_TEST_CASE(unlimited_recv)
 {

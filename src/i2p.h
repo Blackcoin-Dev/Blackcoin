@@ -117,9 +117,11 @@ public:
      * @param[out] proxy_error If an error occurs due to proxy or general network failure, then
      * this is set to `true`. If an error occurs due to unreachable peer (likely peer is down), then
      * it is set to `false`. Only set if `false` is returned.
+     * @param[out] attempted If provided, reports whether a complete destination STREAM CONNECT
+     * request was sent, regardless of the reply.
      * @return true on success
      */
-    bool Connect(const CService& to, Connection& conn, bool& proxy_error) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    bool Connect(const CService& to, Connection& conn, bool& proxy_error, bool* attempted = nullptr) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
 private:
     /**
@@ -172,11 +174,13 @@ private:
      * @param[in] request Raw request to send, a newline terminator is appended to it.
      * @param[in] check_result_ok If true then after receiving the reply a check is made
      * whether it contains "RESULT=OK" and an exception is thrown if it does not.
+     * @param[out] request_sent If provided, set to true after the complete request is sent.
      * @throws std::runtime_error if an error occurs
      */
     Reply SendRequestAndGetReply(const Sock& sock,
                                  const std::string& request,
-                                 bool check_result_ok = true) const;
+                                 bool check_result_ok = true,
+                                 bool* request_sent = nullptr) const;
 
     /**
      * Open a new connection to the SAM proxy.

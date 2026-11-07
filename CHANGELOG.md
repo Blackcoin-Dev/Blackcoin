@@ -1,5 +1,15 @@
 # Changelog
 
+## v30.1.5.3rc3 (DEVELOPMENT, unreleased candidate)
+
+- Queue wallet transaction updates and label refreshes when the wallet lock is
+  busy so the Qt event loop can continue processing input and repainting.
+- Give legacy peer candidates a bounded replenishment turn when the QQ target
+  is met, an ordinary full-relay slot opens, and no legacy full-relay peer
+  remains. Keep the first eligible QQ candidate as a fallback.
+- Return the canonical MuHash inverse of one directly, preserving reductions,
+  inventory roots and serialized state.
+
 ## v30.1.5.3rc2 (DEVELOPMENT, unreleased candidate)
 
 - After two QQ-hint attempts during an outage, reserve a bounded search for a

@@ -1142,7 +1142,7 @@ public:
     bool GetNetworkActive() const { return fNetworkActive; };
     bool GetUseAddrmanOutgoing() const { return m_use_addrman_outgoing; };
     void SetNetworkActive(bool active);
-    // attempted reports direct TCP or a full SOCKS destination CONNECT, not I2P SAM.
+    // attempted reports direct TCP or a complete SOCKS or I2P destination CONNECT.
     void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, std::shared_ptr<qq::Probe> qq_probe = {}, bool* attempted = nullptr) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
     bool CheckIncomingNonce(uint64_t nonce);
 

@@ -469,7 +469,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
             i2p::Connection conn;
 
             if (m_i2p_sam_session) {
-                connected = m_i2p_sam_session->Connect(addrConnect, conn, proxyConnectionFailed);
+                connected = m_i2p_sam_session->Connect(addrConnect, conn, proxyConnectionFailed, &attempted);
             } else {
                 {
                     LOCK(m_unused_i2p_sessions_mutex);
@@ -481,7 +481,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                         m_unused_i2p_sessions.pop();
                     }
                 }
-                connected = i2p_transient_session->Connect(addrConnect, conn, proxyConnectionFailed);
+                connected = i2p_transient_session->Connect(addrConnect, conn, proxyConnectionFailed, &attempted);
                 if (!connected) {
                     LOCK(m_unused_i2p_sessions_mutex);
                     if (m_unused_i2p_sessions.size() < MAX_UNUSED_I2P_SESSIONS_SIZE) {
@@ -510,10 +510,9 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
             connected = ConnectSocketDirectly(addrConnect, *sock, nConnectTimeout,
                                               conn_type == ConnectionType::MANUAL, &attempted);
         }
-        if (proxyConnectionFailed) attempted = false;
+        // Keep addrman's proxy-failure accounting separate from the transport's
+        // report that a destination request was sent.
         if (!proxyConnectionFailed) {
-            // If a connection to the node was attempted, and failure (if any) is not caused by a problem connecting to
-            // the proxy, mark this as an attempt.
             addrman.Attempt(addrConnect, fCountFailure);
         }
     } else if (pszDest && GetNameProxy(proxy)) {
@@ -2554,7 +2553,11 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
     qq::Arbiter transient_arbiter;
     std::weak_ptr<qq::Probe> outstanding_qq;
     bool recovery_addr_fetch_turn{true};
-    unsigned bootstrap_qq_attempts{0};
+    unsigned preferred_qq_attempts{0};
+    bool tried_legacy_at_target{false};
+    const auto is_legacy_full_relay = [](const CNode& node) {
+        return node.IsFullOutboundConn() && !node.IsQQProbe() && !(node.m_accepted_services & NODE_QUANTUM_QUASAR);
+    };
     auto next_qq_probe = qq::Clock::now();
     const bool use_seednodes{gArgs.IsArgSet("-seednode")};
 
@@ -2574,7 +2577,17 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         CSemaphoreGrant grant(*semOutbound, /*fTry=*/true);
         if (interruptNet)
             return;
-        if (!grant || !fNetworkActive) continue;
+        if (!fNetworkActive) continue;
+        if (!grant) {
+            // A successful legacy handshake can fill the final permit. Observe
+            // that recovery so a subsequent loss gets a fresh legacy-first turn.
+            if (tried_legacy_at_target) {
+                ForEachNode([&](const CNode* node) {
+                    if (is_legacy_full_relay(*node)) tried_legacy_at_target = false;
+                });
+            }
+            continue;
+        }
 
         const std::unordered_set<Network> fixed_seed_networks{GetReachableEmptyNetworks()};
         if (add_fixed_seeds && !fixed_seed_networks.empty()) {
@@ -2625,7 +2638,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         // Only connect out to one peer per ipv4/ipv6 network group (/16 for IPv4).
         int nOutboundFullRelay = 0;
         int nOutboundBlockRelay = 0;
-        bool baseline_connected{false};
+        bool has_legacy_full_relay{false};
         int outbound_privacy_network_peers = 0;
         std::set<std::vector<unsigned char>> outbound_ipv46_peer_netgroups;
 
@@ -2634,7 +2647,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             for (const CNode* pnode : m_nodes) {
                 if (pnode->IsFullOutboundConn()) {
                     nOutboundFullRelay++;
-                    baseline_connected |= pnode->fSuccessfullyConnected && !pnode->fDisconnect;
+                    has_legacy_full_relay |= NodeFullyConnected(pnode) && is_legacy_full_relay(*pnode);
                 }
                 if (pnode->IsBlockOnlyConn()) nOutboundBlockRelay++;
 
@@ -2678,12 +2691,17 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         const auto steady_now = qq::Clock::now();
         const auto pending = outstanding_qq.lock();
         const bool qq_deficit = qq_status.deficit > 0;
-        if (baseline_connected || !qq_deficit) bootstrap_qq_attempts = 0;
-        const bool recover_legacy = !baseline_connected && qq_deficit && bootstrap_qq_attempts >= 2;
+        if (!qq_deficit) preferred_qq_attempts = 0;
+        const bool full_relay_vacancy = nOutboundFullRelay < m_max_outbound_full_relay;
+        const bool prefer_qq_for_vacancy = qq_deficit && full_relay_vacancy;
+        const bool seek_legacy_at_target = qq_status.target > 0 && !qq_deficit && !has_legacy_full_relay;
+        if (!seek_legacy_at_target) tried_legacy_at_target = false;
+        const bool legacy_turn = full_relay_vacancy &&
+            ((prefer_qq_for_vacancy && preferred_qq_attempts >= 2) || (seek_legacy_at_target && !tried_legacy_at_target));
         const bool qq_probe_allowed = HasQQProbeHeadroom() &&
             qq_status.constraint != "chain-not-ready" && qq_status.constraint != "initializing";
         bool qq_probe = false;
-        bool prefer_qq = qq_deficit && nOutboundFullRelay < m_max_outbound_full_relay;
+        bool prefer_qq = prefer_qq_for_vacancy;
         bool addr_fetch_due;
         { LOCK(m_addr_fetches_mutex); addr_fetch_due = !m_addr_fetches.empty(); }
 
@@ -2853,9 +2871,10 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 continue;
             }
 
-            // During an outage, bound consecutive actual QQ-hint attempts,
-            // not just raw draws. Keep a fully checked fallback for QQ-only pools.
-            if (recover_legacy && conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !qq_probe) {
+            // Give legacy addresses a turn after two QQ attempts, or when
+            // replenishing without a legacy relay after reaching the QQ target.
+            // Keep a fully checked fallback for QQ-only pools.
+            if (legacy_turn && conn_type == ConnectionType::OUTBOUND_FULL_RELAY) {
                 if (addr.nServices & NODE_QUANTUM_QUASAR) {
                     if (!qq_recovery_fallback.IsValid()) qq_recovery_fallback = addr;
                     continue;
@@ -2893,9 +2912,14 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             }
             bool attempted{false};
             OpenNetworkConnection(addrConnect, count_failures, std::move(grant), /*strDest=*/nullptr, conn_type, use_v2transport, std::move(probe), &attempted);
-            if (attempted && prefer_qq && conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !qq_probe) {
-                bootstrap_qq_attempts = (addrConnect.nServices & NODE_QUANTUM_QUASAR) ?
-                    std::min(bootstrap_qq_attempts + 1, 2U) : 0;
+            if (attempted && full_relay_vacancy && conn_type == ConnectionType::OUTBOUND_FULL_RELAY) {
+                const bool qq_hint = addrConnect.nServices & NODE_QUANTUM_QUASAR;
+                if (prefer_qq_for_vacancy) {
+                    preferred_qq_attempts = qq_hint ? std::min(preferred_qq_attempts + 1, 2U) : 0;
+                }
+                // A stale legacy hint must not monopolize a vacancy when
+                // the only reachable peers advertise QQ.
+                if (seek_legacy_at_target) tried_legacy_at_target = !qq_hint;
             }
         }
     }

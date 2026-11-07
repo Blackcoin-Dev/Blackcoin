@@ -76,6 +76,7 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QDeadlineTimer>
 #include <QFile>
 #include <QMenu>
 #include <QMessageBox>
@@ -268,6 +269,76 @@ void ConfirmMessageBox(QMessageBox::StandardButton confirm_type,
             if (auto* dialog = expected_dialog()) dialog->reject();
         });
 }
+
+// The asynchronous miner start opens a page-owned QMessageBox from a worker
+// completion. Observe its Show event before relying on the native modal loop.
+class OwnedQuestionResponder final : public QObject
+{
+public:
+    OwnedQuestionResponder(QWidget& owner, QString title, QString body, int timeout_ms = 5000)
+        : m_owner{&owner}, m_title{std::move(title)}, m_body{std::move(body)},
+          m_deadline{timeout_ms, Qt::PreciseTimer}
+    {
+        qApp->installEventFilter(this);
+        m_timeout.setSingleShot(true);
+        m_timeout.setTimerType(Qt::PreciseTimer);
+        connect(&m_timeout, &QTimer::timeout, this, [this] {
+            m_timed_out = true;
+            if (m_dialog && m_dialog->isVisible()) m_dialog->reject();
+        });
+        m_timeout.start(timeout_ms);
+    }
+
+    bool finished() const { return m_finished; }
+    bool timedOut() const { return m_timed_out; }
+    bool approved() const { return m_approved; }
+
+protected:
+    bool eventFilter(QObject* object, QEvent* event) override
+    {
+        if (event->type() != QEvent::Show || m_seen) return false;
+        auto* dialog = qobject_cast<QMessageBox*>(object);
+        if (!dialog || !m_owner || dialog->parentWidget() != m_owner ||
+            dialog->icon() != QMessageBox::Question ||
+            dialog->standardButtons() != (QMessageBox::Yes | QMessageBox::No) ||
+            !dialog->text().contains(m_body)) return false;
+#ifndef Q_OS_MAC
+        if (dialog->windowTitle() != m_title) return false;
+#endif
+
+        m_seen = true;
+        m_dialog = dialog;
+        connect(dialog, &QDialog::finished, this, [this](int result) {
+            m_finished = true;
+            m_timeout.stop();
+            m_approved = m_dialog && !m_timed_out && result == QMessageBox::Yes &&
+                m_dialog->clickedButton() == m_dialog->button(QMessageBox::Yes);
+        });
+        // Defer the response until QDialog::exec has entered its event loop.
+        QMetaObject::invokeMethod(this, [this] {
+            if (!m_dialog || !m_dialog->isVisible() || m_finished) return;
+            if (m_deadline.hasExpired()) {
+                m_timed_out = true;
+                m_dialog->reject();
+                return;
+            }
+            if (auto* button = m_dialog->button(QMessageBox::Yes); button && button->isEnabled()) button->click();
+        }, Qt::QueuedConnection);
+        return false;
+    }
+
+private:
+    const QPointer<QWidget> m_owner;
+    const QString m_title;
+    const QString m_body;
+    const QDeadlineTimer m_deadline;
+    QTimer m_timeout;
+    QPointer<QMessageBox> m_dialog;
+    bool m_seen{false};
+    bool m_finished{false};
+    bool m_timed_out{false};
+    bool m_approved{false};
+};
 
 void AnswerPowClaimRecoveryConsent(bool enable, bool use_escape = false,
                                    const QString& expected_wallet = {},
@@ -1044,10 +1115,13 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     const bool staking_only_before_policy = walletModel.getWalletUnlockStakingOnly();
     AnswerInitialPowClaimRecoveryChoice(
         InitialPowClaimRecoveryChoice::PAUSE_AND_ASK);
-    ConfirmMessageBox(QMessageBox::Yes,
-        QStringLiteral("This will start the built-in Gold Rush PoW miner"),
-        QStringLiteral("Start Gold Rush PoW mining"));
-    pow_enable->click();
+    {
+        OwnedQuestionResponder confirm_start(page, QStringLiteral("Start Gold Rush PoW mining"),
+            QStringLiteral("This will start the built-in Gold Rush PoW miner"));
+        pow_enable->click();
+        QTRY_VERIFY_WITH_TIMEOUT(confirm_start.finished() || confirm_start.timedOut(), 6000);
+        QVERIFY2(confirm_start.approved(), "Expected page-owned Gold Rush PoW start confirmation was not answered");
+    }
     QTRY_COMPARE_WITH_TIMEOUT(
         walletModel.wallet().getPowClaimRecoveryPolicy().mode,
         interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK, 5000);
@@ -1153,10 +1227,13 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     auto stop_before_schedule_restore = interfaces::MakeCleanupHandler(
         [core_wallet] { core_wallet->StopPowMining(); });
 
-    ConfirmMessageBox(QMessageBox::Yes,
-        QStringLiteral("This will start the built-in Gold Rush PoW miner"),
-        QStringLiteral("Start Gold Rush PoW mining"));
-    pow_enable->click();
+    {
+        OwnedQuestionResponder confirm_start(page, QStringLiteral("Start Gold Rush PoW mining"),
+            QStringLiteral("This will start the built-in Gold Rush PoW miner"));
+        pow_enable->click();
+        QTRY_VERIFY_WITH_TIMEOUT(confirm_start.finished() || confirm_start.timedOut(), 6000);
+        QVERIFY2(confirm_start.approved(), "Expected page-owned Gold Rush PoW start confirmation was not answered");
+    }
     const auto locked_input_wait_diagnostic = [&] {
         const interfaces::WalletPowMiningInfo current = walletModel.wallet().getPowMiningInfo();
         const auto gate = WITH_LOCK(core_wallet->m_pow_miner_mutex, return core_wallet->m_pow_mining_gate);
@@ -3244,46 +3321,63 @@ void TestCloseAllWalletsCallbackLockOrder(interfaces::Node& node, const Platform
     QCOMPARE(controller.getOpenWallets().size(), size_t{1}); // New concurrent wallet was outside the close snapshot.
 }
 
-// A hidden prior box must never consume a waiter for an async question.
-// The exact owned real box is rejected after 2s on the old-helper negative path.
-void TestMessageBoxWaitsForVisibleActiveQuestion()
+// An async question must be matched by owner and content even when other
+// questions are visible, and a matching question after the deadline is refused.
+void TestOwnedQuestionResponder()
 {
+    QWidget owner;
+    QWidget other_owner;
     const QString title = QStringLiteral("Delayed confirmation regression");
     const QString body = QStringLiteral("Expected delayed question for confirmation regression");
     QMessageBox hidden(QMessageBox::Question, title, body,
-                       QMessageBox::Yes | QMessageBox::No);
+        QMessageBox::Yes | QMessageBox::No, &owner);
+    QMessageBox wrong_body(QMessageBox::Question, title, QStringLiteral("Unrelated question"),
+        QMessageBox::Yes | QMessageBox::No, &owner);
+    QMessageBox wrong_owner(QMessageBox::Question, title, body,
+        QMessageBox::Yes | QMessageBox::No, &other_owner);
     QSignalSpy hidden_finished(&hidden, &QDialog::finished);
-    QVERIFY(!hidden.isVisible());
-    QPointer<QMessageBox> real;
-    bool finished{false};
-    bool actual_yes_clicked{false};
-    int result{QDialog::Rejected};
-    QTimer cleanup;
-    cleanup.setSingleShot(true);
-    QObject::connect(&cleanup, &QTimer::timeout, &cleanup, [&] {
-        if (real) real->reject(); // Only this regression's exact owned dialog.
-    });
-    cleanup.start(2000);
-    ConfirmMessageBox(QMessageBox::Yes, body, title);
-    QTimer::singleShot(50, &cleanup, [&] {
-        QMessageBox question(QMessageBox::Question, title, body,
-                             QMessageBox::Yes | QMessageBox::No);
-        real = &question;
-        result = question.exec();
-        actual_yes_clicked = question.clickedButton() == question.button(QMessageBox::Yes);
-        finished = true;
-    });
-    QTRY_VERIFY_WITH_TIMEOUT(finished, 3000);
-    cleanup.stop();
+    QSignalSpy wrong_body_finished(&wrong_body, &QDialog::finished);
+    QSignalSpy wrong_owner_finished(&wrong_owner, &QDialog::finished);
+    for (const bool late : {false, true}) {
+        OwnedQuestionResponder responder(owner, title, body, late ? 0 : 1000);
+        if (!late) {
+            wrong_body.show();
+            wrong_owner.show();
+            QVERIFY(wrong_body.isVisible());
+            QVERIFY(wrong_owner.isVisible());
+        }
+        QPointer<QMessageBox> real;
+        bool finished{false};
+        int result{QDialog::Rejected};
+        QTimer cleanup;
+        cleanup.setSingleShot(true);
+        QObject::connect(&cleanup, &QTimer::timeout, &cleanup, [&] {
+            if (real) real->reject(); // Only this regression's exact owned dialog.
+        });
+        cleanup.start(2000);
+        QTimer::singleShot(50, &cleanup, [&] {
+            QMessageBox question(QMessageBox::Question, title, body,
+                QMessageBox::Yes | QMessageBox::No, &owner);
+            real = &question;
+            result = question.exec();
+            finished = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(finished, 3000);
+        cleanup.stop();
+        QVERIFY(real.isNull());
+        QVERIFY(responder.finished());
+        QCOMPARE(responder.approved(), !late);
+        QCOMPARE(responder.timedOut(), late);
+        QCOMPARE(result, late ? int{QDialog::Rejected} : int{QMessageBox::Yes});
+    }
     QCOMPARE(hidden_finished.count(), 0);
-    QCOMPARE(result, int{QMessageBox::Yes});
-    QVERIFY(actual_yes_clicked);
-    QVERIFY(real.isNull());
+    QCOMPARE(wrong_body_finished.count(), 0);
+    QCOMPARE(wrong_owner_finished.count(), 0);
 }
 
 void TestWalletControllerCallbacks(interfaces::Node& node)
 {
-    TestMessageBoxWaitsForVisibleActiveQuestion();
+    TestOwnedQuestionResponder();
     // Explicitly enable a private settings path: closeAllWallets removes startup
     // settings through the real backend; -nosettings would invalidate that API.
     TestingSetup test{ChainType::REGTEST, {"-settings=wallet-callback-tests.json", "-staking=0", "-powmining=0"}};

@@ -33,6 +33,12 @@
 #include <thread>
 #include <string>
 
+#if !defined(WIN32) && !defined(SO_NOSIGPIPE)
+#include <future>
+#include <pthread.h>
+#include <signal.h>
+#endif
+
 namespace {
 constexpr int64_t NOW{1793670000};
 UniValue Peer(const std::string& address = "8.8.8.8", int port = 23800)
@@ -240,6 +246,9 @@ class LocalTLS {
     TestSocket listener{static_cast<SOCKET>(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP))};
     std::thread thread;
     std::atomic<bool> stopping{false};
+#if !defined(WIN32) && defined(SO_NOSIGPIPE)
+    bool socket_signal_setup_failed{false}; // Read after the worker joins.
+#endif
     const std::string response;
     const bool socks, refuse;
     const int stall;
@@ -283,6 +292,15 @@ class LocalTLS {
             const SOCKET fd = static_cast<SOCKET>(accept(listener.Descriptor(), nullptr, nullptr));
             if (fd == INVALID_SOCKET) continue;
             TestSocket socket{fd};
+#if !defined(WIN32) && defined(SO_NOSIGPIPE)
+            // Darwin can deliver socket SIGPIPE outside the calling thread.
+            // Suppress it on this socket before attaching the OpenSSL BIO.
+            const int enabled{1};
+            if (socket.SetSockOpt(SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
+                socket_signal_setup_failed = true;
+                return;
+            }
+#endif
             if (!socket.SetNonBlocking()) return;
             ++connections;
             if (socks) {
@@ -384,9 +402,36 @@ public:
         socklen_t length{sizeof(address)};
         Check(listener.GetSockName(reinterpret_cast<sockaddr*>(&address), &length) == 0);
         port = ntohs(address.sin_port);
+#if !defined(WIN32) && !defined(SO_NOSIGPIPE)
+        std::promise<bool> signal_ready;
+        auto ready = signal_ready.get_future();
+        thread = std::thread([this, signal_ready = std::move(signal_ready)]() mutable {
+            // OpenSSL socket BIOs can write during handshake, reads and writes.
+            // Keep SIGPIPE blocked until this worker exits so a pending signal
+            // cannot be delivered when the fixture stops.
+            sigset_t blocked{};
+            const bool ok = sigemptyset(&blocked) == 0 && sigaddset(&blocked, SIGPIPE) == 0 &&
+                pthread_sigmask(SIG_BLOCK, &blocked, nullptr) == 0;
+            signal_ready.set_value(ok);
+            if (ok) Serve();
+        });
+        if (!ready.get()) {
+            thread.join();
+            throw std::runtime_error("local TLS fixture could not block SIGPIPE");
+        }
+#else
         thread = std::thread([this] { Serve(); });
+#endif
     }
-    void Stop() { stopping = true; if (thread.joinable()) thread.join(); }
+    void Stop()
+    {
+        stopping = true;
+        if (!thread.joinable()) return;
+        thread.join();
+#if !defined(WIN32) && defined(SO_NOSIGPIPE)
+        if (socket_signal_setup_failed) BOOST_ERROR("local TLS fixture could not set SO_NOSIGPIPE");
+#endif
+    }
     ~LocalTLS() { Stop(); }
     httpsseed::test::Endpoint Endpoint() const
     {

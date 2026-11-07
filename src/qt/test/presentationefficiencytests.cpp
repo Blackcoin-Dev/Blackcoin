@@ -3,6 +3,7 @@
 
 #include <qt/test/presentationefficiencytests.h>
 
+#include <common/args.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <qt/clientmodel.h>
@@ -10,9 +11,12 @@
 #include <qt/platformstyle.h>
 #include <qt/rpcconsole.h>
 #include <test/util/setup_common.h>
+#include <univalue.h>
 
 #include <QSignalSpy>
 #include <QTest>
+
+#include <utility>
 
 #ifdef ENABLE_WALLET
 #include <interfaces/wallet.h>
@@ -36,7 +40,23 @@
 
 #include <algorithm>
 #include <vector>
+#endif // ENABLE_WALLET
 
+namespace {
+std::unique_ptr<interfaces::Handler> PreserveApplicationSettings()
+{
+    common::Settings settings;
+    gArgs.LockSettings([&](const auto& current) { settings = current; });
+    return interfaces::MakeCleanupHandler([settings = std::move(settings)]() mutable {
+        // TestingSetup leaves the forced datadir pointing at its deleted
+        // directory. Subsequent Qt suites still use the application settings.
+        gArgs.LockSettings([&](auto& current) { current = std::move(settings); });
+        gArgs.ClearPathCache();
+    });
+}
+} // namespace
+
+#ifdef ENABLE_WALLET
 namespace {
 class HistoryModel final : public QAbstractTableModel
 {
@@ -224,6 +244,7 @@ void PresentationEfficiencyTests::recentTransactionProjection()
 
 void PresentationEfficiencyTests::recentTransactionClick()
 {
+    const auto restore_settings = PreserveApplicationSettings();
     TestingSetup test{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
     auto* previous = m_node.context();
     auto restore = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
@@ -277,6 +298,7 @@ void PresentationEfficiencyTests::recentTransactionClick()
 
 void PresentationEfficiencyTests::peerPollingFollowsVisibility()
 {
+    const auto restore_settings = PreserveApplicationSettings();
     TestingSetup test{ChainType::REGTEST};
     auto* previous = m_node.context();
     auto restore = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });

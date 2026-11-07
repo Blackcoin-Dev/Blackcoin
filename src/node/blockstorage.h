@@ -169,8 +169,8 @@ private:
 
     CAutoFile OpenUndoFile(const FlatFilePos& pos, bool fReadOnly = false) const;
 
-    bool WriteBlockToDisk(const CBlock& block, FlatFilePos& pos) const;
-    bool UndoWriteToDisk(const CBlockUndo& blockundo, FlatFilePos& pos, const uint256& hashBlock) const;
+    bool WriteBlockToDisk(const CBlock& block, FlatFilePos& pos, unsigned int serialized_size) const;
+    bool UndoWriteToDisk(const CBlockUndo& blockundo, FlatFilePos& pos, const uint256& hashBlock, unsigned int serialized_size) const;
 
     RecursiveMutex cs_LastBlockFile;
     std::vector<CBlockFileInfo> m_blockfile_info;

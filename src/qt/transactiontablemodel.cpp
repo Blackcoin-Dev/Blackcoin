@@ -73,6 +73,7 @@ struct TransactionNotification
     uint256 hash;
     ChangeType status;
     bool suppress_incoming{false};
+    bool initial_history_boundary{false};
 };
 
 // Private implementation
@@ -88,12 +89,16 @@ public:
 
     //! Local cache of wallet sorted by transaction hash
     QList<TransactionRecord> cachedWallet;
+    std::deque<TransactionRecord> m_initial_history;
+    void PublishInitialHistory();
+    void FinishInitialHistory(bool deferred);
 
     // Wallet changes and scan progress can arrive on different core threads.
     // Never hold this queue lock while reading wallet state or emitting model signals.
     Mutex m_notification_mutex;
     bool m_loaded GUARDED_BY(m_notification_mutex){false};
     bool m_scanning GUARDED_BY(m_notification_mutex){false};
+    bool m_initial_boundary_pending GUARDED_BY(m_notification_mutex){false};
     bool m_notifications_stopped GUARDED_BY(m_notification_mutex){false};
     bool m_drain_scheduled GUARDED_BY(m_notification_mutex){false};
     std::vector<TransactionNotification> m_scanned_notifications GUARDED_BY(m_notification_mutex);
@@ -124,20 +129,6 @@ public:
     std::set<CTxDestination> m_pending_labels;
     bool m_label_refresh_scheduled{false};
     std::set<CTxDestination> m_changed_labels;
-
-    /* Query entire wallet anew from core.
-     */
-    void refreshWallet(interfaces::Wallet& wallet)
-    {
-        for (const auto& wtx : wallet.getWalletTxs()) {
-            if (TransactionRecord::showTransaction(wtx)) {
-                cachedWallet.append(TransactionRecord::decomposeTransaction(wtx));
-            }
-        }
-        LOCK(m_notification_mutex);
-        m_loaded = true;
-        DispatchScannedNotifications();
-    }
 
     /* Update our model of the wallet incrementally, to synchronize our model of the wallet
        with that of the core.
@@ -262,7 +253,7 @@ public:
     }
 };
 
-TransactionTableModel::TransactionTableModel(const PlatformStyle *_platformStyle, WalletModel *parent):
+TransactionTableModel::TransactionTableModel(const PlatformStyle* _platformStyle, WalletModel* parent, bool defer_history):
         QAbstractTableModel(parent),
         walletModel(parent),
         priv(std::make_shared<TransactionTablePriv>(this)),
@@ -271,9 +262,66 @@ TransactionTableModel::TransactionTableModel(const PlatformStyle *_platformStyle
     subscribeToCoreSignals();
 
     columns << QString() << QString() << tr("Date") << tr("Type") << tr("Label") << BitcoinUnits::getAmountColumnTitle(walletModel->getOptionsModel()->getDisplayUnit());
-    priv->refreshWallet(walletModel->wallet());
+    if (!defer_history) {
+        auto transactions = walletModel->wallet().getWalletTxs();
+        std::sort(transactions.begin(), transactions.end());
+        for (const auto& tx : transactions) {
+            if (TransactionRecord::showTransaction(tx)) priv->cachedWallet.append(TransactionRecord::decomposeTransaction(tx));
+        }
+        m_history_loaded = true;
+        priv->FinishInitialHistory(/*deferred=*/false);
+    }
 
     connect(walletModel->getOptionsModel(), &OptionsModel::displayUnitChanged, this, &TransactionTableModel::updateDisplayUnit);
+}
+
+void TransactionTableModel::setInitialHistory(std::deque<TransactionRecord> history)
+{
+    assert(priv->cachedWallet.empty() && priv->m_initial_history.empty());
+    priv->m_initial_history = std::move(history);
+    priv->cachedWallet.reserve(priv->m_initial_history.size());
+    priv->PublishInitialHistory();
+}
+
+void TransactionTablePriv::PublishInitialHistory()
+{
+    constexpr int MAX_ROWS_PER_TURN{256};
+    const QPointer<TransactionTableModel> model{parent};
+    const int count = std::min<size_t>(MAX_ROWS_PER_TURN, m_initial_history.size());
+    if (count > 0) {
+        const int first = cachedWallet.size();
+        model->fProcessingQueuedTransactions = true;
+        model->beginInsertRows({}, first, first + count - 1);
+        for (int i = 0; i < count; ++i) {
+            cachedWallet.append(m_initial_history.front());
+            m_initial_history.pop_front();
+        }
+        model->endInsertRows();
+        if (!model) return;
+        model->fProcessingQueuedTransactions = false;
+    }
+    if (m_initial_history.empty()) {
+        FinishInitialHistory(/*deferred=*/true);
+    } else {
+        const bool invoked = QMetaObject::invokeMethod(parent, [state = shared_from_this()] {
+            state->PublishInitialHistory();
+        }, Qt::QueuedConnection);
+        assert(invoked);
+    }
+}
+
+void TransactionTablePriv::FinishInitialHistory(bool deferred)
+{
+    LOCK(m_notification_mutex);
+    m_loaded = true;
+    m_initial_boundary_pending = deferred;
+    DispatchScannedNotifications();
+}
+
+void TransactionTableModel::reportHistoryLoadFailure()
+{
+    m_history_load_failed = true;
+    Q_EMIT historyLoadFailed();
 }
 
 TransactionTableModel::~TransactionTableModel()
@@ -935,6 +983,18 @@ void TransactionTablePriv::DrainPendingUpdates()
             notification = m_pending_updates.front();
         }
 
+        if (notification.initial_history_boundary) {
+            {
+                LOCK(m_notification_mutex);
+                m_pending_updates.pop_front();
+            }
+            const QPointer<TransactionTableModel> model{parent};
+            model->m_history_loaded = true;
+            Q_EMIT model->historyLoaded();
+            if (!model) return;
+            continue;
+        }
+
         interfaces::WalletTx tx;
         if (notification.status != CT_DELETED &&
             !parent->walletModel->wallet().tryGetWalletTx(notification.hash, tx)) {
@@ -999,6 +1059,10 @@ void TransactionTablePriv::DispatchScannedNotifications()
         m_pending_updates.push_back(notification);
     }
     m_scanned_notifications.clear();
+    if (m_initial_boundary_pending) {
+        m_pending_updates.push_back({{}, CT_UPDATED, false, true});
+        m_initial_boundary_pending = false;
+    }
     SchedulePendingUpdates();
 }
 

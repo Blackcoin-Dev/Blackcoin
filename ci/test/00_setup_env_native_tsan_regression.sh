@@ -10,7 +10,11 @@ export LC_ALL=C.UTF-8
 source "$(dirname "${BASH_SOURCE[0]}")/00_setup_env_native_tsan.sh"
 
 export CONTAINER_NAME=ci_native_tsan_regression
-export DEP_OPTS="${DEP_OPTS} NO_QT=1 NO_UPNP=1 NO_NATPMP=1"
+if [[ "${REGRESSION_PROFILE:-functional}" == efficiency-units ]]; then
+  export DEP_OPTS="${DEP_OPTS} NO_UPNP=1 NO_NATPMP=1"
+else
+  export DEP_OPTS="${DEP_OPTS} NO_QT=1 NO_UPNP=1 NO_NATPMP=1"
+fi
 export BITCOIN_CONFIG="${BITCOIN_CONFIG} --with-gui=no --disable-tests --disable-bench --disable-fuzz-binary"
 export GOAL="-C src blackcoind blackcoin-cli"
 export RUN_UNIT_TESTS=false
@@ -25,4 +29,8 @@ if [[ "${CI_NETWORK_REGRESSION:-false}" == "true" ]]; then
   export BITCOIN_CONFIG="${BITCOIN_CONFIG} --enable-tests"
   export GOAL="-C src test/test_blackcoin"
   export RUN_FUNCTIONAL_TESTS=false
+  if [[ "${REGRESSION_PROFILE:-functional}" == efficiency-units ]]; then
+    export BITCOIN_CONFIG="${BITCOIN_CONFIG} --with-gui=qt5"
+    export GOAL="-C src test/test_blackcoin qt/test/test_blackcoin-qt"
+  fi
 fi

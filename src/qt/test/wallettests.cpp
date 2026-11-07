@@ -16,6 +16,7 @@
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
+#include <qt/accountpage.h>
 #include <qt/bitcoinunits.h>
 #include <qt/bitcoinamountfield.h>
 #include <qt/clientmodel.h>
@@ -93,6 +94,7 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QTextEdit>
+#include <QTreeWidget>
 #include <QListView>
 #include <QDialogButtonBox>
 #include <QDialog>
@@ -3494,6 +3496,429 @@ void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const Platfo
              qPrintable(QStringLiteral("Page destruction waited %1 ms for full refresh").arg(destroy_elapsed_ms)));
 }
 
+void TestHiddenSendBalanceHeartbeat(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    QVERIFY(!gui.sendCoinsDialog.isVisible());
+
+    std::promise<void> locked;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+    });
+    locked.get_future().wait();
+
+    QElapsedTimer timer;
+    timer.start();
+    QEventLoop loop;
+    QMetaObject::invokeMethod(&loop, [&] {
+        Q_EMIT gui.walletModel->balanceChanged(interfaces::WalletBalances{});
+    }, Qt::QueuedConnection);
+    QTimer::singleShot(0, &loop, [&] {
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    holder.join();
+
+    qInfo("Hidden Send balance heartbeat: %lld ms", static_cast<long long>(timer.elapsed()));
+    QVERIFY2(heartbeat_during_lock, "Hidden Send balance update blocked behind the wallet lock");
+}
+
+class DirtyBalanceOnDelivery : public QObject
+{
+public:
+    explicit DirtyBalanceOnDelivery(WalletModel& model, bool dirty = true) : m_model(model), m_dirty(dirty) {}
+    int deliveries{0};
+
+protected:
+    bool eventFilter(QObject* object, QEvent* event) override
+    {
+        if (object == &m_model && event->type() == QEvent::MetaCall) {
+            ++deliveries;
+            if (m_dirty) m_model.updateTransaction();
+        }
+        return false;
+    }
+
+private:
+    WalletModel& m_model;
+    bool m_dirty;
+};
+
+void TestWalletDisplaySnapshots(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using Family = interfaces::WalletDisplayCoinFamily;
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+
+    wallet::CCoinControl legacy;
+    legacy.m_input_family = wallet::CCoinControl::InputFamily::LEGACY;
+    const CAmount legacy_total = model.wallet().getAvailableBalance(legacy);
+    QVERIFY(legacy_total > 0);
+    DirtyBalanceOnDelivery churn(model);
+    model.installEventFilter(&churn);
+    model.startPollBalance();
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedBalance().balance > 0, 5000);
+    QVERIFY(churn.deliveries > 0);
+    model.removeEventFilter(&churn);
+    QVERIFY(!model.getCachedSendBalance(Family::LEGACY));
+    gui.sendCoinsDialog.show();
+    // Keep newer wallet dirtiness pending while a coherent selected-family
+    // result can still publish under the same request identity.
+    for (int i = 0; i < 64; ++i) {
+        model.updateTransaction();
+        model.pollBalanceChanged();
+    }
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedSendBalance(Family::LEGACY).has_value(), 5000);
+    QCOMPARE(*model.getCachedSendBalance(Family::LEGACY), legacy_total);
+
+    std::optional<COutPoint> spendable;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        for (const auto& coin : wallet::AvailableCoins(*wallet, &legacy).All()) {
+            if (coin.spendable) {
+                spendable = coin.outpoint;
+                break;
+            }
+        }
+    }
+    QVERIFY(spendable);
+    QVERIFY(model.wallet().lockCoin(*spendable, /*write_to_db=*/false));
+    model.refreshSendBalance();
+    const CAmount locked_total = model.wallet().getAvailableBalance(legacy);
+    QVERIFY(locked_total < legacy_total);
+    QTRY_COMPARE_WITH_TIMEOUT(model.getCachedSendBalance(Family::LEGACY).value_or(-1), locked_total, 5000);
+    QVERIFY(model.wallet().unlockCoin(*spendable));
+
+    model.setSendBalanceFamily(Family::DIRECT_QUANTUM);
+    wallet::CCoinControl quantum;
+    quantum.m_input_family = wallet::CCoinControl::InputFamily::QUANTUM_MIGRATION;
+    quantum.m_exclude_generated_quantum_inputs = true;
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedSendBalance(Family::DIRECT_QUANTUM).has_value(), 5000);
+    QCOMPARE(*model.getCachedSendBalance(Family::DIRECT_QUANTUM), model.wallet().getAvailableBalance(quantum));
+    gui.sendCoinsDialog.hide();
+
+    bool cancelled{false};
+    auto request = model.requestAccountSnapshot([&](auto snapshot) { cancelled = snapshot->cancelled; });
+    QVERIFY(request);
+    request->store(true, std::memory_order_release);
+    QTRY_VERIFY_WITH_TIMEOUT(cancelled, 5000);
+}
+
+void TestWalletPollCoalescing(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+    qApp->processEvents();
+
+    // Keep the timer stopped so only this explicitly offered burst can run.
+    // No GUI deliveries occur between offers.
+    DirtyBalanceOnDelivery observer(model, /*dirty=*/false);
+    model.installEventFilter(&observer);
+    for (int i = 0; i < 64; ++i) {
+        model.updateTransaction();
+        model.pollBalanceChanged();
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(observer.deliveries, 2, 5000);
+    QTest::qWait(300);
+    QCOMPARE(observer.deliveries, 2);
+    QVERIFY(model.getCachedBalance().balance > 0);
+    model.removeEventFilter(&observer);
+    qInfo("Wallet poll coalescing: 64 offers, two worker completions");
+}
+
+void TestWalletDisplayExceptionRecovery(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+    qApp->processEvents();
+
+    uint256 txid;
+    CTransactionRef original;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        for (auto& [id, entry] : wallet->mapWallet) {
+            if (wallet->IsTxImmature(entry) || entry.tx->vout.empty()) continue;
+            txid = id;
+            original = entry.tx;
+            CMutableTransaction invalid{*entry.tx};
+            invalid.vout.front().nValue = MAX_MONEY + 1;
+            entry.tx = MakeTransactionRef(std::move(invalid));
+            entry.MarkDirty();
+            break;
+        }
+    }
+    QVERIFY(original);
+    const auto restore = [&] {
+        LOCK(wallet->cs_wallet);
+        auto& entry = wallet->mapWallet.at(txid);
+        entry.tx = original;
+        entry.MarkDirty();
+    };
+    const auto cleanup = interfaces::MakeCleanupHandler(restore);
+
+    // The same native snapshot path throws on the synthetic corrupt amount.
+    bool throws{false};
+    try {
+        interfaces::WalletDisplayBalances snapshot;
+        model.wallet().tryGetDisplayBalances(snapshot, std::nullopt, std::nullopt);
+    } catch (const std::runtime_error&) {
+        throws = true;
+    }
+    QVERIFY(throws);
+
+    DirtyBalanceOnDelivery delivery(model);
+    model.installEventFilter(&delivery);
+    QTest::ignoreMessage(QtWarningMsg, "Wallet display snapshot failed");
+    model.pollBalanceChanged();
+    QTRY_VERIFY_WITH_TIMEOUT(delivery.deliveries > 0, 5000);
+    QCOMPARE(model.getCachedBalance().balance, CAmount{0});
+    model.removeEventFilter(&delivery);
+    restore();
+    model.updateTransaction();
+    model.pollBalanceChanged();
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedBalance().balance > 0, 5000);
+}
+
+void TestAccountSnapshotFiltering(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    auto& wallet_interface = gui.walletModel->wallet();
+    const auto tiered = wallet_interface.createQuantumStakeAddress("account contention", 9450);
+    QVERIFY(tiered);
+    AccountPage page(style.get());
+    page.setWalletModel(gui.walletModel.get());
+    page.show();
+    QVERIFY(QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection));
+    auto* tree = page.findChild<QTreeWidget*>();
+    auto* search = page.findChild<QLineEdit*>();
+    QVERIFY(tree);
+    QVERIFY(search);
+    const auto visible_rows = [&] {
+        int count{0};
+        for (int row = 0; row < tree->topLevelItemCount(); ++row) {
+            if (!tree->topLevelItem(row)->isHidden()) ++count;
+        }
+        return count;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(visible_rows() > 0, 5000);
+    const QStringList card_names{QStringLiteral("accountTotalCard"), QStringLiteral("accountLegacyCard"),
+        QStringLiteral("accountQuantumCard"), QStringLiteral("accountAttentionCard")};
+    QList<QLabel*> cards;
+    QStringList wallet_card_text;
+    for (const auto& name : card_names) {
+        auto* card = page.findChild<QLabel*>(name);
+        QVERIFY(card);
+        cards.push_back(card);
+        wallet_card_text.push_back(card->text());
+    }
+
+    std::promise<void> locked;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+    });
+    locked.get_future().wait();
+    bool addresses_available{true};
+    bool delegations_available{true};
+    bool stake_outputs_available{true};
+    bool rgb_available{true};
+    bool eutxo_available{true};
+    wallet_interface.listQuantumAddresses(&addresses_available);
+    wallet_interface.listQuantumColdStakeDelegations(&delegations_available);
+    wallet_interface.listQuantumStakeOutputs(tiered->address, &stake_outputs_available);
+    wallet_interface.listRGBAssets(false, &rgb_available);
+    wallet_interface.listEUTXOStates(true, &eutxo_available);
+    const bool refresh_invoked = QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection);
+    search->setText(QStringLiteral("no-matching-account-outpoint"));
+    QEventLoop loop;
+    int visible_groups{-1};
+    QTimer::singleShot(350, &loop, [&] {
+        visible_groups = visible_rows();
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    holder.join();
+    QVERIFY(refresh_invoked);
+    QVERIFY(!addresses_available && !delegations_available && !stake_outputs_available && !rgb_available && !eutxo_available);
+    QVERIFY2(heartbeat_during_lock, "Account search waited for the wallet lock");
+    QVERIFY(tree->topLevelItemCount() > 0);
+    QCOMPARE(visible_groups, 0);
+
+    search->clear();
+    QTRY_VERIFY_WITH_TIMEOUT(visible_rows() > 0, 5000);
+    QVERIFY(QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection));
+    page.setPrivacy(true);
+    QTest::qWait(75);
+    QCOMPARE(tree->topLevelItemCount(), 0);
+    for (auto* card : cards) QVERIFY(card->text().contains(QStringLiteral("hidden"), Qt::CaseInsensitive));
+    page.setPrivacy(false);
+    for (int i = 0; i < cards.size(); ++i) QVERIFY(cards[i]->text() != wallet_card_text[i]);
+
+    QVERIFY(QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection));
+    QTRY_VERIFY_WITH_TIMEOUT(visible_rows() > 0, 5000);
+    page.hide();
+    page.setWalletModel(nullptr);
+    for (int i = 0; i < cards.size(); ++i) QVERIFY(cards[i]->text() != wallet_card_text[i]);
+    QCOMPARE(tree->topLevelItemCount(), 0);
+}
+
+void TestDeferredWalletHistory(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    constexpr int SYNTHETIC_HISTORY_ROWS{4096};
+    const auto history_dest = wallet->GetNewDestination(OutputType::BECH32, "long history");
+    QVERIFY(history_dest);
+    const auto history_script = GetScriptForDestination(*history_dest);
+    for (int i = 0; i < SYNTHETIC_HISTORY_ROWS; ++i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{18}, static_cast<uint32_t>(i)});
+        tx.vout.emplace_back(COIN, history_script);
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(tx)), wallet::TxStateInactive{}));
+    }
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    OptionsModel options(node);
+    bilingual_str error;
+    QVERIFY(options.Init(error));
+    ClientModel client(node, &options);
+    auto model = std::make_unique<WalletModel>(
+        interfaces::MakeWallet(*node.walletLoader().context(), wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    auto* table = model->getTransactionTableModel();
+    TransactionView view(style.get());
+    view.setModel(model.get());
+    QVERIFY(!table->isHistoryLoaded());
+    QCOMPARE(table->rowCount({}), 0);
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    const QString filename = output.filePath(QStringLiteral("history.csv"));
+    QVERIFY(!view.exportTransactions(filename));
+    QVERIFY(!QFile::exists(filename));
+
+    const auto dest = wallet->GetNewDestination(OutputType::BECH32, "late history transaction");
+    QVERIFY(dest);
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{uint256{17}, 0});
+    tx.vout.emplace_back(COIN, GetScriptForDestination(*dest));
+    const auto late = MakeTransactionRef(std::move(tx));
+    int chunks{0};
+    int largest_chunk{0};
+    int rows_at_publication_heartbeat{-1};
+    qint64 publication_heartbeat_ms{-1};
+    bool inserted_during_publish{false};
+    QString clicked_hash;
+    OverviewPage overview(style.get());
+    overview.setWalletModel(model.get());
+    auto* recent = overview.findChild<QListView*>(QStringLiteral("listTransactions"));
+    auto* history_view = view.findChild<QTableView*>(QStringLiteral("transactionView"));
+    QVERIFY(recent);
+    QVERIFY(history_view);
+    QObject::connect(&overview, &OverviewPage::transactionClicked,
+        &view, qOverload<const QModelIndex&>(&TransactionView::focusTransaction));
+    QElapsedTimer publication_timer;
+    QObject::connect(table, &TransactionTableModel::rowsInserted, table, [&](const QModelIndex&, int first, int last) {
+        if (table->isHistoryLoaded() || !table->processingQueuedTransactions()) return;
+        largest_chunk = std::max(largest_chunk, last - first + 1);
+        if (++chunks != 1) return;
+        publication_timer.start();
+        QMetaObject::invokeMethod(table, [&] {
+            publication_heartbeat_ms = publication_timer.elapsed();
+            rows_at_publication_heartbeat = table->rowCount({});
+            QVERIFY(!table->isHistoryLoaded());
+            QVERIFY(!view.exportTransactions(filename));
+            const auto recent_index = recent->model()->index(0, TransactionTableModel::ToAddress);
+            QVERIFY(recent_index.isValid());
+            clicked_hash = recent_index.data(TransactionTableModel::TxHashRole).toString();
+            QVERIFY(QMetaObject::invokeMethod(&overview, "handleTransactionClicked", Qt::DirectConnection,
+                Q_ARG(QModelIndex, recent_index)));
+            inserted_during_publish = wallet->AddToWallet(late, wallet::TxStateInactive{}) != nullptr;
+        }, Qt::QueuedConnection);
+    });
+
+    std::promise<void> locked;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+    });
+    locked.get_future().wait();
+    model->startPollBalance();
+    QEventLoop loop;
+    QTimer::singleShot(0, &loop, [&] {
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    holder.join();
+    QVERIFY(heartbeat_during_lock);
+
+    QTRY_VERIFY_WITH_TIMEOUT(table->isHistoryLoaded(), 5000);
+    QVERIFY(inserted_during_publish);
+    QVERIFY(!clicked_hash.isEmpty());
+    QCOMPARE(history_view->currentIndex().data(TransactionTableModel::TxHashRole).toString(), clicked_hash);
+    QCOMPARE(table->rowCount({}), SYNTHETIC_HISTORY_ROWS + 106);
+    QVERIFY(chunks > 1);
+    QVERIFY(largest_chunk <= 256);
+    QVERIFY(rows_at_publication_heartbeat > 0 && rows_at_publication_heartbeat < SYNTHETIC_HISTORY_ROWS);
+    qInfo("Deferred history yielded at %d/%d rows after %lld ms, %d publication chunks",
+        rows_at_publication_heartbeat, table->rowCount({}), static_cast<long long>(publication_heartbeat_ms), chunks);
+    QVERIFY(FindTx(*table, late->GetHash()).isValid());
+    QVERIFY(view.exportTransactions(filename));
+    QFile csv(filename);
+    QVERIFY(csv.open(QIODevice::ReadOnly));
+    const auto rows = csv.readAll().trimmed().split('\n');
+    QCOMPARE(rows.size(), SYNTHETIC_HISTORY_ROWS + 107);
+    QVERIFY(std::any_of(rows.cbegin(), rows.cend(), [&](const QByteArray& row) {
+        return row.contains(QByteArray::fromStdString(late->GetHash().ToString()));
+    }));
+
+    // Unload with history still queued behind the same held wallet lock.
+    auto closing = std::make_unique<WalletModel>(
+        interfaces::MakeWallet(*node.walletLoader().context(), wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    const QPointer<TransactionTableModel> closing_table{closing->getTransactionTableModel()};
+    std::promise<void> closing_locked;
+    std::promise<void> closed;
+    auto wait_for_close = closed.get_future();
+    bool closed_during_lock{false};
+    std::thread close_holder([&] {
+        LOCK(wallet->cs_wallet);
+        closing_locked.set_value();
+        closed_during_lock = wait_for_close.wait_for(750ms) == std::future_status::ready;
+    });
+    closing_locked.get_future().wait();
+    closing->startPollBalance();
+    closing.reset();
+    closed.set_value();
+    close_holder.join();
+    QVERIFY(closed_during_lock);
+    QVERIFY(closing_table.isNull());
+    QTest::qWait(75);
+}
+
 void TestTransactionTableResponsiveUnderWalletLock(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
 {
     using namespace std::chrono_literals;
@@ -4174,6 +4599,16 @@ void TestGUI(interfaces::Node& node)
     node.setContext(&test.m_node);
 
     const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
+    if (lane.isEmpty() || lane == QStringLiteral("wallet-efficiency")) {
+        TestHiddenSendBalanceHeartbeat(node, SetupDescriptorsWallet(node, test));
+        TestWalletDisplaySnapshots(node, SetupDescriptorsWallet(node, test));
+        TestWalletPollCoalescing(node, SetupDescriptorsWallet(node, test));
+        TestWalletDisplayExceptionRecovery(node, SetupDescriptorsWallet(node, test));
+        TestAccountSnapshotFiltering(node, SetupDescriptorsWallet(node, test));
+        TestDeferredWalletHistory(node, SetupDescriptorsWallet(node, test));
+        if (lane == QStringLiteral("wallet-efficiency")) return;
+    }
+
     if (lane.isEmpty() || lane == QStringLiteral("transaction-contention")) {
         TestTransactionTableResponsiveUnderWalletLock(node, SetupDescriptorsWallet(node, test));
         if (lane == QStringLiteral("transaction-contention")) return;
@@ -4238,6 +4673,29 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     auto tiered_coldstake_result = wallet_interface.createQuantumColdStakeAddress(
         staker_result->public_key, "reorg-tiered-coldstake", 9450);
     QVERIFY(tiered_coldstake_result);
+    const auto compare_coldstake_batch = [&](CAmount funded_liquid_amount = 0) {
+        const std::vector<std::string> addresses{
+            liquid_coldstake_result->address, tiered_coldstake_result->address, "invalid"};
+        const auto grouped = wallet_interface.getQuantumColdStakeBalances(addresses);
+        QCOMPARE(grouped.size(), addresses.size());
+        for (const auto& address : addresses) {
+            const auto single = wallet_interface.getQuantumColdStakeBalanceInfo(address);
+            const auto& bulk = grouped.at(address);
+            QCOMPARE(bulk.available, single.available);
+            QCOMPARE(bulk.valid_delegation_address, single.valid_delegation_address);
+            QCOMPARE(bulk.amount, single.amount);
+            if (address == liquid_coldstake_result->address) QCOMPARE(bulk.confirmed_amount, funded_liquid_amount);
+            QCOMPARE(bulk.outputs, single.outputs);
+            QCOMPARE(bulk.confirmed_amount, single.confirmed_amount);
+            QCOMPARE(bulk.confirmed_outputs, single.confirmed_outputs);
+            QCOMPARE(bulk.unconfirmed_amount, single.unconfirmed_amount);
+            QCOMPARE(bulk.unconfirmed_outputs, single.unconfirmed_outputs);
+            QCOMPARE(bulk.spendable_amount, single.spendable_amount);
+            QCOMPARE(bulk.spendable_outputs, single.spendable_outputs);
+            QCOMPARE(bulk.current_height, single.current_height);
+        }
+    };
+    compare_coldstake_batch();
 
     StakingMiningPage page(platform_style.get());
     page.setClientModel(mini_gui.clientModel.get());
@@ -4277,8 +4735,16 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
         QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
         qApp->processEvents();
     };
+    std::optional<uint256> previous_balance_tip;
     const auto expect_controls = [&](int expected_height, bool quantum_active, bool legacy_active, bool tiers_active) {
         QCOMPARE(height(), expected_height);
+        compare_coldstake_batch();
+        SyncRecoveryReviewWalletTip(wallet, node);
+        interfaces::WalletDisplayBalances snapshot;
+        QVERIFY(wallet_interface.tryGetDisplayBalances(snapshot, previous_balance_tip, std::nullopt));
+        QCOMPARE(snapshot.block_hash, node.getBestBlockHash());
+        previous_balance_tip = snapshot.block_hash;
+        QVERIFY(!wallet_interface.tryGetDisplayBalances(snapshot, previous_balance_tip, std::nullopt));
         const interfaces::WalletQuantumFundingStatus status = wallet_interface.getQuantumFundingStatus();
         QVERIFY(status.available);
         QCOMPARE(status.quantum_outputs_active, quantum_active);
@@ -4358,6 +4824,39 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     mine_block();
     mine_block();
     expect_controls(109, /*quantum_active=*/true, /*legacy_active=*/false, /*tiers_active=*/true);
+
+    // Inject confirmed fixture coins after the branch checks, matching the
+    // wallet record and regtest UTXO view for both policies.
+    const auto* funding_block = WITH_LOCK(::cs_main, return test.m_node.chainman->ActiveChain().Tip());
+    QVERIFY(funding_block);
+    CMutableTransaction funding;
+    funding.vin.emplace_back(COutPoint{uint256{0x43}, 0});
+    const auto direct_script = GetScriptForDestination(DecodeDestination(staker_result->address));
+    const auto coldstake_script = GetScriptForDestination(DecodeDestination(liquid_coldstake_result->address));
+    QVERIFY(!direct_script.empty());
+    QVERIFY(!coldstake_script.empty());
+    funding.vout.emplace_back(3 * COIN, direct_script);
+    funding.vout.emplace_back(5 * COIN, coldstake_script);
+    const auto funded = MakeTransactionRef(std::move(funding));
+    QVERIFY(wallet->AddToWallet(funded, wallet::TxStateConfirmed{
+        funding_block->GetBlockHash(), funding_block->nHeight, 1}));
+    {
+        LOCK(::cs_main);
+        for (uint32_t i = 0; i < funded->vout.size(); ++i) {
+            test.m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+                COutPoint{funded->GetHash(), i}, Coin{funded->vout[i], funding_block->nHeight,
+                    /*coinbase=*/false, /*coinstake=*/false, funded->nTime}, /*possible_overwrite=*/false);
+        }
+    }
+    compare_coldstake_batch(5 * COIN);
+    wallet::CCoinControl quantum;
+    quantum.m_input_family = wallet::CCoinControl::InputFamily::QUANTUM_MIGRATION;
+    quantum.m_exclude_generated_quantum_inputs = true;
+    const CAmount direct_total = wallet_interface.getAvailableBalance(quantum);
+    QCOMPARE(direct_total, 3 * COIN);
+    interfaces::WalletDisplayBalances display;
+    QVERIFY(wallet_interface.tryGetDisplayBalances(display, std::nullopt, interfaces::WalletDisplayCoinFamily::DIRECT_QUANTUM));
+    QCOMPARE(display.send_family_balance.value_or(-1), direct_total);
 }
 
 } // namespace
@@ -4365,7 +4864,7 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
 void WalletTests::walletTests()
 {
     const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
-    QVERIFY2(lane.isEmpty() || lane == QStringLiteral("pow-controls") || lane == QStringLiteral("recovery-ui") || lane == QStringLiteral("miner-control") || lane == QStringLiteral("wallet-load-callbacks") || lane == QStringLiteral("transaction-contention") || lane == QStringLiteral("transaction-label-contention"),
+    QVERIFY2(lane.isEmpty() || lane == QStringLiteral("pow-controls") || lane == QStringLiteral("recovery-ui") || lane == QStringLiteral("miner-control") || lane == QStringLiteral("wallet-load-callbacks") || lane == QStringLiteral("transaction-contention") || lane == QStringLiteral("transaction-label-contention") || lane == QStringLiteral("wallet-efficiency"),
              "Unknown BLACKCOIN_QT_WALLET_TEST");
     if (!lane.isEmpty()) qInfo("FILTERED WalletTests lane: %s (not the full wallet GUI suite)", qPrintable(lane));
 #ifdef Q_OS_MACOS

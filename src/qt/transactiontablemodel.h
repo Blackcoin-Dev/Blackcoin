@@ -10,6 +10,7 @@
 #include <QAbstractTableModel>
 #include <QStringList>
 
+#include <deque>
 #include <memory>
 
 namespace interfaces {
@@ -28,7 +29,7 @@ class TransactionTableModel : public QAbstractTableModel
     Q_OBJECT
 
 public:
-    explicit TransactionTableModel(const PlatformStyle *platformStyle, WalletModel *parent = nullptr);
+    explicit TransactionTableModel(const PlatformStyle* platformStyle, WalletModel* parent, bool defer_history);
     ~TransactionTableModel();
 
     enum ColumnIndex {
@@ -85,6 +86,11 @@ public:
     QModelIndex index(int row, int column, const QModelIndex & parent = QModelIndex()) const override;
     bool processingQueuedTransactions() const { return fProcessingQueuedTransactions; }
     void invalidateAddressLabel(const QString& address);
+    bool isHistoryLoaded() const { return m_history_loaded; }
+    bool historyLoadHasFailed() const { return m_history_load_failed; }
+    void setInitialHistory(std::deque<TransactionRecord> history);
+    void reportHistoryLoadFailure();
+
 
 private:
     WalletModel *walletModel;
@@ -93,6 +99,8 @@ private:
     QStringList columns;
     std::shared_ptr<TransactionTablePriv> priv;
     bool fProcessingQueuedTransactions{false};
+    bool m_history_loaded{false};
+    bool m_history_load_failed{false};
     const PlatformStyle *platformStyle;
 
     void subscribeToCoreSignals();
@@ -111,6 +119,10 @@ private:
     QVariant txStatusDecoration(const TransactionRecord *wtx) const;
     QVariant txWatchonlyDecoration(const TransactionRecord *wtx) const;
     QVariant txAddressDecoration(const TransactionRecord *wtx) const;
+
+Q_SIGNALS:
+    void historyLoaded();
+    void historyLoadFailed();
 
 public Q_SLOTS:
     void updateConfirmations();

@@ -31,7 +31,9 @@ PeerTableModel::~PeerTableModel() = default;
 
 void PeerTableModel::startAutoRefresh()
 {
+    if (timer->isActive()) return;
     timer->start();
+    refresh();
 }
 
 void PeerTableModel::stopAutoRefresh()

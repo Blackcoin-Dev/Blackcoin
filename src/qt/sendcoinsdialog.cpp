@@ -155,7 +155,13 @@ void SendCoinsDialog::setClientModel(ClientModel *_clientModel)
 
 void SendCoinsDialog::setModel(WalletModel *_model)
 {
-    this->model = _model;
+    if (model == _model) return;
+    if (model) {
+        model->setSendBalanceFamily(std::nullopt);
+        disconnect(model, nullptr, this, nullptr);
+        if (model->getOptionsModel()) disconnect(model->getOptionsModel(), nullptr, this, nullptr);
+    }
+    model = _model;
 
     if(_model && _model->getOptionsModel())
     {
@@ -169,9 +175,10 @@ void SendCoinsDialog::setModel(WalletModel *_model)
         }
 
         connect(_model, &WalletModel::balanceChanged, this, &SendCoinsDialog::setBalance);
+        connect(_model, &WalletModel::sendBalanceChanged, this, &SendCoinsDialog::refreshBalance);
         connect(_model->getOptionsModel(), &OptionsModel::displayUnitChanged, this, &SendCoinsDialog::refreshBalance);
+        updateSpendBalanceRequest();
         refreshBalance();
-        updateSpendSourceBalance();
 
         // Coin Control
         connect(_model->getOptionsModel(), &OptionsModel::displayUnitChanged, this, &SendCoinsDialog::coinControlUpdateLabels);
@@ -181,8 +188,22 @@ void SendCoinsDialog::setModel(WalletModel *_model)
     }
 }
 
+void SendCoinsDialog::showEvent(QShowEvent* event)
+{
+    QDialog::showEvent(event);
+    updateSpendBalanceRequest();
+    if (model) refreshBalance();
+}
+
+void SendCoinsDialog::hideEvent(QHideEvent* event)
+{
+    if (model) model->setSendBalanceFamily(std::nullopt);
+    QDialog::hideEvent(event);
+}
+
 SendCoinsDialog::~SendCoinsDialog()
 {
+    if (model) model->setSendBalanceFamily(std::nullopt);
     QSettings settings;
 
     delete ui;
@@ -679,7 +700,7 @@ void SendCoinsDialog::setBalance(const interfaces::WalletBalances& balances)
 {
     if(model && model->getOptionsModel())
     {
-        CAmount balance = balances.legacy_balance;
+        std::optional<CAmount> balance = balances.legacy_balance;
         if (model->wallet().hasExternalSigner()) {
             balance = balances.balance;
             ui->labelBalanceName->setText(tr("External balance:"));
@@ -687,15 +708,14 @@ void SendCoinsDialog::setBalance(const interfaces::WalletBalances& balances)
             balance = balances.watch_only_balance;
             ui->labelBalanceName->setText(tr("Watch-only balance:"));
         } else if (m_spend_source_combo && m_spend_source_combo->currentData().toInt() == SPEND_SOURCE_QUANTUM) {
-            CCoinControl source_control;
-            source_control.m_input_family = CCoinControl::InputFamily::QUANTUM_MIGRATION;
-            source_control.m_exclude_generated_quantum_inputs = true;
-            balance = model->getAvailableBalance(&source_control);
+            balance = model->getCachedSendBalance(interfaces::WalletDisplayCoinFamily::DIRECT_QUANTUM);
             ui->labelBalanceName->setText(tr("Direct quantum spendable:"));
         } else {
             ui->labelBalanceName->setText(tr("Selected legacy balance:"));
         }
-        ui->labelBalance->setText(BitcoinUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), balance));
+        ui->labelBalance->setText(balance
+            ? BitcoinUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), *balance)
+            : tr("Refreshing…"));
         updateSpendSourceBalance();
     }
 }
@@ -708,7 +728,8 @@ void SendCoinsDialog::refreshBalance()
 void SendCoinsDialog::spendSourceChanged()
 {
     updateCoinControlState();
-    refreshBalance();
+    updateSpendBalanceRequest();
+    if (model) refreshBalance();
     coinControlUpdateLabels();
 }
 
@@ -846,21 +867,29 @@ bool SendCoinsDialog::ensureSpendSourceChange(CCoinControl& coin_control)
     return true;
 }
 
+interfaces::WalletDisplayCoinFamily SendCoinsDialog::spendBalanceFamily() const
+{
+    return m_spend_source_combo && m_spend_source_combo->currentData().toInt() == SPEND_SOURCE_QUANTUM
+        ? interfaces::WalletDisplayCoinFamily::DIRECT_QUANTUM : interfaces::WalletDisplayCoinFamily::LEGACY;
+}
+
+void SendCoinsDialog::updateSpendBalanceRequest()
+{
+    if (model) model->setSendBalanceFamily(isVisible() ? std::optional{spendBalanceFamily()} : std::nullopt);
+}
+
 void SendCoinsDialog::updateSpendSourceBalance()
 {
-    if (!model || !model->getOptionsModel() || !m_spend_source_combo || !m_spend_source_balance_label || !m_spend_source_warning_label) {
-        return;
-    }
-    const bool quantum_source = m_spend_source_combo->currentData().toInt() == SPEND_SOURCE_QUANTUM;
-    CCoinControl source_control;
-    source_control.m_input_family = quantum_source
-        ? CCoinControl::InputFamily::QUANTUM_MIGRATION
-        : CCoinControl::InputFamily::LEGACY;
-    source_control.m_exclude_generated_quantum_inputs = quantum_source;
-    const CAmount source_balance = model->getAvailableBalance(&source_control);
-    const QString family = quantum_source ? tr("Direct quantum spendable:") : tr("Legacy spendable:");
-    m_spend_source_balance_label->setText(QStringLiteral("%1 %2").arg(family, BitcoinUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), source_balance)));
-    m_spend_source_warning_label->setVisible(quantum_source);
+    if (!model || !model->getOptionsModel() || !m_spend_source_balance_label || !m_spend_source_warning_label) return;
+    const auto family = spendBalanceFamily();
+    const bool quantum = family == interfaces::WalletDisplayCoinFamily::DIRECT_QUANTUM;
+    const auto balance = model->getCachedSendBalance(family);
+    const QString name = quantum ? tr("Direct quantum spendable:") : tr("Legacy spendable:");
+    const QString amount = balance
+        ? BitcoinUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), *balance)
+        : tr("Refreshing…");
+    m_spend_source_balance_label->setText(QStringLiteral("%1 %2").arg(name, amount));
+    m_spend_source_warning_label->setVisible(quantum);
 }
 
 // Coin Control: copy label "Quantity" to clipboard
@@ -915,7 +944,10 @@ void SendCoinsDialog::coinControlFeatureChanged(bool checked)
 void SendCoinsDialog::coinControlButtonClicked()
 {
     auto dlg = new CoinControlDialog(*m_coin_control, model, platformStyle);
-    connect(dlg, &QDialog::finished, this, &SendCoinsDialog::coinControlUpdateLabels);
+    connect(dlg, &QDialog::finished, this, [this] {
+        coinControlUpdateLabels();
+        if (model) model->refreshSendBalance();
+    });
     GUIUtil::ShowModalDialogAsynchronously(dlg);
 }
 

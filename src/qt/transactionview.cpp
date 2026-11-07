@@ -21,6 +21,7 @@
 
 #include <chrono>
 #include <optional>
+#include <utility>
 
 #include <QApplication>
 #include <QComboBox>
@@ -133,6 +134,9 @@ TransactionView::TransactionView(const PlatformStyle *platformStyle, QWidget *pa
     transactionView = new QTableView(this);
     transactionView->setObjectName("transactionView");
     vlayout->addLayout(filter_layout);
+    m_history_state = new QLabel(tr("Loading wallet history…"), this);
+    m_history_state->hide();
+    vlayout->addWidget(m_history_state);
     vlayout->addWidget(createDateRangeWidget());
     vlayout->addWidget(transactionView);
     vlayout->setSpacing(0);
@@ -193,17 +197,42 @@ TransactionView::~TransactionView()
 
 void TransactionView::setModel(WalletModel *_model)
 {
+    m_pending_focus = std::monostate{};
     this->model = _model;
     if(_model)
     {
         transactionProxyModel = new TransactionFilterProxy(this);
-        transactionProxyModel->setSourceModel(_model->getTransactionTableModel());
+        auto* history = _model->getTransactionTableModel();
+        if (history->historyLoadHasFailed()) {
+            m_history_state->setText(tr("Wallet history could not be loaded. Reopen the wallet to try again."));
+        }
+        m_history_state->setVisible(!history->isHistoryLoaded());
+        search_widget->setEnabled(history->isHistoryLoaded());
+        connect(history, &TransactionTableModel::historyLoaded, this, [this, history] {
+            if (!model || model->getTransactionTableModel() != history) return;
+            m_history_state->hide();
+            search_widget->setEnabled(true);
+            const auto pending = std::exchange(m_pending_focus, std::monostate{});
+            if (const auto* index = std::get_if<QPersistentModelIndex>(&pending); index && index->isValid()) {
+                // Recreate the index after publication and replay so its
+                // internal record pointer comes from the current model data.
+                focusTransaction(history->index(index->row(), index->column()));
+            } else if (const auto* txid = std::get_if<uint256>(&pending)) {
+                focusTransaction(*txid);
+            } else if (isVisible()) {
+                ensureHistorySource();
+            }
+        });
+        connect(history, &TransactionTableModel::historyLoadFailed, this, [this, history] {
+            if (!model || model->getTransactionTableModel() != history) return;
+            m_history_state->setText(tr("Wallet history could not be loaded. Reopen the wallet to try again."));
+        });
         transactionProxyModel->setDynamicSortFilter(true);
         transactionProxyModel->setSortCaseSensitivity(Qt::CaseInsensitive);
         transactionProxyModel->setFilterCaseSensitivity(Qt::CaseInsensitive);
         transactionProxyModel->setSortRole(Qt::EditRole);
         transactionView->setModel(transactionProxyModel);
-        transactionView->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder);
+        ensureHistorySource();
 
         if (_model->getOptionsModel())
         {
@@ -229,11 +258,30 @@ void TransactionView::setModel(WalletModel *_model)
         }
 
         // show/hide column Watch-only
-        updateWatchOnlyColumn(_model->wallet().haveWatchOnly());
+        updateWatchOnlyColumn(_model->haveWatchOnly());
 
         // Watch-only signal
         connect(_model, &WalletModel::notifyWatchonlyChanged, this, &TransactionView::updateWatchOnlyColumn);
     }
+}
+
+bool TransactionView::ensureHistorySource()
+{
+    if (!model || !transactionProxyModel) return false;
+    auto* history = model->getTransactionTableModel();
+    if (!history->isHistoryLoaded()) return false;
+    if (!transactionProxyModel->sourceModel()) {
+        transactionProxyModel->setSourceModel(history);
+        transactionView->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder);
+        updateWatchOnlyColumn(model->haveWatchOnly());
+    }
+    return true;
+}
+
+void TransactionView::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    ensureHistorySource();
 }
 
 void TransactionView::changeEvent(QEvent* e)
@@ -340,6 +388,12 @@ void TransactionView::exportClicked()
         return;
     }
 
+    if (!model->getTransactionTableModel()->isHistoryLoaded()) {
+        Q_EMIT message(tr("History Unavailable"), tr("Wait for wallet history to finish loading before exporting."),
+            CClientUIInterface::MSG_WARNING);
+        return;
+    }
+
     // CSV is currently the only supported format
     QString filename = GUIUtil::getSaveFileName(this,
         tr("Export Transaction History"), QString(),
@@ -362,7 +416,7 @@ void TransactionView::exportClicked()
 
 bool TransactionView::exportTransactions(const QString& filename)
 {
-    if (!model || !model->getOptionsModel() || !transactionProxyModel) return false;
+    if (!model || !model->getOptionsModel() || !ensureHistorySource()) return false;
 
     const auto export_model = transactionProxyModel->makeExportModel();
     CSVModelWriter writer(filename);
@@ -566,8 +620,11 @@ void TransactionView::dateRangeChanged()
 
 void TransactionView::focusTransaction(const QModelIndex &idx)
 {
-    if(!transactionProxyModel)
+    if (!model || !idx.isValid() || idx.model() != model->getTransactionTableModel()) return;
+    if (!ensureHistorySource()) {
+        m_pending_focus = QPersistentModelIndex{idx};
         return;
+    }
     QModelIndex targetIdx = transactionProxyModel->mapFromSource(idx);
     transactionView->scrollTo(targetIdx);
     transactionView->setCurrentIndex(targetIdx);
@@ -576,8 +633,11 @@ void TransactionView::focusTransaction(const QModelIndex &idx)
 
 void TransactionView::focusTransaction(const uint256& txid)
 {
-    if (!transactionProxyModel)
+    if (!model) return;
+    if (!ensureHistorySource()) {
+        m_pending_focus = txid;
         return;
+    }
 
     const QModelIndexList results = this->model->getTransactionTableModel()->match(
         this->model->getTransactionTableModel()->index(0,0),

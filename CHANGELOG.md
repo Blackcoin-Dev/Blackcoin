@@ -1,5 +1,25 @@
 # Changelog
 
+## v30.1.5.3rc4 (DEVELOPMENT, unreleased candidate)
+
+- Show Overview's recent transactions through a five-row projection, preserving
+  the existing sorting and source transaction mapping without hiding every
+  history row after updates. Poll peer statistics only while Peers is shown.
+- Skip automatic staking package selection for an already-searched time slot
+  and chain tip. Preserve the late eligibility check and explicit caller paths.
+- Reuse authenticated predecessor proof buckets within one forward block
+  transition, batch the ordered payout inventory updates, and reuse checked
+  block/undo serialized sizes. Preserve state bytes and undo checksums.
+- Coalesce balance display requests on the wallet worker, skip hidden Send
+  balance scans, and filter Account details from a completed snapshot. Preserve
+  newer updates while publishing completed results and distinguish contention
+  from empty data.
+- Load wallet history outside the UI thread and publish at most 256 rows per
+  event-loop turn. Replay live updates before enabling complete-history search
+  and export, and retain transaction clicks made while loading.
+- Preserve wallet storage and consensus rules. Exact-source qualification
+  remains pending.
+
 ## v30.1.5.3rc3 (DEVELOPMENT, unreleased candidate)
 
 - Queue wallet transaction updates and label refreshes when the wallet lock is

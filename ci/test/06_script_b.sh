@@ -195,8 +195,12 @@ if [ -n "$USE_VALGRIND" ]; then
 fi
 
 if [[ "${CI_NETWORK_REGRESSION:-false}" == "true" ]]; then
+  qt_binary=()
+  if [[ "${REGRESSION_PROFILE:-bootstrap-units}" == efficiency-units ]]; then
+    qt_binary=(src/qt/test/test_blackcoin-qt)
+  fi
   LD_LIBRARY_PATH="${DEPENDS_DIR}/${HOST}/lib" \
-    "${BASE_ROOT_DIR}/ci/test/run_network_regression.sh" src/test/test_blackcoin
+    "${BASE_ROOT_DIR}/ci/test/run_network_regression.sh" src/test/test_blackcoin "${qt_binary[@]}"
 fi
 
 if [ "$RUN_UNIT_TESTS" = "true" ]; then

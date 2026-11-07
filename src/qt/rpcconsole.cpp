@@ -593,6 +593,7 @@ RPCConsole::RPCConsole(interfaces::Node& node, const PlatformStyle *_platformSty
 
 RPCConsole::~RPCConsole()
 {
+    if (m_peer_refresh_model) m_peer_refresh_model->stopAutoRefresh();
     QSettings settings;
 #ifdef ENABLE_WALLET
     if (WalletModel::isWalletEnabled()) {
@@ -660,6 +661,8 @@ bool RPCConsole::eventFilter(QObject* obj, QEvent *event)
 
 void RPCConsole::setClientModel(ClientModel *model, int bestblock_height, int64_t bestblock_date, double verification_progress)
 {
+    if (m_peer_refresh_model) m_peer_refresh_model->stopAutoRefresh();
+    m_peer_refresh_model = model ? model->getPeerTableModel() : nullptr;
     clientModel = model;
 
     bool wallet_enabled{false};
@@ -722,7 +725,7 @@ void RPCConsole::setClientModel(ClientModel *model, int bestblock_height, int64_
 
         // peer table signal handling - update peer details when selecting new node
         connect(ui->peerWidget->selectionModel(), &QItemSelectionModel::selectionChanged, this, &RPCConsole::updateDetailWidget);
-        connect(model->getPeerTableModel(), &QAbstractItemModel::dataChanged, [this] { updateDetailWidget(); });
+        connect(model->getPeerTableModel(), &QAbstractItemModel::dataChanged, this, [this] { updateDetailWidget(); });
 
         // set up ban table
         ui->banlistWidget->setModel(model->getBanTableModel());
@@ -790,6 +793,7 @@ void RPCConsole::setClientModel(ClientModel *model, int bestblock_height, int64_
         thread.quit();
         thread.wait();
     }
+    updatePeerTableRefresh();
 }
 
 #ifdef ENABLE_WALLET
@@ -1139,6 +1143,7 @@ void RPCConsole::on_tabWidget_currentChanged(int index)
     if (ui->tabWidget->widget(index) == ui->tab_console) {
         ui->lineEdit->setFocus();
     }
+    updatePeerTableRefresh();
 }
 
 void RPCConsole::on_openDebugLogfileButton_clicked()
@@ -1265,12 +1270,17 @@ void RPCConsole::resizeEvent(QResizeEvent *event)
 void RPCConsole::showEvent(QShowEvent *event)
 {
     QWidget::showEvent(event);
+    updatePeerTableRefresh();
+}
 
-    if (!clientModel || !clientModel->getPeerTableModel())
-        return;
-
-    // start PeerTableModel auto refresh
-    clientModel->getPeerTableModel()->startAutoRefresh();
+void RPCConsole::updatePeerTableRefresh()
+{
+    if (!m_peer_refresh_model) return;
+    if (isVisible() && ui->tabWidget->currentIndex() == int(TabTypes::PEERS)) {
+        m_peer_refresh_model->startAutoRefresh();
+    } else {
+        m_peer_refresh_model->stopAutoRefresh();
+    }
 }
 
 void RPCConsole::hideEvent(QHideEvent *event)
@@ -1281,12 +1291,7 @@ void RPCConsole::hideEvent(QHideEvent *event)
     m_banlist_widget_header_state = ui->banlistWidget->horizontalHeader()->saveState();
 
     QWidget::hideEvent(event);
-
-    if (!clientModel || !clientModel->getPeerTableModel())
-        return;
-
-    // stop PeerTableModel auto refresh
-    clientModel->getPeerTableModel()->stopAutoRefresh();
+    if (m_peer_refresh_model) m_peer_refresh_model->stopAutoRefresh();
 }
 
 void RPCConsole::showPeersTableContextMenu(const QPoint& point)

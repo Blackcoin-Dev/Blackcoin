@@ -17,6 +17,7 @@
 
 #include <QByteArray>
 #include <QCompleter>
+#include <QPointer>
 #include <QThread>
 #include <QWidget>
 
@@ -177,6 +178,8 @@ private:
     RPCExecutor* m_executor{nullptr};
     WalletModel* m_last_wallet_model{nullptr};
     bool m_is_executing{false};
+    void updatePeerTableRefresh();
+    QPointer<PeerTableModel> m_peer_refresh_model;
     QByteArray m_peer_widget_header_state;
     QByteArray m_banlist_widget_header_state;
 

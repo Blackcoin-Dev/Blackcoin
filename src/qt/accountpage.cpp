@@ -48,6 +48,9 @@
 
 namespace {
 constexpr uint16_t OPERATOR_COMMITMENT_BLOCKS = 40500;
+constexpr int FILTER_FAMILY_ROLE{Qt::UserRole + 2};
+constexpr int FILTER_TEXT_ROLE{Qt::UserRole + 3};
+constexpr int GROUP_AMOUNT_ROLE{Qt::UserRole + 4};
 
 struct StakeOutputDetail
 {
@@ -255,18 +258,18 @@ QString addressNote(const QString& family)
 
 AccountPage::AccountPage(const PlatformStyle* platformStyle, QWidget* parent)
     : QWidget(parent),
-      m_timer(new QTimer(this)),
       m_filter_timer(new QTimer(this))
 {
     Q_UNUSED(platformStyle);
     setupUi();
-    // This page reads the whole wallet on refresh (listCoins, quantum stake
-    // outputs, EUTXO states), which costs seconds on large wallets. It is
-    // therefore refreshed only on demand: the Refresh button, or the debounced
-    // filter/search controls. There is no periodic or block-driven auto-sweep.
     m_filter_timer->setSingleShot(true);
     m_filter_timer->setInterval(250);
-    connect(m_filter_timer, &QTimer::timeout, this, &AccountPage::refresh);
+    connect(m_filter_timer, &QTimer::timeout, this, &AccountPage::applySnapshotFilter);
+}
+
+AccountPage::~AccountPage()
+{
+    if (m_refresh_cancel) m_refresh_cancel->store(true, std::memory_order_release);
 }
 
 void AccountPage::setupUi()
@@ -359,8 +362,21 @@ void AccountPage::setupUi()
     connect(m_search, &QLineEdit::textChanged, this, &AccountPage::scheduleRefresh);
 }
 
+void AccountPage::discardSnapshot()
+{
+    ++m_refresh_generation;
+    if (m_refresh_cancel) m_refresh_cancel->store(true, std::memory_order_release);
+    m_refresh_cancel.reset();
+    m_refresh_queued = false;
+    m_snapshot.reset();
+    m_snapshot_rendered = false;
+    m_filter_timer->stop();
+    m_tree->clear();
+}
+
 void AccountPage::setWalletModel(WalletModel* walletModel)
 {
+    discardSnapshot();
     if (m_wallet_model) {
         disconnect(m_wallet_model, nullptr, this, nullptr);
     }
@@ -370,21 +386,18 @@ void AccountPage::setWalletModel(WalletModel* walletModel)
         // every block and would re-sweep the whole wallet on the GUI thread.
         connect(m_wallet_model, &QObject::destroyed, this, [this] {
             m_wallet_model = nullptr;
-            m_tree->clear();
-            m_status->setText(tr("No wallet is loaded."));
+            discardSnapshot();
+            renderSnapshot();
         });
-        m_tree->clear();
-        m_status->setText(tr("Press Refresh to load account details."));
-    } else {
-        m_tree->clear();
-        m_status->setText(tr("No wallet is loaded."));
     }
+    renderSnapshot();
 }
 
 void AccountPage::setPrivacy(bool privacy)
 {
     m_privacy = privacy;
-    refresh();
+    if (privacy) discardSnapshot();
+    renderSnapshot();
 }
 
 bool AccountPage::rowMatchesFilter(const QString& family, const QString& address, const QString& label) const
@@ -407,74 +420,85 @@ void AccountPage::scheduleRefresh()
 
 void AccountPage::showEvent(QShowEvent* event)
 {
-    // Switching to this tab must stay instant, so do not sweep the wallet on
-    // show. The last loaded data (if any) stays visible; the user reloads it
-    // with the Refresh button.
     QWidget::showEvent(event);
+    renderSnapshot();
 }
 
 void AccountPage::refresh()
 {
-    // The refresh walks the entire wallet (listCoins, quantum stake outputs,
-    // EUTXO states); on large wallets that takes seconds of GUI-thread time,
-    // so skip it while the page is hidden or the window is minimized.
-    // showEvent() catches up when the page returns.
-    if (!isVisible() || window()->isMinimized()) {
-        m_refresh_queued = false;
-        return;
-    }
-    if (m_refreshing) {
+    if (!isVisible() || window()->isMinimized() || m_privacy || !m_wallet_model) return;
+    if (m_refresh_cancel) {
         m_refresh_queued = true;
+        m_refresh_cancel->store(true, std::memory_order_release);
         return;
     }
-    m_refreshing = true;
-    auto finish_refresh = [this] {
-        m_refreshing = false;
-        if (m_refresh_queued) {
-            m_refresh_queued = false;
-            QTimer::singleShot(100, this, &AccountPage::refresh);
+    m_status->setText(tr("Loading account details…"));
+    const auto generation = m_refresh_generation;
+    const QPointer<AccountPage> view{this};
+    m_refresh_cancel = m_wallet_model->requestAccountSnapshot([view, generation](auto snapshot) {
+        if (!view || view->m_refresh_generation != generation) return;
+        view->m_refresh_cancel.reset();
+        if (view->m_refresh_queued) {
+            view->m_refresh_queued = false;
+            view->refresh();
+            return;
         }
-    };
+        if (snapshot->cancelled) return;
+        if (snapshot->stale) {
+            view->m_status->setText(tr("Wallet state changed or is busy. Press Refresh to try again."));
+            return;
+        }
+        if (!snapshot->error.empty()) {
+            view->m_status->setText(tr("Unable to refresh account details: %1").arg(QString::fromStdString(snapshot->error).toHtmlEscaped()));
+            return;
+        }
+        view->m_snapshot = std::move(snapshot);
+        view->m_snapshot_rendered = false;
+        view->renderSnapshot();
+    });
+    if (!m_refresh_cancel) m_status->setText(tr("Wallet is closing."));
+}
 
+void AccountPage::renderSnapshot()
+{
     if (m_privacy) {
-        m_tree->clear();
         m_total_card->setText(tr("<b>Values hidden</b><br>Privacy mode is enabled."));
         m_legacy_card->setText(tr("<b>Legacy</b><br>Hidden"));
         m_quantum_card->setText(tr("<b>Quantum</b><br>Hidden"));
         m_attention_card->setText(tr("<b>Attention</b><br>Hidden"));
         m_status->setText(tr("Disable privacy mode to inspect account-level coins."));
-        finish_refresh();
         return;
     }
 
-    if (!m_wallet_model) {
-        m_tree->clear();
-        m_total_card->setText(tr("Load a wallet to inspect account details."));
+    if (!m_snapshot) {
+        m_total_card->setText(m_wallet_model ? tr("Wallet totals will appear here.") : tr("Load a wallet to inspect account details."));
         m_legacy_card->setText(QStringLiteral("-"));
         m_quantum_card->setText(QStringLiteral("-"));
         m_attention_card->setText(QStringLiteral("-"));
-        m_status->setText(tr("No wallet is loaded."));
-        finish_refresh();
+        if (!m_refresh_cancel) {
+            m_status->setText(m_wallet_model ? tr("Press Refresh to load account details.") : tr("No wallet is loaded."));
+        }
         return;
     }
 
-    interfaces::Wallet& wallet = m_wallet_model->wallet();
-    const interfaces::WalletBalances balances = wallet.getBalances();
-    const interfaces::WalletMigrationStatus migration = wallet.getMigrationStatus();
-    const interfaces::WalletDemurrageInfo demurrage = wallet.getDemurrageInfo();
-    const std::vector<interfaces::WalletRGBAssetInfo> rgb_assets = wallet.listRGBAssets(/*include_spent=*/false);
-    const std::vector<interfaces::WalletEUTXOStateInfo> eutxo_states = wallet.listEUTXOStates(/*include_spent=*/true);
-    const interfaces::Wallet::CoinsList coins = wallet.listCoins();
+    if (!isVisible() || window()->isMinimized()) return;
+    if (m_snapshot_rendered) {
+        applySnapshotFilter();
+        return;
+    }
+    const auto& snapshot = *m_snapshot;
+    const auto& balances = snapshot.balances;
+    const auto& migration = snapshot.migration;
+    const auto& demurrage = snapshot.demurrage;
     AccountOutputMetadata metadata;
-    const std::vector<interfaces::WalletQuantumAddressInfo> quantum_addresses = wallet.listQuantumAddresses();
     std::set<std::string> unverified_quantum_keys;
-    for (const interfaces::WalletQuantumAddressInfo& info : quantum_addresses) {
+    for (const auto& info : snapshot.quantum_addresses) {
         if (!info.backup_verified) unverified_quantum_keys.insert(info.public_key);
         if (!info.tiered) continue;
         StakeOutputDetail detail;
         detail.operator_bond = info.label == "coldstake-operator" && info.unbonding_blocks == OPERATOR_COMMITMENT_BLOCKS;
         detail.role = detail.operator_bond ? tr("Operator bond") : tr("Self stake");
-        const std::vector<interfaces::WalletQuantumStakeOutputInfo> outputs = wallet.listQuantumStakeOutputs(info.address);
+        const auto& outputs = snapshot.stake_outputs.at(info.address);
         for (const interfaces::WalletQuantumStakeOutputInfo& output : outputs) {
             StakeOutputDetail output_detail = detail;
             output_detail.state = QString::fromStdString(output.state);
@@ -483,11 +507,10 @@ void AccountPage::refresh()
             metadata.stake_outputs[outpoint] = output_detail;
         }
     }
-    const std::vector<interfaces::WalletQuantumColdStakeInfo> coldstake_delegations = wallet.listQuantumColdStakeDelegations();
-    for (const interfaces::WalletQuantumColdStakeInfo& info : coldstake_delegations) {
+    for (const auto& info : snapshot.coldstake_delegations) {
         ColdStakeDetail detail;
         detail.info = info;
-        detail.balance = wallet.getQuantumColdStakeBalanceInfo(info.address);
+        detail.balance = snapshot.coldstake_balances.at(info.address);
         metadata.coldstake_addresses[QString::fromStdString(info.address)] = detail;
     }
 
@@ -529,15 +552,11 @@ void AccountPage::refresh()
     QSignalBlocker tree_blocker(m_tree);
     m_tree->clear();
 
-    int visible_groups{0};
-    int visible_outputs{0};
-    CAmount visible_amount{0};
-    for (const auto& entry : coins) {
+    for (const auto& entry : snapshot.coins) {
         const CTxDestination& dest = entry.first;
         const QString address = QString::fromStdString(EncodeDestination(dest));
-        std::string label_std;
-        wallet.getAddress(dest, &label_std, /*is_mine=*/nullptr, /*purpose=*/nullptr);
-        const QString label = QString::fromStdString(label_std);
+        const auto label_entry = snapshot.labels.find(dest);
+        const QString label = label_entry == snapshot.labels.end() ? QString{} : QString::fromStdString(label_entry->second);
 
         CAmount group_amount{0};
         int min_depth{std::numeric_limits<int>::max()};
@@ -572,7 +591,6 @@ void AccountPage::refresh()
         }
 
         if (entry.second.empty()) continue;
-        if (!rowMatchesFilter(family, searchable, label)) continue;
 
         if (!same_type || group_type.isEmpty()) {
             group_type = family;
@@ -594,6 +612,9 @@ void AccountPage::refresh()
             : group_status);
         parent->setText(Notes, group_note);
         parent->setData(Address, Qt::UserRole, address);
+        parent->setData(Type, FILTER_FAMILY_ROLE, family);
+        parent->setData(Type, FILTER_TEXT_ROLE, searchable);
+        parent->setData(Amount, GROUP_AMOUNT_ROLE, qlonglong(group_amount));
         parent->setToolTip(Address, address);
         parent->setToolTip(Notes, parent->text(Notes));
 
@@ -620,25 +641,46 @@ void AccountPage::refresh()
             child->setToolTip(Notes, detail.notes);
         }
 
-        ++visible_groups;
-        visible_outputs += static_cast<int>(entry.second.size());
-        visible_amount += group_amount;
     }
 
     if (migration.available && migration.goldrush_reward_outputs_needing_move > 0) {
         const QString family = tr("Quantum");
         const QString searchable = tr("Gold Rush locked aggregate quantum reward phase lock");
-        if (rowMatchesFilter(family, searchable, QString())) {
-            auto* item = new QTreeWidgetItem(m_tree);
-            item->setText(Type, tr("Gold Rush locked"));
-            item->setText(Address, tr("(aggregate)"));
-            item->setText(Label, QString());
-            item->setText(Amount, formatBLK(migration.goldrush_reward_amount_needing_move));
-            item->setText(Outputs, QString::number(migration.goldrush_reward_outputs_needing_move));
-            item->setText(Confirmations, QStringLiteral("-"));
-            item->setText(Status, tr("phase locked"));
-            item->setText(Notes, tr("These Gold Rush reward outputs remain unspendable until Gold Rush ends and normal maturity is satisfied. They then become ordinary direct quantum outputs without a required fresh-address move. Exact outpoints are not exposed to this account view, so this aggregate row is not added to the visible balance total."));
-            item->setToolTip(Notes, item->text(Notes));
+        auto* item = new QTreeWidgetItem(m_tree);
+        item->setText(Type, tr("Gold Rush locked"));
+        item->setText(Address, tr("(aggregate)"));
+        item->setText(Label, QString());
+        item->setText(Amount, formatBLK(migration.goldrush_reward_amount_needing_move));
+        item->setText(Outputs, QString::number(migration.goldrush_reward_outputs_needing_move));
+        item->setText(Confirmations, QStringLiteral("-"));
+        item->setText(Status, tr("phase locked"));
+        item->setText(Notes, tr("These Gold Rush reward outputs remain unspendable until Gold Rush ends and normal maturity is satisfied. They then become ordinary direct quantum outputs without a required fresh-address move. Exact outpoints are not exposed to this account view, so this aggregate row is not added to the visible balance total."));
+        item->setToolTip(Notes, item->text(Notes));
+        item->setData(Type, FILTER_FAMILY_ROLE, family);
+        item->setData(Type, FILTER_TEXT_ROLE, searchable);
+    }
+
+    m_snapshot_rendered = true;
+    applySnapshotFilter();
+}
+
+void AccountPage::applySnapshotFilter()
+{
+    if (!isVisible() || window()->isMinimized() || m_privacy || !m_snapshot_rendered) return;
+    QSignalBlocker tree_blocker(m_tree);
+    m_tree->clearSelection();
+    int visible_groups{0};
+    int visible_outputs{0};
+    CAmount visible_amount{0};
+    for (int row = 0; row < m_tree->topLevelItemCount(); ++row) {
+        auto* item = m_tree->topLevelItem(row);
+        const bool visible = rowMatchesFilter(item->data(Type, FILTER_FAMILY_ROLE).toString(),
+            item->data(Type, FILTER_TEXT_ROLE).toString(), item->text(Label));
+        item->setHidden(!visible);
+        if (visible && item->childCount() > 0) {
+            ++visible_groups;
+            visible_outputs += item->childCount();
+            visible_amount += item->data(Amount, GROUP_AMOUNT_ROLE).toLongLong();
         }
     }
 
@@ -648,14 +690,15 @@ void AccountPage::refresh()
         m_tree->expandToDepth(0);
     }
 
+    if (m_refresh_cancel) return;
+    const auto& snapshot = *m_snapshot;
     m_status->setText(tr("%1 address group(s), %2 output(s), %3 visible after filters. RGB assets: %4. EUTXO state records: %5. Demurrage monitored outputs: %6.")
         .arg(visible_groups)
         .arg(visible_outputs)
         .arg(formatBLK(visible_amount))
-        .arg(static_cast<int>(rgb_assets.size()))
-        .arg(static_cast<int>(eutxo_states.size()))
-        .arg(demurrage.available ? demurrage.quantum_outputs : 0));
-    finish_refresh();
+        .arg(static_cast<int>(snapshot.rgb_assets))
+        .arg(static_cast<int>(snapshot.eutxo_states))
+        .arg(snapshot.demurrage.available ? snapshot.demurrage.quantum_outputs : 0));
 }
 
 void AccountPage::copySelectedAddress()
@@ -677,8 +720,11 @@ void AccountPage::copySelectedOutpoint()
 
 void AccountPage::exportCsv()
 {
+    if (m_privacy || !m_snapshot_rendered) return;
+    const auto snapshot = m_snapshot;
+    const QPointer<AccountPage> view{this};
     const QString filename = QFileDialog::getSaveFileName(this, tr("Export account detail"), QString(), tr("Comma separated file (*.csv)"));
-    if (filename.isEmpty()) return;
+    if (!view || filename.isEmpty() || m_privacy || m_snapshot != snapshot || !m_snapshot_rendered) return;
 
     QFile file(filename);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -698,7 +744,9 @@ void AccountPage::exportCsv()
     out << "\n";
     for (int row = 0; row < m_tree->topLevelItemCount(); ++row) {
         QTreeWidgetItem* parent = m_tree->topLevelItem(row);
-        const int rows = std::max(1, parent->childCount());
+        if (!rowMatchesFilter(parent->data(Type, FILTER_FAMILY_ROLE).toString(),
+                parent->data(Type, FILTER_TEXT_ROLE).toString(), parent->text(Label))) continue;
+        const int rows = parent->childCount();
         for (int child_index = -1; child_index < rows; ++child_index) {
             QTreeWidgetItem* item = child_index < 0 ? parent : parent->child(child_index);
             for (int col = 0; col < ColumnCount; ++col) {

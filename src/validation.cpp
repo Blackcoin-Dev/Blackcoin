@@ -4222,7 +4222,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // a parallel shadow ledger, but they do not enlarge the base coinstake subsidy.
     const int64_t shadow_mtp = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
     const bool shadow_gold_rush_active = IsShadowGoldRushRewardActive(params.GetConsensus(), shadow_mtp, pindex->nHeight);
-    if (ApplyShadowBlockResult(view, block, pindex, &blockundo, shadow_gold_rush_active) == ShadowApplyResult::LOCAL_INTERNAL_ERROR) {
+    ShadowReplayProofWindow proof_window;
+    if (ApplyShadowBlockResult(view, block, pindex, &blockundo, shadow_gold_rush_active,
+                               fJustCheck ? nullptr : &proof_window) == ShadowApplyResult::LOCAL_INTERNAL_ERROR) {
         return FatalError(m_chainman.GetNotifications(), state,
             strprintf("Local Quantum Quasar shadow-state evaluation failed at height %d; the base block was not marked invalid", pindex->nHeight),
             _("A local Quantum Quasar shadow-state evaluation failed. Blackcoin has stopped without rejecting the base-chain block; restart after checking system memory and logs."));
@@ -4342,7 +4344,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             _("Blackcoin could not update the authenticated Gold Rush inventory checkpoint."));
     }
     if (pindex->nHeight >= SHADOW_WHITELIST_HEIGHT) {
-        WriteShadowReplayStateMarker(view, pindex, params.GetConsensus());
+        WriteShadowReplayStateMarker(view, pindex, params.GetConsensus(), &proof_window);
     }
 
     if (!m_blockman.WriteUndoDataForBlock(blockundo, state, *pindex)) {
@@ -6765,7 +6767,9 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
         }
         const int64_t shadow_mtp = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
         const bool shadow_gold_rush_active = IsShadowGoldRushRewardActive(m_chainman.GetConsensus(), shadow_mtp, pindex->nHeight);
-        if (ApplyShadowBlockResult(inputs, block, pindex, &block_undo, shadow_gold_rush_active) == ShadowApplyResult::LOCAL_INTERNAL_ERROR) {
+        ShadowReplayProofWindow proof_window;
+        if (ApplyShadowBlockResult(inputs, block, pindex, &block_undo, shadow_gold_rush_active,
+                                   &proof_window) == ShadowApplyResult::LOCAL_INTERNAL_ERROR) {
             return error("RollforwardBlock(): failed to apply Quantum Quasar shadow state at height %d", pindex->nHeight);
         }
         if (!Consensus::RollforwardDemurrageBlock(inputs, block, pindex, m_chainman.GetConsensus())) {
@@ -6775,7 +6779,7 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
             return error("RollforwardBlock(): failed to advance Gold Rush inventory checkpoint at height %d", pindex->nHeight);
         }
         if (pindex->nHeight >= SHADOW_WHITELIST_HEIGHT) {
-            WriteShadowReplayStateMarker(inputs, pindex, m_chainman.GetConsensus());
+            WriteShadowReplayStateMarker(inputs, pindex, m_chainman.GetConsensus(), &proof_window);
         }
     }
     return true;

@@ -1,11 +1,48 @@
-# Blackcoin Core 30.1.5.3rc3 (DEVELOPMENT, unreleased candidate)
+# Blackcoin Core 30.1.5.3rc4 (DEVELOPMENT, unreleased candidate)
 
 RELEASE_NOTES_NOT_FINAL
 
-Blackcoin Core 30.1.5.3rc3 improves peer discovery, bounds header replay tracking,
+Blackcoin Core 30.1.5.3rc4 improves peer discovery, bounds header replay tracking,
 and reduces work in mining controls, block-template assembly, and UTXO scans.
 This candidate has `CLIENT_VERSION_IS_RELEASE=false`.
 Release qualification is pending.
+
+## RC4 responsiveness and efficiency
+
+- Wallet balance display uses one active worker request and retains the latest
+  pending update. A completed snapshot can publish while newer wallet changes
+  await another poll. Recoverable failures retain the last valid display and
+  release the active request. Hidden Send pages no longer scan family balances;
+  visible pages use the existing authoritative coin-selection policy.
+- Account Refresh reads a cancellable snapshot on the wallet worker. Filtering
+  and search use the completed snapshot without another wallet scan. Busy reads
+  cannot become an empty result. Switching wallets or enabling privacy clears
+  the old display immediately, and export validates the selected snapshot after
+  the save dialog. A backend call already running can still delay wallet shutdown.
+- Initial wallet history is prepared off the UI thread and published in chunks
+  of at most 256 rows. Live updates are replayed before search and export can
+  treat that history as complete. A recent-transaction click during loading is
+  retained for selection after completion. The full History model can still
+  perform an initial sort when attached.
+- Overview exposes five recent transactions through a bounded projection of the
+  existing sort/filter model. Changes below those rows no longer require a
+  row-hiding loop over the full wallet history. Transaction clicks still refer
+  to the authoritative history model.
+- Peer statistics refresh on entry to Peers and periodically while that tab is
+  visible. Hidden windows and the Console/Network Traffic tabs stop that timer.
+- Background staking checks whether its wallet already searched the current
+  time slot and chain tip before selecting mempool packages. A missed wallet
+  try-lock follows the original path. The late eligibility check, per-wallet
+  search state, explicit calls and forced-kernel paths remain in place. A skipped
+  retry leaves the reported last-template statistics unchanged.
+- Forward block processing can reuse the authenticated predecessor proof-bucket
+  coins read during that same transition. The cache belongs to the exact view,
+  block and ancestors; the current bucket is read from the updated view. Startup,
+  audit and undo checks retain fresh reads.
+- Payout inventory accumulators update in their original order and serialize
+  once after the claim loop inside the existing staged transaction. Block and
+  undo writers reuse their reservation's payload size. State serialization,
+  disk framing and undo checksum calculation remain unchanged.
 
 ## Peer discovery and header replay tracking
 
@@ -101,11 +138,11 @@ changes. History scans also check RPC cancellation for each record.
 
 ## Compatibility and release qualification
 
-The source version is `30.1.5.3rc3`; numeric `CLIENT_VERSION` remains
+The source version is `30.1.5.3rc4`; numeric `CLIENT_VERSION` remains
 `300105`.
 macOS uses short version `30.1.5`, bundle version `30.1.503`, and
 `BlackcoinFullVersion=30.1.5.3` (the base revision). The runtime and configured
-package version remain `30.1.5.3rc3`.
+package version remain `30.1.5.3rc4`.
 
 This release preserves consensus and reward rules, activation
 heights, wire protocol, wallet storage, and chainstate formats. No reindex or

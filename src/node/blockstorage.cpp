@@ -33,6 +33,7 @@
 #include <wallet/wallet.h>
 #endif
 
+#include <limits>
 #include <map>
 #include <unordered_map>
 
@@ -502,7 +503,7 @@ CBlockFileInfo* BlockManager::GetBlockFileInfo(size_t n)
     return &m_blockfile_info.at(n);
 }
 
-bool BlockManager::UndoWriteToDisk(const CBlockUndo& blockundo, FlatFilePos& pos, const uint256& hashBlock) const
+bool BlockManager::UndoWriteToDisk(const CBlockUndo& blockundo, FlatFilePos& pos, const uint256& hashBlock, unsigned int serialized_size) const
 {
     // Open history file to append
     CAutoFile fileout{OpenUndoFile(pos)};
@@ -511,8 +512,7 @@ bool BlockManager::UndoWriteToDisk(const CBlockUndo& blockundo, FlatFilePos& pos
     }
 
     // Write index header
-    unsigned int nSize = GetSerializeSize(blockundo);
-    fileout << GetParams().MessageStart() << nSize;
+    fileout << GetParams().MessageStart() << serialized_size;
 
     // Write undo data
     long fileOutPos = ftell(fileout.Get());
@@ -790,7 +790,7 @@ bool BlockManager::FindUndoPos(BlockValidationState& state, int nFile, FlatFileP
     return true;
 }
 
-bool BlockManager::WriteBlockToDisk(const CBlock& block, FlatFilePos& pos) const
+bool BlockManager::WriteBlockToDisk(const CBlock& block, FlatFilePos& pos, unsigned int serialized_size) const
 {
     // Open history file to append
     CAutoFile fileout{OpenBlockFile(pos)};
@@ -799,8 +799,7 @@ bool BlockManager::WriteBlockToDisk(const CBlock& block, FlatFilePos& pos) const
     }
 
     // Write index header
-    unsigned int nSize = GetSerializeSize(TX_WITH_WITNESS(block));
-    fileout << GetParams().MessageStart() << nSize;
+    fileout << GetParams().MessageStart() << serialized_size;
 
     // Write block
     long fileOutPos = ftell(fileout.Get());
@@ -822,10 +821,15 @@ bool BlockManager::WriteUndoDataForBlock(const CBlockUndo& blockundo, BlockValid
     // Write undo information to disk
     if (block.GetUndoPos().IsNull()) {
         FlatFilePos _pos;
-        if (!FindUndoPos(state, block.nFile, _pos, ::GetSerializeSize(blockundo) + 40)) {
+        const size_t undo_size = ::GetSerializeSize(blockundo);
+        if (undo_size > std::numeric_limits<unsigned int>::max() - 40) {
+            return FatalError(m_opts.notifications, state, "Undo data exceeds the block file record size limit");
+        }
+        const auto serialized_size = static_cast<unsigned int>(undo_size);
+        if (!FindUndoPos(state, block.nFile, _pos, serialized_size + 40)) {
             return error("ConnectBlock(): FindUndoPos failed");
         }
-        if (!UndoWriteToDisk(blockundo, _pos, block.pprev->GetBlockHash())) {
+        if (!UndoWriteToDisk(blockundo, _pos, block.pprev->GetBlockHash(), serialized_size)) {
             return FatalError(m_opts.notifications, state, "Failed to write undo data");
         }
         // rev files are written in block height order, whereas blk files are written as blocks come in (often out of order)
@@ -941,7 +945,13 @@ bool BlockManager::ReadRawBlockFromDisk(std::vector<uint8_t>& block, const FlatF
 
 FlatFilePos BlockManager::SaveBlockToDisk(const CBlock& block, int nHeight, const FlatFilePos* dbp)
 {
-    unsigned int nBlockSize = ::GetSerializeSize(TX_WITH_WITNESS(block));
+    const size_t block_size = ::GetSerializeSize(TX_WITH_WITNESS(block));
+    if (block_size > std::numeric_limits<unsigned int>::max() - BLOCK_SERIALIZATION_HEADER_SIZE) {
+        error("SaveBlockToDisk: block exceeds the block file record size limit");
+        return FlatFilePos();
+    }
+    const auto serialized_size = static_cast<unsigned int>(block_size);
+    unsigned int nBlockSize = serialized_size;
     FlatFilePos blockPos;
     const auto position_known {dbp != nullptr};
     if (position_known) {
@@ -957,7 +967,7 @@ FlatFilePos BlockManager::SaveBlockToDisk(const CBlock& block, int nHeight, cons
         return FlatFilePos();
     }
     if (!position_known) {
-        if (!WriteBlockToDisk(block, blockPos)) {
+        if (!WriteBlockToDisk(block, blockPos, serialized_size)) {
             m_opts.notifications.fatalError("Failed to write block");
             return FlatFilePos();
         }

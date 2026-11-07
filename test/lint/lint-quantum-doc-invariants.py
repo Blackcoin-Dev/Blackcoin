@@ -950,7 +950,7 @@ def check_development_release_identity(root, failures):
     workflow = read_text(root, workflow_relative)
     for fragment in (
         "name: v30.1.5.3 signed maintenance release build",
-        "default: 30.1.5.3-beta3",
+        "default: 30.1.5.3-beta4",
         "- 'v30.1.5.3'",
         "group: v30.1.5.3-release-",
         'test "$BASE_VERSION" = "30.1.5.3"',

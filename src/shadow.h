@@ -1,6 +1,7 @@
 #ifndef BITCOIN_SHADOW_H
 #define BITCOIN_SHADOW_H
 
+#include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <primitives/block.h>
@@ -14,6 +15,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 class CBlockIndex;
@@ -21,7 +23,6 @@ class CBlockUndo;
 class CCoinsView;
 class CCoinsViewCache;
 class CCoinsViewCursor;
-struct Coin;
 namespace Consensus {
 struct Params;
 }
@@ -857,7 +858,11 @@ const char* ValueLifecycleCategoryName(ValueLifecycleCategory category);
 using ShadowBlockReader = std::function<bool(const CBlockIndex&, CBlock&)>;
 /** Versioned schedule/semantics marker used to decide whether startup must
  *  rebuild exact shadow state even when aggregate obligation is unchanged. */
+class ShadowReplayProofWindow;
 void WriteShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* pindex, const Consensus::Params& consensus);
+void WriteShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* pindex,
+                                  const Consensus::Params& consensus,
+                                  const ShadowReplayProofWindow* proof_window);
 void RewindShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* disconnected, const Consensus::Params& consensus);
 /** O(1) rolling inventory checkpoint maintenance. The checkpoint is anchored
  * to every connected tip from the first Gold Rush reward height onward. */
@@ -946,7 +951,31 @@ enum class ShadowApplyResult {
  *  allocation failure while publishing the child can partially mutate the
  *  supplied cache; every production caller must therefore supply a disposable
  *  outer cache and discard it on LOCAL_INTERNAL_ERROR. */
-ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
+/** Validated predecessor buckets for one successfully staged forward transition.
+ *  Ordinary transaction spends precede capture. Forward shadow application only
+ *  appends the current bucket. Other auxiliary writes use separate outpoint
+ *  domains. Never carry this across blocks, undo, or an arbitrary view mutation.
+ */
+class ShadowReplayProofWindow
+{
+public:
+    using Buckets = std::vector<std::pair<const CBlockIndex*, Coin>>;
+
+private:
+    friend ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache&, const CBlock&, const CBlockIndex*, const CBlockUndo*, bool, ShadowReplayProofWindow*);
+    const CCoinsViewCache* m_view{nullptr};
+    const CBlockIndex* m_block{nullptr};
+    Buckets m_coins; // descending from m_block->pprev
+
+public:
+    const Coin* Find(const CCoinsViewCache& view, const CBlockIndex* block, const CBlockIndex* ancestor) const;
+};
+
+ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
+                                        const CBlockUndo* blockundo, bool gold_rush_active,
+                                        ShadowReplayProofWindow* proof_window);
+ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
+                                        const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 bool ApplyShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 

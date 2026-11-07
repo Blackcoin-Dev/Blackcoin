@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -62,7 +63,7 @@ class WalletModel : public QObject
     Q_OBJECT
 
 public:
-    explicit WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle *platformStyle, QObject *parent = nullptr);
+    explicit WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle* platformStyle, QObject* parent = nullptr, bool defer_history = false);
     ~WalletModel();
 
     enum StatusCode // Returned by sendCoins
@@ -135,6 +136,26 @@ public:
         std::string operator_query_address;
         std::string selected_coldstake_query_address;
     };
+
+    struct AccountSnapshot {
+        bool cancelled{false};
+        bool stale{false};
+        std::string error;
+        interfaces::WalletBalances balances;
+        interfaces::WalletMigrationStatus migration;
+        interfaces::WalletDemurrageInfo demurrage;
+        size_t rgb_assets{0};
+        size_t eutxo_states{0};
+        interfaces::Wallet::CoinsList coins;
+        std::map<CTxDestination, std::string> labels;
+        std::vector<interfaces::WalletQuantumAddressInfo> quantum_addresses;
+        std::map<std::string, std::vector<interfaces::WalletQuantumStakeOutputInfo>> stake_outputs;
+        std::vector<interfaces::WalletQuantumColdStakeInfo> coldstake_delegations;
+        std::map<std::string, interfaces::WalletQuantumColdStakeBalanceInfo> coldstake_balances;
+    };
+
+    std::shared_ptr<std::atomic<bool>> requestAccountSnapshot(
+        std::function<void(std::shared_ptr<const AccountSnapshot>)> callback);
 
     /** Serialized miner control; consent belongs to this exact view token. */
     struct PowMiningControlRequest {
@@ -327,6 +348,11 @@ public:
 
     // Retrieve the cached wallet balance
     interfaces::WalletBalances getCachedBalance() const;
+    bool haveWatchOnly() const { return fHaveWatchOnly; }
+
+    void setSendBalanceFamily(std::optional<interfaces::WalletDisplayCoinFamily> family);
+    std::optional<CAmount> getCachedSendBalance(interfaces::WalletDisplayCoinFamily family) const;
+    void refreshSendBalance();
 
     /** Queue one full-detail snapshot on the existing wallet worker thread. */
     void requestStakingMiningSnapshot(const StakingMiningSnapshotRequest& request);
@@ -375,10 +401,6 @@ private:
     interfaces::Node& m_node;
 
     bool fHaveWatchOnly;
-    //! Set from GUI-thread notification handlers, read and cleared from the
-    //! worker-thread balance poll.
-    std::atomic<bool> fForceCheckBalanceChanged{false};
-
     // Wallet has an options model for wallet-specific options
     // (transaction fee, for example)
     OptionsModel *optionsModel;
@@ -393,15 +415,36 @@ private:
     bool m_status_update_retry_scheduled{false};
     QTimer* timer;
 
-    // Block hash denoting when the last balance update was done.
+    // Balance request, generation and cache ownership stay on the GUI thread.
     uint256 m_cached_last_update_tip{};
-
-    int pollNum = 0;
+    QMetaObject::Connection m_balance_tip_connection;
+    uint64_t m_balance_context_generation{0};
+    uint64_t m_balance_generation{1};
+    uint64_t m_applied_balance_generation{0};
+    bool m_balance_poll_started{false};
+    int m_balance_poll_ticks{0};
+    bool m_balance_poll_in_flight{false};
+    bool m_balance_poll_pending{false};
+    bool m_balance_retry_scheduled{false};
+    bool m_balance_failure_reported{false};
+    void invalidateBalanceSnapshot();
+    std::optional<interfaces::WalletDisplayCoinFamily> m_requested_send_family;
+    uint64_t m_send_request_generation{0};
+    std::optional<interfaces::WalletDisplayCoinFamily> m_cached_send_family;
+    std::optional<CAmount> m_cached_send_balance;
+    uint256 m_cached_send_tip{};
+    uint64_t m_cached_send_generation{0};
     std::atomic<uint64_t> nWeight;
     std::atomic<bool> updateStakeWeight;
 
+    void requestInitialHistory();
+    bool m_deferred_history{false};
+    bool m_history_request_pending{false};
+    std::atomic<bool> m_history_cancel{false};
+
     QThread t;
     WalletWorker *worker;
+    std::shared_ptr<std::atomic<bool>> m_account_snapshot_cancel;
     std::shared_ptr<std::atomic<bool>> m_staking_snapshot_cancel;
     uint64_t m_staking_snapshot_request_id{0};
     std::shared_ptr<const StakingMiningSnapshot> m_completed_staking_snapshot;
@@ -477,6 +520,7 @@ Q_SIGNALS:
     void canGetAddressesChanged();
 
     void timerTimeout();
+    void sendBalanceChanged();
 
     /** Emitted on the GUI thread after a worker request completes or cancels. */
     void stakingMiningSnapshotReady(quint64 request_id, quint64 generation);

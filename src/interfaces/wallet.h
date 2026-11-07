@@ -52,6 +52,9 @@ namespace interfaces {
 class Handler;
 struct WalletAddress;
 struct WalletBalances;
+struct WalletDisplayBalances;
+
+enum class WalletDisplayCoinFamily { LEGACY, DIRECT_QUANTUM };
 struct WalletTx;
 struct WalletTxOut;
 struct WalletTxStatus;
@@ -226,7 +229,8 @@ public:
     virtual bool tryGetWalletTx(const uint256& txid, WalletTx& tx) = 0;
 
     //! Get list of all wallet transactions.
-    virtual std::set<WalletTx> getWalletTxs() = 0;
+    virtual std::vector<WalletTx> getWalletTxs() = 0;
+    virtual bool tryGetWalletTxs(std::vector<WalletTx>& transactions) = 0;
 
     //! Try to get updated status for a particular transaction, if possible without blocking.
     virtual bool tryGetTxStatus(const uint256& txid,
@@ -259,6 +263,10 @@ public:
 
     //! Get balances if possible without blocking.
     virtual bool tryGetBalances(WalletBalances& balances, uint256& block_hash) = 0;
+
+    //! Read one synchronized display snapshot. An unchanged tip or busy wallet returns false.
+    virtual bool tryGetDisplayBalances(WalletDisplayBalances& result,
+        const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family) = 0;
 
     //! Get balance.
     virtual CAmount getBalance() = 0;
@@ -418,10 +426,11 @@ public:
     virtual util::Result<WalletQuantumAddressInfo> createQuantumStakeAddress(const std::string& label, uint16_t unbonding_blocks) = 0;
 
     //! List wallet-backed Blackcoin ML-DSA migration addresses.
-    virtual std::vector<WalletQuantumAddressInfo> listQuantumAddresses() = 0;
+    //! Where supplied, availability distinguishes lock contention from an empty list.
+    virtual std::vector<WalletQuantumAddressInfo> listQuantumAddresses(bool* available = nullptr) = 0;
 
     //! List wallet-known Quantum Cold-Stake delegations.
-    virtual std::vector<WalletQuantumColdStakeInfo> listQuantumColdStakeDelegations() = 0;
+    virtual std::vector<WalletQuantumColdStakeInfo> listQuantumColdStakeDelegations(bool* available = nullptr) = 0;
 
     //! Return verified local Quantum Cold-Stake operator registry state.
     virtual WalletQuantumPoolInfo getQuantumPoolInfo() = 0;
@@ -439,7 +448,7 @@ public:
     virtual WalletQuantumOperatorBondInfo getQuantumStakeAddressBondInfo(const std::string& stake_address) = 0;
 
     //! List wallet-owned staking UTXOs for a tiered self-staking address.
-    virtual std::vector<WalletQuantumStakeOutputInfo> listQuantumStakeOutputs(const std::string& stake_address) = 0;
+    virtual std::vector<WalletQuantumStakeOutputInfo> listQuantumStakeOutputs(const std::string& stake_address, bool* available = nullptr) = 0;
 
     //! Fund this wallet's tiered self-staking address from spendable wallet funds.
     virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumStakeAddress(const std::string& stake_address, CAmount amount, bool allow_new_quantum_key) = 0;
@@ -455,6 +464,8 @@ public:
 
     //! Return wallet-owned Quantum Cold-Stake delegation funding status.
     virtual WalletQuantumColdStakeBalanceInfo getQuantumColdStakeBalanceInfo(const std::string& coldstake_address) = 0;
+    virtual std::map<std::string, WalletQuantumColdStakeBalanceInfo> getQuantumColdStakeBalances(
+        const std::vector<std::string>& addresses) = 0;
 
     //! Fund this wallet's Quantum Cold-Stake delegation address from spendable quantum funds.
     virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumColdStakeAddress(const std::string& coldstake_address, CAmount amount, bool allow_new_quantum_key) = 0;
@@ -485,10 +496,10 @@ public:
     virtual util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key) = 0;
 
     //! List wallet-owned RGB assets and assignments.
-    virtual std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false) = 0;
+    virtual std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false, bool* available = nullptr) = 0;
 
     //! List wallet-persisted EUTXO states.
-    virtual std::vector<WalletEUTXOStateInfo> listEUTXOStates(bool include_spent = false) = 0;
+    virtual std::vector<WalletEUTXOStateInfo> listEUTXOStates(bool include_spent = false, bool* available = nullptr) = 0;
 
     //! Read wallet demurrage exposure for direct quantum outputs.
     virtual WalletDemurrageInfo getDemurrageInfo() = 0;
@@ -626,6 +637,13 @@ struct WalletBalances
                unconfirmed_watch_only_balance != prev.unconfirmed_watch_only_balance ||
                immature_watch_only_balance != prev.immature_watch_only_balance || watch_only_stake != prev.watch_only_stake;
     }
+};
+
+struct WalletDisplayBalances
+{
+    WalletBalances balances;
+    uint256 block_hash;
+    std::optional<CAmount> send_family_balance;
 };
 
 // Wallet transaction information.

@@ -11,6 +11,7 @@
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
+#include <qt/recenttransactionproxy.h>
 #include <qt/transactionfilterproxy.h>
 #include <qt/transactionoverviewwidget.h>
 #include <qt/transactiontablemodel.h>
@@ -202,8 +203,10 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
 
 void OverviewPage::handleTransactionClicked(const QModelIndex &index)
 {
-    if(filter)
-        Q_EMIT transactionClicked(filter->mapToSource(index));
+    if (m_recent_transactions) {
+        const QModelIndex transaction = filter->mapToSource(m_recent_transactions->mapToSource(index));
+        if (transaction.isValid()) Q_EMIT transactionClicked(transaction);
+    }
 }
 
 void OverviewPage::setPrivacy(bool privacy)
@@ -320,6 +323,9 @@ void OverviewPage::setClientModel(ClientModel *model)
 void OverviewPage::setWalletModel(WalletModel *model)
 {
     this->walletModel = model;
+    ui->listTransactions->setModel(nullptr);
+    m_recent_transactions.reset();
+    filter.reset();
     if(model && model->getOptionsModel())
     {
         // Set up transaction list
@@ -330,13 +336,10 @@ void OverviewPage::setWalletModel(WalletModel *model)
         filter->setShowInactive(false);
         filter->sort(TransactionTableModel::Date, Qt::DescendingOrder);
 
-        ui->listTransactions->setModel(filter.get());
+        m_recent_transactions = std::make_unique<RecentTransactionProxy>(*filter, NUM_ITEMS);
+        ui->listTransactions->setModel(m_recent_transactions.get());
         ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
 
-        connect(filter.get(), &TransactionFilterProxy::rowsInserted, this, &OverviewPage::LimitTransactionRows);
-        connect(filter.get(), &TransactionFilterProxy::rowsRemoved, this, &OverviewPage::LimitTransactionRows);
-        connect(filter.get(), &TransactionFilterProxy::rowsMoved, this, &OverviewPage::LimitTransactionRows);
-        LimitTransactionRows();
         // Keep up to date with wallet
         setBalance(model->getCachedBalance());
         connect(model, &WalletModel::balanceChanged, this, &OverviewPage::setBalance);
@@ -366,16 +369,6 @@ void OverviewPage::changeEvent(QEvent* e)
     }
 
     QWidget::changeEvent(e);
-}
-
-// Only show most recent NUM_ITEMS rows
-void OverviewPage::LimitTransactionRows()
-{
-    if (filter && ui->listTransactions && ui->listTransactions->model() && filter.get() == ui->listTransactions->model()) {
-        for (int i = 0; i < filter->rowCount(); ++i) {
-            ui->listTransactions->setRowHidden(i, i >= NUM_ITEMS);
-        }
-    }
 }
 
 void OverviewPage::updateDisplayUnit()

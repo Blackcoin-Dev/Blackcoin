@@ -13,7 +13,7 @@ on:
         description: Diagnostic selection only; full qualification is unchanged
         type: choice
         default: functional
-        options: [functional, bootstrap-units, performance-units]
+        options: [functional, bootstrap-units, performance-units, efficiency-units]
       target_sha:
         description: Full commit SHA to test (defaults to the selected branch)
         required: false
@@ -267,9 +267,13 @@ jobs:
           restore-keys: regression-native-v1-${{ hashFiles('depends/**/*.mk', 'depends/packages/*', 'depends/patches/**/*') }}-
 
       - name: Build pinned dependencies
+        env:
+          REGRESSION_PROFILE: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && inputs.regression_profile || 'functional' }}
         run: |
+          qt_opts=(NO_QT=1)
+          if [[ "$REGRESSION_PROFILE" == efficiency-units ]]; then qt_opts=(); fi
           make -j "$MAKEJOBS" -C depends \
-            HOST="$HOST" NO_QT=1 NO_UPNP=1 NO_NATPMP=1
+            HOST="$HOST" "${qt_opts[@]}" NO_UPNP=1 NO_NATPMP=1
 
       - name: Configure debug and lock-order build
         if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
@@ -283,7 +287,7 @@ jobs:
             --disable-zmq
 
       - name: Configure targeted debug binaries
-        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile != 'bootstrap-units' && inputs.regression_profile != 'performance-units') }}
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile != 'bootstrap-units' && inputs.regression_profile != 'performance-units' && inputs.regression_profile != 'efficiency-units') }}
         run: |
           ./autogen.sh
           ./configure --prefix="$PWD/depends/$HOST" --with-gui=no \
@@ -291,10 +295,14 @@ jobs:
             --disable-zmq CC='ccache gcc' CXX='ccache g++'
 
       - name: Configure focused unit binaries
-        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units') }}
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units' || inputs.regression_profile == 'efficiency-units') }}
+        env:
+          REGRESSION_PROFILE: ${{ inputs.regression_profile }}
         run: |
           ./autogen.sh
-          ./configure --prefix="$PWD/depends/$HOST" --with-gui=no \
+          gui=no
+          if [[ "$REGRESSION_PROFILE" == efficiency-units ]]; then gui=qt5; fi
+          ./configure --prefix="$PWD/depends/$HOST" --with-gui="$gui" \
             --enable-debug --enable-tests --disable-bench --disable-fuzz-binary \
             --disable-zmq CC='ccache gcc' CXX='ccache g++'
 
@@ -309,21 +317,28 @@ jobs:
           CCACHE_MAXSIZE: 1G
           REGRESSION_PROFILE: ${{ inputs.regression_profile || 'functional' }}
         run: |
-          if [[ "$REGRESSION_PROFILE" == bootstrap-units || "$REGRESSION_PROFILE" == performance-units ]]; then
+          if [[ "$REGRESSION_PROFILE" == efficiency-units ]]; then
+            make -C src -j "$MAKEJOBS" test/test_blackcoin qt/test/test_blackcoin-qt
+          elif [[ "$REGRESSION_PROFILE" == bootstrap-units || "$REGRESSION_PROFILE" == performance-units ]]; then
             make -C src -j "$MAKEJOBS" test/test_blackcoin
           else
             make -C src -j "$MAKEJOBS" blackcoind blackcoin-cli
           fi
 
       - name: Run focused unit suites together
-        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units') }}
+        if: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units' || inputs.regression_profile == 'efficiency-units') }}
         env:
           REGRESSION_PROFILE: ${{ inputs.regression_profile }}
           NETWORK_REGRESSION_LOG: ${{ github.workspace }}/.ci/${{ inputs.regression_profile }}.log
-        run: ci/test/run_network_regression.sh src/test/test_blackcoin
+        run: |
+          qt_binary=()
+          if [[ "$REGRESSION_PROFILE" == efficiency-units ]]; then
+            qt_binary=(src/qt/test/test_blackcoin-qt)
+          fi
+          ci/test/run_network_regression.sh src/test/test_blackcoin "${qt_binary[@]}"
 
       - name: Retain focused unit result
-        if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units') }}
+        if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units' || inputs.regression_profile == 'efficiency-units') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ inputs.regression_profile }}-native-${{ env.TARGET_SHA }}-attempt-${{ github.run_attempt }}
@@ -346,7 +361,7 @@ jobs:
         run: make -j "$MAKEJOBS" check
 
       - name: Upload exact test binaries
-        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') || (inputs.regression_profile != 'bootstrap-units' && inputs.regression_profile != 'performance-units') }}
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') || (inputs.regression_profile != 'bootstrap-units' && inputs.regression_profile != 'performance-units' && inputs.regression_profile != 'efficiency-units') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: safety-gate-native-${{ env.TARGET_SHA }}
@@ -973,7 +988,7 @@ jobs:
 
   exhaustive-functional:
     name: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && 'targeted previously failing functional tests' || 'complete extended functional suite' }}
-    if: ${{ ((inputs.regression_scope == 'all' || inputs.regression_scope == 'native') && (inputs.regression_profile != 'bootstrap-units' && inputs.regression_profile != 'performance-units')) || ((inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.run_extended_functional == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request')) }}
+    if: ${{ ((inputs.regression_scope == 'all' || inputs.regression_scope == 'native') && (inputs.regression_profile != 'bootstrap-units' && inputs.regression_profile != 'performance-units' && inputs.regression_profile != 'efficiency-units')) || ((inputs.regression_scope == '' || inputs.regression_scope == 'full') && ((inputs.run_extended_functional == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request')) }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 480
@@ -1044,7 +1059,7 @@ jobs:
         id: sanitizer-gate
         env:
           CI_OS_NAME: linux
-          CI_NETWORK_REGRESSION: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units') }}
+          CI_NETWORK_REGRESSION: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units' || inputs.regression_profile == 'efficiency-units') }}
           REGRESSION_PROFILE: ${{ inputs.regression_profile || 'functional' }}
           FILE_ENV: ${{ (inputs.regression_scope != '' && inputs.regression_scope != 'full') && format('ci/test/00_setup_env_native_{0}_regression.sh', matrix.flavor) || matrix.environment }}
           MAKEJOBS: -j2
@@ -1106,7 +1121,7 @@ jobs:
           [[ "$report_ready" = true ]]
 
       - name: Retain focused sanitizer full log
-        if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units') }}
+        if: ${{ always() && (inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units' || inputs.regression_profile == 'efficiency-units') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ inputs.regression_profile }}-${{ matrix.flavor }}-${{ env.TARGET_SHA }}-attempt-${{ github.run_attempt }}
@@ -1129,7 +1144,7 @@ jobs:
           key: ${{ steps.regression-cache.outputs.cache-primary-key }}
 
       - name: Upload exact-source ThreadSanitizer reports
-        if: ${{ always() && (matrix.name == 'thread-sanitizer' || ((inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units'))) && steps.sanitizer-gate.outputs.report_ready == 'true' }}
+        if: ${{ always() && (matrix.name == 'thread-sanitizer' || ((inputs.regression_scope != '' && inputs.regression_scope != 'full') && (inputs.regression_profile == 'bootstrap-units' || inputs.regression_profile == 'performance-units' || inputs.regression_profile == 'efficiency-units'))) && steps.sanitizer-gate.outputs.report_ready == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sanitizer-reports-${{ matrix.name }}-${{ env.TARGET_SHA }}-attempt-${{ github.run_attempt }}

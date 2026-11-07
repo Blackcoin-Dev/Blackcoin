@@ -6,12 +6,12 @@
 #define BITCOIN_QT_ACCOUNTPAGE_H
 
 #include <consensus/amount.h>
+#include <qt/walletmodel.h>
 
 #include <QPointer>
 #include <QWidget>
 
 class PlatformStyle;
-class WalletModel;
 
 QT_BEGIN_NAMESPACE
 class QComboBox;
@@ -29,6 +29,7 @@ class AccountPage : public QWidget
 
 public:
     explicit AccountPage(const PlatformStyle* platformStyle, QWidget* parent = nullptr);
+    ~AccountPage() override;
     void setWalletModel(WalletModel* walletModel);
     void setPrivacy(bool privacy);
 
@@ -58,8 +59,11 @@ private:
 
     QPointer<WalletModel> m_wallet_model;
     bool m_privacy{false};
-    bool m_refreshing{false};
+    std::shared_ptr<std::atomic<bool>> m_refresh_cancel;
+    std::shared_ptr<const WalletModel::AccountSnapshot> m_snapshot;
+    uint64_t m_refresh_generation{0};
     bool m_refresh_queued{false};
+    bool m_snapshot_rendered{false};
 
     QLabel* m_total_card{nullptr};
     QLabel* m_legacy_card{nullptr};
@@ -74,10 +78,12 @@ private:
     QPushButton* m_export{nullptr};
     QPushButton* m_guide{nullptr};
     QTreeWidget* m_tree{nullptr};
-    QTimer* m_timer{nullptr};
     QTimer* m_filter_timer{nullptr};
 
     void setupUi();
+    void renderSnapshot();
+    void applySnapshotFilter();
+    void discardSnapshot();
     bool rowMatchesFilter(const QString& family, const QString& address, const QString& label) const;
 };
 

@@ -35,6 +35,16 @@ bool IsDirectQuantumMigrationScript(const CScript& script)
     return tier && !tier->tiered && !tier->cold_stake;
 }
 
+const Coin* ShadowReplayProofWindow::Find(const CCoinsViewCache& view, const CBlockIndex* block,
+                                         const CBlockIndex* ancestor) const
+{
+    if (m_view != &view || m_block != block || !block || !block->pprev || !ancestor ||
+        ancestor->nHeight > block->pprev->nHeight) return nullptr;
+    const auto offset = static_cast<size_t>(block->pprev->nHeight - ancestor->nHeight);
+    if (offset >= m_coins.size() || m_coins[offset].first != ancestor) return nullptr;
+    return &m_coins[offset].second;
+}
+
 namespace {
 
 using valtype = std::vector<unsigned char>;
@@ -430,7 +440,8 @@ COutPoint ReplayStateOutpoint()
 }
 
 valtype ReplayStateFingerprint(const Consensus::Params& consensus, const CBlockIndex* pindex,
-                               const CCoinsViewCache& view);
+                               const CCoinsViewCache& view,
+                               const ShadowReplayProofWindow* proof_window = nullptr);
 
 } // namespace
 
@@ -505,6 +516,11 @@ CScript CanonicalizeLegacyStakeScript(const CScript& scriptPubKey)
 {
     return CanonicalLegacyStakeScript(scriptPubKey);
 }
+
+static ShadowPowAccountingResult PrepareShadowPowClaimAccountingWithWindow(
+    const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
+    const Consensus::Params& consensus, ShadowPowAccountingContext& context_out,
+    ShadowReplayProofWindow::Buckets* proof_window);
 
 namespace {
 
@@ -721,7 +737,7 @@ bool DecodeLogicalProofBucket(const CScript& script, LogicalProofBucket& bucket)
 
 bool ReadLogicalProofBucket(const CCoinsViewCache& view,
                             const CBlockIndex* pindex,
-                            LogicalProofBucket& bucket)
+                            LogicalProofBucket& bucket, Coin* authenticated_coin = nullptr)
 {
     bucket = {};
     if (!pindex) return false;
@@ -734,8 +750,10 @@ bool ReadLogicalProofBucket(const CCoinsViewCache& view,
         !DecodeLogicalProofBucket(coin.out.scriptPubKey, bucket)) {
         return false;
     }
-    return bucket.height == static_cast<uint32_t>(pindex->nHeight) &&
-           bucket.block_hash == pindex->GetBlockHash();
+    if (bucket.height != static_cast<uint32_t>(pindex->nHeight) ||
+        bucket.block_hash != pindex->GetBlockHash()) return false;
+    if (authenticated_coin) *authenticated_coin = std::move(coin);
+    return true;
 }
 
 bool WriteLogicalProofBucket(CCoinsViewCache& view,
@@ -768,7 +786,8 @@ bool WriteLogicalProofBucket(CCoinsViewCache& view,
 bool ReadRecentLogicalProofs(const CCoinsViewCache& view,
                              const CBlockIndex* tip,
                              const Consensus::Params& consensus,
-                             std::set<uint256>& proof_ids)
+                             std::set<uint256>& proof_ids,
+                             ShadowReplayProofWindow::Buckets* proof_window = nullptr)
 {
     proof_ids.clear();
     if (!tip) return true;
@@ -788,10 +807,13 @@ bool ReadRecentLogicalProofs(const CCoinsViewCache& view,
         consensus.nShadowCompetingClaimsActivationHeight,
         effective_tip_height -
             static_cast<int>(SHADOW_POW_LATE_ORIGIN_WINDOW) + 1);
+    if (proof_window) proof_window->reserve(effective_tip_height - first_height + 1);
     for (int height = effective_tip_height; height >= first_height; --height) {
         const CBlockIndex* ancestor = SafeGetAncestor(effective_tip, height);
         LogicalProofBucket bucket;
-        if (!ancestor || !ReadLogicalProofBucket(view, ancestor, bucket)) {
+        if (!ancestor) return false;
+        Coin* coin = proof_window ? &proof_window->emplace_back(ancestor, Coin{}).second : nullptr;
+        if (!ReadLogicalProofBucket(view, ancestor, bucket, coin)) {
             return false;
         }
         for (const uint256& proof_id : bucket.proof_ids) {
@@ -808,7 +830,8 @@ bool ReadRecentLogicalProofs(const CCoinsViewCache& view,
 
 uint256 LogicalProofBucketWindowCommitment(
     const CCoinsViewCache& view, const CBlockIndex* tip,
-    const Consensus::Params& consensus)
+    const Consensus::Params& consensus,
+    const ShadowReplayProofWindow* proof_window)
 {
     CHashWriter ss;
     ss << std::string{"Quantum Quasar Logical POW Proof Bucket Window v1"};
@@ -840,15 +863,16 @@ uint256 LogicalProofBucketWindowCommitment(
         const CBlockIndex* ancestor = SafeGetAncestor(effective_tip, height);
         const COutPoint outpoint = ancestor
             ? LogicalProofBucketOutpoint(ancestor) : COutPoint{};
-        Coin coin;
-        const bool present = ancestor && view.GetCoin(outpoint, coin) &&
-                             !coin.IsSpent();
+        const Coin* coin = proof_window ? proof_window->Find(view, tip, ancestor) : nullptr;
+        // Fetch the new bucket and all uncached coins from the current view.
+        if (ancestor && !coin) coin = &view.AccessCoin(outpoint);
+        const bool present = coin && !coin->IsSpent();
         ss << height << (ancestor ? ancestor->GetBlockHash() : uint256{})
            << outpoint << present;
         if (present) {
-            ss << coin.nHeight << coin.nTime << coin.out.nValue
-               << coin.fCoinBase << coin.fCoinStake
-               << coin.out.scriptPubKey;
+            ss << coin->nHeight << coin->nTime << coin->out.nValue
+               << coin->fCoinBase << coin->fCoinStake
+               << coin->out.scriptPubKey;
         }
     }
     return ss.GetHash();
@@ -1779,7 +1803,7 @@ uint256 DemurrageScheduleCommitment(const Consensus::Params& consensus)
 }
 
 valtype ReplayStateFingerprint(const Consensus::Params& consensus, const CBlockIndex* pindex,
-                               const CCoinsViewCache& view)
+                               const CCoinsViewCache& view, const ShadowReplayProofWindow* proof_window)
 {
     if (!pindex) return {};
     CHashWriter ss;
@@ -1813,7 +1837,7 @@ valtype ReplayStateFingerprint(const Consensus::Params& consensus, const CBlockI
         ss << std::string{"Quantum Quasar Logical POW Proof Accounting v1"}
            << consensus.nShadowCompetingClaimsActivationHeight
            << SHADOW_POW_LATE_ORIGIN_WINDOW
-           << LogicalProofBucketWindowCommitment(view, pindex, consensus);
+           << LogicalProofBucketWindowCommitment(view, pindex, consensus, proof_window);
     }
     // QQP4 is disabled on mainnet in this release.  Do not alter the exact
     // deployed schema-12 checkpoint stream before a separately scheduled Q4
@@ -3901,12 +3925,13 @@ ShadowPowClaimResult FindPowShadowClaims(const CCoinsViewCache& view,
                                          const CBlock& block, const CBlockIndex* pindex,
                                          const CBlockUndo* blockundo,
                                          const ShadowPoolState& pool,
-                                         const Consensus::Params& consensus)
+                                         const Consensus::Params& consensus,
+                                         ShadowReplayProofWindow::Buckets* proof_window = nullptr)
 {
     if (pindex && consensus.IsShadowCompetingClaimsActive(pindex->nHeight)) {
         ShadowPowAccountingContext context;
-        if (PrepareShadowPowClaimAccounting(view, block, pindex, consensus,
-                                            context) !=
+        if (PrepareShadowPowClaimAccountingWithWindow(view, block, pindex, consensus,
+                                                      context, proof_window) !=
                 ShadowPowAccountingResult::OK ||
             !context.valid || context.credited_pow_pool != pool.pow_amount) {
             ShadowPowClaimResult result;
@@ -3925,7 +3950,26 @@ bool IsValidDirectClaimMarker(const CBlockIndex* pindex, const ShadowClaim& clai
         claim.target.size() <= std::numeric_limits<uint16_t>::max();
 }
 
-bool AddClaimMarker(CCoinsViewCache& view, const CBlockIndex* pindex, uint32_t marker_index, ShadowClaim claim)
+bool LoadClaimInventory(const CCoinsViewCache& view, const CBlockIndex* pindex,
+                        GoldRushInventoryState& inventory)
+{
+    const GoldRushInventoryReadResult inventory_result = ReadGoldRushInventory(view, inventory);
+    if (inventory_result == GoldRushInventoryReadResult::INVALID ||
+        (inventory_result == GoldRushInventoryReadResult::MISSING &&
+         pindex->nHeight != SHADOW_REWARD_START_HEIGHT)) return false;
+    if (inventory_result == GoldRushInventoryReadResult::VALID &&
+        inventory.tip_hash != pindex->GetBlockHash() &&
+        (!pindex->pprev || inventory.tip_hash != pindex->pprev->GetBlockHash())) {
+        return false;
+    }
+    if (inventory_result == GoldRushInventoryReadResult::VALID &&
+        inventory.tip_hash != pindex->GetBlockHash() &&
+        !GoldRushInventoryRootsValid(inventory)) return false;
+    return true;
+}
+
+bool AddClaimMarker(CCoinsViewCache& view, const CBlockIndex* pindex, uint32_t marker_index,
+                    ShadowClaim claim, GoldRushInventoryState& inventory)
 {
     claim.direct = true;
     if (!IsValidDirectClaimMarker(pindex, claim)) {
@@ -3943,19 +3987,6 @@ bool AddClaimMarker(CCoinsViewCache& view, const CBlockIndex* pindex, uint32_t m
     payout_record.claim_hash = HashGoldRushClaim(claim);
     payout_record.target = claim.target;
 
-    GoldRushInventoryState inventory;
-    const GoldRushInventoryReadResult inventory_result = ReadGoldRushInventory(view, inventory);
-    if (inventory_result == GoldRushInventoryReadResult::INVALID ||
-        (inventory_result == GoldRushInventoryReadResult::MISSING &&
-         pindex->nHeight != SHADOW_REWARD_START_HEIGHT)) return false;
-    if (inventory_result == GoldRushInventoryReadResult::VALID &&
-        inventory.tip_hash != pindex->GetBlockHash() &&
-        (!pindex->pprev || inventory.tip_hash != pindex->pprev->GetBlockHash())) {
-        return false;
-    }
-    if (inventory_result == GoldRushInventoryReadResult::VALID &&
-        inventory.tip_hash != pindex->GetBlockHash() &&
-        !GoldRushInventoryRootsValid(inventory)) return false;
     if (inventory.issued_count == std::numeric_limits<uint64_t>::max() ||
         inventory.issued_nominal > MAX_MONEY - claim.amount) {
         return false;
@@ -3993,7 +4024,7 @@ bool AddClaimMarker(CCoinsViewCache& view, const CBlockIndex* pindex, uint32_t m
     payout_marker.nHeight = pindex->nHeight;
     payout_marker.nTime = pindex->GetBlockTime();
     view.AddCoin(GoldRushPayoutOutpoint(payout_outpoint), std::move(payout_marker), true);
-    return WriteGoldRushInventory(view, pindex, std::move(inventory), /*finalize=*/false);
+    return true;
 }
 
 std::optional<std::vector<ShadowClaim>> ReadAuthenticatedBlockClaims(
@@ -5028,10 +5059,10 @@ bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block,
                                      total_out);
 }
 
-ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
+static ShadowPowAccountingResult PrepareShadowPowClaimAccountingBase(
     const CCoinsViewCache& view, const CBlockIndex* pindex,
     const Consensus::Params& consensus,
-    ShadowPowAccountingContext& context_out)
+    ShadowPowAccountingContext& context_out, ShadowReplayProofWindow::Buckets* proof_window)
 {
     context_out = {};
     if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT ||
@@ -5105,11 +5136,18 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
         consensus.nShadowQQP4ActivationHeight;
     if (context_out.canonical_rule_active &&
         !ReadRecentLogicalProofs(view, pindex->pprev, consensus,
-                                 context_out.accounted_logical_proofs)) {
+                                 context_out.accounted_logical_proofs, proof_window)) {
         return ShadowPowAccountingResult::LOCAL_INTERNAL_ERROR;
     }
     context_out.valid = true;
     return ShadowPowAccountingResult::OK;
+}
+
+ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlockIndex* pindex,
+    const Consensus::Params& consensus, ShadowPowAccountingContext& context_out)
+{
+    return PrepareShadowPowClaimAccountingBase(view, pindex, consensus, context_out, nullptr);
 }
 
 ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
@@ -5121,13 +5159,13 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
                                             context_out);
 }
 
-ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
-    const CCoinsViewCache& view, const CBlock& block,
-    const CBlockIndex* pindex, const Consensus::Params& consensus,
-    ShadowPowAccountingContext& context_out)
+static ShadowPowAccountingResult PrepareShadowPowClaimAccountingWithWindow(
+    const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
+    const Consensus::Params& consensus, ShadowPowAccountingContext& context_out,
+    ShadowReplayProofWindow::Buckets* proof_window)
 {
     const ShadowPowAccountingResult base_result =
-        PrepareShadowPowClaimAccounting(view, pindex, consensus, context_out);
+        PrepareShadowPowClaimAccountingBase(view, pindex, consensus, context_out, proof_window);
     if (base_result != ShadowPowAccountingResult::OK || !context_out.valid ||
         !context_out.canonical_rule_active) return base_result;
 
@@ -5199,6 +5237,13 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
                            static_cast<int>(decoded.origin_height))});
     }
     return ShadowPowAccountingResult::OK;
+}
+
+ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
+    const Consensus::Params& consensus, ShadowPowAccountingContext& context_out)
+{
+    return PrepareShadowPowClaimAccountingWithWindow(view, block, pindex, consensus, context_out, nullptr);
 }
 
 ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
@@ -5348,19 +5393,26 @@ bool IsShadowMarkerScript(const CScript& script)
            ParseMarkerScript(script, MARKER_REPLAY_STATE);
 }
 
-void WriteShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* pindex, const Consensus::Params& consensus)
+void WriteShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* pindex,
+                                  const Consensus::Params& consensus,
+                                  const ShadowReplayProofWindow* proof_window)
 {
     if (!pindex || pindex->nHeight < SHADOW_WHITELIST_HEIGHT) return;
     const COutPoint outpoint = ReplayStateOutpoint();
     if (view.HaveCoin(outpoint)) view.SpendCoin(outpoint);
     Coin coin;
     coin.out.nValue = 0;
-    coin.out.scriptPubKey = MarkerScript(MARKER_REPLAY_STATE, ReplayStateFingerprint(consensus, pindex, view));
+    coin.out.scriptPubKey = MarkerScript(MARKER_REPLAY_STATE, ReplayStateFingerprint(consensus, pindex, view, proof_window));
     coin.fCoinBase = true;
     coin.fCoinStake = false;
     coin.nHeight = pindex->nHeight;
     coin.nTime = pindex->GetBlockTime();
     view.AddCoin(outpoint, std::move(coin), true);
+}
+
+void WriteShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* pindex, const Consensus::Params& consensus)
+{
+    WriteShadowReplayStateMarker(view, pindex, consensus, nullptr);
 }
 
 void RewindShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* disconnected, const Consensus::Params& consensus)
@@ -7885,7 +7937,9 @@ bool MineShadowProofDataRange(const CScript& target,
                               data_out, tries_done);
 }
 
-static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, bool gold_rush_active)
+static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CBlock& block,
+                                                const CBlockIndex* pindex, const CBlockUndo* blockundo,
+                                                bool gold_rush_active, ShadowReplayProofWindow::Buckets* proof_window)
 {
     if (!gold_rush_active) return ShadowApplyResult::OK;
     if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT || pindex->nHeight > SHADOW_REWARD_END_HEIGHT) return ShadowApplyResult::OK;
@@ -7952,7 +8006,7 @@ static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CB
     const std::map<CScript, CScript> active_signals = ActiveSignalPayoutScripts(active_signal_state);
     ShadowPowClaimResult pow_claim = FindPowShadowClaims(
         view, block, pindex, blockundo, credited_pool,
-        Params().GetConsensus());
+        Params().GetConsensus(), proof_window);
     if (pow_claim.internal_error) return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
     std::vector<uint256> newly_accounted_logical_proofs;
     if (Params().GetConsensus().IsShadowCompetingClaimsActive(
@@ -8082,9 +8136,20 @@ static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CB
             return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
         }
     }
-    uint32_t claim_marker_index = 0;
-    for (const ShadowClaim& claim : claims_to_apply) {
-        if (!AddClaimMarker(view, pindex, claim_marker_index++, claim)) return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+    if (!claims_to_apply.empty()) {
+        // Every claim updates the same inventory. Keep it local to the staged
+        // cache transition and serialize it after the ordered claim loop.
+        GoldRushInventoryState inventory;
+        if (!LoadClaimInventory(view, pindex, inventory)) return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+        uint32_t claim_marker_index = 0;
+        for (const ShadowClaim& claim : claims_to_apply) {
+            if (!AddClaimMarker(view, pindex, claim_marker_index++, claim, inventory)) {
+                return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+            }
+        }
+        if (!WriteGoldRushInventory(view, pindex, std::move(inventory), /*finalize=*/false)) {
+            return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+        }
     }
     if (Params().GetConsensus().IsShadowCompetingClaimsActive(
             pindex->nHeight) &&
@@ -8105,8 +8170,11 @@ static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CB
     return ShadowApplyResult::OK;
 }
 
-ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, bool gold_rush_active)
+ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block,
+                                        const CBlockIndex* pindex, const CBlockUndo* blockundo,
+                                        bool gold_rush_active, ShadowReplayProofWindow* proof_window)
 {
+    if (proof_window) *proof_window = {};
     if (!gold_rush_active || !pindex ||
         pindex->nHeight < SHADOW_REWARD_START_HEIGHT ||
         pindex->nHeight > SHADOW_REWARD_END_HEIGHT) {
@@ -8126,13 +8194,20 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
         // the caller's anchor explicitly so publishing shadow-only writes can
         // never clear or advance the base-chain tip.
         staged.SetBestBlock(view.GetBestBlock());
+        ShadowReplayProofWindow::Buckets predecessor_buckets;
         const ShadowApplyResult result = ApplyShadowBlockToCache(
-            staged, block, pindex, blockundo, gold_rush_active);
+            staged, block, pindex, blockundo, gold_rush_active,
+            proof_window ? &predecessor_buckets : nullptr);
         if (result != ShadowApplyResult::OK) return result;
         if (!staged.Flush()) {
             LogPrintf("ERROR: Quantum Quasar shadow-state staging flush failed at height %d\n",
                       pindex ? pindex->nHeight : -1);
             return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+        }
+        if (proof_window) {
+            proof_window->m_view = &view;
+            proof_window->m_block = pindex;
+            proof_window->m_coins = std::move(predecessor_buckets);
         }
         return ShadowApplyResult::OK;
     } catch (const std::bad_alloc&) {
@@ -8143,6 +8218,12 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
                   pindex ? pindex->nHeight : -1);
     }
     return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+}
+
+ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
+                                        const CBlockUndo* blockundo, bool gold_rush_active)
+{
+    return ApplyShadowBlockResult(view, block, pindex, blockundo, gold_rush_active, nullptr);
 }
 
 bool ApplyShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, bool gold_rush_active)

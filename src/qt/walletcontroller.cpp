@@ -157,7 +157,7 @@ QPointer<WalletModel> WalletController::getOrCreateWallet(std::unique_ptr<interf
 
     // Instantiate model and register it.
     WalletModel* wallet_model = new WalletModel(std::move(wallet), m_client_model, m_platform_style,
-                                                nullptr /* required for the following moveToThread() call */);
+                                                nullptr /* required for moveToThread() */, /*defer_history=*/true);
 
     // Guard the model before transferring it to the GUI thread. Queued parent
     // binding must remain safe if an unload removes the model first.

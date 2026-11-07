@@ -242,12 +242,21 @@ void BlockAssembler::resetBlock()
     m_next_block_fees.clear();
 }
 
+#ifdef ENABLE_WALLET
+static bool CanSearchStakeSlot(int64_t search_time, int64_t previous_time, const uint256& tip, const uint256& previous_tip)
+{
+    return previous_time == 0 || search_time > previous_time ||
+           (search_time == previous_time && tip != previous_tip);
+}
+#endif
+
 std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn,
                                                                  CWallet* pwallet,
                                                                  bool* pfPoSCancel,
                                                                  int64_t* pFees,
                                                                  CTxDestination destination,
-                                                                 std::optional<COutPoint> forced_kernel)
+                                                                 std::optional<COutPoint> forced_kernel,
+                                                                 [[maybe_unused]] StakeSearch stake_search)
 {
     const auto time_start{SteadyClock::now()};
 
@@ -287,6 +296,19 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
             return nullptr;
         }
         pblock->nTime = static_cast<uint32_t>(*pos_time);
+#ifdef ENABLE_WALLET
+        // A background retry can reach the same slot many times before the
+        // clock or tip advances. Leave the late check authoritative for a
+        // search, including when this preliminary try-lock misses.
+        if (stake_search == StakeSearch::BACKGROUND && !forced_kernel) {
+            TRY_LOCK(pwallet->cs_wallet, wallet_lock);
+            if (wallet_lock && !CanSearchStakeSlot(pblock->nTime, pwallet->m_last_coin_stake_search_time,
+                                                   pindexPrev->GetBlockHash(), pwallet->m_last_coin_stake_search_tip)) {
+                if (pfPoSCancel) *pfPoSCancel = true;
+                return nullptr;
+            }
+        }
+#endif
     } else {
         // Package checks must use the same generic next-header timestamp
         // retained by the final template. In particular, an accelerated chain
@@ -362,9 +384,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         CMutableTransaction txCoinStake;
         txCoinStake.nTime = pblock->nTime;
 
-        int64_t nSearchTime = txCoinStake.nTime; // search to current time
-        int64_t last_search_time{0};
-        uint256 last_search_tip;
+        const int64_t nSearchTime = txCoinStake.nTime;
         // cs_main is already held by BlockAssembler. Never wait on the wallet
         // here: an RPC may have a wallet snapshot in progress and must be
         // allowed to finish without stalling block processing. Keep the
@@ -372,13 +392,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         // published for a search that lost a wallet-lock race and never ran.
         TRY_LOCK(pwallet->cs_wallet, wallet_lock);
         if (!wallet_lock) return nullptr;
-        last_search_time = pwallet->m_last_coin_stake_search_time;
-        last_search_tip = pwallet->m_last_coin_stake_search_tip;
-        if (last_search_time == 0) last_search_time = nSearchTime - 1;
-
+        const int64_t previous_time = pwallet->m_last_coin_stake_search_time;
         const uint256 current_tip_hash = pindexPrev->GetBlockHash();
-        if (nSearchTime > last_search_time ||
-            (nSearchTime == last_search_time && current_tip_hash != last_search_tip)) {
+        if (CanSearchStakeSlot(nSearchTime, previous_time, current_tip_hash, pwallet->m_last_coin_stake_search_tip)) {
+            const int64_t last_search_time = previous_time == 0 ? nSearchTime - 1 : previous_time;
             std::vector<CTransactionRef> selected_txs;
             selected_txs.reserve(pblock->vtx.size() > 0 ? pblock->vtx.size() - 1 : 0);
             for (size_t i = 1; i < pblock->vtx.size(); ++i) {
@@ -1211,7 +1228,9 @@ void PoSMiner(CWallet *pwallet)
                 // BlockAssembler owns its chainstate locking and CreateCoinStake
                 // acquires cs_main before trying cs_wallet. Do not wrap it in a
                 // wallet-first lock pair.
-                pblocktemplate = BlockAssembler{pwallet->chain().chainman().ActiveChainstate(), &pwallet->chain().mempool()}.CreateNewBlock(GetScriptForDestination(dest), pwallet, &fPoSCancel, &pFees, dest);
+                pblocktemplate = BlockAssembler{pwallet->chain().chainman().ActiveChainstate(), &pwallet->chain().mempool()}
+                                     .CreateNewBlock(GetScriptForDestination(dest), pwallet, &fPoSCancel, &pFees, dest,
+                                                     std::nullopt, BlockAssembler::StakeSearch::BACKGROUND);
             }
             catch (const std::runtime_error &e)
             {

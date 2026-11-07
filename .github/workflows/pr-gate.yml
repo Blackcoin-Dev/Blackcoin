@@ -333,6 +333,7 @@ jobs:
         run: |
           qt_binary=()
           if [[ "$REGRESSION_PROFILE" == efficiency-units ]]; then
+            export LD_LIBRARY_PATH="$PWD/depends/$HOST/lib"
             qt_binary=(src/qt/test/test_blackcoin-qt)
           fi
           ci/test/run_network_regression.sh src/test/test_blackcoin "${qt_binary[@]}"

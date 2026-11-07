@@ -7,8 +7,12 @@
 import ast
 import itertools
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 
 
@@ -145,6 +149,35 @@ class RegressionWorkflowTests(unittest.TestCase):
                                  name in (full if scope in {"", "full"} else focused))
         self.assertIn("--disable-tests --disable-bench --disable-fuzz-binary", steps["Configure targeted debug binaries"])
         self.assertIn('make -C src -j "$MAKEJOBS" blackcoind blackcoin-cli', steps["Compile only regression prerequisites"])
+
+    def test_focused_native_qt_runner_gets_the_depends_loader_path(self):
+        step = self.steps("native-build-and-unit")["Run focused unit suites together"]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        host = field(self.workflow, "HOST", 2)
+        with tempfile.TemporaryDirectory(prefix="focused native workflow ") as temp:
+            workspace = Path(temp).resolve()
+            runner = workspace / "ci/test/run_network_regression.sh"
+            runner.parent.mkdir(parents=True)
+            runner.write_text('#!/bin/sh\nprintf "%s\\n" "$LD_LIBRARY_PATH" "$@"\nexit "$HELPER_EXIT"\n',
+                              encoding="utf-8")
+            runner.chmod(0o700)
+            cases = (("bootstrap-units", 0), ("performance-units", 0),
+                     ("efficiency-units", 0), ("efficiency-units", 127))
+            for profile, status in cases:
+                with self.subTest(profile=profile, status=status):
+                    result = subprocess.run(
+                        ["bash", "-e", "-o", "pipefail", "-c", script], cwd=workspace,
+                        env=dict(os.environ, HOST=host, REGRESSION_PROFILE=profile,
+                                 LD_LIBRARY_PATH="/inherited-loader-path", HELPER_EXIT=str(status)),
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    if profile == "efficiency-units":
+                        expected = [str(workspace / "depends" / host / "lib"),
+                                    "src/test/test_blackcoin", "src/qt/test/test_blackcoin-qt"]
+                    else:
+                        expected = ["/inherited-loader-path", "src/test/test_blackcoin"]
+                    self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_focused_preflight_retains_identity_but_omits_unrelated_full_suites(self):
         steps = self.steps("policy-and-lint")

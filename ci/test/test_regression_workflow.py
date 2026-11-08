@@ -150,6 +150,52 @@ class RegressionWorkflowTests(unittest.TestCase):
         self.assertIn("--disable-tests --disable-bench --disable-fuzz-binary", steps["Configure targeted debug binaries"])
         self.assertIn('make -C src -j "$MAKEJOBS" blackcoind blackcoin-cli', steps["Compile only regression prerequisites"])
 
+    def test_full_native_configure_requires_zmq(self):
+        step = self.steps("native-build-and-unit")["Configure debug and lock-order build"]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory(prefix="native ZMQ workflow ") as temp:
+            workspace = Path(temp).resolve()
+            config = workspace / "test/config.ini"
+            config.parent.mkdir()
+            for name, content in (
+                ("autogen.sh", "#!/bin/sh\n"),
+                ("configure", """#!/bin/sh
+if [ "$GENERATE_CONFIG" = 1 ]; then
+    setting='#ENABLE_ZMQ=true'
+    for arg; do
+        if [ "$arg" = '--enable-zmq' ]; then setting='ENABLE_ZMQ=true'; fi
+    done
+    printf '%s\\n' '[components]' "$setting" > test/config.ini
+fi
+"""),
+            ):
+                tool = workspace / name
+                tool.write_text(content, encoding="utf-8")
+                tool.chmod(0o700)
+            cases = {
+                "generated": (None, True),
+                "false": ("[components]\nENABLE_ZMQ=false\n", False),
+                "missing": ("[components]\n#ENABLE_ZMQ=true\n", False),
+                "wrong-section": ("[environment]\nENABLE_ZMQ=true\n[components]\n", False),
+                "inherited": ("[DEFAULT]\nENABLE_ZMQ=true\n[components]\n", False),
+                "malformed": ("[components\nENABLE_ZMQ=true\n", False),
+                "missing-file": (None, False),
+            }
+            for case, (ini, succeeds) in cases.items():
+                with self.subTest(case=case):
+                    config.unlink(missing_ok=True)
+                    if ini is not None:
+                        config.write_text(ini, encoding="utf-8")
+                    result = subprocess.run(
+                        ["bash", "-e", "-o", "pipefail", "-c", script], cwd=workspace,
+                        env=dict(os.environ, HOST=field(self.workflow, "HOST", 2),
+                                 GENERATE_CONFIG="1" if case == "generated" else "0"),
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                    if succeeds:
+                        self.assertEqual(config.read_text(encoding="utf-8"), "[components]\nENABLE_ZMQ=true\n")
+
     def test_focused_native_qt_runner_gets_the_depends_loader_path(self):
         step = self.steps("native-build-and-unit")["Run focused unit suites together"]
         script = textwrap.dedent(step.split("        run: |\n", 1)[1])

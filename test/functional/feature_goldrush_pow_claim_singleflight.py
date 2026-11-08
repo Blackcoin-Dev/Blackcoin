@@ -876,6 +876,24 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(self._is_abandoned(wallet, txid), False)
 
+    def _advance_to_ineligible_qqp2_tip(self, wallet, txid, funding_address, max_blocks=32):
+        """Find a descendant where the exact retained claim is proof-ineligible."""
+        node = self.nodes[0]
+        raw = wallet.gettransaction(txid)["hex"]
+        for blocks in range(1, max_blocks + 1):
+            tip = self.generateblock(node, output=funding_address, transactions=[])["hash"]
+            node.syncwithvalidationinterfacequeue()
+            result = node.testmempoolaccept([raw])[0]
+            assert_equal(result["txid"], txid)
+            assert_equal(node.getbestblockhash(), tip)
+            if result["allowed"]:
+                continue
+            if result.get("reject-reason") != "shadow-proof-invalid":
+                raise AssertionError(f"Unexpected rejection of retained QQP2 claim {txid} at tip {tip}: {result}")
+            self.log.info("Retained QQP2 claim %s became proof-ineligible at tip %s after %d empty block(s)", txid, tip, blocks)
+            return tip
+        raise AssertionError(f"Retained QQP2 claim {txid} remained eligible across {max_blocks} descendant tips")
+
     def _wait_for_quarantine_observation(self, wallet, txid, tip, *, diagnose_observation=False):
         """Review only after asynchronous branch-quarantine metadata is durable."""
         reviewed = None
@@ -2617,14 +2635,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(len(fault.listunspent(1, 9999999, [fault_address])), 0)
 
         self.log.info("A disabled wallet broadcaster retains exact commit-authorized resolution bytes")
-        # Advance beyond the failed QQP2 claim's intended height so its
-        # pinned-tip classification is eligible for the explicit conflict
-        # resolver. -walletbroadcast=0 is a real, deterministic relay-failure
-        # path: persistence and consent succeed, while wallet relay refuses.
-        fault_quarantine_tip = self.generateblock(
-            node, output=funding_address, transactions=[]
-        )["hash"]
-        node.syncwithvalidationinterfacequeue()
+        # An unbound QQP2 can remain valid on a descendant. Establish actual
+        # proof ineligibility before waiting for its durable branch observation.
+        # -walletbroadcast=0 still allows persistence and consent but refuses relay.
+        fault_quarantine_tip = self._advance_to_ineligible_qqp2_tip(
+            fault, first_fault_txid, funding_address
+        )
         self._wait_for_quarantine_observation(
             fault, first_fault_txid, fault_quarantine_tip, diagnose_observation=True
         )
@@ -4392,6 +4408,37 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
             if isinstance(response, Exception):
                 raise response
             return response
+
+    def test_fault_claim_descendant_selection(self):
+        allowed = {"txid": "claim", "allowed": True}
+        ineligible = {"txid": "claim", "allowed": False, "reject-reason": "shadow-proof-invalid"}
+        unrelated = {"txid": "claim", "allowed": False, "reject-reason": "missing-inputs"}
+        for results, expected_tip, expected_error in (
+            ([allowed, ineligible], "tip-2", None),
+            ([unrelated], None, "Unexpected rejection.*missing-inputs"),
+            ([allowed, allowed], None, "remained eligible across 2 descendant tips"),
+        ):
+            with self.subTest(results=results):
+                node = mock.Mock()
+                wallet = mock.Mock()
+                wallet.gettransaction.return_value = {"hex": "persisted-claim"}
+                harness = mock.Mock(nodes=[node])
+                tips = [f"tip-{i}" for i in range(1, len(results) + 1)]
+                harness.generateblock.side_effect = [{"hash": tip} for tip in tips]
+                node.getbestblockhash.side_effect = tips
+                node.testmempoolaccept.side_effect = [[result] for result in results]
+                advance = GoldRushPowClaimSingleFlightTest._advance_to_ineligible_qqp2_tip
+                if expected_error is None:
+                    self.assertEqual(advance(harness, wallet, "claim", "funding", max_blocks=2), expected_tip)
+                else:
+                    with self.assertRaisesRegex(AssertionError, expected_error):
+                        advance(harness, wallet, "claim", "funding", max_blocks=2)
+                wallet.gettransaction.assert_called_once_with("claim")
+                self.assertEqual(harness.generateblock.call_args_list, [
+                    mock.call(node, output="funding", transactions=[])
+                ] * len(results))
+                self.assertEqual(node.syncwithvalidationinterfacequeue.call_count, len(results))
+                self.assertEqual(node.testmempoolaccept.call_args_list, [mock.call(["persisted-claim"])] * len(results))
 
     def test_quarantine_review_waits_for_exact_durable_observation(self):
         known = {

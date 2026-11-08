@@ -882,7 +882,8 @@ jobs:
       - name: Run critical protocol and wallet gates
         run: |
           python3 test/functional/test_runner.py \
-            --ci --jobs=2 --failfast --combinedlogslen=2000 \
+            --ci --jobs=2 --failfast --combinedlogslen=2000 --nocleanup \
+            --tmpdirprefix="$RUNNER_TEMP/critical-protocol-$TARGET_SHA-$GITHUB_RUN_ATTEMPT" \
             feature_quantum_activation_boundary.py \
             feature_blackcoin_phase.py \
             feature_goldrush_migration_rpc.py \
@@ -923,6 +924,15 @@ jobs:
             feature_config_args.py \
             feature_reindex.py \
             feature_shutdown.py
+
+      - name: Retain critical singleflight test log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: critical-singleflight-log-${{ env.TARGET_SHA }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/critical-protocol-${{ env.TARGET_SHA }}-${{ github.run_attempt }}/**/feature_goldrush_pow_claim_singleflight_*/test_framework.log
+          if-no-files-found: error
+          retention-days: 3
 
   mixed-version:
     name: real v26.2, v28.4, v30.1, and candidate interoperability

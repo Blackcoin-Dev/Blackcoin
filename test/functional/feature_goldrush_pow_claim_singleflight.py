@@ -876,13 +876,18 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(self._is_abandoned(wallet, txid), False)
 
-    def _wait_for_quarantine_observation(self, wallet, txid, tip):
+    def _wait_for_quarantine_observation(self, wallet, txid, tip, *, diagnose_observation=False):
         """Review only after asynchronous branch-quarantine metadata is durable."""
         reviewed = None
+        first = last = None
 
         def observation_is_current():
-            nonlocal reviewed
+            nonlocal reviewed, first, last
             info = get_recovery_info(wallet, True)
+            if diagnose_observation:
+                if first is None:
+                    first = info
+                last = info
             if not info["wallet_tip_matches"] or info["active_tip"] != tip:
                 return False
             components = [component for component in info["component_details"]
@@ -897,8 +902,60 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             reviewed = info
             return True
 
-        self.wait_until(observation_is_current, timeout=20)
+        timed_out = False
+        try:
+            self.wait_until(observation_is_current, timeout=20)
+        except AssertionError:
+            timed_out = True
+            raise
+        finally:
+            if diagnose_observation:
+                try:
+                    self.log.info("Quarantine observation for claim %s at expected tip %s", txid, tip)
+                    self.log.info("First recovery observation %s", self._quarantine_observation_sample(first, txid))
+                    self.log.info("Last recovery observation %s", self._quarantine_observation_sample(last, txid))
+                    if timed_out:
+                        node = self.nodes[0]
+                        current_tip = node.getbestblockhash()
+                        raw = wallet.gettransaction(txid)["hex"]
+                        result = node.testmempoolaccept([raw])[0]
+                        self.log.error("Claim %s testmempoolaccept at current chain tip %s returned %s", txid, current_tip, result)
+                except Exception as error:
+                    self.log.error("Could not collect quarantine observation diagnostics (%s)", error)
         return reviewed
+
+    @staticmethod
+    def _quarantine_observation_sample(info, txid):
+        if info is None:
+            return None
+        top_fields = (
+            "chain_ready", "active_tip", "active_height", "wallet_processed_tip",
+            "wallet_processed_height", "wallet_generation", "wallet_tip_matches",
+            "database_outcome_ambiguous", "raw_claim_objects", "claim_ownership_pending",
+            "claim_ownership_capacity_exceeded", "claim_inventory_capacity_exceeded",
+            "proof_evaluation_budget_exhausted", "proof_evaluation_capacity_exceeded",
+            "proof_evaluation_retryable_local_failure", "proof_evaluation_retryable_local_state",
+        )
+        component_fields = (
+            "classification", "all_claims_quarantined", "stale_depth_known", "minimum_stale_depth",
+            "has_revalidating_unbound_proof", "anchor_authenticated", "anchor_unspent",
+        )
+        node_fields = (
+            "disposition", "proof_version", "proof_origin_bound", "proof_input_bound",
+            "proof_may_revalidate_on_descendant", "quarantined", "in_mempool",
+            "stale_depth_known", "stale_depth",
+        )
+        matches = [component for component in info["component_details"] if txid in component["claim_txids"]]
+        sample = {field: info.get(field) for field in top_fields}
+        sample["matching_components"] = len(matches)
+        sample["claim_unanchored"] = txid in info.get("unanchored_claim_txids", ())
+        sample["claim_components"] = []
+        for component in matches[:2]:
+            summary = {field: component.get(field) for field in component_fields}
+            claim = next((node for node in component["nodes"] if node["txid"] == txid), {})
+            summary["claim"] = {field: claim.get(field) for field in node_fields}
+            sample["claim_components"].append(summary)
+        return sample
 
     def _wait_for_automatic_resolution(self, wallet, node, claim_txid, tip):
         """Return one complete, tip-bound observation and its relayed resolution."""
@@ -2569,7 +2626,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )["hash"]
         node.syncwithvalidationinterfacequeue()
         self._wait_for_quarantine_observation(
-            fault, first_fault_txid, fault_quarantine_tip
+            fault, first_fault_txid, fault_quarantine_tip, diagnose_observation=True
         )
         failed_relay_preview = fault.resolveallshadowpowclaims()
         assert_equal(failed_relay_preview["actionable_components"], 1)

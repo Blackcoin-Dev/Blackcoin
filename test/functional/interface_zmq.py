@@ -224,9 +224,11 @@ class ZMQTest (BitcoinTestFramework):
         txid = hashtx.receive()
         assert_equal(payment_txid, txid.hex())
 
-        # Should receive the broadcasted raw transaction.
+        # Should receive the broadcasted raw transaction. Blackcoin defaults
+        # -rpcserialversion to 0, so ZMQ rawtx carries the non-witness
+        # serialization, whose hash is the txid rather than the wtxid.
         hex = rawtx.receive()
-        assert_equal(payment_tx['wtxid'], hash256_reversed(hex).hex())
+        assert_equal(payment_tx['txid'], hash256_reversed(hex).hex())
 
         # Mining the block with this tx should result in second notification
         # after coinbase tx notification

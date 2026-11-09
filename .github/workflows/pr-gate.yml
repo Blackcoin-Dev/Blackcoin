@@ -1050,6 +1050,26 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Provide pinned published 30.1.5.2 upgrade baseline
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline_dir="$RUNNER_TEMP/blackcoin-30.1.5.2-baseline"
+          archive="$baseline_dir/Blackcoin-30.1.5.2-Linux-x86_64.tar.gz"
+          mkdir -p "$baseline_dir"
+          curl --location --fail --silent --show-error \
+            --retry 6 --retry-max-time 120 \
+            https://github.com/Blackcoin-Dev/Blackcoin/releases/download/v30.1.5.2/Blackcoin-30.1.5.2-Linux-x86_64.tar.gz \
+            --output "$archive"
+          echo 'd2922f034102f900b8b2b9ebe676719eb3dc51cf52cb5443c713227212372aa6  '"$archive" |
+            sha256sum --check --strict
+          tar -C "$baseline_dir" -xzf "$archive" blackcoind
+          echo '9661078be75bb4c5d9c92a71f1f93a9e060eac0843bec4cd17d81854c7d9fc36  '"$baseline_dir/blackcoind" |
+            sha256sum --check --strict
+          chmod 0755 "$baseline_dir/blackcoind"
+          echo "BLACKCOIN_30152_BITCOIND=$baseline_dir/blackcoind" >> "$GITHUB_ENV"
+
       - name: Run all default and extended functional tests
         if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: |

@@ -7,13 +7,14 @@
 #include <bench/bench.h>
 
 #include <chrono>
-#include <cstdio>
+#include <iostream>
 #include <chainparams.h>
 #include <wallet/coincontrol.h>
 #include <consensus/merkle.h>
 #include <kernel/chain.h>
 #include <node/context.h>
 #include <test/util/setup_common.h>
+#include <tinyformat.h>
 #include <validation.h>
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
@@ -229,7 +230,7 @@ static void ListCoinsBench(benchmark::Bench& bench, unsigned int chain_size, Lis
             assert(!coins);
             worst = std::max(worst, std::chrono::steady_clock::now() - requested);
         });
-        std::printf("WalletListCoinsCancelLatency%u worst_ns_after_request=%lld\n", chain_size, (long long)worst.count());
+        tfm::format(std::cout, "WalletListCoinsCancelLatency%u worst_ns_after_request=%d\n", chain_size, worst.count());
     }
 }
 

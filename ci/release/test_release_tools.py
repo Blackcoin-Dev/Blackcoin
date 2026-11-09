@@ -1736,6 +1736,7 @@ class ReleaseToolTests(unittest.TestCase):
             archive = Path(temporary) / "release.tar.gz"
             archive.write_bytes(b"stale partial bytes from an earlier attempt")
             delays = []
+
             class Truncated(io.BytesIO):
                 def read(self, *args):
                     raise builder.http.client.IncompleteRead(b"partial")

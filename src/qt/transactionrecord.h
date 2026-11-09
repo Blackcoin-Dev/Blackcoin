@@ -134,17 +134,18 @@ public:
      */
     bool statusUpdateNeeded(const uint256& block_hash) const;
 
-    /** Sort keys for the Status and Date columns. Built once per status update
-        instead of on every comparison of an initial table sort; the strings are
-        identical to formatting status.sortKey on demand. */
-    const QString& statusSortKey() const;
+    /** Sort key for the Status column, formatted on demand (rarely sorted). */
+    QString statusSortKey() const;
+    /** Sort key for the Date column, the default and initial table sort.
+        Built once per status update instead of on every comparison; the string
+        is identical to formatting time and status.sortKey on demand. */
     const QString& dateSortKey() const;
 
 private:
-    mutable QString m_status_sort_key;
+    // Lazily filled from const data(); records are only read and updated on the
+    // GUI thread, so the cache needs no locking.
     mutable QString m_date_sort_key;
-    mutable bool m_sort_keys_valid{false};
-    void buildSortKeys() const;
+    mutable bool m_date_sort_key_valid{false};
 };
 
 #endif // BITCOIN_QT_TRANSACTIONRECORD_H

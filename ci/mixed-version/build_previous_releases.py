@@ -7,6 +7,7 @@
 import argparse
 from contextlib import contextmanager
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unicodedata
+import urllib.error
 import urllib.request
 
 
@@ -741,6 +744,38 @@ def reject_tracked_destructive_root(path, repository_root):
             )
 
 
+RELEASE_FETCH_ATTEMPTS = 6
+RELEASE_FETCH_TIMEOUT = 60
+TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def fetch_release_archive(request, archive, *, attempts=RELEASE_FETCH_ATTEMPTS, sleep=time.sleep):
+    """Download a release archive, retrying transient failures with backoff.
+
+    Each attempt rewrites the archive from the beginning. The caller still
+    verifies the pinned digest afterwards, so a retry can only accept the
+    same verified bytes. Non-transient HTTP errors fail immediately.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=RELEASE_FETCH_TIMEOUT) as response, \
+                    archive.open("wb") as destination:
+                shutil.copyfileobj(response, destination)
+            return
+        except urllib.error.HTTPError as error:
+            if error.code not in TRANSIENT_HTTP_STATUSES or attempt == attempts:
+                raise
+            reason = f"HTTP {error.code}"
+        except (OSError, http.client.HTTPException) as error:
+            if attempt == attempts:
+                raise
+            reason = repr(error)
+        delay = 2 ** (attempt - 1)
+        print(f"Release archive fetch attempt {attempt}/{attempts} failed ({reason}); "
+              f"retrying in {delay} s", file=sys.stderr, flush=True)
+        sleep(delay)
+
+
 def download_exact_release(source, *, output_dir, build_root, host):
     """Install an immutable, digest-pinned upstream release asset.
 
@@ -758,8 +793,7 @@ def download_exact_release(source, *, output_dir, build_root, host):
         asset["url"],
         headers={"User-Agent": "Blackcoin-v30.1.1-mixed-version-gate"},
     )
-    with urllib.request.urlopen(request) as response, archive.open("wb") as destination:
-        shutil.copyfileobj(response, destination)
+    fetch_release_archive(request, archive)
     if file_sha256(archive) != asset["sha256"]:
         raise RuntimeError(f"{source['version']} release archive digest mismatch")
 

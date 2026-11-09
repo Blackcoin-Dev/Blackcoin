@@ -2565,6 +2565,19 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         LogPrintf("Fixed seeds are disabled\n");
     }
 
+    // Diagnostics only (-debug=net): explain why QQ probes are not issued
+    // while a QQ deficit persists. Rate limited; no behaviour change.
+    uint64_t qq_diag_grant_failures{0};
+    qq::Clock::time_point qq_diag_next{};
+    const auto qq_diag = [&](const char* branch, int full, int block, bool deficit, bool probe_allowed,
+                             bool probe_due, bool pending_active, int admitted, const std::string& constraint) {
+        if (!deficit || !LogAcceptCategory(BCLog::NET, BCLog::Level::Debug)) return;
+        const auto t = qq::Clock::now();
+        if (t < qq_diag_next) return;
+        qq_diag_next = t + std::chrono::seconds{10};
+        LogPrint(BCLog::NET, "QQ probe diagnostics: branch=%s full=%d block=%d probe_allowed=%d probe_due=%d pending_active=%d admitted=%d constraint=%s grant_failures=%u\n",
+                 branch, full, block, probe_allowed, probe_due, pending_active, admitted, constraint, qq_diag_grant_failures);
+    };
     while (!interruptNet)
     {
         if (!interruptNet.sleep_for(std::chrono::milliseconds(500)))
@@ -2579,6 +2592,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             return;
         if (!fNetworkActive) continue;
         if (!grant) {
+            ++qq_diag_grant_failures;
             // A successful legacy handshake can fill the final permit. Observe
             // that recovery so a subsequent loss gets a fresh legacy-first turn.
             if (tried_legacy_at_target) {
@@ -2716,7 +2730,10 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         // block-relay-only peer (to confirm our tip is current, see below) or the next_feeler
         // timer to decide if we should open a FEELER.
 
+        const bool qq_diag_due = qq_deficit && qq_probe_allowed && steady_now >= next_qq_probe;
+        const bool qq_diag_pending = pending && pending->active;
         if (!m_anchors.empty() && (nOutboundBlockRelay < m_max_outbound_block_relay)) {
+            qq_diag("anchor", nOutboundFullRelay, nOutboundBlockRelay, qq_deficit, qq_probe_allowed, qq_diag_due, qq_diag_pending, -1, qq_status.constraint);
             conn_type = ConnectionType::BLOCK_RELAY;
             anchor = true;
         } else if (addr_fetch_due && recovery_addr_fetch_turn &&
@@ -2726,14 +2743,17 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             // an empty addrman may depend on their response to fill any slot.
             // Alternate with ordinary recovery so neither class monopolizes it.
             recovery_addr_fetch_turn = false;
+            qq_diag("addr-fetch-vacancy", nOutboundFullRelay, nOutboundBlockRelay, qq_deficit, qq_probe_allowed, qq_diag_due, qq_diag_pending, -1, qq_status.constraint);
             grant.Release();
             ProcessAddrFetch();
             continue;
         } else if (nOutboundFullRelay < m_max_outbound_full_relay) {
             recovery_addr_fetch_turn = true;
+            qq_diag("full-relay-vacancy", nOutboundFullRelay, nOutboundBlockRelay, qq_deficit, qq_probe_allowed, qq_diag_due, qq_diag_pending, -1, qq_status.constraint);
             // OUTBOUND_FULL_RELAY
         } else if (nOutboundBlockRelay < m_max_outbound_block_relay) {
             recovery_addr_fetch_turn = true;
+            qq_diag("block-relay-vacancy", nOutboundFullRelay, nOutboundBlockRelay, qq_deficit, qq_probe_allowed, qq_diag_due, qq_diag_pending, -1, qq_status.constraint);
             conn_type = ConnectionType::BLOCK_RELAY;
         } else {
             // Six transient classes share existing semaphore headroom. Periodic
@@ -2745,6 +2765,9 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 now > next_extra_block_relay && m_start_extra_block_relay_peers,
                 network_due, qq_deficit && qq_probe_allowed && steady_now >= next_qq_probe && (!pending || !pending->active)}};
             const int admitted = transient_arbiter.Pick(due);
+            if (admitted != 5) {
+                qq_diag("transient", nOutboundFullRelay, nOutboundBlockRelay, qq_deficit, qq_probe_allowed, qq_diag_due, qq_diag_pending, admitted, qq_status.constraint);
+            }
             if (admitted < 0) continue;
             switch (admitted) {
             case 0:

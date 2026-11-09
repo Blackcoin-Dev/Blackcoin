@@ -233,7 +233,22 @@ class QQPursuitTest(BitcoinTestFramework):
             if status["eligible"] == count:
                 return
             time.sleep(1)
+        self.dump_qq_diagnostics()
         raise AssertionError(f"QQ target not reached: {node.getnetworkinfo()['qqoutbound']}")
+
+    def dump_qq_diagnostics(self):
+        """Log connection and QQ state so a timeout explains itself."""
+        node = self.nodes[0]
+        for sample in range(2):
+            peers = node.getpeerinfo()
+            types = {}
+            for p in peers:
+                types[p["connection_type"]] = types.get(p["connection_type"], 0) + 1
+            info = node.getnetworkinfo()
+            self.log.info(f"QQ diagnostics sample {sample}: peers={len(peers)} max_connections=19 "
+                          f"types={types} qqoutbound={info['qqoutbound']}")
+            if sample == 0:
+                time.sleep(60)
 
     def test_legacy_replenishment(self):
         node = self.nodes[0]

@@ -81,8 +81,13 @@ class ChainstateRebuildLifecycleTest(BitcoinTestFramework):
         A connection to this socket is refused while the reservation prevents
         Blackcoin from binding the same endpoint. It gives the test both an
         active listener-isolation probe and a deterministic startup guard.
+
+        The reservation deliberately omits SO_REUSEADDR so the daemon's own
+        reusable listener cannot share the endpoint. Without that option the
+        bind is refused while a previous node's server-closed RPC connections
+        remain in TIME_WAIT (a fixed 60 seconds on Linux), so wait past it.
         """
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 90
         while True:
             reserved = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:

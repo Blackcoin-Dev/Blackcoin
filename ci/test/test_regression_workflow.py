@@ -253,6 +253,22 @@ fi
         for script in (focus, self.steps("native-build-and-unit")["Configure targeted debug binaries"]):
             self.assertNotRegex(script, r"(?m)\\\\\s*$", "shell continuation must be a single backslash")
 
+    def test_extended_suite_provides_pinned_30152_upgrade_baseline(self):
+        steps = self.steps("exhaustive-functional")
+        names = list(steps)
+        baseline = steps["Provide pinned published 30.1.5.2 upgrade baseline"]
+        full = steps["Run all default and extended functional tests"]
+        self.assertLess(names.index("Provide pinned published 30.1.5.2 upgrade baseline"),
+                        names.index("Run all default and extended functional tests"))
+        self.assertIn("releases/download/v30.1.5.2/Blackcoin-30.1.5.2-Linux-x86_64.tar.gz", baseline)
+        self.assertIn("d2922f034102f900b8b2b9ebe676719eb3dc51cf52cb5443c713227212372aa6", baseline)
+        self.assertIn("9661078be75bb4c5d9c92a71f1f93a9e060eac0843bec4cd17d81854c7d9fc36", baseline)
+        self.assertEqual(baseline.count("sha256sum --check --strict"), 2)
+        self.assertIn('BLACKCOIN_30152_BITCOIND=$baseline_dir/blackcoind', baseline)
+        for scope in ("", "full", "all", "native"):
+            self.assertEqual(bool(expression(field(baseline, "if", 8), variables(scope))),
+                             bool(expression(field(full, "if", 8), variables(scope))))
+
     def test_sanitizer_focus_selects_only_requested_flavor_and_singleflight(self):
         job = self.jobs["sanitizer-gates"]
         include = field(job, "include", 8)

@@ -5,10 +5,12 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/amount.h>
+#include <interfaces/wallet.h>
 #include <policy/fees.h>
 #include <script/solver.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
+#include <wallet/context.h>
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
@@ -146,6 +148,36 @@ BOOST_FIXTURE_TEST_CASE(list_coins_interrupt, TestChain100Setup)
     // Funding paths without a callback are unaffected.
     CoinFilterParams params;
     BOOST_CHECK(!AvailableCoins(*wallet, /*coinControl=*/nullptr, /*feerate=*/std::nullopt, params).interrupted);
+}
+
+BOOST_FIXTURE_TEST_CASE(list_coins_interrupt_mid_walk, TestChain100Setup)
+{
+    // Enough wallet transactions for several interrupt polls.
+    for (int i = 0; i < 4 * static_cast<int>(CoinFilterParams::INTERRUPT_CHECK_INTERVAL); ++i) {
+        CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    }
+    std::shared_ptr<CWallet> wallet{CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey).release()};
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->mapWallet.size() > 4 * CoinFilterParams::INTERRUPT_CHECK_INTERVAL);
+        size_t polls{0};
+        // Fire on the third poll: the walk is part way through and must stop there.
+        BOOST_CHECK(!ListCoins(*wallet, [&] { return ++polls == 3; }).has_value());
+        BOOST_CHECK_EQUAL(polls, 3U);
+    }
+
+    // The interface used by the GUI snapshot reports an interrupted walk as nullopt
+    // and an uninterrupted one exactly like listCoins().
+    WalletContext wallet_context;
+    wallet_context.chain = m_node.chain.get();
+    auto wallet_interface = interfaces::MakeWallet(wallet_context, wallet);
+    size_t polls{0};
+    BOOST_CHECK(!wallet_interface->listCoins([&] { return ++polls == 2; }).has_value());
+    BOOST_CHECK_EQUAL(polls, 2U);
+    const auto full = wallet_interface->listCoins();
+    const auto polled = wallet_interface->listCoins([] { return false; });
+    BOOST_REQUIRE(polled.has_value());
+    BOOST_CHECK_EQUAL(polled->size(), full.size());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

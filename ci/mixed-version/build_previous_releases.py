@@ -758,9 +758,9 @@ def fetch_release_archive(request, archive, *, attempts=RELEASE_FETCH_ATTEMPTS, 
     """
     for attempt in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(request, timeout=RELEASE_FETCH_TIMEOUT) as response, \
-                    archive.open("wb") as destination:
-                shutil.copyfileobj(response, destination)
+            with urllib.request.urlopen(request, timeout=RELEASE_FETCH_TIMEOUT) as response:
+                with archive.open("wb") as destination:
+                    shutil.copyfileobj(response, destination)
             return
         except urllib.error.HTTPError as error:
             if error.code not in TRANSIENT_HTTP_STATUSES or attempt == attempts:

@@ -16,6 +16,7 @@
 #include <wallet/wallet.h>
 
 #include <array>
+#include <functional>
 #include <optional>
 
 namespace wallet {
@@ -101,6 +102,8 @@ TxSize CalculateMaximumSignedTxSize(const CTransaction& tx, const CWallet* walle
  */
 struct CoinsResult {
     std::map<OutputType, std::vector<COutput>> coins;
+    //! True when CoinFilterParams::interrupt stopped the walk; the result is partial.
+    bool interrupted{false};
 
     /** Concatenate and return all COutputs as one vector */
     std::vector<COutput> All() const;
@@ -149,6 +152,12 @@ struct CoinFilterParams {
     // Fully decayed demurrage outputs are consensus-locked. Listing views opt in
     // so users can diagnose them, but ordinary funding skips them.
     bool include_demurrage_locked_outputs{false};
+    // Optional cooperative cancellation for long read-only listings. Checked
+    // every INTERRUPT_CHECK_INTERVAL wallet transactions; when it returns true
+    // the walk stops early and CoinsResult::interrupted is set. Funding paths
+    // leave it empty.
+    std::function<bool()> interrupt;
+    static constexpr size_t INTERRUPT_CHECK_INTERVAL{64};
 };
 
 /**
@@ -174,6 +183,13 @@ const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& 
  * Return list of available coins and locked coins grouped by non-change output address.
  */
 std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/**
+ * Interruptible ListCoins. Returns std::nullopt if interrupt() returned true
+ * before the walk finished; otherwise the same result as ListCoins(wallet).
+ */
+std::optional<std::map<CTxDestination, std::vector<COutput>>> ListCoins(const CWallet& wallet, const std::function<bool()>& interrupt)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 struct SelectionFilter {

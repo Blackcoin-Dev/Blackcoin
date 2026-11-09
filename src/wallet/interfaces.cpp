@@ -2876,9 +2876,15 @@ public:
     }
     CoinsList listCoins() override
     {
+        return *listCoins(/*interrupt=*/{});
+    }
+    std::optional<CoinsList> listCoins(const std::function<bool()>& interrupt) override
+    {
         LOCK2(::cs_main, m_wallet->cs_wallet);
+        const auto listed = ListCoins(*m_wallet, interrupt);
+        if (!listed) return std::nullopt;
         CoinsList result;
-        for (const auto& entry : ListCoins(*m_wallet)) {
+        for (const auto& entry : *listed) {
             auto& group = result[entry.first];
             for (const auto& coin : entry.second) {
                 group.emplace_back(coin.outpoint,

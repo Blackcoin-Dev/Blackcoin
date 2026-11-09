@@ -291,6 +291,10 @@ public:
     using CoinsList = std::map<CTxDestination, std::vector<std::tuple<COutPoint, WalletTxOut>>>;
     virtual CoinsList listCoins() = 0;
 
+    //! Interruptible listCoins for background snapshots. interrupt() is polled
+    //! during the wallet walk; returns std::nullopt if it stopped the walk.
+    virtual std::optional<CoinsList> listCoins(const std::function<bool()>& interrupt) = 0;
+
     //! Return wallet transaction output information.
     virtual std::vector<WalletTxOut> getCoins(const std::vector<COutPoint>& outputs) = 0;
 

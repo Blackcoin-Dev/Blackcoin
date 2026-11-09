@@ -120,5 +120,33 @@ BOOST_FIXTURE_TEST_CASE(wallet_duplicated_preset_inputs_test, TestChain100Setup)
     BOOST_CHECK(!res_tx.has_value());
 }
 
+BOOST_FIXTURE_TEST_CASE(list_coins_interrupt, TestChain100Setup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    LOCK2(::cs_main, wallet->cs_wallet);
+    const auto full = ListCoins(*wallet);
+    BOOST_REQUIRE(!full.empty());
+
+    // A callback that never fires yields exactly the uninterrupted listing.
+    size_t polls{0};
+    const auto polled = ListCoins(*wallet, [&] { ++polls; return false; });
+    BOOST_REQUIRE(polled.has_value());
+    BOOST_CHECK(polled->size() == full.size());
+    for (const auto& [dest, coins] : full) {
+        const auto it = polled->find(dest);
+        BOOST_REQUIRE(it != polled->end());
+        BOOST_CHECK_EQUAL(it->second.size(), coins.size());
+    }
+    BOOST_CHECK(polls >= 1);
+    BOOST_CHECK(polls <= wallet->mapWallet.size() / CoinFilterParams::INTERRUPT_CHECK_INTERVAL + 1);
+
+    // A callback that fires stops the walk and reports no partial listing.
+    BOOST_CHECK(!ListCoins(*wallet, [] { return true; }).has_value());
+
+    // Funding paths without a callback are unaffected.
+    CoinFilterParams params;
+    BOOST_CHECK(!AvailableCoins(*wallet, /*coinControl=*/nullptr, /*feerate=*/std::nullopt, params).interrupted);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

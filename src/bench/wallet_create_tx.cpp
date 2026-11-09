@@ -5,6 +5,9 @@
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
 #include <bench/bench.h>
+
+#include <chrono>
+#include <cstdio>
 #include <chainparams.h>
 #include <wallet/coincontrol.h>
 #include <consensus/merkle.h>
@@ -178,6 +181,63 @@ static void AvailableCoins(benchmark::Bench& bench, const std::vector<OutputType
     });
 }
 
+enum class ListCoinsMode { FULL, POLLED, CANCEL };
+
+static void ListCoinsBench(benchmark::Bench& bench, unsigned int chain_size, ListCoinsMode mode)
+{
+    const auto test_setup = MakeNoLogFileContext<const TestingSetup>();
+    SetMockTime(test_setup->m_node.chainman->GetParams().GenesisBlock().nTime);
+    CWallet wallet{test_setup->m_node.chain.get(), "", CreateMockableWalletDatabase()};
+    {
+        LOCK2(::cs_main, wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetupDescriptorScriptPubKeyMans();
+        if (wallet.LoadWallet() != DBErrors::LOAD_OK) assert(false);
+    }
+    const CScript dest{GetScriptForDestination(getNewDestination(wallet, OutputType::BECH32M))};
+    const auto& params = Params();
+    for (unsigned int i = 0; i < chain_size; ++i) generateFakeBlock(params, test_setup->m_node, wallet, dest);
+
+    if (mode == ListCoinsMode::FULL) {
+        // Time the whole ListCoins walk the Account snapshot performs.
+        bench.epochIterations(2).run([&] {
+            LOCK2(::cs_main, wallet.cs_wallet);
+            const auto coins = wallet::ListCoins(wallet);
+            assert(!coins.empty());
+        });
+    } else if (mode == ListCoinsMode::POLLED) {
+        // Same walk with a cancellation callback that never fires (polling overhead).
+        bench.epochIterations(2).run([&] {
+            LOCK2(::cs_main, wallet.cs_wallet);
+            const auto coins = wallet::ListCoins(wallet, [] { return false; });
+            assert(coins && !coins->empty());
+        });
+    } else {
+        // Request cancellation halfway through the walk and time how long the
+        // walk keeps holding cs_main/cs_wallet after the request.
+        std::chrono::nanoseconds worst{0};
+        bench.epochIterations(2).run([&] {
+            size_t polls{0};
+            std::chrono::steady_clock::time_point requested{};
+            LOCK2(::cs_main, wallet.cs_wallet);
+            const size_t trip = wallet.mapWallet.size() / wallet::CoinFilterParams::INTERRUPT_CHECK_INTERVAL / 2;
+            const auto coins = wallet::ListCoins(wallet, [&] {
+                if (polls++ < trip) return false;
+                requested = std::chrono::steady_clock::now();
+                return true;
+            });
+            assert(!coins);
+            worst = std::max(worst, std::chrono::steady_clock::now() - requested);
+        });
+        std::printf("WalletListCoinsCancelLatency%u worst_ns_after_request=%lld\n", chain_size, (long long)worst.count());
+    }
+}
+
+static void WalletListCoins1k(benchmark::Bench& bench) { ListCoinsBench(bench, 1000, ListCoinsMode::FULL); }
+static void WalletListCoins5k(benchmark::Bench& bench) { ListCoinsBench(bench, 5000, ListCoinsMode::FULL); }
+static void WalletListCoins5kPolled(benchmark::Bench& bench) { ListCoinsBench(bench, 5000, ListCoinsMode::POLLED); }
+static void WalletListCoins5kCancel(benchmark::Bench& bench) { ListCoinsBench(bench, 5000, ListCoinsMode::CANCEL); }
+
 static void WalletCreateTxUseOnlyPresetInputs(benchmark::Bench& bench) { WalletCreateTx(bench, OutputType::BECH32, /*allow_other_inputs=*/false,
                                                                                         {{/*num_of_internal_inputs=*/4}}); }
 
@@ -189,3 +249,7 @@ static void WalletAvailableCoins(benchmark::Bench& bench) { AvailableCoins(bench
 BENCHMARK(WalletCreateTxUseOnlyPresetInputs, benchmark::PriorityLevel::LOW)
 BENCHMARK(WalletCreateTxUsePresetInputsAndCoinSelection, benchmark::PriorityLevel::LOW)
 BENCHMARK(WalletAvailableCoins, benchmark::PriorityLevel::LOW);
+BENCHMARK(WalletListCoins1k, benchmark::PriorityLevel::LOW);
+BENCHMARK(WalletListCoins5k, benchmark::PriorityLevel::LOW);
+BENCHMARK(WalletListCoins5kPolled, benchmark::PriorityLevel::LOW);
+BENCHMARK(WalletListCoins5kCancel, benchmark::PriorityLevel::LOW);

@@ -373,8 +373,11 @@ std::shared_ptr<std::atomic<bool>> WalletModel::requestAccountSnapshot(
             if (unavailable(available) || checkpoint()) return;
             snapshot->eutxo_states = m_wallet->listEUTXOStates(/*include_spent=*/true, &available).size();
             if (unavailable(available) || checkpoint()) return;
-            snapshot->coins = m_wallet->listCoins();
-            if (checkpoint()) return;
+            // Poll cancellation inside the coin walk so wallet switches and
+            // shutdown do not wait for a full listing of a large wallet.
+            auto coins = m_wallet->listCoins(checkpoint);
+            if (!coins || checkpoint()) return;
+            snapshot->coins = std::move(*coins);
             for (const auto& address : m_wallet->getAddresses()) {
                 snapshot->labels.emplace(address.dest, address.name);
             }

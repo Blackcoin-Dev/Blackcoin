@@ -856,8 +856,13 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const std::set<COutPoint> protected_rgb_seals = wallet.GetProtectedRGBSeals();
 
     std::set<uint256> trusted_parents;
+    size_t walked{0};
     for (const auto& entry : wallet.mapWallet)
     {
+        if (params.interrupt && walked++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && params.interrupt()) {
+            result.interrupted = true;
+            return result;
+        }
         const uint256& wtxid = entry.first;
         const CWalletTx& wtx = entry.second;
 
@@ -1021,6 +1026,11 @@ const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& 
 
 std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
 {
+    return *ListCoins(wallet, /*interrupt=*/{});
+}
+
+std::optional<std::map<CTxDestination, std::vector<COutput>>> ListCoins(const CWallet& wallet, const std::function<bool()>& interrupt)
+{
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
 
@@ -1032,7 +1042,10 @@ std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
     CoinFilterParams coins_params;
     coins_params.only_spendable = false;
     coins_params.skip_locked = false;
-    for (const COutput& coin : AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coins_params).All()) {
+    coins_params.interrupt = interrupt;
+    const CoinsResult available = AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coins_params);
+    if (available.interrupted) return std::nullopt;
+    for (const COutput& coin : available.All()) {
         CTxDestination address;
         if ((coin.spendable || (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && coin.solvable))) {
             if (!ExtractDestination(FindNonChangeParentOutput(wallet, coin.outpoint).scriptPubKey, address)) {

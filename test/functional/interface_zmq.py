@@ -122,11 +122,11 @@ class ZMQTest (BitcoinTestFramework):
         try:
             self.test_basic()
             self.test_replacement_disabled()
-            # test_sequence and test_mempool_sync are inherited from Bitcoin
-            # Core and drive mempool replacement (RBF) notifications. Blackcoin
-            # rejects replacements with txn-mempool-conflict, so they need a
-            # non-RBF port and are not run here.
-            self.log.info("Skipping RBF-dependent sequence and mempool-sync subtests (replacement disabled)")
+            # Blackcoin rejects mempool replacements (txn-mempool-conflict), so
+            # the inherited sequence and mempool-sync subtests are ported to
+            # exercise add/remove/connect/disconnect without RBF.
+            self.test_sequence()
+            self.test_mempool_sync()
             self.test_reorg()
             self.test_multiple_interfaces()
             self.test_ipv6()
@@ -256,6 +256,8 @@ class ZMQTest (BitcoinTestFramework):
         self.log.info("Replacement is rejected, so ZMQ publishes no removal for it")
         payment_tx = self.wallet.send_self_transfer(from_node=self.nodes[1])
         self.sync_all()
+        # The conflict check runs before script checks, so the modified copy is
+        # rejected as a conflict.
         payment_tx['tx'].vout[0].nValue -= 1000
         assert_raises_rpc_error(-26, "txn-mempool-conflict",
                                 self.nodes[1].sendrawtransaction, payment_tx['tx'].serialize().hex())
@@ -352,16 +354,6 @@ class ZMQTest (BitcoinTestFramework):
         assert_equal((payment_txid, "A", seq_num), seq.receive_sequence())
         seq_num += 1
 
-        self.log.info("Testing RBF notification")
-        # Replace it to test eviction/addition notification
-        payment_tx['tx'].vout[0].nValue -= 1000
-        rbf_txid = self.nodes[1].sendrawtransaction(payment_tx['tx'].serialize().hex())
-        self.sync_all()
-        assert_equal((payment_txid, "R", seq_num), seq.receive_sequence())
-        seq_num += 1
-        assert_equal((rbf_txid, "A", seq_num), seq.receive_sequence())
-        seq_num += 1
-
         # Doesn't get published when mined, make a block and tx to "flush" the possibility
         # though the mempool sequence number does go up by the number of transactions
         # removed from the mempool by the block mining it.
@@ -400,7 +392,8 @@ class ZMQTest (BitcoinTestFramework):
         assert self.nodes[0].getrawmempool(mempool_sequence=True)["mempool_sequence"] > seq_num
 
         assert_equal((best_hash, "D", None), seq.receive_sequence())
-        assert_equal((rbf_txid, "A", seq_num), seq.receive_sequence())
+        # Without replacement, the transaction mined in the invalidated block re-enters.
+        assert_equal((payment_txid, "A", seq_num), seq.receive_sequence())
         seq_num += 1
 
         # Other things may happen but aren't wallet-deterministic so we don't test for them currently
@@ -408,45 +401,41 @@ class ZMQTest (BitcoinTestFramework):
         self.generatetoaddress(self.nodes[1], 1, ADDRESS_BCRT1_UNSPENDABLE)
 
         self.log.info("Evict mempool transaction by block conflict")
-        orig_tx = self.wallet.send_self_transfer(from_node=self.nodes[0])
-        orig_txid = orig_tx['txid']
-
-        # More to be simply mined
+        # Transactions to be simply mined, created first so the conflicted
+        # transaction can only depend on them, never the reverse.
         more_tx = []
         for _ in range(5):
             more_tx.append(self.wallet.send_self_transfer(from_node=self.nodes[0]))
+        orig_tx = self.wallet.send_self_transfer(from_node=self.nodes[0])
+        orig_txid = orig_tx['txid']
 
+        # Mine a block with a conflicting version of orig_tx that never entered
+        # the mempool (Blackcoin has no replacement), evicting orig_tx.
         orig_tx['tx'].vout[0].nValue -= 1000
-        bump_txid = self.nodes[0].sendrawtransaction(orig_tx['tx'].serialize().hex())
-        # Mine the pre-bump tx
-        txs_to_add = [orig_tx['hex']] + [tx['hex'] for tx in more_tx]
+        txs_to_add = [tx['hex'] for tx in more_tx] + [orig_tx['tx'].serialize().hex()]
         block = create_block(int(self.nodes[0].getbestblockhash(), 16), create_coinbase(self.nodes[0].getblockcount()+1), txlist=txs_to_add)
         add_witness_commitment(block)
         block.solve()
         assert_equal(self.nodes[0].submitblock(block.serialize().hex()), None)
         tip = self.nodes[0].getbestblockhash()
         assert_equal(int(tip, 16), block.sha256)
+        # The mined variant replaced orig_tx's outputs; resync the MiniWallet.
+        self.wallet.rescan_utxos()
         orig_txid_2 = self.wallet.send_self_transfer(from_node=self.nodes[0])['txid']
 
-        # Flush old notifications until evicted tx original entry
+        # Flush old notifications until the first simply-mined tx
         (hash_str, label, mempool_seq) = seq.receive_sequence()
-        while hash_str != orig_txid:
+        while hash_str != more_tx[0]['txid']:
             (hash_str, label, mempool_seq) = seq.receive_sequence()
-        mempool_seq += 1
-
-        # Added original tx
         assert_equal(label, "A")
-        # More transactions to be simply mined
-        for i in range(len(more_tx)):
+        mempool_seq += 1
+        for i in range(1, len(more_tx)):
             assert_equal((more_tx[i]['txid'], "A", mempool_seq), seq.receive_sequence())
             mempool_seq += 1
-        # Bumped by rbf
-        assert_equal((orig_txid, "R", mempool_seq), seq.receive_sequence())
-        mempool_seq += 1
-        assert_equal((bump_txid, "A", mempool_seq), seq.receive_sequence())
+        assert_equal((orig_txid, "A", mempool_seq), seq.receive_sequence())
         mempool_seq += 1
         # Conflict announced first, then block
-        assert_equal((bump_txid, "R", mempool_seq), seq.receive_sequence())
+        assert_equal((orig_txid, "R", mempool_seq), seq.receive_sequence())
         mempool_seq += 1
         assert_equal((tip, "C", None), seq.receive_sequence())
         mempool_seq += len(more_tx)
@@ -497,11 +486,9 @@ class ZMQTest (BitcoinTestFramework):
             get_raw_seq = mempool_snapshot["mempool_sequence"]
 
         # Things continue to happen in the "interim" while waiting for snapshot results
-        # We have node 0 do all these to avoid p2p races with RBF announcements
+        # Node 0 does all of these to keep the notification order deterministic
         for _ in range(num_txs):
             txs.append(self.wallet.send_self_transfer(from_node=self.nodes[0]))
-        txs[-1]['tx'].vout[0].nValue -= 1000
-        self.nodes[0].sendrawtransaction(txs[-1]['tx'].serialize().hex())
         self.sync_all()
         self.generatetoaddress(self.nodes[0], 1, ADDRESS_BCRT1_UNSPENDABLE)
         final_txid = self.wallet.send_self_transfer(from_node=self.nodes[0])['txid']
@@ -517,10 +504,10 @@ class ZMQTest (BitcoinTestFramework):
                     raise Exception(f"We somehow jumped mempool sequence numbers! zmq_mem_seq: {zmq_mem_seq} > get_raw_seq: {get_raw_seq}")
 
         # 4) Moving forward, we apply the delta to our local view
-        #    remaining txs(5) + 1 rbf(A+R) + 1 block connect + 1 final tx
+        #    remaining txs(5) + 1 block connect + 1 final tx (no replacement)
         expected_sequence = get_raw_seq
         r_gap = 0
-        for _ in range(num_txs + 2 + 1 + 1):
+        for _ in range(num_txs + 1 + 1):
             (hash_str, label, mempool_sequence) = seq.receive_sequence()
             if mempool_sequence is not None:
                 if mempool_sequence != expected_sequence:

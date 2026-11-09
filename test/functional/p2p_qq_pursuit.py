@@ -208,6 +208,28 @@ class QQPursuitTest(BitcoinTestFramework):
         node.mockscheduler(46)
         self.wait_until(lambda: node.getnetworkinfo()["qqoutbound"]["generation"] > generation)
 
+    def evict_extra_block_relay(self):
+        """Let the node retire a transient extra block-relay-only peer.
+
+        The node periodically opens one extra block-relay-only connection on
+        the single spare outbound permit and evicts it once it has been
+        connected for MINIMUM_CONNECT_TIME (30 s of mocked time). This test
+        rewinds mocktime to age_base after each retained candidate, so an
+        extra peer opened just after a replacement can look younger than
+        30 s forever, keep the spare permit and block every QQ probe. Advance
+        mocktime past its connect time, let the eviction run, then restore
+        the rewound clock.
+        """
+        node = self.nodes[0]
+        extra = [p for p in node.getpeerinfo() if p["connection_type"] == "block-relay-only"]
+        if len(extra) <= 2:
+            return
+        saved = node.mocktime
+        node.setmocktime(max(p["conntime"] for p in extra) + 31)
+        self.evaluate()
+        self.wait_until(lambda: sum(p["connection_type"] == "block-relay-only" for p in node.getpeerinfo()) <= 2)
+        node.setmocktime(saved)
+
     def wait_qualified(self, count):
         node = self.nodes[0]
         deadline = time.monotonic() + count * 80 + 160
@@ -219,6 +241,7 @@ class QQPursuitTest(BitcoinTestFramework):
             if new_ids:
                 node.bumpmocktime(31)
                 self.aged_peers.update(new_ids)
+            self.evict_extra_block_relay()
             self.evaluate()
             status = node.getnetworkinfo()["qqoutbound"]
             if status["eligible"] > last_count:

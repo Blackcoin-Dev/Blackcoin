@@ -1070,6 +1070,13 @@ jobs:
           chmod 0755 "$baseline_dir/blackcoind"
           echo "BLACKCOIN_30152_BITCOIND=$baseline_dir/blackcoind" >> "$GITHUB_ENV"
 
+      - name: Install functional test ZMQ module
+        if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-zmq
+          python3 -c 'import zmq'
+
       - name: Run all default and extended functional tests
         if: ${{ (inputs.regression_scope == '' || inputs.regression_scope == 'full') }}
         run: |

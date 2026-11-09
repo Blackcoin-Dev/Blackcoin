@@ -269,6 +269,19 @@ fi
             self.assertEqual(bool(expression(field(baseline, "if", 8), variables(scope))),
                              bool(expression(field(full, "if", 8), variables(scope))))
 
+    def test_extended_suite_installs_python_zmq_before_full_run(self):
+        steps = self.steps("exhaustive-functional")
+        names = list(steps)
+        install = steps["Install functional test ZMQ module"]
+        full = steps["Run all default and extended functional tests"]
+        self.assertLess(names.index("Install functional test ZMQ module"),
+                        names.index("Run all default and extended functional tests"))
+        self.assertIn("python3-zmq", install)
+        self.assertIn("python3 -c 'import zmq'", install)
+        for scope in ("", "full", "all", "native"):
+            self.assertEqual(bool(expression(field(install, "if", 8), variables(scope))),
+                             bool(expression(field(full, "if", 8), variables(scope))))
+
     def test_sanitizer_focus_selects_only_requested_flavor_and_singleflight(self):
         job = self.jobs["sanitizer-gates"]
         include = field(job, "include", 8)

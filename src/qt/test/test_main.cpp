@@ -11,6 +11,7 @@
 #include <qt/bitcoin.h>
 #include <qt/test/apptests.h>
 #include <qt/test/chainstaterebuildassistanttests.h>
+#include <qt/test/csvmodelwritertests.h>
 #include <qt/test/optiontests.h>
 #include <qt/test/presentationefficiencytests.h>
 #include <qt/test/rpcnestedtests.h>
@@ -98,6 +99,9 @@ int main(int argc, char* argv[])
 
     ChainstateRebuildAssistantTests chainstate_rebuild_assistant_tests;
     num_test_failures += QTest::qExec(&chainstate_rebuild_assistant_tests);
+
+    CSVModelWriterTests csv_model_writer_tests;
+    num_test_failures += QTest::qExec(&csv_model_writer_tests);
 
     PresentationEfficiencyTests presentation_efficiency_tests(app.node());
     num_test_failures += QTest::qExec(&presentation_efficiency_tests);

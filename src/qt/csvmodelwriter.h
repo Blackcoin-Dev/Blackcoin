@@ -26,20 +26,16 @@ public:
     void addColumn(const QString &title, int column, int role=Qt::EditRole);
 
     /** Perform export of the model to CSV.
+        Rows are read on the calling (GUI) thread in fixed-size batches; each
+        formatted batch is handed to a writer thread so file I/O overlaps model
+        reads. At most two batches are held in memory. Returns after the file
+        is complete, so the export reflects one consistent model state.
         @returns true on success, false otherwise
     */
     bool write();
 
-    /** Read the model on the calling (GUI) thread and return the complete CSV
-        text. This is the only step that touches the model.
-    */
-    QString snapshot() const;
-
-    /** Write CSV text produced by snapshot(). Touches no model or widget, so a
-        caller may run it on a worker thread to keep file I/O off the GUI thread.
-        @returns true on success, false otherwise
-    */
-    static bool writeSnapshot(const QString& filename, const QString& csv);
+    /** Rows formatted per batch handed to the writer thread. */
+    static constexpr int BATCH_ROWS{4096};
 
 private:
     QString filename;

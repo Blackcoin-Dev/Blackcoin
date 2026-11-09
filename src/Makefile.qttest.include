@@ -10,6 +10,7 @@ TESTS += qt/test/test_blackcoin-qt
 TEST_QT_MOC_CPP = \
   qt/test/moc_apptests.cpp \
   qt/test/moc_chainstaterebuildassistanttests.cpp \
+  qt/test/moc_csvmodelwritertests.cpp \
   qt/test/moc_optiontests.cpp \
   qt/test/moc_presentationefficiencytests.cpp \
   qt/test/moc_rpcnestedtests.cpp \
@@ -27,6 +28,7 @@ TEST_QT_H = \
   qt/test/addressbooktests.h \
   qt/test/apptests.h \
   qt/test/chainstaterebuildassistanttests.h \
+  qt/test/csvmodelwritertests.h \
   qt/test/optiontests.h \
   qt/test/presentationefficiencytests.h \
   qt/test/rpcnestedtests.h \
@@ -43,6 +45,7 @@ qt_test_test_blackcoin_qt_SOURCES = \
   init/bitcoin-qt.cpp \
   qt/test/apptests.cpp \
   qt/test/chainstaterebuildassistanttests.cpp \
+  qt/test/csvmodelwritertests.cpp \
   qt/test/optiontests.cpp \
   qt/test/presentationefficiencytests.cpp \
   qt/test/rpcnestedtests.cpp \

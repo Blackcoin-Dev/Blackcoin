@@ -10,6 +10,7 @@
 
 QT_BEGIN_NAMESPACE
 class QAbstractItemModel;
+class QIODevice;
 QT_END_NAMESPACE
 
 /** Export a Qt table model to a CSV file. This is useful for analyzing or post-processing the data in
@@ -33,6 +34,11 @@ public:
         @returns true on success, false otherwise
     */
     bool write();
+
+    /** Same as write(), into an already open device (used by tests to inject
+        device failures). The device is written only from the writer thread.
+    */
+    bool write(QIODevice& device);
 
     /** Rows formatted per batch handed to the writer thread. */
     static constexpr int BATCH_ROWS{4096};

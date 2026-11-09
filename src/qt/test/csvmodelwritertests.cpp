@@ -9,6 +9,7 @@
 #include <QByteArray>
 #include <QDateTime>
 #include <QFile>
+#include <QIODevice>
 #include <QStandardItemModel>
 #include <QTemporaryDir>
 #include <QTextStream>
@@ -62,6 +63,40 @@ QByteArray WriterCsv(const QString& path, const QAbstractItemModel* model, const
     in.open(QIODevice::ReadOnly);
     return in.readAll();
 }
+
+//! Accepts the first byte_limit bytes, then fails every write.
+class FailingDevice : public QIODevice
+{
+public:
+    explicit FailingDevice(qint64 byte_limit) : m_limit(byte_limit) {}
+    qint64 written() const { return m_written; }
+
+protected:
+    qint64 readData(char*, qint64) override { return -1; }
+    qint64 writeData(const char*, qint64 len) override
+    {
+        if (m_written + len > m_limit) return -1;
+        m_written += len;
+        return len;
+    }
+
+private:
+    const qint64 m_limit;
+    qint64 m_written{0};
+};
+
+//! Counts model reads; read only from the test (GUI) thread.
+class CountingModel : public QStandardItemModel
+{
+public:
+    using QStandardItemModel::QStandardItemModel;
+    mutable int reads{0};
+    QVariant data(const QModelIndex& index, int role) const override
+    {
+        ++reads;
+        return QStandardItemModel::data(index, role);
+    }
+};
 
 QList<QVariant> HostileValues()
 {
@@ -134,6 +169,38 @@ void CSVModelWriterTests::emptyAndNullModels()
     QCOMPARE(WriterCsv(dir.filePath("null.csv"), nullptr, columns, &ok),
              LegacyCsv(dir.filePath("null-old.csv"), nullptr, columns));
     QVERIFY(ok);
+}
+
+void CSVModelWriterTests::zeroColumns()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    QStandardItemModel model(5, 2);
+    const QList<Column> columns;
+    bool ok{false};
+    QCOMPARE(WriterCsv(dir.filePath("zero.csv"), &model, columns, &ok),
+             LegacyCsv(dir.filePath("zero-old.csv"), &model, columns));
+    QVERIFY(ok);
+}
+
+void CSVModelWriterTests::deviceFailureAfterFirstBatchStopsEarly()
+{
+    const int rows = 6 * CSVModelWriter::BATCH_ROWS;
+    CountingModel model(rows, 1);
+    for (int r = 0; r < rows; ++r) model.setData(model.index(r, 0), QStringLiteral("value %1").arg(r), Qt::EditRole);
+    model.reads = 0;
+
+    // Room for roughly one formatted batch: the second batch write fails while
+    // the producer keeps formatting and blocks in Push for the next slot.
+    FailingDevice device(qint64{CSVModelWriter::BATCH_ROWS} * 20);
+    QVERIFY(device.open(QIODevice::WriteOnly));
+    CSVModelWriter writer(QStringLiteral("unused"));
+    writer.setModel(&model);
+    writer.addColumn(QStringLiteral("Value"), 0);
+    QVERIFY(!writer.write(device));
+    QVERIFY(device.written() > 0);
+    // The producer stops after the failure instead of reading every row.
+    QVERIFY2(model.reads < rows, qPrintable(QStringLiteral("reads=%1 rows=%2").arg(model.reads).arg(rows)));
 }
 
 void CSVModelWriterTests::unwritablePathFails()

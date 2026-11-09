@@ -4,8 +4,11 @@
 
 #include <qt/csvmodelwriter.h>
 
+#include <util/thread.h>
+
 #include <QAbstractItemModel>
 #include <QFile>
+#include <QIODevice>
 #include <QTextStream>
 
 #include <condition_variable>
@@ -27,11 +30,12 @@ void AppendValue(QString& out, const QString& value)
     out += QLatin1Char('"');
 }
 
-/** Single writer thread fed by a queue bounded to one pending batch. */
+/** Single named writer thread fed by a queue bounded to one pending batch. */
 class BatchWriter
 {
 public:
-    explicit BatchWriter(QFile& file) : m_thread([this, &file] { Run(file); }) {}
+    explicit BatchWriter(QIODevice& device)
+        : m_thread(&util::TraceThread, "csvexport", [this, &device] { Run(device); }) {}
     ~BatchWriter() { Finish(); }
 
     //! Queue one formatted batch. Returns false once the writer has failed.
@@ -58,11 +62,11 @@ public:
     }
 
 private:
-    void Run(QFile& file)
+    void Run(QIODevice& device)
     {
         // Text mode keeps the legacy line-ending translation; the stream is
         // flushed after every batch so a write error is seen promptly.
-        QTextStream out(&file);
+        QTextStream out(&device);
         while (true) {
             QString batch;
             {
@@ -75,7 +79,7 @@ private:
             m_space.notify_one();
             out << batch;
             out.flush();
-            if (out.status() != QTextStream::Ok || file.error() != QFile::NoError) {
+            if (out.status() != QTextStream::Ok) {
                 std::lock_guard lock{m_mutex};
                 m_failed = true;
                 m_queue.clear();
@@ -121,36 +125,37 @@ bool CSVModelWriter::write()
     QFile file(filename);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
         return false;
-
-    const int numRows = model ? model->rowCount() : 0;
-    bool ok{true};
-    {
-        BatchWriter writer{file};
-        QString batch;
-
-        // Header row
-        for (int i = 0; i < columns.size(); ++i) {
-            if (i != 0) batch += QLatin1Char(',');
-            AppendValue(batch, columns[i].title);
-        }
-        batch += QLatin1Char('\n');
-
-        // Data rows, read here on the model's thread in bounded batches.
-        for (int j = 0; j < numRows; ++j) {
-            for (int i = 0; i < columns.size(); ++i) {
-                if (i != 0) batch += QLatin1Char(',');
-                const QVariant data = model->index(j, columns[i].column).data(columns[i].role);
-                AppendValue(batch, data.toString());
-            }
-            batch += QLatin1Char('\n');
-            if ((j + 1) % BATCH_ROWS == 0) {
-                if (!writer.Push(std::move(batch))) break;
-                batch = QString{};
-            }
-        }
-        if (!batch.isEmpty()) writer.Push(std::move(batch));
-        ok = writer.Finish();
-    }
+    const bool ok = write(file);
     file.close();
     return ok && file.error() == QFile::NoError;
+}
+
+bool CSVModelWriter::write(QIODevice& device)
+{
+    const int numRows = model ? model->rowCount() : 0;
+    BatchWriter writer{device};
+    QString batch;
+
+    // Header row
+    for (int i = 0; i < columns.size(); ++i) {
+        if (i != 0) batch += QLatin1Char(',');
+        AppendValue(batch, columns[i].title);
+    }
+    batch += QLatin1Char('\n');
+
+    // Data rows, read here on the model's thread in bounded batches.
+    for (int j = 0; j < numRows; ++j) {
+        for (int i = 0; i < columns.size(); ++i) {
+            if (i != 0) batch += QLatin1Char(',');
+            const QVariant data = model->index(j, columns[i].column).data(columns[i].role);
+            AppendValue(batch, data.toString());
+        }
+        batch += QLatin1Char('\n');
+        if ((j + 1) % BATCH_ROWS == 0) {
+            if (!writer.Push(std::move(batch))) break;
+            batch = QString{};
+        }
+    }
+    if (!batch.isEmpty()) writer.Push(std::move(batch));
+    return writer.Finish();
 }

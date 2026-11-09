@@ -16,6 +16,8 @@ private Q_SLOTS:
     void hostileValuesMatchLegacyBytes();
     void batchBoundariesMatchLegacyBytes();
     void emptyAndNullModels();
+    void zeroColumns();
+    void deviceFailureAfterFirstBatchStopsEarly();
     void unwritablePathFails();
 };
 

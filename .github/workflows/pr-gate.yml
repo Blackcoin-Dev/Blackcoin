@@ -161,6 +161,7 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/actionlint_1.7.9_linux_amd64.tar.gz"
           curl --location --fail --silent --show-error \
+            --retry 6 --retry-max-time 120 \
             https://github.com/rhysd/actionlint/releases/download/v1.7.9/actionlint_1.7.9_linux_amd64.tar.gz \
             --output "$archive"
           echo '233b280d05e100837f4af1433c7b40a5dcb306e3aa68fb4f17f8a7f45a7df7b4  '"$archive" |

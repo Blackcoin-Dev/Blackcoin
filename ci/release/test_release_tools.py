@@ -8,6 +8,7 @@ import copy
 import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -1720,6 +1721,59 @@ class ReleaseToolTests(unittest.TestCase):
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, release)
+
+    def test_mixed_version_release_fetch_retries_only_transient_failures(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        error = builder.urllib.error
+
+        def http_error(code):
+            return error.HTTPError("https://example.invalid/a.tar.gz", code, "status", {}, None)
+
+        class Response(io.BytesIO):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "release.tar.gz"
+            archive.write_bytes(b"stale partial bytes from an earlier attempt")
+            delays = []
+            class Truncated(io.BytesIO):
+                def read(self, *args):
+                    raise builder.http.client.IncompleteRead(b"partial")
+
+            outcomes = [http_error(504), error.URLError("reset"), Truncated(b""), Response(b"verified bytes")]
+
+            def urlopen(request, timeout):
+                self.assertEqual(timeout, builder.RELEASE_FETCH_TIMEOUT)
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+            with mock.patch.object(builder.urllib.request, "urlopen", side_effect=urlopen), \
+                 mock.patch("builtins.print"):
+                builder.fetch_release_archive("request", archive, sleep=delays.append)
+            self.assertEqual(archive.read_bytes(), b"verified bytes")
+            self.assertEqual(delays, [1, 2, 4])
+
+            for code in (403, 404):
+                with self.subTest(code=code):
+                    delays.clear()
+                    with mock.patch.object(builder.urllib.request, "urlopen",
+                                           side_effect=http_error(code)) as opened, \
+                         mock.patch("builtins.print"):
+                        with self.assertRaises(error.HTTPError):
+                            builder.fetch_release_archive("request", archive, sleep=delays.append)
+                    self.assertEqual(opened.call_count, 1)
+                    self.assertEqual(delays, [])
+
+            delays.clear()
+            with mock.patch.object(builder.urllib.request, "urlopen",
+                                   side_effect=http_error(504)) as opened, \
+                 mock.patch("builtins.print"):
+                with self.assertRaises(error.HTTPError):
+                    builder.fetch_release_archive("request", archive, sleep=delays.append)
+            self.assertEqual(opened.call_count, builder.RELEASE_FETCH_ATTEMPTS)
+            self.assertEqual(delays, [1, 2, 4, 8, 16])
 
     def test_mixed_version_command_runner_executes_all_commands(self):
         builder = load_mixed_version_module("build_previous_releases")

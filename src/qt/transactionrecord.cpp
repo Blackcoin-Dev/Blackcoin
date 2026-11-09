@@ -314,6 +314,7 @@ void TransactionRecord::updateStatus(const interfaces::WalletTxStatus& wtx, cons
         wtx.time_received,
         idx,
         typesort);
+    m_sort_keys_valid = false;
     status.countsForBalance = wtx.is_trusted && !(wtx.blocks_to_maturity > 0);
     status.depth = wtx.depth_in_main_chain;
     status.m_cur_block_hash = block_hash;
@@ -376,4 +377,23 @@ QString TransactionRecord::getTxHash() const
 int TransactionRecord::getOutputIndex() const
 {
     return idx;
+}
+
+void TransactionRecord::buildSortKeys() const
+{
+    m_status_sort_key = QString::fromStdString(status.sortKey);
+    m_date_sort_key = QString::fromStdString(strprintf("%020s-%s", time, status.sortKey));
+    m_sort_keys_valid = true;
+}
+
+const QString& TransactionRecord::statusSortKey() const
+{
+    if (!m_sort_keys_valid) buildSortKeys();
+    return m_status_sort_key;
+}
+
+const QString& TransactionRecord::dateSortKey() const
+{
+    if (!m_sort_keys_valid) buildSortKeys();
+    return m_date_sort_key;
 }

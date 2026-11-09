@@ -133,6 +133,18 @@ public:
     /** Return whether a status update is needed.
      */
     bool statusUpdateNeeded(const uint256& block_hash) const;
+
+    /** Sort keys for the Status and Date columns. Built once per status update
+        instead of on every comparison of an initial table sort; the strings are
+        identical to formatting status.sortKey on demand. */
+    const QString& statusSortKey() const;
+    const QString& dateSortKey() const;
+
+private:
+    mutable QString m_status_sort_key;
+    mutable QString m_date_sort_key;
+    mutable bool m_sort_keys_valid{false};
+    void buildSortKeys() const;
 };
 
 #endif // BITCOIN_QT_TRANSACTIONRECORD_H

@@ -678,9 +678,9 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
         // Edit role is used for sorting, so return the unformatted values
         switch (column) {
         case Status:
-            return QString::fromStdString(rec->status.sortKey);
+            return rec->statusSortKey();
         case Date:
-            return QString::fromStdString(strprintf("%020s-%s", rec->time, rec->status.sortKey));
+            return rec->dateSortKey();
         case Type:
             return formatTxType(rec);
         case Watchonly:

@@ -29,63 +29,57 @@ void CSVModelWriter::addColumn(const QString &title, int column, int role)
     columns.append(col);
 }
 
-static void writeValue(QTextStream &f, const QString &value)
+static void appendValue(QString& out, const QString& value)
 {
-    QString escaped = value;
-    escaped.replace('"', "\"\"");
-    f << "\"" << escaped << "\"";
+    out += QLatin1Char('"');
+    if (value.contains(QLatin1Char('"'))) {
+        QString escaped = value;
+        escaped.replace(QLatin1Char('"'), QLatin1String("\"\""));
+        out += escaped;
+    } else {
+        out += value;
+    }
+    out += QLatin1Char('"');
 }
 
-static void writeSep(QTextStream &f)
+QString CSVModelWriter::snapshot() const
 {
-    f << ",";
+    const int numRows = model ? model->rowCount() : 0;
+    QString out;
+
+    // Header row
+    for (int i = 0; i < columns.size(); ++i) {
+        if (i != 0) out += QLatin1Char(',');
+        appendValue(out, columns[i].title);
+    }
+    out += QLatin1Char('\n');
+    if (numRows > 0) out.reserve(out.size() * (numRows + 1));
+
+    // Data rows
+    for (int j = 0; j < numRows; ++j) {
+        for (int i = 0; i < columns.size(); ++i) {
+            if (i != 0) out += QLatin1Char(',');
+            const QVariant data = model->index(j, columns[i].column).data(columns[i].role);
+            appendValue(out, data.toString());
+        }
+        out += QLatin1Char('\n');
+    }
+    return out;
 }
 
-static void writeNewline(QTextStream &f)
+bool CSVModelWriter::writeSnapshot(const QString& filename, const QString& csv)
 {
-    f << "\n";
+    QFile file(filename);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return false;
+    QTextStream out(&file);
+    out << csv;
+    out.flush();
+    file.close();
+    return file.error() == QFile::NoError;
 }
 
 bool CSVModelWriter::write()
 {
-    QFile file(filename);
-    if(!file.open(QIODevice::WriteOnly | QIODevice::Text))
-        return false;
-    QTextStream out(&file);
-
-    int numRows = 0;
-    if(model)
-    {
-        numRows = model->rowCount();
-    }
-
-    // Header row
-    for(int i=0; i<columns.size(); ++i)
-    {
-        if(i!=0)
-        {
-            writeSep(out);
-        }
-        writeValue(out, columns[i].title);
-    }
-    writeNewline(out);
-
-    // Data rows
-    for(int j=0; j<numRows; ++j)
-    {
-        for(int i=0; i<columns.size(); ++i)
-        {
-            if(i!=0)
-            {
-                writeSep(out);
-            }
-            QVariant data = model->index(j, columns[i].column).data(columns[i].role);
-            writeValue(out, data.toString());
-        }
-        writeNewline(out);
-    }
-
-    file.close();
-
-    return file.error() == QFile::NoError;
+    return writeSnapshot(filename, snapshot());
 }

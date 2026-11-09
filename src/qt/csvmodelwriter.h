@@ -30,6 +30,17 @@ public:
     */
     bool write();
 
+    /** Read the model on the calling (GUI) thread and return the complete CSV
+        text. This is the only step that touches the model.
+    */
+    QString snapshot() const;
+
+    /** Write CSV text produced by snapshot(). Touches no model or widget, so a
+        caller may run it on a worker thread to keep file I/O off the GUI thread.
+        @returns true on success, false otherwise
+    */
+    static bool writeSnapshot(const QString& filename, const QString& csv);
+
 private:
     QString filename;
     const QAbstractItemModel* model{nullptr};

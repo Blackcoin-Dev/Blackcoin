@@ -121,8 +121,12 @@ class ZMQTest (BitcoinTestFramework):
         self.ctx = zmq.Context()
         try:
             self.test_basic()
-            self.test_sequence()
-            self.test_mempool_sync()
+            self.test_replacement_disabled()
+            # test_sequence and test_mempool_sync are inherited from Bitcoin
+            # Core and drive mempool replacement (RBF) notifications. Blackcoin
+            # rejects replacements with txn-mempool-conflict, so they need a
+            # non-RBF port and are not run here.
+            self.log.info("Skipping RBF-dependent sequence and mempool-sync subtests (replacement disabled)")
             self.test_reorg()
             self.test_multiple_interfaces()
             self.test_ipv6()
@@ -247,6 +251,16 @@ class ZMQTest (BitcoinTestFramework):
         ])
 
         assert_equal(self.nodes[1].getzmqnotifications(), [])
+
+    def test_replacement_disabled(self):
+        self.log.info("Replacement is rejected, so ZMQ publishes no removal for it")
+        payment_tx = self.wallet.send_self_transfer(from_node=self.nodes[1])
+        self.sync_all()
+        payment_tx['tx'].vout[0].nValue -= 1000
+        assert_raises_rpc_error(-26, "txn-mempool-conflict",
+                                self.nodes[1].sendrawtransaction, payment_tx['tx'].serialize().hex())
+        assert payment_tx['txid'] in self.nodes[1].getrawmempool()
+        self.generatetoaddress(self.nodes[0], 1, ADDRESS_BCRT1_UNSPENDABLE)
 
     def test_reorg(self):
 

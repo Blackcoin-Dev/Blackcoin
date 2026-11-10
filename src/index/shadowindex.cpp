@@ -805,7 +805,9 @@ void ShadowIndex::BlockDisconnected(const std::shared_ptr<const CBlock>& block,
     const IndexSummary after = GetSummary();
     if (after.synced && after.best_block_height == pindex->pprev->nHeight &&
         after.best_block_hash == pindex->pprev->GetBlockHash()) {
-        m_revision.fetch_add(1, std::memory_order_release);
+        if (before.best_block_hash != after.best_block_hash) {
+            m_revision.fetch_add(1, std::memory_order_release);
+        }
         if (m_event_stream_suppressed) {
             if (IndexMatchesActiveTip(after)) {
                 m_event_stream_suppressed = false;
@@ -959,25 +961,11 @@ bool ShadowIndex::CustomInit(const std::optional<interfaces::BlockKey>& block)
     return true;
 }
 
-bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
+BaseIndex::AppendResult ShadowIndex::CustomAppendWithStatus(const interfaces::BlockInfo& block)
 {
     if (!block.data || (block.height > 0 && !block.prev_hash)) {
-        return error("%s: missing block data at height %d", __func__, block.height);
-    }
-
-    ShadowIndexBlockRecord existing;
-    if (block.height >= SHADOW_REWARD_START_HEIGHT && m_db->ReadBlock(block.hash, existing)) {
-        return existing.height == block.height && existing.block_hash == block.hash;
-    }
-    if (block.height >= SHADOW_REWARD_START_HEIGHT && m_db->Exists(DBBlockKey{block.hash})) {
-        return error("%s: unreadable shadow block record for %s", __func__, block.hash.ToString());
-    }
-
-    QuantumWitnessBlockUndo existing_witness_undo;
-    const bool witness_block_already_indexed = m_db->Read(
-        DBQuantumWitnessBlockKey{block.hash}, existing_witness_undo);
-    if (!witness_block_already_indexed && m_db->Exists(DBQuantumWitnessBlockKey{block.hash})) {
-        return error("%s: unreadable quantum witness block record for %s", __func__, block.hash.ToString());
+        error("%s: missing block data at height %d", __func__, block.height);
+        return AppendResult::FAILED;
     }
 
     const CBlockIndex* pindex{nullptr};
@@ -989,7 +977,22 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         pindex = m_chainstate->m_blockman.LookupBlockIndex(block.hash);
         if (!pindex || pindex->nHeight != block.height ||
             pindex->GetBlockHash() != block.hash) {
-            return error("%s: block index mismatch for %s", __func__, block.hash.ToString());
+            error("%s: block index mismatch for %s", __func__, block.hash.ToString());
+            return AppendResult::FAILED;
+        }
+        // Validation callbacks and the background sync reader can lag a reorg.
+        // Authenticate membership together with the mutable chainstate reads;
+        // a skipped block must not acquire an index record or advance its tip.
+        if (!m_chainstate->m_chain.Contains(pindex)) return AppendResult::STALE;
+
+        ShadowIndexBlockRecord existing;
+        if (block.height >= SHADOW_REWARD_START_HEIGHT && m_db->ReadBlock(block.hash, existing)) {
+            return existing.height == block.height && existing.block_hash == block.hash
+                ? AppendResult::APPLIED : AppendResult::FAILED;
+        }
+        if (block.height >= SHADOW_REWARD_START_HEIGHT && m_db->Exists(DBBlockKey{block.hash})) {
+            error("%s: unreadable shadow block record for %s", __func__, block.hash.ToString());
+            return AppendResult::FAILED;
         }
         block_mtp = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
         if (block.height >= SHADOW_REWARD_START_HEIGHT) {
@@ -998,10 +1001,26 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
             if (PrepareShadowPowClaimAccounting(m_chainstate->CoinsTip(), *block.data, pindex,
                                                 pow_accounting_context) !=
                 ShadowPowAccountingResult::OK) {
-                return error("%s: unable to authenticate POW claim context for %s",
-                             __func__, block.hash.ToString());
+                error("%s: unable to authenticate POW claim context for %s",
+                      __func__, block.hash.ToString());
+                return AppendResult::FAILED;
             }
         }
+    }
+    return AppendPrepared(block, pindex, block_mtp, payouts, pow_accounting_context)
+        ? AppendResult::APPLIED : AppendResult::FAILED;
+}
+
+bool ShadowIndex::AppendPrepared(const interfaces::BlockInfo& block, const CBlockIndex* pindex,
+                                int64_t block_mtp,
+                                const std::vector<ShadowSyntheticPayoutTransaction>& payouts,
+                                const ShadowPowAccountingContext& pow_accounting_context)
+{
+    QuantumWitnessBlockUndo existing_witness_undo;
+    const bool witness_block_already_indexed = m_db->Read(
+        DBQuantumWitnessBlockKey{block.hash}, existing_witness_undo);
+    if (!witness_block_already_indexed && m_db->Exists(DBQuantumWitnessBlockKey{block.hash})) {
+        return error("%s: unreadable quantum witness block record for %s", __func__, block.hash.ToString());
     }
 
     // Preparing the immutable context above performs no Argon2 work. Read undo

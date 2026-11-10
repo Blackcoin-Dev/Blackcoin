@@ -121,6 +121,16 @@ protected:
     /// Initialize internal state from the database and block index.
     [[nodiscard]] virtual bool CustomInit(const std::optional<interfaces::BlockKey>& block) { return true; }
 
+    enum class AppendResult { APPLIED, STALE, FAILED };
+
+    /** A stale candidate writes nothing and must not advance the index tip.
+     * Indexes that only consume immutable block/undo data keep their existing
+     * bool append contract through this default adapter. */
+    [[nodiscard]] virtual AppendResult CustomAppendWithStatus(const interfaces::BlockInfo& block)
+    {
+        return CustomAppend(block) ? AppendResult::APPLIED : AppendResult::FAILED;
+    }
+
     /// Write update index entries for a newly connected block.
     [[nodiscard]] virtual bool CustomAppend(const interfaces::BlockInfo& block) { return true; }
 

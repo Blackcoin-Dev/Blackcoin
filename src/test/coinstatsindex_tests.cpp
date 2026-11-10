@@ -10,9 +10,11 @@
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <dbwrapper.h>
+#include <hash.h>
 #include <index/coinstatsindex.h>
 #include <index/shadowindex.h>
 #include <interfaces/chain.h>
+#include <kernel/chain.h>
 #include <kernel/coinstats.h>
 #include <pow.h>
 #include <shadow.h>
@@ -23,7 +25,10 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <cstddef>
 #include <limits>
 #include <memory>
@@ -44,6 +49,16 @@ struct ShadowIndexTestAccess
     }
 
     static CDBWrapper& Database(ShadowIndex& index) { return index.GetDB(); }
+
+    static void Commit(ShadowIndex& index, const CBlockIndex* tip)
+    {
+        index.ChainStateFlushed(ChainstateRole::NORMAL, GetLocator(tip));
+    }
+
+    static bool AppendReturnsError(ShadowIndex& index, const CBlock& block, const CBlockIndex* pindex)
+    {
+        return index.CustomAppendWithStatus(kernel::MakeBlockInfo(pindex, &block)) == ShadowIndex::AppendResult::FAILED;
+    }
 };
 
 namespace {
@@ -89,6 +104,274 @@ IndexRows ReadIndexRows(ShadowIndex& index)
     }
     return rows;
 }
+
+/** Callbacks own their state. Destruction releases a blocked callback even
+ * when a test assertion throws before the index is stopped. */
+class IndexCallbackBarrier
+{
+    struct State {
+        std::promise<void> entered;
+        std::promise<void> release;
+        std::future<void> entered_future{entered.get_future()};
+        std::shared_future<void> release_future{release.get_future().share()};
+        std::atomic<bool> used{false};
+        std::atomic<bool> released{false};
+        std::atomic<bool> timed_out{false};
+    };
+    std::shared_ptr<State> m_state{std::make_shared<State>()};
+
+public:
+    ~IndexCallbackBarrier() { Release(); }
+    std::function<void()> Callback() const
+    {
+        return [state = m_state] {
+            if (state->used.exchange(true)) return;
+            state->entered.set_value();
+            if (state->release_future.wait_for(std::chrono::seconds{30}) != std::future_status::ready) {
+                state->timed_out.store(true);
+            }
+        };
+    }
+    bool Wait() { return m_state->entered_future.wait_for(std::chrono::seconds{10}) == std::future_status::ready; }
+    void Release()
+    {
+        if (!m_state->released.exchange(true)) m_state->release.set_value();
+    }
+    bool TimedOut() const { return m_state->timed_out.load(); }
+};
+
+/** Stop while the complete derived index and its callback captures live.
+ * Unregistering alone does not wait for an already executing callback. */
+class ScopedIndexStop
+{
+    BaseIndex& m_index;
+    IndexCallbackBarrier* m_barrier;
+    bool m_stopped{false};
+
+public:
+    explicit ScopedIndexStop(BaseIndex& index, IndexCallbackBarrier* barrier = nullptr)
+        : m_index{index}, m_barrier{barrier} {}
+    ~ScopedIndexStop() { Stop(); }
+    void Stop()
+    {
+        if (m_stopped) return;
+        if (m_barrier) m_barrier->Release();
+        m_index.Interrupt();
+        SyncWithValidationInterfaceQueue();
+        m_index.Stop();
+        m_stopped = true;
+    }
+};
+
+// This regression uses only the original ShadowIndex API. The identical
+// fixture is applied to the unchanged release source for the baseline run.
+class ShadowIndexQueuedTestingSetup : public BoundedShadowIndexTestingSetup
+{
+public:
+    void CheckQueuedReorg(bool replacement)
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        Chainstate& chainstate = chainman.ActiveChainstate();
+        const CScript old_script = GetScriptForDestination(WitnessUnknown{2, std::vector<unsigned char>(32, 0x64)});
+        const CScript new_script = GetScriptForDestination(WitnessUnknown{2, std::vector<unsigned char>(32, 0x65)});
+        IndexRows recovered_rows;
+        const CBlockIndex* active_tip{nullptr};
+        {
+            std::vector<uint256> connected_events;
+            ShadowIndex index{interfaces::MakeChain(m_node), 1 << 20, false, false,
+                [&](bool connected, const ShadowIndexBlockEvent& event) {
+                    if (connected) connected_events.push_back(event.block_hash);
+                }};
+            IndexCallbackBarrier barrier;
+            ScopedIndexStop stop_index{index, &barrier};
+            BOOST_REQUIRE(index.Init());
+            BOOST_REQUIRE(index.StartBackgroundSync());
+            IndexWaitSynced(index);
+            SyncWithValidationInterfaceQueue();
+            CallFunctionInValidationInterfaceQueue(barrier.Callback());
+            BOOST_REQUIRE(barrier.Wait());
+            const CBlock old_block = CreateAndProcessBlock({}, old_script);
+            CBlockIndex* invalidated = WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(old_block.GetHash()));
+            BOOST_REQUIRE(invalidated);
+            BlockValidationState state;
+            BOOST_REQUIRE(chainstate.InvalidateBlock(state, invalidated));
+            BOOST_REQUIRE_MESSAGE(state.IsValid(), state.ToString());
+            if (replacement) CreateAndProcessBlock({}, new_script);
+            active_tip = WITH_LOCK(cs_main, return chainstate.m_chain.Tip());
+            // One old connect, one disconnect, one replacement keeps the
+            // paused queue below validation's ten-callback drain threshold.
+            barrier.Release();
+            SyncWithValidationInterfaceQueue();
+            BOOST_REQUIRE(!barrier.TimedOut());
+            BOOST_REQUIRE_EQUAL(m_node.exit_status.load(), EXIT_SUCCESS);
+            BOOST_CHECK(index.GetSummary().best_block_hash == active_tip->GetBlockHash());
+            ShadowIndexBlockRecord removed;
+            BOOST_CHECK(!index.LookupBlock(old_block.GetHash(), removed));
+            BOOST_CHECK(std::find(connected_events.begin(), connected_events.end(), old_block.GetHash()) == connected_events.end());
+            const CBlock next = CreateAndProcessBlock({}, new_script);
+            SyncWithValidationInterfaceQueue();
+            active_tip = WITH_LOCK(cs_main, return chainstate.m_chain.Tip());
+            BOOST_CHECK(index.GetSummary().best_block_hash == next.GetHash());
+            BOOST_REQUIRE(!connected_events.empty());
+            BOOST_CHECK(connected_events.back() == next.GetHash());
+            ShadowIndexTestAccess::Commit(index, active_tip);
+            stop_index.Stop();
+            recovered_rows = ReadIndexRows(index);
+        }
+        {
+            ShadowIndex restarted{interfaces::MakeChain(m_node), 1 << 20};
+            ScopedIndexStop stop_restarted{restarted};
+            BOOST_REQUIRE(restarted.Init());
+            BOOST_REQUIRE(restarted.StartBackgroundSync());
+            IndexWaitSynced(restarted);
+            SyncWithValidationInterfaceQueue();
+            BOOST_CHECK(restarted.GetSummary().best_block_hash == active_tip->GetBlockHash());
+            stop_restarted.Stop();
+            BOOST_CHECK(ReadIndexRows(restarted) == recovered_rows);
+        }
+        ShadowIndex clean{interfaces::MakeChain(m_node), 1 << 20, true, true};
+        ScopedIndexStop stop_clean{clean};
+        BOOST_REQUIRE(clean.Init());
+        BOOST_REQUIRE(clean.StartBackgroundSync());
+        IndexWaitSynced(clean);
+        SyncWithValidationInterfaceQueue();
+        stop_clean.Stop();
+        BOOST_CHECK(ReadIndexRows(clean) == recovered_rows);
+    }
+};
+
+class BarrierShadowIndex : public ShadowIndex
+{
+    int m_pause_height{-1};
+    bool m_after{false};
+    std::function<void()> m_pause;
+
+protected:
+    AppendResult CustomAppendWithStatus(const interfaces::BlockInfo& block) override
+    {
+        if (!m_after && block.height == m_pause_height) m_pause();
+        return ShadowIndex::CustomAppendWithStatus(block);
+    }
+    bool AppendPrepared(const interfaces::BlockInfo& block, const CBlockIndex* pindex,
+                        int64_t block_mtp,
+                        const std::vector<ShadowSyntheticPayoutTransaction>& payouts,
+                        const ShadowPowAccountingContext& context) override
+    {
+        if (m_after && block.height == m_pause_height) m_pause();
+        return ShadowIndex::AppendPrepared(block, pindex, block_mtp, payouts, context);
+    }
+
+public:
+    using ShadowIndex::ShadowIndex;
+    void PauseAt(int height, bool after, std::function<void()> pause)
+    {
+        m_pause_height = height;
+        m_after = after;
+        m_pause = std::move(pause);
+    }
+};
+
+class ShadowIndexStaleTestingSetup : public BoundedShadowIndexTestingSetup
+{
+public:
+    void CheckReorg(bool after_snapshot, bool background, bool replacement)
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        Chainstate& chainstate = chainman.ActiveChainstate();
+        const CScript old_script = GetScriptForDestination(WitnessUnknown{2, std::vector<unsigned char>(32, 0x61)});
+        const CScript new_script = GetScriptForDestination(WitnessUnknown{2, std::vector<unsigned char>(32, 0x62)});
+        std::vector<CBlock> old_blocks;
+        if (background) {
+            for (int i = 0; i < 3; ++i) old_blocks.push_back(CreateAndProcessBlock({}, old_script));
+            SyncWithValidationInterfaceQueue();
+        }
+
+        IndexRows recovered_rows;
+        const CBlockIndex* active_tip{nullptr};
+        {
+            std::vector<uint256> connected_events;
+            BarrierShadowIndex index{interfaces::MakeChain(m_node), 1 << 20, false, false,
+                [&](bool connected, const ShadowIndexBlockEvent& event) {
+                    if (connected) connected_events.push_back(event.block_hash);
+                }};
+            IndexCallbackBarrier barrier;
+            ScopedIndexStop stop_index{index, &barrier};
+            BOOST_REQUIRE(index.Init());
+            if (background || after_snapshot) {
+                // Background sync has already written height101 when its
+                // selected height102 is invalidated before its snapshot.
+                const int pause_height = SHADOW_REWARD_START_HEIGHT + (background ? 1 : 0);
+                index.PauseAt(pause_height, after_snapshot, barrier.Callback());
+            }
+            BOOST_REQUIRE(index.StartBackgroundSync());
+            if (!background) {
+                IndexWaitSynced(index);
+                SyncWithValidationInterfaceQueue();
+                if (!after_snapshot) {
+                    CallFunctionInValidationInterfaceQueue(barrier.Callback());
+                    BOOST_REQUIRE(barrier.Wait());
+                }
+                old_blocks.push_back(CreateAndProcessBlock({}, old_script));
+                if (after_snapshot) BOOST_REQUIRE(barrier.Wait());
+            } else {
+                BOOST_REQUIRE(barrier.Wait());
+            }
+
+            CBlockIndex* invalidated = WITH_LOCK(cs_main, return chainman.m_blockman.LookupBlockIndex(old_blocks.front().GetHash()));
+            BOOST_REQUIRE(invalidated);
+            BlockValidationState state;
+            BOOST_REQUIRE(chainstate.InvalidateBlock(state, invalidated));
+            BOOST_REQUIRE_MESSAGE(state.IsValid(), state.ToString());
+            if (replacement) {
+                for (int i = 0; i < (background ? 3 : 1); ++i) CreateAndProcessBlock({}, new_script);
+            }
+            if (background) {
+                // Drain notifications while m_synced is still false; only
+                // ThreadSync can reconcile this branch switch or shrink.
+                SyncWithValidationInterfaceQueue();
+            }
+            active_tip = WITH_LOCK(cs_main, return chainstate.m_chain.Tip());
+            barrier.Release();
+            IndexWaitSynced(index);
+            SyncWithValidationInterfaceQueue();
+            BOOST_CHECK(!barrier.TimedOut());
+            BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_SUCCESS);
+            BOOST_CHECK(index.GetSummary().best_block_hash == active_tip->GetBlockHash());
+            BOOST_CHECK_EQUAL(index.GetSummary().best_block_height, active_tip->nHeight);
+            for (const CBlock& old : old_blocks) {
+                ShadowIndexBlockRecord removed;
+                BOOST_CHECK(!index.LookupBlock(old.GetHash(), removed));
+                if (!after_snapshot) {
+                    BOOST_CHECK(std::find(connected_events.begin(), connected_events.end(), old.GetHash()) == connected_events.end());
+                }
+            }
+            ShadowIndexTestAccess::Commit(index, active_tip);
+            stop_index.Stop();
+            recovered_rows = ReadIndexRows(index);
+        }
+        {
+            ShadowIndex restarted{interfaces::MakeChain(m_node), 1 << 20};
+            ScopedIndexStop stop_restarted{restarted};
+            BOOST_REQUIRE(restarted.Init());
+            BOOST_REQUIRE(restarted.StartBackgroundSync());
+            IndexWaitSynced(restarted);
+            SyncWithValidationInterfaceQueue();
+            BOOST_CHECK(restarted.GetSummary().best_block_hash == active_tip->GetBlockHash());
+            stop_restarted.Stop();
+            BOOST_CHECK(ReadIndexRows(restarted) == recovered_rows);
+        }
+        ShadowIndex clean{interfaces::MakeChain(m_node), 1 << 20, true, true};
+        ScopedIndexStop stop_clean{clean};
+        BOOST_REQUIRE(clean.Init());
+        BOOST_REQUIRE(clean.StartBackgroundSync());
+        IndexWaitSynced(clean);
+        SyncWithValidationInterfaceQueue();
+        stop_clean.Stop();
+        // All records, undo, supply rows, witness rows and persisted locator
+        // must match a fresh index on the replacement branch or shortened tip.
+        BOOST_CHECK(ReadIndexRows(clean) == recovered_rows);
+    }
+};
 
 struct InterruptedShadowRewind {};
 
@@ -232,6 +515,67 @@ public:
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(coinstatsindex_tests)
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_queued_stale_connect_reconciles, ShadowIndexQueuedTestingSetup)
+{
+    CheckQueuedReorg(/*replacement=*/true);
+}
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_queued_disconnect_only_reconciles, ShadowIndexQueuedTestingSetup)
+{
+    CheckQueuedReorg(/*replacement=*/false);
+}
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_reorg_after_snapshot_reconciles, ShadowIndexStaleTestingSetup)
+{
+    CheckReorg(/*after_snapshot=*/true, /*background=*/false, /*replacement=*/true);
+}
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_background_stale_selection_reconciles, ShadowIndexStaleTestingSetup)
+{
+    CheckReorg(/*after_snapshot=*/false, /*background=*/true, /*replacement=*/true);
+}
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_background_disconnect_only_reconciles, ShadowIndexStaleTestingSetup)
+{
+    CheckReorg(/*after_snapshot=*/false, /*background=*/true, /*replacement=*/false);
+}
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_active_corruption_remains_error, BoundedShadowIndexTestingSetup)
+{
+    Chainstate& chainstate = Assert(m_node.chainman)->ActiveChainstate();
+    ShadowIndex index{interfaces::MakeChain(m_node), 1 << 20};
+    ScopedIndexStop stop_index{index};
+    BOOST_REQUIRE(index.Init());
+    BOOST_REQUIRE(index.StartBackgroundSync());
+    IndexWaitSynced(index);
+    SyncWithValidationInterfaceQueue();
+    stop_index.Stop();
+    const IndexRows before = ReadIndexRows(index);
+    const CScript script = GetScriptForDestination(WitnessUnknown{2, std::vector<unsigned char>(32, 0x63)});
+    const CBlock block = CreateAndProcessBlock({}, script);
+    const CBlockIndex* tip = WITH_LOCK(cs_main, return chainstate.m_chain.Tip());
+    BOOST_REQUIRE(tip->GetBlockHash() == block.GetHash());
+    bool append_error{false};
+    {
+        LOCK(cs_main);
+        CHashWriter writer;
+        writer << std::string("Quantum Quasar Shadow Pool Undo") << tip->nHeight << tip->GetBlockHash();
+        const COutPoint undo_outpoint{writer.GetHash(), 0};
+        Coin original;
+        BOOST_REQUIRE(chainstate.CoinsTip().GetCoin(undo_outpoint, original));
+        Coin corrupt{original};
+        ++corrupt.nTime;
+        BOOST_REQUIRE(chainstate.CoinsTip().SpendCoin(undo_outpoint));
+        chainstate.CoinsTip().AddCoin(undo_outpoint, std::move(corrupt), true);
+        append_error = ShadowIndexTestAccess::AppendReturnsError(index, block, tip);
+        chainstate.CoinsTip().SpendCoin(undo_outpoint);
+        chainstate.CoinsTip().AddCoin(undo_outpoint, std::move(original), true);
+    }
+    BOOST_CHECK(append_error);
+    BOOST_CHECK(ReadIndexRows(index) == before);
+    BOOST_CHECK_EQUAL(index.GetSummary().best_block_height, SHADOW_REWARD_START_HEIGHT - 1);
+}
 
 BOOST_FIXTURE_TEST_CASE(shadowindex_interrupted_single_block_rewind_recovers, ShadowIndexRewindTestingSetup)
 {

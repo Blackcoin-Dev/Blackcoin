@@ -4,6 +4,8 @@
 
 #include <qt/transactiontablemodel.h>
 
+#include <unordered_map>
+
 #include <qt/addresstablemodel.h>
 #include <qt/bitcoinunits.h>
 #include <qt/clientmodel.h>
@@ -21,8 +23,10 @@
 #include <sync.h>
 #include <tinyformat.h>
 #include <uint256.h>
+#include <util/strencodings.h>
 
 #include <algorithm>
+#include <cctype>
 #include <deque>
 #include <iterator>
 #include <map>
@@ -91,6 +95,14 @@ public:
 
     //! Local cache of wallet sorted by transaction hash
     QList<TransactionRecord> cachedWallet;
+    //! Identity -> record. Qt 5's QList stores a large or non-movable element out of line, so the pointers stay valid
+    //! while other rows come and go; only erasing a record invalidates its own entry. A QList that stores elements
+    //! inline (Qt 6) would leave these pointers dangling on any insert or erase, so refuse to build then.
+    static_assert(QT_VERSION < QT_VERSION_CHECK(6, 0, 0) && (QTypeInfo<TransactionRecord>::isLarge || QTypeInfo<TransactionRecord>::isStatic),
+                  "m_by_id relies on QList storing TransactionRecord out of line");
+    std::unordered_map<uint64_t, TransactionRecord*> m_by_id;
+    void Register(TransactionRecord& record) { m_by_id[record.presentation_id] = &record; }
+    TransactionRecord* FindById(uint64_t id) const { const auto found = m_by_id.find(id); return found == m_by_id.end() ? nullptr : found->second; }
     uint64_t m_next_row_id{1};
     void AssignIdentity(TransactionRecord& row)
     {
@@ -121,6 +133,16 @@ public:
     void PostDrain();
     void DrainPendingUpdates();
 
+    //! Decoding an address (base58 or bech32 checksum) dominates a label lookup; decoding is a pure function of
+    //! the string, so remembering it needs no invalidation. Bounded so a huge history cannot grow it without limit.
+    std::unordered_map<std::string, CTxDestination> m_decoded;
+    const CTxDestination& Destination(const std::string& address)
+    {
+        const auto found = m_decoded.find(address);
+        if (found != m_decoded.end()) return found->second;
+        if (m_decoded.size() >= 500000) m_decoded.clear();
+        return m_decoded.emplace(address, DecodeDestination(address)).first->second;
+    }
     QString LabelForAddress(const TransactionRecord& record);
     void ForgetLabelRow(const TransactionRecord& record);
     void NotifyChangedLabelRows();
@@ -142,6 +164,22 @@ public:
     std::set<CTxDestination> m_pending_labels;
     bool m_label_refresh_scheduled{false};
     std::set<CTxDestination> m_changed_labels;
+
+    //! Insert one transaction's records at a hash-ordered position with fresh identities.
+    void InsertGroup(int lowerIndex, QList<TransactionRecord> toInsert)
+    {
+        if (toInsert.isEmpty()) return; /* only if something to insert */
+        for (auto& record : toInsert) AssignIdentity(record);
+        parent->beginInsertRows(QModelIndex(), lowerIndex, lowerIndex+toInsert.size()-1);
+        int insert_idx = lowerIndex;
+        for (const TransactionRecord &rec : toInsert)
+        {
+            cachedWallet.insert(insert_idx, rec);
+            Register(cachedWallet[insert_idx]);
+            insert_idx += 1;
+        }
+        parent->endInsertRows();
+    }
 
     /* Update our model of the wallet incrementally, to synchronize our model of the wallet
        with that of the core.
@@ -186,20 +224,7 @@ public:
             if(showTransaction && wtx.tx)
             {
                 // Added -- insert at the right position
-                QList<TransactionRecord> toInsert =
-                        TransactionRecord::decomposeTransaction(wtx);
-                if(!toInsert.isEmpty()) /* only if something to insert */
-                {
-                    for (auto& record : toInsert) AssignIdentity(record);
-                    parent->beginInsertRows(QModelIndex(), lowerIndex, lowerIndex+toInsert.size()-1);
-                    int insert_idx = lowerIndex;
-                    for (const TransactionRecord &rec : toInsert)
-                    {
-                        cachedWallet.insert(insert_idx, rec);
-                        insert_idx += 1;
-                    }
-                    parent->endInsertRows();
-                }
+                InsertGroup(lowerIndex, TransactionRecord::decomposeTransaction(wtx));
             }
             break;
         case CT_DELETED:
@@ -212,6 +237,7 @@ public:
             parent->beginRemoveRows(QModelIndex(), lowerIndex, upperIndex-1);
             for (auto entry = lower; entry != upper; ++entry) {
                 ForgetLabelRow(*entry);
+                m_by_id.erase(entry->presentation_id);
             }
             cachedWallet.erase(lower, upper);
             parent->endRemoveRows();
@@ -232,20 +258,23 @@ public:
         return cachedWallet.size();
     }
 
+    //! If a status update is needed (blocks came in since last check), try to update the status of this
+    //! transaction from the wallet. Otherwise, simply re-use the cached status.
+    static void RefreshStatus(interfaces::Wallet& wallet, const uint256& cur_block_hash, TransactionRecord* rec)
+    {
+        interfaces::WalletTxStatus wtx;
+        int numBlocks;
+        int64_t block_time;
+        if (!cur_block_hash.IsNull() && rec->statusUpdateNeeded(cur_block_hash) && wallet.tryGetTxStatus(rec->hash, wtx, numBlocks, block_time)) {
+            rec->updateStatus(wtx, cur_block_hash, numBlocks, block_time);
+        }
+    }
+
     TransactionRecord* index(interfaces::Wallet& wallet, const uint256& cur_block_hash, const int idx)
     {
         if (idx >= 0 && idx < cachedWallet.size()) {
             TransactionRecord *rec = &cachedWallet[idx];
-
-            // If a status update is needed (blocks came in since last check),
-            // try to update the status of this transaction from the wallet.
-            // Otherwise, simply re-use the cached status.
-            interfaces::WalletTxStatus wtx;
-            int numBlocks;
-            int64_t block_time;
-            if (!cur_block_hash.IsNull() && rec->statusUpdateNeeded(cur_block_hash) && wallet.tryGetTxStatus(rec->hash, wtx, numBlocks, block_time)) {
-                rec->updateStatus(wtx, cur_block_hash, numBlocks, block_time);
-            }
+            RefreshStatus(wallet, cur_block_hash, rec);
             return rec;
         }
         return nullptr;
@@ -283,7 +312,10 @@ TransactionTableModel::TransactionTableModel(const PlatformStyle* _platformStyle
             if (TransactionRecord::showTransaction(tx)) {
                 auto rows = TransactionRecord::decomposeTransaction(tx);
                 for (auto& row : rows) priv->AssignIdentity(row);
-                priv->cachedWallet.append(rows);
+                for (const auto& row : rows) {
+                    priv->cachedWallet.append(row);
+                    priv->Register(priv->cachedWallet.last());
+                }
             }
         }
         m_history_loaded = true;
@@ -313,6 +345,7 @@ void TransactionTablePriv::PublishInitialHistory()
         model->beginInsertRows({}, first, first + count - 1);
         for (int i = 0; i < count; ++i) {
             cachedWallet.append(m_initial_history.front());
+            Register(cachedWallet.last());
             m_initial_history.pop_front();
         }
         model->endInsertRows();
@@ -335,6 +368,23 @@ void TransactionTablePriv::FinishInitialHistory(bool deferred)
     m_loaded = true;
     m_initial_boundary_pending = deferred;
     DispatchScannedNotifications();
+}
+
+void TransactionTableModel::insertRecords(QList<TransactionRecord> records)
+{
+    for (int first = 0; first < records.size();) {
+        int last = first + 1;
+        while (last < records.size() && records[last].hash == records[first].hash) ++last;
+        const int lower = std::lower_bound(priv->cachedWallet.cbegin(), priv->cachedWallet.cend(), records[first].hash, TxLessThan()) - priv->cachedWallet.cbegin();
+        priv->InsertGroup(lower, records.mid(first, last - first));
+        first = last;
+    }
+}
+
+void TransactionTableModel::mutateRecords(const std::function<void(TransactionRecord&)>& mutate)
+{
+    for (auto& record : priv->cachedWallet) mutate(record);
+    updateConfirmations();
 }
 
 void TransactionTableModel::reportHistoryLoadFailure()
@@ -654,9 +704,13 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
 {
     if(!index.isValid())
         return QVariant();
-    TransactionRecord *rec = static_cast<TransactionRecord*>(index.internalPointer());
+    return dataFor(static_cast<TransactionRecord*>(index.internalPointer()), index.column(), role);
+}
 
-    const auto column = static_cast<ColumnIndex>(index.column());
+QVariant TransactionTableModel::dataFor(TransactionRecord* rec, int column_index, int role) const
+{
+
+    const auto column = static_cast<ColumnIndex>(column_index);
     switch (role) {
     case RawDecorationRole:
         switch (column) {
@@ -673,7 +727,7 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
         assert(false);
     case Qt::DecorationRole:
     {
-        QIcon icon = qvariant_cast<QIcon>(index.data(RawDecorationRole));
+        QIcon icon = qvariant_cast<QIcon>(dataFor(rec, column_index, RawDecorationRole));
         return platformStyle->TextColorIcon(icon);
     }
     case Qt::DisplayRole:
@@ -710,7 +764,7 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
     case Qt::ToolTipRole:
         return formatTooltip(rec);
     case Qt::TextAlignmentRole:
-        return column_alignments[index.column()];
+        return column_alignments[column_index];
     case Qt::ForegroundRole:
         // Use the "danger" color for abandoned transactions
         if(rec->status.status == TransactionStatus::Abandoned)
@@ -722,11 +776,11 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
         {
             return COLOR_UNCONFIRMED;
         }
-        if(index.column() == Amount && (rec->credit+rec->debit) < 0)
+        if(column_index == Amount && (rec->credit+rec->debit) < 0)
         {
             return COLOR_NEGATIVE;
         }
-        if(index.column() == ToAddress)
+        if(column_index == ToAddress)
         {
             return addressColor(rec);
         }
@@ -857,7 +911,7 @@ void TransactionTableModel::updateDisplayUnit()
 
 QString TransactionTablePriv::LabelForAddress(const TransactionRecord& record)
 {
-    const CTxDestination dest = DecodeDestination(record.address);
+    const CTxDestination dest = Destination(record.address);
     if (!IsValidDestination(dest)) return {};
     auto& entry = m_labels[dest];
     entry.transactions.insert(record.hash);
@@ -877,7 +931,7 @@ QString TransactionTablePriv::LabelForAddress(const TransactionRecord& record)
 
 void TransactionTablePriv::ForgetLabelRow(const TransactionRecord& record)
 {
-    const CTxDestination dest = DecodeDestination(record.address);
+    const CTxDestination dest = Destination(record.address);
     const auto entry = m_labels.find(dest);
     if (entry == m_labels.end()) return;
     entry->second.transactions.erase(record.hash);
@@ -1130,4 +1184,66 @@ int TransactionTableModel::transactionRow(const TransactionRowIdentity& identity
     const auto found = std::lower_bound(first, last, identity.id,
         [](const TransactionRecord& row, uint64_t id) { return row.presentation_id < id; });
     return found != last && found->presentation_id == identity.id ? std::distance(records.cbegin(), found) : -1;
+}
+
+bool TransactionTableModel::transactionScanRow(int row, int column, TransactionScanRow& out) const
+{
+    if (row < 0 || row >= priv->cachedWallet.size()) return false;
+    TransactionRecord* rec = &priv->cachedWallet[row];
+    // Unless asked, the cached status is used as is: refreshing it needs the wallet lock, which a scan of the
+    // whole history must not take once per row. Rows that are displayed refresh their status in transactionData().
+    // A row whose status is final (confirmed, nothing flagged it) cannot change its sort key, so only rows that have
+    // never been refreshed, are flagged, or are still maturing or confirming take the wallet lock.
+    if (out.refresh_status && (rec->status.sortKey.empty() || rec->status.needsUpdate || rec->status.status != TransactionStatus::Confirmed)) {
+        TransactionTablePriv::RefreshStatus(walletModel->wallet(), walletModel->getLastBlockProcessed(), rec);
+    }
+    out.identity = {rec->hash, rec->presentation_id};
+    out.status = rec->status.status;
+    out.type = rec->type;
+    out.watchonly = rec->involvesWatchAddress;
+    out.time = rec->time;
+    out.amount = qint64(rec->credit + rec->debit);
+    switch (column) {
+    case Status: out.key = TransactionScanRow::Key::TEXT; out.text = QString::fromStdString(rec->status.sortKey); break;
+    case Watchonly: out.key = TransactionScanRow::Key::NUMBER; out.number = rec->involvesWatchAddress ? 1 : 0; break;
+    case Date: out.key = TransactionScanRow::Key::DATE; out.number = rec->time; out.text = QString::fromStdString(rec->status.sortKey); break;
+    case Type: out.key = TransactionScanRow::Key::TEXT; out.text = formatTxType(rec); break;
+    case ToAddress: out.key = TransactionScanRow::Key::TEXT; out.text = formatTxToAddress(rec, true); break;
+    case Amount: out.key = TransactionScanRow::Key::NUMBER; out.number = out.amount; break;
+    default: return false;
+    }
+    return true;
+}
+
+bool TransactionTableModel::transactionMatchesText(int row, const QString& needle, bool& supported) const
+{
+    supported = true;
+    if (row < 0 || row >= priv->cachedWallet.size()) return false;
+    TransactionRecord* rec = &priv->cachedWallet[row];
+    bool ascii = true;
+    for (const QChar c : needle) ascii = ascii && c.unicode() < 128;
+    if (ascii) {
+        // ASCII needles compare byte-wise; the address and the hash text are ASCII.
+        const std::string lowered = needle.toLower().toStdString();
+        const auto contains = [&lowered](const std::string& text) {
+            return std::search(text.begin(), text.end(), lowered.begin(), lowered.end(),
+                [](char a, char b) { return ToLower(a) == b; }) != text.end();
+        };
+        if (contains(rec->address) || contains(rec->hash.ToString())) return true;
+    } else {
+        if (QString::fromStdString(rec->address).contains(needle, Qt::CaseInsensitive) ||
+            rec->getTxHash().contains(needle, Qt::CaseInsensitive)) return true;
+    }
+    return dataFor(rec, 0, LabelRole).toString().contains(needle, Qt::CaseInsensitive);
+}
+
+bool TransactionTableModel::transactionData(const TransactionRowIdentity& identity, int column, int role, QVariant& out) const
+{
+    if (identity.id == 0) return false;
+    const auto found = priv->FindById(identity.id);
+    if (!found || found->hash != identity.hash) return false;
+    if (role < 0) { out = QVariant(); return true; }
+    TransactionTablePriv::RefreshStatus(walletModel->wallet(), walletModel->getLastBlockProcessed(), found);
+    out = dataFor(found, column, role);
+    return true;
 }

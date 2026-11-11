@@ -67,6 +67,9 @@
 #include <stdexcept>
 #include <future>
 #include <map>
+#include <filesystem>
+#include <util/fs.h>
+#include <wallet/walletutil.h>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -95,6 +98,14 @@
 #include <QTableView>
 #include <QTableWidget>
 #include <QTemporaryDir>
+#ifndef WIN32
+#include <sys/resource.h>
+#endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <pthread.h>
+#endif
+#include <QAccessible>
 #include <QTest>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -5989,4 +6000,443 @@ void WalletTests::workerOutlivesShutdownRequest()
         model.reset();
     }
     RemoveWallet(context, wallet, /* load_on_start= */ std::nullopt);
+}
+
+namespace {
+//! Synthetic wallet history. Hashes are scattered (the table keeps its cache in hash order) and times are a fixed
+//! permutation, so inserts land throughout the source and every sort has real work to do.
+double ProcessCpuSeconds()
+{
+#ifndef WIN32
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    return usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 + usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
+#else
+    return 0.0; // Logged for developers only; not measured on Windows.
+#endif
+}
+
+uint64_t SplitMix(uint64_t x)
+{
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+QList<TransactionRecord> SyntheticHistory(size_t first, size_t count, size_t total, bool newest = false)
+{
+    QList<TransactionRecord> records;
+    records.reserve(count);
+    for (size_t i = first; i < first + count; ++i) {
+        uint256 hash;
+        const uint64_t mixed = SplitMix(i + 1);
+        for (int b = 0; b < 8; ++b) *(hash.begin() + b) = static_cast<unsigned char>(mixed >> (8 * (7 - b)));
+        // Groups of about four rows share a second, so ordering by Date falls back to the status tie-break.
+        const qint64 time = newest ? 1600000000 + static_cast<qint64>(total + i) * 600 + 7
+                                   : 1600000000 + static_cast<qint64>(((i * 7919) % total) / 4) * 600;
+        const auto type = (i % 5 == 0) ? TransactionRecord::SendToAddress : (i % 7 == 0 ? TransactionRecord::Staked : TransactionRecord::RecvWithAddress);
+        const CAmount amount = 100000 + static_cast<CAmount>((i * 104729) % 9000000);
+        // Valid P2PKH addresses: the label column and the text search decode every address, as they do for a real wallet.
+        uint160 key_hash;
+        for (int b = 0; b < 8; ++b) *(key_hash.begin() + b) = static_cast<unsigned char>(SplitMix(i + 0x51ed) >> (8 * b));
+        const std::string address = EncodeDestination(PKHash(key_hash));
+        TransactionRecord record(hash, time, type, address, type == TransactionRecord::SendToAddress ? -amount : 0, type == TransactionRecord::SendToAddress ? 0 : amount);
+        record.involvesWatchAddress = false;
+        record.idx = static_cast<int>(i % 3);
+        record.status.status = (i % 53 == 0) ? TransactionStatus::Conflicted : (i % 11 == 0 ? TransactionStatus::Confirming : TransactionStatus::Confirmed);
+        record.status.countsForBalance = record.status.status != TransactionStatus::Conflicted;
+        // A quarter of the rows have never had their status read (empty key), the rest carry the key a refresh produces.
+        if (i % 4 != 1) {
+            record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", static_cast<int>((i * 31) % 97), static_cast<int>(i % 2),
+                                              static_cast<unsigned>(time), record.idx, type == TransactionRecord::SendToAddress ? 2 : 3);
+        }
+        records.append(record);
+    }
+    std::sort(records.begin(), records.end(), [](const TransactionRecord& a, const TransactionRecord& b) { return a.hash < b.hash; });
+    return records;
+}
+} // namespace
+
+void WalletTests::historyScaleBenchmark_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::newRow("5k") << 5000;
+    QTest::newRow("50k") << 50000;
+    QTest::newRow("200k") << 200000;
+}
+
+void WalletTests::historyScaleBenchmark()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-scale", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    TransactionView& view = gui.transactionView;
+    auto* proxy = view.findChild<TransactionPresentationProxy*>();
+    QVERIFY(proxy);
+    auto* history = gui.walletModel->getTransactionTableModel();
+    view.resize(1100, 600);
+    view.show();
+    QTRY_VERIFY_WITH_TIMEOUT(history->isHistoryLoaded() && proxy->isReady(), 10000);
+
+    // Main-thread responsiveness: a 1 ms heartbeat records the longest gap.
+    QElapsedTimer beat_clock;
+    qint64 worst_gap_ms{0};
+    QTimer heartbeat;
+    heartbeat.setInterval(1);
+    heartbeat.setTimerType(Qt::PreciseTimer);
+    beat_clock.start();
+    connect(&heartbeat, &QTimer::timeout, &heartbeat, [&] {
+        worst_gap_ms = std::max<qint64>(worst_gap_ms, beat_clock.restart());
+    });
+    heartbeat.start();
+
+    struct Row { QString action; qint64 ms; qint64 worst; int count; TransactionPresentationProxy::Stats stats; qint64 cpu_ms; };
+    std::vector<Row> table;
+    // Reference order: the synchronous QSortFilterProxyModel the projection replaced, run for the smaller sizes.
+    std::unique_ptr<TransactionFilterProxy> oracle;
+    const auto make_oracle = [&](int column, Qt::SortOrder order) {
+        auto result = std::make_unique<TransactionFilterProxy>();
+        result->setSortRole(Qt::EditRole);
+        result->setSortCaseSensitivity(Qt::CaseInsensitive);
+        result->setSourceModel(history);
+        result->sort(column, order);
+        return result;
+    };
+    const auto compare_with = [&](const TransactionFilterProxy& reference, const QString& action) {
+        QVERIFY2(reference.rowCount() == proxy->rowCount(), qPrintable(action + QStringLiteral(": row count")));
+        for (int i = 0; i < proxy->rowCount(); ++i) {
+            if (proxy->index(i, 0).data(TransactionTableModel::TxHashRole) != reference.index(i, 0).data(TransactionTableModel::TxHashRole)) {
+                QFAIL(qPrintable(action + QStringLiteral(": order differs from the synchronous oracle at row %1").arg(i)));
+            }
+        }
+    };
+    const auto check_oracle = [&](const QString& action) { if (oracle) compare_with(*oracle, action); };
+
+    // Wall-clock numbers are logged, not asserted: they depend on the host. What is asserted is algorithmic: how many
+    // scans an action causes, how many rows they visit, and that no single slice exceeds a bound calibrated against
+    // sorting a fixed array in this same process.
+    qint64 calibration_ns{0};
+    {
+        std::vector<uint64_t> values(100000);
+        for (size_t i = 0; i < values.size(); ++i) values[i] = SplitMix(i);
+        QElapsedTimer clock;
+        clock.start();
+        std::stable_sort(values.begin(), values.end());
+        calibration_ns = std::max<qint64>(clock.nsecsElapsed(), 1000000);
+    }
+    const qint64 slice_bound_ns = std::max<qint64>(100000000, 25 * calibration_ns);
+    qint64 last_cpu_ms{0};
+    const auto run_once = [&](auto&& begin, int expected_rows, qint64& ms, qint64& worst) {
+        const double cpu_before = ProcessCpuSeconds();
+        proxy->resetStats();
+        worst_gap_ms = 0;
+        beat_clock.restart();
+        QElapsedTimer timer;
+        timer.start();
+        begin();
+        while (!(proxy->isReady() && (expected_rows < 0 || proxy->rowCount() == expected_rows)) && timer.elapsed() < 120000)
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        ms = timer.elapsed();
+        worst = worst_gap_ms;
+        QCoreApplication::processEvents();
+        last_cpu_ms = static_cast<qint64>((ProcessCpuSeconds() - cpu_before) * 1000);
+    };
+    //! scan_factor bounds rows visited as a multiple of the history size (restarts included); 0 means no scan at all.
+    const auto measure = [&](const QString& action, auto&& begin, int expected_rows, auto&& apply_to_oracle, double scan_factor = 2.0) {
+        qint64 ms{0}, worst{0};
+        run_once(begin, expected_rows, ms, worst);
+        const auto stats = proxy->stats();
+        const bool ready = proxy->isReady();
+        const int result_rows = proxy->rowCount();
+        table.push_back({action, ms, worst, result_rows, stats, last_cpu_ms});
+        QVERIFY2(ready, qPrintable(action));
+        QVERIFY2(static_cast<double>(stats.rows_scanned) <= scan_factor * (rows + 50),
+                 qPrintable(QStringLiteral("%1 scanned %2 rows (limit %3 x history)").arg(action).arg(stats.rows_scanned).arg(scan_factor)));
+        QVERIFY2(scan_factor > 0 || stats.rebuilds == 0, qPrintable(action + QStringLiteral(": rebuilt although nothing changed")));
+        // Remapping persistent indexes costs per index, and an accessibility client can hold one per cell; allow for it.
+        const qint64 allowed_ns = slice_bound_ns + stats.persistent_indexes * 6000;
+        QVERIFY2(stats.max_slice_ns <= allowed_ns,
+                 qPrintable(QStringLiteral("%1 ran a %2 ms slice (bound %3 ms, %4 persistent indexes)").arg(action).arg(stats.max_slice_ns / 1000000).arg(allowed_ns / 1000000).arg(stats.persistent_indexes)));
+        if (oracle) { apply_to_oracle(); check_oracle(action); }
+    };
+    const auto measure_plain = [&](const QString& action, auto&& begin, int expected_rows, double scan_factor = 2.0) {
+        measure(action, begin, expected_rows, [] {}, scan_factor);
+    };
+
+    const size_t total = static_cast<size_t>(rows);
+    const QList<TransactionRecord> bulk = SyntheticHistory(0, total, total);
+    std::deque<TransactionRecord> all(bulk.cbegin(), bulk.cend());
+    const int N = rows;
+    // The initial publication arrives in many source batches, each restarting the scan: only the slice bound applies.
+    measure_plain(QStringLiteral("publish"), [&] { history->setInitialHistory(std::move(all)); }, N, 1e9);
+    if (rows <= 50000) {
+        oracle = make_oracle(TransactionTableModel::Date, Qt::DescendingOrder);
+        check_oracle(QStringLiteral("initial"));
+    }
+
+    auto* table_view = view.findChild<QTableView*>(QStringLiteral("transactionView"));
+    QVERIFY(table_view);
+    // The projection is current: showing the page again must not scan.
+    measure_plain(QStringLiteral("hide_show"), [&] { view.hide(); QCoreApplication::processEvents(); view.show(); }, N, 0.0);
+    static const char* const names[] = {"status", "watch", "date", "type", "label", "amount"};
+    for (int column : {2, 3, 4, 5, 0}) {
+        for (Qt::SortOrder order : {Qt::AscendingOrder, Qt::DescendingOrder}) {
+            measure(QStringLiteral("sort_%1_%2").arg(names[column]).arg(order == Qt::AscendingOrder ? "asc" : "desc"),
+                    [&] { table_view->sortByColumn(column, order); }, N, [&] { oracle->sort(-1); oracle->sort(column, order); });
+        }
+    }
+    measure(QStringLiteral("sort_date_desc"), [&] { table_view->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder); }, N,
+            [&] { oracle->sort(-1); oracle->sort(TransactionTableModel::Date, Qt::DescendingOrder); });
+    // Type change and filters (model level, i.e. after the page's typing debounce).
+    const auto count_if = [&](auto&& predicate) { return static_cast<int>(std::count_if(bulk.cbegin(), bulk.cend(), predicate)); };
+    const quint32 send_only = TransactionFilterProxy::TYPE(TransactionRecord::SendToAddress);
+    measure(QStringLiteral("type_send"), [&] { proxy->setTypeFilter(send_only); },
+            count_if([](const TransactionRecord& r) { return r.type == TransactionRecord::SendToAddress; }), [&] { oracle->setTypeFilter(send_only); });
+    measure(QStringLiteral("type_all"), [&] { proxy->setTypeFilter(TransactionFilterProxy::ALL_TYPES); }, N, [&] { oracle->setTypeFilter(TransactionFilterProxy::ALL_TYPES); });
+    measure(QStringLiteral("inactive_hidden"), [&] { proxy->setShowInactive(false); },
+            count_if([](const TransactionRecord& r) { return r.status.status != TransactionStatus::Conflicted; }), [&] { oracle->setShowInactive(false); });
+    measure(QStringLiteral("inactive_shown"), [&] { proxy->setShowInactive(true); }, N, [&] { oracle->setShowInactive(true); });
+    const QString common = QStringLiteral("1a");
+    const auto matches = [&](const TransactionRecord& r, const QString& needle) {
+        return QString::fromStdString(r.address).contains(needle, Qt::CaseInsensitive) || QString::fromStdString(r.hash.ToString()).contains(needle, Qt::CaseInsensitive);
+    };
+    measure(QStringLiteral("filter_common"), [&] { proxy->setSearchString(common); }, count_if([&](const TransactionRecord& r) { return matches(r, common); }), [&] { oracle->setSearchString(common); });
+    const QString rare = QString::fromStdString(bulk[bulk.size() / 3].address);
+    measure(QStringLiteral("filter_rare"), [&] { proxy->setSearchString(rare); }, count_if([&](const TransactionRecord& r) { return matches(r, rare); }), [&] { oracle->setSearchString(rare); });
+    measure(QStringLiteral("filter_clear"), [&] { proxy->setSearchString({}); }, N, [&] { oracle->setSearchString({}); });
+
+    // A confirmation refresh changes status keys of rows that may never have been displayed. The Status order must
+    // follow, and a fresh scan must order Date ties by the new keys, exactly as the synchronous proxy reading every
+    // row does.
+    if (rows <= 50000) {
+        oracle.reset();
+        measure_plain(QStringLiteral("sort_status_before_refresh"), [&] { table_view->sortByColumn(TransactionTableModel::Status, Qt::AscendingOrder); }, N);
+        compare_with(*make_oracle(TransactionTableModel::Status, Qt::AscendingOrder), QStringLiteral("status sort before refresh"));
+        measure_plain(QStringLiteral("refresh_keys_status_sorted"), [&] {
+            history->mutateRecords([](TransactionRecord& record) {
+                const unsigned char b = *record.hash.begin();
+                if (b % 3 == 0) record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", 5 + (b % 50), 1, 9u, record.idx, 3);
+                else if (b % 3 == 1 && !record.status.sortKey.empty()) record.status.sortKey.clear();
+            });
+        }, N, 2.0);
+        QVERIFY2(proxy->stats().rebuilds + proxy->stats().restarts >= 1, "a status refresh did not rebuild a Status-sorted projection");
+        compare_with(*make_oracle(TransactionTableModel::Status, Qt::AscendingOrder), QStringLiteral("status sort after refresh"));
+        measure_plain(QStringLiteral("sort_date_after_refresh"), [&] { table_view->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder); }, N);
+        compare_with(*make_oracle(TransactionTableModel::Date, Qt::DescendingOrder), QStringLiteral("date sort after refresh"));
+        measure_plain(QStringLiteral("sort_date_asc_after_refresh"), [&] { table_view->sortByColumn(TransactionTableModel::Date, Qt::AscendingOrder); }, N);
+        compare_with(*make_oracle(TransactionTableModel::Date, Qt::AscendingOrder), QStringLiteral("date ascending sort after refresh"));
+        measure_plain(QStringLiteral("sort_date_desc_again"), [&] { table_view->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder); }, N);
+    }
+
+    // Block burst: ten notifications of five rows each, then the status refresh a new block causes.
+    const auto burst = SyntheticHistory(total, 50, total, /*newest=*/true);
+    measure_plain(QStringLiteral("block_burst"), [&] {
+        for (int group = 0; group < 10; ++group) {
+            QList<TransactionRecord> part;
+            for (int i = 0; i < 5; ++i) part.append(burst[group * 5 + i]);
+            history->insertRecords(part);
+        }
+        history->updateConfirmations();
+    }, N + 50, 12.0);
+    if (rows <= 50000) compare_with(*make_oracle(TransactionTableModel::Date, Qt::DescendingOrder), QStringLiteral("after block burst"));
+    // A new block alone (Date sort, inactive rows shown) re-sorts nothing.
+    measure_plain(QStringLiteral("block_status_only"), [&] { history->updateConfirmations(); }, N + 50, 0.0);
+    heartbeat.stop();
+    for (const auto& row : table) {
+        qInfo().noquote() << QStringLiteral("HSB rows=%1 action=%2 ms=%3 cpu_ms=%11 worst_main_gap_ms=%4 result_rows=%5 rebuilds=%6 restarts=%7 slices=%8 max_slice_ms=%9 scanned=%10")
+            .arg(rows).arg(row.action).arg(row.ms).arg(row.worst).arg(row.count).arg(row.stats.rebuilds).arg(row.stats.restarts)
+            .arg(row.stats.slices).arg(row.stats.max_slice_ns / 1000000.0, 0, 'f', 2).arg(row.stats.rows_scanned).arg(row.cpu_ms)
+            + QStringLiteral(" persistent=%1 accessibility_active=%2").arg(row.stats.persistent_indexes).arg(QAccessible::isActive())
+            + QStringLiteral(" layout_ms[about,remap,changed]=%1,%2,%3").arg(row.stats.max_layout_ns[0] / 1e6, 0, 'f', 2).arg(row.stats.max_layout_ns[1] / 1e6, 0, 'f', 2).arg(row.stats.max_layout_ns[2] / 1e6, 0, 'f', 2)
+            + QStringLiteral(" op_max_ms[scan,sort,map,old,add,reorder,interim,publish,retire]=") + [&] {
+                QStringList parts;
+                for (int64_t ns : row.stats.max_op_ns) parts << QString::number(ns / 1000000.0, 'f', 2);
+                return parts.join(',');
+            }();
+    }
+}
+
+namespace {
+//! CPU seconds consumed so far by each thread of this process, keyed by thread name (macOS), or one process total.
+std::map<std::string, double> ThreadCpuSeconds()
+{
+    std::map<std::string, double> result;
+#ifdef __APPLE__
+    thread_act_array_t threads;
+    mach_msg_type_number_t count{0};
+    if (task_threads(mach_task_self(), &threads, &count) == KERN_SUCCESS) {
+        for (mach_msg_type_number_t i = 0; i < count; ++i) {
+            thread_basic_info_data_t info;
+            mach_msg_type_number_t size = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(threads[i], THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &size) != KERN_SUCCESS) continue;
+            char name[64] = {};
+            if (pthread_t thread = pthread_from_mach_thread_np(threads[i])) pthread_getname_np(thread, name, sizeof(name));
+            const double seconds = info.user_time.seconds + info.user_time.microseconds / 1e6 + info.system_time.seconds + info.system_time.microseconds / 1e6;
+            result[strprintf("%s#%u", name[0] ? name : "unnamed", i)] = seconds;
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_t));
+    }
+#endif
+    result["process"] = ProcessCpuSeconds();
+    return result;
+}
+} // namespace
+
+void WalletTests::historyInitialLoad()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    // Developer measurement with multi-second settle waits and no assertions beyond a completed load: it runs only
+    // on request so the default test run stays short and free of timing dependence.
+    if (!std::getenv("BLACKCOIN_QT_BENCH") && !std::getenv("BLACKCOIN_QT_SEED_WALLET")) {
+        QSKIP("Developer measurement; set BLACKCOIN_QT_BENCH=1 or BLACKCOIN_QT_SEED_WALLET=<datadir> to run");
+    }
+    // Without BLACKCOIN_QT_SEED_WALLET (a datadir holding regtest/wallets/<name>) this measures the mock wallet only.
+    const char* seed = std::getenv("BLACKCOIN_QT_SEED_WALLET");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    WalletContext& context = *m_node.walletLoader().context();
+
+    QElapsedTimer wall;
+    const auto before_all = ThreadCpuSeconds();
+    wall.start();
+    const auto report = [&](const char* stage) {
+        const auto now = ThreadCpuSeconds();
+        QString threads;
+        for (const auto& [name, seconds] : now) {
+            const double delta = seconds - (before_all.count(name) ? before_all.at(name) : 0.0);
+            if (name != "process" && delta >= 0.05) threads += QStringLiteral(" %1=%2").arg(QString::fromStdString(name)).arg(delta, 0, 'f', 2);
+        }
+        qInfo().noquote() << QStringLiteral("HIL variant=%1 stage=%2 wall_ms=%3 process_cpu_ms=%4 threads:%5")
+            .arg(seed ? "seed-wallet" : "mock").arg(stage).arg(wall.elapsed()).arg(static_cast<int>((now.at("process") - before_all.at("process")) * 1000)).arg(threads);
+    };
+
+    std::shared_ptr<CWallet> wallet;
+    if (seed) {
+        const std::string name = "rc5_synthetic_baseline";
+        const fs::path source = fs::path(seed) / "regtest" / "wallets" / fs::PathFromString(name);
+        const fs::path target = wallet::GetWalletDir() / fs::PathFromString(name);
+        std::filesystem::create_directories(target.parent_path());
+        std::filesystem::copy(source, target, std::filesystem::copy_options::recursive);
+        wallet::DatabaseOptions options;
+        options.require_existing = true;
+        wallet::DatabaseStatus status;
+        bilingual_str error;
+        std::vector<bilingual_str> warnings;
+        wallet = wallet::LoadWallet(context, name, std::nullopt, options, status, error, warnings);
+        QVERIFY2(wallet, qPrintable(QString::fromStdString(error.original)));
+    } else {
+        wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-initial", CreateMockableWalletDatabase());
+        QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+        AddWallet(context, wallet);
+    }
+    report("wallet_loaded");
+    OptionsModel options_model(m_node);
+    bilingual_str error;
+    QVERIFY(options_model.Init(error));
+    ClientModel client(m_node, &options_model);
+    auto model = std::make_unique<WalletModel>(interfaces::MakeWallet(context, wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    // As initModelForWallet does: the model keeps its own wallet reference, the registry must not outlive the test.
+    wallet::RemoveWallet(context, wallet, std::nullopt);
+    // The whole wallet view, as the application builds it: Overview (recent rows), History, Send, Receive, Staking, Account.
+    WalletView wallet_view(model.get(), style.get(), nullptr);
+    wallet_view.setClientModel(&client);
+    wallet_view.resize(1100, 700);
+    wallet_view.show();
+    auto* view = wallet_view.findChild<TransactionView*>();
+    QVERIFY(view);
+    auto* proxy = view->findChild<TransactionPresentationProxy*>();
+    auto* history = model->getTransactionTableModel();
+    QVERIFY(proxy && history);
+    report("model_created");
+    model->startPollBalance();
+    qint64 loaded_ms{-1};
+    QElapsedTimer settle;
+    settle.start();
+    // The History page is hidden behind Overview, so its projection is dormant; only the model's load is awaited.
+    while (!history->isHistoryLoaded() && settle.elapsed() < 240000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        if (loaded_ms < 0 && history->isHistoryLoaded()) { loaded_ms = wall.elapsed(); report("history_published"); }
+    }
+    QVERIFY(history->isHistoryLoaded());
+    report("history_loaded");
+    qInfo().noquote() << QStringLiteral("HIL rows=%1").arg(history->rowCount({}));
+    // Idle: nothing should keep a core busy once the pages are loaded. Settled = two consecutive seconds under 5% of a core.
+    int quiet{0};
+    double last_cpu = ThreadCpuSeconds().at("process");
+    QElapsedTimer settle_clock;
+    settle_clock.start();
+    const qint64 first_ms = wall.elapsed();
+    while (quiet < 2 && settle_clock.elapsed() < 120000) {
+        QTest::qWait(1000);
+        const double cpu = ThreadCpuSeconds().at("process");
+        quiet = (cpu - last_cpu < 0.05) ? quiet + 1 : 0;
+        last_cpu = cpu;
+    }
+    qInfo().noquote() << QStringLiteral("HIL cpu_settled_after_ms=%1 (history ready at %2)").arg(wall.elapsed() - 2000).arg(first_ms);
+    report("cpu_settled");
+    const auto idle_start = ThreadCpuSeconds();
+    QTest::qWait(5000);
+    const auto idle_end = ThreadCpuSeconds();
+    qInfo().noquote() << QStringLiteral("HIL idle_cpu_percent_of_core=%1 accessibility_active=%2").arg((idle_end.at("process") - idle_start.at("process")) / 5.0 * 100.0, 0, 'f', 2).arg(QAccessible::isActive());
+    // Blocks with 40 wallet transactions every 5 seconds, as in the soak: CPU spent per block with Overview showing.
+    {
+        const size_t base = 1000000;
+        const auto before = ThreadCpuSeconds();
+        for (int block = 0; block < 6; ++block) {
+            history->insertRecords(SyntheticHistory(base + block * 40, 40, 100000, /*newest=*/true));
+            history->updateConfirmations();
+            QTest::qWait(500);
+        }
+        const auto after = ThreadCpuSeconds();
+        QString threads;
+        for (const auto& [name, seconds] : after) {
+            const double delta = seconds - (before.count(name) ? before.at(name) : 0.0);
+            if (name != "process" && delta >= 0.01) threads += QStringLiteral(" %1=%2").arg(QString::fromStdString(name)).arg(delta, 0, 'f', 3);
+        }
+        qInfo().noquote() << QStringLiteral("HIL per_block_cpu_ms=%1 (6 blocks x 40 rows, includes 500 ms event loop) threads:%2")
+            .arg((after.at("process") - before.at("process")) / 6.0 * 1000.0, 0, 'f', 1).arg(threads);
+    }
+    wallet_view.hide();
 }

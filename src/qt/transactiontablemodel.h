@@ -13,6 +13,7 @@
 #include <QStringList>
 
 #include <deque>
+#include <functional>
 #include <memory>
 
 namespace interfaces {
@@ -91,10 +92,19 @@ public:
     bool isHistoryLoaded() const { return m_history_loaded; }
     bool historyLoadHasFailed() const { return m_history_load_failed; }
     void setInitialHistory(std::deque<TransactionRecord> history);
+    /** Insert already decomposed records the way a wallet notification does: grouped by transaction hash, each group
+     *  placed in hash order with fresh GUI identities. Used by tests that cannot create tens of thousands of wallet
+     *  transactions; production code reaches the same insertion through wallet notifications. */
+    void insertRecords(QList<TransactionRecord> records);
+    /** Change every record in place and announce it as a block's status refresh does (tests only). */
+    void mutateRecords(const std::function<void(TransactionRecord&)>& mutate);
     void reportHistoryLoadFailure();
     QModelIndexList indexesForTransaction(const uint256& hash) const;
     TransactionRowIdentity transactionIdentity(int row) const override;
     int transactionRow(const TransactionRowIdentity& identity) const override;
+    bool transactionScanRow(int row, int column, TransactionScanRow& out) const override;
+    bool transactionMatchesText(int row, const QString& needle, bool& supported) const override;
+    bool transactionData(const TransactionRowIdentity& identity, int column, int role, QVariant& out) const override;
 
 
 private:
@@ -111,6 +121,7 @@ private:
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
 
+    QVariant dataFor(TransactionRecord* rec, int column, int role) const;
     QString lookupAddress(const TransactionRecord& record, bool tooltip) const;
     QVariant addressColor(const TransactionRecord *wtx) const;
     QString formatTxStatus(const TransactionRecord *wtx) const;

@@ -31,6 +31,9 @@ private Q_SLOTS:
     void receiveCapabilityContention();
     void receiveCapabilityLifecycle();
     void workerOutlivesShutdownRequest();
+    void historyScaleBenchmark_data();
+    void historyScaleBenchmark();
+    void historyInitialLoad();
 };
 
 #endif // BITCOIN_QT_TEST_WALLETTESTS_H

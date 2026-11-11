@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <qt/accountpage.h>
+#include <qt/visibilitycontroller.h>
 
 #include <qt/bitcoinunits.h>
 #include <qt/guiutil.h>
@@ -26,6 +27,8 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QDialog>
+#include <QElapsedTimer>
+#include <QHideEvent>
 #include <QDialogButtonBox>
 #include <QFile>
 #include <QFileDialog>
@@ -256,19 +259,46 @@ QString addressNote(const QString& family)
 
 } // namespace
 
+struct AccountPage::RenderState
+{
+    AccountOutputMetadata metadata;
+    std::set<std::string> unverified;
+    size_t quantum{0}, stake_output{0}, delegation{0};
+    interfaces::Wallet::CoinsList::const_iterator group;
+    size_t output{0};
+    QTreeWidgetItem* parent{nullptr};
+    QString address, label, family, type, note, status;
+    CAmount amount{0};
+    int depth{std::numeric_limits<int>::max()};
+    bool same_type{true}, same_status{true};
+    enum Phase { METADATA, CARDS, ROWS } phase{METADATA};
+};
+
 AccountPage::AccountPage(const PlatformStyle* platformStyle, QWidget* parent)
     : QWidget(parent),
       m_filter_timer(new QTimer(this))
 {
     Q_UNUSED(platformStyle);
     setupUi();
+    m_render_timer = new QTimer(this);
+    m_render_timer->setSingleShot(true);
+    connect(m_render_timer, &QTimer::timeout, this, &AccountPage::renderSlice);
+    m_filter_slice_timer = new QTimer(this);
+    m_filter_slice_timer->setSingleShot(true);
+    connect(m_filter_slice_timer, &QTimer::timeout, this, &AccountPage::filterSlice);
     m_filter_timer->setSingleShot(true);
     m_filter_timer->setInterval(250);
     connect(m_filter_timer, &QTimer::timeout, this, &AccountPage::applySnapshotFilter);
+    m_visibility = std::make_unique<VisibilityController>(*this, [this](bool active) {
+        if (active) renderSnapshot();
+        else suspendWork();
+    }, [this] { return !m_privacy; });
+    m_visibility->refresh();
 }
 
 AccountPage::~AccountPage()
 {
+    m_visibility.reset();
     if (m_refresh_cancel) m_refresh_cancel->store(true, std::memory_order_release);
 }
 
@@ -339,14 +369,15 @@ void AccountPage::setupUi()
     m_tree->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_tree->setAlternatingRowColors(true);
     m_tree->setUniformRowHeights(true);
-    m_tree->header()->setSectionResizeMode(Type, QHeaderView::ResizeToContents);
+    m_tree->header()->setSectionResizeMode(Type, QHeaderView::Interactive);
     m_tree->header()->setSectionResizeMode(Address, QHeaderView::Stretch);
-    m_tree->header()->setSectionResizeMode(Label, QHeaderView::ResizeToContents);
-    m_tree->header()->setSectionResizeMode(Amount, QHeaderView::ResizeToContents);
-    m_tree->header()->setSectionResizeMode(Outputs, QHeaderView::ResizeToContents);
-    m_tree->header()->setSectionResizeMode(Confirmations, QHeaderView::ResizeToContents);
-    m_tree->header()->setSectionResizeMode(Status, QHeaderView::ResizeToContents);
+    m_tree->header()->setSectionResizeMode(Label, QHeaderView::Interactive);
+    m_tree->header()->setSectionResizeMode(Amount, QHeaderView::Interactive);
+    m_tree->header()->setSectionResizeMode(Outputs, QHeaderView::Interactive);
+    m_tree->header()->setSectionResizeMode(Confirmations, QHeaderView::Interactive);
+    m_tree->header()->setSectionResizeMode(Status, QHeaderView::Interactive);
     m_tree->header()->setSectionResizeMode(Notes, QHeaderView::Stretch);
+    m_tree->header()->setDefaultSectionSize(120);
     outer->addWidget(m_tree, 1);
 
     m_status = new QLabel(tr("Load a wallet to inspect account details."), this);
@@ -371,6 +402,9 @@ void AccountPage::discardSnapshot()
     m_snapshot.reset();
     m_snapshot_rendered = false;
     m_filter_timer->stop();
+    m_render_timer->stop();
+    m_filter_slice_timer->stop();
+    m_render_state.reset();
     m_tree->clear();
 }
 
@@ -397,6 +431,7 @@ void AccountPage::setPrivacy(bool privacy)
 {
     m_privacy = privacy;
     if (privacy) discardSnapshot();
+    m_visibility->refresh();
     renderSnapshot();
 }
 
@@ -414,19 +449,36 @@ bool AccountPage::rowMatchesFilter(const QString& family, const QString& address
 
 void AccountPage::scheduleRefresh()
 {
-    if (!m_filter_timer) return;
+    if (!m_filter_timer || !m_visibility->active()) return;
     m_filter_timer->start();
 }
 
 void AccountPage::showEvent(QShowEvent* event)
 {
     QWidget::showEvent(event);
-    renderSnapshot();
+    m_visibility->refresh();
+}
+
+void AccountPage::hideEvent(QHideEvent* event)
+{
+    QWidget::hideEvent(event);
+    m_visibility->refresh();
+}
+
+void AccountPage::suspendWork()
+{
+    ++m_refresh_generation;
+    if (m_refresh_cancel) m_refresh_cancel->store(true, std::memory_order_release);
+    m_refresh_cancel.reset();
+    m_refresh_queued = false;
+    m_filter_timer->stop();
+    m_filter_slice_timer->stop();
+    m_render_timer->stop();
 }
 
 void AccountPage::refresh()
 {
-    if (!isVisible() || window()->isMinimized() || m_privacy || !m_wallet_model) return;
+    if (!m_visibility->active() || m_privacy || !m_wallet_model) return;
     if (m_refresh_cancel) {
         m_refresh_queued = true;
         m_refresh_cancel->store(true, std::memory_order_release);
@@ -452,6 +504,9 @@ void AccountPage::refresh()
             view->m_status->setText(tr("Unable to refresh account details: %1").arg(QString::fromStdString(snapshot->error).toHtmlEscaped()));
             return;
         }
+        view->m_render_timer->stop();
+        view->m_filter_slice_timer->stop();
+        view->m_render_state.reset();
         view->m_snapshot = std::move(snapshot);
         view->m_snapshot_rendered = false;
         view->renderSnapshot();
@@ -481,168 +536,169 @@ void AccountPage::renderSnapshot()
         return;
     }
 
-    if (!isVisible() || window()->isMinimized()) return;
+    if (!m_visibility->active()) return;
     if (m_snapshot_rendered) {
         applySnapshotFilter();
         return;
     }
+    if (!m_render_state) {
+        m_tree->clear();
+        m_tree->setEnabled(false);
+        m_export->setEnabled(false);
+        m_copy_address->setEnabled(false);
+        m_copy_outpoint->setEnabled(false);
+        m_render_state = std::make_unique<RenderState>();
+        m_render_state->group = m_snapshot->coins.cbegin();
+        m_status->setText(tr("Preparing account rows…"));
+    }
+    m_render_timer->start(0);
+}
+
+void AccountPage::renderSlice()
+{
+    if (!m_visibility->active() || m_privacy || !m_snapshot || !m_render_state) return;
     const auto& snapshot = *m_snapshot;
     const auto& balances = snapshot.balances;
     const auto& migration = snapshot.migration;
-    const auto& demurrage = snapshot.demurrage;
-    AccountOutputMetadata metadata;
-    std::set<std::string> unverified_quantum_keys;
-    for (const auto& info : snapshot.quantum_addresses) {
-        if (!info.backup_verified) unverified_quantum_keys.insert(info.public_key);
-        if (!info.tiered) continue;
-        StakeOutputDetail detail;
-        detail.operator_bond = info.label == "coldstake-operator" && info.unbonding_blocks == OPERATOR_COMMITMENT_BLOCKS;
-        detail.role = detail.operator_bond ? tr("Operator bond") : tr("Self stake");
-        const auto& outputs = snapshot.stake_outputs.at(info.address);
-        for (const interfaces::WalletQuantumStakeOutputInfo& output : outputs) {
-            StakeOutputDetail output_detail = detail;
-            output_detail.state = QString::fromStdString(output.state);
-            output_detail.unlock_height = output.unlock_height;
-            const QString outpoint = QString::fromStdString(output.txid) + QStringLiteral(":") + QString::number(output.vout);
-            metadata.stake_outputs[outpoint] = output_detail;
-        }
-    }
-    for (const auto& info : snapshot.coldstake_delegations) {
-        ColdStakeDetail detail;
-        detail.info = info;
-        detail.balance = snapshot.coldstake_balances.at(info.address);
-        metadata.coldstake_addresses[QString::fromStdString(info.address)] = detail;
-    }
-
-    const CAmount lifecycle_locked = balances.synthetic_mature_locked_balance +
-        balances.direct_quantum_phase_locked_balance +
-        balances.quantum_contract_restricted_balance +
-        balances.final_locked_legacy_balance + balances.demurrage_locked_balance;
-    m_total_card->setText(tr("<b>Wallet lifecycle totals</b><br>Ordinary available: %1<br>Pending: %2<br>Immature: %3<br>Locked/restricted: %4")
-        .arg(formatBLK(balances.balance))
-        .arg(formatBLK(balances.unconfirmed_balance))
-        .arg(formatBLK(balances.immature_balance))
-        .arg(formatBLK(lifecycle_locked)));
-    m_legacy_card->setText(tr("<b>Legacy lifecycle</b><br>Spendable now: %1<br>Final-locked: %2<br>Spendable legacy value must migrate before Final activation.")
-        .arg(formatBLK(balances.legacy_balance))
-        .arg(formatBLK(balances.final_locked_legacy_balance)));
-    m_quantum_card->setText(tr("<b>Quantum lifecycle</b><br>Direct spendable: %1<br>Gold Rush immature: %2<br>Gold Rush mature/phase-locked: %3<br>Other phase/contract restricted: %4")
-        .arg(formatBLK(balances.quantum_balance))
-        .arg(formatBLK(balances.synthetic_immature_balance))
-        .arg(formatBLK(balances.synthetic_mature_locked_balance))
-        .arg(formatBLK(balances.direct_quantum_phase_locked_balance +
-                       balances.quantum_contract_restricted_balance)));
-    QString attention;
-    if (migration.available) {
-        attention = tr("<b>Attention</b><br>Legacy to migrate: %1<br>Gold Rush rewards phase-locked: %2<br>Staked/delegated quantum: %3<br>Demurrage locked: %4<br>Demurrage burned: %5")
-            .arg(formatBLK(migration.eligible_legacy_amount))
-            .arg(formatBLK(migration.goldrush_reward_amount_needing_move))
-            .arg(formatBLK(migration.staked_quantum_amount))
-            .arg(formatBLK(balances.demurrage_locked_balance))
-            .arg(formatBLK(balances.demurrage_burned_balance));
-    } else {
-        attention = tr("<b>Attention</b><br>Migration status is busy; refresh shortly.");
-    }
-    if (!unverified_quantum_keys.empty()) {
-        attention += tr("<br><b>Backup required:</b> %1 non-HD quantum key(s) do not have a completed reopen-and-sign backup verification event. Unlock the wallet and use Backup Wallet now. The wallet cannot track whether an external backup file is later moved or deleted.")
-            .arg(static_cast<int>(unverified_quantum_keys.size()));
-    }
-    m_attention_card->setText(attention);
-
-    QSignalBlocker tree_blocker(m_tree);
-    m_tree->clear();
-
-    for (const auto& entry : snapshot.coins) {
-        const CTxDestination& dest = entry.first;
-        const QString address = QString::fromStdString(EncodeDestination(dest));
-        const auto label_entry = snapshot.labels.find(dest);
-        const QString label = label_entry == snapshot.labels.end() ? QString{} : QString::fromStdString(label_entry->second);
-
-        CAmount group_amount{0};
-        int min_depth{std::numeric_limits<int>::max()};
-        QString family = tr("Other");
-        QString group_type;
-        QString group_note;
-        QString group_status;
-        bool same_type{true};
-        bool same_status{true};
-        QString searchable = address + QStringLiteral(" ") + label;
-        std::vector<OutputRowDetail> output_details;
-        output_details.reserve(entry.second.size());
-        for (const auto& coin_tuple : entry.second) {
-            const COutPoint& outpoint = std::get<0>(coin_tuple);
-            const interfaces::WalletTxOut& out = std::get<1>(coin_tuple);
-            group_amount += out.txout.nValue;
-            min_depth = std::min(min_depth, out.depth_in_main_chain);
-            const OutputRowDetail detail = describeOutput(dest, outpoint, out, address, metadata);
-            output_details.push_back(detail);
-            if (family == tr("Other") || detail.family != tr("Other")) family = detail.family;
-            if (group_type.isEmpty()) {
-                group_type = detail.type;
-                group_note = detail.notes;
-                group_status = detail.status;
-            } else {
-                same_type = same_type && group_type == detail.type;
-                same_status = same_status && group_status == detail.status;
+    auto& state = *m_render_state;
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QSignalBlocker blocker(m_tree);
+    for (int work = 0; work < 128 && elapsed.elapsed() < 4; ++work) {
+        if (state.phase == RenderState::METADATA) {
+            if (state.quantum < snapshot.quantum_addresses.size()) {
+                const auto& info = snapshot.quantum_addresses[state.quantum];
+                if (!info.backup_verified) state.unverified.insert(info.public_key);
+                const auto* outputs = info.tiered ? &snapshot.stake_outputs.at(info.address) : nullptr;
+                if (outputs && state.stake_output < outputs->size()) {
+                    const auto& output = (*outputs)[state.stake_output++];
+                    StakeOutputDetail detail;
+                    detail.operator_bond = info.label == "coldstake-operator" && info.unbonding_blocks == OPERATOR_COMMITMENT_BLOCKS;
+                    detail.role = detail.operator_bond ? tr("Operator bond") : tr("Self stake");
+                    detail.state = QString::fromStdString(output.state);
+                    detail.unlock_height = output.unlock_height;
+                    state.metadata.stake_outputs[QString::fromStdString(output.txid) + QStringLiteral(":") + QString::number(output.vout)] = std::move(detail);
+                } else {
+                    ++state.quantum;
+                    state.stake_output = 0;
+                }
+                continue;
             }
-            searchable += QStringLiteral(" ") + QString::fromStdString(outpoint.ToString()) +
-                          QStringLiteral(" ") + detail.type +
-                          QStringLiteral(" ") + detail.notes;
+            if (state.delegation < snapshot.coldstake_delegations.size()) {
+                const auto& info = snapshot.coldstake_delegations[state.delegation++];
+                ColdStakeDetail detail;
+                detail.info = info;
+                detail.balance = snapshot.coldstake_balances.at(info.address);
+                state.metadata.coldstake_addresses[QString::fromStdString(info.address)] = std::move(detail);
+                continue;
+            }
+            state.phase = RenderState::CARDS;
         }
+        if (state.phase == RenderState::CARDS) {
+            const CAmount lifecycle_locked = balances.synthetic_mature_locked_balance +
+                balances.direct_quantum_phase_locked_balance +
+                balances.quantum_contract_restricted_balance +
+                balances.final_locked_legacy_balance + balances.demurrage_locked_balance;
+            m_total_card->setText(tr("<b>Wallet lifecycle totals</b><br>Ordinary available: %1<br>Pending: %2<br>Immature: %3<br>Locked/restricted: %4")
+                .arg(formatBLK(balances.balance))
+                .arg(formatBLK(balances.unconfirmed_balance))
+                .arg(formatBLK(balances.immature_balance))
+                .arg(formatBLK(lifecycle_locked)));
+            m_legacy_card->setText(tr("<b>Legacy lifecycle</b><br>Spendable now: %1<br>Final-locked: %2<br>Spendable legacy value must migrate before Final activation.")
+                .arg(formatBLK(balances.legacy_balance))
+                .arg(formatBLK(balances.final_locked_legacy_balance)));
+            m_quantum_card->setText(tr("<b>Quantum lifecycle</b><br>Direct spendable: %1<br>Gold Rush immature: %2<br>Gold Rush mature/phase-locked: %3<br>Other phase/contract restricted: %4")
+                .arg(formatBLK(balances.quantum_balance))
+                .arg(formatBLK(balances.synthetic_immature_balance))
+                .arg(formatBLK(balances.synthetic_mature_locked_balance))
+                .arg(formatBLK(balances.direct_quantum_phase_locked_balance +
+                               balances.quantum_contract_restricted_balance)));
+            QString attention;
+            if (migration.available) {
+                attention = tr("<b>Attention</b><br>Legacy to migrate: %1<br>Gold Rush rewards phase-locked: %2<br>Staked/delegated quantum: %3<br>Demurrage locked: %4<br>Demurrage burned: %5")
+                    .arg(formatBLK(migration.eligible_legacy_amount))
+                    .arg(formatBLK(migration.goldrush_reward_amount_needing_move))
+                    .arg(formatBLK(migration.staked_quantum_amount))
+                    .arg(formatBLK(balances.demurrage_locked_balance))
+                    .arg(formatBLK(balances.demurrage_burned_balance));
+            } else {
+                attention = tr("<b>Attention</b><br>Migration status is busy; refresh shortly.");
+            }
+            if (!state.unverified.empty()) {
+                attention += tr("<br><b>Backup required:</b> %1 non-HD quantum key(s) do not have a completed reopen-and-sign backup verification event. Unlock the wallet and use Backup Wallet now. The wallet cannot track whether an external backup file is later moved or deleted.")
+                    .arg(static_cast<int>(state.unverified.size()));
+            }
+            m_attention_card->setText(attention);
 
-        if (entry.second.empty()) continue;
-
-        if (!same_type || group_type.isEmpty()) {
-            group_type = family;
-            group_note = addressNote(family);
+            state.phase = RenderState::ROWS;
         }
-        if (!same_status) {
-            group_status.clear();
+        if (state.group == snapshot.coins.cend()) break;
+        const auto& entry = *state.group;
+        if (entry.second.empty()) { ++state.group; continue; }
+        if (!state.parent) {
+            state.address = QString::fromStdString(EncodeDestination(entry.first));
+            const auto label = snapshot.labels.find(entry.first);
+            state.label = label == snapshot.labels.end() ? QString{} : QString::fromStdString(label->second);
+            state.family = tr("Other");
+            state.type.clear();
+            state.note.clear();
+            state.status.clear();
+            state.same_type = state.same_status = true;
+            state.amount = 0;
+            state.depth = std::numeric_limits<int>::max();
+            state.output = 0;
+            state.parent = new QTreeWidgetItem(m_tree);
+            state.parent->setHidden(true);
         }
-
-        auto* parent = new QTreeWidgetItem(m_tree);
-        parent->setText(Type, group_type);
-        parent->setText(Address, address.isEmpty() ? tr("(script without address)") : address);
-        parent->setText(Label, label);
-        parent->setText(Amount, formatBLK(group_amount));
-        parent->setText(Outputs, QString::number(static_cast<int>(entry.second.size())));
-        parent->setText(Confirmations, minDepthText(min_depth == std::numeric_limits<int>::max() ? 0 : min_depth));
-        parent->setText(Status, group_status.isEmpty()
-            ? (min_depth <= 0 ? tr("needs confirmation") : tr("available"))
-            : group_status);
-        parent->setText(Notes, group_note);
-        parent->setData(Address, Qt::UserRole, address);
-        parent->setData(Type, FILTER_FAMILY_ROLE, family);
-        parent->setData(Type, FILTER_TEXT_ROLE, searchable);
-        parent->setData(Amount, GROUP_AMOUNT_ROLE, qlonglong(group_amount));
-        parent->setToolTip(Address, address);
-        parent->setToolTip(Notes, parent->text(Notes));
-
-        for (int i = 0; i < static_cast<int>(entry.second.size()); ++i) {
-            const auto& coin_tuple = entry.second.at(i);
-            const COutPoint& outpoint = std::get<0>(coin_tuple);
-            const interfaces::WalletTxOut& out = std::get<1>(coin_tuple);
-            const OutputRowDetail& detail = output_details.at(i);
+        if (state.output < entry.second.size()) {
+            const auto& [outpoint, out] = entry.second[state.output++];
+            const auto detail = describeOutput(entry.first, outpoint, out, state.address, state.metadata);
+            state.amount += out.txout.nValue;
+            state.depth = std::min(state.depth, out.depth_in_main_chain);
+            if (state.family == tr("Other") || detail.family != tr("Other")) state.family = detail.family;
+            if (state.type.isEmpty()) { state.type = detail.type; state.note = detail.notes; state.status = detail.status; }
+            else { state.same_type &= state.type == detail.type; state.same_status &= state.status == detail.status; }
             const QString outpoint_text = QString::fromStdString(outpoint.ToString());
-            auto* child = new QTreeWidgetItem(parent);
+            auto* child = new QTreeWidgetItem(state.parent);
             child->setText(Type, detail.type);
             child->setText(Address, outpoint_text);
-            child->setText(Label, label);
+            child->setText(Label, state.label);
             child->setText(Amount, formatBLK(out.txout.nValue));
             child->setText(Outputs, tr("1"));
             child->setText(Confirmations, QString::number(out.depth_in_main_chain));
-            child->setText(Status, detail.status.isEmpty() || out.depth_in_main_chain <= 0 || out.is_spent
-                ? outputStatus(out)
-                : detail.status);
+            child->setText(Status, detail.status.isEmpty() || out.depth_in_main_chain <= 0 || out.is_spent ? outputStatus(out) : detail.status);
             child->setText(Notes, detail.notes);
-            child->setData(Address, Qt::UserRole, address);
+            child->setData(Address, Qt::UserRole, state.address);
             child->setData(Address, Qt::UserRole + 1, outpoint_text);
+            const QString child_filter_text = outpoint_text + QStringLiteral(" ") + detail.type + QStringLiteral(" ") + detail.notes;
+            child->setData(Type, FILTER_TEXT_ROLE, child_filter_text);
             child->setToolTip(Address, outpoint_text);
             child->setToolTip(Notes, detail.notes);
+            continue;
         }
-
+        auto* parent = state.parent;
+        parent->setText(Type, state.same_type && !state.type.isEmpty() ? state.type : state.family);
+        parent->setText(Address, state.address.isEmpty() ? tr("(script without address)") : state.address);
+        parent->setText(Label, state.label);
+        parent->setText(Amount, formatBLK(state.amount));
+        parent->setText(Outputs, QString::number(static_cast<int>(entry.second.size())));
+        parent->setText(Confirmations, minDepthText(state.depth));
+        parent->setText(Status, state.same_status && !state.status.isEmpty() ? state.status : (state.depth <= 0 ? tr("needs confirmation") : tr("available")));
+        parent->setText(Notes, state.same_type && !state.type.isEmpty() ? state.note : addressNote(state.family));
+        parent->setData(Address, Qt::UserRole, state.address);
+        parent->setData(Type, FILTER_FAMILY_ROLE, state.family);
+        const QString group_filter_text = state.address + QStringLiteral(" ") + state.label;
+        parent->setData(Type, FILTER_TEXT_ROLE, group_filter_text);
+        parent->setData(Amount, GROUP_AMOUNT_ROLE, qlonglong(state.amount));
+        parent->setToolTip(Address, state.address);
+        parent->setToolTip(Notes, parent->text(Notes));
+        state.parent = nullptr;
+        ++state.group;
     }
-
+    if (state.group != snapshot.coins.cend() || state.phase != RenderState::ROWS) {
+        m_render_timer->start(0);
+        return;
+    }
     if (migration.available && migration.goldrush_reward_outputs_needing_move > 0) {
         const QString family = tr("Quantum");
         const QString searchable = tr("Gold Rush locked aggregate quantum reward phase lock");
@@ -660,44 +716,73 @@ void AccountPage::renderSnapshot()
         item->setData(Type, FILTER_TEXT_ROLE, searchable);
     }
 
+    m_render_state.reset();
     m_snapshot_rendered = true;
+    m_tree->setEnabled(true);
+    m_copy_address->setEnabled(true);
+    m_copy_outpoint->setEnabled(true);
     applySnapshotFilter();
 }
 
 void AccountPage::applySnapshotFilter()
 {
-    if (!isVisible() || window()->isMinimized() || m_privacy || !m_snapshot_rendered) return;
-    QSignalBlocker tree_blocker(m_tree);
+    if (!m_visibility->active() || m_privacy || !m_snapshot_rendered) return;
+    m_filter_needle = m_search->text().trimmed();
+    m_filter_family = m_family_filter->currentData().toString();
+    m_filter_row = m_filter_child = m_visible_groups = m_visible_outputs = 0;
+    m_visible_amount = 0;
+    m_filter_match = false;
+    m_export->setEnabled(false);
     m_tree->clearSelection();
-    int visible_groups{0};
-    int visible_outputs{0};
-    CAmount visible_amount{0};
-    for (int row = 0; row < m_tree->topLevelItemCount(); ++row) {
-        auto* item = m_tree->topLevelItem(row);
-        const bool visible = rowMatchesFilter(item->data(Type, FILTER_FAMILY_ROLE).toString(),
-            item->data(Type, FILTER_TEXT_ROLE).toString(), item->text(Label));
-        item->setHidden(!visible);
-        if (visible && item->childCount() > 0) {
-            ++visible_groups;
-            visible_outputs += item->childCount();
-            visible_amount += item->data(Amount, GROUP_AMOUNT_ROLE).toLongLong();
+    m_filter_slice_timer->start(0);
+}
+
+void AccountPage::filterSlice()
+{
+    if (!m_visibility->active() || m_privacy || !m_snapshot_rendered || !m_snapshot) return;
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QSignalBlocker blocker(m_tree);
+    for (int work = 0; work < 128 && elapsed.elapsed() < 4 && m_filter_row < m_tree->topLevelItemCount(); ++work) {
+        auto* item = m_tree->topLevelItem(m_filter_row);
+        const auto family = item->data(Type, FILTER_FAMILY_ROLE).toString();
+        const bool family_matches = m_filter_family.isEmpty() || family == m_filter_family;
+        if (m_filter_child == 0) {
+            const auto text = item->data(Type, FILTER_TEXT_ROLE).toString();
+            m_filter_match = m_filter_needle.isEmpty() || family.contains(m_filter_needle, Qt::CaseInsensitive) ||
+                text.contains(m_filter_needle, Qt::CaseInsensitive);
+            m_filter_tail = m_filter_needle.isEmpty() ? QString{} : text.right(m_filter_needle.size() - 1);
         }
+        if (family_matches && !m_filter_match && m_filter_child < item->childCount()) {
+            // Preserve matches crossing the exact old concatenation boundary,
+            // without allocating or searching one giant per-group QString.
+            const QString text = m_filter_tail + QStringLiteral(" ") + item->child(m_filter_child++)->data(Type, FILTER_TEXT_ROLE).toString();
+            m_filter_match = text.contains(m_filter_needle, Qt::CaseInsensitive);
+            m_filter_tail = text.right(m_filter_needle.size() - 1);
+            continue;
+        }
+        const bool visible = family_matches && m_filter_match;
+        item->setHidden(!visible);
+        // Uniform heights and collapsed output groups avoid a second full
+        // expanded-row layout. A user can expand the group they are inspecting.
+        if (visible && item->childCount() > 0) {
+            ++m_visible_groups;
+            m_visible_outputs += item->childCount();
+            m_visible_amount += item->data(Amount, GROUP_AMOUNT_ROLE).toLongLong();
+        }
+        ++m_filter_row;
+        m_filter_child = 0;
     }
-
-    if (visible_groups <= 12) {
-        m_tree->expandAll();
-    } else {
-        m_tree->expandToDepth(0);
+    if (m_filter_row < m_tree->topLevelItemCount()) {
+        m_filter_slice_timer->start(0);
+        return;
     }
-
+    m_export->setEnabled(true);
     if (m_refresh_cancel) return;
     const auto& snapshot = *m_snapshot;
     m_status->setText(tr("%1 address group(s), %2 output(s), %3 visible after filters. RGB assets: %4. EUTXO state records: %5. Demurrage monitored outputs: %6.")
-        .arg(visible_groups)
-        .arg(visible_outputs)
-        .arg(formatBLK(visible_amount))
-        .arg(static_cast<int>(snapshot.rgb_assets))
-        .arg(static_cast<int>(snapshot.eutxo_states))
+        .arg(m_visible_groups).arg(m_visible_outputs).arg(formatBLK(m_visible_amount))
+        .arg(static_cast<int>(snapshot.rgb_assets)).arg(static_cast<int>(snapshot.eutxo_states))
         .arg(snapshot.demurrage.available ? snapshot.demurrage.quantum_outputs : 0));
 }
 
@@ -720,11 +805,11 @@ void AccountPage::copySelectedOutpoint()
 
 void AccountPage::exportCsv()
 {
-    if (m_privacy || !m_snapshot_rendered) return;
+    if (m_privacy || !m_snapshot_rendered || m_filter_slice_timer->isActive() || m_filter_timer->isActive()) return;
     const auto snapshot = m_snapshot;
     const QPointer<AccountPage> view{this};
     const QString filename = QFileDialog::getSaveFileName(this, tr("Export account detail"), QString(), tr("Comma separated file (*.csv)"));
-    if (!view || filename.isEmpty() || m_privacy || m_snapshot != snapshot || !m_snapshot_rendered) return;
+    if (!view || filename.isEmpty() || m_privacy || m_snapshot != snapshot || !m_snapshot_rendered || m_filter_slice_timer->isActive() || m_filter_timer->isActive()) return;
 
     QFile file(filename);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -744,8 +829,7 @@ void AccountPage::exportCsv()
     out << "\n";
     for (int row = 0; row < m_tree->topLevelItemCount(); ++row) {
         QTreeWidgetItem* parent = m_tree->topLevelItem(row);
-        if (!rowMatchesFilter(parent->data(Type, FILTER_FAMILY_ROLE).toString(),
-                parent->data(Type, FILTER_TEXT_ROLE).toString(), parent->text(Label))) continue;
+        if (parent->isHidden()) continue;
         const int rows = parent->childCount();
         for (int child_index = -1; child_index < rows; ++child_index) {
             QTreeWidgetItem* item = child_index < 0 ? parent : parent->child(child_index);

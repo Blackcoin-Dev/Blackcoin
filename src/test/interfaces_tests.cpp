@@ -8,15 +8,88 @@
 #include <chainparams.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
+#include <interfaces/handler.h>
+#include <interfaces/node.h>
+#include <rpc/server.h>
 #include <test/util/setup_common.h>
 #include <script/solver.h>
 #include <validation.h>
+#include <tinyformat.h>
 
 #include <boost/test/unit_test.hpp>
 
 using interfaces::FoundBlock;
 
 BOOST_FIXTURE_TEST_SUITE(interfaces_tests, TestChain100Setup)
+
+BOOST_AUTO_TEST_CASE(stake_estimator_bounded_frozen_target)
+{
+    auto node = interfaces::MakeNode(m_node);
+    // Synthetic headers exercise a sparse stake history without mining or I/O.
+    std::vector<CBlockIndex> headers(1600);
+    std::vector<uint256> hashes(headers.size());
+    for (size_t i = 0; i < headers.size(); ++i) {
+        hashes[i] = uint256S(strprintf("%064x", i + 1));
+        headers[i].phashBlock = &hashes[i];
+        headers[i].pprev = i ? &headers[i - 1] : nullptr;
+        headers[i].nHeight = i;
+        headers[i].nTime = 100000 + i * 64;
+        headers[i].nBits = 0x1d00ffff;
+        if (i % 20 == 0) headers[i].SetProofOfStake();
+    }
+    LOCK(::cs_main);
+    auto& chainman = *m_node.chainman;
+    const CBlockIndex* saved = chainman.m_best_header;
+    auto restore = interfaces::MakeCleanupHandler([&] { chainman.m_best_header = const_cast<CBlockIndex*>(saved); });
+    chainman.m_best_header = &headers[1499];
+    const double expected = GetPoSKernelPS(chainman);
+    uint256 sampled, current;
+    double estimate{-1};
+    BOOST_CHECK(!node->tryGetPoSKernelPS(sampled, estimate, current)); // <=512 visits.
+    chainman.m_best_header = &headers[1500];
+    BOOST_CHECK(!node->tryGetPoSKernelPS(sampled, estimate, current));
+    chainman.m_best_header = &headers[1501];
+    BOOST_REQUIRE(node->tryGetPoSKernelPS(sampled, estimate, current));
+    BOOST_CHECK(sampled == hashes[1499]); // Completed the frozen older target.
+    BOOST_CHECK(current == hashes[1501]); // Authoritative identity rejects it as current.
+    BOOST_CHECK_EQUAL(estimate, expected);
+    const double newer_expected = GetPoSKernelPS(chainman);
+    BOOST_CHECK(!node->tryGetPoSKernelPS(sampled, estimate, current));
+    BOOST_CHECK(!node->tryGetPoSKernelPS(sampled, estimate, current));
+    BOOST_REQUIRE(node->tryGetPoSKernelPS(sampled, estimate, current));
+    BOOST_CHECK(sampled == hashes[1501]);
+    BOOST_CHECK_EQUAL(estimate, newer_expected);
+    BOOST_CHECK(node->tryGetPoSKernelPS(sampled, estimate, current)); // Complete cache hit.
+}
+
+BOOST_AUTO_TEST_CASE(stake_estimator_nonmonotonic_timestamps)
+{
+    auto node = interfaces::MakeNode(m_node);
+    std::vector<CBlockIndex> headers(3);
+    std::vector<uint256> hashes{uint256S("01"), uint256S("02"), uint256S("03")};
+    const uint32_t times[]{1000, 1100, 1050};
+    for (size_t i = 0; i < headers.size(); ++i) {
+        headers[i].phashBlock = &hashes[i];
+        headers[i].pprev = i ? &headers[i - 1] : nullptr;
+        headers[i].nHeight = i;
+        headers[i].nTime = times[i];
+        headers[i].nBits = 0x1d00ffff;
+        headers[i].SetProofOfStake();
+    }
+    LOCK(::cs_main);
+    auto& chainman = *m_node.chainman;
+    auto* saved = chainman.m_best_header;
+    auto restore = interfaces::MakeCleanupHandler([&] { chainman.m_best_header = saved; });
+    chainman.m_best_header = &headers.back();
+    uint256 sampled, current;
+    double estimate{0};
+    BOOST_REQUIRE(node->tryGetPoSKernelPS(sampled, estimate, current));
+    BOOST_CHECK(sampled == hashes.back());
+    BOOST_CHECK(current == hashes.back());
+    BOOST_CHECK_EQUAL(estimate, GetPoSKernelPS(chainman));
+    const double expected = 2 * 4294967296.0 / 50 * (Params().GetConsensus().nStakeTimestampMask + 1);
+    BOOST_CHECK_EQUAL(estimate, expected);
+}
 
 BOOST_AUTO_TEST_CASE(findBlock)
 {

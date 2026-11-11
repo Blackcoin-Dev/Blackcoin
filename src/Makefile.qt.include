@@ -169,9 +169,12 @@ BITCOIN_QT_H = \
   qt/transactionfilterproxy.h \
   qt/transactionoverviewwidget.h \
   qt/transactionrecord.h \
+  qt/transactionrow.h \
   qt/transactiontablemodel.h \
   qt/transactionview.h \
+  qt/visibilitycontroller.h \
   qt/utilitydialog.h \
+  qt/uiperf.h \
   qt/walletcontroller.h \
   qt/walletframe.h \
   qt/walletmodel.h \

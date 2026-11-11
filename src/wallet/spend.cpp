@@ -856,8 +856,13 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const std::set<COutPoint> protected_rgb_seals = wallet.GetProtectedRGBSeals();
 
     std::set<uint256> trusted_parents;
+    size_t walked{0};
     for (const auto& entry : wallet.mapWallet)
     {
+        if (params.interrupt && walked++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && params.interrupt()) {
+            result.interrupted = true;
+            return result;
+        }
         const uint256& wtxid = entry.first;
         const CWalletTx& wtx = entry.second;
 
@@ -881,6 +886,10 @@ CoinsResult AvailableCoins(const CWallet& wallet,
         bool tx_from_me = CachedTxIsFromMe(wallet, wtx, ISMINE_ALL);
 
         for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
+            if (params.interrupt && walked++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && params.interrupt()) {
+                result.interrupted = true;
+                return result;
+            }
             const CTxOut& output = wtx.tx->vout[i];
             const COutPoint outpoint(wtxid, i);
 
@@ -999,14 +1008,18 @@ CoinsResult AvailableCoinsListUnspent(const CWallet& wallet, const CCoinControl*
     return AvailableCoins(wallet, coinControl, /*feerate=*/ std::nullopt, params);
 }
 
-const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& outpoint)
+static const CTxOut* FindNonChangeParentOutputInterruptible(const CWallet& wallet, const COutPoint& outpoint,
+                                                         const std::function<bool()>& interrupt)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
     const CWalletTx* wtx{Assert(wallet.GetWalletTx(outpoint.hash))};
 
     const CTransaction* ptx = wtx->tx.get();
     int n = outpoint.n;
+    size_t ancestors{0};
     while (OutputIsChange(wallet, ptx->vout[n]) && ptx->vin.size() > 0) {
+        if (interrupt && ancestors++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && interrupt()) return nullptr;
         const COutPoint& prevout = ptx->vin[0].prevout;
         const CWalletTx* it = wallet.GetWalletTx(prevout.hash);
         if (!it || it->tx->vout.size() <= prevout.n ||
@@ -1016,10 +1029,20 @@ const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& 
         ptx = it->tx.get();
         n = prevout.n;
     }
-    return ptx->vout[n];
+    return &ptx->vout[n];
+}
+
+const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& outpoint)
+{
+    return *FindNonChangeParentOutputInterruptible(wallet, outpoint, {});
 }
 
 std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
+{
+    return *ListCoins(wallet, /*interrupt=*/{});
+}
+
+std::optional<std::map<CTxDestination, std::vector<COutput>>> ListCoins(const CWallet& wallet, const std::function<bool()>& interrupt)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
@@ -1032,18 +1055,28 @@ std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
     CoinFilterParams coins_params;
     coins_params.only_spendable = false;
     coins_params.skip_locked = false;
-    for (const COutput& coin : AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coins_params).All()) {
-        CTxDestination address;
-        if ((coin.spendable || (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && coin.solvable))) {
-            if (!ExtractDestination(FindNonChangeParentOutput(wallet, coin.outpoint).scriptPubKey, address)) {
-                // For backwards compatibility, we convert P2PK output scripts into PKHash destinations
-                if (auto pk_dest = std::get_if<PubKeyDestination>(&address)) {
-                    address = PKHash(pk_dest->GetPubKey());
-                } else {
-                    continue;
+    coins_params.interrupt = interrupt;
+    const CoinsResult available = AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coins_params);
+    if (available.interrupted) return std::nullopt;
+    size_t grouped{0};
+    // Iterate the existing groups directly; All() would make another full copy.
+    for (const auto& entry : available.coins) {
+        for (const COutput& coin : entry.second) {
+            if (interrupt && grouped++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && interrupt()) return std::nullopt;
+            CTxDestination address;
+            if ((coin.spendable || (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && coin.solvable))) {
+                const CTxOut* parent = FindNonChangeParentOutputInterruptible(wallet, coin.outpoint, interrupt);
+                if (!parent) return std::nullopt;
+                if (!ExtractDestination(parent->scriptPubKey, address)) {
+                    // For backwards compatibility, we convert P2PK output scripts into PKHash destinations
+                    if (auto pk_dest = std::get_if<PubKeyDestination>(&address)) {
+                        address = PKHash(pk_dest->GetPubKey());
+                    } else {
+                        continue;
+                    }
                 }
+                result[address].emplace_back(coin);
             }
-            result[address].emplace_back(coin);
         }
     }
     return result;

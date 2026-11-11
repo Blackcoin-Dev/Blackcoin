@@ -41,6 +41,7 @@ class BitcoinApplication: public QApplication
 public:
     explicit BitcoinApplication();
     ~BitcoinApplication();
+    bool notify(QObject* receiver, QEvent* event) override;
 
 #ifdef ENABLE_WALLET
     /// Create payment server
@@ -118,6 +119,7 @@ private:
 
     void startThread();
     void scheduleChainstateRelaunch(const QString& phase);
+    void finishShutdown();
 };
 
 int GuiMain(int argc, char* argv[]);

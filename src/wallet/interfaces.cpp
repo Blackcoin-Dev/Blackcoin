@@ -2424,6 +2424,10 @@ public:
     bool hasPrivateKeys() override { return m_wallet->HasPrivateKeys(); }
     bool isCrypted() override { return m_wallet->IsCrypted(); }
     bool lock() override { return m_wallet->Lock(); }
+    bool tryRestoreGuiUnlockState(bool relock, bool staking_only) override
+    {
+        return m_wallet->TryRestoreGuiUnlockState(relock, staking_only);
+    }
     bool unlock(const SecureString& wallet_passphrase,
                 std::optional<bool> staking_only) override
     {
@@ -2538,6 +2542,27 @@ public:
             result.emplace_back(dest, is_mine, purpose.value_or(is_mine ? AddressPurpose::RECEIVE : AddressPurpose::SEND), label);
         });
         return result;
+    }
+    bool tryGetAddresses(std::vector<WalletAddress>& addresses,
+                         const std::function<bool()>& interrupt) const override
+    {
+        if (interrupt && interrupt()) return false;
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) return false;
+        struct Cancelled {};
+        std::vector<WalletAddress> result;
+        size_t visited{0};
+        try {
+            m_wallet->ForEachAddrBookEntry([&](const CTxDestination& dest, const std::string& label, bool is_change, const std::optional<AddressPurpose>& purpose) EXCLUSIVE_LOCKS_REQUIRED(m_wallet->cs_wallet) {
+                if (interrupt && visited++ % 64 == 0 && interrupt()) throw Cancelled{};
+                if (is_change) return;
+                const isminetype is_mine = m_wallet->IsMine(dest);
+                result.emplace_back(dest, is_mine, purpose.value_or(is_mine ? AddressPurpose::RECEIVE : AddressPurpose::SEND), label);
+            });
+        } catch (const Cancelled&) { return false; }
+        if (interrupt && interrupt()) return false;
+        addresses = std::move(result);
+        return true;
     }
     std::vector<std::string> getAddressReceiveRequests() override {
         LOCK(m_wallet->cs_wallet);
@@ -2657,11 +2682,21 @@ public:
         LOCK(m_wallet->cs_wallet);
         return getWalletTxsLocked();
     }
-    bool tryGetWalletTxs(std::vector<WalletTx>& transactions) override
+    bool tryGetWalletTxs(std::vector<WalletTx>& transactions,
+                         const std::function<bool()>& interrupt = {}) override
     {
+        if (interrupt && interrupt()) return false;
         TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
         if (!locked_wallet || m_wallet->IsScanning()) return false;
-        transactions = getWalletTxsLocked();
+        std::vector<WalletTx> captured;
+        captured.reserve(m_wallet->mapWallet.size());
+        size_t visited{0};
+        for (const auto& entry : m_wallet->mapWallet) {
+            if (interrupt && visited++ % 64 == 0 && interrupt()) return false;
+            captured.push_back(MakeWalletTx(*m_wallet, entry.second));
+        }
+        if (interrupt && interrupt()) return false;
+        transactions = std::move(captured);
         return true;
     }
     bool tryGetTxStatus(const uint256& txid,
@@ -2877,10 +2912,28 @@ public:
     CoinsList listCoins() override
     {
         LOCK2(::cs_main, m_wallet->cs_wallet);
+        return *makeCoinsList(/*interrupt=*/{});
+    }
+    std::optional<CoinsList> tryListCoins(const std::function<bool()>& interrupt) override
+    {
+        if (interrupt && interrupt()) return std::nullopt;
+        TRY_LOCK(::cs_main, main_lock);
+        if (!main_lock) return std::nullopt;
+        TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
+        if (!wallet_lock) return std::nullopt;
+        return makeCoinsList(interrupt);
+    }
+    std::optional<CoinsList> makeCoinsList(const std::function<bool()>& interrupt)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_wallet->cs_wallet)
+    {
+        const auto listed = ListCoins(*m_wallet, interrupt);
+        if (!listed) return std::nullopt;
         CoinsList result;
-        for (const auto& entry : ListCoins(*m_wallet)) {
+        size_t copied{0};
+        for (const auto& entry : *listed) {
             auto& group = result[entry.first];
             for (const auto& coin : entry.second) {
+                if (interrupt && copied++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && interrupt()) return std::nullopt;
                 group.emplace_back(coin.outpoint,
                     MakeWalletTxOut(*m_wallet, coin));
             }
@@ -2914,6 +2967,7 @@ public:
     }
     bool hdEnabled() override { return m_wallet->IsHDEnabled(); }
     bool canGetAddresses() override { return m_wallet->CanGetAddresses(); }
+    bool tryCanGetAddresses(bool& result) override { return m_wallet->TryCanGetAddresses(result); }
     bool hasExternalSigner() override { return m_wallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER); }
     bool privateKeysDisabled() override { return m_wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS); }
     bool taprootEnabled() override {

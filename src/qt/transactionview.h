@@ -12,12 +12,14 @@
 #include <QKeyEvent>
 #include <QPersistentModelIndex>
 #include <QWidget>
+#include <memory>
 
 #include <variant>
 
+class VisibilityController;
 class PlatformStyle;
 class TransactionDescDialog;
-class TransactionFilterProxy;
+class TransactionPresentationProxy;
 class WalletModel;
 
 QT_BEGIN_NAMESPACE
@@ -70,10 +72,12 @@ public:
 protected:
     void changeEvent(QEvent* e) override;
     void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
+    std::unique_ptr<VisibilityController> m_visibility;
     WalletModel *model{nullptr};
-    TransactionFilterProxy *transactionProxyModel{nullptr};
+    TransactionPresentationProxy *transactionProxyModel{nullptr};
     QTableView *transactionView{nullptr};
 
     QComboBox *dateWidget;
@@ -95,6 +99,7 @@ private:
 
     QWidget *createDateRangeWidget();
     bool ensureHistorySource();
+    void updateHistoryState();
 
     bool eventFilter(QObject *obj, QEvent *event) override;
 

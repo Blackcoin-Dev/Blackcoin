@@ -12,6 +12,7 @@
 #include <qt/platformstyle.h>
 #include <qt/quantumguides.h>
 #include <qt/walletmodel.h>
+#include <qt/visibilitycontroller.h>
 
 #include <addresstype.h>
 #include <common/args.h>
@@ -302,6 +303,15 @@ StakingMiningPage::StakingMiningPage(const PlatformStyle* platformStyle, QWidget
     m_timer = new QTimer(this);
     m_timer->setInterval(5000);
     connect(m_timer, &QTimer::timeout, this, &StakingMiningPage::updateStatus);
+    m_detail_retry_timer = new QTimer(this);
+    m_detail_retry_timer->setSingleShot(true);
+    connect(m_detail_retry_timer, &QTimer::timeout, this, [this] {
+        if (!detailRefreshAllowed()) { cancelFullDetailRefresh(); return; }
+        startFullDetailRefresh();
+    });
+    m_detail_visibility = std::make_unique<VisibilityController>(*this, [this](bool active) {
+        if (!active) cancelFullDetailRefresh();
+    });
 
     connect(m_staking_enable, &QCheckBox::clicked, this, &StakingMiningPage::onStakingToggled);
     connect(m_unlock_staking_only, &QCheckBox::clicked, this, &StakingMiningPage::onUnlockStakingOnlyToggled);
@@ -413,6 +423,8 @@ StakingMiningPage::StakingMiningPage(const PlatformStyle* platformStyle, QWidget
 
 StakingMiningPage::~StakingMiningPage()
 {
+    m_detail_visibility.reset();
+    cancelFullDetailRefresh();
     if (m_pow_control_current) m_pow_control_current->store(false, std::memory_order_release);
     if (m_wallet_model && m_pow_control_request) m_wallet_model->cancelPowMiningControl(m_pow_control_request);
     if (m_pow_recovery_view_current) {
@@ -2790,6 +2802,7 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
         disconnect(m_wallet_model, nullptr, this, nullptr);
     }
 
+    cancelFullDetailRefresh();
     ++m_wallet_generation;
     m_wallet_model = walletModel;
     // Wallet-scoped payout text and copy authority must not survive an
@@ -2829,6 +2842,10 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
     m_pow_recovery_operation_purpose =
         PowClaimRecoveryOperationPurpose::REVIEW;
 
+    // Clear the previous wallet's detail panels without launching a detail sweep.
+    m_force_full_refresh = false;
+    resetStatusForNoWallet();
+
     if (m_wallet_model) {
         connect(m_wallet_model, &WalletModel::powMiningControlReady,
                 this, &StakingMiningPage::onPowMiningControlReady);
@@ -2839,6 +2856,7 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
         connect(m_wallet_model, &WalletModel::powClaimRecoveryOperationReady,
                 this, &StakingMiningPage::onPowClaimRecoveryOperationReady);
         connect(m_wallet_model, &QObject::destroyed, this, [this] {
+            cancelFullDetailRefresh();
             ++m_wallet_generation;
             m_wallet_model = nullptr;
             if (m_timer) m_timer->stop();
@@ -4176,16 +4194,46 @@ void StakingMiningPage::updateStatus()
     // Keep wallet-scoped standing authority synchronized with headless RPC or
     // another view without ever entering cs_wallet on the Qt event thread.
     // User actions also perform their own immediate preflight read.
-    if (m_status_refresh_tick % 6 == 0 && !m_claim_recovery_policy_pending) {
+    // A background policy read yields queued detail work in WalletModel. Do
+    // not let this cadence cancel the explicit snapshot queued above, an
+    // existing pass, or its bounded delayed retry. User policy actions keep
+    // their priority; the next idle cadence refreshes the background policy.
+    if (m_status_refresh_tick % 6 == 0 && !m_claim_recovery_policy_pending &&
+        !m_detail_refresh_in_flight && !m_detail_refresh_pending) {
         requestPowClaimRecoveryPolicy(
             WalletModel::PowClaimRecoveryPolicyRequest::Operation::INFO);
     }
 }
 
+bool StakingMiningPage::detailRefreshAllowed() const
+{
+    return m_wallet_model && !m_wallet_model->isShuttingDown() &&
+           !m_wallet_model->node().shutdownRequested() && m_detail_visibility && m_detail_visibility->active();
+}
+
+void StakingMiningPage::cancelFullDetailRefresh()
+{
+    if (m_detail_retry_timer) m_detail_retry_timer->stop();
+    ++m_detail_refresh_epoch;
+    const bool interrupted = m_detail_refresh_in_flight || m_detail_refresh_pending;
+    m_detail_refresh_pending = false;
+    if (m_wallet_model && m_detail_refresh_in_flight) {
+        m_wallet_model->cancelStakingMiningSnapshot(m_detail_request_in_flight);
+    }
+    if (interrupted && m_refresh_hint) {
+        m_refresh_hint->setText(tr("Detail refresh stopped. Previous details may be stale. Press Refresh to retry."));
+    }
+}
+
 void StakingMiningPage::queueFullDetailRefresh()
 {
-    if (!m_wallet_model) return;
+    if (!detailRefreshAllowed()) return;
 
+    // Only an explicit refresh/action opens a new budget. Timer retries keep
+    // this epoch and cannot reset their own bound.
+    ++m_detail_refresh_epoch;
+    m_detail_retries = 0;
+    m_detail_retry_timer->stop();
     m_detail_refresh_pending = true;
     if (m_detail_refresh_in_flight) {
         // At most one snapshot executes at a time. Repeated clicks collapse to
@@ -4200,11 +4248,12 @@ void StakingMiningPage::queueFullDetailRefresh()
 
 void StakingMiningPage::startFullDetailRefresh()
 {
-    if (!m_wallet_model || !m_detail_refresh_pending || m_detail_refresh_in_flight) return;
+    if (!detailRefreshAllowed() || !m_detail_refresh_pending || m_detail_refresh_in_flight) return;
 
     m_detail_refresh_pending = false;
     m_detail_refresh_in_flight = true;
     m_detail_request_in_flight = ++m_detail_request_sequence;
+    m_detail_request_epoch = m_detail_refresh_epoch;
 
     WalletModel::StakingMiningSnapshotRequest request;
     request.request_id = m_detail_request_in_flight;
@@ -4232,10 +4281,19 @@ void StakingMiningPage::onStakingMiningSnapshotReady(quint64 request_id, quint64
     m_detail_refresh_in_flight = false;
     m_detail_request_in_flight = 0;
 
+    if (!detailRefreshAllowed()) {
+        cancelFullDetailRefresh();
+        if (m_refresh_hint) m_refresh_hint->setText(tr("Detail refresh stopped. Previous details may be stale. Press Refresh to retry."));
+        return;
+    }
     // Do not apply an obsolete result when a click/action arrived while the
     // worker was active. Run exactly one coalesced latest request instead.
     if (m_detail_refresh_pending) {
         startFullDetailRefresh();
+        return;
+    }
+    if (m_detail_request_epoch != m_detail_refresh_epoch) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("Detail refresh stopped. Previous details may be stale. Press Refresh to retry."));
         return;
     }
     if (!snapshot) {
@@ -4244,6 +4302,17 @@ void StakingMiningPage::onStakingMiningSnapshotReady(quint64 request_id, quint64
     }
     if (snapshot->cancelled) {
         if (m_refresh_hint) m_refresh_hint->setText(tr("Detail refresh was cancelled."));
+        return;
+    }
+    if (snapshot->transient_unavailable) {
+        if (m_detail_retries < 2) {
+            ++m_detail_retries;
+            m_detail_refresh_pending = true;
+            if (m_refresh_hint) m_refresh_hint->setText(tr("Wallet details are busy; retrying (%1/2). Previous details may be stale.").arg(m_detail_retries));
+            m_detail_retry_timer->start(50);
+        } else if (m_refresh_hint) {
+            m_refresh_hint->setText(tr("Wallet details are busy. Previous details may be stale. Press Refresh to retry."));
+        }
         return;
     }
     if (!snapshot->error.empty()) {
@@ -4266,7 +4335,8 @@ void StakingMiningPage::onStakingMiningSnapshotReady(quint64 request_id, quint64
 void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMiningSnapshot& snapshot)
 {
     Q_ASSERT(QThread::currentThread() == thread());
-    if (!m_wallet_model || snapshot.request.generation != m_wallet_generation) return;
+    if (!detailRefreshAllowed() || snapshot.request.generation != m_wallet_generation ||
+        snapshot.cancelled || snapshot.stale_tip || snapshot.transient_unavailable || !snapshot.error.empty()) return;
 
     QScopedValueRollback<bool> updating_guard(m_updating, true);
     m_selfstake_withdraw_available = false;
@@ -5075,26 +5145,26 @@ void StakingMiningPage::resetStatusForNoWallet()
     m_staking_enable->setChecked(false);
     m_unlock_staking_only->setChecked(false);
     m_unlock_quantum_legacy_staking->setChecked(false);
-    m_staking_status->setText(tr("No wallet loaded"));
+    m_staking_status->setText((m_wallet_model ? tr("Wallet loaded; status pending") : tr("No wallet loaded")));
     m_stake_weight->setText(QStringLiteral("-"));
-    m_goldrush_badge->setText(tr("Gold Rush: no wallet loaded"));
-    m_pos_goldrush_status->setText(tr("PoS Gold Rush jackpot: no wallet loaded"));
-    m_staking_summary->setText(tr("Load a wallet to view staking, Gold Rush, and unlock status."));
-    m_dashboard_action->setText(tr("<b>Recommended next step</b><br>Load a wallet to view staking, mining, migration, and cold-staking actions."));
-    m_dashboard_wallet->setText(tr("<b>Wallet</b><br>No wallet loaded."));
-    m_dashboard_pos->setText(tr("<b>PoS Gold Rush</b><br>No wallet loaded."));
-    m_dashboard_pow->setText(tr("<b>PoW Gold Rush</b><br>No wallet loaded."));
-    m_dashboard_coldstake->setText(tr("<b>Cold staking</b><br>No wallet loaded."));
-    if (m_refresh_hint) m_refresh_hint->setText(tr("Load a wallet to refresh detail panels."));
+    m_goldrush_badge->setText((m_wallet_model ? tr("Gold Rush: refresh details") : tr("Gold Rush: no wallet loaded")));
+    m_pos_goldrush_status->setText((m_wallet_model ? tr("PoS Gold Rush jackpot: refresh details") : tr("PoS Gold Rush jackpot: no wallet loaded")));
+    m_staking_summary->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to view staking, Gold Rush, and unlock status.")));
+    m_dashboard_action->setText((m_wallet_model ? tr("<b>Recommended next step</b><br>Refresh details to inspect this wallet's mining, migration, and cold-staking state.") : tr("<b>Recommended next step</b><br>Load a wallet to view staking, mining, migration, and cold-staking actions.")));
+    m_dashboard_wallet->setText((m_wallet_model ? tr("<b>Wallet</b><br>%1 is loaded. Details have not been refreshed.").arg(m_wallet_model->getDisplayName().toHtmlEscaped()) : tr("<b>Wallet</b><br>No wallet loaded.")));
+    m_dashboard_pos->setText((m_wallet_model ? tr("<b>PoS Gold Rush</b><br>Details have not been refreshed for this wallet.") : tr("<b>PoS Gold Rush</b><br>No wallet loaded.")));
+    m_dashboard_pow->setText((m_wallet_model ? tr("<b>PoW Gold Rush</b><br>Details have not been refreshed for this wallet.") : tr("<b>PoW Gold Rush</b><br>No wallet loaded.")));
+    m_dashboard_coldstake->setText((m_wallet_model ? tr("<b>Cold staking</b><br>Details have not been refreshed for this wallet.") : tr("<b>Cold staking</b><br>No wallet loaded.")));
+    if (m_refresh_hint) m_refresh_hint->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to refresh detail panels.")));
 
     m_donation_enable->setChecked(false);
-    m_donation_status->setText(tr("Load a wallet to configure the optional Quantum Quasar development donation."));
+    m_donation_status->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to configure the optional Quantum Quasar development donation.")));
 
     m_pow_enable->setChecked(false);
     m_pow_unlock_wallet->setChecked(false);
     m_pow_settings_dirty = false;
     m_pow_payout->clear();
-    m_pow_status->setText(tr("Load a wallet to use Gold Rush PoW mining."));
+    m_pow_status->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to use Gold Rush PoW mining.")));
     m_pow_recovery_review->setVisible(false);
     m_pow_recovery_review->setEnabled(false);
     m_auto_claim_recovery->setChecked(false);
@@ -5106,31 +5176,31 @@ void StakingMiningPage::resetStatusForNoWallet()
     m_migration_legacy_amount->setText(QStringLiteral("-"));
     m_migration_quantum_amount->setText(QStringLiteral("-"));
     m_migration_goldrush_amount->setText(QStringLiteral("-"));
-    m_migration_advice->setText(tr("Load a wallet to view migration status."));
+    m_migration_advice->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to view migration status.")));
     m_migration_action_status->setText(QStringLiteral("-"));
     m_coldstake_quantum_available->setText(QStringLiteral("-"));
-    m_demurrage_status->setText(tr("Load a wallet to view demurrage status."));
+    m_demurrage_status->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to view demurrage status.")));
     m_demurrage_amounts->setText(QStringLiteral("-"));
     m_demurrage_guards->setText(QStringLiteral("-"));
     m_demurrage_sweep_available = false;
     m_rgb_assets->setRowCount(0);
-    m_rgb_status->setText(tr("Load a wallet to view RGB assets."));
+    m_rgb_status->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to view RGB assets.")));
     m_eutxo_states->setRowCount(0);
-    m_eutxo_status->setText(tr("Load a wallet to view EUTXO states."));
-    m_quantum_address_count->setText(QStringLiteral("0"));
-    m_coldstake_count->setText(QStringLiteral("0"));
+    m_eutxo_status->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to view EUTXO states.")));
+    m_quantum_address_count->setText(m_wallet_model ? QStringLiteral("-") : QStringLiteral("0"));
+    m_coldstake_count->setText(m_wallet_model ? QStringLiteral("-") : QStringLiteral("0"));
     m_quantum_address->clear();
     m_quantum_pubkey->clear();
     m_selfstake_address->clear();
     {
         QSignalBlocker selfstake_selector_blocker(m_selfstake_selector);
         m_selfstake_selector->clear();
-        m_selfstake_selector->addItem(tr("Load a wallet to select a staking address"), QString());
+        m_selfstake_selector->addItem((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to select a staking address")), QString());
     }
     {
         QSignalBlocker output_selector_blocker(m_selfstake_output_selector);
         m_selfstake_output_selector->clear();
-        m_selfstake_output_selector->addItem(tr("Load a wallet to select staking outputs"), QString());
+        m_selfstake_output_selector->addItem((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to select staking outputs")), QString());
     }
     if (m_selfstake_fund_amount) m_selfstake_fund_amount->setValue(COIN);
     m_selfstake_last_action_status.clear();
@@ -5141,30 +5211,30 @@ void StakingMiningPage::resetStatusForNoWallet()
     {
         QSignalBlocker operator_selector_blocker(m_operator_selector);
         m_operator_selector->clear();
-        m_operator_selector->addItem(tr("Load a wallet to select a node key"), QString());
+        m_operator_selector->addItem((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to select a node key")), QString());
     }
     if (m_operator_bond_amount) m_operator_bond_amount->setValue(COIN);
     m_operator_last_action_status.clear();
     m_operator_status->setText(tr("No node key selected. Nodes must fund a 30-day bonded staking address before delegators can verify them."));
     m_operator_withdraw->setText(tr("Stop node"));
     m_operator_registry->setRowCount(0);
-    m_operator_registry_status->setText(tr("Load a wallet to view cold-staking nodes."));
+    m_operator_registry_status->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to view cold-staking nodes.")));
     {
         QSignalBlocker selector_blocker(m_coldstake_operator_selector);
         m_coldstake_operator_selector->clear();
-        m_coldstake_operator_selector->addItem(tr("Load a wallet to select a cold-staking node"), QString());
+        m_coldstake_operator_selector->addItem((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to select a cold-staking node")), QString());
     }
     m_coldstake_operator_user_selected = false;
     {
         QSignalBlocker delegation_selector_blocker(m_coldstake_existing_selector);
         m_coldstake_existing_selector->clear();
-        m_coldstake_existing_selector->addItem(tr("Load a wallet to select a delegation address"), QString());
+        m_coldstake_existing_selector->addItem((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to select a delegation address")), QString());
     }
     if (m_coldstake_fund_amount) m_coldstake_fund_amount->setValue(COIN);
     m_coldstake_last_action_status.clear();
     m_coldstake_address->clear();
     m_coldstake_address_staker_hash.clear();
-    m_coldstake_summary->setText(tr("Load a wallet to view quantum staking and cold-staking status."));
+    m_coldstake_summary->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to view quantum staking and cold-staking status.")));
     m_coldstake_selection_summary->setText(QStringLiteral("-"));
     m_coldstake_status->setText(QStringLiteral("-"));
 

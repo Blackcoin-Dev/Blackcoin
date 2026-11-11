@@ -114,6 +114,9 @@ public:
     /** Subtransaction index, for sort key */
     int idx;
 
+    /** Assigned on GUI publication; zero while in an unpublished worker snapshot. */
+    uint64_t presentation_id{0};
+
     /** Status: can change with block chain update */
     TransactionStatus status;
 

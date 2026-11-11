@@ -1,11 +1,35 @@
-# Blackcoin Core 30.1.5.3rc4 (DEVELOPMENT, unreleased candidate)
+# Blackcoin Core 30.1.5.3rc5 (DEVELOPMENT, unreleased candidate)
 
 RELEASE_NOTES_NOT_FINAL
 
-Blackcoin Core 30.1.5.3rc4 improves peer discovery, bounds header replay tracking,
+Blackcoin Core 30.1.5.3rc5 improves peer discovery, bounds header replay tracking,
 and reduces work in mining controls, block-template assembly, and UTXO scans.
 This candidate has `CLIENT_VERSION_IS_RELEASE=false`.
 Release qualification is pending.
+
+## RC5 UI responsiveness
+
+- macOS reopen handling restores a minimized main window before activating it.
+  Hidden and minimized pages pause display work and resume on visibility events.
+- History filtering, sorting and publication proceed in bounded work slices.
+  Stable row identities preserve selections through live changes. Overview keeps
+  an independent five-row preview, and source loading or failure remains visible.
+- Account rendering and filtering use bounded work slices over the cached wallet
+  snapshot. Wallet snapshot and history preparation support cancellation while
+  waiting for locks and between expensive operations.
+- Application shutdown drains background UI workers without blocking the GUI
+  event loop. Recovery results remain owned through completion messages.
+  An individual wallet unload can still wait for active worker work to finish.
+- Staking display estimates run in the background with a 512-header bound and
+  current-tip validation.
+- Optional `-uiperflog=<absolute-new-file>` records GUI event-loop timer lateness.
+  It is disabled by default and does not measure input-to-paint latency.
+
+RC5 compilation, regression tests, rendered UI comparisons and local soak
+qualification are pending. These implementation changes do not establish a
+measured improvement on the MacBook Air. Explicit export/copy operations,
+large selection updates and some allocation or destruction work remain
+synchronous and require measurement.
 
 ## RC4 responsiveness and efficiency
 
@@ -138,11 +162,11 @@ changes. History scans also check RPC cancellation for each record.
 
 ## Compatibility and release qualification
 
-The source version is `30.1.5.3rc4`; numeric `CLIENT_VERSION` remains
+The source version is `30.1.5.3rc5`; numeric `CLIENT_VERSION` remains
 `300105`.
 macOS uses short version `30.1.5`, bundle version `30.1.503`, and
 `BlackcoinFullVersion=30.1.5.3` (the base revision). The runtime and configured
-package version remain `30.1.5.3rc4`.
+package version remain `30.1.5.3rc5`.
 
 This release preserves consensus and reward rules, activation
 heights, wire protocol, wallet storage, and chainstate formats. No reindex or

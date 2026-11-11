@@ -3443,6 +3443,24 @@ bool CWallet::CanGetAddresses(bool internal) const
     return false;
 }
 
+bool CWallet::TryCanGetAddresses(bool& result, bool internal) const
+{
+    TRY_LOCK(cs_wallet, lock);
+    if (!lock) return false;
+    for (OutputType type : OUTPUT_TYPES) {
+        const auto* manager = GetScriptPubKeyMan(type, internal);
+        if (!manager) continue;
+        bool capable{false};
+        if (!manager->TryCanGetAddresses(capable, internal)) return false;
+        if (capable) {
+            result = true;
+            return true;
+        }
+    }
+    result = false;
+    return true;
+}
+
 void CWallet::SetWalletFlag(uint64_t flags)
 {
     LOCK(cs_wallet);
@@ -9678,6 +9696,34 @@ bool CWallet::Lock()
     }
 
     NotifyStatusChanged(this);
+    return true;
+}
+
+bool CWallet::TryRestoreGuiUnlockState(bool relock, bool staking_only)
+{
+    if (!relock && !staking_only) return true;
+    bool notify{false};
+    {
+        // Match Lock() ordering. A GUI shutdown poll must not block behind
+        // either lock or perform a partial restoration when one is busy.
+        TRY_LOCK(m_relock_mutex, relock_guard);
+        if (!relock_guard) return false;
+        TRY_LOCK(cs_wallet, wallet_guard);
+        if (!wallet_guard) return false;
+        if (relock && IsCrypted()) {
+            if (!vMasterKey.empty()) {
+                memory_cleanse(vMasterKey.data(), vMasterKey.size() * sizeof(decltype(vMasterKey)::value_type));
+                vMasterKey.clear();
+            }
+            PublishPowMiningWalletAuthorityLocked();
+            notify = true;
+        }
+        if (staking_only && !m_wallet_unlock_staking_only.exchange(true, std::memory_order_acq_rel)) {
+            PublishPowMiningWalletAuthorityLocked();
+            notify = true;
+        }
+    }
+    if (notify) NotifyStatusChanged(this);
     return true;
 }
 

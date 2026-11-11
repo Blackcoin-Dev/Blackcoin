@@ -1410,6 +1410,7 @@ public:
     bool IsCrypted() const;
     bool IsLocked() const override;
     bool Lock();
+    bool TryRestoreGuiUnlockState(bool relock, bool staking_only);
 
     /** Interface to assert chain access */
     bool HaveChain() const { return m_chain ? true : false; }
@@ -2138,6 +2139,8 @@ public:
 
     /* Returns true if the wallet can give out new addresses. This means it has keys in the keypool or can generate new keys */
     bool CanGetAddresses(bool internal = false) const;
+    /** Try the wallet and manager locks; leave result untouched if unavailable. */
+    bool TryCanGetAddresses(bool& result, bool internal = false) const;
 
     /* Returns the time of the first created key or, in case of an import, it could be the time of the first received transaction */
     int64_t GetBirthTime() const { return m_birth_time; }

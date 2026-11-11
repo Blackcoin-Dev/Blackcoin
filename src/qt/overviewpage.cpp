@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <qt/overviewpage.h>
+#include <qt/visibilitycontroller.h>
 #include <qt/forms/ui_overviewpage.h>
 
 #include <qt/bitcoinunits.h>
@@ -11,7 +12,6 @@
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
-#include <qt/recenttransactionproxy.h>
 #include <qt/transactionfilterproxy.h>
 #include <qt/transactionoverviewwidget.h>
 #include <qt/transactiontablemodel.h>
@@ -199,12 +199,21 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     showOutOfSyncWarning(true);
     connect(ui->labelWalletStatus, &QPushButton::clicked, this, &OverviewPage::outOfSyncWarningClicked);
     connect(ui->labelTransactionsStatus, &QPushButton::clicked, this, &OverviewPage::outOfSyncWarningClicked);
+    m_visibility = std::make_unique<VisibilityController>(*this, [this](bool active) {
+        if (filter) {
+            filter->setActive(active);
+            // An inactive projection has no columns. Restore the list column
+            // after reattaching its source, including initial show and reentry.
+            if (active) ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
+        }
+    }, [this] { return !m_privacy; });
+    m_visibility->refresh();
 }
 
 void OverviewPage::handleTransactionClicked(const QModelIndex &index)
 {
-    if (m_recent_transactions) {
-        const QModelIndex transaction = filter->mapToSource(m_recent_transactions->mapToSource(index));
+    if (filter) {
+        const QModelIndex transaction = filter->mapToSource(index);
         if (transaction.isValid()) Q_EMIT transactionClicked(transaction);
     }
 }
@@ -212,13 +221,14 @@ void OverviewPage::handleTransactionClicked(const QModelIndex &index)
 void OverviewPage::setPrivacy(bool privacy)
 {
     m_privacy = privacy;
-    clientModel->getOptionsModel()->setOption(OptionsModel::OptionID::MaskValues, privacy);
-    const auto& balances = walletModel->getCachedBalance();
-    if (balances.balance != -1) {
-        setBalance(balances);
+    if (clientModel && clientModel->getOptionsModel()) clientModel->getOptionsModel()->setOption(OptionsModel::OptionID::MaskValues, privacy);
+    if (walletModel && walletModel->getOptionsModel()) {
+        const auto& balances = walletModel->getCachedBalance();
+        if (balances.balance != -1) setBalance(balances);
     }
 
     ui->listTransactions->setVisible(!m_privacy);
+    m_visibility->refresh();
 
     const QString status_tip = m_privacy ? tr("Privacy mode activated for the Overview tab. To unmask the values, uncheck Settings->Mask values.") : "";
     setStatusTip(status_tip);
@@ -228,6 +238,7 @@ void OverviewPage::setPrivacy(bool privacy)
 
 OverviewPage::~OverviewPage()
 {
+    m_visibility.reset();
     delete ui;
 }
 
@@ -322,22 +333,22 @@ void OverviewPage::setClientModel(ClientModel *model)
 
 void OverviewPage::setWalletModel(WalletModel *model)
 {
+    if (walletModel) disconnect(walletModel, nullptr, this, nullptr);
     this->walletModel = model;
     ui->listTransactions->setModel(nullptr);
-    m_recent_transactions.reset();
     filter.reset();
     if(model && model->getOptionsModel())
     {
         // Set up transaction list
-        filter.reset(new TransactionFilterProxy());
+        filter = std::make_unique<TransactionPresentationProxy>(nullptr, NUM_ITEMS);
+        m_visibility->refresh();
+        filter->setActive(m_visibility->active());
         filter->setSourceModel(model->getTransactionTableModel());
-        filter->setDynamicSortFilter(true);
         filter->setSortRole(Qt::EditRole);
         filter->setShowInactive(false);
         filter->sort(TransactionTableModel::Date, Qt::DescendingOrder);
 
-        m_recent_transactions = std::make_unique<RecentTransactionProxy>(*filter, NUM_ITEMS);
-        ui->listTransactions->setModel(m_recent_transactions.get());
+        ui->listTransactions->setModel(filter.get());
         ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
 
         // Keep up to date with wallet
@@ -414,4 +425,16 @@ void OverviewPage::setMonospacedFont(bool use_embedded_font)
     ui->labelWatchTotal->setFont(f);
     if (m_label_legacy_balance) m_label_legacy_balance->setFont(f);
     if (m_label_quantum_balance) m_label_quantum_balance->setFont(f);
+}
+
+void OverviewPage::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    m_visibility->refresh();
+}
+
+void OverviewPage::hideEvent(QHideEvent* event)
+{
+    QWidget::hideEvent(event);
+    m_visibility->refresh();
 }

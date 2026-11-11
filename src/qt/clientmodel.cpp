@@ -22,6 +22,8 @@
 #include <validation.h>
 
 #include <stdint.h>
+#include <cmath>
+#include <limits>
 
 #include <QDebug>
 #include <QMetaObject>
@@ -40,7 +42,7 @@ ClientModel::ClientModel(interfaces::Node& node, OptionsModel *_optionsModel, QO
     cachedBestHeaderHeight = -1;
     cachedBestHeaderTime = -1;
 
-    peerTableModel = new PeerTableModel(m_node, this);
+    peerTableModel = new PeerTableModel(m_node, m_thread, this);
     m_peer_table_sort_proxy = new PeerTableSortProxy(this);
     m_peer_table_sort_proxy->setSourceModel(peerTableModel);
 
@@ -49,43 +51,115 @@ ClientModel::ClientModel(interfaces::Node& node, OptionsModel *_optionsModel, QO
     QTimer* timer = new QTimer;
     timer->setInterval(MODEL_UPDATE_DELAY);
     connect(timer, &QTimer::timeout, [this] {
+        if (m_stopping.load(std::memory_order_acquire)) return;
+        sampleConnectionCounts();
         // no locking required at this point
         // the following calls will acquire the required lock
         Q_EMIT mempoolSizeChanged(m_node.getMempoolSize(), m_node.getMempoolDynamicUsage());
         Q_EMIT bytesChanged(m_node.getTotalBytesRecv(), m_node.getTotalBytesSent());
+        if (m_kernel_sample_requested.exchange(false, std::memory_order_acq_rel)) {
+            const uint64_t generation = WITH_LOCK(m_cached_tip_mutex, return m_header_generation);
+            uint256 header_hash, current_header;
+            double estimate{0};
+            const bool complete = m_node.tryGetPoSKernelPS(header_hash, estimate, current_header);
+            LOCK(m_cached_tip_mutex);
+            // Header notifications carry no hash. A notification during this
+            // query invalidates it, including same-height reorgs. Never hold
+            // the cache mutex across the Node call's cs_main try-lock.
+            if (generation == m_header_generation) {
+                m_verified_header_hash = current_header;
+                if (complete) {
+                    m_kernel_sample_hash = header_hash;
+                    m_kernel_sample = std::isfinite(estimate) && estimate > 0 ? std::optional<double>{estimate} : std::nullopt;
+                }
+            } else {
+                m_verified_header_hash.SetNull();
+            }
+        }
     });
     connect(m_thread, &QThread::finished, timer, &QObject::deleteLater);
     connect(m_thread, &QThread::started, [timer] { timer->start(); });
     // move timer to thread so that polling doesn't disturb main event loop
     timer->moveToThread(m_thread);
+    // Subscribe before starting the initial asynchronous connection sample.
+    subscribeToCoreSignals();
     m_thread->start();
     QTimer::singleShot(0, timer, []() {
         util::ThreadRename("qt-clientmodl");
     });
+}
 
-    subscribeToCoreSignals();
+std::optional<double> ClientModel::cachedPoSKernelPS()
+{
+    m_kernel_sample_requested.store(true, std::memory_order_release);
+    LOCK(m_cached_tip_mutex);
+    if (m_verified_header_hash.IsNull() || m_verified_header_hash != m_kernel_sample_hash) return std::nullopt;
+    return m_kernel_sample;
+}
+
+void ClientModel::beginShutdown()
+{
+    m_stopping.store(true, std::memory_order_release);
+    peerTableModel->beginShutdown();
+    m_thread->quit();
+}
+
+bool ClientModel::shutdownReady()
+{
+    return m_thread->wait(0);
 }
 
 ClientModel::~ClientModel()
 {
+    beginShutdown();
     unsubscribeFromCoreSignals();
-
-    m_thread->quit();
     m_thread->wait();
+}
+
+ClientModel::ConnectionCounts ClientModel::getConnectionCounts() const
+{
+    LOCK(m_connection_cache_mutex);
+    return m_connection_counts;
 }
 
 int ClientModel::getNumConnections(unsigned int flags) const
 {
-    ConnectionDirection connections = ConnectionDirection::None;
+    const auto counts = getConnectionCounts();
+    if (flags == CONNECTIONS_IN) return counts.inbound;
+    if (flags == CONNECTIONS_OUT) return counts.outbound;
+    if (flags == CONNECTIONS_ALL) return counts.total;
+    return 0;
+}
 
-    if(flags == CONNECTIONS_IN)
-        connections = ConnectionDirection::In;
-    else if (flags == CONNECTIONS_OUT)
-        connections = ConnectionDirection::Out;
-    else if (flags == CONNECTIONS_ALL)
-        connections = ConnectionDirection::Both;
+void ClientModel::sampleConnectionCounts()
+{
+    Q_ASSERT(QThread::currentThread() == m_thread);
+    const uint64_t generation = WITH_LOCK(m_connection_cache_mutex, return m_connection_generation);
+    // The old API has separate count reads. A bounded observation rejects
+    // detected churn; it is not an atomic peer-topology snapshot. Never hold
+    // the cache mutex across Core networking locks, and never spin on churn.
+    const auto before = m_node.getNodeCount(ConnectionDirection::Both);
+    const auto inbound = m_node.getNodeCount(ConnectionDirection::In);
+    const auto outbound = m_node.getNodeCount(ConnectionDirection::Out);
+    const auto after = m_node.getNodeCount(ConnectionDirection::Both);
+    publishConnectionCounts(generation, before, inbound, outbound, after);
+}
 
-    return m_node.getNodeCount(connections);
+void ClientModel::publishConnectionCounts(uint64_t generation, size_t before, size_t inbound, size_t outbound, size_t after)
+{
+    const auto maximum = size_t{std::numeric_limits<int>::max()};
+    const bool coherent = before == after && after <= maximum &&
+        inbound <= after && outbound <= after && inbound + outbound == after;
+    const ConnectionCounts sampled{after <= maximum ? int(after) : -1,
+        coherent ? int(inbound) : -1, coherent ? int(outbound) : -1};
+    bool changed{false};
+    {
+        LOCK(m_connection_cache_mutex);
+        if (m_stopping.load(std::memory_order_acquire) || generation != m_connection_generation) return;
+        changed = sampled.total != m_connection_counts.total || sampled.inbound != m_connection_counts.inbound || sampled.outbound != m_connection_counts.outbound;
+        m_connection_counts = sampled;
+    }
+    if (changed) Q_EMIT numConnectionsChanged(sampled.total);
 }
 
 int ClientModel::getHeaderTipHeight() const
@@ -150,8 +224,9 @@ uint256 ClientModel::getBestBlockHash()
 BlockSource ClientModel::getBlockSource() const
 {
     if (m_node.isLoadingBlocks()) return BlockSource::DISK;
-    if (getNumConnections() > 0) return BlockSource::NETWORK;
-    return BlockSource::NONE;
+    const int connections = getNumConnections();
+    if (connections < 0) return BlockSource::UNKNOWN;
+    return connections > 0 ? BlockSource::NETWORK : BlockSource::NONE;
 }
 
 QString ClientModel::getStatusBarWarnings() const
@@ -215,6 +290,7 @@ void ClientModel::TipChanged(SynchronizationState sync_state, interfaces::BlockT
         // cache best headers time and height to reduce future cs_main locks
         cachedBestHeaderHeight = tip.block_height;
         cachedBestHeaderTime = tip.block_time;
+        WITH_LOCK(m_cached_tip_mutex, ++m_header_generation; m_verified_header_hash.SetNull(););
     } else if (synctype == SyncType::BLOCK_SYNC) {
         m_cached_num_blocks = tip.block_height;
         WITH_LOCK(m_cached_tip_mutex, m_cached_tip_blocks = tip.block_hash;);
@@ -240,6 +316,12 @@ void ClientModel::subscribeToCoreSignals()
         });
     m_handler_notify_num_connections_changed = m_node.handleNotifyNumConnectionsChanged(
         [this](int new_num_connections) {
+            {
+                LOCK(m_connection_cache_mutex);
+                if (m_stopping.load(std::memory_order_acquire)) return;
+                ++m_connection_generation;
+                m_connection_counts = {new_num_connections, -1, -1};
+            }
             Q_EMIT numConnectionsChanged(new_num_connections);
         });
     m_handler_notify_network_active_changed = m_node.handleNotifyNetworkActiveChanged(

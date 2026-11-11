@@ -5,13 +5,21 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/amount.h>
+#include <interfaces/handler.h>
+#include <interfaces/wallet.h>
 #include <policy/fees.h>
 #include <script/solver.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
+#include <wallet/context.h>
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
+
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <thread>
 
 #include <boost/test/unit_test.hpp>
 
@@ -118,6 +126,96 @@ BOOST_FIXTURE_TEST_CASE(wallet_duplicated_preset_inputs_test, TestChain100Setup)
     recipients[0].fSubtractFeeFromAmount = false;
     res_tx = CreateTransaction(*wallet, recipients, /*change_pos*/-1, coin_control);
     BOOST_CHECK(!res_tx.has_value());
+}
+
+BOOST_FIXTURE_TEST_CASE(list_coins_interrupt, TestChain100Setup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    LOCK2(::cs_main, wallet->cs_wallet);
+    const auto full = ListCoins(*wallet);
+    BOOST_REQUIRE(!full.empty());
+
+    // A callback that never fires yields exactly the uninterrupted listing.
+    size_t polls{0};
+    const auto polled = ListCoins(*wallet, [&] { ++polls; return false; });
+    BOOST_REQUIRE(polled.has_value());
+    BOOST_CHECK(polled->size() == full.size());
+    for (const auto& [dest, coins] : full) {
+        const auto it = polled->find(dest);
+        BOOST_REQUIRE(it != polled->end());
+        BOOST_REQUIRE_EQUAL(it->second.size(), coins.size());
+        for (size_t i = 0; i < coins.size(); ++i) {
+            BOOST_CHECK(it->second[i].outpoint == coins[i].outpoint);
+            BOOST_CHECK(it->second[i].txout == coins[i].txout);
+        }
+    }
+    const size_t complete_polls = polls;
+    polls = 0;
+    BOOST_CHECK(!ListCoins(*wallet, [&] { return ++polls == complete_polls; }).has_value());
+    BOOST_CHECK_EQUAL(polls, complete_polls);
+    BOOST_CHECK(polls >= 1);
+    // Polls also cover outputs, grouping and ancestry.
+    BOOST_CHECK(polls > 1);
+
+    // A callback that fires stops the walk and reports no partial listing.
+    BOOST_CHECK(!ListCoins(*wallet, [] { return true; }).has_value());
+
+    // Funding paths without a callback are unaffected.
+    CoinFilterParams params;
+    BOOST_CHECK(!AvailableCoins(*wallet, /*coinControl=*/nullptr, /*feerate=*/std::nullopt, params).interrupted);
+}
+
+BOOST_FIXTURE_TEST_CASE(list_coins_interrupt_mid_walk, TestChain100Setup)
+{
+    // Enough wallet transactions for several interrupt polls.
+    for (int i = 0; i < 4 * static_cast<int>(CoinFilterParams::INTERRUPT_CHECK_INTERVAL); ++i) {
+        CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    }
+    std::shared_ptr<CWallet> wallet{CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey).release()};
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->mapWallet.size() > 4 * CoinFilterParams::INTERRUPT_CHECK_INTERVAL);
+        size_t polls{0};
+        // Fire on the third poll: the walk is part way through and must stop there.
+        BOOST_CHECK(!ListCoins(*wallet, [&] { return ++polls == 3; }).has_value());
+        BOOST_CHECK_EQUAL(polls, 3U);
+    }
+
+    // The interface used by the GUI snapshot reports an interrupted walk as nullopt
+    // and an uninterrupted one exactly like listCoins().
+    WalletContext wallet_context;
+    wallet_context.chain = m_node.chain.get();
+    auto wallet_interface = interfaces::MakeWallet(wallet_context, wallet);
+    size_t polls{0};
+    BOOST_CHECK(!wallet_interface->tryListCoins([&] { return ++polls == 2; }).has_value());
+    BOOST_CHECK_EQUAL(polls, 2U);
+    const auto full = wallet_interface->listCoins();
+    const auto polled = wallet_interface->tryListCoins([] { return false; });
+    BOOST_REQUIRE(polled.has_value());
+    BOOST_CHECK_EQUAL(polled->size(), full.size());
+    // The GUI snapshot must not wait behind another holder of cs_wallet.
+    std::promise<void> locked, release_lock;
+    auto released = release_lock.get_future().share();
+    std::atomic<bool> deadline_expired{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        deadline_expired = released.wait_for(std::chrono::seconds{3}) == std::future_status::timeout;
+    });
+    auto cleanup = interfaces::MakeCleanupHandler([&] { release_lock.set_value(); holder.join(); });
+    locked.get_future().wait();
+    const bool busy = !wallet_interface->tryListCoins([] { return false; }).has_value();
+    const bool returned_while_held = !deadline_expired.load();
+    cleanup.reset(); // Release/join before assertions, including fatal failures.
+    BOOST_CHECK(returned_while_held);
+    BOOST_CHECK(busy);
+    // Initial history cancellation likewise publishes no partial replacement.
+    std::vector<interfaces::WalletTx> transactions(1);
+    size_t history_polls{0};
+    BOOST_CHECK(!wallet_interface->tryGetWalletTxs(transactions, [&] { return ++history_polls == 3; }));
+    BOOST_CHECK_EQUAL(transactions.size(), 1U);
+    BOOST_CHECK(wallet_interface->tryGetWalletTxs(transactions));
+    BOOST_CHECK_EQUAL(transactions.size(), wallet->mapWallet.size());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

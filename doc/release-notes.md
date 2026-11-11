@@ -1,10 +1,12 @@
-30.1.5.3rc4 DEVELOPMENT Candidate Notes
+30.1.5.3rc5 DEVELOPMENT Candidate Notes
 ======================================
 
-This development candidate improves QQ peer discovery and qualification, bounds
-header replay tracking, moves mining controls off the GUI thread, and reduces
-block-template and UTXO scan work. It preserves consensus and storage formats.
-The source is RC4 with `CLIENT_VERSION_IS_RELEASE=false`; final release
+This development candidate adds macOS window restoration, incremental history
+and Account rendering, cancellable wallet preparation and asynchronous UI worker
+shutdown. It retains the earlier QQ peer discovery, header replay tracking,
+mining-control, block-template and UTXO scan changes. Consensus and storage
+formats are unchanged. RC5 UI and local soak qualification remain pending.
+The source is RC5 with `CLIENT_VERSION_IS_RELEASE=false`; final release
 qualification is pending. See
 `doc/release-notes/release-notes-30.1.5.3.md` for configuration changes,
 compatibility, and the measured synthetic template-assembly benchmark.

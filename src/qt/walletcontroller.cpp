@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 
 #include <QApplication>
 #include <QMessageBox>
@@ -55,6 +56,32 @@ WalletController::WalletController(ClientModel& client_model, const PlatformStyl
     QTimer::singleShot(0, m_activity_worker, []() {
         util::ThreadRename("qt-walletctrl");
     });
+}
+
+void WalletController::beginShutdown()
+{
+    m_closing.store(true, std::memory_order_release);
+    m_activity_thread->quit();
+}
+
+bool WalletController::shutdownReady()
+{
+    // A Core load callback may still be creating a model under this mutex.
+    // Leave the GUI event loop running until that ownership transfer and
+    // every already-running activity have finished.
+    std::unique_lock<QMutex> lock(m_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    std::vector<QPointer<WalletModel>> models;
+    models.reserve(m_wallets.size());
+    for (WalletModel* model : m_wallets) models.emplace_back(model);
+    lock.unlock(); // Never call a model/observer while holding the registry.
+    bool ready = m_activity_thread->wait(0);
+    for (const auto& model : models) {
+        if (!model) continue;
+        model->beginShutdown();
+        if (model) ready = model->shutdownReady() && ready;
+    }
+    return ready;
 }
 
 // Not using the default destructor because not all member types definitions are
@@ -144,6 +171,7 @@ void WalletController::closeAllWallets(QWidget* parent)
 QPointer<WalletModel> WalletController::getOrCreateWallet(std::unique_ptr<interfaces::Wallet> wallet)
 {
     QMutexLocker locker(&m_mutex);
+    if (m_closing.load(std::memory_order_acquire)) return {};
 
     // Return model instance if exists.
     if (!m_wallets.empty()) {

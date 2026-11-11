@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,7 @@ QT_END_NAMESPACE
 class WalletModel : public QObject
 {
     Q_OBJECT
+    friend class WalletTests; // Deterministic shutdown publication ordering fixture.
 
 public:
     explicit WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle* platformStyle, QObject* parent = nullptr, bool defer_history = false);
@@ -112,6 +114,8 @@ public:
         StakingMiningSnapshotRequest request;
         bool cancelled{false};
         bool stale_tip{false};
+        bool transient_unavailable{false};
+        std::string unavailable_stage;
         std::string error;
         std::string start_tip;
         std::string end_tip;
@@ -310,6 +314,8 @@ public:
         ~UnlockContext();
 
         bool isValid() const { return valid; }
+        //! Nonblocking narrowing restoration used only while draining shutdown.
+        bool tryRestore();
 
         // Disable unused copy/move constructors/assignments explicitly.
         UnlockContext(const UnlockContext&) = delete;
@@ -322,6 +328,7 @@ public:
         const bool valid;
         const bool relock;
         const std::optional<bool> restoreStakingOnly;
+        bool restored{false};
     };
 
     UnlockContext requestUnlock();
@@ -386,7 +393,22 @@ public:
     // Otherwise, uses the wallet's cached available balance.
     CAmount getAvailableBalance(const wallet::CCoinControl* control);
 
+    /** Start cooperative shutdown without waiting on the GUI thread. */
+    void beginShutdown();
+    /** GUI-thread lifecycle state; does not acquire a wallet lock. */
+    bool isShuttingDown() const { return m_joined; }
+    /** True only once the worker is fully joined; never waits. */
+    bool shutdownReady();
     void join();
+    /** Coalesce state-only Core transaction notifications before posting. */
+    void queueTransactionChanged();
+
+    /** GUI-only advisory cache; an unavailable read never publishes false. */
+    std::optional<bool> getCachedAddressCapability() const { return m_address_capability; }
+    /** A view must release its demand on hide, detach and destruction. */
+    void setAddressCapabilityConsumer(const QObject* consumer, bool active);
+    /** Thread-safe, coalesced Core invalidation; never reads the wallet. */
+    void queueAddressCapabilityChanged();
 
 private:
     std::unique_ptr<interfaces::Wallet> m_wallet;
@@ -441,6 +463,7 @@ private:
     bool m_deferred_history{false};
     bool m_history_request_pending{false};
     std::atomic<bool> m_history_cancel{false};
+    std::atomic<bool> m_history_yield{false};
 
     QThread t;
     WalletWorker *worker;
@@ -461,7 +484,7 @@ private:
         QUEUED,
         CANCELLED_BEFORE_CORE,
         CORE_ENTERED,
-        FINISHED,
+        FINISHED, // Produced outcome still owes GUI publication.
     };
     struct PowClaimRecoveryOperationControl {
         std::atomic<bool> cancel_requested{false};
@@ -475,6 +498,17 @@ private:
     std::map<uint64_t, bool> m_pow_claim_recovery_restore_staking_only;
     uint64_t m_pow_claim_recovery_mutation_in_flight{0};
     bool m_joined{false};
+    std::atomic<bool> m_transaction_notification_queued{false};
+
+    std::optional<bool> m_address_capability;
+    std::set<const QObject*> m_address_capability_consumers;
+    std::atomic<bool> m_address_capability_observed{false};
+    std::atomic<bool> m_address_capability_dirty{true};
+    std::atomic<bool> m_address_capability_notification_queued{false};
+    std::shared_ptr<std::atomic<bool>> m_address_capability_cancel;
+    bool m_address_capability_in_flight{false};
+    QTimer* m_address_capability_retry;
+    void requestAddressCapability();
 
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
@@ -483,6 +517,7 @@ private:
         PowClaimRecoveryOperationRequest request,
         const std::shared_ptr<PowClaimRecoveryOperationControl>& control);
     void restorePowClaimRecoveryUnlock(uint64_t request_id);
+    bool tryRestorePowClaimRecoveryUnlock(uint64_t request_id);
     void publishPowClaimRecoveryOperationResult(
         const std::shared_ptr<PowClaimRecoveryOperationResult>& result);
 
@@ -516,7 +551,7 @@ Q_SIGNALS:
     // Signal that wallet is about to be removed
     void unload();
 
-    // Notify that there are now keys in the keypool
+    // A new authoritative capability value was accepted into the GUI cache
     void canGetAddressesChanged();
 
     void timerTimeout();

@@ -12,6 +12,7 @@ TEST_QT_MOC_CPP = \
   qt/test/moc_chainstaterebuildassistanttests.cpp \
   qt/test/moc_optiontests.cpp \
   qt/test/moc_presentationefficiencytests.cpp \
+  qt/test/moc_uiworkertests.cpp \
   qt/test/moc_rpcnestedtests.cpp \
   qt/test/moc_shadowresourcedialogtests.cpp \
   qt/test/moc_uritests.cpp
@@ -20,6 +21,7 @@ if ENABLE_WALLET
 TEST_QT_MOC_CPP += \
   qt/test/moc_addressbooktests.cpp \
   qt/test/moc_themetests.cpp \
+  qt/test/moc_uirenderingtests.cpp \
   qt/test/moc_wallettests.cpp
 endif # ENABLE_WALLET
 
@@ -29,6 +31,8 @@ TEST_QT_H = \
   qt/test/chainstaterebuildassistanttests.h \
   qt/test/optiontests.h \
   qt/test/presentationefficiencytests.h \
+  qt/test/uirenderingtests.h \
+  qt/test/uiworkertests.h \
   qt/test/rpcnestedtests.h \
   qt/test/shadowresourcedialogtests.h \
   qt/test/themetests.h \
@@ -45,6 +49,7 @@ qt_test_test_blackcoin_qt_SOURCES = \
   qt/test/chainstaterebuildassistanttests.cpp \
   qt/test/optiontests.cpp \
   qt/test/presentationefficiencytests.cpp \
+  qt/test/uiworkertests.cpp \
   qt/test/rpcnestedtests.cpp \
   qt/test/shadowresourcedialogtests.cpp \
   qt/test/test_main.cpp \
@@ -56,6 +61,7 @@ qt_test_test_blackcoin_qt_SOURCES += \
   qt/test/addressbooktests.cpp \
   qt/test/themetests.cpp \
   qt/test/wallettests.cpp \
+  qt/test/uirenderingtests.cpp \
   wallet/test/wallet_test_fixture.cpp
 endif # ENABLE_WALLET
 

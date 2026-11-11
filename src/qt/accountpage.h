@@ -10,7 +10,9 @@
 
 #include <QPointer>
 #include <QWidget>
+#include <memory>
 
+class VisibilityController;
 class PlatformStyle;
 
 QT_BEGIN_NAMESPACE
@@ -35,6 +37,7 @@ public:
 
 protected:
     void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private Q_SLOTS:
     void refresh();
@@ -45,6 +48,19 @@ private Q_SLOTS:
     void showGuide();
 
 private:
+    std::unique_ptr<VisibilityController> m_visibility;
+    friend class UiRenderingTests;
+    struct RenderState;
+    std::unique_ptr<RenderState> m_render_state;
+    QTimer* m_render_timer{nullptr};
+    QTimer* m_filter_slice_timer{nullptr};
+    int m_filter_row{0}, m_filter_child{0}, m_visible_groups{0}, m_visible_outputs{0};
+    CAmount m_visible_amount{0};
+    bool m_filter_match{false};
+    QString m_filter_needle, m_filter_family, m_filter_tail;
+    void renderSlice();
+    void filterSlice();
+
     enum Column {
         Type = 0,
         Address,
@@ -84,6 +100,7 @@ private:
     void renderSnapshot();
     void applySnapshotFilter();
     void discardSnapshot();
+    void suspendWork();
     bool rowMatchesFilter(const QString& family, const QString& address, const QString& label) const;
 };
 

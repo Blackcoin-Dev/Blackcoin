@@ -11,9 +11,9 @@
 #include <memory>
 
 class ClientModel;
-class RecentTransactionProxy;
-class TransactionFilterProxy;
+class TransactionPresentationProxy;
 class TxViewDelegate;
+class VisibilityController;
 class PlatformStyle;
 class WalletModel;
 
@@ -49,8 +49,11 @@ Q_SIGNALS:
 
 protected:
     void changeEvent(QEvent* e) override;
+    void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
+    std::unique_ptr<VisibilityController> m_visibility;
     Ui::OverviewPage *ui;
     ClientModel* clientModel{nullptr};
     WalletModel* walletModel{nullptr};
@@ -65,8 +68,7 @@ private:
     const PlatformStyle* m_platform_style;
 
     TxViewDelegate *txdelegate;
-    std::unique_ptr<TransactionFilterProxy> filter;
-    std::unique_ptr<RecentTransactionProxy> m_recent_transactions;
+    std::unique_ptr<TransactionPresentationProxy> filter;
 
 private Q_SLOTS:
     void updateDisplayUnit();

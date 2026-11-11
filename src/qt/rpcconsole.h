@@ -25,6 +25,7 @@ class PlatformStyle;
 class RPCExecutor;
 class RPCTimerInterface;
 class WalletModel;
+class VisibilityController;
 
 namespace interfaces {
     class Node;
@@ -55,6 +56,8 @@ public:
     }
 
     void setClientModel(ClientModel *model = nullptr, int bestblock_height = 0, int64_t bestblock_date = 0, double verification_progress = 0.0);
+    void beginShutdown();
+    bool shutdownReady();
 
 #ifdef ENABLE_WALLET
     void addWallet(WalletModel* const walletModel);
@@ -175,11 +178,13 @@ private:
     int consoleFontSize = 0;
     QCompleter *autoCompleter = nullptr;
     QThread thread;
-    RPCExecutor* m_executor{nullptr};
+    QPointer<RPCExecutor> m_executor;
+    bool m_stopping{false};
     WalletModel* m_last_wallet_model{nullptr};
     bool m_is_executing{false};
     void updatePeerTableRefresh();
     QPointer<PeerTableModel> m_peer_refresh_model;
+    std::unique_ptr<VisibilityController> m_peer_visibility;
     QByteArray m_peer_widget_header_state;
     QByteArray m_banlist_widget_header_state;
 

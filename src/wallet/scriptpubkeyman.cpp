@@ -491,6 +491,15 @@ bool LegacyScriptPubKeyMan::CanGetAddresses(bool internal) const
     return keypool_has_keys;
 }
 
+bool LegacyScriptPubKeyMan::TryCanGetAddresses(bool& result, bool internal) const
+{
+    TRY_LOCK(cs_KeyStore, lock);
+    if (!lock) return false;
+    // Reuse the predicate under its recursive lock without waiting for it.
+    result = CanGetAddresses(internal);
+    return true;
+}
+
 bool LegacyScriptPubKeyMan::Upgrade(int prev_version, int new_version, bilingual_str& error)
 {
     LOCK(cs_KeyStore);
@@ -2426,6 +2435,14 @@ bool DescriptorScriptPubKeyMan::CanGetAddresses(bool internal) const
     return m_wallet_descriptor.descriptor->IsSingleType() &&
            m_wallet_descriptor.descriptor->IsRange() &&
            (HavePrivateKeys() || m_wallet_descriptor.next_index < m_wallet_descriptor.range_end);
+}
+
+bool DescriptorScriptPubKeyMan::TryCanGetAddresses(bool& result, bool internal) const
+{
+    TRY_LOCK(cs_desc_man, lock);
+    if (!lock) return false;
+    result = CanGetAddresses(internal);
+    return true;
 }
 
 bool DescriptorScriptPubKeyMan::HavePrivateKeys() const

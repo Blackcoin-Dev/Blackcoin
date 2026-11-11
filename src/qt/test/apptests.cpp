@@ -31,6 +31,10 @@
 #include <QtTest/QtTestWidgets>
 #include <QtTest/QtTestGui>
 
+#ifdef Q_OS_MACOS
+#include <qt/macdockiconhandler.h>
+#endif
+
 namespace {
 //! Regex find a string group inside of the console output
 QString FindInConsole(const QString& output, const QString& pattern)
@@ -94,6 +98,18 @@ void AppTests::guiTests(BitcoinGUI* window)
 {
     HandleCallback callback{"guiTests", *this};
     QVERIFY(window->findChild<QAction*>("openShadowResourceAction"));
+#ifdef Q_OS_MACOS
+    // Exercise the production reopen signal with Cocoa. AppTests is skipped on
+    // the macOS minimal plugin above; this is not a synthetic Dock-click claim.
+    window->showMinimized();
+    QTRY_VERIFY_WITH_TIMEOUT(window->isMinimized(), 3000);
+    QVERIFY(QMetaObject::invokeMethod(MacDockIconHandler::instance(), "dockIconClicked", Qt::DirectConnection));
+    QTRY_VERIFY_WITH_TIMEOUT(window->isVisible() && !window->isMinimized(), 3000);
+    window->hide();
+    QVERIFY(!window->isVisible());
+    QVERIFY(QMetaObject::invokeMethod(MacDockIconHandler::instance(), "dockIconClicked", Qt::DirectConnection));
+    QTRY_VERIFY_WITH_TIMEOUT(window->isVisible() && !window->isMinimized(), 3000);
+#endif
     connect(window, &BitcoinGUI::consoleShown, this, &AppTests::consoleTests);
     expectCallback("consoleTests");
     QAction* action = window->findChild<QAction*>("openRPCConsoleAction");

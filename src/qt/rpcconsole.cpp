@@ -7,6 +7,7 @@
 #endif
 
 #include <qt/rpcconsole.h>
+#include <qt/visibilitycontroller.h>
 #include <qt/forms/ui_debugwindow.h>
 
 #include <chainparams.h>
@@ -479,6 +480,7 @@ RPCConsole::RPCConsole(interfaces::Node& node, const PlatformStyle *_platformSty
     platformStyle(_platformStyle)
 {
     ui->setupUi(this);
+    ui->peerWidget->setMeasurementRole(UiPaintProbe::Role::PEERS);
     QSettings settings;
 #ifdef ENABLE_WALLET
     if (WalletModel::isWalletEnabled()) {
@@ -589,10 +591,17 @@ RPCConsole::RPCConsole(interfaces::Node& node, const PlatformStyle *_platformSty
     clear();
 
     GUIUtil::handleCloseWindowShortcut(this);
+    m_peer_visibility = std::make_unique<VisibilityController>(*this, [this](bool active) {
+        if (!m_peer_refresh_model) return;
+        if (active) m_peer_refresh_model->startAutoRefresh();
+        else m_peer_refresh_model->stopAutoRefresh();
+    }, [this] { return !m_stopping && ui->tabWidget->currentIndex() == int(TabTypes::PEERS); });
+    m_peer_visibility->refresh();
 }
 
 RPCConsole::~RPCConsole()
 {
+    m_peer_visibility.reset();
     if (m_peer_refresh_model) m_peer_refresh_model->stopAutoRefresh();
     QSettings settings;
 #ifdef ENABLE_WALLET
@@ -976,9 +985,11 @@ void RPCConsole::message(int category, const QString &message, bool html)
 
 void RPCConsole::updateNetworkState()
 {
-    QString connections = QString::number(clientModel->getNumConnections()) + " (";
-    connections += tr("In:") + " " + QString::number(clientModel->getNumConnections(CONNECTIONS_IN)) + " / ";
-    connections += tr("Out:") + " " + QString::number(clientModel->getNumConnections(CONNECTIONS_OUT)) + ")";
+    const auto counts = clientModel->getConnectionCounts();
+    const auto display_count = [this](int count) { return count < 0 ? tr("Unavailable") : QString::number(count); };
+    QString connections = display_count(counts.total) + " (";
+    connections += tr("In:") + " " + display_count(counts.inbound) + " / ";
+    connections += tr("Out:") + " " + display_count(counts.outbound) + ")";
 
     if(!clientModel->node().getNetworkActive()) {
         connections += " (" + tr("Network activity disabled") + ")";
@@ -1021,6 +1032,7 @@ void RPCConsole::setMempoolSize(long numberOfTxs, size_t dynUsage)
 
 void RPCConsole::on_lineEdit_returnPressed()
 {
+    if (m_stopping || !thread.isRunning() || !m_executor) return;
     QString cmd = ui->lineEdit->text().trimmed();
 
     if (cmd.isEmpty()) {
@@ -1071,8 +1083,9 @@ void RPCConsole::on_lineEdit_returnPressed()
     message(CMD_REPLY, tr("Executing…"));
     m_is_executing = true;
 
-    QMetaObject::invokeMethod(m_executor, [this, cmd, wallet_model] {
-        m_executor->request(cmd, wallet_model);
+    RPCExecutor* const executor = m_executor.data();
+    QMetaObject::invokeMethod(executor, [executor, cmd, wallet_model] {
+        executor->request(cmd, wallet_model);
     });
 
     cmd = QString::fromStdString(strFilteredCmd);
@@ -1113,13 +1126,26 @@ void RPCConsole::browseHistory(int offset)
     ui->lineEdit->setText(cmd);
 }
 
+void RPCConsole::beginShutdown()
+{
+    m_stopping = true;
+    updatePeerTableRefresh();
+    ui->lineEdit->setEnabled(false);
+    thread.quit();
+}
+
+bool RPCConsole::shutdownReady()
+{
+    return thread.wait(0);
+}
+
 void RPCConsole::startExecutor()
 {
     m_executor = new RPCExecutor(m_node);
     m_executor->moveToThread(&thread);
 
     // Replies from executor object must go to this object
-    connect(m_executor, &RPCExecutor::reply, this, [this](int category, const QString& command) {
+    connect(m_executor.data(), &RPCExecutor::reply, this, [this](int category, const QString& command) {
         // Remove "Executing…" message.
         ui->messagesWidget->undo();
         message(category, command);
@@ -1128,12 +1154,12 @@ void RPCConsole::startExecutor()
     });
 
     // Make sure executor object is deleted in its own thread
-    connect(&thread, &QThread::finished, m_executor, &RPCExecutor::deleteLater);
+    connect(&thread, &QThread::finished, m_executor.data(), &RPCExecutor::deleteLater);
 
     // Default implementation of QThread::run() simply spins up an event loop in the thread,
     // which is what we want.
     thread.start();
-    QTimer::singleShot(0, m_executor, []() {
+    QTimer::singleShot(0, m_executor.data(), []() {
         util::ThreadRename("qt-rpcconsole");
     });
 }
@@ -1185,6 +1211,7 @@ void RPCConsole::updateDetailWidget()
         return;
     }
     const auto stats = selected_peers.first().data(PeerTableModel::StatsRole).value<CNodeCombinedStats*>();
+    if (!stats) return;
     // update the detail ui with latest node information
     QString peerAddrDetails(QString::fromStdString(stats->nodeStats.m_addr_name) + " ");
     peerAddrDetails += tr("(peer: %1)").arg(QString::number(stats->nodeStats.nodeid));
@@ -1275,8 +1302,9 @@ void RPCConsole::showEvent(QShowEvent *event)
 
 void RPCConsole::updatePeerTableRefresh()
 {
+    if (m_peer_visibility) m_peer_visibility->refresh();
     if (!m_peer_refresh_model) return;
-    if (isVisible() && ui->tabWidget->currentIndex() == int(TabTypes::PEERS)) {
+    if (m_peer_visibility && m_peer_visibility->active()) {
         m_peer_refresh_model->startAutoRefresh();
     } else {
         m_peer_refresh_model->stopAutoRefresh();

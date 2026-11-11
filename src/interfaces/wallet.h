@@ -122,6 +122,11 @@ public:
     //! Lock wallet.
     virtual bool lock() = 0;
 
+    //! Restore temporary GUI authority without waiting for wallet/relock locks.
+    //! false retains the caller's restoration obligation. This can only lock
+    //! the wallet and/or restrict it to staking-only, never unlock or expand it.
+    virtual bool tryRestoreGuiUnlockState(bool relock, bool staking_only) = 0;
+
     //! Unlock wallet.
     virtual bool unlock(const SecureString& wallet_passphrase,
                         std::optional<bool> staking_only = std::nullopt) = 0;
@@ -181,6 +186,8 @@ public:
 
     //! Get wallet address list.
     virtual std::vector<WalletAddress> getAddresses() const = 0;
+    virtual bool tryGetAddresses(std::vector<WalletAddress>& addresses,
+                                 const std::function<bool()>& interrupt) const = 0;
 
     //! Get receive requests.
     virtual std::vector<std::string> getAddressReceiveRequests() = 0;
@@ -230,7 +237,8 @@ public:
 
     //! Get list of all wallet transactions.
     virtual std::vector<WalletTx> getWalletTxs() = 0;
-    virtual bool tryGetWalletTxs(std::vector<WalletTx>& transactions) = 0;
+    virtual bool tryGetWalletTxs(std::vector<WalletTx>& transactions,
+                                 const std::function<bool()>& interrupt = {}) = 0;
 
     //! Try to get updated status for a particular transaction, if possible without blocking.
     virtual bool tryGetTxStatus(const uint256& txid,
@@ -291,6 +299,11 @@ public:
     using CoinsList = std::map<CTxDestination, std::vector<std::tuple<COutPoint, WalletTxOut>>>;
     virtual CoinsList listCoins() = 0;
 
+    //! Interruptible listCoins for background snapshots. interrupt() is polled
+    //! during traversal and grouping. Returns nullopt on cancellation or busy locks;
+    //! no partial listing escapes. The ordinary listCoins contract is unchanged.
+    virtual std::optional<CoinsList> tryListCoins(const std::function<bool()>& interrupt) = 0;
+
     //! Return wallet transaction output information.
     virtual std::vector<WalletTxOut> getCoins(const std::vector<COutPoint>& outputs) = 0;
 
@@ -304,6 +317,9 @@ public:
 
     // Return whether the wallet is blank.
     virtual bool canGetAddresses() = 0;
+
+    /** Nonblocking capability query. False means unavailable; result is unchanged. */
+    virtual bool tryCanGetAddresses(bool& result) = 0;
 
     // Return whether private keys enabled.
     virtual bool privateKeysDisabled() = 0;

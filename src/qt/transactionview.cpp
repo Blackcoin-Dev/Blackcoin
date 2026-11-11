@@ -3,6 +3,8 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <qt/transactionview.h>
+#include <qt/visibilitycontroller.h>
+#include <qt/uiperf.h>
 
 #include <qt/addresstablemodel.h>
 #include <qt/bitcoinunits.h>
@@ -131,10 +133,11 @@ TransactionView::TransactionView(const PlatformStyle *platformStyle, QWidget *pa
     vlayout->setContentsMargins(0,0,0,0);
     vlayout->setSpacing(0);
 
-    transactionView = new QTableView(this);
+    transactionView = new UiPaintTableView(this);
     transactionView->setObjectName("transactionView");
     vlayout->addLayout(filter_layout);
     m_history_state = new QLabel(tr("Loading wallet history…"), this);
+    m_history_state->setObjectName(QStringLiteral("transactionHistoryState"));
     m_history_state->hide();
     vlayout->addWidget(m_history_state);
     vlayout->addWidget(createDateRangeWidget());
@@ -177,6 +180,12 @@ TransactionView::TransactionView(const PlatformStyle *platformStyle, QWidget *pa
     connect(dateWidget, qOverload<int>(&QComboBox::activated), this, &TransactionView::chooseDate);
     connect(typeWidget, qOverload<int>(&QComboBox::activated), this, &TransactionView::chooseType);
     connect(watchOnlyWidget, qOverload<int>(&QComboBox::activated), this, &TransactionView::chooseWatchonly);
+    connect(amountWidget, &QLineEdit::textEdited, this, [this] {
+        static_cast<UiPaintTableView*>(transactionView)->measurementAction(UiPaintProbe::Action::FILTER_RESULT, true, {}, UiPaintProbe::FilterChannel::AMOUNT);
+    });
+    connect(search_widget, &QLineEdit::textEdited, this, [this] {
+        static_cast<UiPaintTableView*>(transactionView)->measurementAction(UiPaintProbe::Action::FILTER_RESULT, true, {}, UiPaintProbe::FilterChannel::SEARCH);
+    });
     connect(amountWidget, &QLineEdit::textChanged, amount_typing_delay, qOverload<>(&QTimer::start));
     connect(amount_typing_delay, &QTimer::timeout, this, &TransactionView::changedAmount);
     connect(search_widget, &QLineEdit::textChanged, prefix_typing_delay, qOverload<>(&QTimer::start));
@@ -187,10 +196,16 @@ TransactionView::TransactionView(const PlatformStyle *platformStyle, QWidget *pa
 
     // Double-clicking on a transaction on the transaction history page shows details
     connect(this, &TransactionView::doubleClicked, this, &TransactionView::showDetails);
+    m_visibility = std::make_unique<VisibilityController>(*this, [this](bool active) {
+        if (transactionProxyModel) transactionProxyModel->setActive(active);
+        updateHistoryState();
+    });
+    m_visibility->refresh();
 }
 
 TransactionView::~TransactionView()
 {
+    m_visibility.reset();
     QSettings settings;
     settings.setValue("TransactionViewHeaderState", transactionView->horizontalHeader()->saveState());
 }
@@ -198,20 +213,17 @@ TransactionView::~TransactionView()
 void TransactionView::setModel(WalletModel *_model)
 {
     m_pending_focus = std::monostate{};
+    transactionView->setModel(nullptr);
+    delete transactionProxyModel;
+    transactionProxyModel = nullptr;
     this->model = _model;
     if(_model)
     {
-        transactionProxyModel = new TransactionFilterProxy(this);
+        transactionProxyModel = new TransactionPresentationProxy(this);
         auto* history = _model->getTransactionTableModel();
-        if (history->historyLoadHasFailed()) {
-            m_history_state->setText(tr("Wallet history could not be loaded. Reopen the wallet to try again."));
-        }
-        m_history_state->setVisible(!history->isHistoryLoaded());
-        search_widget->setEnabled(history->isHistoryLoaded());
         connect(history, &TransactionTableModel::historyLoaded, this, [this, history] {
             if (!model || model->getTransactionTableModel() != history) return;
-            m_history_state->hide();
-            search_widget->setEnabled(true);
+            updateHistoryState();
             const auto pending = std::exchange(m_pending_focus, std::monostate{});
             if (const auto* index = std::get_if<QPersistentModelIndex>(&pending); index && index->isValid()) {
                 // Recreate the index after publication and replay so its
@@ -219,20 +231,36 @@ void TransactionView::setModel(WalletModel *_model)
                 focusTransaction(history->index(index->row(), index->column()));
             } else if (const auto* txid = std::get_if<uint256>(&pending)) {
                 focusTransaction(*txid);
-            } else if (isVisible()) {
+            } else if (m_visibility->active()) {
                 ensureHistorySource();
             }
         });
         connect(history, &TransactionTableModel::historyLoadFailed, this, [this, history] {
             if (!model || model->getTransactionTableModel() != history) return;
-            m_history_state->setText(tr("Wallet history could not be loaded. Reopen the wallet to try again."));
+            updateHistoryState();
         });
-        transactionProxyModel->setDynamicSortFilter(true);
         transactionProxyModel->setSortCaseSensitivity(Qt::CaseInsensitive);
-        transactionProxyModel->setFilterCaseSensitivity(Qt::CaseInsensitive);
         transactionProxyModel->setSortRole(Qt::EditRole);
+        m_visibility->refresh();
+        transactionProxyModel->setActive(m_visibility->active());
         transactionView->setModel(transactionProxyModel);
-        ensureHistorySource();
+        transactionView->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder);
+        static_cast<UiPaintTableView*>(transactionView)->observeHistoryProjection(transactionProxyModel);
+        connect(transactionProxyModel, &TransactionPresentationProxy::projectionStarted, this, [this] {
+            updateHistoryState();
+        });
+        connect(transactionProxyModel, &TransactionPresentationProxy::projectionReady, this, [this] {
+            updateHistoryState();
+            const auto pending = std::exchange(m_pending_focus, std::monostate{});
+            if (const auto* index = std::get_if<QPersistentModelIndex>(&pending); index && index->isValid()) {
+                focusTransaction(model->getTransactionTableModel()->index(index->row(), index->column()));
+            } else if (const auto* txid = std::get_if<uint256>(&pending)) {
+                focusTransaction(*txid);
+            }
+        });
+        transactionProxyModel->setSourceModel(history);
+        if (m_visibility->active()) ensureHistorySource();
+        updateHistoryState();
 
         if (_model->getOptionsModel())
         {
@@ -263,6 +291,23 @@ void TransactionView::setModel(WalletModel *_model)
         // Watch-only signal
         connect(_model, &WalletModel::notifyWatchonlyChanged, this, &TransactionView::updateWatchOnlyColumn);
     }
+    updateHistoryState();
+}
+
+void TransactionView::updateHistoryState()
+{
+    const auto* history = model ? model->getTransactionTableModel() : nullptr;
+    const bool failed = history && history->historyLoadHasFailed();
+    const bool loaded = history && history->isHistoryLoaded();
+    const bool projected = transactionProxyModel && transactionProxyModel->isReady();
+    if (failed) m_history_state->setText(tr("Wallet history could not be loaded. Reopen the wallet to try again."));
+    else if (!loaded) m_history_state->setText(tr("Loading wallet history…"));
+    else m_history_state->setText(tr("Updating transaction history…"));
+    m_history_state->setVisible(history && (failed || !loaded || !projected));
+    search_widget->setEnabled(loaded && !failed);
+    // Removed source identities can be absent while the next projection is
+    // pending. Navigation queues until readiness; user actions stay disabled.
+    transactionView->setEnabled(loaded && !failed && projected);
 }
 
 bool TransactionView::ensureHistorySource()
@@ -270,18 +315,22 @@ bool TransactionView::ensureHistorySource()
     if (!model || !transactionProxyModel) return false;
     auto* history = model->getTransactionTableModel();
     if (!history->isHistoryLoaded()) return false;
-    if (!transactionProxyModel->sourceModel()) {
-        transactionProxyModel->setSourceModel(history);
-        transactionView->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder);
-        updateWatchOnlyColumn(model->haveWatchOnly());
-    }
+    m_visibility->refresh();
+    transactionProxyModel->setActive(m_visibility->active());
     return true;
 }
 
 void TransactionView::showEvent(QShowEvent* event)
 {
     QWidget::showEvent(event);
+    m_visibility->refresh();
     ensureHistorySource();
+}
+
+void TransactionView::hideEvent(QHideEvent* event)
+{
+    QWidget::hideEvent(event);
+    m_visibility->refresh();
 }
 
 void TransactionView::changeEvent(QEvent* e)
@@ -301,6 +350,7 @@ void TransactionView::changeEvent(QEvent* e)
 void TransactionView::chooseDate(int idx)
 {
     if (!transactionProxyModel) return;
+    static_cast<UiPaintTableView*>(transactionView)->measurementAction(UiPaintProbe::Action::FILTER_RESULT, true, {}, UiPaintProbe::FilterChannel::COMBO);
     QDate current = QDate::currentDate();
     dateRangeWidget->setVisible(false);
     switch(dateWidget->itemData(idx).toInt())
@@ -349,6 +399,7 @@ void TransactionView::chooseType(int idx)
 {
     if(!transactionProxyModel)
         return;
+    static_cast<UiPaintTableView*>(transactionView)->measurementAction(UiPaintProbe::Action::FILTER_RESULT, true, {}, UiPaintProbe::FilterChannel::COMBO);
     transactionProxyModel->setTypeFilter(
         typeWidget->itemData(idx).toInt());
 }
@@ -357,6 +408,7 @@ void TransactionView::chooseWatchonly(int idx)
 {
     if(!transactionProxyModel)
         return;
+    static_cast<UiPaintTableView*>(transactionView)->measurementAction(UiPaintProbe::Action::FILTER_RESULT, true, {}, UiPaintProbe::FilterChannel::COMBO);
     transactionProxyModel->setWatchOnlyFilter(
         static_cast<TransactionFilterProxy::WatchOnlyFilter>(watchOnlyWidget->itemData(idx).toInt()));
 }
@@ -365,13 +417,16 @@ void TransactionView::changedSearch()
 {
     if(!transactionProxyModel)
         return;
+    static_cast<UiPaintTableView*>(transactionView)->measurementDeferred(true, UiPaintProbe::FilterChannel::SEARCH);
     transactionProxyModel->setSearchString(search_widget->text());
+    static_cast<UiPaintTableView*>(transactionView)->measurementDeferred(false, UiPaintProbe::FilterChannel::SEARCH);
 }
 
 void TransactionView::changedAmount()
 {
     if(!transactionProxyModel)
         return;
+    static_cast<UiPaintTableView*>(transactionView)->measurementDeferred(true, UiPaintProbe::FilterChannel::AMOUNT);
     CAmount amount_parsed = 0;
     if (BitcoinUnits::parse(model->getOptionsModel()->getDisplayUnit(), amountWidget->text(), &amount_parsed)) {
         transactionProxyModel->setMinAmount(amount_parsed);
@@ -380,6 +435,7 @@ void TransactionView::changedAmount()
     {
         transactionProxyModel->setMinAmount(0);
     }
+    static_cast<UiPaintTableView*>(transactionView)->measurementDeferred(false, UiPaintProbe::FilterChannel::AMOUNT);
 }
 
 void TransactionView::exportClicked()
@@ -438,6 +494,7 @@ bool TransactionView::exportTransactions(const QString& filename)
 
 void TransactionView::contextualMenu(const QPoint &point)
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     QModelIndex index = transactionView->indexAt(point);
     QModelIndexList selection = transactionView->selectionModel()->selectedRows(0);
     if (selection.empty())
@@ -457,6 +514,7 @@ void TransactionView::contextualMenu(const QPoint &point)
 
 void TransactionView::abandonTx()
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     if(!transactionView || !transactionView->selectionModel())
         return;
     QModelIndexList selection = transactionView->selectionModel()->selectedRows(0);
@@ -473,36 +531,43 @@ void TransactionView::abandonTx()
 
 void TransactionView::copyAddress()
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     GUIUtil::copyEntryData(transactionView, 0, TransactionTableModel::AddressRole);
 }
 
 void TransactionView::copyLabel()
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     GUIUtil::copyEntryData(transactionView, 0, TransactionTableModel::ExportLabelRole);
 }
 
 void TransactionView::copyAmount()
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     GUIUtil::copyEntryData(transactionView, 0, TransactionTableModel::FormattedAmountRole);
 }
 
 void TransactionView::copyTxID()
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     GUIUtil::copyEntryData(transactionView, 0, TransactionTableModel::TxHashRole);
 }
 
 void TransactionView::copyTxHex()
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     GUIUtil::copyEntryData(transactionView, 0, TransactionTableModel::TxHexRole);
 }
 
 void TransactionView::copyTxPlainText()
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     GUIUtil::copyEntryData(transactionView, 0, TransactionTableModel::TxPlainTextRole);
 }
 
 void TransactionView::editLabel()
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     if(!transactionView->selectionModel() ||!model)
         return;
     QModelIndexList selection = transactionView->selectionModel()->selectedRows();
@@ -549,6 +614,7 @@ void TransactionView::editLabel()
 
 void TransactionView::showDetails()
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     if(!transactionView->selectionModel())
         return;
     QModelIndexList selection = transactionView->selectionModel()->selectedRows();
@@ -566,6 +632,7 @@ void TransactionView::showDetails()
 
 void TransactionView::openThirdPartyTxUrl(QString url)
 {
+    if (!transactionProxyModel || !transactionProxyModel->isReady()) return;
     if(!transactionView || !transactionView->selectionModel())
         return;
     QModelIndexList selection = transactionView->selectionModel()->selectedRows(0);
@@ -621,7 +688,7 @@ void TransactionView::dateRangeChanged()
 void TransactionView::focusTransaction(const QModelIndex &idx)
 {
     if (!model || !idx.isValid() || idx.model() != model->getTransactionTableModel()) return;
-    if (!ensureHistorySource()) {
+    if (!ensureHistorySource() || !transactionProxyModel->isReady()) {
         m_pending_focus = QPersistentModelIndex{idx};
         return;
     }
@@ -634,15 +701,12 @@ void TransactionView::focusTransaction(const QModelIndex &idx)
 void TransactionView::focusTransaction(const uint256& txid)
 {
     if (!model) return;
-    if (!ensureHistorySource()) {
+    if (!ensureHistorySource() || !transactionProxyModel->isReady()) {
         m_pending_focus = txid;
         return;
     }
 
-    const QModelIndexList results = this->model->getTransactionTableModel()->match(
-        this->model->getTransactionTableModel()->index(0,0),
-        TransactionTableModel::TxHashRole,
-        QString::fromStdString(txid.ToString()), -1);
+    const QModelIndexList results = model->getTransactionTableModel()->indexesForTransaction(txid);
 
     transactionView->setFocus();
     transactionView->selectionModel()->clearSelection();
@@ -668,6 +732,7 @@ bool TransactionView::eventFilter(QObject *obj, QEvent *event)
         QKeyEvent *ke = static_cast<QKeyEvent *>(event);
         if (ke->key() == Qt::Key_C && ke->modifiers().testFlag(Qt::ControlModifier))
         {
+             if (!transactionProxyModel || !transactionProxyModel->isReady()) return true;
              GUIUtil::copyEntryData(transactionView, 0, TransactionTableModel::TxPlainTextRole);
              return true;
         }

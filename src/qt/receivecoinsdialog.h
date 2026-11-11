@@ -13,10 +13,13 @@
 #include <QKeyEvent>
 #include <QMenu>
 #include <QPoint>
+#include <QPointer>
+#include <memory>
 #include <QVariant>
 
 class PlatformStyle;
 class WalletModel;
+class VisibilityController;
 
 namespace Ui {
     class ReceiveCoinsDialog;
@@ -51,7 +54,12 @@ public Q_SLOTS:
 
 private:
     Ui::ReceiveCoinsDialog *ui;
-    WalletModel* model{nullptr};
+    QPointer<WalletModel> model;
+    std::unique_ptr<VisibilityController> m_visibility;
+    QMetaObject::Connection m_capability_connection;
+    QMetaObject::Connection m_options_connection;
+    QMetaObject::Connection m_model_destroyed_connection;
+    void updateAddressCapability();
     QMenu *contextMenu;
     QAction* copyLabelAction;
     QAction* copyMessageAction;

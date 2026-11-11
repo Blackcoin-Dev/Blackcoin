@@ -277,20 +277,29 @@ void PresentationEfficiencyTests::recentTransactionClick()
     WalletModel model{interfaces::MakeWallet(*loader->context(), wallet), client, style.get()};
     OverviewPage page{style.get()};
     page.setWalletModel(&model);
+    page.show();
     auto* view = page.findChild<TransactionOverviewWidget*>("listTransactions");
     QVERIFY(view);
     QTRY_COMPARE_WITH_TIMEOUT(model.getTransactionTableModel()->rowCount({}), 8, 3000);
-    QCOMPARE(view->model()->rowCount(), 5);
-    const QModelIndex recent = view->model()->index(1, view->modelColumn());
-    const auto txid = recent.data(TransactionTableModel::TxHashRole);
-    QVERIFY(!txid.toString().isEmpty());
-    QSignalSpy clicked{&page, &OverviewPage::transactionClicked};
-    Q_EMIT view->clicked(recent);
-    QCOMPARE(clicked.count(), 1);
-    const QModelIndex original = qvariant_cast<QModelIndex>(clicked.takeFirst().at(0));
-    QCOMPARE(original.model(), model.getTransactionTableModel());
-    QCOMPARE(original.column(), TransactionTableModel::ToAddress);
-    QCOMPARE(original.data(TransactionTableModel::TxHashRole), txid);
+    for (int activation = 0; activation < 2; ++activation) {
+        QTRY_COMPARE_WITH_TIMEOUT(view->model()->rowCount(), 5, 3000);
+        QCOMPARE(view->modelColumn(), static_cast<int>(TransactionTableModel::ToAddress));
+        const QModelIndex recent = view->model()->index(1, view->modelColumn());
+        const auto txid = recent.data(TransactionTableModel::TxHashRole);
+        QVERIFY(!txid.toString().isEmpty());
+        QSignalSpy clicked{&page, &OverviewPage::transactionClicked};
+        Q_EMIT view->clicked(recent);
+        QCOMPARE(clicked.count(), 1);
+        const QModelIndex original = qvariant_cast<QModelIndex>(clicked.takeFirst().at(0));
+        QCOMPARE(original.model(), model.getTransactionTableModel());
+        QCOMPARE(original.column(), TransactionTableModel::ToAddress);
+        QCOMPARE(original.data(TransactionTableModel::TxHashRole), txid);
+        if (activation == 0) {
+            page.hide();
+            QTRY_COMPARE_WITH_TIMEOUT(view->model()->rowCount(), 0, 3000);
+            page.show();
+        }
+    }
     page.setWalletModel(nullptr);
     QVERIFY(!view->model());
 }
@@ -308,7 +317,7 @@ void PresentationEfficiencyTests::peerPollingFollowsVisibility()
     ClientModel model{m_node, nullptr};
     RPCConsole console{m_node, style.get(), nullptr};
     auto detach = interfaces::MakeCleanupHandler([&] { console.setClientModel(nullptr); });
-    QSignalSpy refreshed{model.getPeerTableModel(), &QAbstractItemModel::dataChanged};
+    QSignalSpy refreshed{model.getPeerTableModel(), &PeerTableModel::refreshCompleted};
     console.setClientModel(&model);
     QTest::qWait(2 * MODEL_UPDATE_DELAY.count());
     QCOMPARE(refreshed.count(), 0);
@@ -317,21 +326,29 @@ void PresentationEfficiencyTests::peerPollingFollowsVisibility()
     QTest::qWait(2 * MODEL_UPDATE_DELAY.count());
     QCOMPARE(refreshed.count(), 0);
     console.setTabFocus(RPCConsole::TabTypes::PEERS);
-    QCOMPARE(refreshed.count(), 1);
-    QTRY_VERIFY_WITH_TIMEOUT(refreshed.count() >= 2, 1000);
+    QTRY_VERIFY_WITH_TIMEOUT(refreshed.count() >= 1, 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(refreshed.count() >= 2, 3000);
     console.setTabFocus(RPCConsole::TabTypes::GRAPH);
     const int stopped_count = refreshed.count();
     QTest::qWait(2 * MODEL_UPDATE_DELAY.count());
     QCOMPARE(refreshed.count(), stopped_count);
     console.setTabFocus(RPCConsole::TabTypes::PEERS);
-    QCOMPARE(refreshed.count(), stopped_count + 1);
+    QTRY_VERIFY_WITH_TIMEOUT(refreshed.count() > stopped_count, 3000);
     console.hide();
+    const int hidden_count = refreshed.count();
     QTest::qWait(2 * MODEL_UPDATE_DELAY.count());
-    QCOMPARE(refreshed.count(), stopped_count + 1);
+    QCOMPARE(refreshed.count(), hidden_count);
     console.show();
-    QCOMPARE(refreshed.count(), stopped_count + 2);
-    console.setClientModel(nullptr);
+    QTRY_VERIFY_WITH_TIMEOUT(refreshed.count() > hidden_count, 3000);
+    console.showMinimized();
+    const int minimized_count = refreshed.count();
     QTest::qWait(2 * MODEL_UPDATE_DELAY.count());
-    QCOMPARE(refreshed.count(), stopped_count + 2);
-    qInfo("Peer stats refreshes while hidden, on Console/Graph, or detached: 0. Peers entry, reentry and show refreshed immediately.");
+    QCOMPARE(refreshed.count(), minimized_count);
+    console.showNormal();
+    QTRY_VERIFY_WITH_TIMEOUT(refreshed.count() > minimized_count, 3000);
+    console.setClientModel(nullptr);
+    const int detached_count = refreshed.count();
+    QTest::qWait(2 * MODEL_UPDATE_DELAY.count());
+    QCOMPARE(refreshed.count(), detached_count);
+    qInfo("Peer refresh attempts complete asynchronously only for visible, nonminimized Peers; hidden, other-tab and detached completions are discarded.");
 }

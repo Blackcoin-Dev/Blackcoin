@@ -29,6 +29,8 @@
 #include <optional>
 #include <set>
 
+#include <stdexcept>
+#include <QElapsedTimer>
 #include <QColor>
 #include <QDateTime>
 #include <QDebug>
@@ -89,6 +91,13 @@ public:
 
     //! Local cache of wallet sorted by transaction hash
     QList<TransactionRecord> cachedWallet;
+    uint64_t m_next_row_id{1};
+    void AssignIdentity(TransactionRecord& row)
+    {
+        // Unsigned wrap latches zero. No subsequent row can reuse an ID.
+        if (m_next_row_id == 0) throw std::overflow_error("GUI transaction row identity exhausted");
+        row.presentation_id = m_next_row_id++;
+    }
     std::deque<TransactionRecord> m_initial_history;
     void PublishInitialHistory();
     void FinishInitialHistory(bool deferred);
@@ -115,6 +124,10 @@ public:
     QString LabelForAddress(const TransactionRecord& record);
     void ForgetLabelRow(const TransactionRecord& record);
     void NotifyChangedLabelRows();
+    void DrainChangedLabelRows();
+    std::optional<CTxDestination> m_notifying_label;
+    std::optional<uint256> m_notified_label_hash;
+    bool m_label_notify_scheduled{false};
     void InvalidateAddressLabel(const QString& address);
     void ScheduleLabelRefresh();
     void RefreshLabels();
@@ -177,6 +190,7 @@ public:
                         TransactionRecord::decomposeTransaction(wtx);
                 if(!toInsert.isEmpty()) /* only if something to insert */
                 {
+                    for (auto& record : toInsert) AssignIdentity(record);
                     parent->beginInsertRows(QModelIndex(), lowerIndex, lowerIndex+toInsert.size()-1);
                     int insert_idx = lowerIndex;
                     for (const TransactionRecord &rec : toInsert)
@@ -266,7 +280,11 @@ TransactionTableModel::TransactionTableModel(const PlatformStyle* _platformStyle
         auto transactions = walletModel->wallet().getWalletTxs();
         std::sort(transactions.begin(), transactions.end());
         for (const auto& tx : transactions) {
-            if (TransactionRecord::showTransaction(tx)) priv->cachedWallet.append(TransactionRecord::decomposeTransaction(tx));
+            if (TransactionRecord::showTransaction(tx)) {
+                auto rows = TransactionRecord::decomposeTransaction(tx);
+                for (auto& row : rows) priv->AssignIdentity(row);
+                priv->cachedWallet.append(rows);
+            }
         }
         m_history_loaded = true;
         priv->FinishInitialHistory(/*deferred=*/false);
@@ -290,6 +308,7 @@ void TransactionTablePriv::PublishInitialHistory()
     const int count = std::min<size_t>(MAX_ROWS_PER_TURN, m_initial_history.size());
     if (count > 0) {
         const int first = cachedWallet.size();
+        for (int i = 0; i < count; ++i) AssignIdentity(m_initial_history[i]);
         model->fProcessingQueuedTransactions = true;
         model->beginInsertRows({}, first, first + count - 1);
         for (int i = 0; i < count; ++i) {
@@ -339,13 +358,10 @@ void TransactionTableModel::updateAmountColumnTitle()
 
 void TransactionTableModel::updateConfirmations()
 {
-    if (priv->size() == 0) return;
-    // Blocks came in since last poll.
-    // Invalidate status (number of confirmations) and (possibly) description
-    //  for all rows. Qt is smart enough to only actually request the data for the
-    //  visible rows.
-    Q_EMIT dataChanged(index(0, Status), index(priv->size()-1, Status));
-    Q_EMIT dataChanged(index(0, ToAddress), index(priv->size()-1, ToAddress));
+    if (priv->cachedWallet.empty()) return;
+    Q_EMIT dataChanged(index(0, 0), index(priv->cachedWallet.size() - 1, columns.size() - 1),
+        {Qt::DisplayRole, Qt::EditRole, Qt::DecorationRole, Qt::ForegroundRole,
+         Qt::ToolTipRole, StatusRole, ConfirmedRole, RawDecorationRole});
 }
 
 int TransactionTableModel::rowCount(const QModelIndex &parent) const
@@ -921,42 +937,42 @@ void TransactionTablePriv::RefreshLabels()
 
 void TransactionTablePriv::NotifyChangedLabelRows()
 {
-    std::vector<int> affected_rows;
-    for (const auto& dest : m_changed_labels) {
-        for (const auto& hash : m_labels.at(dest).transactions) {
-            const auto [first, last] = std::equal_range(cachedWallet.cbegin(), cachedWallet.cend(), hash, TxLessThan());
-            for (auto entry = first; entry != last; ++entry) {
-                if (DecodeDestination(entry->address) == dest) {
-                    affected_rows.push_back(std::distance(cachedWallet.cbegin(), entry));
-                }
-            }
+    if (m_label_notify_scheduled || m_changed_labels.empty()) return;
+    m_label_notify_scheduled = true;
+    QTimer::singleShot(0, parent, [state = shared_from_this()] { state->DrainChangedLabelRows(); });
+}
+
+void TransactionTablePriv::DrainChangedLabelRows()
+{
+    QElapsedTimer elapsed;
+    elapsed.start();
+    for (int work = 0; work < 32 && elapsed.elapsed() < 4; ++work) {
+        if (!m_notifying_label) {
+            if (m_changed_labels.empty()) { m_label_notify_scheduled = false; return; }
+            m_notifying_label = *m_changed_labels.begin();
+            m_changed_labels.erase(m_changed_labels.begin());
+            m_notified_label_hash.reset();
+        }
+        const auto label = m_labels.find(*m_notifying_label);
+        if (label == m_labels.end()) { m_notifying_label.reset(); continue; }
+        const auto& hashes = label->second.transactions;
+        const auto hash = m_notified_label_hash ? hashes.upper_bound(*m_notified_label_hash) : hashes.begin();
+        if (hash == hashes.end()) { m_notifying_label.reset(); continue; }
+        m_notified_label_hash = *hash;
+        const auto [first, last] = std::equal_range(cachedWallet.cbegin(), cachedWallet.cend(), *hash, TxLessThan());
+        std::vector<QPersistentModelIndex> rows;
+        for (auto entry = first; entry != last; ++entry) {
+            if (DecodeDestination(entry->address) == *m_notifying_label) rows.emplace_back(parent->index(std::distance(cachedWallet.cbegin(), entry), 0));
+        }
+        const QPointer<TransactionTableModel> model{parent};
+        for (const auto& row : rows) {
+            if (!row.isValid()) continue;
+            Q_EMIT model->dataChanged(row, model->index(row.row(), TransactionTableModel::ToAddress),
+                {Qt::DisplayRole, Qt::EditRole, Qt::ForegroundRole, Qt::ToolTipRole, TransactionTableModel::LabelRole});
+            if (!model) return;
         }
     }
-    m_changed_labels.clear();
-    std::sort(affected_rows.begin(), affected_rows.end());
-    affected_rows.erase(std::unique(affected_rows.begin(), affected_rows.end()), affected_rows.end());
-
-    // Preserve row identity if a listener inserts or removes rows during a
-    // dataChanged signal. Only adjacent affected rows share a signal.
-    std::vector<QPersistentModelIndex> rows;
-    rows.reserve(affected_rows.size());
-    for (const int row : affected_rows) rows.emplace_back(parent->index(row, 0));
-
-    const QPointer<TransactionTableModel> model{parent};
-    for (auto first = rows.cbegin(); first != rows.cend();) {
-        if (!first->isValid()) {
-            ++first;
-            continue;
-        }
-        auto last = first;
-        while (std::next(last) != rows.cend() && std::next(last)->row() == last->row() + 1) {
-            ++last;
-        }
-        Q_EMIT model->dataChanged(*first, model->index(last->row(), TransactionTableModel::ToAddress),
-            {Qt::DisplayRole, Qt::EditRole, Qt::ForegroundRole, Qt::ToolTipRole, TransactionTableModel::LabelRole});
-        if (!model) return;
-        first = std::next(last);
-    }
+    QTimer::singleShot(0, parent, [state = shared_from_this()] { state->DrainChangedLabelRows(); });
 }
 
 void TransactionTablePriv::PostDrain()
@@ -971,7 +987,9 @@ void TransactionTablePriv::DrainPendingUpdates()
 {
     constexpr int MAX_UPDATES_PER_TURN{32};
     constexpr int WALLET_RETRY_MS{25};
-    for (int processed = 0; processed < MAX_UPDATES_PER_TURN; ++processed) {
+    QElapsedTimer elapsed;
+    elapsed.start();
+    for (int processed = 0; processed < MAX_UPDATES_PER_TURN && elapsed.elapsed() < 4; ++processed) {
         TransactionNotification notification;
         {
             LOCK(m_notification_mutex);
@@ -1085,4 +1103,31 @@ void TransactionTableModel::unsubscribeFromCoreSignals()
     // Disconnect signals from wallet
     m_handler_transaction_changed->disconnect();
     m_handler_show_progress->disconnect();
+}
+
+QModelIndexList TransactionTableModel::indexesForTransaction(const uint256& hash) const
+{
+    QModelIndexList result;
+    const auto [first, last] = std::equal_range(priv->cachedWallet.cbegin(), priv->cachedWallet.cend(), hash, TxLessThan());
+    for (auto entry = first; entry != last; ++entry) result.append(index(std::distance(priv->cachedWallet.cbegin(), entry), 0));
+    return result;
+}
+
+TransactionRowIdentity TransactionTableModel::transactionIdentity(int row) const
+{
+    if (row < 0 || row >= priv->cachedWallet.size()) return {};
+    const auto& record = priv->cachedWallet[row];
+    return {record.hash, record.presentation_id};
+}
+
+int TransactionTableModel::transactionRow(const TransactionRowIdentity& identity) const
+{
+    if (identity.id == 0) return -1;
+    const auto& records = priv->cachedWallet;
+    const auto [first, last] = std::equal_range(records.cbegin(), records.cend(), identity.hash, TxLessThan());
+    // Each hash's rows are allocated together in presentation order. Status and
+    // label changes leave IDs/order intact; delete/reinsert obtains fresh IDs.
+    const auto found = std::lower_bound(first, last, identity.id,
+        [](const TransactionRecord& row, uint64_t id) { return row.presentation_id < id; });
+    return found != last && found->presentation_id == identity.id ? std::distance(records.cbegin(), found) : -1;
 }

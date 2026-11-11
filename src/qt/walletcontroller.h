@@ -10,6 +10,7 @@
 #include <sync.h>
 #include <util/translation.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
@@ -57,6 +58,8 @@ class WalletController : public QObject
 public:
     WalletController(ClientModel& client_model, const PlatformStyle* platform_style, QObject* parent);
     ~WalletController();
+    void beginShutdown();
+    bool shutdownReady();
 
     //! Returns wallet models currently open.
     std::vector<WalletModel*> getOpenWallets() const;
@@ -91,7 +94,7 @@ private:
     // Owns all registered models, including models awaiting GUI parenting.
     std::vector<WalletModel*> m_wallets;
     // GUI-thread state: shutdown drains the list and rejects queued removal.
-    bool m_closing{false};
+    std::atomic<bool> m_closing{false};
     std::unique_ptr<interfaces::Handler> m_handler_load_wallet;
 
     friend class WalletControllerActivity;

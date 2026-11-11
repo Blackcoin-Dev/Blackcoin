@@ -14,6 +14,7 @@
 #include <qt/receiverequestdialog.h>
 #include <qt/recentrequeststablemodel.h>
 #include <qt/walletmodel.h>
+#include <qt/visibilitycontroller.h>
 
 #include <QAction>
 #include <QCursor>
@@ -33,6 +34,11 @@ ReceiveCoinsDialog::ReceiveCoinsDialog(const PlatformStyle *_platformStyle, QWid
     platformStyle(_platformStyle)
 {
     ui->setupUi(this);
+    ui->receiveButton->setEnabled(false);
+    m_visibility = std::make_unique<VisibilityController>(*this, [this](bool active) {
+        if (model && model->getOptionsModel()) model->setAddressCapabilityConsumer(this, active);
+        updateAddressCapability();
+    });
 
     if (!_platformStyle->getImagesOnButtons()) {
         ui->clearButton->setIcon(QIcon());
@@ -77,12 +83,26 @@ ReceiveCoinsDialog::ReceiveCoinsDialog(const PlatformStyle *_platformStyle, QWid
 
 void ReceiveCoinsDialog::setModel(WalletModel *_model)
 {
+    if (model) {
+        model->setAddressCapabilityConsumer(this, false);
+    }
+    disconnect(m_capability_connection);
+    // QObject::destroyed runs after QPointer has cleared. Keep this handle
+    // independently because the shared OptionsModel can outlive that wallet.
+    disconnect(m_options_connection);
+    disconnect(m_model_destroyed_connection);
+    if (auto* selection = ui->recentRequestsView->selectionModel()) disconnect(selection, nullptr, this, nullptr);
+    ui->recentRequestsView->setModel(nullptr);
+    ui->showRequestButton->setEnabled(false);
+    ui->removeRequestButton->setEnabled(false);
+    ui->addressType->clear();
     this->model = _model;
+    ui->receiveButton->setEnabled(false);
 
     if(_model && _model->getOptionsModel())
     {
         _model->getRecentRequestsTableModel()->sort(RecentRequestsTableModel::Date, Qt::DescendingOrder);
-        connect(_model->getOptionsModel(), &OptionsModel::displayUnitChanged, this, &ReceiveCoinsDialog::updateDisplayUnit);
+        m_options_connection = connect(_model->getOptionsModel(), &OptionsModel::displayUnitChanged, this, &ReceiveCoinsDialog::updateDisplayUnit);
         updateDisplayUnit();
 
         QTableView* tableView = ui->recentRequestsView;
@@ -115,19 +135,26 @@ void ReceiveCoinsDialog::setModel(WalletModel *_model)
             }
         }
 
-        // Set the button to be enabled or disabled based on whether the wallet can give out new addresses.
-        ui->receiveButton->setEnabled(model->wallet().canGetAddresses());
         updateAddressTypeNotice();
-
-        // Enable/disable the receive button if the wallet is now able/unable to give out new addresses.
-        connect(model, &WalletModel::canGetAddressesChanged, this, [this] {
-            ui->receiveButton->setEnabled(model->wallet().canGetAddresses());
-        });
+        m_capability_connection = connect(model, &WalletModel::canGetAddressesChanged, this, &ReceiveCoinsDialog::updateAddressCapability);
+        m_model_destroyed_connection = connect(model, &QObject::destroyed, this, [this] { setModel(nullptr); });
+        m_visibility->refresh();
+        model->setAddressCapabilityConsumer(this, m_visibility->active());
+        updateAddressCapability();
     }
+}
+
+void ReceiveCoinsDialog::updateAddressCapability()
+{
+    // A cache miss is pending. The backend still validates every explicit
+    // address-generation action; this display hint never grants authority.
+    ui->receiveButton->setEnabled(model && model->getOptionsModel() && model->getCachedAddressCapability().value_or(false));
 }
 
 ReceiveCoinsDialog::~ReceiveCoinsDialog()
 {
+    m_visibility.reset();
+    if (model) model->setAddressCapabilityConsumer(this, false);
     QSettings settings;
     settings.setValue("RecentRequestsViewHeaderState", ui->recentRequestsView->horizontalHeader()->saveState());
     delete ui;

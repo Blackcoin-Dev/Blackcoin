@@ -6,6 +6,8 @@
 #define BITCOIN_QT_TRANSACTIONTABLEMODEL_H
 
 #include <qt/bitcoinunits.h>
+#include <qt/transactionrow.h>
+#include <uint256.h>
 
 #include <QAbstractTableModel>
 #include <QStringList>
@@ -24,7 +26,7 @@ class WalletModel;
 
 /** UI model for the transaction table of a wallet.
  */
-class TransactionTableModel : public QAbstractTableModel
+class TransactionTableModel : public QAbstractTableModel, public TransactionRowSource
 {
     Q_OBJECT
 
@@ -90,6 +92,9 @@ public:
     bool historyLoadHasFailed() const { return m_history_load_failed; }
     void setInitialHistory(std::deque<TransactionRecord> history);
     void reportHistoryLoadFailure();
+    QModelIndexList indexesForTransaction(const uint256& hash) const;
+    TransactionRowIdentity transactionIdentity(int row) const override;
+    int transactionRow(const TransactionRowIdentity& identity) const override;
 
 
 private:

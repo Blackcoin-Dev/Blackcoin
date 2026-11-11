@@ -105,7 +105,8 @@ public:
     /** Disconnect core signals from GUI client */
     void unsubscribeFromCoreSignals();
 
-    void join();
+    void beginShutdown();
+    bool shutdownReady();
 
     bool isPrivacyModeActivated() const;
 

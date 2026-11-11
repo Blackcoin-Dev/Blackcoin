@@ -217,6 +217,9 @@ public:
     /* Returns true if the wallet can give out new addresses. This means it has keys in the keypool or can generate new keys */
     virtual bool CanGetAddresses(bool internal = false) const { return false; }
 
+    /** False means unavailable, not incapable; result is untouched on failure. */
+    virtual bool TryCanGetAddresses(bool& result, bool internal = false) const { result = false; return true; }
+
     /** Upgrades the wallet to the specified version */
     virtual bool Upgrade(int prev_version, int new_version, bilingual_str& error) { return true; }
 
@@ -421,6 +424,7 @@ public:
     std::unique_ptr<CKeyMetadata> GetMetadata(const CTxDestination& dest) const override;
 
     bool CanGetAddresses(bool internal = false) const override;
+    bool TryCanGetAddresses(bool& result, bool internal = false) const override;
 
     std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const override;
 
@@ -653,6 +657,7 @@ public:
     std::unique_ptr<CKeyMetadata> GetMetadata(const CTxDestination& dest) const override;
 
     bool CanGetAddresses(bool internal = false) const override;
+    bool TryCanGetAddresses(bool& result, bool internal = false) const override;
 
     std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const override;
     std::unique_ptr<FlatSigningProvider> GetSigningProviderForScript(const CScript& script) const;

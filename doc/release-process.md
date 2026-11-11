@@ -1,17 +1,17 @@
 # Blackcoin Core release process
 
-## Current v30.1.5.3rc4 DEVELOPMENT candidate
+## Current v30.1.5.3rc5 DEVELOPMENT candidate
 
 This is an unpublished development candidate. `configure.ac` records major 30,
-minor 1, build 5, revision 3, RC4, and `CLIENT_VERSION_IS_RELEASE=false`.
+minor 1, build 5, revision 3, RC5, and `CLIENT_VERSION_IS_RELEASE=false`.
 The numeric `CLIENT_VERSION` remains `300105`; macOS short version remains
 `30.1.5`, bundle version is `30.1.503`, and `BlackcoinFullVersion` is
 `30.1.5.3` (the base revision). The runtime and configured package version
-remain `30.1.5.3rc4`. The canonical development notes are
+remain `30.1.5.3rc5`. The canonical development notes are
 `doc/release-notes/release-notes-30.1.5.3.md`.
 
-Manual candidate packages use an explicit `30.1.5.3-alpha4` or
-`30.1.5.3-beta4` label bound to the exact source SHA. Such builds do not publish
+Manual candidate packages use an explicit `30.1.5.3-alpha5` or
+`30.1.5.3-beta5` label bound to the exact source SHA. Such builds do not publish
 a release. The future `v30.1.5.3` production path remains blocked until RC0,
 release=true, final canonical notes, the complete exact-source safety gate,
 a Blackcoin-Dev SSH-signed source commit and annotated tag, and protected

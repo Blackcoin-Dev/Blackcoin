@@ -13,6 +13,7 @@
 #include <qt/test/chainstaterebuildassistanttests.h>
 #include <qt/test/optiontests.h>
 #include <qt/test/presentationefficiencytests.h>
+#include <qt/test/uiworkertests.h>
 #include <qt/test/rpcnestedtests.h>
 #include <qt/test/shadowresourcedialogtests.h>
 #include <qt/test/uritests.h>
@@ -23,10 +24,13 @@
 #include <qt/test/addressbooktests.h>
 #include <qt/test/themetests.h>
 #include <qt/test/wallettests.h>
+#include <qt/test/uirenderingtests.h>
 #endif // ENABLE_WALLET
 
 #include <QApplication>
 #include <QDebug>
+#include <QSettings>
+#include <QTemporaryDir>
 #include <QObject>
 #include <QTest>
 
@@ -87,6 +91,12 @@ int main(int argc, char* argv[])
         setenv("QT_QPA_PLATFORM", "minimal", 0 /* overwrite */);
     #endif
 
+    QTemporaryDir isolated_settings;
+    if (!isolated_settings.isValid()) return 2;
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated_settings.path());
+    QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, isolated_settings.path());
+
     BitcoinApplication app;
     app.setApplicationName("Blackcoin-Qt-test");
     app.createNode(*init);
@@ -102,6 +112,9 @@ int main(int argc, char* argv[])
     PresentationEfficiencyTests presentation_efficiency_tests(app.node());
     num_test_failures += QTest::qExec(&presentation_efficiency_tests);
 
+    UiWorkerTests ui_worker_tests;
+    num_test_failures += QTest::qExec(&ui_worker_tests);
+
     OptionTests options_tests(app.node());
     num_test_failures += QTest::qExec(&options_tests);
 
@@ -115,6 +128,9 @@ int main(int argc, char* argv[])
     num_test_failures += QTest::qExec(&shadow_resource_dialog_tests);
 
 #ifdef ENABLE_WALLET
+    UiRenderingTests ui_rendering_tests;
+    num_test_failures += QTest::qExec(&ui_rendering_tests);
+
     WalletTests test5(app.node());
     num_test_failures += QTest::qExec(&test5);
 

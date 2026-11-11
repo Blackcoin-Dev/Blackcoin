@@ -98,7 +98,8 @@ public:
     //! Identity -> record. Qt 5's QList stores a large or non-movable element out of line, so the pointers stay valid
     //! while other rows come and go; only erasing a record invalidates its own entry. A QList that stores elements
     //! inline (Qt 6) would leave these pointers dangling on any insert or erase, so refuse to build then.
-    static_assert(QT_VERSION < QT_VERSION_CHECK(6, 0, 0) && (QTypeInfo<TransactionRecord>::isLarge || QTypeInfo<TransactionRecord>::isStatic),
+    static_assert(QT_VERSION < QT_VERSION_CHECK(6, 0, 0), "m_by_id relies on Qt 5 QList node storage");
+    static_assert(QTypeInfo<TransactionRecord>::isLarge ? true : QTypeInfo<TransactionRecord>::isStatic != 0,
                   "m_by_id relies on QList storing TransactionRecord out of line");
     std::unordered_map<uint64_t, TransactionRecord*> m_by_id;
     void Register(TransactionRecord& record) { m_by_id[record.presentation_id] = &record; }

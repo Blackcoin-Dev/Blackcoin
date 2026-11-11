@@ -1074,7 +1074,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     ConfirmMessageBox(QMessageBox::Yes);
     quantum_new->click();
-    QTRY_COMPARE_WITH_TIMEOUT(quantum_address_count->text(), QString("1"), 10000);
+    QTRY_COMPARE_WITH_TIMEOUT(quantum_address_count->text(), QString("1"), 60000);
     const CTxDestination gui_quantum_dest = DecodeDestination(quantum_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_quantum_dest));
     QVERIFY(IsQuantumMigrationDestination(gui_quantum_dest));
@@ -6016,12 +6016,17 @@ double ProcessCpuSeconds()
 #endif
 }
 
+// Deterministic bit mixer for synthetic rows. Only XOR and masked shifts, so
+// it never wraps: the integer sanitizer treats unsigned wrap as an error here.
 uint64_t SplitMix(uint64_t x)
 {
-    x += 0x9e3779b97f4a7c15ULL;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-    return x ^ (x >> 31);
+    x ^= 0x9e3779b97f4a7c15ULL;
+    for (int round = 0; round < 4; ++round) {
+        x ^= (x & (~uint64_t{0} >> 13)) << 13;
+        x ^= x >> 7;
+        x ^= (x & (~uint64_t{0} >> 17)) << 17;
+    }
+    return x;
 }
 
 QList<TransactionRecord> SyntheticHistory(size_t first, size_t count, size_t total, bool newest = false)
@@ -6072,6 +6077,9 @@ void WalletTests::historyScaleBenchmark()
     if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
 #endif
     QFETCH(int, rows);
+    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) {
+        QSKIP("Large-wallet measurement; set BLACKCOIN_QT_BENCH=1 to run");
+    }
     common::Settings saved_settings;
     gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
     auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {

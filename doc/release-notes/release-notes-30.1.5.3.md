@@ -22,6 +22,12 @@ Release qualification is pending.
   An individual wallet unload can still wait for active worker work to finish.
 - Staking display estimates run in the background with a 512-header bound and
   current-tip validation.
+- Block-tip notifications to the GUI are coalesced in every synchronization
+  state. Catching up after the node has left initial block download no longer
+  delivers one GUI update per block, which stalled the window for seconds.
+  The synchronization overlay evaluates the current time once per update.
+- The wallet worker object is destroyed only after its thread has exited,
+  closing a rare crash during wallet unload and shutdown.
 - Optional `-uiperflog=<absolute-new-file>` records GUI event-loop timer lateness.
   It is disabled by default and does not measure input-to-paint latency.
 

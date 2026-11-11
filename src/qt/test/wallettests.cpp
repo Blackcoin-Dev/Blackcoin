@@ -3152,7 +3152,10 @@ void TestPowMiningAsyncControlLifecycle(interfaces::Node& node, const PlatformSt
     const bool other_wallet_completed_independently = ready_b.count() == 1;
     model.cancelPowMiningControl(cancelled_id);
     const int before = ticks;
-    QTest::qWait(30);
+    // The GUI heartbeat must keep running while the authority mutex is held.
+    // Wait for the ticks instead of sampling a fixed 30 ms window, which a
+    // loaded machine can stretch past the tick interval.
+    QTRY_VERIFY_WITH_TIMEOUT(ticks - before > 2, 5000);
     const int during_lock = ticks - before;
     release.set_value();
     holder.join();
@@ -5928,4 +5931,43 @@ void WalletTests::receiveCapabilityLifecycle()
     QCOMPARE(shared_options.displayUnitReceiverCount(), options_with_wallet);
     rebound.reset();
     QCOMPARE(shared_options.displayUnitReceiverCount(), options_without_wallet);
+}
+
+void WalletTests::workerOutlivesShutdownRequest()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-worker-lifetime", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    WalletContext& context = *m_node.walletLoader().context();
+    OptionsModel options(m_node);
+    bilingual_str error;
+    QVERIFY(options.Init(error));
+    ClientModel client(m_node, &options);
+    AddWallet(context, wallet);
+    // Regression: beginShutdown() asks the worker thread to quit; the worker
+    // must stay valid until join() deletes it, however far the thread exit
+    // has progressed when the model is destroyed.
+    for (int i = 0; i < 200; ++i) {
+        auto model = std::make_unique<WalletModel>(interfaces::MakeWallet(context, wallet), client, style.get());
+        if (i % 4 != 0) model->beginShutdown();
+        if (i % 4 == 2) QThread::yieldCurrentThread();
+        if (i % 4 == 3) QTest::qWait(1);
+        model.reset();
+    }
+    RemoveWallet(context, wallet, /* load_on_start= */ std::nullopt);
 }

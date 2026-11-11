@@ -30,6 +30,7 @@ private Q_SLOTS:
     void receiveCapabilityContention_data();
     void receiveCapabilityContention();
     void receiveCapabilityLifecycle();
+    void workerOutlivesShutdownRequest();
 };
 
 #endif // BITCOIN_QT_TEST_WALLETTESTS_H

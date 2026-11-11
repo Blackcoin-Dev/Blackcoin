@@ -83,9 +83,10 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     worker = new WalletWorker;
     worker->moveToThread(&(t));
     // WalletWorker has thread affinity and deliberately has no QObject parent.
-    // Retire it on its own thread when the event loop finishes instead of
-    // leaking one worker for every WalletModel lifetime.
-    connect(&t, &QThread::finished, worker, &QObject::deleteLater);
+    // join() deletes it after the worker thread has fully exited. It must not
+    // be retired through QThread::finished: that destroys the worker on the
+    // exiting thread while QThread::isRunning() can still be true, so join()
+    // could dereference a freed worker.
     t.start();
 
     m_address_capability_retry->setSingleShot(true);
@@ -1997,15 +1998,15 @@ void WalletModel::join()
     beginShutdown();
     // Destructors retain a safe blocking fallback; the application drains on
     // its event loop and reaches this point only after shutdownReady().
-    if (t.isRunning()) {
-        if (worker)
-            worker->disconnect(this);
-        t.quit();
-        t.wait();
-        // The finished-to-deleteLater connection destroys the worker in its
-        // owning thread before wait() returns. Avoid retaining a dangling
-        // pointer when join() is called again during WalletModel destruction.
-    }
+    // The worker stays alive until this function deletes it, so it is safe to
+    // disconnect it here even if beginShutdown() already asked the thread to
+    // quit and the thread is exiting concurrently.
+    if (worker) worker->disconnect(this);
+    t.quit();
+    t.wait();
+    // The thread has exited: no slot can be running on the worker, and a
+    // QObject whose thread has finished may be deleted from another thread.
+    delete worker;
     worker = nullptr;
 
     // The queued completion may never run during unload. Critical backup

@@ -26,4 +26,4 @@ private Q_SLOTS:
     void blockTipSingleNotificationIsPrompt();
     void blockTipShutdownDropsPending();
 };
-#endif
+#endif // BITCOIN_QT_TEST_UIWORKERTESTS_H

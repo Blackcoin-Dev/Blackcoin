@@ -26,4 +26,4 @@ public:
     virtual TransactionRowIdentity transactionIdentity(int row) const = 0;
     virtual int transactionRow(const TransactionRowIdentity& identity) const = 0;
 };
-#endif
+#endif // BITCOIN_QT_TRANSACTIONROW_H

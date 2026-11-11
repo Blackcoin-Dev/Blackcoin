@@ -855,4 +855,4 @@ private:
     quint64 m_generation{0};
 };
 
-#endif
+#endif // BITCOIN_QT_UIPERF_H

@@ -19,4 +19,4 @@ private Q_SLOTS:
     void paintProjectionInvalidation();
     void paintProjectionDeadline();
 };
-#endif
+#endif // BITCOIN_QT_TEST_UIRENDERINGTESTS_H

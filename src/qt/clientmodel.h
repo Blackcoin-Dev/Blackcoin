@@ -13,6 +13,7 @@
 #include <optional>
 #include <sync.h>
 #include <uint256.h>
+#include <util/time.h>
 
 class BanTableModel;
 class CBlockIndex;
@@ -134,7 +135,26 @@ private:
     //! A thread to interact with m_node asynchronously
     QThread* const m_thread;
 
-    void TipChanged(SynchronizationState sync_state, interfaces::BlockTip tip, double verification_progress, SyncType synctype) EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex);
+    //! Latest block tip not yet delivered to the GUI. Block-tip notifications
+    //! are coalesced in every synchronization state: at most one is emitted per
+    //! MODEL_UPDATE_DELAY, a quiet period is followed by an immediate leading
+    //! emit, and the newest tip of a burst is always delivered by the model
+    //! timer. m_block_tip_mutex is a leaf lock: it is never held while taking
+    //! another lock or emitting a signal.
+    struct PendingBlockTip {
+        int height{0};
+        int64_t time{0};
+        double verification_progress{0};
+        SynchronizationState sync_state{};
+    };
+    Mutex m_block_tip_mutex;
+    std::optional<PendingBlockTip> m_pending_block_tip GUARDED_BY(m_block_tip_mutex);
+    std::optional<SteadyClock::time_point> m_last_block_tip_emit GUARDED_BY(m_block_tip_mutex);
+    void submitBlockTip(const PendingBlockTip& tip) EXCLUSIVE_LOCKS_REQUIRED(!m_block_tip_mutex);
+    void flushPendingBlockTip() EXCLUSIVE_LOCKS_REQUIRED(!m_block_tip_mutex);
+    void emitBlockTip(const PendingBlockTip& tip);
+
+    void TipChanged(SynchronizationState sync_state, interfaces::BlockTip tip, double verification_progress, SyncType synctype) EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex, !m_block_tip_mutex);
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
 

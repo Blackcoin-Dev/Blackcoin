@@ -31,7 +31,6 @@
 #include <QTimer>
 
 static SteadyClock::time_point g_last_header_tip_update_notification{};
-static SteadyClock::time_point g_last_block_tip_update_notification{};
 
 ClientModel::ClientModel(interfaces::Node& node, OptionsModel *_optionsModel, QObject *parent) :
     QObject(parent),
@@ -52,6 +51,9 @@ ClientModel::ClientModel(interfaces::Node& node, OptionsModel *_optionsModel, QO
     timer->setInterval(MODEL_UPDATE_DELAY);
     connect(timer, &QTimer::timeout, [this] {
         if (m_stopping.load(std::memory_order_acquire)) return;
+        // Deliver the newest coalesced block tip first, before any Node call
+        // below can wait on a Core lock.
+        flushPendingBlockTip();
         sampleConnectionCounts();
         // no locking required at this point
         // the following calls will acquire the required lock
@@ -99,7 +101,13 @@ std::optional<double> ClientModel::cachedPoSKernelPS()
 
 void ClientModel::beginShutdown()
 {
-    m_stopping.store(true, std::memory_order_release);
+    {
+        // Fence against submitBlockTip/flushPendingBlockTip, which re-check
+        // m_stopping under this mutex before they record or emit a tip.
+        LOCK(m_block_tip_mutex);
+        m_stopping.store(true, std::memory_order_release);
+        m_pending_block_tip.reset();
+    }
     peerTableModel->beginShutdown();
     m_thread->quit();
 }
@@ -296,16 +304,64 @@ void ClientModel::TipChanged(SynchronizationState sync_state, interfaces::BlockT
         WITH_LOCK(m_cached_tip_mutex, m_cached_tip_blocks = tip.block_hash;);
     }
 
-    // Throttle GUI notifications about (a) blocks during initial sync, and (b) both blocks and headers during reindex.
-    const bool throttle = (sync_state != SynchronizationState::POST_INIT && synctype == SyncType::BLOCK_SYNC) || sync_state == SynchronizationState::INIT_REINDEX;
+    if (synctype == SyncType::BLOCK_SYNC) {
+        // Coalesce in every sync state: a fast catch-up outside initial block
+        // download delivers thousands of tips per second to the GUI thread.
+        submitBlockTip({tip.block_height, tip.block_time, verification_progress, sync_state});
+        return;
+    }
+
+    // Header notifications arrive once per headers message, not per block, and
+    // are throttled only during reindex.
+    const bool throttle = sync_state == SynchronizationState::INIT_REINDEX;
     const auto now{throttle ? SteadyClock::now() : SteadyClock::time_point{}};
-    auto& nLastUpdateNotification = synctype != SyncType::BLOCK_SYNC ? g_last_header_tip_update_notification : g_last_block_tip_update_notification;
-    if (throttle && now < nLastUpdateNotification + MODEL_UPDATE_DELAY) {
+    if (throttle && now < g_last_header_tip_update_notification + MODEL_UPDATE_DELAY) {
         return;
     }
 
     Q_EMIT numBlocksChanged(tip.block_height, QDateTime::fromSecsSinceEpoch(tip.block_time), verification_progress, synctype, sync_state);
-    nLastUpdateNotification = now;
+    g_last_header_tip_update_notification = now;
+}
+
+void ClientModel::emitBlockTip(const PendingBlockTip& tip)
+{
+    Q_EMIT numBlocksChanged(tip.height, QDateTime::fromSecsSinceEpoch(tip.time), tip.verification_progress, SyncType::BLOCK_SYNC, tip.sync_state);
+}
+
+void ClientModel::submitBlockTip(const PendingBlockTip& tip)
+{
+    {
+        LOCK(m_block_tip_mutex);
+        if (m_stopping.load(std::memory_order_acquire)) return;
+        const auto now{SteadyClock::now()};
+        if (m_pending_block_tip || (m_last_block_tip_emit && now < *m_last_block_tip_emit + MODEL_UPDATE_DELAY)) {
+            // Inside the quiet-period window: keep only the newest tip for
+            // the model timer to deliver.
+            m_pending_block_tip = tip;
+            return;
+        }
+        m_last_block_tip_emit = now;
+    }
+    // Leading edge: nothing was emitted for MODEL_UPDATE_DELAY and nothing is
+    // pending, so an isolated block is shown at once.
+    emitBlockTip(tip);
+}
+
+void ClientModel::flushPendingBlockTip()
+{
+    PendingBlockTip tip;
+    {
+        LOCK(m_block_tip_mutex);
+        if (m_stopping.load(std::memory_order_acquire) || !m_pending_block_tip) return;
+        const auto now{SteadyClock::now()};
+        // The timer ticks every MODEL_UPDATE_DELAY, so allow for scheduling
+        // jitter; otherwise a tick a little early would wait a full extra tick.
+        if (m_last_block_tip_emit && now < *m_last_block_tip_emit + MODEL_UPDATE_DELAY - MODEL_UPDATE_DELAY / 5) return;
+        tip = *m_pending_block_tip;
+        m_pending_block_tip.reset();
+        m_last_block_tip_emit = now;
+    }
+    emitBlockTip(tip);
 }
 
 void ClientModel::subscribeToCoreSignals()

@@ -22,5 +22,8 @@ private Q_SLOTS:
     void consoleRejectsAfterShutdown();
     void peerSnapshotsDoNotBlockGui();
     void peerRowsPreserveIdentity();
+    void blockTipBurstIsCoalesced();
+    void blockTipSingleNotificationIsPrompt();
+    void blockTipShutdownDropsPending();
 };
 #endif

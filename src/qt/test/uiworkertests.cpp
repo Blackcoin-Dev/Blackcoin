@@ -29,7 +29,12 @@
 #include <QPersistentModelIndex>
 #include <QSignalSpy>
 #include <QStandardItemModel>
+#include <qt/guiconstants.h>
+#include <chain.h>
+#include <algorithm>
+#include <chrono>
 #include <future>
+#include <mutex>
 #include <functional>
 #include <stdexcept>
 
@@ -155,11 +160,11 @@ void UiWorkerTests::terminalStallBeforeQuit()
     const auto path = directory.filePath("terminal.jsonl");
     QVERIFY2(probe.start(path, error), qPrintable(error));
     QTRY_VERIFY_WITH_TIMEOUT(probe.count() >= 2, 3000);
-    qint64 callbacks_before{0};
-    QEventLoop loop;
-    QTimer::singleShot(0, &loop, [&] { callbacks_before = probe.count(); QThread::msleep(500); loop.quit(); });
-    loop.exec();
-    // No processEvents/qWait here: the delayed timer must not recover first.
+    // Stall the thread with no event loop running. An inner QEventLoop could
+    // dispatch the overdue timer in the same pass that handles quit(), so the
+    // delayed timer would recover before finish().
+    const qint64 callbacks_before{probe.count()};
+    QThread::msleep(500);
     QVERIFY2(probe.finish(error), qPrintable(error));
     QCOMPARE(probe.count(), callbacks_before);
     QFile file(path);
@@ -769,4 +774,177 @@ void UiWorkerTests::slowNotifyJournal()
     QCOMPARE(int(inner.receiver), int(UiSlowNotifyJournal::Receiver::WIDGET));
     QVERIFY2(probe.finish(error), qPrintable(error));
 #endif
+}
+
+namespace {
+//! Synthetic chain whose tips are published through the real Core signal, so
+//! the test exercises ClientModel's handler exactly as the node does.
+struct SyntheticTips {
+    std::vector<CBlockIndex> index;
+    std::vector<uint256> hashes;
+    explicit SyntheticTips(size_t count) : index(count), hashes(count)
+    {
+        for (size_t i = 0; i < count; ++i) {
+            hashes[i] = uint256S(strprintf("%064x", i + 1));
+            index[i].phashBlock = &hashes[i];
+            index[i].pprev = i ? &index[i - 1] : nullptr;
+            index[i].nHeight = i;
+            index[i].nTime = 1700000000 + i * 64;
+            index[i].nChainTx = i + 1;
+        }
+    }
+    void notify(size_t i, SynchronizationState state) { uiInterface.NotifyBlockTip(state, &index[i]); }
+};
+
+struct DeliveredTip {
+    int height;
+    qint64 time;
+    SyncType type;
+    SynchronizationState state;
+};
+
+//! Collects numBlocksChanged. The connection is direct, so the slot runs on the
+//! emitting thread (SyncType and SynchronizationState are only registered as
+//! Qt metatypes by the application); access is therefore locked.
+struct TipCollector : QObject {
+    mutable std::mutex mutex;
+    std::vector<DeliveredTip> m_tips;
+    explicit TipCollector(ClientModel& model)
+    {
+        connect(&model, &ClientModel::numBlocksChanged, this,
+            [this](int height, const QDateTime& date, double, SyncType type, SynchronizationState state) {
+                std::lock_guard<std::mutex> lock(mutex);
+                m_tips.push_back({height, date.toSecsSinceEpoch(), type, state});
+            }, Qt::DirectConnection);
+    }
+    std::vector<DeliveredTip> tips() const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return m_tips;
+    }
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        m_tips.clear();
+    }
+    size_t count() const { return tips().size(); }
+    int last_height() const
+    {
+        const auto all = tips();
+        return all.empty() ? -1 : all.back().height;
+    }
+};
+} // namespace
+
+void UiWorkerTests::blockTipBurstIsCoalesced()
+{
+    const auto restore_settings = PreserveApplicationSettings();
+    TestingSetup setup{ChainType::REGTEST};
+    auto node = interfaces::MakeNode(setup.m_node);
+    constexpr size_t BURST{5000};
+    SyntheticTips chain(BURST);
+    ClientModel model(*node, nullptr);
+    TipCollector collector(model);
+    auto cleanup = interfaces::MakeCleanupHandler([&] {
+        model.beginShutdown();
+        model.m_thread->wait();
+    });
+    // Outside initial block download (a catch-up after sleep) and inside it.
+    for (const auto state : {SynchronizationState::POST_INIT, SynchronizationState::INIT_DOWNLOAD}) {
+        collector.clear();
+        const auto start = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < BURST; ++i) chain.notify(i, state);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        // The cached height is never throttled.
+        QCOMPARE(model.getNumBlocks(), int(BURST - 1));
+        // The newest tip is always delivered, even though the burst ended
+        // between model-timer ticks.
+        QTRY_COMPARE_WITH_TIMEOUT(collector.last_height(), int(BURST - 1), 5000);
+        QTest::qWait(3 * MODEL_UPDATE_DELAY.count()); // nothing further may arrive
+        const auto delivered = collector.tips();
+        QCOMPARE(delivered.back().height, int(BURST - 1));
+        QCOMPARE(delivered.back().time, qint64(chain.index[BURST - 1].nTime));
+        QCOMPARE(int(delivered.back().state), int(state));
+        // One leading emit, then at most one per MODEL_UPDATE_DELAY.
+        const auto window_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        // Flush spacing is 4/5 of the delay; +1 absorbs a stalled burst on a loaded host.
+        const size_t bound = 2 + size_t(window_ms / 200) + 1;
+        QVERIFY2(!delivered.empty() && delivered.size() <= bound,
+            qPrintable(QStringLiteral("emitted %1 for %2 notifications in %3 ms (bound %4)")
+                .arg(delivered.size()).arg(BURST).arg(window_ms).arg(bound)));
+        for (const auto& tip : delivered) QCOMPARE(int(tip.type), int(SyncType::BLOCK_SYNC));
+        // Delivered heights never move backwards.
+        for (size_t i = 1; i < delivered.size(); ++i) QVERIFY(delivered[i].height > delivered[i - 1].height);
+    }
+}
+
+void UiWorkerTests::blockTipSingleNotificationIsPrompt()
+{
+    const auto restore_settings = PreserveApplicationSettings();
+    TestingSetup setup{ChainType::REGTEST};
+    auto node = interfaces::MakeNode(setup.m_node);
+    SyntheticTips chain(8);
+    ClientModel model(*node, nullptr);
+    TipCollector collector(model);
+    auto cleanup = interfaces::MakeCleanupHandler([&] {
+        model.beginShutdown();
+        model.m_thread->wait();
+    });
+    // An isolated block is a leading-edge emit: delivered before notify()
+    // returns, without waiting for a timer tick.
+    chain.notify(3, SynchronizationState::POST_INIT);
+    QCOMPARE(collector.count(), size_t{1});
+    QCOMPARE(collector.last_height(), 3);
+    QCOMPARE(int(collector.tips()[0].type), int(SyncType::BLOCK_SYNC));
+    QCOMPARE(int(collector.tips()[0].state), int(SynchronizationState::POST_INIT));
+    // After a quiet period the next isolated block is again immediate.
+    QTest::qWait(2 * MODEL_UPDATE_DELAY.count());
+    chain.notify(4, SynchronizationState::POST_INIT);
+    QCOMPARE(collector.count(), size_t{2});
+    QCOMPARE(collector.last_height(), 4);
+    // A block right behind one that was just shown is held back, then
+    // delivered by the timer rather than lost. The hold-back is only asserted
+    // when the scheduler did not stall for most of the 200 ms spacing.
+    const auto shown = std::chrono::steady_clock::now();
+    chain.notify(5, SynchronizationState::POST_INIT);
+    const bool quick = std::chrono::steady_clock::now() - shown < std::chrono::milliseconds(50);
+    if (quick) QCOMPARE(collector.count(), size_t{2});
+    QTRY_COMPARE_WITH_TIMEOUT(collector.last_height(), 5, 10000);
+    QCOMPARE(collector.count(), size_t{3});
+    QTest::qWait(3 * MODEL_UPDATE_DELAY.count());
+    QCOMPARE(collector.count(), size_t{3});
+}
+
+void UiWorkerTests::blockTipShutdownDropsPending()
+{
+    const auto restore_settings = PreserveApplicationSettings();
+    TestingSetup setup{ChainType::REGTEST};
+    auto node = interfaces::MakeNode(setup.m_node);
+    SyntheticTips chain(8);
+    ClientModel model(*node, nullptr);
+    TipCollector collector(model);
+    auto cleanup = interfaces::MakeCleanupHandler([&] {
+        model.beginShutdown();
+        model.m_thread->wait();
+    });
+    chain.notify(1, SynchronizationState::POST_INIT); // leading edge
+    const auto started = std::chrono::steady_clock::now();
+    chain.notify(2, SynchronizationState::POST_INIT); // pending for the timer
+    model.beginShutdown();
+    const bool quick = std::chrono::steady_clock::now() - started < std::chrono::milliseconds(50);
+    QTRY_VERIFY_WITH_TIMEOUT(model.shutdownReady(), 10000);
+    // A flush before beginShutdown is only possible if this thread stalled
+    // for >= 200 ms; the pending-drop is asserted for the normal case.
+    if (quick) {
+        QCOMPARE(collector.count(), size_t{1});
+        QCOMPARE(collector.last_height(), 1);
+    }
+    const size_t settled = collector.count();
+    const int settled_height = collector.last_height();
+    // A tip offered once stopping has begun is cached but never emitted.
+    chain.notify(3, SynchronizationState::POST_INIT);
+    QCOMPARE(model.getNumBlocks(), 3);
+    QTest::qWait(3 * MODEL_UPDATE_DELAY.count());
+    QCOMPARE(collector.count(), settled);
+    QCOMPARE(collector.last_height(), settled_height);
 }

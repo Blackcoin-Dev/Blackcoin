@@ -138,6 +138,10 @@ TransactionView::TransactionView(const PlatformStyle *platformStyle, QWidget *pa
     vlayout->addLayout(filter_layout);
     m_history_state = new QLabel(tr("Loading wallet history…"), this);
     m_history_state->setObjectName(QStringLiteral("transactionHistoryState"));
+    // The status text must not set the page's minimum width: wrap it so a
+    // narrow window keeps its layout while history is loading or updating.
+    m_history_state->setWordWrap(true);
+    m_history_state->setMinimumWidth(0);
     m_history_state->hide();
     vlayout->addWidget(m_history_state);
     vlayout->addWidget(createDateRangeWidget());

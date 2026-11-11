@@ -140,7 +140,7 @@ bool SetMinimizedAndWaitForPlatform(QWidget& window, bool minimized, int timeout
 {
     const auto request_state = [&] {
         window.setWindowState(minimized ? window.windowState() | Qt::WindowMinimized
-                                        : window.windowState() & ~Qt::WindowMinimized);
+                                        : window.windowState() & ~Qt::WindowStates(Qt::WindowMinimized));
     };
     // Headless and other backends retain their existing functional state checks.
     // Only Cocoa exercises the native acknowledgement contract in this fixture.
@@ -365,7 +365,7 @@ void UiRenderingTests::accountLargeGroupCancellationAndFilter()
     QTRY_VERIFY(!page.m_visibility->active());
     QVERIFY(cancelled->load(std::memory_order_acquire));
     QVERIFY(!page.m_refresh_cancel && !page.m_render_timer->isActive());
-    page.setWindowState(page.windowState() & ~Qt::WindowMinimized);
+    page.setWindowState(page.windowState() & ~Qt::WindowStates(Qt::WindowMinimized));
     QTRY_VERIFY(page.m_visibility->active());
     QTRY_VERIFY_WITH_TIMEOUT(page.m_snapshot_rendered && !page.m_filter_slice_timer->isActive(), 30000);
     QCOMPARE(page.m_tree->topLevelItem(0)->childCount(), 10000);

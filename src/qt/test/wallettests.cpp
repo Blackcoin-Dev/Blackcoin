@@ -4717,6 +4717,25 @@ void TestWalletPagesScale(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
     QVERIFY(table);
     QVERIFY(table->isVisible());
     QVERIFY(transaction_view.minimumSizeHint().width() <= 480);
+    {
+        // The history status label may be visible while history loads or
+        // updates; none of its texts may widen the page's minimum width. Force
+        // each text visible instead of depending on the model's timing.
+        auto* state = transaction_view.findChild<QLabel*>(QStringLiteral("transactionHistoryState"));
+        QVERIFY(state);
+        const bool was_hidden = state->isHidden();
+        const QString original = state->text();
+        for (const QString& text : {TransactionView::tr("Loading wallet history…"),
+                                    TransactionView::tr("Updating transaction history…"),
+                                    TransactionView::tr("Wallet history could not be loaded. Reopen the wallet to try again.")}) {
+            state->setText(text);
+            state->show();
+            QVERIFY(state->isVisible());
+            QVERIFY2(transaction_view.minimumSizeHint().width() <= 480, qPrintable(text));
+        }
+        state->setText(original);
+        state->setVisible(!was_hidden);
+    }
     transaction_view.hide();
 
     WalletView wallet_view(mini_gui.walletModel.get(), platformStyle, nullptr);

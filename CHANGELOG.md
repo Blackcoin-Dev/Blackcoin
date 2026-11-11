@@ -1,5 +1,18 @@
 # Changelog
 
+## v30.1.5.3rc5 (DEVELOPMENT, unreleased candidate)
+
+- Bound GUI-thread work for wallet history, Account, Staking and Peers with
+  workers and work slices. Pause display work on hidden and minimized pages,
+  and restore a minimized main window on a macOS reopen before activating it.
+- Coalesce block-tip notifications to the GUI in every synchronization state.
+  Catching up outside initial block download previously delivered one update
+  per block and stalled the window for seconds.
+- Destroy the wallet worker only after its thread has exited, closing a rare
+  crash during wallet unload and shutdown.
+- Add the opt-in `-uiperflog` and `-uipaintlog` diagnostics, disabled by
+  default.
+
 ## v30.1.5.3rc4 (DEVELOPMENT, unreleased candidate)
 
 - Show Overview's recent transactions through a five-row projection, preserving

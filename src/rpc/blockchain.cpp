@@ -125,7 +125,10 @@ double GetPoSKernelPS(ChainstateManager& chainman)
             if (pindexPrevStake)
             {
                 dStakeKernelsTriedAvg += GetDifficulty(pindexPrevStake) * 4294967296.0;
-                nStakesTime += pindexPrevStake->nTime - pindex->nTime;
+                // Header timestamps are not monotonic. Subtract as signed
+                // 64-bit values so an earlier successor contributes a negative
+                // interval without unsigned wraparound.
+                nStakesTime += static_cast<int>(int64_t{pindexPrevStake->nTime} - int64_t{pindex->nTime});
                 nStakesHandled++;
             }
             pindexPrevStake = pindex;

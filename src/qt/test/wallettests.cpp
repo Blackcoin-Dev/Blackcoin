@@ -6031,6 +6031,22 @@ uint64_t SplitMix(uint64_t x)
     return x;
 }
 
+//! Deterministic generator for the order tests (xorshift64): only XOR and masked shifts, so it never wraps.
+class TestRandom
+{
+public:
+    explicit TestRandom(uint64_t seed) : m_state(seed ^ 0x9e3779b97f4a7c15ULL) { if (m_state == 0) m_state = 1; }
+    uint64_t operator()()
+    {
+        m_state ^= (m_state & (~uint64_t{0} >> 13)) << 13;
+        m_state ^= m_state >> 7;
+        m_state ^= (m_state & (~uint64_t{0} >> 17)) << 17;
+        return m_state;
+    }
+private:
+    uint64_t m_state;
+};
+
 QList<TransactionRecord> SyntheticHistory(size_t first, size_t count, size_t total, bool newest = false)
 {
     QList<TransactionRecord> records;
@@ -6515,11 +6531,16 @@ void WalletTests::historyInitialLoad()
     wallet_view.hide();
 }
 
+//! The always-on rows are small (400 rows) and one sort configuration each, so every row is a short function that
+//! stays far inside the per-function limit of a sanitizer build. The 5k and 50k rows run all configurations in one
+//! function and only with BLACKCOIN_QT_BENCH.
 void WalletTests::historyIncrementalUpdates_data()
 {
     QTest::addColumn<int>("rows");
-    QTest::newRow("5k") << 5000;
-    QTest::newRow("50k") << 50000;
+    QTest::addColumn<int>("config_index");
+    for (int config = 0; config < 7; ++config) QTest::newRow(qPrintable(QStringLiteral("small-%1").arg(config))) << 400 << config;
+    QTest::newRow("5k") << 5000 << -1;
+    QTest::newRow("50k") << 50000 << -1;
 }
 
 //! Random interleavings of inserts, removals and status changes, each batch followed by a comparison, row for row,
@@ -6530,7 +6551,8 @@ void WalletTests::historyIncrementalUpdates()
     if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
 #endif
     QFETCH(int, rows);
-    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet oracle; set BLACKCOIN_QT_BENCH=1 to run");
+    QFETCH(int, config_index);
+    if (rows > 400 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet oracle; set BLACKCOIN_QT_BENCH=1 to run");
     common::Settings saved_settings;
     gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
     auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
@@ -6576,7 +6598,7 @@ void WalletTests::historyIncrementalUpdates()
     proxy.setSourceModel(history);
     QItemSelectionModel selection(&proxy);
     bool layout_mode{false};
-    std::mt19937_64 random(0xb10c + static_cast<uint64_t>(rows));
+    TestRandom random(0xb10c + static_cast<uint64_t>(rows));
     size_t next_first = static_cast<size_t>(rows) + 1000;
 
     struct Config { int column; Qt::SortOrder order; bool show_inactive; };
@@ -6588,7 +6610,13 @@ void WalletTests::historyIncrementalUpdates()
         configs.push_back({TransactionTableModel::ToAddress, Qt::AscendingOrder, true});
         configs.push_back({TransactionTableModel::Date, Qt::DescendingOrder, false});
     }
-    const int batches = rows <= 5000 ? 24 : 8;
+    const int batches = rows <= 400 ? 12 : (rows <= 5000 ? 24 : 8);
+    size_t first_config{0};
+    if (config_index >= 0) {
+        QVERIFY(static_cast<size_t>(config_index) < configs.size());
+        first_config = static_cast<size_t>(config_index);
+        configs = {configs[first_config]};
+    }
     const auto settle = [&] {
         QCoreApplication::processEvents();
         QTRY_VERIFY_WITH_TIMEOUT(proxy.isReady(), 60000);
@@ -6612,7 +6640,7 @@ void WalletTests::historyIncrementalUpdates()
     for (size_t c = 0; c < configs.size(); ++c) {
         const Config& config = configs[c];
         // Alternate how row changes are announced: insert/remove signals, or one layout change (accessibility active).
-        layout_mode = (c % 2) == 1;
+        layout_mode = ((first_config + c) % 2) == 1;
         proxy.setLayoutUpdates(layout_mode);
         proxy.setShowInactive(config.show_inactive);
         proxy.sort(config.column, config.order);
@@ -6697,11 +6725,15 @@ void WalletTests::historyIncrementalUpdates()
     }
 }
 
+//! One row per sort configuration. The always-on rows use 300 rows, so each is a short function that stays far inside
+//! the per-function limit of a sanitizer build; the 3k and 50k rows need BLACKCOIN_QT_BENCH.
 void WalletTests::historyOrderOracle_data()
 {
     QTest::addColumn<int>("rows");
-    QTest::newRow("3k") << 3000;
-    QTest::newRow("50k") << 50000;
+    QTest::addColumn<int>("config_index");
+    for (int config = 0; config < 30; ++config) QTest::newRow(qPrintable(QStringLiteral("small-%1").arg(config))) << 300 << config;
+    for (int config = 0; config < 30; ++config) QTest::newRow(qPrintable(QStringLiteral("3k-%1").arg(config))) << 3000 << config;
+    for (int config = 0; config < 6; ++config) QTest::newRow(qPrintable(QStringLiteral("50k-%1").arg(config))) << 50000 << config;
 }
 
 //! Targeted and randomized changes to many rows at once (clustered, interleaved, large fractions, with inserts and
@@ -6713,7 +6745,8 @@ void WalletTests::historyOrderOracle()
     if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
 #endif
     QFETCH(int, rows);
-    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet oracle; set BLACKCOIN_QT_BENCH=1 to run");
+    QFETCH(int, config_index);
+    if (rows > 300 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet oracle; set BLACKCOIN_QT_BENCH=1 to run");
     common::Settings saved_settings;
     gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
     auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
@@ -6755,8 +6788,8 @@ void WalletTests::historyOrderOracle()
     proxy.setSortCaseSensitivity(Qt::CaseInsensitive);
     proxy.setSourceModel(history);
     std::unique_ptr<QAbstractItemModelTester> tester;
-    if (rows <= 3000) tester = std::make_unique<QAbstractItemModelTester>(&proxy, QAbstractItemModelTester::FailureReportingMode::QtTest);
-    std::mt19937_64 random(0x0dd5eed + static_cast<uint64_t>(rows));
+    if (rows <= 300) tester = std::make_unique<QAbstractItemModelTester>(&proxy, QAbstractItemModelTester::FailureReportingMode::QtTest);
+    TestRandom random(0x0dd5eed + static_cast<uint64_t>(rows));
     size_t next_first = static_cast<size_t>(rows) + 5000;
 
     const auto name_of = [](const uint256& hash) { return QString::fromStdString(hash.ToString()); };
@@ -6840,11 +6873,17 @@ void WalletTests::historyOrderOracle()
                    {TransactionTableModel::Date, Qt::DescendingOrder, true}, {TransactionTableModel::Amount, Qt::AscendingOrder, false},
                    {TransactionTableModel::Status, Qt::AscendingOrder, false, 1}, {TransactionTableModel::Date, Qt::DescendingOrder, false, 2}};
     }
-    const int random_batches = rows <= 3000 ? 10 : 3;
+    const int random_batches = rows <= 300 ? 4 : (rows <= 3000 ? 10 : 3);
+    QVERIFY(config_index >= 0 && static_cast<size_t>(config_index) < configs.size());
+    configs = {configs[static_cast<size_t>(config_index)]};
+    // A run of rows starting somewhere in the projection, never before its start or past its end.
+    const auto run_start = [&](int length) {
+        const int span = proxy.rowCount() - length;
+        return span > 0 ? static_cast<int>(random() % static_cast<uint64_t>(span)) : 0;
+    };
 
     for (size_t c = 0; c < configs.size(); ++c) {
         const Config config = configs[c];
-        if (c >= 2) tester.reset();
         proxy.setLayoutUpdates(config.layout);
         apply_filter(proxy, config.filter);
         proxy.sort(config.column, config.order);
@@ -6916,14 +6955,14 @@ void WalletTests::historyOrderOracle()
         }, /*expect_no_scan=*/!config.layout);
         // Clustered: a run of adjacent rows all change at once.
         step(QStringLiteral("40 adjacent rows"), [&] {
-            const auto run = run_of(static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount() - 100)), 40);
+            const auto run = run_of(run_start(40), 40);
             const std::set<QString> chosen(run.begin(), run.end());
             const uint64_t salt = random();
             mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
         });
         // A run whose members swap places: the first becomes the last.
         step(QStringLiteral("25 adjacent rows reversed"), [&] {
-            const auto run = run_of(static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount() - 100)), 25);
+            const auto run = run_of(run_start(25), 25);
             std::map<QString, size_t> place;
             for (size_t k = 0; k < run.size(); ++k) place[run[k]] = k;
             mutate(std::set<QString>(run.begin(), run.end()), [&](TransactionRecord& r) {
@@ -6949,13 +6988,19 @@ void WalletTests::historyOrderOracle()
             });
         });
         // Inserts, removals and changes of existing rows announced in the same flush.
-        step(QStringLiteral("insert, remove and change in one flush"), [&] {
-            add_some(20);
-            remove_some(5);
-            const auto chosen = pick_live(6);
-            const uint64_t salt = random();
-            mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
-        });
+        // New rows are placed among rows that are themselves moving, so this runs several times with a run of adjacent
+        // rows changing as well.
+        for (int round = 0; round < 4; ++round) {
+            step(QStringLiteral("insert, remove and change in one flush %1").arg(round), [&] {
+                add_some(20);
+                remove_some(5);
+                auto chosen = pick_live(6);
+                const auto run = run_of(run_start(12), 12);
+                chosen.insert(run.begin(), run.end());
+                const uint64_t salt = random();
+                mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+            });
+        }
         // Large fractions of the table.
         for (int percent : {10, 35, 70}) {
             step(QStringLiteral("%1 percent of all rows").arg(percent), [&] {
@@ -6969,7 +7014,8 @@ void WalletTests::historyOrderOracle()
             step(QStringLiteral("random batch %1").arg(batch), [&] {
                 const uint64_t shape = random() % 4;
                 if (shape == 0) {
-                    const auto run = run_of(static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount() - 400)), 1 + static_cast<int>(random() % 300));
+                    const int length = 1 + static_cast<int>(random() % 300);
+                    const auto run = run_of(run_start(length), length);
                     const uint64_t salt = random();
                     mutate(std::set<QString>(run.begin(), run.end()), [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
                 } else if (shape == 1) {

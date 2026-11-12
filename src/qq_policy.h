@@ -15,6 +15,43 @@ constexpr auto RETRY_INTERVAL = std::chrono::seconds{30};
 constexpr auto DNS_COOLDOWN = std::chrono::minutes{30};
 constexpr size_t MAX_ADDR_FETCHES{64};
 constexpr int MAX_CANDIDATE_DRAWS{100};
+/** Full-relay peers that must be connected before QQ pursuit may use vacancies. */
+constexpr int LEGACY_FIRST_FLOOR{4};
+/** A legacy address that failed a legacy-first dial yields to QQ hints for this long. */
+constexpr auto LEGACY_FIRST_FAILED_MEMORY = std::chrono::minutes{10};
+/** How long a completed handshake with a QQ-capable peer counts as evidence that QQ peers are reachable. */
+constexpr auto EVIDENCE_WINDOW = std::chrono::minutes{30};
+
+inline int LegacyFirstFloor(int full_relay_capacity)
+{
+    return std::min(LEGACY_FIRST_FLOOR, std::max(0, full_relay_capacity));
+}
+
+/** The QQ deficit cannot be satisfied while the chain is not ready, unless a QQ peer is already connected. */
+inline int EffectiveDeficit(int deficit, bool chain_ready, bool qq_peer_connected)
+{
+    return (chain_ready || qq_peer_connected) ? deficit : 0;
+}
+
+/**
+ * Candidate selection is legacy-first (QQ-flagged addresses wait behind
+ * legacy ones) unless QQ peers are known to be reachable and enough
+ * full-relay peers are already connected. QQ pursuit then uses only the
+ * slots above the floor.
+ */
+inline bool LegacyFirst(int qq_target, int connected_full_relay, int full_relay_capacity, bool qq_evidence)
+{
+    return qq_target > 0 && (!qq_evidence || connected_full_relay < LegacyFirstFloor(full_relay_capacity));
+}
+
+/** Retry delays after consecutive unproductive HTTPS rounds; afterwards the normal cadence applies. */
+constexpr std::chrono::seconds HTTPS_BACKOFF[]{std::chrono::seconds{60}, std::chrono::seconds{120},
+                                               std::chrono::seconds{300}, std::chrono::seconds{600}};
+constexpr size_t HTTPS_BACKOFF_STEPS{sizeof(HTTPS_BACKOFF) / sizeof(HTTPS_BACKOFF[0])};
+
+/** Seconds of no peers before the zero-peer line may be logged, and the minimum spacing between lines. */
+constexpr std::chrono::seconds ZERO_PEER_LOG_AFTER{60};
+constexpr std::chrono::minutes ZERO_PEER_LOG_EVERY{10};
 
 inline int EffectiveTarget(int requested, int capacity)
 {

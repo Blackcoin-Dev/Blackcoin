@@ -4,11 +4,15 @@
 #include <https_seed_client.h>
 #include <net_processing.h>
 #include <netmessagemaker.h>
+#include <logging.h>
+#include <test/util/logging.h>
 #include <test/util/net.h>
 #include <util/time.h>
+#include <util/strencodings.h>
 #include <util/string.h>
 #include <version.h>
 #include <net_https_seed.h>
+#include <timedata.h>
 #include <netgroup.h>
 #include <test/util/setup_common.h>
 #include <univalue.h>
@@ -26,6 +30,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <condition_variable>
+#include <fstream>
+#include <sstream>
 #include <mutex>
 #include <limits>
 #include <memory>
@@ -750,6 +756,12 @@ public:
     ~WorkerRun() { Stop(); }
 };
 
+/** PeerManager::ProcessMessage(VERSION) feeds AddTimeData(), which keeps process-wide state (sample filter, one-shot
+ * clock warning). A later timedata_tests/addtimedata needs it pristine, so reset it when a handshake scope ends. */
+struct TimeDataScope {
+    ~TimeDataScope() { TestOnlyResetTimeData(); }
+};
+
 struct DNSLookupScope {
     DNSLookupFn previous{g_dns_lookup};
     ~DNSLookupScope() { g_dns_lookup = std::move(previous); }
@@ -850,6 +862,7 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_https_addrman_automatic_peer, TestingSetu
     TestSocket accepted{peer_fd};
     // Complete the real PeerManager VERSION/VERACK path using the existing
     // serialized-message fixture. Socket selection above was automatic and real.
+    TimeDataScope time_data_scope;
     LOCK(NetEventsInterface::g_msgproc_mutex);
     connman.FlushSendBuffer(*learned);
     const CNetMsgMaker messages{0};
@@ -871,7 +884,34 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_https_addrman_automatic_peer, TestingSetu
 }
 
 namespace {
-void PreparePersistedBootstrap(node::NodeContext& node, bool legacy = true, int qq_target = 8)
+/** Add outbound full-relay peers that completed VERSION/VERACK. A QQ peer also records QQ handshake evidence. */
+void AddConnectedFullRelay(node::NodeContext& node, unsigned count, bool qq, unsigned first_octet = 30)
+{
+    auto& connman = static_cast<ConnmanTestMsg&>(*node.connman);
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    for (unsigned i = 0; i < count; ++i) {
+        auto* peer = new CNode{static_cast<NodeId>(1000 + first_octet * 100 + i), /*sock=*/nullptr,
+                               CAddress{LookupNumeric(strprintf("%u.%u.0.1", first_octet + i, i), 15714), NODE_NETWORK},
+                               /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0, CAddress{}, /*addrNameIn=*/"",
+                               ConnectionType::OUTBOUND_FULL_RELAY, /*inbound_onion=*/false};
+        connman.Handshake(*peer, /*successfully_connected=*/true,
+                          ServiceFlags(NODE_NETWORK | (qq ? NODE_QUANTUM_QUASAR : NODE_NONE)),
+                          ServiceFlags(NODE_NETWORK), PROTOCOL_VERSION, /*relay_txs=*/true);
+        BOOST_REQUIRE(peer->fSuccessfullyConnected);
+        connman.AddTestNode(*peer); // Owned (and finalized) by the connman at teardown.
+    }
+}
+
+/** Bootstrap state in which QQ pursuit applies: proof QQ peers are reachable, and enough peers connected. */
+void EnableQQPursuit(node::NodeContext& node, unsigned floor_peers = qq::LEGACY_FIRST_FLOOR, bool qq_peers = false)
+{
+    auto& connman = static_cast<ConnmanTestMsg&>(*node.connman);
+    connman.PublishQQStatus(0, 0, false, ""); // Chain ready, deficit at target.
+    AddConnectedFullRelay(node, floor_peers, qq_peers);
+    connman.NoteQQHandshake();
+}
+
+void PreparePersistedBootstrap(node::NodeContext& node, bool legacy = true, int qq_target = 8, unsigned legacy_stride = 10)
 {
     // Actual deterministic addrman and actual Connman/PeerManager, not a selector mock.
     node.peerman.reset();
@@ -894,7 +934,7 @@ void PreparePersistedBootstrap(node::NodeContext& node, bool legacy = true, int 
     connman.Init(options);
     connman.PublishQQStatus(0, 0, false, "chain-not-ready");
     for (unsigned i = 0; node.addrman->Size() < 6446 && i < 30000; ++i) {
-        const bool qq = !legacy || i % 10 != 0;
+        const bool qq = !legacy || i % legacy_stride != 0;
         const auto address = LookupNumeric(strprintf("11.%u.%u.1", i / 256, i % 256), qq ? 46005 : 15714);
         CAddress entry{address, ServiceFlags(NODE_NETWORK | (qq ? NODE_QUANTUM_QUASAR : NODE_NONE))};
         entry.nTime = NodeSeconds{std::chrono::seconds{NOW - (qq ? 60 * 86400 : 60)}};
@@ -919,7 +959,11 @@ public:
 
 BOOST_FIXTURE_TEST_CASE(actual_connman_persisted_qq_pool_bootstrap_attempt_fairness, TestingSetup)
 {
+    // N1a: the QQ,QQ,legacy cadence now applies only with recent QQ handshake
+    // evidence and at least four connected full-relay peers. Same assertions
+    // as in RC5; only this precondition was added to the fixture.
     PreparePersistedBootstrap(m_node);
+    EnableQQPursuit(m_node);
     auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
     SocketFactoryScope factory;
     std::mutex mutex;
@@ -976,6 +1020,268 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_target_zero_does_not_force_lega
     BOOST_REQUIRE(attempts.size() >= 3);
     BOOST_CHECK(attempts[0] && attempts[1] && attempts[2]);
     BOOST_CHECK_EQUAL(connman.GetQQTarget(), 0);
+}
+
+namespace {
+/** Run the real open-connections thread against refusing sockets and return the first `count` attempt classes (Q: QQ-flagged hint, L: legacy). */
+std::string ObserveBootstrapAttempts(ConnmanTestMsg& connman, size_t count, std::chrono::seconds timeout = std::chrono::seconds{60})
+{
+    SocketFactoryScope factory;
+    std::mutex mutex;
+    std::string seen;
+    CreateSock = [&](const CService& address) -> std::unique_ptr<Sock> {
+        const bool qq = address.GetPort() == 46005;
+        return std::make_unique<RefusedBootstrapSocket>([&, qq] {
+            std::lock_guard<std::mutex> lock{mutex};
+            seen += qq ? 'Q' : 'L';
+            if (seen.size() == count) connman.Interrupt();
+        });
+    };
+    connman.StartHTTPSAutomaticConnectionsForTest();
+    const bool completed = Eventually([&] { std::lock_guard<std::mutex> lock{mutex}; return seen.size() >= count; }, timeout);
+    connman.StopHTTPSForTest();
+    BOOST_REQUIRE(completed);
+    std::lock_guard<std::mutex> lock{mutex};
+    return seen.substr(0, count);
+}
+
+std::string DebugLogText()
+{
+    std::ifstream file{LogInstance().m_file_path};
+    std::stringstream text;
+    text << file.rdbuf();
+    return text.str();
+}
+
+size_t CountOf(const std::string& text, const std::string& needle)
+{
+    size_t count{0};
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++count;
+    return count;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(qq_legacy_first_policy_rules)
+{
+    // Floor: four connected full-relay peers, or all of a smaller capacity.
+    BOOST_CHECK_EQUAL(qq::LegacyFirstFloor(16), 4);
+    BOOST_CHECK_EQUAL(qq::LegacyFirstFloor(4), 4);
+    BOOST_CHECK_EQUAL(qq::LegacyFirstFloor(3), 3);
+    BOOST_CHECK_EQUAL(qq::LegacyFirstFloor(0), 0);
+    BOOST_CHECK_EQUAL(qq::LegacyFirstFloor(-1), 0);
+    // No QQ evidence: legacy-first at every peer count, including a full set.
+    for (int peers = 0; peers <= 16; ++peers) BOOST_CHECK(qq::LegacyFirst(8, peers, 16, false));
+    // Evidence: legacy-first below the floor only.
+    for (int peers = 0; peers < 4; ++peers) BOOST_CHECK(qq::LegacyFirst(8, peers, 16, true));
+    for (int peers = 4; peers <= 16; ++peers) BOOST_CHECK(!qq::LegacyFirst(8, peers, 16, true));
+    BOOST_CHECK(qq::LegacyFirst(2, 2, 3, true));
+    BOOST_CHECK(!qq::LegacyFirst(2, 3, 3, true));
+    // Policy off: selection is never reordered.
+    BOOST_CHECK(!qq::LegacyFirst(0, 0, 16, false));
+    // Deficit is 0 in IBD unless a QQ peer is already connected.
+    BOOST_CHECK_EQUAL(qq::EffectiveDeficit(8, false, false), 0);
+    BOOST_CHECK_EQUAL(qq::EffectiveDeficit(8, false, true), 8);
+    BOOST_CHECK_EQUAL(qq::EffectiveDeficit(8, true, false), 8);
+    BOOST_CHECK_EQUAL(qq::EffectiveDeficit(0, true, true), 0);
+    // Backoff schedule.
+    BOOST_CHECK_EQUAL(qq::HTTPS_BACKOFF_STEPS, 4U);
+    const int64_t expected[]{60, 120, 300, 600};
+    for (size_t i = 0; i < 4; ++i) BOOST_CHECK_EQUAL(qq::HTTPS_BACKOFF[i].count(), expected[i]);
+}
+
+BOOST_FIXTURE_TEST_CASE(qq_handshake_evidence_window, TestingSetup)
+{
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    const auto start = qq::Clock::now();
+    BOOST_CHECK(!connman.HasRecentQQHandshake(start));
+    connman.NoteQQHandshake(start);
+    BOOST_CHECK(connman.HasRecentQQHandshake(start));
+    BOOST_CHECK(connman.HasRecentQQHandshake(start + qq::EVIDENCE_WINDOW));
+    BOOST_CHECK(!connman.HasRecentQQHandshake(start + qq::EVIDENCE_WINDOW + std::chrono::seconds{1}));
+    connman.NoteQQHandshake(start + std::chrono::hours{1});
+    BOOST_CHECK(connman.HasRecentQQHandshake(start + std::chrono::hours{1} + std::chrono::minutes{29}));
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_zero_qq_evidence_prefers_legacy, TestingSetup)
+{
+    // Thousands of dead QQ-flagged entries, a quarter legacy, no peers, no QQ
+    // evidence, chain ready (deficit at target): every attempt is legacy.
+    PreparePersistedBootstrap(m_node, true, 8, 4);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.PublishQQStatus(0, 0, false, "");
+    BOOST_REQUIRE_EQUAL(connman.GetQQStatus().deficit, 8);
+    const auto observed = ObserveBootstrapAttempts(connman, 20);
+    BOOST_TEST_MESSAGE("Zero QQ evidence, zero peers: " << observed);
+    BOOST_CHECK_EQUAL(observed, std::string(20, 'L'));
+    BOOST_CHECK_EQUAL(connman.GetQQStatus().connect_attempts, 0U);
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_qq_evidence_below_floor_stays_legacy_first, TestingSetup)
+{
+    // Recent QQ evidence, but one connected peer short of the floor of four.
+    PreparePersistedBootstrap(m_node, true, 8, 4);
+    EnableQQPursuit(m_node, qq::LEGACY_FIRST_FLOOR - 1);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    BOOST_REQUIRE(connman.HasRecentQQHandshake());
+    const auto observed = ObserveBootstrapAttempts(connman, 12);
+    BOOST_TEST_MESSAGE("Evidence with 3 peers: " << observed);
+    BOOST_CHECK_EQUAL(observed, std::string(12, 'L'));
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_qq_evidence_at_floor_resumes_pursuit, TestingSetup)
+{
+    PreparePersistedBootstrap(m_node, true, 8, 4);
+    EnableQQPursuit(m_node, qq::LEGACY_FIRST_FLOOR);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    const auto observed = ObserveBootstrapAttempts(connman, 12);
+    BOOST_TEST_MESSAGE("Evidence with 4 peers: " << observed);
+    BOOST_CHECK_EQUAL(observed, "QQLQQLQQLQQL");
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_expired_qq_evidence_is_legacy_first, TestingSetup)
+{
+    // The only QQ handshake is older than the window: no pursuit even with a full floor.
+    PreparePersistedBootstrap(m_node, true, 8, 4);
+    EnableQQPursuit(m_node, qq::LEGACY_FIRST_FLOOR);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.NoteQQHandshake(qq::Clock::now() - qq::EVIDENCE_WINDOW - std::chrono::minutes{1});
+    BOOST_REQUIRE(!connman.HasRecentQQHandshake());
+    const auto observed = ObserveBootstrapAttempts(connman, 12);
+    BOOST_TEST_MESSAGE("Expired evidence with 4 peers: " << observed);
+    BOOST_CHECK_EQUAL(observed, std::string(12, 'L'));
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_ibd_treats_qq_deficit_as_zero, TestingSetup)
+{
+    // Evidence and four legacy peers (pursuit would apply), but the chain is not
+    // ready: the published deficit stays at target, the dial preference is off,
+    // so the QQ,QQ,legacy cadence must not appear in a QQ-rich pool.
+    PreparePersistedBootstrap(m_node, true, 8, 4);
+    EnableQQPursuit(m_node, qq::LEGACY_FIRST_FLOOR);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.PublishQQStatus(0, 0, false, "chain-not-ready");
+    BOOST_REQUIRE_EQUAL(connman.GetQQStatus().deficit, 8);
+    const auto observed = ObserveBootstrapAttempts(connman, 30);
+    BOOST_TEST_MESSAGE("IBD, legacy peers only: " << observed);
+    // The cadence never puts two legacy attempts side by side, and never three QQ ones.
+    BOOST_CHECK_MESSAGE(observed.find("LL") != std::string::npos || observed.find("QQQ") != std::string::npos,
+                        "IBD must not shape draws: " << observed);
+    BOOST_CHECK_EQUAL(connman.GetQQStatus().deficit, 8);
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_ibd_with_connected_qq_peers_keeps_pursuit, TestingSetup)
+{
+    // A connected QQ peer keeps the deficit alive in IBD.
+    PreparePersistedBootstrap(m_node, true, 8, 4);
+    EnableQQPursuit(m_node, qq::LEGACY_FIRST_FLOOR, /*qq_peers=*/true);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.PublishQQStatus(4, 0, false, "chain-not-ready");
+    const auto observed = ObserveBootstrapAttempts(connman, 12);
+    BOOST_TEST_MESSAGE("IBD with connected QQ peers: " << observed);
+    BOOST_CHECK_EQUAL(observed, "QQLQQLQQLQQL");
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_https_backoff_schedule_and_reset, TestingSetup)
+{
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    PrepareWorker(connman, m_node);
+    enum Step { FAIL, REJECT, EMPTY, HINT };
+    const std::vector<Step> script{FAIL, REJECT, EMPTY, FAIL, FAIL, HINT, FAIL, HINT};
+    std::atomic<unsigned> fetches{0};
+    WorkerGate gate{connman};
+    httpsseed::WorkerHooks hooks;
+    hooks.now = [&] { return gate.Now(); };
+    hooks.wait = [&] { return gate.Wait(); };
+    hooks.fetch = [&](const auto&, const auto&) -> httpsseed::FetchResult {
+        const auto step = script.at(fetches++);
+        if (step == FAIL) return {false, {}, "fixture failure"};
+        if (step == REJECT) return {true, "not json", {}};
+        UniValue doc{UniValue::VOBJ};
+        doc.pushKV("schema", "blackcoin.bootstrap/1");
+        doc.pushKV("network", "main");
+        doc.pushKV("generated_at", NOW);
+        doc.pushKV("expires_at", NOW + 120);
+        UniValue peers{UniValue::VARR};
+        if (step == HINT) peers.push_back(Peer());
+        doc.pushKV("peers", peers);
+        return {true, doc.write(), {}};
+    };
+    WorkerRun worker{connman, gate, hooks};
+    {
+        ASSERT_DEBUG_LOG("HTTPS seed round: outcome=fetch-failed hints=0 retry_in=60s");
+        BOOST_REQUIRE(gate.Step());
+        BOOST_CHECK_EQUAL(fetches.load(), 1U);
+    }
+    // Each unproductive round is retried at 60, 120, 300, 600 s.
+    const auto retry_after = [&](int64_t gap) {
+        const auto before = fetches.load();
+        BOOST_REQUIRE(gate.Step(gap - 1));
+        BOOST_CHECK_EQUAL(fetches.load(), before);
+        BOOST_REQUIRE(gate.Step(1));
+        BOOST_CHECK_EQUAL(fetches.load(), before + 1);
+    };
+    retry_after(60);   // round 2: rejected body
+    retry_after(120);  // round 3: accepted, zero hints
+    retry_after(300);  // round 4: failed
+    retry_after(600);  // round 5: failed
+    // Backoff exhausted: the normal 30 to 35 minute cadence resumes.
+    BOOST_REQUIRE(gate.Step(1799));
+    BOOST_CHECK_EQUAL(fetches.load(), 5U);
+    {
+        ASSERT_DEBUG_LOG("HTTPS seed round: outcome=accepted hints=1");
+        BOOST_REQUIRE(gate.Step(301)); // round 6: one usable hint resets the backoff
+        BOOST_CHECK_EQUAL(fetches.load(), 6U);
+    }
+    BOOST_CHECK_EQUAL(m_node.addrman->Size(), 1U);
+    BOOST_REQUIRE(gate.Step(1799));
+    BOOST_CHECK_EQUAL(fetches.load(), 6U);
+    BOOST_REQUIRE(gate.Step(301)); // round 7: failed, after the reset
+    BOOST_CHECK_EQUAL(fetches.load(), 7U);
+    retry_after(60);   // back to the first backoff step
+    BOOST_CHECK_EQUAL(fetches.load(), 8U);
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_zero_peers_logs_once_per_ten_minutes_without_addresses, TestingSetup)
+{
+    PreparePersistedBootstrap(m_node);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    SocketFactoryScope factory;
+    std::atomic<unsigned> attempts{0};
+    CreateSock = [&](const CService&) -> std::unique_ptr<Sock> {
+        return std::make_unique<RefusedBootstrapSocket>([&] { ++attempts; });
+    };
+    connman.StartHTTPSAutomaticConnectionsForTest();
+    struct Stop { ConnmanTestMsg& c; ~Stop() { c.StopHTTPSForTest(); } } stop{connman};
+    const auto passes = [&](unsigned more) {
+        const auto target = attempts.load() + more;
+        BOOST_REQUIRE(Eventually([&] { return attempts.load() >= target; }, std::chrono::seconds{30}));
+    };
+    passes(2); // The zero-peer window is open.
+    BOOST_CHECK_EQUAL(CountOf(DebugLogText(), "No peers for"), 0U);
+    SetMockTime(NOW + 61);
+    passes(2);
+    BOOST_REQUIRE(Eventually([&] { return CountOf(DebugLogText(), "No peers for") == 1; }));
+    const auto text = DebugLogText();
+    const auto at = text.find("No peers for 61 seconds: addrman=6446 dial_attempts=");
+    BOOST_REQUIRE(at != std::string::npos);
+    const auto line = text.substr(at, text.find('\n', at) - at);
+    BOOST_TEST_MESSAGE(line);
+    BOOST_CHECK(line.find('.') == std::string::npos); // No address in the line.
+    const std::string prefix{"No peers for 61 seconds: addrman=6446 dial_attempts="};
+    const auto separator = line.find(" dial_failures=");
+    BOOST_REQUIRE(separator != std::string::npos);
+    uint64_t logged_attempts{0}, logged_failures{0};
+    BOOST_REQUIRE(ParseUInt64(line.substr(prefix.size(), separator - prefix.size()), &logged_attempts));
+    BOOST_REQUIRE(ParseUInt64(line.substr(separator + std::string{" dial_failures="}.size()), &logged_failures));
+    BOOST_CHECK(logged_attempts >= 2);
+    BOOST_CHECK_EQUAL(logged_attempts, logged_failures);
+    // Rate limit: nothing more for ten minutes of (mock) time.
+    SetMockTime(NOW + 61 + 599);
+    passes(3);
+    BOOST_CHECK_EQUAL(CountOf(DebugLogText(), "No peers for"), 1U);
+    SetMockTime(NOW + 61 + 600);
+    passes(2);
+    BOOST_REQUIRE(Eventually([&] { return CountOf(DebugLogText(), "No peers for") == 2; }));
 }
 
 namespace {
@@ -1052,6 +1358,7 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_qq_only_pool_keeps_attempting, 
 BOOST_FIXTURE_TEST_CASE(actual_connman_bootstrap_socket_creation_is_not_attempt, TestingSetup)
 {
     PreparePersistedBootstrap(m_node);
+    EnableQQPursuit(m_node);
     auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
     SocketFactoryScope factory;
     unsigned rejected{0};
@@ -1092,6 +1399,7 @@ public:
 
 void CompleteBootstrapHandshake(ConnmanTestMsg& connman, node::NodeContext& node, CNode& peer)
 {
+    TimeDataScope time_data_scope;
     LOCK(NetEventsInterface::g_msgproc_mutex);
     connman.FlushSendBuffer(peer);
     const CNetMsgMaker messages{0};
@@ -1112,6 +1420,7 @@ void CompleteBootstrapHandshake(ConnmanTestMsg& connman, node::NodeContext& node
 void LegacyReplenishmentAfterBootstrap(node::NodeContext& node, bool handshake)
 {
     PreparePersistedBootstrap(node);
+    EnableQQPursuit(node);
     auto& connman = static_cast<ConnmanTestMsg&>(*node.connman);
     TestSocket listener{static_cast<SOCKET>(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP))};
     sockaddr_in local{}; local.sin_family = AF_INET; local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -1372,26 +1681,28 @@ void PairedWorkerRace(node::NodeContext& node, bool dns_first)
     BOOST_REQUIRE(dg.Step(1799));
     BOOST_REQUIRE(hg.Step(1799));
     BOOST_CHECK_EQUAL(base.load(), 3U);
-    BOOST_CHECK_EQUAL(https.load(), 1U);
+    // N1b: a rejected body (round 1) is retried after 60 s, so the failed
+    // round 2 already ran inside this jump (RC5 waited a full cadence).
+    BOOST_CHECK_EQUAL(https.load(), dns_first ? 1U : 2U);
     // Only DNS is due; the HTTPS clock remains unchanged.
     connman.PublishQQStatus(0, 0, false, "");
     BOOST_REQUIRE(dg.Step(501));
     BOOST_CHECK_EQUAL(base.load(), 6U);
     BOOST_CHECK_EQUAL(plain.load(), dns_first ? 6U : 0U);
     BOOST_CHECK_EQUAL(qq.load(), 3U);
-    BOOST_CHECK_EQUAL(https.load(), 1U);
-    BOOST_REQUIRE(hg.Step(501));
-    BOOST_CHECK_EQUAL(https.load(), 2U);
+    BOOST_CHECK_EQUAL(https.load(), dns_first ? 1U : 2U);
+    BOOST_REQUIRE(hg.Step(501)); // Past the 120 s retry after round 2 (or the normal cadence).
+    BOOST_CHECK_EQUAL(https.load(), dns_first ? 2U : 3U);
     connman.SetNetworkActive(false);
     BOOST_REQUIRE(dg.Step(2300));
     BOOST_REQUIRE(hg.Step(2300));
     BOOST_CHECK_EQUAL(base.load(), 6U);
-    BOOST_CHECK_EQUAL(https.load(), 2U);
+    BOOST_CHECK_EQUAL(https.load(), dns_first ? 2U : 3U);
     connman.SetNetworkActive(true);
     BOOST_REQUIRE(hg.Step());
     BOOST_REQUIRE(dg.Step());
     BOOST_CHECK_EQUAL(base.load(), 9U);
-    BOOST_CHECK_EQUAL(https.load(), 3U);
+    BOOST_CHECK_EQUAL(https.load(), dns_first ? 3U : 4U);
     workers.Stop();
     connman.ClearTestNodes();
 }

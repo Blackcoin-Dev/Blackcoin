@@ -1259,6 +1259,18 @@ public:
         if (failed) ++m_qq_status.connect_failures;
     }
     void RecordQQDNSRound() { LOCK(m_qq_status_mutex); ++m_qq_status.dns_rounds; }
+    /** Record a completed handshake with a QQ-capable outbound full-relay peer. */
+    void NoteQQHandshake(qq::Clock::time_point when = qq::Clock::now())
+    {
+        m_last_qq_handshake.store(when.time_since_epoch().count(), std::memory_order_relaxed);
+    }
+    /** True if a QQ-capable peer completed a handshake within qq::EVIDENCE_WINDOW of now. */
+    bool HasRecentQQHandshake(qq::Clock::time_point now = qq::Clock::now()) const
+    {
+        const auto last = m_last_qq_handshake.load(std::memory_order_relaxed);
+        if (last == 0) return false;
+        return now - qq::Clock::time_point{qq::Clock::duration{last}} <= qq::EVIDENCE_WINDOW;
+    }
     /** Includes disconnecting nodes until their socket/grant has retired. */
     bool HasNode(NodeId id) const { LOCK(m_nodes_mutex); for (const auto* node : m_nodes) if (node->GetId() == id) return true; return false; }
 
@@ -1548,6 +1560,9 @@ private:
 
     // How many full-relay (tx, block, addr) outbound peers we want
     int m_max_outbound_full_relay;
+    std::atomic<qq::Clock::rep> m_last_qq_handshake{0};
+    std::atomic<uint64_t> m_dial_attempts{0};
+    std::atomic<uint64_t> m_dial_failures{0};
     int m_qq_requested_target{-1};
     int m_qq_target{0};
     mutable Mutex m_qq_status_mutex;

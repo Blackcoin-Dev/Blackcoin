@@ -3934,6 +3934,9 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             return;
         }
 
+        // Proof that QQ-capable peers are reachable steers later dial preference.
+        if (pfrom.IsFullOutboundConn() && (pfrom.m_accepted_services & NODE_QUANTUM_QUASAR)) m_connman.NoteQQHandshake();
+
         // Log succesful connections unconditionally for outbound, but not for inbound as those
         // can be triggered by an attacker at high rate.
         if (!pfrom.IsInboundConn() || LogAcceptCategory(BCLog::NET, BCLog::Level::Debug)) {
@@ -5549,7 +5552,10 @@ void PeerManagerImpl::EvaluateQQPeers(std::chrono::seconds now)
             lease->active = false;
             ++eligible;
         }
-        if (candidate_ready && !lease->promoted && eligible < m_connman.GetQQTarget()) {
+        // A one-for-one retirement is allowed only while the established peers
+        // (the probe excluded) stay at or above the connectivity floor.
+        const bool above_floor = m_connman.GetFullOutboundCount() > qq::LegacyFirstFloor(m_connman.GetFullOutboundTarget());
+        if (candidate_ready && !lease->promoted && eligible < m_connman.GetQQTarget() && above_floor) {
             m_connman.ForEachNode([&](CNode* node) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_connman.GetNodesMutex()) {
                 auto* state = State(node->GetId());
                 if (!node->IsFullOutboundConn() || node->IsQQProbe() || node->m_qq_eligible || !state ||

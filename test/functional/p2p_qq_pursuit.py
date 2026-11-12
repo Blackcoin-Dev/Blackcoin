@@ -55,6 +55,8 @@ class LocalRoute(socketserver.BaseRequestHandler):
                 if available:
                     route[2].used = True
             if not available:
+                # Optional fixture knob: make unreachable hints cost time like real dead hosts.
+                time.sleep(getattr(self.server, "unknown_route_delay", 0))
                 client.sendall(b"\x05\x04\x00\x01" + bytes(6))
                 return
             upstream = socket.create_connection(route[:2], timeout=5)

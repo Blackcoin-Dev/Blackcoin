@@ -32,6 +32,7 @@
 #include <QDoubleValidator>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QAccessible>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
@@ -250,6 +251,13 @@ void TransactionView::setModel(WalletModel *_model)
         transactionView->setModel(transactionProxyModel);
         transactionView->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder);
         static_cast<UiPaintTableView*>(transactionView)->observeHistoryProjection(transactionProxyModel);
+        connect(transactionProxyModel, &TransactionPresentationProxy::structureAboutToChange, this, [this] {
+            // Qt's accessible table keeps an interface and a persistent index per cell it has been asked about. The
+            // layout change that follows would remap each of them just before invalidating them all; invalidate first.
+            if (!QAccessible::isActive()) return;
+            QAccessibleTableModelChangeEvent reset(transactionView, QAccessibleTableModelChangeEvent::ModelReset);
+            QAccessible::updateAccessibility(&reset);
+        });
         connect(transactionProxyModel, &TransactionPresentationProxy::projectionStarted, this, [this] {
             updateHistoryState();
         });

@@ -5,6 +5,7 @@
 #include <qt/transactiontablemodel.h>
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include <qt/addresstablemodel.h>
 #include <qt/bitcoinunits.h>
@@ -36,6 +37,7 @@
 #include <stdexcept>
 #include <QElapsedTimer>
 #include <QColor>
+#include <QGuiApplication>
 #include <QDateTime>
 #include <QDebug>
 #include <QIcon>
@@ -102,7 +104,37 @@ public:
     static_assert(QTypeInfo<TransactionRecord>::isLarge ? true : QTypeInfo<TransactionRecord>::isStatic != 0,
                   "m_by_id relies on QList storing TransactionRecord out of line");
     std::unordered_map<uint64_t, TransactionRecord*> m_by_id;
-    void Register(TransactionRecord& record) { m_by_id[record.presentation_id] = &record; }
+    //! Rows whose status may still change with a new block, in two classes. Active rows have been refreshed at least
+    //! once and are not settled (confirming, maturing, flagged, conflicted): every block re-evaluates all of them, with
+    //! no budget, so a displayed confirmation state is never stale. Unrefreshed rows have never been read from the
+    //! wallet (empty sort key): a block reads a bounded number of them, round-robin, so every row is reached.
+    std::unordered_set<uint64_t> m_active;
+    std::set<uint64_t> m_unrefreshed;
+    uint64_t m_refresh_cursor{0};
+    //! Tests: stands in for the wallet's answer when a row's status is refreshed.
+    std::function<void(TransactionRecord&)> m_refresh_hook;
+    static bool Settled(const TransactionRecord& record)
+    {
+        return record.status.status == TransactionStatus::Confirmed && !record.status.needsUpdate && !record.status.sortKey.empty();
+    }
+    //! File a record under the class its current status belongs to (or none, when settled).
+    void Track(const TransactionRecord& record)
+    {
+        const uint64_t id = record.presentation_id;
+        if (record.status.sortKey.empty()) {
+            m_active.erase(id);
+            m_unrefreshed.insert(id);
+        } else {
+            m_unrefreshed.erase(id);
+            if (Settled(record)) m_active.erase(id); else m_active.insert(id);
+        }
+    }
+    void Untrack(uint64_t id) { m_active.erase(id); m_unrefreshed.erase(id); }
+    void Register(TransactionRecord& record)
+    {
+        m_by_id[record.presentation_id] = &record;
+        Track(record);
+    }
     TransactionRecord* FindById(uint64_t id) const { const auto found = m_by_id.find(id); return found == m_by_id.end() ? nullptr : found->second; }
     uint64_t m_next_row_id{1};
     void AssignIdentity(TransactionRecord& row)
@@ -165,6 +197,19 @@ public:
     std::set<CTxDestination> m_pending_labels;
     bool m_label_refresh_scheduled{false};
     std::set<CTxDestination> m_changed_labels;
+
+    //! Remove the records at [lowerIndex, upperIndex).
+    void EraseRange(int lowerIndex, int upperIndex)
+    {
+        parent->beginRemoveRows(QModelIndex(), lowerIndex, upperIndex - 1);
+        for (int i = lowerIndex; i < upperIndex; ++i) {
+            ForgetLabelRow(cachedWallet[i]);
+            m_by_id.erase(cachedWallet[i].presentation_id);
+            Untrack(cachedWallet[i].presentation_id);
+        }
+        cachedWallet.erase(cachedWallet.begin() + lowerIndex, cachedWallet.begin() + upperIndex);
+        parent->endRemoveRows();
+    }
 
     //! Insert one transaction's records at a hash-ordered position with fresh identities.
     void InsertGroup(int lowerIndex, QList<TransactionRecord> toInsert)
@@ -235,13 +280,7 @@ public:
                 break;
             }
             // Removed -- remove entire transaction from table
-            parent->beginRemoveRows(QModelIndex(), lowerIndex, upperIndex-1);
-            for (auto entry = lower; entry != upper; ++entry) {
-                ForgetLabelRow(*entry);
-                m_by_id.erase(entry->presentation_id);
-            }
-            cachedWallet.erase(lower, upper);
-            parent->endRemoveRows();
+            EraseRange(lowerIndex, upperIndex);
             break;
         case CT_UPDATED:
             // Miscellaneous updates -- nothing to do, status update will take care of this, and is only computed for
@@ -249,6 +288,7 @@ public:
             for (int i = lowerIndex; i < upperIndex; i++) {
                 TransactionRecord *rec = &cachedWallet[i];
                 rec->status.needsUpdate = true;
+                Track(*rec);
             }
             break;
         }
@@ -271,11 +311,20 @@ public:
         }
     }
 
+    //! RefreshStatus, and re-file the record if that changed which class of unsettled row it is.
+    void Refresh(interfaces::Wallet& wallet, const uint256& cur_block_hash, TransactionRecord* rec)
+    {
+        const bool was_empty = rec->status.sortKey.empty();
+        const bool was_settled = Settled(*rec);
+        if (m_refresh_hook) m_refresh_hook(*rec); else RefreshStatus(wallet, cur_block_hash, rec);
+        if (was_empty != rec->status.sortKey.empty() || was_settled != Settled(*rec)) Track(*rec);
+    }
+
     TransactionRecord* index(interfaces::Wallet& wallet, const uint256& cur_block_hash, const int idx)
     {
         if (idx >= 0 && idx < cachedWallet.size()) {
             TransactionRecord *rec = &cachedWallet[idx];
-            RefreshStatus(wallet, cur_block_hash, rec);
+            Refresh(wallet, cur_block_hash, rec);
             return rec;
         }
         return nullptr;
@@ -324,6 +373,7 @@ TransactionTableModel::TransactionTableModel(const PlatformStyle* _platformStyle
     }
 
     connect(walletModel->getOptionsModel(), &OptionsModel::displayUnitChanged, this, &TransactionTableModel::updateDisplayUnit);
+    connect(qApp, &QGuiApplication::paletteChanged, this, [this] { m_recolored_icons.clear(); });
 }
 
 void TransactionTableModel::setInitialHistory(std::deque<TransactionRecord> history)
@@ -382,10 +432,36 @@ void TransactionTableModel::insertRecords(QList<TransactionRecord> records)
     }
 }
 
+void TransactionTableModel::removeRecords(const std::vector<uint256>& hashes)
+{
+    for (const uint256& hash : hashes) {
+        const auto lower = std::lower_bound(priv->cachedWallet.cbegin(), priv->cachedWallet.cend(), hash, TxLessThan()) - priv->cachedWallet.cbegin();
+        const auto upper = std::upper_bound(priv->cachedWallet.cbegin(), priv->cachedWallet.cend(), hash, TxLessThan()) - priv->cachedWallet.cbegin();
+        if (lower != upper) priv->EraseRange(static_cast<int>(lower), static_cast<int>(upper));
+    }
+}
+
+void TransactionTableModel::setRefreshHook(std::function<void(TransactionRecord&)> hook) { priv->m_refresh_hook = std::move(hook); }
+
 void TransactionTableModel::mutateRecords(const std::function<void(TransactionRecord&)>& mutate)
 {
-    for (auto& record : priv->cachedWallet) mutate(record);
-    updateConfirmations();
+    std::vector<int> changed;
+    for (int row = 0; row < priv->cachedWallet.size(); ++row) {
+        TransactionRecord& record = priv->cachedWallet[row];
+        const std::string key = record.status.sortKey;
+        const auto status = record.status.status;
+        const auto type = record.type;
+        const auto credit = record.credit;
+        const auto debit = record.debit;
+        const std::string address = record.address;
+        mutate(record);
+        if (key != record.status.sortKey || status != record.status.status || type != record.type || credit != record.credit ||
+            debit != record.debit || address != record.address) {
+            changed.push_back(row);
+            priv->Track(record);
+        }
+    }
+    announceRows(changed);
 }
 
 void TransactionTableModel::reportHistoryLoadFailure()
@@ -409,10 +485,67 @@ void TransactionTableModel::updateAmountColumnTitle()
 
 void TransactionTableModel::updateConfirmations()
 {
-    if (priv->cachedWallet.empty()) return;
-    Q_EMIT dataChanged(index(0, 0), index(priv->cachedWallet.size() - 1, columns.size() - 1),
-        {Qt::DisplayRole, Qt::EditRole, Qt::DecorationRole, Qt::ForegroundRole,
-         Qt::ToolTipRole, StatusRole, ConfirmedRole, RawDecorationRole});
+    // A new block changes what is displayed only for rows that are not yet settled, and only rows whose displayed
+    // status really changed are announced. Every active row (read from the wallet before, still confirming, maturing
+    // or flagged) is re-evaluated by every block: nothing a view may be showing is skipped. Rows never read from the
+    // wallet are read MaxRefreshPerBlock at a time, round-robin from where the last block stopped, so a block takes
+    // the wallet lock a bounded number of times for them and every one is reached.
+    std::vector<int> rows;
+    const auto evaluate = [&](TransactionRecord* record) {
+        const auto status = record->status.status;
+        const auto depth = record->status.depth;
+        const auto matures = record->status.matures_in;
+        const auto counts = record->status.countsForBalance;
+        const std::string key = record->status.sortKey;
+        priv->Refresh(walletModel->wallet(), walletModel->getLastBlockProcessed(), record);
+        if (status != record->status.status || depth != record->status.depth || matures != record->status.matures_in ||
+            counts != record->status.countsForBalance || key != record->status.sortKey) {
+            const int row = rowOfRecord(*record);
+            if (row >= 0) rows.push_back(row);
+        }
+    };
+    const std::vector<uint64_t> active(priv->m_active.begin(), priv->m_active.end());
+    for (const uint64_t id : active) {
+        TransactionRecord* record = priv->FindById(id);
+        if (!record) { priv->Untrack(id); continue; }
+        evaluate(record);
+    }
+    std::vector<uint64_t> batch;
+    const size_t count = std::min(MaxRefreshPerBlock, priv->m_unrefreshed.size());
+    auto it = priv->m_unrefreshed.upper_bound(priv->m_refresh_cursor);
+    for (size_t k = 0; k < count; ++k) {
+        if (it == priv->m_unrefreshed.end()) it = priv->m_unrefreshed.begin();
+        batch.push_back(*it);
+        ++it;
+    }
+    if (!batch.empty()) priv->m_refresh_cursor = batch.back();
+    for (const uint64_t id : batch) {
+        TransactionRecord* record = priv->FindById(id);
+        if (!record) { priv->Untrack(id); continue; }
+        evaluate(record);
+    }
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    announceRows(rows);
+}
+
+void TransactionTableModel::announceRows(const std::vector<int>& rows)
+{
+    static const QVector<int> roles{Qt::DisplayRole, Qt::EditRole, Qt::DecorationRole, Qt::ForegroundRole,
+                                    Qt::ToolTipRole, StatusRole, ConfirmedRole, RawDecorationRole};
+    if (rows.empty()) return;
+    std::vector<std::pair<int, int>> ranges;
+    for (size_t i = 0; i < rows.size();) {
+        size_t j = i;
+        while (j + 1 < rows.size() && rows[j + 1] == rows[j] + 1) ++j;
+        ranges.emplace_back(rows[i], rows[j]);
+        i = j + 1;
+    }
+    // Many scattered ranges cost more in the views than one covering range (which only says "these may have changed").
+    if (ranges.size() > 64) ranges = {{rows.front(), rows.back()}};
+    for (const auto& [first, last] : ranges) {
+        Q_EMIT dataChanged(createIndex(first, 0, &priv->cachedWallet[first]), createIndex(last, columns.size() - 1, &priv->cachedWallet[last]), roles);
+    }
 }
 
 int TransactionTableModel::rowCount(const QModelIndex &parent) const
@@ -560,27 +693,32 @@ QString TransactionTableModel::formatTxType(const TransactionRecord *wtx) const
     }
 }
 
-QVariant TransactionTableModel::txAddressDecoration(const TransactionRecord *wtx) const
+QString TransactionTableModel::addressIconPath(const TransactionRecord *wtx)
 {
     switch(wtx->type)
     {
     case TransactionRecord::Generated:
-        return QIcon(":/icons/tx_mined");
+        return ":/icons/tx_mined";
     case TransactionRecord::Staked:
-	    return QIcon(":/icons/tx_staked");
+        return ":/icons/tx_staked";
     case TransactionRecord::GoldRushPosStake:
-        return QIcon(":/icons/tx_staked");
+        return ":/icons/tx_staked";
     case TransactionRecord::GoldRushPowClaim:
-        return QIcon(":/icons/tx_mined");
+        return ":/icons/tx_mined";
     case TransactionRecord::RecvWithAddress:
     case TransactionRecord::RecvFromOther:
-        return QIcon(":/icons/tx_input");
+        return ":/icons/tx_input";
     case TransactionRecord::SendToAddress:
     case TransactionRecord::SendToOther:
-        return QIcon(":/icons/tx_output");
+        return ":/icons/tx_output";
     default:
-        return QIcon(":/icons/tx_inout");
+        return ":/icons/tx_inout";
     }
+}
+
+QVariant TransactionTableModel::txAddressDecoration(const TransactionRecord *wtx) const
+{
+    return QIcon(addressIconPath(wtx));
 }
 
 QString TransactionTableModel::formatTxToAddress(const TransactionRecord *wtx, bool tooltip) const
@@ -649,37 +787,44 @@ QString TransactionTableModel::formatTxAmount(const TransactionRecord *wtx, bool
     return QString(str);
 }
 
-QVariant TransactionTableModel::txStatusDecoration(const TransactionRecord *wtx) const
+QString TransactionTableModel::statusIconPath(const TransactionRecord *wtx)
 {
     switch(wtx->status.status)
     {
     case TransactionStatus::Unconfirmed:
-        return QIcon(":/icons/transaction_0");
+        return ":/icons/transaction_0";
     case TransactionStatus::Abandoned:
-        return QIcon(":/icons/transaction_abandoned");
+        return ":/icons/transaction_abandoned";
     case TransactionStatus::Confirming:
         switch(wtx->status.depth)
         {
-        case 1: return QIcon(":/icons/transaction_1");
-        case 2: return QIcon(":/icons/transaction_2");
-        case 3: return QIcon(":/icons/transaction_3");
-        case 4: return QIcon(":/icons/transaction_4");
-        default: return QIcon(":/icons/transaction_5");
+        case 1: return ":/icons/transaction_1";
+        case 2: return ":/icons/transaction_2";
+        case 3: return ":/icons/transaction_3";
+        case 4: return ":/icons/transaction_4";
+        default: return ":/icons/transaction_5";
         };
     case TransactionStatus::Confirmed:
-        return QIcon(":/icons/transaction_confirmed");
+        return ":/icons/transaction_confirmed";
     case TransactionStatus::Conflicted:
-        return QIcon(":/icons/transaction_conflicted");
+        return ":/icons/transaction_conflicted";
     case TransactionStatus::Immature: {
         int total = wtx->status.depth + wtx->status.matures_in;
         int part = (wtx->status.depth * 4 / total) + 1;
-        return QIcon(QString(":/icons/transaction_%1").arg(part));
+        return QString(":/icons/transaction_%1").arg(part);
         }
     case TransactionStatus::NotAccepted:
-        return QIcon(":/icons/transaction_0");
+        return ":/icons/transaction_0";
     default:
-        return COLOR_BLACK;
+        return {};
     }
+}
+
+QVariant TransactionTableModel::txStatusDecoration(const TransactionRecord *wtx) const
+{
+    const QString path = statusIconPath(wtx);
+    if (path.isEmpty()) return COLOR_BLACK;
+    return QIcon(path);
 }
 
 QVariant TransactionTableModel::txWatchonlyDecoration(const TransactionRecord *wtx) const
@@ -728,6 +873,22 @@ QVariant TransactionTableModel::dataFor(TransactionRecord* rec, int column_index
         assert(false);
     case Qt::DecorationRole:
     {
+        // Loading an icon from its resource and recolouring every size costs milliseconds; a repaint asks for it per
+        // cell. The result depends only on the icon and the palette, so keep it until the palette changes.
+        QString path;
+        switch (column) {
+        case Status: path = statusIconPath(rec); break;
+        case Watchonly: if (rec->involvesWatchAddress) path = ":/icons/eye"; break;
+        case ToAddress: path = addressIconPath(rec); break;
+        default: break;
+        }
+        if (!path.isEmpty()) {
+            const auto cached = m_recolored_icons.constFind(path);
+            if (cached != m_recolored_icons.constEnd()) return *cached;
+            const QIcon colored = platformStyle->TextColorIcon(QIcon(path));
+            m_recolored_icons.insert(path, colored);
+            return colored;
+        }
         QIcon icon = qvariant_cast<QIcon>(dataFor(rec, column_index, RawDecorationRole));
         return platformStyle->TextColorIcon(icon);
     }
@@ -1187,16 +1348,14 @@ int TransactionTableModel::transactionRow(const TransactionRowIdentity& identity
     return found != last && found->presentation_id == identity.id ? std::distance(records.cbegin(), found) : -1;
 }
 
-bool TransactionTableModel::transactionScanRow(int row, int column, TransactionScanRow& out) const
+bool TransactionTableModel::fillScanRow(TransactionRecord* rec, int column, TransactionScanRow& out) const
 {
-    if (row < 0 || row >= priv->cachedWallet.size()) return false;
-    TransactionRecord* rec = &priv->cachedWallet[row];
     // Unless asked, the cached status is used as is: refreshing it needs the wallet lock, which a scan of the
     // whole history must not take once per row. Rows that are displayed refresh their status in transactionData().
     // A row whose status is final (confirmed, nothing flagged it) cannot change its sort key, so only rows that have
     // never been refreshed, are flagged, or are still maturing or confirming take the wallet lock.
     if (out.refresh_status && (rec->status.sortKey.empty() || rec->status.needsUpdate || rec->status.status != TransactionStatus::Confirmed)) {
-        TransactionTablePriv::RefreshStatus(walletModel->wallet(), walletModel->getLastBlockProcessed(), rec);
+        priv->Refresh(walletModel->wallet(), walletModel->getLastBlockProcessed(), rec);
     }
     out.identity = {rec->hash, rec->presentation_id};
     out.status = rec->status.status;
@@ -1215,6 +1374,27 @@ bool TransactionTableModel::transactionScanRow(int row, int column, TransactionS
     }
     return true;
 }
+
+bool TransactionTableModel::transactionScanRow(int row, int column, TransactionScanRow& out) const
+{
+    if (row < 0 || row >= priv->cachedWallet.size()) return false;
+    return fillScanRow(&priv->cachedWallet[row], column, out);
+}
+
+bool TransactionTableModel::transactionScanRowById(const TransactionRowIdentity& identity, int column, TransactionScanRow& out) const
+{
+    if (identity.id == 0) return false;
+    TransactionRecord* rec = priv->FindById(identity.id);
+    return rec && rec->hash == identity.hash && fillScanRow(rec, column, out);
+}
+
+int TransactionTableModel::rowOfRecord(const TransactionRecord& record) const
+{
+    return transactionRow({record.hash, record.presentation_id});
+}
+
+size_t TransactionTableModel::unsettledRows() const { return priv->m_active.size() + priv->m_unrefreshed.size(); }
+size_t TransactionTableModel::activeRows() const { return priv->m_active.size(); }
 
 bool TransactionTableModel::transactionMatchesText(int row, const QString& needle, bool& supported) const
 {
@@ -1244,7 +1424,7 @@ bool TransactionTableModel::transactionData(const TransactionRowIdentity& identi
     const auto found = priv->FindById(identity.id);
     if (!found || found->hash != identity.hash) return false;
     if (role < 0) { out = QVariant(); return true; }
-    TransactionTablePriv::RefreshStatus(walletModel->wallet(), walletModel->getLastBlockProcessed(), found);
+    priv->Refresh(walletModel->wallet(), walletModel->getLastBlockProcessed(), found);
     out = dataFor(found, column, role);
     return true;
 }

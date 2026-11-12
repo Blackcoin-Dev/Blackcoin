@@ -7,10 +7,12 @@
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionrecord.h>
 
+#include <QAccessible>
 #include <QElapsedTimer>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <unordered_set>
 #include <optional>
 #include <stdexcept>
 
@@ -180,6 +182,7 @@ void TransactionPresentationProxy::clearProjection(DiagnosticChange reason)
     beginResetModel();
     if (m_keep_projection) {
         discardStash();
+        ensureReverse();
         m_stash_rows = std::move(m_rows);
         m_stash_reverse = std::move(m_reverse);
         m_rows.clear();
@@ -238,7 +241,7 @@ void TransactionPresentationProxy::watchDormant()
     m_dormant.push_back(connect(source, &QAbstractItemModel::modelReset, this, bump));
     m_dormant.push_back(connect(source, &QObject::destroyed, this, bump));
     m_dormant.push_back(connect(source, &QAbstractItemModel::dataChanged, this,
-        [this](const QModelIndex&, const QModelIndex&, const QVector<int>& roles) { if (dependencyChange(roles)) ++m_source_version; }));
+        [this](const QModelIndex&, const QModelIndex&, const QVector<int>& roles) { if (dependencyChange(roles, /*tie_sensitive=*/false)) ++m_source_version; }));
 }
 
 void TransactionPresentationProxy::discardStash()
@@ -259,6 +262,7 @@ bool TransactionPresentationProxy::restoreStash()
     beginResetModel();
     m_rows = std::move(m_stash_rows);
     m_reverse = std::move(m_stash_reverse);
+    m_reverse_valid = true;
     m_visible_rows = static_cast<int>(m_rows.size());
     m_display = Display::FINAL;
     m_ready = true;
@@ -269,17 +273,19 @@ bool TransactionPresentationProxy::restoreStash()
     return true;
 }
 
-bool TransactionPresentationProxy::dependencyChange(const QVector<int>& roles) const
+bool TransactionPresentationProxy::dependencyChange(const QVector<int>& roles, bool tie_sensitive) const
 {
     const bool key_roles = roles.empty() || roles.contains(TransactionTableModel::TypeRole) ||
         roles.contains(TransactionTableModel::DateRole) || roles.contains(TransactionTableModel::WatchonlyRole) ||
         roles.contains(TransactionTableModel::AddressRole) || roles.contains(TransactionTableModel::TxHashRole) ||
         roles.contains(TransactionTableModel::LabelRole) || roles.contains(TransactionTableModel::AmountRole);
     const bool status_roles = roles.contains(Qt::EditRole) || roles.contains(TransactionTableModel::StatusRole);
-    // The Status column and a status-dependent filter follow confirmations. The Date column uses the status only to
-    // order rows of the same second, which a confirmation refresh alone does not re-sort until the next rebuild.
+    // The Status column and a status-dependent filter follow confirmations. The Date column uses the status to order
+    // rows of the same second: a live projection keeps those ties exact (the source now announces only rows whose
+    // status can change, so this is a handful of rows), while a dormant one accepts stale ties until it is rebuilt.
     // Other sources report EditRole for any key change.
-    return key_roles || (status_roles && (!m_fast || !m_filter.showsInactive() || m_column == TransactionTableModel::Status));
+    return key_roles || (status_roles && (!m_fast || !m_filter.showsInactive() || m_column == TransactionTableModel::Status ||
+                                          (tie_sensitive && m_column == TransactionTableModel::Date)));
 }
 
 void TransactionPresentationProxy::setActive(bool active)
@@ -297,18 +303,40 @@ void TransactionPresentationProxy::attach()
     auto* source = sourceModel();
     if (!source) return;
     m_connections.push_back(connect(source, &QAbstractItemModel::rowsInserted, this,
-        [this](const QModelIndex&, int first, int) {
-            Q_EMIT diagnosticInvalidated(DiagnosticChange::SOURCE_ROWS);
+        [this](const QModelIndex&, int first, int last) {
             // A top-five scan can consume newly appended initial-history rows.
-            if (m_limit >= 0 && m_work && !m_abort && m_phase == Phase::SCAN && first >= m_cursor) return;
+            if (m_limit >= 0 && m_work && !m_abort && m_phase == Phase::SCAN && first >= m_cursor) {
+                Q_EMIT diagnosticInvalidated(DiagnosticChange::SOURCE_ROWS);
+                return;
+            }
+            if (incrementalReady() || !m_pending_inserts.empty()) {
+                Q_EMIT diagnosticInvalidated(DiagnosticChange::SOURCE_ROWS, /*ready=*/true);
+                for (int row = first; row <= last; ++row) {
+                    const auto identity = m_locator->transactionIdentity(row);
+                    if (identity.id != 0) m_pending_inserts.push_back(identity);
+                }
+                scheduleInsertFlush();
+                return;
+            }
+            Q_EMIT diagnosticInvalidated(DiagnosticChange::SOURCE_ROWS);
             continueRebuild();
         }));
-    m_connections.push_back(connect(source, &QAbstractItemModel::rowsAboutToBeRemoved, this, [this] {
-        Q_EMIT diagnosticInvalidated(DiagnosticChange::SOURCE_ROWS);
+    m_connections.push_back(connect(source, &QAbstractItemModel::rowsAboutToBeRemoved, this, [this](const QModelIndex&, int first, int last) {
+        m_removals_captured = captureRemovals(first, last);
+        Q_EMIT diagnosticInvalidated(DiagnosticChange::SOURCE_ROWS, m_removals_captured);
+        if (m_removals_captured) return;
         m_ready = false;
         Q_EMIT projectionStarted();
     }));
-    m_connections.push_back(connect(source, &QAbstractItemModel::rowsRemoved, this, [this] { requestRebuildFor(DiagnosticChange::SOURCE_ROWS); }));
+    m_connections.push_back(connect(source, &QAbstractItemModel::rowsRemoved, this, [this] {
+        if (m_removals_captured) {
+            m_removals_captured = false;
+            QElapsedTimer applying;
+            applying.start();
+            if (applyRemovals()) { ++m_stats.incremental_batches; m_stats.incremental_ns += applying.nsecsElapsed(); return; }
+        }
+        requestRebuildFor(DiagnosticChange::SOURCE_ROWS);
+    }));
     m_connections.push_back(connect(source, &QAbstractItemModel::rowsMoved, this, [this] { requestRebuildFor(DiagnosticChange::SOURCE_ROWS); }));
     m_connections.push_back(connect(source, &QAbstractItemModel::layoutChanged, this, [this] { requestRebuildFor(DiagnosticChange::SOURCE_LAYOUT); }));
     m_connections.push_back(connect(source, &QAbstractItemModel::headerDataChanged, this, &QAbstractItemModel::headerDataChanged));
@@ -319,6 +347,24 @@ void TransactionPresentationProxy::attach()
         [this](const QModelIndex& first, const QModelIndex& last, const QVector<int>& roles) {
             const bool dependency_changed = dependencyChange(roles);
             Q_EMIT diagnosticInvalidated(DiagnosticChange::SOURCE_DATA, !dependency_changed && isReady());
+            if (!first.isValid() || !last.isValid()) return;
+            if ((incrementalReady() || !m_pending_updates.empty()) && last.row() - first.row() + 1 <= 512 &&
+                m_pending_updates.size() + static_cast<size_t>(last.row() - first.row() + 1) <= 512) {
+                if (m_pending_updates.empty()) { m_pending_first_column = first.column(); m_pending_last_column = last.column(); m_pending_roles.clear(); m_pending_dependency = false; }
+                m_pending_first_column = std::min(m_pending_first_column, first.column());
+                m_pending_last_column = std::max(m_pending_last_column, last.column());
+                for (int role : roles) if (!m_pending_roles.contains(role)) m_pending_roles.push_back(role);
+                if (roles.empty()) { m_pending_roles.clear(); m_pending_dependency = true; }
+                m_pending_dependency = m_pending_dependency || dependency_changed;
+                for (int row = first.row(); row <= last.row(); ++row) {
+                    const auto identity = m_locator->transactionIdentity(row);
+                    if (identity.id != 0) m_pending_updates.push_back(identity);
+                }
+                scheduleInsertFlush();
+                return;
+            }
+            // Too much at once for an incremental update: whatever is waiting is covered by the rebuild below.
+            m_pending_updates.clear();
             if (!m_rows.empty()) Q_EMIT dataChanged(index(0, first.column()), index(rowCount() - 1, last.column()), roles);
             if (!dependency_changed) return;
             if (m_work) { ++m_stats.restarts; m_restart = true; m_ready = false; Q_EMIT projectionStarted(); }
@@ -354,6 +400,9 @@ void TransactionPresentationProxy::continueRebuild()
         return;
     }
     ++m_stats.rebuilds;
+    m_pending_inserts.clear();
+    m_removals_captured = false;
+    ensureReverse();
     const auto count = static_cast<size_t>(sourceModel()->rowCount());
     const auto retained = m_limit >= 0 ? static_cast<size_t>(m_limit + 1) : count;
     m_entries.reserve(retained);
@@ -614,6 +663,7 @@ void TransactionPresentationProxy::runSlice()
         }
         beginInsertRows({}, 0, m_next_rows.size() - 1);
         m_rows.swap(m_next_rows); m_reverse.swap(m_next_reverse);
+        m_reverse_valid = true;
         m_visible_rows = m_rows.size();
         endInsertRows();
         // Entries remain the bounded top-five working set; publication planning
@@ -636,6 +686,7 @@ TransactionRowIdentity TransactionPresentationProxy::identityAt(int row) const
 
 QModelIndex TransactionPresentationProxy::mapIdentity(const TransactionRowIdentity& identity, int column) const
 {
+    if (m_display == Display::FINAL) ensureReverse();
     const auto& reverse = m_display == Display::INTERIM ? m_next_reverse : m_reverse;
     int row = reverse.find(identity.id);
     if (row < 0) return {};
@@ -646,6 +697,8 @@ QModelIndex TransactionPresentationProxy::mapIdentity(const TransactionRowIdenti
 
 void TransactionPresentationProxy::changeLayout(Display display)
 {
+    // See insertKeyed: drop an attached accessibility client's per-cell state before it is remapped one by one.
+    if (display == Display::FINAL && layoutUpdates()) Q_EMIT structureAboutToChange();
     QElapsedTimer step;
     step.start();
     Q_EMIT layoutAboutToBeChanged();
@@ -672,6 +725,8 @@ void TransactionPresentationProxy::changeLayout(Display display)
         if (!m_rows.empty()) m_retired_rows.push_back(std::move(m_rows));
         if (!m_reverse.empty()) m_retired_maps.push_back(std::move(m_reverse));
         m_rows.swap(m_next_rows); m_reverse.swap(m_next_reverse);
+        m_reverse_valid = true;
+        m_visible_rows = static_cast<int>(m_rows.size());
     }
     m_display = display;
     std::vector<int> new_rows(identities.size(), -1);
@@ -694,13 +749,16 @@ void TransactionPresentationProxy::changeLayout(Display display)
 
 void TransactionPresentationProxy::publish()
 {
-    if (!m_removed.empty()) {
+    // With an accessibility client holding per-cell state, each row insert/remove signal makes Qt visit every cell
+    // (seconds at 200,000 rows): announce a changed membership as the single layout change that a reorder already is.
+    const bool single_layout_change = (!m_removed.empty() || !m_added.empty()) && m_fast && m_limit < 0 && layoutUpdates();
+    if (!single_layout_change && !m_removed.empty()) {
         changeLayout(Display::REORDERED);
         beginRemoveRows({}, m_survivors.size(), m_visible_rows - 1);
         m_visible_rows = m_survivors.size();
         endRemoveRows();
     }
-    if (!m_added.empty()) {
+    if (!single_layout_change && !m_added.empty()) {
         beginInsertRows({}, m_visible_rows, m_next_rows.size() - 1);
         m_display = Display::INTERIM;
         m_visible_rows = m_next_rows.size();
@@ -709,6 +767,489 @@ void TransactionPresentationProxy::publish()
     changeLayout(Display::FINAL);
     m_ready = !m_restart;
     if (m_ready) Q_EMIT projectionReady();
+}
+
+// ---- Incremental maintenance -------------------------------------------------------------------------------------
+//
+// The projection is ordered by (sort key, source order), where source order is the table model's own row order: its
+// hash, then the GUI identity allocated in presentation order. That total order is what a full rebuild produces, so a
+// row can be placed by binary search and the result stays identical to a rebuild.
+
+bool TransactionPresentationProxy::layoutUpdates() const { return m_layout_updates.value_or(QAccessible::isActive()); }
+
+void TransactionPresentationProxy::ensureReverse() const
+{
+    if (m_reverse_valid) return;
+    m_reverse.clear();
+    m_reverse.reserve(m_rows.size());
+    for (size_t i = 0; i < m_rows.size(); ++i) m_reverse.insert(m_rows[i].id, static_cast<int>(i));
+    m_reverse_valid = true;
+}
+
+bool TransactionPresentationProxy::incrementalReady() const
+{
+    return m_active && m_fast && m_locator && sourceModel() && m_ready && !m_restart && !m_abort &&
+           m_display == Display::FINAL && m_visible_rows == static_cast<int>(m_rows.size()) &&
+           (!m_work || m_phase == Phase::RETIRE);
+}
+
+bool TransactionPresentationProxy::keyLess(const KeyedRow& x, const KeyedRow& y) const
+{
+    switch (m_fast_key) {
+    case TransactionScanRow::Key::NUMBER: return x.number < y.number;
+    case TransactionScanRow::Key::DATE: return x.number != y.number ? x.number < y.number : x.text < y.text;
+    case TransactionScanRow::Key::TEXT: return x.text < y.text;
+    }
+    return false;
+}
+
+bool TransactionPresentationProxy::rowPrecedes(const KeyedRow& a, const KeyedRow& b) const
+{
+    const bool ascending = m_sort_order == Qt::AscendingOrder;
+    const KeyedRow& first = ascending ? a : b;
+    const KeyedRow& second = ascending ? b : a;
+    if (keyLess(first, second)) return true;
+    if (keyLess(second, first)) return false;
+    if (a.identity.hash != b.identity.hash) return a.identity.hash < b.identity.hash;
+    return a.identity.id < b.identity.id;
+}
+
+TransactionPresentationProxy::KeyedRow TransactionPresentationProxy::keyedFrom(const TransactionScanRow& scan) const
+{
+    KeyedRow row;
+    row.identity = scan.identity;
+    row.number = scan.number;
+    if (scan.key != TransactionScanRow::Key::NUMBER) {
+        row.text = m_filter.sortCaseSensitivity() == Qt::CaseInsensitive ? scan.text.toCaseFolded() : scan.text;
+    }
+    return row;
+}
+
+bool TransactionPresentationProxy::existingKey(const TransactionRowIdentity& identity, KeyedRow& out) const
+{
+    const auto captured = m_removal_lookup.find(identity.id);
+    if (captured != m_removal_lookup.end()) {
+        out = *captured->second;
+        return true;
+    }
+    TransactionScanRow scan;
+    if (!m_locator->transactionScanRowById(identity, m_column, scan)) return false;
+    out = keyedFrom(scan);
+    return true;
+}
+
+//! First position whose row does not precede `item`, among the rows whose positions are not in `skip` (ascending).
+//! The returned value counts only rows that are not skipped. ok=false if a probed row can no longer be read from the
+//! source (the caller then falls back to a rebuild).
+int TransactionPresentationProxy::lowerBoundPosition(const KeyedRow& item, const std::vector<int>& skip, bool& ok) const
+{
+    int low = 0;
+    int high = static_cast<int>(m_rows.size()) - static_cast<int>(skip.size());
+    KeyedRow probe;
+    while (low < high) {
+        const int mid = low + (high - low) / 2;
+        const int real = realPosition(mid, skip);
+        if (!existingKey(m_rows[static_cast<size_t>(real)], probe)) { ok = false; return 0; }
+        if (rowPrecedes(probe, item)) low = mid + 1;
+        else high = mid;
+    }
+    return low;
+}
+
+//! The row index of the `virtual_index`-th row that is not in `skip` (ascending positions).
+int TransactionPresentationProxy::realPosition(int virtual_index, const std::vector<int>& skip)
+{
+    int real = virtual_index;
+    for (const int skipped : skip) {
+        if (skipped <= real) ++real;
+        else break;
+    }
+    return real;
+}
+
+int TransactionPresentationProxy::lowerBoundPosition(const KeyedRow& item, int skip, bool& ok) const
+{
+    return lowerBoundPosition(item, skip >= 0 ? std::vector<int>{skip} : std::vector<int>{}, ok);
+}
+
+//! Position of each identity in the projection (-1 if absent), in one pass over the rows.
+std::vector<int> TransactionPresentationProxy::positionsOf(const std::vector<TransactionRowIdentity>& identities) const
+{
+    std::vector<int> result(identities.size(), -1);
+    RowIdIndex wanted;
+    wanted.reserve(identities.size());
+    for (size_t i = 0; i < identities.size(); ++i) wanted.insert(identities[i].id, static_cast<int>(i));
+    size_t found = 0;
+    for (size_t row = 0; row < m_rows.size() && found < identities.size(); ++row) {
+        const int slot = wanted.find(m_rows[row].id);
+        if (slot >= 0 && result[static_cast<size_t>(slot)] < 0) { result[static_cast<size_t>(slot)] = static_cast<int>(row); ++found; }
+    }
+    return result;
+}
+
+void TransactionPresentationProxy::scheduleInsertFlush()
+{
+    if (m_flush_scheduled) return;
+    m_flush_scheduled = true;
+    // Notifications for one block arrive back to back; applying them together is one shift of the rows, not one each.
+    QTimer::singleShot(10, this, [this] { flushInserts(); });
+}
+
+//! Insert already ordered or unordered rows; all positions are computed before the first insertion and applied from the
+//! back, so each contiguous run is one beginInsertRows/endInsertRows pair.
+bool TransactionPresentationProxy::insertKeyed(std::vector<KeyedRow> items)
+{
+    std::sort(items.begin(), items.end(), [this](const KeyedRow& a, const KeyedRow& b) { return rowPrecedes(a, b); });
+    std::vector<int> positions;
+    positions.reserve(items.size());
+    std::vector<KeyedRow> fresh;
+    fresh.reserve(items.size());
+    for (auto& item : items) {
+        bool ok{true};
+        const int position = lowerBoundPosition(item, -1, ok);
+        if (!ok) return false;
+        if (position < static_cast<int>(m_rows.size()) && m_rows[static_cast<size_t>(position)] == item.identity) continue; // already there
+        if (m_limit >= 0 && position >= m_limit) continue;                // cannot enter the top rows
+        positions.push_back(position);
+        fresh.push_back(std::move(item));
+    }
+    if (m_limit < 0 && !fresh.empty() && layoutUpdates()) {
+        // An accessibility client that has walked the table holds an interface and a persistent index per cell, and Qt
+        // revisits every one of them for each row-insert signal (over a second at 50,000 rows). One layout change
+        // invalidates them once instead.
+        Q_EMIT structureAboutToChange();
+        Q_EMIT layoutAboutToBeChanged();
+        const auto before = persistentIndexList();
+        std::vector<TransactionRowIdentity> merged;
+        merged.reserve(m_rows.size() + fresh.size());
+        size_t next = 0;
+        for (size_t row = 0; row <= m_rows.size(); ++row) {
+            while (next < fresh.size() && positions[next] == static_cast<int>(row)) merged.push_back(fresh[next++].identity);
+            if (row < m_rows.size()) merged.push_back(m_rows[row]);
+        }
+        m_rows.swap(merged);
+        m_visible_rows = static_cast<int>(m_rows.size());
+        m_reverse_valid = false;
+        QModelIndexList after;
+        after.reserve(before.size());
+        for (const auto& old_index : before) {
+            const int shift = static_cast<int>(std::upper_bound(positions.begin(), positions.end(), old_index.row()) - positions.begin());
+            after.append(index(old_index.row() + shift, old_index.column()));
+        }
+        changePersistentIndexList(before, after);
+        Q_EMIT layoutChanged();
+        return true;
+    }
+    for (size_t end = positions.size(); end > 0;) {
+        size_t begin = end - 1;
+        while (begin > 0 && positions[begin - 1] == positions[end - 1]) --begin;
+        const int at = positions[end - 1];
+        const int count = static_cast<int>(end - begin);
+        beginInsertRows({}, at, at + count - 1);
+        std::vector<TransactionRowIdentity> run;
+        run.reserve(static_cast<size_t>(count));
+        for (size_t k = begin; k < end; ++k) run.push_back(fresh[k].identity);
+        m_rows.insert(m_rows.begin() + at, run.begin(), run.end());
+        m_visible_rows = static_cast<int>(m_rows.size());
+        m_reverse_valid = false;
+        endInsertRows();
+        end = begin;
+    }
+    while (m_limit >= 0 && static_cast<int>(m_rows.size()) > m_limit) {
+        const int last = static_cast<int>(m_rows.size()) - 1;
+        beginRemoveRows({}, last, last);
+        m_rows.pop_back();
+        m_visible_rows = static_cast<int>(m_rows.size());
+        m_reverse_valid = false;
+        endRemoveRows();
+    }
+    return true;
+}
+
+void TransactionPresentationProxy::flushInserts()
+{
+    m_flush_scheduled = false;
+    auto identities = std::move(m_pending_inserts);
+    m_pending_inserts.clear();
+    auto updated = std::move(m_pending_updates);
+    m_pending_updates.clear();
+    const bool dependency = m_pending_dependency;
+    m_pending_dependency = false;
+    if (identities.empty() && updated.empty()) return;
+    const size_t threshold = std::max<size_t>(256, m_rows.size() / 50);
+    if (!incrementalReady() || (m_limit < 0 && identities.size() > threshold)) { continueRebuild(); return; }
+    QElapsedTimer applying;
+    applying.start();
+    // Rows that changed are repositioned first, among the rows that did not change; only then are new rows placed.
+    bool done = true;
+    if (!updated.empty()) {
+        if (dependency) done = applyUpdates(updated, m_pending_first_column, m_pending_last_column, m_pending_roles);
+        else forwardDataChanged(updated, m_pending_first_column, m_pending_last_column, m_pending_roles);
+    }
+    if (done && !identities.empty()) done = incrementalReady() && flushNewRows(identities);
+    if (done) { ++m_stats.incremental_batches; m_stats.incremental_ns += applying.nsecsElapsed(); }
+    else continueRebuild();
+}
+
+bool TransactionPresentationProxy::flushNewRows(const std::vector<TransactionRowIdentity>& identities)
+{
+    const bool status_dependent = !m_filter.showsInactive() || m_column == TransactionTableModel::Status || m_column == TransactionTableModel::Date;
+    std::vector<KeyedRow> items;
+    items.reserve(identities.size());
+    for (const auto& identity : identities) {
+        const int row = m_locator->transactionRow(identity);
+        if (row < 0) continue; // gone again before this batch was applied
+        TransactionScanRow scan;
+        scan.refresh_status = status_dependent;
+        if (!m_locator->transactionScanRow(row, m_column, scan) || !m_filter.matchesScan(scan, *m_locator, row)) continue;
+        items.push_back(keyedFrom(scan));
+    }
+    return insertKeyed(std::move(items));
+}
+
+bool TransactionPresentationProxy::captureRemovals(int first, int last)
+{
+    m_captured_removals.clear();
+    if (!incrementalReady() || m_limit >= 0) return false;
+    const size_t count = static_cast<size_t>(last - first + 1);
+    if (count > std::max<size_t>(256, m_rows.size() / 50)) return false;
+    const bool status_dependent = !m_filter.showsInactive() || m_column == TransactionTableModel::Status || m_column == TransactionTableModel::Date;
+    for (int row = first; row <= last; ++row) {
+        TransactionScanRow scan;
+        scan.refresh_status = status_dependent;
+        if (!m_locator->transactionScanRow(row, m_column, scan)) { m_captured_removals.clear(); return false; }
+        CapturedRemoval captured;
+        captured.in_projection = m_filter.matchesScan(scan, *m_locator, row);
+        captured.row = keyedFrom(scan);
+        m_captured_removals.push_back(std::move(captured));
+    }
+    return true;
+}
+
+bool TransactionPresentationProxy::applyRemovals()
+{
+    auto captured = std::move(m_captured_removals);
+    m_captured_removals.clear();
+    if (!incrementalReady()) return false;
+    m_removal_lookup.clear();
+    for (const auto& removal : captured) m_removal_lookup.emplace(removal.row.identity.id, &removal.row);
+    std::vector<int> positions;
+    bool ok{true};
+    for (const auto& removal : captured) {
+        if (!removal.in_projection) continue;
+        const int position = lowerBoundPosition(removal.row, -1, ok);
+        if (!ok || position >= static_cast<int>(m_rows.size()) || !(m_rows[static_cast<size_t>(position)] == removal.row.identity)) { ok = false; break; }
+        positions.push_back(position);
+    }
+    m_removal_lookup.clear();
+    if (!ok) return false;
+    std::sort(positions.begin(), positions.end());
+    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+    if (!positions.empty() && layoutUpdates()) {
+        // See insertKeyed: one layout change instead of a row-remove signal that walks every accessible cell.
+        Q_EMIT structureAboutToChange();
+        Q_EMIT layoutAboutToBeChanged();
+        const auto before = persistentIndexList();
+        std::vector<TransactionRowIdentity> kept;
+        kept.reserve(m_rows.size() - positions.size());
+        size_t next = 0;
+        for (size_t row = 0; row < m_rows.size(); ++row) {
+            if (next < positions.size() && positions[next] == static_cast<int>(row)) { ++next; continue; }
+            kept.push_back(m_rows[row]);
+        }
+        m_rows.swap(kept);
+        m_visible_rows = static_cast<int>(m_rows.size());
+        m_reverse_valid = false;
+        QModelIndexList after;
+        after.reserve(before.size());
+        for (const auto& old_index : before) {
+            const auto at = std::lower_bound(positions.begin(), positions.end(), old_index.row());
+            const bool removed = at != positions.end() && *at == old_index.row();
+            after.append(removed ? QModelIndex{} : index(old_index.row() - static_cast<int>(at - positions.begin()), old_index.column()));
+        }
+        changePersistentIndexList(before, after);
+        Q_EMIT layoutChanged();
+        return true;
+    }
+    for (size_t end = positions.size(); end > 0;) {
+        size_t begin = end - 1;
+        while (begin > 0 && positions[begin - 1] + 1 == positions[begin]) --begin;
+        beginRemoveRows({}, positions[begin], positions[end - 1]);
+        m_rows.erase(m_rows.begin() + positions[begin], m_rows.begin() + positions[end - 1] + 1);
+        m_visible_rows = static_cast<int>(m_rows.size());
+        m_reverse_valid = false;
+        endRemoveRows();
+        end = begin;
+    }
+    return true;
+}
+
+void TransactionPresentationProxy::forwardDataChanged(const std::vector<TransactionRowIdentity>& identities, int first_column, int last_column, const QVector<int>& roles)
+{
+    if (m_rows.empty()) return;
+    std::vector<int> positions = positionsOf(identities);
+    positions.erase(std::remove(positions.begin(), positions.end(), -1), positions.end());
+    std::sort(positions.begin(), positions.end());
+    emitChangedRows(positions, first_column, last_column, roles);
+}
+
+//! Announce changed rows (sorted positions). Every dataChanged is an event for an attached accessibility client, which
+//! can answer each one with a round trip to its process; a few scattered rows are announced as one covering range.
+void TransactionPresentationProxy::emitChangedRows(const std::vector<int>& positions, int first_column, int last_column, const QVector<int>& roles)
+{
+    if (positions.empty()) return;
+    std::vector<std::pair<int, int>> runs;
+    for (size_t i = 0; i < positions.size();) {
+        size_t j = i;
+        while (j + 1 < positions.size() && positions[j + 1] == positions[j] + 1) ++j;
+        runs.emplace_back(positions[i], positions[j]);
+        i = j + 1;
+    }
+    if (runs.size() > 3) runs = {{positions.front(), positions.back()}};
+    for (const auto& [first, last] : runs) Q_EMIT dataChanged(index(first, first_column), index(last, last_column), roles);
+}
+
+//! Reposition rows whose data changed. Every target position is computed on the sequence that excludes *all* changed
+//! rows (they sit at old positions but carry new keys, so they must not be probed), and rows are then placed in their
+//! final order, each into the sorted remainder plus the rows already placed. Rows that need no move are not moved.
+//! More than 32 moving rows, or a move while an accessibility client is attached (a layout change is cheaper there),
+//! falls back to a rebuild.
+bool TransactionPresentationProxy::applyUpdates(const std::vector<TransactionRowIdentity>& wanted, int first_column, int last_column, const QVector<int>& roles)
+{
+    if (wanted.size() > 512) return false;
+    struct Change { TransactionRowIdentity identity; KeyedRow keyed; bool matches{false}; int position{-1}; };
+    std::vector<Change> changes;
+    std::vector<TransactionRowIdentity> identities;
+    std::unordered_set<uint64_t> seen;
+    const bool status_dependent = !m_filter.showsInactive() || m_column == TransactionTableModel::Status || m_column == TransactionTableModel::Date;
+    for (const auto& identity : wanted) {
+        if (!seen.insert(identity.id).second) continue;
+        const int row = m_locator->transactionRow(identity);
+        if (row < 0) continue; // removed again before this batch was applied
+        Change change;
+        change.identity = identity;
+        TransactionScanRow scan;
+        scan.refresh_status = status_dependent;
+        if (!m_locator->transactionScanRow(row, m_column, scan)) return false;
+        change.matches = m_filter.matchesScan(scan, *m_locator, row);
+        change.keyed = keyedFrom(scan);
+        identities.push_back(identity);
+        changes.push_back(std::move(change));
+    }
+    const std::vector<int> found = positionsOf(identities);
+    for (size_t i = 0; i < changes.size(); ++i) changes[i].position = found[i];
+    std::vector<size_t> removals, present;
+    std::vector<KeyedRow> insertions;
+    for (size_t i = 0; i < changes.size(); ++i) {
+        if (changes[i].position < 0) { if (changes[i].matches) insertions.push_back(changes[i].keyed); }
+        else if (!changes[i].matches) removals.push_back(i);
+        else present.push_back(i);
+    }
+    // Rows that leave or may move: none of them may be probed while placing any of them.
+    std::vector<int> skip;
+    for (size_t i : removals) skip.push_back(changes[i].position);
+    for (size_t i : present) skip.push_back(changes[i].position);
+    std::sort(skip.begin(), skip.end());
+    // Do the present rows keep their places? They do when each sits where the sorted remainder puts it, and their
+    // own order is unchanged.
+    std::sort(present.begin(), present.end(), [&](size_t a, size_t b) { return changes[a].position < changes[b].position; });
+    bool unmoved = true;
+    for (size_t k = 0; k < present.size() && unmoved; ++k) {
+        const Change& change = changes[present[k]];
+        if (k > 0 && !rowPrecedes(changes[present[k - 1]].keyed, change.keyed)) { unmoved = false; break; }
+        bool ok{true};
+        const int target = lowerBoundPosition(change.keyed, skip, ok);
+        if (!ok) return false;
+        const int before = static_cast<int>(std::lower_bound(skip.begin(), skip.end(), change.position) - skip.begin());
+        unmoved = target == change.position - before;
+    }
+    if (!unmoved && (present.size() > 32 || layoutUpdates())) return false;
+    // Rows that leave.
+    if (!removals.empty()) {
+        std::vector<int> rows;
+        for (size_t i : removals) rows.push_back(changes[i].position);
+        std::sort(rows.begin(), rows.end());
+        removeRuns(rows);
+    }
+    if (!unmoved) {
+        // Place the changed rows one by one in their final order. While one is placed, the rows still waiting are skipped.
+        std::vector<size_t> order = present;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return rowPrecedes(changes[a].keyed, changes[b].keyed); });
+        std::unordered_set<uint64_t> waiting;
+        for (size_t i : order) waiting.insert(changes[i].identity.id);
+        for (size_t i : order) {
+            std::vector<TransactionRowIdentity> pending;
+            for (size_t j : order) if (waiting.count(changes[j].identity.id)) pending.push_back(changes[j].identity);
+            const std::vector<int> places = positionsOf(pending);
+            std::vector<int> unplaced(places.begin(), places.end());
+            if (std::find(unplaced.begin(), unplaced.end(), -1) != unplaced.end()) return false;
+            std::sort(unplaced.begin(), unplaced.end());
+            const int from = positionsOf({changes[i].identity})[0];
+            bool ok{true};
+            const int target = lowerBoundPosition(changes[i].keyed, unplaced, ok);
+            if (!ok) return false;
+            const int anchor = realPosition(target, unplaced);   // the row it goes in front of, or the end
+            waiting.erase(changes[i].identity.id);
+            if (anchor == from || anchor == from + 1) continue;
+            if (!beginMoveRows({}, from, from, {}, anchor)) return false;
+            const auto first = m_rows.begin();
+            if (anchor > from) std::rotate(first + from, first + from + 1, first + anchor);
+            else std::rotate(first + anchor, first + from, first + from + 1);
+            m_reverse_valid = false;
+            endMoveRows();
+        }
+    }
+    // Their cells changed wherever they ended up.
+    if (!present.empty()) {
+        std::vector<TransactionRowIdentity> moved;
+        for (size_t i : present) moved.push_back(changes[i].identity);
+        std::vector<int> rows = positionsOf(moved);
+        rows.erase(std::remove(rows.begin(), rows.end(), -1), rows.end());
+        std::sort(rows.begin(), rows.end());
+        emitChangedRows(rows, first_column, last_column, roles);
+    }
+    if (!insertions.empty() && !insertKeyed(std::move(insertions))) return false;
+    return true;
+}
+
+//! Remove the given positions (ascending), one signal per contiguous run, from the back.
+void TransactionPresentationProxy::removeRuns(const std::vector<int>& rows)
+{
+    if (layoutUpdates() && !rows.empty()) {
+        Q_EMIT structureAboutToChange();
+        Q_EMIT layoutAboutToBeChanged();
+        const auto before = persistentIndexList();
+        std::vector<TransactionRowIdentity> kept;
+        kept.reserve(m_rows.size() - rows.size());
+        size_t next = 0;
+        for (size_t row = 0; row < m_rows.size(); ++row) {
+            if (next < rows.size() && rows[next] == static_cast<int>(row)) { ++next; continue; }
+            kept.push_back(m_rows[row]);
+        }
+        m_rows.swap(kept);
+        m_visible_rows = static_cast<int>(m_rows.size());
+        m_reverse_valid = false;
+        QModelIndexList after;
+        after.reserve(before.size());
+        for (const auto& old_index : before) {
+            const auto at = std::lower_bound(rows.begin(), rows.end(), old_index.row());
+            const bool removed = at != rows.end() && *at == old_index.row();
+            after.append(removed ? QModelIndex{} : index(old_index.row() - static_cast<int>(at - rows.begin()), old_index.column()));
+        }
+        changePersistentIndexList(before, after);
+        Q_EMIT layoutChanged();
+        return;
+    }
+    for (size_t end = rows.size(); end > 0;) {
+        size_t begin = end - 1;
+        while (begin > 0 && rows[begin - 1] + 1 == rows[begin]) --begin;
+        beginRemoveRows({}, rows[begin], rows[end - 1]);
+        m_rows.erase(m_rows.begin() + rows[begin], m_rows.begin() + rows[end - 1] + 1);
+        m_visible_rows = static_cast<int>(m_rows.size());
+        m_reverse_valid = false;
+        endRemoveRows();
+        end = begin;
+    }
 }
 
 void TransactionPresentationProxy::sort(int column, Qt::SortOrder order) { m_column = column; m_sort_order = order; requestRebuildFor(DiagnosticChange::SORT); }

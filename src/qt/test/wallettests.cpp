@@ -67,6 +67,7 @@
 #include <stdexcept>
 #include <future>
 #include <map>
+#include <random>
 #include <filesystem>
 #include <util/fs.h>
 #include <wallet/walletutil.h>
@@ -105,6 +106,7 @@
 #include <mach/mach.h>
 #include <pthread.h>
 #endif
+#include <QAbstractItemModelTester>
 #include <QAccessible>
 #include <QTest>
 #include <QTimer>
@@ -6066,9 +6068,13 @@ QList<TransactionRecord> SyntheticHistory(size_t first, size_t count, size_t tot
 void WalletTests::historyScaleBenchmark_data()
 {
     QTest::addColumn<int>("rows");
-    QTest::newRow("5k") << 5000;
-    QTest::newRow("50k") << 50000;
-    QTest::newRow("200k") << 200000;
+    QTest::addColumn<bool>("accessibility");
+    QTest::newRow("5k") << 5000 << false;
+    QTest::newRow("50k") << 50000 << false;
+    QTest::newRow("200k") << 200000 << false;
+    // With accessibility active the table holds an interface and a persistent index for every cell (macOS bridge cost).
+    QTest::newRow("50k+ax") << 50000 << true;
+    QTest::newRow("200k+ax") << 200000 << true;
 }
 
 void WalletTests::historyScaleBenchmark()
@@ -6077,6 +6083,10 @@ void WalletTests::historyScaleBenchmark()
     if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
 #endif
     QFETCH(int, rows);
+    QFETCH(bool, accessibility);
+#ifndef Q_OS_MACOS
+    if (accessibility) QSKIP("The accessibility cost is reproduced with the macOS bridge only");
+#endif
     if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) {
         QSKIP("Large-wallet measurement; set BLACKCOIN_QT_BENCH=1 to run");
     }
@@ -6106,6 +6116,9 @@ void WalletTests::historyScaleBenchmark()
     TransactionView& view = gui.transactionView;
     auto* proxy = view.findChild<TransactionPresentationProxy*>();
     QVERIFY(proxy);
+    // Without an accessibility client the proxy announces row changes with insert/remove signals; with one, as a layout
+    // change. The benchmark pins the path to the row being measured (this host always has some client attached).
+    proxy->setLayoutUpdates(accessibility ? std::optional<bool>{true} : std::optional<bool>{false});
     auto* history = gui.walletModel->getTransactionTableModel();
     view.resize(1100, 600);
     view.show();
@@ -6158,8 +6171,22 @@ void WalletTests::historyScaleBenchmark()
         calibration_ns = std::max<qint64>(clock.nsecsElapsed(), 1000000);
     }
     const qint64 slice_bound_ns = std::max<qint64>(100000000, 25 * calibration_ns);
+    // An accessibility client keeps walking the table, so the cell interfaces (and a persistent index per cell) are there
+    // again whenever something changes; rebuild that footprint before each measured action, outside its timing.
+    QTableView* ax_table{nullptr};
+    qint64 ax_cells{0}; // cell interfaces and persistent indexes a client holds; the layout change tears them down first
+    const auto walk_cells = [&] {
+        if (!ax_table) return;
+        QAccessibleInterface* interface = QAccessible::queryAccessibleInterface(ax_table);
+        if (!interface || !interface->tableInterface()) return;
+        auto* accessible_table = interface->tableInterface();
+        for (int row = 0; row < accessible_table->rowCount(); ++row)
+            for (int column = 0; column < accessible_table->columnCount(); ++column) accessible_table->cellAt(row, column);
+    };
     qint64 last_cpu_ms{0};
     const auto run_once = [&](auto&& begin, int expected_rows, qint64& ms, qint64& worst) {
+        walk_cells();
+        QCoreApplication::processEvents();
         const double cpu_before = ProcessCpuSeconds();
         proxy->resetStats();
         worst_gap_ms = 0;
@@ -6187,7 +6214,7 @@ void WalletTests::historyScaleBenchmark()
                  qPrintable(QStringLiteral("%1 scanned %2 rows (limit %3 x history)").arg(action).arg(stats.rows_scanned).arg(scan_factor)));
         QVERIFY2(scan_factor > 0 || stats.rebuilds == 0, qPrintable(action + QStringLiteral(": rebuilt although nothing changed")));
         // Remapping persistent indexes costs per index, and an accessibility client can hold one per cell; allow for it.
-        const qint64 allowed_ns = slice_bound_ns + stats.persistent_indexes * 6000;
+        const qint64 allowed_ns = slice_bound_ns + std::max<qint64>(stats.persistent_indexes, ax_cells) * 6000;
         QVERIFY2(stats.max_slice_ns <= allowed_ns,
                  qPrintable(QStringLiteral("%1 ran a %2 ms slice (bound %3 ms, %4 persistent indexes)").arg(action).arg(stats.max_slice_ns / 1000000).arg(allowed_ns / 1000000).arg(stats.persistent_indexes)));
         if (oracle) { apply_to_oracle(); check_oracle(action); }
@@ -6211,6 +6238,25 @@ void WalletTests::historyScaleBenchmark()
     QVERIFY(table_view);
     // The projection is current: showing the page again must not scan.
     measure_plain(QStringLiteral("hide_show"), [&] { view.hide(); QCoreApplication::processEvents(); view.show(); }, N, 0.0);
+    if (accessibility) {
+        // Make an accessibility client's footprint real: every cell has an interface and a persistent index.
+        QAccessible::setActive(true);
+        QElapsedTimer ax_clock;
+        ax_clock.start();
+        ax_table = table_view;
+        walk_cells();
+        const qint64 setup_ms = ax_clock.elapsed();
+        const size_t persistent_count = proxy->persistentIndexCount();
+        ax_cells = static_cast<qint64>(persistent_count);
+        // Qt's own floor: tearing down that many cell interfaces and persistent indexes.
+        QElapsedTimer teardown_clock;
+        teardown_clock.start();
+        QAccessibleTableModelChangeEvent reset(table_view, QAccessibleTableModelChangeEvent::ModelReset);
+        QAccessible::updateAccessibility(&reset);
+        const qint64 teardown_ms = teardown_clock.elapsed();
+        walk_cells();
+        qInfo().noquote() << QStringLiteral("HSB rows=%1 accessibility_setup_ms=%2 persistent_indexes=%3 accessibility_teardown_ms=%4").arg(rows).arg(setup_ms).arg(persistent_count).arg(teardown_ms);
+    }
     static const char* const names[] = {"status", "watch", "date", "type", "label", "amount"};
     for (int column : {2, 3, 4, 5, 0}) {
         for (Qt::SortOrder order : {Qt::AscendingOrder, Qt::DescendingOrder}) {
@@ -6261,6 +6307,19 @@ void WalletTests::historyScaleBenchmark()
         measure_plain(QStringLiteral("sort_date_desc_again"), [&] { table_view->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder); }, N);
     }
 
+    // From here the history behaves like a settled wallet: nearly every row is confirmed to its final depth and a few
+    // dozen are still confirming, so a block announces only those.
+    measure_plain(QStringLiteral("settle_statuses"), [&] {
+        history->mutateRecords([](TransactionRecord& record) {
+            const unsigned char b0 = record.hash.begin()[0];
+            const unsigned char b1 = record.hash.begin()[1];
+            if (record.status.sortKey.empty()) {
+                record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", 5 + (b0 % 50), 0, static_cast<unsigned>(record.time), record.idx, 3);
+            }
+            record.status.status = (b0 == 0 && b1 < 8) ? TransactionStatus::Confirming : TransactionStatus::Confirmed;
+        });
+    }, N, 1e9);
+    if (rows <= 50000) compare_with(*make_oracle(TransactionTableModel::Date, Qt::DescendingOrder), QStringLiteral("after settling statuses"));
     // Block burst: ten notifications of five rows each, then the status refresh a new block causes.
     const auto burst = SyntheticHistory(total, 50, total, /*newest=*/true);
     measure_plain(QStringLiteral("block_burst"), [&] {
@@ -6270,15 +6329,22 @@ void WalletTests::historyScaleBenchmark()
             history->insertRecords(part);
         }
         history->updateConfirmations();
-    }, N + 50, 12.0);
+    }, N + 50, 0.0);
+    QVERIFY2(proxy->stats().incremental_batches >= 1, "a block was not applied incrementally");
     if (rows <= 50000) compare_with(*make_oracle(TransactionTableModel::Date, Qt::DescendingOrder), QStringLiteral("after block burst"));
     // A new block alone (Date sort, inactive rows shown) re-sorts nothing.
-    measure_plain(QStringLiteral("block_status_only"), [&] { history->updateConfirmations(); }, N + 50, 0.0);
+    measure_plain(QStringLiteral("block_status_only"), [&] {
+        QElapsedTimer announce;
+        announce.start();
+        history->updateConfirmations();
+        qInfo().noquote() << QStringLiteral("HSB rows=%1 status_announcement_ms=%2 unsettled_rows=%3").arg(rows).arg(announce.elapsed()).arg(history->unsettledRows());
+    }, N + 50, 0.0);
     heartbeat.stop();
     for (const auto& row : table) {
         qInfo().noquote() << QStringLiteral("HSB rows=%1 action=%2 ms=%3 cpu_ms=%11 worst_main_gap_ms=%4 result_rows=%5 rebuilds=%6 restarts=%7 slices=%8 max_slice_ms=%9 scanned=%10")
             .arg(rows).arg(row.action).arg(row.ms).arg(row.worst).arg(row.count).arg(row.stats.rebuilds).arg(row.stats.restarts)
             .arg(row.stats.slices).arg(row.stats.max_slice_ns / 1000000.0, 0, 'f', 2).arg(row.stats.rows_scanned).arg(row.cpu_ms)
+            + QStringLiteral(" incremental_batches=%1 incremental_ms=%2").arg(row.stats.incremental_batches).arg(row.stats.incremental_ns / 1e6, 0, 'f', 2)
             + QStringLiteral(" persistent=%1 accessibility_active=%2").arg(row.stats.persistent_indexes).arg(QAccessible::isActive())
             + QStringLiteral(" layout_ms[about,remap,changed]=%1,%2,%3").arg(row.stats.max_layout_ns[0] / 1e6, 0, 'f', 2).arg(row.stats.max_layout_ns[1] / 1e6, 0, 'f', 2).arg(row.stats.max_layout_ns[2] / 1e6, 0, 'f', 2)
             + QStringLiteral(" op_max_ms[scan,sort,map,old,add,reorder,interim,publish,retire]=") + [&] {
@@ -6447,4 +6513,693 @@ void WalletTests::historyInitialLoad()
             .arg((after.at("process") - before.at("process")) / 6.0 * 1000.0, 0, 'f', 1).arg(threads);
     }
     wallet_view.hide();
+}
+
+void WalletTests::historyIncrementalUpdates_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::newRow("5k") << 5000;
+    QTest::newRow("50k") << 50000;
+}
+
+//! Random interleavings of inserts, removals and status changes, each batch followed by a comparison, row for row,
+//! with a freshly built synchronous proxy. Persistent indexes and the selection must keep pointing at the same rows.
+void WalletTests::historyIncrementalUpdates()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet oracle; set BLACKCOIN_QT_BENCH=1 to run");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-incremental", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    auto* history = gui.walletModel->getTransactionTableModel();
+
+    // A settled history: confirmed and keyed, except a few rows that are still confirming.
+    QList<TransactionRecord> bulk = SyntheticHistory(0, static_cast<size_t>(rows), static_cast<size_t>(rows));
+    for (auto& record : bulk) {
+        const unsigned char b0 = record.hash.begin()[0];
+        if (record.status.sortKey.empty()) record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", 5 + (b0 % 50), 0, static_cast<unsigned>(record.time), record.idx, 3);
+        record.status.status = (b0 < 2) ? TransactionStatus::Confirming : TransactionStatus::Confirmed;
+    }
+    std::vector<uint256> live;
+    for (const auto& record : bulk) live.push_back(record.hash);
+    history->setInitialHistory(std::deque<TransactionRecord>(bulk.cbegin(), bulk.cend()));
+    QTRY_VERIFY_WITH_TIMEOUT(history->rowCount({}) == rows, 60000);
+
+    TransactionPresentationProxy proxy;
+    // The structural tester checks every signal against the model but is slow: it watches only the first batches.
+    std::unique_ptr<QAbstractItemModelTester> tester;
+    if (rows <= 5000) tester = std::make_unique<QAbstractItemModelTester>(&proxy, QAbstractItemModelTester::FailureReportingMode::QtTest);
+    proxy.setSortCaseSensitivity(Qt::CaseInsensitive);
+    proxy.setSourceModel(history);
+    QItemSelectionModel selection(&proxy);
+    bool layout_mode{false};
+    std::mt19937_64 random(0xb10c + static_cast<uint64_t>(rows));
+    size_t next_first = static_cast<size_t>(rows) + 1000;
+
+    struct Config { int column; Qt::SortOrder order; bool show_inactive; };
+    std::vector<Config> configs{{TransactionTableModel::Date, Qt::DescendingOrder, true}, {TransactionTableModel::Status, Qt::AscendingOrder, true}};
+    if (rows <= 5000) {
+        configs.push_back({TransactionTableModel::Date, Qt::AscendingOrder, true});
+        configs.push_back({TransactionTableModel::Amount, Qt::AscendingOrder, true});
+        configs.push_back({TransactionTableModel::Type, Qt::DescendingOrder, true});
+        configs.push_back({TransactionTableModel::ToAddress, Qt::AscendingOrder, true});
+        configs.push_back({TransactionTableModel::Date, Qt::DescendingOrder, false});
+    }
+    const int batches = rows <= 5000 ? 24 : 8;
+    const auto settle = [&] {
+        QCoreApplication::processEvents();
+        QTRY_VERIFY_WITH_TIMEOUT(proxy.isReady(), 60000);
+        QCoreApplication::processEvents();
+        QVERIFY(proxy.isReady());
+    };
+    const auto matches_fresh = [&](const Config& config, const QString& what) {
+        TransactionFilterProxy reference;
+        reference.setSortRole(Qt::EditRole);
+        reference.setSortCaseSensitivity(Qt::CaseInsensitive);
+        reference.setShowInactive(config.show_inactive);
+        reference.setSourceModel(history);
+        reference.sort(config.column, config.order);
+        QVERIFY2(reference.rowCount() == proxy.rowCount(), qPrintable(QStringLiteral("%1: %2 rows, rebuild has %3").arg(what).arg(proxy.rowCount()).arg(reference.rowCount())));
+        for (int i = 0; i < proxy.rowCount(); ++i) {
+            if (proxy.index(i, 0).data(TransactionTableModel::TxHashRole) != reference.index(i, 0).data(TransactionTableModel::TxHashRole))
+                QFAIL(qPrintable(QStringLiteral("%1: row %2 differs from a fresh rebuild").arg(what).arg(i)));
+        }
+    };
+
+    for (size_t c = 0; c < configs.size(); ++c) {
+        const Config& config = configs[c];
+        // Alternate how row changes are announced: insert/remove signals, or one layout change (accessibility active).
+        layout_mode = (c % 2) == 1;
+        proxy.setLayoutUpdates(layout_mode);
+        proxy.setShowInactive(config.show_inactive);
+        proxy.sort(config.column, config.order);
+        settle();
+        // Persistent indexes and a selection on rows that are visible now.
+        std::vector<std::pair<QPersistentModelIndex, QString>> tracked;
+        for (int k = 0; k < 24 && proxy.rowCount() > 0; ++k) {
+            const int row = static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount()));
+            const QModelIndex index = proxy.index(row, 0);
+            tracked.emplace_back(QPersistentModelIndex(index), index.data(TransactionTableModel::TxHashRole).toString());
+            if (k < 6) selection.select(index, QItemSelectionModel::Select | QItemSelectionModel::Rows);
+        }
+        std::set<QString> removed_total;
+        for (int batch = 0; batch < batches; ++batch) {
+            if (c == 0 && batch == 6) tester.reset();
+            proxy.resetStats();
+            const int kind = static_cast<int>(random() % 3);
+            QString what = QStringLiteral("config %1 batch %2").arg(c).arg(batch);
+            bool expect_incremental = !(config.column == TransactionTableModel::Status) || kind != 2;
+            std::set<QString> gone;
+            if (kind == 0) {
+                const size_t count = 1 + random() % 40;
+                QList<TransactionRecord> fresh = SyntheticHistory(next_first, count, static_cast<size_t>(rows));
+                next_first += count;
+                for (auto& record : fresh) {
+                    record.status.status = TransactionStatus::Confirmed;
+                    if (record.status.sortKey.empty()) record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", static_cast<int>(random() % 60), 0, static_cast<unsigned>(record.time), record.idx, 3);
+                    live.push_back(record.hash);
+                }
+                history->insertRecords(fresh);
+                what += QStringLiteral(" insert %1").arg(count);
+            } else if (kind == 1) {
+                std::vector<uint256> victims;
+                const size_t count = 1 + random() % 20;
+                for (size_t k = 0; k < count && live.size() > 1; ++k) {
+                    const size_t at = random() % live.size();
+                    victims.push_back(live[at]);
+                    gone.insert(QString::fromStdString(live[at].ToString()));
+                    live[at] = live.back();
+                    live.pop_back();
+                }
+                history->removeRecords(victims);
+                what += QStringLiteral(" remove %1").arg(victims.size());
+            } else {
+                std::set<uint256> chosen;
+                const size_t count = 1 + random() % 10;
+                for (size_t k = 0; k < count; ++k) chosen.insert(live[random() % live.size()]);
+                const uint64_t salt = random();
+                history->mutateRecords([&](TransactionRecord& record) {
+                    if (!chosen.count(record.hash)) return;
+                    const uint64_t mixed = SplitMix(salt ^ static_cast<uint64_t>(record.presentation_id));
+                    record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", static_cast<int>(mixed % 60), static_cast<int>((mixed >> 8) % 2), static_cast<unsigned>(record.time), record.idx, static_cast<int>(2 + (mixed >> 16) % 2));
+                    record.status.status = (mixed >> 24) % 7 == 0 ? TransactionStatus::Conflicted : ((mixed >> 32) % 2 ? TransactionStatus::Confirming : TransactionStatus::Confirmed);
+                });
+                what += QStringLiteral(" status %1").arg(count);
+                expect_incremental = expect_incremental && config.show_inactive;
+            }
+            removed_total.insert(gone.begin(), gone.end());
+            settle();
+            if (expect_incremental) {
+                QVERIFY2(proxy.stats().rebuilds == 0 && proxy.stats().rows_scanned == 0, qPrintable(what + QStringLiteral(": needed a scan")));
+            }
+            matches_fresh(config, what);
+            for (const auto& [index, hash] : tracked) {
+                if (removed_total.count(hash)) continue;
+                QVERIFY2(index.isValid() && index.data(TransactionTableModel::TxHashRole).toString() == hash,
+                         qPrintable(what + QStringLiteral(": a persistent index moved to another transaction (valid=%1 row=%2 now=%3 want=%4 rebuilds=%5 restarts=%6 incremental=%7)")
+                             .arg(index.isValid()).arg(index.row()).arg(index.data(TransactionTableModel::TxHashRole).toString().left(10)).arg(hash.left(10))
+                             .arg(proxy.stats().rebuilds).arg(proxy.stats().restarts).arg(proxy.stats().incremental_batches)));
+            }
+            for (const auto& [index, hash] : tracked) {
+                if (removed_total.count(hash) || !index.isValid()) continue;
+                // Rows selected at the start of this configuration stay selected while they survive.
+            }
+        }
+        for (size_t k = 0; k < 6 && k < tracked.size(); ++k) {
+            const auto& [index, hash] = tracked[k];
+            if (index.isValid()) QVERIFY2(selection.isSelected(index), "a surviving selected row lost its selection");
+        }
+        selection.clear();
+        // The batches above may have removed rows that later configurations track; start each with a fresh sample.
+    }
+}
+
+void WalletTests::historyOrderOracle_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::newRow("3k") << 3000;
+    QTest::newRow("50k") << 50000;
+}
+
+//! Targeted and randomized changes to many rows at once (clustered, interleaved, large fractions, with inserts and
+//! removals in the same flush), every sort column in both directions, with row announcements and with a layout change.
+//! The oracle is a fresh synchronous rebuild; row order must be identical after every step.
+void WalletTests::historyOrderOracle()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet oracle; set BLACKCOIN_QT_BENCH=1 to run");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-order", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    auto* history = gui.walletModel->getTransactionTableModel();
+
+    QList<TransactionRecord> bulk = SyntheticHistory(0, static_cast<size_t>(rows), static_cast<size_t>(rows));
+    for (auto& record : bulk) {
+        const unsigned char b0 = record.hash.begin()[0];
+        if (record.status.sortKey.empty()) record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", 5 + (b0 % 50), 0, static_cast<unsigned>(record.time), record.idx, 3);
+        record.status.status = (b0 < 2) ? TransactionStatus::Confirming : TransactionStatus::Confirmed;
+        record.involvesWatchAddress = (b0 % 5) == 0;
+    }
+    std::vector<uint256> live;
+    for (const auto& record : bulk) live.push_back(record.hash);
+    history->setInitialHistory(std::deque<TransactionRecord>(bulk.cbegin(), bulk.cend()));
+    QTRY_VERIFY_WITH_TIMEOUT(history->rowCount({}) == rows, 60000);
+
+    TransactionPresentationProxy proxy;
+    proxy.setSortCaseSensitivity(Qt::CaseInsensitive);
+    proxy.setSourceModel(history);
+    std::unique_ptr<QAbstractItemModelTester> tester;
+    if (rows <= 3000) tester = std::make_unique<QAbstractItemModelTester>(&proxy, QAbstractItemModelTester::FailureReportingMode::QtTest);
+    std::mt19937_64 random(0x0dd5eed + static_cast<uint64_t>(rows));
+    size_t next_first = static_cast<size_t>(rows) + 5000;
+
+    const auto name_of = [](const uint256& hash) { return QString::fromStdString(hash.ToString()); };
+    const auto settle = [&] {
+        QCoreApplication::processEvents();
+        QTRY_VERIFY_WITH_TIMEOUT(proxy.isReady(), 60000);
+        QCoreApplication::processEvents();
+        QVERIFY(proxy.isReady());
+    };
+    // Filters: 0 none; 1 hides inactive; 2 type, minimum amount, hides inactive; 3 date range and search text;
+    // 4 watch-only; 5 not watch-only, search text, hides inactive. Rows whose status changes enter or leave 1, 2, 5.
+    const auto apply_filter = [&](auto& target, int filter) {
+        target.setShowInactive(filter == 1 || filter == 2 || filter == 5 ? false : true);
+        target.setTypeFilter(filter == 2 ? (TransactionFilterProxy::TYPE(TransactionRecord::SendToAddress) | TransactionFilterProxy::TYPE(TransactionRecord::Staked)) : TransactionFilterProxy::ALL_TYPES);
+        target.setMinAmount(filter == 2 ? 2000000 : 0);
+        if (filter == 3) target.setDateRange(QDateTime::fromSecsSinceEpoch(1600000000 + 600 * (rows / 16)), QDateTime::fromSecsSinceEpoch(1600000000 + 600 * (rows / 5)));
+        else target.setDateRange(std::nullopt, std::nullopt);
+        target.setSearchString(filter == 3 ? QStringLiteral("a") : (filter == 5 ? QStringLiteral("1") : QString()));
+        target.setWatchOnlyFilter(filter == 4 ? TransactionFilterProxy::WatchOnlyFilter_Yes : (filter == 5 ? TransactionFilterProxy::WatchOnlyFilter_No : TransactionFilterProxy::WatchOnlyFilter_All));
+    };
+    const auto compare = [&](int column, Qt::SortOrder order, int filter, const QString& what) {
+        TransactionFilterProxy reference;
+        reference.setSortRole(Qt::EditRole);
+        reference.setSortCaseSensitivity(Qt::CaseInsensitive);
+        apply_filter(reference, filter);
+        reference.setSourceModel(history);
+        reference.sort(column, order);
+        QVERIFY2(reference.rowCount() == proxy.rowCount(), qPrintable(QStringLiteral("%1: %2 rows, rebuild has %3").arg(what).arg(proxy.rowCount()).arg(reference.rowCount())));
+        for (int i = 0; i < proxy.rowCount(); ++i) {
+            if (proxy.index(i, 0).data(TransactionTableModel::TxHashRole) != reference.index(i, 0).data(TransactionTableModel::TxHashRole))
+                QFAIL(qPrintable(QStringLiteral("%1: row %2 differs from a fresh rebuild").arg(what).arg(i)));
+        }
+    };
+    const auto key_for = [](const TransactionRecord& record, int major, int minor) {
+        return strprintf("%010d-%01d-%010u-%03d-%d", major, minor, static_cast<unsigned>(record.time), record.idx, 3);
+    };
+    //! Give a record a new status key and status from one random word: what a block changes in an existing row.
+    //! Type, amount and address never change after a row exists, so only a new row gets them (reroll_new).
+    const auto reroll = [&](TransactionRecord& record, uint64_t mixed) {
+        record.status.sortKey = key_for(record, static_cast<int>(mixed % 60), static_cast<int>((mixed >> 8) % 2));
+        record.status.status = (mixed >> 24) % 9 == 0 ? TransactionStatus::Conflicted : ((mixed >> 32) % 2 ? TransactionStatus::Confirming : TransactionStatus::Confirmed);
+    };
+    const auto reroll_new = [&](TransactionRecord& record, uint64_t mixed) {
+        reroll(record, mixed);
+        const CAmount amount = 100000 + static_cast<CAmount>((mixed >> 20) % 9000000);
+        const unsigned kind = static_cast<unsigned>((mixed >> 44) % 3);
+        record.involvesWatchAddress = (mixed >> 52) % 4 == 0;
+        record.type = kind == 0 ? TransactionRecord::SendToAddress : (kind == 1 ? TransactionRecord::Staked : TransactionRecord::RecvWithAddress);
+        record.debit = kind == 0 ? -amount : 0;
+        record.credit = kind == 0 ? 0 : amount;
+    };
+    const auto mutate = [&](const std::set<QString>& chosen, const std::function<void(TransactionRecord&)>& change) {
+        history->mutateRecords([&](TransactionRecord& record) {
+            if (chosen.count(name_of(record.hash))) change(record);
+        });
+    };
+    //! The transactions on proxy rows [start, start + length), in the order shown.
+    const auto run_of = [&](int start, int length) {
+        std::vector<QString> run;
+        for (int i = start; i < start + length && i < proxy.rowCount(); ++i) run.push_back(proxy.index(i, 0).data(TransactionTableModel::TxHashRole).toString());
+        return run;
+    };
+    const auto pick_live = [&](size_t count) {
+        std::set<QString> chosen;
+        for (size_t k = 0; k < count && !live.empty(); ++k) chosen.insert(name_of(live[random() % live.size()]));
+        return chosen;
+    };
+
+    struct Config { int column; Qt::SortOrder order; bool layout; int filter{0}; };
+    std::vector<Config> configs;
+    if (rows <= 3000) {
+        for (int column : {TransactionTableModel::Status, TransactionTableModel::Date, TransactionTableModel::Amount, TransactionTableModel::Type, TransactionTableModel::ToAddress})
+            for (Qt::SortOrder order : {Qt::AscendingOrder, Qt::DescendingOrder})
+                for (bool layout : {false, true}) configs.push_back({column, order, layout});
+        // Filtered projections, with and without a layout change: rows enter and leave the filter in one flush.
+        for (int filter = 1; filter <= 5; ++filter)
+            for (bool layout : {false, true})
+                configs.push_back({filter % 2 ? TransactionTableModel::Status : TransactionTableModel::Date, filter % 3 ? Qt::AscendingOrder : Qt::DescendingOrder, layout, filter});
+    } else {
+        configs = {{TransactionTableModel::Status, Qt::AscendingOrder, false}, {TransactionTableModel::Status, Qt::DescendingOrder, false},
+                   {TransactionTableModel::Date, Qt::DescendingOrder, true}, {TransactionTableModel::Amount, Qt::AscendingOrder, false},
+                   {TransactionTableModel::Status, Qt::AscendingOrder, false, 1}, {TransactionTableModel::Date, Qt::DescendingOrder, false, 2}};
+    }
+    const int random_batches = rows <= 3000 ? 10 : 3;
+
+    for (size_t c = 0; c < configs.size(); ++c) {
+        const Config config = configs[c];
+        if (c >= 2) tester.reset();
+        proxy.setLayoutUpdates(config.layout);
+        apply_filter(proxy, config.filter);
+        proxy.sort(config.column, config.order);
+        settle();
+        std::vector<std::pair<QPersistentModelIndex, QString>> tracked;
+        for (int k = 0; k < 24 && proxy.rowCount() > 0; ++k) {
+            const QModelIndex index = proxy.index(static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount())), 0);
+            tracked.emplace_back(QPersistentModelIndex(index), index.data(TransactionTableModel::TxHashRole).toString());
+        }
+        std::set<QString> removed_total;
+        const auto step = [&](const QString& label, const std::function<void()>& action, bool expect_no_scan = false) {
+            const QString what = QStringLiteral("column %1 order %2 layout %3: %4").arg(config.column).arg(config.order).arg(config.layout).arg(label);
+            proxy.resetStats();
+            action();
+            settle();
+            if (expect_no_scan) QVERIFY2(proxy.stats().rebuilds == 0 && proxy.stats().rows_scanned == 0, qPrintable(what + QStringLiteral(": needed a scan")));
+            compare(config.column, config.order, config.filter, what);
+            for (const auto& [index, hash] : tracked) {
+                if (removed_total.count(hash)) continue;
+                if (config.filter != 0 && !index.isValid()) {
+                    // A row whose status changed may have left the filter; then it must be absent from the projection.
+                    for (int i = 0; i < proxy.rowCount(); ++i)
+                        QVERIFY2(proxy.index(i, 0).data(TransactionTableModel::TxHashRole).toString() != hash, qPrintable(what + QStringLiteral(": a row in the projection has an invalid persistent index")));
+                    removed_total.insert(hash); // it may re-enter later, with a new index; this one stays dead
+                    continue;
+                }
+                QVERIFY2(index.isValid() && index.data(TransactionTableModel::TxHashRole).toString() == hash,
+                         qPrintable(what + QStringLiteral(": a persistent index moved to another transaction")));
+            }
+        };
+        const auto remove_some = [&](size_t count) {
+            std::vector<uint256> victims;
+            for (size_t k = 0; k < count && live.size() > 100; ++k) {
+                const size_t at = random() % live.size();
+                victims.push_back(live[at]);
+                removed_total.insert(name_of(live[at]));
+                live[at] = live.back();
+                live.pop_back();
+            }
+            history->removeRecords(victims);
+        };
+        const auto add_some = [&](size_t count) {
+            QList<TransactionRecord> fresh = SyntheticHistory(next_first, count, static_cast<size_t>(rows));
+            next_first += count;
+            for (auto& record : fresh) {
+                reroll_new(record, random());
+                live.push_back(record.hash);
+            }
+            history->insertRecords(fresh);
+        };
+
+        // The reviewer's case: three unconfirmed rows on top (Status ascending), a block confirms the first two, which
+        // keep a key that is still above every confirmed row but below the third.
+        const std::vector<uint256> top(live.begin(), live.begin() + 3);
+        std::set<QString> u123{name_of(top[0]), name_of(top[1]), name_of(top[2])};
+        step(QStringLiteral("U1 U2 U3 unconfirmed"), [&] {
+            mutate(u123, [&](TransactionRecord& r) {
+                const int n = r.hash == top[0] ? 1 : (r.hash == top[1] ? 2 : 3);
+                r.status.status = TransactionStatus::Unconfirmed;
+                r.status.sortKey = key_for(r, n, 0);
+            });
+        });
+        step(QStringLiteral("block confirms U1 and U2"), [&] {
+            mutate(u123, [&](TransactionRecord& r) {
+                if (r.hash == top[2]) return;
+                r.status.status = TransactionStatus::Confirming;
+                r.status.sortKey = key_for(r, 4, r.hash == top[0] ? 0 : 1);
+            });
+        }, /*expect_no_scan=*/!config.layout);
+        // Clustered: a run of adjacent rows all change at once.
+        step(QStringLiteral("40 adjacent rows"), [&] {
+            const auto run = run_of(static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount() - 100)), 40);
+            const std::set<QString> chosen(run.begin(), run.end());
+            const uint64_t salt = random();
+            mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+        });
+        // A run whose members swap places: the first becomes the last.
+        step(QStringLiteral("25 adjacent rows reversed"), [&] {
+            const auto run = run_of(static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount() - 100)), 25);
+            std::map<QString, size_t> place;
+            for (size_t k = 0; k < run.size(); ++k) place[run[k]] = k;
+            mutate(std::set<QString>(run.begin(), run.end()), [&](TransactionRecord& r) {
+                const size_t k = place.at(name_of(r.hash));
+                const size_t m = run.size() - 1 - k;
+                r.status.sortKey = key_for(r, 10 + static_cast<int>(m), 0);
+                r.status.status = TransactionStatus::Confirmed;
+            });
+        });
+        // Several rows far apart take each other's place, so their targets interleave with their old positions.
+        step(QStringLiteral("8 rows rotate through each other's keys"), [&] {
+            const auto chosen = pick_live(8);
+            struct Saved { std::string key; TransactionStatus::Status status; };
+            std::vector<QString> order(chosen.begin(), chosen.end());
+            std::map<QString, Saved> saved;
+            mutate(chosen, [&](TransactionRecord& r) { saved[name_of(r.hash)] = {r.status.sortKey, r.status.status}; });
+            std::map<QString, QString> from;
+            for (size_t k = 0; k < order.size(); ++k) from[order[k]] = order[(k + 3) % order.size()];
+            mutate(chosen, [&](TransactionRecord& r) {
+                const Saved& s = saved.at(from.at(name_of(r.hash)));
+                r.status.sortKey = s.key;
+                r.status.status = s.status;
+            });
+        });
+        // Inserts, removals and changes of existing rows announced in the same flush.
+        step(QStringLiteral("insert, remove and change in one flush"), [&] {
+            add_some(20);
+            remove_some(5);
+            const auto chosen = pick_live(6);
+            const uint64_t salt = random();
+            mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+        });
+        // Large fractions of the table.
+        for (int percent : {10, 35, 70}) {
+            step(QStringLiteral("%1 percent of all rows").arg(percent), [&] {
+                std::set<QString> chosen;
+                for (const auto& hash : live) if (static_cast<int>(random() % 100) < percent) chosen.insert(name_of(hash));
+                const uint64_t salt = random();
+                mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+            });
+        }
+        for (int batch = 0; batch < random_batches; ++batch) {
+            step(QStringLiteral("random batch %1").arg(batch), [&] {
+                const uint64_t shape = random() % 4;
+                if (shape == 0) {
+                    const auto run = run_of(static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount() - 400)), 1 + static_cast<int>(random() % 300));
+                    const uint64_t salt = random();
+                    mutate(std::set<QString>(run.begin(), run.end()), [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+                } else if (shape == 1) {
+                    const auto chosen = pick_live(1 + random() % 10);
+                    const uint64_t salt = random();
+                    mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+                } else if (shape == 2) {
+                    add_some(1 + random() % 30);
+                    remove_some(random() % 20);
+                } else {
+                    std::set<QString> chosen;
+                    const int percent = 1 + static_cast<int>(random() % 50);
+                    for (const auto& hash : live) if (static_cast<int>(random() % 100) < percent) chosen.insert(name_of(hash));
+                    const uint64_t salt = random();
+                    mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+                }
+            });
+        }
+    }
+}
+
+//! A block on a large history that was never shown must not announce the table: only the rows one block can
+//! refresh (a fixed budget), and nothing at all reaches a dormant presentation proxy.
+void WalletTests::historyBlockAnnouncementBounded_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::newRow("5k") << 5000;
+    QTest::newRow("50k") << 50000;
+}
+
+void WalletTests::historyBlockAnnouncementBounded()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet measurement; set BLACKCOIN_QT_BENCH=1 to run");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-bounded", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    auto* history = gui.walletModel->getTransactionTableModel();
+
+    // As the application leaves a loaded history: a quarter of the rows were never refreshed (empty key), some confirm.
+    const QList<TransactionRecord> bulk = SyntheticHistory(0, static_cast<size_t>(rows), static_cast<size_t>(rows));
+    history->setInitialHistory(std::deque<TransactionRecord>(bulk.cbegin(), bulk.cend()));
+    QTRY_VERIFY_WITH_TIMEOUT(history->rowCount({}) == rows, 120000);
+    QVERIFY2(history->unsettledRows() >= static_cast<size_t>(rows / 5), "premise: many rows are unsettled");
+
+    // History is not shown: its projection exists, sorted by Date, but is dormant.
+    TransactionPresentationProxy proxy;
+    proxy.setSourceModel(history);
+    proxy.sort(TransactionTableModel::Date, Qt::DescendingOrder);
+    QTRY_VERIFY_WITH_TIMEOUT(proxy.isReady(), 120000);
+    proxy.setActive(false);
+
+    QSignalSpy source_changes(history, &QAbstractItemModel::dataChanged);
+    QSignalSpy proxy_changes(&proxy, &QAbstractItemModel::dataChanged);
+    const auto rows_announced = [](const QSignalSpy& spy) {
+        size_t total{0};
+        for (const auto& call : spy) total += static_cast<size_t>(call.at(1).toModelIndex().row() - call.at(0).toModelIndex().row() + 1);
+        return total;
+    };
+    constexpr int blocks = 5;
+    for (int block = 0; block < blocks; ++block) {
+        history->updateConfirmations();
+        QCoreApplication::processEvents();
+        QTest::qWait(30);
+    }
+    QVERIFY2(rows_announced(source_changes) <= blocks * TransactionTableModel::MaxRefreshPerBlock,
+             qPrintable(QStringLiteral("%1 rows announced by %2 blocks").arg(rows_announced(source_changes)).arg(blocks)));
+    QCOMPARE(rows_announced(proxy_changes), size_t{0});
+}
+
+void WalletTests::historyConfirmationNotStarved_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::newRow("3k") << 3000;
+    QTest::newRow("50k") << 50000;
+}
+
+//! More than a block's budget of rows never settle (conflicted) and many more were never read from the wallet, and one
+//! recent confirming transaction must still be re-evaluated and announced by every block, and a Status-sorted
+//! projection must equal a fresh rebuild after each block. Never-read rows are reached round-robin within the budget.
+void WalletTests::historyConfirmationNotStarved()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet measurement; set BLACKCOIN_QT_BENCH=1 to run");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-starved", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    auto* history = gui.walletModel->getTransactionTableModel();
+
+    const auto key_of = [](const TransactionRecord& record, int major) {
+        return strprintf("%010d-%01d-%010u-%03d-%d", major, 0, static_cast<unsigned>(record.time), record.idx, 3);
+    };
+    QList<TransactionRecord> bulk = SyntheticHistory(0, static_cast<size_t>(rows), static_cast<size_t>(rows));
+    uint256 target;
+    int target_index = rows / 2;
+    while (target_index % 5 == 0 || target_index % 3 == 1) ++target_index;
+    for (int k = 0; k < bulk.size(); ++k) {
+        TransactionRecord& record = bulk[k];
+        const unsigned char b0 = record.hash.begin()[0];
+        record.status.status = TransactionStatus::Confirmed;
+        record.status.sortKey = key_of(record, 5 + (b0 % 50));
+        if (k % 5 == 0) record.status.status = TransactionStatus::Conflicted;       // never settles
+        else if (k % 3 == 1) record.status.sortKey.clear();                         // never read from the wallet
+        if (k == target_index) {
+            target = record.hash;
+            record.status.status = TransactionStatus::Confirming;
+            record.status.depth = 1;
+            record.status.sortKey = key_of(record, 80);
+        }
+    }
+    history->setInitialHistory(std::deque<TransactionRecord>(bulk.cbegin(), bulk.cend()));
+    QTRY_VERIFY_WITH_TIMEOUT(history->rowCount({}) == rows, 60000);
+    QVERIFY2(history->activeRows() > TransactionTableModel::MaxRefreshPerBlock, "premise: more permanent rows than a block's budget");
+    const size_t unrefreshed_start = history->unsettledRows() - history->activeRows();
+    QVERIFY2(unrefreshed_start > 2 * TransactionTableModel::MaxRefreshPerBlock, "premise: many never-read rows");
+
+    // The wallet's answer: the target gains a confirmation per block and a lower key; a never-read row gets its key.
+    int block{0};
+    history->setRefreshHook([&](TransactionRecord& record) {
+        if (record.hash == target) {
+            record.status.status = TransactionStatus::Confirming;
+            record.status.depth = block + 1;
+            record.status.sortKey = key_of(record, 400 - 30 * block);
+        } else if (record.status.sortKey.empty()) {
+            record.status.status = TransactionStatus::Confirmed;
+            record.status.sortKey = key_of(record, 5 + (record.hash.begin()[0] % 50));
+        }
+    });
+    QSignalSpy changes(history, &QAbstractItemModel::dataChanged);
+    const auto target_row = [&] {
+        for (int r = 0; r < history->rowCount({}); ++r) {
+            if (history->index(r, 0).data(TransactionTableModel::TxHashRole).toString() == QString::fromStdString(target.ToString())) return r;
+        }
+        return -1;
+    };
+    const auto announced = [&](int row) {
+        for (const auto& call : changes) {
+            if (call.at(0).toModelIndex().row() <= row && row <= call.at(1).toModelIndex().row()) return true;
+        }
+        return false;
+    };
+    const auto one_block = [&](const QString& what) {
+        ++block;
+        changes.clear();
+        history->updateConfirmations();
+        QCoreApplication::processEvents();
+        const int row = target_row();
+        QVERIFY2(row >= 0, "target row vanished");
+        QVERIFY2(announced(row), qPrintable(what + QStringLiteral(": the confirming row was not announced by the block")));
+    };
+    // Part one: no projection exists, so nothing but the blocks reads the never-read rows.
+    const size_t blocks_to_read = (unrefreshed_start + TransactionTableModel::MaxRefreshPerBlock - 1) / TransactionTableModel::MaxRefreshPerBlock;
+    for (size_t b = 1; b <= blocks_to_read + 1; ++b) {
+        one_block(QStringLiteral("block %1").arg(b));
+        const size_t left = history->unsettledRows() - history->activeRows();
+        const size_t read_at_least = std::min(unrefreshed_start, b * TransactionTableModel::MaxRefreshPerBlock);
+        QVERIFY2(left <= unrefreshed_start - read_at_least, qPrintable(QStringLiteral("block %1 left %2 never-read rows").arg(b).arg(left)));
+    }
+    QCOMPARE(history->unsettledRows() - history->activeRows(), size_t{0});
+
+    // Part two: a Status-sorted projection follows the target's rising confirmations exactly.
+    TransactionPresentationProxy proxy;
+    proxy.setSortCaseSensitivity(Qt::CaseInsensitive);
+    proxy.setSourceModel(history);
+    proxy.sort(TransactionTableModel::Status, Qt::AscendingOrder);
+    const auto settle = [&] {
+        QCoreApplication::processEvents();
+        QTRY_VERIFY_WITH_TIMEOUT(proxy.isReady(), 60000);
+        QCoreApplication::processEvents();
+    };
+    settle();
+    for (int b = 0; b < 4; ++b) {
+        one_block(QStringLiteral("projected block %1").arg(b));
+        settle();
+        TransactionFilterProxy reference;
+        reference.setSortRole(Qt::EditRole);
+        reference.setSortCaseSensitivity(Qt::CaseInsensitive);
+        reference.setSourceModel(history);
+        reference.sort(TransactionTableModel::Status, Qt::AscendingOrder);
+        QCOMPARE(proxy.rowCount(), reference.rowCount());
+        for (int i = 0; i < proxy.rowCount(); ++i) {
+            if (proxy.index(i, 0).data(TransactionTableModel::TxHashRole) != reference.index(i, 0).data(TransactionTableModel::TxHashRole))
+                QFAIL(qPrintable(QStringLiteral("block %1: row %2 differs from a fresh rebuild").arg(b).arg(i)));
+        }
+    }
+    history->setRefreshHook({});
 }

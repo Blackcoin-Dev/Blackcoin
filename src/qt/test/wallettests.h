@@ -34,6 +34,14 @@ private Q_SLOTS:
     void historyScaleBenchmark_data();
     void historyScaleBenchmark();
     void historyInitialLoad();
+    void historyIncrementalUpdates_data();
+    void historyIncrementalUpdates();
+    void historyOrderOracle_data();
+    void historyOrderOracle();
+    void historyBlockAnnouncementBounded_data();
+    void historyBlockAnnouncementBounded();
+    void historyConfirmationNotStarved_data();
+    void historyConfirmationNotStarved();
 };
 
 #endif // BITCOIN_QT_TEST_WALLETTESTS_H

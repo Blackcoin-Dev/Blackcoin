@@ -10,6 +10,8 @@
 #include <uint256.h>
 
 #include <QAbstractTableModel>
+#include <QHash>
+#include <QIcon>
 #include <QStringList>
 
 #include <deque>
@@ -96,13 +98,23 @@ public:
      *  placed in hash order with fresh GUI identities. Used by tests that cannot create tens of thousands of wallet
      *  transactions; production code reaches the same insertion through wallet notifications. */
     void insertRecords(QList<TransactionRecord> records);
+    /** Remove every record of the given transactions, as a wallet deletion notification does (tests only). */
+    void removeRecords(const std::vector<uint256>& hashes);
     /** Change every record in place and announce it as a block's status refresh does (tests only). */
+    void setRefreshHook(std::function<void(TransactionRecord&)> hook);
     void mutateRecords(const std::function<void(TransactionRecord&)>& mutate);
+    /** Rows whose status can still change on the next block (not yet confirmed to the final depth). */
+    size_t unsettledRows() const;
+    //! Rows read from the wallet before and not settled: every block re-evaluates all of them.
+    size_t activeRows() const;
+    //! Most never-read rows that one block reads from the wallet (round-robin); active rows have no budget.
+    static constexpr size_t MaxRefreshPerBlock = 256;
     void reportHistoryLoadFailure();
     QModelIndexList indexesForTransaction(const uint256& hash) const;
     TransactionRowIdentity transactionIdentity(int row) const override;
     int transactionRow(const TransactionRowIdentity& identity) const override;
     bool transactionScanRow(int row, int column, TransactionScanRow& out) const override;
+    bool transactionScanRowById(const TransactionRowIdentity& identity, int column, TransactionScanRow& out) const override;
     bool transactionMatchesText(int row, const QString& needle, bool& supported) const override;
     bool transactionData(const TransactionRowIdentity& identity, int column, int role, QVariant& out) const override;
 
@@ -122,6 +134,9 @@ private:
     void unsubscribeFromCoreSignals();
 
     QVariant dataFor(TransactionRecord* rec, int column, int role) const;
+    bool fillScanRow(TransactionRecord* rec, int column, TransactionScanRow& out) const;
+    int rowOfRecord(const TransactionRecord& record) const;
+    void announceRows(const std::vector<int>& rows);
     QString lookupAddress(const TransactionRecord& record, bool tooltip) const;
     QVariant addressColor(const TransactionRecord *wtx) const;
     QString formatTxStatus(const TransactionRecord *wtx) const;
@@ -132,6 +147,9 @@ private:
     QString formatTxToAddress(const TransactionRecord *wtx, bool tooltip) const;
     QString formatTxAmount(const TransactionRecord *wtx, bool showUnconfirmed=true, BitcoinUnits::SeparatorStyle separators=BitcoinUnits::SeparatorStyle::STANDARD) const;
     QString formatTooltip(const TransactionRecord *rec) const;
+    static QString statusIconPath(const TransactionRecord *wtx);
+    static QString addressIconPath(const TransactionRecord *wtx);
+    mutable QHash<QString, QIcon> m_recolored_icons;
     QVariant txStatusDecoration(const TransactionRecord *wtx) const;
     QVariant txWatchonlyDecoration(const TransactionRecord *wtx) const;
     QVariant txAddressDecoration(const TransactionRecord *wtx) const;

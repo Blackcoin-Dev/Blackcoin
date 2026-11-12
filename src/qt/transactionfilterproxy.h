@@ -18,6 +18,7 @@
 #include <deque>
 #include <algorithm>
 #include <map>
+#include <unordered_map>
 #include <QHash>
 #include <QSortFilterProxyModel>
 
@@ -158,7 +159,7 @@ public:
     Q_ENUM(DiagnosticChange)
     void setSourceModel(QAbstractItemModel* source) override;
     void setActive(bool active);
-    bool isReady() const { return m_ready && !m_restart; }
+    bool isReady() const { return m_ready && !m_restart && m_pending_inserts.empty() && m_pending_updates.empty(); }
     /** Work counters for tests and diagnostics; they do not influence behaviour. */
     struct Stats {
         uint64_t rebuilds{0};       //!< complete scans started
@@ -166,11 +167,17 @@ public:
         uint64_t slices{0};
         uint64_t rows_scanned{0};
         int64_t max_slice_ns{0};
+        int64_t incremental_ns{0};       //!< time spent applying those batches
+        uint64_t incremental_batches{0}; //!< insert/remove/update batches applied without a scan
         int64_t persistent_indexes{0}; //!< most persistent indexes remapped by one layout change
         int64_t max_layout_ns[3]{}; //!< longest about-to-change signal, persistent-index remap, layout-changed signal
         int64_t max_op_ns[9]{};     //!< longest single operation per phase (SCAN, SORT, MAP, ..., RETIRE)
     };
     const Stats& stats() const { return m_stats; }
+    /** Applies incremental row changes as one layout change instead of row insert/remove signals. The default follows
+     *  QAccessible::isActive(); tests force either way. */
+    void setLayoutUpdates(std::optional<bool> forced) { m_layout_updates = forced; }
+    size_t persistentIndexCount() const { return static_cast<size_t>(persistentIndexList().size()); }
     void resetStats() { m_stats = {}; }
     bool isActive() const { return m_active; }
     void sort(int column, Qt::SortOrder order = Qt::AscendingOrder) override;
@@ -193,6 +200,9 @@ public:
     void setSortCaseSensitivity(Qt::CaseSensitivity value);
     std::unique_ptr<TransactionFilterProxy> makeExportModel() const;
 Q_SIGNALS:
+    /** Emitted before the proxy applies a batch of row changes as one layout change. Lets the page drop an attached
+     *  accessibility client's per-cell state first, so it is not remapped index by index only to be discarded. */
+    void structureAboutToChange();
     void projectionReady();
     void projectionStarted();
     /** Observer-only invalidation. Internal RETIRE continuation keeps this epoch. */
@@ -229,9 +239,53 @@ private:
     void watchDormant();
     bool restoreStash();
     void discardStash();
-    bool dependencyChange(const QVector<int>& roles) const;
+    bool dependencyChange(const QVector<int>& roles, bool tie_sensitive = true) const;
+
+    // Incremental maintenance of a complete, unlimited or top-K projection: rows that arrive, leave or change are
+    // placed by binary search over the sorted rows and announced with row insert/remove/move signals, so the view and
+    // an attached accessibility client are not asked to relayout the whole table for each block.
+    struct KeyedRow {
+        TransactionRowIdentity identity;
+        qint64 number{0};
+        QString text;
+    };
+    struct CapturedRemoval { KeyedRow row; bool in_projection{false}; };
+    std::vector<TransactionRowIdentity> m_pending_inserts;
+    std::vector<CapturedRemoval> m_captured_removals;
+    bool m_removals_captured{false};
+    bool m_flush_scheduled{false};
+    bool incrementalReady() const;
+    bool keyLess(const KeyedRow& x, const KeyedRow& y) const;
+    bool rowPrecedes(const KeyedRow& a, const KeyedRow& b) const;
+    KeyedRow keyedFrom(const TransactionScanRow& scan) const;
+    bool existingKey(const TransactionRowIdentity& identity, KeyedRow& out) const;
+    int lowerBoundPosition(const KeyedRow& item, int skip, bool& ok) const;
+    int lowerBoundPosition(const KeyedRow& item, const std::vector<int>& skip, bool& ok) const;
+    static int realPosition(int virtual_index, const std::vector<int>& skip);
+    std::vector<int> positionsOf(const std::vector<TransactionRowIdentity>& identities) const;
+    void ensureReverse() const;
+    void scheduleInsertFlush();
+    void flushInserts();
+    bool flushNewRows(const std::vector<TransactionRowIdentity>& identities);
+    bool insertKeyed(std::vector<KeyedRow> items);
+    bool captureRemovals(int first, int last);
+    bool applyRemovals();
+    bool applyUpdates(const std::vector<TransactionRowIdentity>& identities, int first_column, int last_column, const QVector<int>& roles);
+    void forwardDataChanged(const std::vector<TransactionRowIdentity>& identities, int first_column, int last_column, const QVector<int>& roles);
+    void removeRuns(const std::vector<int>& rows);
+    void emitChangedRows(const std::vector<int>& positions, int first_column, int last_column, const QVector<int>& roles);
+    // Source dataChanged notifications of one block, merged until the flush timer fires.
+    std::vector<TransactionRowIdentity> m_pending_updates;
+    QVector<int> m_pending_roles;
+    int m_pending_first_column{0}, m_pending_last_column{0};
+    bool m_pending_dependency{false};
+    std::unordered_map<uint64_t, const KeyedRow*> m_removal_lookup;
     Rows m_rows, m_next_rows;
-    Reverse m_reverse, m_next_reverse;
+    mutable Reverse m_reverse;
+    Reverse m_next_reverse;
+    mutable bool m_reverse_valid{true};
+    std::optional<bool> m_layout_updates;
+    bool layoutUpdates() const;
     std::deque<Rows> m_retired_rows;
     std::deque<Reverse> m_retired_maps;
     std::vector<int> m_survivors, m_removed, m_added, m_reordered, m_old_to_reordered;

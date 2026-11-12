@@ -50,6 +50,8 @@ public:
     virtual int transactionRow(const TransactionRowIdentity& identity) const = 0;
     /** Fill `out` for `row` with the sort key of `column`. False if unsupported. */
     virtual bool transactionScanRow(int row, int column, TransactionScanRow& out) const { Q_UNUSED(row) Q_UNUSED(column) Q_UNUSED(out) return false; }
+    /** The same by identity, for rows the caller already holds; false if the row is gone. */
+    virtual bool transactionScanRowById(const TransactionRowIdentity& identity, int column, TransactionScanRow& out) const { Q_UNUSED(identity) Q_UNUSED(column) Q_UNUSED(out) return false; }
     /** The case-insensitive search the filter applies to address, hash and label. */
     virtual bool transactionMatchesText(int row, const QString& needle, bool& supported) const { Q_UNUSED(row) Q_UNUSED(needle) supported = false; return false; }
     /** Display data by identity without resolving a source row. False if unsupported or the row is gone. */

@@ -34,6 +34,7 @@
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <util/ui_change_type.h>
+#include <wallet/block_connect_activity.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
 #include <wallet/fees.h>
@@ -2824,6 +2825,12 @@ public:
     bool tryGetDisplayBalances(WalletDisplayBalances& result,
         const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family) override
     {
+        // The scan below is O(wallet outputs) with chainstate lookups and holds
+        // cs_main. While the validation scheduler is dispatching a block to the
+        // loaded wallets, taking cs_main here makes the scheduler wait at the
+        // start of every following wallet (L15). Yield; the caller polls again.
+        // A deferral is bounded (BlockConnectActivity::MAX_DEFER_MS).
+        if (BlockConnectActivity::Global().ShouldDefer(BlockConnectActivity::NowMs())) return false;
         TRY_LOCK(::cs_main, locked_main);
         if (!locked_main) return false;
         TRY_LOCK(m_wallet->cs_wallet, locked_wallet);

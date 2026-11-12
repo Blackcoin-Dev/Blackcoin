@@ -179,6 +179,7 @@ BITCOIN_TESTS =\
   test/validation_chainstate_tests.cpp \
   test/validation_chainstatemanager_tests.cpp \
   test/validation_flush_tests.cpp \
+  test/validation_stall_tests.cpp \
   test/validation_tests.cpp \
   test/validationinterface_tests.cpp \
   test/v2_block_time_tests.cpp \
@@ -190,6 +191,7 @@ BITCOIN_TESTS += \
   test/quantum_redelegation_tests.cpp \
   wallet/test/psbt_wallet_tests.cpp \
   wallet/test/spend_tests.cpp \
+  wallet/test/block_connect_activity_tests.cpp \
   wallet/test/wallet_tests.cpp \
   wallet/test/walletdb_tests.cpp \
   wallet/test/wallet_crypto_tests.cpp \

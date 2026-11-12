@@ -49,6 +49,8 @@ using wallet::CRecipient;
 using wallet::DEFAULT_DISABLE_WALLET;
 
 static constexpr int POLL_SYNC_SKIP{30};
+//! Refresh interval for a wallet model that is not the one shown (L15).
+static constexpr std::chrono::seconds BACKGROUND_POLL_INTERVAL{60};
 
 class WalletWorker : public QObject
 {
@@ -111,6 +113,14 @@ void WalletModel::startPollBalance()
     timer->start(MODEL_UPDATE_DELAY);
     pollBalanceChanged();
     requestInitialHistory();
+}
+
+void WalletModel::setBalancePollForeground(bool foreground)
+{
+    if (m_poll_foreground == foreground) return;
+    m_poll_foreground = foreground;
+    // Showing a wallet refreshes it now instead of waiting for the next tick.
+    if (foreground && m_balance_poll_started) pollBalanceChanged();
 }
 
 void WalletModel::requestInitialHistory()
@@ -222,6 +232,12 @@ void WalletModel::pollBalanceChanged()
         m_balance_poll_pending = true;
         return;
     }
+    // A model that is not shown keeps its last snapshot and refreshes slowly.
+    // The first snapshot and an active send-balance request are never gated.
+    if (!m_poll_foreground && m_applied_balance_generation != 0 && !m_requested_send_family &&
+        std::chrono::steady_clock::now() - m_last_balance_result < BACKGROUND_POLL_INTERVAL) {
+        return;
+    }
 
     m_balance_poll_in_flight = true;
     const uint64_t generation = m_balance_generation;
@@ -270,6 +286,7 @@ void WalletModel::pollBalanceChanged()
                 const bool tip_changed = snapshot.block_hash != m_cached_last_update_tip;
                 const bool wallet_changed = generation != m_applied_balance_generation;
                 m_applied_balance_generation = generation;
+                m_last_balance_result = std::chrono::steady_clock::now();
                 m_cached_last_update_tip = snapshot.block_hash;
                 const bool send_current = family && family == m_requested_send_family && send_generation == m_send_request_generation;
                 const bool send_changed = send_current &&

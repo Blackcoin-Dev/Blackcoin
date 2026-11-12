@@ -27,6 +27,8 @@
 #include <string>
 #include <vector>
 
+#include <chrono>
+
 #include <QObject>
 #include <QThread>
 
@@ -450,6 +452,10 @@ private:
     bool m_balance_retry_scheduled{false};
     bool m_balance_failure_reported{false};
     void invalidateBalanceSnapshot();
+    //! Only the wallet shown in the main window polls at full rate (L15). Others
+    //! refresh at most every BACKGROUND_POLL_INTERVAL, and at once when shown.
+    bool m_poll_foreground{true};
+    std::chrono::steady_clock::time_point m_last_balance_result{};
     std::optional<interfaces::WalletDisplayCoinFamily> m_requested_send_family;
     uint64_t m_send_request_generation{0};
     std::optional<interfaces::WalletDisplayCoinFamily> m_cached_send_family;
@@ -570,6 +576,9 @@ Q_SIGNALS:
 public Q_SLOTS:
     /* Starts a timer to periodically update the balance */
     void startPollBalance();
+
+    /* Mark this model as the one the user is looking at (L15). */
+    void setBalancePollForeground(bool foreground);
 
     /* Wallet status might have changed */
     void updateStatus();

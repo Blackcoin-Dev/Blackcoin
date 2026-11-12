@@ -352,6 +352,7 @@ BITCOIN_CORE_H = \
   util/vector.h \
   validation.h \
   validationinterface.h \
+  validation_stall.h \
   version.h \
   versionbits.h \
   wallet/bdb.h \
@@ -388,6 +389,7 @@ BITCOIN_CORE_H = \
   wallet/walletdb.h \
   wallet/wallettool.h \
   wallet/walletutil.h \
+  wallet/block_connect_activity.h \
   walletinitinterface.h \
   warnings.h \
   zmq/zmqabstractnotifier.h \

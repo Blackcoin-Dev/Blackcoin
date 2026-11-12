@@ -50,6 +50,7 @@
 #include <util/strencodings.h>
 #include <util/trace.h>
 #include <validation.h>
+#include <validation_stall.h>
 
 #include <algorithm>
 #include <atomic>
@@ -852,6 +853,16 @@ private:
     enum class HeaderProcessingResult { ACCEPTED, FAILED, RESOURCE_EXHAUSTED };
     HeaderProcessingResult ProcessNetBlockHeaders(CNode& node, const std::vector<CBlockHeader>& block, bool min_pow_checked, BlockValidationState& state, bool old_client, const CBlockIndex** ppindex=nullptr);
     bool ProcessNetBlock(const std::shared_ptr<const CBlock> pblock, bool force_processing, bool min_pow_checked, bool* new_block, CNode& node);
+
+    /**
+     * ProcessNewBlock ran on the message handler thread from stall_start to
+     * stall_end (for example parked on the validation-interface queue, L15).
+     * No peer could deliver anything meanwhile, so move the block-download
+     * clocks of every peer forward by the overlap. A peer that is silent for
+     * its own full budget is still disconnected.
+     */
+    void ExcuseValidationStall(std::chrono::microseconds stall_start, std::chrono::microseconds stall_end)
+        EXCLUSIVE_LOCKS_REQUIRED(!cs_main);
 
     CNodeHeaders* ServiceHeaders(const CNode& node) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
@@ -1797,10 +1808,27 @@ bool PeerManagerImpl::ProcessNetBlock(const std::shared_ptr<const CBlock> pblock
         }
     }
 
-    if (!m_chainman.ProcessNewBlock(pblock_const, force_processing, min_pow_checked, new_block))
+    const auto process_start = GetTime<std::chrono::microseconds>();
+    const bool processed = m_chainman.ProcessNewBlock(pblock_const, force_processing, min_pow_checked, new_block);
+    ExcuseValidationStall(process_start, GetTime<std::chrono::microseconds>());
+    if (!processed)
         return error("%s: ProcessNewBlock FAILED", __func__);
 
     return true;
+}
+
+void PeerManagerImpl::ExcuseValidationStall(std::chrono::microseconds stall_start, std::chrono::microseconds stall_end)
+{
+    if (stall_end - stall_start < validation_stall::MIN_EXCUSED_STALL) return;
+    LOCK(cs_main);
+    for (auto& [node_id, state] : m_node_states) {
+        if (!state.vBlocksInFlight.empty()) {
+            state.m_downloading_since += validation_stall::ShiftForStall(state.m_downloading_since, stall_start, stall_end);
+        }
+        if (state.m_stalling_since.count()) {
+            state.m_stalling_since += validation_stall::ShiftForStall(state.m_stalling_since, stall_start, stall_end);
+        }
+    }
 }
 
 void PeerManagerImpl::AddTxAnnouncement(const CNode& node, const GenTxid& gtxid, std::chrono::microseconds current_time)

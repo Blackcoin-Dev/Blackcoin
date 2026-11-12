@@ -84,6 +84,8 @@ bool WalletFrame::addView(WalletView* walletView)
 
     walletStack->addWidget(walletView);
     mapWalletViews[walletView->getWalletModel()] = walletView;
+    // Only the wallet that is shown polls its balance at full rate (L15).
+    walletView->getWalletModel()->setBalancePollForeground(currentWalletView() == walletView);
 
     return true;
 }
@@ -110,6 +112,10 @@ void WalletFrame::setCurrentWallet(WalletModel* wallet_model)
     walletView->updateGeometry();
 
     walletStack->setCurrentWidget(walletView);
+
+    for (auto i = mapWalletViews.constBegin(); i != mapWalletViews.constEnd(); ++i) {
+        i.key()->setBalancePollForeground(i.key() == wallet_model);
+    }
 
     Q_EMIT currentWalletSet();
 }

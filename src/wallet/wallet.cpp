@@ -6,6 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/wallet.h>
+#include <wallet/block_connect_activity.h>
 #include <wallet/claim_maintenance.h>
 #include <wallet/pow_mining_duty_cycle.h>
 
@@ -795,16 +796,41 @@ static bool IsQuantumProtectedSpendAllowedOutput(const CTransaction& tx, unsigne
     return IsQuantumProtectedScript(txout.scriptPubKey);
 }
 
+// The payouts of a block are a pure function of that block's authenticated
+// claim markers, not of any wallet. The validation scheduler calls every loaded
+// wallet for each block, so remember the last non-empty result by block hash
+// and take cs_main once per block instead of once per wallet (L15). An empty
+// result is never cached: it can be a transient absence of markers.
+static Mutex g_shadow_payout_cache_mutex;
+static uint256 g_shadow_payout_cache_hash GUARDED_BY(g_shadow_payout_cache_mutex);
+static std::vector<ShadowSyntheticPayoutTransaction> g_shadow_payout_cache GUARDED_BY(g_shadow_payout_cache_mutex);
+
 static std::vector<ShadowSyntheticPayoutTransaction> GetWalletShadowPayoutTransactions(CWallet& wallet, const interfaces::BlockInfo& block)
 {
     AssertLockNotHeld(wallet.cs_wallet);
     if (!block.data) return {};
-    LOCK(cs_main);
-    return GetAppliedShadowClaimPayoutTransactionRecords(
-        wallet.chain().getCoinsTip(),
-        block.height,
-        block.hash,
-        block.data->GetBlockTime());
+    {
+        LOCK(g_shadow_payout_cache_mutex);
+        if (!g_shadow_payout_cache.empty() && g_shadow_payout_cache_hash == block.hash) {
+            return g_shadow_payout_cache;
+        }
+    }
+    // The cache mutex is not held while taking cs_main: no lock-order edge.
+    std::vector<ShadowSyntheticPayoutTransaction> payouts;
+    {
+        LOCK(cs_main);
+        payouts = GetAppliedShadowClaimPayoutTransactionRecords(
+            wallet.chain().getCoinsTip(),
+            block.height,
+            block.hash,
+            block.data->GetBlockTime());
+    }
+    if (!payouts.empty()) {
+        LOCK(g_shadow_payout_cache_mutex);
+        g_shadow_payout_cache_hash = block.hash;
+        g_shadow_payout_cache = payouts;
+    }
+    return payouts;
 }
 
 static void AnnotateWalletShadowPayout(CWallet& wallet, const ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch)
@@ -3095,6 +3121,8 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         return;
     }
     assert(block.data);
+    // Tell the GUI balance poll that block dispatch is in progress (L15).
+    const BlockConnectActivityScope block_connect_activity;
     const WalletBlockTime block_time{block.data->GetBlockTime(), block.chain_time_max};
     const std::vector<ShadowSyntheticPayoutTransaction> shadow_payout_txs = GetWalletShadowPayoutTransactions(*this, block);
     std::set<COutPoint> authenticated_shadow_payouts;
@@ -3182,6 +3210,7 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
 void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
 {
     assert(block.data);
+    const BlockConnectActivityScope block_connect_activity;
     {
     LOCK(cs_wallet);
 

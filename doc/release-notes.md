@@ -1,4 +1,4 @@
-30.1.5.3rc5 DEVELOPMENT Candidate Notes
+30.1.5.3rc6 DEVELOPMENT Candidate Notes
 ======================================
 
 This development candidate adds macOS window restoration, incremental history
@@ -6,7 +6,7 @@ and Account rendering, cancellable wallet preparation and asynchronous UI worker
 shutdown. It retains the earlier QQ peer discovery, header replay tracking,
 mining-control, block-template and UTXO scan changes. Consensus and storage
 formats are unchanged. RC5 UI and local soak qualification remain pending.
-The source is RC5 with `CLIENT_VERSION_IS_RELEASE=false`; final release
+The source is RC6 with `CLIENT_VERSION_IS_RELEASE=false`; final release
 qualification is pending. See
 `doc/release-notes/release-notes-30.1.5.3.md` for configuration changes,
 compatibility, and the measured synthetic template-assembly benchmark.

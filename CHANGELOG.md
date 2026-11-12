@@ -1,6 +1,6 @@
 # Changelog
 
-## v30.1.5.3rc5 (DEVELOPMENT, unreleased candidate)
+## v30.1.5.3rc6 (DEVELOPMENT, unreleased candidate)
 
 - Bound GUI-thread work for wallet history, Account, Staking and Peers with
   workers and work slices. Pause display work on hidden and minimized pages,

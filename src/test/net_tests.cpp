@@ -2161,7 +2161,11 @@ BOOST_AUTO_TEST_CASE(pe_parse_invalid)
     BOOST_CHECK(Rejects(padded, "256"));
     BOOST_CHECK(Rejects(Json() + " trailing"));
     BOOST_CHECK(Rejects(Json() + "{}"));
-    BOOST_CHECK(Rejects(std::string("{\"schema\":\"blackcoin.public-endpoint/1\",\"address\":\"8.8.4.4\",\"port\":1,\"observed_at\":1794480000,\0}", 100), ""));
+    {
+        // The text holds a NUL byte, so take its length from the array.
+        static constexpr char with_nul[] = "{\"schema\":\"blackcoin.public-endpoint/1\",\"address\":\"8.8.4.4\",\"port\":1,\"observed_at\":1794480000,\0}";
+        BOOST_CHECK(Rejects(std::string(with_nul, sizeof(with_nul) - 1), ""));
+    }
     BOOST_CHECK(Rejects("\xff\xfe{}", "ASCII"));
     BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1,"observed_at":1794480000})" "\x01", "ASCII"));
     // exactly 256 bytes of valid content is accepted

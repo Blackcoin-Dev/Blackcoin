@@ -627,6 +627,7 @@ static RPCHelpMan getnetworkinfo()
                             {RPCResult::Type::BOOL, "listening", "The extra runtime listening socket is open"},
                             {RPCResult::Type::STR, "address", /*optional=*/true, "Advertised public address (only while active)"},
                             {RPCResult::Type::NUM, "port", /*optional=*/true, "Advertised public port (only while active)"},
+                            {RPCResult::Type::STR, "via", /*optional=*/true, "configured: an existing listener already serves the port; runtime: an extra socket was opened (only while active)"},
                             {RPCResult::Type::NUM, "age", /*optional=*/true, "Seconds since the file's observed_at (only while active)"},
                             {RPCResult::Type::STR, "status", "active, or why nothing is advertised"},
                         }},
@@ -719,6 +720,7 @@ static RPCHelpMan getnetworkinfo()
             if (pe.active) {
                 pe_obj.pushKV("address", pe.address);
                 pe_obj.pushKV("port", pe.port);
+                pe_obj.pushKV("via", pe.via);
                 pe_obj.pushKV("age", pe.age);
             }
             pe_obj.pushKV("status", pe.status);

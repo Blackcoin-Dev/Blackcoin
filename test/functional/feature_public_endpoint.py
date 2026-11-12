@@ -16,6 +16,7 @@ time still drives the poller's sleep.
 import json
 import os
 import socket
+import subprocess
 import time
 
 from test_framework.test_framework import BitcoinTestFramework
@@ -33,6 +34,13 @@ def port_open(port):
             return True
     except OSError:
         return False
+
+
+def listeners(pid, port):
+    """Number of listening TCP sockets of the process on this port (lsof)."""
+    out = subprocess.run(["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"],
+                         capture_output=True, text=True, timeout=30).stdout
+    return sum(1 for line in out.splitlines() if line.rstrip().endswith(f":{port} (LISTEN)") or f":{port} (LISTEN)" in line)
 
 
 class PublicEndpointTest(BitcoinTestFramework):
@@ -290,6 +298,65 @@ class PublicEndpointTest(BitcoinTestFramework):
         assert not port_open(f4)
         assert "Public endpoint" in self.dlog()
 
+        self.log.info("F equal to a port bound only on 127.0.0.1 is never treated as served by the configured listener")
+        now = self.now()
+        self.start_node(0, extra_args=["-debug=net", *self.base_args()])
+        node0.setmocktime(now)
+        assert_equal(listeners(node0.process.pid, p0), 1)
+        self.write(self.tuple_json(ADDR1, p0))
+        # Linux refuses the wildcard bind (withdrawn); BSD lets a wildcard socket share the port (runtime socket).
+        self.wait_until(lambda: self.pe() is not None and (self.pe()["active"] or "cannot listen" in self.pe()["status"]), timeout=30)
+        pe = self.pe()
+        assert pe.get("via") != "configured", pe
+        self.log.info("  outcome on this platform: %s", "runtime socket opened beside the 127.0.0.1 listener" if pe["active"] else "withdrawn, bind refused")
+        if pe["active"]:
+            assert_equal(pe["via"], "runtime")
+            assert_equal(listeners(node0.process.pid, p0), 2)
+        else:
+            assert_equal(self.local(), [])
+            assert_equal(listeners(node0.process.pid, p0), 1)
+
+        self.log.info("F equal to a configured any-address port: active with no extra socket")
+        self.restart0("-nobind", f"-bind=0.0.0.0:{p0}", *self.base_args())
+        # the datadir conf also binds 127.0.0.1, so count what is there before the feature acts
+        base = listeners(node0.process.pid, p0)
+        assert base >= 1
+        self.write(self.tuple_json(ADDR1, p0))
+        self.wait_active(ADDR1, p0)
+        pe = self.pe()
+        assert_equal((pe["active"], pe["listening"], pe["via"]), (True, True, "configured"))
+        assert_equal(self.local(), [(ADDR1, p0)])
+        assert_equal(listeners(node0.process.pid, p0), base)
+        assert "served by the configured listener on port %d" % p0 in self.dlog()
+        node1.addnode(f"127.0.0.1:{p0}", "onetry")
+        self.wait_until(lambda: any(p["inbound"] and p["addrbind"] == f"127.0.0.1:{p0}" for p in node0.getpeerinfo()))
+        assert_equal(listeners(node0.process.pid, p0), base)
+
+        self.log.info("Moving away opens a runtime socket and keeps the configured one")
+        self.write(self.tuple_json(ADDR1, f4))
+        self.wait_active(ADDR1, f4)
+        assert_equal(self.pe()["via"], "runtime")
+        assert_equal(listeners(node0.process.pid, f4), 1)
+        assert_equal(listeners(node0.process.pid, p0), base)
+        assert port_open(p0)
+
+        self.log.info("Moving back onto the configured port closes the runtime socket and keeps the configured one")
+        self.write(self.tuple_json(ADDR1, p0))
+        self.wait_active(ADDR1, p0)
+        assert_equal(self.pe()["via"], "configured")
+        self.wait_until(lambda: listeners(node0.process.pid, f4) == 0, timeout=10)
+        assert_equal(listeners(node0.process.pid, p0), base)
+        assert port_open(p0)
+        assert not port_open(f4)
+        assert any(p["inbound"] for p in node0.getpeerinfo()), "peers stay connected"
+
+        self.log.info("Withdrawing on the configured port never closes the configured socket")
+        os.remove(self.datadir_path)
+        self.assert_withdrawn("file not found", [])
+        assert port_open(p0)
+        assert_equal(listeners(node0.process.pid, p0), base)
+
+        self.stop_node(0)
         self.log.info("Inert with -listen=0 and with an IPv4 proxy")
         self.start_node(0, extra_args=["-debug=net", "-nobind", "-listen=0", *self.base_args()])
         node0.setmocktime(t0)

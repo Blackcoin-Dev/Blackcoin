@@ -2373,6 +2373,13 @@ BOOST_AUTO_TEST_CASE(pe_state_generation_and_retry)
     BOOST_CHECK_EQUAL(publicendpoint::GetInfo().status, "active");
     BOOST_CHECK_EQUAL(publicendpoint::GetInfo().address, "8.8.4.4");
     BOOST_CHECK_EQUAL(publicendpoint::GetInfo().port, 5000);
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().via, "runtime");
+    publicendpoint::Activate(pair, 116, /*via_configured_listener=*/true);
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().via, "configured");
+    BOOST_CHECK_EQUAL(publicendpoint::ChangeSeq(), seq0 + 1); // same pair, no re-announcement
+    publicendpoint::Withdraw("x");
+    BOOST_CHECK(publicendpoint::GetInfo().via.empty());
+    publicendpoint::Activate(pair, 117);
 
     // withdrawal request from the poller
     publicendpoint::Tracker::Decision gone;

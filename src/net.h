@@ -235,6 +235,7 @@ struct Info {
     bool listening{false};
     std::string address;
     uint16_t port{0};
+    std::string via; //!< "configured" (an existing listener serves the port) or "runtime" (extra socket), empty when inactive
     int64_t observed_at{0};
     int64_t age{0};
     std::string status;
@@ -249,7 +250,7 @@ void Submit(const Tracker::Decision& decision);
 //! Socket handler: take new work if the generation moved past `applied_gen`.
 bool TakeWork(uint64_t& applied_gen, std::optional<CService>& wanted, int64_t& observed_at, std::string& status);
 //! Socket handler: record the result. Both bump nothing the poller reads except `active`.
-void Activate(const CService& pair, int64_t observed_at);
+void Activate(const CService& pair, int64_t observed_at, bool via_configured_listener = false);
 void Withdraw(const std::string& reason);
 std::optional<CService> Active();
 //! Incremented every time a (new) pair becomes active; the message handler compares per peer.
@@ -1434,12 +1435,15 @@ private:
     public:
         std::shared_ptr<Sock> sock;
         inline void AddSocketPermissionFlags(NetPermissionFlags& flags) const { NetPermissions::AddFlag(flags, m_permissions); }
-        ListenSocket(std::shared_ptr<Sock> sock_, NetPermissionFlags permissions_)
-            : sock{sock_}, m_permissions{permissions_}
+        ListenSocket(std::shared_ptr<Sock> sock_, NetPermissionFlags permissions_, CService bind_ = CService{})
+            : sock{sock_}, m_bind{std::move(bind_)}, m_permissions{permissions_}
         {
         }
+        //! The address this socket was actually bound to.
+        const CService& BindAddress() const { return m_bind; }
 
     private:
+        CService m_bind;
         NetPermissionFlags m_permissions;
     };
 
@@ -1454,6 +1458,8 @@ private:
     void ThreadPublicEndpoint();
     /** Socket handler thread only: apply the wanted public endpoint (open/close the runtime listener, AddLocal). */
     void ApplyPublicEndpoint();
+    /** Socket handler thread only: a configured listener already accepts IPv4 on every address at this port. */
+    bool ConfiguredListenerCoversIPv4(uint16_t port) const;
     bool Bind(const CService& addr, unsigned int flags, NetPermissionFlags permissions);
     bool InitBinds(const Options& options);
 

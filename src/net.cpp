@@ -356,6 +356,7 @@ struct State {
     std::string apply_error;          //!< latest bind or local-address failure of the socket handler
     uint64_t wanted_gen{0};           //!< bumped whenever work (change or retry) is due
     std::optional<CService> active;   //!< socket handler: bound, local address added, advertised
+    bool via_configured{false};       //!< active pair is served by a configured listener, no runtime socket
     int64_t active_observed_at{0};
     uint64_t change_seq{0};
 };
@@ -462,7 +463,8 @@ std::optional<std::string> ReadFile(const fs::path& datadir, const std::string& 
 #else
     std::error_code ec;
     const auto status = fs::symlink_status(path, ec);
-    if (ec || !fs::exists(status)) { reason = "file not found"; return std::nullopt; }
+    // fs::exists only takes a path; test the status we already have.
+    if (ec || !std::filesystem::exists(status)) { reason = "file not found"; return std::nullopt; }
     if (fs::is_symlink(status)) { reason = "file is a symbolic link"; return std::nullopt; }
     if (!fs::is_regular_file(status)) { reason = "not a regular file"; return std::nullopt; }
     const auto size = fs::file_size(path, ec);
@@ -558,9 +560,10 @@ bool TakeWork(uint64_t& applied_gen, std::optional<CService>& wanted, int64_t& o
     return true;
 }
 
-void Activate(const CService& pair, int64_t observed_at)
+void Activate(const CService& pair, int64_t observed_at, bool via_configured_listener)
 {
     LOCK(g_mutex);
+    g_state.via_configured = via_configured_listener;
     if (g_state.active != pair) ++g_state.change_seq;
     g_state.active = pair;
     g_state.active_observed_at = observed_at;
@@ -596,6 +599,7 @@ Info GetInfo()
     if (g_state.active) {
         info.address = g_state.active->ToStringAddr();
         info.port = g_state.active->GetPort();
+        info.via = g_state.via_configured ? "configured" : "runtime";
         info.observed_at = g_state.active_observed_at;
         info.age = std::max<int64_t>(0, GetTime() - g_state.active_observed_at);
     }
@@ -2515,12 +2519,15 @@ void CConnman::ApplyPublicEndpoint()
         withdraw(status.empty() ? "no usable tuple" : status);
         return;
     }
-    if (previous && *previous == *wanted && m_pe_listen_socket) return;
-
     const uint16_t port{wanted->GetPort()};
+    // A configured listener that already accepts IPv4 on every address at this port serves the pair:
+    // open nothing, and never close the configured socket.
+    const bool covered{ConfiguredListenerCoversIPv4(port)};
+    if (previous && *previous == *wanted && (covered ? !m_pe_listen_socket : m_pe_listen_socket != nullptr)) return;
+
     std::shared_ptr<Sock> new_sock;
-    const bool same_port{m_pe_listen_socket && m_pe_listen_port == port};
-    if (!same_port) {
+    const bool same_port{!covered && m_pe_listen_socket && m_pe_listen_port == port};
+    if (!covered && !same_port) {
         bilingual_str error;
         if (!BindListenSocket(CService{CNetAddr{in_addr{htonl(INADDR_ANY)}}, port}, error, new_sock, /*quiet=*/true)) {
             withdraw(strprintf("cannot listen on 0.0.0.0:%u (%s)", port, error.original));
@@ -2539,14 +2546,38 @@ void CConnman::ApplyPublicEndpoint()
         m_pe_last_logged_failure = reason;
         return;
     }
-    if (!same_port) {
-        m_pe_listen_socket = std::make_unique<ListenSocket>(std::move(new_sock), NetPermissionFlags::None);
+    if (covered) {
+        m_pe_listen_socket.reset(); // moving back onto a configured port closes the runtime socket
+        m_pe_listen_port = 0;
+    } else if (!same_port) {
+        m_pe_listen_socket = std::make_unique<ListenSocket>(std::move(new_sock), NetPermissionFlags::None,
+                                                            CService{CNetAddr{in_addr{htonl(INADDR_ANY)}}, port});
         m_pe_listen_port = port;
     }
-    publicendpoint::Activate(*wanted, observed_at);
+    publicendpoint::Activate(*wanted, observed_at, covered);
     m_pe_last_logged_failure.clear();
-    LogPrintf("Public endpoint now %s%s (listening on 0.0.0.0:%u)\n", wanted->ToStringAddrPort(),
-              previous ? strprintf(", was %s", previous->ToStringAddrPort()) : "", port);
+    const std::string served{covered ? strprintf("served by the configured listener on port %u", port) : strprintf("listening on 0.0.0.0:%u", port)};
+    LogPrintf("Public endpoint now %s%s (%s)\n", wanted->ToStringAddrPort(),
+              previous ? strprintf(", was %s", previous->ToStringAddrPort()) : "", served);
+}
+
+bool CConnman::ConfiguredListenerCoversIPv4(uint16_t port) const
+{
+    for (const ListenSocket& listener : vhListenSocket) {
+        const CService& bound{listener.BindAddress()};
+        if (bound.GetPort() != port) continue;
+        if (bound.IsIPv4()) {
+            if (bound.ToStringAddr() == "0.0.0.0") return true;
+        } else if (bound.IsIPv6() && bound.ToStringAddr() == "::") {
+            // [::] accepts IPv4 only when the socket is really dual-stack (IPV6_V6ONLY off).
+            int v6only{1};
+            socklen_t len{sizeof(v6only)};
+#ifdef IPV6_V6ONLY
+            if (listener.sock->GetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &len) == 0 && v6only == 0) return true;
+#endif
+        }
+    }
+    return false;
 }
 
 void CConnman::ThreadPublicEndpoint()
@@ -3607,7 +3638,7 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
 {
     std::shared_ptr<Sock> sock;
     if (!BindListenSocket(addrBind, strError, sock, /*quiet=*/false)) return false;
-    vhListenSocket.emplace_back(std::move(sock), permissions);
+    vhListenSocket.emplace_back(std::move(sock), permissions, addrBind);
     return true;
 }
 

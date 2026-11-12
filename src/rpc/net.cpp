@@ -621,6 +621,15 @@ static RPCHelpMan getnetworkinfo()
                         {RPCResult::Type::NUM, "connections_in", "the number of inbound connections"},
                         {RPCResult::Type::NUM, "connections_out", "the number of outbound connections"},
                         {RPCResult::Type::BOOL, "networkactive", "whether p2p networking is enabled"},
+                        {RPCResult::Type::OBJ, "publicendpoint", /*optional=*/true, "Runtime public endpoint (-publicendpointfile); present only when that option is on",
+                        {
+                            {RPCResult::Type::BOOL, "active", "A pair is bound, listening and advertised"},
+                            {RPCResult::Type::BOOL, "listening", "The extra runtime listening socket is open"},
+                            {RPCResult::Type::STR, "address", /*optional=*/true, "Advertised public address (only while active)"},
+                            {RPCResult::Type::NUM, "port", /*optional=*/true, "Advertised public port (only while active)"},
+                            {RPCResult::Type::NUM, "age", /*optional=*/true, "Seconds since the file's observed_at (only while active)"},
+                            {RPCResult::Type::STR, "status", "active, or why nothing is advertised"},
+                        }},
                         {RPCResult::Type::OBJ, "qqoutbound", "Current-chain QQ connection preference; not future-fork readiness",
                         {
                             {RPCResult::Type::NUM, "requested", "Requested preference, -1 means automatic half capacity"},
@@ -703,6 +712,18 @@ static RPCHelpMan getnetworkinfo()
         qq.pushKV("connect_failures", status.connect_failures);
         qq.pushKV("dns_rounds", status.dns_rounds);
         obj.pushKV("qqoutbound", std::move(qq));
+        if (const auto pe = publicendpoint::GetInfo(); pe.enabled) {
+            UniValue pe_obj(UniValue::VOBJ);
+            pe_obj.pushKV("active", pe.active);
+            pe_obj.pushKV("listening", pe.listening);
+            if (pe.active) {
+                pe_obj.pushKV("address", pe.address);
+                pe_obj.pushKV("port", pe.port);
+                pe_obj.pushKV("age", pe.age);
+            }
+            pe_obj.pushKV("status", pe.status);
+            obj.pushKV("publicendpoint", std::move(pe_obj));
+        }
         obj.pushKV("connections", node.connman->GetNodeCount(ConnectionDirection::Both));
         obj.pushKV("connections_in", node.connman->GetNodeCount(ConnectionDirection::In));
         obj.pushKV("connections_out", node.connman->GetNodeCount(ConnectionDirection::Out));

@@ -17,6 +17,7 @@
 #include <net_processing.h>
 #include <netaddress.h>
 #include <netbase.h>
+#include <net_https_seed.h>
 #include <netmessagemaker.h>
 #include <node/blockstorage.h>
 #include <serialize.h>
@@ -36,12 +37,17 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <fstream>
 #include <ios>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+
+#ifndef WIN32
+#include <sys/stat.h>
+#endif
 
 using namespace std::literals;
 
@@ -2065,6 +2071,373 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         auto ret = tester.Interact();
         BOOST_CHECK(!ret);
     }
+}
+
+// Runtime public endpoint (-publicendpointfile)
+
+namespace {
+std::string Json(const std::string& address = "8.8.4.4", const std::string& port = "44822", const std::string& observed = "1794480000")
+{
+    return "{\"schema\":\"blackcoin.public-endpoint/1\",\"address\":\"" + address + "\",\"port\":" + port + ",\"observed_at\":" + observed + "}";
+}
+bool Rejects(const std::string& text, const std::string& expect_reason_part = "")
+{
+    std::string reason;
+    const auto tuple = publicendpoint::Parse(text, reason);
+    if (tuple) return false;
+    return expect_reason_part.empty() || reason.find(expect_reason_part) != std::string::npos;
+}
+std::unique_ptr<CNode> MakePeer(const CService& peer_addr, ConnectionType type = ConnectionType::OUTBOUND_FULL_RELAY)
+{
+    return std::make_unique<CNode>(/*id=*/0, /*sock=*/nullptr, CAddress{peer_addr, NODE_NETWORK},
+                                   /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0, CAddress{},
+                                   /*pszDest=*/std::string{}, type, /*inbound_onion=*/false);
+}
+struct PublicEndpointReset {
+    PublicEndpointReset() { publicendpoint::Reset(); }
+    ~PublicEndpointReset() { publicendpoint::Reset(); }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(pe_parse_valid)
+{
+    std::string reason;
+    const auto tuple = publicendpoint::Parse(Json(), reason);
+    BOOST_REQUIRE_MESSAGE(tuple.has_value(), reason);
+    BOOST_CHECK_EQUAL(tuple->address.ToStringAddr(), "8.8.4.4");
+    BOOST_CHECK_EQUAL(tuple->port, 44822);
+    BOOST_CHECK_EQUAL(tuple->observed_at, 1794480000);
+    // key order, whitespace and a trailing newline are fine
+    BOOST_CHECK(publicendpoint::Parse("{ \"observed_at\": 1794480000,\n \"port\": 1, \"address\": \"8.8.4.4\", \"schema\": \"blackcoin.public-endpoint/1\" }\n", reason));
+    BOOST_CHECK(publicendpoint::Parse(Json("8.8.4.4", "65535"), reason));
+    BOOST_CHECK(publicendpoint::Parse(Json("8.8.4.4", "1"), reason));
+}
+
+BOOST_AUTO_TEST_CASE(pe_parse_invalid)
+{
+    BOOST_CHECK(Rejects("", "empty"));
+    BOOST_CHECK(Rejects("not json"));
+    BOOST_CHECK(Rejects("[]"));
+    BOOST_CHECK(Rejects("\"x\""));
+    BOOST_CHECK(Rejects("{}", "unexpected keys"));
+    // unknown schema or version
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/2","address":"8.8.4.4","port":1,"observed_at":1794480000})", "schema"));
+    BOOST_CHECK(Rejects(R"({"schema":1,"address":"8.8.4.4","port":1,"observed_at":1794480000})", "schema"));
+    // extra key, missing key, duplicate key
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1,"observed_at":1794480000,"x":1})", "unexpected keys"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1})", "unexpected keys"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1,"port":2})", "unexpected keys"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1})", "unexpected keys"));
+    // wrong types
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "\"44822\""), "wrong value type"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "44822", "\"1794480000\""), "wrong value type"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "true"), "wrong value type"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "null"), "wrong value type"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":4,"port":1,"observed_at":1794480000})", "wrong value type"));
+    // port forms and range
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "0")));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "65536"), "port"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "-1"), "port"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "44822.0"), "port"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "4.4822e4"), "port"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "099999")));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "123456"), "port"));
+    // observed_at forms
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "-5"), "observed_at"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "0"), "observed_at"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "1794480000.5"), "observed_at"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "1e9"), "observed_at"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "99999999999999999999"), "observed_at"));
+    // addresses: private, loopback, documentation, shared, multicast, IPv6, names, non-canonical
+    for (const std::string a : {"10.1.2.3", "127.0.0.1", "192.168.1.1", "172.16.0.1", "169.254.1.1", "100.64.0.1", "0.0.0.0",
+                                "203.0.113.7", "198.51.100.1", "224.0.0.1", "255.255.255.255", "2001:4860:4860::8888",
+                                "localhost", "example.com", "", " 8.8.4.4", "8.8.4.4 ", "08.8.4.4", "8.8.4.04", "8.8.4", "8.8.4.4.4",
+                                "0x8.8.4.4", "::ffff:8.8.4.4", "8.8.4.4:44822", "8.8.4.4/32", "8.8.4.4%eth0"}) {
+        BOOST_CHECK_MESSAGE(Rejects(Json(a), "address"), "address accepted: " + a);
+    }
+    // oversize and not plain text
+    std::string padded = Json();
+    padded.insert(padded.size() - 1, std::string(300, ' '));
+    BOOST_CHECK(Rejects(padded, "256"));
+    BOOST_CHECK(Rejects(Json() + " trailing"));
+    BOOST_CHECK(Rejects(Json() + "{}"));
+    BOOST_CHECK(Rejects(std::string("{\"schema\":\"blackcoin.public-endpoint/1\",\"address\":\"8.8.4.4\",\"port\":1,\"observed_at\":1794480000,\0}", 100), ""));
+    BOOST_CHECK(Rejects("\xff\xfe{}", "ASCII"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1,"observed_at":1794480000})" "\x01", "ASCII"));
+    // exactly 256 bytes of valid content is accepted
+    std::string exact = Json();
+    exact.insert(exact.size() - 1, std::string(256 - exact.size(), ' '));
+    BOOST_CHECK_EQUAL(exact.size(), 256U);
+    std::string reason;
+    BOOST_CHECK_MESSAGE(publicendpoint::Parse(exact, reason).has_value(), reason);
+    exact += " ";
+    BOOST_CHECK(Rejects(exact, "256"));
+}
+
+BOOST_AUTO_TEST_CASE(pe_file_names)
+{
+    BOOST_CHECK(publicendpoint::ValidFileName("public-endpoint.json"));
+    BOOST_CHECK(publicendpoint::ValidFileName(".hidden"));
+    for (const std::string n : {std::string{}, std::string{"."}, std::string{".."}, std::string{"a/b"}, std::string{"../x"}, std::string{"/abs"}, std::string{"a\\b"}, std::string{"x\n"}, std::string{"c:file"}, std::string("a\0b", 3), std::string(256, 'a')}) {
+        BOOST_CHECK_MESSAGE(!publicendpoint::ValidFileName(n), "name accepted: " + n);
+    }
+    std::string reason;
+    BOOST_CHECK(!publicendpoint::ReadFile(m_path_root, "../escape", reason));
+    BOOST_CHECK_EQUAL(reason, "invalid file name");
+}
+
+#ifndef WIN32
+BOOST_AUTO_TEST_CASE(pe_read_file)
+{
+    const fs::path dir{m_path_root / "pe_read"};
+    fs::create_directories(dir);
+    std::string reason;
+
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "missing.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file not found");
+
+    {
+        std::ofstream f{dir / "ok.json", std::ios::binary};
+        f << Json();
+    }
+    const auto content = publicendpoint::ReadFile(dir, "ok.json", reason);
+    BOOST_REQUIRE(content.has_value());
+    BOOST_CHECK_EQUAL(*content, Json());
+
+    // a symbolic link is never followed, whatever it points to
+    fs::create_symlink(dir / "ok.json", dir / "link.json");
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "link.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file is a symbolic link");
+    fs::create_symlink("/etc/hosts", dir / "link2.json");
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "link2.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file is a symbolic link");
+    fs::create_symlink(dir / "nowhere", dir / "dangling.json");
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "dangling.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file is a symbolic link");
+
+    // a directory and a fifo are not regular files (and reading a fifo does not block)
+    fs::create_directories(dir / "subdir.json");
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "subdir.json", reason));
+    BOOST_CHECK_EQUAL(reason, "not a regular file");
+    BOOST_REQUIRE_EQUAL(mkfifo((dir / "fifo.json").c_str(), 0600), 0);
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "fifo.json", reason));
+    BOOST_CHECK_EQUAL(reason, "not a regular file");
+
+    // oversize: 257 bytes is refused, 256 is read
+    {
+        std::ofstream f{dir / "big.json", std::ios::binary};
+        f << std::string(257, ' ');
+    }
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "big.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file larger than 256 bytes");
+    {
+        std::ofstream f{dir / "max.json", std::ios::binary};
+        f << std::string(256, ' ');
+    }
+    BOOST_CHECK(publicendpoint::ReadFile(dir, "max.json", reason).has_value());
+    {
+        std::ofstream f{dir / "huge.json", std::ios::binary};
+        f << std::string(100000, 'x');
+    }
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "huge.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file larger than 256 bytes");
+}
+#endif
+
+BOOST_AUTO_TEST_CASE(pe_tracker_two_reads)
+{
+    publicendpoint::Tracker tracker{180, {}};
+    const int64_t now{1794480000};
+    const auto read = [&](const std::string& addr, uint16_t port, int64_t observed) {
+        publicendpoint::Tuple t;
+        BOOST_REQUIRE(httpsseed::ParsePublicAddress(addr, t.address));
+        t.port = port;
+        t.observed_at = observed;
+        return t;
+    };
+    // first read: nothing yet
+    auto d = tracker.Observe(read("8.8.4.4", 5000, now), "", now);
+    BOOST_CHECK(!d.wanted);
+    // second identical read: applied (observed_at may differ, the pair is what must match)
+    d = tracker.Observe(read("8.8.4.4", 5000, now + 15), "", now + 15);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.wanted->ToStringAddrPort(), "8.8.4.4:5000");
+    BOOST_CHECK_EQUAL(d.observed_at, now + 15);
+    // refreshed read keeps it
+    d = tracker.Observe(read("8.8.4.4", 5000, now + 30), "", now + 30);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.observed_at, now + 30);
+    // a different pair: the old one stays until the new one is confirmed
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 45), "", now + 45);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.wanted->GetPort(), 5000);
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 60), "", now + 60);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.wanted->GetPort(), 6000);
+    // a flapping pair (A, B, A) never applies B and A needs two consecutive reads again
+    d = tracker.Observe(read("8.8.4.4", 7000, now + 75), "", now + 75);
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 90), "", now + 90);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.wanted->GetPort(), 6000);
+    // an unusable read withdraws at once and the next good pair needs two reads
+    d = tracker.Observe(std::nullopt, "file not found", now + 105);
+    BOOST_CHECK(!d.wanted);
+    BOOST_CHECK_EQUAL(d.status, "file not found");
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 120), "", now + 120);
+    BOOST_CHECK(!d.wanted);
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 135), "", now + 135);
+    BOOST_CHECK(d.wanted);
+    // a bad read between two good ones breaks the run
+    tracker.Observe(std::nullopt, "malformed", now + 150);
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 165), "", now + 165);
+    BOOST_CHECK(!d.wanted);
+}
+
+BOOST_AUTO_TEST_CASE(pe_tracker_age_future_ports)
+{
+    const int64_t now{1794480000};
+    publicendpoint::Tracker tracker{180, {8332, 8334}};
+    const auto read = [&](uint16_t port, int64_t observed) {
+        publicendpoint::Tuple t;
+        BOOST_REQUIRE(httpsseed::ParsePublicAddress("8.8.4.4", t.address));
+        t.port = port;
+        t.observed_at = observed;
+        return t;
+    };
+    // stale: older than the maximum age is refused, exactly the maximum age is fine
+    for (int i = 0; i < 2; ++i) BOOST_CHECK(!tracker.Observe(read(5000, now - 181), "", now).wanted);
+    tracker.Observe(read(5000, now - 180), "", now);
+    BOOST_CHECK(tracker.Observe(read(5000, now - 180), "", now).wanted);
+    // an applied pair goes stale: withdrawn on the first stale read
+    BOOST_CHECK(!tracker.Observe(read(5000, now - 180), "", now + 1).wanted);
+    // future: up to 60 s tolerated, beyond that refused
+    publicendpoint::Tracker t2{180, {}};
+    t2.Observe(read(5000, now + 60), "", now);
+    BOOST_CHECK(t2.Observe(read(5000, now + 60), "", now).wanted);
+    publicendpoint::Tracker t3{180, {}};
+    t3.Observe(read(5000, now + 61), "", now);
+    const auto future = t3.Observe(read(5000, now + 61), "", now);
+    BOOST_CHECK(!future.wanted);
+    BOOST_CHECK_EQUAL(future.status, "observed_at is in the future");
+    // reserved ports (RPC, onion target) are never a public pair
+    publicendpoint::Tracker t4{180, {8332, 8334}};
+    t4.Observe(read(8332, now), "", now);
+    BOOST_CHECK(!t4.Observe(read(8332, now), "", now).wanted);
+    t4.Observe(read(8334, now), "", now);
+    BOOST_CHECK(!t4.Observe(read(8334, now), "", now).wanted);
+    // a one-second maximum age
+    publicendpoint::Tracker t5{1, {}};
+    t5.Observe(read(5000, now - 1), "", now);
+    BOOST_CHECK(t5.Observe(read(5000, now - 1), "", now).wanted);
+    BOOST_CHECK(!t5.Observe(read(5000, now - 1), "", now + 1).wanted);
+}
+
+BOOST_AUTO_TEST_CASE(pe_state_generation_and_retry)
+{
+    PublicEndpointReset guard;
+    uint64_t applied{0};
+    std::optional<CService> wanted;
+    int64_t observed{0};
+    std::string status;
+    BOOST_CHECK(!publicendpoint::Enabled());
+    publicendpoint::SetEnabled(true);
+    BOOST_CHECK(publicendpoint::Enabled());
+    BOOST_CHECK(!publicendpoint::TakeWork(applied, wanted, observed, status));
+
+    const CService pair{LookupNumeric("8.8.4.4", 5000)};
+    publicendpoint::Tracker::Decision d;
+    d.wanted = pair;
+    d.observed_at = 100;
+    publicendpoint::Submit(d);
+    BOOST_REQUIRE(publicendpoint::TakeWork(applied, wanted, observed, status));
+    BOOST_CHECK(wanted == pair);
+    BOOST_CHECK_EQUAL(observed, 100);
+    BOOST_CHECK(!publicendpoint::TakeWork(applied, wanted, observed, status)); // nothing new
+
+    // bind failed (not active): the same wanted pair is retried on the next poll
+    publicendpoint::Withdraw("cannot listen");
+    publicendpoint::Submit(d);
+    BOOST_CHECK(publicendpoint::TakeWork(applied, wanted, observed, status));
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().status, "cannot listen");
+    BOOST_CHECK(!publicendpoint::GetInfo().active);
+
+    // success: no more retries, seq moves once
+    const uint64_t seq0{publicendpoint::ChangeSeq()};
+    publicendpoint::Activate(pair, 100);
+    BOOST_CHECK_EQUAL(publicendpoint::ChangeSeq(), seq0 + 1);
+    publicendpoint::Activate(pair, 115);
+    BOOST_CHECK_EQUAL(publicendpoint::ChangeSeq(), seq0 + 1);
+    publicendpoint::Submit(d);
+    BOOST_CHECK(!publicendpoint::TakeWork(applied, wanted, observed, status));
+    BOOST_CHECK(publicendpoint::GetInfo().active);
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().status, "active");
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().address, "8.8.4.4");
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().port, 5000);
+
+    // withdrawal request from the poller
+    publicendpoint::Tracker::Decision gone;
+    gone.status = "stale";
+    publicendpoint::Submit(gone);
+    BOOST_REQUIRE(publicendpoint::TakeWork(applied, wanted, observed, status));
+    BOOST_CHECK(!wanted);
+    BOOST_CHECK_EQUAL(status, "stale");
+    publicendpoint::Withdraw(status);
+    BOOST_CHECK(!publicendpoint::Active());
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().status, "stale");
+}
+
+BOOST_AUTO_TEST_CASE(pe_advertisement_is_exactly_the_pair)
+{
+    PublicEndpointReset guard;
+    const bool old_listen{fListen};
+    const bool old_discover{fDiscover};
+    fListen = true;
+    g_reachable_nets.Add(NET_IPV4);
+    const CService internal{LookupNumeric("9.9.9.9", 7777)};
+    const CService external_old{LookupNumeric("1.2.3.4", 7777)};
+    auto peer = MakePeer(LookupNumeric("5.6.7.8", 8333));
+    // the peer reports an address and port it sees for us: must never be echoed back while the feature is on
+    peer->SetAddrLocal(CService{LookupNumeric("1.2.3.4", 7777)});
+
+    // feature off: legacy behaviour (a configured local address is advertised)
+    fDiscover = true;
+    BOOST_CHECK(AddLocal(external_old, LOCAL_MANUAL));
+    const auto before = GetLocalAddrForPeer(*peer);
+    BOOST_REQUIRE(before.has_value());
+    BOOST_CHECK_EQUAL(before->GetPort(), 7777);
+
+    // feature on, no active pair: nothing at all, not the configured address, not the observed one
+    publicendpoint::SetEnabled(true);
+    BOOST_CHECK(!GetLocalAddrForPeer(*peer).has_value());
+
+    // active pair: exactly that pair, whatever the peer sees and whatever else is in the local map
+    const CService pair{LookupNumeric("8.8.4.4", 5000)};
+    publicendpoint::Activate(pair, 100);
+    for (int i = 0; i < 50; ++i) {
+        const auto adv = GetLocalAddrForPeer(*peer);
+        BOOST_REQUIRE(adv.has_value());
+        BOOST_CHECK_EQUAL(adv->ToStringAddrPort(), "8.8.4.4:5000");
+    }
+    // inbound peer that observed the old pair: still the active pair
+    auto inbound = MakePeer(LookupNumeric("5.6.7.9", 50000), ConnectionType::INBOUND);
+    inbound->SetAddrLocal(CService{LookupNumeric("1.2.3.4", 7777)});
+    for (int i = 0; i < 50; ++i) {
+        const auto adv = GetLocalAddrForPeer(*inbound);
+        BOOST_REQUIRE(adv.has_value());
+        BOOST_CHECK_EQUAL(adv->ToStringAddrPort(), "8.8.4.4:5000");
+    }
+    // withdrawn again: nothing
+    publicendpoint::Withdraw("stale");
+    BOOST_CHECK(!GetLocalAddrForPeer(*peer).has_value());
+    BOOST_CHECK(!GetLocalAddrForPeer(*inbound).has_value());
+    // not listening: nothing even with an active pair
+    publicendpoint::Activate(pair, 100);
+    fListen = false;
+    BOOST_CHECK(!GetLocalAddrForPeer(*peer).has_value());
+
+    RemoveLocal(external_old);
+    fListen = old_listen;
+    fDiscover = old_discover;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

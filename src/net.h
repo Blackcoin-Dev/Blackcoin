@@ -33,6 +33,7 @@
 #include <sync.h>
 #include <uint256.h>
 #include <util/check.h>
+#include <util/fs.h>
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
 
@@ -46,6 +47,8 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <set>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -173,6 +176,86 @@ void RemoveLocal(const CService& addr);
 bool SeenLocal(const CService& addr);
 bool IsLocal(const CService& addr);
 CService GetLocalAddress(const CNode& peer);
+
+/**
+ * Runtime public endpoint (-publicendpointfile). An external process writes the
+ * node's currently reachable public IPv4 address and port into a small JSON
+ * file in the datadir; Core polls it, opens an extra listening socket on that
+ * port, and advertises exactly that pair. Everything fails closed: when the
+ * pair is missing, malformed, stale, or cannot be bound, nothing is advertised.
+ */
+namespace publicendpoint {
+inline constexpr size_t MAX_FILE_SIZE{256};
+inline constexpr int64_t MAX_FUTURE_SKEW{60};
+inline constexpr int64_t DEFAULT_MAX_AGE{180};
+inline constexpr int64_t DEFAULT_POLL_INTERVAL{15};
+inline constexpr const char* SCHEMA{"blackcoin.public-endpoint/1"};
+
+struct Tuple {
+    CNetAddr address;
+    uint16_t port{0};
+    int64_t observed_at{0};
+};
+
+/** A bare file name (no directory part) that resolves inside the datadir. */
+bool ValidFileName(const std::string& name);
+/** Strict parse of the file content. On failure returns nullopt and sets reason. */
+std::optional<Tuple> Parse(std::string_view text, std::string& reason);
+/** Read the file without following a symlink; regular file of at most MAX_FILE_SIZE bytes. */
+std::optional<std::string> ReadFile(const fs::path& datadir, const std::string& name, std::string& reason);
+
+/**
+ * Pure poll-to-poll state machine (poller thread only). A new pair is
+ * applied only after two consecutive polls read the same pair; anything
+ * invalid, stale or future-dated withdraws at once.
+ */
+class Tracker
+{
+public:
+    struct Decision {
+        std::optional<CService> wanted; //!< pair to advertise, nullopt = withdraw
+        int64_t observed_at{0};         //!< observed_at of the read that confirms `wanted`
+        std::string status;             //!< why `wanted` is empty or pending
+    };
+    Tracker(int64_t max_age, std::set<uint16_t> excluded_ports) : m_max_age{max_age}, m_excluded_ports{std::move(excluded_ports)} {}
+    /** `reading` is the parse of this poll's file (nullopt = no usable tuple, `reason` says why). */
+    Decision Observe(const std::optional<Tuple>& reading, const std::string& reason, int64_t now);
+
+private:
+    const int64_t m_max_age;
+    const std::set<uint16_t> m_excluded_ports;
+    std::optional<CService> m_candidate;
+    std::optional<CService> m_wanted;
+    int64_t m_wanted_observed_at{0};
+};
+
+struct Info {
+    bool enabled{false};
+    bool active{false};
+    bool listening{false};
+    std::string address;
+    uint16_t port{0};
+    int64_t observed_at{0};
+    int64_t age{0};
+    std::string status;
+};
+
+//! Shared state, one mutex. Poller writes the wanted pair, the socket handler thread applies it.
+void Reset();
+void SetEnabled(bool enabled);
+bool Enabled();
+//! Poller: publish the decision; bumps the generation when it changed or a retry is due.
+void Submit(const Tracker::Decision& decision);
+//! Socket handler: take new work if the generation moved past `applied_gen`.
+bool TakeWork(uint64_t& applied_gen, std::optional<CService>& wanted, int64_t& observed_at, std::string& status);
+//! Socket handler: record the result. Both bump nothing the poller reads except `active`.
+void Activate(const CService& pair, int64_t observed_at);
+void Withdraw(const std::string& reason);
+std::optional<CService> Active();
+//! Incremented every time a (new) pair becomes active; the message handler compares per peer.
+uint64_t ChangeSeq();
+Info GetInfo();
+} // namespace publicendpoint
 
 extern bool fDiscover;
 extern bool fListen;
@@ -1082,6 +1165,11 @@ public:
         std::vector<std::string> m_specified_outgoing;
         std::vector<std::string> m_added_nodes;
         bool m_i2p_accept_incoming;
+        /// -publicendpointfile (empty = feature off or inert) and its limits.
+        std::string m_public_endpoint_file;
+        int64_t m_public_endpoint_max_age{publicendpoint::DEFAULT_MAX_AGE};
+        int64_t m_public_endpoint_poll_interval{publicendpoint::DEFAULT_POLL_INTERVAL};
+        std::set<uint16_t> m_public_endpoint_excluded_ports;
     };
 
     void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex)
@@ -1121,6 +1209,10 @@ public:
             }
         }
         m_onion_binds = connOptions.onion_binds;
+        m_public_endpoint_file = connOptions.m_public_endpoint_file;
+        m_public_endpoint_max_age = connOptions.m_public_endpoint_max_age;
+        m_public_endpoint_poll_interval = connOptions.m_public_endpoint_poll_interval;
+        m_public_endpoint_excluded_ports = connOptions.m_public_endpoint_excluded_ports;
     }
 
     CConnman(uint64_t seed0, uint64_t seed1, AddrMan& addrman, const NetGroupManager& netgroupman,
@@ -1356,6 +1448,12 @@ private:
     std::chrono::seconds GetMaxOutboundTimeLeftInCycle_() const EXCLUSIVE_LOCKS_REQUIRED(m_total_bytes_sent_mutex);
 
     bool BindListenPort(const CService& bindAddr, bilingual_str& strError, NetPermissionFlags permissions);
+    /** Create, bind and listen on a socket without registering it. `quiet` suppresses the log lines. */
+    bool BindListenSocket(const CService& bindAddr, bilingual_str& strError, std::shared_ptr<Sock>& out, bool quiet);
+    /** Poller thread for -publicendpointfile. */
+    void ThreadPublicEndpoint();
+    /** Socket handler thread only: apply the wanted public endpoint (open/close the runtime listener, AddLocal). */
+    void ApplyPublicEndpoint();
     bool Bind(const CService& addr, unsigned int flags, NetPermissionFlags permissions);
     bool InitBinds(const Options& options);
 
@@ -1619,6 +1717,18 @@ private:
     std::atomic<uint64_t> m_https_seed_generation{0};
     bool m_https_seed_enabled{false};
     std::thread threadHTTPSAddressSeed;
+    std::thread threadPublicEndpoint;
+    /// Runtime listening socket for the public endpoint port. Touched only by the
+    /// socket handler thread while threads run (and by Start/StopNodes outside them).
+    std::unique_ptr<ListenSocket> m_pe_listen_socket;
+    uint16_t m_pe_listen_port{0};
+    uint64_t m_pe_applied_gen{0};
+    std::string m_pe_last_logged_failure;
+    // Set in Init() before any thread starts, read-only afterwards.
+    std::string m_public_endpoint_file;
+    int64_t m_public_endpoint_max_age{publicendpoint::DEFAULT_MAX_AGE};
+    int64_t m_public_endpoint_poll_interval{publicendpoint::DEFAULT_POLL_INTERVAL};
+    std::set<uint16_t> m_public_endpoint_excluded_ports;
     std::thread threadDNSAddressSeed;
     std::thread threadSocketHandler;
     std::thread threadOpenAddedConnections;

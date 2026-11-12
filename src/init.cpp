@@ -535,6 +535,9 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-dns", strprintf("Allow DNS lookups for -addnode, -seednode and -connect (default: %u)", DEFAULT_NAME_LOOKUP), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-dnsseed", strprintf("Query for peer addresses via DNS lookup, if low on addresses (default: %u unless -connect used or -maxconnections=0)", DEFAULT_DNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-externalip=<ip>", "Specify your own public address", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-publicendpointfile=<name>", "Name of a file inside the data directory that an external process keeps up to date with this node's currently reachable public IPv4 address and port, as one JSON object of at most 256 bytes: {\"schema\":\"blackcoin.public-endpoint/1\",\"address\":\"<ipv4>\",\"port\":<port>,\"observed_at\":<unix seconds>}. Turns the feature on (default: off). The node polls the file, opens an extra listening socket on 0.0.0.0:<port>, and advertises exactly that pair; with no valid pair it advertises nothing. Inert with -listen=0 or an IPv4 proxy. With this option, -externalip is not advertised and -discover defaults to 0.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-publicendpointmaxage=<seconds>", strprintf("Withdraw the public endpoint when the file's observed_at is older than this many seconds (default: %d; range 1-86400)", publicendpoint::DEFAULT_MAX_AGE), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-publicendpointpollinterval=<seconds>", strprintf("Seconds between reads of the -publicendpointfile file (default: %d; regtest only, range 1-60)", publicendpoint::DEFAULT_POLL_INTERVAL), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-httpsseed", "Fetch bounded peer hints from the mainnet HTTPS directory (default: 1; disabled by -dnsseed=0, -dns=0, -connect, -maxconnections=0 or non-IP-only networks)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-fixedseeds", strprintf("Allow fixed seeds if DNS seeds don't provide peers (default: %u)", DEFAULT_FIXEDSEEDS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-forcednsseed", strprintf("Always query for peer addresses via DNS lookup (default: %u)", DEFAULT_FORCEDNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -738,6 +741,22 @@ static void StartupNotify(const ArgsManager& args)
 }
 #endif
 
+/** -publicendpointfile is inert without inbound listening or when IPv4 is only reachable through a proxy. */
+static bool PublicEndpointRequested(const ArgsManager& args)
+{
+    if (!args.IsArgSet("-publicendpointfile")) return false;
+    Proxy ipv4_proxy;
+    if (!args.GetBoolArg("-listen", DEFAULT_LISTEN)) {
+        LogPrintf("-publicendpointfile ignored: -listen=0\n");
+        return false;
+    }
+    if (GetProxy(NET_IPV4, ipv4_proxy)) {
+        LogPrintf("-publicendpointfile ignored: IPv4 is reached through a proxy\n");
+        return false;
+    }
+    return true;
+}
+
 static bool AppInitServers(NodeContext& node)
 {
     const ArgsManager& args = *Assert(node.args);
@@ -807,6 +826,12 @@ void InitParameterInteraction(ArgsManager& args)
         if (args.SoftSetBoolArg("-i2pacceptincoming", false)) {
             LogPrintf("%s: parameter interaction: -listen=0 -> setting -i2pacceptincoming=0\n", __func__);
         }
+    }
+
+    if (args.IsArgSet("-publicendpointfile")) {
+        // the runtime pair is the only address this node advertises
+        if (args.SoftSetBoolArg("-discover", false))
+            LogPrintf("%s: parameter interaction: -publicendpointfile set -> setting -discover=0\n", __func__);
     }
 
     if (args.IsArgSet("-externalip")) {
@@ -968,6 +993,20 @@ bool AppInitParameterInteraction(const ArgsManager& args)
                   ChainTypeToString(chain), SHADOW_WHITELIST_HEIGHT, SHADOW_REWARD_START_HEIGHT, SHADOW_REWARD_END_HEIGHT);
     }
 
+    if (args.IsArgSet("-publicendpointfile")) {
+        if (!publicendpoint::ValidFileName(args.GetArg("-publicendpointfile", ""))) {
+            return InitError(Untranslated("-publicendpointfile must be a plain file name inside the data directory (no path, no '..')"));
+        }
+        const int64_t max_age = args.GetIntArg("-publicendpointmaxage", publicendpoint::DEFAULT_MAX_AGE);
+        if (max_age < 1 || max_age > 86400) {
+            return InitError(Untranslated("-publicendpointmaxage must be between 1 and 86400 seconds"));
+        }
+    }
+    if (args.IsArgSet("-publicendpointpollinterval")) {
+        const int64_t poll = args.GetIntArg("-publicendpointpollinterval", publicendpoint::DEFAULT_POLL_INTERVAL);
+        if (chain != ChainType::REGTEST) return InitError(Untranslated("-publicendpointpollinterval is only supported on regtest."));
+        if (poll < 1 || poll > 60) return InitError(Untranslated("-publicendpointpollinterval must be between 1 and 60 seconds"));
+    }
     if (args.IsArgSet("-shadowcompetingclaimsheight") && chain != ChainType::REGTEST) {
         return InitError(_("-shadowcompetingclaimsheight is only supported on regtest."));
     }
@@ -1608,10 +1647,14 @@ static bool AppInitMainImpl(NodeContext& node,
         g_reachable_nets.Remove(NET_ONION);
     }
 
+    const bool public_endpoint_on{PublicEndpointRequested(args)};
+
     for (const std::string& strAddr : args.GetArgs("-externalip")) {
         const std::optional<CService> addrLocal{Lookup(strAddr, GetListenPort(), fNameLookup)};
-        if (addrLocal.has_value() && addrLocal->IsValid())
-            AddLocal(addrLocal.value(), LOCAL_MANUAL);
+        if (addrLocal.has_value() && addrLocal->IsValid()) {
+            // With a runtime public endpoint the configured address is not advertised.
+            if (!public_endpoint_on) AddLocal(addrLocal.value(), LOCAL_MANUAL);
+        }
         else
             return InitError(ResolveErrMsg("externalip", strAddr));
     }
@@ -2246,6 +2289,16 @@ static bool AppInitMainImpl(NodeContext& node,
 
     connOptions.vSeedNodes = args.GetArgs("-seednode");
     connOptions.m_https_seed = args.GetBoolArg("-httpsseed", true);
+
+    if (PublicEndpointRequested(args)) {
+        connOptions.m_public_endpoint_file = args.GetArg("-publicendpointfile", "");
+        connOptions.m_public_endpoint_max_age = args.GetIntArg("-publicendpointmaxage", publicendpoint::DEFAULT_MAX_AGE);
+        connOptions.m_public_endpoint_poll_interval = args.GetIntArg("-publicendpointpollinterval", publicendpoint::DEFAULT_POLL_INTERVAL);
+        // Ports this node uses for something else can never be a public pair.
+        connOptions.m_public_endpoint_excluded_ports.insert(static_cast<uint16_t>(args.GetIntArg("-rpcport", BaseParams().RPCPort())));
+        connOptions.m_public_endpoint_excluded_ports.insert(BaseParams().OnionServiceTargetPort());
+        LogPrintf("Public endpoint file %s in the data directory, max age %d s\n", connOptions.m_public_endpoint_file, connOptions.m_public_endpoint_max_age);
+    }
 
     // Initiate outbound connections unless connect=0
     connOptions.m_use_addrman_outgoing = !args.IsArgSet("-connect");

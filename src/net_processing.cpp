@@ -485,6 +485,8 @@ struct Peer {
     std::chrono::microseconds m_next_addr_send GUARDED_BY(m_addr_send_times_mutex){0};
     /** Time point to possibly re-announce our local address to this peer. */
     std::chrono::microseconds m_next_local_addr_send GUARDED_BY(m_addr_send_times_mutex){0};
+    /** publicendpoint::ChangeSeq() at our last self-announcement to this peer. */
+    uint64_t m_public_endpoint_seq GUARDED_BY(m_addr_send_times_mutex){0};
     /** Whether the peer has signaled support for receiving ADDRv2 (BIP155)
      *  messages, indicating a preference to receive ADDRv2 instead of ADDR ones. */
     std::atomic_bool m_wants_addrv2{false};
@@ -5824,8 +5826,11 @@ void PeerManagerImpl::MaybeSendAddr(CNode& node, Peer& peer, std::chrono::micros
 
     LOCK(peer.m_addr_send_times_mutex);
     // Periodically advertise our local address to the peer.
+    // A new runtime public endpoint (-publicendpointfile) is announced at once.
+    const uint64_t public_endpoint_seq{publicendpoint::ChangeSeq()};
+    const bool public_endpoint_changed{peer.m_public_endpoint_seq != public_endpoint_seq};
     if (fListen && !m_chainman.IsInitialBlockDownload() &&
-        peer.m_next_local_addr_send < current_time) {
+        (peer.m_next_local_addr_send < current_time || public_endpoint_changed)) {
         // If we've sent before, clear the bloom filter for the peer, so that our
         // self-announcement will actually go out.
         // This might be unnecessary if the bloom filter has already rolled
@@ -5840,6 +5845,11 @@ void PeerManagerImpl::MaybeSendAddr(CNode& node, Peer& peer, std::chrono::micros
             PushAddress(peer, local_addr);
         }
         peer.m_next_local_addr_send = GetExponentialRand(current_time, AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL);
+        if (public_endpoint_changed) {
+            // Do not wait for the next address-batch timer.
+            peer.m_next_addr_send = 0us;
+        }
+        peer.m_public_endpoint_seq = public_endpoint_seq;
     }
 
     // We sent an `addr` message to this peer recently. Nothing more to do.

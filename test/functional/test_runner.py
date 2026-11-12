@@ -381,6 +381,7 @@ BASE_SCRIPTS = [
     'feature_minchainwork.py',
     'rpc_getblockstats.py',
     'feature_bind_port_externalip.py',
+    'feature_public_endpoint.py',
     'wallet_create_tx.py --legacy-wallet',
     'wallet_send.py --legacy-wallet',
     'wallet_send.py --descriptors',

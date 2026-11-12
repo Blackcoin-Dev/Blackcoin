@@ -39,7 +39,9 @@
 #include <util/threadinterrupt.h>
 #include <util/trace.h>
 #include <util/translation.h>
+#include <util/time.h>
 #include <util/vector.h>
+#include <univalue.h>
 
 #ifdef WIN32
 #include <string.h>
@@ -49,9 +51,16 @@
 #include <ifaddrs.h>
 #endif
 
+#ifndef WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <fstream>
 #include <functional>
 #include <optional>
 #include <unordered_map>
@@ -252,6 +261,17 @@ static int GetnScore(const CService& addr)
 
 std::optional<CService> GetLocalAddrForPeer(CNode& node)
 {
+    if (publicendpoint::Enabled()) {
+        // Runtime public endpoint: advertise exactly the active pair, or nothing.
+        // Never mix in discovered, configured or peer-observed addresses and
+        // ports, so the internal listening port is not advertised in any state.
+        if (!fListen) return std::nullopt;
+        const std::optional<CService> pair{publicendpoint::Active()};
+        if (!pair || !g_reachable_nets.Contains(*pair)) return std::nullopt;
+        if (pair->GetNetwork() != node.ConnectedThroughNetwork() && node.IsConnectedThroughPrivacyNet()) return std::nullopt;
+        LogPrint(BCLog::NET, "Advertising address %s to peer=%d\n", pair->ToStringAddrPort(), node.GetId());
+        return pair;
+    }
     CService addrLocal{GetLocalAddress(node)};
     if (gArgs.GetBoolArg("-addrmantest", false)) {
         // use IPv4 loopback during addrmantest
@@ -325,6 +345,264 @@ void RemoveLocal(const CService& addr)
     LogPrintf("RemoveLocal(%s)\n", addr.ToStringAddrPort());
     mapLocalHost.erase(addr);
 }
+
+namespace publicendpoint {
+namespace {
+struct State {
+    bool enabled{false};
+    std::optional<CService> wanted;   //!< poller -> socket handler
+    int64_t wanted_observed_at{0};
+    std::string status;               //!< latest poller reason or note, for operators
+    std::string apply_error;          //!< latest bind or local-address failure of the socket handler
+    uint64_t wanted_gen{0};           //!< bumped whenever work (change or retry) is due
+    std::optional<CService> active;   //!< socket handler: bound, local address added, advertised
+    int64_t active_observed_at{0};
+    uint64_t change_seq{0};
+};
+GlobalMutex g_mutex;
+State g_state GUARDED_BY(g_mutex);
+} // namespace
+
+bool ValidFileName(const std::string& name)
+{
+    if (name.empty() || name.size() > 255 || name == "." || name == "..") return false;
+    for (const char c : name) {
+        if (c == '/' || c == '\\' || c == '\0' || c == ':' || static_cast<unsigned char>(c) < 0x20) return false;
+    }
+    return true;
+}
+
+static bool AllDigits(const std::string& text, size_t max_len)
+{
+    if (text.empty() || text.size() > max_len || text[0] == '0') return false;
+    return std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+std::optional<Tuple> Parse(std::string_view text, std::string& reason)
+{
+    if (text.empty()) { reason = "empty file"; return std::nullopt; }
+    if (text.size() > MAX_FILE_SIZE) { reason = "file larger than 256 bytes"; return std::nullopt; }
+    for (const char c : text) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u >= 0x80 || (u < 0x20 && c != '\n' && c != '\r' && c != '\t')) { reason = "file is not plain ASCII text"; return std::nullopt; }
+    }
+    UniValue root;
+    if (!root.read(text) || !root.isObject()) { reason = "file is not a JSON object"; return std::nullopt; }
+    if (root.size() != 4) { reason = "unexpected keys"; return std::nullopt; }
+    const UniValue& schema = root.find_value("schema");
+    const UniValue& address = root.find_value("address");
+    const UniValue& port = root.find_value("port");
+    const UniValue& observed_at = root.find_value("observed_at");
+    // Four entries, each of the four names present once: no extra or duplicate key.
+    if (schema.isNull() && !root.exists("schema")) { reason = "unexpected keys"; return std::nullopt; }
+    if (!root.exists("address") || !root.exists("port") || !root.exists("observed_at")) { reason = "unexpected keys"; return std::nullopt; }
+    if (!schema.isStr() || schema.get_str() != SCHEMA) { reason = "unknown schema"; return std::nullopt; }
+    if (!address.isStr() || !port.isNum() || !observed_at.isNum()) { reason = "wrong value type"; return std::nullopt; }
+    Tuple tuple;
+    if (!httpsseed::ParsePublicAddress(address.get_str(), tuple.address) || !tuple.address.IsIPv4()) {
+        reason = "address is not a canonical public IPv4 address";
+        return std::nullopt;
+    }
+    const std::string port_text{port.getValStr()};
+    const std::string time_text{observed_at.getValStr()};
+    if (!AllDigits(port_text, 5)) { reason = "port is not a plain integer"; return std::nullopt; }
+    const auto port_value = ToIntegral<uint32_t>(port_text);
+    if (!port_value || *port_value < 1 || *port_value > 65535) { reason = "port out of range"; return std::nullopt; }
+    if (!AllDigits(time_text, 15)) { reason = "observed_at is not a plain integer"; return std::nullopt; }
+    const auto time_value = ToIntegral<int64_t>(time_text);
+    if (!time_value) { reason = "observed_at out of range"; return std::nullopt; }
+    tuple.port = static_cast<uint16_t>(*port_value);
+    tuple.observed_at = *time_value;
+    return tuple;
+}
+
+std::optional<std::string> ReadFile(const fs::path& datadir, const std::string& name, std::string& reason)
+{
+    if (!ValidFileName(name)) { reason = "invalid file name"; return std::nullopt; }
+    // A bare name joined to the datadir cannot leave it.
+    const fs::path path{datadir / fs::PathFromString(name)};
+    std::string data;
+#ifndef WIN32
+    const std::string native{fs::PathToString(path)};
+    const int fd = open(native.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        const int err = errno;
+        if (err == ELOOP || err == EMLINK) reason = "file is a symbolic link";
+        else if (err == ENOENT) reason = "file not found";
+        else reason = "file not readable";
+        return std::nullopt;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        reason = "not a regular file";
+        return std::nullopt;
+    }
+    if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) > MAX_FILE_SIZE) {
+        close(fd);
+        reason = "file larger than 256 bytes";
+        return std::nullopt;
+    }
+    char buf[MAX_FILE_SIZE + 1];
+    size_t got = 0;
+    while (got < sizeof(buf)) {
+        const ssize_t n = read(fd, buf + got, sizeof(buf) - got);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            reason = "file not readable";
+            return std::nullopt;
+        }
+        if (n == 0) break;
+        got += static_cast<size_t>(n);
+    }
+    close(fd);
+    if (got > MAX_FILE_SIZE) { reason = "file larger than 256 bytes"; return std::nullopt; }
+    data.assign(buf, got);
+#else
+    std::error_code ec;
+    const auto status = fs::symlink_status(path, ec);
+    if (ec || !fs::exists(status)) { reason = "file not found"; return std::nullopt; }
+    if (fs::is_symlink(status)) { reason = "file is a symbolic link"; return std::nullopt; }
+    if (!fs::is_regular_file(status)) { reason = "not a regular file"; return std::nullopt; }
+    const auto size = fs::file_size(path, ec);
+    if (ec) { reason = "file not readable"; return std::nullopt; }
+    if (size > MAX_FILE_SIZE) { reason = "file larger than 256 bytes"; return std::nullopt; }
+    std::ifstream file{path, std::ios::binary};
+    if (!file) { reason = "file not readable"; return std::nullopt; }
+    data.resize(MAX_FILE_SIZE + 1);
+    file.read(data.data(), data.size());
+    data.resize(static_cast<size_t>(file.gcount()));
+    if (data.size() > MAX_FILE_SIZE) { reason = "file larger than 256 bytes"; return std::nullopt; }
+#endif
+    return data;
+}
+
+Tracker::Decision Tracker::Observe(const std::optional<Tuple>& reading, const std::string& reason, int64_t now)
+{
+    Decision out;
+    const auto reject = [&](const std::string& why) {
+        // Anything unusable ends the run of identical reads and withdraws at once.
+        m_candidate.reset();
+        m_wanted.reset();
+        out.status = why;
+        return out;
+    };
+    if (!reading) return reject(reason.empty() ? "no usable tuple" : reason);
+    if (reading->observed_at > now + MAX_FUTURE_SKEW) return reject("observed_at is in the future");
+    if (now - reading->observed_at > m_max_age) return reject("observed_at is older than the maximum age");
+    if (m_excluded_ports.count(reading->port)) return reject("port is reserved by this node");
+    const CService pair{reading->address, reading->port};
+    if (m_wanted && *m_wanted == pair) {
+        m_candidate = pair;
+        m_wanted_observed_at = reading->observed_at;
+    } else if (m_candidate && *m_candidate == pair) {
+        // Second consecutive identical read: apply.
+        m_wanted = pair;
+        m_wanted_observed_at = reading->observed_at;
+    } else {
+        m_candidate = pair;
+        out.wanted = m_wanted; // keep what is applied until the new pair is confirmed
+        out.observed_at = m_wanted_observed_at;
+        out.status = "awaiting a second identical read";
+        return out;
+    }
+    out.wanted = m_wanted;
+    out.observed_at = m_wanted_observed_at;
+    return out;
+}
+
+void Reset()
+{
+    LOCK(g_mutex);
+    g_state = State{};
+}
+
+void SetEnabled(bool enabled)
+{
+    LOCK(g_mutex);
+    g_state.enabled = enabled;
+    if (enabled) g_state.status = "waiting for the first read";
+}
+
+bool Enabled()
+{
+    LOCK(g_mutex);
+    return g_state.enabled;
+}
+
+void Submit(const Tracker::Decision& decision)
+{
+    LOCK(g_mutex);
+    g_state.status = decision.status;
+    g_state.wanted_observed_at = decision.observed_at;
+    if (!decision.wanted) g_state.apply_error.clear();
+    if (decision.wanted != g_state.wanted) {
+        g_state.wanted = decision.wanted;
+        ++g_state.wanted_gen;
+    } else if (g_state.wanted && g_state.active != g_state.wanted) {
+        ++g_state.wanted_gen; // retry after a failed bind or local-address step
+    } else if (g_state.active) {
+        g_state.active_observed_at = decision.observed_at; // refreshed read of the same pair
+    }
+}
+
+bool TakeWork(uint64_t& applied_gen, std::optional<CService>& wanted, int64_t& observed_at, std::string& status)
+{
+    LOCK(g_mutex);
+    if (g_state.wanted_gen == applied_gen) return false;
+    applied_gen = g_state.wanted_gen;
+    wanted = g_state.wanted;
+    observed_at = g_state.wanted_observed_at;
+    status = g_state.status;
+    return true;
+}
+
+void Activate(const CService& pair, int64_t observed_at)
+{
+    LOCK(g_mutex);
+    if (g_state.active != pair) ++g_state.change_seq;
+    g_state.active = pair;
+    g_state.active_observed_at = observed_at;
+    g_state.apply_error.clear();
+}
+
+void Withdraw(const std::string& reason)
+{
+    LOCK(g_mutex);
+    g_state.active.reset();
+    g_state.apply_error = reason;
+}
+
+std::optional<CService> Active()
+{
+    LOCK(g_mutex);
+    return g_state.active;
+}
+
+uint64_t ChangeSeq()
+{
+    LOCK(g_mutex);
+    return g_state.change_seq;
+}
+
+Info GetInfo()
+{
+    LOCK(g_mutex);
+    Info info;
+    info.enabled = g_state.enabled;
+    info.active = g_state.active.has_value();
+    info.listening = info.active; // the pair is active only while its socket is bound
+    if (g_state.active) {
+        info.address = g_state.active->ToStringAddr();
+        info.port = g_state.active->GetPort();
+        info.observed_at = g_state.active_observed_at;
+        info.age = std::max<int64_t>(0, GetTime() - g_state.active_observed_at);
+    }
+    info.status = info.active ? std::string{"active"} : (g_state.apply_error.empty() ? g_state.status : g_state.apply_error);
+    return info;
+}
+} // namespace publicendpoint
 
 /** vote for a local address */
 bool SeenLocal(const CService& addr)
@@ -2028,6 +2306,9 @@ Sock::EventsPerSock CConnman::GenerateWaitSockets(Span<CNode* const> nodes)
     for (const ListenSocket& hListenSocket : vhListenSocket) {
         events_per_sock.emplace(hListenSocket.sock, Sock::Events{Sock::RECV});
     }
+    if (m_pe_listen_socket) {
+        events_per_sock.emplace(m_pe_listen_socket->sock, Sock::Events{Sock::RECV});
+    }
 
     for (CNode* pnode : nodes) {
         bool select_recv = !pnode->fPauseRecv;
@@ -2186,6 +2467,12 @@ void CConnman::SocketHandlerListening(const Sock::EventsPerSock& events_per_sock
             AcceptConnection(listen_socket);
         }
     }
+    if (m_pe_listen_socket && !interruptNet) {
+        const auto it = events_per_sock.find(m_pe_listen_socket->sock);
+        if (it != events_per_sock.end() && it->second.occurred & Sock::RECV) {
+            AcceptConnection(*m_pe_listen_socket);
+        }
+    }
 }
 
 void CConnman::ThreadSocketHandler()
@@ -2194,10 +2481,87 @@ void CConnman::ThreadSocketHandler()
 
     while (!interruptNet)
     {
+        ApplyPublicEndpoint();
         DisconnectNodes();
         NotifyNumConnectionsChanged();
         SocketHandler();
     }
+}
+
+void CConnman::ApplyPublicEndpoint()
+{
+    if (m_public_endpoint_file.empty()) return;
+    std::optional<CService> wanted;
+    int64_t observed_at{0};
+    std::string status;
+    if (!publicendpoint::TakeWork(m_pe_applied_gen, wanted, observed_at, status)) return;
+
+    const std::optional<CService> previous{publicendpoint::Active()};
+    const auto withdraw = [&](const std::string& reason) {
+        const bool was_active = previous.has_value();
+        const bool was_listening = m_pe_listen_socket != nullptr;
+        m_pe_listen_socket.reset(); // closes the runtime socket
+        m_pe_listen_port = 0;
+        if (previous) RemoveLocal(*previous);
+        publicendpoint::Withdraw(reason);
+        // One line per withdrawal; a repeated identical failure is not logged again.
+        if (was_active || was_listening || m_pe_last_logged_failure != reason) {
+            LogPrintf("Public endpoint withdrawn: %s\n", reason);
+        }
+        m_pe_last_logged_failure = reason;
+    };
+
+    if (!wanted) {
+        withdraw(status.empty() ? "no usable tuple" : status);
+        return;
+    }
+    if (previous && *previous == *wanted && m_pe_listen_socket) return;
+
+    const uint16_t port{wanted->GetPort()};
+    std::shared_ptr<Sock> new_sock;
+    const bool same_port{m_pe_listen_socket && m_pe_listen_port == port};
+    if (!same_port) {
+        bilingual_str error;
+        if (!BindListenSocket(CService{CNetAddr{in_addr{htonl(INADDR_ANY)}}, port}, error, new_sock, /*quiet=*/true)) {
+            withdraw(strprintf("cannot listen on 0.0.0.0:%u (%s)", port, error.original));
+            return;
+        }
+    }
+    // The local-address map is keyed by address only: take the old entry out before adding the new.
+    if (previous) RemoveLocal(*previous);
+    if (!AddLocal(*wanted, LOCAL_MANUAL)) {
+        new_sock.reset();
+        const std::string reason{strprintf("%s is not usable as a local address on this node", wanted->ToStringAddrPort())};
+        m_pe_listen_socket.reset();
+        m_pe_listen_port = 0;
+        publicendpoint::Withdraw(reason);
+        LogPrintf("Public endpoint withdrawn: %s\n", reason);
+        m_pe_last_logged_failure = reason;
+        return;
+    }
+    if (!same_port) {
+        m_pe_listen_socket = std::make_unique<ListenSocket>(std::move(new_sock), NetPermissionFlags::None);
+        m_pe_listen_port = port;
+    }
+    publicendpoint::Activate(*wanted, observed_at);
+    m_pe_last_logged_failure.clear();
+    LogPrintf("Public endpoint now %s%s (listening on 0.0.0.0:%u)\n", wanted->ToStringAddrPort(),
+              previous ? strprintf(", was %s", previous->ToStringAddrPort()) : "", port);
+}
+
+void CConnman::ThreadPublicEndpoint()
+{
+    publicendpoint::Tracker tracker{m_public_endpoint_max_age, m_public_endpoint_excluded_ports};
+    const auto datadir = gArgs.GetDataDirNet();
+    const std::chrono::seconds interval{m_public_endpoint_poll_interval};
+    do {
+        std::string reason;
+        std::optional<publicendpoint::Tuple> reading;
+        if (const auto content = publicendpoint::ReadFile(datadir, m_public_endpoint_file, reason)) {
+            reading = publicendpoint::Parse(*content, reason);
+        }
+        publicendpoint::Submit(tracker.Observe(reading, reason, GetTime()));
+    } while (interruptNet.sleep_for(interval));
 }
 
 void CConnman::WakeMessageHandler()
@@ -3241,7 +3605,18 @@ void CConnman::ThreadI2PAcceptIncoming()
 
 bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions)
 {
+    std::shared_ptr<Sock> sock;
+    if (!BindListenSocket(addrBind, strError, sock, /*quiet=*/false)) return false;
+    vhListenSocket.emplace_back(std::move(sock), permissions);
+    return true;
+}
+
+bool CConnman::BindListenSocket(const CService& addrBind, bilingual_str& strError, std::shared_ptr<Sock>& out, bool quiet)
+{
     int nOne = 1;
+    const auto log_error = [&](const std::string& line) {
+        if (!quiet) LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", line);
+    };
 
     // Create socket for listening for incoming connections
     struct sockaddr_storage sockaddr;
@@ -3249,14 +3624,14 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
     if (!addrBind.GetSockAddr((struct sockaddr*)&sockaddr, &len))
     {
         strError = strprintf(Untranslated("Bind address family for %s not supported"), addrBind.ToStringAddrPort());
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        log_error(strError.original);
         return false;
     }
 
     std::unique_ptr<Sock> sock = CreateSock(addrBind);
     if (!sock) {
         strError = strprintf(Untranslated("Couldn't open socket for incoming connections (socket returned error %s)"), NetworkErrorString(WSAGetLastError()));
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        log_error(strError.original);
         return false;
     }
 
@@ -3264,7 +3639,7 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
     // the program was closed and restarted.
     if (sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
         strError = strprintf(Untranslated("Error setting SO_REUSEADDR on socket: %s, continuing anyway"), NetworkErrorString(WSAGetLastError()));
-        LogPrintf("%s\n", strError.original);
+        if (!quiet) LogPrintf("%s\n", strError.original);
     }
 
     // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option
@@ -3273,14 +3648,14 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
 #ifdef IPV6_V6ONLY
         if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
             strError = strprintf(Untranslated("Error setting IPV6_V6ONLY on socket: %s, continuing anyway"), NetworkErrorString(WSAGetLastError()));
-            LogPrintf("%s\n", strError.original);
+            if (!quiet) LogPrintf("%s\n", strError.original);
         }
 #endif
 #ifdef WIN32
         int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
         if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int)) == SOCKET_ERROR) {
             strError = strprintf(Untranslated("Error setting IPV6_PROTECTION_LEVEL on socket: %s, continuing anyway"), NetworkErrorString(WSAGetLastError()));
-            LogPrintf("%s\n", strError.original);
+            if (!quiet) LogPrintf("%s\n", strError.original);
         }
 #endif
     }
@@ -3291,20 +3666,20 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
             strError = strprintf(_("Unable to bind to %s on this computer. %s is probably already running."), addrBind.ToStringAddrPort(), PACKAGE_NAME);
         else
             strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToStringAddrPort(), NetworkErrorString(nErr));
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        log_error(strError.original);
         return false;
     }
-    LogPrintf("Bound to %s\n", addrBind.ToStringAddrPort());
+    if (!quiet) LogPrintf("Bound to %s\n", addrBind.ToStringAddrPort());
 
     // Listen for incoming connections
     if (sock->Listen(SOMAXCONN) == SOCKET_ERROR)
     {
         strError = strprintf(_("Listening for incoming connections failed (listen returned error %s)"), NetworkErrorString(WSAGetLastError()));
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        log_error(strError.original);
         return false;
     }
 
-    vhListenSocket.emplace_back(std::move(sock), permissions);
+    out = std::move(sock);
     return true;
 }
 
@@ -3504,6 +3879,14 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         fMsgProcWake = false;
     }
 
+    // Runtime public endpoint state must be in place before any thread can read it.
+    publicendpoint::Reset();
+    if (!m_public_endpoint_file.empty()) {
+        publicendpoint::SetEnabled(true);
+        m_pe_applied_gen = 0;
+        m_pe_last_logged_failure.clear();
+    }
+
     // Send and receive from sockets, accept connections
     threadSocketHandler = std::thread(&util::TraceThread, "net", [this] { ThreadSocketHandler(); });
 
@@ -3518,6 +3901,10 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         } else {
             LogPrintf("HTTPS discovery unavailable: TLS transport initialization failed\n");
         }
+    }
+
+    if (!m_public_endpoint_file.empty()) {
+        threadPublicEndpoint = std::thread(&util::TraceThread, "pubendpoint", [this] { ThreadPublicEndpoint(); });
     }
 
     // Initiate manual connections
@@ -3603,6 +3990,8 @@ void CConnman::StopThreads()
         threadOpenAddedConnections.join();
     if (threadHTTPSAddressSeed.joinable())
         threadHTTPSAddressSeed.join();
+    if (threadPublicEndpoint.joinable())
+        threadPublicEndpoint.join();
     if (threadDNSAddressSeed.joinable())
         threadDNSAddressSeed.join();
     if (threadSocketHandler.joinable())
@@ -3638,6 +4027,11 @@ void CConnman::StopNodes()
     }
     m_nodes_disconnected.clear();
     vhListenSocket.clear();
+    // Runtime public endpoint: all threads are joined, nothing else touches this state.
+    m_pe_listen_socket.reset();
+    m_pe_listen_port = 0;
+    if (const auto active = publicendpoint::Active()) RemoveLocal(*active);
+    publicendpoint::Reset();
     // Queued fallbacks own grants too. Return them before destroying either
     // semaphore, including shutdown while networking is paused.
     WITH_LOCK(m_reconnections_mutex, m_reconnections.clear());

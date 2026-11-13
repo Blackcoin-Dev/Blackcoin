@@ -356,7 +356,11 @@ class PublicEndpointTest(BitcoinTestFramework):
         assert port_open(p0)
         assert_equal(listeners(node0.process.pid, p0), base)
 
-        self.stop_node(0)
+        # Linux refuses the conf's 127.0.0.1 bind once 0.0.0.0 holds the port and says so at startup.
+        node0.stderr.seek(0)
+        startup_stderr = node0.stderr.read().decode("utf-8").strip()
+        assert startup_stderr in ("", f"Error: Unable to bind to 127.0.0.1:{p0} on this computer. Blackcoin is probably already running."), startup_stderr
+        self.stop_node(0, expected_stderr=startup_stderr)
         self.log.info("Inert with -listen=0 and with an IPv4 proxy")
         self.start_node(0, extra_args=["-debug=net", "-nobind", "-listen=0", *self.base_args()])
         node0.setmocktime(t0)

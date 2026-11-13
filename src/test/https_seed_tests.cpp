@@ -1089,6 +1089,137 @@ BOOST_AUTO_TEST_CASE(qq_legacy_first_policy_rules)
     for (size_t i = 0; i < 4; ++i) BOOST_CHECK_EQUAL(qq::HTTPS_BACKOFF[i].count(), expected[i]);
 }
 
+BOOST_AUTO_TEST_CASE(qq_legacy_first_qq_turn_policy_rules)
+{
+    // The turn comes after two consecutive legacy-first dials, and only in legacy-first.
+    BOOST_CHECK(!qq::LegacyFirstQQTurn(true, 0));
+    BOOST_CHECK(!qq::LegacyFirstQQTurn(true, 1));
+    BOOST_CHECK(qq::LegacyFirstQQTurn(true, 2));
+    BOOST_CHECK(qq::LegacyFirstQQTurn(true, 7));
+    for (unsigned streak = 0; streak < 10; ++streak) BOOST_CHECK(!qq::LegacyFirstQQTurn(false, streak));
+    // The streak: a failed legacy-first dial to a non-QQ address adds one.
+    BOOST_CHECK_EQUAL(qq::NextLegacyFirstStreak(0, true, false, false, false), 1U);
+    BOOST_CHECK_EQUAL(qq::NextLegacyFirstStreak(1, true, false, false, false), 2U);
+    // A QQ turn resets it whatever it dialed.
+    BOOST_CHECK_EQUAL(qq::NextLegacyFirstStreak(2, true, true, true, false), 0U);
+    BOOST_CHECK_EQUAL(qq::NextLegacyFirstStreak(2, true, true, false, true), 0U);
+    // A dial that connected, a QQ-flagged dial in any other selection, or any
+    // dial outside legacy-first resets it.
+    BOOST_CHECK_EQUAL(qq::NextLegacyFirstStreak(1, true, false, false, true), 0U);
+    BOOST_CHECK_EQUAL(qq::NextLegacyFirstStreak(1, true, false, true, false), 0U);
+    BOOST_CHECK_EQUAL(qq::NextLegacyFirstStreak(1, false, false, false, false), 0U);
+    // Simulated cadence of failing dials: two legacy, one QQ turn, repeat.
+    unsigned streak{0};
+    std::string cadence;
+    for (int i = 0; i < 9; ++i) {
+        const bool turn = qq::LegacyFirstQQTurn(true, streak);
+        cadence += turn ? 'Q' : 'L';
+        streak = qq::NextLegacyFirstStreak(streak, true, turn, turn, false);
+    }
+    BOOST_CHECK_EQUAL(cadence, "LLQLLQLLQ");
+    // A legacy peer that connects shows the pool works: no turn is earned.
+    streak = 0;
+    for (int i = 0; i < 6; ++i) {
+        BOOST_CHECK(!qq::LegacyFirstQQTurn(true, streak));
+        streak = qq::NextLegacyFirstStreak(streak, true, false, false, true);
+    }
+    // The legacy-first predicate itself is unchanged, and policy off stays off.
+    BOOST_CHECK(!qq::LegacyFirst(0, 0, 16, false));
+}
+
+BOOST_FIXTURE_TEST_CASE(qq_seed_hint_evidence_window, TestingSetup)
+{
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    const auto start = qq::Clock::now();
+    BOOST_CHECK(!connman.HasQQEvidence(start));
+    // An empty round is not evidence.
+    connman.NoteQQSeedHints(0, start);
+    BOOST_CHECK(!connman.HasRecentQQSeedHints(start));
+    connman.NoteQQSeedHints(3, start);
+    BOOST_CHECK(connman.HasQQEvidence(start));
+    BOOST_CHECK(connman.HasQQEvidence(start + qq::EVIDENCE_WINDOW));
+    BOOST_CHECK(!connman.HasQQEvidence(start + qq::EVIDENCE_WINDOW + std::chrono::seconds{1}));
+    // A later empty round does not erase a recent hint round, and does not extend it.
+    connman.NoteQQSeedHints(0, start + std::chrono::minutes{10});
+    BOOST_CHECK(connman.HasQQEvidence(start + std::chrono::minutes{20}));
+    // Seed hints are not a handshake and do not change what the handshake reports.
+    BOOST_CHECK(!connman.HasRecentQQHandshake(start));
+}
+
+namespace {
+/** Mostly dead legacy addresses and a few QQ-flagged hints, as on a real node after a seed round. */
+void PrepareLegacyHeavyPool(node::NodeContext& node, unsigned qq_hints)
+{
+    PreparePersistedBootstrap(node, /*legacy=*/true, /*qq_target=*/8, /*legacy_stride=*/1); // Every entry legacy.
+    // A bucket collision with an existing entry rejects an add; move to another group until it lands.
+    for (unsigned i = 0, probe = 0; i < qq_hints; ++probe) {
+        BOOST_REQUIRE(probe < 500);
+        CAddress hint{LookupNumeric(strprintf("13.%u.0.1", probe), 46005), ServiceFlags(NODE_NETWORK | NODE_QUANTUM_QUASAR)};
+        hint.nTime = NodeSeconds{std::chrono::seconds{NOW - 60}};
+        if (node.addrman->Add({hint}, LookupNumeric(strprintf("14.%u.0.1", probe), 15714))) ++i;
+    }
+    BOOST_REQUIRE_EQUAL(node.addrman->Size(), 6446U + qq_hints);
+    unsigned flagged{0};
+    for (const auto& entry : node.addrman->GetAddr(0, 0, std::nullopt)) flagged += (entry.nServices & NODE_QUANTUM_QUASAR) ? 1 : 0;
+    BOOST_REQUIRE_EQUAL(flagged, qq_hints);
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_legacy_first_gives_qq_hint_a_turn, TestingSetup)
+{
+    // The field defect: thousands of dead legacy entries, three QQ hints, no
+    // peers, no evidence. Legacy-first alone never dials a hint.
+    PrepareLegacyHeavyPool(m_node, 3);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.PublishQQStatus(0, 0, false, "");
+    const auto observed = ObserveBootstrapAttempts(connman, 15);
+    BOOST_TEST_MESSAGE("Legacy-heavy pool, three hints, zero peers: " << observed);
+    // One distinct hint per turn. Once every hint was offered in the last ten
+    // minutes the turn falls back to an ordinary draw, which here is legacy.
+    BOOST_CHECK_EQUAL(observed.substr(0, 9), "LLQLLQLLQ");
+    BOOST_CHECK_EQUAL(std::count(observed.begin(), observed.end(), 'Q'), 3);
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_qq_turn_reaches_a_lone_hint_in_a_large_pool, TestingSetup)
+{
+    // One hint among thousands of dead legacy entries: the first turn dials it.
+    PrepareLegacyHeavyPool(m_node, 1);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.PublishQQStatus(0, 0, false, "");
+    const auto observed = ObserveBootstrapAttempts(connman, 3);
+    BOOST_TEST_MESSAGE("Legacy-heavy pool, one hint, zero peers: " << observed);
+    BOOST_CHECK_EQUAL(observed, "LLQ");
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_qq_turn_costs_nothing_without_qq_addresses, TestingSetup)
+{
+    // No QQ-flagged address at all: the turn falls back to any valid address and
+    // every attempt still dials the legacy pool.
+    PrepareLegacyHeavyPool(m_node, 0);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.PublishQQStatus(0, 0, false, "");
+    const auto observed = ObserveBootstrapAttempts(connman, 12);
+    BOOST_TEST_MESSAGE("Legacy-only pool: " << observed);
+    BOOST_CHECK_EQUAL(observed, std::string(12, 'L'));
+}
+
+BOOST_FIXTURE_TEST_CASE(actual_connman_seed_hints_are_evidence_at_the_floor, TestingSetup)
+{
+    // Four connected peers and a fresh seed round with hints: pursuit resumes
+    // without any handshake. Without the round it stays legacy-first.
+    PreparePersistedBootstrap(m_node, true, 8, 4);
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    connman.PublishQQStatus(0, 0, false, "");
+    AddConnectedFullRelay(m_node, qq::LEGACY_FIRST_FLOOR, false);
+    BOOST_REQUIRE(!connman.HasQQEvidence());
+    connman.NoteQQSeedHints(3);
+    BOOST_REQUIRE(connman.HasQQEvidence());
+    BOOST_REQUIRE(!connman.HasRecentQQHandshake());
+    const auto observed = ObserveBootstrapAttempts(connman, 12);
+    BOOST_TEST_MESSAGE("Seed-hint evidence with 4 peers: " << observed);
+    BOOST_CHECK_EQUAL(observed, "QQLQQLQQLQQL");
+}
+
 BOOST_FIXTURE_TEST_CASE(qq_handshake_evidence_window, TestingSetup)
 {
     auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
@@ -1105,14 +1236,15 @@ BOOST_FIXTURE_TEST_CASE(qq_handshake_evidence_window, TestingSetup)
 BOOST_FIXTURE_TEST_CASE(actual_connman_zero_qq_evidence_prefers_legacy, TestingSetup)
 {
     // Thousands of dead QQ-flagged entries, a quarter legacy, no peers, no QQ
-    // evidence, chain ready (deficit at target): every attempt is legacy.
+    // evidence, chain ready (deficit at target): legacy first, with one QQ
+    // turn after every two legacy dials.
     PreparePersistedBootstrap(m_node, true, 8, 4);
     auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
     connman.PublishQQStatus(0, 0, false, "");
     BOOST_REQUIRE_EQUAL(connman.GetQQStatus().deficit, 8);
     const auto observed = ObserveBootstrapAttempts(connman, 20);
     BOOST_TEST_MESSAGE("Zero QQ evidence, zero peers: " << observed);
-    BOOST_CHECK_EQUAL(observed, std::string(20, 'L'));
+    BOOST_CHECK_EQUAL(observed, "LLQLLQLLQLLQLLQLLQLL");
     BOOST_CHECK_EQUAL(connman.GetQQStatus().connect_attempts, 0U);
 }
 
@@ -1125,7 +1257,7 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_qq_evidence_below_floor_stays_legacy_firs
     BOOST_REQUIRE(connman.HasRecentQQHandshake());
     const auto observed = ObserveBootstrapAttempts(connman, 12);
     BOOST_TEST_MESSAGE("Evidence with 3 peers: " << observed);
-    BOOST_CHECK_EQUAL(observed, std::string(12, 'L'));
+    BOOST_CHECK_EQUAL(observed, "LLQLLQLLQLLQ");
 }
 
 BOOST_FIXTURE_TEST_CASE(actual_connman_qq_evidence_at_floor_resumes_pursuit, TestingSetup)
@@ -1148,7 +1280,7 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_expired_qq_evidence_is_legacy_first, Test
     BOOST_REQUIRE(!connman.HasRecentQQHandshake());
     const auto observed = ObserveBootstrapAttempts(connman, 12);
     BOOST_TEST_MESSAGE("Expired evidence with 4 peers: " << observed);
-    BOOST_CHECK_EQUAL(observed, std::string(12, 'L'));
+    BOOST_CHECK_EQUAL(observed, "LLQLLQLLQLLQ");
 }
 
 BOOST_FIXTURE_TEST_CASE(actual_connman_ibd_treats_qq_deficit_as_zero, TestingSetup)
@@ -1270,11 +1402,19 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_zero_peers_logs_once_per_ten_minutes_with
     const std::string prefix{"No peers for 61 seconds: addrman=6446 dial_attempts="};
     const auto separator = line.find(" dial_failures=");
     BOOST_REQUIRE(separator != std::string::npos);
-    uint64_t logged_attempts{0}, logged_failures{0};
+    const auto hints_at = line.find(" qq_hints=");
+    const auto dials_at = line.find(" qq_dials=");
+    BOOST_REQUIRE(hints_at != std::string::npos && dials_at != std::string::npos && separator < hints_at && hints_at < dials_at);
+    uint64_t logged_attempts{0}, logged_failures{0}, logged_hints{1}, logged_qq_dials{0};
     BOOST_REQUIRE(ParseUInt64(line.substr(prefix.size(), separator - prefix.size()), &logged_attempts));
-    BOOST_REQUIRE(ParseUInt64(line.substr(separator + std::string{" dial_failures="}.size()), &logged_failures));
+    const std::string failures_label{" dial_failures="};
+    BOOST_REQUIRE(ParseUInt64(line.substr(separator + failures_label.size(), hints_at - separator - failures_label.size()), &logged_failures));
+    BOOST_REQUIRE(ParseUInt64(line.substr(hints_at + std::string{" qq_hints="}.size(), dials_at - hints_at - std::string{" qq_hints="}.size()), &logged_hints));
+    BOOST_REQUIRE(ParseUInt64(line.substr(dials_at + std::string{" qq_dials="}.size()), &logged_qq_dials));
     BOOST_CHECK(logged_attempts >= 2);
     BOOST_CHECK_EQUAL(logged_attempts, logged_failures);
+    BOOST_CHECK_EQUAL(logged_hints, 0U); // No accepted seed round in this test.
+    BOOST_CHECK(logged_qq_dials <= logged_attempts);
     // Rate limit: nothing more for ten minutes of (mock) time.
     SetMockTime(NOW + 61 + 599);
     passes(3);

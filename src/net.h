@@ -1364,6 +1364,28 @@ public:
         if (last == 0) return false;
         return now - qq::Clock::time_point{qq::Clock::duration{last}} <= qq::EVIDENCE_WINDOW;
     }
+    /**
+     * Record an accepted HTTPS seed round with at least one hint. The publisher
+     * lists a node only after an outside handshake succeeded, so a fresh round
+     * counts as evidence that QQ peers are reachable. Not reported by getnetworkinfo.
+     */
+    void NoteQQSeedHints(size_t hints, qq::Clock::time_point when = qq::Clock::now())
+    {
+        m_last_qq_seed_hints_count.store(hints, std::memory_order_relaxed);
+        if (hints > 0) m_last_qq_seed_hints.store(when.time_since_epoch().count(), std::memory_order_relaxed);
+    }
+    /** True if an accepted HTTPS seed round carried hints within qq::EVIDENCE_WINDOW of now. */
+    bool HasRecentQQSeedHints(qq::Clock::time_point now = qq::Clock::now()) const
+    {
+        const auto last = m_last_qq_seed_hints.load(std::memory_order_relaxed);
+        if (last == 0) return false;
+        return now - qq::Clock::time_point{qq::Clock::duration{last}} <= qq::EVIDENCE_WINDOW;
+    }
+    /** QQ evidence for legacy-first: a recent QQ handshake or a recent seed round with hints. */
+    bool HasQQEvidence(qq::Clock::time_point now = qq::Clock::now()) const
+    {
+        return HasRecentQQHandshake(now) || HasRecentQQSeedHints(now);
+    }
     /** Includes disconnecting nodes until their socket/grant has retired. */
     bool HasNode(NodeId id) const { LOCK(m_nodes_mutex); for (const auto* node : m_nodes) if (node->GetId() == id) return true; return false; }
 
@@ -1665,7 +1687,10 @@ private:
     // How many full-relay (tx, block, addr) outbound peers we want
     int m_max_outbound_full_relay;
     std::atomic<qq::Clock::rep> m_last_qq_handshake{0};
+    std::atomic<qq::Clock::rep> m_last_qq_seed_hints{0};
+    std::atomic<size_t> m_last_qq_seed_hints_count{0};
     std::atomic<uint64_t> m_dial_attempts{0};
+    std::atomic<uint64_t> m_qq_dial_attempts{0};
     std::atomic<uint64_t> m_dial_failures{0};
     int m_qq_requested_target{-1};
     int m_qq_target{0};

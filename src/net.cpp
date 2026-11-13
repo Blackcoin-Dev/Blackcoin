@@ -2216,6 +2216,21 @@ void CConnman::DisconnectNodes()
                     LogPrint(BCLog::NET, "retrying with v1 transport protocol for peer=%d\n", pnode->GetId());
                 }
 
+                // One line per lost peer that had completed the handshake. No addresses.
+                if (pnode->fSuccessfullyConnected && (!pnode->IsInboundConn() || LogAcceptCategory(BCLog::NET, BCLog::Level::Debug))) {
+                    size_t remaining{0};
+                    for (const CNode* other : m_nodes) remaining += other->fSuccessfullyConnected ? 1 : 0;
+                    std::string subver;
+                    {
+                        LOCK(pnode->m_subver_mutex);
+                        subver = pnode->cleanSubVer;
+                    }
+                    LogPrintf("Peer lost: peer=%d type=%s direction=%s transport=%s subver=%s connected_for=%ds peers_remaining=%u\n",
+                              pnode->GetId(), pnode->ConnectionTypeAsString(), pnode->IsInboundConn() ? "inbound" : "outbound",
+                              TransportTypeAsString(pnode->m_transport->GetInfo().transport_type), subver,
+                              (GetTime<std::chrono::seconds>() - pnode->m_connected).count(), remaining);
+                }
+
                 // release outbound grant (if any)
                 pnode->grantOutbound.Release();
 
@@ -2696,9 +2711,11 @@ void CConnman::ThreadHTTPSAddressSeed()
         LogPrint(BCLog::NET, "HTTPS discovery round: hints=%u qq_deficit=%d outage=%d\n",
             parsed.peers.size(), deficit, connected == 0);
         if (parsed.peers.empty()) {
+            NoteQQSeedHints(0);
             unproductive("accepted-empty");
         } else {
             unproductive_rounds = 0;
+            NoteQQSeedHints(parsed.peers.size());
             LogPrintf("HTTPS seed round: outcome=accepted hints=%u retry_in=%ds\n", parsed.peers.size(),
                       std::chrono::duration_cast<std::chrono::seconds>(next_round - worker_now()).count());
         }
@@ -2972,13 +2989,17 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
     std::weak_ptr<qq::Probe> outstanding_qq;
     bool recovery_addr_fetch_turn{true};
     unsigned preferred_qq_attempts{0};
+    // Consecutive failed legacy-first full-relay dials to non-QQ addresses; two earn QQ hints a turn.
+    unsigned legacy_first_streak{0};
     bool tried_legacy_at_target{false};
     // Legacy-first dials that did not connect, with the time of the failure.
     std::map<CService, std::chrono::microseconds> legacy_failed;
+    // QQ hints dialed on a QQ turn; they are not offered again for LEGACY_FIRST_FAILED_MEMORY.
+    std::map<CService, std::chrono::microseconds> qq_turn_tried;
     // Zero-peer diagnostics: window start and the dial counters at that moment.
     std::optional<std::chrono::microseconds> zero_peers_since;
     std::optional<std::chrono::microseconds> zero_peers_last_log;
-    uint64_t zero_peers_attempts{0}, zero_peers_failures{0};
+    uint64_t zero_peers_attempts{0}, zero_peers_failures{0}, zero_peers_qq_attempts{0};
     const auto is_legacy_full_relay = [](const CNode& node) {
         return node.IsFullOutboundConn() && !node.IsQQProbe() && !(node.m_accepted_services & NODE_QUANTUM_QUASAR);
     };
@@ -3008,12 +3029,14 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 zero_peers_since = clock_now;
                 zero_peers_attempts = m_dial_attempts;
                 zero_peers_failures = m_dial_failures;
+                zero_peers_qq_attempts = m_qq_dial_attempts;
             } else if (clock_now - *zero_peers_since >= qq::ZERO_PEER_LOG_AFTER &&
                        (!zero_peers_last_log || clock_now - *zero_peers_last_log >= qq::ZERO_PEER_LOG_EVERY)) {
                 zero_peers_last_log = clock_now;
-                LogPrintf("No peers for %d seconds: addrman=%u dial_attempts=%u dial_failures=%u\n",
+                LogPrintf("No peers for %d seconds: addrman=%u dial_attempts=%u dial_failures=%u qq_hints=%u qq_dials=%u\n",
                           std::chrono::duration_cast<std::chrono::seconds>(clock_now - *zero_peers_since).count(),
-                          addrman.Size(), m_dial_attempts - zero_peers_attempts, m_dial_failures - zero_peers_failures);
+                          addrman.Size(), m_dial_attempts - zero_peers_attempts, m_dial_failures - zero_peers_failures,
+                          m_last_qq_seed_hints_count.load(), m_qq_dial_attempts - zero_peers_qq_attempts);
             }
         }
 
@@ -3153,7 +3176,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         // the remaining vacancies; it never disconnects an established peer.
         const bool legacy_first = full_relay_vacancy &&
             qq::LegacyFirst(qq_status.target, connected_full_relay, m_max_outbound_full_relay,
-                            qq_peer_connected || HasRecentQQHandshake(steady_now));
+                            qq_peer_connected || HasQQEvidence(steady_now));
         const bool prefer_qq_for_vacancy = qq_deficit && full_relay_vacancy && !legacy_first;
         const bool seek_legacy_at_target = qq_status.target > 0 && !qq_deficit && !has_legacy_full_relay;
         if (!seek_legacy_at_target) tried_legacy_at_target = false;
@@ -3163,6 +3186,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             qq_status.constraint != "chain-not-ready" && qq_status.constraint != "initializing";
         bool qq_probe = false;
         bool prefer_qq = prefer_qq_for_vacancy;
+        if (!legacy_first) legacy_first_streak = 0;
         bool addr_fetch_due;
         { LOCK(m_addr_fetches_mutex); addr_fetch_due = !m_addr_fetches.empty(); }
 
@@ -3233,6 +3257,26 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             }
         }
 
+        // Guaranteed turn for QQ hints: legacy-first would otherwise never reach
+        // them while the pool holds enough (mostly dead) legacy addresses, and
+        // without a QQ handshake there is never any evidence to end legacy-first.
+        const bool qq_turn = conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !fFeeler && !anchor && !qq_probe &&
+            qq::LegacyFirstQQTurn(legacy_first, legacy_first_streak);
+
+        // Random draws find a handful of hints among thousands of legacy
+        // entries only a few percent of the time, so a QQ turn first walks the
+        // QQ-flagged addresses themselves, least recently offered first.
+        std::vector<CAddress> qq_turn_candidates;
+        if (qq_turn) {
+            for (const CAddress& candidate : addrman.GetAddr(/*max_addresses=*/0, /*max_pct=*/0, /*network=*/std::nullopt)) {
+                if (!(candidate.nServices & NODE_QUANTUM_QUASAR)) continue;
+                const auto tried = qq_turn_tried.find(candidate);
+                if (tried != qq_turn_tried.end() && now - tried->second < qq::LEGACY_FIRST_FAILED_MEMORY) continue;
+                qq_turn_candidates.push_back(candidate);
+                if (qq_turn_candidates.size() >= static_cast<size_t>(qq::MAX_CANDIDATE_DRAWS / 4)) break;
+            }
+        }
+
         addrman.ResolveCollisions();
 
         const auto current_time{NodeClock::now()};
@@ -3285,7 +3329,12 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 // If preferred_net has a value set, pick an extra outbound
                 // peer from that network. The eviction logic in net_processing
                 // ensures that a peer from another network will be evicted.
-                std::tie(addr, addr_last_try) = addrman.Select(false, preferred_net);
+                if (qq_turn && !qq_turn_candidates.empty()) {
+                    addr = qq_turn_candidates.back();
+                    qq_turn_candidates.pop_back();
+                } else {
+                    std::tie(addr, addr_last_try) = addrman.Select(false, preferred_net);
+                }
             }
 
             // Require outbound IPv4/IPv6 connections, other than feelers, to be to distinct network groups
@@ -3335,7 +3384,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             // Legacy-first: QQ-flagged hints wait until the later draws, and a legacy
             // address that just failed a dial yields to them, so one dead legacy entry
             // cannot monopolize a vacancy.
-            if (legacy_first && conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !qq_probe &&
+            if (legacy_first && !qq_turn && conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !qq_probe &&
                 nTries <= qq::MAX_CANDIDATE_DRAWS / 2) {
                 if (addr.nServices & NODE_QUANTUM_QUASAR) continue;
                 const auto failed = legacy_failed.find(addr);
@@ -3345,12 +3394,12 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             // Give legacy addresses a turn after two QQ attempts, or when
             // replenishing without a legacy relay after reaching the QQ target.
             // Keep a fully checked fallback for QQ-only pools.
-            if (legacy_turn && conn_type == ConnectionType::OUTBOUND_FULL_RELAY) {
+            if (legacy_turn && !qq_turn && conn_type == ConnectionType::OUTBOUND_FULL_RELAY) {
                 if (addr.nServices & NODE_QUANTUM_QUASAR) {
                     if (!qq_recovery_fallback.IsValid()) qq_recovery_fallback = addr;
                     continue;
                 }
-            } else if (prefer_qq && (qq_probe || nTries <= qq::MAX_CANDIDATE_DRAWS / 2) && !(addr.nServices & NODE_QUANTUM_QUASAR)) continue;
+            } else if ((prefer_qq || qq_turn) && (qq_probe || nTries <= qq::MAX_CANDIDATE_DRAWS / 2) && !(addr.nServices & NODE_QUANTUM_QUASAR)) continue;
             addrConnect = addr;
             break;
         }
@@ -3387,6 +3436,15 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 !(addrConnect.nServices & NODE_QUANTUM_QUASAR) && !AlreadyConnectedToAddress(addrConnect)) {
                 if (legacy_failed.size() >= 64) legacy_failed.erase(legacy_failed.begin());
                 legacy_failed[addrConnect] = now;
+            }
+            if (attempted && qq_turn && (addrConnect.nServices & NODE_QUANTUM_QUASAR)) {
+                if (qq_turn_tried.size() >= 64) qq_turn_tried.erase(qq_turn_tried.begin());
+                qq_turn_tried[addrConnect] = now;
+            }
+            if (attempted && conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !qq_probe) {
+                legacy_first_streak = qq::NextLegacyFirstStreak(legacy_first_streak, legacy_first, qq_turn,
+                                                                addrConnect.nServices & NODE_QUANTUM_QUASAR,
+                                                                AlreadyConnectedToAddress(addrConnect));
             }
             if (attempted && full_relay_vacancy && conn_type == ConnectionType::OUTBOUND_FULL_RELAY) {
                 const bool qq_hint = addrConnect.nServices & NODE_QUANTUM_QUASAR;
@@ -3530,6 +3588,7 @@ void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFai
     if (attempted) *attempted = connection_attempted;
     if (connection_attempted) {
         ++m_dial_attempts;
+        if (addrConnect.nServices & NODE_QUANTUM_QUASAR) ++m_qq_dial_attempts;
         if (!pnode) ++m_dial_failures;
     }
     if (qq_probe) RecordQQConnect(pnode == nullptr);

@@ -3971,12 +3971,17 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // can be triggered by an attacker at high rate.
         if (!pfrom.IsInboundConn() || LogAcceptCategory(BCLog::NET, BCLog::Level::Debug)) {
             const auto mapped_as{m_connman.GetMappedAS(pfrom.addr)};
-            LogPrintf("New %s %s peer connected: version: %d, blocks=%d, peer=%d%s%s\n",
+            std::string subver;
+            {
+                LOCK(pfrom.m_subver_mutex);
+                subver = pfrom.cleanSubVer;
+            }
+            LogPrintf("New %s %s peer connected: version: %d, blocks=%d, peer=%d%s%s subver=%s\n",
                       pfrom.ConnectionTypeAsString(),
                       TransportTypeAsString(pfrom.m_transport->GetInfo().transport_type),
                       pfrom.nVersion.load(), peer->m_starting_height,
                       pfrom.GetId(), (fLogIPs ? strprintf(", peeraddr=%s", pfrom.addr.ToStringAddrPort()) : ""),
-                      (mapped_as ? strprintf(", mapped_as=%d", mapped_as) : ""));
+                      (mapped_as ? strprintf(", mapped_as=%d", mapped_as) : ""), subver);
         }
 
         if (pfrom.GetCommonVersion() >= SHORT_IDS_BLOCKS_VERSION) {

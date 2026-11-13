@@ -44,6 +44,34 @@ inline bool LegacyFirst(int qq_target, int connected_full_relay, int full_relay_
     return qq_target > 0 && (!qq_evidence || connected_full_relay < LegacyFirstFloor(full_relay_capacity));
 }
 
+/**
+ * Legacy-first keeps legacy addresses ahead of QQ hints, but a pool of mostly
+ * dead legacy addresses must not starve the hints for ever (a QQ handshake is
+ * the only thing that creates QQ evidence). After this many consecutive
+ * failed legacy-first full-relay dials to non-QQ addresses, the next full-relay
+ * selection is a QQ turn.
+ */
+constexpr unsigned LEGACY_FIRST_QQ_TURN_AFTER{2};
+
+/** True when the next full-relay selection must be a QQ turn. Never true outside legacy-first. */
+inline bool LegacyFirstQQTurn(bool legacy_first, unsigned consecutive_legacy_dials)
+{
+    return legacy_first && consecutive_legacy_dials >= LEGACY_FIRST_QQ_TURN_AFTER;
+}
+
+/**
+ * The legacy-first dial counter after a full-relay dial attempt. Only dials
+ * that fail count, since a legacy peer that connects shows the pool works. A
+ * QQ turn resets it whatever it dialed; a failed legacy-first dial to a
+ * non-QQ address adds one; a dial to a QQ address, a dial that connected, or
+ * any attempt outside legacy-first resets it.
+ */
+inline unsigned NextLegacyFirstStreak(unsigned streak, bool legacy_first, bool qq_turn, bool dialed_qq_flagged, bool connected)
+{
+    if (!legacy_first || qq_turn || dialed_qq_flagged || connected) return 0;
+    return streak + 1;
+}
+
 /** Retry delays after consecutive unproductive HTTPS rounds; afterwards the normal cadence applies. */
 constexpr std::chrono::seconds HTTPS_BACKOFF[]{std::chrono::seconds{60}, std::chrono::seconds{120},
                                                std::chrono::seconds{300}, std::chrono::seconds{600}};

@@ -311,8 +311,11 @@ class QQPursuitTest(BitcoinTestFramework):
             candidate.sync_with_ping()
             self.wait_until(lambda: f"{candidate.fixture_ip}:15714" in full_relay_ids())
             self.log.info("Destinations with a stale legacy hint: %s", self.proxy.requests[start:])
-            assert_equal(self.proxy.requests[start:start + 2],
-                         [(legacy.fixture_ip, 15714), (candidate.fixture_ip, 15714)])
+            # The stale legacy hint is dialed first. The QQ candidate follows
+            # after one or two failed legacy dials, depending on timing.
+            attempts = self.proxy.requests[start:]
+            assert_equal(attempts[0], (legacy.fixture_ip, 15714))
+            assert (candidate.fixture_ip, 15714) in attempts[1:3], attempts
             assert_equal(len(full_relay_ids()), 3)
             assert_equal(node.getnetworkinfo()["qqoutbound"]["deficit"], 0)
         finally:

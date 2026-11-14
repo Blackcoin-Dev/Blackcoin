@@ -15,7 +15,7 @@ import time
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import ErrorMatch
-from test_framework.util import assert_equal, assert_greater_than_or_equal, p2p_port
+from test_framework.util import assert_greater_than_or_equal, p2p_port
 
 RETRY_LINE = "is in use; retrying for up to"
 SUCCESS_LINE = "after retrying for"

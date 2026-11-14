@@ -406,6 +406,7 @@ BASE_SCRIPTS = [
     'p2p_qq_pursuit.py --legacy-replenishment',
     'p2p_legacy_only_connectivity.py',
     'p2p_qq_hint_turn.py',
+    'feature_bind_retry.py',
     'p2p_seed_bootstrap.py',
     'feature_bind_port_discover.py',
     'p2p_unrequested_blocks.py',

@@ -3696,12 +3696,52 @@ void CConnman::ThreadI2PAcceptIncoming()
 bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions)
 {
     std::shared_ptr<Sock> sock;
-    if (!BindListenSocket(addrBind, strError, sock, /*quiet=*/false)) return false;
+    bool in_use{false};
+    if (!BindListenSocket(addrBind, strError, sock, /*quiet=*/false, &in_use)) {
+        if (!in_use) return false;
+
+        // "Address in use" can be transient (see DEFAULT_BIND_RETRY_SECONDS). Retry within
+        // the budget shared by this InitBinds() pass, polling for shutdown while waiting.
+        const auto start{SteadyClock::now()};
+        if (!m_bind_retry_deadline) m_bind_retry_deadline = start + std::chrono::seconds{m_bind_retry_seconds};
+        const auto deadline{*m_bind_retry_deadline};
+        if (start < deadline) {
+            const int budget_s = int(std::chrono::ceil<std::chrono::seconds>(deadline - start).count());
+            LogPrintf("Listen address %s is in use; retrying for up to %d seconds\n", addrBind.ToStringAddrPort(), budget_s);
+            while (SteadyClock::now() < deadline) {
+                const auto next{SteadyClock::now() + BIND_RETRY_INTERVAL};
+                while (SteadyClock::now() < next) {
+                    if (m_shutdown_requested && m_shutdown_requested()) {
+                        LogPrintf("Shutdown requested while waiting to bind to %s\n", addrBind.ToStringAddrPort());
+                        m_bind_aborted = true;
+                        return false;
+                    }
+                    UninterruptibleSleep(BIND_RETRY_POLL);
+                }
+                in_use = false;
+                if (BindListenSocket(addrBind, strError, sock, /*quiet=*/true, &in_use)) {
+                    const auto waited{std::chrono::duration_cast<std::chrono::milliseconds>(SteadyClock::now() - start)};
+                    LogPrintf("Bound to %s after retrying for %d.%03d seconds\n", addrBind.ToStringAddrPort(),
+                              int(waited.count() / 1000), int(waited.count() % 1000));
+                    vhListenSocket.emplace_back(std::move(sock), permissions, addrBind);
+                    return true;
+                }
+                if (!in_use) {
+                    // A different failure now: report it as a normal bind failure.
+                    LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+                    return false;
+                }
+            }
+        }
+        // Still in use: fail exactly as before.
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        return false;
+    }
     vhListenSocket.emplace_back(std::move(sock), permissions, addrBind);
     return true;
 }
 
-bool CConnman::BindListenSocket(const CService& addrBind, bilingual_str& strError, std::shared_ptr<Sock>& out, bool quiet)
+bool CConnman::BindListenSocket(const CService& addrBind, bilingual_str& strError, std::shared_ptr<Sock>& out, bool quiet, bool* addr_in_use)
 {
     int nOne = 1;
     const auto log_error = [&](const std::string& line) {
@@ -3752,10 +3792,16 @@ bool CConnman::BindListenSocket(const CService& addrBind, bilingual_str& strErro
 
     if (sock->Bind(reinterpret_cast<struct sockaddr*>(&sockaddr), len) == SOCKET_ERROR) {
         int nErr = WSAGetLastError();
-        if (nErr == WSAEADDRINUSE)
+        if (nErr == WSAEADDRINUSE) {
             strError = strprintf(_("Unable to bind to %s on this computer. %s is probably already running."), addrBind.ToStringAddrPort(), PACKAGE_NAME);
-        else
+            if (addr_in_use) {
+                // The caller may retry and logs the error itself if it gives up.
+                *addr_in_use = true;
+                return false;
+            }
+        } else {
             strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToStringAddrPort(), NetworkErrorString(nErr));
+        }
         log_error(strError.original);
         return false;
     }
@@ -3873,6 +3919,7 @@ bool CConnman::Bind(const CService& addr_, unsigned int flags, NetPermissionFlag
 
     bilingual_str strError;
     if (!BindListenPort(addr, strError, permissions)) {
+        if (m_bind_aborted) return false; // shutdown requested, no error box
         if ((flags & BF_REPORT_ERROR) && m_client_interface) {
             m_client_interface->ThreadSafeMessageBox(strError, "", CClientUIInterface::MSG_ERROR);
         }
@@ -3888,6 +3935,8 @@ bool CConnman::Bind(const CService& addr_, unsigned int flags, NetPermissionFlag
 
 bool CConnman::InitBinds(const Options& options)
 {
+    m_bind_retry_deadline.reset();
+    m_bind_aborted = false;
     bool fBound = false;
     for (const auto& addrBind : options.vBinds) {
         fBound |= Bind(addrBind, BF_REPORT_ERROR, NetPermissionFlags::None);
@@ -3914,7 +3963,7 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
     Init(connOptions);
 
     if (fListen && !InitBinds(connOptions)) {
-        if (m_client_interface) {
+        if (m_client_interface && !m_bind_aborted) {
             m_client_interface->ThreadSafeMessageBox(
                 _("Failed to listen on any port. Use -listen=0 if you want this."),
                 "", CClientUIInterface::MSG_ERROR);

@@ -67,6 +67,18 @@ static const bool DEFAULT_WHITELISTRELAY = true;
 /** Default for -whitelistforcerelay. */
 static const bool DEFAULT_WHITELISTFORCERELAY = false;
 
+/**
+ * A P2P listen port inside the OS ephemeral range (Linux: 32768-60999) can be held
+ * for a moment as the local port of another process's outgoing connection when the
+ * network namespace is shared (VPN client, web viewer), so bind() fails with
+ * "address in use" although nothing listens there. Retry such a bind once per
+ * BIND_RETRY_INTERVAL for up to DEFAULT_BIND_RETRY_SECONDS before giving up.
+ */
+static constexpr int DEFAULT_BIND_RETRY_SECONDS{30};
+static constexpr std::chrono::seconds BIND_RETRY_INTERVAL{1};
+/** Granularity at which a shutdown request is noticed while waiting to retry a bind. */
+static constexpr std::chrono::milliseconds BIND_RETRY_POLL{100};
+
 /** Time after which to disconnect, after waiting for a ping response (or inactivity). */
 static constexpr std::chrono::minutes TIMEOUT_INTERVAL{20};
 /** Run the feeler connection loop once every 2 minutes. **/
@@ -1171,6 +1183,10 @@ public:
         int64_t m_public_endpoint_max_age{publicendpoint::DEFAULT_MAX_AGE};
         int64_t m_public_endpoint_poll_interval{publicendpoint::DEFAULT_POLL_INTERVAL};
         std::set<uint16_t> m_public_endpoint_excluded_ports;
+        /// Seconds to keep retrying a P2P listen bind that fails with "address in use".
+        int m_bind_retry_seconds{DEFAULT_BIND_RETRY_SECONDS};
+        /// Polled while waiting to retry a bind, so a shutdown request ends the wait.
+        std::function<bool()> m_shutdown_requested;
     };
 
     void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex)
@@ -1178,6 +1194,8 @@ public:
         AssertLockNotHeld(m_total_bytes_sent_mutex);
 
         nLocalServices = connOptions.nLocalServices;
+        m_bind_retry_seconds = connOptions.m_bind_retry_seconds;
+        m_shutdown_requested = connOptions.m_shutdown_requested;
         nMaxConnections = connOptions.nMaxConnections;
         m_max_outbound_full_relay = std::min(connOptions.m_max_outbound_full_relay, connOptions.nMaxConnections);
         m_max_outbound_block_relay = connOptions.m_max_outbound_block_relay;
@@ -1475,7 +1493,8 @@ private:
 
     bool BindListenPort(const CService& bindAddr, bilingual_str& strError, NetPermissionFlags permissions);
     /** Create, bind and listen on a socket without registering it. `quiet` suppresses the log lines. */
-    bool BindListenSocket(const CService& bindAddr, bilingual_str& strError, std::shared_ptr<Sock>& out, bool quiet);
+    /** If addr_in_use is given and the bind fails with "address in use", it is set to true and the error is not logged (the caller decides). */
+    bool BindListenSocket(const CService& bindAddr, bilingual_str& strError, std::shared_ptr<Sock>& out, bool quiet, bool* addr_in_use = nullptr);
     /** Poller thread for -publicendpointfile. */
     void ThreadPublicEndpoint();
     /** Socket handler thread only: apply the wanted public endpoint (open/close the runtime listener, AddLocal). */
@@ -1735,6 +1754,13 @@ private:
      * the lifetime of `m_i2p_sam_session`.
      */
     CThreadInterrupt interruptNet;
+
+    /// P2P listen bind retry state, see BindListenPort(). The deadline is shared by all
+    /// binds of one InitBinds() call so that the total wait stays bounded.
+    int m_bind_retry_seconds{DEFAULT_BIND_RETRY_SECONDS};
+    std::function<bool()> m_shutdown_requested;
+    std::optional<SteadyClock::time_point> m_bind_retry_deadline;
+    bool m_bind_aborted{false};
 
     /**
      * I2P SAM session.

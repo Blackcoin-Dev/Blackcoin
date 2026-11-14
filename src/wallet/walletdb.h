@@ -15,6 +15,8 @@
 #include <wallet/shadow_pow_claim_recovery_types.h>
 #include <wallet/walletutil.h>
 #include <key.h>
+#include <serialize.h>
+#include <uint256.h>
 
 #include <stdint.h>
 #include <string>
@@ -109,6 +111,7 @@ extern const std::string QUANTUM_REDELEGATION_LAST_WIN;
 extern const std::string SETTINGS;
 extern const std::string QQ_DEVELOPMENT_DONATION_CONSENT;
 extern const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY;
+extern const std::string SYNTHETIC_PAYOUT_CHECKPOINT;
 extern const std::string SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER;
 extern const std::string SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER;
 extern const std::string TX;
@@ -207,6 +210,42 @@ public:
         hd_seed_id.SetNull();
         key_origin.clear();
         has_key_origin = false;
+    }
+};
+
+/**
+ * Wallet-scoped record that lets startup skip re-authenticating synthetic Gold
+ * Rush payouts it already authenticated.
+ *
+ * Authenticating one payout block costs a pool-undo and one claim-marker
+ * chainstate lookup per claim, so doing it for every payout block of a
+ * large wallet on every start is slow on cold storage. The record is a hint,
+ * never an authority: it is honored only when the schema and client version
+ * match, `block_hash` is still the active-chain block at `height`, and
+ * `digest`/`count` equal the digest/count of the wallet's confirmed
+ * synthetic payout records at or below `height` (so any added, removed,
+ * moved or stale-flagged record forces a full authentication). A missing,
+ * unreadable or rejected record only means the full authentication runs.
+ * Older releases ignore the unknown key and keep it when they rewrite the
+ * wallet.
+ */
+struct SyntheticPayoutCheckpoint {
+    static constexpr uint32_t CURRENT_SCHEMA{1};
+    uint32_t schema{0};
+    int32_t client_version{0};
+    int32_t height{-1};
+    uint256 block_hash;
+    uint32_t count{0};
+    uint256 digest;
+
+    SERIALIZE_METHODS(SyntheticPayoutCheckpoint, obj)
+    {
+        READWRITE(obj.schema, obj.client_version, obj.height, obj.block_hash, obj.count, obj.digest);
+    }
+    bool operator==(const SyntheticPayoutCheckpoint& other) const
+    {
+        return schema == other.schema && client_version == other.client_version && height == other.height &&
+               block_hash == other.block_hash && count == other.count && digest == other.digest;
     }
 };
 
@@ -333,6 +372,12 @@ public:
     bool WriteShadowPowClaimLegacyRelayClockHighWater(int64_t high_water);
     DBErrors ReadShadowPowClaimLegacyRelayClockHighWater(
         int64_t& high_water, std::string* error = nullptr);
+
+    /** Hint that lets startup skip re-authenticating synthetic payouts it already verified. */
+    bool WriteSyntheticPayoutCheckpoint(const SyntheticPayoutCheckpoint& checkpoint);
+    /** Returns false when the record is absent or unreadable (the caller then authenticates everything). */
+    bool ReadSyntheticPayoutCheckpoint(SyntheticPayoutCheckpoint& checkpoint);
+    bool EraseSyntheticPayoutCheckpoint();
 
     /** Optional wallet-scoped Quantum Quasar development-donation consent. */
     bool WriteQQDevelopmentDonationConsent(const QQDevelopmentDonationConsent& consent);

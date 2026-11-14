@@ -72,6 +72,7 @@ const std::string QUANTUM_REDELEGATION_LAST_WIN{"quantumredelegationlastwin"};
 const std::string SETTINGS{"settings"};
 const std::string QQ_DEVELOPMENT_DONATION_CONSENT{"qqdevelopmentdonationconsent"};
 const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY{"shadowpowclaimrecoverypolicy"};
+const std::string SYNTHETIC_PAYOUT_CHECKPOINT{"syntheticpayoutcheckpoint"};
 const std::string SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER{
     "shadowpowclaimrelayclockhighwater"};
 const std::string SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER{
@@ -460,6 +461,25 @@ DBErrors WalletBatch::ReadShadowPowClaimRecoveryPolicy(ShadowPowClaimRecoveryPol
 bool WalletBatch::EraseShadowPowClaimRecoveryPolicy()
 {
     return EraseIC(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY);
+}
+
+bool WalletBatch::WriteSyntheticPayoutCheckpoint(const SyntheticPayoutCheckpoint& checkpoint)
+{
+    return WriteIC(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, checkpoint);
+}
+
+bool WalletBatch::ReadSyntheticPayoutCheckpoint(SyntheticPayoutCheckpoint& checkpoint)
+{
+    checkpoint = SyntheticPayoutCheckpoint{};
+    if (m_batch->Read(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, checkpoint)) return true;
+    // A failed read can leave a partially decoded record behind.
+    checkpoint = SyntheticPayoutCheckpoint{};
+    return false;
+}
+
+bool WalletBatch::EraseSyntheticPayoutCheckpoint()
+{
+    return EraseIC(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT);
 }
 
 bool WalletBatch::WriteShadowPowClaimRelayClockHighWater(int64_t high_water)

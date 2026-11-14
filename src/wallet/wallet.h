@@ -39,6 +39,7 @@
 #include <wallet/shadow_pow_claim_recovery_types.h>
 #include <wallet/transaction.h>
 #include <wallet/types.h>
+#include <wallet/walletdb.h>
 #include <wallet/walletutil.h>
 
 #include <atomic>
@@ -356,6 +357,14 @@ struct ShadowPowClaimInventory {
  * performing a second proof-classification pass. */
 ShadowPowClaimInventory BuildShadowPowClaimCompatibilityInventory(
     const ShadowPowClaimRecoveryInventory& recovery_inventory);
+
+/** One confirmed synthetic Gold Rush payout record, as hashed into a SyntheticPayoutCheckpoint. */
+struct SyntheticPayoutRef {
+    uint256 txid;
+    uint256 block_hash;
+    int height{-1};
+    bool stale{false};
+};
 
 /** Block timing captured before taking cs_wallet. */
 struct WalletBlockTime {
@@ -952,6 +961,14 @@ private:
     void IndexOwnedLegacyShadowScripts(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecomputeConfirmedSyntheticPayoutIndex() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** See SyntheticPayoutCheckpoint. Heights are those currently stored in the wallet transactions. */
+    std::vector<SyntheticPayoutRef> CollectSyntheticPayoutRefs() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Cached copy of the persisted checkpoint (nullopt when none is stored). */
+    std::optional<SyntheticPayoutCheckpoint> m_synthetic_payout_checkpoint GUARDED_BY(cs_wallet);
+    /** True once LoadWallet authenticated every payout without error; checkpoints are never written before. */
+    bool m_synthetic_payout_checkpoint_trusted GUARDED_BY(cs_wallet){false};
+    /** Persist a checkpoint for block_hash/height if the wallet holds synthetic payouts and it changed. */
+    void WriteSyntheticPayoutCheckpoint(WalletBatch& batch, const uint256& block_hash, int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool ReconcileWalletShadowPayoutsForBlock(const uint256& block_hash, int block_height,
                                               const std::set<COutPoint>& authenticated_outpoints,
                                               WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

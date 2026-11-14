@@ -185,6 +185,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_migration_rpc.py',
     'feature_goldrush_coldstake_auto_migration.py',
     'feature_goldrush_coinstatsindex.py',
+    'wallet_goldrush_payout_checkpoint.py',
     'feature_shadowindex_claim_boundary.py',
     'feature_witness_inventory_performance.py',
     'feature_goldrush_reorg.py',

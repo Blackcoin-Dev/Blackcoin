@@ -27,6 +27,7 @@
 #include <crypto/mldsa.h>
 #include <crypto/sha256.h>
 #include <external_signer.h>
+#include <clientversion.h>
 #include <hash.h>
 #include <index/disktxpos.h>
 #include <index/txindex.h>
@@ -900,6 +901,62 @@ void CWallet::RecomputeConfirmedSyntheticPayoutIndex()
     }
 }
 
+/** Announce payout authentication up front when it is large enough to be noticeable. */
+static constexpr size_t SYNTHETIC_PAYOUT_AUTHENTICATION_NOTICE_BLOCKS{1000};
+
+std::vector<SyntheticPayoutRef> CWallet::CollectSyntheticPayoutRefs() const
+{
+    AssertLockHeld(cs_wallet);
+    std::vector<SyntheticPayoutRef> refs;
+    for (const auto& [block_hash, txids] : m_confirmed_synthetic_payouts_by_block) {
+        for (const uint256& txid : txids) {
+            const auto wallet_tx = mapWallet.find(txid);
+            if (wallet_tx == mapWallet.end()) continue;
+            const CWalletTx& wtx = wallet_tx->second;
+            const auto* confirmed = wtx.state<TxStateConfirmed>();
+            if (!confirmed || confirmed->confirmed_block_hash != block_hash) continue;
+            refs.push_back(SyntheticPayoutRef{
+                txid, block_hash, confirmed->confirmed_block_height,
+                wtx.mapValue.count(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY) != 0});
+        }
+    }
+    return refs;
+}
+
+/** Count and digest of the synthetic payout records at heights [0, max_height]; order independent. */
+static std::pair<uint32_t, uint256> HashSyntheticPayoutRefs(std::vector<SyntheticPayoutRef> refs, int max_height)
+{
+    refs.erase(std::remove_if(refs.begin(), refs.end(), [max_height](const SyntheticPayoutRef& ref) {
+        return ref.height < 0 || ref.height > max_height;
+    }), refs.end());
+    std::sort(refs.begin(), refs.end(), [](const SyntheticPayoutRef& a, const SyntheticPayoutRef& b) {
+        return a.txid < b.txid;
+    });
+    HashWriter hasher{};
+    for (const SyntheticPayoutRef& ref : refs) {
+        hasher << ref.txid << ref.block_hash << ref.stale;
+    }
+    return {static_cast<uint32_t>(refs.size()), hasher.GetHash()};
+}
+
+void CWallet::WriteSyntheticPayoutCheckpoint(WalletBatch& batch, const uint256& block_hash, int height)
+{
+    AssertLockHeld(cs_wallet);
+    if (block_hash.IsNull() || height < 0) return;
+    const auto [count, digest] = HashSyntheticPayoutRefs(CollectSyntheticPayoutRefs(), height);
+    if (count == 0) return;
+    SyntheticPayoutCheckpoint checkpoint;
+    checkpoint.schema = SyntheticPayoutCheckpoint::CURRENT_SCHEMA;
+    checkpoint.client_version = CLIENT_VERSION;
+    checkpoint.height = height;
+    checkpoint.block_hash = block_hash;
+    checkpoint.count = count;
+    checkpoint.digest = digest;
+    if (m_synthetic_payout_checkpoint && *m_synthetic_payout_checkpoint == checkpoint) return;
+    // The record is only a startup hint. If it cannot be written the next start authenticates everything.
+    if (batch.WriteSyntheticPayoutCheckpoint(checkpoint)) m_synthetic_payout_checkpoint = checkpoint;
+}
+
 /**
  * Reconcile only synthetic records already attributed to one active block.
  * The caller derives authenticated_outpoints from chainstate without holding
@@ -1711,6 +1768,11 @@ void CWallet::chainStateFlushed(ChainstateRole role, const CBlockLocator& loc)
     }
     WalletBatch batch(GetDatabase());
     batch.WriteBestBlock(loc);
+    // Every synthetic payout up to the last processed block was authenticated
+    // when it was recorded; remember that so the next start can skip it.
+    if (m_synthetic_payout_checkpoint_trusted) {
+        WriteSyntheticPayoutCheckpoint(batch, m_last_block_processed, m_last_block_processed_height);
+    }
 }
 
 void CWallet::SetMinVersion(enum WalletFeature nVersion, WalletBatch* batch_in)
@@ -6196,10 +6258,16 @@ DBErrors CWallet::LoadWallet()
     DBErrors nLoadWalletRet;
     std::set<uint256> referenced_blocks;
     std::set<uint256> synthetic_payout_blocks;
+    std::vector<SyntheticPayoutRef> synthetic_payout_refs;
+    std::optional<SyntheticPayoutCheckpoint> payout_checkpoint;
     {
         LOCK(cs_wallet);
-        nLoadWalletRet = WalletBatch(GetDatabase()).LoadWallet(this);
+        WalletBatch load_batch(GetDatabase());
+        nLoadWalletRet = load_batch.LoadWallet(this);
         if (HaveChain()) {
+            SyntheticPayoutCheckpoint stored;
+            if (load_batch.ReadSyntheticPayoutCheckpoint(stored)) payout_checkpoint = stored;
+            m_synthetic_payout_checkpoint = payout_checkpoint;
             for (const auto& [_, wtx] : mapWallet) {
                 if (const auto* conf = wtx.state<TxStateConfirmed>()) {
                     referenced_blocks.insert(conf->confirmed_block_hash);
@@ -6210,6 +6278,7 @@ DBErrors CWallet::LoadWallet()
                     referenced_blocks.insert(conf->conflicting_block_hash);
                 }
             }
+            if (payout_checkpoint) synthetic_payout_refs = CollectSyntheticPayoutRefs();
         }
     }
 
@@ -6218,6 +6287,8 @@ DBErrors CWallet::LoadWallet()
     // reconciliation in separate phases avoids nested chain/wallet locks.
     std::map<uint256, std::optional<int>> active_block_heights;
     std::map<uint256, std::set<COutPoint>> authenticated_shadow_payouts;
+    uint256 payout_tip_hash;
+    int payout_tip_height{-1};
     if (HaveChain() && !referenced_blocks.empty()) {
         LOCK(::cs_main);
         ChainstateManager& chainman = chain().chainman();
@@ -6225,23 +6296,78 @@ DBErrors CWallet::LoadWallet()
             const CBlockIndex* block_index = chainman.m_blockman.LookupBlockIndex(block_hash);
             if (block_index && chainman.ActiveChain().Contains(block_index)) {
                 active_block_heights.emplace(block_hash, block_index->nHeight);
-                if (synthetic_payout_blocks.count(block_hash) != 0) {
-                    std::set<COutPoint> block_payouts;
-                    for (const ShadowSyntheticPayoutTransaction& payout :
-                         GetAppliedShadowClaimPayoutTransactionRecords(
-                             chainman.ActiveChainstate().CoinsTip(),
-                             block_index->nHeight,
-                             block_hash,
-                             block_index->GetBlockTime())) {
-                        if (payout.tx && !payout.tx->vout.empty()) {
-                            block_payouts.emplace(payout.tx->GetHash(), 0);
-                        }
-                    }
-                    authenticated_shadow_payouts.emplace(block_hash, std::move(block_payouts));
-                }
             } else {
                 active_block_heights.emplace(block_hash, std::nullopt);
             }
+        }
+        if (const CBlockIndex* tip = chainman.ActiveChain().Tip()) {
+            payout_tip_hash = tip->GetBlockHash();
+            payout_tip_height = tip->nHeight;
+        }
+
+        // Payout authentication costs a pool-undo and one claim-marker
+        // chainstate lookup per claim for every payout block, which is slow
+        // on cold storage. Blocks at or below a still-valid checkpoint were
+        // authenticated by an earlier start (or when the wallet recorded
+        // them) and their records are unchanged, so only newer blocks are
+        // authenticated now. Anything that does not match exactly falls back
+        // to authenticating every payout block.
+        int verified_through_height{-1};
+        if (payout_checkpoint && !synthetic_payout_blocks.empty() &&
+            payout_checkpoint->schema == SyntheticPayoutCheckpoint::CURRENT_SCHEMA &&
+            payout_checkpoint->client_version == CLIENT_VERSION && payout_checkpoint->height >= 0) {
+            const CBlockIndex* checkpoint_index = chainman.m_blockman.LookupBlockIndex(payout_checkpoint->block_hash);
+            if (checkpoint_index && checkpoint_index->nHeight == payout_checkpoint->height &&
+                chainman.ActiveChain().Contains(checkpoint_index)) {
+                for (SyntheticPayoutRef& ref : synthetic_payout_refs) {
+                    const auto snapshot = active_block_heights.find(ref.block_hash);
+                    ref.height = (snapshot != active_block_heights.end() && snapshot->second) ? *snapshot->second : -1;
+                }
+                const auto [count, digest] = HashSyntheticPayoutRefs(synthetic_payout_refs, payout_checkpoint->height);
+                if (count == payout_checkpoint->count && digest == payout_checkpoint->digest) {
+                    verified_through_height = payout_checkpoint->height;
+                }
+            }
+        }
+
+        size_t blocks_to_authenticate{0};
+        size_t blocks_verified{0};
+        for (const uint256& block_hash : synthetic_payout_blocks) {
+            const auto snapshot = active_block_heights.find(block_hash);
+            if (snapshot == active_block_heights.end() || !snapshot->second) continue;
+            if (*snapshot->second > verified_through_height) {
+                ++blocks_to_authenticate;
+            } else {
+                ++blocks_verified;
+            }
+        }
+        if (blocks_to_authenticate >= SYNTHETIC_PAYOUT_AUTHENTICATION_NOTICE_BLOCKS) {
+            WalletLogPrintf("Authenticating synthetic Gold Rush payouts in %u blocks (%u already verified); the wallet logs nothing else until this finishes\n",
+                            blocks_to_authenticate, blocks_verified);
+        }
+        const auto authentication_start{SteadyClock::now()};
+        for (const uint256& block_hash : synthetic_payout_blocks) {
+            const auto snapshot = active_block_heights.find(block_hash);
+            if (snapshot == active_block_heights.end() || !snapshot->second || *snapshot->second <= verified_through_height) continue;
+            const CBlockIndex* block_index = chainman.m_blockman.LookupBlockIndex(block_hash);
+            if (!block_index) continue;
+            std::set<COutPoint> block_payouts;
+            for (const ShadowSyntheticPayoutTransaction& payout :
+                 GetAppliedShadowClaimPayoutTransactionRecords(
+                     chainman.ActiveChainstate().CoinsTip(),
+                     block_index->nHeight,
+                     block_hash,
+                     block_index->GetBlockTime())) {
+                if (payout.tx && !payout.tx->vout.empty()) {
+                    block_payouts.emplace(payout.tx->GetHash(), 0);
+                }
+            }
+            authenticated_shadow_payouts.emplace(block_hash, std::move(block_payouts));
+        }
+        if (!synthetic_payout_blocks.empty()) {
+            WalletLogPrintf("Gold Rush payout check: %u payout blocks authenticated, %u already verified through height %d, took %d ms\n",
+                            blocks_to_authenticate, blocks_verified, verified_through_height,
+                            Ticks<std::chrono::milliseconds>(SteadyClock::now() - authentication_start));
         }
     }
 
@@ -6287,6 +6413,12 @@ DBErrors CWallet::LoadWallet()
     RecomputeConfirmedSyntheticPayoutIndex();
     RecomputeLiveUnspentStakeOutpoints();
     RebuildShadowPowClaimIndexesLocked();
+    if (HaveChain() && reconciliation_write_ok && nLoadWalletRet == DBErrors::LOAD_OK) {
+        // Every confirmed synthetic payout at or below the tip is now authenticated.
+        m_synthetic_payout_checkpoint_trusted = true;
+        WalletBatch checkpoint_batch(GetDatabase());
+        WriteSyntheticPayoutCheckpoint(checkpoint_batch, payout_tip_hash, payout_tip_height);
+    }
     if (nLoadWalletRet == DBErrors::NEED_REWRITE)
     {
         if (GetDatabase().Rewrite("\x04pool"))

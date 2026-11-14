@@ -653,6 +653,60 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_walletdb_roundtrip)
     BOOST_CHECK(output == DefaultShadowPowClaimRecoveryPolicy());
 }
 
+BOOST_AUTO_TEST_CASE(synthetic_payout_checkpoint_roundtrip_and_malformed_is_ignored)
+{
+    std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+    WalletBatch batch(*database, /*flush_on_close=*/false);
+
+    SyntheticPayoutCheckpoint output;
+    BOOST_CHECK(!batch.ReadSyntheticPayoutCheckpoint(output));
+
+    SyntheticPayoutCheckpoint input;
+    input.schema = SyntheticPayoutCheckpoint::CURRENT_SCHEMA;
+    input.client_version = CLIENT_VERSION;
+    input.height = 1234;
+    input.block_hash = Hash(std::string{"block"});
+    input.count = 77;
+    input.digest = Hash(std::string{"digest"});
+    BOOST_REQUIRE(batch.WriteSyntheticPayoutCheckpoint(input));
+    BOOST_REQUIRE(batch.ReadSyntheticPayoutCheckpoint(output));
+    BOOST_CHECK(output == input);
+
+    // A record of another type cannot be decoded and reads as absent.
+    {
+        std::unique_ptr<DatabaseBatch> raw_batch = database->MakeBatch(/*flush_on_close=*/false);
+        BOOST_REQUIRE(raw_batch->Write(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, std::string{"truncated"}));
+    }
+    BOOST_CHECK(!batch.ReadSyntheticPayoutCheckpoint(output));
+    BOOST_CHECK(output == SyntheticPayoutCheckpoint{});
+
+    BOOST_REQUIRE(batch.WriteSyntheticPayoutCheckpoint(input));
+    BOOST_REQUIRE(batch.EraseSyntheticPayoutCheckpoint());
+    BOOST_CHECK(!batch.ReadSyntheticPayoutCheckpoint(output));
+}
+
+BOOST_AUTO_TEST_CASE(synthetic_payout_checkpoint_never_prevents_wallet_loading)
+{
+    for (const bool malformed : {false, true}) {
+        std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+        {
+            std::unique_ptr<DatabaseBatch> raw_batch = database->MakeBatch(/*flush_on_close=*/false);
+            if (malformed) {
+                BOOST_REQUIRE(raw_batch->Write(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, std::string{"truncated"}));
+            } else {
+                SyntheticPayoutCheckpoint checkpoint;
+                checkpoint.schema = SyntheticPayoutCheckpoint::CURRENT_SCHEMA;
+                checkpoint.client_version = CLIENT_VERSION;
+                checkpoint.height = 5;
+                BOOST_REQUIRE(raw_batch->Write(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, checkpoint));
+            }
+        }
+        const std::shared_ptr<CWallet> wallet(
+            new CWallet(m_node.chain.get(), "payout-checkpoint-load", std::move(database)));
+        BOOST_CHECK_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(shadow_pow_claim_recovery_policy_malformed_is_noncritical)
 {
     auto check_malformed = [this](const auto& malformed_value) {

@@ -262,6 +262,16 @@ extern std::function<std::unique_ptr<Sock>(const CService&)> CreateSock;
 // Optional attempted output is set immediately before Sock::Connect.
 bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nTimeout, bool manual_connection, bool* attempted = nullptr);
 
+/** Value reported by GetLastConnectError() when the connect wait timed out. */
+static constexpr int CONNECT_ERROR_TIMEOUT{-1};
+/**
+ * The errno of the last ConnectSocketDirectly() failure on this thread,
+ * CONNECT_ERROR_TIMEOUT if it timed out, 0 if it succeeded or never ran.
+ * Diagnostics only; ConnectSocketDirectly() behaves the same without it.
+ */
+int GetLastConnectError();
+void ClearLastConnectError();
+
 /**
  * Connect to a specified destination service through a SOCKS5 proxy by first
  * connecting to the SOCKS5 proxy.

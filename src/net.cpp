@@ -841,6 +841,95 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
     return pnode;
 }
 
+namespace {
+/** Lowercase an errno text for a log token: letters, digits and single spaces only. */
+std::string SanitizeErrorText(const std::string& text)
+{
+    std::string out;
+    for (const char c : text) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            out += c;
+        } else if (c >= 'A' && c <= 'Z') {
+            out += static_cast<char>(c - 'A' + 'a');
+        } else if ((c == ' ' || c == '_' || c == '-' || c == ':' || c == ',' || c == '(') && !out.empty() && out.back() != ' ') {
+            out += ' ';
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out.empty() ? "unknown" : out;
+}
+
+/** Classes of failed outbound dials, indexes into CConnman::m_dial_fail_by_class. */
+enum DialFailClass : uint8_t { FAIL_TIMEOUT, FAIL_REFUSED, FAIL_UNREACHABLE, FAIL_ADDRNOTAVAIL, FAIL_OTHER };
+static_assert(FAIL_OTHER + 1 == DIAL_FAIL_CLASSES);
+
+DialFailClass ClassifyConnectError(int err)
+{
+    if (err == CONNECT_ERROR_TIMEOUT) return FAIL_TIMEOUT;
+    if (err == 0) return FAIL_OTHER;
+#ifdef WIN32
+    switch (err) {
+    case WSAETIMEDOUT: return FAIL_TIMEOUT;
+    case WSAECONNREFUSED: return FAIL_REFUSED;
+    case WSAENETUNREACH: case WSAEHOSTUNREACH: case WSAENETDOWN: return FAIL_UNREACHABLE;
+    case WSAEADDRNOTAVAIL: return FAIL_ADDRNOTAVAIL;
+    default: return FAIL_OTHER;
+    }
+#else
+    switch (err) {
+    case ETIMEDOUT: return FAIL_TIMEOUT;
+    case ECONNREFUSED: return FAIL_REFUSED;
+    case ENETUNREACH: case EHOSTUNREACH: case ENETDOWN: return FAIL_UNREACHABLE;
+    case EADDRNOTAVAIL: return FAIL_ADDRNOTAVAIL;
+    default: return FAIL_OTHER;
+    }
+#endif
+}
+
+const char* DialFailClassToken(uint8_t cls)
+{
+    switch (cls) {
+    case FAIL_TIMEOUT: return "timeout";
+    case FAIL_REFUSED: return "refused";
+    case FAIL_UNREACHABLE: return "unreachable";
+    case FAIL_ADDRNOTAVAIL: return "addrnotavail";
+    case FAIL_OTHER: return "other";
+    }
+    return "none";
+}
+} // namespace
+
+std::string DisconnectReasonToString(DisconnectReason reason, int err)
+{
+    switch (reason) {
+    case DisconnectReason::NONE: return "local_other";
+    case DisconnectReason::REMOTE_CLOSED: return "remote_closed";
+    case DisconnectReason::RECV_ERROR: return "recv_error:" + SanitizeErrorText(NetworkErrorString(err));
+    case DisconnectReason::SEND_ERROR: return "send_error:" + SanitizeErrorText(NetworkErrorString(err));
+    case DisconnectReason::TRANSPORT_ERROR: return "transport_error";
+    case DisconnectReason::TIMEOUT_NO_MESSAGE: return "timeout_no_message";
+    case DisconnectReason::TIMEOUT_SEND: return "timeout_send";
+    case DisconnectReason::TIMEOUT_RECV: return "timeout_recv";
+    case DisconnectReason::TIMEOUT_HANDSHAKE: return "timeout_handshake";
+    case DisconnectReason::TIMEOUT_PING: return "timeout_ping";
+    case DisconnectReason::TIMEOUT_BLOCK_STALL: return "timeout_block_stall";
+    case DisconnectReason::TIMEOUT_BLOCK_DOWNLOAD: return "timeout_block_download";
+    case DisconnectReason::TIMEOUT_HEADERS: return "timeout_headers";
+    case DisconnectReason::LOCAL_MISBEHAVIOR: return "local_misbehavior";
+    case DisconnectReason::LOCAL_PROTOCOL: return "local_protocol";
+    case DisconnectReason::LOCAL_EVICTION: return "local_eviction";
+    case DisconnectReason::LOCAL_STALE_TIP: return "local_stale_tip";
+    case DisconnectReason::LOCAL_NETWORK_INACTIVE: return "local_network_inactive";
+    case DisconnectReason::LOCAL_SHUTDOWN: return "local_shutdown";
+    case DisconnectReason::LOCAL_RPC: return "local_rpc";
+    case DisconnectReason::LOCAL_BANNED: return "local_banned";
+    case DisconnectReason::LOCAL_TASK_DONE: return "local_task_done";
+    case DisconnectReason::LOCAL_PROBE_EXPIRED: return "local_probe_expired";
+    case DisconnectReason::LOCAL_OTHER: return "local_other";
+    }
+    return "local_other";
+}
+
 void CNode::CloseSocketDisconnect()
 {
     fDisconnect = true;
@@ -1928,6 +2017,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
                 int nErr = WSAGetLastError();
                 if (nErr != WSAEWOULDBLOCK && nErr != WSAEMSGSIZE && nErr != WSAEINTR && nErr != WSAEINPROGRESS) {
                     LogPrint(BCLog::NET, "socket send error for peer=%d: %s\n", node.GetId(), NetworkErrorString(nErr));
+                    if (!node.fDisconnect) node.SetDisconnectReason(DisconnectReason::SEND_ERROR, nErr);
                     node.CloseSocketDisconnect();
                 }
             }
@@ -1988,7 +2078,7 @@ bool CConnman::AttemptToEvictConnection()
     for (CNode* pnode : m_nodes) {
         if (pnode->GetId() == *node_id_to_evict) {
             LogPrint(BCLog::NET, "selected %s connection for eviction peer=%d; disconnecting\n", pnode->ConnectionTypeAsString(), pnode->GetId());
-            pnode->fDisconnect = true;
+            pnode->Disconnect(DisconnectReason::LOCAL_EVICTION);
             return true;
         }
     }
@@ -2186,7 +2276,7 @@ void CConnman::DisconnectNodes()
             for (CNode* pnode : m_nodes) {
                 if (!pnode->fDisconnect) {
                     LogPrint(BCLog::NET, "Network not active, dropping peer=%d\n", pnode->GetId());
-                    pnode->fDisconnect = true;
+                    pnode->Disconnect(DisconnectReason::LOCAL_NETWORK_INACTIVE);
                 }
             }
         }
@@ -2196,7 +2286,7 @@ void CConnman::DisconnectNodes()
         for (CNode* pnode : nodes_copy)
         {
             const bool expired_probe = pnode->m_qq_probe && pnode->m_qq_probe->Expired(qq::Clock::now());
-            if (expired_probe) pnode->fDisconnect = true;
+            if (expired_probe) pnode->Disconnect(DisconnectReason::LOCAL_PROBE_EXPIRED);
             if (pnode->fDisconnect)
             {
                 // remove from m_nodes
@@ -2216,19 +2306,49 @@ void CConnman::DisconnectNodes()
                     LogPrint(BCLog::NET, "retrying with v1 transport protocol for peer=%d\n", pnode->GetId());
                 }
 
-                // One line per lost peer that had completed the handshake. No addresses.
-                if (pnode->fSuccessfullyConnected && (!pnode->IsInboundConn() || LogAcceptCategory(BCLog::NET, BCLog::Level::Debug))) {
+                // An outbound connection that reached TCP but ended before verack because the
+                // remote closed or reset it: how a node that refuses us looks from here.
+                if (!pnode->IsInboundConn() && !pnode->fSuccessfullyConnected && !expired_probe) {
+                    switch (pnode->GetDisconnectReason()) {
+                    case DisconnectReason::REMOTE_CLOSED:
+                    case DisconnectReason::RECV_ERROR:
+                    case DisconnectReason::SEND_ERROR:
+                        ++m_handshake_failures;
+                        break;
+                    default: break;
+                    }
+                }
+
+                // One line per lost peer that had completed the handshake. Addresses only with -logips.
+                if (pnode->fSuccessfullyConnected) {
                     size_t remaining{0};
                     for (const CNode* other : m_nodes) remaining += other->fSuccessfullyConnected ? 1 : 0;
-                    std::string subver;
+                    // Peers lost within the last ten seconds, inbound ones too.
+                    size_t lost_together{0};
                     {
-                        LOCK(pnode->m_subver_mutex);
-                        subver = pnode->cleanSubVer;
+                        const auto steady_now{std::chrono::steady_clock::now()};
+                        LOCK(m_lost_peers_mutex);
+                        m_lost_peer_times.push_back(steady_now);
+                        while (!m_lost_peer_times.empty() && steady_now - m_lost_peer_times.front() > std::chrono::seconds{10}) {
+                            m_lost_peer_times.pop_front();
+                        }
+                        lost_together = m_lost_peer_times.size();
                     }
-                    LogPrintf("Peer lost: peer=%d type=%s direction=%s transport=%s subver=%s connected_for=%ds peers_remaining=%u\n",
-                              pnode->GetId(), pnode->ConnectionTypeAsString(), pnode->IsInboundConn() ? "inbound" : "outbound",
-                              TransportTypeAsString(pnode->m_transport->GetInfo().transport_type), subver,
-                              (GetTime<std::chrono::seconds>() - pnode->m_connected).count(), remaining);
+                    if (!pnode->IsInboundConn() || LogAcceptCategory(BCLog::NET, BCLog::Level::Debug)) {
+                        std::string subver;
+                        {
+                            LOCK(pnode->m_subver_mutex);
+                            subver = pnode->cleanSubVer;
+                        }
+                        // reason comes last because a recv or send error token contains spaces.
+                        LogPrintf("Peer lost: peer=%d type=%s direction=%s transport=%s subver=%s connected_for=%ds peers_remaining=%u%s%s reason=%s\n",
+                                  pnode->GetId(), pnode->ConnectionTypeAsString(), pnode->IsInboundConn() ? "inbound" : "outbound",
+                                  TransportTypeAsString(pnode->m_transport->GetInfo().transport_type), subver,
+                                  (GetTime<std::chrono::seconds>() - pnode->m_connected).count(), remaining,
+                                  remaining == 0 ? strprintf(" lost_together=%u", lost_together) : "",
+                                  fLogIPs ? strprintf(" addr=%s", pnode->addr.ToStringAddrPort()) : "",
+                                  pnode->GetDisconnectReasonString());
+                    }
                 }
 
                 // release outbound grant (if any)
@@ -2285,8 +2405,9 @@ bool CConnman::ShouldRunInactivityChecks(const CNode& node, std::chrono::seconds
     return node.m_connected + m_peer_connect_timeout < now;
 }
 
-bool CConnman::InactivityCheck(const CNode& node) const
+bool CConnman::InactivityCheck(const CNode& node, DisconnectReason* reason) const
 {
+    const auto set_reason = [&](DisconnectReason r) { if (reason) *reason = r; };
     // Tests that see disconnects after using mocktime can start nodes with a
     // large timeout. For example, -peertimeout=999999999.
     const auto now{GetTime<std::chrono::seconds>()};
@@ -2297,21 +2418,25 @@ bool CConnman::InactivityCheck(const CNode& node) const
 
     if (last_recv.count() == 0 || last_send.count() == 0) {
         LogPrint(BCLog::NET, "socket no message in first %i seconds, %d %d peer=%d\n", count_seconds(m_peer_connect_timeout), last_recv.count() != 0, last_send.count() != 0, node.GetId());
+        set_reason(DisconnectReason::TIMEOUT_NO_MESSAGE);
         return true;
     }
 
     if (now > last_send + TIMEOUT_INTERVAL) {
         LogPrint(BCLog::NET, "socket sending timeout: %is peer=%d\n", count_seconds(now - last_send), node.GetId());
+        set_reason(DisconnectReason::TIMEOUT_SEND);
         return true;
     }
 
     if (now > last_recv + TIMEOUT_INTERVAL) {
         LogPrint(BCLog::NET, "socket receive timeout: %is peer=%d\n", count_seconds(now - last_recv), node.GetId());
+        set_reason(DisconnectReason::TIMEOUT_RECV);
         return true;
     }
 
     if (!node.fSuccessfullyConnected) {
         LogPrint(BCLog::NET, "version handshake timeout peer=%d\n", node.GetId());
+        set_reason(DisconnectReason::TIMEOUT_HANDSHAKE);
         return true;
     }
 
@@ -2441,6 +2566,7 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
             {
                 bool notify = false;
                 if (!pnode->ReceiveMsgBytes({pchBuf, (size_t)nBytes}, notify)) {
+                    if (!pnode->fDisconnect) pnode->SetDisconnectReason(DisconnectReason::TRANSPORT_ERROR);
                     pnode->CloseSocketDisconnect();
                 }
                 RecordBytesRecv(nBytes);
@@ -2454,6 +2580,7 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
                 // socket closed gracefully
                 if (!pnode->fDisconnect) {
                     LogPrint(BCLog::NET, "socket closed for peer=%d\n", pnode->GetId());
+                    pnode->SetDisconnectReason(DisconnectReason::REMOTE_CLOSED);
                 }
                 pnode->CloseSocketDisconnect();
             }
@@ -2465,13 +2592,15 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
                 {
                     if (!pnode->fDisconnect) {
                         LogPrint(BCLog::NET, "socket recv error for peer=%d: %s\n", pnode->GetId(), NetworkErrorString(nErr));
+                        pnode->SetDisconnectReason(DisconnectReason::RECV_ERROR, nErr);
                     }
                     pnode->CloseSocketDisconnect();
                 }
             }
         }
 
-        if (InactivityCheck(*pnode)) pnode->fDisconnect = true;
+        DisconnectReason inactivity_reason{DisconnectReason::NONE};
+        if (InactivityCheck(*pnode, &inactivity_reason)) pnode->Disconnect(inactivity_reason);
     }
 }
 
@@ -2999,7 +3128,8 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
     // Zero-peer diagnostics: window start and the dial counters at that moment.
     std::optional<std::chrono::microseconds> zero_peers_since;
     std::optional<std::chrono::microseconds> zero_peers_last_log;
-    uint64_t zero_peers_attempts{0}, zero_peers_failures{0}, zero_peers_qq_attempts{0};
+    uint64_t zero_peers_attempts{0}, zero_peers_failures{0}, zero_peers_qq_attempts{0}, zero_peers_handshake_failures{0};
+    std::array<uint64_t, DIAL_FAIL_CLASSES> zero_peers_fail_by_class{};
     const auto is_legacy_full_relay = [](const CNode& node) {
         return node.IsFullOutboundConn() && !node.IsQQProbe() && !(node.m_accepted_services & NODE_QUANTUM_QUASAR);
     };
@@ -3030,13 +3160,24 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 zero_peers_attempts = m_dial_attempts;
                 zero_peers_failures = m_dial_failures;
                 zero_peers_qq_attempts = m_qq_dial_attempts;
+                zero_peers_handshake_failures = m_handshake_failures;
+                for (size_t i{0}; i < DIAL_FAIL_CLASSES; ++i) zero_peers_fail_by_class[i] = m_dial_fail_by_class[i];
+                m_last_dial_fail_class = DIAL_FAIL_CLASSES;
             } else if (clock_now - *zero_peers_since >= qq::ZERO_PEER_LOG_AFTER &&
                        (!zero_peers_last_log || clock_now - *zero_peers_last_log >= qq::ZERO_PEER_LOG_EVERY)) {
                 zero_peers_last_log = clock_now;
-                LogPrintf("No peers for %d seconds: addrman=%u dial_attempts=%u dial_failures=%u qq_hints=%u qq_dials=%u\n",
+                // Dial failures and refusals since the peers reached zero, by class.
+                LogPrintf("No peers for %d seconds: addrman=%u dial_attempts=%u dial_failures=%u qq_hints=%u qq_dials=%u fail_timeout=%u fail_refused=%u fail_unreachable=%u fail_addrnotavail=%u fail_other=%u last_fail=%s handshake_fail=%u network_active=%d\n",
                           std::chrono::duration_cast<std::chrono::seconds>(clock_now - *zero_peers_since).count(),
                           addrman.Size(), m_dial_attempts - zero_peers_attempts, m_dial_failures - zero_peers_failures,
-                          m_last_qq_seed_hints_count.load(), m_qq_dial_attempts - zero_peers_qq_attempts);
+                          m_last_qq_seed_hints_count.load(), m_qq_dial_attempts - zero_peers_qq_attempts,
+                          m_dial_fail_by_class[FAIL_TIMEOUT] - zero_peers_fail_by_class[FAIL_TIMEOUT],
+                          m_dial_fail_by_class[FAIL_REFUSED] - zero_peers_fail_by_class[FAIL_REFUSED],
+                          m_dial_fail_by_class[FAIL_UNREACHABLE] - zero_peers_fail_by_class[FAIL_UNREACHABLE],
+                          m_dial_fail_by_class[FAIL_ADDRNOTAVAIL] - zero_peers_fail_by_class[FAIL_ADDRNOTAVAIL],
+                          m_dial_fail_by_class[FAIL_OTHER] - zero_peers_fail_by_class[FAIL_OTHER],
+                          DialFailClassToken(m_last_dial_fail_class), m_handshake_failures - zero_peers_handshake_failures,
+                          fNetworkActive ? 1 : 0);
             }
         }
 
@@ -3584,12 +3725,18 @@ void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFai
         return;
 
     bool connection_attempted{false};
+    ClearLastConnectError();
     CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport, connection_attempted);
     if (attempted) *attempted = connection_attempted;
     if (connection_attempted) {
         ++m_dial_attempts;
         if (addrConnect.nServices & NODE_QUANTUM_QUASAR) ++m_qq_dial_attempts;
-        if (!pnode) ++m_dial_failures;
+        if (!pnode) {
+            ++m_dial_failures;
+            const DialFailClass fail_class{ClassifyConnectError(GetLastConnectError())};
+            ++m_dial_fail_by_class[fail_class];
+            m_last_dial_fail_class = fail_class;
+        }
     }
     if (qq_probe) RecordQQConnect(pnode == nullptr);
 
@@ -4157,6 +4304,7 @@ void CConnman::StopNodes()
     std::vector<CNode*> nodes;
     WITH_LOCK(m_nodes_mutex, nodes.swap(m_nodes));
     for (CNode* pnode : nodes) {
+        pnode->SetDisconnectReason(DisconnectReason::LOCAL_SHUTDOWN);
         pnode->CloseSocketDisconnect();
         DeleteNode(pnode);
     }
@@ -4313,43 +4461,43 @@ void CConnman::GetNodeStats(std::vector<CNodeStats>& vstats) const
     }
 }
 
-bool CConnman::DisconnectNode(const std::string& strNode)
+bool CConnman::DisconnectNode(const std::string& strNode, DisconnectReason reason)
 {
     LOCK(m_nodes_mutex);
     if (CNode* pnode = FindNode(strNode)) {
         LogPrint(BCLog::NET, "disconnect by address%s matched peer=%d; disconnecting\n", (fLogIPs ? strprintf("=%s", strNode) : ""), pnode->GetId());
-        pnode->fDisconnect = true;
+        pnode->Disconnect(reason);
         return true;
     }
     return false;
 }
 
-bool CConnman::DisconnectNode(const CSubNet& subnet)
+bool CConnman::DisconnectNode(const CSubNet& subnet, DisconnectReason reason)
 {
     bool disconnected = false;
     LOCK(m_nodes_mutex);
     for (CNode* pnode : m_nodes) {
         if (subnet.Match(pnode->addr)) {
             LogPrint(BCLog::NET, "disconnect by subnet%s matched peer=%d; disconnecting\n", (fLogIPs ? strprintf("=%s", subnet.ToString()) : ""), pnode->GetId());
-            pnode->fDisconnect = true;
+            pnode->Disconnect(reason);
             disconnected = true;
         }
     }
     return disconnected;
 }
 
-bool CConnman::DisconnectNode(const CNetAddr& addr)
+bool CConnman::DisconnectNode(const CNetAddr& addr, DisconnectReason reason)
 {
-    return DisconnectNode(CSubNet(addr));
+    return DisconnectNode(CSubNet(addr), reason);
 }
 
-bool CConnman::DisconnectNode(NodeId id)
+bool CConnman::DisconnectNode(NodeId id, DisconnectReason reason)
 {
     LOCK(m_nodes_mutex);
     for(CNode* pnode : m_nodes) {
         if (id == pnode->GetId()) {
             LogPrint(BCLog::NET, "disconnect by id peer=%d; disconnecting\n", pnode->GetId());
-            pnode->fDisconnect = true;
+            pnode->Disconnect(reason);
             return true;
         }
     }

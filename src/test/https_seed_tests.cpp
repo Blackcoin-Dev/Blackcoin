@@ -1410,7 +1410,24 @@ BOOST_FIXTURE_TEST_CASE(actual_connman_zero_peers_logs_once_per_ten_minutes_with
     const std::string failures_label{" dial_failures="};
     BOOST_REQUIRE(ParseUInt64(line.substr(separator + failures_label.size(), hints_at - separator - failures_label.size()), &logged_failures));
     BOOST_REQUIRE(ParseUInt64(line.substr(hints_at + std::string{" qq_hints="}.size(), dials_at - hints_at - std::string{" qq_hints="}.size()), &logged_hints));
-    BOOST_REQUIRE(ParseUInt64(line.substr(dials_at + std::string{" qq_dials="}.size()), &logged_qq_dials));
+    // qq_dials is followed by the failure breakdown, which later fields append to.
+    const auto dials_value_at = dials_at + std::string{" qq_dials="}.size();
+    const auto dials_end = line.find(' ', dials_value_at);
+    BOOST_REQUIRE(dials_end != std::string::npos);
+    BOOST_REQUIRE(ParseUInt64(line.substr(dials_value_at, dials_end - dials_value_at), &logged_qq_dials));
+    // The breakdown classifies exactly the failures counted in dial_failures.
+    uint64_t classified{0};
+    for (const std::string label : {" fail_timeout=", " fail_refused=", " fail_unreachable=", " fail_addrnotavail=", " fail_other="}) {
+        const auto at_label = line.find(label);
+        BOOST_REQUIRE(at_label != std::string::npos);
+        const auto value_at = at_label + label.size();
+        uint64_t value{0};
+        BOOST_REQUIRE(ParseUInt64(line.substr(value_at, line.find(' ', value_at) - value_at), &value));
+        classified += value;
+    }
+    BOOST_CHECK_EQUAL(classified, logged_failures);
+    BOOST_CHECK(line.find(" last_fail=") != std::string::npos);
+    BOOST_CHECK(line.find(" handshake_fail=0 network_active=1") != std::string::npos);
     BOOST_CHECK(logged_attempts >= 2);
     BOOST_CHECK_EQUAL(logged_attempts, logged_failures);
     BOOST_CHECK_EQUAL(logged_hints, 0U); // No accepted seed round in this test.

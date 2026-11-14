@@ -819,12 +819,12 @@ static RPCHelpMan setban()
         if (isSubnet) {
             banman.Ban(subNet, banTime, absolute);
             if (node.connman) {
-                node.connman->DisconnectNode(subNet);
+                node.connman->DisconnectNode(subNet, DisconnectReason::LOCAL_BANNED);
             }
         } else {
             banman.Ban(netAddr, banTime, absolute);
             if (node.connman) {
-                node.connman->DisconnectNode(netAddr);
+                node.connman->DisconnectNode(netAddr, DisconnectReason::LOCAL_BANNED);
             }
         }
     }

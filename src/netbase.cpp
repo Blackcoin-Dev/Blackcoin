@@ -517,9 +517,15 @@ static void LogConnectFailure(bool manual_connection, const char* fmt, const Arg
     }
 }
 
+static thread_local int t_last_connect_error{0};
+
+int GetLastConnectError() { return t_last_connect_error; }
+void ClearLastConnectError() { t_last_connect_error = 0; }
+
 bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nTimeout, bool manual_connection, bool* attempted)
 {
     if (attempted) *attempted = false;
+    t_last_connect_error = 0;
     // Create a sockaddr from the specified service.
     struct sockaddr_storage sockaddr;
     socklen_t len = sizeof(sockaddr);
@@ -541,11 +547,13 @@ bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nT
             const Sock::Event requested = Sock::RECV | Sock::SEND;
             Sock::Event occurred;
             if (!sock.Wait(std::chrono::milliseconds{nTimeout}, requested, &occurred)) {
+                t_last_connect_error = WSAGetLastError();
                 LogPrintf("wait for connect to %s failed: %s\n",
                           addrConnect.ToStringAddrPort(),
                           NetworkErrorString(WSAGetLastError()));
                 return false;
             } else if (occurred == 0) {
+                t_last_connect_error = CONNECT_ERROR_TIMEOUT;
                 LogPrint(BCLog::NET, "connection attempt to %s timed out\n", addrConnect.ToStringAddrPort());
                 return false;
             }
@@ -558,10 +566,12 @@ bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nT
             socklen_t sockerr_len = sizeof(sockerr);
             if (sock.GetSockOpt(SOL_SOCKET, SO_ERROR, (sockopt_arg_type)&sockerr, &sockerr_len) ==
                 SOCKET_ERROR) {
+                t_last_connect_error = WSAGetLastError();
                 LogPrintf("getsockopt() for %s failed: %s\n", addrConnect.ToStringAddrPort(), NetworkErrorString(WSAGetLastError()));
                 return false;
             }
             if (sockerr != 0) {
+                t_last_connect_error = sockerr;
                 LogConnectFailure(manual_connection,
                                   "connect() to %s failed after wait: %s",
                                   addrConnect.ToStringAddrPort(),
@@ -575,6 +585,7 @@ bool ConnectSocketDirectly(const CService &addrConnect, const Sock& sock, int nT
         else
 #endif
         {
+            t_last_connect_error = WSAGetLastError();
             LogConnectFailure(manual_connection, "connect() to %s failed: %s", addrConnect.ToStringAddrPort(), NetworkErrorString(WSAGetLastError()));
             return false;
         }

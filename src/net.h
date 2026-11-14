@@ -37,6 +37,7 @@
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -74,6 +75,8 @@ static const bool DEFAULT_WHITELISTFORCERELAY = false;
  * "address in use" although nothing listens there. Retry such a bind once per
  * BIND_RETRY_INTERVAL for up to DEFAULT_BIND_RETRY_SECONDS before giving up.
  */
+/** Number of classes of failed outbound dials counted by CConnman. */
+static constexpr size_t DIAL_FAIL_CLASSES{5};
 static constexpr int DEFAULT_BIND_RETRY_SECONDS{30};
 static constexpr std::chrono::seconds BIND_RETRY_INTERVAL{1};
 /** Granularity at which a shutdown request is noticed while waiting to retry a bind. */
@@ -780,6 +783,37 @@ struct CNodeOptions
 };
 
 /** Information about a peer */
+/** Why a connection ended, for the "Peer lost" log line. The first reason set on a node wins. */
+enum class DisconnectReason : uint8_t {
+    NONE = 0,              //!< not set; reported as local_other
+    REMOTE_CLOSED,         //!< recv() returned 0: the peer closed the socket
+    RECV_ERROR,            //!< recv() failed (errno kept)
+    SEND_ERROR,            //!< send() failed (errno kept)
+    TRANSPORT_ERROR,       //!< bad transport data (v2 handshake, bad magic, oversized message)
+    TIMEOUT_NO_MESSAGE,    //!< nothing sent or received in the first -peertimeout seconds
+    TIMEOUT_SEND,          //!< no send for TIMEOUT_INTERVAL
+    TIMEOUT_RECV,          //!< no receive for TIMEOUT_INTERVAL
+    TIMEOUT_HANDSHAKE,     //!< version handshake did not complete
+    TIMEOUT_PING,          //!< ping not answered
+    TIMEOUT_BLOCK_STALL,   //!< stalling block download
+    TIMEOUT_BLOCK_DOWNLOAD,//!< block download timeout
+    TIMEOUT_HEADERS,       //!< headers download timeout
+    LOCAL_MISBEHAVIOR,     //!< discouraged or disconnected for misbehavior
+    LOCAL_PROTOCOL,        //!< protocol violation or unusable peer (version, services, insufficient work)
+    LOCAL_EVICTION,        //!< inbound eviction, extra outbound or block-relay-only peer, QQ replacement
+    LOCAL_STALE_TIP,       //!< outbound peer on an old chain while our tip is stale
+    LOCAL_NETWORK_INACTIVE,//!< setnetworkactive false
+    LOCAL_SHUTDOWN,        //!< node shutting down
+    LOCAL_RPC,             //!< disconnectnode RPC
+    LOCAL_BANNED,          //!< setban RPC
+    LOCAL_TASK_DONE,       //!< feeler or addr-fetch connection finished its job
+    LOCAL_PROBE_EXPIRED,   //!< QQ probe expired or rejected
+    LOCAL_OTHER,           //!< a local decision that is not individually classified
+};
+
+/** Stable lowercase token for a reason; recv_error and send_error append ":<errno text>". */
+std::string DisconnectReasonToString(DisconnectReason reason, int err = 0);
+
 class CNode
 {
 public:
@@ -848,8 +882,29 @@ public:
     // Setting fDisconnect to true will cause the node to be disconnected the
     // next time DisconnectNodes() runs
     std::atomic_bool fDisconnect{false};
+    /** Record why the connection ended. The first call wins; thread safe. Does not set fDisconnect. */
+    void SetDisconnectReason(DisconnectReason reason, int err = 0)
+    {
+        uint64_t expected{0};
+        m_disconnect_state.compare_exchange_strong(expected, (uint64_t{static_cast<uint8_t>(reason)} << 32) | static_cast<uint32_t>(err));
+    }
+    /** Record the reason and set fDisconnect. */
+    void Disconnect(DisconnectReason reason, int err = 0)
+    {
+        SetDisconnectReason(reason, err);
+        fDisconnect = true;
+    }
+    /** The recorded reason as a log token; local_other when none was recorded. */
+    std::string GetDisconnectReasonString() const
+    {
+        const uint64_t state{m_disconnect_state.load()};
+        return DisconnectReasonToString(static_cast<DisconnectReason>(state >> 32), static_cast<int>(state & 0xffffffffU));
+    }
+    DisconnectReason GetDisconnectReason() const { return static_cast<DisconnectReason>(m_disconnect_state.load() >> 32); }
     CSemaphoreGrant grantOutbound;
     std::atomic<int> nRefCount{0};
+    /** DisconnectReason in the high 32 bits, errno in the low 32; 0 until set. */
+    std::atomic<uint64_t> m_disconnect_state{0};
 
     const uint64_t nKeyedNetGroup;
     std::atomic_bool fPauseRecv{false};
@@ -1430,10 +1485,10 @@ public:
     size_t GetNodeCount(ConnectionDirection) const;
     uint32_t GetMappedAS(const CNetAddr& addr) const;
     void GetNodeStats(std::vector<CNodeStats>& vstats) const;
-    bool DisconnectNode(const std::string& node);
-    bool DisconnectNode(const CSubNet& subnet);
-    bool DisconnectNode(const CNetAddr& addr);
-    bool DisconnectNode(NodeId id);
+    bool DisconnectNode(const std::string& node, DisconnectReason reason = DisconnectReason::LOCAL_RPC);
+    bool DisconnectNode(const CSubNet& subnet, DisconnectReason reason = DisconnectReason::LOCAL_RPC);
+    bool DisconnectNode(const CNetAddr& addr, DisconnectReason reason = DisconnectReason::LOCAL_RPC);
+    bool DisconnectNode(NodeId id, DisconnectReason reason = DisconnectReason::LOCAL_RPC);
 
     //! Used to convey which local services we are offering peers during node
     //! connection.
@@ -1528,7 +1583,7 @@ private:
     void DisconnectNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_nodes_mutex);
     void NotifyNumConnectionsChanged();
     /** Return true if the peer is inactive and should be disconnected. */
-    bool InactivityCheck(const CNode& node) const;
+    bool InactivityCheck(const CNode& node, DisconnectReason* reason = nullptr) const;
 
     /**
      * Generate a collection of sockets to check for IO readiness.
@@ -1711,6 +1766,14 @@ private:
     std::atomic<uint64_t> m_dial_attempts{0};
     std::atomic<uint64_t> m_qq_dial_attempts{0};
     std::atomic<uint64_t> m_dial_failures{0};
+    /** Dial failures by class, indexed by the DialFailClass enum in net.cpp; the sum equals m_dial_failures. */
+    std::array<std::atomic<uint64_t>, DIAL_FAIL_CLASSES> m_dial_fail_by_class{};
+    std::atomic<uint8_t> m_last_dial_fail_class{DIAL_FAIL_CLASSES};
+    /** Outbound connections that connected at TCP level and ended before verack because the remote closed or reset. */
+    std::atomic<uint64_t> m_handshake_failures{0};
+    /** Times at which peers that completed the handshake were lost, for the lost_together count. */
+    Mutex m_lost_peers_mutex;
+    std::deque<std::chrono::steady_clock::time_point> m_lost_peer_times GUARDED_BY(m_lost_peers_mutex);
     int m_qq_requested_target{-1};
     int m_qq_target{0};
     mutable Mutex m_qq_status_mutex;

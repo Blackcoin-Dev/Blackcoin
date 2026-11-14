@@ -788,6 +788,46 @@ public:
     }
 };
 
+//! Let the chain finish announcing the blocks this test already made: drain the
+//! validation callback queue and wait until the GUI's cached tip (the tip every
+//! detail snapshot is checked against) equals the active chain tip. This
+//! removes the lag-induced stale snapshot; it cannot exclude a try-lock miss on
+//! cs_main while another thread holds it, which WaitForDetailPanels covers.
+void SettleChainTip(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wallet)
+{
+    SyncWithValidationInterfaceQueue();
+    const auto active_tip = [&] {
+        return WITH_LOCK(::cs_main, return core_wallet->chain().chainman().ActiveChain().Tip()->GetBlockHash());
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(mini_gui.clientModel->getBestBlockHash() == active_tip(), 20000);
+}
+
+//! Wait until done() holds, pressing Refresh the way a user would.
+//! The page never applies a detail snapshot taken while the chain tip moved or
+//! cs_main could not be try-locked (very slow sanitizer builds); it shows "The
+//! chain tip changed during refresh" and waits for Refresh. When that hint is
+//! up, press Refresh again, at most max_refreshes times, and give each attempt
+//! the full timeout. Returns whether done() held; call sites keep their
+//! original assertions after it, so it never weakens them.
+bool WaitForDetailPanels(QPushButton* refresh, const QLabel* hint, const std::function<bool()>& done,
+                         int timeout_ms, int max_refreshes = 5)
+{
+    int refreshes{0};
+    QElapsedTimer attempt;
+    attempt.start();
+    while (!done()) {
+        if (attempt.elapsed() >= timeout_ms) return false;
+        if (refreshes < max_refreshes && hint->text().contains(QStringLiteral("The chain tip changed during refresh"))) {
+            ++refreshes;
+            qInfo() << "Detail snapshot was stale; pressing Refresh again" << refreshes << "of" << max_refreshes;
+            refresh->click();
+            attempt.restart();
+        }
+        QTest::qWait(10);
+    }
+    return true;
+}
+
 void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wallet, const PlatformStyle* platformStyle)
 {
     WalletModel& walletModel = *mini_gui.walletModel;
@@ -1005,7 +1045,10 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(coldstake_withdraw);
     QVERIFY(coldstake_status);
 
+    SettleChainTip(mini_gui, core_wallet);
     refresh_details->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return refresh_hint->text().contains(QString("Detail panels updated")); }, 10000);
     QTRY_VERIFY_WITH_TIMEOUT(refresh_hint->text().contains(QString("Detail panels updated")), 10000);
 
     // The completed detail snapshot has released the page's update guard.
@@ -1075,7 +1118,10 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QCOMPARE(quantum_address_count->text(), QString("0"));
 
     ConfirmMessageBox(QMessageBox::Yes);
+    SettleChainTip(mini_gui, core_wallet);
     quantum_new->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return quantum_address_count->text() == QString("1"); }, 60000);
     QTRY_COMPARE_WITH_TIMEOUT(quantum_address_count->text(), QString("1"), 60000);
     const CTxDestination gui_quantum_dest = DecodeDestination(quantum_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_quantum_dest));
@@ -1094,6 +1140,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     selfstake_lock_period->setCurrentIndex(5);
     ConfirmMessageBox(QMessageBox::Yes);
     selfstake_new->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return selfstake_selector->findData(selfstake_address->text()) >= 0; }, 10000);
     QTRY_VERIFY_WITH_TIMEOUT(selfstake_selector->findData(selfstake_address->text()) >= 0, 10000);
     const CTxDestination gui_selfstake_dest = DecodeDestination(selfstake_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_selfstake_dest));
@@ -1112,6 +1160,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     ConfirmMessageBox(QMessageBox::Yes);
     coldstake_operator_new->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return coldstake_operator_address_selector->findData(coldstake_operator_address->text()) >= 0; }, 10000);
     QTRY_VERIFY_WITH_TIMEOUT(coldstake_operator_address_selector->findData(coldstake_operator_address->text()) >= 0, 10000);
     const CTxDestination gui_operator_dest = DecodeDestination(coldstake_operator_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_operator_dest));
@@ -1146,6 +1196,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
         });
     auto stop_coldstake_trace = interfaces::MakeCleanupHandler([&] { QObject::disconnect(coldstake_trace); });
     coldstake_new->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return quantum_coldstake_count->text() == QString("1"); }, 10000);
     QTRY_COMPARE_WITH_TIMEOUT(quantum_coldstake_count->text(), QString("1"), 10000);
 
     const CTxDestination gui_coldstake_dest = DecodeDestination(coldstake_address->text().toStdString());
@@ -1286,9 +1338,19 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     release_payout_holder.reset();
     QVERIFY(!payout_main_lock_expired.load());
     qInfo() << "Payout snapshot precondition: direct unavailable probe completed and fixture locks released";
+    SettleChainTip(mini_gui, core_wallet);
     refresh_details->click();
 
-    QTRY_COMPARE_WITH_TIMEOUT(payout_snapshot_ready.count(), 1, 20000);
+    // A press can legitimately yield a stale result first (the page then asks
+    // for another Refresh), so a retry may add one more snapshot signal than
+    // the single one this click produced. Require at least one signal and the
+    // applied-snapshot state, not an exact count.
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] {
+            return payout_snapshot_ready.count() >= 1 &&
+                   refresh_hint->text().contains(QStringLiteral("Detail panels updated"));
+        }, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(payout_snapshot_ready.count() >= 1, 20000);
     QVERIFY(refresh_hint->text().contains(QStringLiteral("Detail panels updated")));
     QCOMPARE(pow_payout->text(), expected_payout);
     QVERIFY(pow_copy->isEnabled());
@@ -1359,6 +1421,11 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QCOMPARE(walletModel.wallet().getPowMiningInfo().hashrate, 0.0);
 
     refresh_details->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] {
+            return pow_status->text().contains(QString("legacy BLK UTXO")) &&
+                   pow_dashboard->text().contains(QString("waiting for a spendable legacy fee UTXO"));
+        }, 10000);
     QTRY_VERIFY_WITH_TIMEOUT(pow_status->text().contains(QString("legacy BLK UTXO")), 10000);
     QTRY_VERIFY_WITH_TIMEOUT(pow_dashboard->text().contains(QString("waiting for a spendable legacy fee UTXO")), 10000);
     QVERIFY(!pow_dashboard->text().contains(QString("running at 0")));
@@ -2207,7 +2274,12 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         QVERIFY(scope_refresh);
         QVERIFY(scope_checkbox);
         QVERIFY(scope_summary);
+        auto* scope_hint =
+            scope_page.findChild<QLabel*>("stakingMiningRefreshHint");
+        QVERIFY(scope_hint);
         scope_refresh->click();
+        WaitForDetailPanels(scope_refresh, scope_hint,
+            [&] { return scope_summary->text().contains(QStringLiteral("Unlock mode: locked")); }, 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!scope_checkbox->isChecked(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(
             scope_summary->text().contains(QStringLiteral("Unlock mode: locked")),
@@ -2981,6 +3053,8 @@ void TestStakingMiningPayoutClearsAcrossWalletIdentity(
         &page, "updateStatus", Qt::DirectConnection));
     QVERIFY(pow_copy->isEnabled());
     refresh->click();
+    WaitForDetailPanels(refresh, refresh_hint,
+        [&] { return refresh_hint->text().contains(QStringLiteral("Detail panels updated")); }, 20000);
     QTRY_VERIFY_WITH_TIMEOUT(
         refresh_hint->text().contains(QStringLiteral("Detail panels updated")),
         20000);

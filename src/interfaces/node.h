@@ -209,6 +209,10 @@ public:
     virtual uint256 getBestBlockHash() = 0;
     virtual bool tryGetBestBlockHash(uint256& hash) = 0;
 
+    //! Non-blocking lookup of a known block's height and whether it is on the
+    //! active chain. Returns false when the block is unknown or cs_main is busy.
+    virtual bool tryGetBlockHeight(const uint256& hash, int& height, bool& in_active_chain) = 0;
+
     //! Get last block time.
     virtual int64_t getLastBlockTime() = 0;
 

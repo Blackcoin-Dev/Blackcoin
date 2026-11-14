@@ -119,8 +119,16 @@ public:
         bool transient_unavailable{false};
         std::string unavailable_stage;
         std::string error;
+        //! The first tip the worker saw is authoritative for this result.
+        //! stale_tip now means only "invalid": no starting tip could be
+        //! determined, or the start block was reorganized out before the end.
         std::string start_tip;
         std::string end_tip;
+        int start_height{-1};
+        //! The chain tip moved (or could not be re-read) after start_tip, so
+        //! wallet reads may span more than one block. The result stays usable
+        //! and the view must say so.
+        bool tip_advanced{false};
 
         interfaces::WalletPowMiningInfo pow;
         interfaces::WalletMigrationStatus migration;

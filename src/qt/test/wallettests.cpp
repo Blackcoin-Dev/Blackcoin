@@ -791,8 +791,9 @@ public:
 //! Let the chain finish announcing the blocks this test already made: drain the
 //! validation callback queue and wait until the GUI's cached tip (the tip every
 //! detail snapshot is checked against) equals the active chain tip. This
-//! removes the lag-induced stale snapshot; it cannot exclude a try-lock miss on
-//! cs_main while another thread holds it, which WaitForDetailPanels covers.
+//! removes the lag between the GUI's cached tip and the chain, so a result is
+//! labelled with the block the test expects; a tip advance no longer discards a
+//! detail snapshot, and only a reorganization does (WaitForDetailPanels).
 void SettleChainTip(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wallet)
 {
     SyncWithValidationInterfaceQueue();
@@ -803,12 +804,12 @@ void SettleChainTip(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wall
 }
 
 //! Wait until done() holds, pressing Refresh the way a user would.
-//! The page never applies a detail snapshot taken while the chain tip moved or
-//! cs_main could not be try-locked (very slow sanitizer builds); it shows "The
-//! chain tip changed during refresh" and waits for Refresh. When that hint is
-//! up, press Refresh again, at most max_refreshes times, and give each attempt
-//! the full timeout. Returns whether done() held; call sites keep their
-//! original assertions after it, so it never weakens them.
+//! The page applies a detail snapshot taken while the chain tip advanced and
+//! labels it with its block; it discards one only when its start block was
+//! reorganized out, showing "The chain reorganized during refresh" and waiting
+//! for Refresh. When that hint is up, press Refresh again, at most max_refreshes
+//! times, and give each attempt the full timeout. Returns whether done() held;
+//! call sites keep their original assertions after it, so it never weakens them.
 bool WaitForDetailPanels(QPushButton* refresh, const QLabel* hint, const std::function<bool()>& done,
                          int timeout_ms, int max_refreshes = 5)
 {
@@ -817,7 +818,7 @@ bool WaitForDetailPanels(QPushButton* refresh, const QLabel* hint, const std::fu
     attempt.start();
     while (!done()) {
         if (attempt.elapsed() >= timeout_ms) return false;
-        if (refreshes < max_refreshes && hint->text().contains(QStringLiteral("The chain tip changed during refresh"))) {
+        if (refreshes < max_refreshes && hint->text().contains(QStringLiteral("The chain reorganized during refresh"))) {
             ++refreshes;
             qInfo() << "Detail snapshot was stale; pressing Refresh again" << refreshes << "of" << max_refreshes;
             refresh->click();
@@ -3820,8 +3821,10 @@ void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const Platfo
 
     QSignalSpy ready_spy(&wallet_model, &WalletModel::stakingMiningSnapshotReady);
 
-    // A result built for any other tip must be marked stale before wallet
-    // detail calls run, and must remain an immutable, inspectable result.
+    // The requested tip is only the page's label. A request made against a tip
+    // the chain no longer has (or has not yet announced) still yields a usable,
+    // immutable result labelled with the tip the worker saw; only a
+    // reorganized-out start block sets stale_tip.
     WalletModel::StakingMiningSnapshotRequest stale_request;
     stale_request.request_id = 1000000;
     stale_request.generation = 1000000;
@@ -3831,7 +3834,10 @@ void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const Platfo
     const std::shared_ptr<const WalletModel::StakingMiningSnapshot> stale_snapshot =
         wallet_model.takeStakingMiningSnapshot(stale_request.request_id);
     QVERIFY(stale_snapshot);
-    QVERIFY(stale_snapshot->stale_tip);
+    QVERIFY(!stale_snapshot->stale_tip);
+    QVERIFY(!stale_snapshot->start_tip.empty());
+    QVERIFY(stale_snapshot->start_tip != stale_request.expected_tip);
+    QVERIFY(stale_snapshot->start_height >= 0);
     ready_spy.clear();
 
     std::promise<void> first_lock_held;
@@ -5121,6 +5127,39 @@ void TestGUIWatchOnly(interfaces::Node& node, TestChain100Setup& test)
         node, test.coinbaseKey, platformStyle.get());
 }
 
+//! Reproduces the permanent "chain tip changed during refresh" failure: a block
+//! connects after every Refresh press and before its result is delivered, as on
+//! a node whose blocks arrive faster than a refresh completes. The page must
+//! still show every result, labelled with the block it was taken at.
+void TestDetailRefreshSurvivesTipAdvance(interfaces::Node& node, TestChain100Setup& test, const std::shared_ptr<CWallet>& wallet)
+{
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI mini_gui(node, style.get());
+    mini_gui.initModelForWallet(node, wallet, style.get());
+    StakingMiningPage page(style.get());
+    page.setClientModel(mini_gui.clientModel.get());
+    page.setWalletModel(mini_gui.walletModel.get());
+    page.show();
+    qApp->processEvents();
+    QPushButton* refresh = page.findChild<QPushButton*>("stakingMiningRefresh");
+    QLabel* hint = page.findChild<QLabel*>("stakingMiningRefreshHint");
+    QVERIFY(refresh && hint);
+
+    SettleChainTip(mini_gui, wallet);
+    for (int round = 0; round < 3; ++round) {
+        refresh->click();
+        QVERIFY(!hint->text().contains(QStringLiteral("Detail panels updated")));
+        // The result is not delivered to the page until the event loop runs, so
+        // the tip has moved on from the one the request was made against.
+        const uint256 before = WITH_LOCK(::cs_main, return wallet->chain().chainman().ActiveChain().Tip()->GetBlockHash());
+        test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+        QVERIFY(WITH_LOCK(::cs_main, return wallet->chain().chainman().ActiveChain().Tip()->GetBlockHash()) != before);
+        QTRY_VERIFY_WITH_TIMEOUT(hint->text().contains(QStringLiteral("Detail panels updated as of block")), 20000);
+        QVERIFY(!hint->text().contains(QStringLiteral("changed during refresh")));
+        QVERIFY(!hint->text().contains(QStringLiteral("reorganized")));
+    }
+}
+
 void TestGUI(interfaces::Node& node)
 {
     // Set up wallet and chain with 105 blocks (5 mature blocks for spending).
@@ -5168,6 +5207,8 @@ void TestGUI(interfaces::Node& node)
     // Legacy watch-only wallet test
     // Verify PSBT creation.
     TestGUIWatchOnly(node, test);
+
+    TestDetailRefreshSurvivesTipAdvance(node, test, SetupDescriptorsWallet(node, test));
 }
 
 void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)

@@ -338,6 +338,16 @@ public:
         hash = tip ? tip->GetBlockHash() : chainman().GetParams().GenesisBlock().GetHash();
         return true;
     }
+    bool tryGetBlockHeight(const uint256& hash, int& height, bool& in_active_chain) override
+    {
+        TRY_LOCK(::cs_main, lock);
+        if (!lock) return false;
+        const CBlockIndex* index = chainman().m_blockman.LookupBlockIndex(hash);
+        if (!index) return false;
+        height = index->nHeight;
+        in_active_chain = chainman().ActiveChain().Contains(index);
+        return true;
+    }
     int64_t getLastBlockTime() override
     {
         LOCK(::cs_main);

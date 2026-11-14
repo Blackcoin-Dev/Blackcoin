@@ -502,17 +502,28 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
         }
 
         try {
+            // The tip the worker sees first labels this result. A busy cs_main
+            // (block connect can hold it for tens of seconds) falls back to the
+            // tip the page requested against; the request's expected_tip is a
+            // label, not a gate, so a tip that advances between requests cannot
+            // discard the work.
             uint256 start_tip;
-            if (!m_node.tryGetBestBlockHash(start_tip)) {
+            if (m_node.tryGetBestBlockHash(start_tip)) {
+                snapshot->start_tip = start_tip.GetHex();
+            } else if (!request.expected_tip.empty()) {
+                snapshot->start_tip = request.expected_tip;
+                start_tip.SetHex(request.expected_tip);
+            } else {
                 snapshot->stale_tip = true;
                 publish();
                 return;
             }
-            snapshot->start_tip = start_tip.GetHex();
-            if (!request.expected_tip.empty() && snapshot->start_tip != request.expected_tip) {
-                snapshot->stale_tip = true;
-                publish();
-                return;
+            {
+                bool start_in_active_chain{false};
+                int start_height{-1};
+                if (m_node.tryGetBlockHeight(start_tip, start_height, start_in_active_chain)) {
+                    snapshot->start_height = start_height;
+                }
             }
 
             // These collections use try-locks. An unavailable read is not an
@@ -611,15 +622,24 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
                     return;
                 }
             }
+            // A tip that advanced while the wallet was read still yields a
+            // usable result, flagged so the view can say it may span blocks.
+            // Only a start block that left the active chain invalidates it.
             uint256 end_tip;
-            if (!m_node.tryGetBestBlockHash(end_tip)) {
-                snapshot->stale_tip = true;
-                publish();
-                return;
+            if (m_node.tryGetBestBlockHash(end_tip)) {
+                snapshot->end_tip = end_tip.GetHex();
+                snapshot->tip_advanced = snapshot->end_tip != snapshot->start_tip;
+            } else {
+                snapshot->tip_advanced = true;
             }
-            snapshot->end_tip = end_tip.GetHex();
-            snapshot->stale_tip = snapshot->start_tip != snapshot->end_tip ||
-                (!request.expected_tip.empty() && snapshot->end_tip != request.expected_tip);
+            if (snapshot->tip_advanced) {
+                bool start_in_active_chain{true};
+                int ignored_height{-1};
+                if (m_node.tryGetBlockHeight(start_tip, ignored_height, start_in_active_chain) &&
+                    !start_in_active_chain) {
+                    snapshot->stale_tip = true;
+                }
+            }
         } catch (const std::exception& e) {
             snapshot->error = e.what();
         } catch (...) {

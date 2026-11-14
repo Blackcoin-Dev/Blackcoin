@@ -4320,12 +4320,11 @@ void StakingMiningPage::onStakingMiningSnapshotReady(quint64 request_id, quint64
         return;
     }
 
-    const std::string current_tip = m_wallet_model->getLastBlockProcessed().GetHex();
-    if (snapshot->stale_tip ||
-        snapshot->request.expected_tip != current_tip ||
-        snapshot->start_tip != current_tip ||
-        snapshot->end_tip != current_tip) {
-        if (m_refresh_hint) m_refresh_hint->setText(tr("The chain tip changed during refresh. Press Refresh to load a consistent snapshot."));
+    // A tip that merely advanced is not an error: the result is shown and
+    // labelled with the block it was taken at. Only a result whose start block
+    // was reorganized out of the chain (or never had a tip) is discarded.
+    if (snapshot->stale_tip) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("The chain reorganized during refresh. Press Refresh to reload."));
         return;
     }
 
@@ -5129,7 +5128,14 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     }
 
     applyOperatorRegistry(snapshot.pool);
-    if (m_refresh_hint) m_refresh_hint->setText(tr("Detail panels updated. Press Refresh to reload."));
+    if (m_refresh_hint) {
+        const QString as_of = snapshot.start_height >= 0
+            ? tr("block %1").arg(snapshot.start_height)
+            : tr("block %1").arg(QString::fromStdString(snapshot.start_tip.substr(0, 12)));
+        m_refresh_hint->setText(snapshot.tip_advanced
+            ? tr("Detail panels updated as of %1. The chain tip advanced during refresh, so figures may span more than one block. Press Refresh to reload.").arg(as_of)
+            : tr("Detail panels updated as of %1. Press Refresh to reload.").arg(as_of));
+    }
 }
 
 void StakingMiningPage::resetStatusForNoWallet()

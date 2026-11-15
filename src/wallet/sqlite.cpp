@@ -274,6 +274,7 @@ void SQLiteDatabase::Open()
     if (m_db == nullptr) {
         m_transaction_poisoned = false;
         m_transaction_owner = nullptr;
+        m_bulk_active = false;
         if (!m_mock) {
             TryCreateDirectories(fs::PathFromString(m_dir_path));
         }
@@ -643,10 +644,30 @@ std::unique_ptr<DatabaseCursor> SQLiteBatch::GetNewPrefixCursor(Span<const std::
     return cursor;
 }
 
+static constexpr const char* NESTED_SAVEPOINT{"bitcoin_nested_txn"};
+
 bool SQLiteBatch::TxnBegin(bool durable)
 {
     if (!m_database.m_db || m_txn_mutex) return false;
     SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_bulk_active) {
+        // A bulk scope already holds the connection's only transaction. Its
+        // atomic units nest as a SAVEPOINT; the durable flag cannot change the
+        // synchronous mode inside a transaction, and durability is reached
+        // when the scope commits, before any other thread can observe it.
+        if (m_database.m_transaction_poisoned || m_database.m_transaction_owner ||
+            sqlite3_get_autocommit(m_database.m_db) != 0) return false;
+        const std::string begin = strprintf("SAVEPOINT %s", NESTED_SAVEPOINT);
+        if (sqlite3_exec(m_database.m_db, begin.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {
+            LogPrintf("SQLiteBatch: Failed to begin the nested transaction\n");
+            return false;
+        }
+        m_savepoint_txn = true;
+        m_durable_txn = false;
+        m_database.m_transaction_owner = this;
+        m_txn_mutex = lock.Release();
+        return true;
+    }
     if (m_database.m_transaction_poisoned ||
         m_database.m_transaction_owner || sqlite3_get_autocommit(m_database.m_db) == 0) return false;
     if (durable && m_database.m_use_unsafe_sync) {
@@ -674,7 +695,9 @@ void SQLiteBatch::ReleaseTransaction()
 {
     assert(m_txn_mutex);
     assert(m_database.m_transaction_owner == this);
-    assert(sqlite3_get_autocommit(m_database.m_db) != 0);
+    // A nested SAVEPOINT leaves the scope's own transaction open.
+    assert(m_savepoint_txn || sqlite3_get_autocommit(m_database.m_db) != 0);
+    m_savepoint_txn = false;
     if (m_durable_txn && m_database.m_use_unsafe_sync) {
         if (sqlite3_exec(m_database.m_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr) != SQLITE_OK) {
             LogPrintf("SQLiteBatch: Failed to restore unsafe synchronous mode after transaction\n");
@@ -688,6 +711,20 @@ void SQLiteBatch::ReleaseTransaction()
 bool SQLiteBatch::TxnCommit()
 {
     if (!m_txn_mutex) return false;
+    if (m_savepoint_txn) {
+        // Inside a bulk scope the connection stays in a transaction. If SQLite
+        // rolled the scope back by itself (an I/O or full-disk error), this
+        // unit is lost and the caller must treat it as failed.
+        if (sqlite3_get_autocommit(m_database.m_db) != 0) {
+            ReleaseTransaction();
+            return false;
+        }
+        const std::string release = strprintf("RELEASE %s", NESTED_SAVEPOINT);
+        const bool released = sqlite3_exec(m_database.m_db, release.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
+        if (!released) LogPrintf("SQLiteBatch: Failed to commit the nested transaction\n");
+        ReleaseTransaction();
+        return released;
+    }
     if (sqlite3_get_autocommit(m_database.m_db) != 0) {
         // SQLite may itself roll back on an I/O or constraint failure. Only
         // the owner releases its lock and durability state in that case.
@@ -717,6 +754,22 @@ bool SQLiteBatch::TxnCommit()
 bool SQLiteBatch::TxnAbort()
 {
     if (!m_txn_mutex) return false;
+    if (m_savepoint_txn) {
+        if (sqlite3_get_autocommit(m_database.m_db) != 0) {
+            ReleaseTransaction();
+            return false;
+        }
+        const std::string rollback = strprintf("ROLLBACK TO %s", NESTED_SAVEPOINT);
+        const std::string release = strprintf("RELEASE %s", NESTED_SAVEPOINT);
+        const bool aborted =
+            sqlite3_exec(m_database.m_db, rollback.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK &&
+            sqlite3_exec(m_database.m_db, release.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
+        if (!aborted) LogPrintf("SQLiteBatch: Failed to abort the nested transaction\n");
+        // The savepoint is gone, or the scope's transaction already ended.
+        // Either way the scope, not this batch, owns what is left.
+        if (aborted || sqlite3_get_autocommit(m_database.m_db) != 0) ReleaseTransaction();
+        return aborted;
+    }
     if (sqlite3_get_autocommit(m_database.m_db) != 0) {
         ReleaseTransaction();
         return false;
@@ -730,6 +783,64 @@ bool SQLiteBatch::TxnAbort()
         ReleaseTransaction();
     }
     return aborted;
+}
+
+namespace {
+/**
+ * One SQLite transaction shared by every batch of the connection, held by the
+ * creating thread. The recursive connection mutex stays held, so no other
+ * thread can read or write the wallet database until Commit (the same
+ * exclusion an ordinary TxnBegin gives).
+ */
+class SQLiteBulkScope : public DatabaseBulkScope
+{
+    SQLiteDatabase& m_database;
+    sqlite3_mutex* m_mutex;
+    bool m_done{false};
+
+public:
+    SQLiteBulkScope(SQLiteDatabase& database, sqlite3_mutex* mutex) : m_database(database), m_mutex(mutex) {}
+    ~SQLiteBulkScope() override { Commit(); }
+
+    bool Commit() override
+    {
+        if (m_done) return true;
+        m_done = true;
+        // A nested batch that outlived its call would leave a savepoint open.
+        // Its unit is already counted failed; the scope still ends here.
+        bool committed{false};
+        if (sqlite3_get_autocommit(m_database.m_db) == 0) {
+            committed = sqlite3_exec(m_database.m_db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr) == SQLITE_OK;
+            if (!committed) {
+                LogPrintf("SQLiteDatabase: Failed to commit the grouped wallet writes\n");
+                if (sqlite3_get_autocommit(m_database.m_db) == 0 &&
+                    sqlite3_exec(m_database.m_db, "ROLLBACK TRANSACTION", nullptr, nullptr, nullptr) != SQLITE_OK) {
+                    LogPrintf("SQLiteDatabase: Failed to roll back the grouped wallet writes\n");
+                    m_database.m_transaction_poisoned = true;
+                }
+            }
+        } else {
+            LogPrintf("SQLiteDatabase: The grouped wallet writes were rolled back by SQLite\n");
+        }
+        m_database.m_bulk_active = false;
+        sqlite3_mutex_leave(m_mutex);
+        return committed;
+    }
+};
+} // namespace
+
+std::unique_ptr<DatabaseBulkScope> SQLiteDatabase::MakeBulkScope()
+{
+    if (!m_db) return nullptr;
+    SQLiteConnectionLock lock(m_db);
+    if (m_transaction_poisoned || m_transaction_owner || m_bulk_active ||
+        sqlite3_get_autocommit(m_db) == 0) return nullptr;
+    if (sqlite3_exec(m_db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        LogPrintf("SQLiteDatabase: Failed to begin the grouped wallet writes\n");
+        return nullptr;
+    }
+    m_bulk_active = true;
+    return std::make_unique<SQLiteBulkScope>(*this, lock.Release());
 }
 
 std::unique_ptr<SQLiteDatabase> MakeSQLiteDatabase(const fs::path& path, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error)

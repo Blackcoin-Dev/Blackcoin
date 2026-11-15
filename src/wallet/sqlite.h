@@ -55,6 +55,9 @@ private:
     sqlite3_stmt* m_delete_stmt{nullptr};
     sqlite3_stmt* m_delete_prefix_stmt{nullptr};
     bool m_durable_txn{false};
+    // True when TxnBegin joined an open bulk scope with a SAVEPOINT instead of
+    // a transaction of its own.
+    bool m_savepoint_txn{false};
     // Successful TxnBegin retains the recursive FULLMUTEX connection lock.
     // Only this batch can end the transaction, on the thread that began it.
     sqlite3_mutex* m_txn_mutex{nullptr};
@@ -155,6 +158,9 @@ public:
     /** Make a SQLiteBatch connected to this database */
     std::unique_ptr<DatabaseBatch> MakeBatch(bool flush_on_close = true) override;
 
+    /** Group this thread's writes into one SQLite transaction (see DatabaseBulkScope) */
+    std::unique_ptr<DatabaseBulkScope> MakeBulkScope() override;
+
     sqlite3* m_db{nullptr};
     bool m_use_unsafe_sync;
     // Protected by sqlite3_db_mutex(m_db). An unabortable transaction whose
@@ -162,6 +168,10 @@ public:
     // batch. Poison survives until the database connection is reopened.
     bool m_transaction_poisoned{false};
     const SQLiteBatch* m_transaction_owner{nullptr};
+    // A bulk scope owns an open transaction that every batch of this
+    // connection writes into. Protected by sqlite3_db_mutex(m_db), which the
+    // scope holds for its whole life.
+    bool m_bulk_active{false};
 };
 
 std::unique_ptr<SQLiteDatabase> MakeSQLiteDatabase(const fs::path& path, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);

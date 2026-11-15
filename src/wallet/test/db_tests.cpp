@@ -22,8 +22,10 @@
 
 #include <fstream>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -424,6 +426,96 @@ BOOST_AUTO_TEST_CASE(sqlite_batch_unabortable_close_poisoned_until_reload)
     BOOST_CHECK(!reloaded->Exists(std::string{"foreign"}));
     BOOST_CHECK(!reloaded->Exists(std::string{"new-batch"}));
     BOOST_CHECK(reloaded->Write(std::string{"after-reload"}, 4));
+}
+
+static int CountCommits(sqlite3* db, const std::function<void()>& fn)
+{
+    int commits{0};
+    sqlite3_commit_hook(db, [](void* arg) -> int { ++*static_cast<int*>(arg); return 0; }, &commits);
+    fn();
+    sqlite3_commit_hook(db, nullptr, nullptr);
+    return commits;
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_bulk_scope_groups_writes_into_one_commit)
+{
+    DatabaseOptions options;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "bulk", options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    SQLiteHooksReset reset{database->m_db};
+
+    // Without a scope every write is its own commit, whichever batch makes it.
+    BOOST_CHECK_EQUAL(CountCommits(database->m_db, [&] {
+        for (int i = 0; i < 4; ++i) BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"plain"} + std::to_string(i), i));
+    }), 4);
+
+    // With a scope the same writes, through separate batches, commit once.
+    BOOST_CHECK_EQUAL(CountCommits(database->m_db, [&] {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        // Only one scope, and no transaction of another kind, at a time.
+        BOOST_CHECK(!database->MakeBulkScope());
+        for (int i = 0; i < 4; ++i) BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"bulk"} + std::to_string(i), i));
+        int value{0};
+        BOOST_REQUIRE(database->MakeBatch()->Read(std::string{"bulk3"}, value));
+        BOOST_CHECK_EQUAL(value, 3);
+        BOOST_CHECK(scope->Commit());
+        BOOST_CHECK(scope->Commit());
+    }), 1);
+    BOOST_CHECK_EQUAL(sqlite3_get_autocommit(database->m_db), 1);
+    BOOST_CHECK(!database->m_bulk_active);
+    for (int i = 0; i < 4; ++i) BOOST_CHECK(database->MakeBatch()->Exists(std::string{"bulk"} + std::to_string(i)));
+
+    // An atomic unit inside the scope nests as a savepoint: a commit joins the
+    // scope's single commit, an abort undoes only that unit.
+    BOOST_CHECK_EQUAL(CountCommits(database->m_db, [&] {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        auto unit = database->MakeBatch();
+        BOOST_REQUIRE(unit->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(unit->Write(std::string{"unit-kept"}, 1));
+        BOOST_REQUIRE(unit->TxnCommit());
+        BOOST_REQUIRE(unit->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(unit->Write(std::string{"unit-dropped"}, 2));
+        BOOST_REQUIRE(unit->TxnAbort());
+        BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"after-units"}, 3));
+        BOOST_CHECK_EQUAL(sqlite3_get_autocommit(database->m_db), 0);
+        // The scope does not give other batches a transaction of their own.
+        BOOST_CHECK(!database->MakeBatch()->TxnCommit());
+    }), 1);
+    auto reader = database->MakeBatch();
+    BOOST_CHECK(reader->Exists(std::string{"unit-kept"}));
+    BOOST_CHECK(!reader->Exists(std::string{"unit-dropped"}));
+    BOOST_CHECK(reader->Exists(std::string{"after-units"}));
+
+    // Leaving the scope early still commits what was written.
+    try {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"before-throw"}, 4));
+        throw std::runtime_error("unwind");
+    } catch (const std::runtime_error&) {
+    }
+    BOOST_CHECK_EQUAL(sqlite3_get_autocommit(database->m_db), 1);
+    BOOST_CHECK(reader->Exists(std::string{"before-throw"}));
+
+    // An open ordinary transaction refuses a scope.
+    auto owner = database->MakeBatch();
+    BOOST_REQUIRE(owner->TxnBegin());
+    BOOST_CHECK(!database->MakeBulkScope());
+    BOOST_REQUIRE(owner->TxnAbort());
+
+    // Everything the scope committed is on disk after a reopen.
+    reader.reset();
+    owner.reset();
+    database->Close();
+    database->Open();
+    auto reopened = database->MakeBatch();
+    BOOST_CHECK(reopened->Exists(std::string{"bulk0"}));
+    BOOST_CHECK(reopened->Exists(std::string{"unit-kept"}));
+    BOOST_CHECK(reopened->Exists(std::string{"before-throw"}));
 }
 #endif // USE_SQLITE
 

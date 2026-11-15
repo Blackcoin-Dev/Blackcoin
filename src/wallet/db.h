@@ -43,6 +43,25 @@ public:
     virtual Status Next(DataStream& key, DataStream& value) { return Status::FAIL; }
 };
 
+/**
+ * Groups every write made through any batch of one database, on the thread
+ * that created the scope, into a single durable commit. Reads and writes keep
+ * their meaning; only the number of disk commits changes. The scope commits
+ * what was written when it is destroyed, so a caller that unwinds early keeps
+ * the same per-write persistence it had without a scope.
+ */
+class DatabaseBulkScope
+{
+public:
+    DatabaseBulkScope() = default;
+    virtual ~DatabaseBulkScope() = default;
+    DatabaseBulkScope(const DatabaseBulkScope&) = delete;
+    DatabaseBulkScope& operator=(const DatabaseBulkScope&) = delete;
+
+    /** Commit now. False when the grouped writes could not be made durable. */
+    virtual bool Commit() = 0;
+};
+
 /** RAII class that provides access to a WalletDatabase */
 class DatabaseBatch
 {
@@ -187,6 +206,13 @@ public:
 
     /** Make a DatabaseBatch connected to this database */
     virtual std::unique_ptr<DatabaseBatch> MakeBatch(bool flush_on_close = true) = 0;
+
+    /**
+     * Begin grouping this thread's writes into one commit. Returns nullptr when
+     * the backend cannot group writes or a transaction is already open; the
+     * caller then simply writes one commit at a time as before.
+     */
+    virtual std::unique_ptr<DatabaseBulkScope> MakeBulkScope() { return nullptr; }
 };
 
 enum class DatabaseFormat {

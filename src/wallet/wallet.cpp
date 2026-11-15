@@ -3239,13 +3239,30 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         }
         transactionRemovedFromMempool(block.data->vtx[index], MemPoolRemovalReason::BLOCK);
     }
-    for (size_t index = 0; index < shadow_payout_txs.size(); ++index) {
-        SyncTransaction(shadow_payout_txs[index].tx,
-                        TxStateConfirmed{block.hash, block.height, static_cast<int>(block.data->vtx.size() + index)},
-                        /*update_tx=*/true, /*rescanning_old_block=*/false, block_time);
-    }
-    for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
-        AnnotateWalletShadowPayout(*this, payout, batch);
+    {
+        // Each payout record costs several separate database commits (order
+        // position, the record, its annotation, key top-up), and a wallet can
+        // receive dozens per block. Group them into one commit per block. The
+        // scope commits on unwinding too, so an exception keeps the records
+        // already written, exactly as one commit per write did.
+        std::unique_ptr<DatabaseBulkScope> payout_writes;
+        if (!shadow_payout_txs.empty()) payout_writes = GetDatabase().MakeBulkScope();
+        for (size_t index = 0; index < shadow_payout_txs.size(); ++index) {
+            SyncTransaction(shadow_payout_txs[index].tx,
+                            TxStateConfirmed{block.hash, block.height, static_cast<int>(block.data->vtx.size() + index)},
+                            /*update_tx=*/true, /*rescanning_old_block=*/false, block_time);
+        }
+        for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
+            AnnotateWalletShadowPayout(*this, payout, batch);
+        }
+        if (payout_writes && !payout_writes->Commit()) {
+            // Same stance as a failed record write in AddToWallet: memory may
+            // now differ from disk, so no new claim or recovery is authorized
+            // until the wallet is reloaded.
+            m_shadow_pow_claim_recovery_db_ambiguous = true;
+            WalletLogPrintf("Failed to persist the synthetic Gold Rush payout records of block %s\n",
+                            block.hash.ToString());
+        }
     }
     for (const CTransactionRef& ptx : block.data->vtx) {
         RecordQuantumRedelegationWins(*ptx, block.height, batch);
@@ -3254,9 +3271,26 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     // mempool, so it will not receive a stale-removal callback. Mark every
     // remaining unconfirmed proof for the scheduler's broadcast-independent
     // validation pass after each connected block.
-    for (auto& [txid, wtx] : mapWallet) {
-        if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx) ||
-            GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) continue;
+    // Proof presence is tracked per record (every record is classified when it
+    // enters the wallet), so visit only those records instead of testing the
+    // whole wallet on every block. Records too large to parse in a callback
+    // are indexed as unknown and are tested here exactly as before. The
+    // matching records are collected first because the durable update
+    // refreshes the indexes being read.
+    std::vector<uint256> unconfirmed_proofs;
+    const auto collect_unconfirmed_proofs = [&](const std::set<uint256>& txids) {
+        for (const uint256& txid : txids) {
+            const auto wallet_tx = mapWallet.find(txid);
+            if (wallet_tx == mapWallet.end()) continue;
+            const CWalletTx& wtx = wallet_tx->second;
+            if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx) ||
+                GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) continue;
+            unconfirmed_proofs.push_back(txid);
+        }
+    };
+    collect_unconfirmed_proofs(m_shadow_pow_all_proof_txids);
+    collect_unconfirmed_proofs(m_shadow_pow_unknown_proof_presence_txids);
+    for (const uint256& txid : unconfirmed_proofs) {
         UpdateShadowPowClaimRecoveryRecordDurably(
             txid,
             [&](CWalletTx& persisted) {
@@ -6206,6 +6240,9 @@ bool CWallet::CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std:
     committed_wtx.m_it_wtxOrdered = wtxOrdered.insert(std::make_pair(committed_wtx.nOrderPos, &committed_wtx));
     AddToSpends(committed_wtx);
     RefreshLiveUnspentStakeOutpoints(committed_wtx);
+    // Every record that enters the wallet is classified for the proof
+    // indexes; blockConnected relies on them instead of a whole-wallet scan.
+    RefreshShadowPowClaimIndexEntryLocked(committed_wtx);
     MaybeUpdateBirthTime(committed_wtx.GetTxTime());
     MarkDestinationsDirty(tx_destinations);
     committed_wtx.MarkDirty();

@@ -9,6 +9,7 @@
 #include <test/util/setup_common.h>
 #include <util/check.h>
 #include <util/fs.h>
+#include <util/string.h>
 #include <util/translation.h>
 #ifdef USE_BDB
 #include <wallet/bdb.h>
@@ -448,7 +449,7 @@ BOOST_AUTO_TEST_CASE(sqlite_bulk_scope_groups_writes_into_one_commit)
 
     // Without a scope every write is its own commit, whichever batch makes it.
     BOOST_CHECK_EQUAL(CountCommits(database->m_db, [&] {
-        for (int i = 0; i < 4; ++i) BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"plain"} + std::to_string(i), i));
+        for (int i = 0; i < 4; ++i) BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"plain"} + ToString(i), i));
     }), 4);
 
     // With a scope the same writes, through separate batches, commit once.
@@ -457,7 +458,7 @@ BOOST_AUTO_TEST_CASE(sqlite_bulk_scope_groups_writes_into_one_commit)
         BOOST_REQUIRE(scope);
         // Only one scope, and no transaction of another kind, at a time.
         BOOST_CHECK(!database->MakeBulkScope());
-        for (int i = 0; i < 4; ++i) BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"bulk"} + std::to_string(i), i));
+        for (int i = 0; i < 4; ++i) BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"bulk"} + ToString(i), i));
         int value{0};
         BOOST_REQUIRE(database->MakeBatch()->Read(std::string{"bulk3"}, value));
         BOOST_CHECK_EQUAL(value, 3);
@@ -466,7 +467,7 @@ BOOST_AUTO_TEST_CASE(sqlite_bulk_scope_groups_writes_into_one_commit)
     }), 1);
     BOOST_CHECK_EQUAL(sqlite3_get_autocommit(database->m_db), 1);
     BOOST_CHECK(!database->m_bulk_active);
-    for (int i = 0; i < 4; ++i) BOOST_CHECK(database->MakeBatch()->Exists(std::string{"bulk"} + std::to_string(i)));
+    for (int i = 0; i < 4; ++i) BOOST_CHECK(database->MakeBatch()->Exists(std::string{"bulk"} + ToString(i)));
 
     // An atomic unit inside the scope nests as a savepoint: a commit joins the
     // scope's single commit, an abort undoes only that unit.

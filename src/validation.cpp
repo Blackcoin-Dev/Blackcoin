@@ -5068,11 +5068,40 @@ static bool NotifyHeaderTip(ChainstateManager& chainman) LOCKS_EXCLUDED(cs_main)
     return fNotify;
 }
 
-static void LimitValidationInterfaceQueue() LOCKS_EXCLUDED(cs_main) {
+//! Maximum validation callbacks pending before block connection waits during
+//! initial block download or reindex (bounds memory while running far ahead).
+static constexpr int MAX_CALLBACKS_PENDING_IBD{10};
+//! Once synced, block connection only waits when this many callbacks are pending.
+static constexpr int MAX_CALLBACKS_PENDING_SYNCED{1000};
+//! A wait on the validation queue at least this long is always logged.
+static constexpr auto QUEUE_WAIT_LOG_THRESHOLD{1s};
+
+static void LimitValidationInterfaceQueue(ChainstateManager& chainman) LOCKS_EXCLUDED(cs_main) {
     AssertLockNotHeld(cs_main);
 
-    if (GetMainSignals().CallbacksPending() > 10) {
-        SyncWithValidationInterfaceQueue();
+    const size_t pending{GetMainSignals().CallbacksPending()};
+    if (pending <= static_cast<size_t>(MAX_CALLBACKS_PENDING_IBD)) return;
+
+    // cs_main is not held here, so IsInitialBlockDownload() may take it.
+    const bool ibd{chainman.IsInitialBlockDownload()};
+    if (!ibd && pending <= static_cast<size_t>(MAX_CALLBACKS_PENDING_SYNCED)) {
+        // Rate limit this line to one per 10 seconds.
+        static std::atomic<int64_t> last_log_ms{std::numeric_limits<int64_t>::min()};
+        const int64_t now_ms{Ticks<std::chrono::milliseconds>(SteadyClock::now().time_since_epoch())};
+        int64_t last{last_log_ms.load()};
+        if ((last == std::numeric_limits<int64_t>::min() || now_ms - last >= 10000) &&
+            last_log_ms.compare_exchange_strong(last, now_ms)) {
+            LogPrintf("Validation queue: pending=%d, not waiting (synced)\n", pending);
+        }
+        return;
+    }
+
+    const auto start{SteadyClock::now()};
+    SyncWithValidationInterfaceQueue();
+    const auto waited{SteadyClock::now() - start};
+    if (waited >= QUEUE_WAIT_LOG_THRESHOLD) {
+        LogPrintf("Validation queue wait: pending=%d waited=%dms ibd=%d\n", pending,
+                  Ticks<std::chrono::milliseconds>(waited), ibd);
     }
 }
 
@@ -5115,13 +5144,15 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
     CBlockIndex *pindexNewTip = nullptr;
     bool exited_ibd{false};
     do {
-        // Block until the validation queue drains. This should largely
-        // never happen in normal operation, however may happen during
-        // reindex, causing memory blowup if we run too far ahead.
+        // During initial block download and reindex, block until the
+        // validation queue drains (more than 10 callbacks pending), so we do
+        // not run far ahead and blow up memory. Once synced the limit is
+        // relaxed to 1000: a caught-up node with many wallets must not stall
+        // block connection behind per-wallet mempool callbacks.
         // Note that if a validationinterface callback ends up calling
         // ActivateBestChain this may lead to a deadlock! We should
         // probably have a DEBUG_LOCKORDER test for this in the future.
-        LimitValidationInterfaceQueue();
+        LimitValidationInterfaceQueue(m_chainman);
 
         {
             LOCK(cs_main);
@@ -5324,7 +5355,7 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
         if (m_chainman.m_interrupt) break;
 
         // Make sure the queue of validation callbacks doesn't grow unboundedly.
-        LimitValidationInterfaceQueue();
+        LimitValidationInterfaceQueue(m_chainman);
 
         LOCK(cs_main);
         // Lock for as long as disconnectpool is in scope to make sure MaybeUpdateMempoolForReorg is

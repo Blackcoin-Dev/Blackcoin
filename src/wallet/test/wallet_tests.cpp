@@ -62,12 +62,18 @@
 #include <wallet/rpc/util.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
+#ifdef USE_SQLITE
+#include <wallet/sqlite.h>
+#endif
 #include <wallet/staking.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
 
 #include <boost/test/unit_test.hpp>
 #include <univalue.h>
+#ifdef USE_SQLITE
+#include <sqlite3.h>
+#endif
 
 using node::MAX_BLOCKFILE_SIZE;
 
@@ -6432,6 +6438,57 @@ static std::shared_ptr<CWallet> TestLoadQuantumWalletBackup(const fs::path& path
     BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
     return wallet;
 }
+
+#ifdef USE_SQLITE
+BOOST_FIXTURE_TEST_CASE(BlockConnectedCommitsOncePerWallet, WalletTestingSetup)
+{
+    // Every database write one connected block causes in a wallet (here the
+    // payments of several block transactions) is one SQLite commit, not one
+    // per record.
+    auto wallet = TestLoadQuantumWallet("block-connected-one-commit", DatabaseFormat::SQLITE, m_node.chain.get());
+    CScript script;
+    {
+        LOCK(wallet->cs_wallet);
+        auto dest = wallet->GetNewQuantumDestination("one-commit");
+        BOOST_REQUIRE(dest);
+        script = GetScriptForDestination(*dest);
+    }
+
+    CBlock block;
+    CMutableTransaction coinbase;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].scriptSig = CScript{} << 1 << OP_0;
+    coinbase.vout.resize(1);
+    block.vtx.push_back(MakeTransactionRef(coinbase));
+    for (int i = 0; i < 3; ++i) {
+        CMutableTransaction mtx;
+        mtx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256{static_cast<uint8_t>(i + 1)}), 0});
+        mtx.vout.emplace_back(COIN * (i + 1), script);
+        block.vtx.push_back(MakeTransactionRef(mtx));
+    }
+
+    const uint256 block_hash{uint256{77}};
+    const uint256 prev_hash{uint256{76}};
+    interfaces::BlockInfo info{block_hash};
+    info.prev_hash = &prev_hash;
+    info.height = 1;
+    info.data = &block;
+    info.chain_time_max = GetTime() + 3600;
+
+    sqlite3* db = static_cast<SQLiteDatabase&>(wallet->GetDatabase()).m_db;
+    int commits{0};
+    sqlite3_commit_hook(db, [](void* arg) -> int { ++*static_cast<int*>(arg); return 0; }, &commits);
+    wallet->blockConnected(ChainstateRole::NORMAL, info);
+    sqlite3_commit_hook(db, nullptr, nullptr);
+
+    BOOST_CHECK_EQUAL(commits, 1);
+    LOCK(wallet->cs_wallet);
+    for (size_t i = 1; i < block.vtx.size(); ++i) {
+        BOOST_CHECK(wallet->GetWalletTx(block.vtx[i]->GetHash()));
+    }
+    BOOST_CHECK_EQUAL(sqlite3_get_autocommit(db), 1);
+}
+#endif
 
 BOOST_FIXTURE_TEST_CASE(QuantumWalletKeysPersistAndSign, QuantumWalletSigningTestingSetup)
 {

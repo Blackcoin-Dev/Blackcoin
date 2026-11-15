@@ -3199,6 +3199,26 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     m_last_block_processed_height = block.height;
     m_last_block_processed = block.hash;
 
+    // Every database write this callback makes for the block (payout
+    // reconciliation, block transactions, claim quarantine clears, payout
+    // records) is grouped into one commit per wallet per block. Atomic units
+    // inside nest as savepoints, so an inner abort still undoes only that
+    // unit. If the process dies mid-callback the wallet reopens with none of
+    // the block's writes and resynchronizes from its persisted best block.
+    // The scope also commits on unwinding, as one commit per write did.
+    std::unique_ptr<DatabaseBulkScope> block_writes = GetDatabase().MakeBulkScope();
+    const auto commit_block_writes = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        if (block_writes && !block_writes->Commit()) {
+            // Same stance as a failed record write in AddToWallet: memory may
+            // now differ from disk, so no new claim or recovery is authorized
+            // until the wallet is reloaded.
+            m_shadow_pow_claim_recovery_db_ambiguous = true;
+            WalletLogPrintf("Failed to persist the wallet writes of block %s\n",
+                            block.hash.ToString());
+        }
+        block_writes.reset();
+    };
+
     WalletBatch batch(GetDatabase());
     if (!ReconcileWalletShadowPayoutsForBlock(
             block.hash, block.height, authenticated_shadow_payouts, batch)) {
@@ -3208,7 +3228,10 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
 
     // No need to scan block if it was created before the wallet birthday.
     // Uses chain max time and twice the grace period to adjust time for block time variability.
-    if (block.chain_time_max < m_birth_time.load() - (TIMESTAMP_WINDOW * 2)) return;
+    if (block.chain_time_max < m_birth_time.load() - (TIMESTAMP_WINDOW * 2)) {
+        commit_block_writes();
+        return;
+    }
 
     // Scan block
     for (size_t index = 0; index < block.data->vtx.size(); index++) {
@@ -3240,13 +3263,7 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         transactionRemovedFromMempool(block.data->vtx[index], MemPoolRemovalReason::BLOCK);
     }
     {
-        // Each payout record costs several separate database commits (order
-        // position, the record, its annotation, key top-up), and a wallet can
-        // receive dozens per block. Group them into one commit per block. The
-        // scope commits on unwinding too, so an exception keeps the records
-        // already written, exactly as one commit per write did.
-        std::unique_ptr<DatabaseBulkScope> payout_writes;
-        if (!shadow_payout_txs.empty()) payout_writes = GetDatabase().MakeBulkScope();
+        // Payout records are written inside the block's single commit scope.
         for (size_t index = 0; index < shadow_payout_txs.size(); ++index) {
             SyncTransaction(shadow_payout_txs[index].tx,
                             TxStateConfirmed{block.hash, block.height, static_cast<int>(block.data->vtx.size() + index)},
@@ -3254,14 +3271,6 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         }
         for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
             AnnotateWalletShadowPayout(*this, payout, batch);
-        }
-        if (payout_writes && !payout_writes->Commit()) {
-            // Same stance as a failed record write in AddToWallet: memory may
-            // now differ from disk, so no new claim or recovery is authorized
-            // until the wallet is reloaded.
-            m_shadow_pow_claim_recovery_db_ambiguous = true;
-            WalletLogPrintf("Failed to persist the synthetic Gold Rush payout records of block %s\n",
-                            block.hash.ToString());
         }
     }
     for (const CTransactionRef& ptx : block.data->vtx) {
@@ -3299,6 +3308,7 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
             },
             "mark connected-block claim quarantine");
     }
+    commit_block_writes();
     }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a block connects.
 }

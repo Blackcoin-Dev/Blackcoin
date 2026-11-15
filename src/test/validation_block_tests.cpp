@@ -15,10 +15,13 @@
 #include <test/util/random.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
+#include <test/util/validation.h>
 #include <util/time.h>
 #include <validation.h>
 #include <validationinterface.h>
 
+#include <chrono>
+#include <future>
 #include <thread>
 
 using node::BlockAssembler;
@@ -217,6 +220,64 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
 
     LOCK(cs_main);
     BOOST_CHECK_EQUAL(sub->m_expected_tip, m_node.chainman->ActiveChain().Tip()->GetBlockHash());
+}
+
+//! Queue more than the strict limit of validation callbacks behind one that is
+//! blocked until `release` is set, then process a block on another thread.
+static std::future<bool> ProcessBlockBehindBlockedQueue(ChainstateManager& chainman, std::shared_ptr<const CBlock> block, std::promise<void>& release)
+{
+    std::promise<void> blocked;
+    std::future<void> blocked_future{blocked.get_future()};
+    std::shared_future<void> release_future{release.get_future().share()};
+    CallFunctionInValidationInterfaceQueue([&blocked, release_future] {
+        blocked.set_value();
+        release_future.wait();
+    });
+    blocked_future.wait();
+    for (int i = 0; i < 20; ++i) CallFunctionInValidationInterfaceQueue([] {});
+    BOOST_REQUIRE_GT(GetMainSignals().CallbacksPending(), 10U);
+    return std::async(std::launch::async, [&chainman, block] {
+        bool ignored;
+        return chainman.ProcessNewBlock(block, true, true, &ignored);
+    });
+}
+
+BOOST_AUTO_TEST_CASE(synced_node_does_not_wait_for_validation_queue)
+{
+    bool ignored;
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+    SyncWithValidationInterfaceQueue();
+    static_cast<TestChainstateManager&>(*m_node.chainman).JumpOutOfIbd();
+    BOOST_REQUIRE(!m_node.chainman->IsInitialBlockDownload());
+
+    std::promise<void> release;
+    auto block = GoodBlock(Params().GenesisBlock().GetHash());
+    auto processed = ProcessBlockBehindBlockedQueue(*m_node.chainman, block, release);
+    // Once synced, block connection does not wait for a stalled callback.
+    const bool done{processed.wait_for(std::chrono::seconds{30}) == std::future_status::ready};
+    release.set_value();
+    BOOST_REQUIRE_MESSAGE(done, "ProcessNewBlock waited for the validation queue on a synced node");
+    BOOST_CHECK(processed.get());
+    SyncWithValidationInterfaceQueue();
+    LOCK(cs_main);
+    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Tip()->GetBlockHash(), block->GetHash());
+}
+
+BOOST_AUTO_TEST_CASE(ibd_node_waits_for_validation_queue)
+{
+    bool ignored;
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+    SyncWithValidationInterfaceQueue();
+    BOOST_REQUIRE(m_node.chainman->IsInitialBlockDownload());
+
+    std::promise<void> release;
+    auto block = GoodBlock(Params().GenesisBlock().GetHash());
+    auto processed = ProcessBlockBehindBlockedQueue(*m_node.chainman, block, release);
+    // During initial block download the strict limit still applies.
+    BOOST_CHECK(processed.wait_for(std::chrono::milliseconds{500}) == std::future_status::timeout);
+    release.set_value();
+    BOOST_CHECK(processed.get());
+    SyncWithValidationInterfaceQueue();
 }
 
 /**

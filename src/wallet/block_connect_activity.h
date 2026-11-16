@@ -78,16 +78,17 @@ private:
  * The scan is O(wallet outputs) and holds cs_main. With many loaded wallets
  * every GUI poll thread would otherwise scan at once and starve the validation
  * and message-handler threads of cs_main. TryBegin() admits one scan at a time
- * and refuses a new one until as much time has passed since the previous scan
- * ended as that scan took (clamped to MIN_BACKOFF_MS..MAX_BACKOFF_MS), so GUI
- * scans hold cs_main at most about half of the time. A poll that returned
+ * and, after a scan that took at least BACKOFF_THRESHOLD_MS, refuses a new one
+ * until as much time has passed since that scan ended as it took (at most
+ * MAX_BACKOFF_MS), so GUI scans hold cs_main at most about half of the time.
+ * A cheap scan imposes no back-off. A poll that returned
  * early without scanning records no back-off. Advisory and atomic: a wrong
  * answer only delays or admits one poll; it never affects wallet data.
  */
 class GuiBalanceScanGate
 {
 public:
-    static constexpr int64_t MIN_BACKOFF_MS{250};
+    static constexpr int64_t BACKOFF_THRESHOLD_MS{250};
     static constexpr int64_t MAX_BACKOFF_MS{10000};
 
     /** True if the caller may scan now; the caller must then call End(). */
@@ -97,8 +98,8 @@ public:
         if (!m_running.compare_exchange_strong(expected, true, std::memory_order_acquire)) return false;
         const int64_t last_duration = m_last_duration_ms.load(std::memory_order_relaxed);
         const int64_t last_end = m_last_end_ms.load(std::memory_order_relaxed);
-        if (last_duration > 0 && last_end != 0) {
-            const int64_t backoff = std::clamp(last_duration, MIN_BACKOFF_MS, MAX_BACKOFF_MS);
+        if (last_duration >= BACKOFF_THRESHOLD_MS && last_end != 0) {
+            const int64_t backoff = std::min(last_duration, MAX_BACKOFF_MS);
             if (now_ms - last_end < backoff) {
                 m_running.store(false, std::memory_order_release);
                 return false;

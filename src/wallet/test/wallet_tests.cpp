@@ -5846,6 +5846,7 @@ BOOST_FIXTURE_TEST_CASE(lifecycle_memo_matches_database_path, TestChain100Setup)
         const Scan plain = scan(false);
         const size_t deep = deep_outputs(false).size();
         const uint64_t shallow = plain.stats.outputs - deep;
+        BOOST_REQUIRE_GT(deep, 16U); // otherwise a cap of shallow + 8 would not cut the first pass
         WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
         size_t previous_size = 0;
         int attempts = 0;
@@ -5863,7 +5864,14 @@ BOOST_FIXTURE_TEST_CASE(lifecycle_memo_matches_database_path, TestChain100Setup)
             previous_size = std::max(previous_size, memo_size());
         }
         BOOST_CHECK(completed);
-        BOOST_CHECK_GT(attempts, 2);
+        // The memo starts empty, so a full pass needs `shallow + deep` database
+        // reads and the first attempt (cap `shallow + 8`) is always cut short.
+        // How many more attempts follow depends on where the shallow outputs
+        // fall in mapWallet, whose order is salted per process, so only the
+        // bounds are asserted: at least two, and at most one per 8 - slice
+        // new deep outputs (every exhausted attempt memoizes at least that many).
+        BOOST_CHECK_GE(attempts, 2);
+        BOOST_CHECK_LE(static_cast<uint64_t>(attempts), deep / (8 - std::min<uint64_t>(deep_outputs(true).size(), 7)) + 2);
         BOOST_CHECK_EQUAL(memo_size(), deep);
         // The unlimited memo scan after completion equals the plain path too.
         const Scan memo = scan(true);

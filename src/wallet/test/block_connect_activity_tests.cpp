@@ -75,17 +75,29 @@ BOOST_AUTO_TEST_CASE(gui_balance_scan_gate_backs_off_for_the_last_duration)
     gate.End(14001, /*scanned=*/false);
 }
 
+BOOST_AUTO_TEST_CASE(gui_balance_scan_gate_cheap_scans_impose_no_back_off)
+{
+    GuiBalanceScanGate gate;
+    BOOST_CHECK(gate.TryBegin(1000));
+    gate.End(1005); // 5 ms scan
+    BOOST_CHECK(gate.TryBegin(1005)); // immediately admitted again
+    gate.End(1005 + GuiBalanceScanGate::BACKOFF_THRESHOLD_MS - 1); // just under the threshold
+    BOOST_CHECK(gate.TryBegin(1005 + GuiBalanceScanGate::BACKOFF_THRESHOLD_MS - 1));
+    gate.End(2000, /*scanned=*/false);
+}
+
 BOOST_AUTO_TEST_CASE(gui_balance_scan_gate_clamps_the_back_off)
 {
     GuiBalanceScanGate gate;
-    // A very short scan still waits MIN_BACKOFF_MS.
+    // A 300 ms scan: refused until 300 ms after it ended.
     BOOST_CHECK(gate.TryBegin(1000));
-    gate.End(1005);
-    BOOST_CHECK(!gate.TryBegin(1005 + GuiBalanceScanGate::MIN_BACKOFF_MS - 1));
-    BOOST_CHECK(gate.TryBegin(1005 + GuiBalanceScanGate::MIN_BACKOFF_MS));
-    // A very long scan waits at most MAX_BACKOFF_MS.
-    gate.End(1005 + GuiBalanceScanGate::MIN_BACKOFF_MS + 60000);
-    const int64_t end = 1005 + GuiBalanceScanGate::MIN_BACKOFF_MS + 60000;
+    gate.End(1300);
+    BOOST_CHECK(!gate.TryBegin(1300));
+    BOOST_CHECK(!gate.TryBegin(1599));
+    BOOST_CHECK(gate.TryBegin(1600));
+    // A 60 s scan waits at most MAX_BACKOFF_MS.
+    gate.End(1600 + 60000);
+    const int64_t end = 1600 + 60000;
     BOOST_CHECK(!gate.TryBegin(end + GuiBalanceScanGate::MAX_BACKOFF_MS - 1));
     BOOST_CHECK(gate.TryBegin(end + GuiBalanceScanGate::MAX_BACKOFF_MS));
     gate.End(end + GuiBalanceScanGate::MAX_BACKOFF_MS, /*scanned=*/false);

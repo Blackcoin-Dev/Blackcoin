@@ -5880,12 +5880,7 @@ BOOST_FIXTURE_TEST_CASE(lifecycle_memo_matches_database_path, TestChain100Setup)
         BOOST_CHECK_EQUAL(memo.stats.memo_hits, deep - deep_outputs(true).size());
     }
 
-    // A disconnect clears the whole memo; reconnecting the block restores
-    // identical results on both paths.
-    {
-        BOOST_REQUIRE_GT(memo_size(), 0U);
-        disconnect_last();
-        BOOST_CHECK_EQUAL(memo_size(), 0U);
+    const auto reconnect_last = [&] {
         const LifecycleTestBlock& last = mined.back();
         interfaces::BlockInfo info{last.hash};
         info.prev_hash = &last.prev_hash;
@@ -5893,11 +5888,114 @@ BOOST_FIXTURE_TEST_CASE(lifecycle_memo_matches_database_path, TestChain100Setup)
         info.data = &last.block;
         info.chain_time_max = last.time_max;
         wallet->blockConnected(ChainstateRole::NORMAL, info);
+    };
+    const auto marker = [&] { return WITH_LOCK(wallet->cs_wallet, return wallet->GetBalanceScanMarker()); };
+
+    // A disconnect of the tip keeps the deep entries (every one of them
+    // confirmed below the disconnected block) and bumps the balance marker;
+    // after the block is connected again the next scan serves them from the
+    // memo without reading them from the database.
+    {
+        const size_t before = memo_size();
+        BOOST_REQUIRE_GT(before, 0U);
+        const uint64_t marker_before = marker();
+        disconnect_last();
+        BOOST_CHECK_EQUAL(memo_size(), before);
+        BOOST_CHECK_GT(marker(), marker_before);
+        reconnect_last();
         const Scan plain = scan(false);
         const Scan memo = scan(true);
         BOOST_REQUIRE(plain.ok && memo.ok);
         CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
-        BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false).size());
+        const size_t deep = deep_outputs(false).size();
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+        BOOST_CHECK_EQUAL(memo.stats.memo_hits, deep - deep_outputs(true).size());
+        BOOST_CHECK_EQUAL(memo.stats.outputs, memo.stats.memo_hits + memo.stats.database_reads);
+    }
+
+    // A disconnect erases the entries confirmed at or above the disconnected
+    // height and nothing below it.
+    {
+        const int height = mined.back().height;
+        const COutPoint at{uint256{0x51}, 0}, above{uint256{0x52}, 3}, below{uint256{0x53}, 1};
+        const size_t before = memo_size();
+        {
+            LOCK(wallet->cs_wallet);
+            WalletOutputLifecycleMemo entry;
+            entry.confirmed_block_height = height;
+            wallet->m_output_lifecycle_memo[at] = entry;
+            entry.confirmed_block_height = height + 5;
+            wallet->m_output_lifecycle_memo[above] = entry;
+            entry.confirmed_block_height = height - 1;
+            wallet->m_output_lifecycle_memo[below] = entry;
+        }
+        BOOST_CHECK_EQUAL(memo_size(), before + 3);
+        disconnect_last();
+        {
+            LOCK(wallet->cs_wallet);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.count(at), 0U);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.count(above), 0U);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.count(below), 1U);
+            wallet->m_output_lifecycle_memo.erase(below);
+        }
+        BOOST_CHECK_EQUAL(memo_size(), before);
+        reconnect_last();
+        const Scan plain = scan(false);
+        const Scan memo = scan(true);
+        BOOST_REQUIRE(plain.ok && memo.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        BOOST_CHECK_EQUAL(memo_size(), before);
+    }
+
+    // A transaction that becomes conflicted (CWallet::MarkConflicted, private,
+    // calls this helper for the confirmed transaction that changed state)
+    // loses its own entries only.
+    {
+        const std::vector<COutPoint> deep = deep_outputs(false);
+        BOOST_REQUIRE_GT(deep.size(), 2U);
+        const uint256 txid = deep.front().hash;
+        const size_t own = static_cast<size_t>(std::count_if(deep.begin(), deep.end(), [&](const COutPoint& o) { return o.hash == txid; }));
+        BOOST_REQUIRE_GT(own, 0U);
+        const size_t before = memo_size();
+        BOOST_REQUIRE_GE(before, deep.size());
+        const uint64_t marker_before = marker();
+        WITH_LOCK(wallet->cs_wallet, wallet->EraseOutputLifecycleMemoForTx(txid));
+        BOOST_CHECK_EQUAL(memo_size(), before - own);
+        BOOST_CHECK_GT(marker(), marker_before);
+        LOCK(wallet->cs_wallet);
+        for (const COutPoint& o : deep) {
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.count(o), o.hash == txid ? 0U : 1U);
+        }
+    }
+
+    // The helpers alone: by height, by transaction, and a full clear still
+    // clears everything and bumps the marker.
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->m_output_lifecycle_memo.clear();
+        WalletOutputLifecycleMemo entry;
+        for (int i = 0; i < 4; ++i) {
+            entry.confirmed_block_height = 10 * (i + 1);
+            wallet->m_output_lifecycle_memo[COutPoint{uint256{0x60}, static_cast<uint32_t>(i)}] = entry;
+            wallet->m_output_lifecycle_memo[COutPoint{uint256{0x61}, static_cast<uint32_t>(i)}] = entry;
+        }
+        uint64_t m = wallet->GetBalanceScanMarker();
+        wallet->EraseOutputLifecycleMemoFromHeight(30);
+        BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), 4U); // heights 10 and 20 of both
+        BOOST_CHECK_GT(wallet->GetBalanceScanMarker(), m);
+        m = wallet->GetBalanceScanMarker();
+        wallet->EraseOutputLifecycleMemoForTx(uint256{0x60});
+        BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), 2U);
+        for (const auto& [outpoint, memo_entry] : wallet->m_output_lifecycle_memo) BOOST_CHECK(outpoint.hash == uint256{0x61});
+        BOOST_CHECK_GT(wallet->GetBalanceScanMarker(), m);
+        m = wallet->GetBalanceScanMarker();
+        wallet->EraseOutputLifecycleMemoForTx(uint256{0x99}); // unknown: no entries, marker still moves
+        BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), 2U);
+        BOOST_CHECK_GT(wallet->GetBalanceScanMarker(), m);
+        m = wallet->GetBalanceScanMarker();
+        wallet->ClearOutputLifecycleMemo();
+        BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), 0U);
+        BOOST_CHECK_GT(wallet->GetBalanceScanMarker(), m);
     }
 }
 
@@ -6023,6 +6121,8 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         BOOST_CHECK_EQUAL(cold.stats.outputs, plain.stats.outputs);
         BOOST_CHECK_EQUAL(cold.stats.memo_hits, 0U);
         BOOST_CHECK_EQUAL(cold.stats.database_reads, plain.stats.outputs);
+        // Each output is counted once: outputs = memo hits + database reads.
+        BOOST_CHECK_EQUAL(cold.stats.outputs, cold.stats.memo_hits + cold.stats.database_reads);
         BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false));
         BOOST_REQUIRE_GT(memo_size(), 0U);
     }
@@ -6041,6 +6141,7 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         BOOST_CHECK_EQUAL(warm.stats.memo_hits, deep - slice);
         BOOST_CHECK_EQUAL(warm.stats.database_reads, plain.stats.outputs - (deep - slice));
         BOOST_CHECK_EQUAL(warm.stats.outputs, plain.stats.outputs);
+        BOOST_CHECK_EQUAL(warm.stats.outputs, warm.stats.memo_hits + warm.stats.database_reads);
     }
 
     // 3. With demurrage forced on in the captured tip, the memoized outputs
@@ -6270,6 +6371,65 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         BOOST_CHECK_GT(plain.balance.m_mine_untrusted_pending + plain.balance.m_mine_trusted, 0);
         // The unconfirmed change is never served from the memo.
         BOOST_CHECK_GT(r.pass.pending.size(), 0U);
+    }
+
+    // 10. Mempool traffic that does not touch the wallet does not discard a
+    // pass; a transaction that pays the wallet, or spends one of its outputs,
+    // does.
+    {
+        const CScript foreign = CScript() << OP_TRUE;
+        const auto make_tx = [&](const COutPoint& prevout, const CScript& script) {
+            CMutableTransaction mtx;
+            mtx.vin.emplace_back(prevout);
+            mtx.vout.emplace_back(COIN, script);
+            return MakeTransactionRef(mtx);
+        };
+        const auto add_and_remove = [&](const CTransactionRef& tx) {
+            wallet->transactionAddedToMempool(tx);
+            wallet->transactionRemovedFromMempool(tx, MemPoolRemovalReason::EXPIRY);
+        };
+
+        // (1) Unrelated: marker unchanged, the injected scan still publishes.
+        const CTransactionRef unrelated = make_tx(COutPoint{uint256{0x91}, 0}, foreign);
+        const uint64_t before = marker();
+        add_and_remove(unrelated);
+        BOOST_CHECK_EQUAL(marker(), before);
+        const auto plain = plain_scan();
+        TwoPhase r = two_phase([&] { add_and_remove(make_tx(COutPoint{uint256{0x92}, 1}, foreign)); });
+        BOOST_REQUIRE_MESSAGE(r.a_ok && r.b_ok, r.a_error + r.b_error);
+        CompareLifecycleScans(plain.balance, plain.summary, r.balance, r.summary);
+
+        // (2a) Pays the wallet: becomes a wallet transaction, marker moves, pass discarded.
+        const CTransactionRef paying = make_tx(COutPoint{uint256{0x93}, 0}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+        const uint64_t m1 = marker();
+        r = two_phase([&] { wallet->transactionAddedToMempool(paying); });
+        BOOST_CHECK(r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK_GT(marker(), m1);
+
+        // (2b) Spends one of the wallet's outputs (pays elsewhere).
+        COutPoint own;
+        {
+            LOCK(wallet->cs_wallet);
+            for (const auto& [txid, wtx] : wallet->mapWallet) {
+                if (wtx.IsCoinBase() && wallet->IsMine(wtx.tx->vout[0]) != ISMINE_NO) {
+                    own = COutPoint{txid, 0};
+                    break;
+                }
+            }
+        }
+        BOOST_REQUIRE(!own.IsNull());
+        const CTransactionRef spending = make_tx(own, foreign);
+        const uint64_t m2 = marker();
+        r = two_phase([&] { wallet->transactionAddedToMempool(spending); });
+        BOOST_CHECK(r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK_GT(marker(), m2);
+
+        // Removal of a wallet transaction moves the marker too.
+        const uint64_t m3 = marker();
+        wallet->transactionRemovedFromMempool(paying, MemPoolRemovalReason::EXPIRY);
+        BOOST_CHECK_GT(marker(), m3);
     }
 }
 

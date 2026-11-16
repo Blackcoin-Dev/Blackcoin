@@ -1459,9 +1459,42 @@ public:
     /** GUI-display-only memo of chainstate facts for deep confirmed outputs
      * (see WalletOutputLifecycleMemo). Never persisted. */
     mutable std::map<COutPoint, WalletOutputLifecycleMemo> m_output_lifecycle_memo GUARDED_BY(cs_wallet);
+    /** Drop every memoized fact. Used when nothing can be said about which
+     * entries are still right: a rescan, or an entry that disagreed with the
+     * chainstate. */
     void ClearOutputLifecycleMemo() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         m_output_lifecycle_memo.clear();
+        BumpBalanceScanMarker();
+    }
+    /** Drop the memoized facts of outputs confirmed at or above `height`: the
+     * entries a disconnect of the block at that height can have made wrong.
+     * Entries are only made for outputs of transactions at least
+     * LIFECYCLE_MEMO_MIN_DEPTH deep, and every lookup checks the entry against
+     * the transaction's confirmed block hash prefix and height, so an entry
+     * below the disconnected height describes a block that is still in the
+     * chain and a shallow reorg cannot make it wrong; whatever slips past is
+     * caught by the rolling re-verification against the chainstate. */
+    void EraseOutputLifecycleMemoFromHeight(int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        for (auto it = m_output_lifecycle_memo.begin(); it != m_output_lifecycle_memo.end();) {
+            if (it->second.confirmed_block_height >= height) {
+                it = m_output_lifecycle_memo.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        BumpBalanceScanMarker();
+    }
+    /** Drop the memoized facts of the outputs of one transaction (it changed
+     * state, for example became conflicted). The map is ordered by outpoint,
+     * so the outputs of a transaction are one contiguous range. */
+    void EraseOutputLifecycleMemoForTx(const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        auto it = m_output_lifecycle_memo.lower_bound(COutPoint{txid, 0});
+        while (it != m_output_lifecycle_memo.end() && it->first.hash == txid) {
+            it = m_output_lifecycle_memo.erase(it);
+        }
         BumpBalanceScanMarker();
     }
 

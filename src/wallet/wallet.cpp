@@ -2954,8 +2954,10 @@ void CWallet::MarkConflicted(const uint256& hashBlock, int conflicting_height, c
             // Block is 'more conflicted' than current confirm; update.
             // Mark transaction as conflicted with this block.
             wtx.m_state = TxStateConflicted{hashBlock, conflicting_height};
-            // A confirmed transaction changed state: drop every memoized fact.
-            ClearOutputLifecycleMemo();
+            // A confirmed transaction changed state: drop the memoized facts
+            // of its own outputs. Other transactions' entries describe blocks
+            // that are still in the chain and are checked on every lookup.
+            EraseOutputLifecycleMemoForTx(wtx.GetHash());
             return TxUpdate::CHANGED;
         }
         return TxUpdate::UNCHANGED;
@@ -3032,11 +3034,17 @@ void CWallet::SyncTransaction(const CTransactionRef& ptx, const SyncTxState& sta
 
 void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
     LOCK(cs_wallet);
-    BumpBalanceScanMarker();
+    // Every mempool transaction of the network arrives here, for every loaded
+    // wallet. The balance scan marker moves only when this wallet's state can
+    // change: SyncTransaction bumps (AddToWallet, MarkInputsDirty) when the
+    // transaction pays or spends the wallet and so becomes a wallet
+    // transaction, and the block below bumps when it was one already.
+    // An unrelated transaction leaves the marker alone.
     SyncTransaction(tx, TxStateInMempool{});
 
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
+        BumpBalanceScanMarker();
         RefreshMempoolStatus(it->second);
         UpdatePendingShadowSignalIndex(it->second);
         // Validation-interface delivery can lag a later eviction/removal.
@@ -3119,9 +3127,12 @@ void CWallet::transactionSubmittedByRpc(const CTransactionRef& tx)
 
 void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason) {
     LOCK(cs_wallet);
-    BumpBalanceScanMarker();
+    // As above: only a wallet transaction changes wallet state here (the
+    // CONFLICT path below goes through SyncTransaction, which bumps when the
+    // transaction is, or turns out to be, ours).
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
+        BumpBalanceScanMarker();
         RefreshMempoolStatus(it->second);
         UpdatePendingShadowSignalIndex(it->second);
 
@@ -3342,8 +3353,14 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     // future with a stickier abandoned state or even removing abandontransaction call.
     m_last_block_processed_height = block.height - 1;
     m_last_block_processed = *Assert(block.prev_hash);
-    // Any reorg invalidates every memoized chainstate fact (fail closed).
-    ClearOutputLifecycleMemo();
+    // Drop only the memoized chainstate facts of outputs confirmed in the
+    // disconnected block or above. Entries exist only for outputs at least
+    // LIFECYCLE_MEMO_MIN_DEPTH deep and are checked against the confirming
+    // block's hash prefix and height on every lookup, so a shallow reorg
+    // cannot make a deeper entry wrong; the rolling re-verification against
+    // the chainstate still catches anything else. Keeping them spares every
+    // loaded wallet a full warm-up after a reorg.
+    EraseOutputLifecycleMemoFromHeight(block.height);
 
     int disconnect_height = block.height;
     std::set<uint256> disconnected_block_txids;

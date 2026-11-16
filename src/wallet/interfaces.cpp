@@ -2835,39 +2835,97 @@ public:
     bool tryGetDisplayBalances(WalletDisplayBalances& result,
         const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family) override
     {
+        m_gui_diag.Attempt();
+        const bool published = TryGetDisplayBalancesInner(result, unchanged_tip, send_family);
+        const int64_t now_ms = BlockConnectActivity::NowMs();
+        if (published) {
+            m_last_publish_ms.store(now_ms);
+            if (const auto line = m_gui_diag.OnPublished(now_ms, m_wallet->GetName())) {
+                m_wallet->WalletLogPrintf("%s\n", *line);
+            }
+        } else if (!m_gui_diag.HasPublished()) {
+            // Never published: say now and then why not. The memo size is read
+            // without waiting for the wallet lock.
+            int64_t memo_size{-1};
+            {
+                TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+                if (locked_wallet) memo_size = static_cast<int64_t>(m_wallet->m_output_lifecycle_memo.size());
+            }
+            if (const auto line = m_gui_diag.TakeWaitingSummary(now_ms, m_wallet->GetName(), memo_size)) {
+                m_wallet->WalletLogPrintf("%s\n", *line);
+            }
+        }
+        return published;
+    }
+    //! The reason a failed scan stage gave, as a diagnostics category.
+    static GuiBalanceScanDiagnostics::Reason ReasonForError(const std::string& error, bool budget_exhausted)
+    {
+        using Reason = GuiBalanceScanDiagnostics::Reason;
+        if (budget_exhausted) return Reason::BUDGET;
+        if (error.find("yielded") != std::string::npos) return Reason::YIELDED;
+        if (error.find("synchronized") != std::string::npos) return Reason::NOT_SYNCED;
+        if (error.find("tip moved") != std::string::npos) return Reason::TIP_MOVED;
+        if (error.find("changed") != std::string::npos) return Reason::WALLET_MOVED;
+        return Reason::OTHER;
+    }
+    bool TryGetDisplayBalancesInner(WalletDisplayBalances& result,
+        const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family)
+    {
+        using Reason = GuiBalanceScanDiagnostics::Reason;
         // The balance scan is O(wallet outputs). It reads the wallet in three
         // lock scopes so that cs_main is held only for work that needs the
         // chainstate:
-        //   phase 0 (cs_main, cs_wallet): checks, and the tip facts;
+        //   phase 0 (cs_main, cs_wallet): checks, and the tip facts; O(1),
+        //     under TRY_LOCKs, needs no gate;
         //   phase A (cs_wallet only):     GetBalance and the walk over the
-        //     outputs; whatever needs the chainstate is listed, not read;
+        //     outputs; whatever needs the chainstate is listed, not read.
+        //     At most GuiBalanceScanQueue::MAX_PHASE_A_WALLETS wallets run
+        //     it at once so that many worker threads cannot saturate the CPU;
         //   phase B (cs_main, cs_wallet): the listed outputs are resolved, the
-        //     balance is published.
-        // Anything that moved between the scopes (tip, wallet) discards the
-        // pass and keeps the last display; the caller polls again.
+        //     balance is published. One wallet at a time process-wide, with a
+        //     back-off after a long hold, so the scans cannot monopolise
+        //     cs_main.
+        // Both limits are fair waiting queues (wallets that never published
+        // first, then the oldest publish): a worker with a finished pass waits
+        // for its turn holding no lock, for a bounded time. Anything that
+        // moved between the scopes (tip, wallet) discards the pass and keeps
+        // the last display; the caller polls again.
         //
         // While the validation scheduler is dispatching a block to the loaded
         // wallets, taking cs_main here makes the scheduler wait at the start
         // of every following wallet (L15). Yield; the caller polls again.
         // A deferral is bounded (BlockConnectActivity::MAX_DEFER_MS).
         BlockConnectActivity& activity = BlockConnectActivity::Global();
-        if (activity.ShouldDefer(BlockConnectActivity::NowMs())) return false;
+        if (activity.ShouldDefer(BlockConnectActivity::NowMs())) {
+            m_gui_diag.Count(Reason::DEFERRED);
+            return false;
+        }
         // A scan let through the deferral cap runs to its end; any other scan
-        // gives way (phase A) to a block that starts to be dispatched.
+        // gives way (phase A, and while waiting for a turn) to a block that
+        // starts to be dispatched.
         const bool let_through = activity.IsDispatching(BlockConnectActivity::NowMs());
-        // At most one GUI balance scan runs process-wide, and a new one waits
-        // as long as the previous one held cs_main, so the scans cannot
-        // monopolise it. Taken before the locks and released on every return
-        // path.
-        GuiBalanceScanGuard scan_guard;
-        if (!scan_guard.Admitted()) return false;
+        std::optional<Reason> give_up_reason;
+        const auto give_up = [&]() {
+            if (!let_through && activity.IsDispatching(BlockConnectActivity::NowMs())) {
+                give_up_reason = Reason::YIELDED;
+                return true;
+            }
+            if (m_wallet->HaveChain() && m_wallet->chain().shutdownRequested()) {
+                give_up_reason = Reason::SHUTDOWN;
+                return true;
+            }
+            return false;
+        };
+        const int64_t last_publish_ms = m_last_publish_ms.load();
 
         const int64_t scan_start_ms = BlockConnectActivity::NowMs();
-        int64_t main_ms{0};   // time holding cs_main: phase 0 and phase B
-        int64_t wallet_ms{0}; // phase A
+        int64_t main_ms{0};      // time holding cs_main: phase 0 and phase B
+        int64_t wallet_ms{0};    // phase A
+        int64_t gate_wait_ms{0}; // waiting for the phase A slot and the phase B gate
         WalletLifecycleScanStats scan_stats;
         LifecycleBulkPass pass;
         bool scanned{false};
+        bool resolve_started{false};
         bool complete{false};
         std::optional<WalletDisplayBalances> display;
 
@@ -2881,70 +2939,89 @@ public:
                 (m_last_budget_log_ms.load() == 0 || scan_end_ms - m_last_budget_log_ms.load() >= 30000);
             if (slow || progress) {
                 if (progress) m_last_budget_log_ms.store(scan_end_ms);
-                m_wallet->WalletLogPrintf("GUI balance scan: wallet=%s outputs=%d database_reads=%d memo_hits=%d memo_size=%d pending=%d budget_exhausted=%d main_ms=%d wallet_ms=%d took=%dms\n",
-                                          m_wallet->GetName(), scan_stats.outputs, scan_stats.database_reads,
-                                          scan_stats.memo_hits, WITH_LOCK(m_wallet->cs_wallet, return m_wallet->m_output_lifecycle_memo.size()),
-                                          scan_stats.pending, scan_stats.budget_exhausted ? 1 : 0,
-                                          main_ms, wallet_ms, scan_took_ms);
+                // The chainstate part adds the wallet part's counts to its own
+                // once it has started; before that only the wallet part's
+                // counts exist. Either way each output is counted once.
+                const WalletLifecycleScanStats& counted = resolve_started ? scan_stats : pass.stats;
+                const uint64_t pending = resolve_started ? scan_stats.pending : pass.stats.pending;
+                // Never wait for the wallet lock just to log (cs_main may be held here).
+                int64_t memo_size{-1};
+                {
+                    TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+                    if (locked_wallet) memo_size = static_cast<int64_t>(m_wallet->m_output_lifecycle_memo.size());
+                }
+                m_wallet->WalletLogPrintf("GUI balance scan: wallet=%s outputs=%d database_reads=%d memo_hits=%d memo_size=%d pending=%d budget_exhausted=%d main_ms=%d wallet_ms=%d gate_wait_ms=%d took=%dms\n",
+                                          m_wallet->GetName(), counted.outputs, scan_stats.database_reads,
+                                          counted.memo_hits, memo_size,
+                                          pending, scan_stats.budget_exhausted ? 1 : 0,
+                                          main_ms, wallet_ms, gate_wait_ms, scan_took_ms);
             }
+        };
+        const auto fail = [&](Reason reason) {
+            m_gui_diag.Count(reason);
+            finish();
+            return false;
+        };
+        // Why a bounded wait for a turn ended without one.
+        const auto gave_up_waiting = [&](Reason timeout_reason) {
+            return fail(give_up_reason ? *give_up_reason : timeout_reason);
         };
 
         // Phase 0.
         std::optional<LifecycleScanTip> tip;
         {
             TRY_LOCK(::cs_main, locked_main);
-            if (!locked_main) return false;
+            if (!locked_main) return fail(Reason::MAIN_BUSY);
             TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-            if (!locked_wallet) return false;
+            if (!locked_wallet) return fail(Reason::WALLET_BUSY);
             // Keep the last valid display while notifications catch up to the active tip.
             tip = CaptureLifecycleScanTip(*m_wallet);
-            if (!tip) return false;
+            if (!tip) return fail(Reason::NOT_SYNCED);
+            // Nothing new to show: not a failure, not counted.
             if (unchanged_tip && *unchanged_tip == tip->hash) return false;
             scanned = true;
             main_ms += BlockConnectActivity::NowMs() - scan_start_ms;
         }
-        scan_guard.AddMainHold(main_ms);
 
-        // Phase A: the wallet, without cs_main.
+        // Phase A: the wallet, without cs_main, a few wallets at a time.
         {
+            GuiBalanceScanSlot slot_a{GuiBalanceScanQueue::WalletPhase(), last_publish_ms,
+                                      GuiBalanceScanQueue::MAX_WAIT_MS, give_up};
+            gate_wait_ms += slot_a.WaitedMs();
+            if (!slot_a.Admitted()) return gave_up_waiting(Reason::SLOT_TIMEOUT);
+
             const int64_t phase_start_ms = BlockConnectActivity::NowMs();
             TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-            if (!locked_wallet) {
-                finish();
-                return false;
-            }
+            if (!locked_wallet) return fail(Reason::WALLET_BUSY);
             std::string error;
             const bool ok = ScanLifecycleWalletSide(
                 *m_wallet, *tip, /*min_depth=*/0, /*avoid_reuse=*/true, pass, error,
                 [&]() { return !let_through && activity.IsDispatching(BlockConnectActivity::NowMs()); });
-            scan_stats.outputs = pass.stats.outputs;
-            scan_stats.memo_hits = pass.stats.memo_hits;
-            scan_stats.pending = pass.stats.pending;
             wallet_ms = BlockConnectActivity::NowMs() - phase_start_ms;
-            if (!ok) {
-                finish();
-                return false;
-            }
+            if (!ok) return fail(ReasonForError(error, /*budget_exhausted=*/false));
         }
 
-        // Phase B: the chainstate part, under both locks.
+        // Phase B: the chainstate part, under both locks, one wallet at a time.
         {
-            TRY_LOCK(::cs_main, locked_main);
-            if (!locked_main) {
-                finish();
-                return false;
-            }
-            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-            if (!locked_wallet) {
-                finish();
-                return false;
-            }
+            GuiBalanceScanSlot gate{GuiBalanceScanQueue::MainPhase(), last_publish_ms,
+                                    GuiBalanceScanQueue::MAX_WAIT_MS, give_up};
+            gate_wait_ms += gate.WaitedMs();
+            if (!gate.Admitted()) return gave_up_waiting(Reason::GATE_TIMEOUT);
+
+            // The gate admits one scan at a time, so at most one GUI thread
+            // waits for cs_main here. Waiting, instead of a bare try, keeps a
+            // short hold by someone else from throwing away the wallet pass
+            // that was just read. The wallet lock stays a try: cs_main must
+            // not be held idle behind a long wallet operation.
+            LOCK(::cs_main);
             const int64_t phase_start_ms = BlockConnectActivity::NowMs();
             const auto record_hold = [&]() {
                 const int64_t held = BlockConnectActivity::NowMs() - phase_start_ms;
                 main_ms += held;
-                scan_guard.AddMainHold(held);
+                gate.AddMainHold(held);
             };
+            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+            if (!locked_wallet) return fail(Reason::WALLET_BUSY);
             Balance bal;
             WalletLifecycleSummary lifecycle;
             std::string error;
@@ -2952,6 +3029,7 @@ public:
             options.stats = &scan_stats;
             // Memo progress made so far counts for the next attempt, so only
             // the part of the scan that needs cs_main is time limited.
+            resolve_started = true;
             const bool ok = ResolveLifecycleBulkPass(
                 *m_wallet, pass, std::chrono::steady_clock::now() + GUI_SCAN_BUDGET, bal, lifecycle, error, options);
             if (ok) {
@@ -2966,10 +3044,11 @@ public:
                     display->send_family_balance = getAvailableBalanceLocked(control);
                 }
                 complete = true;
-            } else if (!scan_stats.budget_exhausted) {
+            } else {
+                const Reason reason = ReasonForError(error, scan_stats.budget_exhausted);
+                m_gui_diag.Count(reason);
                 // A moved tip or wallet is routine; anything else is worth a line.
-                if (error.find("moved") == std::string::npos && error.find("changed") == std::string::npos &&
-                    error.find("synchronized") == std::string::npos) {
+                if (!scan_stats.budget_exhausted && reason == Reason::OTHER) {
                     m_wallet->WalletLogPrintf("Unable to calculate lifecycle-adjusted GUI balance: %s\n", error);
                 }
             }
@@ -4021,6 +4100,11 @@ public:
     static constexpr std::chrono::milliseconds GUI_SCAN_BUDGET{250};
     //! Last time a budget-cut GUI scan was logged (rate limit per wallet).
     std::atomic<int64_t> m_last_budget_log_ms{0};
+    //! When this wallet last published a balance to the GUI (0 = never); the
+    //! scan queues serve the wallet with the oldest publish first.
+    std::atomic<int64_t> m_last_publish_ms{0};
+    //! Why this wallet's GUI balance scans did not publish.
+    GuiBalanceScanDiagnostics m_gui_diag{BlockConnectActivity::NowMs()};
 };
 
 class WalletLoaderImpl : public WalletLoader

@@ -2945,6 +2945,8 @@ void CWallet::MarkConflicted(const uint256& hashBlock, int conflicting_height, c
             // Block is 'more conflicted' than current confirm; update.
             // Mark transaction as conflicted with this block.
             wtx.m_state = TxStateConflicted{hashBlock, conflicting_height};
+            // A confirmed transaction changed state: drop every memoized fact.
+            ClearOutputLifecycleMemo();
             return TxUpdate::CHANGED;
         }
         return TxUpdate::UNCHANGED;
@@ -3326,6 +3328,8 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     // future with a stickier abandoned state or even removing abandontransaction call.
     m_last_block_processed_height = block.height - 1;
     m_last_block_processed = *Assert(block.prev_hash);
+    // Any reorg invalidates every memoized chainstate fact (fail closed).
+    ClearOutputLifecycleMemo();
 
     int disconnect_height = block.height;
     std::set<uint256> disconnected_block_txids;
@@ -4175,6 +4179,7 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
     auto start_time{reserver.now()};
 
     assert(reserver.isReserved());
+    WITH_LOCK(cs_wallet, ClearOutputLifecycleMemo());
 
     uint256 block_hash = start_block;
     ScanResult result;

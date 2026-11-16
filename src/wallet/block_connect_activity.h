@@ -5,6 +5,7 @@
 #ifndef BITCOIN_WALLET_BLOCK_CONNECT_ACTIVITY_H
 #define BITCOIN_WALLET_BLOCK_CONNECT_ACTIVITY_H
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -69,6 +70,87 @@ public:
 private:
     std::atomic<int64_t> m_last_ms{0};
     std::atomic<int64_t> m_defer_since_ms{0};
+};
+
+/**
+ * Process-wide single-flight and back-off for the GUI balance scan.
+ *
+ * The scan is O(wallet outputs) and holds cs_main. With many loaded wallets
+ * every GUI poll thread would otherwise scan at once and starve the validation
+ * and message-handler threads of cs_main. TryBegin() admits one scan at a time
+ * and refuses a new one until as much time has passed since the previous scan
+ * ended as that scan took (clamped to MIN_BACKOFF_MS..MAX_BACKOFF_MS), so GUI
+ * scans hold cs_main at most about half of the time. A poll that returned
+ * early without scanning records no back-off. Advisory and atomic: a wrong
+ * answer only delays or admits one poll; it never affects wallet data.
+ */
+class GuiBalanceScanGate
+{
+public:
+    static constexpr int64_t MIN_BACKOFF_MS{250};
+    static constexpr int64_t MAX_BACKOFF_MS{10000};
+
+    /** True if the caller may scan now; the caller must then call End(). */
+    bool TryBegin(int64_t now_ms)
+    {
+        bool expected{false};
+        if (!m_running.compare_exchange_strong(expected, true, std::memory_order_acquire)) return false;
+        const int64_t last_duration = m_last_duration_ms.load(std::memory_order_relaxed);
+        const int64_t last_end = m_last_end_ms.load(std::memory_order_relaxed);
+        if (last_duration > 0 && last_end != 0) {
+            const int64_t backoff = std::clamp(last_duration, MIN_BACKOFF_MS, MAX_BACKOFF_MS);
+            if (now_ms - last_end < backoff) {
+                m_running.store(false, std::memory_order_release);
+                return false;
+            }
+        }
+        m_start_ms.store(now_ms, std::memory_order_relaxed);
+        return true;
+    }
+
+    /** Release after a TryBegin() that returned true. scanned=false (an early
+     * return that did no scan) records a zero duration and so no back-off. */
+    void End(int64_t now_ms, bool scanned = true)
+    {
+        const int64_t duration = scanned ? std::max<int64_t>(0, now_ms - m_start_ms.load(std::memory_order_relaxed)) : 0;
+        m_last_duration_ms.store(duration, std::memory_order_relaxed);
+        m_last_end_ms.store(now_ms, std::memory_order_relaxed);
+        m_running.store(false, std::memory_order_release);
+    }
+
+    static GuiBalanceScanGate& Global()
+    {
+        static GuiBalanceScanGate instance;
+        return instance;
+    }
+
+private:
+    std::atomic<bool> m_running{false};
+    std::atomic<int64_t> m_start_ms{0};
+    std::atomic<int64_t> m_last_end_ms{0};
+    std::atomic<int64_t> m_last_duration_ms{0};
+};
+
+/** Holds the GUI balance scan gate for the current scope. Call MarkScanned()
+ * once the scan has really started; otherwise no back-off is imposed. */
+class GuiBalanceScanGuard
+{
+public:
+    explicit GuiBalanceScanGuard(GuiBalanceScanGate& gate = GuiBalanceScanGate::Global())
+        : m_gate(gate), m_admitted(gate.TryBegin(BlockConnectActivity::NowMs())) {}
+    ~GuiBalanceScanGuard()
+    {
+        if (m_admitted) m_gate.End(BlockConnectActivity::NowMs(), m_scanned);
+    }
+    GuiBalanceScanGuard(const GuiBalanceScanGuard&) = delete;
+    GuiBalanceScanGuard& operator=(const GuiBalanceScanGuard&) = delete;
+    bool Admitted() const { return m_admitted; }
+    void MarkScanned() { m_scanned = true; }
+
+private:
+    GuiBalanceScanGate& m_gate;
+    const bool m_admitted;
+    bool m_scanned{false};
 };
 
 /** Stamps activity on construction and destruction. */

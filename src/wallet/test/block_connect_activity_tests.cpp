@@ -50,5 +50,60 @@ BOOST_AUTO_TEST_CASE(quiet_resets_the_defer_window)
     BOOST_CHECK(a.ShouldDefer(6100));  // a fresh window starts
 }
 
+BOOST_AUTO_TEST_CASE(gui_balance_scan_gate_single_flight)
+{
+    GuiBalanceScanGate gate;
+    BOOST_CHECK(gate.TryBegin(1000));
+    BOOST_CHECK(!gate.TryBegin(1001)); // one scan at a time
+    BOOST_CHECK(!gate.TryBegin(60000));
+    gate.End(1100);
+    BOOST_CHECK(gate.TryBegin(100000)); // long after the last scan
+    gate.End(100000, /*scanned=*/false);
+}
+
+BOOST_AUTO_TEST_CASE(gui_balance_scan_gate_backs_off_for_the_last_duration)
+{
+    GuiBalanceScanGate gate;
+    // A 2 s scan: nothing is admitted for the next 2 s.
+    BOOST_CHECK(gate.TryBegin(10000));
+    gate.End(12000);
+    BOOST_CHECK(!gate.TryBegin(12000));
+    BOOST_CHECK(!gate.TryBegin(13999));
+    BOOST_CHECK(gate.TryBegin(14000));
+    gate.End(14000, /*scanned=*/false);
+    BOOST_CHECK(gate.TryBegin(14001)); // a no-op scan imposes no back-off
+    gate.End(14001, /*scanned=*/false);
+}
+
+BOOST_AUTO_TEST_CASE(gui_balance_scan_gate_clamps_the_back_off)
+{
+    GuiBalanceScanGate gate;
+    // A very short scan still waits MIN_BACKOFF_MS.
+    BOOST_CHECK(gate.TryBegin(1000));
+    gate.End(1005);
+    BOOST_CHECK(!gate.TryBegin(1005 + GuiBalanceScanGate::MIN_BACKOFF_MS - 1));
+    BOOST_CHECK(gate.TryBegin(1005 + GuiBalanceScanGate::MIN_BACKOFF_MS));
+    // A very long scan waits at most MAX_BACKOFF_MS.
+    gate.End(1005 + GuiBalanceScanGate::MIN_BACKOFF_MS + 60000);
+    const int64_t end = 1005 + GuiBalanceScanGate::MIN_BACKOFF_MS + 60000;
+    BOOST_CHECK(!gate.TryBegin(end + GuiBalanceScanGate::MAX_BACKOFF_MS - 1));
+    BOOST_CHECK(gate.TryBegin(end + GuiBalanceScanGate::MAX_BACKOFF_MS));
+    gate.End(end + GuiBalanceScanGate::MAX_BACKOFF_MS, /*scanned=*/false);
+}
+
+BOOST_AUTO_TEST_CASE(gui_balance_scan_guard_releases_on_every_path)
+{
+    GuiBalanceScanGate gate;
+    {
+        GuiBalanceScanGuard guard{gate};
+        BOOST_CHECK(guard.Admitted());
+        GuiBalanceScanGuard second{gate};
+        BOOST_CHECK(!second.Admitted());
+        // an early return: never marked scanned
+    }
+    GuiBalanceScanGuard again{gate};
+    BOOST_CHECK(again.Admitted()); // released, and no back-off recorded
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

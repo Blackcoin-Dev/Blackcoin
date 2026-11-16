@@ -837,6 +837,26 @@ struct WalletShadowSolveReference
     uint256 solve_txid;
 };
 
+/**
+ * In-memory (never persisted) record of the chainstate-derived facts of one
+ * deep confirmed wallet output, used only by the GUI balance display path to
+ * avoid re-reading the coins database for every output on every poll. It is
+ * valid only while the wallet transaction stays confirmed in the same block at
+ * the same height with the same output, and is cleared on any reorg or rescan.
+ */
+struct WalletOutputLifecycleMemo {
+    //! First 64 bits (GetUint64(0)) of the confirming block hash.
+    uint64_t confirmed_block_hash_prefix{0};
+    //! First 64 bits of the SHA256 of the serialized CTxOut the facts describe.
+    uint64_t txout_digest{0};
+    uint32_t coin_time{0};
+    int32_t confirmed_block_height{0};
+    uint32_t coin_height{0};
+    bool coinbase{false};
+    bool coinstake{false};
+    bool synthetic{false};
+};
+
 class WalletRescanReserver; //forward declarations for ScanForWalletTransactions/RescanFromTime
 /**
  * A CWallet maintains a set of transactions and balances, and provides the ability to create new transactions.
@@ -1435,6 +1455,11 @@ public:
     /** Map from txid to CWalletTx for all transactions this wallet is
      * interested in, including received and sent transactions. */
     std::unordered_map<uint256, CWalletTx, SaltedTxidHasher> mapWallet GUARDED_BY(cs_wallet);
+
+    /** GUI-display-only memo of chainstate facts for deep confirmed outputs
+     * (see WalletOutputLifecycleMemo). Never persisted. */
+    mutable std::map<COutPoint, WalletOutputLifecycleMemo> m_output_lifecycle_memo GUARDED_BY(cs_wallet);
+    void ClearOutputLifecycleMemo() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { m_output_lifecycle_memo.clear(); }
 
     typedef std::multimap<int64_t, CWalletTx*> TxItems;
     TxItems wtxOrdered;

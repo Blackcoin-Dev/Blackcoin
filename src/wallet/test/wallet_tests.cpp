@@ -5623,6 +5623,276 @@ BOOST_FIXTURE_TEST_CASE(lifecycle_balance_requires_matching_wallet_and_chain_tip
     BOOST_CHECK_EQUAL(gui_block_hash, tip->GetBlockHash());
 }
 
+namespace {
+struct LifecycleTestBlock {
+    CBlock block;
+    uint256 hash;
+    uint256 prev_hash;
+    int height;
+    unsigned int time_max;
+};
+
+void CompareLifecycleAmounts(const WalletLifecycleAmounts& a, const WalletLifecycleAmounts& b)
+{
+    BOOST_CHECK(a.outputs == b.outputs);
+    BOOST_CHECK(a.nominal == b.nominal);
+    BOOST_CHECK(a.effective == b.effective);
+    BOOST_CHECK(a.burned == b.burned);
+    BOOST_CHECK_EQUAL(a.ordinary_available, b.ordinary_available);
+    BOOST_CHECK_EQUAL(a.spendable_legacy, b.spendable_legacy);
+    BOOST_CHECK_EQUAL(a.spendable_quantum, b.spendable_quantum);
+}
+
+void CompareLifecycleScans(const Balance& a, const WalletLifecycleSummary& sa,
+                           const Balance& b, const WalletLifecycleSummary& sb)
+{
+    BOOST_CHECK_EQUAL(a.m_mine_trusted, b.m_mine_trusted);
+    BOOST_CHECK_EQUAL(a.m_mine_untrusted_pending, b.m_mine_untrusted_pending);
+    BOOST_CHECK_EQUAL(a.m_mine_immature, b.m_mine_immature);
+    BOOST_CHECK_EQUAL(a.m_mine_stake, b.m_mine_stake);
+    BOOST_CHECK_EQUAL(a.m_watchonly_trusted, b.m_watchonly_trusted);
+    BOOST_CHECK_EQUAL(a.m_watchonly_immature, b.m_watchonly_immature);
+    BOOST_CHECK_EQUAL(sa.evaluation_height, sb.evaluation_height);
+    BOOST_CHECK_EQUAL(sa.evaluation_mtp, sb.evaluation_mtp);
+    CompareLifecycleAmounts(sa.mine, sb.mine);
+    CompareLifecycleAmounts(sa.watchonly, sb.watchonly);
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(lifecycle_memo_matches_database_path, TestChain100Setup)
+{
+    std::unique_ptr<CWallet> wallet{CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey)};
+
+    std::vector<LifecycleTestBlock> mined;
+    const auto mine_and_connect = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            LifecycleTestBlock entry;
+            entry.block = CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+            const CBlockIndex* tip = WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                                               return m_node.chainman->ActiveChain().Tip());
+            entry.hash = tip->GetBlockHash();
+            entry.prev_hash = tip->pprev->GetBlockHash();
+            entry.height = tip->nHeight;
+            entry.time_max = tip->GetBlockTimeMax();
+            mined.push_back(std::move(entry));
+            const LifecycleTestBlock& e = mined.back();
+            interfaces::BlockInfo info{e.hash};
+            info.prev_hash = &e.prev_hash;
+            info.height = e.height;
+            info.data = &e.block;
+            info.chain_time_max = e.time_max;
+            wallet->blockConnected(ChainstateRole::NORMAL, info);
+        }
+    };
+    const auto disconnect_last = [&] {
+        const LifecycleTestBlock& e = mined.back();
+        interfaces::BlockInfo info{e.hash};
+        info.prev_hash = &e.prev_hash;
+        info.height = e.height;
+        info.data = &e.block;
+        info.chain_time_max = e.time_max;
+        wallet->blockDisconnected(info);
+    };
+    struct Scan {
+        Balance balance;
+        WalletLifecycleSummary summary;
+        WalletLifecycleScanStats stats;
+        bool ok{false};
+    };
+    const auto scan = [&](bool use_memo, uint64_t max_database_reads = 0) {
+        Scan result;
+        WalletLifecycleOptions options;
+        options.use_memo = use_memo;
+        options.max_database_reads = max_database_reads;
+        options.stats = &result.stats;
+        std::string error;
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        result.ok = GetLifecycleAdjustedBalance(*wallet, /*min_depth=*/0, /*avoid_reuse=*/true,
+                                               result.balance, result.summary, error, options);
+        if (max_database_reads == 0) BOOST_CHECK_MESSAGE(result.ok, error);
+        if (result.stats.budget_exhausted) {
+            BOOST_CHECK(!result.ok);
+            BOOST_CHECK_EQUAL(error, "Wallet lifecycle scan budget exhausted");
+        }
+        return result;
+    };
+    // Deep wallet outputs, and the subset the rolling re-verification re-reads
+    // from the database at the current tip.
+    const auto deep_outputs = [&](bool slice_only) {
+        std::vector<COutPoint> outpoints;
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        const int tip_height = wallet->GetLastBlockHeight();
+        for (const auto& [txid, wtx] : wallet->mapWallet) {
+            if (wallet->GetTxDepthInMainChain(wtx) < 100) continue;
+            for (uint32_t n = 0; n < wtx.tx->vout.size(); ++n) {
+                const COutPoint outpoint{txid, n};
+                if (wallet->IsSpent(outpoint) ||
+                    (wallet->IsMine(wtx.tx->vout[n]) & ISMINE_SPENDABLE) == ISMINE_NO) continue;
+                const bool in_slice = (outpoint.hash.GetUint64(0) + n + static_cast<uint64_t>(tip_height)) % LIFECYCLE_MEMO_VERIFY_MODULUS == 0;
+                if (!slice_only || in_slice) outpoints.push_back(outpoint);
+            }
+        }
+        return outpoints;
+    };
+    const auto memo_size = [&] { return WITH_LOCK(wallet->cs_wallet, return wallet->m_output_lifecycle_memo.size()); };
+
+    // Blocks 1..N are deep once N+100 blocks exist; below that they are not.
+    mine_and_connect(40);
+    {
+        const Scan plain = scan(false);
+        BOOST_REQUIRE(plain.ok);
+        BOOST_CHECK_EQUAL(plain.stats.database_reads, plain.stats.outputs);
+        BOOST_CHECK_EQUAL(plain.stats.memo_hits, 0U);
+        BOOST_CHECK_EQUAL(memo_size(), 0U); // the default path never touches the memo
+
+        const size_t deep = deep_outputs(false).size();
+        BOOST_REQUIRE_GT(deep, 0U);
+        BOOST_REQUIRE_LT(deep, plain.stats.outputs);
+
+        const Scan first = scan(true);
+        BOOST_REQUIRE(first.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, first.balance, first.summary);
+        BOOST_CHECK_EQUAL(first.stats.memo_hits, 0U);
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+
+        const Scan second = scan(true);
+        BOOST_REQUIRE(second.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, second.balance, second.summary);
+        const size_t slice = deep_outputs(true).size();
+        BOOST_CHECK_EQUAL(second.stats.memo_hits, deep - slice);
+        BOOST_CHECK_EQUAL(second.stats.database_reads, second.stats.outputs - (deep - slice));
+        BOOST_CHECK_LT(second.stats.database_reads, plain.stats.database_reads);
+    }
+
+    // New blocks: deep outputs keep joining the memo and results stay equal.
+    for (int round = 0; round < 3; ++round) {
+        mine_and_connect(1);
+        const Scan plain = scan(false);
+        const Scan memo = scan(true);
+        BOOST_REQUIRE(plain.ok && memo.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false).size());
+    }
+
+    // A memo whose stored block hash or output digest no longer matches is
+    // ignored and replaced by the database result.
+    {
+        const std::vector<COutPoint> deep = deep_outputs(false);
+        const std::vector<COutPoint> slice = deep_outputs(true);
+        const auto in_slice = [&](const COutPoint& o) { return std::find(slice.begin(), slice.end(), o) != slice.end(); };
+        const auto victim = std::find_if(deep.begin(), deep.end(), [&](const COutPoint& o) { return !in_slice(o); });
+        BOOST_REQUIRE(victim != deep.end());
+        WalletOutputLifecycleMemo good;
+        {
+            LOCK(wallet->cs_wallet);
+            good = wallet->m_output_lifecycle_memo.at(*victim);
+            auto& entry = wallet->m_output_lifecycle_memo.at(*victim);
+            entry.confirmed_block_hash_prefix ^= 0xff;
+            entry.coin_time += 12345; // would change the result if it were used
+            entry.synthetic = !entry.synthetic;
+        }
+        const Scan plain = scan(false);
+        const Scan memo = scan(true);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        BOOST_CHECK_EQUAL(memo.stats.memo_hits, deep.size() - slice.size() - 1);
+        {
+            LOCK(wallet->cs_wallet);
+            const auto& entry = wallet->m_output_lifecycle_memo.at(*victim);
+            BOOST_CHECK_EQUAL(entry.confirmed_block_hash_prefix, good.confirmed_block_hash_prefix);
+            BOOST_CHECK_EQUAL(entry.coin_time, good.coin_time);
+            BOOST_CHECK_EQUAL(entry.synthetic, good.synthetic);
+        }
+        {
+            LOCK(wallet->cs_wallet);
+            wallet->m_output_lifecycle_memo.at(*victim).txout_digest ^= 0xff;
+        }
+        const Scan digest = scan(true);
+        CompareLifecycleScans(plain.balance, plain.summary, digest.balance, digest.summary);
+        BOOST_CHECK_EQUAL(digest.stats.memo_hits, deep.size() - slice.size() - 1);
+    }
+
+    // Rolling re-verification: find a tip height at which some deep output is
+    // in the re-read slice, corrupt its memo with otherwise matching keys, and
+    // require the scan to notice, clear the memo and return the database answer.
+    {
+        while (deep_outputs(true).empty()) mine_and_connect(1);
+        const std::vector<COutPoint> slice = deep_outputs(true);
+        scan(true); // make sure every deep output is memoized at this tip
+        {
+            LOCK(wallet->cs_wallet);
+            wallet->m_output_lifecycle_memo.at(slice.front()).coin_time += 777;
+        }
+        const Scan plain = scan(false);
+        Scan memo;
+        {
+            DebugLogHelper log_helper{"Lifecycle memo disagrees with the chainstate"};
+            memo = scan(true);
+        }
+        BOOST_REQUIRE(memo.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        BOOST_CHECK_LT(memo.stats.memo_hits, deep_outputs(false).size() - slice.size() + 1);
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->m_output_lifecycle_memo.count(slice.front()) == 1);
+    }
+
+    // A budget-limited scan stops early, keeps what it memoized, and repeated
+    // attempts eventually complete with the database-path result.
+    {
+        BOOST_CHECK_LE(sizeof(WalletOutputLifecycleMemo), 32U);
+        const Scan plain = scan(false);
+        const size_t deep = deep_outputs(false).size();
+        const uint64_t shallow = plain.stats.outputs - deep;
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        size_t previous_size = 0;
+        int attempts = 0;
+        bool completed = false;
+        while (attempts++ < 200) {
+            const Scan limited = scan(true, shallow + 8);
+            if (limited.ok) {
+                completed = true;
+                CompareLifecycleScans(plain.balance, plain.summary, limited.balance, limited.summary);
+                break;
+            }
+            BOOST_CHECK(limited.stats.budget_exhausted);
+            BOOST_CHECK_EQUAL(limited.stats.database_reads, shallow + 8);
+            BOOST_CHECK_GE(memo_size(), previous_size);
+            previous_size = std::max(previous_size, memo_size());
+        }
+        BOOST_CHECK(completed);
+        BOOST_CHECK_GT(attempts, 2);
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+        // The unlimited memo scan after completion equals the plain path too.
+        const Scan memo = scan(true);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        // Exactly the verification slice is read from the database.
+        BOOST_CHECK_EQUAL(memo.stats.memo_hits, deep - deep_outputs(true).size());
+    }
+
+    // A disconnect clears the whole memo; reconnecting the block restores
+    // identical results on both paths.
+    {
+        BOOST_REQUIRE_GT(memo_size(), 0U);
+        disconnect_last();
+        BOOST_CHECK_EQUAL(memo_size(), 0U);
+        const LifecycleTestBlock& last = mined.back();
+        interfaces::BlockInfo info{last.hash};
+        info.prev_hash = &last.prev_hash;
+        info.height = last.height;
+        info.data = &last.block;
+        info.chain_time_max = last.time_max;
+        wallet->blockConnected(ChainstateRole::NORMAL, info);
+        const Scan plain = scan(false);
+        const Scan memo = scan(true);
+        BOOST_REQUIRE(plain.ok && memo.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false).size());
+    }
+}
+
 BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions, TestChain100Setup)
 {
     // Cap last block file size, and mine new block in a new block file.

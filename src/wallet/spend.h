@@ -16,6 +16,7 @@
 #include <wallet/wallet.h>
 
 #include <array>
+#include <chrono>
 #include <functional>
 #include <optional>
 
@@ -39,6 +40,34 @@ struct WalletLifecycleSummary {
     WalletLifecycleAmounts watchonly;
 };
 
+/** One deep memoized output in this many is re-read from the database on
+ * every memo-enabled scan (selected by outpoint hash, index and tip height). */
+static constexpr uint64_t LIFECYCLE_MEMO_VERIFY_MODULUS{1024};
+
+/** Counters filled by a lifecycle scan, for logging and tests. */
+struct WalletLifecycleScanStats {
+    uint64_t outputs{0};        //!< outputs classified
+    uint64_t database_reads{0}; //!< outputs whose chainstate facts were read from the coins view
+    uint64_t memo_hits{0};      //!< outputs served from the wallet's lifecycle memo
+    bool budget_exhausted{false}; //!< the scan stopped because its budget ran out
+};
+
+/** Optional behaviour of the lifecycle accounting. The defaults reproduce the
+ * un-memoized behaviour exactly. */
+struct WalletLifecycleOptions {
+    /** Serve chainstate facts of deep confirmed outputs from the wallet's
+     * in-memory memo (GUI display path only). */
+    bool use_memo{false};
+    /** Memo-enabled scans only: stop (returning false with stats->budget_exhausted
+     * set) once this much time has passed, checked every 16 database reads. 0 =
+     * unlimited. Memo entries stored so far are kept. */
+    std::chrono::milliseconds budget{0};
+    /** Memo-enabled scans only: stop after this many database reads (0 =
+     * unlimited). Deterministic knob for tests. */
+    uint64_t max_database_reads{0};
+    WalletLifecycleScanStats* stats{nullptr};
+};
+
 /** Whether the wallet transaction view and active UTXO view describe the
  * same chain tip. Lifecycle accounting must not combine the wallet state from
  * one tip with coins from another. */
@@ -50,7 +79,8 @@ bool WalletLifecycleViewIsSynchronized(const CWallet& wallet)
 bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,
                               const CTxOut& txout,
                               ValueLifecycleClassification& classification,
-                              std::string& error)
+                              std::string& error,
+                              const WalletLifecycleOptions& options = {})
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /** Return the ordinary-spendable wallet balance and a mutually exclusive
@@ -59,7 +89,8 @@ bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,
 bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
                                  bool avoid_reuse, Balance& balance,
                                  WalletLifecycleSummary& summary,
-                                 std::string& error)
+                                 std::string& error,
+                                 const WalletLifecycleOptions& options = {})
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /** Whether this wallet can satisfy a legacy input with a scriptSig-committed

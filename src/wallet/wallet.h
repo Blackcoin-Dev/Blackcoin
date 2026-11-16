@@ -1459,7 +1459,23 @@ public:
     /** GUI-display-only memo of chainstate facts for deep confirmed outputs
      * (see WalletOutputLifecycleMemo). Never persisted. */
     mutable std::map<COutPoint, WalletOutputLifecycleMemo> m_output_lifecycle_memo GUARDED_BY(cs_wallet);
-    void ClearOutputLifecycleMemo() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { m_output_lifecycle_memo.clear(); }
+    void ClearOutputLifecycleMemo() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        m_output_lifecycle_memo.clear();
+        BumpBalanceScanMarker();
+    }
+
+    /** Monotonic counter of wallet changes that can alter a balance: every
+     * change to mapWallet contents or a transaction's state, the spend map,
+     * the keys and scripts that decide IsMine(), the wallet flags and the
+     * lifecycle memo. The GUI balance scan reads the wallet in one lock
+     * scope and resolves chainstate facts in a later one; it discards its
+     * work when this value has moved in between. A bump that is missing
+     * would let a stale balance reach the screen, so callers bump
+     * liberally: extra bumps only cost a repeated scan. */
+    uint64_t m_balance_scan_marker GUARDED_BY(cs_wallet){0};
+    void BumpBalanceScanMarker() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { ++m_balance_scan_marker; }
+    uint64_t GetBalanceScanMarker() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_balance_scan_marker; }
 
     typedef std::multimap<int64_t, CWalletTx*> TxItems;
     TxItems wtxOrdered;
@@ -2512,6 +2528,7 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         ++m_shadow_pow_claim_candidate_state_generation;
+        BumpBalanceScanMarker();
     }
     void RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

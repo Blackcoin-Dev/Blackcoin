@@ -8,17 +8,22 @@
 #define BITCOIN_WALLET_SPEND_H
 
 #include <consensus/amount.h>
+#include <consensus/demurrage.h>
 #include <policy/fees.h> // for FeeCalculation
 #include <shadow.h>
 #include <util/result.h>
 #include <wallet/coinselection.h>
+#include <wallet/receive.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
 #include <array>
 #include <chrono>
 #include <functional>
+#include <map>
 #include <optional>
+#include <set>
+#include <vector>
 
 namespace wallet {
 struct Balance;
@@ -50,7 +55,13 @@ struct WalletLifecycleScanStats {
     uint64_t database_reads{0}; //!< outputs whose chainstate facts were read from the coins view
     uint64_t memo_hits{0};      //!< outputs served from the wallet's lifecycle memo
     bool budget_exhausted{false}; //!< the scan stopped because its budget ran out
+    bool memo_cleared{false};   //!< a verified memo entry disagreed with the chainstate and the memo was dropped
+    uint64_t pending{0};        //!< two-phase scans: outputs handed to the chainstate phase
 };
+
+/** Latest demurrage attestation per scriptPubKey, resolved at most once per
+ * scan. Filled lazily by GetWalletOutputLifecycle when supplied. */
+using LifecycleAttestationMap = std::map<CScript, std::optional<Consensus::DemurrageAttestationState>>;
 
 /** Optional behaviour of the lifecycle accounting. The defaults reproduce the
  * un-memoized behaviour exactly. */
@@ -66,6 +77,10 @@ struct WalletLifecycleOptions {
      * unlimited). Deterministic knob for tests. */
     uint64_t max_database_reads{0};
     WalletLifecycleScanStats* stats{nullptr};
+    /** Memo-enabled scans only: when set, the demurrage attestation of a
+     * script is read from (and stored in) this map instead of being read from
+     * the coins view once per output. */
+    LifecycleAttestationMap* attestations{nullptr};
 };
 
 /** Whether the wallet transaction view and active UTXO view describe the
@@ -91,6 +106,83 @@ bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
                                  WalletLifecycleSummary& summary,
                                  std::string& error,
                                  const WalletLifecycleOptions& options = {})
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/** Chain facts a GUI balance scan captures under cs_main before it reads the
+ * wallet without it. */
+struct LifecycleScanTip {
+    uint256 hash;
+    int height{0};
+    int evaluation_height{0};
+    int64_t evaluation_mtp{0};
+    //! Whether demurrage applies at the evaluation height (the attestation of
+    //! each output's script is then needed to classify it).
+    bool demurrage_active{false};
+};
+
+/** Capture the active tip. Returns nullopt without a tip or when the wallet
+ * and the active chain tip differ. */
+std::optional<LifecycleScanTip> CaptureLifecycleScanTip(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/** An output whose classification needs the chainstate. */
+struct LifecyclePendingOutput {
+    uint256 txid;
+    uint32_t n{0};
+    bool wallet_immature{false};
+    bool mine_spendable{false};
+    bool watchonly{false};
+    //! The memoized facts are usable; only the demurrage attestation is missing.
+    bool memo_hit{false};
+};
+
+/** What the wallet-only part of a two-phase lifecycle balance scan produced:
+ * the balance and summary of every output it could classify alone, and the
+ * outputs left for the chainstate part. */
+struct LifecycleBulkPass {
+    LifecycleScanTip tip;
+    //! CWallet::GetBalanceScanMarker() when the wallet was read.
+    uint64_t marker{0};
+    Balance balance;
+    WalletLifecycleSummary summary;
+    std::vector<LifecyclePendingOutput> pending;
+    //! Distinct scriptPubKeys of the pending memo hits (demurrage only).
+    std::set<CScript> attestation_scripts;
+    int min_depth{0};
+    bool avoid_reuse{false};
+    //! Bookkeeping of the wallet-only part (outputs, memo hits).
+    WalletLifecycleScanStats stats;
+};
+
+/** Number of outputs the wallet-only part visits between two calls of its
+ * abort callback. */
+static constexpr uint64_t LIFECYCLE_BULK_ABORT_INTERVAL{1024};
+
+/** Part one of the two-phase GUI balance scan: everything that needs no
+ * chainstate, under cs_wallet only (never cs_main). The same numbers as
+ * GetLifecycleAdjustedBalance once ResolveLifecycleBulkPass has resolved the
+ * pending outputs. Returns false (error set) when the wallet tip is not
+ * tip.hash, on an arithmetic error, or when should_abort (called every
+ * LIFECYCLE_BULK_ABORT_INTERVAL outputs) returns true. */
+bool ScanLifecycleWalletSide(const CWallet& wallet, const LifecycleScanTip& tip,
+                             int min_depth, bool avoid_reuse,
+                             LifecycleBulkPass& pass, std::string& error,
+                             const std::function<bool()>& should_abort = {})
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** Part two: resolve the pending outputs against the chainstate under cs_main
+ * and cs_wallet, and produce the balance. Fails closed (false, error set)
+ * unless the active tip and the wallet tip are still pass.tip.hash and the
+ * wallet change marker is unchanged, and when a verified memo entry
+ * disagreed with the chainstate. The time limit is tested before every
+ * pending output; options.max_database_reads is the deterministic knob.
+ * budget_exhausted is set in options.stats when a limit stopped the pass
+ * (memo entries written so far are kept). options.use_memo is implied. */
+bool ResolveLifecycleBulkPass(const CWallet& wallet, LifecycleBulkPass& pass,
+                              std::chrono::steady_clock::time_point deadline,
+                              Balance& balance, WalletLifecycleSummary& summary,
+                              std::string& error,
+                              const WalletLifecycleOptions& options = {})
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /** Whether this wallet can satisfy a legacy input with a scriptSig-committed

@@ -50,6 +50,72 @@ BOOST_AUTO_TEST_CASE(quiet_resets_the_defer_window)
     BOOST_CHECK(a.ShouldDefer(6100));  // a fresh window starts
 }
 
+BOOST_AUTO_TEST_CASE(is_dispatching_changes_no_state)
+{
+    BlockConnectActivity a;
+    BOOST_CHECK(!a.IsDispatching(1000));
+    a.Note(1000);
+    BOOST_CHECK(a.IsDispatching(1000 + BlockConnectActivity::QUIET_MS - 1));
+    BOOST_CHECK(!a.IsDispatching(1000 + BlockConnectActivity::QUIET_MS));
+    // Asking never opens a deferral window: the first ShouldDefer still starts it.
+    for (int i = 0; i < 100; ++i) BOOST_CHECK(a.IsDispatching(1100));
+    BOOST_CHECK(a.ShouldDefer(1100));
+}
+
+BOOST_AUTO_TEST_CASE(gui_balance_scan_gate_backs_off_on_cs_main_time_only)
+{
+    // A scan that ran 5 s, of which only 40 ms with cs_main: no back-off.
+    {
+        GuiBalanceScanGate gate;
+        BOOST_CHECK(gate.TryBegin(1000));
+        gate.End(6000, /*scanned=*/true, /*held_ms=*/40);
+        BOOST_CHECK(gate.TryBegin(6001));
+        gate.End(6001, /*scanned=*/false);
+    }
+    // The same scan holding cs_main for 400 ms: the next waits 400 ms.
+    {
+        GuiBalanceScanGate gate;
+        BOOST_CHECK(gate.TryBegin(1000));
+        gate.End(6000, /*scanned=*/true, /*held_ms=*/400);
+        BOOST_CHECK(!gate.TryBegin(6399));
+        BOOST_CHECK(gate.TryBegin(6400));
+        gate.End(6400, /*scanned=*/false);
+    }
+    // Without a held time the elapsed time counts, as before.
+    {
+        GuiBalanceScanGate gate;
+        BOOST_CHECK(gate.TryBegin(1000));
+        gate.End(1600);
+        BOOST_CHECK(!gate.TryBegin(2199));
+        BOOST_CHECK(gate.TryBegin(2200));
+        gate.End(2200, /*scanned=*/false);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(gui_balance_scan_guard_reports_main_hold)
+{
+    GuiBalanceScanGate gate;
+    {
+        GuiBalanceScanGuard guard{gate};
+        BOOST_REQUIRE(guard.Admitted());
+        guard.AddMainHold(100);
+        guard.AddMainHold(300); // phase 0 and phase B add up
+    }
+    BOOST_CHECK(!gate.TryBegin(BlockConnectActivity::NowMs())); // 400 ms back-off from now
+    {
+        GuiBalanceScanGuard guard{gate};
+        BOOST_CHECK(!guard.Admitted());
+    }
+    GuiBalanceScanGate quiet;
+    {
+        GuiBalanceScanGuard guard{quiet};
+        BOOST_REQUIRE(guard.Admitted());
+        guard.AddMainHold(10); // cheap hold: no pause
+    }
+    BOOST_CHECK(quiet.TryBegin(BlockConnectActivity::NowMs()));
+    quiet.End(BlockConnectActivity::NowMs(), false);
+}
+
 BOOST_AUTO_TEST_CASE(gui_balance_scan_gate_single_flight)
 {
     GuiBalanceScanGate gate;

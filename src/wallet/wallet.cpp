@@ -437,6 +437,7 @@ bool CWallet::UpdateShadowPowClaimRecoveryRecordsDurably(
     std::string_view operation, std::vector<uint256>* changed_txids)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
     if (changed_txids) changed_txids->clear();
     if (m_shadow_pow_claim_recovery_db_ambiguous ||
         m_locked_coins_db_ambiguous) {
@@ -972,6 +973,7 @@ bool CWallet::ReconcileWalletShadowPayoutsForBlock(
     WalletBatch& batch)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
     bool write_ok{true};
     const auto indexed = m_confirmed_synthetic_payouts_by_block.find(block_hash);
     if (indexed == m_confirmed_synthetic_payouts_by_block.end()) return true;
@@ -2404,6 +2406,7 @@ void CWallet::MarkDirty()
 {
     {
         LOCK(cs_wallet);
+        BumpBalanceScanMarker();
         for (std::pair<const uint256, CWalletTx>& item : mapWallet)
             item.second.MarkDirty();
     }
@@ -2412,6 +2415,7 @@ void CWallet::MarkDirty()
 void CWallet::SetSpentKeyState(WalletBatch& batch, const uint256& hash, unsigned int n, bool used, std::set<CTxDestination>& tx_destinations)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
     const CWalletTx* srctx = GetWalletTx(hash);
     if (!srctx) return;
 
@@ -2464,6 +2468,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
                                 std::optional<WalletBlockTime> block_time)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     WalletBatch batch(GetDatabase(), fFlushOnClose);
 
@@ -2657,6 +2662,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
 
 bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx, bool reconcile_chainstate)
 {
+    BumpBalanceScanMarker();
     const auto& ins = mapWallet.emplace(std::piecewise_construct, std::forward_as_tuple(hash), std::forward_as_tuple(nullptr, TxStateInactive{}));
     CWalletTx& wtx = ins.first->second;
     if (!fill_wtx(wtx, ins.second)) {
@@ -2817,6 +2823,7 @@ bool CWallet::TransactionCanBeAbandoned(const uint256& hashTx) const
 
 void CWallet::MarkInputsDirty(const CTransactionRef& tx)
 {
+    BumpBalanceScanMarker();
     for (const CTxIn& txin : tx->vin) {
         auto it = mapWallet.find(txin.prevout.hash);
         if (it != mapWallet.end()) {
@@ -2829,6 +2836,7 @@ bool CWallet::AbandonTransaction(const uint256& hashTx, bool automatic_shadow_st
 {
     {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     // Can't mark abandoned if confirmed or in mempool
     auto it = mapWallet.find(hashTx);
@@ -2928,6 +2936,7 @@ bool CWallet::AbandonTransaction(const uint256& hashTx, bool automatic_shadow_st
 void CWallet::MarkConflicted(const uint256& hashBlock, int conflicting_height, const uint256& hashTx)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     // If number of conflict confirms cannot be determined, this means
     // that the block is still unknown or not yet part of the main chain,
@@ -2958,6 +2967,7 @@ void CWallet::MarkConflicted(const uint256& hashBlock, int conflicting_height, c
 }
 
 void CWallet::RecursiveUpdateTxState(const uint256& tx_hash, const TryUpdatingStateFn& try_updating_state) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+    BumpBalanceScanMarker();
     // Do not flush the wallet here for performance reasons
     WalletBatch batch(GetDatabase(), false);
 
@@ -3022,6 +3032,7 @@ void CWallet::SyncTransaction(const CTransactionRef& ptx, const SyncTxState& sta
 
 void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
     SyncTransaction(tx, TxStateInMempool{});
 
     auto it = mapWallet.find(tx->GetHash());
@@ -3108,6 +3119,7 @@ void CWallet::transactionSubmittedByRpc(const CTransactionRef& tx)
 
 void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason) {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
         RefreshMempoolStatus(it->second);
@@ -3197,6 +3209,7 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     }
     {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     m_last_block_processed_height = block.height;
     m_last_block_processed = block.hash;
@@ -3321,6 +3334,7 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     const BlockConnectActivityScope block_connect_activity;
     {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     // At block disconnection, this will change an abandoned transaction to
     // be unconfirmed, whether or not the transaction is added back to the mempool.
@@ -3603,6 +3617,7 @@ bool CWallet::TryCanGetAddresses(bool& result, bool internal) const
 void CWallet::SetWalletFlag(uint64_t flags)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
     m_wallet_flags |= flags;
     if (!WalletBatch(GetDatabase()).WriteWalletFlags(m_wallet_flags))
         throw std::runtime_error(std::string(__func__) + ": writing wallet flags failed");
@@ -3617,6 +3632,7 @@ void CWallet::UnsetWalletFlag(uint64_t flag)
 void CWallet::UnsetWalletFlagWithDB(WalletBatch& batch, uint64_t flag)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
     m_wallet_flags &= ~flag;
     if (!batch.WriteWalletFlags(m_wallet_flags))
         throw std::runtime_error(std::string(__func__) + ": writing wallet flags failed");
@@ -5765,6 +5781,7 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
             shadow_pow_authority ? &::cs_main : nullptr,
             "::cs_main", __FILE__, __LINE__);
         LOCK(cs_wallet);
+        BumpBalanceScanMarker();
         WalletLogPrintf("CommitTransaction:\n%s", tx->ToString()); // NOLINT(bitcoin-unterminated-logprintf)
 
         bool reopen_automatic_shadow_signal{false};
@@ -6107,6 +6124,7 @@ bool CWallet::CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std:
     bool should_broadcast{false};
     {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     if (mapWallet.count(hash)) return fail("RGB anchor transaction is already in the wallet");
     if (rgb_data.contract_id.IsNull() || rgb_data.transition_id.IsNull()) return fail("RGB transition id is invalid");
@@ -6492,6 +6510,7 @@ DBErrors CWallet::LoadWallet()
 DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256>& vHashOut)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
     DBErrors nZapSelectTxRet = WalletBatch(GetDatabase()).ZapSelectTx(vHashIn, vHashOut);
     for (const uint256& hash : vHashOut) {
         const auto& it = mapWallet.find(hash);
@@ -8369,6 +8388,7 @@ std::optional<int64_t> CWallet::GetOldestKeyPoolTime() const
 }
 
 void CWallet::MarkDestinationsDirty(const std::set<CTxDestination>& destinations) {
+    BumpBalanceScanMarker();
     for (auto& entry : mapWallet) {
         CWalletTx& wtx = entry.second;
         if (wtx.m_is_cache_empty) continue;
@@ -10065,6 +10085,7 @@ LegacyScriptPubKeyMan* CWallet::GetOrCreateLegacyScriptPubKeyMan()
 void CWallet::AddScriptPubKeyMan(const uint256& id, std::unique_ptr<ScriptPubKeyMan> spkm_man)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
     // Add spkm_man to m_spk_managers before calling any method
     // that might access it.
     const auto& spkm = m_spk_managers[id] = std::move(spkm_man);
@@ -10291,6 +10312,7 @@ std::optional<bool> CWallet::IsInternalScriptPubKeyMan(ScriptPubKeyMan* spk_man)
 ScriptPubKeyMan* CWallet::AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal, bilingual_str* error)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
 
     if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
         WalletLogPrintf("Cannot add WalletDescriptor to a non-descriptor wallet\n");

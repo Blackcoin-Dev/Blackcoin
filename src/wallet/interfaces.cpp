@@ -2759,8 +2759,7 @@ public:
     {
         return {m_wallet->GetActiveScriptVerifyFlags(), Params().GetConsensus().nQuantumSighashChainId};
     }
-    WalletBalances getBalancesLocked(WalletLifecycleScanStats* gui_scan_stats = nullptr,
-                                     std::chrono::milliseconds gui_scan_budget = std::chrono::milliseconds{0})
+    WalletBalances getBalancesLocked()
     {
         AssertLockHeld(::cs_main);
         AssertLockHeld(m_wallet->cs_wallet);
@@ -2768,22 +2767,21 @@ public:
         Balance bal;
         WalletLifecycleSummary lifecycle;
         std::string lifecycle_error;
-        // Only the GUI display scan (which passes stats) may use the memo of
-        // deep outputs' chainstate facts; every other caller reads the database.
-        WalletLifecycleOptions lifecycle_options;
-        lifecycle_options.use_memo = gui_scan_stats != nullptr;
-        lifecycle_options.stats = gui_scan_stats;
-        lifecycle_options.budget = gui_scan_budget;
         if (!GetLifecycleAdjustedBalance(*m_wallet, 0, /*avoid_reuse=*/true,
-                                         bal, lifecycle, lifecycle_error, lifecycle_options)) {
-            // A budget cut is progress, not an error: the caller keeps the
-            // last valid display and polls again.
-            if (gui_scan_stats && gui_scan_stats->budget_exhausted) return result;
+                                         bal, lifecycle, lifecycle_error)) {
             m_wallet->WalletLogPrintf("Unable to calculate lifecycle-adjusted GUI balance: %s\n",
                                       lifecycle_error);
             result.have_watch_only = haveWatchOnly();
             return result;
         }
+        return makeBalances(bal, lifecycle);
+    }
+    //! The display balances of a finished lifecycle-adjusted balance. Shared
+    //! by the single-lock path and the GUI's two-phase scan.
+    WalletBalances makeBalances(const Balance& bal, const WalletLifecycleSummary& lifecycle)
+        EXCLUSIVE_LOCKS_REQUIRED(m_wallet->cs_wallet)
+    {
+        WalletBalances result;
         result.balance = bal.m_mine_trusted;
         result.legacy_balance = lifecycle.mine.spendable_legacy;
         result.quantum_balance = lifecycle.mine.spendable_quantum;
@@ -2837,55 +2835,150 @@ public:
     bool tryGetDisplayBalances(WalletDisplayBalances& result,
         const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family) override
     {
-        // The scan below is O(wallet outputs) with chainstate lookups and holds
-        // cs_main. While the validation scheduler is dispatching a block to the
-        // loaded wallets, taking cs_main here makes the scheduler wait at the
-        // start of every following wallet (L15). Yield; the caller polls again.
+        // The balance scan is O(wallet outputs). It reads the wallet in three
+        // lock scopes so that cs_main is held only for work that needs the
+        // chainstate:
+        //   phase 0 (cs_main, cs_wallet): checks, and the tip facts;
+        //   phase A (cs_wallet only):     GetBalance and the walk over the
+        //     outputs; whatever needs the chainstate is listed, not read;
+        //   phase B (cs_main, cs_wallet): the listed outputs are resolved, the
+        //     balance is published.
+        // Anything that moved between the scopes (tip, wallet) discards the
+        // pass and keeps the last display; the caller polls again.
+        //
+        // While the validation scheduler is dispatching a block to the loaded
+        // wallets, taking cs_main here makes the scheduler wait at the start
+        // of every following wallet (L15). Yield; the caller polls again.
         // A deferral is bounded (BlockConnectActivity::MAX_DEFER_MS).
-        if (BlockConnectActivity::Global().ShouldDefer(BlockConnectActivity::NowMs())) return false;
+        BlockConnectActivity& activity = BlockConnectActivity::Global();
+        if (activity.ShouldDefer(BlockConnectActivity::NowMs())) return false;
+        // A scan let through the deferral cap runs to its end; any other scan
+        // gives way (phase A) to a block that starts to be dispatched.
+        const bool let_through = activity.IsDispatching(BlockConnectActivity::NowMs());
         // At most one GUI balance scan runs process-wide, and a new one waits
-        // as long as the previous one took, so the scans cannot monopolise
-        // cs_main. Taken before the locks and released on every return path.
+        // as long as the previous one held cs_main, so the scans cannot
+        // monopolise it. Taken before the locks and released on every return
+        // path.
         GuiBalanceScanGuard scan_guard;
         if (!scan_guard.Admitted()) return false;
-        TRY_LOCK(::cs_main, locked_main);
-        if (!locked_main) return false;
-        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-        if (!locked_wallet) return false;
-        // Keep the last valid display while notifications catch up to the active tip.
-        if (!WalletLifecycleViewIsSynchronized(*m_wallet)) return false;
-        const uint256 tip = m_wallet->GetLastBlockHash();
-        if (unchanged_tip && *unchanged_tip == tip) return false;
 
-        scan_guard.MarkScanned();
         const int64_t scan_start_ms = BlockConnectActivity::NowMs();
+        int64_t main_ms{0};   // time holding cs_main: phase 0 and phase B
+        int64_t wallet_ms{0}; // phase A
         WalletLifecycleScanStats scan_stats;
-        WalletDisplayBalances display;
-        display.block_hash = tip;
-        display.balances = getBalancesLocked(&scan_stats, GUI_SCAN_BUDGET);
-        if (!scan_stats.budget_exhausted && send_family) {
-            CCoinControl control;
-            const bool quantum = *send_family == WalletDisplayCoinFamily::DIRECT_QUANTUM;
-            control.m_input_family = quantum ? CCoinControl::InputFamily::QUANTUM_MIGRATION : CCoinControl::InputFamily::LEGACY;
-            control.m_exclude_generated_quantum_inputs = quantum;
-            display.send_family_balance = getAvailableBalanceLocked(control);
+        LifecycleBulkPass pass;
+        bool scanned{false};
+        bool complete{false};
+        std::optional<WalletDisplayBalances> display;
+
+        const auto finish = [&]() {
+            if (!scanned) return;
+            const int64_t scan_end_ms = BlockConnectActivity::NowMs();
+            const int64_t scan_took_ms = scan_end_ms - scan_start_ms;
+            const bool slow = main_ms >= 250 || scan_took_ms >= 2000;
+            // A scan cut by its budget logs its progress at most once per 30 s.
+            const bool progress = scan_stats.budget_exhausted &&
+                (m_last_budget_log_ms.load() == 0 || scan_end_ms - m_last_budget_log_ms.load() >= 30000);
+            if (slow || progress) {
+                if (progress) m_last_budget_log_ms.store(scan_end_ms);
+                m_wallet->WalletLogPrintf("GUI balance scan: wallet=%s outputs=%d database_reads=%d memo_hits=%d memo_size=%d pending=%d budget_exhausted=%d main_ms=%d wallet_ms=%d took=%dms\n",
+                                          m_wallet->GetName(), scan_stats.outputs, scan_stats.database_reads,
+                                          scan_stats.memo_hits, WITH_LOCK(m_wallet->cs_wallet, return m_wallet->m_output_lifecycle_memo.size()),
+                                          scan_stats.pending, scan_stats.budget_exhausted ? 1 : 0,
+                                          main_ms, wallet_ms, scan_took_ms);
+            }
+        };
+
+        // Phase 0.
+        std::optional<LifecycleScanTip> tip;
+        {
+            TRY_LOCK(::cs_main, locked_main);
+            if (!locked_main) return false;
+            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+            if (!locked_wallet) return false;
+            // Keep the last valid display while notifications catch up to the active tip.
+            tip = CaptureLifecycleScanTip(*m_wallet);
+            if (!tip) return false;
+            if (unchanged_tip && *unchanged_tip == tip->hash) return false;
+            scanned = true;
+            main_ms += BlockConnectActivity::NowMs() - scan_start_ms;
         }
-        const int64_t scan_end_ms = BlockConnectActivity::NowMs();
-        const int64_t scan_took_ms = scan_end_ms - scan_start_ms;
-        const bool slow = scan_took_ms >= 1000;
-        // A scan cut by its budget logs its progress at most once per 30 s.
-        const bool progress = scan_stats.budget_exhausted &&
-            (m_last_budget_log_ms.load() == 0 || scan_end_ms - m_last_budget_log_ms.load() >= 30000);
-        if (slow || progress) {
-            if (progress) m_last_budget_log_ms.store(scan_end_ms);
-            m_wallet->WalletLogPrintf("GUI balance scan: wallet=%s outputs=%d database_reads=%d memo_hits=%d memo_size=%d budget_exhausted=%d took=%dms\n",
-                                      m_wallet->GetName(), scan_stats.outputs, scan_stats.database_reads,
-                                      scan_stats.memo_hits, m_wallet->m_output_lifecycle_memo.size(),
-                                      scan_stats.budget_exhausted ? 1 : 0, scan_took_ms);
+        scan_guard.AddMainHold(main_ms);
+
+        // Phase A: the wallet, without cs_main.
+        {
+            const int64_t phase_start_ms = BlockConnectActivity::NowMs();
+            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+            if (!locked_wallet) {
+                finish();
+                return false;
+            }
+            std::string error;
+            const bool ok = ScanLifecycleWalletSide(
+                *m_wallet, *tip, /*min_depth=*/0, /*avoid_reuse=*/true, pass, error,
+                [&]() { return !let_through && activity.IsDispatching(BlockConnectActivity::NowMs()); });
+            scan_stats.outputs = pass.stats.outputs;
+            scan_stats.memo_hits = pass.stats.memo_hits;
+            scan_stats.pending = pass.stats.pending;
+            wallet_ms = BlockConnectActivity::NowMs() - phase_start_ms;
+            if (!ok) {
+                finish();
+                return false;
+            }
         }
-        // Keep the last valid display when the budget cut the scan short.
-        if (scan_stats.budget_exhausted) return false;
-        result = std::move(display);
+
+        // Phase B: the chainstate part, under both locks.
+        {
+            TRY_LOCK(::cs_main, locked_main);
+            if (!locked_main) {
+                finish();
+                return false;
+            }
+            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+            if (!locked_wallet) {
+                finish();
+                return false;
+            }
+            const int64_t phase_start_ms = BlockConnectActivity::NowMs();
+            const auto record_hold = [&]() {
+                const int64_t held = BlockConnectActivity::NowMs() - phase_start_ms;
+                main_ms += held;
+                scan_guard.AddMainHold(held);
+            };
+            Balance bal;
+            WalletLifecycleSummary lifecycle;
+            std::string error;
+            WalletLifecycleOptions options;
+            options.stats = &scan_stats;
+            // Memo progress made so far counts for the next attempt, so only
+            // the part of the scan that needs cs_main is time limited.
+            const bool ok = ResolveLifecycleBulkPass(
+                *m_wallet, pass, std::chrono::steady_clock::now() + GUI_SCAN_BUDGET, bal, lifecycle, error, options);
+            if (ok) {
+                display.emplace();
+                display->block_hash = tip->hash;
+                display->balances = makeBalances(bal, lifecycle);
+                if (send_family) {
+                    CCoinControl control;
+                    const bool quantum = *send_family == WalletDisplayCoinFamily::DIRECT_QUANTUM;
+                    control.m_input_family = quantum ? CCoinControl::InputFamily::QUANTUM_MIGRATION : CCoinControl::InputFamily::LEGACY;
+                    control.m_exclude_generated_quantum_inputs = quantum;
+                    display->send_family_balance = getAvailableBalanceLocked(control);
+                }
+                complete = true;
+            } else if (!scan_stats.budget_exhausted) {
+                // A moved tip or wallet is routine; anything else is worth a line.
+                if (error.find("moved") == std::string::npos && error.find("changed") == std::string::npos &&
+                    error.find("synchronized") == std::string::npos) {
+                    m_wallet->WalletLogPrintf("Unable to calculate lifecycle-adjusted GUI balance: %s\n", error);
+                }
+            }
+            record_hold();
+        }
+        finish();
+        // Keep the last valid display when the pass was discarded or cut short.
+        if (!complete) return false;
+        result = std::move(*display);
         return true;
     }
     CAmount getBalance() override

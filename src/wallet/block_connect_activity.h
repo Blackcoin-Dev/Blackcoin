@@ -55,6 +55,15 @@ public:
         return true;
     }
 
+    /** True while a block dispatch has been seen within QUIET_MS. Unlike
+     * ShouldDefer() it changes no state, so a scan that was let through the
+     * deferral cap can ask it again without opening a new deferral window. */
+    bool IsDispatching(int64_t now_ms) const
+    {
+        const int64_t last = m_last_ms.load(std::memory_order_relaxed);
+        return last != 0 && now_ms - last < QUIET_MS;
+    }
+
     static int64_t NowMs()
     {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -110,10 +119,17 @@ public:
     }
 
     /** Release after a TryBegin() that returned true. scanned=false (an early
-     * return that did no scan) records a zero duration and so no back-off. */
-    void End(int64_t now_ms, bool scanned = true)
+     * return that did no scan) records a zero duration and so no back-off.
+     * held_ms >= 0 replaces the elapsed time as the duration the back-off is
+     * based on: a scan that holds cs_main only part of the time passes that
+     * part, so the time it spent without cs_main costs the others no pause. */
+    void End(int64_t now_ms, bool scanned = true, int64_t held_ms = -1)
     {
-        const int64_t duration = scanned ? std::max<int64_t>(0, now_ms - m_start_ms.load(std::memory_order_relaxed)) : 0;
+        int64_t duration = 0;
+        if (scanned) {
+            duration = held_ms >= 0 ? held_ms
+                                    : std::max<int64_t>(0, now_ms - m_start_ms.load(std::memory_order_relaxed));
+        }
         m_last_duration_ms.store(duration, std::memory_order_relaxed);
         m_last_end_ms.store(now_ms, std::memory_order_relaxed);
         m_running.store(false, std::memory_order_release);
@@ -133,7 +149,10 @@ private:
 };
 
 /** Holds the GUI balance scan gate for the current scope. Call MarkScanned()
- * once the scan has really started; otherwise no back-off is imposed. */
+ * once the scan has really started (the back-off then follows the elapsed
+ * time), or AddMainHold() with each stretch spent holding cs_main (the
+ * back-off then follows the sum of those stretches); otherwise no back-off is
+ * imposed. */
 class GuiBalanceScanGuard
 {
 public:
@@ -141,17 +160,23 @@ public:
         : m_gate(gate), m_admitted(gate.TryBegin(BlockConnectActivity::NowMs())) {}
     ~GuiBalanceScanGuard()
     {
-        if (m_admitted) m_gate.End(BlockConnectActivity::NowMs(), m_scanned);
+        if (m_admitted) m_gate.End(BlockConnectActivity::NowMs(), m_scanned, m_held_ms);
     }
     GuiBalanceScanGuard(const GuiBalanceScanGuard&) = delete;
     GuiBalanceScanGuard& operator=(const GuiBalanceScanGuard&) = delete;
     bool Admitted() const { return m_admitted; }
     void MarkScanned() { m_scanned = true; }
+    void AddMainHold(int64_t held_ms)
+    {
+        m_scanned = true;
+        m_held_ms = std::max<int64_t>(0, m_held_ms) + std::max<int64_t>(0, held_ms);
+    }
 
 private:
     GuiBalanceScanGate& m_gate;
     const bool m_admitted;
     bool m_scanned{false};
+    int64_t m_held_ms{-1};
 };
 
 /** Stamps activity on construction and destruction. */

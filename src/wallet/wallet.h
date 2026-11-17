@@ -994,6 +994,14 @@ private:
 
     std::map<COutPoint, CStakeCache> stakeCache;
 
+    // Own transactions to put back into the mempool when the chain allows (see
+    // RetryDroppedTransactions). Ordered by txid; submission order is the wallet order.
+    struct ResubmitRetryEntry {
+        uint256 last_attempt_tip; //! wallet best block at the last attempt
+        unsigned int attempts{0};
+    };
+    std::map<uint256, ResubmitRetryEntry> m_resubmit_retry GUARDED_BY(cs_wallet);
+
     // Per-tip selection of stake candidates and their kernel inputs (see
     // wallet/staking.h, StakeSlotCache). Owned and validated by staking.cpp;
     // only ever dropped or replaced under cs_wallet.
@@ -1815,6 +1823,32 @@ public:
     void RepairStaleShadowTransactions(bool force);
     void ResubmitWalletTransactions(bool relay, bool force, bool include_claims = true);
 
+    //! Own transactions that the node lost or refused for a reason the next
+    //! block can change (not final at the current height, inputs not yet in
+    //! the chain or mempool), kept in memory so that they are put back as soon
+    //! as the chain allows rather than at the 12 to 36 hour periodic resend.
+    //! Never persisted; rebuilt at every start.
+    static constexpr size_t MAX_RESUBMIT_RETRY_TXS{2000};
+    static constexpr size_t MAX_RESUBMIT_RETRY_PER_TICK{100};
+    static constexpr unsigned int MAX_RESUBMIT_RETRY_ATTEMPTS{1000};
+    //! True for a transaction the generic resubmit path may submit: unconfirmed,
+    //! not a coinbase or coinstake, and not owned by the Gold Rush claim,
+    //! recovery or reorg machinery, which decide for themselves whether and
+    //! when to relay.
+    static bool IsGenericResubmitCandidate(const CWalletTx& wtx);
+    //! True when a mempool refusal can disappear as the chain advances.
+    static bool IsTipDependentRefusal(const std::string& err_string);
+    //! Add a candidate to the retry set (no-op for a non-candidate or a full set).
+    bool QueueResubmitRetry(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Drop the entries whose transaction is gone or no longer a candidate in
+    //! the inactive state (accepted, confirmed, conflicted, abandoned).
+    void PruneResubmitRetry() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! One tick of the retry set: if the best block moved since an entry was
+    //! last tried, submit it to the mempool without relay, in wallet order and
+    //! at most MAX_RESUBMIT_RETRY_PER_TICK per call. Returns the number accepted.
+    size_t RetryDroppedTransactions();
+    size_t GetResubmitRetryCount() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_resubmit_retry.size(); }
+    bool IsInResubmitRetry(const uint256& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_resubmit_retry.count(txid) != 0; }
     /** Relay at most one retained proof using the exact typed authorization. */
     bool RelayRetainedShadowPowClaim(bool relay);
     /** Coalesce off-notification claim work; never executes inline. */

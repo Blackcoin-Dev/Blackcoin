@@ -16,13 +16,18 @@ then checks that
   rescan of the same chain produces,
 - the persisted position keeps working when the node's chain is shorter than
   the wallet's own best block (the node lost unflushed blocks),
-- after new blocks replace the lost ones, the live wallet, the same wallet
-  after an unload and reload, the same wallet after a clean restart and a full
-  rescan all agree.
+- after new blocks replace the lost ones, the wallet puts its own transactions
+  of the lost blocks back into the mempool by itself, on its one-minute tick
+  and without a reload, and the live wallet, the same wallet after an unload
+  and reload, the same wallet after a clean restart and a full rescan all
+  agree,
+- the periodic 12 to 36 hour resend fires on a transaction that sat
+  unconfirmed in the mempool.
 """
 
 import re
 import time
+from contextlib import nullcontext
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
@@ -119,35 +124,48 @@ class WalletBestBlockDurabilityTest(BitcoinTestFramework):
                     raise AssertionError(f"balances differ: {pick(left[key])} != {pick(right[key])}")
                 raise AssertionError(f"{key} differs: {left[key]} != {right[key]}")
 
-    def _resubmit_wallet_transactions(self, wallet):
-        """Put the wallet's own unconfirmed transactions back into the mempool, as far as the chain allows.
+    def _own_sends(self, wallet):
+        """Txids of the wallet's own unconfirmed, not abandoned sends."""
+        return sorted({entry["txid"] for entry in wallet.listtransactions("*", 100000, 0, True)
+                       if entry["category"] == "send" and entry["confirmations"] == 0 and not entry.get("abandoned")})
+
+    def _acceptable_but_absent(self, wallet):
+        """Own unconfirmed sends the node would take now but does not hold.
 
         The transactions of the blocks the node lost are inactive in the wallet
-        and not in the node's mempool (the restart emptied it). The wallet
-        retries them only at load and on its 12 to 24 hour timer, and a
-        transaction that is not final at the restart height (its lock time is
-        the height it was made at) is refused until the chain passes that
-        height. The live wallet therefore counts them as unspendable and their
-        inputs as spent until they are resubmitted, which is the same as for
-        any wallet transaction that dropped out of the mempool. Reloading
-        resubmits them, so a live and a reloaded wallet are compared only
-        after this step has made the mempool the same for both.
+        and not in the node's mempool (the restart emptied it). A transaction
+        that is not final at the restart height (its lock time is the height it
+        was made at) is refused until the chain passes that height. Whatever the
+        chain allows must be back in the mempool without any help.
         """
         node = self.nodes[0]
-        submitted = 0
-        progress = True
-        while progress:
-            progress = False
-            for entry in wallet.listtransactions("*", 100000, 0, True):
-                if entry["category"] != "send" or entry["confirmations"] != 0 or entry.get("abandoned"):
-                    continue
-                tx = wallet.gettransaction(entry["txid"])
-                if node.testmempoolaccept([tx["hex"]])[0]["allowed"]:
-                    node.sendrawtransaction(tx["hex"])
-                    submitted += 1
-                    progress = True
+        mempool = set(node.getrawmempool())
+        absent = []
+        for txid in self._own_sends(wallet):
+            if txid in mempool:
+                continue
+            if node.testmempoolaccept([wallet.gettransaction(txid)["hex"]])[0]["allowed"]:
+                absent.append(txid)
+        return absent
+
+    def _resend_tick(self, wallet):
+        """Run the scheduler's one-minute wallet tick and wait for it to finish."""
+        node = self.nodes[0]
+        node.mockscheduler(60)
         node.syncwithvalidationinterfacequeue()
-        return submitted
+
+    def _wait_for_wallet_to_resubmit(self, wallet, max_ticks=3):
+        """Tick until the wallet holds every own transaction the chain allows. Returns the ticks used."""
+        node = self.nodes[0]
+        for tick in range(1, max_ticks + 1):
+            with node.assert_debug_log(["own transactions back into the mempool"], timeout=30) if tick == 1 else nullcontext():
+                self._resend_tick(wallet)
+            try:
+                self.wait_until(lambda: not self._acceptable_but_absent(wallet), timeout=10)
+                return tick
+            except AssertionError:
+                continue
+        raise AssertionError(f"the wallet left {self._acceptable_but_absent(wallet)} out of the mempool after {max_ticks} ticks")
 
     def _check_live_reload_rescan(self, wallet, reload):
         """The live wallet equals the same wallet after `reload` and after a full rescan."""
@@ -246,9 +264,11 @@ class WalletBestBlockDurabilityTest(BitcoinTestFramework):
         self.log.info("New blocks replace the lost ones: live wallet, reloaded wallet and full rescan agree")
         for _ in range(3):
             self._mine_pos_block(wallet)
-        resubmitted = self._resubmit_wallet_transactions(wallet)
-        self.log.info(f"{resubmitted} wallet transactions of the lost blocks are back in the mempool")
-        assert resubmitted > 0
+        waiting = self._acceptable_but_absent(wallet)
+        self.log.info(f"{len(waiting)} wallet transactions of the lost blocks are acceptable but not in the mempool")
+        assert len(waiting) > 0, "the lost blocks must have taken wallet transactions out of the mempool"
+        ticks = self._wait_for_wallet_to_resubmit(wallet)
+        self.log.info(f"the wallet put them back by itself within {ticks} one-minute tick(s), no reload, no sendrawtransaction")
         wallet, replaced = self._check_live_reload_rescan(wallet, self._unload_and_load)
 
         self.log.info("A clean restart keeps the state and needs no rescan")
@@ -262,7 +282,8 @@ class WalletBestBlockDurabilityTest(BitcoinTestFramework):
         self._set_mocktime((node.getblockheader(node.getbestblockhash())["time"] & ~0xf) + 16)
         for _ in range(2):
             self._mine_pos_block(wallet)
-        self._resubmit_wallet_transactions(wallet)
+        self._resend_tick(wallet)
+        self.wait_until(lambda: not self._acceptable_but_absent(wallet), timeout=10)
 
         def restart(_wallet):
             self.stop_node(0)
@@ -270,7 +291,48 @@ class WalletBestBlockDurabilityTest(BitcoinTestFramework):
             assert_equal(restart_rescanned, 0)
             return reloaded
 
-        self._check_live_reload_rescan(wallet, restart)
+        wallet, _ = self._check_live_reload_rescan(wallet, restart)
+        self._check_periodic_resend(wallet)
+
+    def _check_periodic_resend(self, wallet):
+        """The 12 to 36 hour resend fires for a transaction that stays unconfirmed in the mempool.
+
+        Three things have to hold at once, and a test that misses one sees no
+        resend: the next resend time is 12 hours plus up to 24 hours of jitter
+        after the wallet was created or last resent (the mock clock has to pass
+        it), the scheduler moves only a bounded step per mockscheduler call
+        (the tick itself is every minute, so one call is enough once the clock
+        has moved), and the resend takes only transactions received more than
+        five minutes before the best block, which is stamped when a block
+        connects after the time jump.
+        """
+        # A block template skips transactions below -blockmintxfee, so a restart with a
+        # high floor keeps the next send in the mempool while blocks keep coming.
+        self.stop_node(0)
+        wallet, _, _ = self._start_and_load(extra=["-blockmintxfee=0.5"])
+        node = self.nodes[0]
+        self._set_mocktime((node.getblockheader(node.getbestblockhash())["time"] & ~0xf) + 16)
+        self.log.info("Periodic resend: a transaction kept out of blocks is resubmitted after 36 hours")
+        address = wallet.getnewaddress("", "bech32")
+        txid = wallet.send(outputs=[{address: 0.01}])["txid"]
+        self._mine_pos_block(wallet)
+        assert_equal(wallet.gettransaction(txid)["confirmations"], 0)
+        assert txid in node.getrawmempool()
+
+        # Before the jump the tick must leave it alone.
+        with node.assert_debug_log([], unexpected_msgs=[f"Submitting wtx {txid} to mempool for relay"]):
+            node.mockscheduler(60)
+            node.syncwithvalidationinterfacequeue()
+
+        self._set_mocktime(self.mock_time + 37 * 60 * 60)
+        # A block after the jump stamps the best block time that the resend compares against.
+        self._mine_pos_block(wallet)
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(wallet.gettransaction(txid)["confirmations"], 0)
+        # Older sends that no block took may be resent in the same pass, so look for this
+        # transaction's own submission and the pass summary rather than an exact count.
+        with node.assert_debug_log([f"Submitting wtx {txid} to mempool for relay", "unconfirmed transactions"], timeout=30):
+            node.mockscheduler(60)
 
 
 if __name__ == '__main__':

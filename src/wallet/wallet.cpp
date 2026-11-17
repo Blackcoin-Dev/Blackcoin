@@ -3556,6 +3556,9 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     WalletBatch batch(GetDatabase());
     for (const CTransactionRef& ptx : Assert(block.data)->vtx) {
         SyncTransaction(ptx, TxStateInactive{});
+        // The node puts most disconnected transactions back into its mempool
+        // itself; one it refuses is retried when the chain moves on.
+        if (const auto own = mapWallet.find(ptx->GetHash()); own != mapWallet.end()) QueueResubmitRetry(own->second);
         if (TransactionHasShadowSignal(*ptx)) {
             const auto signal_it = mapWallet.find(ptx->GetHash());
             if (signal_it != mapWallet.end()) {
@@ -5265,8 +5268,20 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force, bool include_cl
     // deadlocking the PoS thread.
     for (const uint256& txid : to_submit) {
         std::string err_string;
-        if (SubmitTxMemoryPoolAndRelay(txid, err_string, relay)) {
-            ++submitted_tx_count;
+        const bool accepted = SubmitTxMemoryPoolAndRelay(txid, err_string, relay);
+        if (accepted) ++submitted_tx_count;
+        // A refusal the next block can undo (not final yet, parents missing)
+        // goes to the retry set instead of waiting for the periodic resend.
+        LOCK(cs_wallet);
+        const auto it = mapWallet.find(txid);
+        if (accepted || it == mapWallet.end()) {
+            m_resubmit_retry.erase(txid);
+        } else if (IsTipDependentRefusal(err_string)) {
+            QueueResubmitRetry(it->second);
+            const auto entry = m_resubmit_retry.find(txid);
+            if (entry != m_resubmit_retry.end()) entry->second.last_attempt_tip = m_last_block_processed;
+        } else {
+            m_resubmit_retry.erase(txid);
         }
     }
 
@@ -5343,9 +5358,119 @@ void CWallet::RequestClaimMaintenance(bool resolve, bool relay)
 
 /** @} */ // end of mapWallet
 
+bool CWallet::IsGenericResubmitCandidate(const CWalletTx& wtx)
+{
+    if (!wtx.tx || !wtx.isUnconfirmed() || wtx.IsCoinBase() || wtx.IsCoinStake()) return false;
+    // Managed claim recovery records, signed recovery drafts and their cleanup
+    // transactions are relayed only by the recovery scheduler; QQSPROOF relay
+    // authority comes only from its typed gate; reorg-marked shadow records
+    // belong to the shadow repair pass. None of them is ever generic.
+    for (const char* key : {SHADOW_POW_RESOLUTION_SCHEMA_KEY, SHADOW_POW_CLEANUP_FOR_KEY,
+                            SHADOW_POW_QUARANTINE_KEY, LEGACY_SHADOW_POW_CLEANUP_QUARANTINE_KEY,
+                            REORG_SHADOW_RESUBMIT_KEY, AUTO_SHADOW_STALE_KEY, MANUAL_SHADOW_ABANDON_KEY}) {
+        if (wtx.mapValue.count(key) != 0) return false;
+    }
+    if (TransactionHasShadowProof(*wtx.tx)) return false;
+    return true;
+}
+
+bool CWallet::IsTipDependentRefusal(const std::string& err_string)
+{
+    // Validation reasons that depend on the height, the time or the contents
+    // of the chain and mempool, and so can clear when a block is connected.
+    static const char* const REASONS[] = {
+        "non-final", "non-BIP68-final", "time-too-new",
+        "bad-txns-inputs-missingorspent", "premature", "mempool full",
+        "mempool min fee not met", "too-long-mempool-chain",
+        "wallet-broadcast-in-flight",
+    };
+    for (const char* reason : REASONS) {
+        if (err_string.find(reason) != std::string::npos) return true;
+    }
+    return false;
+}
+
+bool CWallet::QueueResubmitRetry(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    if (!fBroadcastTransactions || !IsGenericResubmitCandidate(wtx)) return false;
+    if (m_resubmit_retry.count(wtx.GetHash())) return true;
+    if (m_resubmit_retry.size() >= MAX_RESUBMIT_RETRY_TXS) return false;
+    m_resubmit_retry.emplace(wtx.GetHash(), ResubmitRetryEntry{});
+    return true;
+}
+
+void CWallet::PruneResubmitRetry()
+{
+    AssertLockHeld(cs_wallet);
+    for (auto it = m_resubmit_retry.begin(); it != m_resubmit_retry.end();) {
+        const auto wtx = mapWallet.find(it->first);
+        // Accepted (in the mempool), confirmed, conflicted, abandoned or removed.
+        const bool keep = wtx != mapWallet.end() && wtx->second.isInactive() &&
+                          IsGenericResubmitCandidate(wtx->second) &&
+                          it->second.attempts < MAX_RESUBMIT_RETRY_ATTEMPTS;
+        it = keep ? std::next(it) : m_resubmit_retry.erase(it);
+    }
+}
+
+size_t CWallet::RetryDroppedTransactions()
+{
+    AssertLockNotHeld(cs_main);
+    AssertLockNotHeld(cs_wallet);
+    std::vector<uint256> to_submit;
+    uint256 tip;
+    {
+        LOCK(cs_wallet);
+        if (!fBroadcastTransactions) {
+            m_resubmit_retry.clear();
+            return 0;
+        }
+        PruneResubmitRetry();
+        if (m_resubmit_retry.empty() || m_last_block_processed.IsNull()) return 0;
+        tip = m_last_block_processed;
+        // Insertion order, so that a parent is tried before its child.
+        std::set<const CWalletTx*, WalletTxOrderComparator> ordered;
+        for (const auto& [txid, entry] : m_resubmit_retry) {
+            if (entry.last_attempt_tip == tip) continue; // nothing new since the last try
+            ordered.insert(&mapWallet.at(txid));
+        }
+        for (const CWalletTx* wtx : ordered) {
+            if (to_submit.size() >= MAX_RESUBMIT_RETRY_PER_TICK) break;
+            to_submit.push_back(wtx->GetHash());
+        }
+    }
+    if (to_submit.empty() || !chain().isReadyToBroadcast()) return 0;
+
+    // Without cs_wallet, as in ResubmitWalletTransactions. No relay: the
+    // transaction was not new to the network, and the periodic resend relays
+    // it under the usual rules once it is old enough.
+    size_t accepted{0};
+    for (const uint256& txid : to_submit) {
+        std::string err_string;
+        const bool ok = SubmitTxMemoryPoolAndRelay(txid, err_string, /*relay=*/false);
+        LOCK(cs_wallet);
+        const auto entry = m_resubmit_retry.find(txid);
+        if (entry == m_resubmit_retry.end()) continue;
+        if (ok) {
+            ++accepted;
+            m_resubmit_retry.erase(entry);
+        } else if (IsTipDependentRefusal(err_string)) {
+            entry->second.last_attempt_tip = tip;
+            ++entry->second.attempts;
+        } else {
+            m_resubmit_retry.erase(entry);
+        }
+    }
+    if (accepted > 0) {
+        WalletLogPrintf("%s: put %u own transactions back into the mempool\n", __func__, accepted);
+    }
+    return accepted;
+}
+
 void MaybeResendWalletTxs(WalletContext& context)
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets(context)) {
+        pwallet->RetryDroppedTransactions();
         MaybeAutoDemurrageAttest(*pwallet);
         MaybeAutoShadowSignal(*pwallet);
         MaybeAutoRedelegateQuantumColdStake(*pwallet);
@@ -9671,6 +9796,15 @@ void CWallet::ReportLegacyClaimSourceCapacity(bool force)
 void CWallet::postInitProcess()
 {
     ReportLegacyClaimSourceCapacity(/*force=*/true);
+
+    // Transactions the load marked inactive (their block is not in the active
+    // chain) are retried as the chain allows, not only at the periodic resend.
+    {
+        LOCK(cs_wallet);
+        for (const auto& [txid, wtx] : mapWallet) {
+            if (wtx.isInactive()) QueueResubmitRetry(wtx);
+        }
+    }
 
     // Add wallet transactions that aren't already in a block to mempool
     // Do this here as mempool requires genesis block to be loaded

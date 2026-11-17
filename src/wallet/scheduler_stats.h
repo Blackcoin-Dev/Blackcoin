@@ -81,6 +81,53 @@ private:
 };
 
 /**
+ * SQLite commit measurement, to decide later whether WAL mode would help.
+ * DURABLE and NON_DURABLE are explicit transactions ended by COMMIT (by the
+ * flag given to TxnBegin), BULK_SCOPE is a grouped-writes scope's COMMIT, and
+ * AUTOCOMMIT is a single write outside any transaction, where SQLite commits
+ * implicitly (the timed span then includes the write itself). The nested
+ * savepoint release of a unit inside a transaction is not a commit and is not
+ * counted. Counters are lock-free and never affect wallet data.
+ */
+enum class SqliteCommitKind : size_t {
+    DURABLE,
+    NON_DURABLE,
+    BULK_SCOPE,
+    AUTOCOMMIT,
+};
+constexpr size_t SQLITE_COMMIT_KINDS{4};
+
+struct SqliteCommitCounts {
+    uint64_t count{0};
+    uint64_t total_us{0};
+    uint64_t max_us{0};
+};
+using SqliteCommitSnapshot = std::array<SqliteCommitCounts, SQLITE_COMMIT_KINDS>;
+
+class SqliteCommitCounters
+{
+public:
+    void Record(SqliteCommitKind kind, std::chrono::microseconds duration);
+    SqliteCommitSnapshot Snapshot() const;
+    /** Read and zero, so the next call reports only what happened since. */
+    SqliteCommitSnapshot Take();
+    void Reset();
+
+private:
+    struct Counters {
+        std::atomic<uint64_t> count{0};
+        std::atomic<uint64_t> total_us{0};
+        std::atomic<uint64_t> max_us{0};
+    };
+    std::array<Counters, SQLITE_COMMIT_KINDS> m_counters;
+};
+
+/** Every SQLite wallet database of the process adds here as well as to its own counters. */
+SqliteCommitCounters& ProcessSqliteCommits();
+/** " | sqlite commits since last line: durable n=.. total=..ms max=..ms ..." (kinds with no commits are omitted). */
+std::string FormatSqliteCommits(const SqliteCommitSnapshot& snapshot);
+
+/**
  * Brackets one handler's use of cs_wallet. Declare it before the LOCK, call
  * LockAcquired() right after the LOCK, and let it go out of scope after the
  * lock is released:

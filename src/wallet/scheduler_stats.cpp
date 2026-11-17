@@ -38,6 +38,8 @@ void UpdateMax(std::atomic<uint64_t>& max, uint64_t value)
 
 uint64_t ToMs(uint64_t us) { return us / 1000; }
 
+constexpr const char* SQLITE_COMMIT_NAMES[SQLITE_COMMIT_KINDS] = {"durable", "non_durable", "bulk_scope", "autocommit"};
+
 std::string FormatHistogram(const std::array<uint64_t, LATENCY_BUCKETS>& h)
 {
     return strprintf("%u/%u/%u/%u/%u", h[0], h[1], h[2], h[3], h[4]);
@@ -130,10 +132,69 @@ void SchedulerStats::MaybeLogSummary(std::chrono::steady_clock::time_point now)
         if (last != 0 && now_ns - last < interval_ns) return;
     } while (!m_last_summary_ns.compare_exchange_weak(last, now_ns, std::memory_order_relaxed));
 
-    LogPrintf("%s\n", FormatSummary());
+    LogPrintf("%s%s\n", FormatSummary(), FormatSqliteCommits(ProcessSqliteCommits().Take()));
     if (const std::optional<ProcessMemory> memory = GetProcessMemory()) {
         LogPrintf("%s\n", FormatProcessMemory(*memory));
     }
+}
+
+void SqliteCommitCounters::Record(SqliteCommitKind kind, std::chrono::microseconds duration)
+{
+    Counters& c = m_counters[static_cast<size_t>(kind)];
+    const uint64_t us = duration.count() < 0 ? 0 : static_cast<uint64_t>(duration.count());
+    c.count.fetch_add(1, std::memory_order_relaxed);
+    c.total_us.fetch_add(us, std::memory_order_relaxed);
+    UpdateMax(c.max_us, us);
+}
+
+SqliteCommitSnapshot SqliteCommitCounters::Snapshot() const
+{
+    SqliteCommitSnapshot out;
+    for (size_t i = 0; i < SQLITE_COMMIT_KINDS; ++i) {
+        out[i].count = m_counters[i].count.load(std::memory_order_relaxed);
+        out[i].total_us = m_counters[i].total_us.load(std::memory_order_relaxed);
+        out[i].max_us = m_counters[i].max_us.load(std::memory_order_relaxed);
+    }
+    return out;
+}
+
+SqliteCommitSnapshot SqliteCommitCounters::Take()
+{
+    SqliteCommitSnapshot out;
+    for (size_t i = 0; i < SQLITE_COMMIT_KINDS; ++i) {
+        out[i].count = m_counters[i].count.exchange(0, std::memory_order_relaxed);
+        out[i].total_us = m_counters[i].total_us.exchange(0, std::memory_order_relaxed);
+        out[i].max_us = m_counters[i].max_us.exchange(0, std::memory_order_relaxed);
+    }
+    return out;
+}
+
+void SqliteCommitCounters::Reset()
+{
+    (void)Take();
+}
+
+SqliteCommitCounters& ProcessSqliteCommits()
+{
+    static SqliteCommitCounters counters;
+    return counters;
+}
+
+std::string FormatSqliteCommits(const SqliteCommitSnapshot& snapshot)
+{
+    uint64_t commits{0}, total_us{0}, max_us{0};
+    std::string detail;
+    for (size_t i = 0; i < SQLITE_COMMIT_KINDS; ++i) {
+        const SqliteCommitCounts& c = snapshot[i];
+        if (c.count == 0) continue;
+        commits += c.count;
+        total_us += c.total_us;
+        max_us = std::max(max_us, c.max_us);
+        detail += strprintf(" %s=%u/%u/%u", SQLITE_COMMIT_NAMES[i], c.count, ToMs(c.total_us), ToMs(c.max_us));
+    }
+    std::string out = strprintf(" | sqlite commits since last line: n=%u total=%u ms max=%u ms", commits, ToMs(total_us), ToMs(max_us));
+    if (!detail.empty()) out += strprintf(" (kind=n/total_ms/max_ms:%s)", detail);
+    return out;
 }
 
 WalletCallbackTimer::WalletCallbackTimer(WalletCallbackKind kind)

@@ -13,6 +13,7 @@
 #include <util/fs_helpers.h>
 #include <util/check.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <wallet/db.h>
 
@@ -392,8 +393,26 @@ bool SQLiteDatabase::Backup(const std::string& dest) const
     return res == SQLITE_OK;
 }
 
+void SQLiteDatabase::RecordCommit(SqliteCommitKind kind, std::chrono::microseconds duration)
+{
+    m_commit_counters.Record(kind, duration);
+    ProcessSqliteCommits().Record(kind, duration);
+}
+
 void SQLiteDatabase::Close()
 {
+    if (m_db) {
+        const SqliteCommitSnapshot commits = m_commit_counters.Snapshot();
+        uint64_t n{0}, total_us{0}, max_us{0};
+        for (const SqliteCommitCounts& c : commits) {
+            n += c.count;
+            total_us += c.total_us;
+            max_us = std::max(max_us, c.max_us);
+        }
+        if (n > 0) {
+            LogPrintf("SQLite commits for %s over its lifetime: n=%u total=%u ms max=%u ms\n", m_file_path, n, total_us / 1000, max_us / 1000);
+        }
+    }
     int res = sqlite3_close(m_db);
     if (res != SQLITE_OK) {
         throw std::runtime_error(strprintf("SQLiteDatabase: Failed to close database: %s\n", sqlite3_errstr(res)));
@@ -498,7 +517,14 @@ bool SQLiteBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
     if (!BindBlobToStatement(stmt, 1, key, "key")) return false;
     if (!BindBlobToStatement(stmt, 2, value, "value")) return false;
 
+    // Outside a transaction SQLite commits this statement by itself.
+    const bool implicit_commit = sqlite3_get_autocommit(m_database.m_db) != 0;
+    const auto step_start = implicit_commit ? SteadyClock::now() : SteadyClock::time_point{};
     int res = sqlite3_step(stmt);
+    if (implicit_commit) {
+        m_database.RecordCommit(SqliteCommitKind::AUTOCOMMIT,
+                                std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - step_start));
+    }
     sqlite3_clear_bindings(stmt);
     sqlite3_reset(stmt);
     if (res != SQLITE_DONE) {
@@ -517,7 +543,14 @@ bool SQLiteBatch::ExecStatement(sqlite3_stmt* stmt, Span<const std::byte> blob)
 
     if (!BindBlobToStatement(stmt, 1, blob, "key")) return false;
 
+    // Outside a transaction SQLite commits this statement by itself.
+    const bool implicit_commit = sqlite3_get_autocommit(m_database.m_db) != 0;
+    const auto step_start = implicit_commit ? SteadyClock::now() : SteadyClock::time_point{};
     int res = sqlite3_step(stmt);
+    if (implicit_commit) {
+        m_database.RecordCommit(SqliteCommitKind::AUTOCOMMIT,
+                                std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - step_start));
+    }
     sqlite3_clear_bindings(stmt);
     sqlite3_reset(stmt);
     if (res != SQLITE_DONE) {
@@ -731,7 +764,10 @@ bool SQLiteBatch::TxnCommit()
         ReleaseTransaction();
         return false;
     }
+    const auto commit_start = SteadyClock::now();
     int res = sqlite3_exec(m_database.m_db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr);
+    m_database.RecordCommit(m_durable_txn ? SqliteCommitKind::DURABLE : SqliteCommitKind::NON_DURABLE,
+                            std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - commit_start));
     if (res != SQLITE_OK) {
         LogPrintf("SQLiteBatch: Failed to commit the transaction\n");
         // A failed COMMIT can leave the connection inside the transaction.
@@ -810,7 +846,10 @@ public:
         // Its unit is already counted failed; the scope still ends here.
         bool committed{false};
         if (sqlite3_get_autocommit(m_database.m_db) == 0) {
+            const auto commit_start = SteadyClock::now();
             committed = sqlite3_exec(m_database.m_db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr) == SQLITE_OK;
+            m_database.RecordCommit(SqliteCommitKind::BULK_SCOPE,
+                                    std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - commit_start));
             if (!committed) {
                 LogPrintf("SQLiteDatabase: Failed to commit the grouped wallet writes\n");
                 if (sqlite3_get_autocommit(m_database.m_db) == 0 &&

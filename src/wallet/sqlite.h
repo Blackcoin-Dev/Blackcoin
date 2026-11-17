@@ -9,6 +9,9 @@
 
 #include <sync.h>
 #include <wallet/db.h>
+#include <wallet/scheduler_stats.h>
+
+#include <chrono>
 
 struct bilingual_str;
 
@@ -172,6 +175,13 @@ public:
     // connection writes into. Protected by sqlite3_db_mutex(m_db), which the
     // scope holds for its whole life.
     bool m_bulk_active{false};
+
+    /** Record a commit in this database's counters and the process-wide ones. */
+    void RecordCommit(SqliteCommitKind kind, std::chrono::microseconds duration);
+    const SqliteCommitCounters& CommitCounters() const { return m_commit_counters; }
+
+private:
+    SqliteCommitCounters m_commit_counters;
 };
 
 std::unique_ptr<SQLiteDatabase> MakeSQLiteDatabase(const fs::path& path, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);

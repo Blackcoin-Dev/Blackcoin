@@ -520,6 +520,73 @@ BOOST_AUTO_TEST_CASE(sqlite_bulk_scope_groups_writes_into_one_commit)
 }
 #endif // USE_SQLITE
 
+BOOST_AUTO_TEST_CASE(sqlite_commit_counters_split_by_kind)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "commit_counters", options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    ProcessSqliteCommits().Reset();
+    const auto count = [&](SqliteCommitKind kind) {
+        return database->CommitCounters().Snapshot()[static_cast<size_t>(kind)].count;
+    };
+
+    // A write outside any transaction commits by itself.
+    BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"plain"}, 1));
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::AUTOCOMMIT), 1U);
+    BOOST_REQUIRE(database->MakeBatch()->Erase(std::string{"plain"}));
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::AUTOCOMMIT), 2U);
+
+    // Writes inside a transaction are not commits; its COMMIT is, by flag.
+    {
+        auto batch = database->MakeBatch();
+        BOOST_REQUIRE(batch->TxnBegin(/*durable=*/false));
+        BOOST_REQUIRE(batch->Write(std::string{"a"}, 1));
+        BOOST_REQUIRE(batch->Write(std::string{"b"}, 2));
+        BOOST_CHECK_EQUAL(count(SqliteCommitKind::AUTOCOMMIT), 2U);
+        BOOST_REQUIRE(batch->TxnCommit());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::NON_DURABLE), 1U);
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::DURABLE), 0U);
+    {
+        auto batch = database->MakeBatch();
+        BOOST_REQUIRE(batch->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(batch->Write(std::string{"c"}, 3));
+        BOOST_REQUIRE(batch->TxnCommit());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::DURABLE), 1U);
+
+    // A bulk scope commits once, a unit inside it commits nothing, and an
+    // aborted transaction is no commit at all.
+    {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        auto batch = database->MakeBatch();
+        BOOST_REQUIRE(batch->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(batch->Write(std::string{"d"}, 4));
+        BOOST_REQUIRE(batch->TxnCommit());
+        BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"e"}, 5));
+        BOOST_REQUIRE(scope->Commit());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::BULK_SCOPE), 1U);
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::DURABLE), 1U);
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::AUTOCOMMIT), 2U);
+    {
+        auto batch = database->MakeBatch();
+        BOOST_REQUIRE(batch->TxnBegin());
+        BOOST_REQUIRE(batch->Write(std::string{"f"}, 6));
+        BOOST_REQUIRE(batch->TxnAbort());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::NON_DURABLE), 1U);
+
+    // The process-wide counters saw the same commits: 2 + 1 + 1 + 1.
+    uint64_t process_total{0};
+    for (const SqliteCommitCounts& c : ProcessSqliteCommits().Snapshot()) process_total += c.count;
+    BOOST_CHECK_EQUAL(process_total, 5U);
+}
+
 BOOST_AUTO_TEST_CASE(db_cursor_prefix_range_test)
 {
     // Test each supported db

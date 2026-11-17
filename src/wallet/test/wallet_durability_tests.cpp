@@ -6,6 +6,7 @@
 #include <interfaces/chain.h>
 #include <random.h>
 #include <script/script.h>
+#include <test/util/logging.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <util/check.h>
@@ -95,6 +96,45 @@ BOOST_AUTO_TEST_CASE(scheduler_stats_records_wait_and_hold)
     BOOST_CHECK_EQUAL(s.hold_histogram[1], 2U);
     BOOST_CHECK_EQUAL(stats.Snapshot(WalletCallbackKind::MEMPOOL_ADDED).count, 0U);
     BOOST_CHECK(stats.FormatSummary().find("connected n=2") != std::string::npos);
+    stats.Reset();
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_commit_counters_accumulate_and_drain)
+{
+    using namespace std::chrono_literals;
+    SqliteCommitCounters counters;
+    counters.Record(SqliteCommitKind::DURABLE, 30ms);
+    counters.Record(SqliteCommitKind::DURABLE, 10ms);
+    counters.Record(SqliteCommitKind::AUTOCOMMIT, 1ms);
+    const SqliteCommitSnapshot peek = counters.Snapshot();
+    BOOST_CHECK_EQUAL(peek[static_cast<size_t>(SqliteCommitKind::DURABLE)].count, 2U);
+    BOOST_CHECK_EQUAL(peek[static_cast<size_t>(SqliteCommitKind::DURABLE)].total_us, 40000U);
+    BOOST_CHECK_EQUAL(peek[static_cast<size_t>(SqliteCommitKind::DURABLE)].max_us, 30000U);
+    BOOST_CHECK_EQUAL(peek[static_cast<size_t>(SqliteCommitKind::NON_DURABLE)].count, 0U);
+
+    // Take reads and zeroes: the next line covers only what came after.
+    const SqliteCommitSnapshot taken = counters.Take();
+    const std::string line = FormatSqliteCommits(taken);
+    BOOST_CHECK(line.find("n=3 total=41 ms max=30 ms") != std::string::npos);
+    BOOST_CHECK(line.find("durable=2/40/30") != std::string::npos);
+    BOOST_CHECK(line.find("autocommit=1/1/1") != std::string::npos);
+    BOOST_CHECK(line.find("non_durable") == std::string::npos);
+    BOOST_CHECK(FormatSqliteCommits(counters.Take()).find("n=0 total=0 ms max=0 ms") != std::string::npos);
+}
+
+BOOST_FIXTURE_TEST_CASE(summary_line_carries_the_sqlite_commits_since_the_last_line, BasicTestingSetup)
+{
+    using namespace std::chrono_literals;
+    SchedulerStats& stats = SchedulerStats::Instance();
+    stats.Reset();
+    ProcessSqliteCommits().Reset();
+    ProcessSqliteCommits().Record(SqliteCommitKind::BULK_SCOPE, 5ms);
+    {
+        ASSERT_DEBUG_LOG("sqlite commits since last line: n=1 total=5 ms max=5 ms");
+        stats.MaybeLogSummary(std::chrono::steady_clock::now());
+    }
+    // The line drained the counters.
+    BOOST_CHECK_EQUAL(ProcessSqliteCommits().Snapshot()[static_cast<size_t>(SqliteCommitKind::BULK_SCOPE)].count, 0U);
     stats.Reset();
 }
 

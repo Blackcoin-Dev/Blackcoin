@@ -60,7 +60,13 @@
 #include <clientversion.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <limits>
+#include <unordered_map>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#endif
 #include <chrono>
 #include <functional>
 #include <exception>
@@ -122,6 +128,7 @@
 #include <QEvent>
 #include <QPointer>
 #include <QSignalSpy>
+#include <QRegularExpression>
 
 using wallet::AddWallet;
 using wallet::CWallet;
@@ -4333,6 +4340,9 @@ void TestDeferredWalletHistory(interfaces::Node& node, const std::shared_ptr<CWa
     });
     locked.get_future().wait();
     model->startPollBalance();
+    // History is read only for a wallet that is shown.
+    QVERIFY(!table->isHistoryRequested());
+    model->requestHistory();
     QEventLoop loop;
     QTimer::singleShot(0, &loop, [&] {
         heartbeat.set_value();
@@ -4451,6 +4461,7 @@ void TestDeferredWalletHistory(interfaces::Node& node, const std::shared_ptr<CWa
     });
     closing_locked.get_future().wait();
     closing->startPollBalance();
+    closing->requestHistory();
     closing.reset();
     closed.set_value();
     close_holder.join();
@@ -5188,6 +5199,386 @@ void TestDetailRefreshSurvivesTipAdvance(interfaces::Node& node, TestChain100Set
     }
 }
 
+
+//! The slimmer row prints and sorts exactly as the string-keyed row did, and shares what it can.
+void TestSlimTransactionRow()
+{
+    std::mt19937 rng(7);
+    for (int i = 0; i < 20000; ++i) {
+        const int height = (i % 7 == 0) ? std::numeric_limits<int>::max() : static_cast<int>(rng() % 2000000) - (i % 5 == 0 ? 1000 : 0);
+        const bool generated = rng() & 1;
+        const unsigned received = static_cast<unsigned>(rng());
+        const int idx = static_cast<int>(rng() % 1200);
+        const int type_order = std::array<int, 3>{2, 3, 9}[rng() % 3];
+        const std::string expected = strprintf("%010d-%01d-%010u-%03d-%d", height, generated ? 1 : 0, received, idx, type_order);
+        const TransactionSortKey key(height, generated, received, idx, type_order);
+        QCOMPARE(QString::fromStdString(key.str()), QString::fromStdString(expected));
+        TransactionSortKey parsed;
+        parsed = expected;
+        QVERIFY(parsed == key);
+        QVERIFY(!key.empty());
+    }
+    TransactionSortKey never_read;
+    QVERIFY(never_read.empty());
+    QVERIFY(never_read.str().empty());
+    TransactionSortKey cleared(5, false, 1, 0, 3);
+    cleared.clear();
+    QVERIFY(cleared.empty());
+    cleared = std::string("not a key");
+    QVERIFY(cleared.empty());
+
+    // Order of the printed keys is the order of the fields' text; the compact key must not change it.
+    std::vector<TransactionSortKey> keys;
+    for (int i = 0; i < 500; ++i) keys.emplace_back(static_cast<int>(rng() % 50), rng() & 1, static_cast<unsigned>(rng() % 1000), static_cast<int>(rng() % 4), 2 + static_cast<int>(rng() % 2));
+    std::vector<std::string> texts;
+    for (const auto& key : keys) texts.push_back(key.str());
+    std::sort(texts.begin(), texts.end());
+    std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) { return a.str() < b.str(); });
+    for (size_t i = 0; i < keys.size(); ++i) QCOMPARE(QString::fromStdString(keys[i].str()), QString::fromStdString(texts[i]));
+
+    static_assert(sizeof(TransactionRecord) <= 160, "a row is a heap node of the table: keep it small");
+    const size_t pool_before = TransactionAddress::PoolSize();
+    {
+        std::vector<TransactionRecord> rows;
+        for (int i = 0; i < 1000; ++i) rows.emplace_back(uint256{static_cast<unsigned char>(i % 250 + 1)}, i, TransactionRecord::GoldRushPowClaim, "claim address shared by many rows 0123456789", 0, i);
+        QCOMPARE(TransactionAddress::PoolSize(), pool_before + 1);
+        for (const auto& row : rows) QCOMPARE(QString::fromStdString(row.address), QStringLiteral("claim address shared by many rows 0123456789"));
+        rows.front().address = std::string("another");
+        QCOMPARE(TransactionAddress::PoolSize(), pool_before + 2);
+        QVERIFY(rows[1].address == std::string("claim address shared by many rows 0123456789"));
+    }
+    QCOMPARE(TransactionAddress::PoolSize(), pool_before);
+    TransactionAddress empty;
+    QVERIFY(empty.empty());
+    QVERIFY(empty == std::string());
+}
+
+//! Add a mix of transactions the wallet history shows: receives, sends, Gold Rush claims and payouts, control rows.
+//! Only some of them carry the notes the list reads; every one also carries notes it does not.
+void AddMixedHistory(const std::shared_ptr<CWallet>& wallet, int count, uint32_t salt, std::vector<uint256>& hashes)
+{
+    const auto dest = wallet->GetNewDestination(OutputType::BECH32, "mixed history " + std::to_string(salt));
+    const auto script = GetScriptForDestination(*dest);
+    const CScript external = GetScriptForDestination(WitnessV0KeyHash(uint160(std::vector<unsigned char>(20, static_cast<unsigned char>(salt + 1)))));
+    const std::array<std::string, 3> claim_addresses{"bc1qclaimaddressone", "bc1qclaimaddresstwo", "bc1qclaimaddressthree"};
+    for (int i = 0; i < count; ++i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{static_cast<unsigned char>(salt + 40)}, static_cast<uint32_t>(i)});
+        tx.vout.emplace_back(COIN + i, script);
+        tx.nLockTime = static_cast<uint32_t>(salt * 100000 + i);
+        const auto ref = MakeTransactionRef(tx);
+        const int kind = i % 6;
+        std::function<bool(wallet::CWalletTx&, bool)> update = [&](wallet::CWalletTx& wtx, bool) {
+            wtx.mapValue["message"] = "note the list never reads " + std::to_string(i);
+            wtx.mapValue["n"] = "1";
+            if (kind == 1) { wtx.mapValue["comment"] = "PoW - Quantum Claim"; wtx.mapValue["to"] = claim_addresses[i % 3]; }
+            if (kind == 2) { wtx.mapValue["comment"] = "PoS - Quantum Stake"; wtx.mapValue["to"] = claim_addresses[(i + 1) % 3]; }
+            if (kind == 3) { wtx.mapValue["comment"] = "PoW Claim"; }
+            if (kind == 5) { wtx.mapValue["from"] = "someone " + std::to_string(i % 4); }
+            return true;
+        };
+        QVERIFY2(wallet->AddToWallet(ref, wallet::TxStateInactive{}, update), "add history transaction");
+        hashes.push_back(ref->GetHash());
+        if (kind == 4) {
+            // A send that spends the received output.
+            CMutableTransaction spend;
+            spend.vin.emplace_back(COutPoint{ref->GetHash(), 0});
+            spend.vout.emplace_back(COIN / 2, external);
+            const auto spend_ref = MakeTransactionRef(spend);
+            QVERIFY(wallet->AddToWallet(spend_ref, wallet::TxStateInactive{}));
+            hashes.push_back(spend_ref->GetHash());
+        }
+    }
+}
+
+struct HistoryRow {
+    QString hash, type_text, to_text, amount_text, date_text, address;
+    int type;
+    qint64 amount;
+    bool operator==(const HistoryRow& o) const
+    {
+        return hash == o.hash && type_text == o.type_text && to_text == o.to_text && amount_text == o.amount_text && date_text == o.date_text &&
+               address == o.address && type == o.type && amount == o.amount;
+    }
+};
+
+std::vector<HistoryRow> ReadRows(TransactionTableModel& table)
+{
+    std::vector<HistoryRow> rows;
+    for (int row = 0; row < table.rowCount({}); ++row) {
+        const auto cell = [&](int column, int role) { return table.data(table.index(row, column), role); };
+        rows.push_back({cell(0, TransactionTableModel::TxHashRole).toString(), cell(TransactionTableModel::Type, Qt::DisplayRole).toString(),
+                        cell(TransactionTableModel::ToAddress, Qt::DisplayRole).toString(), cell(TransactionTableModel::Amount, Qt::DisplayRole).toString(),
+                        cell(TransactionTableModel::Date, Qt::DisplayRole).toString(), cell(0, TransactionTableModel::AddressRole).toString(),
+                        cell(0, TransactionTableModel::TypeRole).toInt(), cell(0, TransactionTableModel::AmountRole).toLongLong()});
+    }
+    return rows;
+}
+
+QStringList g_captured_gui_messages;
+QtMessageHandler g_previous_message_handler{nullptr};
+void CaptureGuiMessages(QtMsgType type, const QMessageLogContext& context, const QString& message)
+{
+    g_captured_gui_messages << message;
+    if (g_previous_message_handler) g_previous_message_handler(type, context, message);
+}
+
+void TestLazyWalletHistory(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet, const std::shared_ptr<CWallet>& second_wallet)
+{
+    constexpr int MIXED{4200}; // about 7000 transactions: several 2,000 transaction chunks
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    OptionsModel options(node);
+    bilingual_str error;
+    QVERIFY(options.Init(error));
+    ClientModel client(node, &options);
+    g_captured_gui_messages.clear();
+    g_previous_message_handler = qInstallMessageHandler(CaptureGuiMessages);
+    struct Restore { ~Restore() { qInstallMessageHandler(g_previous_message_handler); } } restore;
+
+    std::vector<uint256> before_hashes;
+    AddMixedHistory(wallet, MIXED, 1, before_hashes);
+    const auto context = node.walletLoader().context();
+
+    // 1. A wallet nobody has looked at reads nothing, keeps no queue, and still announces what arrives.
+    auto lazy = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    auto* table = lazy->getTransactionTableModel();
+    lazy->startPollBalance();
+    QTest::qWait(300);
+    QVERIFY(!table->isHistoryRequested());
+    QVERIFY(!table->isHistoryLoaded());
+    QCOMPARE(table->rowCount({}), 0);
+    QVERIFY(WalletModel::historyLoadActiveForTest() == nullptr);
+    QSignalSpy incoming(table, &TransactionTableModel::incomingWhileNotLoaded);
+    {
+        const auto dest = wallet->GetNewDestination(OutputType::BECH32, "arrives while hidden");
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{77}, 0});
+        tx.vout.emplace_back(3 * COIN, GetScriptForDestination(*dest));
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(tx)), wallet::TxStateInactive{}));
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(incoming.count(), 1, 5000);
+    QCOMPARE(incoming.at(0).at(1).toLongLong(), qint64(3 * COIN));
+    QVERIFY(!incoming.at(0).at(2).toString().isEmpty());
+    QCOMPARE(table->rowCount({}), 0);
+    QVERIFY(!table->isHistoryRequested());
+
+    // 2. Showing it reads it, in chunks; a transaction that arrives meanwhile appears exactly once.
+    lazy->requestHistory();
+    QVERIFY(table->isHistoryRequested());
+    CMutableTransaction during_tx;
+    during_tx.vin.emplace_back(COutPoint{uint256{78}, 0});
+    during_tx.vout.emplace_back(5 * COIN, GetScriptForDestination(*wallet->GetNewDestination(OutputType::BECH32, "arrives while loading")));
+    const auto during = MakeTransactionRef(std::move(during_tx));
+    QVERIFY(wallet->AddToWallet(during, wallet::TxStateInactive{}));
+    QVERIFY(WalletModel::historyLoadActiveForTest() == lazy.get());
+    QTRY_VERIFY_WITH_TIMEOUT(table->isHistoryLoaded(), 60000);
+    QTRY_VERIFY_WITH_TIMEOUT(WalletModel::historyLoadActiveForTest() == nullptr, 5000);
+    int during_rows{0};
+    for (int row = 0; row < table->rowCount({}); ++row) {
+        if (table->data(table->index(row, 0), TransactionTableModel::TxHashRole).toString() == QString::fromStdString(during->GetHash().ToString())) ++during_rows;
+    }
+    QCOMPARE(during_rows, 1);
+    for (const auto& message : g_captured_gui_messages) QVERIFY2(!message.contains(QStringLiteral("already in model")), qPrintable(message));
+
+    // 3. The streamed, key-filtered load equals the eager load, row for row and in order.
+    WalletModel eager(interfaces::MakeWallet(*context, wallet), client, style.get());
+    auto* eager_table = eager.getTransactionTableModel();
+    QVERIFY(eager_table->isHistoryLoaded());
+    QCOMPARE(table->rowCount({}), eager_table->rowCount({}));
+    QVERIFY(table->rowCount({}) > MIXED);
+    const auto lazy_rows = ReadRows(*table);
+    const auto eager_rows = ReadRows(*eager_table);
+    QVERIFY(lazy_rows == eager_rows);
+    std::set<int> types;
+    for (const auto& row : lazy_rows) types.insert(row.type);
+    QString type_list;
+    for (const int type : types) type_list += QString::number(type) + QLatin1Char(' ');
+    QVERIFY2(types.count(TransactionRecord::GoldRushPowClaim) && types.count(TransactionRecord::GoldRushPosStake) &&
+             types.count(TransactionRecord::SendToAddress) && types.count(TransactionRecord::RecvWithAddress) && types.count(TransactionRecord::Other),
+             qPrintable(type_list));
+    // Claim rows show the "to" note, which the filtered load must still carry.
+    const bool claim_address_shown = std::any_of(lazy_rows.begin(), lazy_rows.end(), [](const HistoryRow& row) { return row.address == QStringLiteral("bc1qclaimaddressone"); });
+    QVERIFY(claim_address_shown);
+
+    // 4. One history read at a time in the process, and the wallet being shown goes first.
+    std::vector<uint256> second_hashes;
+    AddMixedHistory(second_wallet, 150, 2, second_hashes);
+    auto first = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    auto shown = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, second_wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    first->setBalancePollForeground(false);
+    QStringList load_order;
+    QObject::connect(first->getTransactionTableModel(), &TransactionTableModel::historyLoaded, [&] { load_order << QStringLiteral("hidden"); });
+    QObject::connect(shown->getTransactionTableModel(), &TransactionTableModel::historyLoaded, [&] { load_order << QStringLiteral("shown"); });
+    first->requestHistory();
+    shown->requestHistory();
+    QVERIFY(WalletModel::historyLoadActiveForTest() == first.get());
+    QCOMPARE(WalletModel::historyLoadWaitingForTest(), size_t{1});
+    QVERIFY(shown->getTransactionTableModel()->rowCount({}) == 0);
+    QTRY_VERIFY_WITH_TIMEOUT(first->getTransactionTableModel()->isHistoryLoaded() && shown->getTransactionTableModel()->isHistoryLoaded(), 60000);
+    QCOMPARE(load_order, (QStringList{QStringLiteral("shown"), QStringLiteral("hidden")}));
+    QCOMPARE(first->getTransactionTableModel()->rowCount({}), table->rowCount({}));
+    QTRY_VERIFY_WITH_TIMEOUT(WalletModel::historyLoadActiveForTest() == nullptr, 5000);
+    QCOMPARE(WalletModel::historyLoadWaitingForTest(), size_t{0});
+    first.reset();
+    shown.reset();
+}
+
+void TestBatchedStatusRefresh(interfaces::Node& node, TestChain100Setup& test, const std::shared_ptr<CWallet>& wallet)
+{
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    WalletContext& context = *node.walletLoader().context();
+    AddWallet(context, wallet);
+    auto model = std::make_unique<WalletModel>(interfaces::MakeWallet(context, wallet), *gui.clientModel, style.get(), nullptr, /*defer_history=*/true);
+    RemoveWallet(context, wallet, std::nullopt);
+    auto* table = model->getTransactionTableModel();
+    SettleChainTip(gui, wallet);
+    model->requestHistory();
+    QTRY_VERIFY_WITH_TIMEOUT(table->isHistoryLoaded(), 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(table->rowCount({}) > 100, 5000);
+    QVERIFY(table->unsettledRows() > 0);
+
+    const auto depth_text = [](const QString& tip) {
+        const auto match = QRegularExpression(QStringLiteral("\\((\\d+) ")).match(tip);
+        return match.hasMatch() ? match.captured(1).toInt() : -1;
+    };
+    const auto tooltips = [&]() -> std::map<QString, std::pair<int, int>> {
+        std::map<QString, std::pair<int, int>> out; // hash -> (status, shown confirmations)
+        for (int row = 0; row < table->rowCount({}); ++row) {
+            const auto id = table->transactionIdentity(row);
+            QVariant tip, status, hash;
+            if (!table->transactionData(id, 0, Qt::ToolTipRole, tip) || !table->transactionData(id, 0, TransactionTableModel::StatusRole, status) ||
+                !table->transactionData(id, 0, TransactionTableModel::TxHashRole, hash)) continue;
+            out[hash.toString()] = {status.toInt(), depth_text(tip.toString())};
+        }
+        return out;
+    };
+
+    // One batch reads every row that can still change (and a bounded number of never-read rows) under one lock.
+    const auto start = table->statusStats();
+    table->updateConfirmations();
+    auto stats = table->statusStats();
+    QCOMPARE(stats.batches, start.batches + 1);
+    QVERIFY(stats.rows >= start.rows + table->activeRows());
+    QCOMPARE(stats.single_reads, start.single_reads);
+    const auto first_view = tooltips();
+
+    test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    SyncWithValidationInterfaceQueue();
+    SettleChainTip(gui, wallet);
+    SyncRecoveryReviewWalletTip(wallet, node); // a standalone test wallet does not follow the chain by itself
+    const auto before_block = table->statusStats();
+    table->updateConfirmations();
+    stats = table->statusStats();
+    QCOMPARE(stats.batches, before_block.batches + 1); // one call for the block
+    QVERIFY(stats.rows > before_block.rows);
+    const auto second_view = tooltips();
+    QCOMPARE(table->statusStats().single_reads, before_block.single_reads); // no per-row reads were needed to show them
+    int advanced{0};
+    for (const auto& [hash, shown_before] : first_view) {
+        const auto& shown_after = second_view.at(hash);
+        if (shown_before.second < 0 || shown_after.second < 0) continue;
+        QVERIFY2(shown_after.second == shown_before.second + 1,
+                 qPrintable(QStringLiteral("%1 status %2->%3 shown %4->%5 tip %6 key %7").arg(hash).arg(shown_before.first).arg(shown_after.first).arg(shown_before.second).arg(shown_after.second).arg(table->tipHeight()).arg(
+                     [&] { for (int row = 0; row < table->rowCount({}); ++row) { const auto id = table->transactionIdentity(row); QVariant h, k; table->transactionData(id, 0, TransactionTableModel::TxHashRole, h); if (h.toString() == hash) { table->transactionData(id, 0, Qt::EditRole, k); return k.toString(); } } return QString(); }())));
+        ++advanced;
+    }
+    QVERIFY(advanced > 50);
+
+    // A refused lock reads nothing and leaves the rows marked: the next attempt succeeds without another block.
+    std::promise<void> locked;
+    std::promise<void> release;
+    auto wait_release = release.get_future();
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        wait_release.wait();
+    });
+    locked.get_future().wait();
+    const auto refused_before = table->statusStats();
+    table->updateConfirmations();
+    QCOMPARE(table->statusStats().batches, refused_before.batches);
+    QTest::qWait(120);
+    release.set_value();
+    holder.join();
+    QTRY_VERIFY_WITH_TIMEOUT(table->statusStats().batches > refused_before.batches, 5000);
+}
+
+#ifdef __APPLE__
+//! Allocation cost of a published row: the layout of release candidate 11 (reproduced from its header) against the current one.
+void TestHistoryRowAllocations()
+{
+    struct LegacyStatus {
+        bool countsForBalance{false};
+        std::string sortKey;
+        int matures_in{0};
+        int status{0};
+        qint64 depth{0};
+        uint256 m_cur_block_hash;
+        bool needsUpdate{false};
+    };
+    struct LegacyRecord {
+        uint256 hash;
+        qint64 time{0};
+        int type{0};
+        std::string address;
+        CAmount debit{0};
+        CAmount credit{0};
+        int idx{0};
+        uint64_t presentation_id{0};
+        LegacyStatus status;
+        bool involvesWatchAddress{false};
+    };
+    constexpr int ROWS{60000};
+    const std::string claim_address = "BLACKCOINQuantumClaimAddress0123456789abcdef";
+    const auto in_use = [] {
+        malloc_statistics_t stats{};
+        malloc_zone_statistics(nullptr, &stats);
+        return std::pair<size_t, size_t>{stats.blocks_in_use, stats.size_in_use};
+    };
+    const auto key_text = [](int i) { return strprintf("%010d-%01d-%010u-%03d-%d", 1000 + i / 2, 0, 1700000000u + i, 0, 9); };
+
+    const auto legacy_before = in_use();
+    auto legacy_list = std::make_unique<QList<LegacyRecord>>();
+    auto legacy_ids = std::make_unique<std::unordered_map<uint64_t, LegacyRecord*>>();
+    legacy_list->reserve(ROWS);
+    for (int i = 0; i < ROWS; ++i) {
+        LegacyRecord record;
+        record.hash = uint256{static_cast<unsigned char>(i % 250 + 1)};
+        record.address = claim_address;
+        record.status.sortKey = key_text(i);
+        record.presentation_id = i + 1;
+        legacy_list->append(record);
+        (*legacy_ids)[i + 1] = &legacy_list->last();
+    }
+    const auto legacy_after = in_use();
+
+    const auto current_before = in_use();
+    auto current_list = std::make_unique<QList<TransactionRecord>>();
+    auto current_ids = std::make_unique<std::vector<TransactionRecord*>>();
+    current_list->reserve(ROWS);
+    for (int i = 0; i < ROWS; ++i) {
+        TransactionRecord record(uint256{static_cast<unsigned char>(i % 250 + 1)}, 0, TransactionRecord::GoldRushPowClaim, claim_address, 0, 1);
+        record.status.sortKey = TransactionSortKey(1000 + i / 2, false, 1700000000u + i, 0, 9);
+        record.presentation_id = i + 1;
+        current_list->append(record);
+        if (current_ids->size() <= record.presentation_id) current_ids->resize(record.presentation_id + 1);
+        (*current_ids)[record.presentation_id] = &current_list->last();
+    }
+    const auto current_after = in_use();
+
+    const auto per_row = [](const std::pair<size_t, size_t>& before, const std::pair<size_t, size_t>& after) {
+        return std::pair<double, double>{double(after.first - before.first) / ROWS, double(after.second - before.second) / ROWS};
+    };
+    const auto legacy = per_row(legacy_before, legacy_after);
+    const auto current = per_row(current_before, current_after);
+    qInfo("History row cost (malloc zones, %d rows): rc11 layout %.2f allocations %.1f bytes per row; now %.2f allocations %.1f bytes per row; sizeof %zu -> %zu",
+        ROWS, legacy.first, legacy.second, current.first, current.second, sizeof(LegacyRecord), sizeof(TransactionRecord));
+    QVERIFY(current.first < legacy.first / 2);
+    QVERIFY(current.second < legacy.second * 0.7);
+}
+#endif
+
 void TestGUI(interfaces::Node& node)
 {
     // Set up wallet and chain with 105 blocks (5 mature blocks for spending).
@@ -5208,7 +5599,16 @@ void TestGUI(interfaces::Node& node)
         TestWalletDisplayExceptionRecovery(node, SetupDescriptorsWallet(node, test));
         TestAccountSnapshotFiltering(node, SetupDescriptorsWallet(node, test));
         TestDeferredWalletHistory(node, SetupDescriptorsWallet(node, test));
-        if (lane == QStringLiteral("wallet-efficiency")) return;
+        TestSlimTransactionRow();
+#ifdef __APPLE__
+        TestHistoryRowAllocations();
+#endif
+        TestLazyWalletHistory(node, SetupDescriptorsWallet(node, test), SetupDescriptorsWallet(node, test));
+        // It mines a block, which later tests of the shared chain must not see: run it last.
+        if (lane == QStringLiteral("wallet-efficiency")) {
+            TestBatchedStatusRefresh(node, test, SetupDescriptorsWallet(node, test));
+            return;
+        }
     }
 
     if (lane.isEmpty() || lane == QStringLiteral("transaction-contention")) {
@@ -5237,6 +5637,7 @@ void TestGUI(interfaces::Node& node)
     TestGUIWatchOnly(node, test);
 
     TestDetailRefreshSurvivesTipAdvance(node, test, SetupDescriptorsWallet(node, test));
+    TestBatchedStatusRefresh(node, test, SetupDescriptorsWallet(node, test));
 }
 
 void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
@@ -6624,6 +7025,7 @@ void WalletTests::historyInitialLoad()
     QVERIFY(proxy && history);
     report("model_created");
     model->startPollBalance();
+    model->requestHistory();
     qint64 loaded_ms{-1};
     QElapsedTimer settle;
     settle.start();

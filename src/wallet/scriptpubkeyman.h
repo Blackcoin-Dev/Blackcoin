@@ -581,6 +581,8 @@ private:
     ScriptPubKeyMap m_map_script_pub_keys GUARDED_BY(cs_desc_man);
     PubKeyMap m_map_pubkeys GUARDED_BY(cs_desc_man);
     int32_t m_max_cached_index = -1;
+    //! True when next_index was advanced in memory and TopUp must still write the descriptor.
+    bool m_descriptor_write_pending GUARDED_BY(cs_desc_man){false};
 
     KeyMap m_map_keys GUARDED_BY(cs_desc_man);
     CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);

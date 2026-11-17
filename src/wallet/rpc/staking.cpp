@@ -4747,7 +4747,7 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether process-wide background automation may create new non-HD keys in loaded wallets."},
             {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, claim_evaluation_pending, claim_evaluation_capacity, ready, hashing, or error."},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
-            {RPCResult::Type::NUM, "cpu_percent", "Per-worker active-work duty target, including selection and proof preparation. Explicit waits count toward the idle period."},
+            {RPCResult::Type::NUM, "cpu_percent", "Per-worker active-work duty target, including selection and proof preparation. Explicit waits count toward the idle period. The budget is spent work first: after a new tip the worker does not sleep until its claim is submitted, then sleeps off what it owes; it may run ahead by at most two target block spacings of budget before it falls back to sleeping after every batch."},
             {RPCResult::Type::NUM, "workers_hashing", "Workers currently inside a proof batch."},
             {RPCResult::Type::NUM, "workers_error", "Workers in a local-error retry state."},
             {RPCResult::Type::OBJ, "duty_cycle", "Coherent bounded telemetry for the last successful miner start. Reset on a new start/reconfiguration or process restart; retained after stop. In-progress periods are omitted. Durations are actual steady-clock nanoseconds, not thread CPU time or host power. Telemetry publication occurs outside the budgeted interval.", {
@@ -4756,7 +4756,7 @@ static RPCHelpMan getpowmininginfo()
                 {RPCResult::Type::ARR, "workers", "One record per configured worker, at most 256.", {
                     {RPCResult::Type::OBJ, "", "", {
                         {RPCResult::Type::NUM, "worker", "Zero-based worker slot."},
-                        {RPCResult::Type::NUM, "completed_periods", "Iterations whose required wait finished with current mining authority."},
+                        {RPCResult::Type::NUM, "completed_periods", "Budget periods whose required wait finished with current mining authority. A period runs from one point where the worker owes no idle time to the next, so it can span many loop iterations while a claim is being worked on."},
                         {RPCResult::Type::NUM, "completed_work_periods", "Completed periods containing successful proof-hash evaluations."},
                         {RPCResult::Type::NUM, "completed_active_ns", "Completed elapsed time excluding measured explicit and duty waits; includes selection and lock waits."},
                         {RPCResult::Type::NUM, "completed_explicit_wait_ns", "Actual explicit waits inside completed iterations."},
@@ -4782,6 +4782,23 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::STR_AMOUNT, "next_claim_payout", "Estimated payout for a valid PoW claim in the next block."},
             {RPCResult::Type::NUM, "next_claim_amount", "Estimated payout for a valid PoW claim in the next block, in satoshis."},
             {RPCResult::Type::NUM, "claims_submitted", "Claims submitted by this miner since it started."},
+            {RPCResult::Type::OBJ, "last_claim_timing", "Timing of the most recently finished claim attempt of the built-in miner (one attempt is the work done for one tip). The same numbers are logged once per attempt as a \"Gold Rush PoW claim timing:\" line. Offsets are milliseconds from the moment this wallet's block-connected callback saw the tip; -1 means the step was not reached. Not persisted across restart.", {
+                {RPCResult::Type::BOOL, "valid", "Whether an attempt has finished since the wallet was loaded. The other fields are empty or zero until then."},
+                {RPCResult::Type::STR_HEX, "tip", "Tip the attempt worked on."},
+                {RPCResult::Type::NUM, "height", "Height of that tip, or -1."},
+                {RPCResult::Type::NUM, "block_time", "The tip block's own timestamp."},
+                {RPCResult::Type::NUM, "tip_seen_unix_ms", "System time at which the wallet saw the tip, in milliseconds since the epoch."},
+                {RPCResult::Type::BOOL, "tip_seen_known", "False when the block-connected callback for the tip was not observed (the miner started on a tip the wallet already had); offsets then count from the miner's first sight of the tip."},
+                {RPCResult::Type::STR, "result", "submitted, persisted_pending, conflict, input_unavailable, failed, tip_changed, cancelled or stopped."},
+                {RPCResult::Type::BOOL, "tip_changed", "Whether the tip changed before the claim was submitted."},
+                {RPCResult::Type::NUM, "gate_ready_ms", "Offset at which the mining gate for the tip was settled."},
+                {RPCResult::Type::NUM, "first_hash_ms", "Offset at which the proof search started."},
+                {RPCResult::Type::NUM, "proof_found_ms", "Offset at which a proof was found."},
+                {RPCResult::Type::NUM, "mempool_accept_ms", "Offset at which the claim was accepted by the local mempool."},
+                {RPCResult::Type::NUM, "hashes", "Proof hashes evaluated in the attempt, all workers."},
+                {RPCResult::Type::NUM, "batches", "Search batches run in the attempt, all workers."},
+                {RPCResult::Type::NUM, "duty_sleep_ms", "CPU duty sleep taken inside the attempt, summed over workers. Zero unless the work-first allowance was used up."},
+            }},
             {RPCResult::Type::NUM, "unresolved_claims", "Unconfirmed wallet QQSPROOF transactions, whether live or quarantined."},
             {RPCResult::Type::NUM, "live_claims", "Unconfirmed wallet QQSPROOF transactions currently in the local mempool."},
             {RPCResult::Type::NUM, "quarantined_claims", "Backward-compatible legacy count (same as blocking_quarantined_claims). It is audit evidence, not the candidate mining predicate; a safe typed family may relay or refresh while this count is nonzero."},
@@ -4969,6 +4986,26 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("duty_cycle", std::move(duty));
     obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());
     obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
+    {
+        const WalletPowClaimTiming timing = pwallet->GetPowClaimTiming();
+        UniValue last_timing(UniValue::VOBJ);
+        last_timing.pushKV("valid", timing.valid);
+        last_timing.pushKV("tip", timing.tip.GetHex());
+        last_timing.pushKV("height", timing.height);
+        last_timing.pushKV("block_time", timing.block_time);
+        last_timing.pushKV("tip_seen_unix_ms", timing.tip_seen_unix_ms);
+        last_timing.pushKV("tip_seen_known", timing.tip_seen_known);
+        last_timing.pushKV("result", timing.result);
+        last_timing.pushKV("tip_changed", timing.tip_changed);
+        last_timing.pushKV("gate_ready_ms", timing.gate_ready_ms);
+        last_timing.pushKV("first_hash_ms", timing.first_hash_ms);
+        last_timing.pushKV("proof_found_ms", timing.proof_found_ms);
+        last_timing.pushKV("mempool_accept_ms", timing.mempool_accept_ms);
+        last_timing.pushKV("hashes", timing.hashes);
+        last_timing.pushKV("batches", timing.batches);
+        last_timing.pushKV("duty_sleep_ms", timing.duty_sleep_ms);
+        obj.pushKV("last_claim_timing", std::move(last_timing));
+    }
     obj.pushKV("unresolved_claims",
                static_cast<uint64_t>(unresolved_claims));
     obj.pushKV("live_claims", static_cast<uint64_t>(live_claims));

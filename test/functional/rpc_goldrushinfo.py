@@ -644,6 +644,18 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(pow_info["shadow_reward_next_height"], node.getblockcount() + 1)
         assert pow_info["shadow_reward_start_height"] <= pow_info["shadow_reward_next_height"]
         assert pow_info["shadow_reward_next_height"] <= pow_info["shadow_reward_end_height"]
+        # The per-claim timing record is always present; it is empty until
+        # the built-in miner has finished an attempt.
+        timing = pow_info["last_claim_timing"]
+        assert_equal(sorted(timing), sorted([
+            "valid", "tip", "height", "block_time", "tip_seen_unix_ms",
+            "tip_seen_known", "result", "tip_changed", "gate_ready_ms",
+            "first_hash_ms", "proof_found_ms", "mempool_accept_ms", "hashes",
+            "batches", "duty_sleep_ms"]))
+        assert_equal(timing["valid"], False)
+        assert_equal(timing["result"], "")
+        assert_equal(timing["mempool_accept_ms"], -1)
+        assert "last_claim_timing" in wallet.help("getpowmininginfo")
         pow_help = wallet.help("setpowmining")
         assert "allow_new_payout_key" in pow_help
         assert "Back up the wallet immediately" in pow_help

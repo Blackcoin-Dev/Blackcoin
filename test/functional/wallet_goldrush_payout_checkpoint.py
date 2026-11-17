@@ -187,7 +187,20 @@ class WalletGoldRushPayoutCheckpointTest(BitcoinTestFramework):
         assert_equal((authenticated, verified), (0, payouts))
         assert_equal(self._snapshot(node.get_wallet_rpc(WALLET_NAME)), before)
 
-        self.log.info("Payouts recorded after the checkpoint are authenticated; older ones are not")
+        self.log.info("A payout recorded with its block is covered by the checkpoint that moves with that block")
+        # The wallet stores the payout checkpoint in the same commit as the
+        # records of each connected block, so a payout recorded while the
+        # wallet was loaded is already covered when it is loaded again.
+        saved = {}
+
+        def save_checkpoint(value):
+            saved["checkpoint"] = value
+            return value
+
+        self._edit_checkpoint(save_checkpoint)
+        self.start_node(0, self.node_args)
+        authenticated, verified, _ = self._load_wallet()
+        assert_equal((authenticated, verified), (0, payouts))
         wallet = node.get_wallet_rpc(WALLET_NAME)
         self._set_mocktime((node.getblockheader(node.getbestblockhash())["time"] & ~0xf) + 16)
         self._mine_pos_block(wallet)
@@ -195,7 +208,16 @@ class WalletGoldRushPayoutCheckpointTest(BitcoinTestFramework):
         assert_equal(self._payout_count(newer), payouts + 1)
         node.unloadwallet(WALLET_NAME)
         authenticated, verified, through = self._load_wallet()
+        assert_equal((authenticated, verified), (0, payouts + 1))
+        assert_equal(self._snapshot(node.get_wallet_rpc(WALLET_NAME)), newer)
+
+        self.log.info("Payouts recorded after the stored checkpoint are authenticated; older ones are not")
+        # Put back the checkpoint that was stored before the last payout was recorded.
+        self._edit_checkpoint(lambda value: saved["checkpoint"])
+        self.start_node(0, self.node_args)
+        authenticated, verified, through = self._load_wallet()
         assert_equal((authenticated, verified), (1, payouts))
+        assert through > 0
         assert_equal(self._snapshot(node.get_wallet_rpc(WALLET_NAME)), newer)
 
         self.log.info("A checkpoint block that left the active chain is ignored; the payouts above the fork are deactivated")

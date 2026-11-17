@@ -15,7 +15,10 @@ then checks that
 - the wallet's balances, transactions and payout records equal what a full
   rescan of the same chain produces,
 - the persisted position keeps working when the node's chain is shorter than
-  the wallet's own best block (the node lost unflushed blocks).
+  the wallet's own best block (the node lost unflushed blocks),
+- after new blocks replace the lost ones, the live wallet, the same wallet
+  after an unload and reload, the same wallet after a clean restart and a full
+  rescan all agree.
 """
 
 import re
@@ -45,6 +48,9 @@ class WalletBestBlockDurabilityTest(BitcoinTestFramework):
         self.node_args = [
             "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
+            # gettransaction must return the signed transaction with its witness data,
+            # so that the test can put the wallet's transactions back into the mempool.
+            "-rpcserialversion=1",
             "-staketimio=20",
             "-autostartstaking=0",
             "-qqautoshadowsignal=1",
@@ -112,6 +118,52 @@ class WalletBestBlockDurabilityTest(BitcoinTestFramework):
                     pick = lambda b: {k: b["mine"][k] for k in ("trusted", "untrusted_pending", "immature", "stake")}
                     raise AssertionError(f"balances differ: {pick(left[key])} != {pick(right[key])}")
                 raise AssertionError(f"{key} differs: {left[key]} != {right[key]}")
+
+    def _resubmit_wallet_transactions(self, wallet):
+        """Put the wallet's own unconfirmed transactions back into the mempool, as far as the chain allows.
+
+        The transactions of the blocks the node lost are inactive in the wallet
+        and not in the node's mempool (the restart emptied it). The wallet
+        retries them only at load and on its 12 to 24 hour timer, and a
+        transaction that is not final at the restart height (its lock time is
+        the height it was made at) is refused until the chain passes that
+        height. The live wallet therefore counts them as unspendable and their
+        inputs as spent until they are resubmitted, which is the same as for
+        any wallet transaction that dropped out of the mempool. Reloading
+        resubmits them, so a live and a reloaded wallet are compared only
+        after this step has made the mempool the same for both.
+        """
+        node = self.nodes[0]
+        submitted = 0
+        progress = True
+        while progress:
+            progress = False
+            for entry in wallet.listtransactions("*", 100000, 0, True):
+                if entry["category"] != "send" or entry["confirmations"] != 0 or entry.get("abandoned"):
+                    continue
+                tx = wallet.gettransaction(entry["txid"])
+                if node.testmempoolaccept([tx["hex"]])[0]["allowed"]:
+                    node.sendrawtransaction(tx["hex"])
+                    submitted += 1
+                    progress = True
+        node.syncwithvalidationinterfacequeue()
+        return submitted
+
+    def _check_live_reload_rescan(self, wallet, reload):
+        """The live wallet equals the same wallet after `reload` and after a full rescan."""
+        live = self._snapshot(wallet)
+        wallet = reload(wallet)
+        reloaded = self._snapshot(wallet)
+        self._assert_same(live, reloaded)
+        wallet.rescanblockchain(0)
+        self._assert_same(live, self._snapshot(wallet))
+        return wallet, live
+
+    def _unload_and_load(self, wallet):
+        wallet.unloadwallet()
+        node = self.nodes[0]
+        node.loadwallet(WALLET_NAME)
+        return node.get_wallet_rpc(WALLET_NAME)
 
     def _kill_node(self):
         """End the node as a power cut would: no shutdown, so no chainstate flush."""
@@ -191,11 +243,34 @@ class WalletBestBlockDurabilityTest(BitcoinTestFramework):
         wallet.rescanblockchain(0)
         self._assert_same(crashed, self._snapshot(wallet))
 
+        self.log.info("New blocks replace the lost ones: live wallet, reloaded wallet and full rescan agree")
+        for _ in range(3):
+            self._mine_pos_block(wallet)
+        resubmitted = self._resubmit_wallet_transactions(wallet)
+        self.log.info(f"{resubmitted} wallet transactions of the lost blocks are back in the mempool")
+        assert resubmitted > 0
+        wallet, replaced = self._check_live_reload_rescan(wallet, self._unload_and_load)
+
         self.log.info("A clean restart keeps the state and needs no rescan")
         self.stop_node(0)
         wallet, rescanned, _ = self._start_and_load()
         assert_equal(rescanned, 0)
-        self._assert_same(crashed, self._snapshot(wallet))
+        self._assert_same(replaced, self._snapshot(wallet))
+
+        self.log.info("After a clean restart too, more blocks keep live, reloaded and rescanned wallets equal")
+        node = self.nodes[0]
+        self._set_mocktime((node.getblockheader(node.getbestblockhash())["time"] & ~0xf) + 16)
+        for _ in range(2):
+            self._mine_pos_block(wallet)
+        self._resubmit_wallet_transactions(wallet)
+
+        def restart(_wallet):
+            self.stop_node(0)
+            reloaded, restart_rescanned, _ = self._start_and_load()
+            assert_equal(restart_rescanned, 0)
+            return reloaded
+
+        self._check_live_reload_rescan(wallet, restart)
 
 
 if __name__ == '__main__':

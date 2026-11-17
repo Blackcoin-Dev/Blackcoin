@@ -17,6 +17,7 @@
 #include <util/bip32.h>
 #include <util/check.h>
 #include <util/fs.h>
+#include <util/thread_qos.h>
 #include <util/time.h>
 #include <util/translation.h>
 #ifdef USE_BDB
@@ -1060,7 +1061,24 @@ struct LoadResult
 };
 
 using LoadFunc = std::function<DBErrors(CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err)>;
-static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std::string& key, DataStream& prefix, LoadFunc load_func)
+
+/**
+ * Where the time goes while loading one kind of record, for the "Wallet load
+ * phases" log line: stepping the database cursor, deserialising the record,
+ * and everything else the load callback does (for transactions, the index
+ * maintenance in CWallet::LoadToWallet). Four steady-clock reads per record.
+ */
+struct LoadSubPhaseTimes {
+    int64_t cursor_ns{0};
+    int64_t deserialize_ns{0};
+    int64_t index_ns{0};
+};
+static int64_t NowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(SteadyClock::now().time_since_epoch()).count();
+}
+
+static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std::string& key, DataStream& prefix, LoadFunc load_func, LoadSubPhaseTimes* timers = nullptr)
 {
     LoadResult result;
     DataStream ssKey;
@@ -1074,8 +1092,11 @@ static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std:
         return result;
     }
 
+    int64_t previous_end_ns = timers ? NowNs() : 0;
     while (true) {
         DatabaseCursor::Status status = cursor->Next(ssKey, ssValue);
+        const int64_t record_start_ns = timers ? NowNs() : 0;
+        if (timers) timers->cursor_ns += record_start_ns - previous_end_ns;
         if (status == DatabaseCursor::Status::DONE) {
             break;
         } else if (status == DatabaseCursor::Status::FAIL) {
@@ -1088,6 +1109,11 @@ static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std:
         assert(type == key);
         std::string error;
         DBErrors record_res = load_func(pwallet, ssKey, ssValue, error);
+        if (timers) {
+            previous_end_ns = NowNs();
+            // Deserialisation was already added by the callback; the rest of the callback is index maintenance.
+            timers->index_ns += previous_end_ns - record_start_ns;
+        }
         if (record_res != DBErrors::LOAD_OK) {
             pwallet->WalletLogPrintf("%s\n", error);
         }
@@ -1097,11 +1123,11 @@ static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std:
     return result;
 }
 
-static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std::string& key, LoadFunc load_func)
+static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std::string& key, LoadFunc load_func, LoadSubPhaseTimes* timers = nullptr)
 {
     DataStream prefix;
     prefix << key;
-    return LoadRecords(pwallet, batch, key, prefix, load_func);
+    return LoadRecords(pwallet, batch, key, prefix, load_func, timers);
 }
 
 static DBErrors LoadLegacyWalletRecords(CWallet* pwallet, DatabaseBatch& batch, int last_client) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
@@ -1759,7 +1785,7 @@ static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) E
     return result;
 }
 
-static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vector<uint256>& upgraded_txs, bool& any_unordered) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vector<uint256>& upgraded_txs, bool& any_unordered, LoadSubPhaseTimes& sub_times) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
 {
     AssertLockHeld(pwallet->cs_wallet);
     DBErrors result = DBErrors::LOAD_OK;
@@ -1767,7 +1793,7 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vecto
     // Load tx record
     any_unordered = false;
     LoadResult tx_res = LoadRecords(pwallet, batch, DBKeys::TX,
-        [&any_unordered, &upgraded_txs] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+        [&any_unordered, &upgraded_txs, &sub_times] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
         DBErrors result = DBErrors::LOAD_OK;
         uint256 hash;
         key >> hash;
@@ -1780,7 +1806,11 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vecto
                 result = DBErrors::CORRUPT;
                 return false;
             }
+            const int64_t deserialize_start_ns = NowNs();
             value >> wtx;
+            const int64_t deserialize_ns = NowNs() - deserialize_start_ns;
+            sub_times.deserialize_ns += deserialize_ns;
+            sub_times.index_ns -= deserialize_ns; // LoadRecords charges the whole callback to the index bucket
             if (wtx.GetHash() != hash)
                 return false;
 
@@ -1815,7 +1845,7 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vecto
             result = std::max(result, DBErrors::NEED_RESCAN);
         }
         return result;
-    });
+    }, &sub_times);
     result = std::max(result, tx_res.m_result);
 
     // Load locked utxo record
@@ -1999,11 +2029,17 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         struct PhaseReport {
             int64_t legacy{0}, descriptors{0}, quantum{0}, address_book{0}, transactions{0}, active_spkms{0}, decryption{0};
             size_t tx_count{0};
+            LoadSubPhaseTimes tx_sub;
         } phases;
+        const auto load_start = SteadyClock::now();
+        const std::optional<int64_t> load_cpu_start = util::CurrentThreadCpuMicros();
         const auto report_phases = [&]() {
-            pwallet->WalletLogPrintf("Wallet load phases (ms): legacy keys %d, descriptors %d, quantum and RGB records %d, address book %d, %u transactions %d, active script managers %d, decryption keys %d\n",
+            pwallet->WalletLogPrintf("Wallet load phases (ms): legacy keys %d, descriptors %d, quantum and RGB records %d, address book %d, %u transactions %d (cursor %d, deserialize %d, index %d), active script managers %d, decryption keys %d; total wall %d%s\n",
                                      phases.legacy, phases.descriptors, phases.quantum, phases.address_book,
-                                     phases.tx_count, phases.transactions, phases.active_spkms, phases.decryption);
+                                     phases.tx_count, phases.transactions,
+                                     phases.tx_sub.cursor_ns / 1000000, phases.tx_sub.deserialize_ns / 1000000, phases.tx_sub.index_ns / 1000000,
+                                     phases.active_spkms, phases.decryption, elapsed_ms(load_start),
+                                     util::FormatThreadLoadContext(load_cpu_start));
         };
 
         // Load legacy wallet keys
@@ -2028,7 +2064,7 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         phases.address_book = lap();
 
         // Load tx records
-        result = std::max(LoadTxRecords(pwallet, *m_batch, upgraded_txs, any_unordered), result);
+        result = std::max(LoadTxRecords(pwallet, *m_batch, upgraded_txs, any_unordered, phases.tx_sub), result);
         phases.transactions = lap();
         phases.tx_count = pwallet->mapWallet.size();
 

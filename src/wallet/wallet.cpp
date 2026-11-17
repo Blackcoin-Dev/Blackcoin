@@ -74,6 +74,7 @@
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/getuniquepath.h>
+#include <util/thread_qos.h>
 #include <util/message.h>
 #include <util/moneystr.h>
 #include <util/result.h>
@@ -6598,6 +6599,7 @@ DBErrors CWallet::LoadWallet()
     std::vector<SyntheticPayoutRef> synthetic_payout_refs;
     std::optional<SyntheticPayoutCheckpoint> payout_checkpoint;
     const auto load_start{SteadyClock::now()};
+    const std::optional<int64_t> load_cpu_start{util::CurrentThreadCpuMicros()};
     {
         LOCK(cs_wallet);
         WalletBatch load_batch(GetDatabase());
@@ -6745,10 +6747,14 @@ DBErrors CWallet::LoadWallet()
                 reconciliation_write_ok;
         }
     }
-    WalletLogPrintf("Wallet load: %d ms reading the database, %d ms chain snapshot and payout check, %d ms reconciling wallet records\n",
+    // wall is the whole load; thread-cpu is this thread's CPU time over the same span. CPU close to wall
+    // with every phase slow means slow cores; CPU far below wall means descheduled or waiting on I/O.
+    WalletLogPrintf("Wallet load: %d ms reading the database, %d ms chain snapshot and payout check, %d ms reconciling wallet records; total wall %d ms%s\n",
                     Ticks<std::chrono::milliseconds>(db_done - load_start),
                     Ticks<std::chrono::milliseconds>(chain_snapshot_done - db_done),
-                    Ticks<std::chrono::milliseconds>(SteadyClock::now() - chain_snapshot_done));
+                    Ticks<std::chrono::milliseconds>(SteadyClock::now() - chain_snapshot_done),
+                    Ticks<std::chrono::milliseconds>(SteadyClock::now() - load_start),
+                    util::FormatThreadLoadContext(load_cpu_start));
     if (!reconciliation_write_ok) {
         WalletLogPrintf("Failed to persist one or more synthetic Gold Rush payout reconciliation updates while loading the wallet\n");
         if (static_cast<int>(nLoadWalletRet) < static_cast<int>(DBErrors::NONCRITICAL_ERROR)) {

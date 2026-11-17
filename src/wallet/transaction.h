@@ -216,12 +216,43 @@ public:
      * externally and came in through the network or sendrawtransaction RPC.
      */
     bool fFromMe;
-    int64_t nOrderPos; //!< position in ordered transaction list
-    std::multimap<int64_t, CWalletTx*>::const_iterator m_it_wtxOrdered;
 
-    // memory only
-    enum AmountType { DEBIT, CREDIT, IMMATURE_CREDIT, AVAILABLE_CREDIT, AMOUNTTYPE_ENUM_ELEMENTS };
-    mutable CachableAmount m_amounts[AMOUNTTYPE_ENUM_ELEMENTS];
+    /**
+     * Memory-only Gold Rush claim index state of the wallet's own (mapWallet)
+     * copy of this record. These bits, with m_shadow_pow_relay_frontier
+     * below, replace per-transaction membership in txid-keyed containers on
+     * CWallet, so they describe the record a txid names, not a value: a copy
+     * starts unindexed and assigning to a record leaves its index state
+     * alone. Maintained only by the CWallet claim index functions, under
+     * cs_wallet.
+     */
+    struct ShadowPowIndexState {
+        //! The transaction bytes carry a QQSPROOF (ownership independent).
+        bool proof : 1;
+        //! Proof record classified as locally relevant (authored, adopted, from-me or implicitly owned).
+        bool claim : 1;
+        //! m_shadow_pow_relay_frontier is this record's entry in one of the two ordered relay-frontier sets.
+        bool has_relay_frontier : 1;
+        //! That entry is in the legacy receipt-clock set, not the schema set.
+        bool legacy_relay_frontier : 1;
+        //! Each distinct non-null input of this proof record holds one reference in the proof-anchor index.
+        bool proof_inputs_from_vin : 1;
+
+        ShadowPowIndexState() noexcept : proof{false}, claim{false}, has_relay_frontier{false}, legacy_relay_frontier{false}, proof_inputs_from_vin{false} {}
+        ShadowPowIndexState(const ShadowPowIndexState&) noexcept : ShadowPowIndexState{} {}
+        ShadowPowIndexState& operator=(const ShadowPowIndexState&) noexcept { return *this; }
+    };
+    //! Relay-expiry frontier of this record (meaningful when has_relay_frontier). Not copied, like the bits.
+    struct ShadowPowRelayFrontier {
+        int64_t value{0};
+        ShadowPowRelayFrontier() noexcept = default;
+        ShadowPowRelayFrontier(const ShadowPowRelayFrontier&) noexcept {}
+        ShadowPowRelayFrontier& operator=(const ShadowPowRelayFrontier&) noexcept { return *this; }
+    };
+    // The index bits and the two cache flags sit together in what was padding
+    // after fFromMe, and the frontier takes the slot the flags had, so the
+    // index state adds nothing to the size of a record.
+    mutable ShadowPowIndexState m_shadow_pow_index;
     /**
      * This flag is true if all m_amounts caches are empty. This is particularly
      * useful in places where MarkDirty is conditionally called and the
@@ -230,7 +261,23 @@ public:
      */
     mutable bool m_is_cache_empty{true};
     mutable bool fChangeCached;
+
+    int64_t nOrderPos; //!< position in ordered transaction list
+    std::multimap<int64_t, CWalletTx*>::const_iterator m_it_wtxOrdered;
+
+    // memory only
+    enum AmountType { DEBIT, CREDIT, IMMATURE_CREDIT, AVAILABLE_CREDIT, AMOUNTTYPE_ENUM_ELEMENTS };
+    mutable CachableAmount m_amounts[AMOUNTTYPE_ENUM_ELEMENTS];
+    mutable ShadowPowRelayFrontier m_shadow_pow_relay_frontier;
     mutable CAmount nChangeCached;
+
+    //! Forget this record's claim index state (CWallet::RebuildShadowPowClaimIndexesLocked).
+    void ResetShadowPowIndexState() const noexcept
+    {
+        m_shadow_pow_index.proof = m_shadow_pow_index.claim = m_shadow_pow_index.has_relay_frontier =
+            m_shadow_pow_index.legacy_relay_frontier = m_shadow_pow_index.proof_inputs_from_vin = false;
+        m_shadow_pow_relay_frontier.value = 0;
+    }
 
     CWalletTx(CTransactionRef tx, const TxState& state) : tx(std::move(tx)), m_state(state)
     {

@@ -3289,7 +3289,7 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
         // in this callback. Unknown ownership is handled by bounded repair.
         size_t record_work{0}, record_bytes{0};
         if (reason != MemPoolRemovalReason::BLOCK &&
-            m_shadow_pow_claim_txids.count(tx->GetHash()) != 0 &&
+            IsShadowPowLocalClaimIndexedLocked(tx->GetHash()) &&
             ConsumeShadowPowRepairRecordBudget(it->second, record_work, record_bytes)) {
             auto root_it = mapWallet.find(tx->GetHash());
             if (root_it != mapWallet.end() && root_it->second.isUnconfirmed()) {
@@ -7008,8 +7008,12 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
             --m_shadow_pow_claim_stale_ownership_records;
         }
         ClearShadowPowProofPresenceIndexLocked(hash);
+        // The proof, local-claim and relay-frontier indexes are stored on the
+        // record and go with it; only the ordered frontier entry remains.
+        const bool had_relay_frontier{it->second.m_shadow_pow_index.has_relay_frontier};
+        const bool legacy_relay_frontier{it->second.m_shadow_pow_index.legacy_relay_frontier};
+        const int64_t relay_frontier{it->second.m_shadow_pow_relay_frontier.value};
         mapWallet.erase(it);
-        m_shadow_pow_claim_txids.erase(hash);
         m_shadow_pow_managed_resolution_txids.erase(hash);
         m_shadow_pow_legacy_cleanup_pending_txids.erase(hash);
         m_shadow_pow_unconfirmed_claim_txids.erase(hash);
@@ -7018,14 +7022,11 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
         m_shadow_pow_foreign_claim_txids.erase(hash);
         m_shadow_pow_unconfirmed_implicit_claim_txids.erase(hash);
         m_shadow_pow_claim_ownership_generation_by_txid.erase(hash);
-        const auto frontier =
-            m_shadow_pow_relay_frontier_by_txid.find(hash);
-        if (frontier != m_shadow_pow_relay_frontier_by_txid.end()) {
-            auto& domain = frontier->second.first
+        if (had_relay_frontier) {
+            auto& domain = legacy_relay_frontier
                 ? m_shadow_pow_legacy_relay_frontiers
                 : m_shadow_pow_schema_relay_frontiers;
-            domain.erase({frontier->second.second, hash});
-            m_shadow_pow_relay_frontier_by_txid.erase(frontier);
+            domain.erase({relay_frontier, hash});
         }
         for (const uint256& spender_txid : direct_spenders) {
             const auto spender = mapWallet.find(spender_txid);

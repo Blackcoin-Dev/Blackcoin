@@ -1312,7 +1312,9 @@ private:
     // independent of unrelated ordinary wallet history while cs_main is
     // held. Runtime graph construction still enforces its own strict work
     // budget before any proof evaluation.
-    std::set<uint256> m_shadow_pow_claim_txids GUARDED_BY(cs_wallet);
+    // Kept as CWalletTx::m_shadow_pow_index.claim on the record itself: a
+    // lifetime set of every claim cost one tree node per claim. Read it with
+    // IsShadowPowLocalClaimIndexedLocked().
     // Metadata-presence indexes are independent of claim proof ownership.
     // Keep malformed and terminal managed records visible to usage accounting.
     std::set<uint256> m_shadow_pow_managed_resolution_txids GUARDED_BY(cs_wallet);
@@ -1322,7 +1324,8 @@ private:
     // Ownership-independent proof-presence index. This deliberately includes
     // confirmed incoming and foreign QQSPROOF carriers so warm ordering and
     // historical-anchor reservation remain TransactionHasShadowProof-exact.
-    std::set<uint256> m_shadow_pow_all_proof_txids GUARDED_BY(cs_wallet);
+    // Kept as CWalletTx::m_shadow_pow_index.proof on the record itself; read
+    // it with IsIndexedShadowPowClaimLocked().
     // Runtime callbacks do not parse records above the per-record byte cap.
     // Any such record makes proof presence unknown and warm selection returns
     // a typed capacity result before authorizing a prefix.
@@ -1340,15 +1343,22 @@ private:
         GUARDED_BY(cs_wallet);
     // Complete incremental reverse index for ownership-independent proof
     // anchors. Lifetime history is never walked or capped by hot selection.
+    // A proof record indexed from its own inputs (every ordinary claim) keeps
+    // no vector here: CWalletTx::m_shadow_pow_index.proof_inputs_from_vin
+    // says that its distinct non-null inputs are the ones referenced, and
+    // they are read back from the immutable transaction. Only an input list
+    // supplied by the out-of-lock classifier is stored.
     std::map<uint256, std::vector<COutPoint>>
         m_shadow_pow_proof_inputs_by_txid GUARDED_BY(cs_wallet);
-    std::map<COutPoint, std::set<uint256>> m_shadow_pow_proof_anchor_txids
+    // Number of indexed records that reference each anchor (each record
+    // counts once per outpoint). Only presence is ever read.
+    std::map<COutPoint, uint32_t> m_shadow_pow_proof_anchor_txids
         GUARDED_BY(cs_wallet);
     // Unknown oversized records conservatively reserve their input anchors
     // until the out-of-lock type classifier proves them ordinary or proof.
     std::map<uint256, std::vector<COutPoint>>
         m_shadow_pow_unknown_inputs_by_txid GUARDED_BY(cs_wallet);
-    std::map<COutPoint, std::set<uint256>> m_shadow_pow_unknown_anchor_txids
+    std::map<COutPoint, uint32_t> m_shadow_pow_unknown_anchor_txids
         GUARDED_BY(cs_wallet);
     std::set<uint256> m_shadow_pow_proof_input_index_pending_txids
         GUARDED_BY(cs_wallet);
@@ -1407,8 +1417,9 @@ private:
         m_shadow_pow_schema_relay_frontiers GUARDED_BY(cs_wallet);
     std::set<std::pair<int64_t, uint256>>
         m_shadow_pow_legacy_relay_frontiers GUARDED_BY(cs_wallet);
-    std::map<uint256, std::pair<bool, int64_t>>
-        m_shadow_pow_relay_frontier_by_txid GUARDED_BY(cs_wallet);
+    // The reverse index (which set, which frontier) is kept on the record:
+    // CWalletTx::m_shadow_pow_index.{has_relay_frontier, legacy_relay_frontier}
+    // and CWalletTx::m_shadow_pow_relay_frontier.
     // Durable monotonic maximum of validated relay-expiry frontiers. It
     // advances in one scalar write after cs_main is released, so a later
     // chain-time or released-record receipt-clock rollback cannot revive
@@ -2160,13 +2171,33 @@ public:
     bool IsIndexedShadowPowClaimLocked(const uint256& txid) const
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
-        return m_shadow_pow_all_proof_txids.count(txid) != 0;
+        const auto it = mapWallet.find(txid);
+        return it != mapWallet.end() && it->second.m_shadow_pow_index.proof;
     }
 
-    const std::set<uint256>& GetAllShadowPowProofTxidsLocked() const
+    //! Whether txid is a proof record indexed as a local claim (the former
+    //! m_shadow_pow_claim_txids membership).
+    bool IsShadowPowLocalClaimIndexedLocked(const uint256& txid) const
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
-        return m_shadow_pow_all_proof_txids;
+        const auto it = mapWallet.find(txid);
+        return it != mapWallet.end() && it->second.m_shadow_pow_index.claim;
+    }
+
+    //! Insert into (true) or erase from (false) the two per-record indexes.
+    //! They are keyed by txid like the sets they replace: the bit lives on
+    //! the wallet's own record of txid, whichever copy the caller holds.
+    void SetShadowPowLocalClaimIndexedLocked(const uint256& txid, bool indexed) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        const auto it = mapWallet.find(txid);
+        if (it != mapWallet.end()) it->second.m_shadow_pow_index.claim = indexed;
+    }
+    void SetShadowPowProofIndexedLocked(const uint256& txid, bool indexed) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        const auto it = mapWallet.find(txid);
+        if (it != mapWallet.end()) it->second.m_shadow_pow_index.proof = indexed;
     }
 
     bool IsNonConfirmedShadowPowProofLocked(const uint256& txid) const
@@ -2175,18 +2206,29 @@ public:
         return m_shadow_pow_nonconfirmed_proof_txids.count(txid) != 0;
     }
 
+    //! Whether the claim index state kept on the records (proof and local
+    //! claim bits, relay frontier, anchor references) agrees with the
+    //! containers it is paired with and with what a recomputation from the
+    //! records gives. Walks the whole history: tests only. On failure the
+    //! first disagreement is described in *failure.
+    bool CheckShadowPowClaimIndexConsistencyLocked(std::string* failure = nullptr) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     //! Whether every proof or unknown-presence record that is not confirmed
-    //! is in the non-confirmed index. Walks the whole history: tests only.
+    //! is in the non-confirmed index, and the per-record claim index state is
+    //! consistent. Walks the whole history: tests only.
     bool CheckShadowPowNonConfirmedProofIndexLocked() const
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
-        for (const auto* txids : {&m_shadow_pow_all_proof_txids,
-                                  &m_shadow_pow_unknown_proof_presence_txids}) {
-            for (const uint256& txid : *txids) {
-                const auto it = mapWallet.find(txid);
-                if (it == mapWallet.end() || it->second.isConfirmed()) continue;
-                if (m_shadow_pow_nonconfirmed_proof_txids.count(txid) == 0) return false;
-            }
+        if (!CheckShadowPowClaimIndexConsistencyLocked()) return false;
+        for (const auto& [txid, wtx] : mapWallet) {
+            if (!wtx.m_shadow_pow_index.proof || wtx.isConfirmed()) continue;
+            if (m_shadow_pow_nonconfirmed_proof_txids.count(txid) == 0) return false;
+        }
+        for (const uint256& txid : m_shadow_pow_unknown_proof_presence_txids) {
+            const auto it = mapWallet.find(txid);
+            if (it == mapWallet.end() || it->second.isConfirmed()) continue;
+            if (m_shadow_pow_nonconfirmed_proof_txids.count(txid) == 0) return false;
         }
         return true;
     }

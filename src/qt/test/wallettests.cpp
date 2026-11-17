@@ -5421,6 +5421,32 @@ void TestLazyWalletHistory(interfaces::Node& node, const std::shared_ptr<CWallet
     QCOMPARE(WalletModel::historyLoadWaitingForTest(), size_t{0});
     first.reset();
     shown.reset();
+
+    // 5. A hidden wallet whose lock stays busy does not keep the turn from the wallet being shown.
+    auto stuck = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    auto looked_at = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, second_wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    stuck->setBalancePollForeground(false);
+    std::promise<void> lock_taken, lock_release;
+    std::shared_future<void> release_future{lock_release.get_future().share()};
+    std::thread lock_holder([&] {
+        LOCK(wallet->cs_wallet);
+        lock_taken.set_value();
+        release_future.wait();
+    });
+    lock_taken.get_future().wait();
+    stuck->requestHistory();
+    QTest::qWait(200);
+    QVERIFY(WalletModel::historyLoadActiveForTest() == stuck.get());
+    QVERIFY(!stuck->getTransactionTableModel()->isHistoryLoaded());
+    looked_at->requestHistory();
+    QTRY_VERIFY_WITH_TIMEOUT(looked_at->getTransactionTableModel()->isHistoryLoaded(), 10000);
+    QVERIFY(!stuck->getTransactionTableModel()->isHistoryLoaded());
+    lock_release.set_value();
+    lock_holder.join();
+    QTRY_VERIFY_WITH_TIMEOUT(stuck->getTransactionTableModel()->isHistoryLoaded(), 60000);
+    QTRY_VERIFY_WITH_TIMEOUT(WalletModel::historyLoadActiveForTest() == nullptr, 5000);
+    stuck.reset();
+    looked_at.reset();
 }
 
 void TestBatchedStatusRefresh(interfaces::Node& node, TestChain100Setup& test, const std::shared_ptr<CWallet>& wallet)

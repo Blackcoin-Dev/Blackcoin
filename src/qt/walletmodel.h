@@ -500,6 +500,8 @@ private:
     struct HistoryLoad;
     void runHistoryChunk();
     void historyChunkDone();
+    //! A wallet that is not shown gives its turn to the one that is; true when it did.
+    bool yieldHistorySlotToShownWallet();
     void releaseHistorySlot();
     static void startNextHistoryLoad();
     std::shared_ptr<HistoryLoad> m_history_load;

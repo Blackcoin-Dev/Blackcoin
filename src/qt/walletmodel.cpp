@@ -268,7 +268,9 @@ void WalletModel::runHistoryChunk()
                 return;
             }
             if (busy) {
-                // The wallet lock was busy (a staking pass, a scan): ask again shortly, holding our turn.
+                // The wallet lock was busy (a staking pass, a scan). A wallet that may be busy for long must not hold
+                // the process-wide turn against the wallet being shown; otherwise ask again shortly, holding our turn.
+                if (yieldHistorySlotToShownWallet()) return;
                 QTimer::singleShot(25, this, &WalletModel::runHistoryChunk);
                 return;
             }
@@ -291,7 +293,7 @@ void WalletModel::runHistoryChunk()
     assert(invoked);
 }
 
-void WalletModel::historyChunkDone()
+bool WalletModel::yieldHistorySlotToShownWallet()
 {
     // A wallet that is not shown gives way to one that is: its place in the file is kept (the read resumes where it
     // stopped), and the wallet being looked at starts at once.
@@ -300,8 +302,14 @@ void WalletModel::historyChunkDone()
         waiting.push_back(this);
         HistoryActive().clear();
         startNextHistoryLoad();
-        return;
+        return true;
     }
+    return false;
+}
+
+void WalletModel::historyChunkDone()
+{
+    if (yieldHistorySlotToShownWallet()) return;
     // Another worker request asked for the thread: let it run before the next chunk.
     int delay_ms{0};
     if (m_history_yield.exchange(false, std::memory_order_acq_rel)) delay_ms = 25;

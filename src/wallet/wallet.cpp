@@ -5056,6 +5056,20 @@ void CWallet::RepairStaleShadowTransactions(bool force)
         return;
     }
 
+    // Everything below only repairs records of the hot claim sets. With all of
+    // them empty (the normal state of a wallet that holds no unconfirmed or
+    // unclassified claim) the inventory build is skipped; the per-minute pass
+    // then costs a few set size checks instead of a graph build.
+    {
+        LOCK(cs_wallet);
+        if (m_shadow_pow_unconfirmed_claim_txids.empty() &&
+            m_shadow_pow_unconfirmed_implicit_claim_txids.empty() &&
+            m_shadow_pow_unclassified_claim_txids.empty() &&
+            !ShadowPowProofInputIndexUnavailableLocked()) {
+            return;
+        }
+    }
+
     // Reuse the bounded indexed graph and its wallet-scoped singleflight
     // cache. Argon2 runs outside both locks, and snapshot retries are bounded
     // even for force=true. Full mempool-policy acceptance belongs exclusively

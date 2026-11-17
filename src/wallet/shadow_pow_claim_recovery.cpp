@@ -6560,7 +6560,13 @@ void CWallet::MaybeAutoResolveShadowPowClaims()
     // operator reviewed. Creation still could never exceed the wallet max.
     manual_retry.max_fee_per_resolution = m_default_max_tx_fee;
     manual_retry.aggregate_batch_fee_cap = MAX_MONEY;
-    if (HaveChain() && chain().isReadyToBroadcast()) {
+    // The retry only looks for managed resolution records. The metadata index
+    // that feeds the inventory's MANAGED_RESOLUTION nodes is empty for almost
+    // every wallet, and building the inventory is the expensive part of this
+    // per-minute pass, so skip it when there is nothing it could find.
+    const bool have_managed_resolutions = WITH_LOCK(
+        cs_wallet, return !m_shadow_pow_managed_resolution_txids.empty());
+    if (have_managed_resolutions && HaveChain() && chain().isReadyToBroadcast()) {
         const ShadowPowClaimRecoveryInventory inventory =
             GetShadowPowClaimRecoveryInventory();
         for (const ShadowPowClaimRecoveryComponent& component :

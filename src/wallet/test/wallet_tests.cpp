@@ -9790,6 +9790,12 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     }
 
 
+    // A repeated add is not logged any more, but it still announces the
+    // transaction, so the stale events are visible through that signal.
+    std::map<uint256, int> announced;
+    boost::signals2::scoped_connection announce_connection{wallet->NotifyTransactionChanged.connect(
+        [&announced](const uint256& txid, ChangeType) { ++announced[txid]; })};
+
     // Unblock notification queue and make sure stale blockConnected and
     // transactionAddedToMempool events are processed
     promise.set_value();
@@ -9797,6 +9803,10 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     // The stale block_tx and mempool_tx events re-add records the wallet
     // already holds in the same state, so nothing more is logged
     BOOST_CHECK_EQUAL(addtx_count, 2);
+    // but each was processed once more and announced
+    BOOST_CHECK_EQUAL(announced[block_tx.GetHash()], 1);
+    BOOST_CHECK_EQUAL(announced[mempool_tx.GetHash()], 1);
+    announce_connection.disconnect();
 
 
     TestUnloadWallet(std::move(wallet));

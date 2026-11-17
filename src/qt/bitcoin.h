@@ -11,6 +11,7 @@
 
 #include <interfaces/node.h>
 #include <qt/initexecutor.h>
+#include <qt/macos_appnap.h>
 
 #include <assert.h>
 #include <memory>
@@ -116,6 +117,10 @@ private:
     QString m_chainstate_rebuild_phase;
     QStringList m_relaunch_arguments;
     bool m_shutdown_in_progress{false};
+#ifdef Q_OS_MACOS
+    //! Keeps macOS App Nap off from the start of init until the window has taken over and again through shutdown.
+    std::unique_ptr<CAppNapInhibitor> m_init_app_nap;
+#endif
 
     void startThread();
     void scheduleChainstateRelaunch(const QString& phase);

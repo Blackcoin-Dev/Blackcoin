@@ -242,6 +242,12 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
 
 #ifdef Q_OS_MACOS
     m_app_nap_inhibitor = new CAppNapInhibitor;
+    // Held until the first tip update says otherwise: the application also
+    // holds its own activity from the start of init, so there is no gap.
+    m_app_nap_inhibitor->disableAppNap();
+    m_app_nap_timer = new QTimer(this);
+    connect(m_app_nap_timer, &QTimer::timeout, this, &BitcoinGUI::pollAppNapWalletWork);
+    m_app_nap_timer->start(5000);
 #endif
 
     GUIUtil::handleCloseWindowShortcut(this);
@@ -1166,13 +1172,11 @@ void BitcoinGUI::openOptionsDialogWithTab(OptionsDialog::Tab tab)
 
 void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVerificationProgress, SyncType synctype, SynchronizationState sync_state)
 {
-// Disabling macOS App Nap on initial sync, disk and reindex operations.
+// Disabling macOS App Nap on initial sync, disk and reindex operations, and
+// while any loaded wallet is staking or mining (see applyAppNapPolicy()).
 #ifdef Q_OS_MACOS
-    if (sync_state == SynchronizationState::POST_INIT) {
-        m_app_nap_inhibitor->enableAppNap();
-    } else {
-        m_app_nap_inhibitor->disableAppNap();
-    }
+    m_app_nap_sync_work = sync_state != SynchronizationState::POST_INIT;
+    applyAppNapPolicy();
 #endif
 
     if (modalOverlay)
@@ -1826,8 +1830,46 @@ void BitcoinGUI::unsubscribeFromCoreSignals()
     m_handler_question->disconnect();
 }
 
+#ifdef Q_OS_MACOS
+void BitcoinGUI::applyAppNapPolicy()
+{
+    if (!m_app_nap_inhibitor) return;
+    if (m_app_nap_sync_work || m_app_nap_wallet_work) {
+        m_app_nap_inhibitor->disableAppNap();
+    } else {
+        m_app_nap_inhibitor->enableAppNap();
+    }
+}
+
+bool BitcoinGUI::anyWalletStakingOrMining() const
+{
+#ifdef ENABLE_WALLET
+    if (!m_wallet_controller) return false;
+    for (WalletModel* wallet_model : m_wallet_controller->getOpenWallets()) {
+        interfaces::Wallet& wallet = wallet_model->wallet();
+        if (wallet.getStakingInfo().enabled || wallet.getPowMiningInfo().enabled) return true;
+    }
+#endif
+    return false;
+}
+
+void BitcoinGUI::pollAppNapWalletWork()
+{
+    if (!clientModel) return;
+    const bool work = anyWalletStakingOrMining();
+    if (work == m_app_nap_wallet_work) return;
+    m_app_nap_wallet_work = work;
+    applyAppNapPolicy();
+}
+#endif
+
 void BitcoinGUI::beginShutdown()
 {
+#ifdef Q_OS_MACOS
+    // Closing the wallets flushes every database; keep the process out of App Nap until it exits.
+    if (m_app_nap_timer) m_app_nap_timer->stop();
+    if (m_app_nap_inhibitor) m_app_nap_inhibitor->disableAppNap();
+#endif
     shadowResourceDialog->requestShutdown();
     if (rpcConsole) rpcConsole->beginShutdown();
 #ifdef ENABLE_WALLET

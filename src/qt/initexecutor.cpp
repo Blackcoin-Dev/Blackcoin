@@ -6,6 +6,8 @@
 
 #include <interfaces/node.h>
 #include <util/exception.h>
+#include <logging.h>
+#include <util/thread_qos.h>
 #include <util/threadnames.h>
 
 #include <exception>
@@ -42,6 +44,16 @@ void InitExecutor::initialize()
     QMetaObject::invokeMethod(&m_context, [this] {
         try {
             util::ThreadRename("qt-init");
+            // The init thread loads every wallet. Left at the default, macOS
+            // may run it on the efficiency cores while the window is in the
+            // background.
+            // A thread does not inherit its starter's class (measured), so
+            // every node thread started with TraceThread asks for the class
+            // itself from now on: scheduler, network, script checks, import.
+            util::SetDefaultThreadQosUserInitiated(true);
+            const bool qos_set = util::SetCurrentThreadQosUserInitiated();
+            LogPrintf("qt-init thread QoS: set=%s class=%s\n", qos_set ? "yes" : "no",
+                      util::CurrentThreadQosName().value_or("n/a"));
             qDebug() << "Running initialization in thread";
             interfaces::BlockAndHeaderTipInfo tip_info;
             interfaces::AppInitResult result = m_node.appInitMain(&tip_info);
@@ -58,6 +70,7 @@ void InitExecutor::shutdown()
 {
     QMetaObject::invokeMethod(&m_context, [this] {
         try {
+            util::SetCurrentThreadQosUserInitiated();
             qDebug() << "Running Shutdown in thread";
             m_node.appShutdown();
             qDebug() << "Shutdown finished";

@@ -38,6 +38,7 @@
 #include <uint256.h>
 #include <util/exception.h>
 #include <util/string.h>
+#include <util/thread_qos.h>
 #include <util/threadnames.h>
 #include <util/translation.h>
 #include <validation.h>
@@ -324,6 +325,11 @@ BitcoinApplication::BitcoinApplication()
     // Qt runs setlocale(LC_ALL, "") on initialization.
     RegisterMetaTypes();
     setQuitOnLastWindowClosed(false);
+    // The wallet load log lines report whether the application was frontmost.
+    util::SetApplicationActiveHint(applicationState() == Qt::ApplicationActive);
+    connect(this, &QGuiApplication::applicationStateChanged, this, [](Qt::ApplicationState state) {
+        util::SetApplicationActiveHint(state == Qt::ApplicationActive);
+    });
 }
 
 void BitcoinApplication::setupPlatformStyle()
@@ -466,6 +472,15 @@ void BitcoinApplication::parameterSetup()
 void BitcoinApplication::requestInitialize()
 {
     qDebug() << __func__ << ": Requesting initialize";
+#ifdef Q_OS_MACOS
+    // Loading wallets and the chainstate can take minutes; without an
+    // activity macOS App Nap may run the init thread on the efficiency cores
+    // whenever the window is not frontmost. The window's own inhibitor takes
+    // over once init has finished.
+    if (!m_init_app_nap) m_init_app_nap = std::make_unique<CAppNapInhibitor>();
+    m_init_app_nap->disableAppNap();
+    LogPrintf("macOS App Nap activity held for init: %s\n", m_init_app_nap->isAppNapDisabled() ? "yes" : "no");
+#endif
     startThread();
     Q_EMIT requestedInitialize();
 }
@@ -474,6 +489,10 @@ void BitcoinApplication::requestShutdown()
 {
     if (m_shutdown_in_progress) return;
     m_shutdown_in_progress = true;
+#ifdef Q_OS_MACOS
+    // Shutdown flushes every wallet database; keep it out of App Nap.
+    if (m_init_app_nap) m_init_app_nap->disableAppNap();
+#endif
 
     // Relaunch only after the durable COMMIT_READY transition. An interrupted
     // BUILDING journal exits without spawning a verifier and is recovered by
@@ -617,6 +636,10 @@ void BitcoinApplication::initializeResult(interfaces::AppInitResult result, inte
         }
 #endif
         pollShutdownTimer->start(SHUTDOWN_POLLING_DELAY);
+#ifdef Q_OS_MACOS
+        // The window now owns the policy (syncing, or a wallet staking or mining).
+        if (m_init_app_nap && !m_shutdown_in_progress) m_init_app_nap->enableAppNap();
+#endif
     }
 }
 

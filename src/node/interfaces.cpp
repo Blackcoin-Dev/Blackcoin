@@ -679,9 +679,26 @@ public:
     }
     CBlockLocator getDenseChainLocator(const uint256& block_hash) override
     {
-        LOCK(::cs_main);
-        const CBlockIndex* index = chainman().m_blockman.LookupBlockIndex(block_hash);
-        return GetDenseLocator(index);
+        // Every loaded wallet asks for the same block's locator on each block
+        // connection, so remember the last one. A block's locator depends only
+        // on its own ancestry, so a block hash is a complete key and a reorg
+        // cannot make the cached value stale.
+        {
+            LOCK(m_dense_locator_mutex);
+            if (m_dense_locator_hash == block_hash && !m_dense_locator.IsNull()) return m_dense_locator;
+        }
+        CBlockLocator locator;
+        {
+            LOCK(::cs_main);
+            const CBlockIndex* index = chainman().m_blockman.LookupBlockIndex(block_hash);
+            locator = GetDenseLocator(index);
+        }
+        if (!locator.IsNull()) {
+            LOCK(m_dense_locator_mutex);
+            m_dense_locator_hash = block_hash;
+            m_dense_locator = locator;
+        }
+        return locator;
     }
     std::optional<int> findLocatorFork(const CBlockLocator& locator) override
     {
@@ -985,6 +1002,9 @@ public:
     ChainstateManager& chainman() override { return *Assert(m_node.chainman); }
     const CTxMemPool& mempool() override { return *Assert(m_node.mempool); }
     NodeContext& m_node;
+    Mutex m_dense_locator_mutex;
+    uint256 m_dense_locator_hash GUARDED_BY(m_dense_locator_mutex);
+    CBlockLocator m_dense_locator GUARDED_BY(m_dense_locator_mutex);
 };
 } // namespace
 } // namespace node

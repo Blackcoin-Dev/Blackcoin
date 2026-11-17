@@ -19,6 +19,9 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <future>
+#include <thread>
+
 #include <sqlite3.h>
 
 namespace wallet {
@@ -295,6 +298,46 @@ BOOST_FIXTURE_TEST_CASE(dense_locator_resumes_within_a_few_blocks, TestChain100S
         BOOST_CHECK_LE(cutoff - *fork, lost < 10 ? 0 : 4);
         BOOST_CHECK_LE(cutoff - *fork, 4);
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(dense_chain_locator_is_built_once_per_block_and_follows_reorgs, TestChain100Setup)
+{
+    const auto tip_of = [&] { return WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return Assert(m_node.chainman)->ActiveChain().Tip()); };
+    CBlockIndex* old_tip = tip_of();
+    const uint256 old_hash = old_tip->GetBlockHash();
+    const CBlockLocator first = m_node.chain->getDenseChainLocator(old_hash);
+    BOOST_CHECK(first.vHave == GetDenseLocator(old_tip).vHave);
+
+    // The second call for the same block does not take cs_main: with cs_main held elsewhere it still returns.
+    std::promise<void> held, release;
+    std::thread holder([&] {
+        LOCK(::cs_main);
+        held.set_value();
+        release.get_future().wait();
+    });
+    held.get_future().wait();
+    auto cached = std::async(std::launch::async, [&] { return m_node.chain->getDenseChainLocator(old_hash); });
+    const bool served_without_cs_main = cached.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    release.set_value();
+    holder.join();
+    BOOST_REQUIRE(served_without_cs_main);
+    BOOST_CHECK(cached.get().vHave == first.vHave);
+
+    // A reorg: the cache is keyed by block hash, so the new tip gets its own locator and the old one stays right.
+    BlockValidationState state;
+    BOOST_REQUIRE(m_node.chainman->ActiveChainstate().InvalidateBlock(state, old_tip));
+    const CBlock replacement = CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    const CBlockIndex* new_tip = tip_of();
+    BOOST_REQUIRE(new_tip->GetBlockHash() == replacement.GetHash());
+    BOOST_REQUIRE(new_tip->GetBlockHash() != old_hash);
+    const CBlockLocator second = m_node.chain->getDenseChainLocator(new_tip->GetBlockHash());
+    BOOST_CHECK(second.vHave == GetDenseLocator(new_tip).vHave);
+    BOOST_CHECK(second.vHave.front() == new_tip->GetBlockHash());
+    BOOST_CHECK(m_node.chain->getDenseChainLocator(old_hash).vHave == first.vHave);
+    BOOST_CHECK(m_node.chain->getDenseChainLocator(new_tip->GetBlockHash()).vHave == second.vHave);
+    // An unknown block has no locator and does not disturb the cache.
+    BOOST_CHECK(m_node.chain->getDenseChainLocator(GetRandHash()).IsNull());
+    BOOST_CHECK(m_node.chain->getDenseChainLocator(new_tip->GetBlockHash()).vHave == second.vHave);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

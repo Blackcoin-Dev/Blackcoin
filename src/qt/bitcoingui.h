@@ -349,10 +349,11 @@ public Q_SLOTS:
 
 #ifdef ENABLE_WALLET
     void updateStakingIcon();
-#ifdef Q_OS_MACOS
-    /** Re-evaluate whether a staking or mining wallet needs App Nap held off. */
-    void pollAppNapWalletWork();
 #endif
+#ifdef Q_OS_MACOS
+    /** Re-evaluate whether a staking or mining wallet needs App Nap held off.
+     *  Declared without ENABLE_WALLET: the constructor connects it on every macOS build. */
+    void pollAppNapWalletWork();
 #endif
 
     /** called by a timer to check if ShutdownRequested() has been set **/

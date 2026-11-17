@@ -76,6 +76,8 @@ enum class TransactionError;
 namespace interfaces {
 class Wallet;
 }
+struct ShadowSyntheticPayoutTransaction;
+
 namespace wallet {
 class CWallet;
 class WalletClaimMaintenance;
@@ -428,6 +430,10 @@ struct WalletBlockTime {
     int64_t block_max_time{0};
 };
 class WalletBatch;
+class CWallet;
+/** Annotate the wallet record of a block's synthetic payout (comment, address, marker, clears the stale
+ *  mark) and keep the payout index and digest in step. Exposed for tests. */
+void AnnotateWalletShadowPayout(CWallet& wallet, const ::ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch);
 enum class DBErrors : int;
 } // namespace wallet
 struct CBlockLocator;
@@ -970,6 +976,7 @@ private:
     friend class WalletRescanReserver;
     friend struct WalletLoadTestAccess;
     friend class WalletClaimMaintenance;
+    friend void AnnotateWalletShadowPayout(CWallet& wallet, const ::ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch);
     std::shared_ptr<WalletClaimMaintenanceSlot> m_claim_maintenance GUARDED_BY(cs_wallet);
     bool m_claim_maintenance_unregistered GUARDED_BY(cs_wallet){false};
 

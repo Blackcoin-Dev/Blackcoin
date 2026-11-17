@@ -845,7 +845,7 @@ static std::vector<ShadowSyntheticPayoutTransaction> GetWalletShadowPayoutTransa
     return payouts;
 }
 
-static void AnnotateWalletShadowPayout(CWallet& wallet, const ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch)
+void AnnotateWalletShadowPayout(CWallet& wallet, const ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch)
 {
     AssertLockHeld(wallet.cs_wallet);
     if (!payout.tx) return;
@@ -876,6 +876,10 @@ static void AnnotateWalletShadowPayout(CWallet& wallet, const ShadowSyntheticPay
     changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY) != 0 || changed;
 
     if (changed) {
+        // The stale mark is part of the record's digest term. A record
+        // re-confirmed on its block while it still carried the mark was
+        // indexed with it, so the index follows the cleared mark.
+        wallet.UpdateConfirmedSyntheticPayoutIndex(wtx);
         batch.WriteTx(wtx);
         wtx.MarkDirty();
         wallet.NotifyTransactionChanged(txid, CT_UPDATED);

@@ -254,6 +254,41 @@ BOOST_AUTO_TEST_CASE(incremental_digest_equals_full_recompute_after_random_chang
     BOOST_CHECK_EQUAL(wallet.GetSyntheticPayoutDigestLocked(1000).first, 0U);
 }
 
+BOOST_AUTO_TEST_CASE(clearing_the_stale_mark_of_a_reconfirmed_payout_updates_the_digest)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{uint256{9}, 0});
+    tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    const CTransactionRef record = MakeTransactionRef(std::move(tx));
+    // A deactivated payout record carries the stale mark and is not confirmed.
+    BOOST_REQUIRE(wallet.AddToWallet(record, TxStateInactive{}, [](CWalletTx& wtx, bool) {
+        wtx.mapValue["qq_synthetic_goldrush_payout"] = "1";
+        wtx.mapValue["qq_synthetic_goldrush_payout_stale"] = "1";
+        return true;
+    }));
+    // Its block connects again: the record is confirmed with the mark still on it...
+    const uint256 block{7};
+    BOOST_REQUIRE(wallet.AddToWallet(record, TxStateConfirmed{block, 5, 0}));
+    // ...and the block's annotation clears the mark.
+    ShadowSyntheticPayoutTransaction payout;
+    payout.tx = record;
+    payout.target = CScript{} << OP_TRUE;
+    payout.amount = COIN;
+    {
+        LOCK(wallet.cs_wallet);
+        WalletBatch batch(wallet.GetDatabase());
+        AnnotateWalletShadowPayout(wallet, payout, batch);
+        BOOST_CHECK(wallet.mapWallet.at(record->GetHash()).mapValue.count("qq_synthetic_goldrush_payout_stale") == 0);
+        for (const int height : {-1, 4, 5, 1000}) {
+            BOOST_CHECK(wallet.GetSyntheticPayoutDigestLocked(height) ==
+                        wallet.RecomputeSyntheticPayoutDigestLocked(height, SyntheticPayoutCheckpoint::CURRENT_SCHEMA));
+        }
+        BOOST_CHECK_EQUAL(wallet.GetSyntheticPayoutDigestLocked(1000).first, 1U);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(checkpoint_written_by_the_previous_release_is_recognised)
 {
     std::vector<SyntheticPayoutRef> refs;

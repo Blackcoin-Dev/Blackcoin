@@ -196,6 +196,12 @@ bool ShadowPowClaimRefreshInputMatchesMiningGate(
 
 static constexpr int DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS{1};
 
+/** Largest live legacy claim-source subset the complete wallet snapshot accepts. Above it
+ * the PoW miner's snapshot fails with `legacy_source_outputs` and claim creation stops. */
+static constexpr size_t SHADOW_POW_CLAIM_LEGACY_SOURCE_OUTPUT_CAPACITY{65536};
+/** The wallet warns, and the logged capacity line turns into a warning, from this percentage. */
+static constexpr size_t SHADOW_POW_CLAIM_LEGACY_SOURCE_WARNING_PERCENT{75};
+
 /** Diagnostics from one complete wallet-only claim-input source snapshot.
  * Counts are observations, never input-selection authority. A nonnumeric
  * failure has zero observed/limit values. */
@@ -205,6 +211,7 @@ struct ShadowPowClaimInputEnumerationInfo {
     size_t capacity_limit{0};
     size_t live_outputs{0};
     size_t legacy_source_outputs{0};
+    size_t legacy_source_output_limit{SHADOW_POW_CLAIM_LEGACY_SOURCE_OUTPUT_CAPACITY};
     size_t script_managers{0};
     size_t manager_work{0};
     size_t source_work{0};
@@ -1030,6 +1037,13 @@ private:
     std::set<CScript> m_owned_legacy_shadow_scripts GUARDED_BY(cs_wallet);
     std::map<uint256, std::set<uint256>> m_confirmed_synthetic_payouts_by_block GUARDED_BY(cs_wallet);
     std::map<uint256, uint256> m_confirmed_synthetic_payout_block_by_txid GUARDED_BY(cs_wallet);
+    /** Every coinstake in the wallet. Whether a transaction is a coinstake never changes,
+     *  so this only follows insertion and removal. */
+    std::set<uint256> m_coinstake_txids GUARDED_BY(cs_wallet);
+    /** When the legacy claim-source capacity was last logged (steady clock). */
+    std::optional<std::chrono::steady_clock::time_point> m_legacy_source_capacity_reported GUARDED_BY(cs_wallet);
+    /** Incremental payout digest, kept in step with the two indexes above. */
+    SyntheticPayoutDigest m_synthetic_payout_digest GUARDED_BY(cs_wallet);
     void RefreshLatestShadowSolve(const CScript& target) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RemoveIndexedShadowSolve(const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void IndexConfirmedShadowSolve(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

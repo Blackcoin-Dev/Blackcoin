@@ -221,6 +221,10 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(gate["mining_gate_coherent"], True)
         assert_equal(gate["mining_gate_database_ambiguous"], False)
         assert_equal(gate["mining_gate_unsafe_claims"], 0)
+        enumeration = gate["claim_input_enumeration"]
+        assert_equal(enumeration["legacy_source_output_limit"], 65536)
+        assert_equal(enumeration["legacy_source_outputs_near_limit"], False)
+        assert enumeration["legacy_source_outputs"] < enumeration["legacy_source_output_limit"]
         assert_equal(gate["mining_gate_unsafe_components"], 0)
         assert_equal(gate["mining_gate_action"], "refresh_same_anchor")
         assert_equal(gate["mining_gate_can_submit"], True)

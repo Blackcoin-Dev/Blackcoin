@@ -4834,6 +4834,8 @@ static RPCHelpMan getpowmininginfo()
                 {RPCResult::Type::NUM, "capacity_limit", "Limit at the failed numeric guard, or zero for a nonnumeric guard."},
                 {RPCResult::Type::NUM, "live_outputs", "All wallet-known live outputs, including outputs that cannot be legacy claim inputs."},
                 {RPCResult::Type::NUM, "legacy_source_outputs", "Complete immutable-script legacy source subset before dynamic eligibility checks."},
+                {RPCResult::Type::NUM, "legacy_source_output_limit", "Largest legacy source subset the snapshot accepts; above it claim creation stops with capacity reason legacy_source_outputs."},
+                {RPCResult::Type::BOOL, "legacy_source_outputs_near_limit", "Whether legacy_source_outputs has reached 75% of legacy_source_output_limit; consolidate or spend small outputs."},
                 {RPCResult::Type::NUM, "script_managers", "Wallet script managers considered by the bounded scan."},
                 {RPCResult::Type::NUM, "manager_work", "Projected manager visits, when the earlier source and manager-count guards passed."},
                 {RPCResult::Type::NUM, "source_work", "Completed source and protected-asset work before success or refusal."},
@@ -5043,6 +5045,10 @@ static RPCHelpMan getpowmininginfo()
     input_enumeration.pushKV("capacity_limit", static_cast<uint64_t>(enumeration.capacity_limit));
     input_enumeration.pushKV("live_outputs", static_cast<uint64_t>(enumeration.live_outputs));
     input_enumeration.pushKV("legacy_source_outputs", static_cast<uint64_t>(enumeration.legacy_source_outputs));
+    input_enumeration.pushKV("legacy_source_output_limit", static_cast<uint64_t>(enumeration.legacy_source_output_limit));
+    input_enumeration.pushKV("legacy_source_outputs_near_limit",
+        enumeration.legacy_source_outputs * 100 >=
+            enumeration.legacy_source_output_limit * SHADOW_POW_CLAIM_LEGACY_SOURCE_WARNING_PERCENT);
     input_enumeration.pushKV("script_managers", static_cast<uint64_t>(enumeration.script_managers));
     input_enumeration.pushKV("manager_work", static_cast<uint64_t>(enumeration.manager_work));
     input_enumeration.pushKV("source_work", static_cast<uint64_t>(enumeration.source_work));

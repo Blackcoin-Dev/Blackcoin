@@ -5330,6 +5330,7 @@ void MaybeResendWalletTxs(WalletContext& context)
         MaybeAutoDemurrageAttest(*pwallet);
         MaybeAutoShadowSignal(*pwallet);
         MaybeAutoRedelegateQuantumColdStake(*pwallet);
+        pwallet->ReportLegacyClaimSourceCapacity(/*force=*/false);
         const bool resend = pwallet->ShouldResend();
         pwallet->RequestClaimMaintenance(/*resolve=*/true, /*relay=*/resend);
         if (!resend) continue;
@@ -9585,8 +9586,32 @@ bool CWallet::UpgradeWallet(int version, bilingual_str& error)
     return true;
 }
 
+void CWallet::ReportLegacyClaimSourceCapacity(bool force)
+{
+    LOCK(cs_wallet);
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && m_legacy_source_capacity_reported &&
+        now - *m_legacy_source_capacity_reported < std::chrono::hours{1}) {
+        return;
+    }
+    m_legacy_source_capacity_reported = now;
+    const size_t count = m_live_unspent_legacy_claim_outpoints.size();
+    const size_t limit = SHADOW_POW_CLAIM_LEGACY_SOURCE_OUTPUT_CAPACITY;
+    if (count > limit) {
+        WalletLogPrintf("Warning: %u live legacy claim source outputs exceed the %u the PoW miner can snapshot; Gold Rush claim creation is stopped until the count is reduced by consolidating or spending outputs\n",
+                        count, limit);
+    } else if (count * 100 >= limit * SHADOW_POW_CLAIM_LEGACY_SOURCE_WARNING_PERCENT) {
+        WalletLogPrintf("Warning: %u of %u live legacy claim source outputs (%u%%); above %u the PoW miner's wallet snapshot fails and claim creation stops. Consolidate or spend small outputs\n",
+                        count, limit, count * 100 / limit, limit);
+    } else {
+        WalletLogPrintf("Live legacy claim source outputs: %u of %u\n", count, limit);
+    }
+}
+
 void CWallet::postInitProcess()
 {
+    ReportLegacyClaimSourceCapacity(/*force=*/true);
+
     // Add wallet transactions that aren't already in a block to mempool
     // Do this here as mempool requires genesis block to be loaded
     ResubmitWalletTransactions(/*relay=*/false, /*force=*/true);
@@ -11579,7 +11604,7 @@ struct ShadowPowClaimStakeReserveSnapshot
  * Only the maintained immutable-script legacy subset consumes this budget:
  * quantum rewards and provably unusable outputs cannot be legacy claim or
  * reserve candidates. Keep this complete scan finite (not paginated). */
-constexpr size_t MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS{65536};
+constexpr size_t MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS{SHADOW_POW_CLAIM_LEGACY_SOURCE_OUTPUT_CAPACITY};
 // Charge outputs, protected-asset records, and spender edges together, with
 // headroom for spend history even at the output bound. The protected-asset
 // namespace retains its own, smaller preflight below.
@@ -11698,6 +11723,7 @@ ShadowPowClaimWarmSourceSnapshot BuildShadowPowClaimWarmSourceSnapshot(
     auto& diagnostics = snapshot.input_enumeration;
     diagnostics.live_outputs = wallet.GetLiveUnspentStakeOutpoints().size();
     diagnostics.legacy_source_outputs = wallet.GetLiveUnspentLegacyClaimOutpoints().size();
+    diagnostics.legacy_source_output_limit = MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS;
     diagnostics.script_managers = wallet.GetScriptPubKeyManCountLocked();
 
     const Consensus::Params& consensus = Params().GetConsensus();

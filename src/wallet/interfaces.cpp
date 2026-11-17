@@ -34,9 +34,9 @@
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <util/ui_change_type.h>
-#include <wallet/block_connect_activity.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/display_balance.h>
 #include <wallet/fees.h>
 #include <wallet/types.h>
 #include <wallet/load.h>
@@ -2419,6 +2419,7 @@ class WalletImpl : public Wallet
 {
 public:
     explicit WalletImpl(WalletContext& context, const std::shared_ptr<CWallet>& wallet) : m_context(context), m_wallet(wallet) {}
+    ~WalletImpl() override { releaseDisplay(); }
 
     bool encryptWallet(const SecureString& wallet_passphrase) override
     {
@@ -2776,10 +2777,14 @@ public:
         }
         return makeBalances(bal, lifecycle);
     }
-    //! The display balances of a finished lifecycle-adjusted balance. Shared
-    //! by the single-lock path and the GUI's two-phase scan.
     WalletBalances makeBalances(const Balance& bal, const WalletLifecycleSummary& lifecycle)
         EXCLUSIVE_LOCKS_REQUIRED(m_wallet->cs_wallet)
+    {
+        return makeBalances(bal, lifecycle, haveWatchOnly());
+    }
+    //! The display balances of a finished lifecycle-adjusted balance. Shared
+    //! by the single-lock path and the display worker's snapshots.
+    static WalletBalances makeBalances(const Balance& bal, const WalletLifecycleSummary& lifecycle, bool have_watch_only)
     {
         WalletBalances result;
         result.balance = bal.m_mine_trusted;
@@ -2806,7 +2811,7 @@ public:
         result.unconfirmed_balance = bal.m_mine_untrusted_pending;
         result.immature_balance = bal.m_mine_immature;
         result.stake = bal.m_mine_stake;
-        result.have_watch_only = haveWatchOnly();
+        result.have_watch_only = have_watch_only;
         if (result.have_watch_only) {
             result.watch_only_balance = bal.m_watchonly_trusted;
             result.unconfirmed_watch_only_balance = bal.m_watchonly_untrusted_pending;
@@ -2832,233 +2837,104 @@ public:
         block_hash = result.block_hash;
         return true;
     }
+    //! How long a synchronous display request waits for the display worker.
+    static constexpr std::chrono::seconds DISPLAY_SYNC_TIMEOUT{10};
+    //! The display state of this wallet on the process-wide worker, acquired
+    //! on first use. Null once the wallet has been removed.
+    std::shared_ptr<WalletDisplayBalance> display()
+    {
+        std::lock_guard<std::mutex> lock(m_display_mutex);
+        if (!m_display && !m_display_released) m_display = DisplayBalanceWorker::Global().Acquire(*m_wallet);
+        return m_display;
+    }
+    //! Take the wallet off the display worker. Returns once the worker is not
+    //! in a slice of it; the worker does not touch the wallet afterwards.
+    void releaseDisplay()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_display_mutex);
+            m_display_released = true;
+            if (!m_display) return;
+            m_display.reset();
+        }
+        // Outside the mutex: this waits for the slice in progress, whose
+        // announcement may be read by a caller of display().
+        DisplayBalanceWorker::Global().Release(*m_wallet);
+    }
+    static std::optional<bool> DisplayFamilyIsQuantum(std::optional<WalletDisplayCoinFamily> family)
+    {
+        if (!family) return std::nullopt;
+        return *family == WalletDisplayCoinFamily::DIRECT_QUANTUM;
+    }
+    static void FillDisplayBalances(WalletDisplayBalances& result, const WalletDisplayBalance& state,
+                                    const DisplayBalanceSnapshot& snapshot)
+    {
+        result.available = true;
+        result.balances = makeBalances(snapshot.balance, snapshot.lifecycle, snapshot.have_watch_only);
+        result.block_hash = snapshot.tip_hash;
+        result.block_height = snapshot.tip_height;
+        result.exact = state.IsCurrent(snapshot);
+        result.sequence = snapshot.sequence;
+        result.send_family.reset();
+        result.send_family_balance.reset();
+        if (snapshot.send_family_quantum && snapshot.send_family_balance) {
+            result.send_family = *snapshot.send_family_quantum
+                ? WalletDisplayCoinFamily::DIRECT_QUANTUM : WalletDisplayCoinFamily::LEGACY;
+            result.send_family_balance = snapshot.send_family_balance;
+        }
+    }
+    WalletDisplayBalances getDisplaySnapshot() override
+    {
+        // Neither cs_main nor cs_wallet: the published snapshot behind its
+        // leaf mutex, and one atomic read of the wallet change marker.
+        WalletDisplayBalances result;
+        const std::shared_ptr<WalletDisplayBalance> state = display();
+        if (!state) return result;
+        result.failed = state->Failed();
+        if (const auto snapshot = state->Snapshot()) FillDisplayBalances(result, *state, *snapshot);
+        return result;
+    }
+    void requestDisplayBalances(bool foreground, std::optional<WalletDisplayCoinFamily> send_family, bool retry_send) override
+    {
+        const std::shared_ptr<WalletDisplayBalance> state = display();
+        if (!state) return;
+        if (state->SetInterest(foreground, DisplayFamilyIsQuantum(send_family), retry_send)) {
+            DisplayBalanceWorker::Global().Wake();
+        }
+    }
+    std::unique_ptr<Handler> handleDisplayBalancesChanged(DisplayBalancesChangedFn fn) override
+    {
+        const std::shared_ptr<WalletDisplayBalance> state = display();
+        if (!state) return MakeSignalHandler(boost::signals2::connection{});
+        return MakeSignalHandler(state->NotifyChanged.connect(fn));
+    }
     bool tryGetDisplayBalances(WalletDisplayBalances& result,
         const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family) override
     {
-        m_gui_diag.Attempt();
-        const bool published = TryGetDisplayBalancesInner(result, unchanged_tip, send_family);
-        const int64_t now_ms = BlockConnectActivity::NowMs();
-        if (published) {
-            m_last_publish_ms.store(now_ms);
-            if (const auto line = m_gui_diag.OnPublished(now_ms, m_wallet->GetName())) {
-                m_wallet->WalletLogPrintf("%s\n", *line);
-            }
-        } else if (!m_gui_diag.HasPublished()) {
-            // Never published: say now and then why not. The memo size is read
-            // without waiting for the wallet lock.
-            int64_t memo_size{-1};
-            {
-                TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-                if (locked_wallet) memo_size = static_cast<int64_t>(m_wallet->m_output_lifecycle_memo.size());
-            }
-            if (const auto line = m_gui_diag.TakeWaitingSummary(now_ms, m_wallet->GetName(), memo_size)) {
-                m_wallet->WalletLogPrintf("%s\n", *line);
-            }
+        // The caller waits for the display worker: a pass that starts after
+        // this call either confirms the published snapshot or replaces it.
+        // No wallet or chain lock is taken on this thread.
+        const std::shared_ptr<WalletDisplayBalance> state = display();
+        if (!state) return false;
+        const std::optional<bool> quantum = DisplayFamilyIsQuantum(send_family);
+        const auto deadline = std::chrono::steady_clock::now() + DISPLAY_SYNC_TIMEOUT;
+        for (int round = 0;; ++round) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0) return false;
+            const DisplayBalanceOutcome outcome = state->RequestAndWait(
+                quantum, remaining, [] { DisplayBalanceWorker::Global().Wake(); });
+            if (outcome.exception) std::rethrow_exception(outcome.exception);
+            if (!outcome.ok || !outcome.snapshot) return false;
+            const DisplayBalanceSnapshot& snapshot = *outcome.snapshot;
+            // A send-family balance can miss its turn when a lock was busy.
+            if (quantum && round < 3 &&
+                !(snapshot.send_family_quantum == quantum && snapshot.send_family_balance)) continue;
+            // Nothing new to show.
+            if (unchanged_tip && *unchanged_tip == snapshot.tip_hash) return false;
+            FillDisplayBalances(result, *state, snapshot);
+            if (quantum && result.send_family != send_family) result.send_family_balance.reset();
+            return true;
         }
-        return published;
-    }
-    //! The reason a failed scan stage gave, as a diagnostics category.
-    static GuiBalanceScanDiagnostics::Reason ReasonForError(const std::string& error, bool budget_exhausted)
-    {
-        using Reason = GuiBalanceScanDiagnostics::Reason;
-        if (budget_exhausted) return Reason::BUDGET;
-        if (error.find("yielded") != std::string::npos) return Reason::YIELDED;
-        if (error.find("synchronized") != std::string::npos) return Reason::NOT_SYNCED;
-        if (error.find("tip moved") != std::string::npos) return Reason::TIP_MOVED;
-        if (error.find("changed") != std::string::npos) return Reason::WALLET_MOVED;
-        return Reason::OTHER;
-    }
-    bool TryGetDisplayBalancesInner(WalletDisplayBalances& result,
-        const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family)
-    {
-        using Reason = GuiBalanceScanDiagnostics::Reason;
-        // The balance scan is O(wallet outputs). It reads the wallet in three
-        // lock scopes so that cs_main is held only for work that needs the
-        // chainstate:
-        //   phase 0 (cs_main, cs_wallet): checks, and the tip facts; O(1),
-        //     under TRY_LOCKs, needs no gate;
-        //   phase A (cs_wallet only):     GetBalance and the walk over the
-        //     outputs; whatever needs the chainstate is listed, not read.
-        //     At most GuiBalanceScanQueue::MAX_PHASE_A_WALLETS wallets run
-        //     it at once so that many worker threads cannot saturate the CPU;
-        //   phase B (cs_main, cs_wallet): the listed outputs are resolved, the
-        //     balance is published. One wallet at a time process-wide, with a
-        //     back-off after a long hold, so the scans cannot monopolise
-        //     cs_main.
-        // Both limits are fair waiting queues (wallets that never published
-        // first, then the oldest publish): a worker with a finished pass waits
-        // for its turn holding no lock, for a bounded time. Anything that
-        // moved between the scopes (tip, wallet) discards the pass and keeps
-        // the last display; the caller polls again.
-        //
-        // While the validation scheduler is dispatching a block to the loaded
-        // wallets, taking cs_main here makes the scheduler wait at the start
-        // of every following wallet (L15). Yield; the caller polls again.
-        // A deferral is bounded (BlockConnectActivity::MAX_DEFER_MS).
-        BlockConnectActivity& activity = BlockConnectActivity::Global();
-        if (activity.ShouldDefer(BlockConnectActivity::NowMs())) {
-            m_gui_diag.Count(Reason::DEFERRED);
-            return false;
-        }
-        // A scan let through the deferral cap runs to its end; any other scan
-        // gives way (phase A, and while waiting for a turn) to a block that
-        // starts to be dispatched.
-        const bool let_through = activity.IsDispatching(BlockConnectActivity::NowMs());
-        std::optional<Reason> give_up_reason;
-        const auto give_up = [&]() {
-            if (!let_through && activity.IsDispatching(BlockConnectActivity::NowMs())) {
-                give_up_reason = Reason::YIELDED;
-                return true;
-            }
-            if (m_wallet->HaveChain() && m_wallet->chain().shutdownRequested()) {
-                give_up_reason = Reason::SHUTDOWN;
-                return true;
-            }
-            return false;
-        };
-        const int64_t last_publish_ms = m_last_publish_ms.load();
-
-        const int64_t scan_start_ms = BlockConnectActivity::NowMs();
-        int64_t main_ms{0};      // time holding cs_main: phase 0 and phase B
-        int64_t wallet_ms{0};    // phase A
-        int64_t gate_wait_ms{0}; // waiting for the phase A slot and the phase B gate
-        WalletLifecycleScanStats scan_stats;
-        LifecycleBulkPass pass;
-        bool scanned{false};
-        bool resolve_started{false};
-        bool complete{false};
-        std::optional<WalletDisplayBalances> display;
-
-        const auto finish = [&]() {
-            if (!scanned) return;
-            const int64_t scan_end_ms = BlockConnectActivity::NowMs();
-            const int64_t scan_took_ms = scan_end_ms - scan_start_ms;
-            const bool slow = main_ms >= 250 || scan_took_ms >= 2000;
-            // A scan cut by its budget logs its progress at most once per 30 s.
-            const bool progress = scan_stats.budget_exhausted &&
-                (m_last_budget_log_ms.load() == 0 || scan_end_ms - m_last_budget_log_ms.load() >= 30000);
-            if (slow || progress) {
-                if (progress) m_last_budget_log_ms.store(scan_end_ms);
-                // The chainstate part adds the wallet part's counts to its own
-                // once it has started; before that only the wallet part's
-                // counts exist. Either way each output is counted once.
-                const WalletLifecycleScanStats& counted = resolve_started ? scan_stats : pass.stats;
-                const uint64_t pending = resolve_started ? scan_stats.pending : pass.stats.pending;
-                // Never wait for the wallet lock just to log (cs_main may be held here).
-                int64_t memo_size{-1};
-                {
-                    TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-                    if (locked_wallet) memo_size = static_cast<int64_t>(m_wallet->m_output_lifecycle_memo.size());
-                }
-                m_wallet->WalletLogPrintf("GUI balance scan: wallet=%s outputs=%d database_reads=%d memo_hits=%d memo_size=%d pending=%d budget_exhausted=%d main_ms=%d wallet_ms=%d gate_wait_ms=%d took=%dms\n",
-                                          m_wallet->GetName(), counted.outputs, scan_stats.database_reads,
-                                          counted.memo_hits, memo_size,
-                                          pending, scan_stats.budget_exhausted ? 1 : 0,
-                                          main_ms, wallet_ms, gate_wait_ms, scan_took_ms);
-            }
-        };
-        const auto fail = [&](Reason reason) {
-            m_gui_diag.Count(reason);
-            finish();
-            return false;
-        };
-        // Why a bounded wait for a turn ended without one.
-        const auto gave_up_waiting = [&](Reason timeout_reason) {
-            return fail(give_up_reason ? *give_up_reason : timeout_reason);
-        };
-
-        // Phase 0.
-        std::optional<LifecycleScanTip> tip;
-        {
-            TRY_LOCK(::cs_main, locked_main);
-            if (!locked_main) return fail(Reason::MAIN_BUSY);
-            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-            if (!locked_wallet) return fail(Reason::WALLET_BUSY);
-            // Keep the last valid display while notifications catch up to the active tip.
-            tip = CaptureLifecycleScanTip(*m_wallet);
-            if (!tip) return fail(Reason::NOT_SYNCED);
-            // Nothing new to show: not a failure, not counted.
-            if (unchanged_tip && *unchanged_tip == tip->hash) return false;
-            scanned = true;
-            main_ms += BlockConnectActivity::NowMs() - scan_start_ms;
-        }
-
-        // Phase A: the wallet, without cs_main, a few wallets at a time.
-        {
-            GuiBalanceScanSlot slot_a{GuiBalanceScanQueue::WalletPhase(), last_publish_ms,
-                                      GuiBalanceScanQueue::MAX_WAIT_MS, give_up};
-            gate_wait_ms += slot_a.WaitedMs();
-            if (!slot_a.Admitted()) return gave_up_waiting(Reason::SLOT_TIMEOUT);
-
-            const int64_t phase_start_ms = BlockConnectActivity::NowMs();
-            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-            if (!locked_wallet) return fail(Reason::WALLET_BUSY);
-            std::string error;
-            const bool ok = ScanLifecycleWalletSide(
-                *m_wallet, *tip, /*min_depth=*/0, /*avoid_reuse=*/true, pass, error,
-                [&]() { return !let_through && activity.IsDispatching(BlockConnectActivity::NowMs()); });
-            wallet_ms = BlockConnectActivity::NowMs() - phase_start_ms;
-            if (!ok) return fail(ReasonForError(error, /*budget_exhausted=*/false));
-        }
-
-        // Phase B: the chainstate part, under both locks, one wallet at a time.
-        {
-            GuiBalanceScanSlot gate{GuiBalanceScanQueue::MainPhase(), last_publish_ms,
-                                    GuiBalanceScanQueue::MAX_WAIT_MS, give_up};
-            gate_wait_ms += gate.WaitedMs();
-            if (!gate.Admitted()) return gave_up_waiting(Reason::GATE_TIMEOUT);
-
-            // The gate admits one scan at a time, so at most one GUI thread
-            // waits for cs_main here. Waiting, instead of a bare try, keeps a
-            // short hold by someone else from throwing away the wallet pass
-            // that was just read. The wallet lock stays a try: cs_main must
-            // not be held idle behind a long wallet operation.
-            LOCK(::cs_main);
-            const int64_t phase_start_ms = BlockConnectActivity::NowMs();
-            const auto record_hold = [&]() {
-                const int64_t held = BlockConnectActivity::NowMs() - phase_start_ms;
-                main_ms += held;
-                gate.AddMainHold(held);
-            };
-            TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-            if (!locked_wallet) return fail(Reason::WALLET_BUSY);
-            Balance bal;
-            WalletLifecycleSummary lifecycle;
-            std::string error;
-            WalletLifecycleOptions options;
-            options.stats = &scan_stats;
-            // Memo progress made so far counts for the next attempt, so only
-            // the part of the scan that needs cs_main is time limited.
-            resolve_started = true;
-            const bool ok = ResolveLifecycleBulkPass(
-                *m_wallet, pass, std::chrono::steady_clock::now() + GUI_SCAN_BUDGET, bal, lifecycle, error, options);
-            if (ok) {
-                display.emplace();
-                display->block_hash = tip->hash;
-                display->balances = makeBalances(bal, lifecycle);
-                if (send_family) {
-                    CCoinControl control;
-                    const bool quantum = *send_family == WalletDisplayCoinFamily::DIRECT_QUANTUM;
-                    control.m_input_family = quantum ? CCoinControl::InputFamily::QUANTUM_MIGRATION : CCoinControl::InputFamily::LEGACY;
-                    control.m_exclude_generated_quantum_inputs = quantum;
-                    display->send_family_balance = getAvailableBalanceLocked(control);
-                }
-                complete = true;
-            } else {
-                const Reason reason = ReasonForError(error, scan_stats.budget_exhausted);
-                m_gui_diag.Count(reason);
-                // A moved tip or wallet is routine; anything else is worth a line.
-                if (!scan_stats.budget_exhausted && reason == Reason::OTHER) {
-                    m_wallet->WalletLogPrintf("Unable to calculate lifecycle-adjusted GUI balance: %s\n", error);
-                }
-            }
-            record_hold();
-        }
-        finish();
-        // Keep the last valid display when the pass was discarded or cut short.
-        if (!complete) return false;
-        result = std::move(*display);
-        return true;
     }
     CAmount getBalance() override
     {
@@ -3194,6 +3070,7 @@ public:
     CAmount getDefaultMaxTxFee() override { return m_wallet->m_default_max_tx_fee; }
     void remove() override
     {
+        releaseDisplay();
         RemoveWallet(m_context, m_wallet, /*load_on_start=*/false);
     }
     unsigned int getQQDevelopmentDonationPercentage() override
@@ -4096,15 +3973,9 @@ public:
 
     WalletContext& m_context;
     std::shared_ptr<CWallet> m_wallet;
-    //! Time budget of one GUI balance scan holding cs_main.
-    static constexpr std::chrono::milliseconds GUI_SCAN_BUDGET{250};
-    //! Last time a budget-cut GUI scan was logged (rate limit per wallet).
-    std::atomic<int64_t> m_last_budget_log_ms{0};
-    //! When this wallet last published a balance to the GUI (0 = never); the
-    //! scan queues serve the wallet with the oldest publish first.
-    std::atomic<int64_t> m_last_publish_ms{0};
-    //! Why this wallet's GUI balance scans did not publish.
-    GuiBalanceScanDiagnostics m_gui_diag{BlockConnectActivity::NowMs()};
+    std::mutex m_display_mutex;
+    std::shared_ptr<WalletDisplayBalance> m_display;
+    bool m_display_released{false};
 };
 
 class WalletLoaderImpl : public WalletLoader

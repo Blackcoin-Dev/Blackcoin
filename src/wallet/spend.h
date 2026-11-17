@@ -55,8 +55,8 @@ struct WalletLifecycleScanStats {
     uint64_t database_reads{0}; //!< outputs whose chainstate facts were read from the coins view
     uint64_t memo_hits{0};      //!< outputs served from the wallet's lifecycle memo
     bool budget_exhausted{false}; //!< the scan stopped because its budget ran out
-    bool memo_cleared{false};   //!< a verified memo entry disagreed with the chainstate and the memo was dropped
-    uint64_t pending{0};        //!< two-phase scans: outputs handed to the chainstate phase
+    uint64_t memo_mismatches{0}; //!< verified memo entries that disagreed with the chainstate (each one was dropped)
+    uint64_t pending{0};        //!< sliced passes: outputs handed to the chainstate slices
 };
 
 /** Latest demurrage attestation per scriptPubKey, resolved at most once per
@@ -108,8 +108,8 @@ bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
                                  const WalletLifecycleOptions& options = {})
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
-/** Chain facts a GUI balance scan captures under cs_main before it reads the
- * wallet without it. */
+/** Chain facts a display balance pass captures under cs_main before it reads
+ * the wallet without it. */
 struct LifecycleScanTip {
     uint256 hash;
     int height{0};
@@ -120,70 +120,246 @@ struct LifecycleScanTip {
     bool demurrage_active{false};
 };
 
-/** Capture the active tip. Returns nullopt without a tip or when the wallet
- * and the active chain tip differ. */
-std::optional<LifecycleScanTip> CaptureLifecycleScanTip(const CWallet& wallet)
-    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+/**
+ * The sliced display balance engine.
+ *
+ * The balance the GUI shows is computed by a background worker in slices.
+ * Every slice takes exactly one of cs_main and cs_wallet (never both), with a
+ * try-lock, for a bounded time. Three resumable pieces of state exist per
+ * wallet:
+ *
+ *  - LifecycleMemoJournal: chainstate facts read under cs_main that still
+ *    have to be written to the wallet's lifecycle memo under cs_wallet. Each
+ *    entry is validated against the wallet when it is applied, so entries
+ *    survive any restart.
+ *  - LifecycleWarmup: fills the memo of a wallet that has many deep outputs
+ *    without a memo entry (after a start). A cursor over mapWallet; it does
+ *    not depend on the tip or on the wallet change marker, so nothing it has
+ *    done is ever discarded.
+ *  - LifecyclePass: one consistent computation of the balance for a tip T and
+ *    a wallet change marker m. It walks the wallet (cs_wallet slices), reads
+ *    whatever needs the chainstate (cs_main slices) and restarts, keeping the
+ *    journal, when T or m moves. Its result is exact for (T, m): every wallet
+ *    slice saw marker m and the wallet at T, every chainstate slice saw the
+ *    active tip T.
+ */
 
-/** An output whose classification needs the chainstate. */
-struct LifecyclePendingOutput {
-    uint256 txid;
-    uint32_t n{0};
+/** Limits of one slice. A budget of zero means no time limit. */
+struct LifecycleSliceLimits {
+    std::chrono::milliseconds wallet_budget{20};
+    std::chrono::milliseconds main_budget{25};
+    //! Deterministic knob for tests: end a slice after this many items
+    //! (transactions and outputs walked, outputs resolved, entries stored).
+    uint64_t max_items{0};
+    //! Clock, injectable for tests. Empty = std::chrono::steady_clock::now.
+    std::function<std::chrono::steady_clock::time_point()> now;
+    //! Number of items between two clock reads.
+    static constexpr uint64_t CLOCK_INTERVAL{64};
+
+    static LifecycleSliceLimits Unlimited()
+    {
+        LifecycleSliceLimits limits;
+        limits.wallet_budget = std::chrono::milliseconds{0};
+        limits.main_budget = std::chrono::milliseconds{0};
+        return limits;
+    }
+};
+
+/** Demurrage attestations by script, valid for one tip only. Kept across the
+ * slices and the restarts of the passes of a wallet for as long as the tip
+ * holds, so that a wallet with many scripts converges. */
+struct LifecycleAttestationCache {
+    uint256 tip_hash;
+    LifecycleAttestationMap map;
+    void ResetFor(const uint256& tip)
+    {
+        if (tip_hash == tip) return;
+        tip_hash = tip;
+        map.clear();
+    }
+};
+
+/** Memo changes waiting for a cs_wallet slice. */
+struct LifecycleMemoJournal {
+    struct Entry {
+        COutPoint outpoint;
+        //! What the wallet said about the transaction when the facts were
+        //! requested; the entry is applied only if the wallet still says so.
+        uint256 confirmed_block_hash;
+        int confirmed_block_height{0};
+        uint64_t txout_digest{0};
+        WalletOutputLifecycleMemo memo;
+        //! Drop the memo entry of the outpoint instead of writing one.
+        bool erase{false};
+    };
+    std::vector<Entry> entries;
+    size_t cursor{0};
+    uint64_t stored{0};  //!< entries written since the journal was created
+    uint64_t dropped{0}; //!< entries the wallet no longer agreed with
+    uint64_t erased{0};  //!< memo entries removed after a disagreement with the chainstate
+    uint64_t mismatches{0}; //!< verified entries that disagreed with the chainstate
+    //! Drop the whole memo at the next wallet slice (repeated disagreements).
+    bool clear_all{false};
+    size_t Waiting() const { return entries.size() - cursor; }
+};
+
+enum class LifecycleSliceResult {
+    MORE,         //!< the slice ended on its limit; call again
+    DONE,         //!< the pass has a result / the warm-up has nothing left to do
+    UP_TO_DATE,   //!< pass only: the wallet is at LifecyclePass::known, nothing was computed
+    LOCK_BUSY,    //!< the lock the slice needs was not free; nothing was done
+    NOT_SYNCED,   //!< pass only: the wallet has not processed the active tip (pass reset)
+    TIP_MOVED,    //!< pass only: the active tip moved (pass reset, journal kept)
+    WALLET_MOVED, //!< pass only: the wallet changed (pass reset, journal kept)
+    NEED_WARMUP,  //!< pass only: too many deep outputs without a memo entry (pass reset)
+    FAILED,       //!< pass only: an error (pass reset); see LifecycleSliceReport::error
+};
+
+struct LifecycleSliceReport {
+    LifecycleSliceResult result{LifecycleSliceResult::MORE};
+    bool held_main{false};
+    bool held_wallet{false};
+    //! How long the lock was held, by LifecycleSliceLimits::now.
+    std::chrono::microseconds held{0};
+    std::string error;
+};
+
+/** An output of a pass whose classification needs the chainstate. A copy of
+ * everything the chainstate slice needs, so that it runs without cs_wallet. */
+struct LifecyclePassOutput {
+    COutPoint outpoint;
+    CTxOut txout;
     bool wallet_immature{false};
     bool mine_spendable{false};
     bool watchonly{false};
+    bool tx_coinbase{false};
+    bool tx_coinstake{false};
     //! The memoized facts are usable; only the demurrage attestation is missing.
     bool memo_hit{false};
+    //! The memo entry is in the verify slice: compare it with the chainstate.
+    bool verify{false};
+    //! Deep enough for the memo (the facts read are journaled).
+    bool memo_eligible{false};
+    //! Unconfirmed and in the mempool: classified as a candidate next-block coin.
+    bool in_mempool{false};
+    int64_t tx_time{0};
+    WalletOutputLifecycleMemo memo;
+    uint256 confirmed_block_hash;
+    int confirmed_block_height{0};
+    uint64_t txout_digest{0};
 };
 
-/** What the wallet-only part of a two-phase lifecycle balance scan produced:
- * the balance and summary of every output it could classify alone, and the
- * outputs left for the chainstate part. */
-struct LifecycleBulkPass {
+struct LifecyclePass {
+    enum class Stage { TIP, WALK, CHAIN, STORE, CONFIRM, DONE };
+    Stage stage{Stage::TIP};
+
+    // Options; they survive a reset.
+    int min_depth{0};
+    bool avoid_reuse{true};
+    //! When nonzero, the walk gives up (NEED_WARMUP) as soon as more than this
+    //! many memo-eligible outputs have no memo entry.
+    uint64_t warmup_threshold{0};
+    //! The tip and marker of the result the caller already has. A pass that
+    //! finds the wallet there returns UP_TO_DATE instead of walking it.
+    std::optional<std::pair<uint256, uint64_t>> known;
+    //! Test only: treat demurrage as active whatever the chain parameters say.
+    bool force_demurrage{false};
+
+    // State of the pass in progress.
     LifecycleScanTip tip;
-    //! CWallet::GetBalanceScanMarker() when the wallet was read.
     uint64_t marker{0};
+    bool marker_set{false};
+    bool have_watch_only{false};
+    size_t bucket{0};
+    size_t bucket_count{0};
+    std::set<uint256> trusted_parents;
     Balance balance;
     WalletLifecycleSummary summary;
-    std::vector<LifecyclePendingOutput> pending;
-    //! Distinct scriptPubKeys of the pending memo hits (demurrage only).
-    std::set<CScript> attestation_scripts;
-    int min_depth{0};
-    bool avoid_reuse{false};
-    //! Bookkeeping of the wallet-only part (outputs, memo hits).
+    std::vector<LifecyclePassOutput> pending;
+    size_t chain_cursor{0};
     WalletLifecycleScanStats stats;
+    uint64_t memo_misses{0};     //!< memo-eligible outputs without a usable entry
+    uint64_t memo_mismatches{0}; //!< verified entries that disagreed with the chainstate
+    uint32_t slices{0};
+
+    /** Forget the pass in progress, keep the options. */
+    void Reset()
+    {
+        LifecyclePass fresh;
+        fresh.min_depth = min_depth;
+        fresh.avoid_reuse = avoid_reuse;
+        fresh.warmup_threshold = warmup_threshold;
+        fresh.known = known;
+        fresh.force_demurrage = force_demurrage;
+        *this = std::move(fresh);
+    }
 };
 
-/** Number of outputs the wallet-only part visits between two calls of its
- * abort callback. */
-static constexpr uint64_t LIFECYCLE_BULK_ABORT_INTERVAL{1024};
+/** Run one slice of a pass. Takes cs_main or cs_wallet itself (try-lock) and
+ * never both. On DONE, pass.balance, pass.summary, pass.tip, pass.marker and
+ * pass.have_watch_only are the result; the caller resets the pass before it
+ * starts the next one. Any other terminal result resets the pass here. May
+ * throw what the wallet accounting throws (an amount out of range); the pass
+ * is reset first. */
+LifecycleSliceReport RunLifecyclePassSlice(const CWallet& wallet, LifecyclePass& pass,
+                                           LifecycleMemoJournal& journal,
+                                           LifecycleAttestationCache& attestations,
+                                           const LifecycleSliceLimits& limits = {})
+    EXCLUSIVE_LOCKS_REQUIRED(!::cs_main, !wallet.cs_wallet);
 
-/** Part one of the two-phase GUI balance scan: everything that needs no
- * chainstate, under cs_wallet only (never cs_main). The same numbers as
- * GetLifecycleAdjustedBalance once ResolveLifecycleBulkPass has resolved the
- * pending outputs. Returns false (error set) when the wallet tip is not
- * tip.hash, on an arithmetic error, or when should_abort (called every
- * LIFECYCLE_BULK_ABORT_INTERVAL outputs) returns true. */
-bool ScanLifecycleWalletSide(const CWallet& wallet, const LifecycleScanTip& tip,
-                             int min_depth, bool avoid_reuse,
-                             LifecycleBulkPass& pass, std::string& error,
-                             const std::function<bool()>& should_abort = {})
-    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+/** Run a pass to its end on the calling thread, slice after slice, restarting
+ * as often as `max_restarts` allows. For tests and for callers that are
+ * allowed to wait. Returns the last report (DONE on success). */
+LifecycleSliceReport RunLifecyclePassToEnd(const CWallet& wallet, LifecyclePass& pass,
+                                           LifecycleMemoJournal& journal,
+                                           LifecycleAttestationCache& attestations,
+                                           const LifecycleSliceLimits& limits = LifecycleSliceLimits::Unlimited(),
+                                           int max_restarts = 0)
+    EXCLUSIVE_LOCKS_REQUIRED(!::cs_main, !wallet.cs_wallet);
 
-/** Part two: resolve the pending outputs against the chainstate under cs_main
- * and cs_wallet, and produce the balance. Fails closed (false, error set)
- * unless the active tip and the wallet tip are still pass.tip.hash and the
- * wallet change marker is unchanged, and when a verified memo entry
- * disagreed with the chainstate. The time limit is tested before every
- * pending output; options.max_database_reads is the deterministic knob.
- * budget_exhausted is set in options.stats when a limit stopped the pass
- * (memo entries written so far are kept). options.use_memo is implied. */
-bool ResolveLifecycleBulkPass(const CWallet& wallet, LifecycleBulkPass& pass,
-                              std::chrono::steady_clock::time_point deadline,
-                              Balance& balance, WalletLifecycleSummary& summary,
-                              std::string& error,
-                              const WalletLifecycleOptions& options = {})
-    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+/** One deep wallet output waiting for its chainstate facts. */
+struct LifecycleWarmupItem {
+    COutPoint outpoint;
+    CTxOut txout;
+    uint256 confirmed_block_hash;
+    int confirmed_block_height{0};
+    uint64_t txout_digest{0};
+};
+
+/** Resumable memo warm-up: COLLECT (cs_wallet) lists a batch of deep outputs
+ * without a memo entry, FETCH (cs_main) reads their facts into the journal,
+ * STORE (cs_wallet) applies the journal; then the next batch, until the
+ * cursor has been through mapWallet once. */
+struct LifecycleWarmup {
+    enum class Stage { COLLECT, FETCH, STORE, DONE };
+    Stage stage{Stage::COLLECT};
+    //! Outputs listed per batch.
+    size_t batch_size{4096};
+    size_t bucket{0};
+    size_t bucket_count{0};
+    bool walk_finished{false};
+    std::vector<LifecycleWarmupItem> items;
+    size_t fetch_cursor{0};
+    uint64_t collected{0}; //!< outputs listed so far
+    uint64_t fetched{0};   //!< outputs whose facts were read
+    uint64_t skipped{0};   //!< outputs the chainstate could not describe (left to the pass)
+    uint64_t rewinds{0};   //!< times the cursor went back to the start (mapWallet was rehashed)
+    uint32_t slices{0};
+
+    //! Outputs listed and not yet stored, plus the share of mapWallet walked.
+    size_t Waiting(const LifecycleMemoJournal& journal) const { return (items.size() - fetch_cursor) + journal.Waiting(); }
+    int WalkedPercent() const
+    {
+        if (walk_finished || stage == Stage::DONE) return 100;
+        return bucket_count == 0 ? 0 : static_cast<int>(bucket * 100 / bucket_count);
+    }
+};
+
+/** Run one slice of the warm-up. Never both locks. MORE, DONE or LOCK_BUSY. */
+LifecycleSliceReport RunLifecycleWarmupSlice(const CWallet& wallet, LifecycleWarmup& warmup,
+                                             LifecycleMemoJournal& journal,
+                                             const LifecycleSliceLimits& limits = {})
+    EXCLUSIVE_LOCKS_REQUIRED(!::cs_main, !wallet.cs_wallet);
 
 /** Whether this wallet can satisfy a legacy input with a scriptSig-committed
  * ECDSA/ForkID signature, giving the transaction a txid that cannot be shared

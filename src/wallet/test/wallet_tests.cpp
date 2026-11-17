@@ -35,6 +35,7 @@
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <rpc/server.h>
+#include <script/descriptor.h>
 #include <script/solver.h>
 #include <shadow.h>
 #include <streams.h>
@@ -5999,7 +6000,7 @@ BOOST_FIXTURE_TEST_CASE(lifecycle_memo_matches_database_path, TestChain100Setup)
     }
 }
 
-BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_closed, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(sliced_display_balance_matches_single_lock_and_fails_closed, TestChain100Setup)
 {
     std::unique_ptr<CWallet> wallet{CreateSyncedWallet(
         *m_node.chain,
@@ -6008,10 +6009,25 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         coinbaseKey)};
     wallet->SetBroadcastTransactions(/*broadcast=*/true);
 
+    // More keys, so that the wallet has many distinct scripts.
+    std::vector<CKey> extra_keys(12);
+    {
+        LOCK(wallet->cs_wallet);
+        for (CKey& key : extra_keys) {
+            key.MakeNewKey(/*fCompressed=*/true);
+            FlatSigningProvider provider;
+            std::string error;
+            std::unique_ptr<Descriptor> desc = Parse("combo(" + EncodeSecret(key) + ")", provider, error, /*require_checksum=*/false);
+            BOOST_REQUIRE(desc);
+            WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
+            BOOST_REQUIRE(wallet->AddWalletDescriptor(w_desc, provider, "", false));
+        }
+    }
+
     std::vector<LifecycleTestBlock> mined;
-    const auto mine_block = [&] {
+    const auto mine_block_to = [&](const CScript& script) {
         LifecycleTestBlock entry;
-        entry.block = CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+        entry.block = CreateAndProcessBlock({}, script);
         const CBlockIndex* tip = WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
                                            return m_node.chainman->ActiveChain().Tip());
         entry.hash = tip->GetBlockHash();
@@ -6020,6 +6036,7 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         entry.time_max = tip->GetBlockTimeMax();
         mined.push_back(std::move(entry));
     };
+    const auto mine_block = [&] { mine_block_to(GetScriptForRawPubKey(coinbaseKey.GetPubKey())); };
     const auto notify_wallet = [&](const LifecycleTestBlock& e) {
         interfaces::BlockInfo info{e.hash};
         info.prev_hash = &e.prev_hash;
@@ -6035,42 +6052,61 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         }
     };
 
-    struct TwoPhase {
-        LifecycleBulkPass pass;
-        bool a_ok{false};
-        bool b_ok{false};
-        std::string a_error;
-        std::string b_error;
+    // The memo journal and the attestation cache belong to the wallet's
+    // display state and outlive every pass, as in the display worker.
+    LifecycleMemoJournal journal;
+    LifecycleAttestationCache attestations;
+
+    struct Sliced {
+        bool a_ok{false}; //!< the walk of the wallet finished
+        bool b_ok{false}; //!< the pass has a result
+        LifecycleSliceResult result{LifecycleSliceResult::MORE};
+        std::string error;
         Balance balance;
         WalletLifecycleSummary summary;
         WalletLifecycleScanStats stats;
+        uint64_t walk_memo_hits{0};
+        size_t pending{0};
+        uint32_t slices{0};
+        uint64_t marker{0};
+        uint256 tip;
     };
-    // Phase 0, phase A and phase B as the GUI runs them: the tip is captured
-    // under cs_main, the wallet is read under cs_wallet alone, the chainstate
-    // part runs under both. `between` runs while no lock is held.
-    const auto two_phase = [&](const std::function<void()>& between = {},
-                               std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max(),
-                               uint64_t max_database_reads = 0, bool force_demurrage = false) {
-        TwoPhase r;
-        std::optional<LifecycleScanTip> tip;
-        {
-            LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
-            tip = CaptureLifecycleScanTip(*wallet);
+    // A pass as the display worker runs it: slice after slice, each under one
+    // lock only. `between` runs once, with no lock held, after the walk of
+    // the wallet and before anything is read from the chainstate.
+    const auto sliced = [&](const std::function<void()>& between = {},
+                            const LifecycleSliceLimits& limits = LifecycleSliceLimits::Unlimited(),
+                            bool force_demurrage = false) {
+        Sliced r;
+        LifecyclePass pass;
+        pass.force_demurrage = force_demurrage;
+        bool between_done{false};
+        for (;;) {
+            if (!between_done && pass.stage != LifecyclePass::Stage::TIP && pass.stage != LifecyclePass::Stage::WALK) {
+                r.a_ok = true;
+                r.walk_memo_hits = pass.stats.memo_hits;
+                r.pending = pass.pending.size();
+                between_done = true;
+                if (between) between();
+            }
+            const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+            BOOST_REQUIRE(report.result != LifecycleSliceResult::LOCK_BUSY);
+            // Never both locks, and the report says which one.
+            BOOST_CHECK(report.held_main != report.held_wallet);
+            if (report.result == LifecycleSliceResult::MORE) continue;
+            r.result = report.result;
+            r.error = report.error;
+            if (report.result == LifecycleSliceResult::DONE) {
+                r.b_ok = true;
+                r.balance = pass.balance;
+                r.summary = pass.summary;
+                r.stats = pass.stats;
+                r.slices = pass.slices;
+                r.marker = pass.marker;
+                r.tip = pass.tip.hash;
+            }
+            return r;
         }
-        BOOST_REQUIRE(tip);
-        if (force_demurrage) tip->demurrage_active = true;
-        {
-            LOCK(wallet->cs_wallet);
-            r.a_ok = ScanLifecycleWalletSide(*wallet, *tip, /*min_depth=*/0, /*avoid_reuse=*/true, r.pass, r.a_error);
-        }
-        if (between) between();
-        if (!r.a_ok) return r;
-        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
-        WalletLifecycleOptions options;
-        options.stats = &r.stats;
-        options.max_database_reads = max_database_reads;
-        r.b_ok = ResolveLifecycleBulkPass(*wallet, r.pass, deadline, r.balance, r.summary, r.b_error, options);
-        return r;
     };
     const auto plain_scan = [&] {
         struct Plain {
@@ -6107,15 +6143,20 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         return count;
     };
 
-    mine_and_connect(40);
+    // Blocks to many scripts first (they become deep below), then the rest.
+    for (const CKey& key : extra_keys) {
+        mine_block_to(GetScriptForDestination(PKHash{key.GetPubKey()}));
+        notify_wallet(mined.back());
+    }
+    mine_and_connect(130);
+    const size_t distinct_scripts = extra_keys.size() + 1;
 
-    // 1. Cold memo: every output goes to the chainstate part; same numbers as
-    // the plain scan, and the memo is filled by the chainstate part.
+    // 1. Cold memo: every output goes to the chainstate slices; same numbers
+    // as the plain scan, and the memo is filled from the journal.
     {
         const auto plain = plain_scan();
-        const TwoPhase cold = two_phase();
-        BOOST_REQUIRE_MESSAGE(cold.a_ok, cold.a_error);
-        BOOST_REQUIRE_MESSAGE(cold.b_ok, cold.b_error);
+        const Sliced cold = sliced();
+        BOOST_REQUIRE_MESSAGE(cold.a_ok && cold.b_ok, cold.error);
         CompareLifecycleScans(plain.balance, plain.summary, cold.balance, cold.summary);
         BOOST_CHECK_EQUAL(cold.stats.pending, plain.stats.outputs);
         BOOST_CHECK_EQUAL(cold.stats.outputs, plain.stats.outputs);
@@ -6124,45 +6165,140 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         // Each output is counted once: outputs = memo hits + database reads.
         BOOST_CHECK_EQUAL(cold.stats.outputs, cold.stats.memo_hits + cold.stats.database_reads);
         BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false));
-        BOOST_REQUIRE_GT(memo_size(), 0U);
+        BOOST_REQUIRE_GT(memo_size(), extra_keys.size());
+        BOOST_CHECK_EQUAL(journal.Waiting(), 0U);
+        // The result names the tip and the wallet change marker it is exact for.
+        BOOST_CHECK_EQUAL(cold.marker, marker());
+        BOOST_CHECK(cold.tip == WITH_LOCK(wallet->cs_wallet, return wallet->GetLastBlockHash()));
     }
 
-    // 2. Warm memo: the deep memoized outputs are classified in phase A
+    // 2. Warm memo: the deep memoized outputs are classified during the walk
     // (no cs_main); only shallow outputs and the verify slice are pending.
     {
         const auto plain = plain_scan();
-        const TwoPhase warm = two_phase();
-        BOOST_REQUIRE_MESSAGE(warm.a_ok && warm.b_ok, warm.a_error + warm.b_error);
+        const Sliced warm = sliced();
+        BOOST_REQUIRE_MESSAGE(warm.a_ok && warm.b_ok, warm.error);
         CompareLifecycleScans(plain.balance, plain.summary, warm.balance, warm.summary);
         const uint64_t deep = deep_outputs(false);
         const uint64_t slice = deep_outputs(true);
-        BOOST_CHECK_EQUAL(warm.pass.stats.memo_hits, deep - slice);
-        BOOST_CHECK_EQUAL(warm.pass.pending.size(), plain.stats.outputs - (deep - slice));
+        BOOST_CHECK_EQUAL(warm.walk_memo_hits, deep - slice);
+        BOOST_CHECK_EQUAL(warm.pending, plain.stats.outputs - (deep - slice));
         BOOST_CHECK_EQUAL(warm.stats.memo_hits, deep - slice);
         BOOST_CHECK_EQUAL(warm.stats.database_reads, plain.stats.outputs - (deep - slice));
         BOOST_CHECK_EQUAL(warm.stats.outputs, plain.stats.outputs);
         BOOST_CHECK_EQUAL(warm.stats.outputs, warm.stats.memo_hits + warm.stats.database_reads);
     }
 
-    // 3. With demurrage forced on in the captured tip, the memoized outputs
-    // wait for the attestation of their scripts: they are pending, their
-    // distinct scripts are listed, and the result does not change (demurrage
-    // is not active on this regtest chain).
+    // 3. A resumed pass equals a one-shot pass, however small the slices are
+    // and whatever the clock says.
     {
         const auto plain = plain_scan();
-        const TwoPhase deferred = two_phase({}, std::chrono::steady_clock::time_point::max(), 0, /*force_demurrage=*/true);
-        BOOST_REQUIRE_MESSAGE(deferred.a_ok && deferred.b_ok, deferred.a_error + deferred.b_error);
+        const Sliced one_shot = sliced();
+        BOOST_REQUIRE(one_shot.b_ok);
+        for (const uint64_t items : {1U, 2U, 7U, 64U}) {
+            LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+            limits.max_items = items;
+            const Sliced resumed = sliced({}, limits);
+            BOOST_REQUIRE_MESSAGE(resumed.b_ok, resumed.error);
+            CompareLifecycleScans(one_shot.balance, one_shot.summary, resumed.balance, resumed.summary);
+            CompareLifecycleScans(plain.balance, plain.summary, resumed.balance, resumed.summary);
+            BOOST_CHECK_EQUAL(resumed.stats.outputs, one_shot.stats.outputs);
+            BOOST_CHECK_EQUAL(resumed.stats.memo_hits, one_shot.stats.memo_hits);
+            if (items == 1) BOOST_CHECK_GT(resumed.slices, one_shot.pending);
+            BOOST_CHECK_GT(resumed.slices, one_shot.slices);
+        }
+        // An injected clock that jumps a second at every reading: every slice
+        // ends at its first clock check, and the pass still completes.
+        std::chrono::steady_clock::time_point fake{};
+        uint64_t readings{0};
+        LifecycleSliceLimits limits;
+        limits.now = [&] {
+            ++readings;
+            return fake += 1s;
+        };
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        const Sliced timed = sliced({}, limits);
+        BOOST_REQUIRE_MESSAGE(timed.b_ok, timed.error);
+        CompareLifecycleScans(plain.balance, plain.summary, timed.balance, timed.summary);
+        BOOST_CHECK_GT(readings, 0U);
+        // Cold memo: one chainstate slice per 16 reads at most.
+        BOOST_CHECK_GE(timed.slices, plain.stats.outputs / 16);
+        BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false));
+    }
+
+    // 4. With demurrage forced on, the memoized outputs wait for the
+    // attestation of their scripts: they are pending, each distinct script is
+    // looked up once, and the result does not change (demurrage is not active
+    // on this regtest chain).
+    {
+        const auto plain = plain_scan();
+        attestations = {};
+        const Sliced deferred = sliced({}, LifecycleSliceLimits::Unlimited(), /*force_demurrage=*/true);
+        BOOST_REQUIRE_MESSAGE(deferred.a_ok && deferred.b_ok, deferred.error);
         CompareLifecycleScans(plain.balance, plain.summary, deferred.balance, deferred.summary);
-        BOOST_CHECK_EQUAL(deferred.pass.stats.memo_hits, 0U);
-        BOOST_CHECK(!deferred.pass.attestation_scripts.empty());
-        BOOST_CHECK_LE(deferred.pass.attestation_scripts.size(), deferred.pass.pending.size());
+        BOOST_CHECK_EQUAL(deferred.walk_memo_hits, 0U);
+        BOOST_CHECK_EQUAL(deferred.pending, plain.stats.outputs);
+        BOOST_CHECK_EQUAL(attestations.map.size(), distinct_scripts);
         BOOST_CHECK_EQUAL(deferred.stats.outputs, plain.stats.outputs);
         BOOST_CHECK_EQUAL(deferred.stats.memo_hits + deferred.stats.database_reads, plain.stats.outputs);
         BOOST_CHECK_GT(deferred.stats.memo_hits, 0U);
     }
 
-    // 4. Phase A needs no cs_main: it completes while another thread holds it.
+    // 5. A demurrage-active wallet with many distinct scripts converges even
+    // when no pass gets far: the attestations found so far are kept for as
+    // long as the tip holds, across slices and across restarts.
     {
+        const auto plain = plain_scan();
+        attestations = {};
+        LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+        limits.max_items = 1; // one output per chainstate slice
+        LifecyclePass pass;
+        pass.force_demurrage = true;
+        size_t known_scripts{0};
+        int restarts{0};
+        int chain_slices{0};
+        bool done{false};
+        for (int i = 0; i < 100000 && !done; ++i) {
+            const bool chain = pass.stage == LifecyclePass::Stage::CHAIN;
+            const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+            if (chain) ++chain_slices;
+            if (report.result == LifecycleSliceResult::DONE) {
+                done = true;
+                break;
+            }
+            if (report.result == LifecycleSliceResult::WALLET_MOVED) {
+                ++restarts;
+                // Nothing that was learned about the scripts was lost.
+                BOOST_CHECK_GE(attestations.map.size(), known_scripts);
+                continue;
+            }
+            BOOST_REQUIRE(report.result == LifecycleSliceResult::MORE);
+            // Interrupt every pass after a few chainstate slices until all
+            // scripts are known: no pass ever resolves the wallet in one go.
+            if (chain && chain_slices % 3 == 0 && attestations.map.size() < distinct_scripts &&
+                attestations.map.size() > known_scripts) {
+                known_scripts = attestations.map.size();
+                WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker());
+            }
+        }
+        BOOST_REQUIRE(done);
+        BOOST_CHECK_GT(restarts, 0);
+        BOOST_CHECK_EQUAL(attestations.map.size(), distinct_scripts);
+        CompareLifecycleScans(plain.balance, plain.summary, pass.balance, pass.summary);
+        // A tip change drops the cache: attestations are facts of one tip.
+        mine_and_connect(1);
+        const Sliced next = sliced({}, LifecycleSliceLimits::Unlimited(), /*force_demurrage=*/true);
+        BOOST_REQUIRE(next.b_ok);
+        BOOST_CHECK(attestations.tip_hash == next.tip);
+        BOOST_CHECK_EQUAL(attestations.map.size(), distinct_scripts);
+        attestations = {};
+    }
+
+    // 6. The walk needs no cs_main: it completes while another thread holds it.
+    {
+        LifecyclePass pass;
+        BOOST_REQUIRE(RunLifecyclePassSlice(*wallet, pass, journal, attestations).result == LifecycleSliceResult::MORE);
+        BOOST_REQUIRE(pass.stage == LifecyclePass::Stage::WALK);
         std::promise<void> locked, release;
         std::thread holder([&] {
             LOCK(Assert(m_node.chainman)->GetMutex());
@@ -6170,51 +6306,79 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
             release.get_future().wait();
         });
         locked.get_future().wait();
-        auto scan_a = std::async(std::launch::async, [&] {
-            std::optional<LifecycleScanTip> tip;
-            {
-                // The tip is captured before the other thread locks in real use;
-                // build it by hand here (the regtest chain has no demurrage).
-                tip.emplace();
-                tip->hash = WITH_LOCK(wallet->cs_wallet, return wallet->GetLastBlockHash());
-                tip->height = WITH_LOCK(wallet->cs_wallet, return wallet->GetLastBlockHeight());
-                tip->evaluation_height = tip->height + 1;
+        auto walk = std::async(std::launch::async, [&] {
+            LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+            limits.max_items = 5;
+            while (pass.stage == LifecyclePass::Stage::WALK) {
+                const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+                if (report.result != LifecycleSliceResult::MORE || !report.held_wallet || report.held_main) return false;
             }
-            LifecycleBulkPass pass;
-            std::string error;
-            LOCK(wallet->cs_wallet);
-            return ScanLifecycleWalletSide(*wallet, *tip, 0, true, pass, error);
+            // The next slice needs cs_main, which is taken: nothing happens.
+            return RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits).result == LifecycleSliceResult::LOCK_BUSY;
         });
-        const bool finished = scan_a.wait_for(30s) == std::future_status::ready;
+        const bool finished = walk.wait_for(30s) == std::future_status::ready;
         release.set_value();
         holder.join();
-        BOOST_REQUIRE_MESSAGE(finished, "phase A waited for cs_main");
-        BOOST_CHECK(scan_a.get());
+        BOOST_REQUIRE_MESSAGE(finished, "the walk waited for cs_main");
+        BOOST_CHECK(walk.get());
+        // And a chainstate slice needs no cs_wallet.
+        BOOST_REQUIRE(pass.stage == LifecyclePass::Stage::CHAIN);
+        std::promise<void> wallet_locked, wallet_release;
+        std::thread wallet_holder([&] {
+            LOCK(wallet->cs_wallet);
+            wallet_locked.set_value();
+            wallet_release.get_future().wait();
+        });
+        wallet_locked.get_future().wait();
+        auto chain = std::async(std::launch::async, [&] {
+            while (pass.stage == LifecyclePass::Stage::CHAIN) {
+                const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, LifecycleSliceLimits::Unlimited());
+                if (report.result != LifecycleSliceResult::MORE || !report.held_main || report.held_wallet) return false;
+            }
+            return RunLifecyclePassSlice(*wallet, pass, journal, attestations).result == LifecycleSliceResult::LOCK_BUSY;
+        });
+        const bool chain_finished = chain.wait_for(30s) == std::future_status::ready;
+        wallet_release.set_value();
+        wallet_holder.join();
+        BOOST_REQUIRE_MESSAGE(chain_finished, "a chainstate slice waited for cs_wallet");
+        BOOST_CHECK(chain.get());
+        const auto plain = plain_scan();
+        const LifecycleSliceReport end = RunLifecyclePassToEnd(*wallet, pass, journal, attestations);
+        BOOST_REQUIRE(end.result == LifecycleSliceResult::DONE);
+        CompareLifecycleScans(plain.balance, plain.summary, pass.balance, pass.summary);
     }
 
-    // 5. Fail closed: anything that changes between the two phases discards
-    // the pass and leaves the outputs untouched.
+    // 7. Fail closed: anything that changes between the walk and the end
+    // discards the pass; nothing is reported for it.
     {
-        // 5a. the wallet change marker moved
+        // 7a. the wallet change marker moved
         const uint64_t before = marker();
-        TwoPhase r = two_phase([&] { WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker()); });
+        Sliced r = sliced([&] { WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker()); });
         BOOST_CHECK(r.a_ok);
         BOOST_CHECK(!r.b_ok);
         BOOST_CHECK_EQUAL(r.balance.m_mine_trusted, 0);
         BOOST_CHECK_GT(marker(), before);
 
-        // 5b. a block is connected to the chain and the wallet
-        r = two_phase([&] { mine_and_connect(1); });
+        // 7b. a block is connected to the chain and the wallet
+        r = sliced([&] { mine_and_connect(1); });
         BOOST_CHECK(r.a_ok);
         BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK(r.result == LifecycleSliceResult::TIP_MOVED || r.result == LifecycleSliceResult::WALLET_MOVED);
 
-        // 5c. the chain moved and the wallet has not caught up
-        r = two_phase([&] { mine_block(); });
+        // 7c. the chain moved and the wallet has not caught up: there is no
+        // exact balance for a tip the wallet has not processed, neither for
+        // the pass that was under way nor for one that starts now.
+        r = sliced([&] { mine_block(); });
         BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK(r.result == LifecycleSliceResult::TIP_MOVED);
+        r = sliced();
+        BOOST_CHECK(!r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK(r.result == LifecycleSliceResult::NOT_SYNCED);
         notify_wallet(mined.back());
 
-        // 5d. the wallet tip moved on a reorg (disconnect, then reconnect)
-        r = two_phase([&] {
+        // 7d. the wallet tip moved on a reorg (disconnect, then reconnect)
+        r = sliced([&] {
             const LifecycleTestBlock& e = mined.back();
             interfaces::BlockInfo info{e.hash};
             info.prev_hash = &e.prev_hash;
@@ -6226,9 +6390,10 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         });
         BOOST_CHECK(r.a_ok);
         BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK(r.result == LifecycleSliceResult::WALLET_MOVED);
 
-        // 5e. the wallet learned a transaction
-        r = two_phase([&] {
+        // 7e. the wallet learned a transaction
+        r = sliced([&] {
             CMutableTransaction mtx;
             mtx.vin.emplace_back(COutPoint{uint256{0x42}, 0});
             mtx.vout.emplace_back(COIN, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
@@ -6240,14 +6405,26 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
 
         // After all that, an undisturbed pass is correct again.
         const auto plain = plain_scan();
-        const TwoPhase again = two_phase();
-        BOOST_REQUIRE_MESSAGE(again.b_ok, again.b_error);
+        const Sliced again = sliced();
+        BOOST_REQUIRE_MESSAGE(again.b_ok, again.error);
         CompareLifecycleScans(plain.balance, plain.summary, again.balance, again.summary);
+
+        // A pass that finds the wallet where the caller's result already is
+        // (same tip, same marker) says so without walking it.
+        LifecyclePass pass;
+        pass.known = std::make_pair(again.tip, again.marker);
+        LifecycleSliceReport report = RunLifecyclePassToEnd(*wallet, pass, journal, attestations);
+        BOOST_CHECK(report.result == LifecycleSliceResult::UP_TO_DATE);
+        WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker());
+        report = RunLifecyclePassToEnd(*wallet, pass, journal, attestations);
+        BOOST_CHECK(report.result == LifecycleSliceResult::DONE);
     }
 
-    // 6. The wallet change marker moves wherever wallet contents or states move.
+    // 8. The wallet change marker moves wherever wallet contents or states
+    // move, and can be read without the wallet lock.
     {
         const uint64_t m0 = marker();
+        BOOST_CHECK_EQUAL(wallet->GetBalanceScanMarkerUnlocked(), m0);
         mine_and_connect(1);
         const uint64_t m1 = marker();
         BOOST_CHECK_GT(m1, m0);
@@ -6271,86 +6448,214 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         // A read-only scan moves nothing.
         const uint64_t m5 = marker();
         plain_scan();
-        two_phase();
+        sliced();
         BOOST_CHECK_EQUAL(marker(), m5);
+        BOOST_CHECK_EQUAL(wallet->GetBalanceScanMarkerUnlocked(), m5);
     }
 
-    // 7. A verified memo entry that disagrees with the chainstate fails the
-    // pass closed (outputs served from the memo in phase A cannot be trusted)
-    // and clears the memo; the next pass is right again.
+    // 9. A verified memo entry that disagrees with the chainstate is replaced,
+    // alone: the pass carries on with what the database says (an entry in
+    // the verify slice is never served), every other entry stays.
     {
         while (deep_outputs(true) == 0) mine_and_connect(1);
-        two_phase(); // every deep output memoized at this tip
+        sliced(); // every deep output memoized at this tip
         BOOST_REQUIRE_EQUAL(memo_size(), deep_outputs(false));
+        COutPoint corrupted;
+        WalletOutputLifecycleMemo good;
         {
             LOCK(wallet->cs_wallet);
             const int tip_height = wallet->GetLastBlockHeight();
-            bool corrupted{false};
             for (auto& [outpoint, memo] : wallet->m_output_lifecycle_memo) {
                 if ((outpoint.hash.GetUint64(0) + outpoint.n + static_cast<uint64_t>(tip_height)) % LIFECYCLE_MEMO_VERIFY_MODULUS == 0) {
+                    good = memo;
                     memo.coin_time += 777;
-                    corrupted = true;
+                    corrupted = outpoint;
                     break;
                 }
             }
-            BOOST_REQUIRE(corrupted);
+            BOOST_REQUIRE(!corrupted.IsNull());
         }
-        TwoPhase r;
+        const size_t entries = memo_size();
+        const uint64_t mismatches_before = journal.mismatches;
+        const auto plain = plain_scan();
+        Sliced r;
         {
             DebugLogHelper log_helper{"Lifecycle memo disagrees with the chainstate"};
-            r = two_phase();
+            r = sliced();
         }
-        BOOST_CHECK(r.a_ok);
-        BOOST_CHECK(!r.b_ok);
-        BOOST_CHECK(r.stats.memo_cleared);
-        BOOST_CHECK(!r.stats.budget_exhausted);
-        const auto plain = plain_scan();
-        const TwoPhase again = two_phase();
-        BOOST_REQUIRE_MESSAGE(again.b_ok, again.b_error);
+        BOOST_REQUIRE_MESSAGE(r.a_ok && r.b_ok, r.error);
+        CompareLifecycleScans(plain.balance, plain.summary, r.balance, r.summary);
+        BOOST_CHECK_EQUAL(r.stats.memo_mismatches, 1U);
+        BOOST_CHECK_EQUAL(journal.mismatches, mismatches_before + 1);
+        BOOST_CHECK_EQUAL(memo_size(), entries);
+        {
+            LOCK(wallet->cs_wallet);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.at(corrupted).coin_time, good.coin_time);
+        }
+        // The single-lock path treats it the same way.
+        {
+            LOCK(wallet->cs_wallet);
+            wallet->m_output_lifecycle_memo.at(corrupted).coin_time += 777;
+        }
+        {
+            DebugLogHelper log_helper{"Lifecycle memo disagrees with the chainstate"};
+            WalletLifecycleOptions options;
+            WalletLifecycleScanStats stats;
+            options.use_memo = true;
+            options.stats = &stats;
+            Balance balance;
+            WalletLifecycleSummary summary;
+            std::string error;
+            LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+            BOOST_REQUIRE(GetLifecycleAdjustedBalance(*wallet, 0, true, balance, summary, error, options));
+            CompareLifecycleScans(plain.balance, plain.summary, balance, summary);
+            BOOST_CHECK_EQUAL(stats.memo_mismatches, 1U);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), entries);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.at(corrupted).coin_time, good.coin_time);
+        }
+        const Sliced again = sliced();
+        BOOST_REQUIRE_MESSAGE(again.b_ok, again.error);
+        BOOST_CHECK_EQUAL(again.stats.memo_mismatches, 0U);
         CompareLifecycleScans(plain.balance, plain.summary, again.balance, again.summary);
     }
 
-    // 8. The budget of phase B is tested for every pending output.
+    // 10. A marker bump in the middle of a pass restarts it without losing
+    // memo progress: what the chainstate slices have read is in the journal
+    // and reaches the memo at the next wallet slice, whatever happens to the
+    // pass that read it.
     {
         const auto plain = plain_scan();
-        // A deadline that has already passed: not one output is resolved.
-        TwoPhase r = two_phase({}, std::chrono::steady_clock::now() - 1s);
-        BOOST_CHECK(r.a_ok);
-        BOOST_CHECK(!r.b_ok);
-        BOOST_CHECK(r.stats.budget_exhausted);
-        BOOST_CHECK_EQUAL(r.stats.database_reads, 0U);
-        BOOST_CHECK_EQUAL(r.b_error, "Wallet lifecycle scan budget exhausted");
-
-        // A cap of N database reads stops after exactly N reads, whatever the
-        // order of mapWallet, and the memo keeps its progress; repeated
-        // attempts finish with the plain result.
+        const uint64_t deep = deep_outputs(false);
+        BOOST_REQUIRE_GT(deep, 32U);
         WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
-        // Shallow outputs are read on every attempt and never memoized, so the
-        // cap leaves room for them plus a few deep ones, as in the single-lock
-        // budget test.
-        const uint64_t deep_count = deep_outputs(false);
-        BOOST_REQUIRE_GT(deep_count, 16U);
-        const uint64_t cap = (plain.stats.outputs - deep_count) + 8;
-        size_t previous_memo = 0;
-        bool completed{false};
-        for (int attempt = 0; attempt < 500 && !completed; ++attempt) {
-            r = two_phase({}, std::chrono::steady_clock::time_point::max(), cap);
-            if (r.b_ok) {
-                completed = true;
-                CompareLifecycleScans(plain.balance, plain.summary, r.balance, r.summary);
+        LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+        limits.max_items = 4;
+        LifecyclePass pass;
+        size_t previous_progress{0};
+        size_t previous_memo{0};
+        int restarts{0};
+        bool done{false};
+        for (int i = 0; i < 100000 && !done; ++i) {
+            const bool chain = pass.stage == LifecyclePass::Stage::CHAIN;
+            const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+            if (report.result == LifecycleSliceResult::DONE) {
+                done = true;
                 break;
             }
-            BOOST_REQUIRE(r.a_ok);
-            BOOST_CHECK(r.stats.budget_exhausted);
-            BOOST_CHECK_EQUAL(r.stats.database_reads, cap);
+            // The memo itself only grows; the journal reaches it at the next
+            // wallet slice (the walk of the pass that starts over).
             BOOST_CHECK_GE(memo_size(), previous_memo);
             previous_memo = memo_size();
+            if (report.result == LifecycleSliceResult::WALLET_MOVED) {
+                ++restarts;
+                // The pass is gone; what it read is not.
+                BOOST_CHECK(pass.stage == LifecyclePass::Stage::TIP);
+                BOOST_CHECK_EQUAL(pass.pending.size(), 0U);
+                BOOST_CHECK_GT(memo_size() + journal.Waiting(), previous_progress);
+                previous_progress = memo_size() + journal.Waiting();
+                continue;
+            }
+            BOOST_REQUIRE(report.result == LifecycleSliceResult::MORE);
+            // Bump after every few chainstate slices while the memo is incomplete.
+            if (chain && journal.Waiting() >= 8 && memo_size() + journal.Waiting() < deep) {
+                WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker());
+            }
         }
-        BOOST_CHECK(completed);
-        BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false));
+        BOOST_REQUIRE(done);
+        BOOST_CHECK_GT(restarts, 2);
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+        CompareLifecycleScans(plain.balance, plain.summary, pass.balance, pass.summary);
     }
 
-    // 9. An unconfirmed output (a transaction in the mempool) takes the same
+    // 11. The memo warm-up is its own job: a cursor over the wallet that
+    // depends neither on the tip nor on the marker. It survives marker
+    // bumps, new blocks and any number of interruptions, and nothing it has
+    // read is discarded.
+    {
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        // A pass that is told to hand over does so instead of reading every
+        // deep output itself.
+        LifecyclePass handover;
+        handover.warmup_threshold = 8;
+        BOOST_CHECK(RunLifecyclePassToEnd(*wallet, handover, journal, attestations).result == LifecycleSliceResult::NEED_WARMUP);
+        BOOST_CHECK_EQUAL(memo_size(), 0U);
+
+        LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+        limits.max_items = 3;
+        LifecycleWarmup warmup;
+        warmup.batch_size = 16;
+        size_t previous_memo{0};
+        uint64_t previous_progress{0};
+        int slices{0};
+        int disturbances{0};
+        bool done{false};
+        for (; slices < 100000 && !done; ++slices) {
+            const LifecycleSliceReport report = RunLifecycleWarmupSlice(*wallet, warmup, journal, limits);
+            BOOST_REQUIRE(report.result == LifecycleSliceResult::MORE || report.result == LifecycleSliceResult::DONE);
+            BOOST_CHECK(report.held_main != report.held_wallet);
+            done = report.result == LifecycleSliceResult::DONE;
+            // Progress never goes back: the memo only grows, and so does the
+            // count of what was read.
+            BOOST_CHECK_GE(memo_size(), previous_memo);
+            BOOST_CHECK_GE(warmup.fetched, previous_progress);
+            previous_memo = memo_size();
+            previous_progress = warmup.fetched;
+            if (done) break;
+            if (slices % 7 == 3) {
+                WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker());
+                ++disturbances;
+            }
+            if (slices == 20 || slices == 45) {
+                mine_and_connect(1); // the tip and the wallet move
+                ++disturbances;
+            }
+        }
+        BOOST_REQUIRE(done);
+        BOOST_CHECK_GT(disturbances, 4);
+        BOOST_CHECK_GT(slices, 20);
+        BOOST_CHECK_EQUAL(journal.Waiting(), 0U);
+        // Everything that was deep when the cursor passed it is memoized. An
+        // output that became deep behind the cursor is left to the next pass.
+        const uint64_t deep = deep_outputs(false);
+        BOOST_CHECK_GE(memo_size() + 2, deep);
+        BOOST_CHECK_LE(memo_size(), deep);
+        BOOST_CHECK_EQUAL(warmup.skipped, 0U);
+        // Now the pass no longer hands over, reads only what is not deep or
+        // not memoized yet, and agrees with the plain scan.
+        const auto plain = plain_scan();
+        LifecyclePass pass;
+        pass.warmup_threshold = 8;
+        BOOST_REQUIRE(RunLifecyclePassToEnd(*wallet, pass, journal, attestations).result == LifecycleSliceResult::DONE);
+        CompareLifecycleScans(plain.balance, plain.summary, pass.balance, pass.summary);
+        BOOST_CHECK_LE(pass.stats.database_reads, plain.stats.outputs - deep + 2 + deep_outputs(true));
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+        // A warm-up with nothing to do says so after one walk.
+        LifecycleWarmup idle;
+        LifecycleSliceReport report;
+        do {
+            report = RunLifecycleWarmupSlice(*wallet, idle, journal, LifecycleSliceLimits::Unlimited());
+        } while (report.result == LifecycleSliceResult::MORE);
+        BOOST_CHECK(report.result == LifecycleSliceResult::DONE);
+        BOOST_CHECK_EQUAL(idle.collected, 0U);
+    }
+
+    // 12. The scans do not grow the chainstate coins cache: what they read is
+    // read through to the database and dropped at the end of the slice.
+    {
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        {
+            LOCK(::cs_main);
+            m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+        }
+        const size_t before = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChainstate().CoinsTip().GetCacheSize());
+        const Sliced cold = sliced();
+        BOOST_REQUIRE(cold.b_ok);
+        BOOST_CHECK_GT(cold.stats.database_reads, 100U);
+        const size_t after = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChainstate().CoinsTip().GetCacheSize());
+        BOOST_CHECK_EQUAL(after, before);
+    }
+
+    // 13. An unconfirmed output (a transaction in the mempool) takes the same
     // path in both scans.
     {
         CKey recipient_key;
@@ -6365,15 +6670,15 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
             BOOST_REQUIRE(wallet->mapWallet.at(created->tx->GetHash()).InMempool());
         }
         const auto plain = plain_scan();
-        const TwoPhase r = two_phase();
-        BOOST_REQUIRE_MESSAGE(r.a_ok && r.b_ok, r.a_error + r.b_error);
+        const Sliced r = sliced();
+        BOOST_REQUIRE_MESSAGE(r.a_ok && r.b_ok, r.error);
         CompareLifecycleScans(plain.balance, plain.summary, r.balance, r.summary);
         BOOST_CHECK_GT(plain.balance.m_mine_untrusted_pending + plain.balance.m_mine_trusted, 0);
         // The unconfirmed change is never served from the memo.
-        BOOST_CHECK_GT(r.pass.pending.size(), 0U);
+        BOOST_CHECK_GT(r.pending, 0U);
     }
 
-    // 10. Mempool traffic that does not touch the wallet does not discard a
+    // 14. Mempool traffic that does not touch the wallet does not discard a
     // pass; a transaction that pays the wallet, or spends one of its outputs,
     // does.
     {
@@ -6389,20 +6694,20 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
             wallet->transactionRemovedFromMempool(tx, MemPoolRemovalReason::EXPIRY);
         };
 
-        // (1) Unrelated: marker unchanged, the injected scan still publishes.
+        // (1) Unrelated: marker unchanged, the pass still has its result.
         const CTransactionRef unrelated = make_tx(COutPoint{uint256{0x91}, 0}, foreign);
         const uint64_t before = marker();
         add_and_remove(unrelated);
         BOOST_CHECK_EQUAL(marker(), before);
         const auto plain = plain_scan();
-        TwoPhase r = two_phase([&] { add_and_remove(make_tx(COutPoint{uint256{0x92}, 1}, foreign)); });
-        BOOST_REQUIRE_MESSAGE(r.a_ok && r.b_ok, r.a_error + r.b_error);
+        Sliced r = sliced([&] { add_and_remove(make_tx(COutPoint{uint256{0x92}, 1}, foreign)); });
+        BOOST_REQUIRE_MESSAGE(r.a_ok && r.b_ok, r.error);
         CompareLifecycleScans(plain.balance, plain.summary, r.balance, r.summary);
 
         // (2a) Pays the wallet: becomes a wallet transaction, marker moves, pass discarded.
         const CTransactionRef paying = make_tx(COutPoint{uint256{0x93}, 0}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
         const uint64_t m1 = marker();
-        r = two_phase([&] { wallet->transactionAddedToMempool(paying); });
+        r = sliced([&] { wallet->transactionAddedToMempool(paying); });
         BOOST_CHECK(r.a_ok);
         BOOST_CHECK(!r.b_ok);
         BOOST_CHECK_GT(marker(), m1);
@@ -6421,7 +6726,7 @@ BOOST_FIXTURE_TEST_CASE(two_phase_gui_balance_matches_single_lock_and_fails_clos
         BOOST_REQUIRE(!own.IsNull());
         const CTransactionRef spending = make_tx(own, foreign);
         const uint64_t m2 = marker();
-        r = two_phase([&] { wallet->transactionAddedToMempool(spending); });
+        r = sliced([&] { wallet->transactionAddedToMempool(spending); });
         BOOST_CHECK(r.a_ok);
         BOOST_CHECK(!r.b_ok);
         BOOST_CHECK_GT(marker(), m2);

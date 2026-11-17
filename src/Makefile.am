@@ -390,6 +390,7 @@ BITCOIN_CORE_H = \
   wallet/wallettool.h \
   wallet/walletutil.h \
   wallet/block_connect_activity.h \
+  wallet/display_balance.h \
   walletinitinterface.h \
   warnings.h \
   zmq/zmqabstractnotifier.h \
@@ -560,6 +561,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/rpc/wallet.cpp \
   wallet/scriptpubkeyman.cpp \
   wallet/shadow_pow_claim_recovery.cpp \
+  wallet/display_balance.cpp \
   wallet/spend.cpp \
   wallet/transaction.cpp \
   wallet/wallet.cpp \

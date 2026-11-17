@@ -64,6 +64,13 @@ struct Balance {
     CAmount m_watchonly_stake{0};
 };
 Balance GetBalance(const CWallet& wallet, int min_depth = 0, bool avoid_reuse = true);
+/** Add one wallet transaction's share of GetBalance() to `balance`. GetBalance()
+ * is this over every transaction of mapWallet; the sliced display balance pass
+ * calls it transaction by transaction. `trusted_parents` is the cache that
+ * CachedTxIsTrusted() fills and must be the same set for the whole walk. */
+void AddTxToBalance(const CWallet& wallet, const CWalletTx& wtx, int min_depth, bool avoid_reuse,
+                    std::set<uint256>& trusted_parents, Balance& balance)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
 std::map<CTxDestination, CAmount> GetAddressBalances(const CWallet& wallet);
 std::set<std::set<CTxDestination>> GetAddressGroupings(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);

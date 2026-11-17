@@ -1514,9 +1514,15 @@ public:
      * work when this value has moved in between. A bump that is missing
      * would let a stale balance reach the screen, so callers bump
      * liberally: extra bumps only cost a repeated scan. */
-    uint64_t m_balance_scan_marker GUARDED_BY(cs_wallet){0};
-    void BumpBalanceScanMarker() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { ++m_balance_scan_marker; }
-    uint64_t GetBalanceScanMarker() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_balance_scan_marker; }
+    //! Written only under cs_wallet. Atomic so that the display balance
+    //! worker and the GUI can ask "has anything changed since this snapshot"
+    //! without taking the wallet lock (GetBalanceScanMarkerUnlocked()).
+    std::atomic<uint64_t> m_balance_scan_marker{0};
+    void BumpBalanceScanMarker() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { m_balance_scan_marker.fetch_add(1, std::memory_order_release); }
+    uint64_t GetBalanceScanMarker() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_balance_scan_marker.load(std::memory_order_acquire); }
+    /** The marker without the wallet lock. Advisory: it tells a reader that a
+     * snapshot is out of date, never that wallet data may be read. */
+    uint64_t GetBalanceScanMarkerUnlocked() const { return m_balance_scan_marker.load(std::memory_order_acquire); }
 
     typedef std::multimap<int64_t, CWalletTx*> TxItems;
     TxItems wtxOrdered;

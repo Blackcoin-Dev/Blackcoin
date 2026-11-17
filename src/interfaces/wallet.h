@@ -272,9 +272,29 @@ public:
     //! Get balances if possible without blocking.
     virtual bool tryGetBalances(WalletBalances& balances, uint256& block_hash) = 0;
 
-    //! Read one synchronized display snapshot. An unchanged tip or busy wallet returns false.
+    //! Wait for the display balance worker to confirm or replace the
+    //! published display snapshot with a pass that starts after this call, and
+    //! return that snapshot. Blocks the caller (bounded) but takes no wallet or
+    //! chain lock on its thread; not for the GUI thread. Returns false when the
+    //! tip is `unchanged_tip`, when the wallet has not processed the active tip,
+    //! or when no pass finished in time. Rethrows what the pass threw.
     virtual bool tryGetDisplayBalances(WalletDisplayBalances& result,
         const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family) = 0;
+
+    //! The published display snapshot. Takes neither cs_main nor cs_wallet and
+    //! never waits for the worker; safe on the GUI thread. `available` is
+    //! false until the first balance has been published.
+    virtual WalletDisplayBalances getDisplaySnapshot() = 0;
+
+    //! Tell the display balance worker whether this wallet is the one shown
+    //! and which send-family balance is wanted. `retry_send` asks again for a
+    //! send-family balance that could not be computed. Cheap; never blocks.
+    virtual void requestDisplayBalances(bool foreground, std::optional<WalletDisplayCoinFamily> send_family, bool retry_send) = 0;
+
+    //! Register handler for display snapshot changes (a new snapshot, or a
+    //! change of the failed state). Called on the display worker thread.
+    using DisplayBalancesChangedFn = std::function<void()>;
+    virtual std::unique_ptr<Handler> handleDisplayBalancesChanged(DisplayBalancesChangedFn fn) = 0;
 
     //! Get balance.
     virtual CAmount getBalance() = 0;
@@ -658,8 +678,22 @@ struct WalletBalances
 struct WalletDisplayBalances
 {
     WalletBalances balances;
+    //! The block the balances were computed for.
     uint256 block_hash;
     std::optional<CAmount> send_family_balance;
+    int block_height{-1};
+    //! A balance has been published.
+    bool available{false};
+    //! The wallet has not changed since the balances were computed for
+    //! block_hash. When false the balances are those of block_height and a
+    //! new snapshot is on its way.
+    bool exact{false};
+    //! The last attempt to compute a snapshot ended in an error.
+    bool failed{false};
+    //! Grows with every published snapshot of the wallet.
+    uint64_t sequence{0};
+    //! The family send_family_balance belongs to.
+    std::optional<WalletDisplayCoinFamily> send_family;
 };
 
 // Wallet transaction information.

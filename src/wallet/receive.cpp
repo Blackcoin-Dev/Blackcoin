@@ -306,32 +306,38 @@ bool CachedTxIsTrusted(const CWallet& wallet, const CWalletTx& wtx)
     return CachedTxIsTrusted(wallet, wtx, trusted_parents);
 }
 
+void AddTxToBalance(const CWallet& wallet, const CWalletTx& wtx, const int min_depth, bool avoid_reuse,
+                    std::set<uint256>& trusted_parents, Balance& ret)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const isminefilter reuse_filter = avoid_reuse ? ISMINE_NO : ISMINE_USED;
+    const bool is_trusted{CachedTxIsTrusted(wallet, wtx, trusted_parents)};
+    const int tx_depth{wallet.GetTxDepthInMainChain(wtx)};
+    const CAmount tx_credit_mine{CachedTxGetAvailableCredit(wallet, wtx, ISMINE_SPENDABLE | reuse_filter)};
+    const CAmount tx_credit_watchonly{CachedTxGetAvailableCredit(wallet, wtx, ISMINE_WATCH_ONLY | reuse_filter)};
+    if (is_trusted && tx_depth >= min_depth) {
+        ret.m_mine_trusted += tx_credit_mine;
+        ret.m_watchonly_trusted += tx_credit_watchonly;
+    }
+    if (!is_trusted && tx_depth == 0 && wtx.InMempool()) {
+        ret.m_mine_untrusted_pending += tx_credit_mine;
+        ret.m_watchonly_untrusted_pending += tx_credit_watchonly;
+    }
+    ret.m_mine_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_SPENDABLE);
+    ret.m_watchonly_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_WATCH_ONLY);
+    ret.m_mine_stake += CachedTxGetStakeCredit(wallet, wtx, ISMINE_SPENDABLE);
+    ret.m_watchonly_stake += CachedTxGetStakeCredit(wallet, wtx, ISMINE_WATCH_ONLY);
+}
+
 Balance GetBalance(const CWallet& wallet, const int min_depth, bool avoid_reuse)
 {
     Balance ret;
-    isminefilter reuse_filter = avoid_reuse ? ISMINE_NO : ISMINE_USED;
     {
         LOCK(wallet.cs_wallet);
         std::set<uint256> trusted_parents;
         for (const auto& entry : wallet.mapWallet)
         {
-            const CWalletTx& wtx = entry.second;
-            const bool is_trusted{CachedTxIsTrusted(wallet, wtx, trusted_parents)};
-            const int tx_depth{wallet.GetTxDepthInMainChain(wtx)};
-            const CAmount tx_credit_mine{CachedTxGetAvailableCredit(wallet, wtx, ISMINE_SPENDABLE | reuse_filter)};
-            const CAmount tx_credit_watchonly{CachedTxGetAvailableCredit(wallet, wtx, ISMINE_WATCH_ONLY | reuse_filter)};
-            if (is_trusted && tx_depth >= min_depth) {
-                ret.m_mine_trusted += tx_credit_mine;
-                ret.m_watchonly_trusted += tx_credit_watchonly;
-            }
-            if (!is_trusted && tx_depth == 0 && wtx.InMempool()) {
-                ret.m_mine_untrusted_pending += tx_credit_mine;
-                ret.m_watchonly_untrusted_pending += tx_credit_watchonly;
-            }
-            ret.m_mine_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_SPENDABLE);
-            ret.m_watchonly_immature += CachedTxGetImmatureCredit(wallet, wtx, ISMINE_WATCH_ONLY);
-            ret.m_mine_stake += CachedTxGetStakeCredit(wallet, wtx, ISMINE_SPENDABLE);
-            ret.m_watchonly_stake += CachedTxGetStakeCredit(wallet, wtx, ISMINE_WATCH_ONLY);
+            AddTxToBalance(wallet, entry.second, min_depth, avoid_reuse, trusted_parents, ret);
         }
     }
     return ret;

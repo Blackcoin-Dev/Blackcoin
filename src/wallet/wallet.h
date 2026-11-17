@@ -959,6 +959,11 @@ private:
     std::atomic<bool> fAbortRescan{false};
     std::atomic<bool> fScanningWallet{false}; // controlled by WalletRescanReserver
     std::atomic<bool> m_attaching_chain{false};
+    /** Blocks whose transactions LoadWallet marked Inactive because the block was not in the
+     *  active chain at its snapshot. AttachChainUnpublished rescans from the lowest of these
+     *  that is in the active chain once subscribed, so blocks connected between the snapshot
+     *  and the subscription (which no notification covers) re-confirm their transactions. */
+    std::set<uint256> m_load_inactivated_blocks GUARDED_BY(cs_wallet);
     std::atomic<bool> m_scanning_with_passphrase{false};
     std::atomic<SteadyClock::time_point> m_scanning_start{SteadyClock::time_point{}};
     std::atomic<double> m_scanning_progress{0};

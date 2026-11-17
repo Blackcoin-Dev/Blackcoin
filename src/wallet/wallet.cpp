@@ -6718,6 +6718,8 @@ DBErrors CWallet::LoadWallet()
                     if (!snapshot->second) {
                         // The transaction's block (or conflicting block) was
                         // reorged out while the wallet was offline.
+                        // block_hash refers into the state about to be replaced.
+                        m_load_inactivated_blocks.insert(block_hash);
                         wtx.m_state = TxStateInactive{};
                         MarkShadowPowClaimCandidateStateChangedLocked();
                 } else {
@@ -9461,6 +9463,23 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
 
     // If rescan_required = true, rescan_height remains equal to 0
     int rescan_height = 0;
+    // LoadWallet marked these transactions Inactive in memory (the database still
+    // says Confirmed) because their block was not in the active chain at its
+    // snapshot. A block connected between that snapshot and the subscription above
+    // was announced to nobody, and the stored best block can already be at or past
+    // it (it moves with every connected block), so the locator fork alone may start
+    // the rescan after those blocks or skip it. Start no later than the lowest such
+    // block that is in the active chain now, and rescan even when that block is the tip.
+    std::optional<int> inactivated_floor;
+    for (const uint256& block_hash : walletInstance->m_load_inactivated_blocks) {
+        const CBlockIndex* index = WITH_LOCK(
+            ::cs_main, return chain.chainman().m_blockman.LookupBlockIndex(block_hash));
+        if (index && reconciliation_tip && index->nHeight <= reconciliation_tip->nHeight &&
+            reconciliation_tip->GetAncestor(index->nHeight) == index) {
+            if (!inactivated_floor || index->nHeight < *inactivated_floor) inactivated_floor = index->nHeight;
+        }
+    }
+    walletInstance->m_load_inactivated_blocks.clear();
     if (!rescan_required)
     {
         WalletBatch batch(walletInstance->GetDatabase());
@@ -9470,6 +9489,7 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
                 rescan_height = *fork_height;
             }
         }
+        if (inactivated_floor && *inactivated_floor < rescan_height) rescan_height = *inactivated_floor;
     }
 
     const std::optional<int> tip_height = chain.getHeight();
@@ -9481,7 +9501,7 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
         walletInstance->m_last_block_processed_height = -1;
     }
 
-    if (tip_height && *tip_height != rescan_height)
+    if (tip_height && (*tip_height != rescan_height || (inactivated_floor && !rescan_required)))
     {
         // No need to read and scan block if block was created before
         // our wallet birthday (as adjusted for block time variability)

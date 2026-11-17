@@ -5428,6 +5428,8 @@ void TestBatchedStatusRefresh(interfaces::Node& node, TestChain100Setup& test, c
     const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
     MiniGUI gui(node, style.get());
     WalletContext& context = *node.walletLoader().context();
+    // Earlier tests may have mined: pin the standalone wallet to the chain's current tip, not the fixture's 105.
+    SyncRecoveryReviewWalletTip(wallet, node);
     AddWallet(context, wallet);
     auto model = std::make_unique<WalletModel>(interfaces::MakeWallet(context, wallet), *gui.clientModel, style.get(), nullptr, /*defer_history=*/true);
     RemoveWallet(context, wallet, std::nullopt);

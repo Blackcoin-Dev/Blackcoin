@@ -2334,8 +2334,8 @@ util::Result<WalletQuantumActionTx> CreateWalletDemurrageSweep(CWallet& wallet, 
     return result;
 }
 
-//! Construct wallet tx struct.
-WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx)
+//! Construct wallet tx struct. With value_keys, only those value_map entries are copied.
+WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx, const std::vector<std::string>* value_keys = nullptr)
 {
     LOCK(wallet.cs_wallet);
     WalletTx result;
@@ -2361,7 +2361,14 @@ WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx)
     result.debit = CachedTxGetDebit(wallet, wtx, ISMINE_ALL);
     result.change = CachedTxGetChange(wallet, wtx);
     result.time = wtx.GetTxTime();
-    result.value_map = wtx.mapValue;
+    if (value_keys) {
+        for (const std::string& key : *value_keys) {
+            const auto found = wtx.mapValue.find(key);
+            if (found != wtx.mapValue.end()) result.value_map.emplace(*found);
+        }
+    } else {
+        result.value_map = wtx.mapValue;
+    }
     result.is_coinbase = wtx.IsCoinBase();
     result.is_coinstake = wtx.IsCoinStake();
     return result;
@@ -2701,6 +2708,63 @@ public:
         }
         if (interrupt && interrupt()) return false;
         transactions = std::move(captured);
+        return true;
+    }
+    bool tryGetWalletTxHashes(std::vector<uint256>& hashes) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet || m_wallet->IsScanning()) return false;
+        std::vector<uint256> captured;
+        captured.reserve(m_wallet->mapWallet.size());
+        for (const auto& entry : m_wallet->mapWallet) captured.push_back(entry.first);
+        hashes = std::move(captured);
+        return true;
+    }
+    bool tryGetWalletTxChunk(const std::vector<uint256>& hashes,
+                             size_t& pos,
+                             size_t max_txs,
+                             std::chrono::milliseconds budget,
+                             const std::vector<std::string>& value_keys,
+                             std::vector<WalletTx>& out) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet || m_wallet->IsScanning()) return false;
+        const auto deadline = std::chrono::steady_clock::now() + budget;
+        size_t handled{0};
+        size_t next = pos;
+        while (next < hashes.size() && handled < max_txs) {
+            // Always make progress, then honour the lock budget every few transactions.
+            if (handled > 0 && handled % 16 == 0 && std::chrono::steady_clock::now() >= deadline) break;
+            const auto it = m_wallet->mapWallet.find(hashes[next]);
+            if (it != m_wallet->mapWallet.end()) out.push_back(MakeWalletTx(*m_wallet, it->second, &value_keys));
+            ++next;
+            ++handled;
+        }
+        pos = next;
+        return true;
+    }
+    bool tryGetTxStatuses(const std::vector<uint256>& txids,
+        std::vector<std::optional<WalletTxStatus>>& out,
+        int& num_blocks,
+        int64_t& block_time) override
+    {
+        TRY_LOCK(::cs_main, locked_main);
+        if (!locked_main) return false;
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) return false;
+        num_blocks = m_wallet->GetLastBlockHeight();
+        block_time = -1;
+        CHECK_NONFATAL(m_wallet->chain().findBlock(m_wallet->GetLastBlockHash(), FoundBlock().time(block_time)));
+        out.clear();
+        out.reserve(txids.size());
+        for (const uint256& txid : txids) {
+            const auto mi = m_wallet->mapWallet.find(txid);
+            if (mi == m_wallet->mapWallet.end()) {
+                out.emplace_back();
+            } else {
+                out.emplace_back(MakeWalletTxStatus(*m_wallet, mi->second));
+            }
+        }
         return true;
     }
     bool tryGetTxStatus(const uint256& txid,

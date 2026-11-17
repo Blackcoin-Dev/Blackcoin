@@ -19,6 +19,7 @@
 #include <util/result.h>
 #include <util/ui_change_type.h>
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -239,6 +240,29 @@ public:
     virtual std::vector<WalletTx> getWalletTxs() = 0;
     virtual bool tryGetWalletTxs(std::vector<WalletTx>& transactions,
                                  const std::function<bool()>& interrupt = {}) = 0;
+
+    //! Streamed history, step one: the hash of every wallet transaction, taken under one short wallet lock.
+    //! Returns false on lock contention or while the wallet is scanning (retry later).
+    virtual bool tryGetWalletTxHashes(std::vector<uint256>& hashes) = 0;
+
+    //! Streamed history, step two: describe hashes[pos...] in order, holding the wallet lock for at most
+    //! max_txs transactions or about `budget`, whichever comes first, and advance pos past those handled. A hash
+    //! the wallet no longer holds is skipped. Only the value_map entries named in value_keys are copied, so a
+    //! caller that renders a list does not pay for the free-form notes it never shows. Returns false, with pos
+    //! and out unchanged, on lock contention or while the wallet is scanning.
+    virtual bool tryGetWalletTxChunk(const std::vector<uint256>& hashes,
+                                     size_t& pos,
+                                     size_t max_txs,
+                                     std::chrono::milliseconds budget,
+                                     const std::vector<std::string>& value_keys,
+                                     std::vector<WalletTx>& out) = 0;
+
+    //! Status of many transactions under one acquisition of the node and wallet locks. out[i] is empty when the
+    //! wallet does not hold txids[i]. Returns false, with outputs untouched, on lock contention.
+    virtual bool tryGetTxStatuses(const std::vector<uint256>& txids,
+                                  std::vector<std::optional<WalletTxStatus>>& out,
+                                  int& num_blocks,
+                                  int64_t& block_time) = 0;
 
     //! Try to get updated status for a particular transaction, if possible without blocking.
     virtual bool tryGetTxStatus(const uint256& txid,

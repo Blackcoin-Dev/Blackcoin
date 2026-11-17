@@ -1009,6 +1009,7 @@ bool CWallet::ReconcileWalletShadowPayoutsForBlock(
         wtx.mapValue[SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_BLOCK_KEY] = block_hash.GetHex();
         wtx.mapValue[SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY] = ToString(block_height);
         wtx.m_state = TxStateInactive{};
+        UpdateShadowPowNonConfirmedProofIndexLocked(wtx);
         MarkShadowPowClaimCandidateStateChangedLocked();
         UpdateConfirmedSyntheticPayoutIndex(wtx);
         wtx.MarkDirty();
@@ -3306,12 +3307,12 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     // mempool, so it will not receive a stale-removal callback. Mark every
     // remaining unconfirmed proof for the scheduler's broadcast-independent
     // validation pass after each connected block.
-    // Proof presence is tracked per record (every record is classified when it
-    // enters the wallet), so visit only those records instead of testing the
-    // whole wallet on every block. Records too large to parse in a callback
-    // are indexed as unknown and are tested here exactly as before. The
-    // matching records are collected first because the durable update
-    // refreshes the indexes being read.
+    // Only a record that is not confirmed can match, and those are indexed
+    // on their own (proof records and records too large to classify in a
+    // callback alike), so a wallet with a long confirmed claim history does
+    // not look every one of them up on every block. The matching records are
+    // collected first because the durable update refreshes the index being
+    // read.
     std::vector<uint256> unconfirmed_proofs;
     const auto collect_unconfirmed_proofs = [&](const std::set<uint256>& txids) {
         for (const uint256& txid : txids) {
@@ -3323,8 +3324,7 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
             unconfirmed_proofs.push_back(txid);
         }
     };
-    collect_unconfirmed_proofs(m_shadow_pow_all_proof_txids);
-    collect_unconfirmed_proofs(m_shadow_pow_unknown_proof_presence_txids);
+    collect_unconfirmed_proofs(m_shadow_pow_nonconfirmed_proof_txids);
     for (const uint256& txid : unconfirmed_proofs) {
         UpdateShadowPowClaimRecoveryRecordDurably(
             txid,

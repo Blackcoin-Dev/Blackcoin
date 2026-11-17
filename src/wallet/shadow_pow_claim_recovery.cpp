@@ -1385,6 +1385,21 @@ void CWallet::ClearShadowPowProofPresenceIndexLocked(const uint256& txid)
     m_shadow_pow_known_oversized_proof_txids.erase(txid);
     m_shadow_pow_proof_input_index_pending_txids.erase(txid);
     m_shadow_pow_proof_input_index_capacity_txids.erase(txid);
+    m_shadow_pow_nonconfirmed_proof_txids.erase(txid);
+}
+
+void CWallet::UpdateShadowPowNonConfirmedProofIndexLocked(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    const uint256 txid = wtx.GetHash();
+    const bool tracked =
+        m_shadow_pow_all_proof_txids.count(txid) != 0 ||
+        m_shadow_pow_unknown_proof_presence_txids.count(txid) != 0;
+    if (tracked && !wtx.isConfirmed()) {
+        m_shadow_pow_nonconfirmed_proof_txids.insert(txid);
+    } else {
+        m_shadow_pow_nonconfirmed_proof_txids.erase(txid);
+    }
 }
 
 void CWallet::SetShadowPowProofPresenceIndexLocked(
@@ -1406,6 +1421,7 @@ void CWallet::SetShadowPowProofPresenceIndexLocked(
     } else {
         m_shadow_pow_unknown_proof_presence_txids.insert(txid);
     }
+    UpdateShadowPowNonConfirmedProofIndexLocked(wtx);
 
     // Unknown/oversized callbacks can run beneath cs_main. Publish only a
     // pending scalar there; the existing outside-lock classifier supplies a
@@ -1513,6 +1529,9 @@ void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
             SetShadowPowProofPresenceIndexLocked(
                 wtx, /*exact_proof=*/false, /*unknown=*/true);
         }
+        // A known oversized proof keeps its presence entry above, so its
+        // confirmation state is refreshed here.
+        UpdateShadowPowNonConfirmedProofIndexLocked(wtx);
         m_shadow_pow_claim_txids.erase(txid);
         m_shadow_pow_unconfirmed_claim_txids.erase(txid);
         forget_implicit_ownership();
@@ -1843,6 +1862,7 @@ void CWallet::RebuildShadowPowClaimIndexesLocked()
     m_shadow_pow_all_proof_txids.clear();
     m_shadow_pow_unknown_proof_presence_txids.clear();
     m_shadow_pow_known_oversized_proof_txids.clear();
+    m_shadow_pow_nonconfirmed_proof_txids.clear();
     m_shadow_pow_proof_inputs_by_txid.clear();
     m_shadow_pow_proof_anchor_txids.clear();
     m_shadow_pow_unknown_inputs_by_txid.clear();

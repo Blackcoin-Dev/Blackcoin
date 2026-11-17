@@ -1189,6 +1189,14 @@ private:
         GUARDED_BY(cs_wallet);
     std::set<uint256> m_shadow_pow_known_oversized_proof_txids
         GUARDED_BY(cs_wallet);
+    // The proof and unknown-presence records above that are not confirmed.
+    // A long-lived mining wallet holds tens of thousands of confirmed proof
+    // records and a handful of unconfirmed ones, and the block-connected
+    // callback only ever acts on the latter. Kept as a superset: an entry is
+    // added whenever such a record is seen outside a block and every reader
+    // re-tests the record's state, so a stale entry is harmless.
+    std::set<uint256> m_shadow_pow_nonconfirmed_proof_txids
+        GUARDED_BY(cs_wallet);
     // Complete incremental reverse index for ownership-independent proof
     // anchors. Lifetime history is never walked or capped by hot selection.
     std::map<uint256, std::vector<COutPoint>>
@@ -1948,6 +1956,28 @@ public:
         return m_shadow_pow_all_proof_txids;
     }
 
+    bool IsNonConfirmedShadowPowProofLocked(const uint256& txid) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_shadow_pow_nonconfirmed_proof_txids.count(txid) != 0;
+    }
+
+    //! Whether every proof or unknown-presence record that is not confirmed
+    //! is in the non-confirmed index. Walks the whole history: tests only.
+    bool CheckShadowPowNonConfirmedProofIndexLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        for (const auto* txids : {&m_shadow_pow_all_proof_txids,
+                                  &m_shadow_pow_unknown_proof_presence_txids}) {
+            for (const uint256& txid : *txids) {
+                const auto it = mapWallet.find(txid);
+                if (it == mapWallet.end() || it->second.isConfirmed()) continue;
+                if (m_shadow_pow_nonconfirmed_proof_txids.count(txid) == 0) return false;
+            }
+        }
+        return true;
+    }
+
     bool HasUnknownShadowPowProofPresenceLocked() const
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
@@ -2568,6 +2598,8 @@ public:
     void SetShadowPowProofPresenceIndexLocked(
         const CWalletTx& wtx, bool exact_proof, bool unknown,
         const std::vector<COutPoint>* prevalidated_inputs = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void UpdateShadowPowNonConfirmedProofIndexLocked(const CWalletTx& wtx)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void ClearShadowPowProofPresenceIndexLocked(const uint256& txid)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

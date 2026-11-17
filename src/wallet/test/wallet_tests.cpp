@@ -7250,6 +7250,67 @@ static std::shared_ptr<CWallet> TestLoadQuantumWalletBackup(const fs::path& path
 }
 
 #ifdef USE_SQLITE
+BOOST_FIXTURE_TEST_CASE(NonConfirmedProofIndexFollowsRecordState, BasicTestingSetup)
+{
+    // The block-connected callback visits only proof records that are not
+    // confirmed. A record must enter that index whenever it is, or becomes,
+    // unconfirmed, and leave it once a block confirms it.
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetLastBlockProcessed(321, uint256{42});
+        wallet.SetupLegacyScriptPubKeyMan();
+        BOOST_REQUIRE(wallet.GetOrCreateLegacyScriptPubKeyMan()->AddKeyPubKey(
+            wallet_key, wallet_key.GetPubKey()));
+    }
+    CMutableTransaction funding;
+    funding.vout.emplace_back(2 * COIN, GetScriptForRawPubKey(wallet_key.GetPubKey()));
+    const CTransactionRef funding_ref = MakeTransactionRef(std::move(funding));
+    BOOST_REQUIRE(wallet.AddToWallet(funding_ref, TxStateInactive{}));
+
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0, 0, 0, 0, 0, 0, 0, 0,
+                               0});
+    CMutableTransaction claim;
+    claim.vin.emplace_back(COutPoint{funding_ref->GetHash(), 0});
+    claim.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const CTransactionRef claim_ref = MakeTransactionRef(std::move(claim));
+    BOOST_REQUIRE(TransactionHasShadowProof(*claim_ref));
+    const uint256 claim_txid = claim_ref->GetHash();
+    const uint256 funding_txid = funding_ref->GetHash();
+
+    BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateInactive{}));
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.IsIndexedShadowPowClaimLocked(claim_txid));
+        BOOST_CHECK(wallet.IsNonConfirmedShadowPowProofLocked(claim_txid));
+        // An ordinary record is never indexed.
+        BOOST_CHECK(!wallet.IsNonConfirmedShadowPowProofLocked(funding_txid));
+        BOOST_CHECK(wallet.CheckShadowPowNonConfirmedProofIndexLocked());
+    }
+
+    BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateConfirmed{uint256{43}, 322, 1}));
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.mapWallet.at(claim_txid).isConfirmed());
+        BOOST_CHECK(wallet.IsIndexedShadowPowClaimLocked(claim_txid));
+        BOOST_CHECK(!wallet.IsNonConfirmedShadowPowProofLocked(claim_txid));
+        BOOST_CHECK(wallet.CheckShadowPowNonConfirmedProofIndexLocked());
+    }
+
+    // A reorg returns the record to the unconfirmed state.
+    BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateInactive{}));
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.mapWallet.at(claim_txid).isUnconfirmed());
+        BOOST_CHECK(wallet.IsNonConfirmedShadowPowProofLocked(claim_txid));
+        BOOST_CHECK(wallet.CheckShadowPowNonConfirmedProofIndexLocked());
+    }
+}
+
 BOOST_FIXTURE_TEST_CASE(BlockConnectedCommitsOncePerWallet, WalletTestingSetup)
 {
     // Every database write one connected block causes in a wallet (here the

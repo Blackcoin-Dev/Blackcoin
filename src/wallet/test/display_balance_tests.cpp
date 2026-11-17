@@ -563,25 +563,72 @@ BOOST_AUTO_TEST_CASE(display_state_names_and_log_cadence)
     BOOST_CHECK_EQUAL(classify(&snapshot, false, true, 100, other).ToString(), "behind(1)");
     // A snapshot ahead of the reference is not behind.
     BOOST_CHECK_EQUAL(classify(&snapshot, false, true, 99, std::nullopt).ToString(), "exact");
+
+    // A wallet that is not shown is recomputed at most once a minute, so it
+    // is routinely a block or two behind: that is logged at the ten minute
+    // cadence. The wallet on screen, and any wallet three or more blocks
+    // behind, is logged every minute.
+    for (const int behind : {1, 2}) {
+        state = classify(&snapshot, false, true, 100 + behind, std::nullopt);
+        BOOST_CHECK_EQUAL(state.behind_blocks, behind);
+        BOOST_CHECK_EQUAL(state.SummaryIntervalMs(/*foreground=*/false), WalletDisplayBalance::SUMMARY_INTERVAL_EXACT_MS);
+        BOOST_CHECK_EQUAL(state.SummaryIntervalMs(/*foreground=*/true), WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS);
+    }
+    state = classify(&snapshot, false, true, 100 + WalletDisplayBalance::BEHIND_LOG_MIN_BLOCKS, std::nullopt);
+    BOOST_CHECK_EQUAL(state.SummaryIntervalMs(/*foreground=*/false), WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS);
+    // Nothing published is reported every minute whichever wallet it is.
+    BOOST_CHECK_EQUAL(classify(nullptr, false, false, 100, std::nullopt).SummaryIntervalMs(false),
+                      WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS);
 }
 
-BOOST_FIXTURE_TEST_CASE(worker_log_line_uses_the_new_states, DisplayWalletSetup)
+BOOST_FIXTURE_TEST_CASE(worker_log_line_measures_state_and_age_against_the_same_block, DisplayWalletSetup)
 {
-    // Nothing published yet: "none", logged at the minute cadence.
+    // A snapshot is published, then the wallet processes two more blocks while
+    // this wallet has no turn. The line used to read "state=behind(2) ...
+    // snapshot_age_blocks=0": the state was measured against the wallet's last
+    // processed block and the age against the tip the worker saw when it last
+    // started a pass of this wallet.
     const auto state = std::make_shared<WalletDisplayBalance>(*wallet);
+    state->RunJob([] { return true; });
+    const auto published = state->Snapshot();
+    BOOST_REQUIRE(published);
+    const int height = published->tip_height;
+    BOOST_CHECK_EQUAL(state->State(height, published->tip_hash).ToString(), "exact");
+    Notify(Mine());
+    Notify(Mine());
+    BOOST_CHECK_EQUAL(state->State(height + 2, std::nullopt).ToString(), "behind(2)");
+
+    int lines{0};
+    const auto count_lines = LogInstance().PushBackCallback([&](const std::string& text) {
+        if (text.find("GUI balance worker: wallet=") != std::string::npos) ++lines;
+    });
     const int64_t base = WalletDisplayBalance::NowMs();
+    // Not shown and two blocks behind: nothing at the minute cadence.
+    state->MaybeLogSummary(base + WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS + 1000);
+    BOOST_CHECK_EQUAL(lines, 0);
+    // Shown: the minute cadence, and state and age agree.
+    state->SetInterest(/*foreground=*/true, std::nullopt, /*retry_send=*/false);
     {
-        // Not due yet.
-        state->MaybeLogSummary(base + WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS / 2);
+        ASSERT_DEBUG_LOG(strprintf("state=behind(2) snapshot_height=%d wallet_height=%d snapshot_age_blocks=2 ", height, height + 2));
+        state->MaybeLogSummary(base + WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS + 2000);
     }
+    BOOST_CHECK_EQUAL(lines, 1);
+    // Not shown again: the ten minute cadence.
+    state->SetInterest(/*foreground=*/false, std::nullopt, /*retry_send=*/false);
+    state->MaybeLogSummary(base + 3 * WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS);
+    BOOST_CHECK_EQUAL(lines, 1);
     {
-        ASSERT_DEBUG_LOG("state=none snapshot_height=-1");
-        state->MaybeLogSummary(base + WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS + 1000);
+        ASSERT_DEBUG_LOG("state=behind(2) ");
+        state->MaybeLogSummary(base + WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS + WalletDisplayBalance::SUMMARY_INTERVAL_EXACT_MS + 3000);
     }
+    BOOST_CHECK_EQUAL(lines, 2);
+    // A new snapshot of the wallet's block: exact, age zero.
+    state->RunJob([] { return true; });
     {
-        ASSERT_DEBUG_LOG("state=none snapshot_height=-1");
-        state->MaybeLogSummary(base + 2 * WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS + 2000);
+        ASSERT_DEBUG_LOG(strprintf("state=exact snapshot_height=%d wallet_height=%d snapshot_age_blocks=0 ", height + 2, height + 2));
+        state->MaybeLogSummary(base + 3 * WalletDisplayBalance::SUMMARY_INTERVAL_EXACT_MS);
     }
+    LogInstance().DeleteCallback(count_lines);
 }
 
 // ---- The meter of a cs_main slice ----------------------------------------------

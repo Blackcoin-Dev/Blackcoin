@@ -75,10 +75,16 @@ std::string DisplayBalanceState::ToString() const
     return "none";
 }
 
-int64_t DisplayBalanceState::SummaryIntervalMs() const
+int64_t DisplayBalanceState::SummaryIntervalMs(bool foreground) const
 {
-    return status == DisplayBalanceStatus::BEHIND || status == DisplayBalanceStatus::NONE
-        ? WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS : WalletDisplayBalance::SUMMARY_INTERVAL_EXACT_MS;
+    // A wallet that is not shown is recomputed at most once a minute while a
+    // block arrives about as often, so at any moment it is routinely a block
+    // or two behind. That is not news: only the wallet on screen, or one that
+    // has fallen further behind, is reported at the minute cadence.
+    const bool minute = status == DisplayBalanceStatus::NONE ||
+        (status == DisplayBalanceStatus::BEHIND &&
+         (foreground || behind_blocks >= WalletDisplayBalance::BEHIND_LOG_MIN_BLOCKS));
+    return minute ? WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS : WalletDisplayBalance::SUMMARY_INTERVAL_EXACT_MS;
 }
 
 DisplayBalanceState ClassifyDisplayBalance(const DisplayBalanceSnapshot* snapshot, bool failed, bool marker_current,
@@ -343,19 +349,26 @@ void WalletDisplayBalance::MaybeLogSummary(int64_t now_ms)
         if (reference_height < 0) reference_height = m_last_seen_tip_height;
         const DisplayBalanceState state = ClassifyDisplayBalance(
             m_snapshot.get(), m_failed, m_snapshot && m_snapshot->marker == marker, reference_height, reference_hash);
-        if (now_ms - m_last_summary_ms < state.SummaryIntervalMs()) return;
+        if (now_ms - m_last_summary_ms < state.SummaryIntervalMs(m_foreground)) return;
         m_last_summary_ms = now_ms;
         const int snapshot_height = m_snapshot ? m_snapshot->tip_height : -1;
-        const int age_blocks = m_snapshot && m_last_seen_tip_height >= 0
-            ? std::max(0, m_last_seen_tip_height - snapshot_height) : -1;
-        line = strprintf("GUI balance worker: wallet=%s state=%s snapshot_height=%d snapshot_age_blocks=%d "
-                         "slices=%d max_wallet_slice_ms=%.1f max_main_slice_ms=%.1f "
+        // The age is measured against the same block as the state: the
+        // wallet's last processed block. (It used to be measured against the
+        // tip this worker saw when it last started a pass of this wallet,
+        // which for a wallet that had no turn since is the snapshot's own
+        // block: "behind(7) snapshot_age_blocks=0".) A snapshot of another
+        // block at the wallet's height, after a reorg, is one block behind.
+        const int age_blocks = !m_snapshot ? -1
+            : state.status == DisplayBalanceStatus::BEHIND ? state.behind_blocks : 0;
+        line = strprintf("GUI balance worker: wallet=%s state=%s snapshot_height=%d wallet_height=%d snapshot_age_blocks=%d "
+                         "slices=%d max_wallet_slice_ms=%.1f max_main_slice_ms=%.1f max_send_family_ms=%.1f "
                          "warmup_remaining=%d warmup_walked_pct=%d "
                          "restarts_tip_moved=%d restarts_marker_moved=%d busy_deferrals=%d "
                          "lock_busy=%d not_synced=%d passes=%d failures=%d since_load_s=%d",
                          m_wallet.GetName(), state.ToString(),
-                         snapshot_height, age_blocks,
+                         snapshot_height, reference_height, age_blocks,
                          m_counters.slices, m_counters.max_wallet_us / 1000.0, m_counters.max_main_us / 1000.0,
+                         m_counters.max_send_family_us / 1000.0,
                          m_warmup_waiting, m_warmup_walked_percent,
                          m_counters.restarts_tip, m_counters.restarts_marker, m_counters.busy_deferrals,
                          m_counters.lock_busy, m_counters.not_synced, m_counters.passes, m_counters.failures,
@@ -685,8 +698,9 @@ bool WalletDisplayBalance::RunSendFamily(DisplayBalanceSnapshot& snapshot)
         std::lock_guard<std::mutex> lock(m_mutex);
         m_send_attempted = std::make_tuple(snapshot.tip_hash, snapshot.marker, quantum);
         m_send_force = false;
-        m_counters.max_main_us = std::max(m_counters.max_main_us, held_us);
-        m_counters.max_wallet_us = std::max(m_counters.max_wallet_us, held_us);
+        // Not a slice: both locks, up to SEND_FAMILY_BUDGET by design. It has
+        // a figure of its own so that it is not read as a slice that overran.
+        m_counters.max_send_family_us = std::max(m_counters.max_send_family_us, held_us);
         // A wallet too large for the bound is not asked again at every block.
         if (interrupted) m_send_not_before_ms = NowMs() + BACKGROUND_MIN_INTERVAL_MS;
     }

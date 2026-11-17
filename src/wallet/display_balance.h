@@ -87,8 +87,11 @@ struct DisplayBalanceState {
 
     /** "exact", "current-unverified", "behind(N)", "none" or "failed". */
     std::string ToString() const;
-    /** Log cadence: every minute while a snapshot is behind or missing, every ten minutes otherwise. */
-    int64_t SummaryIntervalMs() const;
+    /** Log cadence: every minute while a snapshot is missing, or is behind
+     * and either belongs to the wallet on screen (`foreground`) or is at
+     * least WalletDisplayBalance::BEHIND_LOG_MIN_BLOCKS behind; every ten
+     * minutes otherwise. */
+    int64_t SummaryIntervalMs(bool foreground = false) const;
 };
 
 /**
@@ -176,6 +179,8 @@ struct DisplayBalanceCounters {
     uint64_t slices{0};
     int64_t max_wallet_us{0};
     int64_t max_main_us{0};
+    //! The on-demand send-family balance (both locks); not a slice.
+    int64_t max_send_family_us{0};
     uint64_t restarts_tip{0};
     uint64_t restarts_marker{0};
     uint64_t busy_deferrals{0};
@@ -204,6 +209,9 @@ public:
     //! Log line interval while the snapshot is behind or missing, and otherwise.
     static constexpr int64_t SUMMARY_INTERVAL_STALE_MS{60000};
     static constexpr int64_t SUMMARY_INTERVAL_EXACT_MS{600000};
+    //! A wallet that is not shown is logged as behind at the minute cadence
+    //! only when it is at least this many blocks behind.
+    static constexpr int BEHIND_LOG_MIN_BLOCKS{3};
     /** The state as the log line reports it. */
     DisplayBalanceState State(int reference_height, const std::optional<uint256>& reference_hash) const;
     //! A pass that meets more deep outputs without a memo entry than this

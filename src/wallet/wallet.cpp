@@ -507,6 +507,7 @@ bool CWallet::UpdateShadowPowClaimRecoveryRecordsDurably(
         assert(live != mapWallet.end());
         live->second.mapValue = std::move(update.record->mapValue);
         live->second.m_state = std::move(update.record->m_state);
+        UpdateUnconfirmedCoinstakeIndex(live->second);
         RefreshShadowPowClaimIndexEntryLocked(live->second);
         live->second.MarkDirty();
         if (changed_txids) changed_txids->push_back(update.txid);
@@ -893,6 +894,7 @@ void CWallet::UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx)
     const uint256 txid = wtx.GetHash();
     m_synthetic_payout_digest.Erase(txid);
     if (wtx.tx && wtx.IsCoinStake()) m_coinstake_txids.insert(txid);
+    UpdateUnconfirmedCoinstakeIndex(wtx);
     const auto previous = m_confirmed_synthetic_payout_block_by_txid.find(txid);
     if (previous != m_confirmed_synthetic_payout_block_by_txid.end()) {
         const auto block = m_confirmed_synthetic_payouts_by_block.find(previous->second);
@@ -912,6 +914,17 @@ void CWallet::UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx)
         wtx.mapValue.count(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY) != 0});
 }
 
+void CWallet::UpdateUnconfirmedCoinstakeIndex(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    if (!wtx.tx || !wtx.IsCoinStake()) return;
+    if (wtx.isConfirmed()) {
+        m_unconfirmed_coinstake_txids.erase(wtx.GetHash());
+    } else {
+        m_unconfirmed_coinstake_txids.insert(wtx.GetHash());
+    }
+}
+
 void CWallet::RecomputeConfirmedSyntheticPayoutIndex()
 {
     AssertLockHeld(cs_wallet);
@@ -919,6 +932,7 @@ void CWallet::RecomputeConfirmedSyntheticPayoutIndex()
     m_confirmed_synthetic_payout_block_by_txid.clear();
     m_synthetic_payout_digest.Clear();
     m_coinstake_txids.clear();
+    m_unconfirmed_coinstake_txids.clear();
     for (const auto& [_, wtx] : mapWallet) {
         UpdateConfirmedSyntheticPayoutIndex(wtx);
     }
@@ -2268,7 +2282,10 @@ void CWallet::RefreshMempoolStatus(CWalletTx& wtx)
         wtx.m_state = TxStateInactive();
         state_changed = true;
     }
-    if (state_changed) MarkShadowPowClaimCandidateStateChangedLocked();
+    if (state_changed) {
+        MarkShadowPowClaimCandidateStateChangedLocked();
+        UpdateUnconfirmedCoinstakeIndex(wtx);
+    }
     // Ordinary inactive/mempool transitions preserve the reservation category.
     // Only admitting an excluded spender can change its inputs' live status.
     // Avoid traversing every same-input sibling on each removal callback.
@@ -2709,6 +2726,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
             // transition in the same wallet-critical section rather than
             // leaving authority dependent on a later callback or restart.
             RefreshShadowPowClaimIndexEntryLocked(*desc_tx);
+            UpdateUnconfirmedCoinstakeIndex(*desc_tx);
             RefreshLiveUnspentStakeOutpoints(*desc_tx);
             RemoveIndexedShadowSolve(desc_tx->GetHash());
             UpdatePendingShadowSignalIndex(*desc_tx);
@@ -3132,6 +3150,7 @@ void CWallet::RecursiveUpdateTxState(const uint256& tx_hash, const TryUpdatingSt
         if (update_state != TxUpdate::UNCHANGED) {
             MarkShadowPowClaimCandidateStateChangedLocked();
             RefreshShadowPowClaimIndexEntryLocked(wtx);
+            UpdateUnconfirmedCoinstakeIndex(wtx);
             RefreshLiveUnspentStakeOutpoints(wtx);
             if (wtx.isConfirmed()) {
                 IndexConfirmedShadowSolve(wtx);
@@ -3691,7 +3710,18 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     work.coinstakes_visited += AbandonOrphanedCoinstakes();
     end_phase(work.coinstakes);
 
-    work.coinstakes_visited += RecomputeQuantumRedelegationWinHistory(batch);
+    // The history holds, per delegation, the height of its newest confirmed
+    // win. Connecting a block only ever raises an entry to that block's
+    // height, so the disconnect can change the history only when an entry
+    // names the disconnected height (or one above it). Without such an entry
+    // a recomputation over every confirmed coinstake would reproduce what is
+    // there.
+    const bool redelegation_win_disconnected = std::any_of(
+        m_redelegation_last_win_height.begin(), m_redelegation_last_win_height.end(),
+        [&](const auto& entry) { return entry.second >= block.height; });
+    if (redelegation_win_disconnected) {
+        work.coinstakes_visited += RecomputeQuantumRedelegationWinHistory(batch);
+    }
     end_phase(work.redelegation);
 
     if (block_writes && !block_writes->Commit()) {
@@ -4682,10 +4712,12 @@ size_t CWallet::AbandonOrphanedCoinstakes()
     }
     size_t visited{0};
 
-    // Walk only the wallet's coinstakes (an immutable property of a transaction,
-    // indexed when it enters the wallet), not its whole history. Abandoning
-    // changes state only, so the index is not modified while iterating.
-    for (const uint256& wtxid : m_coinstake_txids) {
+    // Walk only the wallet's coinstakes that are not confirmed, not every
+    // coinstake it ever made and not its whole history: a confirmed coinstake
+    // has a depth above zero and is never abandoned here. Abandoning keeps a
+    // record unconfirmed but can add descendants to the index, so walk a copy.
+    const std::vector<uint256> unconfirmed{m_unconfirmed_coinstake_txids.begin(), m_unconfirmed_coinstake_txids.end()};
+    for (const uint256& wtxid : unconfirmed) {
         ++visited;
         const auto wallet_tx = mapWallet.find(wtxid);
         if (wallet_tx == mapWallet.end()) continue;
@@ -7063,6 +7095,7 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
         m_pending_shadow_signal_txids.erase(hash);
         m_synthetic_payout_digest.Erase(hash);
         m_coinstake_txids.erase(hash);
+        m_unconfirmed_coinstake_txids.erase(hash);
         const auto synthetic_block = m_confirmed_synthetic_payout_block_by_txid.find(hash);
         if (synthetic_block != m_confirmed_synthetic_payout_block_by_txid.end()) {
             const auto block = m_confirmed_synthetic_payouts_by_block.find(synthetic_block->second);

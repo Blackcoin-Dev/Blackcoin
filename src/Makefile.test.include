@@ -197,6 +197,7 @@ BITCOIN_TESTS += \
   wallet/test/display_balance_tests.cpp \
   wallet/test/wallet_tests.cpp \
   wallet/test/pow_miner_schedule_tests.cpp \
+  wallet/test/reorg_scale_tests.cpp \
   wallet/test/wallet_durability_tests.cpp \
   wallet/test/walletdb_tests.cpp \
   wallet/test/wallet_crypto_tests.cpp \

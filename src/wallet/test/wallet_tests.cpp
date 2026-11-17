@@ -5924,11 +5924,11 @@ BOOST_FIXTURE_TEST_CASE(lifecycle_memo_matches_database_path, TestChain100Setup)
             LOCK(wallet->cs_wallet);
             WalletOutputLifecycleMemo entry;
             entry.confirmed_block_height = height;
-            wallet->m_output_lifecycle_memo[at] = entry;
+            wallet->StoreOutputLifecycleMemo(at, entry);
             entry.confirmed_block_height = height + 5;
-            wallet->m_output_lifecycle_memo[above] = entry;
+            wallet->StoreOutputLifecycleMemo(above, entry);
             entry.confirmed_block_height = height - 1;
-            wallet->m_output_lifecycle_memo[below] = entry;
+            wallet->StoreOutputLifecycleMemo(below, entry);
         }
         BOOST_CHECK_EQUAL(memo_size(), before + 3);
         disconnect_last();
@@ -5973,12 +5973,12 @@ BOOST_FIXTURE_TEST_CASE(lifecycle_memo_matches_database_path, TestChain100Setup)
     // clears everything and bumps the marker.
     {
         LOCK(wallet->cs_wallet);
-        wallet->m_output_lifecycle_memo.clear();
+        wallet->ClearOutputLifecycleMemo();
         WalletOutputLifecycleMemo entry;
         for (int i = 0; i < 4; ++i) {
             entry.confirmed_block_height = 10 * (i + 1);
-            wallet->m_output_lifecycle_memo[COutPoint{uint256{0x60}, static_cast<uint32_t>(i)}] = entry;
-            wallet->m_output_lifecycle_memo[COutPoint{uint256{0x61}, static_cast<uint32_t>(i)}] = entry;
+            wallet->StoreOutputLifecycleMemo(COutPoint{uint256{0x60}, static_cast<uint32_t>(i)}, entry);
+            wallet->StoreOutputLifecycleMemo(COutPoint{uint256{0x61}, static_cast<uint32_t>(i)}, entry);
         }
         uint64_t m = wallet->GetBalanceScanMarker();
         wallet->EraseOutputLifecycleMemoFromHeight(30);

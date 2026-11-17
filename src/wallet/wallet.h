@@ -1131,6 +1131,15 @@ private:
     /** Every coinstake in the wallet. Whether a transaction is a coinstake never changes,
      *  so this only follows insertion and removal. */
     std::set<uint256> m_coinstake_txids GUARDED_BY(cs_wallet);
+    /** The coinstakes that are not confirmed in the wallet's view of the chain
+     *  (inactive, abandoned or not, in the mempool, or conflicted). Only these
+     *  can be orphans that still hold their inputs, so the sweep after a block
+     *  disconnect walks this set and not every coinstake the wallet ever made:
+     *  a staking wallet has one entry per stake it lost. Follows the record's
+     *  state wherever the coinstake index is kept and wherever a state is
+     *  written (UpdateUnconfirmedCoinstakeIndex). */
+    std::set<uint256> m_unconfirmed_coinstake_txids GUARDED_BY(cs_wallet);
+    void UpdateUnconfirmedCoinstakeIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** When the legacy claim-source capacity was last logged (steady clock). */
     std::optional<std::chrono::steady_clock::time_point> m_legacy_source_capacity_reported GUARDED_BY(cs_wallet);
     /** Incremental payout digest, kept in step with the two indexes above. */
@@ -1654,10 +1663,19 @@ public:
     /** GUI-display-only memo of chainstate facts for deep confirmed outputs
      * (see WalletOutputLifecycleMemo). Never persisted. */
     mutable std::map<COutPoint, WalletOutputLifecycleMemo> m_output_lifecycle_memo GUARDED_BY(cs_wallet);
-    /** Store (or replace) the memoized facts of one output. */
+    /** No entry of the memo is confirmed above this height (-1: the memo is
+     * empty or holds no height). Kept by StoreOutputLifecycleMemo, the one
+     * place entries are added, so that a block disconnect does not have to
+     * walk the whole memo to learn that it has nothing to erase: entries are
+     * made only for outputs at least LIFECYCLE_MEMO_MIN_DEPTH deep, so the
+     * disconnected tip is above every one of them. */
+    mutable int m_output_lifecycle_memo_max_height GUARDED_BY(cs_wallet){-1};
+    /** Store (or replace) the memoized facts of one output. Every entry is
+     * added through here. */
     void StoreOutputLifecycleMemo(const COutPoint& outpoint, const WalletOutputLifecycleMemo& memo) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         m_output_lifecycle_memo[outpoint] = memo;
+        m_output_lifecycle_memo_max_height = std::max<int>(m_output_lifecycle_memo_max_height, memo.confirmed_block_height);
     }
     /** Drop every memoized fact. Used when nothing can be said about which
      * entries are still right: a rescan, or an entry that disagreed with the
@@ -1665,6 +1683,7 @@ public:
     void ClearOutputLifecycleMemo() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         m_output_lifecycle_memo.clear();
+        m_output_lifecycle_memo_max_height = -1;
         BumpBalanceScanMarker();
     }
     /** Drop the memoized facts of outputs confirmed at or above `height`: the
@@ -1675,17 +1694,23 @@ public:
      * below the disconnected height describes a block that is still in the
      * chain and a shallow reorg cannot make it wrong; whatever slips past is
      * caught by the rolling re-verification against the chainstate. Returns
-     * the number of entries examined. */
+     * the number of entries examined: none when no entry is confirmed that
+     * high, which is the case for every disconnect of the tip. */
     size_t EraseOutputLifecycleMemoFromHeight(int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         size_t visited{0};
-        for (auto it = m_output_lifecycle_memo.begin(); it != m_output_lifecycle_memo.end();) {
-            ++visited;
-            if (it->second.confirmed_block_height >= height) {
-                it = m_output_lifecycle_memo.erase(it);
-            } else {
-                ++it;
+        if (height <= m_output_lifecycle_memo_max_height) {
+            int max_height{-1};
+            for (auto it = m_output_lifecycle_memo.begin(); it != m_output_lifecycle_memo.end();) {
+                ++visited;
+                if (it->second.confirmed_block_height >= height) {
+                    it = m_output_lifecycle_memo.erase(it);
+                } else {
+                    max_height = std::max<int>(max_height, it->second.confirmed_block_height);
+                    ++it;
+                }
             }
+            m_output_lifecycle_memo_max_height = max_height;
         }
         BumpBalanceScanMarker();
         return visited;

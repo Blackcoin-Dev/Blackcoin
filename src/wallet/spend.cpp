@@ -332,9 +332,9 @@ bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,
     if (!ClassifyLifecycleFacts(facts, outpoint, consensus, evaluation_height, evaluation_mtp,
                                 attestation, classification, error)) return false;
     if (lookup.confirmed_state && !from_memo && facts.confirmed_coin) {
-        wallet.m_output_lifecycle_memo[outpoint] = LifecycleMemoFromFacts(
+        wallet.StoreOutputLifecycleMemo(outpoint, LifecycleMemoFromFacts(
             facts, lookup.confirmed_state->confirmed_block_hash,
-            lookup.confirmed_state->confirmed_block_height, lookup.txout_digest);
+            lookup.confirmed_state->confirmed_block_height, lookup.txout_digest));
     }
     return true;
 }
@@ -615,6 +615,7 @@ bool DrainLifecycleMemoJournal(const CWallet& wallet, LifecycleMemoJournal& jour
         wallet.WalletLogPrintf("Lifecycle memo: repeated disagreements with the chainstate; clearing %u entries\n",
                                wallet.m_output_lifecycle_memo.size());
         wallet.m_output_lifecycle_memo.clear();
+        wallet.m_output_lifecycle_memo_max_height = -1;
         journal.clear_all = false;
     }
     while (journal.cursor < journal.entries.size()) {
@@ -632,7 +633,7 @@ bool DrainLifecycleMemoJournal(const CWallet& wallet, LifecycleMemoJournal& jour
                 LifecycleTxOutDigest(wtx->tx->vout[entry.outpoint.n]) != entry.txout_digest) {
                 ++journal.dropped;
             } else {
-                wallet.m_output_lifecycle_memo[entry.outpoint] = entry.memo;
+                wallet.StoreOutputLifecycleMemo(entry.outpoint, entry.memo);
                 ++journal.stored;
             }
         }

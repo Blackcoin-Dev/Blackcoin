@@ -602,44 +602,6 @@ public:
     uint256 GetBestBlock() const override { return m_source.GetBestBlock(); }
 };
 
-/** Counts the items of a slice and says when the slice must end. */
-class SliceMeter
-{
-public:
-    SliceMeter(const LifecycleSliceLimits& limits, std::chrono::milliseconds budget)
-        : m_limits(limits), m_timed(budget.count() > 0), m_start(Now()), m_deadline(m_start + budget) {}
-
-    std::chrono::steady_clock::time_point Now() const
-    {
-        return m_limits.now ? m_limits.now() : std::chrono::steady_clock::now();
-    }
-    /** Count one item. True when the slice must end; it stays true. */
-    bool Tick(uint64_t clock_interval = LifecycleSliceLimits::CLOCK_INTERVAL)
-    {
-        ++m_items;
-        if (m_expired) return true;
-        if (m_limits.max_items > 0 && m_items >= m_limits.max_items) {
-            m_expired = true;
-        } else if (m_timed && m_items % clock_interval == 0 && Now() >= m_deadline) {
-            m_expired = true;
-        }
-        return m_expired;
-    }
-    bool Expired() const { return m_expired; }
-    std::chrono::microseconds Held() const
-    {
-        return std::chrono::duration_cast<std::chrono::microseconds>(Now() - m_start);
-    }
-
-private:
-    const LifecycleSliceLimits& m_limits;
-    const bool m_timed;
-    const std::chrono::steady_clock::time_point m_start;
-    const std::chrono::steady_clock::time_point m_deadline;
-    uint64_t m_items{0};
-    bool m_expired{false};
-};
-
 /** Number of chainstate reads between two clock reads of a cs_main slice. */
 constexpr uint64_t CHAIN_CLOCK_INTERVAL{16};
 
@@ -727,6 +689,7 @@ LifecycleSliceResult PassMainSliceLocked(const CWallet& wallet, LifecyclePass& p
     attestations.ResetFor(pass.tip.hash);
     CoinsViewPeek peek{wallet.chain().getCoinsTip()};
     CCoinsViewCache view{&peek};
+    meter.SeedMaxChainItem(pass.max_chain_item);
     while (pass.chain_cursor < pass.pending.size()) {
         if (meter.Expired()) return LifecycleSliceResult::MORE;
         const LifecyclePassOutput& out = pass.pending[pass.chain_cursor];
@@ -777,8 +740,12 @@ LifecycleSliceResult PassMainSliceLocked(const CWallet& wallet, LifecyclePass& p
         ++pass.stats.outputs;
 
         std::optional<Consensus::DemurrageAttestationState> attestation;
+        bool read_chainstate = !out.memo_hit;
         if (pass.tip.demurrage_active) {
+            const size_t attestations_before = attestations.map.size();
             attestation = LifecycleAttestationFor(view, out.txout.scriptPubKey, &attestations.map);
+            // A script not seen yet in this pass is a chainstate read too.
+            read_chainstate = read_chainstate || attestations.map.size() != attestations_before;
         }
         ValueLifecycleClassification classification;
         if (!ClassifyLifecycleFacts(facts, out.outpoint, consensus, pass.tip.evaluation_height,
@@ -790,7 +757,12 @@ LifecycleSliceResult PassMainSliceLocked(const CWallet& wallet, LifecyclePass& p
             return LifecycleSliceResult::FAILED;
         }
         ++pass.chain_cursor;
-        meter.Tick(CHAIN_CLOCK_INTERVAL);
+        if (read_chainstate) {
+            meter.TickChainItem();
+            pass.max_chain_item = meter.MaxChainItem();
+        } else {
+            meter.Tick(CHAIN_CLOCK_INTERVAL);
+        }
     }
     pass.stage = LifecyclePass::Stage::STORE;
     return LifecycleSliceResult::MORE;
@@ -922,6 +894,7 @@ LifecycleSliceResult WarmupMainSliceLocked(const CWallet& wallet, LifecycleWarmu
     const Consensus::Params& consensus = Params().GetConsensus();
     CoinsViewPeek peek{wallet.chain().getCoinsTip()};
     CCoinsViewCache view{&peek};
+    meter.SeedMaxChainItem(warmup.max_chain_item);
     while (warmup.fetch_cursor < warmup.items.size()) {
         if (meter.Expired()) return LifecycleSliceResult::MORE;
         const LifecycleWarmupItem& item = warmup.items[warmup.fetch_cursor++];
@@ -932,7 +905,8 @@ LifecycleSliceResult WarmupMainSliceLocked(const CWallet& wallet, LifecycleWarmu
             ? tip_index->GetAncestor(item.confirmed_block_height) : nullptr;
         LifecycleChainFacts facts;
         std::string error;
-        if (block && block->GetBlockHash() == item.confirmed_block_hash &&
+        const bool read_chainstate = block && block->GetBlockHash() == item.confirmed_block_hash;
+        if (read_chainstate &&
             GatherLifecycleChainFactsFromView(item.outpoint, item.txout, view, tip_index, tip_index->nHeight + 1,
                                               consensus, /*in_mempool=*/false, /*tx_time=*/0, facts, error) &&
             facts.confirmed_coin) {
@@ -949,7 +923,12 @@ LifecycleSliceResult WarmupMainSliceLocked(const CWallet& wallet, LifecycleWarmu
             // Left to the consistent pass, which reports what is wrong.
             ++warmup.skipped;
         }
-        meter.Tick(CHAIN_CLOCK_INTERVAL);
+        if (read_chainstate) {
+            meter.TickChainItem();
+            warmup.max_chain_item = meter.MaxChainItem();
+        } else {
+            meter.Tick(CHAIN_CLOCK_INTERVAL);
+        }
     }
     warmup.items.clear();
     warmup.fetch_cursor = 0;

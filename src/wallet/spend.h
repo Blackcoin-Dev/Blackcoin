@@ -18,6 +18,7 @@
 #include <wallet/wallet.h>
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -165,6 +166,75 @@ struct LifecycleSliceLimits {
     }
 };
 
+/**
+ * Counts the items of a slice and says when the slice must end. Items that
+ * read the chainstate (TickChainItem) read the clock every time and end the
+ * slice early when the budget left cannot pay for the costliest such item
+ * seen so far, because one item can make up to three uncached chainstate
+ * reads. Items that do not (Tick) read the clock only every `clock_interval`.
+ * A slice always finishes the item it is on, so it stays within its budget
+ * plus one item (and always makes progress).
+ */
+class SliceMeter
+{
+public:
+    SliceMeter(const LifecycleSliceLimits& limits, std::chrono::milliseconds budget)
+        : m_limits(limits), m_timed(budget.count() > 0), m_start(Now()), m_deadline(m_start + budget), m_last_read(m_start) {}
+
+    std::chrono::steady_clock::time_point Now() const
+    {
+        return m_limits.now ? m_limits.now() : std::chrono::steady_clock::now();
+    }
+    /** Count one item that did not read the chainstate. True when the slice must end; it stays true. */
+    bool Tick(uint64_t clock_interval = LifecycleSliceLimits::CLOCK_INTERVAL)
+    {
+        ++m_items;
+        if (m_expired) return true;
+        if (m_limits.max_items > 0 && m_items >= m_limits.max_items) {
+            m_expired = true;
+        } else if (m_timed && m_items % clock_interval == 0) {
+            m_last_read = Now();
+            if (m_last_read >= m_deadline) m_expired = true;
+        }
+        return m_expired;
+    }
+    /** Count one item that read the chainstate. */
+    bool TickChainItem()
+    {
+        ++m_items;
+        if (m_expired) return true;
+        if (m_limits.max_items > 0 && m_items >= m_limits.max_items) {
+            m_expired = true;
+        } else if (m_timed) {
+            const auto now = Now();
+            m_max_chain_item = std::max(m_max_chain_item,
+                                        std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_read));
+            m_last_read = now;
+            if (now >= m_deadline || now + m_max_chain_item > m_deadline) m_expired = true;
+        }
+        return m_expired;
+    }
+    bool Expired() const { return m_expired; }
+    /** Costliest chainstate item seen, for carrying over to the next slice of the same pass. */
+    std::chrono::microseconds MaxChainItem() const { return m_max_chain_item; }
+    /** Start from half the previous slice's costliest item: a single outlier then stops mattering after a few slices. */
+    void SeedMaxChainItem(std::chrono::microseconds previous) { m_max_chain_item = std::max(m_max_chain_item, previous / 2); }
+    std::chrono::microseconds Held() const
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(Now() - m_start);
+    }
+
+private:
+    const LifecycleSliceLimits& m_limits;
+    const bool m_timed;
+    const std::chrono::steady_clock::time_point m_start;
+    const std::chrono::steady_clock::time_point m_deadline;
+    std::chrono::steady_clock::time_point m_last_read;
+    std::chrono::microseconds m_max_chain_item{0};
+    uint64_t m_items{0};
+    bool m_expired{false};
+};
+
 /** Demurrage attestations by script, valid for one tip only. Kept across the
  * slices and the restarts of the passes of a wallet for as long as the tip
  * holds, so that a wallet with many scripts converges. */
@@ -281,6 +351,8 @@ struct LifecyclePass {
     uint64_t memo_misses{0};     //!< memo-eligible outputs without a usable entry
     uint64_t memo_mismatches{0}; //!< verified entries that disagreed with the chainstate
     uint32_t slices{0};
+    //! Costliest chainstate item of the latest slice; half of it seeds the next slice's meter.
+    std::chrono::microseconds max_chain_item{0};
 
     /** Forget the pass in progress, keep the options. */
     void Reset()
@@ -291,6 +363,7 @@ struct LifecyclePass {
         fresh.warmup_threshold = warmup_threshold;
         fresh.known = known;
         fresh.force_demurrage = force_demurrage;
+        fresh.max_chain_item = max_chain_item;
         *this = std::move(fresh);
     }
 };
@@ -338,6 +411,8 @@ struct LifecycleWarmup {
     size_t bucket{0};
     size_t bucket_count{0};
     bool walk_finished{false};
+    //! Costliest chainstate item of the latest slice; half of it seeds the next slice's meter.
+    std::chrono::microseconds max_chain_item{0};
     std::vector<LifecycleWarmupItem> items;
     size_t fetch_cursor{0};
     uint64_t collected{0}; //!< outputs listed so far

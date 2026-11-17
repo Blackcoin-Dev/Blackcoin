@@ -25,6 +25,7 @@
 #include <support/allocators/secure.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <arith_uint256.h>
 #include <uint256.h>
 #include <util/fs.h>
 #include <util/hasher.h>
@@ -370,6 +371,49 @@ struct SyntheticPayoutRef {
     int height{-1};
     bool stale{false};
 };
+
+/**
+ * Order-independent, incrementally maintained digest of the confirmed synthetic payout
+ * records (SyntheticPayoutCheckpoint schema 2). Every record contributes a 256-bit term
+ * derived from its txid, block hash and stale flag; the digest is the finalised sum of
+ * the terms (mod 2^256) of the records at heights [0, max_height], with their count.
+ * Adding, removing or changing one record costs O(log n), so a flush no longer collects,
+ * sorts and hashes the wallet's whole payout history. Records are bucketed by height so
+ * a prefix digest only subtracts the buckets above max_height.
+ */
+class SyntheticPayoutDigest
+{
+public:
+    /** Add or replace the record for ref.txid. A negative height keeps it out of every digest. */
+    void Set(const SyntheticPayoutRef& ref);
+    void Erase(const uint256& txid);
+    void Clear();
+    /** Count and digest of the records at heights [0, max_height]. */
+    std::pair<uint32_t, uint256> At(int max_height) const;
+    /** The same value computed from scratch over a list of records (used at load and by tests). */
+    static std::pair<uint32_t, uint256> Compute(const std::vector<SyntheticPayoutRef>& refs, int max_height);
+
+private:
+    struct Entry {
+        int height;
+        arith_uint256 term;
+    };
+    struct Bucket {
+        uint32_t count{0};
+        arith_uint256 sum;
+    };
+    static arith_uint256 Term(const SyntheticPayoutRef& ref);
+    static uint256 Finalize(uint32_t count, const arith_uint256& sum);
+    std::map<uint256, Entry> m_entries;
+    std::map<int, Bucket> m_buckets;
+    uint32_t m_count{0};
+    arith_uint256 m_sum;
+};
+
+struct SyntheticPayoutCheckpoint;
+/** Whether a stored checkpoint (either schema) describes exactly these records. The records carry
+ *  the heights to hash against (at load, the active-chain heights of their blocks). */
+bool SyntheticPayoutCheckpointMatches(const SyntheticPayoutCheckpoint& checkpoint, const std::vector<SyntheticPayoutRef>& refs);
 
 /** Block timing captured before taking cs_wallet. */
 struct WalletBlockTime {
@@ -996,6 +1040,16 @@ private:
     void RecomputeConfirmedSyntheticPayoutIndex() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** See SyntheticPayoutCheckpoint. Heights are those currently stored in the wallet transactions. */
     std::vector<SyntheticPayoutRef> CollectSyntheticPayoutRefs() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+public:
+    /** Incremental digest of the confirmed synthetic payouts at heights [0, height]. */
+    std::pair<uint32_t, uint256> GetSyntheticPayoutDigestLocked(int height) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_synthetic_payout_digest.At(height);
+    }
+    /** The same value recomputed from every record in the wallet (tests). schema 1 is the
+     *  sorted-txid hash earlier releases stored, schema 2 the incremental form. */
+    std::pair<uint32_t, uint256> RecomputeSyntheticPayoutDigestLocked(int height, uint32_t schema) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+private:
     /** Cached copy of the persisted checkpoint (nullopt when none is stored). */
     std::optional<SyntheticPayoutCheckpoint> m_synthetic_payout_checkpoint GUARDED_BY(cs_wallet);
     /** True once LoadWallet authenticated every payout without error; checkpoints are never written before. */

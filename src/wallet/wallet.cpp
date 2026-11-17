@@ -886,6 +886,8 @@ void CWallet::UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx)
 {
     AssertLockHeld(cs_wallet);
     const uint256 txid = wtx.GetHash();
+    m_synthetic_payout_digest.Erase(txid);
+    if (wtx.tx && wtx.IsCoinStake()) m_coinstake_txids.insert(txid);
     const auto previous = m_confirmed_synthetic_payout_block_by_txid.find(txid);
     if (previous != m_confirmed_synthetic_payout_block_by_txid.end()) {
         const auto block = m_confirmed_synthetic_payouts_by_block.find(previous->second);
@@ -900,6 +902,9 @@ void CWallet::UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx)
     if (!confirmed || !IsSyntheticGoldRushPayoutRecord(wtx)) return;
     m_confirmed_synthetic_payouts_by_block[confirmed->confirmed_block_hash].insert(txid);
     m_confirmed_synthetic_payout_block_by_txid.emplace(txid, confirmed->confirmed_block_hash);
+    m_synthetic_payout_digest.Set(SyntheticPayoutRef{
+        txid, confirmed->confirmed_block_hash, confirmed->confirmed_block_height,
+        wtx.mapValue.count(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY) != 0});
 }
 
 void CWallet::RecomputeConfirmedSyntheticPayoutIndex()
@@ -907,6 +912,8 @@ void CWallet::RecomputeConfirmedSyntheticPayoutIndex()
     AssertLockHeld(cs_wallet);
     m_confirmed_synthetic_payouts_by_block.clear();
     m_confirmed_synthetic_payout_block_by_txid.clear();
+    m_synthetic_payout_digest.Clear();
+    m_coinstake_txids.clear();
     for (const auto& [_, wtx] : mapWallet) {
         UpdateConfirmedSyntheticPayoutIndex(wtx);
     }
@@ -934,9 +941,86 @@ std::vector<SyntheticPayoutRef> CWallet::CollectSyntheticPayoutRefs() const
     return refs;
 }
 
-/** Count and digest of the synthetic payout records at heights [0, max_height]; order independent. */
-static std::pair<uint32_t, uint256> HashSyntheticPayoutRefs(std::vector<SyntheticPayoutRef> refs, int max_height)
+arith_uint256 SyntheticPayoutDigest::Term(const SyntheticPayoutRef& ref)
 {
+    HashWriter hasher{};
+    hasher << std::string{"blackcoin-synthetic-payout-term-v2"} << ref.txid << ref.block_hash << ref.stale;
+    return UintToArith256(hasher.GetHash());
+}
+
+uint256 SyntheticPayoutDigest::Finalize(uint32_t count, const arith_uint256& sum)
+{
+    HashWriter hasher{};
+    hasher << std::string{"blackcoin-synthetic-payout-digest-v2"} << count << ArithToUint256(sum);
+    return hasher.GetHash();
+}
+
+void SyntheticPayoutDigest::Erase(const uint256& txid)
+{
+    const auto it = m_entries.find(txid);
+    if (it == m_entries.end()) return;
+    const auto bucket = m_buckets.find(it->second.height);
+    if (bucket != m_buckets.end()) {
+        bucket->second.sum -= it->second.term;
+        if (--bucket->second.count == 0) m_buckets.erase(bucket);
+    }
+    m_sum -= it->second.term;
+    --m_count;
+    m_entries.erase(it);
+}
+
+void SyntheticPayoutDigest::Set(const SyntheticPayoutRef& ref)
+{
+    Erase(ref.txid);
+    if (ref.height < 0) return;
+    const arith_uint256 term = Term(ref);
+    m_entries.emplace(ref.txid, Entry{ref.height, term});
+    Bucket& bucket = m_buckets[ref.height];
+    ++bucket.count;
+    bucket.sum += term;
+    ++m_count;
+    m_sum += term;
+}
+
+void SyntheticPayoutDigest::Clear()
+{
+    m_entries.clear();
+    m_buckets.clear();
+    m_count = 0;
+    m_sum = arith_uint256{};
+}
+
+std::pair<uint32_t, uint256> SyntheticPayoutDigest::At(int max_height) const
+{
+    uint32_t count = m_count;
+    arith_uint256 sum = m_sum;
+    for (auto bucket = m_buckets.upper_bound(max_height); bucket != m_buckets.end(); ++bucket) {
+        count -= bucket->second.count;
+        sum -= bucket->second.sum;
+    }
+    return {count, Finalize(count, sum)};
+}
+
+std::pair<uint32_t, uint256> SyntheticPayoutDigest::Compute(const std::vector<SyntheticPayoutRef>& refs, int max_height)
+{
+    uint32_t count{0};
+    arith_uint256 sum;
+    for (const SyntheticPayoutRef& ref : refs) {
+        if (ref.height < 0 || ref.height > max_height) continue;
+        ++count;
+        sum += Term(ref);
+    }
+    return {count, Finalize(count, sum)};
+}
+
+/**
+ * Count and digest of the synthetic payout records at heights [0, max_height], in the
+ * form of a stored checkpoint schema. Schema 1 is the sorted-txid hash of releases up to
+ * rc11 and exists only to recognise (once) a checkpoint those releases wrote.
+ */
+static std::pair<uint32_t, uint256> HashSyntheticPayoutRefs(std::vector<SyntheticPayoutRef> refs, int max_height, uint32_t schema)
+{
+    if (schema != SyntheticPayoutCheckpoint::LEGACY_SCHEMA) return SyntheticPayoutDigest::Compute(refs, max_height);
     refs.erase(std::remove_if(refs.begin(), refs.end(), [max_height](const SyntheticPayoutRef& ref) {
         return ref.height < 0 || ref.height > max_height;
     }), refs.end());
@@ -950,11 +1034,31 @@ static std::pair<uint32_t, uint256> HashSyntheticPayoutRefs(std::vector<Syntheti
     return {static_cast<uint32_t>(refs.size()), hasher.GetHash()};
 }
 
+bool SyntheticPayoutCheckpointMatches(const SyntheticPayoutCheckpoint& checkpoint, const std::vector<SyntheticPayoutRef>& refs)
+{
+    // A checkpoint written by an earlier release (schema 1) is checked once with
+    // the algorithm that wrote it and replaced by a schema 2 record on the next
+    // flush; it is never treated as a mismatch merely for its age.
+    if (checkpoint.schema != SyntheticPayoutCheckpoint::CURRENT_SCHEMA &&
+        checkpoint.schema != SyntheticPayoutCheckpoint::LEGACY_SCHEMA) {
+        return false;
+    }
+    const auto [count, digest] = HashSyntheticPayoutRefs(refs, checkpoint.height, checkpoint.schema);
+    return count == checkpoint.count && digest == checkpoint.digest;
+}
+
+std::pair<uint32_t, uint256> CWallet::RecomputeSyntheticPayoutDigestLocked(int height, uint32_t schema) const
+{
+    AssertLockHeld(cs_wallet);
+    return HashSyntheticPayoutRefs(CollectSyntheticPayoutRefs(), height, schema);
+}
+
 void CWallet::WriteSyntheticPayoutCheckpoint(WalletBatch& batch, const uint256& block_hash, int height)
 {
     AssertLockHeld(cs_wallet);
     if (block_hash.IsNull() || height < 0) return;
-    const auto [count, digest] = HashSyntheticPayoutRefs(CollectSyntheticPayoutRefs(), height);
+    // O(changes): the digest follows every add, move, stale flag and removal of a payout record.
+    const auto [count, digest] = m_synthetic_payout_digest.At(height);
     if (count == 0) return;
     SyntheticPayoutCheckpoint checkpoint;
     checkpoint.schema = SyntheticPayoutCheckpoint::CURRENT_SCHEMA;
@@ -1004,6 +1108,7 @@ bool CWallet::ReconcileWalletShadowPayoutsForBlock(
             changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_BLOCK_KEY) != 0 || changed;
             changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY) != 0 || changed;
             if (changed) {
+                UpdateConfirmedSyntheticPayoutIndex(wtx);
                 wtx.MarkDirty();
                 write_ok = batch.WriteTx(wtx) && write_ok;
                 NotifyTransactionChanged(txid, CT_UPDATED);
@@ -3421,6 +3526,13 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     // future with a stickier abandoned state or even removing abandontransaction call.
     m_last_block_processed_height = block.height - 1;
     m_last_block_processed = *Assert(block.prev_hash);
+
+    // As for a connected block, group every database write this callback makes
+    // (state changes of the block's transactions and payout records, orphaned
+    // coinstake abandons, the redelegation history) into one commit instead of
+    // one autocommit per record. The scope also commits on unwinding.
+    std::unique_ptr<DatabaseBulkScope> block_writes = GetDatabase().MakeBulkScope();
+
     // Drop only the memoized chainstate facts of outputs confirmed in the
     // disconnected block or above. Entries exist only for outputs at least
     // LIFECYCLE_MEMO_MIN_DEPTH deep and are checked against the confirming
@@ -3507,12 +3619,23 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
             }
         }
     }
+    // Records confirmed in the disconnected block that the block itself does
+    // not contain are its synthetic payouts. They are indexed by block, so no
+    // pass over the whole wallet is needed. Copy the txids first: syncing a
+    // record updates the index being read.
     std::vector<CTransactionRef> synthetic_confirmed_txs;
-    for (const auto& [hash, wtx] : mapWallet) {
-        const auto* confirmed = wtx.state<TxStateConfirmed>();
-        if (!confirmed || confirmed->confirmed_block_hash != block.hash) continue;
-        if (disconnected_block_txids.count(hash)) continue;
-        synthetic_confirmed_txs.push_back(wtx.tx);
+    {
+        const auto indexed = m_confirmed_synthetic_payouts_by_block.find(block.hash);
+        if (indexed != m_confirmed_synthetic_payouts_by_block.end()) {
+            for (const uint256& hash : std::vector<uint256>{indexed->second.begin(), indexed->second.end()}) {
+                if (disconnected_block_txids.count(hash)) continue;
+                const auto wallet_tx = mapWallet.find(hash);
+                if (wallet_tx == mapWallet.end()) continue;
+                const auto* confirmed = wallet_tx->second.state<TxStateConfirmed>();
+                if (!confirmed || confirmed->confirmed_block_hash != block.hash) continue;
+                synthetic_confirmed_txs.push_back(wallet_tx->second.tx);
+            }
+        }
     }
     for (const CTransactionRef& tx : synthetic_confirmed_txs) {
         SyncTransaction(tx, TxStateInactive{});
@@ -3527,6 +3650,12 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
 
     RecomputeQuantumRedelegationWinHistory(batch);
 
+    if (block_writes && !block_writes->Commit()) {
+        m_shadow_pow_claim_recovery_db_ambiguous = true;
+        WalletLogPrintf("Failed to persist the wallet writes of disconnecting block %s\n",
+                        block.hash.ToString());
+    }
+    block_writes.reset();
     }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a reorg disconnects a block.
     RequestClaimMaintenance(/*resolve=*/false, /*relay=*/true);
@@ -4502,9 +4631,13 @@ void CWallet::AbandonOrphanedCoinstakes()
         return;
     }
 
-    for (std::pair<const uint256, CWalletTx>& item : mapWallet) {
-        const uint256& wtxid = item.first;
-        CWalletTx& wtx = item.second;
+    // Walk only the wallet's coinstakes (an immutable property of a transaction,
+    // indexed when it enters the wallet), not its whole history. Abandoning
+    // changes state only, so the index is not modified while iterating.
+    for (const uint256& wtxid : m_coinstake_txids) {
+        const auto wallet_tx = mapWallet.find(wtxid);
+        if (wallet_tx == mapWallet.end()) continue;
+        CWalletTx& wtx = wallet_tx->second;
         assert(wtx.GetHash() == wtxid);
         if (GetTxDepthInMainChain(wtx) == 0 && !wtx.isAbandoned() && wtx.IsCoinStake()) {
             LogPrint(BCLog::COINSTAKE, "Abandoning coinstake wtx %s\n", wtx.GetHash().ToString());
@@ -6501,7 +6634,8 @@ DBErrors CWallet::LoadWallet()
         // to authenticating every payout block.
         int verified_through_height{-1};
         if (payout_checkpoint && !synthetic_payout_blocks.empty() &&
-            payout_checkpoint->schema == SyntheticPayoutCheckpoint::CURRENT_SCHEMA &&
+            (payout_checkpoint->schema == SyntheticPayoutCheckpoint::CURRENT_SCHEMA ||
+             payout_checkpoint->schema == SyntheticPayoutCheckpoint::LEGACY_SCHEMA) &&
             payout_checkpoint->client_version == CLIENT_VERSION && payout_checkpoint->height >= 0) {
             const CBlockIndex* checkpoint_index = chainman.m_blockman.LookupBlockIndex(payout_checkpoint->block_hash);
             if (checkpoint_index && checkpoint_index->nHeight == payout_checkpoint->height &&
@@ -6510,8 +6644,7 @@ DBErrors CWallet::LoadWallet()
                     const auto snapshot = active_block_heights.find(ref.block_hash);
                     ref.height = (snapshot != active_block_heights.end() && snapshot->second) ? *snapshot->second : -1;
                 }
-                const auto [count, digest] = HashSyntheticPayoutRefs(synthetic_payout_refs, payout_checkpoint->height);
-                if (count == payout_checkpoint->count && digest == payout_checkpoint->digest) {
+                if (SyntheticPayoutCheckpointMatches(*payout_checkpoint, synthetic_payout_refs)) {
                     verified_through_height = payout_checkpoint->height;
                 }
             }
@@ -6676,6 +6809,8 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
         }
         RemoveIndexedShadowSolve(hash);
         m_pending_shadow_signal_txids.erase(hash);
+        m_synthetic_payout_digest.Erase(hash);
+        m_coinstake_txids.erase(hash);
         const auto synthetic_block = m_confirmed_synthetic_payout_block_by_txid.find(hash);
         if (synthetic_block != m_confirmed_synthetic_payout_block_by_txid.end()) {
             const auto block = m_confirmed_synthetic_payouts_by_block.find(synthetic_block->second);
@@ -7479,7 +7614,10 @@ void CWallet::RecomputeQuantumRedelegationWinHistory(WalletBatch& batch)
     AssertLockHeld(cs_wallet);
     std::map<std::vector<unsigned char>, int> rebuilt;
 
-    for (const auto& [_, wtx] : mapWallet) {
+    for (const uint256& coinstake_txid : m_coinstake_txids) {
+        const auto wallet_tx = mapWallet.find(coinstake_txid);
+        if (wallet_tx == mapWallet.end()) continue;
+        const CWalletTx& wtx = wallet_tx->second;
         if (!wtx.IsCoinStake()) continue;
         const auto* confirmed = wtx.state<TxStateConfirmed>();
         if (!confirmed || confirmed->confirmed_block_height <= 0) continue;

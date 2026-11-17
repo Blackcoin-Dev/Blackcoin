@@ -180,4 +180,108 @@ BOOST_AUTO_TEST_CASE(candidate_scan_cost_on_a_large_wallet)
 
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace
+
+BOOST_AUTO_TEST_SUITE(payout_digest_tests)
+
+namespace {
+// The release up to rc11 hashed the records sorted by txid; reproduced here independently.
+std::pair<uint32_t, uint256> OldReleaseDigest(std::vector<SyntheticPayoutRef> refs, int max_height)
+{
+    refs.erase(std::remove_if(refs.begin(), refs.end(), [&](const SyntheticPayoutRef& r) { return r.height < 0 || r.height > max_height; }), refs.end());
+    std::sort(refs.begin(), refs.end(), [](const auto& a, const auto& b) { return a.txid < b.txid; });
+    HashWriter hasher{};
+    for (const auto& r : refs) hasher << r.txid << r.block_hash << r.stale;
+    return {static_cast<uint32_t>(refs.size()), hasher.GetHash()};
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(incremental_digest_equals_full_recompute_after_random_changes)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+
+    FastRandomContext rng{/*fDeterministic=*/true};
+    std::vector<CTransactionRef> records;
+    auto make_record = [&](size_t i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{static_cast<uint8_t>(i % 200 + 1)}, static_cast<uint32_t>(i)});
+        tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+        return MakeTransactionRef(std::move(tx));
+    };
+    auto mark = [](TxState state) {
+        return [state](CWalletTx& wtx, bool) {
+            wtx.mapValue["qq_synthetic_goldrush_payout"] = "1";
+            wtx.m_state = state;
+            return true;
+        };
+    };
+    auto check = [&] {
+        LOCK(wallet.cs_wallet);
+        for (const int height : {-1, 0, 3, 17, 40, 41, 1000}) {
+            BOOST_CHECK(wallet.GetSyntheticPayoutDigestLocked(height) ==
+                        wallet.RecomputeSyntheticPayoutDigestLocked(height, SyntheticPayoutCheckpoint::CURRENT_SCHEMA));
+        }
+    };
+    for (size_t i = 0; i < 400; ++i) {
+        const uint64_t op = rng.randrange(10);
+        if (records.empty() || op < 5) {
+            records.push_back(make_record(records.size()));
+            const int height = 1 + static_cast<int>(rng.randrange(40));
+            const TxState state = TxStateConfirmed{uint256{static_cast<uint8_t>(height)}, height, 0};
+            BOOST_REQUIRE(wallet.AddToWallet(records.back(), state, mark(state)));
+        } else if (op < 8) { // reorg: the record leaves its block
+            const auto& tx = records[rng.randrange(records.size())];
+            const TxState state = TxStateInactive{};
+            BOOST_REQUIRE(wallet.AddToWallet(tx, state, mark(state)));
+        } else { // reconfirm on a different block and height
+            const auto& tx = records[rng.randrange(records.size())];
+            const int height = 1 + static_cast<int>(rng.randrange(40));
+            const TxState state = TxStateConfirmed{uint256{static_cast<uint8_t>(100 + height)}, height, 0};
+            BOOST_REQUIRE(wallet.AddToWallet(tx, state, mark(state)));
+        }
+        check();
+    }
+    // Removal.
+    std::vector<uint256> txids;
+    for (const auto& tx : records) txids.push_back(tx->GetHash());
+    {
+        LOCK(wallet.cs_wallet);
+        std::vector<uint256> erased;
+        BOOST_REQUIRE_EQUAL(wallet.ZapSelectTx(txids, erased), DBErrors::LOAD_OK);
+    }
+    check();
+    LOCK(wallet.cs_wallet);
+    BOOST_CHECK_EQUAL(wallet.GetSyntheticPayoutDigestLocked(1000).first, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(checkpoint_written_by_the_previous_release_is_recognised)
+{
+    std::vector<SyntheticPayoutRef> refs;
+    for (uint8_t i = 1; i <= 50; ++i) refs.push_back(SyntheticPayoutRef{uint256{i}, uint256{static_cast<uint8_t>(100 + i)}, i, i % 7 == 0});
+    for (const uint32_t schema : {SyntheticPayoutCheckpoint::LEGACY_SCHEMA, SyntheticPayoutCheckpoint::CURRENT_SCHEMA}) {
+        SyntheticPayoutCheckpoint checkpoint;
+        checkpoint.schema = schema;
+        checkpoint.client_version = CLIENT_VERSION;
+        checkpoint.height = 30;
+        const auto [count, digest] = schema == SyntheticPayoutCheckpoint::LEGACY_SCHEMA
+            ? OldReleaseDigest(refs, 30) : SyntheticPayoutDigest::Compute(refs, 30);
+        checkpoint.count = count;
+        checkpoint.digest = digest;
+        BOOST_CHECK(SyntheticPayoutCheckpointMatches(checkpoint, refs));
+        // Any change to a record, in either form, is a mismatch.
+        auto changed = refs;
+        changed[3].stale = !changed[3].stale;
+        BOOST_CHECK(!SyntheticPayoutCheckpointMatches(checkpoint, changed));
+        changed = refs;
+        changed.erase(changed.begin() + 10);
+        BOOST_CHECK(!SyntheticPayoutCheckpointMatches(checkpoint, changed));
+        changed = refs;
+        changed[40].block_hash = uint256{200}; // above the checkpoint height: not covered
+        BOOST_CHECK(SyntheticPayoutCheckpointMatches(checkpoint, changed));
+        checkpoint.schema = 3;
+        BOOST_CHECK(!SyntheticPayoutCheckpointMatches(checkpoint, refs));
+    }
+}
+
+BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

@@ -230,7 +230,11 @@ public:
  * wallet.
  */
 struct SyntheticPayoutCheckpoint {
-    static constexpr uint32_t CURRENT_SCHEMA{1};
+    /** Digest = SHA256d of the records sorted by txid (written by releases up to rc11). A
+     *  stored schema 1 record is verified once with that algorithm and then replaced. */
+    static constexpr uint32_t LEGACY_SCHEMA{1};
+    /** Digest = finalised order-independent sum of per-record terms, maintained incrementally. */
+    static constexpr uint32_t CURRENT_SCHEMA{2};
     uint32_t schema{0};
     int32_t client_version{0};
     int32_t height{-1};

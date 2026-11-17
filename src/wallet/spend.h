@@ -154,8 +154,16 @@ struct LifecycleSliceLimits {
     uint64_t max_items{0};
     //! Clock, injectable for tests. Empty = std::chrono::steady_clock::now.
     std::function<std::chrono::steady_clock::time_point()> now;
-    //! Number of items between two clock reads.
-    static constexpr uint64_t CLOCK_INTERVAL{64};
+    //! Test only: called for every item of a slice before the meter looks at
+    //! the clock, so that an injected clock can charge each item what it costs.
+    std::function<void()> on_item;
+    //! Number of items between two clock reads: every item. What a wallet
+    //! record or one of its outputs costs depends on memory the slice cannot
+    //! see (cached amounts that were invalidated, pages the system has
+    //! compressed or paged out), so a count of items says nothing about the
+    //! time that has passed; 64 such items took more than a second on a
+    //! machine short of memory. A clock read costs tens of nanoseconds.
+    static constexpr uint64_t CLOCK_INTERVAL{1};
 
     static LifecycleSliceLimits Unlimited()
     {
@@ -175,10 +183,13 @@ struct LifecycleSliceLimits {
  * this slice (or the budget is already used up). Slices are spaced by the
  * worker's forced interval, so a slice that stopped after one item whenever an
  * item cost more than half the budget would make warm-up many times slower.
- * Items that do not read the chainstate (Tick) read the clock only every
- * `clock_interval`. A slice always finishes the item it is on, so it stays
- * within its budget plus the cost of at most MIN_ITEMS_BEFORE_EARLY_END - 1
- * more items, and always makes progress.
+ * Items that do not read the chainstate (Tick) read the clock every time too
+ * and end the slice when the budget is used up; a caller may pass a larger
+ * `clock_interval` for items that only read what the slice itself has built.
+ * A slice always finishes the item it is on (a wallet slice: the mapWallet
+ * bucket it is in, which is one record as a rule), so it stays within its
+ * budget plus the cost of that item (a chainstate slice: of at most
+ * MIN_ITEMS_BEFORE_EARLY_END - 1 more items), and always makes progress.
  */
 class SliceMeter
 {
@@ -196,6 +207,7 @@ public:
     bool Tick(uint64_t clock_interval = LifecycleSliceLimits::CLOCK_INTERVAL)
     {
         ++m_items;
+        if (m_limits.on_item) m_limits.on_item();
         if (m_expired) return true;
         if (m_limits.max_items > 0 && m_items >= m_limits.max_items) {
             m_expired = true;
@@ -209,6 +221,7 @@ public:
     bool TickChainItem()
     {
         ++m_items;
+        if (m_limits.on_item) m_limits.on_item();
         if (m_expired) return true;
         if (m_limits.max_items > 0 && m_items >= m_limits.max_items) {
             m_expired = true;

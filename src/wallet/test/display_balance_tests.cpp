@@ -631,6 +631,94 @@ BOOST_FIXTURE_TEST_CASE(worker_log_line_measures_state_and_age_against_the_same_
     LogInstance().DeleteCallback(count_lines);
 }
 
+BOOST_FIXTURE_TEST_CASE(wallet_slice_stays_within_its_budget_plus_the_record_it_is_on, DisplayWalletSetup)
+{
+    // What a record costs depends on memory the slice cannot see: cached
+    // amounts that were invalidated, pages the system compressed. Here every
+    // cached amount is invalid and the injected clock charges each item of a
+    // slice (a record, one of its outputs, a memo entry): cheap at first, then
+    // 3 ms each, as when the walk reaches memory that has to be brought back.
+    // The meter used to read the clock every 64 items; those 64 items would
+    // hold cs_wallet for 190 ms against a 20 ms budget (the field saw 1.4 s).
+    wallet->MarkDirty();
+    size_t records{0};
+    uint64_t largest_bucket_items{0};
+    {
+        LOCK(wallet->cs_wallet);
+        records = wallet->mapWallet.size();
+        for (size_t bucket = 0; bucket < wallet->mapWallet.bucket_count(); ++bucket) {
+            uint64_t items{0};
+            for (auto it = wallet->mapWallet.begin(bucket); it != wallet->mapWallet.end(bucket); ++it) {
+                items += 1 + it->second.tx->vout.size();
+            }
+            largest_bucket_items = std::max(largest_bucket_items, items);
+        }
+    }
+    BOOST_REQUIRE_GT(records, 64U);
+    BOOST_REQUIRE_GT(largest_bucket_items, 0U);
+
+    std::chrono::steady_clock::time_point clock{};
+    uint64_t items{0};
+    const auto item_cost = [&] { return items <= 40 ? std::chrono::microseconds{10} : std::chrono::microseconds{3ms}; };
+    LifecycleSliceLimits limits;
+    limits.now = [&] { return clock; };
+    limits.on_item = [&] {
+        ++items;
+        clock += item_cost();
+    };
+    const auto wallet_bound = std::chrono::microseconds{limits.wallet_budget} + largest_bucket_items * std::chrono::microseconds{3ms};
+    // A chainstate slice ends early only after four items.
+    const auto main_bound = std::chrono::microseconds{limits.main_budget} + 3 * std::chrono::microseconds{3ms};
+
+    LifecyclePass pass;
+    LifecycleMemoJournal journal;
+    LifecycleAttestationCache attestations;
+    int wallet_slices{0}, main_slices{0};
+    std::chrono::microseconds longest_wallet{0};
+    LifecycleSliceReport report;
+    for (int guard = 0; guard < 100000; ++guard) {
+        report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+        BOOST_REQUIRE_MESSAGE(report.result != LifecycleSliceResult::FAILED, report.error);
+        if (report.held_wallet) {
+            ++wallet_slices;
+            longest_wallet = std::max(longest_wallet, report.held);
+            BOOST_CHECK_LE(report.held.count(), wallet_bound.count());
+        }
+        if (report.held_main) {
+            ++main_slices;
+            BOOST_CHECK_LE(report.held.count(), main_bound.count());
+        }
+        if (report.result == LifecycleSliceResult::DONE) break;
+    }
+    BOOST_REQUIRE(report.result == LifecycleSliceResult::DONE);
+    // The budget was what ended the slices: many of them, each near the budget.
+    BOOST_CHECK_GT(wallet_slices, 10);
+    BOOST_CHECK_GT(main_slices, 0);
+    BOOST_CHECK_GE(longest_wallet.count(), std::chrono::microseconds{limits.wallet_budget}.count());
+    BOOST_CHECK_LE(longest_wallet.count(), wallet_bound.count());
+    // Slicing changes nothing about the result.
+    BOOST_CHECK_EQUAL(pass.balance.m_mine_trusted, PlainBalance());
+}
+
+BOOST_FIXTURE_TEST_CASE(worker_log_line_uses_the_new_states, DisplayWalletSetup)
+{
+    // Nothing published yet: "none", logged at the minute cadence.
+    const auto state = std::make_shared<WalletDisplayBalance>(*wallet);
+    const int64_t base = WalletDisplayBalance::NowMs();
+    {
+        // Not due yet.
+        state->MaybeLogSummary(base + WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS / 2);
+    }
+    {
+        ASSERT_DEBUG_LOG("state=none snapshot_height=-1");
+        state->MaybeLogSummary(base + WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS + 1000);
+    }
+    {
+        ASSERT_DEBUG_LOG("state=none snapshot_height=-1");
+        state->MaybeLogSummary(base + 2 * WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS + 2000);
+    }
+}
+
 // ---- The meter of a cs_main slice ----------------------------------------------
 
 namespace {

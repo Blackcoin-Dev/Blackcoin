@@ -387,6 +387,7 @@ BITCOIN_CORE_H = \
   wallet/staking.h \
   wallet/sqlite.h \
   wallet/transaction.h \
+  wallet/txvaluemap.h \
   wallet/types.h \
   wallet/wallet.h \
   wallet/walletdb.h \
@@ -568,6 +569,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/display_balance.cpp \
   wallet/spend.cpp \
   wallet/transaction.cpp \
+  wallet/txvaluemap.cpp \
   wallet/wallet.cpp \
   wallet/walletdb.cpp \
   wallet/walletutil.cpp \

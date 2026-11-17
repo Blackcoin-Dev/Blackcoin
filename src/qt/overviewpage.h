@@ -41,6 +41,7 @@ public:
 
 public Q_SLOTS:
     void setBalance(const interfaces::WalletBalances& balances);
+    void setBalanceStale(bool stale, int height);
     void setPrivacy(bool privacy);
 
 Q_SIGNALS:

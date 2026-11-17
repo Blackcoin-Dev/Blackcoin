@@ -4053,19 +4053,33 @@ void TestWalletPollCoalescing(interfaces::Node& node, const std::shared_ptr<CWal
     qApp->processEvents();
 
     // Keep the timer stopped so only this explicitly offered burst can run.
-    // No GUI deliveries occur between offers.
+    // A poll is a read of the published display snapshot on the GUI thread:
+    // sixty-four offers cause no round trip per offer and no retries. What
+    // does reach the model is bounded: the announcement of the snapshot the
+    // display worker publishes, and the stake weight refresh.
     DirtyBalanceOnDelivery observer(model, /*dirty=*/false);
     model.installEventFilter(&observer);
     for (int i = 0; i < 64; ++i) {
         model.updateTransaction();
         model.pollBalanceChanged();
     }
-    QTRY_COMPARE_WITH_TIMEOUT(observer.deliveries, 2, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedBalance().balance > 0, 5000);
+    QVERIFY(!model.balanceIsStale());
     QTest::qWait(300);
-    QCOMPARE(observer.deliveries, 2);
-    QVERIFY(model.getCachedBalance().balance > 0);
+    const int settled = observer.deliveries;
+    QVERIFY2(settled <= 6, qPrintable(QString::number(settled)));
+    // Nothing keeps polling once the snapshot is on screen.
+    QTest::qWait(600);
+    QCOMPARE(observer.deliveries, settled);
+    // A second burst costs at most the one coalesced stake weight round trip.
+    for (int i = 0; i < 64; ++i) model.pollBalanceChanged();
+    QTest::qWait(300);
+    const int after_burst = observer.deliveries;
+    QVERIFY2(after_burst <= settled + 1, qPrintable(QString::number(after_burst - settled)));
+    QTest::qWait(600);
+    QCOMPARE(observer.deliveries, after_burst);
     model.removeEventFilter(&observer);
-    qInfo("Wallet poll coalescing: 64 offers, two worker completions");
+    qInfo("Wallet poll coalescing: 128 offers, %d deliveries", after_burst);
 }
 
 void TestWalletDisplayExceptionRecovery(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
@@ -4075,6 +4089,13 @@ void TestWalletDisplayExceptionRecovery(interfaces::Node& node, const std::share
     gui.initModelForWallet(node, wallet, style.get());
     WalletModel& model = *gui.walletModel;
     qApp->processEvents();
+
+    // A valid balance first: it is what stays on screen when a later
+    // snapshot cannot be computed.
+    model.pollBalanceChanged();
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedBalance().balance > 0, 5000);
+    const CAmount valid_balance = model.getCachedBalance().balance;
+    QVERIFY(!model.balanceIsStale());
 
     uint256 txid;
     CTransactionRef original;
@@ -4088,6 +4109,8 @@ void TestWalletDisplayExceptionRecovery(interfaces::Node& node, const std::share
             invalid.vout.front().nValue = MAX_MONEY + 1;
             entry.tx = MakeTransactionRef(std::move(invalid));
             entry.MarkDirty();
+            // As every real change of a wallet transaction does.
+            wallet->BumpBalanceScanMarker();
             break;
         }
     }
@@ -4097,6 +4120,7 @@ void TestWalletDisplayExceptionRecovery(interfaces::Node& node, const std::share
         auto& entry = wallet->mapWallet.at(txid);
         entry.tx = original;
         entry.MarkDirty();
+        wallet->BumpBalanceScanMarker();
     };
     const auto cleanup = interfaces::MakeCleanupHandler(restore);
 
@@ -4110,17 +4134,21 @@ void TestWalletDisplayExceptionRecovery(interfaces::Node& node, const std::share
     }
     QVERIFY(throws);
 
+    // The display worker failed the same way; the model says so once, keeps
+    // the last valid balance and marks it stale.
     DirtyBalanceOnDelivery delivery(model);
     model.installEventFilter(&delivery);
     QTest::ignoreMessage(QtWarningMsg, "Wallet display snapshot failed");
     model.pollBalanceChanged();
-    QTRY_VERIFY_WITH_TIMEOUT(delivery.deliveries > 0, 5000);
-    QCOMPARE(model.getCachedBalance().balance, CAmount{0});
+    QTRY_VERIFY_WITH_TIMEOUT(model.balanceIsStale(), 5000);
+    QCOMPARE(model.getCachedBalance().balance, valid_balance);
+    model.pollBalanceChanged();
     model.removeEventFilter(&delivery);
     restore();
     model.updateTransaction();
     model.pollBalanceChanged();
-    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedBalance().balance > 0, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!model.balanceIsStale(), 5000);
+    QCOMPARE(model.getCachedBalance().balance, valid_balance);
 }
 
 void TestAccountSnapshotFiltering(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)

@@ -365,6 +365,11 @@ public:
 
     // Retrieve the cached wallet balance
     interfaces::WalletBalances getCachedBalance() const;
+    //! Whether the cached balance is that of an earlier block (the wallet or
+    //! the chain has moved on and a new balance is being computed), and the
+    //! height of the block it belongs to (-1 before the first balance).
+    bool balanceIsStale() const { return m_balance_stale; }
+    int balanceHeight() const { return m_balance_height; }
     bool haveWatchOnly() const { return fHaveWatchOnly; }
 
     void setSendBalanceFamily(std::optional<interfaces::WalletDisplayCoinFamily> family);
@@ -429,6 +434,7 @@ private:
     std::unique_ptr<interfaces::Handler> m_handler_show_progress;
     std::unique_ptr<interfaces::Handler> m_handler_watch_only_changed;
     std::unique_ptr<interfaces::Handler> m_handler_can_get_addrs_changed;
+    std::unique_ptr<interfaces::Handler> m_handler_display_balances_changed;
     ClientModel* m_client_model;
     interfaces::Node& m_node;
 
@@ -454,22 +460,30 @@ private:
     uint64_t m_balance_generation{1};
     uint64_t m_applied_balance_generation{0};
     bool m_balance_poll_started{false};
-    int m_balance_poll_ticks{0};
-    bool m_balance_poll_in_flight{false};
-    bool m_balance_poll_pending{false};
-    bool m_balance_retry_scheduled{false};
+    bool m_balance_poll_requested{false};
     bool m_balance_failure_reported{false};
     void invalidateBalanceSnapshot();
-    //! Only the wallet shown in the main window polls at full rate (L15). Others
-    //! refresh at most every BACKGROUND_POLL_INTERVAL, and at once when shown.
+    //! Read by the display balance worker: only the wallet shown in the main
+    //! window is refreshed at once; the others at most once a minute.
     bool m_poll_foreground{true};
-    std::chrono::steady_clock::time_point m_last_balance_result{};
+    //! Sequence of the display snapshot that was last applied.
+    uint64_t m_applied_balance_sequence{0};
+    //! Height of the node tip as last announced (-1 = not yet).
+    int m_node_tip_height{-1};
+    //! Whether the balance shown is older than the wallet or the node tip,
+    //! and the block it is the balance of.
+    bool m_balance_stale{false};
+    int m_balance_height{-1};
+    void applyDisplaySnapshot(const interfaces::WalletDisplayBalances& snapshot);
     std::optional<interfaces::WalletDisplayCoinFamily> m_requested_send_family;
-    uint64_t m_send_request_generation{0};
+    bool m_send_retry_requested{false};
     std::optional<interfaces::WalletDisplayCoinFamily> m_cached_send_family;
     std::optional<CAmount> m_cached_send_balance;
-    uint256 m_cached_send_tip{};
-    uint64_t m_cached_send_generation{0};
+    //! Stake weight refresh (wallet worker thread), driven from the poll.
+    uint64_t m_stake_weight_generation{1};
+    uint64_t m_stake_weight_applied_generation{0};
+    bool m_stake_weight_poll_in_flight{false};
+    void pollStakeWeight();
     std::atomic<uint64_t> nWeight;
     std::atomic<bool> updateStakeWeight;
 
@@ -570,6 +584,8 @@ Q_SIGNALS:
 
     void timerTimeout();
     void sendBalanceChanged();
+    // The balance shown became stale (it is that of block `height`) or current again
+    void balanceStaleChanged(bool stale, int height);
 
     /** Emitted on the GUI thread after a worker request completes or cancels. */
     void stakingMiningSnapshotReady(quint64 request_id, quint64 generation);
@@ -598,6 +614,8 @@ public Q_SLOTS:
     void updateWatchOnlyFlag(bool fHaveWatchonly);
     /* Current, immature or unconfirmed balance might have changed - emit 'balanceChanged' if so */
     void pollBalanceChanged();
+    /* The display balance worker published a snapshot or changed its failed state */
+    void displayBalancesChanged();
     /* Update stake weight when changed */
     void checkStakeWeightChanged();
 };

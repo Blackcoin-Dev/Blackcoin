@@ -48,9 +48,6 @@ using wallet::CCoinControl;
 using wallet::CRecipient;
 using wallet::DEFAULT_DISABLE_WALLET;
 
-static constexpr int POLL_SYNC_SKIP{30};
-//! Refresh interval for a wallet model that is not the one shown (L15).
-static constexpr std::chrono::seconds BACKGROUND_POLL_INTERVAL{60};
 
 class WalletWorker : public QObject
 {
@@ -189,9 +186,12 @@ void WalletModel::setClientModel(ClientModel* client_model)
         timer->stop();
         return;
     }
+    m_node_tip_height = -1;
     m_balance_tip_connection = connect(m_client_model, &ClientModel::numBlocksChanged, this,
-        [this](int, const QDateTime&, double, SyncType type, SynchronizationState) {
-            if (type == SyncType::BLOCK_SYNC) invalidateBalanceSnapshot();
+        [this](int count, const QDateTime&, double, SyncType type, SynchronizationState) {
+            if (type != SyncType::BLOCK_SYNC) return;
+            m_node_tip_height = count;
+            invalidateBalanceSnapshot();
         });
     if (m_balance_poll_started) startPollBalance();
 }
@@ -226,122 +226,124 @@ void WalletModel::updateStatus()
 
 void WalletModel::pollBalanceChanged()
 {
-    if (m_joined || !worker || !m_client_model) return;
-    if (m_balance_poll_ticks < POLL_SYNC_SKIP) ++m_balance_poll_ticks;
-    if (m_balance_poll_in_flight) {
-        m_balance_poll_pending = true;
-        return;
-    }
-    // A model that is not shown keeps its last snapshot and refreshes slowly.
-    // The first snapshot and an active send-balance request are never gated.
-    if (!m_poll_foreground && m_applied_balance_generation != 0 && !m_requested_send_family &&
-        std::chrono::steady_clock::now() - m_last_balance_result < BACKGROUND_POLL_INTERVAL) {
-        return;
+    if (m_joined || !m_client_model) return;
+    m_balance_poll_requested = true;
+    // Reading the balance is a read of the snapshot the display balance
+    // worker published: a leaf mutex and nothing else, so it is done here on
+    // the GUI thread. Nothing is retried from here either; the worker decides
+    // when this wallet gets its next snapshot and announces it
+    // (handleDisplayBalancesChanged), and the timer only catches up.
+    m_wallet->requestDisplayBalances(m_poll_foreground, m_requested_send_family,
+                                     std::exchange(m_send_retry_requested, false));
+    applyDisplaySnapshot(m_wallet->getDisplaySnapshot());
+    pollStakeWeight();
+}
+
+void WalletModel::displayBalancesChanged()
+{
+    // A model nobody has polled yet stays untouched until it is.
+    if (m_balance_poll_requested) pollBalanceChanged();
+}
+
+void WalletModel::applyDisplaySnapshot(const interfaces::WalletDisplayBalances& snapshot)
+{
+    if (snapshot.failed && !m_balance_failure_reported) {
+        qWarning("Wallet display snapshot failed");
+        m_balance_failure_reported = true;
+    } else if (!snapshot.failed) {
+        m_balance_failure_reported = false;
     }
 
-    m_balance_poll_in_flight = true;
-    const uint64_t generation = m_balance_generation;
     const uint64_t context_generation = m_balance_context_generation;
-    const auto family = m_requested_send_family;
-    const uint64_t send_generation = m_send_request_generation;
-    const bool send_current = !family || (m_cached_send_family == family &&
-        m_cached_send_tip == m_cached_last_update_tip && m_cached_send_generation == generation);
-    const std::optional<uint256> unchanged_tip = generation == m_applied_balance_generation && send_current
-        ? std::optional<uint256>{m_cached_last_update_tip} : std::nullopt;
-    const bool sync_poll_due = m_applied_balance_generation == 0 || m_balance_poll_ticks >= POLL_SYNC_SKIP;
-    const bool invoked = QMetaObject::invokeMethod(worker, [this, generation, context_generation, family, send_generation, unchanged_tip, sync_poll_due] {
-        interfaces::WalletDisplayBalances snapshot;
-        bool ready{false};
-        bool syncing{false};
-        int height{-1};
-        bool failed{false};
+    const QPointer<WalletModel> model{this};
+    const auto gone = [&] { return !model || m_joined || context_generation != m_balance_context_generation; };
+
+    // The balance on screen is that of snapshot.block_height. It is stale
+    // when the wallet has changed since, or the node is past that block.
+    const bool stale = snapshot.available &&
+        (!snapshot.exact || (m_node_tip_height >= 0 && snapshot.block_height < m_node_tip_height));
+    if (stale != m_balance_stale || (stale && snapshot.block_height != m_balance_height)) {
+        m_balance_stale = stale;
+        m_balance_height = snapshot.block_height;
+        Q_EMIT balanceStaleChanged(stale, snapshot.block_height);
+        if (gone()) return;
+    }
+    if (!snapshot.available) return;
+    m_balance_height = snapshot.block_height;
+
+    const bool new_snapshot = snapshot.sequence != m_applied_balance_sequence;
+    const bool wallet_changed = m_balance_generation != m_applied_balance_generation;
+    if (new_snapshot || (wallet_changed && snapshot.exact)) {
+        const bool tip_changed = snapshot.block_hash != m_cached_last_update_tip;
+        // A snapshot the wallet has already moved past leaves the newer
+        // generation pending; the next snapshot applies it.
+        if (snapshot.exact) m_applied_balance_generation = m_balance_generation;
+        m_applied_balance_sequence = snapshot.sequence;
+        m_cached_last_update_tip = snapshot.block_hash;
+        const bool balance_changed = checkBalanceChanged(snapshot.balances);
+        if (gone()) return;
+        if ((tip_changed || wallet_changed) && transactionTableModel) {
+            transactionTableModel->updateConfirmations();
+            if (gone()) return;
+        }
+        if (tip_changed || balance_changed) ++m_stake_weight_generation;
+    }
+
+    // The send-family balance belongs to one snapshot. A snapshot without the
+    // requested one (not computed yet, or not within its bound) shows none.
+    if (m_requested_send_family) {
+        const std::optional<CAmount> send_balance = snapshot.send_family == m_requested_send_family
+            ? snapshot.send_family_balance : std::nullopt;
+        if (m_cached_send_family != m_requested_send_family || m_cached_send_balance != send_balance) {
+            m_cached_send_family = m_requested_send_family;
+            m_cached_send_balance = send_balance;
+            Q_EMIT sendBalanceChanged();
+        }
+    }
+}
+
+void WalletModel::pollStakeWeight()
+{
+    if (!worker || m_stake_weight_poll_in_flight) return;
+    const uint64_t generation = m_stake_weight_generation;
+    const bool stale = generation != m_stake_weight_applied_generation;
+    if (!stale && !updateStakeWeight.load(std::memory_order_relaxed)) return;
+    m_stake_weight_poll_in_flight = true;
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, generation, stale] {
+        bool applied{false};
         try {
             if (!m_node.shutdownRequested()) {
-                if (m_node.tryGetSyncInfo(height, syncing) && (!syncing || sync_poll_due)) {
-                    ready = m_wallet->tryGetDisplayBalances(snapshot, unchanged_tip, family);
+                int height{-1};
+                bool syncing{false};
+                // The stake weight follows the tip and the balance, but not
+                // while the node is still synchronizing.
+                if (stale && m_node.tryGetSyncInfo(height, syncing) && !syncing) {
+                    updateStakeWeight = true;
+                    applied = true;
                 }
                 checkStakeWeightChanged();
             }
         } catch (...) {
-            ready = false;
-            failed = true;
         }
-        QMetaObject::invokeMethod(this, [this, generation, context_generation, family, send_generation, snapshot, ready, syncing, failed, unchanged_tip] {
-            m_balance_poll_in_flight = false;
-            const bool pending = std::exchange(m_balance_poll_pending, false);
-            if (m_joined || !m_client_model) return;
-            if (context_generation == m_balance_context_generation) {
-                if (failed && !m_balance_failure_reported) {
-                    qWarning("Wallet display snapshot failed");
-                    m_balance_failure_reported = true;
-                } else if (ready) {
-                    m_balance_failure_reported = false;
-                }
-            }
-            // Accept the last coherent display even if a newer dirty event
-            // arrived while it was collected. Keep that newer generation
-            // pending. A different client attachment cannot publish here.
-            if (ready && context_generation == m_balance_context_generation) {
-                m_balance_poll_ticks = 0;
-                const bool tip_changed = snapshot.block_hash != m_cached_last_update_tip;
-                const bool wallet_changed = generation != m_applied_balance_generation;
-                m_applied_balance_generation = generation;
-                m_last_balance_result = std::chrono::steady_clock::now();
-                m_cached_last_update_tip = snapshot.block_hash;
-                const bool send_current = family && family == m_requested_send_family && send_generation == m_send_request_generation;
-                const bool send_changed = send_current &&
-                    (m_cached_send_family != family || m_cached_send_balance != snapshot.send_family_balance);
-                if (send_current) {
-                    m_cached_send_family = family;
-                    m_cached_send_balance = snapshot.send_family_balance;
-                    m_cached_send_tip = snapshot.block_hash;
-                    m_cached_send_generation = generation;
-                }
-                const QPointer<WalletModel> model{this};
-                const bool balance_changed = checkBalanceChanged(snapshot.balances);
-                if (!model || m_joined || context_generation != m_balance_context_generation) return;
-                if ((tip_changed || wallet_changed) && transactionTableModel) {
-                    transactionTableModel->updateConfirmations();
-                    if (!model || m_joined || context_generation != m_balance_context_generation) return;
-                }
-                if (!syncing && (tip_changed || balance_changed)) updateStakeWeight = true;
-                if (send_changed) {
-                    Q_EMIT sendBalanceChanged();
-                    if (!model || m_joined || context_generation != m_balance_context_generation) return;
-                }
-            }
-            if (pending) {
-                pollBalanceChanged();
-            } else if (!ready && !unchanged_tip && !timer->isActive() &&
-                       !m_balance_retry_scheduled && !m_node.shutdownRequested()) {
-                // Manual requests on a stopped timer still get a bounded,
-                // context-owned retry when a snapshot could not be taken.
-                m_balance_retry_scheduled = true;
-                QTimer::singleShot(MODEL_UPDATE_DELAY, this, [this] {
-                    m_balance_retry_scheduled = false;
-                    pollBalanceChanged();
-                });
-            }
+        QMetaObject::invokeMethod(this, [this, generation, applied] {
+            m_stake_weight_poll_in_flight = false;
+            if (applied) m_stake_weight_applied_generation = generation;
         }, Qt::QueuedConnection);
     }, Qt::QueuedConnection);
-    if (!invoked) m_balance_poll_in_flight = false;
+    if (!invoked) m_stake_weight_poll_in_flight = false;
 }
 
 void WalletModel::invalidateBalanceSnapshot()
 {
     ++m_balance_generation;
-    if (m_balance_poll_in_flight) m_balance_poll_pending = true;
 }
 
 void WalletModel::setSendBalanceFamily(std::optional<interfaces::WalletDisplayCoinFamily> family)
 {
     if (m_requested_send_family == family) return;
     m_requested_send_family = family;
-    ++m_send_request_generation;
-    if (family) {
-        m_cached_send_generation = 0;
-        pollBalanceChanged();
-    }
+    if (family) pollBalanceChanged();
+    else if (!m_joined && m_client_model) m_wallet->requestDisplayBalances(m_poll_foreground, std::nullopt, false);
 }
 
 std::optional<CAmount> WalletModel::getCachedSendBalance(interfaces::WalletDisplayCoinFamily family) const
@@ -353,7 +355,8 @@ std::optional<CAmount> WalletModel::getCachedSendBalance(interfaces::WalletDispl
 void WalletModel::refreshSendBalance()
 {
     if (!m_requested_send_family) return;
-    ++m_send_request_generation;
+    // Ask again for a send-family balance that could not be computed.
+    m_send_retry_requested = true;
     invalidateBalanceSnapshot();
     pollBalanceChanged();
 }
@@ -1797,6 +1800,11 @@ void WalletModel::subscribeToCoreSignals()
     m_handler_show_progress = m_wallet->handleShowProgress(std::bind(ShowProgress, this, std::placeholders::_1, std::placeholders::_2));
     m_handler_watch_only_changed = m_wallet->handleWatchOnlyChanged(std::bind(NotifyWatchonlyChanged, this, std::placeholders::_1));
     m_handler_can_get_addrs_changed = m_wallet->handleCanGetAddressesChanged(std::bind(NotifyCanGetAddressesChanged, this));
+    // A new display snapshot was published (display worker thread): read it
+    // on the GUI thread.
+    m_handler_display_balances_changed = m_wallet->handleDisplayBalancesChanged([this] {
+        QMetaObject::invokeMethod(this, "displayBalancesChanged", Qt::QueuedConnection);
+    });
 }
 
 void WalletModel::unsubscribeFromCoreSignals()
@@ -1809,6 +1817,7 @@ void WalletModel::unsubscribeFromCoreSignals()
     m_handler_show_progress->disconnect();
     m_handler_watch_only_changed->disconnect();
     m_handler_can_get_addrs_changed->disconnect();
+    m_handler_display_balances_changed->disconnect();
 }
 
 // WalletModel::UnlockContext implementation

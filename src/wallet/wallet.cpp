@@ -4679,7 +4679,8 @@ void CWallet::AbandonOrphanedCoinstakes()
 bool CWallet::SubmitTxMemoryPoolAndRelay(
     const uint256& txid, std::string& err_string, bool relay,
     const ShadowPowClaimRecoveryBroadcastGuard* recovery_guard,
-    std::optional<CAmount> max_tx_fee_override)
+    std::optional<CAmount> max_tx_fee_override,
+    bool quiet_log)
 {
     // A guarded proof relay is an authorizing boundary. Observe and persist
     // every crossed schema or released-legacy frontier before acquiring the
@@ -4931,7 +4932,12 @@ bool CWallet::SubmitTxMemoryPoolAndRelay(
     }
 
     // Submit transaction to mempool for relay
-    WalletLogPrintf("Submitting wtx %s to mempool for relay\n", txid.ToString());
+    // A retry of a transaction the node already refused logs at debug level only.
+    if (quiet_log) {
+        LogPrint(BCLog::MEMPOOL, "%s Submitting wtx %s to mempool for relay\n", GetDisplayName(), txid.ToString());
+    } else {
+        WalletLogPrintf("Submitting wtx %s to mempool for relay\n", txid.ToString());
+    }
     // Validation-interface callbacks are the sole authority for the wallet's
     // mempool state. Writing TxStateInMempool here can race a later removal
     // callback that already ran before broadcastTransaction returned, leaving
@@ -5298,8 +5304,7 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force, bool include_cl
             m_resubmit_retry.erase(txid);
         } else if (IsTipDependentRefusal(err_string)) {
             QueueResubmitRetry(it->second);
-            const auto entry = m_resubmit_retry.find(txid);
-            if (entry != m_resubmit_retry.end()) entry->second.last_attempt_tip = m_last_block_processed;
+            NoteResubmitRefusal(txid, m_last_block_processed, m_last_block_processed_height, err_string);
         } else {
             m_resubmit_retry.erase(txid);
         }
@@ -5410,6 +5415,41 @@ bool CWallet::IsTipDependentRefusal(const std::string& err_string)
     return false;
 }
 
+void CWallet::NoteResubmitRefusal(const uint256& txid, const uint256& tip, int height,
+                                  const std::string& err_string)
+{
+    AssertLockHeld(cs_wallet);
+    const auto it = m_resubmit_retry.find(txid);
+    if (it == m_resubmit_retry.end()) return;
+    ResubmitRetryEntry& entry = it->second;
+    entry.last_attempt_tip = tip;
+    entry.last_attempt_height = height;
+    if (entry.attempts < std::numeric_limits<unsigned int>::max()) ++entry.attempts;
+    // 1, 2, 4, ... blocks between tries, capped.
+    const unsigned int shift = std::min(entry.attempts - 1, 6U);
+    entry.block_gap = std::min(1U << shift, MAX_RESUBMIT_RETRY_BLOCK_GAP);
+    entry.missing_inputs = err_string.find("bad-txns-inputs-missingorspent") != std::string::npos;
+}
+
+bool CWallet::IsResubmitRetryDue(const uint256& txid, const uint256& tip, int height) const
+{
+    AssertLockHeld(cs_wallet);
+    const auto it = m_resubmit_retry.find(txid);
+    if (it == m_resubmit_retry.end()) return false;
+    const ResubmitRetryEntry& entry = it->second;
+    if (entry.last_attempt_tip == tip) return false; // nothing new since the last try
+    if (entry.last_attempt_height < 0 || height < entry.last_attempt_height) return true;
+    return static_cast<unsigned int>(height - entry.last_attempt_height) >= entry.block_gap;
+}
+
+std::optional<CWallet::ResubmitRetryInfo> CWallet::GetResubmitRetryInfo(const uint256& txid) const
+{
+    AssertLockHeld(cs_wallet);
+    const auto it = m_resubmit_retry.find(txid);
+    if (it == m_resubmit_retry.end()) return std::nullopt;
+    return ResubmitRetryInfo{it->second.attempts, it->second.block_gap, it->second.missing_inputs};
+}
+
 bool CWallet::QueueResubmitRetry(const CWalletTx& wtx)
 {
     AssertLockHeld(cs_wallet);
@@ -5428,7 +5468,9 @@ void CWallet::PruneResubmitRetry()
         // Accepted (in the mempool), confirmed, conflicted, abandoned or removed.
         const bool keep = wtx != mapWallet.end() && wtx->second.isInactive() &&
                           IsGenericResubmitCandidate(wtx->second) &&
-                          it->second.attempts < MAX_RESUBMIT_RETRY_ATTEMPTS;
+                          it->second.attempts < (it->second.missing_inputs
+                              ? MAX_RESUBMIT_RETRY_MISSING_INPUT_ATTEMPTS
+                              : MAX_RESUBMIT_RETRY_ATTEMPTS);
         it = keep ? std::next(it) : m_resubmit_retry.erase(it);
     }
 }
@@ -5439,6 +5481,7 @@ size_t CWallet::RetryDroppedTransactions()
     AssertLockNotHeld(cs_wallet);
     std::vector<uint256> to_submit;
     uint256 tip;
+    int retry_height{-1};
     {
         LOCK(cs_wallet);
         if (!fBroadcastTransactions) {
@@ -5448,10 +5491,12 @@ size_t CWallet::RetryDroppedTransactions()
         PruneResubmitRetry();
         if (m_resubmit_retry.empty() || m_last_block_processed.IsNull()) return 0;
         tip = m_last_block_processed;
+        retry_height = m_last_block_processed_height;
         // Insertion order, so that a parent is tried before its child.
         std::set<const CWalletTx*, WalletTxOrderComparator> ordered;
-        for (const auto& [txid, entry] : m_resubmit_retry) {
-            if (entry.last_attempt_tip == tip) continue; // nothing new since the last try
+        for (const auto& retry : m_resubmit_retry) {
+            const uint256& txid = retry.first;
+            if (!IsResubmitRetryDue(txid, tip, m_last_block_processed_height)) continue;
             ordered.insert(&mapWallet.at(txid));
         }
         for (const CWalletTx* wtx : ordered) {
@@ -5467,7 +5512,9 @@ size_t CWallet::RetryDroppedTransactions()
     size_t accepted{0};
     for (const uint256& txid : to_submit) {
         std::string err_string;
-        const bool ok = SubmitTxMemoryPoolAndRelay(txid, err_string, /*relay=*/false);
+        const bool ok = SubmitTxMemoryPoolAndRelay(
+            txid, err_string, /*relay=*/false, /*recovery_guard=*/nullptr,
+            /*max_tx_fee_override=*/std::nullopt, /*quiet_log=*/true);
         LOCK(cs_wallet);
         const auto entry = m_resubmit_retry.find(txid);
         if (entry == m_resubmit_retry.end()) continue;
@@ -5475,8 +5522,7 @@ size_t CWallet::RetryDroppedTransactions()
             ++accepted;
             m_resubmit_retry.erase(entry);
         } else if (IsTipDependentRefusal(err_string)) {
-            entry->second.last_attempt_tip = tip;
-            ++entry->second.attempts;
+            NoteResubmitRefusal(txid, tip, retry_height, err_string);
         } else {
             m_resubmit_retry.erase(entry);
         }

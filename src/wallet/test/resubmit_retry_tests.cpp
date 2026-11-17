@@ -135,6 +135,62 @@ BOOST_AUTO_TEST_CASE(the_set_is_bounded)
     BOOST_CHECK_EQUAL(wallet.GetResubmitRetryCount(), CWallet::MAX_RESUBMIT_RETRY_TXS);
 }
 
+BOOST_AUTO_TEST_CASE(refusals_back_off_and_missing_inputs_have_a_low_cap)
+{
+    RetryWallet fixture;
+    CWallet& wallet = fixture.wallet;
+    LOCK(wallet.cs_wallet);
+
+    const CTransactionRef tx = MakeTx(40);
+    BOOST_REQUIRE(wallet.AddToWallet(tx, TxStateInactive{}));
+    BOOST_REQUIRE(wallet.QueueResubmitRetry(wallet.mapWallet.at(tx->GetHash())));
+    const uint256 txid = tx->GetHash();
+    // Queued with no refusal yet: due at any new tip.
+    BOOST_CHECK(wallet.IsResubmitRetryDue(txid, uint256{1}, 100));
+
+    // The gap doubles with every refusal, capped, and a tip inside the gap is
+    // not retried. A repeated tip is never retried.
+    int height{100};
+    uint8_t tip_seed{1};
+    std::vector<unsigned int> gaps;
+    for (int refusal = 0; refusal < 10; ++refusal) {
+        wallet.NoteResubmitRefusal(txid, uint256{tip_seed}, height, "non-final");
+        const auto info = wallet.GetResubmitRetryInfo(txid);
+        BOOST_REQUIRE(info);
+        gaps.push_back(info->block_gap);
+        BOOST_CHECK(!info->missing_inputs);
+        BOOST_CHECK(!wallet.IsResubmitRetryDue(txid, uint256{tip_seed}, height)); // same tip
+        if (info->block_gap > 1) {
+            BOOST_CHECK(!wallet.IsResubmitRetryDue(txid, uint256{static_cast<uint8_t>(tip_seed + 1)},
+                                                   height + static_cast<int>(info->block_gap) - 1));
+        }
+        height += static_cast<int>(info->block_gap);
+        BOOST_CHECK(wallet.IsResubmitRetryDue(txid, uint256{static_cast<uint8_t>(tip_seed + 1)}, height));
+        ++tip_seed;
+    }
+    BOOST_CHECK((gaps == std::vector<unsigned int>{1, 2, 4, 8, 16, 32, 64, 64, 64, 64}));
+    BOOST_CHECK_EQUAL(gaps.back(), CWallet::MAX_RESUBMIT_RETRY_BLOCK_GAP);
+    // A reorg to a lower height re-opens the entry.
+    BOOST_CHECK(wallet.IsResubmitRetryDue(txid, uint256{200}, 50));
+
+    // A refusal for a missing input leaves the set after a few attempts, not a thousand.
+    const CTransactionRef spent = MakeTx(41);
+    BOOST_REQUIRE(wallet.AddToWallet(spent, TxStateInactive{}));
+    BOOST_REQUIRE(wallet.QueueResubmitRetry(wallet.mapWallet.at(spent->GetHash())));
+    for (unsigned int attempt = 1; attempt <= CWallet::MAX_RESUBMIT_RETRY_MISSING_INPUT_ATTEMPTS; ++attempt) {
+        wallet.PruneResubmitRetry();
+        BOOST_REQUIRE(wallet.IsInResubmitRetry(spent->GetHash()));
+        wallet.NoteResubmitRefusal(spent->GetHash(), uint256{static_cast<uint8_t>(attempt)},
+                                   static_cast<int>(attempt), "bad-txns-inputs-missingorspent");
+    }
+    BOOST_CHECK(wallet.GetResubmitRetryInfo(spent->GetHash())->missing_inputs);
+    wallet.PruneResubmitRetry();
+    BOOST_CHECK(!wallet.IsInResubmitRetry(spent->GetHash()));
+    // The other transaction, refused only for tip-dependent reasons, is still queued.
+    BOOST_CHECK(wallet.IsInResubmitRetry(txid));
+    BOOST_CHECK_LT(CWallet::MAX_RESUBMIT_RETRY_MISSING_INPUT_ATTEMPTS, CWallet::MAX_RESUBMIT_RETRY_ATTEMPTS);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace
 } // namespace wallet

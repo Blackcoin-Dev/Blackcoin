@@ -1028,7 +1028,14 @@ private:
     // RetryDroppedTransactions). Ordered by txid; submission order is the wallet order.
     struct ResubmitRetryEntry {
         uint256 last_attempt_tip; //! wallet best block at the last attempt
+        int last_attempt_height{-1}; //! its height
         unsigned int attempts{0};
+        //! Blocks that must pass after the last refusal before the next try;
+        //! doubles with every refusal up to MAX_RESUBMIT_RETRY_BLOCK_GAP.
+        unsigned int block_gap{1};
+        //! The last refusal was bad-txns-inputs-missingorspent, which usually
+        //! means the input was spent elsewhere: a much lower attempt cap.
+        bool missing_inputs{false};
     };
     std::map<uint256, ResubmitRetryEntry> m_resubmit_retry GUARDED_BY(cs_wallet);
 
@@ -1872,6 +1879,8 @@ public:
     static constexpr size_t MAX_RESUBMIT_RETRY_TXS{2000};
     static constexpr size_t MAX_RESUBMIT_RETRY_PER_TICK{100};
     static constexpr unsigned int MAX_RESUBMIT_RETRY_ATTEMPTS{1000};
+    static constexpr unsigned int MAX_RESUBMIT_RETRY_MISSING_INPUT_ATTEMPTS{20};
+    static constexpr unsigned int MAX_RESUBMIT_RETRY_BLOCK_GAP{64};
     //! True for a transaction the generic resubmit path may submit: unconfirmed,
     //! not a coinbase or coinstake, and not owned by the Gold Rush claim,
     //! recovery or reorg machinery, which decide for themselves whether and
@@ -1879,6 +1888,21 @@ public:
     static bool IsGenericResubmitCandidate(const CWalletTx& wtx);
     //! True when a mempool refusal can disappear as the chain advances.
     static bool IsTipDependentRefusal(const std::string& err_string);
+    //! Book one refusal of a queued transaction: attempt count, the doubled
+    //! block gap before the next try (capped) and whether the refusal was a
+    //! missing input. No-op for a transaction that is not queued.
+    void NoteResubmitRefusal(const uint256& txid, const uint256& tip, int height,
+                             const std::string& err_string) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Whether a queued transaction may be tried at this tip: the tip moved and
+    //! the backoff gap since the last refusal has passed (a reorg to a lower
+    //! height re-opens it).
+    bool IsResubmitRetryDue(const uint256& txid, const uint256& tip, int height) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    struct ResubmitRetryInfo {
+        unsigned int attempts{0};
+        unsigned int block_gap{1};
+        bool missing_inputs{false};
+    };
+    std::optional<ResubmitRetryInfo> GetResubmitRetryInfo(const uint256& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Add a candidate to the retry set (no-op for a non-candidate or a full set).
     bool QueueResubmitRetry(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Drop the entries whose transaction is gone or no longer a candidate in
@@ -1959,7 +1983,8 @@ public:
     bool SubmitTxMemoryPoolAndRelay(
         const uint256& txid, std::string& err_string, bool relay,
         const ShadowPowClaimRecoveryBroadcastGuard* recovery_guard = nullptr,
-        std::optional<CAmount> max_tx_fee_override = std::nullopt);
+        std::optional<CAmount> max_tx_fee_override = std::nullopt,
+        bool quiet_log = false);
 
     bool ImportScripts(const std::set<CScript> scripts, int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool ImportPrivKeys(const std::map<CKeyID, CKey>& privkey_map, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

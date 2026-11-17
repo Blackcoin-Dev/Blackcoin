@@ -950,6 +950,33 @@ struct WalletOutputLifecycleMemo {
     bool synthetic{false};
 };
 
+/**
+ * What one blockDisconnected() call did while it held cs_wallet: how long each
+ * phase took and how many entries each phase looked at. A disconnect must cost
+ * in proportion to the block, not to the wallet's history; the counters are
+ * what the unit tests assert and the times are what the log line of a slow
+ * disconnect reports.
+ */
+struct BlockDisconnectWork {
+    int height{-1};
+    //! Transactions of the disconnected block.
+    uint64_t block_txs{0};
+    //! Lifecycle memo entries examined.
+    uint64_t memo_entries_visited{0};
+    //! Wallet coinstake records examined (orphan abandon and redelegation history).
+    uint64_t coinstakes_visited{0};
+    //! Synthetic payout records of the block that were deactivated.
+    uint64_t payouts_synced{0};
+    std::chrono::microseconds memo{0};
+    std::chrono::microseconds block_sync{0};
+    std::chrono::microseconds payouts{0};
+    std::chrono::microseconds coinstakes{0};
+    std::chrono::microseconds redelegation{0};
+    std::chrono::microseconds commit{0};
+    std::chrono::microseconds total{0};
+    std::string ToString() const;
+};
+
 class WalletRescanReserver; //forward declarations for ScanForWalletTransactions/RescanFromTime
 /**
  * A CWallet maintains a set of transactions and balances, and provides the ability to create new transactions.
@@ -1006,6 +1033,7 @@ private:
     std::atomic<double> m_scanning_progress{0};
     friend class WalletRescanReserver;
     friend struct WalletLoadTestAccess;
+    friend struct WalletReorgTestAccess;
     friend class WalletClaimMaintenance;
     friend void AnnotateWalletShadowPayout(CWallet& wallet, const ::ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch);
     std::shared_ptr<WalletClaimMaintenanceSlot> m_claim_maintenance GUARDED_BY(cs_wallet);
@@ -1626,6 +1654,11 @@ public:
     /** GUI-display-only memo of chainstate facts for deep confirmed outputs
      * (see WalletOutputLifecycleMemo). Never persisted. */
     mutable std::map<COutPoint, WalletOutputLifecycleMemo> m_output_lifecycle_memo GUARDED_BY(cs_wallet);
+    /** Store (or replace) the memoized facts of one output. */
+    void StoreOutputLifecycleMemo(const COutPoint& outpoint, const WalletOutputLifecycleMemo& memo) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        m_output_lifecycle_memo[outpoint] = memo;
+    }
     /** Drop every memoized fact. Used when nothing can be said about which
      * entries are still right: a rescan, or an entry that disagreed with the
      * chainstate. */
@@ -1641,10 +1674,13 @@ public:
      * the transaction's confirmed block hash prefix and height, so an entry
      * below the disconnected height describes a block that is still in the
      * chain and a shallow reorg cannot make it wrong; whatever slips past is
-     * caught by the rolling re-verification against the chainstate. */
-    void EraseOutputLifecycleMemoFromHeight(int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+     * caught by the rolling re-verification against the chainstate. Returns
+     * the number of entries examined. */
+    size_t EraseOutputLifecycleMemoFromHeight(int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
+        size_t visited{0};
         for (auto it = m_output_lifecycle_memo.begin(); it != m_output_lifecycle_memo.end();) {
+            ++visited;
             if (it->second.confirmed_block_height >= height) {
                 it = m_output_lifecycle_memo.erase(it);
             } else {
@@ -1652,7 +1688,13 @@ public:
             }
         }
         BumpBalanceScanMarker();
+        return visited;
     }
+    /** The last disconnect, for tests and diagnostics. */
+    BlockDisconnectWork m_last_block_disconnect_work GUARDED_BY(cs_wallet);
+    //! A disconnect that holds cs_wallet at least this long is logged with its phases.
+    static constexpr std::chrono::milliseconds SLOW_BLOCK_DISCONNECT_LOG{100};
+
     /** Drop the memoized facts of the outputs of one transaction (it changed
      * state, for example became conflicted). The map is ordered by outpoint,
      * so the outputs of a transaction are one contiguous range. */
@@ -2358,7 +2400,8 @@ public:
     bool LoadQuantumKeyBackupState(const std::vector<unsigned char>& witness_program, bool verified) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadQuantumColdStakeDelegation(const std::vector<unsigned char>& witness_program, const QuantumColdStakeDelegationRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecordQuantumRedelegationWins(const CTransaction& tx, int height, WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    void RecomputeQuantumRedelegationWinHistory(WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Returns the number of coinstake records examined. */
+    size_t RecomputeQuantumRedelegationWinHistory(WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     std::vector<WalletShadowSolveReference> GetRecentShadowSolveReferences(int tip_height, size_t limit) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     std::vector<uint256> GetPendingShadowSignalTxids() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     std::vector<CScript> GetOwnedLegacyShadowScripts(size_t limit) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -2558,7 +2601,8 @@ public:
     int64_t GetBirthTime() const { return m_birth_time; }
 
     /* Function that will remove potentially abandoned coinstakes, returning the input to the wallet. */
-    void AbandonOrphanedCoinstakes();
+    /** Returns the number of coinstake records examined. */
+    size_t AbandonOrphanedCoinstakes();
 
     /**
      * Blocks until the wallet catches up to the chain tip observed on entry.

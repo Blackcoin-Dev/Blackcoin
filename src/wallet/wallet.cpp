@@ -3565,7 +3565,18 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     // cannot make a deeper entry wrong; the rolling re-verification against
     // the chainstate still catches anything else. Keeping them spares every
     // loaded wallet a full warm-up after a reorg.
-    EraseOutputLifecycleMemoFromHeight(block.height);
+    BlockDisconnectWork work;
+    work.height = block.height;
+    work.block_txs = block.data->vtx.size();
+    const auto work_start = std::chrono::steady_clock::now();
+    auto phase_start = work_start;
+    const auto end_phase = [&](std::chrono::microseconds& phase) {
+        const auto now = std::chrono::steady_clock::now();
+        phase += std::chrono::duration_cast<std::chrono::microseconds>(now - phase_start);
+        phase_start = now;
+    };
+    work.memo_entries_visited = EraseOutputLifecycleMemoFromHeight(block.height);
+    end_phase(work.memo);
 
     int disconnect_height = block.height;
     std::set<uint256> disconnected_block_txids;
@@ -3647,6 +3658,7 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
             }
         }
     }
+    end_phase(work.block_sync);
     // Records confirmed in the disconnected block that the block itself does
     // not contain are its synthetic payouts. They are indexed by block, so no
     // pass over the whole wallet is needed. Copy the txids first: syncing a
@@ -3668,15 +3680,19 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     for (const CTransactionRef& tx : synthetic_confirmed_txs) {
         SyncTransaction(tx, TxStateInactive{});
     }
+    work.payouts_synced = synthetic_confirmed_txs.size();
+    end_phase(work.payouts);
 
     // Retained bytes and indexed anchors remain reserved immediately. Claim
     // classification, historical repair and relay run on the shared executor;
     // a disconnect never grants automatic recovery-spend authority.
 
     // Blackcoin - Call to abandon orphaned coinstakes after handling disconnections
-    AbandonOrphanedCoinstakes();
+    work.coinstakes_visited += AbandonOrphanedCoinstakes();
+    end_phase(work.coinstakes);
 
-    RecomputeQuantumRedelegationWinHistory(batch);
+    work.coinstakes_visited += RecomputeQuantumRedelegationWinHistory(batch);
+    end_phase(work.redelegation);
 
     if (block_writes && !block_writes->Commit()) {
         m_shadow_pow_claim_recovery_db_ambiguous = true;
@@ -3684,6 +3700,12 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
                         block.hash.ToString());
     }
     block_writes.reset();
+    end_phase(work.commit);
+    work.total = std::chrono::duration_cast<std::chrono::microseconds>(phase_start - work_start);
+    m_last_block_disconnect_work = work;
+    if (work.total >= SLOW_BLOCK_DISCONNECT_LOG) {
+        WalletLogPrintf("Slow block disconnect: %s\n", work.ToString());
+    }
     }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a reorg disconnects a block.
     RequestClaimMaintenance(/*resolve=*/false, /*relay=*/true);
@@ -4648,7 +4670,7 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
     return result;
 }
 
-void CWallet::AbandonOrphanedCoinstakes()
+size_t CWallet::AbandonOrphanedCoinstakes()
 {
 	LOCK(cs_wallet);
 
@@ -4656,13 +4678,15 @@ void CWallet::AbandonOrphanedCoinstakes()
     // when loading the wallet during a reindex. Do nothing in that
     // case.
     if (m_last_block_processed_height < 0) {
-        return;
+        return 0;
     }
+    size_t visited{0};
 
     // Walk only the wallet's coinstakes (an immutable property of a transaction,
     // indexed when it enters the wallet), not its whole history. Abandoning
     // changes state only, so the index is not modified while iterating.
     for (const uint256& wtxid : m_coinstake_txids) {
+        ++visited;
         const auto wallet_tx = mapWallet.find(wtxid);
         if (wallet_tx == mapWallet.end()) continue;
         CWalletTx& wtx = wallet_tx->second;
@@ -4674,6 +4698,16 @@ void CWallet::AbandonOrphanedCoinstakes()
             }
         }
     }
+    return visited;
+}
+
+std::string BlockDisconnectWork::ToString() const
+{
+    return strprintf("height=%d block_txs=%d total_ms=%.1f (memo=%.1f block_sync=%.1f payouts=%.1f coinstakes=%.1f "
+                     "redelegation=%.1f commit=%.1f) visited: memo_entries=%d coinstakes=%d payouts=%d",
+                     height, block_txs, total.count() / 1000.0, memo.count() / 1000.0, block_sync.count() / 1000.0,
+                     payouts.count() / 1000.0, coinstakes.count() / 1000.0, redelegation.count() / 1000.0,
+                     commit.count() / 1000.0, memo_entries_visited, coinstakes_visited, payouts_synced);
 }
 
 bool CWallet::SubmitTxMemoryPoolAndRelay(
@@ -7828,12 +7862,14 @@ std::vector<CScript> CWallet::GetOwnedLegacyShadowScripts(size_t limit) const
     return scripts;
 }
 
-void CWallet::RecomputeQuantumRedelegationWinHistory(WalletBatch& batch)
+size_t CWallet::RecomputeQuantumRedelegationWinHistory(WalletBatch& batch)
 {
     AssertLockHeld(cs_wallet);
     std::map<std::vector<unsigned char>, int> rebuilt;
+    size_t visited{0};
 
     for (const uint256& coinstake_txid : m_coinstake_txids) {
+        ++visited;
         const auto wallet_tx = mapWallet.find(coinstake_txid);
         if (wallet_tx == mapWallet.end()) continue;
         const CWalletTx& wtx = wallet_tx->second;
@@ -7863,6 +7899,7 @@ void CWallet::RecomputeQuantumRedelegationWinHistory(WalletBatch& batch)
         }
     }
     m_redelegation_last_win_height = std::move(rebuilt);
+    return visited;
 }
 
 bool CWallet::LoadRGBContract(const uint256& contract_id, const RGBContractRecord& record)

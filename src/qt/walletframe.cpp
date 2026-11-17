@@ -86,6 +86,8 @@ bool WalletFrame::addView(WalletView* walletView)
     mapWalletViews[walletView->getWalletModel()] = walletView;
     // Only the wallet that is shown polls its balance at full rate (L15).
     walletView->getWalletModel()->setBalancePollForeground(currentWalletView() == walletView);
+    // History is read for the wallet that is shown, never for the others.
+    if (currentWalletView() == walletView) walletView->getWalletModel()->requestHistory();
 
     return true;
 }
@@ -116,6 +118,8 @@ void WalletFrame::setCurrentWallet(WalletModel* wallet_model)
     for (auto i = mapWalletViews.constBegin(); i != mapWalletViews.constEnd(); ++i) {
         i.key()->setBalancePollForeground(i.key() == wallet_model);
     }
+    // A wallet is read the first time it is shown; one already read catches up on blocks it missed while hidden.
+    wallet_model->requestHistory();
 
     Q_EMIT currentWalletSet();
 }

@@ -32,11 +32,14 @@
 #include <wallet/wallet.h> // for CRecipient
 
 #include <algorithm>
+#include <chrono>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <stdint.h>
 #include <utility>
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QMessageBox>
 #include <QPointer>
@@ -100,6 +103,7 @@ WalletModel::~WalletModel()
     unsubscribeFromCoreSignals();
 
     join();
+    releaseHistorySlot();
 }
 
 void WalletModel::startPollBalance()
@@ -109,7 +113,6 @@ void WalletModel::startPollBalance()
     connect(timer, &QTimer::timeout, this, &WalletModel::pollBalanceChanged, Qt::UniqueConnection);
     timer->start(MODEL_UPDATE_DELAY);
     pollBalanceChanged();
-    requestInitialHistory();
 }
 
 void WalletModel::setBalancePollForeground(bool foreground)
@@ -120,59 +123,184 @@ void WalletModel::setBalancePollForeground(bool foreground)
     if (foreground && m_balance_poll_started) pollBalanceChanged();
 }
 
-void WalletModel::requestInitialHistory()
+// History loading. Only the wallet the user looks at has its transactions read, one wallet at a time in the whole
+// process, and each read is a series of short jobs on the wallet's own worker thread (so other worker requests
+// interleave) instead of one snapshot of every transaction. The state below is touched on the GUI thread only.
+struct WalletModel::HistoryLoad {
+    //! Every transaction hash of the wallet, sorted: the table keeps its rows in this order.
+    std::vector<uint256> hashes;
+    size_t pos{0};
+    bool have_hashes{false};
+};
+
+namespace {
+QPointer<WalletModel>& HistoryActive()
 {
-    if (!m_deferred_history || m_history_request_pending || m_joined) return;
-    m_history_request_pending = true;
-    m_history_yield.store(false, std::memory_order_release);
-    const bool invoked = QMetaObject::invokeMethod(worker, [this] {
-        std::vector<interfaces::WalletTx> transactions;
-        std::deque<TransactionRecord> history;
-        bool ready{false};
+    static QPointer<WalletModel> active;
+    return active;
+}
+std::deque<QPointer<WalletModel>>& HistoryWaiting()
+{
+    static std::deque<QPointer<WalletModel>> waiting;
+    return waiting;
+}
+//! The only free-form transaction notes the list and the incoming-transaction notice read.
+const std::vector<std::string>& HistoryValueKeys()
+{
+    static const std::vector<std::string> keys{"comment", "to", "from"};
+    return keys;
+}
+constexpr size_t HISTORY_CHUNK_TXS{2000};
+constexpr auto HISTORY_CHUNK_LOCK_BUDGET{std::chrono::milliseconds{20}};
+//! Rows received but not yet published to the views; the loader waits while more than this are queued.
+constexpr size_t HISTORY_UNPUBLISHED_LIMIT{4096};
+} // namespace
+
+WalletModel* WalletModel::historyLoadActiveForTest() { return HistoryActive().data(); }
+size_t WalletModel::historyLoadWaitingForTest()
+{
+    size_t waiting{0};
+    for (const auto& model : HistoryWaiting()) waiting += model && !model->m_joined ? 1 : 0;
+    return waiting;
+}
+
+void WalletModel::requestHistory()
+{
+    if (m_joined) return;
+    if (!m_deferred_history) {
+        // Loaded (or built eagerly): only statuses left out of date while the wallet was hidden remain.
+        transactionTableModel->refreshIfStale();
+        return;
+    }
+    if (!m_history_requested) {
+        m_history_requested = true;
+        m_history_load = std::make_shared<HistoryLoad>();
+        transactionTableModel->beginHistoryLoad();
+    }
+    // The wallet being shown goes to the front of the line (it may already be the one running).
+    if (HistoryActive() != this) {
+        auto& waiting = HistoryWaiting();
+        waiting.erase(std::remove_if(waiting.begin(), waiting.end(), [this](const QPointer<WalletModel>& model) { return model == this; }), waiting.end());
+        waiting.push_front(this);
+    }
+    startNextHistoryLoad();
+}
+
+void WalletModel::startNextHistoryLoad()
+{
+    auto& active = HistoryActive();
+    if (active && !active->m_joined && active->m_deferred_history) return;
+    active.clear();
+    auto& waiting = HistoryWaiting();
+    while (!waiting.empty()) {
+        QPointer<WalletModel> next = waiting.front();
+        waiting.pop_front();
+        if (!next || next->m_joined || !next->m_deferred_history) continue;
+        active = next;
+        next->runHistoryChunk();
+        return;
+    }
+}
+
+void WalletModel::releaseHistorySlot()
+{
+    auto& waiting = HistoryWaiting();
+    waiting.erase(std::remove_if(waiting.begin(), waiting.end(), [this](const QPointer<WalletModel>& model) { return model == this || !model; }), waiting.end());
+    if (HistoryActive() == this) {
+        HistoryActive().clear();
+        if (!QCoreApplication::closingDown()) startNextHistoryLoad();
+    }
+}
+
+void WalletModel::runHistoryChunk()
+{
+    if (m_joined || m_history_chunk_pending || !m_history_load || !m_deferred_history) return;
+    m_history_chunk_pending = true;
+    const auto load = m_history_load;
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, load] {
+        std::vector<TransactionRecord> rows;
+        bool busy{false};
         bool failed{false};
-        struct YieldHistory {};
-        const auto interrupted = [this] {
-            return m_history_cancel.load(std::memory_order_acquire) ||
-                   m_history_yield.load(std::memory_order_acquire);
-        };
+        bool hashes_read{false};
         try {
-            ready = !interrupted() && m_wallet->tryGetWalletTxs(transactions, interrupted);
-            if (ready) {
-                size_t comparisons{0};
-                std::sort(transactions.begin(), transactions.end(), [&](const auto& a, const auto& b) {
-                    if (comparisons++ % 1024 == 0 && interrupted()) throw YieldHistory{};
-                    return a < b;
-                });
-                for (const auto& tx : transactions) {
-                    if (interrupted()) throw YieldHistory{};
-                    if (!TransactionRecord::showTransaction(tx)) continue;
-                    for (auto& row : TransactionRecord::decomposeTransaction(tx)) {
-                        history.push_back(std::move(row));
+            if (m_history_cancel.load(std::memory_order_acquire)) {
+                busy = true;
+            } else if (!load->have_hashes) {
+                std::vector<uint256> hashes;
+                if (m_wallet->tryGetWalletTxHashes(hashes)) {
+                    std::sort(hashes.begin(), hashes.end());
+                    load->hashes = std::move(hashes);
+                    load->pos = 0;
+                    load->have_hashes = true;
+                    hashes_read = true;
+                } else {
+                    busy = true;
+                }
+            } else {
+                std::vector<interfaces::WalletTx> transactions;
+                if (m_wallet->tryGetWalletTxChunk(load->hashes, load->pos, HISTORY_CHUNK_TXS, HISTORY_CHUNK_LOCK_BUDGET,
+                                                  HistoryValueKeys(), transactions)) {
+                    rows.reserve(transactions.size());
+                    for (const auto& tx : transactions) {
+                        if (!TransactionRecord::showTransaction(tx)) continue;
+                        for (auto& row : TransactionRecord::decomposeTransaction(tx)) rows.push_back(std::move(row));
                     }
+                } else {
+                    busy = true;
                 }
             }
-        } catch (const YieldHistory&) {
-            ready = false;
-            history.clear();
         } catch (const std::exception& error) {
             qWarning() << "Initial wallet history snapshot failed:" << error.what();
             failed = true;
         }
-        QMetaObject::invokeMethod(this, [this, history = std::move(history), ready, failed]() mutable {
-            m_history_request_pending = false;
-            if (m_joined) return;
+        const bool done = !busy && !failed && load->have_hashes && load->pos >= load->hashes.size();
+        const size_t total = load->hashes.size();
+        QMetaObject::invokeMethod(this, [this, load, rows = std::move(rows), busy, failed, done, hashes_read, total]() mutable {
+            m_history_chunk_pending = false;
+            if (m_joined || load != m_history_load) return;
             if (failed) {
                 m_deferred_history = false;
+                m_history_load.reset();
                 transactionTableModel->reportHistoryLoadFailure();
-            } else if (ready) {
-                m_deferred_history = false;
-                transactionTableModel->setInitialHistory(std::move(history));
-            } else {
-                QTimer::singleShot(25, this, &WalletModel::requestInitialHistory);
+                releaseHistorySlot();
+                return;
             }
+            if (busy) {
+                // The wallet lock was busy (a staking pass, a scan): ask again shortly, holding our turn.
+                QTimer::singleShot(25, this, &WalletModel::runHistoryChunk);
+                return;
+            }
+            if (hashes_read) transactionTableModel->reserveHistory(total);
+            if (!rows.empty()) transactionTableModel->appendInitialHistory(std::move(rows));
+            if (done) {
+                m_deferred_history = false;
+                m_history_load.reset();
+                transactionTableModel->finishInitialHistoryStream();
+                releaseHistorySlot();
+                return;
+            }
+            historyChunkDone();
         }, Qt::QueuedConnection);
     }, Qt::QueuedConnection);
     assert(invoked);
+}
+
+void WalletModel::historyChunkDone()
+{
+    // A wallet that is not shown gives way to one that is: its place in the file is kept (the read resumes where it
+    // stopped), and the wallet being looked at starts at once.
+    auto& waiting = HistoryWaiting();
+    if (!m_poll_foreground && !waiting.empty() && waiting.front() && waiting.front()->m_poll_foreground) {
+        waiting.push_back(this);
+        HistoryActive().clear();
+        startNextHistoryLoad();
+        return;
+    }
+    // Another worker request asked for the thread: let it run before the next chunk.
+    int delay_ms{0};
+    if (m_history_yield.exchange(false, std::memory_order_acq_rel)) delay_ms = 25;
+    else if (transactionTableModel->unpublishedHistoryRows() > HISTORY_UNPUBLISHED_LIMIT) delay_ms = 10;
+    QTimer::singleShot(delay_ms, this, &WalletModel::runHistoryChunk);
 }
 
 void WalletModel::setClientModel(ClientModel* client_model)

@@ -11,12 +11,81 @@
 #include <QList>
 #include <QString>
 
+#include <cstdint>
+#include <memory>
+#include <string>
+
 namespace interfaces {
 class Node;
 class Wallet;
 struct WalletTx;
 struct WalletTxStatus;
 }
+
+/** The status-dependent sort key of a row, stored as its five fields instead of as the 29 character text
+ *  "%010d-%01d-%010u-%03d-%d" (block height, generated flag, time received, output index, type order). A row holds
+ *  this for its whole life, so the text (a heap string per row) is built only when something asks for it. An empty
+ *  key means the row has never been read from the wallet. */
+class TransactionSortKey
+{
+public:
+    TransactionSortKey() = default;
+    TransactionSortKey(int block_height, bool generated, unsigned time_received, int idx, int type_order) :
+        m_height(block_height), m_received(time_received), m_idx(idx), m_generated(generated), m_type_order(static_cast<int8_t>(type_order)), m_set(true) {}
+    //! Accepts the formatted text (the tests assign it); anything else leaves the key empty.
+    TransactionSortKey& operator=(const std::string& text);
+    bool empty() const { return !m_set; }
+    void clear() { *this = TransactionSortKey{}; }
+    int blockHeight() const { return m_height; }
+    //! The text the key stands for, identical to the former per-row string.
+    std::string str() const;
+    operator std::string() const { return str(); }
+    bool operator==(const TransactionSortKey& other) const
+    {
+        return m_set == other.m_set && m_height == other.m_height && m_received == other.m_received && m_idx == other.m_idx &&
+               m_generated == other.m_generated && m_type_order == other.m_type_order;
+    }
+    bool operator!=(const TransactionSortKey& other) const { return !(*this == other); }
+
+private:
+    int32_t m_height{0};
+    uint32_t m_received{0};
+    int32_t m_idx{0};
+    bool m_generated{false};
+    int8_t m_type_order{0};
+    bool m_set{false};
+};
+
+/** A row's address text. Claim and payout rows of one wallet repeat a handful of addresses over hundreds of
+ *  thousands of rows, so equal texts share one allocation (a pool that forgets an address once no row uses it). */
+class TransactionAddress
+{
+public:
+    TransactionAddress() = default;
+    TransactionAddress(const std::string& text) { assign(text); }
+    TransactionAddress(const char* text) { assign(std::string(text)); }
+    TransactionAddress& operator=(const std::string& text) { assign(text); return *this; }
+    const std::string& str() const;
+    operator const std::string&() const { return str(); }
+    bool empty() const { return !m_text || m_text->empty(); }
+    size_t size() const { return str().size(); }
+    bool operator==(const TransactionAddress& other) const { return m_text == other.m_text || str() == other.str(); }
+    bool operator!=(const TransactionAddress& other) const { return !(*this == other); }
+    bool operator==(const std::string& other) const { return str() == other; }
+    bool operator!=(const std::string& other) const { return str() != other; }
+    //! Tests: number of distinct address texts currently shared by rows.
+    static size_t PoolSize();
+
+private:
+    void assign(const std::string& text);
+    std::shared_ptr<const std::string> m_text;
+};
+inline bool operator==(const std::string& a, const TransactionAddress& b) { return b == a; }
+inline bool operator!=(const std::string& a, const TransactionAddress& b) { return b != a; }
+inline bool operator==(const std::string& a, const TransactionSortKey& b) { return b.str() == a; }
+inline bool operator!=(const std::string& a, const TransactionSortKey& b) { return b.str() != a; }
+inline bool operator==(const TransactionSortKey& a, const std::string& b) { return a.str() == b; }
+inline bool operator!=(const TransactionSortKey& a, const std::string& b) { return a.str() != b; }
 
 /** UI model for transaction status. The transaction status is the part of a transaction that will change over time.
  */
@@ -35,24 +104,26 @@ struct TransactionStatus {
 
     /// Transaction counts towards available balance
     bool countsForBalance{false};
-    /// Sorting key based on status
-    std::string sortKey;
+    /// Set when the wallet says this row changed; the next status read replaces it
+    bool needsUpdate{false};
+
+    /** @name Reported status
+       @{*/
+    Status status{Unconfirmed};
+    int depth{0};
+    /**@}*/
 
     /** @name Generated (mined) transactions
        @{*/
     int matures_in{0};
     /**@}*/
 
-    /** @name Reported status
-       @{*/
-    Status status{Unconfirmed};
-    qint64 depth{0};
-    /**@}*/
+    /// Sorting key based on status
+    TransactionSortKey sortKey;
 
-    /** Current block hash (to know whether cached status is still valid) */
-    uint256 m_cur_block_hash{};
-
-    bool needsUpdate{false};
+    /** Fingerprint of the chain tip this status was read at (to know whether the cached status is still valid).
+     *  The first eight bytes of the block hash: a false match only delays one refresh to the next block. */
+    uint64_t m_cur_tip{0};
 };
 
 /** UI model for a transaction. A core transaction can be represented by multiple UI transactions if it has
@@ -106,7 +177,7 @@ public:
     uint256 hash;
     qint64 time;
     Type type;
-    std::string address;
+    TransactionAddress address;
     CAmount debit;
     CAmount credit;
     /**@}*/
@@ -121,7 +192,7 @@ public:
     TransactionStatus status;
 
     /** Whether the transaction was sent/received with a watch-only address */
-    bool involvesWatchAddress;
+    bool involvesWatchAddress{false};
 
     /** Return the unique identifier for this transaction (part) */
     QString getTxHash() const;

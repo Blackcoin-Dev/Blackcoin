@@ -14,9 +14,11 @@
 #include <QIcon>
 #include <QStringList>
 
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <vector>
 
 namespace interfaces {
 class Handler;
@@ -93,7 +95,25 @@ public:
     void invalidateAddressLabel(const QString& address);
     bool isHistoryLoaded() const { return m_history_loaded; }
     bool historyLoadHasFailed() const { return m_history_load_failed; }
+    //! Publish a whole snapshot at once (tests); the wallet model streams with the three calls below instead.
     void setInitialHistory(std::deque<TransactionRecord> history);
+    //! The wallet is being shown: stop dropping its notifications, because a snapshot is about to cover them.
+    //! Returns false when the history is already loaded or already requested.
+    bool beginHistoryLoad();
+    bool isHistoryRequested() const;
+    //! Streamed snapshot, called on the GUI thread: rows arrive in transaction hash order, in chunks. The table is
+    //! published 256 rows per event-loop turn behind them.
+    void reserveHistory(size_t transactions);
+    void appendInitialHistory(std::vector<TransactionRecord> rows);
+    void finishInitialHistoryStream();
+    //! Rows received from the loader and not yet published (readable from any thread; the loader paces itself on it).
+    size_t unpublishedHistoryRows() const { return m_unpublished_rows.load(std::memory_order_acquire); }
+    //! The wallet is shown (or stays shown): refresh statuses that were skipped while it was hidden.
+    void refreshIfStale();
+    //! Tests: how many wallet status requests the table has made, and how many rows they covered.
+    struct StatusStats { size_t batches{0}; size_t rows{0}; size_t single_reads{0}; };
+    StatusStats statusStats() const { return m_status_stats; }
+    int tipHeight() const { return m_tip_height; }
     /** Insert already decomposed records the way a wallet notification does: grouped by transaction hash, each group
      *  placed in hash order with fresh GUI identities. Used by tests that cannot create tens of thousands of wallet
      *  transactions; production code reaches the same insertion through wallet notifications. */
@@ -126,6 +146,10 @@ private:
     QStringList columns;
     std::shared_ptr<TransactionTablePriv> priv;
     bool fProcessingQueuedTransactions{false};
+    std::atomic<size_t> m_unpublished_rows{0};
+    StatusStats m_status_stats;
+    //! Height of the chain tip at the last status read; a settled row's confirmations are derived from it.
+    int m_tip_height{-1};
     bool m_history_loaded{false};
     bool m_history_load_failed{false};
     const PlatformStyle *platformStyle;
@@ -147,6 +171,9 @@ private:
     QString formatTxToAddress(const TransactionRecord *wtx, bool tooltip) const;
     QString formatTxAmount(const TransactionRecord *wtx, bool showUnconfirmed=true, BitcoinUnits::SeparatorStyle separators=BitcoinUnits::SeparatorStyle::STANDARD) const;
     QString formatTooltip(const TransactionRecord *rec) const;
+    //! Confirmations to display: a settled row's depth follows the tip instead of being re-read from the wallet.
+    int displayDepth(const TransactionRecord *rec) const;
+    void refreshStatuses();
     static QString statusIconPath(const TransactionRecord *wtx);
     static QString addressIconPath(const TransactionRecord *wtx);
     mutable QHash<QString, QIcon> m_recolored_icons;
@@ -157,6 +184,8 @@ private:
 Q_SIGNALS:
     void historyLoaded();
     void historyLoadFailed();
+    //! A transaction arrived in a wallet whose history has not been loaded (so no row exists to announce it).
+    void incomingWhileNotLoaded(const QString& date, qint64 amount, const QString& type, const QString& address, const QString& label);
 
 public Q_SLOTS:
     void updateConfirmations();

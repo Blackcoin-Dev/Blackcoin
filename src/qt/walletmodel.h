@@ -272,6 +272,14 @@ public:
     OptionsModel* getOptionsModel() const;
     AddressTableModel* getAddressTableModel() const;
     TransactionTableModel* getTransactionTableModel() const;
+    //! True while this wallet is the one shown (balances refresh at full rate, transaction statuses are kept current).
+    bool isPollForeground() const { return m_poll_foreground; }
+    //! The wallet is being shown: load its transaction history if that has not begun, and bring a history that was
+    //! left out of date while hidden up to date. History is never loaded for a wallet nobody has looked at.
+    void requestHistory();
+    //! Tests: the wallet whose history is being read right now, and how many are waiting for their turn.
+    static WalletModel* historyLoadActiveForTest();
+    static size_t historyLoadWaitingForTest();
     RecentRequestsTableModel* getRecentRequestsTableModel() const;
 
     EncryptionStatus getEncryptionStatus() const;
@@ -487,9 +495,17 @@ private:
     std::atomic<uint64_t> nWeight;
     std::atomic<bool> updateStakeWeight;
 
-    void requestInitialHistory();
+    //! History loading (GUI thread). A wallet's history is read the first time it is shown, one wallet at a time
+    //! process-wide, in chunks that each hold the wallet lock briefly.
+    struct HistoryLoad;
+    void runHistoryChunk();
+    void historyChunkDone();
+    void releaseHistorySlot();
+    static void startNextHistoryLoad();
+    std::shared_ptr<HistoryLoad> m_history_load;
+    bool m_history_requested{false};
+    bool m_history_chunk_pending{false};
     bool m_deferred_history{false};
-    bool m_history_request_pending{false};
     std::atomic<bool> m_history_cancel{false};
     std::atomic<bool> m_history_yield{false};
 

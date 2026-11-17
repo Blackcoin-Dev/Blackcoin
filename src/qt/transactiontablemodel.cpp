@@ -21,6 +21,7 @@
 #include <core_io.h>
 #include <interfaces/handler.h>
 #include <key_io.h>
+#include <logging.h>
 #include <sync.h>
 #include <tinyformat.h>
 #include <uint256.h>
@@ -30,6 +31,7 @@
 #include <cctype>
 #include <deque>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -103,7 +105,9 @@ public:
     static_assert(QT_VERSION < QT_VERSION_CHECK(6, 0, 0), "m_by_id relies on Qt 5 QList node storage");
     static_assert(QTypeInfo<TransactionRecord>::isLarge ? true : QTypeInfo<TransactionRecord>::isStatic != 0,
                   "m_by_id relies on QList storing TransactionRecord out of line");
-    std::unordered_map<uint64_t, TransactionRecord*> m_by_id;
+    //! Presentation ids are handed out in increasing order and never reused, so a dense table (8 bytes per row id,
+    //! null once the row is erased) replaces a node-based hash map (about 48 bytes and an allocation per row).
+    std::vector<TransactionRecord*> m_by_id;
     //! Rows whose status may still change with a new block, in two classes. Active rows have been refreshed at least
     //! once and are not settled (confirming, maturing, flagged, conflicted): every block re-evaluates all of them, with
     //! no budget, so a displayed confirmation state is never stale. Unrefreshed rows have never been read from the
@@ -132,10 +136,13 @@ public:
     void Untrack(uint64_t id) { m_active.erase(id); m_unrefreshed.erase(id); }
     void Register(TransactionRecord& record)
     {
-        m_by_id[record.presentation_id] = &record;
+        const uint64_t id = record.presentation_id;
+        if (id >= m_by_id.size()) m_by_id.resize(id + 1, nullptr);
+        m_by_id[id] = &record;
         Track(record);
     }
-    TransactionRecord* FindById(uint64_t id) const { const auto found = m_by_id.find(id); return found == m_by_id.end() ? nullptr : found->second; }
+    TransactionRecord* FindById(uint64_t id) const { return id < m_by_id.size() ? m_by_id[id] : nullptr; }
+    void ForgetId(uint64_t id) { if (id < m_by_id.size()) m_by_id[id] = nullptr; }
     uint64_t m_next_row_id{1};
     void AssignIdentity(TransactionRecord& row)
     {
@@ -144,7 +151,10 @@ public:
         row.presentation_id = m_next_row_id++;
     }
     std::deque<TransactionRecord> m_initial_history;
+    bool m_stream_complete{false};
+    bool m_publish_scheduled{false};
     void PublishInitialHistory();
+    void SchedulePublish();
     void FinishInitialHistory(bool deferred);
 
     // Wallet changes and scan progress can arrive on different core threads.
@@ -155,8 +165,30 @@ public:
     bool m_initial_boundary_pending GUARDED_BY(m_notification_mutex){false};
     bool m_notifications_stopped GUARDED_BY(m_notification_mutex){false};
     bool m_drain_scheduled GUARDED_BY(m_notification_mutex){false};
+    //! The history snapshot has been asked for. Until then a notification is dropped (the snapshot, taken later,
+    //! contains the transaction), so a wallet nobody looks at holds no queue.
+    bool m_history_requested GUARDED_BY(m_notification_mutex){false};
     std::vector<TransactionNotification> m_scanned_notifications GUARDED_BY(m_notification_mutex);
+    //! While the snapshot loads, one entry per transaction (the latest change wins): the snapshot covers the rest.
+    struct HashPrefix { size_t operator()(const uint256& hash) const { return static_cast<size_t>(hash.GetUint64(0)); } };
+    std::unordered_map<uint256, size_t, HashPrefix> m_scanned_index GUARDED_BY(m_notification_mutex);
     std::deque<TransactionNotification> m_pending_updates GUARDED_BY(m_notification_mutex);
+
+    //! New transactions of a wallet whose history is not loaded: announced from the transaction itself, no rows.
+    static constexpr size_t MAX_UNLOADED_INCOMING{64};
+    std::deque<uint256> m_unloaded_incoming GUARDED_BY(m_notification_mutex);
+    bool m_unloaded_drain_scheduled GUARDED_BY(m_notification_mutex){false};
+    int m_unloaded_retries{0};
+    bool RequestHistory();
+    bool HistoryRequested();
+    void QueueScanned(const TransactionNotification& notification) EXCLUSIVE_LOCKS_REQUIRED(m_notification_mutex);
+    void OfferUnloadedIncoming(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(m_notification_mutex);
+    void DrainUnloadedIncoming();
+
+    //! Statuses are read per block for the rows that can still change; a refused lock leaves them marked for a retry.
+    bool m_status_dirty{false};
+    bool m_status_retry_scheduled{false};
+    int m_status_retries{0};
 
     void NotifyTransactionChanged(const uint256& hash, ChangeType status);
     void NotifyScanProgress(int progress);
@@ -204,7 +236,7 @@ public:
         parent->beginRemoveRows(QModelIndex(), lowerIndex, upperIndex - 1);
         for (int i = lowerIndex; i < upperIndex; ++i) {
             ForgetLabelRow(cachedWallet[i]);
-            m_by_id.erase(cachedWallet[i].presentation_id);
+            ForgetId(cachedWallet[i].presentation_id);
             Untrack(cachedWallet[i].presentation_id);
         }
         cachedWallet.erase(cachedWallet.begin() + lowerIndex, cachedWallet.begin() + upperIndex);
@@ -236,7 +268,9 @@ public:
     {
         const bool showTransaction = TransactionRecord::showTransaction(wtx);
 
-        qDebug() << "TransactionTablePriv::updateWallet: " + QString::fromStdString(hash.ToString()) + " " + QString::number(status);
+        // The strings are built only when the GUI debug category is on: this runs once per wallet notification.
+        const bool log_debug = LogAcceptCategory(BCLog::QT, BCLog::Level::Debug);
+        if (log_debug) qDebug() << "TransactionTablePriv::updateWallet: " + QString::fromStdString(hash.ToString()) + " " + QString::number(status);
 
         // Find bounds of this transaction in model
         QList<TransactionRecord>::iterator lower = std::lower_bound(
@@ -255,16 +289,24 @@ public:
                 status = CT_DELETED; /* In model, but want to hide, treat as deleted */
         }
 
-        qDebug() << "    inModel=" + QString::number(inModel) +
-                    " Index=" + QString::number(lowerIndex) + "-" + QString::number(upperIndex) +
-                    " showTransaction=" + QString::number(showTransaction) + " derivedStatus=" + QString::number(status);
+        if (log_debug) {
+            qDebug() << "    inModel=" + QString::number(inModel) +
+                        " Index=" + QString::number(lowerIndex) + "-" + QString::number(upperIndex) +
+                        " showTransaction=" + QString::number(showTransaction) + " derivedStatus=" + QString::number(status);
+        }
 
         switch(status)
         {
         case CT_NEW:
             if(inModel)
             {
-                qWarning() << "TransactionTablePriv::updateWallet: Warning: Got CT_NEW, but transaction is already in model";
+                // The history snapshot already holds this transaction (the notification was queued while it loaded,
+                // or the transaction came back after a reorganisation): its rows only need a fresh status.
+                for (int i = lowerIndex; i < upperIndex; i++) {
+                    TransactionRecord* rec = &cachedWallet[i];
+                    rec->status.needsUpdate = true;
+                    Track(*rec);
+                }
                 break;
             }
             if(showTransaction && wtx.tx)
@@ -300,23 +342,23 @@ public:
     }
 
     //! If a status update is needed (blocks came in since last check), try to update the status of this
-    //! transaction from the wallet. Otherwise, simply re-use the cached status.
-    static void RefreshStatus(interfaces::Wallet& wallet, const uint256& cur_block_hash, TransactionRecord* rec)
-    {
-        interfaces::WalletTxStatus wtx;
-        int numBlocks;
-        int64_t block_time;
-        if (!cur_block_hash.IsNull() && rec->statusUpdateNeeded(cur_block_hash) && wallet.tryGetTxStatus(rec->hash, wtx, numBlocks, block_time)) {
-            rec->updateStatus(wtx, cur_block_hash, numBlocks, block_time);
-        }
-    }
+    //! transaction from the wallet. Otherwise, simply re-use the cached status. Returns false when the wallet could
+    //! not be asked right now (a lock was busy): the row keeps its place in a tracked class and is read again.
+    bool RefreshStatus(interfaces::Wallet& wallet, const uint256& cur_block_hash, TransactionRecord* rec);
+    void ScheduleStatusRetry();
 
     //! RefreshStatus, and re-file the record if that changed which class of unsettled row it is.
     void Refresh(interfaces::Wallet& wallet, const uint256& cur_block_hash, TransactionRecord* rec)
     {
         const bool was_empty = rec->status.sortKey.empty();
         const bool was_settled = Settled(*rec);
-        if (m_refresh_hook) m_refresh_hook(*rec); else RefreshStatus(wallet, cur_block_hash, rec);
+        if (m_refresh_hook) {
+            m_refresh_hook(*rec);
+        } else if (!was_settled) {
+            // A settled row changes only when the wallet says so (needsUpdate), and its confirmations are derived
+            // from the tip height at display time, so it never costs a wallet query.
+            if (!RefreshStatus(wallet, cur_block_hash, rec)) ScheduleStatusRetry();
+        }
         if (was_empty != rec->status.sortKey.empty() || was_settled != Settled(*rec)) Track(*rec);
     }
 
@@ -369,6 +411,7 @@ TransactionTableModel::TransactionTableModel(const PlatformStyle* _platformStyle
             }
         }
         m_history_loaded = true;
+        priv->RequestHistory();
         priv->FinishInitialHistory(/*deferred=*/false);
     }
 
@@ -379,9 +422,44 @@ TransactionTableModel::TransactionTableModel(const PlatformStyle* _platformStyle
 void TransactionTableModel::setInitialHistory(std::deque<TransactionRecord> history)
 {
     assert(priv->cachedWallet.empty() && priv->m_initial_history.empty());
+    priv->RequestHistory();
+    m_unpublished_rows.store(history.size(), std::memory_order_release);
     priv->m_initial_history = std::move(history);
     priv->cachedWallet.reserve(priv->m_initial_history.size());
+    priv->m_stream_complete = true;
     priv->PublishInitialHistory();
+}
+
+bool TransactionTableModel::beginHistoryLoad() { return priv->RequestHistory(); }
+bool TransactionTableModel::isHistoryRequested() const { return priv->HistoryRequested(); }
+
+void TransactionTableModel::reserveHistory(size_t transactions)
+{
+    priv->cachedWallet.reserve(static_cast<int>(std::min<size_t>(transactions, std::numeric_limits<int>::max() / 2)));
+}
+
+void TransactionTableModel::appendInitialHistory(std::vector<TransactionRecord> rows)
+{
+    m_unpublished_rows.fetch_add(rows.size(), std::memory_order_acq_rel);
+    for (auto& row : rows) priv->m_initial_history.push_back(std::move(row));
+    priv->SchedulePublish();
+}
+
+void TransactionTableModel::finishInitialHistoryStream()
+{
+    priv->m_stream_complete = true;
+    priv->SchedulePublish();
+}
+
+void TransactionTablePriv::SchedulePublish()
+{
+    if (m_publish_scheduled) return;
+    m_publish_scheduled = true;
+    const bool invoked = QMetaObject::invokeMethod(parent, [state = shared_from_this()] {
+        state->m_publish_scheduled = false;
+        state->PublishInitialHistory();
+    }, Qt::QueuedConnection);
+    assert(invoked);
 }
 
 void TransactionTablePriv::PublishInitialHistory()
@@ -401,15 +479,18 @@ void TransactionTablePriv::PublishInitialHistory()
         }
         model->endInsertRows();
         if (!model) return;
+        model->m_unpublished_rows.fetch_sub(count, std::memory_order_acq_rel);
         model->fProcessingQueuedTransactions = false;
     }
     if (m_initial_history.empty()) {
-        FinishInitialHistory(/*deferred=*/true);
+        // More rows may still be on their way: the snapshot is only finished once its loader says so.
+        if (m_stream_complete) {
+            m_stream_complete = false;
+            m_initial_history.shrink_to_fit();
+            FinishInitialHistory(/*deferred=*/true);
+        }
     } else {
-        const bool invoked = QMetaObject::invokeMethod(parent, [state = shared_from_this()] {
-            state->PublishInitialHistory();
-        }, Qt::QueuedConnection);
-        assert(invoked);
+        SchedulePublish();
     }
 }
 
@@ -483,33 +564,72 @@ void TransactionTableModel::updateAmountColumnTitle()
     Q_EMIT headerDataChanged(Qt::Horizontal,Amount,Amount);
 }
 
+bool TransactionTablePriv::RefreshStatus(interfaces::Wallet& wallet, const uint256& cur_block_hash, TransactionRecord* rec)
+{
+    if (cur_block_hash.IsNull() || !rec->statusUpdateNeeded(cur_block_hash)) return true;
+    interfaces::WalletTxStatus wtx;
+    int numBlocks;
+    int64_t block_time;
+    if (!wallet.tryGetTxStatus(rec->hash, wtx, numBlocks, block_time)) return false;
+    parent->m_tip_height = numBlocks;
+    ++parent->m_status_stats.single_reads;
+    rec->updateStatus(wtx, cur_block_hash, numBlocks, block_time);
+    return true;
+}
+
+void TransactionTablePriv::ScheduleStatusRetry()
+{
+    // A refused lock leaves the row tracked; try again soon, a bounded number of times per block.
+    constexpr int MAX_RETRIES{20};
+    if (m_status_retry_scheduled || m_status_retries >= MAX_RETRIES) return;
+    m_status_retry_scheduled = true;
+    ++m_status_retries;
+    QTimer::singleShot(50, parent, [state = shared_from_this()] {
+        state->m_status_retry_scheduled = false;
+        state->parent->refreshStatuses();
+    });
+}
+
 void TransactionTableModel::updateConfirmations()
+{
+    // Nothing to read until the history is published, and a wallet nobody is looking at only remembers that its
+    // statuses are out of date: showing it refreshes them in one pass.
+    if (!m_history_loaded) return;
+    if (!walletModel->isPollForeground()) {
+        priv->m_status_dirty = true;
+        return;
+    }
+    priv->m_status_retries = 0;
+    refreshStatuses();
+}
+
+void TransactionTableModel::refreshIfStale()
+{
+    if (m_history_loaded && priv->m_status_dirty) updateConfirmations();
+}
+
+void TransactionTableModel::refreshStatuses()
 {
     // A new block changes what is displayed only for rows that are not yet settled, and only rows whose displayed
     // status really changed are announced. Every active row (read from the wallet before, still confirming, maturing
     // or flagged) is re-evaluated by every block: nothing a view may be showing is skipped. Rows never read from the
     // wallet are read MaxRefreshPerBlock at a time, round-robin from where the last block stopped, so a block takes
-    // the wallet lock a bounded number of times for them and every one is reached.
+    // the wallet locks a bounded number of times for them and every one is reached. All of them are read with one
+    // acquisition of the locks (in pieces of a bounded size), instead of one try-lock pair per row.
+    if (!m_history_loaded) return;
+    priv->m_status_dirty = false;
+    const uint256 tip = walletModel->getLastBlockProcessed();
     std::vector<int> rows;
-    const auto evaluate = [&](TransactionRecord* record) {
-        const auto status = record->status.status;
-        const auto depth = record->status.depth;
-        const auto matures = record->status.matures_in;
-        const auto counts = record->status.countsForBalance;
-        const std::string key = record->status.sortKey;
-        priv->Refresh(walletModel->wallet(), walletModel->getLastBlockProcessed(), record);
+    const auto changed = [&](TransactionRecord* record, const auto& status, const auto& depth, const auto& matures,
+                             const auto& counts, const TransactionSortKey& key) {
         if (status != record->status.status || depth != record->status.depth || matures != record->status.matures_in ||
             counts != record->status.countsForBalance || key != record->status.sortKey) {
             const int row = rowOfRecord(*record);
             if (row >= 0) rows.push_back(row);
         }
     };
-    const std::vector<uint64_t> active(priv->m_active.begin(), priv->m_active.end());
-    for (const uint64_t id : active) {
-        TransactionRecord* record = priv->FindById(id);
-        if (!record) { priv->Untrack(id); continue; }
-        evaluate(record);
-    }
+
+    std::vector<uint64_t> ids(priv->m_active.begin(), priv->m_active.end());
     std::vector<uint64_t> batch;
     const size_t count = std::min(MaxRefreshPerBlock, priv->m_unrefreshed.size());
     auto it = priv->m_unrefreshed.upper_bound(priv->m_refresh_cursor);
@@ -518,11 +638,71 @@ void TransactionTableModel::updateConfirmations()
         batch.push_back(*it);
         ++it;
     }
-    if (!batch.empty()) priv->m_refresh_cursor = batch.back();
-    for (const uint64_t id : batch) {
-        TransactionRecord* record = priv->FindById(id);
-        if (!record) { priv->Untrack(id); continue; }
-        evaluate(record);
+    ids.insert(ids.end(), batch.begin(), batch.end());
+
+    bool refused{false};
+    if (priv->m_refresh_hook) {
+        for (const uint64_t id : ids) {
+            TransactionRecord* record = priv->FindById(id);
+            if (!record) { priv->Untrack(id); continue; }
+            const auto status = record->status.status;
+            const auto depth = record->status.depth;
+            const auto matures = record->status.matures_in;
+            const auto counts = record->status.countsForBalance;
+            const TransactionSortKey key = record->status.sortKey;
+            priv->Refresh(walletModel->wallet(), tip, record);
+            changed(record, status, depth, matures, counts, key);
+        }
+    } else if (!tip.IsNull()) {
+        constexpr size_t MAX_ROWS_PER_LOCK{1024};
+        for (size_t first = 0; first < ids.size() && !refused; first += MAX_ROWS_PER_LOCK) {
+            const size_t last = std::min(ids.size(), first + MAX_ROWS_PER_LOCK);
+            std::vector<TransactionRecord*> records;
+            std::vector<uint256> hashes;
+            std::unordered_map<uint256, size_t, TransactionTablePriv::HashPrefix> slot;
+            std::vector<size_t> record_slot;
+            for (size_t i = first; i < last; ++i) {
+                TransactionRecord* record = priv->FindById(ids[i]);
+                if (!record) { priv->Untrack(ids[i]); continue; }
+                const auto [position, inserted] = slot.try_emplace(record->hash, hashes.size());
+                if (inserted) hashes.push_back(record->hash);
+                records.push_back(record);
+                record_slot.push_back(position->second);
+            }
+            if (hashes.empty()) continue;
+            std::vector<std::optional<interfaces::WalletTxStatus>> statuses;
+            int num_blocks{0};
+            int64_t block_time{0};
+            if (!walletModel->wallet().tryGetTxStatuses(hashes, statuses, num_blocks, block_time)) {
+                refused = true;
+                break;
+            }
+            ++m_status_stats.batches;
+            m_status_stats.rows += records.size();
+            m_tip_height = num_blocks;
+            for (size_t i = 0; i < records.size(); ++i) {
+                TransactionRecord* record = records[i];
+                const auto& wallet_status = statuses[record_slot[i]];
+                if (!wallet_status) continue;
+                const bool was_empty = record->status.sortKey.empty();
+                const bool was_settled = TransactionTablePriv::Settled(*record);
+                const auto status = record->status.status;
+                const auto depth = record->status.depth;
+                const auto matures = record->status.matures_in;
+                const auto counts = record->status.countsForBalance;
+                const TransactionSortKey key = record->status.sortKey;
+                record->updateStatus(*wallet_status, tip, num_blocks, block_time);
+                if (was_empty != record->status.sortKey.empty() || was_settled != TransactionTablePriv::Settled(*record)) priv->Track(*record);
+                changed(record, status, depth, matures, counts, key);
+            }
+        }
+    }
+    if (refused) {
+        // Nothing was read: the rows stay where they are and the next attempt starts from the same place.
+        priv->ScheduleStatusRetry();
+    } else {
+        priv->m_status_retries = 0;
+        if (!batch.empty()) priv->m_refresh_cursor = batch.back();
     }
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
@@ -580,7 +760,7 @@ QString TransactionTableModel::formatTxStatus(const TransactionRecord *wtx) cons
         status = tr("Confirming (%1 of %2 recommended confirmations)").arg(wtx->status.depth).arg(TransactionRecord::RecommendedNumConfirmations);
         break;
     case TransactionStatus::Confirmed:
-        status = tr("Confirmed (%1 confirmations)").arg(wtx->status.depth);
+        status = tr("Confirmed (%1 confirmations)").arg(displayDepth(wtx));
         break;
     case TransactionStatus::Conflicted:
         status = tr("Conflicted");
@@ -835,6 +1015,17 @@ QVariant TransactionTableModel::txWatchonlyDecoration(const TransactionRecord *w
         return QVariant();
 }
 
+int TransactionTableModel::displayDepth(const TransactionRecord *rec) const
+{
+    // A settled row is not read from the wallet again, so its confirmations follow the tip: the tip height at the
+    // last status read less the height it confirmed at, plus one.
+    if (rec->status.status == TransactionStatus::Confirmed && !rec->status.needsUpdate && m_tip_height > 0 && !rec->status.sortKey.empty()) {
+        const int height = rec->status.sortKey.blockHeight();
+        if (height > 0 && height != std::numeric_limits<int>::max() && height <= m_tip_height) return m_tip_height - height + 1;
+    }
+    return rec->status.depth;
+}
+
 QString TransactionTableModel::formatTooltip(const TransactionRecord *rec) const
 {
     QString tooltip = formatTxStatus(rec) + QString("\n") + formatTxType(rec);
@@ -912,7 +1103,7 @@ QVariant TransactionTableModel::dataFor(TransactionRecord* rec, int column_index
         case Status:
             return QString::fromStdString(rec->status.sortKey);
         case Date:
-            return QString::fromStdString(strprintf("%020s-%s", rec->time, rec->status.sortKey));
+            return QString::fromStdString(strprintf("%020s-%s", rec->time, rec->status.sortKey.str()));
         case Type:
             return formatTxType(rec);
         case Watchonly:
@@ -1229,6 +1420,22 @@ void TransactionTablePriv::DrainPendingUpdates()
             continue;
         }
 
+        if (notification.status == CT_NEW) {
+            // The snapshot (or an earlier notification) already holds this transaction: no need to read it again.
+            const auto [first, last] = std::equal_range(cachedWallet.begin(), cachedWallet.end(), notification.hash, TxLessThan());
+            if (first != last) {
+                {
+                    LOCK(m_notification_mutex);
+                    m_pending_updates.pop_front();
+                }
+                for (auto record = first; record != last; ++record) {
+                    record->status.needsUpdate = true;
+                    Track(*record);
+                }
+                continue;
+            }
+        }
+
         interfaces::WalletTx tx;
         if (notification.status != CT_DELETED &&
             !parent->walletModel->wallet().tryGetWalletTx(notification.hash, tx)) {
@@ -1262,17 +1469,125 @@ void TransactionTablePriv::SchedulePendingUpdates()
     PostDrain();
 }
 
+bool TransactionTablePriv::RequestHistory()
+{
+    LOCK(m_notification_mutex);
+    if (m_loaded || m_history_requested) return false;
+    m_history_requested = true;
+    m_unloaded_incoming.clear();
+    return true;
+}
+
+bool TransactionTablePriv::HistoryRequested()
+{
+    LOCK(m_notification_mutex);
+    return m_history_requested || m_loaded;
+}
+
+void TransactionTablePriv::QueueScanned(const TransactionNotification& notification)
+{
+    if (!m_loaded) {
+        // The snapshot is loading and will contain every transaction it reaches: keep one entry per transaction, the
+        // latest change, so a busy wallet cannot grow this queue past the number of transactions that changed.
+        const auto [position, inserted] = m_scanned_index.try_emplace(notification.hash, m_scanned_notifications.size());
+        if (!inserted) {
+            m_scanned_notifications[position->second].status = notification.status;
+            return;
+        }
+    }
+    m_scanned_notifications.push_back(notification);
+}
+
 void TransactionTablePriv::NotifyTransactionChanged(const uint256& hash, ChangeType status)
 {
     LOCK(m_notification_mutex);
     if (m_notifications_stopped) return;
     const TransactionNotification notification{hash, status};
-    if (!m_loaded || m_scanning) {
-        m_scanned_notifications.push_back(notification);
+    if (!m_loaded) {
+        if (m_history_requested) {
+            QueueScanned(notification);
+        } else if (status == CT_NEW && !m_scanning) {
+            // Nobody has looked at this wallet yet: its history will be read from the wallet when it is shown, so the
+            // change itself is dropped. A new transaction is still announced, from the transaction alone.
+            OfferUnloadedIncoming(hash);
+        }
+        return;
+    }
+    if (m_scanning) {
+        QueueScanned(notification);
         return;
     }
     m_pending_updates.push_back(notification);
     SchedulePendingUpdates();
+}
+
+void TransactionTablePriv::OfferUnloadedIncoming(const uint256& hash)
+{
+    // Bounded: a flood (a rescan of a hidden wallet) announces nothing beyond the first few.
+    if (m_unloaded_incoming.size() >= MAX_UNLOADED_INCOMING) return;
+    m_unloaded_incoming.push_back(hash);
+    if (m_unloaded_drain_scheduled) return;
+    m_unloaded_drain_scheduled = true;
+    const bool invoked = QMetaObject::invokeMethod(parent, [state = shared_from_this()] {
+        state->DrainUnloadedIncoming();
+    }, Qt::QueuedConnection);
+    assert(invoked);
+}
+
+void TransactionTablePriv::DrainUnloadedIncoming()
+{
+    constexpr int WALLET_RETRY_MS{25};
+    constexpr int MAX_RETRIES{40};
+    for (int processed = 0; processed < 8; ++processed) {
+        uint256 hash;
+        {
+            LOCK(m_notification_mutex);
+            if (m_notifications_stopped || m_history_requested || m_loaded) {
+                // Loading has begun: the snapshot lists these transactions, and the popup path is the table's.
+                m_unloaded_incoming.clear();
+                m_unloaded_drain_scheduled = false;
+                return;
+            }
+            if (m_unloaded_incoming.empty()) {
+                m_unloaded_drain_scheduled = false;
+                m_unloaded_retries = 0;
+                return;
+            }
+            hash = m_unloaded_incoming.front();
+        }
+        interfaces::WalletTx tx;
+        if (!parent->walletModel->wallet().tryGetWalletTx(hash, tx)) {
+            if (++m_unloaded_retries <= MAX_RETRIES) {
+                QTimer::singleShot(WALLET_RETRY_MS, parent, [state = shared_from_this()] { state->DrainUnloadedIncoming(); });
+                return;
+            }
+            m_unloaded_retries = 0;
+        }
+        {
+            LOCK(m_notification_mutex);
+            if (!m_unloaded_incoming.empty() && m_unloaded_incoming.front() == hash) m_unloaded_incoming.pop_front();
+        }
+        if (!tx.tx || !TransactionRecord::showTransaction(tx)) continue;
+        const QPointer<TransactionTableModel> model{parent};
+        auto records = TransactionRecord::decomposeTransaction(tx);
+        for (auto& record : records) {
+            const QString date = model->dataFor(&record, TransactionTableModel::Date, Qt::DisplayRole).toString();
+            const QString type = model->dataFor(&record, TransactionTableModel::Type, Qt::DisplayRole).toString();
+            const QString address = QString::fromStdString(record.address);
+            const QString label = model->dataFor(&record, TransactionTableModel::ToAddress, TransactionTableModel::ExportLabelRole).toString();
+            Q_EMIT model->incomingWhileNotLoaded(date, qint64(record.credit + record.debit), type, address, label);
+            if (!model) return;
+        }
+    }
+    LOCK(m_notification_mutex);
+    m_unloaded_drain_scheduled = false;
+    if (!m_unloaded_incoming.empty()) {
+        m_unloaded_drain_scheduled = true;
+        const bool invoked = QMetaObject::invokeMethod(parent, [state = shared_from_this()] {
+            state->DrainUnloadedIncoming();
+        }, Qt::QueuedConnection);
+        assert(invoked);
+    }
 }
 
 void TransactionTablePriv::NotifyScanProgress(int progress)
@@ -1293,6 +1608,7 @@ void TransactionTablePriv::DispatchScannedNotifications()
         m_pending_updates.push_back(notification);
     }
     m_scanned_notifications.clear();
+    m_scanned_index.clear();
     if (m_initial_boundary_pending) {
         m_pending_updates.push_back({{}, CT_UPDATED, false, true});
         m_initial_boundary_pending = false;

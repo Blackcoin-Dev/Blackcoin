@@ -13,6 +13,7 @@
 #include <primitives/transaction.h>
 #include <serialize.h>
 #include <wallet/types.h>
+#include <wallet/txvaluemap.h>
 #include <threadsafety.h>
 #include <tinyformat.h>
 #include <util/overloaded.h>
@@ -143,9 +144,6 @@ struct CachableAmount
 };
 
 
-typedef std::map<std::string, std::string> mapValue_t;
-
-
 /** Legacy class used for deserializing vtxPrev for backwards compatibility.
  * vtxPrev was removed in commit 93a18a3650292afbb441a47d1fa1b94aeb0164e3,
  * but old wallet.dat files may still contain vtxPrev vectors of CMerkleTxs.
@@ -193,8 +191,12 @@ public:
      *     "timesmart"       - serialized nTimeSmart value
      *     "spent"           - serialized vfSpent value that existed prior to
      *                         2014 (removed in commit 93a18a3)
+     *
+     * In memory the map is held packed (see WalletTxValueMap). It reads and
+     * writes like a std::map<std::string, std::string> and is serialized as
+     * one, so the stored bytes are unchanged.
      */
-    mapValue_t mapValue;
+    WalletTxValueMap mapValue;
     std::vector<std::pair<std::string, std::string> > vOrderForm;
     unsigned int fTimeReceivedIsTxTime;
     unsigned int nTimeReceived; //!< time received by this node
@@ -254,7 +256,7 @@ public:
     template<typename Stream>
     void Serialize(Stream& s) const
     {
-        mapValue_t mapValueCopy = mapValue;
+        mapValue_t mapValueCopy = mapValue.ToMap();
 
         mapValueCopy["fromaccount"] = "";
         if (nOrderPos != -1) {
@@ -282,19 +284,21 @@ public:
         bool dummy_bool; //! Used to be fSpent
         uint256 serialized_block_hash;
         int serializedIndex;
-        s >> TX_WITH_WITNESS(tx) >> serialized_block_hash >> dummy_vector1 >> serializedIndex >> dummy_vector2 >> mapValue >> vOrderForm >> fTimeReceivedIsTxTime >> nTimeReceived >> fFromMe >> dummy_bool;
+        mapValue_t values;
+        s >> TX_WITH_WITNESS(tx) >> serialized_block_hash >> dummy_vector1 >> serializedIndex >> dummy_vector2 >> values >> vOrderForm >> fTimeReceivedIsTxTime >> nTimeReceived >> fFromMe >> dummy_bool;
 
         m_state = TxStateInterpretSerialized({serialized_block_hash, serializedIndex});
 
-        const auto it_op = mapValue.find("n");
-        nOrderPos = (it_op != mapValue.end()) ? LocaleIndependentAtoi<int64_t>(it_op->second) : -1;
-        const auto it_ts = mapValue.find("timesmart");
-        nTimeSmart = (it_ts != mapValue.end()) ? static_cast<unsigned int>(LocaleIndependentAtoi<int64_t>(it_ts->second)) : 0;
+        const auto it_op = values.find("n");
+        nOrderPos = (it_op != values.end()) ? LocaleIndependentAtoi<int64_t>(it_op->second) : -1;
+        const auto it_ts = values.find("timesmart");
+        nTimeSmart = (it_ts != values.end()) ? static_cast<unsigned int>(LocaleIndependentAtoi<int64_t>(it_ts->second)) : 0;
 
-        mapValue.erase("fromaccount");
-        mapValue.erase("spent");
-        mapValue.erase("n");
-        mapValue.erase("timesmart");
+        values.erase("fromaccount");
+        values.erase("spent");
+        values.erase("n");
+        values.erase("timesmart");
+        mapValue = values;
     }
 
     void SetTx(CTransactionRef arg)

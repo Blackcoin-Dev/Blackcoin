@@ -358,7 +358,7 @@ static bool ShadowPowClaimPastRelayTtl(const CWalletTx& wtx,
 }
 
 static bool HasValidShadowPowTipObservation(
-    const mapValue_t& values, const char* height_key, const char* tip_key)
+    const WalletTxValueMap& values, const char* height_key, const char* tip_key)
 {
     const auto height = values.find(height_key);
     const auto tip = values.find(tip_key);
@@ -1988,7 +1988,7 @@ void CWallet::SyncMetaData(std::pair<TxSpends::iterator, TxSpends::iterator> ran
         if (copyFrom == copyTo) continue;
         assert(copyFrom && "Oldest wallet transaction in range assumed to have been found.");
         if (!copyFrom->IsEquivalentTo(*copyTo)) continue;
-        const mapValue_t old_map_value = copyTo->mapValue;
+        const WalletTxValueMap old_map_value = copyTo->mapValue;
         const auto old_order_form = copyTo->vOrderForm;
         const int64_t old_time_smart = copyTo->nTimeSmart;
         const bool old_from_me = copyTo->fFromMe;

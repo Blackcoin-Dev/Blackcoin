@@ -56,7 +56,7 @@ bool SafeGraphForAdoption(
     const ShadowPowClaimRecoveryComponent& component,
     std::string& reason_code, std::string& reason);
 
-bool ConsumeShadowPowClaimMetadataBudget(const mapValue_t& values,
+bool ConsumeShadowPowClaimMetadataBudget(const WalletTxValueMap& values,
                                          size_t& aggregate_entries,
                                          size_t& aggregate_bytes)
 {
@@ -99,7 +99,7 @@ bool ConsumeShadowPowClaimMetadataBudget(const mapValue_t& values,
     return true;
 }
 
-bool MetadataFlag(const mapValue_t& values, const char* key)
+bool MetadataFlag(const WalletTxValueMap& values, const char* key)
 {
     const auto it = values.find(key);
     return it != values.end() && it->second == "1";
@@ -117,7 +117,7 @@ bool IsRepairableShadowPowRelayFeePolicyRejection(
            reason == "min relay fee not met";
 }
 
-bool ParseCanonicalMetadataBool(const mapValue_t& values, const char* key,
+bool ParseCanonicalMetadataBool(const WalletTxValueMap& values, const char* key,
                                 bool& value)
 {
     const auto it = values.find(key);
@@ -136,7 +136,7 @@ bool ParseCanonicalMetadataBool(const mapValue_t& values, const char* key,
     return false;
 }
 
-bool ParseMetadataHeight(const mapValue_t& values, const char* key, int& value)
+bool ParseMetadataHeight(const WalletTxValueMap& values, const char* key, int& value)
 {
     const auto it = values.find(key);
     int32_t parsed{-1};
@@ -149,7 +149,7 @@ bool ParseMetadataHeight(const mapValue_t& values, const char* key, int& value)
     return true;
 }
 
-bool ParseMetadataHash(const mapValue_t& values, const char* key, uint256& value)
+bool ParseMetadataHash(const WalletTxValueMap& values, const char* key, uint256& value)
 {
     const auto it = values.find(key);
     if (it == values.end() || it->second.size() != uint256::size() * 2 ||
@@ -160,7 +160,7 @@ bool ParseMetadataHash(const mapValue_t& values, const char* key, uint256& value
     return !value.IsNull();
 }
 
-bool ParseMetadataVout(const mapValue_t& values, const char* key, uint32_t& value)
+bool ParseMetadataVout(const WalletTxValueMap& values, const char* key, uint32_t& value)
 {
     const auto it = values.find(key);
     return it != values.end() &&
@@ -169,7 +169,7 @@ bool ParseMetadataVout(const mapValue_t& values, const char* key, uint32_t& valu
         ParseUInt32(it->second, &value);
 }
 
-bool ParseMetadataOrdinal(const mapValue_t& values, const char* key,
+bool ParseMetadataOrdinal(const WalletTxValueMap& values, const char* key,
                           uint32_t& value)
 {
     const auto it = values.find(key);
@@ -179,7 +179,7 @@ bool ParseMetadataOrdinal(const mapValue_t& values, const char* key,
         ParseUInt32(it->second, &value);
 }
 
-bool ParsePositiveMetadataTime(const mapValue_t& values, const char* key,
+bool ParsePositiveMetadataTime(const WalletTxValueMap& values, const char* key,
                                int64_t& value)
 {
     const auto it = values.find(key);
@@ -194,7 +194,7 @@ bool ParsePositiveMetadataTime(const mapValue_t& values, const char* key,
 }
 
 bool ParseShadowPowClaimRelayClockMetadata(
-    const mapValue_t& values, const uint256& txid, bool& present,
+    const WalletTxValueMap& values, const uint256& txid, bool& present,
     int64_t& birth_time)
 {
     const auto schema = values.find(
@@ -223,7 +223,7 @@ bool ParseShadowPowClaimRelayClockMetadata(
     return true;
 }
 
-bool HasActiveBranchObservation(const mapValue_t& values,
+bool HasActiveBranchObservation(const WalletTxValueMap& values,
                                 const char* height_key,
                                 const char* tip_key,
                                 const CChain& active_chain)
@@ -286,7 +286,7 @@ void ParseClaimLineage(const CWalletTx& wtx,
                        const uint256& generation_fingerprint,
                        ShadowPowClaimRecoveryNode& node)
 {
-    const mapValue_t& values = wtx.mapValue;
+    const WalletTxValueMap& values = wtx.mapValue;
     node.lineage_metadata_present =
         values.count(SHADOW_POW_CLAIM_LINEAGE_SCHEMA_KEY) != 0 ||
         values.count(SHADOW_POW_CLAIM_LINEAGE_FAMILY_KEY) != 0 ||
@@ -4434,8 +4434,11 @@ const char* RecoveryOriginString(ShadowPowClaimRecoveryOrigin origin)
                : SHADOW_POW_RESOLUTION_ORIGIN_MANUAL;
 }
 
+// Values is mapValue_t (a record being built) or WalletTxValueMap (a wallet
+// record's own metadata).
+template <typename Values>
 bool StoreResolutionAuthorizationReceipt(
-    mapValue_t& values, const CTransaction& transaction,
+    Values& values, const CTransaction& transaction,
     const ShadowPowClaimRecoveryPlan* plan, std::string& error)
 {
     if (!plan || plan->plan_id.IsNull() || plan->active_tip.IsNull() ||
@@ -6432,7 +6435,7 @@ CWallet::AdoptShadowPowClaimRecoveryComponent(
 
     struct AdoptionUpdate {
         uint256 txid;
-        mapValue_t metadata;
+        WalletTxValueMap metadata;
     };
     std::vector<AdoptionUpdate> updates;
     updates.reserve(component.claim_txids.size());

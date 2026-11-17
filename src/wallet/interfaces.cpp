@@ -2367,7 +2367,7 @@ WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx, const std::vector<s
             if (found != wtx.mapValue.end()) result.value_map.emplace(*found);
         }
     } else {
-        result.value_map = wtx.mapValue;
+        result.value_map = wtx.mapValue.ToMap();
     }
     result.is_coinbase = wtx.IsCoinBase();
     result.is_coinstake = wtx.IsCoinStake();

@@ -93,6 +93,7 @@ DisplayBalanceOutcome WalletDisplayBalance::RequestAndWait(std::optional<bool> s
     uint64_t ticket;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_aborted) return {};
         ticket = ++m_ticket_requested;
         if (send_family_quantum) {
             // Not everything the send-family balance depends on moves the
@@ -107,10 +108,24 @@ DisplayBalanceOutcome WalletDisplayBalance::RequestAndWait(std::optional<bool> s
     std::unique_lock<std::mutex> lock(m_mutex);
     DisplayBalanceOutcome outcome;
     if (!m_cv.wait_for(lock, timeout, [&] { return m_ticket_done >= ticket; })) return outcome;
+    if (m_aborted) return outcome;
     outcome.ok = m_outcome_ok;
     outcome.exception = m_outcome_exception;
     outcome.snapshot = m_snapshot;
     return outcome;
+}
+
+void WalletDisplayBalance::AbortWaiters()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_aborted = true;
+        m_ticket_done = m_ticket_serving = m_ticket_requested;
+        m_outcome_ok = false;
+        m_outcome_exception = nullptr;
+        m_ticket_send_family.reset();
+    }
+    m_cv.notify_all();
 }
 
 std::optional<bool> WalletDisplayBalance::WantedSendFamily() const
@@ -313,10 +328,49 @@ void WalletDisplayBalance::RunJob(const std::function<bool()>& turn)
         std::lock_guard<std::mutex> lock(m_mutex);
         m_limits = m_next_limits;
     }
-    RunJobInner(turn);
+    try {
+        std::function<void()> fault;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            fault = m_job_fault_for_test;
+        }
+        if (fault) fault();
+        RunJobInner(turn);
+    } catch (const std::exception& e) {
+        HandleJobException(e.what(), std::current_exception());
+    } catch (...) {
+        HandleJobException("unknown exception", std::current_exception());
+    }
     // The wallet has had a turn: its wait for one starts again.
     std::lock_guard<std::mutex> lock(m_mutex);
     m_need_since_ms = 0;
+}
+
+void WalletDisplayBalance::HandleJobException(const std::string& what, std::exception_ptr exception)
+{
+    // Nothing thrown here may leave the worker thread: it serves every wallet
+    // of the process and an escaped exception would end the process.
+    try {
+        bool log{false};
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const int64_t now_ms = NowMs();
+            if (m_last_job_error_log_ms == 0 || now_ms - m_last_job_error_log_ms >= 60000) {
+                m_last_job_error_log_ms = now_ms;
+                log = true;
+            }
+            // The waiters of this attempt get the failure, not a wait for the back-off.
+            m_ticket_serving = m_ticket_requested;
+        }
+        if (log) m_wallet.WalletLogPrintf("GUI balance worker job failed: %s\n", what);
+        // The half-finished state of the failed job is not resumed.
+        m_pass.Reset();
+        m_warmup.reset();
+        FinishOutcome(End::FAILED, exception);
+        BackOff(10000, 10000);
+        SetFailed(true);
+    } catch (...) {
+    }
 }
 
 void WalletDisplayBalance::RunJobInner(const std::function<bool()>& turn)
@@ -650,6 +704,8 @@ void DisplayBalanceWorker::Release(CWallet& wallet)
         it->second.removing = true;
         m_cv.notify_all();
         m_cv.wait(lock, [&] { return !it->second.running; });
+        // Nothing serves the wallet's outstanding synchronous requests any more.
+        it->second.state->AbortWaiters();
         m_entries.erase(it);
         last = m_entries.empty();
         if (last) m_stop = true;
@@ -725,6 +781,10 @@ void DisplayBalanceWorker::Run()
             entries.push_back(&entry);
             candidates.push_back(candidate);
         }
+        if (shutdown) {
+            // No pass will run again: a caller blocked on one must not wait out its timeout.
+            for (auto& [wallet, entry] : m_entries) entry.state->AbortWaiters();
+        }
         const int pick = shutdown ? -1 : PickDisplayWallet(candidates, now_ms);
         if (pick < 0) {
             // Wallet changes are noticed by polling their change markers
@@ -738,7 +798,11 @@ void DisplayBalanceWorker::Run()
         entry.last_served_ms = now_ms;
         const std::shared_ptr<WalletDisplayBalance> state = entry.state;
         lock.unlock();
-        state->RunJob([&] { return WaitTurn(entry); });
+        try {
+            state->RunJob([&] { return WaitTurn(entry); });
+        } catch (...) {
+            // RunJob reports its own failures; this is the last line of defence.
+        }
         lock.lock();
         entry.running = false;
         m_cv.notify_all();

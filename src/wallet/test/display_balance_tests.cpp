@@ -457,5 +457,62 @@ BOOST_FIXTURE_TEST_CASE(releasing_a_wallet_stops_the_worker_promptly, DisplayWal
     BOOST_CHECK_EQUAL(display.balances.balance, PlainBalance());
 }
 
+BOOST_FIXTURE_TEST_CASE(worker_survives_a_throwing_job_and_serves_the_next_wallet, DisplayWalletSetup)
+{
+    std::shared_ptr<CWallet> second{CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()),
+        coinbaseKey).release()};
+    std::unique_ptr<interfaces::Wallet> second_iface = interfaces::MakeWallet(context, second);
+
+    const std::shared_ptr<WalletDisplayBalance> state = DisplayBalanceWorker::Global().Acquire(*wallet);
+    state->SetJobFaultForTest([] { throw std::runtime_error("injected display job failure"); });
+    {
+        DebugLogHelper failed{"GUI balance worker job failed: injected display job failure"};
+        const DisplayBalanceOutcome outcome = state->RequestAndWait(
+            std::nullopt, 20s, [] { DisplayBalanceWorker::Global().Wake(); });
+        // The caller gets the failure at once, not a timeout, and the wallet is marked failed.
+        BOOST_CHECK(!outcome.ok);
+        BOOST_CHECK(outcome.exception);
+        BOOST_CHECK(state->Failed());
+    }
+    // The worker thread is still alive and serves the next wallet.
+    interfaces::WalletDisplayBalances display;
+    BOOST_REQUIRE(second_iface->tryGetDisplayBalances(display, std::nullopt, std::nullopt));
+    BOOST_CHECK(display.available);
+    BOOST_CHECK_GT(display.balances.balance, 0);
+    state->SetJobFaultForTest(nullptr);
+    DisplayBalanceWorker::Global().Release(*wallet);
+    second_iface.reset();
+}
+
+BOOST_FIXTURE_TEST_CASE(releasing_a_wallet_completes_outstanding_requests_as_failed, DisplayWalletSetup)
+{
+    SyncWithValidationInterfaceQueue();
+    std::promise<void> entered, release;
+    CallFunctionInValidationInterfaceQueue([&] {
+        entered.set_value();
+        release.get_future().wait();
+    });
+    entered.get_future().wait();
+    // While the validation interface is blocked no pass starts, so the request stays outstanding.
+    const std::shared_ptr<WalletDisplayBalance> state = DisplayBalanceWorker::Global().Acquire(*wallet);
+    auto request = std::async(std::launch::async, [&] {
+        return state->RequestAndWait(std::nullopt, 20s, [] { DisplayBalanceWorker::Global().Wake(); });
+    });
+    BOOST_CHECK(request.wait_for(300ms) == std::future_status::timeout);
+    const auto start = std::chrono::steady_clock::now();
+    DisplayBalanceWorker::Global().Release(*wallet);
+    iface.reset();
+    BOOST_REQUIRE(request.wait_for(5s) == std::future_status::ready);
+    BOOST_CHECK(std::chrono::steady_clock::now() - start < 5s);
+    const DisplayBalanceOutcome outcome = request.get();
+    BOOST_CHECK(!outcome.ok);
+    // A request made after the wallet left the worker fails at once too.
+    BOOST_CHECK(!state->RequestAndWait(std::nullopt, 20s, [] {}).ok);
+    release.set_value();
+    SyncWithValidationInterfaceQueue();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

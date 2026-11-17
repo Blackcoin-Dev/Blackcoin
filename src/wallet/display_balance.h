@@ -192,6 +192,11 @@ public:
 
     /** Ask for a pass that starts after this call and wait for its outcome.
      * `wake` wakes the worker. */
+    /** Complete every outstanding synchronous request as failed and refuse new
+     * ones: the wallet is being taken off the worker or the node is shutting
+     * down, and no pass will serve them. */
+    void AbortWaiters();
+
     DisplayBalanceOutcome RequestAndWait(std::optional<bool> send_family_quantum,
                                          std::chrono::milliseconds timeout,
                                          const std::function<void()>& wake);
@@ -214,6 +219,13 @@ public:
 
     static int64_t NowMs();
 
+    //! Test only: called at the start of every job on the worker thread; may throw.
+    void SetJobFaultForTest(std::function<void()> fault)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_job_fault_for_test = std::move(fault);
+    }
+
     //! Test only: limits of every slice (deterministic slicing).
     void SetSliceLimitsForTest(const LifecycleSliceLimits& limits)
     {
@@ -232,6 +244,8 @@ private:
     std::optional<bool> WantedSendFamily() const;
     bool SendFamilyDue(const DisplayBalanceSnapshot& snapshot, int64_t now_ms) const;
     void RunJobInner(const std::function<bool()>& turn);
+    /** A job threw: fail the attempt, release waiters, log (rate limited) and back off. */
+    void HandleJobException(const std::string& what, std::exception_ptr exception);
     void RunWarmup(const std::function<bool()>& turn);
     void RunPass(const std::function<bool()>& turn);
     /** Fill the send-family balance of `snapshot` when one is wanted and due.
@@ -268,6 +282,9 @@ private:
     uint64_t m_ticket_serving{0};
     uint64_t m_ticket_done{0};
     std::optional<bool> m_ticket_send_family;
+    bool m_aborted{false};
+    int64_t m_last_job_error_log_ms{0};
+    std::function<void()> m_job_fault_for_test;
     bool m_outcome_ok{false};
     std::exception_ptr m_outcome_exception;
     DisplayBalanceCounters m_counters;

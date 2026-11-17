@@ -8,8 +8,14 @@
 #ifndef BITCOIN_WALLET_STAKING_H
 #define BITCOIN_WALLET_STAKING_H
 
+#include <pos.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
+
+#include <atomic>
+#include <chrono>
+#include <map>
+#include <set>
 
 namespace wallet {
 struct BoundedLegacyStakeCandidate
@@ -61,6 +67,94 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
     LOCKS_EXCLUDED(::cs_main);
 bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet, CAmount& nValueRet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/**
+ * What one tip's staking slots share. The staker searches every slot of a tip
+ * over the same wallet and the same chain, so the selected candidates and the
+ * per-output kernel inputs (the creating block's time, the value, the script)
+ * are computed once per (tip, wallet generation) and reused; a slot then costs
+ * one kernel hash per candidate and no coins-view fetch.
+ *
+ * Validity key: the tip hash (it fixes the height, the median time past, every
+ * phase rule, the coin set and every depth), the live-unspent index generation,
+ * the wallet's balance scan marker (every mapWallet, spend-map, key, script and
+ * flag change), the coin-lock generation, the lock and staking-only unlock
+ * state, and the set of RGB-protected seals. A cache older than
+ * STAKE_SLOT_CACHE_MAX_AGE is rebuilt regardless, as a bound on any wallet
+ * change that does not advance one of the counters.
+ *
+ * The cache only ever decides "no kernel here". A kernel it reports is
+ * confirmed through the uncached CheckKernel and through a fresh uncached
+ * candidate selection before it is used (see CheckStakeSlotKernel).
+ */
+struct StakeSlotCache
+{
+    uint256 tip_hash;
+    uint64_t live_generation{0};
+    uint64_t balance_marker{0};
+    uint64_t coin_lock_generation{0};
+    bool wallet_locked{false};
+    bool staking_only{false};
+    std::set<COutPoint> protected_rgb_seals;
+    std::chrono::steady_clock::time_point built_at;
+    //! Output of SelectCoinsForStaking (nTargetValue = MAX_MONEY), same order.
+    std::set<std::pair<const CWalletTx*, unsigned int>> coins;
+    CAmount value_in{0};
+    //! Kernel inputs per candidate; empty when the phase needs the coin view
+    //! per call (demurrage) or caching is off. CheckKernel falls back to the
+    //! uncached path for an outpoint that is not in it.
+    std::map<COutPoint, CStakeCache> kernels;
+};
+
+struct StakeSlotCacheStats
+{
+    uint64_t hits{0};       //! slots served from the cache
+    uint64_t rebuilds{0};   //! cache built (cold, tip change, generation change, age)
+    uint64_t rejections{0}; //! cached kernel refused by the uncached confirmation
+};
+
+struct StakeSlotCacheState
+{
+    std::shared_ptr<StakeSlotCache> cache;
+    StakeSlotCacheStats stats;
+};
+
+//! Longest a cache is served without a rebuild.
+static constexpr std::chrono::seconds STAKE_SLOT_CACHE_MAX_AGE{120};
+
+//! Test hook and operator escape: false makes every slot select and check
+//! exactly as before the cache existed. Default true.
+extern std::atomic<bool> g_stake_slot_cache_enabled;
+
+/** The selection and kernel inputs for the slot at `tip`; served from the
+ * wallet's cache when it is valid, otherwise built (and kept, unless caching is
+ * off). Never returns null. */
+std::shared_ptr<const StakeSlotCache> AcquireStakeSlotCache(const CWallet& wallet, CBlockIndex* tip)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+/** Drop the wallet's cache (the next slot rebuilds it). */
+void DropStakeSlotCache(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+enum class StakeSlotKernel {
+    NONE,           //! no kernel for this output at this time
+    FOUND,          //! a kernel, confirmed without the cache
+    CACHE_REJECTED, //! the cache said kernel, the uncached path disagreed: cache dropped
+};
+StakeSlotKernel CheckStakeSlotKernel(const CWallet& wallet, const StakeSlotCache& slot, CBlockIndex* tip,
+                                     unsigned int nBits, uint32_t nTime, const COutPoint& prevout)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+struct StakeKernelHit
+{
+    COutPoint prevout;
+    uint32_t time{0};
+};
+/** Every candidate and time CreateCoinStake would test for a kernel, in its
+ * order, with the same checks. Used by tests to compare the cached search with
+ * the uncached one; stops at the first CACHE_REJECTED (reported through
+ * `rejected`). */
+std::vector<StakeKernelHit> ScanStakeKernels(const CWallet& wallet, unsigned int nBits, uint32_t nTime,
+                                             int64_t nSearchInterval, bool use_cache, bool* rejected = nullptr)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval,
                      CMutableTransaction& tx, CAmount& nFees,

@@ -484,6 +484,7 @@ struct CStakeCache;
 
 namespace wallet {
 struct WalletContext;
+struct StakeSlotCacheState;
 
 //! Explicitly unload and delete the wallet.
 //! Blocks the current thread after signaling the unload intent so that all
@@ -992,6 +993,11 @@ private:
     std::atomic<int64_t> m_best_block_time {0};
 
     std::map<COutPoint, CStakeCache> stakeCache;
+
+    // Per-tip selection of stake candidates and their kernel inputs (see
+    // wallet/staking.h, StakeSlotCache). Owned and validated by staking.cpp;
+    // only ever dropped or replaced under cs_wallet.
+    mutable std::shared_ptr<StakeSlotCacheState> m_stake_slot_cache GUARDED_BY(cs_wallet);
 
     // Ordered, broad producer-side prefilter for staking. This contains every
     // wallet-known output that is not currently spent by a non-conflicted,
@@ -1808,6 +1814,7 @@ public:
     /** Validate and repair stale Gold Rush proofs independently of relay policy. */
     void RepairStaleShadowTransactions(bool force);
     void ResubmitWalletTransactions(bool relay, bool force, bool include_claims = true);
+
     /** Relay at most one retained proof using the exact typed authorization. */
     bool RelayRetainedShadowPowClaim(bool relay);
     /** Coalesce off-notification claim work; never executes inline. */
@@ -2043,6 +2050,18 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         return m_live_unspent_stake_generation;
+    }
+
+    /** The per-tip staking selection cache and its counters (created on first
+     * use). See StakeSlotCache in wallet/staking.h. */
+    StakeSlotCacheState& GetStakeSlotCacheStateLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    /** Advances on every effective in-memory coin lock or unlock. */
+    uint64_t GetCoinLockGenerationLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_coin_lock_generation;
     }
 
     /** Bound the raw wallet-spender domain for one captured source and return

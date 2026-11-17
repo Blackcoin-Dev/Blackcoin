@@ -2369,6 +2369,22 @@ void AvailableCoinsForStakingReference(const CWallet& wallet,
     AvailableCoinsForStakingImpl</*REFERENCE=*/true>(wallet, vCoins, coinControl, params);
 }
 
+// Publish the stake weight of a completed full scan for status RPC/GUI readers.
+static void PublishCachedStakeWeight(const CWallet& wallet, CAmount value_in)
+{
+    const CAmount available = value_in > wallet.m_reserve_balance
+        ? value_in - wallet.m_reserve_balance
+        : 0;
+    // Publish the cache pair under the same mutex used to assemble the
+    // typed staking snapshot. The atomics keep legacy low-latency readers
+    // available, while telemetry never combines weight from one scan with
+    // the height from another.
+    LOCK(wallet.m_staking_telemetry_mutex);
+    wallet.m_cached_stake_weight.store(static_cast<uint64_t>(available), std::memory_order_relaxed);
+    const CBlockIndex* tip = wallet.chain().getTip();
+    wallet.m_cached_stake_weight_height.store(tip ? tip->nHeight : -1, std::memory_order_release);
+}
+
 // Select some coins without random shuffle or best subset approximation
 bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet, CAmount& nValueRet)
 {
@@ -2411,21 +2427,145 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
     // Both current callers request the complete staking set. Publish that
     // completed scan for status RPC/GUI readers so they never need to repeat
     // the O(wallet history) walk on a latency-sensitive thread.
-    if (nTargetValue == MAX_MONEY) {
-        const CAmount available = nValueRet > wallet.m_reserve_balance
-            ? nValueRet - wallet.m_reserve_balance
-            : 0;
-        // Publish the cache pair under the same mutex used to assemble the
-        // typed staking snapshot. The atomics keep legacy low-latency readers
-        // available, while telemetry never combines weight from one scan with
-        // the height from another.
-        LOCK(wallet.m_staking_telemetry_mutex);
-        wallet.m_cached_stake_weight.store(static_cast<uint64_t>(available), std::memory_order_relaxed);
-        const CBlockIndex* tip = wallet.chain().getTip();
-        wallet.m_cached_stake_weight_height.store(tip ? tip->nHeight : -1, std::memory_order_release);
-    }
+    if (nTargetValue == MAX_MONEY) PublishCachedStakeWeight(wallet, nValueRet);
 
     return true;
+}
+
+std::atomic<bool> g_stake_slot_cache_enabled{true};
+
+StakeSlotCacheState& CWallet::GetStakeSlotCacheStateLocked() const
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_stake_slot_cache) m_stake_slot_cache = std::make_shared<StakeSlotCacheState>();
+    return *m_stake_slot_cache;
+}
+
+void DropStakeSlotCache(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    wallet.GetStakeSlotCacheStateLocked().cache.reset();
+}
+
+/** True while every input of the selection is what the cache was built from. */
+static bool StakeSlotCacheIsCurrent(const CWallet& wallet, const StakeSlotCache& cache, const CBlockIndex* tip)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    return cache.tip_hash == tip->GetBlockHash() &&
+           cache.live_generation == wallet.GetLiveUnspentStakeGenerationLocked() &&
+           cache.balance_marker == wallet.GetBalanceScanMarker() &&
+           cache.coin_lock_generation == wallet.GetCoinLockGenerationLocked() &&
+           cache.wallet_locked == wallet.IsLocked() &&
+           cache.staking_only == wallet.m_wallet_unlock_staking_only.load() &&
+           cache.protected_rgb_seals == wallet.GetProtectedRGBSeals() &&
+           std::chrono::steady_clock::now() - cache.built_at < STAKE_SLOT_CACHE_MAX_AGE;
+}
+
+static std::shared_ptr<StakeSlotCache> BuildStakeSlotCache(const CWallet& wallet, CBlockIndex* tip, bool with_kernels)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
+{
+    auto cache = std::make_shared<StakeSlotCache>();
+    cache->tip_hash = tip->GetBlockHash();
+    cache->live_generation = wallet.GetLiveUnspentStakeGenerationLocked();
+    cache->balance_marker = wallet.GetBalanceScanMarker();
+    cache->coin_lock_generation = wallet.GetCoinLockGenerationLocked();
+    cache->wallet_locked = wallet.IsLocked();
+    cache->staking_only = wallet.m_wallet_unlock_staking_only.load();
+    cache->protected_rgb_seals = wallet.GetProtectedRGBSeals();
+    cache->built_at = std::chrono::steady_clock::now();
+    CAmount target{MAX_MONEY};
+    SelectCoinsForStaking(wallet, target, cache->coins, cache->value_in);
+    // Under demurrage a kernel value depends on the live coin view, which
+    // CheckKernel reads per call whatever the cache holds.
+    if (with_kernels &&
+        !Params().GetConsensus().IsDemurrageActive(tip->nHeight + 1, tip->GetMedianTimePast())) {
+        CCoinsViewCache& view = wallet.chain().getCoinsTip();
+        for (const auto& [wtx, n] : cache->coins) {
+            CacheKernel(cache->kernels, COutPoint{wtx->GetHash(), n}, tip, view);
+        }
+    }
+    return cache;
+}
+
+std::shared_ptr<const StakeSlotCache> AcquireStakeSlotCache(const CWallet& wallet, CBlockIndex* tip)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    StakeSlotCacheState& state = wallet.GetStakeSlotCacheStateLocked();
+    if (!g_stake_slot_cache_enabled.load()) {
+        // Select as before the cache existed and leave the stored one alone;
+        // it is checked against its key before it is ever served again.
+        return BuildStakeSlotCache(wallet, tip, /*with_kernels=*/false);
+    }
+    if (state.cache && StakeSlotCacheIsCurrent(wallet, *state.cache, tip)) {
+        ++state.stats.hits;
+        PublishCachedStakeWeight(wallet, state.cache->value_in);
+        return state.cache;
+    }
+    state.cache = BuildStakeSlotCache(wallet, tip, /*with_kernels=*/true);
+    ++state.stats.rebuilds;
+    return state.cache;
+}
+
+StakeSlotKernel CheckStakeSlotKernel(const CWallet& wallet, const StakeSlotCache& slot, CBlockIndex* tip,
+                                     unsigned int nBits, uint32_t nTime, const COutPoint& prevout)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    CCoinsViewCache& view = wallet.chain().getCoinsTip();
+    if (!CheckKernel(tip, nBits, nTime, prevout, view, slot.kernels)) return StakeSlotKernel::NONE;
+    // Without an entry for this output the answer came from the coins view,
+    // exactly as before the cache existed.
+    if (slot.kernels.find(prevout) == slot.kernels.end()) return StakeSlotKernel::FOUND;
+
+    // The kernel rests on cached inputs. Confirm it the way validation would
+    // see it, from the coins view, and confirm that the cached candidate
+    // selection is still what a fresh uncached selection gives.
+    bool confirmed = CheckKernel(tip, nBits, nTime, prevout, view);
+    if (confirmed) {
+        std::set<std::pair<const CWalletTx*, unsigned int>> fresh;
+        CAmount fresh_value{0};
+        CAmount target{MAX_MONEY};
+        SelectCoinsForStaking(wallet, target, fresh, fresh_value);
+        confirmed = fresh == slot.coins && fresh_value == slot.value_in;
+    }
+    if (!confirmed) {
+        StakeSlotCacheState& state = wallet.GetStakeSlotCacheStateLocked();
+        ++state.stats.rejections;
+        state.cache.reset();
+        LogPrint(BCLog::COINSTAKE, "CheckStakeSlotKernel : cached kernel for %s not confirmed, cache dropped\n", prevout.ToString());
+        return StakeSlotKernel::CACHE_REJECTED;
+    }
+    return StakeSlotKernel::FOUND;
+}
+
+std::vector<StakeKernelHit> ScanStakeKernels(const CWallet& wallet, unsigned int nBits, uint32_t nTime,
+                                             int64_t nSearchInterval, bool use_cache, bool* rejected)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    if (rejected) *rejected = false;
+    std::vector<StakeKernelHit> hits;
+    CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip) return hits;
+    const bool previous = g_stake_slot_cache_enabled.exchange(use_cache);
+    const auto slot = AcquireStakeSlotCache(wallet, tip);
+    g_stake_slot_cache_enabled.store(previous);
+    for (const auto& [wtx, n] : slot->coins) {
+        const COutPoint prevout{wtx->GetHash(), n};
+        for (unsigned int i = 0; i < std::min<int64_t>(nSearchInterval, 60); ++i) {
+            const StakeSlotKernel result = CheckStakeSlotKernel(wallet, *slot, tip, nBits, nTime - i, prevout);
+            if (result == StakeSlotKernel::CACHE_REJECTED) {
+                if (rejected) *rejected = true;
+                return hits;
+            }
+            if (result == StakeSlotKernel::FOUND) {
+                hits.push_back({prevout, nTime - i});
+                break;
+            }
+        }
+    }
+    return hits;
 }
 
 // peercoin: create coin stake transaction
@@ -2457,10 +2597,8 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     scriptEmpty.clear();
     txNew.vout.push_back(CTxOut(0, scriptEmpty));
 
-    std::set<std::pair<const CWalletTx*, unsigned int> > setCoins;
     std::vector<CTransactionRef> vwtxPrev;
     CAmount nValueIn = 0;
-    CAmount nTargetValue = MAX_MONEY;
     const int64_t stake_mtp = pindexPrev->GetMedianTimePast();
     const int stake_height = pindexPrev->nHeight + 1;
     const Consensus::Params& consensus = Params().GetConsensus();
@@ -2468,9 +2606,11 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     const bool final_quantum_lockout = consensus.IsQuantumFinalLockout(stake_mtp, stake_height);
     const bool stake_reward_split_active = consensus.IsStakeRewardSplitActive(stake_height);
 
-    // Select coins with suitable depth
-    if (!SelectCoinsForStaking(wallet, nTargetValue, setCoins, nValueIn))
-        return false;
+    // Select coins with suitable depth. The selection and the kernel inputs
+    // are shared by every slot of this tip (see StakeSlotCache).
+    const std::shared_ptr<const StakeSlotCache> stake_slot = AcquireStakeSlotCache(wallet, pindexPrev);
+    const std::set<std::pair<const CWalletTx*, unsigned int>>& setCoins = stake_slot->coins;
+    nValueIn = stake_slot->value_in;
 
     if (setCoins.empty() || nValueIn <= wallet.m_reserve_balance)
         return false;
@@ -2525,7 +2665,10 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
             // Search backward in time from the given txNew timestamp
             // Search nSearchInterval seconds back up to nMaxStakeSearchInterval
             const uint32_t kernel_time = txNew.nTime - n;
-            if (CheckKernel(pindexPrev, nBits, kernel_time, prevoutStake, wallet.chain().getCoinsTip()))
+            const StakeSlotKernel kernel_result = CheckStakeSlotKernel(wallet, *stake_slot, pindexPrev, nBits, kernel_time, prevoutStake);
+            // The cache is dropped; the next slot rebuilds it from scratch.
+            if (kernel_result == StakeSlotKernel::CACHE_REJECTED) return false;
+            if (kernel_result == StakeSlotKernel::FOUND)
             {
                 CAmount kernel_principal{0};
                 if (!GetCoinStakeInputPrincipal(wallet.chain().getCoinsTip(), prevoutStake, consensus, pindexPrev->nHeight + 1, stake_mtp, kernel_principal)) {

@@ -2514,14 +2514,15 @@ StakeSlotKernel CheckStakeSlotKernel(const CWallet& wallet, const StakeSlotCache
     AssertLockHeld(wallet.cs_wallet);
     CCoinsViewCache& view = wallet.chain().getCoinsTip();
     if (!CheckKernel(tip, nBits, nTime, prevout, view, slot.kernels)) return StakeSlotKernel::NONE;
-    // Without an entry for this output the answer came from the coins view,
-    // exactly as before the cache existed.
-    if (slot.kernels.find(prevout) == slot.kernels.end()) return StakeSlotKernel::FOUND;
-
-    // The kernel rests on cached inputs. Confirm it the way validation would
-    // see it, from the coins view, and confirm that the cached candidate
-    // selection is still what a fresh uncached selection gives.
-    bool confirmed = CheckKernel(tip, nBits, nTime, prevout, view);
+    // The slot's candidate selection may come from the cache, so a kernel is
+    // only reported once a fresh uncached selection gives the same candidates.
+    // This holds on every path: an output with no kernel entry (every output
+    // once demurrage is active, any CacheKernel miss) was checked against the
+    // coins view above, but its membership in the selection still rests on the
+    // cache. An output with an entry is also confirmed against the coins view
+    // the way validation would see it.
+    const bool has_entry = slot.kernels.find(prevout) != slot.kernels.end();
+    bool confirmed = !has_entry || CheckKernel(tip, nBits, nTime, prevout, view);
     if (confirmed) {
         std::set<std::pair<const CWalletTx*, unsigned int>> fresh;
         CAmount fresh_value{0};

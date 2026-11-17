@@ -413,6 +413,20 @@ BOOST_AUTO_TEST_CASE(a_poisoned_cache_cannot_produce_a_stake)
     const KernelHits recovered = AsPairs(ScanStakeKernels(*wallet, EASY_BITS, time, 1, true, &rejected));
     BOOST_CHECK(!rejected);
     BOOST_CHECK(recovered == AsPairs(honest));
+
+    // 3. The same ineligible coin in the cached selection with no kernel entry
+    //    at all (every output once demurrage is active, any CacheKernel miss):
+    //    the kernel is read from the coins view, and the fresh selection must
+    //    still be compared before it is reported.
+    StakeSlotCache& entryless = *wallet->GetStakeSlotCacheStateLocked().cache;
+    BOOST_REQUIRE(entryless.coins.insert({foreign_wtx, 0}).second);
+    BOOST_REQUIRE(entryless.kernels.count(foreign_outpoint) == 0);
+    const uint64_t entryless_rejections = wallet->GetStakeSlotCacheStateLocked().stats.rejections;
+    const KernelHits entryless_hits = AsPairs(ScanStakeKernels(*wallet, EASY_BITS, time, 1, true, &rejected));
+    BOOST_CHECK(rejected);
+    for (const auto& hit : entryless_hits) BOOST_CHECK(hit.first != foreign_outpoint);
+    BOOST_CHECK_EQUAL(wallet->GetStakeSlotCacheStateLocked().stats.rejections, entryless_rejections + 1);
+    BOOST_CHECK(!wallet->GetStakeSlotCacheStateLocked().cache);
 }
 
 BOOST_AUTO_TEST_CASE(create_coinstake_with_a_poisoned_cache_makes_no_coinstake)

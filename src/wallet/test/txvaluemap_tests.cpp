@@ -24,6 +24,7 @@
 
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -648,12 +649,59 @@ BOOST_AUTO_TEST_CASE(memory_per_claim_measurement)
         for (uint32_t i{0}; i < RECORDS; i += 997) BOOST_CHECK(after[i] == before[i]);
     }
     BOOST_TEST_MESSAGE(strprintf("sizeof(CWalletTx) = %u", unsigned(sizeof(CWalletTx))));
+
+    // Whole records: 50,000 heap-allocated claim records in rc12's layout
+    // (the members CWalletTx had, metadata in a std::map) and 50,000
+    // CWalletTx as they are now, each with its own transaction.
+    struct Rc12WalletTxLayout {
+        mapValue_t mapValue;
+        std::vector<std::pair<std::string, std::string>> vOrderForm;
+        unsigned int fTimeReceivedIsTxTime;
+        unsigned int nTimeReceived;
+        unsigned int nTimeSmart;
+        bool fFromMe;
+        int64_t nOrderPos;
+        std::multimap<int64_t, CWalletTx*>::const_iterator m_it_wtxOrdered;
+        CachableAmount m_amounts[CWalletTx::AMOUNTTYPE_ENUM_ELEMENTS];
+        bool m_is_cache_empty;
+        bool fChangeCached;
+        CAmount nChangeCached;
+        CTransactionRef tx;
+        TxState m_state{TxStateInactive{}};
+    };
+    std::vector<CTransactionRef> txs;
+    txs.reserve(2 * RECORDS);
+    for (uint32_t i{0}; i < 2 * RECORDS; ++i) txs.push_back(MakeTx(i));
+    std::vector<std::unique_ptr<Rc12WalletTxLayout>> old_records;
+    std::vector<std::unique_ptr<CWalletTx>> new_records;
+    old_records.reserve(RECORDS);
+    new_records.reserve(RECORDS);
+    const HeapUse records_start{CurrentHeapUse()};
+    for (uint32_t i{0}; i < RECORDS; ++i) {
+        auto record = std::make_unique<Rc12WalletTxLayout>();
+        record->mapValue = ClaimShapedValues(i);
+        record->tx = txs[i];
+        record->m_state = TxStateConfirmed{uint256{1}, static_cast<int>(i), 1};
+        old_records.push_back(std::move(record));
+    }
+    const HeapUse records_old{CurrentHeapUse()};
+    for (uint32_t i{0}; i < RECORDS; ++i) {
+        auto record = std::make_unique<CWalletTx>(txs[RECORDS + i], TxStateConfirmed{uint256{1}, static_cast<int>(i), 1});
+        record->mapValue = ClaimShapedValues(i);
+        new_records.push_back(std::move(record));
+    }
+    const HeapUse records_new{CurrentHeapUse()};
+    BOOST_TEST_MESSAGE(strprintf(
+        "claim record x %u, without its transaction: rc12 layout (sizeof %u) %.0f heap bytes in %.1f allocations; now (sizeof %u) %.0f heap bytes in %.1f allocations",
+        RECORDS, unsigned(sizeof(Rc12WalletTxLayout)),
+        double(records_old.bytes - records_start.bytes) / RECORDS, double(records_old.blocks - records_start.blocks) / RECORDS,
+        unsigned(sizeof(CWalletTx)),
+        double(records_new.bytes - records_old.bytes) / RECORDS, double(records_new.blocks - records_old.blocks) / RECORDS));
+    BOOST_CHECK(sizeof(CWalletTx) <= sizeof(Rc12WalletTxLayout));
 #else
     BOOST_TEST_MESSAGE("heap measurement uses malloc_zone_statistics and runs on macOS only");
 #endif
 }
-
-BOOST_AUTO_TEST_SUITE_END()
 
 /**
  * Differential test over a wallet database: every transaction record written
@@ -664,7 +712,6 @@ BOOST_AUTO_TEST_SUITE_END()
  * modified through this test, but SQLite may touch its journal) to run the
  * same comparison over a real wallet.
  */
-BOOST_FIXTURE_TEST_SUITE(txvaluemap_wallet_db_tests, TestChain100Setup)
 
 namespace {
 MockableData TxRecords(const MockableData& records)
@@ -684,7 +731,7 @@ MockableData TxRecords(const MockableData& records)
 }
 } // namespace
 
-BOOST_AUTO_TEST_CASE(load_and_rewrite_keeps_every_transaction_record)
+BOOST_FIXTURE_TEST_CASE(load_and_rewrite_keeps_every_transaction_record, TestChain100Setup)
 {
     MockableData records;
     size_t expected_txs{0};

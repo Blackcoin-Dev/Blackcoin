@@ -171,13 +171,20 @@ struct LifecycleSliceLimits {
  * read the chainstate (TickChainItem) read the clock every time and end the
  * slice early when the budget left cannot pay for the costliest such item
  * seen so far, because one item can make up to three uncached chainstate
- * reads. Items that do not (Tick) read the clock only every `clock_interval`.
- * A slice always finishes the item it is on, so it stays within its budget
- * plus one item (and always makes progress).
+ * reads; but only once at least MIN_ITEMS_BEFORE_EARLY_END items were done in
+ * this slice (or the budget is already used up). Slices are spaced by the
+ * worker's forced interval, so a slice that stopped after one item whenever an
+ * item cost more than half the budget would make warm-up many times slower.
+ * Items that do not read the chainstate (Tick) read the clock only every
+ * `clock_interval`. A slice always finishes the item it is on, so it stays
+ * within its budget plus the cost of at most MIN_ITEMS_BEFORE_EARLY_END - 1
+ * more items, and always makes progress.
  */
 class SliceMeter
 {
 public:
+    static constexpr uint64_t MIN_ITEMS_BEFORE_EARLY_END{4};
+
     SliceMeter(const LifecycleSliceLimits& limits, std::chrono::milliseconds budget)
         : m_limits(limits), m_timed(budget.count() > 0), m_start(Now()), m_deadline(m_start + budget), m_last_read(m_start) {}
 
@@ -210,7 +217,10 @@ public:
             m_max_chain_item = std::max(m_max_chain_item,
                                         std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_read));
             m_last_read = now;
-            if (now >= m_deadline || now + m_max_chain_item > m_deadline) m_expired = true;
+            if (now >= m_deadline ||
+                (m_items >= MIN_ITEMS_BEFORE_EARLY_END && now + m_max_chain_item > m_deadline)) {
+                m_expired = true;
+            }
         }
         return m_expired;
     }

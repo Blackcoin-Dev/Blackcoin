@@ -640,12 +640,13 @@ BOOST_AUTO_TEST_CASE(slice_meter_stays_within_its_budget_plus_one_chainstate_ite
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock - start);
     const auto largest_item = 12ms;
     BOOST_CHECK_LE(elapsed.count(), (budget + largest_item).count());
-    // The remaining budget (1 ms) could not pay for another item (12 ms):
-    // the slice ended at 24 ms, after two items, inside the budget itself.
-    BOOST_CHECK_EQUAL(n, 2U);
-    BOOST_CHECK_LE(elapsed.count(), budget.count());
+    // Fewer than four items were done, so the remaining budget (1 ms after two
+    // items) is not used to end the slice early: it ends when the budget is
+    // used up, at 36 ms after three items, within the budget plus one item.
+    BOOST_CHECK_EQUAL(n, 3U);
+    BOOST_CHECK_GT(elapsed.count(), budget.count());
     BOOST_CHECK_EQUAL(meter.MaxChainItem().count(), std::chrono::microseconds{12ms}.count());
-    BOOST_CHECK_EQUAL(slow.reads, 6U);
+    BOOST_CHECK_EQUAL(slow.reads, 9U);
     // The clock was read once per chainstate item, plus once at the start.
     BOOST_CHECK_EQUAL(clock_reads, 1U + n);
 }
@@ -676,14 +677,54 @@ BOOST_AUTO_TEST_CASE(slice_meter_bounds_a_slice_whose_items_get_slower)
 
     // A seed from the previous slice of the pass makes the next slice stop
     // sooner: half of a 40 ms item leaves no room for another item once
-    // 6 ms have passed.
+    // 6 ms have passed, but only after four items were done in the slice.
     clock = start;
     SliceMeter next{limits, budget};
     next.SeedMaxChainItem(40ms);
     clock += 4ms;
     BOOST_CHECK(!next.TickChainItem()); // 4 + 20 < 25
     clock += 2ms;
-    BOOST_CHECK(next.TickChainItem());  // 6 + 20 > 25: no room for another item
+    BOOST_CHECK(!next.TickChainItem()); // 6 + 20 > 25, but only two items so far
+    BOOST_CHECK(!next.TickChainItem()); // three
+    BOOST_CHECK(next.TickChainItem());  // four items and no room for another
+}
+
+BOOST_AUTO_TEST_CASE(slice_meter_makes_progress_with_a_very_slow_view)
+{
+    // Items that cost more than half the budget used to end every slice after
+    // one item (the predicted overrun), and slices are spaced by the worker's
+    // forced interval. A slice now keeps going until four items are done or
+    // the budget is used up.
+    const std::chrono::milliseconds budget{25};
+    const auto run_slice = [&](std::chrono::milliseconds cost, std::chrono::milliseconds seed) {
+        std::chrono::steady_clock::time_point clock{};
+        const auto start = clock;
+        LifecycleSliceLimits limits;
+        limits.now = [&] { return clock; };
+        SliceMeter meter{limits, budget};
+        meter.SeedMaxChainItem(seed);
+        uint32_t items{0};
+        while (!meter.Expired()) {
+            clock += cost;
+            meter.TickChainItem();
+            ++items;
+            BOOST_REQUIRE_LT(items, 100U);
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock - start);
+        // Budget plus the cost of at most three more items.
+        BOOST_CHECK_LE(elapsed.count(), (budget + 3 * cost).count());
+        return items;
+    };
+    // 10 ms items after a slice that saw a 60 ms item: the old rule stopped
+    // after the first (10 + 30 > 25); now three are done (30 ms >= 25 ms).
+    BOOST_CHECK_EQUAL(run_slice(10ms, 60ms), 3U);
+    // 14 ms items against a 25 ms budget: two items use it up.
+    BOOST_CHECK_EQUAL(run_slice(14ms, 28ms), 2U);
+    // A single item that costs more than the whole budget still ends the slice,
+    // after it, with progress made.
+    BOOST_CHECK_EQUAL(run_slice(40ms, 80ms), 1U);
+    // Ordinary costs still stop near the budget: 1 ms items run to the 25 ms budget.
+    BOOST_CHECK_EQUAL(run_slice(1ms, 0ms), 25U);
 }
 
 BOOST_AUTO_TEST_CASE(slice_meter_reads_the_clock_every_16_items_for_memo_hits)

@@ -14535,11 +14535,32 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             int64_t current_relay_clock_effective_time{0};
             bool current_relay_clock_signing_safe{false};
             int64_t current_relay_clock_wall_time{0};
+            // Sample the chain first, under cs_main alone, as values; then the
+            // wallet under cs_wallet alone. The wallet is never waited for
+            // while cs_main is held, so a long cs_wallet hold (an RPC, a
+            // rescan step, a flush) cannot stall block processing through
+            // this poll. Lock order is unchanged: the two locks are not nested.
+            // The two samples are not atomic. That is safe: they only feed
+            // change detection and a coherence flag, a chain advance between
+            // them makes the wallet look one block behind or ahead (so the gate
+            // is refreshed once, which is the conservative direction), and the
+            // next poll re-reads both.
+            bool have_tip{false};
+            int tip_height{-1};
             {
-                LOCK2(::cs_main, cs_wallet);
+                LOCK(::cs_main);
                 const CBlockIndex* tip =
                     chain().chainman().ActiveChain().Tip();
-                if (tip) current_tip = tip->GetBlockHash();
+                if (tip) {
+                    have_tip = true;
+                    current_tip = tip->GetBlockHash();
+                    tip_height = tip->nHeight;
+                    current_relay_clock_median_time_past =
+                        tip->GetMedianTimePast();
+                }
+            }
+            {
+                LOCK(cs_wallet);
                 current_wallet_generation =
                     GetDatabase().nUpdateCounter.load();
                 current_candidate_state =
@@ -14547,24 +14568,21 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 recovery_database_ambiguous =
                     m_shadow_pow_claim_recovery_db_ambiguous ||
                     m_locked_coins_db_ambiguous;
-                wallet_tip_matches = tip &&
+                wallet_tip_matches = have_tip &&
                     m_last_block_processed == current_tip &&
-                    m_last_block_processed_height == tip->nHeight;
+                    m_last_block_processed_height == tip_height;
                 current_relay_clock_high_water =
                     m_shadow_pow_claim_relay_clock_high_water;
                 current_legacy_relay_clock_high_water =
                     m_shadow_pow_claim_legacy_relay_clock_high_water;
-                current_relay_clock_median_time_past = tip
-                    ? tip->GetMedianTimePast()
-                    : 0;
                 const int64_t wall_time = GetTime();
                 current_relay_clock_wall_time = wall_time;
-                current_relay_clock_effective_time = tip
+                current_relay_clock_effective_time = have_tip
                     ? GetShadowPowClaimRelayEffectiveTimeLocked(
                           wall_time,
                           current_relay_clock_median_time_past)
                     : 0;
-                current_relay_clock_signing_safe = tip &&
+                current_relay_clock_signing_safe = have_tip &&
                     IsShadowPowClaimRelayClockSigningSafeLocked(
                         wall_time,
                         current_relay_clock_median_time_past);

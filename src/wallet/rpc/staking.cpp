@@ -18,6 +18,7 @@
 #include <rpc/util.h>
 #include <shadow.h>
 #include <timedata.h>
+#include <util/time.h>
 #include <util/moneystr.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
@@ -54,6 +55,11 @@
 using node::BlockAssembler;
 
 namespace wallet {
+
+//! A recovery inventory is built without cs_main and cs_wallet and then checked against the live wallet and chain
+//! under both. A block callback or a wallet write in between makes the check fail, which says only that the
+//! snapshot is old: build it again, a few times, before telling the caller to retry.
+static constexpr int RECOVERY_INVENTORY_ATTEMPTS{5};
 
 namespace {
 
@@ -4424,7 +4430,9 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     ShadowPowClaimRecoveryPolicyMutationResult policy_state;
     bool database_ambiguous{false};
     bool chain_ready{false};
+    for (int attempt = 1;; ++attempt) {
     inventory = pwallet->GetShadowPowClaimRecoveryInventory();
+    bool coherent{false};
     {
         // One recursive lock snapshot keeps legacy compatibility fields,
         // typed graph details, and durable usage counters on the same tip and
@@ -4435,12 +4443,8 @@ static RPCHelpMan getpowclaimrecoveryinfo()
         if (policy_state.authoritative_state_available) {
             policy = policy_state.authoritative_policy;
         }
-        if (!pwallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(
+        if (pwallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(
                 inventory)) {
-            throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "wallet or active-chain state changed while evaluating Gold Rush recovery proofs; retry");
-        }
         // Serialize the readiness of the snapshot just validated, not a
         // second wall-clock-dependent IBD sample taken after that check.
         chain_ready = inventory.wallet_tip_matches;
@@ -4448,6 +4452,16 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             BuildShadowPowClaimCompatibilityInventory(inventory);
         usage = pwallet->GetShadowPowClaimRecoveryUsageFromInventoryLocked(
             inventory, policy.rolling_fee_window_seconds);
+        coherent = true;
+        }
+    }
+    if (coherent) break;
+    if (attempt >= RECOVERY_INVENTORY_ATTEMPTS) {
+        throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "wallet or active-chain state changed while evaluating Gold Rush recovery proofs; retry");
+    }
+    UninterruptibleSleep(std::chrono::milliseconds{10 * attempt});
     }
     UniValue result(UniValue::VOBJ);
     if (policy_state.authoritative_state_available) {
@@ -4868,16 +4882,16 @@ static RPCHelpMan getpowmininginfo()
     bool pow_mining_enabled{false};
     interfaces::WalletPowMiningState pow_mining_state{
         interfaces::WalletPowMiningState::DISABLED};
+    for (int attempt = 1;; ++attempt) {
     recovery_inventory =
         pwallet->GetShadowPowClaimRecoveryInventory();
+    unresolved_claims = 0;
+    live_claims = 0;
+    bool coherent{false};
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
-        if (!pwallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(
+        if (pwallet->ShadowPowClaimRecoveryStatusMatchesCurrentLocked(
                 recovery_inventory)) {
-            throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "wallet or active-chain state changed while evaluating Gold Rush recovery proofs; retry");
-        }
         claim_inventory = BuildShadowPowClaimCompatibilityInventory(
             recovery_inventory);
         mining_gate =
@@ -4909,6 +4923,16 @@ static RPCHelpMan getpowmininginfo()
             pwallet->GetShadowPowClaimRecoveryUsageFromInventoryLocked(
                 recovery_inventory,
                 recovery_policy.rolling_fee_window_seconds);
+        coherent = true;
+        }
+    }
+    if (coherent) break;
+    if (attempt >= RECOVERY_INVENTORY_ATTEMPTS) {
+        throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "wallet or active-chain state changed while evaluating Gold Rush recovery proofs; retry");
+    }
+    UninterruptibleSleep(std::chrono::milliseconds{10 * attempt});
     }
     stake_reserve = pwallet->GetShadowPowClaimStakeReserveInfo();
     obj.pushKV("enabled", pow_mining_enabled);

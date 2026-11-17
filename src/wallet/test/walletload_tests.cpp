@@ -312,6 +312,75 @@ BOOST_FIXTURE_TEST_CASE(wallet_attach_reconfirms_blocks_connected_after_load_sna
     SyncWithValidationInterfaceQueue();
 }
 
+/**
+ * An own coinstake in a block the node lost is Inactive after the load and used
+ * to keep its kernel input spent for ever. The attach abandons it, and a later
+ * connect of its block reactivates it.
+ */
+BOOST_FIXTURE_TEST_CASE(wallet_attach_abandons_coinstake_of_lost_block, TestChain100Setup)
+{
+    CBlockIndex* old_tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
+    BOOST_REQUIRE(old_tip && old_tip->pprev);
+    const uint256 old_hash = old_tip->GetBlockHash();
+    const int old_height = old_tip->nHeight;
+    const uint256 funding_block = m_node.chain->getBlockHash(1);
+    const CBlockLocator locator = m_node.chain->getTipLocator();
+    const CTransactionRef funding = m_coinbase_txns.front();
+    const COutPoint kernel{funding->GetHash(), 0};
+
+    CMutableTransaction stake_tx;
+    stake_tx.vin.emplace_back(kernel);
+    stake_tx.vout.emplace_back(0, CScript{});
+    stake_tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    const CTransactionRef coinstake = MakeTransactionRef(stake_tx);
+    BOOST_REQUIRE(coinstake->IsCoinStake());
+
+    CWallet seed(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(seed.cs_wallet);
+        seed.SetLastBlockProcessed(old_height, old_hash);
+        BOOST_REQUIRE(seed.AddToWallet(funding, TxStateConfirmed{funding_block, 1, 0}));
+        BOOST_REQUIRE(seed.AddToWallet(coinstake, TxStateConfirmed{old_hash, old_height, 1}));
+        BOOST_REQUIRE(WalletBatch(seed.GetDatabase()).WriteBestBlock(locator));
+    }
+    // The block holding the coinstake is lost: the node is at its parent.
+    BlockValidationState state;
+    BOOST_REQUIRE(m_node.chainman->ActiveChainstate().InvalidateBlock(state, old_tip));
+    SyncWithValidationInterfaceQueue();
+    auto loaded = std::make_shared<CWallet>(m_node.chain.get(), "", DuplicateMockDatabase(seed.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(loaded->LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(loaded->cs_wallet);
+        BOOST_CHECK(loaded->IsSpent(kernel)); // reserved by the Inactive coinstake
+    }
+    bilingual_str error;
+    BOOST_REQUIRE_MESSAGE(WalletLoadTestAccess::Attach(loaded, *m_node.chain, error), error.original);
+    SyncWithValidationInterfaceQueue();
+    {
+        LOCK(loaded->cs_wallet);
+        BOOST_CHECK(loaded->mapWallet.at(coinstake->GetHash()).isAbandoned());
+        BOOST_CHECK(!loaded->IsSpent(kernel));
+    }
+    // The abandonment is persisted.
+    CWallet persisted(nullptr, "", DuplicateMockDatabase(loaded->GetDatabase()));
+    BOOST_REQUIRE_EQUAL(persisted.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(persisted.cs_wallet);
+        BOOST_CHECK(persisted.mapWallet.at(coinstake->GetHash()).isAbandoned());
+    }
+    // The block returns: its notification takes the coinstake back to Confirmed.
+    {
+        LOCK(loaded->cs_wallet);
+        BOOST_REQUIRE(loaded->AddToWallet(coinstake, TxStateConfirmed{old_hash, old_height, 1}));
+        BOOST_CHECK(loaded->mapWallet.at(coinstake->GetHash()).isConfirmed());
+        BOOST_CHECK(!loaded->mapWallet.at(coinstake->GetHash()).isAbandoned());
+        BOOST_CHECK(loaded->IsSpent(kernel));
+    }
+    loaded->m_chain_notifications_handler.reset();
+    SyncWithValidationInterfaceQueue();
+}
+
 /** The pass owns no wallet/chain locks while blocked. Release on all exits. */
 struct MaintenancePassBarrier {
     std::promise<void> entered;

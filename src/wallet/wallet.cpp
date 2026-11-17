@@ -9564,6 +9564,22 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
         walletInstance->chainStateFlushed(ChainstateRole::NORMAL, chain.getTipLocator());
         walletInstance->GetDatabase().IncrementUpdateCounter();
     }
+
+    // A coinstake whose block the node no longer has is Inactive after the load
+    // and the reconciliation above, and an Inactive coinstake that is not
+    // abandoned keeps its kernel inputs spent for as long as the block never
+    // returns. Abandon those now, after the rescan has re-confirmed every
+    // coinstake whose block is in the chain. A block that is merely not yet
+    // reconnected delivers its coinstake through a notification already queued
+    // behind this lock: AddToWallet takes the state over to Confirmed whenever
+    // the kind of state changes, abandoned or not, which reactivates it.
+    {
+        std::unique_ptr<DatabaseBulkScope> abandon_writes = walletInstance->GetDatabase().MakeBulkScope();
+        walletInstance->AbandonOrphanedCoinstakes();
+        if (abandon_writes && !abandon_writes->Commit()) {
+            walletInstance->WalletLogPrintf("Failed to persist the abandoned orphaned coinstakes; they are abandoned again at the next load\n");
+        }
+    }
     walletInstance->m_attaching_chain = false;
 
     // AttachChainUnpublished inherits Bitcoin Core's wallet -> chain lock order

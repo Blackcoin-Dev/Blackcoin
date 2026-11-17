@@ -757,7 +757,12 @@ BOOST_AUTO_TEST_CASE(load_and_rewrite_keeps_every_transaction_record)
     BOOST_REQUIRE_EQUAL(original.size(), expected_txs);
     BOOST_REQUIRE(expected_txs > 0);
 
-    CWallet wallet{m_node.chain.get(), "", CreateMockableWalletDatabase(records)};
+    // A real wallet's confirmed records name blocks this fixture's chain does
+    // not have, and a wallet with a chain deactivates such records in memory
+    // at load. Load a real wallet without a chain so every record keeps the
+    // state it was stored with.
+    interfaces::Chain* const chain{std::getenv("RC13_DIFF_WALLET") ? nullptr : m_node.chain.get()};
+    CWallet wallet{chain, "", CreateMockableWalletDatabase(records)};
     const DBErrors load_result{wallet.LoadWallet()};
     BOOST_TEST_MESSAGE(strprintf("LoadWallet returned %d", int(load_result)));
     LOCK(wallet.cs_wallet);

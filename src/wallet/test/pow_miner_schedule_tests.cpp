@@ -45,7 +45,17 @@ struct ScheduleRun {
     uint64_t tips{0};
     uint64_t interrupted_sleeps{0};
     uint64_t interrupted_batches{0};
+    /** Duty sleeps (excess over the ceilings) that ran across a tip: a tip
+     * never cuts these short. */
+    uint64_t sleeps_across_tip{0};
+    /** Debt right after the end-of-iteration sleeps, the largest seen. */
+    nanoseconds max_debt_after_sleep{0};
     nanoseconds max_debt{0};
+    uint64_t completed_periods{0};
+    uint64_t truncated_periods{0};
+    /** Active and total time of the completed periods only. */
+    nanoseconds completed_active{0};
+    nanoseconds completed_total{0};
 };
 
 ScheduleRun RunSchedule(int cpu_percent, nanoseconds spacing, nanoseconds interval,
@@ -55,6 +65,36 @@ ScheduleRun RunSchedule(int cpu_percent, nanoseconds spacing, nanoseconds interv
     PowMiningDutyLedger ledger{cpu_percent, spacing};
     ScheduleRun run;
     nanoseconds now{0};
+    // The telemetry period, closed by the same rule the miner uses.
+    bool period_open{false};
+    nanoseconds period_start_debt{0};
+    nanoseconds period_active{0};
+    nanoseconds period_total{0};
+    const auto end_iteration = [&](nanoseconds active, nanoseconds slept, nanoseconds waited,
+                                   bool excess_slept) {
+        period_active += active;
+        period_total += active + slept + waited;
+        switch (PowMiningClosePeriod(ledger.Debt(), period_start_debt, excess_slept)) {
+        case PowMiningPeriodClose::COMPLETED:
+            ++run.completed_periods;
+            run.completed_active += period_active;
+            run.completed_total += period_total;
+            period_open = false;
+            break;
+        case PowMiningPeriodClose::TRUNCATED:
+            ++run.truncated_periods;
+            period_open = false;
+            break;
+        case PowMiningPeriodClose::OPEN:
+            break;
+        }
+    };
+    const auto open_period = [&] {
+        if (period_open) return;
+        period_open = true;
+        period_start_debt = ledger.Debt();
+        period_active = period_total = nanoseconds{0};
+    };
     for (uint64_t tip = 0; tip < tips; ++tip) {
         const nanoseconds next_tip = interval * static_cast<int64_t>(tip + 1);
         ++run.tips;
@@ -65,10 +105,13 @@ ScheduleRun RunSchedule(int cpu_percent, nanoseconds spacing, nanoseconds interv
                 // Claim submitted: the idle wait for the next tip is an
                 // explicit wait and pays debt like any other.
                 const nanoseconds wait = next_tip - now;
+                open_period();
                 ledger.Credit(wait);
                 now = next_tip;
+                end_iteration(nanoseconds{0}, nanoseconds{0}, wait, false);
                 break;
             }
+            open_period();
             // One loop iteration: selection and preparation, then a batch.
             // A tip that arrives inside the batch ends it at once.
             nanoseconds search = batch;
@@ -79,7 +122,9 @@ ScheduleRun RunSchedule(int cpu_percent, nanoseconds spacing, nanoseconds interv
                 ++batches;
                 found = batches >= batches_to_proof;
             }
+            const nanoseconds debt_before = ledger.Debt();
             ledger.Charge(search, overhead);
+            const nanoseconds iteration_debt = ledger.Debt() - debt_before;
             now += overhead + search;
             run.active += overhead + search;
             if (found) ++run.proofs;
@@ -87,17 +132,36 @@ ScheduleRun RunSchedule(int cpu_percent, nanoseconds spacing, nanoseconds interv
             const bool tip_arrived = now >= next_tip;
             const bool pending = !found || tip_arrived;
             const bool below_cap = ledger.MayDefer();
-            const nanoseconds wanted = ledger.SleepNeeded(pending);
-            if (pending && below_cap) BOOST_REQUIRE_EQUAL(wanted.count(), 0);
-            if (wanted.count() == 0 || tip_arrived) continue;
-            // A new tip interrupts the sleep the moment it arrives.
-            const nanoseconds slept = std::min(wanted, next_tip - now);
-            if (slept < wanted) ++run.interrupted_sleeps;
-            ledger.Credit(slept);
-            now += slept;
+            const PowMiningSleepPlan plan = ledger.Plan(pending, iteration_debt);
+            if (pending && below_cap) {
+                BOOST_REQUIRE_EQUAL(plan.excess.count(), 0);
+                BOOST_REQUIRE_EQUAL(plan.remainder.count(), 0);
+            }
+            nanoseconds slept{0};
+            // The excess is the duty cycle itself: a tip does not cut it short.
+            if (plan.excess.count() > 0) {
+                const nanoseconds excess = plan.excess;
+                if (now + excess > next_tip) ++run.sleeps_across_tip;
+                ledger.Credit(excess);
+                now += excess;
+                slept += excess;
+                if (pending && below_cap) run.sleep_below_cap += excess;
+                if (!found) run.sleep_before_proof += excess;
+            }
+            // The rest of the debt is slept only when nothing is pending, and
+            // a new tip interrupts it the moment it arrives.
+            if (plan.remainder.count() > 0 && now < next_tip) {
+                const nanoseconds part = std::min<nanoseconds>(plan.remainder, next_tip - now);
+                if (part < plan.remainder) ++run.interrupted_sleeps;
+                ledger.Credit(part);
+                now += part;
+                slept += part;
+                if (!found) run.sleep_before_proof += part;
+            }
             run.duty_sleep += slept;
-            if (pending && below_cap) run.sleep_below_cap += slept;
-            if (!found) run.sleep_before_proof += slept;
+            ledger.ClampToCeilings();
+            run.max_debt_after_sleep = std::max(run.max_debt_after_sleep, ledger.Debt());
+            end_iteration(overhead + search, slept, nanoseconds{0}, plan.excess.count() > 0);
         }
     }
     run.total = now;
@@ -114,7 +178,7 @@ double Fraction(const ScheduleRun& run)
 nanoseconds DebtBound(int cpu_percent, nanoseconds spacing, nanoseconds iteration)
 {
     const PowMiningDutyLedger ledger{cpu_percent, spacing};
-    return ledger.Ceiling() * 2 + PowMiningDutyDebt(iteration, cpu_percent) * 2 +
+    return ledger.SearchCeiling() + ledger.Ceiling() + PowMiningDutyDebt(iteration, cpu_percent) * 2 +
            nanoseconds{2'000'000};
 }
 
@@ -163,39 +227,62 @@ BOOST_AUTO_TEST_CASE(duty_debt_arithmetic)
     BOOST_CHECK_GT(PowMiningDutyDebt(nanoseconds::max(), 1).count(), 0); // saturates
 
     PowMiningDutyLedger ledger{1, 64s};
-    // Two spacings of budget: 2 * 64 s * 99%.
-    BOOST_CHECK_EQUAL(ledger.Ceiling().count(), nanoseconds{126'720ms}.count());
+    // One spacing of budget: 64 s * 99%. The search part is also bounded by
+    // 10 s of search, which at 1% owes far more, so the spacing rule wins.
+    BOOST_CHECK_EQUAL(ledger.Ceiling().count(), nanoseconds{63'360ms}.count());
+    BOOST_CHECK_EQUAL(ledger.SearchCeiling().count(), nanoseconds{63'360ms}.count());
     BOOST_CHECK(ledger.MayDefer());
     BOOST_CHECK_EQUAL(ledger.SleepNeeded(true).count(), 0);
     BOOST_CHECK_EQUAL(ledger.SleepNeeded(false).count(), 0);
-    ledger.Charge(/*search=*/1s, /*other=*/10ms);
-    BOOST_CHECK_EQUAL(ledger.SearchDebt().count(), nanoseconds{99s}.count());
+    ledger.Charge(/*search=*/500ms, /*other=*/10ms);
+    BOOST_CHECK_EQUAL(ledger.SearchDebt().count(), nanoseconds{49'500ms}.count());
     BOOST_CHECK_EQUAL(ledger.OtherDebt().count(), nanoseconds{990ms}.count());
     BOOST_CHECK(ledger.MayDefer());
     BOOST_CHECK_EQUAL(ledger.SleepNeeded(true).count(), 0);
-    BOOST_CHECK_EQUAL(ledger.SleepNeeded(false).count(), 99'990);
-    // 1.28 s of search is the allowance at 1%; one more batch is over it and
-    // only the excess is slept, which is the old interleaved delay.
-    ledger.Charge(280ms, 0ns);
+    BOOST_CHECK_EQUAL(ledger.SleepNeeded(false).count(), 50'490);
+    // 0.64 s of search is the allowance at 1%; the batch that crosses it is
+    // slept for only the excess, which is the old interleaved delay.
+    ledger.Charge(100ms, 0ns);
     BOOST_CHECK(ledger.MayDefer());
     ledger.Charge(64ms, 0ns);
     BOOST_CHECK(!ledger.MayDefer());
-    BOOST_CHECK_EQUAL(ledger.SleepNeeded(true).count(),
-                      PowMiningAdditionalDelay(64ms, 0ms, 1).count());
+    BOOST_CHECK_EQUAL(ledger.SleepNeeded(true).count(), 65'736 - 63'360);
+    // The plan splits it: the excess is the duty cycle (a tip never cuts it
+    // short), the rest is slept only with nothing pending.
+    BOOST_CHECK_EQUAL(ledger.Plan(true).excess.count(), 65'736 - 63'360);
+    BOOST_CHECK_EQUAL(ledger.Plan(true).remainder.count(), 0);
+    BOOST_CHECK_EQUAL(ledger.Plan(false).excess.count(), 65'736 - 63'360);
+    BOOST_CHECK_EQUAL(ledger.Plan(false).remainder.count(), 50'490 + 9'900 + 6'336 - (65'736 - 63'360));
+    // Debt is never carried above a ceiling past the end of an iteration.
+    ledger.ClampToCeilings();
+    BOOST_CHECK(ledger.MayDefer());
+    BOOST_CHECK_EQUAL(ledger.SearchDebt().count(), nanoseconds{63'360ms}.count());
     // Lock waits and gate work are other debt: they never use the search
     // allowance, and they have their own ceiling.
     PowMiningDutyLedger contended{1, 64s};
-    contended.Charge(0ns, 1200ms);
-    contended.Charge(1200ms, 0ns);
+    contended.Charge(0ns, 500ms);
+    contended.Charge(500ms, 0ns);
     BOOST_CHECK(contended.MayDefer());
     contended.Charge(0ns, 200ms);
     BOOST_CHECK(!contended.MayDefer());
-    BOOST_CHECK_EQUAL(contended.SleepNeeded(true).count(), 138'600 - 126'720);
+    BOOST_CHECK_EQUAL(contended.SleepNeeded(true).count(), 69'300 - 63'360);
     // Idle time pays search first, is never banked, and clears everything.
     contended.Credit(1h);
     BOOST_CHECK_EQUAL(contended.Debt().count(), 0);
     contended.Charge(10ms, 0ns);
     BOOST_CHECK_EQUAL(contended.SleepNeeded(false).count(), 990);
+    // At 60% one spacing pays for 25.6 s of idle time (38.4 s of work), but
+    // the search part is held to 10 s of search: 6.667 s of debt.
+    PowMiningDutyLedger sixty{60, 64s};
+    BOOST_CHECK_EQUAL(sixty.Ceiling().count(), nanoseconds{25'600ms}.count());
+    BOOST_CHECK_EQUAL(sixty.SearchCeiling().count(), PowMiningDutyDebt(10s, 60).count());
+    BOOST_CHECK_LT(sixty.SearchCeiling().count(), sixty.Ceiling().count());
+    sixty.Charge(10s, 0ns);
+    BOOST_CHECK(sixty.MayDefer());
+    BOOST_CHECK_EQUAL(sixty.SleepNeeded(true).count(), 0);
+    sixty.Charge(100ms, 0ns);
+    BOOST_CHECK(!sixty.MayDefer());
+    BOOST_CHECK_EQUAL(sixty.SleepNeeded(true).count(), 67); // 66.7 ms of debt, rounded up
     // 100% never owes anything.
     PowMiningDutyLedger full{100, 64s};
     full.Charge(1h, 1h);
@@ -247,7 +334,7 @@ BOOST_AUTO_TEST_CASE(duty_average_searches_as_long_as_the_interval)
             BOOST_CHECK_EQUAL(run.sleep_below_cap.count(), 0);
             BOOST_CHECK_LE(run.max_debt.count(), DebtBound(cpu, 64s, 64'500us).count());
             // Every tip cut a sleep or a batch short.
-            BOOST_CHECK_GE(run.interrupted_sleeps + run.interrupted_batches, tips - 1);
+            BOOST_CHECK_GE(run.interrupted_sleeps + run.interrupted_batches + run.sleeps_across_tip, tips - 1);
         }
     }
 }
@@ -255,7 +342,7 @@ BOOST_AUTO_TEST_CASE(duty_average_searches_as_long_as_the_interval)
 BOOST_AUTO_TEST_CASE(duty_average_searches_that_hit_the_cap)
 {
     // (c) The default 1% with a search of 4 s of hashing per tip, more than
-    // three times the 1.28 s allowance: the worker runs its allowance first,
+    // six times the 0.64 s allowance: the worker runs its allowance first,
     // then falls back to sleeping after every batch.
     const uint64_t tips = 6000;
     const auto run = RunSchedule(1, 64s, 64s, tips, 62'500us, 500us, 64);
@@ -267,24 +354,124 @@ BOOST_AUTO_TEST_CASE(duty_average_searches_that_hit_the_cap)
     BOOST_CHECK_GT(run.sleep_before_proof.count(), 0);
     BOOST_CHECK_LE(run.max_debt.count(), DebtBound(1, 64s, 63ms).count());
     // One hour, worst case: the old schedule allowed 36 s of work; this one
-    // allows 36 s plus both ceilings (2.56 s) plus two iterations.
+    // allows 36 s plus both allowances (0.64 s each) plus two iterations.
     const auto hour = RunSchedule(1, 64s, 16s, 225, 62'500us, 500us, 1'000'000);
     BOOST_CHECK_GE(hour.total.count(), nanoseconds{1h}.count());
-    BOOST_CHECK_LE(hour.total.count(), nanoseconds{1h + 1s}.count());
-    BOOST_CHECK_LE(hour.active.count(), nanoseconds{36s + 2560ms + 200ms}.count());
+    BOOST_CHECK_LE(hour.total.count(), nanoseconds{1h + 7s}.count());
+    BOOST_CHECK_LE(hour.active.count(), nanoseconds{36s + 1280ms + 200ms}.count());
     // A single interval never exceeds the budget of the interval plus the
-    // allowance: on 16 s blocks that is 0.16 s + 2.56 s of work at most.
+    // allowance: on 16 s blocks that is 0.16 s + 1.28 s of work at most.
     const auto first = RunSchedule(1, 64s, 16s, 1, 62'500us, 500us, 1'000'000);
-    BOOST_CHECK_LE(first.active.count(), nanoseconds{160ms + 2560ms + 200ms}.count());
-    // Below the cap the first 1.28 s of search runs without any sleep.
+    BOOST_CHECK_LE(first.active.count(), nanoseconds{160ms + 1280ms + 200ms}.count());
+    // Below the cap the first 0.64 s of search runs without any sleep.
     PowMiningDutyLedger ledger{1, 64s};
     nanoseconds searched{0};
     while (ledger.SleepNeeded(true).count() == 0) {
         ledger.Charge(62'500us, 0ns);
         searched += 62'500us;
     }
-    BOOST_CHECK_GE(searched.count(), nanoseconds{1280ms}.count());
-    BOOST_CHECK_LE(searched.count(), nanoseconds{1280ms + 62'500us}.count());
+    BOOST_CHECK_GE(searched.count(), nanoseconds{640ms}.count());
+    BOOST_CHECK_LE(searched.count(), nanoseconds{640ms + 62'500us}.count());
+}
+
+BOOST_AUTO_TEST_CASE(tip_burst_cannot_inflate_debt_or_duty)
+{
+    // A burst of 10,000 tip signals (initial sync, reindex, a long catch-up):
+    // a tip is pending after every iteration, so only the excess over the
+    // ceilings is slept, and a tip never cuts that sleep short. Debt stays at
+    // or below the ceilings however long the burst lasts, and the worker's
+    // active time stays at the configured share plus the bounded allowance and
+    // one iteration.
+    for (const int cpu : {1, 60}) {
+        BOOST_TEST_CONTEXT("cpu " << cpu) {
+            PowMiningDutyLedger ledger{cpu, 64s};
+            const nanoseconds search{62'500us};
+            const nanoseconds other{2ms};
+            nanoseconds active{0};
+            nanoseconds total{0};
+            for (int tip = 0; tip < 10'000; ++tip) {
+                const nanoseconds debt_before = ledger.Debt();
+                ledger.Charge(search, other);
+                active += search + other;
+                total += search + other;
+                const PowMiningSleepPlan plan =
+                    ledger.Plan(/*work_pending=*/true, ledger.Debt() - debt_before);
+                BOOST_REQUIRE_EQUAL(plan.remainder.count(), 0);
+                ledger.Credit(plan.excess);
+                total += plan.excess;
+                ledger.ClampToCeilings();
+                BOOST_REQUIRE_LE(ledger.SearchDebt().count(), ledger.SearchCeiling().count());
+                BOOST_REQUIRE_LE(ledger.OtherDebt().count(), ledger.Ceiling().count());
+            }
+            const auto active_for = [&](nanoseconds ceiling) {
+                return nanoseconds{ceiling.count() * cpu / (100 - cpu)};
+            };
+            const nanoseconds allowance =
+                active_for(ledger.SearchCeiling()) + active_for(ledger.Ceiling());
+            const nanoseconds bound = nanoseconds{total.count() * cpu / 100} + allowance +
+                                      search + other;
+            BOOST_CHECK_LE(active.count(), bound.count());
+            BOOST_CHECK_GE(active.count(), total.count() * cpu / 100 - nanoseconds{1s}.count());
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(search_burst_is_bounded_by_wall_time)
+{
+    // At 60% one spacing would pay for 38.4 s of search without a sleep; the
+    // 10 s wall bound cuts that to 10 s, after which the interleaved duty
+    // cycle applies for the rest of the tip.
+    PowMiningDutyLedger ledger{60, 64s};
+    nanoseconds searched{0};
+    while (ledger.SleepNeeded(true).count() == 0) {
+        ledger.Charge(62'500us, 0ns);
+        searched += 62'500us;
+    }
+    BOOST_CHECK_GE(searched.count(), nanoseconds{10s}.count());
+    BOOST_CHECK_LE(searched.count(), nanoseconds{10s + 62'500us}.count());
+    // One whole block interval of unfindable work: active time is at most the
+    // configured share of the interval plus the allowance and one iteration.
+    const auto run = RunSchedule(60, 64s, 64s, 1, 62'500us, 500us, 1'000'000);
+    const nanoseconds allowance =
+        nanoseconds{ledger.SearchCeiling().count() * 60 / 40} +
+        nanoseconds{ledger.Ceiling().count() * 60 / 40};
+    BOOST_CHECK_LE(run.active.count(),
+                   (nanoseconds{64s * 60 / 100} + allowance + 63ms).count());
+    BOOST_CHECK_GT(run.sleep_before_proof.count(), 0);
+    BOOST_CHECK_EQUAL(run.sleep_below_cap.count(), 0);
+    // Two workers on one host over a minute, then an hour, stay inside it too.
+    const auto minute = RunSchedule(60, 64s, 60s, 1, 62'500us, 500us, 1'000'000);
+    BOOST_CHECK_LE(minute.active.count(),
+                   (nanoseconds{60s * 60 / 100} + allowance + 63ms).count());
+    const auto hour = RunSchedule(60, 64s, 16s, 225, 62'500us, 500us, 1'000'000);
+    BOOST_CHECK_LE(hour.active.count(),
+                   (nanoseconds{hour.total.count() * 60 / 100} + allowance + 63ms).count());
+}
+
+BOOST_AUTO_TEST_CASE(periods_complete_when_no_proof_is_found)
+{
+    // No proof for many blocks: the debt sits at its ceiling and never returns
+    // to zero. Periods must still complete, each within the duty budget; the
+    // burst that first reached the ceiling is reported as truncated.
+    for (const int cpu : {1, 25, 60}) {
+        BOOST_TEST_CONTEXT("cpu " << cpu) {
+            const auto run = RunSchedule(cpu, 64s, 64s, 300, 62'500us, 500us, 1'000'000);
+            BOOST_CHECK_GT(run.completed_periods, 100U);
+            BOOST_CHECK_GE(run.truncated_periods, 1U);
+            BOOST_CHECK_GT(run.completed_total.count(), 0);
+            BOOST_CHECK_LE(static_cast<double>(run.completed_active.count()) /
+                               static_cast<double>(run.completed_total.count()),
+                           cpu / 100.0 + 1e-6);
+            BOOST_CHECK_LE(run.max_debt_after_sleep.count(),
+                           (PowMiningDutyLedger{cpu, 64s}.SearchCeiling() +
+                            PowMiningDutyLedger{cpu, 64s}.Ceiling()).count());
+        }
+    }
+    // The rule itself.
+    BOOST_CHECK(PowMiningClosePeriod(0ns, 0ns, false) == PowMiningPeriodClose::COMPLETED);
+    BOOST_CHECK(PowMiningClosePeriod(5s, 5s, true) == PowMiningPeriodClose::COMPLETED);
+    BOOST_CHECK(PowMiningClosePeriod(6s, 5s, true) == PowMiningPeriodClose::TRUNCATED);
+    BOOST_CHECK(PowMiningClosePeriod(6s, 5s, false) == PowMiningPeriodClose::OPEN);
 }
 
 BOOST_AUTO_TEST_CASE(tip_signal_wakes_waiters)
@@ -377,12 +564,14 @@ BOOST_AUTO_TEST_CASE(tip_change_interrupts_a_search)
     wallet.m_pow_mining_enabled = false;
 }
 
-BOOST_AUTO_TEST_CASE(miner_thread_wakes_on_block_signal)
+BOOST_AUTO_TEST_CASE(miner_thread_ignores_tips_and_lock_waits_while_chain_not_ready)
 {
-    // A wallet without a chain parks its miner in the one-second availability
-    // wait, the same wait the loop uses for "wait for the next tip". Before
-    // the tip signal the loop could only leave it when the second was over.
-    CWallet wallet{nullptr, "miner-wake", CreateMockableWalletDatabase()};
+    // A wallet without a chain parks its miner in the one-second wait the
+    // loop uses while the node is syncing, reindexing or has no chain. That
+    // wait is not woken by a tip: a burst of block callbacks must not start
+    // iterations that would only find the chain not ready. And time spent
+    // waiting for cs_wallet before the iteration starts is not work.
+    CWallet wallet{nullptr, "miner-not-ready", CreateMockableWalletDatabase()};
     wallet.m_pow_mining_enabled = true;
     wallet.m_pow_cpu_percent = 1;
     wallet.m_pow_state = interfaces::WalletPowMiningState::READY;
@@ -393,49 +582,44 @@ BOOST_AUTO_TEST_CASE(miner_thread_wakes_on_block_signal)
         wallet.m_pow_worker_successful_hashes.assign(1, 0);
     }
     {
+        // The worker's first iteration waits 600 ms for the wallet lock.
+        LOCK(wallet.cs_wallet);
         LOCK(wallet.m_pow_miner_mutex);
         wallet.threadPowMinerGroup = std::make_unique<std::vector<std::thread>>();
         wallet.threadPowMinerGroup->emplace_back([&] { wallet.ThreadShadowPoWMiner(0); });
+        std::this_thread::sleep_for(600ms);
     }
-    const auto wait_for_iteration = [&](uint64_t after, std::chrono::milliseconds limit) {
+    const auto wait_for_period = [&](std::chrono::milliseconds limit) {
         const auto deadline = std::chrono::steady_clock::now() + limit;
-        while (wallet.m_pow_miner_iterations.load() <= after &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(1ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (wallet.GetPowMiningDutyCycle().workers[0].completed_periods > 0) return true;
+            std::this_thread::sleep_for(10ms);
         }
-        return wallet.m_pow_miner_iterations.load() > after;
+        return false;
     };
-    BOOST_REQUIRE(wait_for_iteration(0, 5s));
-    std::vector<int64_t> reaction_ms;
-    for (int round = 0; round < 10; ++round) {
-        // Let the worker settle into a fresh one-second wait.
-        const uint64_t before = wallet.m_pow_miner_iterations.load();
+    BOOST_REQUIRE(wait_for_period(5s));
+    const auto duty = wallet.GetPowMiningDutyCycle().workers[0];
+    // The lock wait is in neither the active nor the explicit wait time.
+    BOOST_CHECK_LT(duty.completed_active_ns, uint64_t{300'000'000});
+    BOOST_CHECK_GT(duty.completed_explicit_wait_ns, uint64_t{900'000'000});
+
+    // Let the worker settle into a fresh wait, then deliver a burst of tips.
+    uint64_t before;
+    do {
+        before = wallet.m_pow_miner_iterations.load();
         std::this_thread::sleep_for(50ms);
-        if (wallet.m_pow_miner_iterations.load() != before) {
-            --round; // The second ran out just now; take another sample.
-            continue;
-        }
-        const auto notified = std::chrono::steady_clock::now();
-        wallet.m_pow_tip_signal.NotifyTip(TipInfo(static_cast<unsigned char>(round + 1), round));
-        BOOST_REQUIRE(wait_for_iteration(before, 5s));
-        reaction_ms.push_back(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - notified).count());
+    } while (wallet.m_pow_miner_iterations.load() != before);
+    for (int tip = 0; tip < 10'000; ++tip) {
+        wallet.m_pow_tip_signal.NotifyTip(TipInfo(static_cast<unsigned char>(tip % 200 + 1), tip));
     }
-    std::sort(reaction_ms.begin(), reaction_ms.end());
-    BOOST_TEST_MESSAGE("signal to next miner iteration, ms: median "
-        << reaction_ms[reaction_ms.size() / 2] << " max " << reaction_ms.back());
-    // Far below the old one-second poll, with room for a loaded machine.
-    BOOST_CHECK_LT(reaction_ms.back(), 200);
-
-    // Without a signal the worker stays in its wait: no busy loop.
-    const uint64_t idle_before = wallet.m_pow_miner_iterations.load();
     std::this_thread::sleep_for(300ms);
-    BOOST_CHECK_LE(wallet.m_pow_miner_iterations.load(), idle_before + 1);
+    // At most the iteration that its own second brings round; never one per tip.
+    BOOST_CHECK_LE(wallet.m_pow_miner_iterations.load(), before + 1);
 
-    // Stop is prompt from inside a wait.
+    // Stop is prompt from inside the wait.
     const auto stop_start = std::chrono::steady_clock::now();
     wallet.StopPowMining();
-    BOOST_CHECK((std::chrono::steady_clock::now() - stop_start) < 200ms);
+    BOOST_CHECK((std::chrono::steady_clock::now() - stop_start) < 400ms);
     BOOST_CHECK(!wallet.m_pow_mining_enabled.load());
 }
 

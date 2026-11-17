@@ -11714,6 +11714,14 @@ PowMinerSleep SleepPowMinerDetailed(
             continue;
         }
         if (watch) {
+            // While the node is syncing, reindexing or loading blocks, each
+            // connected block would start an iteration that can only find the
+            // chain not ready. Do not let the tip end the wait; the bounded
+            // wait itself brings the worker back at its normal cadence.
+            if (wallet.HaveChain() && !wallet.chain().isReadyToBroadcast()) {
+                baseline = wallet.m_pow_tip_signal.Sample();
+                continue;
+            }
             watch->baseline = wallet.m_pow_tip_signal.Sample();
             watch->woken = true;
             return PowMinerSleep::WOKEN;
@@ -11739,6 +11747,8 @@ bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
 struct PowMinerDutyState {
     PowMiningDutyLedger ledger;
     bool open{false};
+    //! Ledger debt when the open period began (see PowMiningClosePeriod()).
+    std::chrono::nanoseconds start_debt{0};
     uint64_t session_id{0};
     uint64_t generation{0};
     std::chrono::nanoseconds elapsed{0};
@@ -11774,7 +11784,9 @@ class PowMinerIterationBudget {
     PowMinerDutyState& m_state;
     uint64_t m_session_id;
     uint64_t m_generation;
-    const std::chrono::steady_clock::time_point m_start{std::chrono::steady_clock::now()};
+    //! Taken after the constructor's wallet lock: waiting for cs_wallet before
+    //! the iteration starts is not work and is not charged as work.
+    std::chrono::steady_clock::time_point m_start;
     std::chrono::nanoseconds m_wait{0};
     std::chrono::nanoseconds m_search{0};
     uint64_t m_hashes{0};
@@ -11798,6 +11810,7 @@ public:
         g_pow_miner_search_time = &m_search;
         g_pow_miner_period_hashes = &m_hashes;
         g_pow_miner_tip_watch = &m_watch;
+        m_start = std::chrono::steady_clock::now();
     }
     /** Claim work for the current tip continues in the next iteration. */
     void SetWorkPending() { m_work_pending = true; }
@@ -11825,6 +11838,7 @@ public:
             // A restart or a lock/unlock pulse ended the open period.
             m_state.Publish(m_wallet, /*finished=*/false);
         }
+        if (!m_state.open) m_state.start_debt = m_state.ledger.Debt();
         m_state.open = true;
         m_state.session_id = m_session_id;
         m_state.generation = m_generation;
@@ -11833,20 +11847,24 @@ public:
         m_state.hashes += m_hashes;
         // Lock waits and gate evaluation are charged as other work, never as
         // search, so they cannot use up the search allowance.
+        const auto debt_before = m_state.ledger.Debt();
         m_state.ledger.Charge(search, active - search);
+        const auto iteration_debt = m_state.ledger.Debt() - debt_before;
         m_state.ledger.Credit(m_wait);
 
         const bool tip_arrived = m_watch.woken ||
             m_wallet.m_pow_tip_signal.TipSequence() != m_watch.baseline.tip;
-        const auto delay = m_state.ledger.SleepNeeded(m_work_pending || tip_arrived);
+        const PowMiningSleepPlan plan =
+            m_state.ledger.Plan(m_work_pending || tip_arrived, iteration_debt);
         PowMinerSleep outcome{PowMinerSleep::FINISHED};
-        if (delay.count() > 0) {
-            // A duty sleep is not an explicit wait, but it is tip-wakeable.
-            g_pow_miner_tip_watch = &m_watch;
+        const auto take_sleep = [&](std::chrono::milliseconds delay, bool wake_on_tip) {
+            if (delay.count() <= 0 || outcome == PowMinerSleep::CANCELLED) return;
+            // A duty sleep is not an explicit wait.
+            g_pow_miner_tip_watch = wake_on_tip ? &m_watch : nullptr;
             const auto wait_start = std::chrono::steady_clock::now();
             outcome = SleepPowMinerDetailed(
                 m_wallet, delay, /*allow_locked_wait=*/false, m_generation,
-                /*wake_on_tip=*/true);
+                wake_on_tip);
             const auto duty_wait = std::chrono::steady_clock::now() - wait_start;
             g_pow_miner_tip_watch = nullptr;
             m_state.ledger.Credit(duty_wait);
@@ -11854,11 +11872,28 @@ public:
             if (!m_attempt_tip.IsNull()) {
                 m_wallet.NotePowClaimAttemptDutySleep(m_attempt_tip, duty_wait);
             }
-        }
+        };
+        // The excess over the ceilings is the duty cycle: no tip cuts it short,
+        // or debt would grow past the ceiling with every block. The rest of
+        // the debt is slept only when no claim work is pending, and a new tip
+        // ends that part at once.
+        take_sleep(plan.excess, /*wake_on_tip=*/false);
+        take_sleep(plan.remainder, /*wake_on_tip=*/true);
+        if (outcome != PowMinerSleep::CANCELLED) m_state.ledger.ClampToCeilings();
         if (outcome == PowMinerSleep::CANCELLED) {
             m_state.Publish(m_wallet, /*finished=*/false);
-        } else if (m_state.ledger.Debt().count() == 0) {
-            m_state.Publish(m_wallet, /*finished=*/true);
+        } else {
+            switch (PowMiningClosePeriod(m_state.ledger.Debt(), m_state.start_debt,
+                                         plan.excess.count() > 0)) {
+            case PowMiningPeriodClose::COMPLETED:
+                m_state.Publish(m_wallet, /*finished=*/true);
+                break;
+            case PowMiningPeriodClose::TRUNCATED:
+                m_state.Publish(m_wallet, /*finished=*/false);
+                break;
+            case PowMiningPeriodClose::OPEN:
+                break;
+            }
         }
     }
 };
@@ -15012,7 +15047,11 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             PublishPowMiningHashrate(0.0);
             PublishPowMiningWorkerState(
                 WalletPowMiningState::CHAIN_UNAVAILABLE);
-            SleepPowMiner(*this, std::chrono::seconds{1});
+            // Not ready (syncing, reindexing, no chain): blocks arriving during
+            // this wait must not start an iteration. Only stop ends it early.
+            SleepPowMiner(*this, std::chrono::seconds{1},
+                          /*allow_locked_wait=*/false, std::nullopt,
+                          /*wake_on_tip=*/false);
             continue;
         }
         ShadowPowClaimMiningGate mining_gate;

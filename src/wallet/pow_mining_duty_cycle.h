@@ -48,6 +48,38 @@ inline std::chrono::nanoseconds PowMiningDutyDebt(
     return std::chrono::nanoseconds{whole * idle + fraction};
 }
 
+/** What the end of an iteration does to the open telemetry period. */
+enum class PowMiningPeriodClose {
+    OPEN,      //!< Keep accumulating.
+    COMPLETED, //!< Report as a completed period: it is within the duty budget.
+    TRUNCATED, //!< Report as truncated: the burst allowance is spent.
+};
+
+/** A period that opened with start_debt and ends with debt_now has spent at
+ * least as much idle time as its active work owes whenever debt_now is not
+ * above start_debt, so its active fraction is at most cpu_percent and it may
+ * be reported as completed. Requiring the debt to reach zero would never
+ * complete a period of a worker whose debt sits at its ceiling (no proof found
+ * for many blocks); instead, when the ceiling forces a duty sleep and the debt
+ * is still above where the period began, the period is closed as truncated
+ * and the next one opens at the pinned debt, where it completes. */
+inline PowMiningPeriodClose PowMiningClosePeriod(
+    std::chrono::nanoseconds debt_now, std::chrono::nanoseconds start_debt,
+    bool excess_slept)
+{
+    if (debt_now <= start_debt) return PowMiningPeriodClose::COMPLETED;
+    return excess_slept ? PowMiningPeriodClose::TRUNCATED : PowMiningPeriodClose::OPEN;
+}
+
+/** Sleep the worker owes at the end of an iteration, in two parts.
+ * excess is the debt above the ceilings: it is the duty cycle itself and is
+ * never cut short by a new tip. remainder is the rest of the carried debt, slept
+ * only when no claim work is pending, and a new tip ends it at once. */
+struct PowMiningSleepPlan {
+    std::chrono::milliseconds excess{0};
+    std::chrono::milliseconds remainder{0};
+};
+
 /** Per-worker duty ledger for the work-first schedule.
  *
  * The long-run rule is the documented one: every span of active work owes
@@ -59,32 +91,41 @@ inline std::chrono::nanoseconds PowMiningDutyDebt(
  *
  * The carry is bounded. Debt is kept in two parts, proof search and
  * everything else (gate evaluation, input selection, lock waits, which the
- * documented accounting conservatively counts as work), and each part may be
- * carried up to Ceiling(): the idle time that BURST_SPACINGS target block
- * spacings of budget pay for. In CPU terms a worker may run ahead of its
- * budget by at most BURST_SPACINGS * spacing * cpu_percent / 100 of search
- * (1.28 s at the default 1% and 64 s spacing) and as much again of other
- * work. Above a ceiling the worker sleeps the excess after every iteration,
- * which is exactly the old interleaved duty cycle. Keeping the two parts
+ * documented accounting conservatively counts as work). Each part may be
+ * carried up to its ceiling, the idle time that BURST_SPACINGS target block
+ * spacings of budget pay for; the search part is further bounded by the idle
+ * time that SEARCH_BURST_WALL (10 s) of search owes, whichever is smaller.
+ * In CPU terms a worker may run ahead of its budget by at most
+ * min(BURST_SPACINGS * spacing * cpu_percent / 100, SEARCH_BURST_WALL) of
+ * search (0.64 s at the default 1% and 64 s spacing, 10 s at 60%) and by at
+ * most BURST_SPACINGS * spacing * cpu_percent / 100 of other work (38.4 s at
+ * 60%). Above a ceiling the worker sleeps the excess after every iteration,
+ * which is the old interleaved duty cycle: it sleeps what each iteration owes. Keeping the two parts
  * apart means a slow gate or a contended lock cannot use up the search
- * allowance.
+ * allowance. Debt is clamped at the ceilings after every sleep, so it cannot
+ * grow without bound whatever happens.
  *
- * Because debt never exceeds the two ceilings plus two iterations (one whose
- * sleep a new tip cut short, and the first one for that tip), active time
+ * Because debt never exceeds the two ceilings plus two iterations, active time
  * over any window of length T is at most
- *   cpu_percent/100 * (T + 2 * BURST_SPACINGS * spacing) + two iterations. */
+ *   cpu_percent/100 * T + (search allowance + other allowance) + two iterations. */
 class PowMiningDutyLedger
 {
 public:
-    static constexpr int BURST_SPACINGS{2};
+    static constexpr int BURST_SPACINGS{1};
+    /** Longest wall time of search that may run without a duty sleep. */
+    static constexpr std::chrono::seconds SEARCH_BURST_WALL{10};
 
     PowMiningDutyLedger(int cpu_percent, std::chrono::nanoseconds block_spacing)
         : m_cpu_percent{std::clamp(cpu_percent, 1, 100)},
-          m_ceiling{std::max(std::chrono::nanoseconds{0}, block_spacing) / 100 *
-                    (BURST_SPACINGS * (100 - std::clamp(cpu_percent, 1, 100)))} {}
+          m_other_ceiling{std::max(std::chrono::nanoseconds{0}, block_spacing) / 100 *
+                          (BURST_SPACINGS * (100 - std::clamp(cpu_percent, 1, 100)))},
+          m_search_ceiling{std::min(m_other_ceiling,
+                                    PowMiningDutyDebt(SEARCH_BURST_WALL, m_cpu_percent))} {}
 
     int CpuPercent() const { return m_cpu_percent; }
-    std::chrono::nanoseconds Ceiling() const { return m_ceiling; }
+    /** Ceiling of the non-search debt (spacing based). */
+    std::chrono::nanoseconds Ceiling() const { return m_other_ceiling; }
+    std::chrono::nanoseconds SearchCeiling() const { return m_search_ceiling; }
     std::chrono::nanoseconds SearchDebt() const { return m_search_debt; }
     std::chrono::nanoseconds OtherDebt() const { return m_other_debt; }
     std::chrono::nanoseconds Debt() const { return m_search_debt + m_other_debt; }
@@ -98,19 +139,35 @@ public:
     }
 
     /** Record idle time actually spent (an explicit wait or a duty sleep).
-     * Idle time beyond the debt is not banked. */
+     * It pays what is above a ceiling first, so a duty sleep owed for one
+     * part's excess is never spent on the other part's allowance; then the
+     * search part, then the rest. Idle time beyond the debt is not banked. */
     void Credit(std::chrono::nanoseconds waited)
     {
         if (waited.count() <= 0) return;
-        const auto search_paid = std::min(waited, m_search_debt);
-        m_search_debt -= search_paid;
-        m_other_debt -= std::min(waited - search_paid, m_other_debt);
+        const auto pay = [&waited](std::chrono::nanoseconds& debt, std::chrono::nanoseconds limit) {
+            const auto paid = std::min(waited, std::max(std::chrono::nanoseconds{0}, debt - limit));
+            debt -= paid;
+            waited -= paid;
+        };
+        pay(m_search_debt, m_search_ceiling);
+        pay(m_other_debt, m_other_ceiling);
+        pay(m_search_debt, std::chrono::nanoseconds{0});
+        pay(m_other_debt, std::chrono::nanoseconds{0});
+    }
+
+    /** Hard stop on accumulation: neither part is ever carried above its
+     * ceiling past the end of an iteration's sleeps. */
+    void ClampToCeilings()
+    {
+        m_search_debt = std::min(m_search_debt, m_search_ceiling);
+        m_other_debt = std::min(m_other_debt, m_other_ceiling);
     }
 
     /** Whether the whole debt may be carried while claim work is pending. */
     bool MayDefer() const
     {
-        return m_search_debt <= m_ceiling && m_other_debt <= m_ceiling;
+        return m_search_debt <= m_search_ceiling && m_other_debt <= m_other_ceiling;
     }
 
     /** Sleep owed now. With claim work pending this is only the excess over
@@ -118,10 +175,33 @@ public:
     std::chrono::milliseconds SleepNeeded(bool work_pending) const
     {
         const auto owed = work_pending
-            ? std::max(std::chrono::nanoseconds{0}, m_search_debt - m_ceiling) +
-              std::max(std::chrono::nanoseconds{0}, m_other_debt - m_ceiling)
+            ? std::max(std::chrono::nanoseconds{0}, m_search_debt - m_search_ceiling) +
+              std::max(std::chrono::nanoseconds{0}, m_other_debt - m_other_ceiling)
             : Debt();
         return std::chrono::ceil<std::chrono::milliseconds>(owed);
+    }
+
+    /** The sleep for the end of an iteration, split into the part a tip may
+     * not cut short and the part it may. iteration_debt is the debt this
+     * iteration created. When either part is over its ceiling the worker has
+     * left the burst and is on the interleaved duty cycle: it sleeps at least
+     * what the iteration itself owes, so debt stops growing at once and the
+     * telemetry period can close. */
+    PowMiningSleepPlan Plan(bool work_pending,
+                            std::chrono::nanoseconds iteration_debt = std::chrono::nanoseconds{0}) const
+    {
+        PowMiningSleepPlan plan;
+        auto excess = std::max(std::chrono::nanoseconds{0}, m_search_debt - m_search_ceiling) +
+                      std::max(std::chrono::nanoseconds{0}, m_other_debt - m_other_ceiling);
+        if (excess.count() > 0) {
+            excess = std::max(excess, std::min(std::max(std::chrono::nanoseconds{0}, iteration_debt), Debt()));
+        }
+        plan.excess = std::chrono::ceil<std::chrono::milliseconds>(excess);
+        if (!work_pending) {
+            plan.remainder = std::max(std::chrono::milliseconds{0},
+                                      SleepNeeded(/*work_pending=*/false) - plan.excess);
+        }
+        return plan;
     }
 
 private:
@@ -132,7 +212,8 @@ private:
     }
 
     int m_cpu_percent;
-    std::chrono::nanoseconds m_ceiling;
+    std::chrono::nanoseconds m_other_ceiling;
+    std::chrono::nanoseconds m_search_ceiling;
     std::chrono::nanoseconds m_search_debt{0};
     std::chrono::nanoseconds m_other_debt{0};
 };

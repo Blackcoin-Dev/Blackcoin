@@ -341,6 +341,7 @@ BITCOIN_CORE_H = \
   util/syserror.h \
   util/thread.h \
   util/threadinterrupt.h \
+  util/thread_qos.h \
   util/threadnames.h \
   util/time.h \
   util/tokenpipe.h \
@@ -825,6 +826,7 @@ libbitcoin_util_a_SOURCES = \
   util/readwritefile.cpp \
   util/signalinterrupt.cpp \
   util/thread.cpp \
+  util/thread_qos.cpp \
   util/threadinterrupt.cpp \
   util/threadnames.cpp \
   util/serfloat.cpp \
@@ -1080,6 +1082,7 @@ libbitcoinkernel_la_SOURCES = \
   util/string.cpp \
   util/syserror.cpp \
   util/thread.cpp \
+  util/thread_qos.cpp \
   util/threadnames.cpp \
   util/time.cpp \
   util/tokenpipe.cpp \

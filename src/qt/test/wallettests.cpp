@@ -4051,6 +4051,26 @@ void TestWalletDisplaySnapshots(interfaces::Node& node, const std::shared_ptr<CW
     QTRY_VERIFY_WITH_TIMEOUT(cancelled, 5000);
 }
 
+// Which states of the balance on screen the user is told about: only a
+// balance of an older block than the node tip (labelled "as of block N,
+// updating"); the right block with a newer wallet change on its way is not.
+void TestBalanceStateLabels()
+{
+    using State = WalletModel::BalanceState;
+    // available, exact, failed, snapshot height, node tip height
+    QVERIFY(WalletModel::ClassifyBalance(false, false, false, -1, 100) == State::None);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, 100) == State::Exact);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, -1) == State::Exact);
+    // The wallet changed since, same block: current-unverified, no label.
+    QVERIFY(WalletModel::ClassifyBalance(true, false, false, 100, 100) == State::CurrentUnverified);
+    // A block behind: labelled, whatever the wallet says.
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 99, 100) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, false, false, 99, 100) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, false, true, 99, 100) == State::Behind);
+    // The last attempt failed at the block of the node: not labelled "updating".
+    QVERIFY(WalletModel::ClassifyBalance(true, false, true, 100, 100) == State::Failed);
+}
+
 void TestWalletPollCoalescing(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
 {
     const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
@@ -4148,6 +4168,8 @@ void TestWalletDisplayExceptionRecovery(interfaces::Node& node, const std::share
     QTest::ignoreMessage(QtWarningMsg, "Wallet display snapshot failed");
     model.pollBalanceChanged();
     QTRY_VERIFY_WITH_TIMEOUT(model.balanceIsStale(), 5000);
+    // The balance is of the block the node is at: not "behind", so no label.
+    QVERIFY(!model.balanceIsBehind());
     QCOMPARE(model.getCachedBalance().balance, valid_balance);
     model.pollBalanceChanged();
     model.removeEventFilter(&delivery);
@@ -5623,6 +5645,7 @@ void TestGUI(interfaces::Node& node)
     if (lane.isEmpty() || lane == QStringLiteral("wallet-efficiency")) {
         TestHiddenSendBalanceHeartbeat(node, SetupDescriptorsWallet(node, test));
         TestWalletDisplaySnapshots(node, SetupDescriptorsWallet(node, test));
+        TestBalanceStateLabels();
         TestWalletPollCoalescing(node, SetupDescriptorsWallet(node, test));
         TestWalletDisplayExceptionRecovery(node, SetupDescriptorsWallet(node, test));
         TestAccountSnapshotFiltering(node, SetupDescriptorsWallet(node, test));

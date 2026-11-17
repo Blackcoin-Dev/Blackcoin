@@ -378,8 +378,8 @@ void OverviewPage::setWalletModel(WalletModel *model)
         // Keep up to date with wallet
         setBalance(model->getCachedBalance());
         connect(model, &WalletModel::balanceChanged, this, &OverviewPage::setBalance);
-        setBalanceStale(model->balanceIsStale(), model->balanceHeight());
-        connect(model, &WalletModel::balanceStaleChanged, this, &OverviewPage::setBalanceStale);
+        setBalanceStale(model->balanceIsBehind(), model->balanceHeight());
+        connect(model, &WalletModel::balanceBehindChanged, this, &OverviewPage::setBalanceStale);
         connect(model, &WalletModel::qqDevelopmentDonationChanged, this, [this, model](unsigned int) {
             setBalance(model->getCachedBalance());
         });
@@ -433,6 +433,8 @@ void OverviewPage::updateAlerts(const QString &warnings)
 
 void OverviewPage::setBalanceStale(bool stale, int height)
 {
+    // Called with "behind" only: a balance of the wallet's last block that a
+    // newer wallet change has not reached yet is not labelled.
     ui->labelBalanceStale->setVisible(stale);
     if (stale) ui->labelBalanceStale->setText(tr("as of block %1, updating").arg(height));
 }

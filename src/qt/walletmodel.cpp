@@ -387,6 +387,14 @@ void WalletModel::displayBalancesChanged()
     if (m_balance_poll_requested) pollBalanceChanged();
 }
 
+WalletModel::BalanceState WalletModel::ClassifyBalance(bool available, bool exact, bool failed, int snapshot_height, int node_tip_height)
+{
+    if (!available) return BalanceState::None;
+    if (node_tip_height >= 0 && snapshot_height < node_tip_height) return BalanceState::Behind;
+    if (failed) return BalanceState::Failed;
+    return exact ? BalanceState::Exact : BalanceState::CurrentUnverified;
+}
+
 void WalletModel::applyDisplaySnapshot(const interfaces::WalletDisplayBalances& snapshot)
 {
     if (snapshot.failed && !m_balance_failure_reported) {
@@ -401,13 +409,24 @@ void WalletModel::applyDisplaySnapshot(const interfaces::WalletDisplayBalances& 
     const auto gone = [&] { return !model || m_joined || context_generation != m_balance_context_generation; };
 
     // The balance on screen is that of snapshot.block_height. It is stale
-    // when the wallet has changed since, or the node is past that block.
-    const bool stale = snapshot.available &&
-        (!snapshot.exact || (m_node_tip_height >= 0 && snapshot.block_height < m_node_tip_height));
-    if (stale != m_balance_stale || (stale && snapshot.block_height != m_balance_height)) {
+    // when the wallet has changed since, or the node is past that block; the
+    // user is told only in the second case (Behind).
+    const BalanceState state = ClassifyBalance(snapshot.available, snapshot.exact, snapshot.failed,
+                                               snapshot.block_height, m_node_tip_height);
+    const bool stale = snapshot.available && state != BalanceState::Exact;
+    const bool behind = state == BalanceState::Behind;
+    const bool was_behind = m_balance_state == BalanceState::Behind;
+    const int previous_height = m_balance_height;
+    m_balance_state = state;
+    if (stale != m_balance_stale || (stale && snapshot.block_height != previous_height)) {
         m_balance_stale = stale;
         m_balance_height = snapshot.block_height;
         Q_EMIT balanceStaleChanged(stale, snapshot.block_height);
+        if (gone()) return;
+    }
+    if (behind != was_behind || (behind && snapshot.block_height != previous_height)) {
+        m_balance_height = snapshot.block_height;
+        Q_EMIT balanceBehindChanged(behind, snapshot.block_height);
         if (gone()) return;
     }
     if (!snapshot.available) return;

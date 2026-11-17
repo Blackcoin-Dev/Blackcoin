@@ -4,6 +4,7 @@
 
 #include <wallet/display_balance.h>
 
+#include <coins.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
 #include <interfaces/wallet.h>
@@ -512,6 +513,206 @@ BOOST_FIXTURE_TEST_CASE(releasing_a_wallet_completes_outstanding_requests_as_fai
     BOOST_CHECK(!state->RequestAndWait(std::nullopt, 20s, [] {}).ok);
     release.set_value();
     SyncWithValidationInterfaceQueue();
+}
+
+// ---- The state of a snapshot ------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(display_state_names_and_log_cadence)
+{
+    DisplayBalanceSnapshot snapshot;
+    snapshot.tip_height = 100;
+    snapshot.tip_hash = uint256::ONE;
+    snapshot.marker = 7;
+    const uint256 other{uint256::ZERO};
+    const auto classify = [&](const DisplayBalanceSnapshot* s, bool failed, bool marker_current, int height,
+                              std::optional<uint256> hash) {
+        return ClassifyDisplayBalance(s, failed, marker_current, height, hash);
+    };
+
+    // Nothing published; an error.
+    auto state = classify(nullptr, false, false, 100, std::nullopt);
+    BOOST_CHECK_EQUAL(state.ToString(), "none");
+    BOOST_CHECK_EQUAL(state.SummaryIntervalMs(), WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS);
+    state = classify(&snapshot, true, true, 100, uint256::ONE);
+    BOOST_CHECK_EQUAL(state.ToString(), "failed");
+    BOOST_CHECK_EQUAL(state.SummaryIntervalMs(), WalletDisplayBalance::SUMMARY_INTERVAL_EXACT_MS);
+
+    // The block of the wallet and an unchanged wallet: exact.
+    state = classify(&snapshot, false, true, 100, uint256::ONE);
+    BOOST_CHECK_EQUAL(state.ToString(), "exact");
+    BOOST_CHECK_EQUAL(state.SummaryIntervalMs(), WalletDisplayBalance::SUMMARY_INTERVAL_EXACT_MS);
+
+    // The same block, but the wallet changed since: current-unverified, and
+    // never "stale": it is of the block the wallet has processed.
+    state = classify(&snapshot, false, false, 100, uint256::ONE);
+    BOOST_CHECK_EQUAL(state.ToString(), "current-unverified");
+    BOOST_CHECK_EQUAL(state.SummaryIntervalMs(), WalletDisplayBalance::SUMMARY_INTERVAL_EXACT_MS);
+    // Without the hash the height alone says the same.
+    BOOST_CHECK_EQUAL(classify(&snapshot, false, false, 100, std::nullopt).ToString(), "current-unverified");
+    // Reference unknown: only the marker is judged.
+    BOOST_CHECK_EQUAL(classify(&snapshot, false, true, -1, std::nullopt).ToString(), "exact");
+    BOOST_CHECK_EQUAL(classify(&snapshot, false, false, -1, std::nullopt).ToString(), "current-unverified");
+
+    // Blocks behind, whatever the marker says; a minute between lines.
+    state = classify(&snapshot, false, true, 103, std::nullopt);
+    BOOST_CHECK_EQUAL(state.ToString(), "behind(3)");
+    BOOST_CHECK_EQUAL(state.behind_blocks, 3);
+    BOOST_CHECK_EQUAL(state.SummaryIntervalMs(), WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS);
+    BOOST_CHECK_EQUAL(classify(&snapshot, false, false, 101, std::nullopt).ToString(), "behind(1)");
+    // Same height, other block (a reorg): behind by at least one.
+    BOOST_CHECK_EQUAL(classify(&snapshot, false, true, 100, other).ToString(), "behind(1)");
+    // A snapshot ahead of the reference is not behind.
+    BOOST_CHECK_EQUAL(classify(&snapshot, false, true, 99, std::nullopt).ToString(), "exact");
+}
+
+BOOST_FIXTURE_TEST_CASE(worker_log_line_uses_the_new_states, DisplayWalletSetup)
+{
+    // Nothing published yet: "none", logged at the minute cadence.
+    const auto state = std::make_shared<WalletDisplayBalance>(*wallet);
+    const int64_t base = WalletDisplayBalance::NowMs();
+    {
+        // Not due yet.
+        state->MaybeLogSummary(base + WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS / 2);
+    }
+    {
+        ASSERT_DEBUG_LOG("state=none snapshot_height=-1");
+        state->MaybeLogSummary(base + WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS + 1000);
+    }
+    {
+        ASSERT_DEBUG_LOG("state=none snapshot_height=-1");
+        state->MaybeLogSummary(base + 2 * WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS + 2000);
+    }
+}
+
+// ---- The meter of a cs_main slice ----------------------------------------------
+
+namespace {
+/** A coins view whose every read takes `per_read` of an injected clock. */
+class SlowCoinsView final : public CCoinsView
+{
+public:
+    SlowCoinsView(std::chrono::steady_clock::time_point& clock, std::chrono::microseconds per_read)
+        : m_clock(clock), m_per_read(per_read) {}
+    bool GetCoin(const COutPoint&, Coin&) const override
+    {
+        ++reads;
+        m_clock += m_per_read;
+        return false;
+    }
+    uint256 GetBestBlock() const override { return {}; }
+    mutable uint64_t reads{0};
+
+private:
+    std::chrono::steady_clock::time_point& m_clock;
+    const std::chrono::microseconds m_per_read;
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(slice_meter_stays_within_its_budget_plus_one_chainstate_item)
+{
+    // An item that misses the memo makes up to three uncached chainstate
+    // reads (the coin, the payout status, the attestation); here each read
+    // costs 4 ms against a 25 ms budget, so an item costs 12 ms. Items are
+    // metered one by one: the old rule (a clock reading every 16 items)
+    // would run on for 16 items, nearly 200 ms.
+    std::chrono::steady_clock::time_point clock{};
+    const auto start = clock;
+    uint64_t clock_reads{0};
+    LifecycleSliceLimits limits;
+    limits.now = [&] {
+        ++clock_reads;
+        return clock;
+    };
+    const std::chrono::milliseconds budget{25};
+    SlowCoinsView slow{clock, 4ms};
+    CCoinsViewCache view{&slow};
+    SliceMeter meter{limits, budget};
+    uint32_t n{0};
+    while (!meter.Expired()) {
+        for (int read = 0; read < 3; ++read) {
+            Coin coin;
+            view.GetCoin(COutPoint{uint256{static_cast<uint8_t>(n + 1)}, static_cast<uint32_t>(read)}, coin);
+        }
+        meter.TickChainItem();
+        ++n;
+        BOOST_REQUIRE_LT(n, 100U);
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock - start);
+    const auto largest_item = 12ms;
+    BOOST_CHECK_LE(elapsed.count(), (budget + largest_item).count());
+    // The remaining budget (1 ms) could not pay for another item (12 ms):
+    // the slice ended at 24 ms, after two items, inside the budget itself.
+    BOOST_CHECK_EQUAL(n, 2U);
+    BOOST_CHECK_LE(elapsed.count(), budget.count());
+    BOOST_CHECK_EQUAL(meter.MaxChainItem().count(), std::chrono::microseconds{12ms}.count());
+    BOOST_CHECK_EQUAL(slow.reads, 6U);
+    // The clock was read once per chainstate item, plus once at the start.
+    BOOST_CHECK_EQUAL(clock_reads, 1U + n);
+}
+
+BOOST_AUTO_TEST_CASE(slice_meter_bounds_a_slice_whose_items_get_slower)
+{
+    // The first items are cheap and teach the meter nothing about the one
+    // that follows: the slice may overrun by that one item, never by more.
+    std::chrono::steady_clock::time_point clock{};
+    const auto start = clock;
+    LifecycleSliceLimits limits;
+    limits.now = [&] { return clock; };
+    const std::chrono::milliseconds budget{25};
+    SliceMeter meter{limits, budget};
+    const std::vector<std::chrono::milliseconds> costs{1ms, 1ms, 1ms, 1ms, 40ms, 1ms, 1ms};
+    size_t done{0};
+    for (const auto cost : costs) {
+        if (meter.Expired()) break;
+        clock += cost;
+        meter.TickChainItem();
+        ++done;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock - start);
+    BOOST_CHECK_EQUAL(done, 5U); // ends after the 40 ms item
+    BOOST_CHECK_LE(elapsed.count(), (budget + 40ms).count());
+    BOOST_CHECK(meter.Expired());
+    BOOST_CHECK_EQUAL(meter.MaxChainItem().count(), std::chrono::microseconds{40ms}.count());
+
+    // A seed from the previous slice of the pass makes the next slice stop
+    // sooner: half of a 40 ms item leaves no room for another item once
+    // 6 ms have passed.
+    clock = start;
+    SliceMeter next{limits, budget};
+    next.SeedMaxChainItem(40ms);
+    clock += 4ms;
+    BOOST_CHECK(!next.TickChainItem()); // 4 + 20 < 25
+    clock += 2ms;
+    BOOST_CHECK(next.TickChainItem());  // 6 + 20 > 25: no room for another item
+}
+
+BOOST_AUTO_TEST_CASE(slice_meter_reads_the_clock_every_16_items_for_memo_hits)
+{
+    std::chrono::steady_clock::time_point clock{};
+    uint64_t clock_reads{0};
+    LifecycleSliceLimits limits;
+    limits.now = [&] {
+        ++clock_reads;
+        return clock;
+    };
+    SliceMeter meter{limits, std::chrono::milliseconds{25}};
+    BOOST_CHECK_EQUAL(clock_reads, 1U); // the start
+    for (int i = 0; i < 15; ++i) BOOST_CHECK(!meter.Tick(16));
+    BOOST_CHECK_EQUAL(clock_reads, 1U);
+    BOOST_CHECK(!meter.Tick(16));
+    BOOST_CHECK_EQUAL(clock_reads, 2U);
+    // A memo-hit run does not teach the meter anything about chainstate cost.
+    BOOST_CHECK_EQUAL(meter.MaxChainItem().count(), 0);
+    // Once the time is up the 16th item ends the slice.
+    clock += 30ms;
+    for (int i = 0; i < 15; ++i) BOOST_CHECK(!meter.Tick(16));
+    BOOST_CHECK(meter.Tick(16));
+    // An item limit still ends it at once.
+    LifecycleSliceLimits limited;
+    limited.max_items = 2;
+    SliceMeter by_items{limited, std::chrono::milliseconds{0}};
+    BOOST_CHECK(!by_items.TickChainItem());
+    BOOST_CHECK(by_items.TickChainItem());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -64,6 +64,45 @@ struct DisplayBalanceSnapshot {
 };
 
 /**
+ * How the published snapshot of a wallet stands, for the log line and the
+ * rules of what the GUI says about it.
+ *
+ *  EXACT               the snapshot is of the wallet's last processed block and
+ *                      the wallet has not changed since (marker unchanged);
+ *  CURRENT_UNVERIFIED  the snapshot is of the wallet's last processed block but
+ *                      the wallet's change marker moved since (an unconfirmed
+ *                      transaction, a label, a key): a new snapshot is due, the
+ *                      balance on screen is of the right block;
+ *  BEHIND              the snapshot is of an older block than the wallet has
+ *                      processed;
+ *  NONE                nothing published yet;
+ *  FAILED              the last attempt to compute a snapshot ended in an error.
+ */
+enum class DisplayBalanceStatus { NONE, FAILED, EXACT, CURRENT_UNVERIFIED, BEHIND };
+
+struct DisplayBalanceState {
+    DisplayBalanceStatus status{DisplayBalanceStatus::NONE};
+    //! BEHIND only: how many blocks (at least 1).
+    int behind_blocks{0};
+
+    /** "exact", "current-unverified", "behind(N)", "none" or "failed". */
+    std::string ToString() const;
+    /** Log cadence: every minute while a snapshot is behind or missing, every ten minutes otherwise. */
+    int64_t SummaryIntervalMs() const;
+};
+
+/**
+ * @param snapshot        the published snapshot, or null
+ * @param failed          the last attempt ended in an error
+ * @param marker_current  the wallet change marker equals the snapshot's
+ * @param reference_height / reference_hash  the wallet's last processed block;
+ *        a negative height means unknown (then only the marker is judged), a
+ *        missing hash means only heights are compared
+ */
+DisplayBalanceState ClassifyDisplayBalance(const DisplayBalanceSnapshot* snapshot, bool failed, bool marker_current,
+                                           int reference_height, const std::optional<uint256>& reference_hash);
+
+/**
  * When the worker may start a slice (I4). It does not start one while the
  * validation interface has a callback queued or executing. So that a node
  * that is busy without pause still gets a balance, deference is bounded:
@@ -162,9 +201,11 @@ class WalletDisplayBalance
 public:
     //! A wallet that is not shown is recomputed at most this often.
     static constexpr int64_t BACKGROUND_MIN_INTERVAL_MS{60000};
-    //! Log line interval without and with an exact snapshot.
+    //! Log line interval while the snapshot is behind or missing, and otherwise.
     static constexpr int64_t SUMMARY_INTERVAL_STALE_MS{60000};
     static constexpr int64_t SUMMARY_INTERVAL_EXACT_MS{600000};
+    /** The state as the log line reports it. */
+    DisplayBalanceState State(int reference_height, const std::optional<uint256>& reference_hash) const;
     //! A pass that meets more deep outputs without a memo entry than this
     //! hands over to the memo warm-up.
     static constexpr uint64_t WARMUP_THRESHOLD{1024};

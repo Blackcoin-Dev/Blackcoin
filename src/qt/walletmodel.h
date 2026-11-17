@@ -378,6 +378,15 @@ public:
     //! height of the block it belongs to (-1 before the first balance).
     bool balanceIsStale() const { return m_balance_stale; }
     int balanceHeight() const { return m_balance_height; }
+    //! How the balance on screen stands against the wallet and the chain.
+    //! Only Behind is worth telling the user about: the balance is of an
+    //! older block than the wallet has processed. CurrentUnverified is the
+    //! right block with a newer wallet change on its way into the balance.
+    enum class BalanceState { None, Exact, CurrentUnverified, Behind, Failed };
+    BalanceState balanceState() const { return m_balance_state; }
+    //! The balance shown is of an older block than the node tip.
+    bool balanceIsBehind() const { return m_balance_state == BalanceState::Behind; }
+    static BalanceState ClassifyBalance(bool available, bool exact, bool failed, int snapshot_height, int node_tip_height);
     bool haveWatchOnly() const { return fHaveWatchOnly; }
 
     void setSendBalanceFamily(std::optional<interfaces::WalletDisplayCoinFamily> family);
@@ -481,6 +490,7 @@ private:
     //! Whether the balance shown is older than the wallet or the node tip,
     //! and the block it is the balance of.
     bool m_balance_stale{false};
+    BalanceState m_balance_state{BalanceState::None};
     int m_balance_height{-1};
     void applyDisplaySnapshot(const interfaces::WalletDisplayBalances& snapshot);
     std::optional<interfaces::WalletDisplayCoinFamily> m_requested_send_family;
@@ -604,6 +614,8 @@ Q_SIGNALS:
     void sendBalanceChanged();
     // The balance shown became stale (it is that of block `height`) or current again
     void balanceStaleChanged(bool stale, int height);
+    // The balance shown is older than the wallet's last block (behind) or no longer is
+    void balanceBehindChanged(bool behind, int height);
 
     /** Emitted on the GUI thread after a worker request completes or cancels. */
     void stakingMiningSnapshotReady(quint64 request_id, quint64 generation);

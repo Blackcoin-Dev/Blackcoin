@@ -8,6 +8,7 @@
 #include <interfaces/chain.h>
 #include <logging.h>
 #include <sync.h>
+#include <util/thread_qos.h>
 #include <util/threadnames.h>
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h>
@@ -60,6 +61,51 @@ std::shared_ptr<const DisplayBalanceSnapshot> WalletDisplayBalance::Snapshot() c
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_snapshot;
+}
+
+std::string DisplayBalanceState::ToString() const
+{
+    switch (status) {
+    case DisplayBalanceStatus::NONE: return "none";
+    case DisplayBalanceStatus::FAILED: return "failed";
+    case DisplayBalanceStatus::EXACT: return "exact";
+    case DisplayBalanceStatus::CURRENT_UNVERIFIED: return "current-unverified";
+    case DisplayBalanceStatus::BEHIND: return strprintf("behind(%d)", behind_blocks);
+    }
+    return "none";
+}
+
+int64_t DisplayBalanceState::SummaryIntervalMs() const
+{
+    return status == DisplayBalanceStatus::BEHIND || status == DisplayBalanceStatus::NONE
+        ? WalletDisplayBalance::SUMMARY_INTERVAL_STALE_MS : WalletDisplayBalance::SUMMARY_INTERVAL_EXACT_MS;
+}
+
+DisplayBalanceState ClassifyDisplayBalance(const DisplayBalanceSnapshot* snapshot, bool failed, bool marker_current,
+                                           int reference_height, const std::optional<uint256>& reference_hash)
+{
+    DisplayBalanceState state;
+    if (failed) {
+        state.status = DisplayBalanceStatus::FAILED;
+    } else if (!snapshot) {
+        state.status = DisplayBalanceStatus::NONE;
+    } else if (reference_height >= 0 &&
+               (snapshot->tip_height < reference_height ||
+                (reference_hash && *reference_hash != snapshot->tip_hash))) {
+        state.status = DisplayBalanceStatus::BEHIND;
+        state.behind_blocks = std::max(1, reference_height - snapshot->tip_height);
+    } else {
+        state.status = marker_current ? DisplayBalanceStatus::EXACT : DisplayBalanceStatus::CURRENT_UNVERIFIED;
+    }
+    return state;
+}
+
+DisplayBalanceState WalletDisplayBalance::State(int reference_height, const std::optional<uint256>& reference_hash) const
+{
+    const uint64_t marker = m_wallet.GetBalanceScanMarkerUnlocked();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return ClassifyDisplayBalance(m_snapshot.get(), m_failed, m_snapshot && m_snapshot->marker == marker,
+                                  reference_height, reference_hash);
 }
 
 bool WalletDisplayBalance::IsCurrent(const DisplayBalanceSnapshot& snapshot) const
@@ -275,13 +321,29 @@ void WalletDisplayBalance::Publish(std::shared_ptr<DisplayBalanceSnapshot> snaps
 
 void WalletDisplayBalance::MaybeLogSummary(int64_t now_ms)
 {
+    // The wallet's last processed block is the reference the snapshot is
+    // judged against. Only a try-lock: the line is advisory and the worker
+    // must not wait for a busy wallet. Without it the worker's own latest
+    // view of the tip height stands in (no hash to compare).
+    int reference_height{-1};
+    std::optional<uint256> reference_hash;
+    {
+        TRY_LOCK(m_wallet.cs_wallet, locked);
+        if (locked) {
+            if (const std::optional<int> height = m_wallet.GetLastBlockHeightIfSet()) {
+                reference_height = *height;
+                reference_hash = m_wallet.GetLastBlockHash();
+            }
+        }
+    }
     const uint64_t marker = m_wallet.GetBalanceScanMarkerUnlocked();
     std::string line;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        const bool exact = m_snapshot && m_snapshot->marker == marker;
-        const int64_t interval = exact ? SUMMARY_INTERVAL_EXACT_MS : SUMMARY_INTERVAL_STALE_MS;
-        if (now_ms - m_last_summary_ms < interval) return;
+        if (reference_height < 0) reference_height = m_last_seen_tip_height;
+        const DisplayBalanceState state = ClassifyDisplayBalance(
+            m_snapshot.get(), m_failed, m_snapshot && m_snapshot->marker == marker, reference_height, reference_hash);
+        if (now_ms - m_last_summary_ms < state.SummaryIntervalMs()) return;
         m_last_summary_ms = now_ms;
         const int snapshot_height = m_snapshot ? m_snapshot->tip_height : -1;
         const int age_blocks = m_snapshot && m_last_seen_tip_height >= 0
@@ -291,7 +353,7 @@ void WalletDisplayBalance::MaybeLogSummary(int64_t now_ms)
                          "warmup_remaining=%d warmup_walked_pct=%d "
                          "restarts_tip_moved=%d restarts_marker_moved=%d busy_deferrals=%d "
                          "lock_busy=%d not_synced=%d passes=%d failures=%d since_load_s=%d",
-                         m_wallet.GetName(), !m_snapshot ? "none" : exact ? "exact" : "stale",
+                         m_wallet.GetName(), state.ToString(),
                          snapshot_height, age_blocks,
                          m_counters.slices, m_counters.max_wallet_us / 1000.0, m_counters.max_main_us / 1000.0,
                          m_warmup_waiting, m_warmup_walked_percent,
@@ -763,6 +825,11 @@ bool DisplayBalanceWorker::WaitTurn(Entry& entry)
 void DisplayBalanceWorker::Run()
 {
     util::ThreadRename("guibalance");
+    // This worker computes the balance the window shows. It starts lazily
+    // from whichever thread first asked for a balance, so say explicitly that
+    // it is user-initiated work rather than inherit a lower class. A no-op
+    // off macOS.
+    util::SetCurrentThreadQosUserInitiated();
     std::unique_lock<std::mutex> lock(m_mutex);
     while (!m_stop) {
         const int64_t now_ms = WalletDisplayBalance::NowMs();

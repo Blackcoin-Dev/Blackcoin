@@ -24,6 +24,7 @@
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <key_io.h>
+#include <logging.h>
 #include <node/interface_ui.h>
 #include <psbt.h>
 #include <util/translation.h>
@@ -176,6 +177,7 @@ void WalletModel::requestHistory()
         m_history_requested = true;
         m_history_load = std::make_shared<HistoryLoad>();
         transactionTableModel->beginHistoryLoad();
+        LogPrint(BCLog::QT, "GUI history: requested for wallet \"%s\"\n", getWalletName().toStdString());
     }
     // The wallet being shown goes to the front of the line (it may already be the one running).
     if (HistoryActive() != this) {
@@ -270,9 +272,13 @@ void WalletModel::runHistoryChunk()
                 QTimer::singleShot(25, this, &WalletModel::runHistoryChunk);
                 return;
             }
-            if (hashes_read) transactionTableModel->reserveHistory(total);
+            if (hashes_read) {
+                transactionTableModel->reserveHistory(total);
+                LogPrint(BCLog::QT, "GUI history: wallet \"%s\" has %u transactions, reading in chunks\n", getWalletName().toStdString(), total);
+            }
             if (!rows.empty()) transactionTableModel->appendInitialHistory(std::move(rows));
             if (done) {
+                LogPrint(BCLog::QT, "GUI history: wallet \"%s\" read completely\n", getWalletName().toStdString());
                 m_deferred_history = false;
                 m_history_load.reset();
                 transactionTableModel->finishInitialHistoryStream();

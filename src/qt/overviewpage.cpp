@@ -331,6 +331,21 @@ void OverviewPage::setClientModel(ClientModel *model)
     }
 }
 
+void OverviewPage::updateHistoryState()
+{
+    if (!m_history_state) {
+        m_history_state = new QLabel(tr("Loading transactions…"), this);
+        m_history_state->setObjectName(QStringLiteral("overviewHistoryState"));
+        m_history_state->setWordWrap(true);
+        ui->verticalLayout->insertWidget(1, m_history_state);
+    }
+    const auto* history = walletModel ? walletModel->getTransactionTableModel() : nullptr;
+    const bool failed = history && history->historyLoadHasFailed();
+    if (failed) m_history_state->setText(tr("Transaction history could not be loaded."));
+    else m_history_state->setText(tr("Loading transactions…"));
+    m_history_state->setVisible(history && (failed || !history->isHistoryLoaded()));
+}
+
 void OverviewPage::setWalletModel(WalletModel *model)
 {
     if (walletModel) disconnect(walletModel, nullptr, this, nullptr);
@@ -344,12 +359,21 @@ void OverviewPage::setWalletModel(WalletModel *model)
         m_visibility->refresh();
         filter->setActive(m_visibility->active());
         filter->setSourceModel(model->getTransactionTableModel());
+        {
+            auto* history = model->getTransactionTableModel();
+            const auto refresh = [this, history] {
+                if (walletModel && walletModel->getTransactionTableModel() == history) updateHistoryState();
+            };
+            connect(history, &TransactionTableModel::historyLoaded, this, refresh);
+            connect(history, &TransactionTableModel::historyLoadFailed, this, refresh);
+        }
         filter->setSortRole(Qt::EditRole);
         filter->setShowInactive(false);
         filter->sort(TransactionTableModel::Date, Qt::DescendingOrder);
 
         ui->listTransactions->setModel(filter.get());
         ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
+        updateHistoryState();
 
         // Keep up to date with wallet
         setBalance(model->getCachedBalance());
@@ -368,6 +392,8 @@ void OverviewPage::setWalletModel(WalletModel *model)
             updateWatchOnlyLabels(showWatchOnly && !walletModel->wallet().privateKeysDisabled());
         });
     }
+
+    updateHistoryState();
 
     // update the display unit, to not use the default ("BTC")
     updateDisplayUnit();

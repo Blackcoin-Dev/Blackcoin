@@ -59,6 +59,9 @@ private:
     ClientModel* clientModel{nullptr};
     WalletModel* walletModel{nullptr};
     bool m_privacy{false};
+    //! Shown in place of the recent list while the wallet's history is being read.
+    QLabel* m_history_state{nullptr};
+    void updateHistoryState();
     QLabel* m_label_legacy_balance_text{nullptr};
     QLabel* m_label_legacy_balance{nullptr};
     QLabel* m_label_quantum_balance_text{nullptr};

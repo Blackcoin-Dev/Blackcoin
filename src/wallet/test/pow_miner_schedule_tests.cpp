@@ -474,6 +474,24 @@ BOOST_AUTO_TEST_CASE(periods_complete_when_no_proof_is_found)
     BOOST_CHECK(PowMiningClosePeriod(6s, 5s, false) == PowMiningPeriodClose::OPEN);
 }
 
+BOOST_AUTO_TEST_CASE(pending_claim_work_is_not_delayed_by_the_carried_debt)
+{
+    // After a retained claim (relay failure) or a same-anchor refresh the
+    // worker re-enters the gate on the same tip with claim work pending: below
+    // the ceilings nothing is slept, while without the pending mark the whole
+    // carried debt would be slept first (tens of seconds at 1%).
+    PowMiningDutyLedger ledger{1, 64s};
+    ledger.Charge(300ms, 5ms);
+    BOOST_CHECK(ledger.MayDefer());
+    BOOST_CHECK_GT(ledger.Plan(/*work_pending=*/false).remainder.count(), 30'000);
+    BOOST_CHECK_EQUAL(ledger.Plan(/*work_pending=*/true).excess.count(), 0);
+    BOOST_CHECK_EQUAL(ledger.Plan(/*work_pending=*/true).remainder.count(), 0);
+    // Above the ceilings it is the same bounded duty cycle as everywhere else.
+    ledger.Charge(500ms, 0ns);
+    BOOST_CHECK_GT(ledger.Plan(/*work_pending=*/true).excess.count(), 0);
+    BOOST_CHECK_EQUAL(ledger.Plan(/*work_pending=*/true).remainder.count(), 0);
+}
+
 BOOST_AUTO_TEST_CASE(tip_signal_wakes_waiters)
 {
     PowMinerTipSignal signal;

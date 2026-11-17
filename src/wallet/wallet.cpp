@@ -15846,6 +15846,10 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED) {
                     ++m_pow_claims_submitted;
                 } else {
+                    // The retained claim is retried through the gate on this
+                    // tip: carry the debt (within the ceilings) rather than
+                    // sleeping it all before worker zero can relay again.
+                    iteration_budget.SetWorkPending();
                     WalletLogPrintf(
                         "Gold Rush PoW worker %d retained a claim after relay failure; re-entering the typed family gate: %s\n",
                         worker_id, error.original);
@@ -15909,6 +15913,8 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                     }
                     PublishPowMiningWorkerState(
                         ShadowPowMiningStateForGate(refresh_reselection));
+                    // Same-anchor refresh continues on this tip.
+                    iteration_budget.SetWorkPending();
                     SleepPowMiner(*this, std::chrono::milliseconds{100});
                 } else if (wait_for_next_tip) {
                     ShadowPowClaimMiningGate wait_snapshot =

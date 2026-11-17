@@ -456,8 +456,13 @@ BOOST_FIXTURE_TEST_SUITE(reorg_scale_tests, TestChain100Setup)
 // twentieth of the size: nothing in either callback walks the history.
 BOOST_AUTO_TEST_CASE(tip_reorg_work_follows_the_block_not_the_history)
 {
+    // The sizes can be lowered for a build with SHADOW_POW_CLAIM_INDEX_SELFCHECK,
+    // which recounts the whole claim index after every update (quadratic):
+    // REORG_SCALE_BLOCKS=1200 REORG_SCALE_SMALL_BLOCKS=300.
     const int large_blocks = EnvInt("REORG_SCALE_BLOCKS", 51000);
-    const int small_blocks = 2500;
+    const int small_blocks = EnvInt("REORG_SCALE_SMALL_BLOCKS", 2500);
+    BOOST_REQUIRE_GT(small_blocks, 200);
+    BOOST_REQUIRE_GT(large_blocks, small_blocks);
     const int stake_every = EnvInt("REORG_SCALE_STAKE_EVERY", 10);
 
     const ReorgOutcome small = DisconnectAndReconnectTip(*m_node.chain, "reorg-scale-small", small_blocks, stake_every);
@@ -473,7 +478,7 @@ BOOST_AUTO_TEST_CASE(tip_reorg_work_follows_the_block_not_the_history)
                            << " commits=" << outcome->new_commits << " rows=" << outcome->new_rows
                            << ", foreign ms=" << outcome->foreign_ms << ", dirty records after=" << outcome->dirtied_by_mempool);
     }
-    BOOST_CHECK_GT(large.records, 100000U);
+    if (large_blocks >= 51000) BOOST_CHECK_GT(large.records, 100000U);
 
     // Nothing proportional to the history: the same counts on both wallets.
     BOOST_CHECK_EQUAL(large.work.memo_entries_visited, small.work.memo_entries_visited);

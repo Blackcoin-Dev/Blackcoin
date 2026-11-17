@@ -358,6 +358,11 @@ struct ShadowPowClaimInventory {
 ShadowPowClaimInventory BuildShadowPowClaimCompatibilityInventory(
     const ShadowPowClaimRecoveryInventory& recovery_inventory);
 
+/** True when an output with this script could ever be a staking candidate: a quantum
+ * migration or cold-stake program, or one of the four legacy kernel script types.
+ * A pure function of the script. */
+bool IsStakeCandidateScript(const CScript& script);
+
 /** One confirmed synthetic Gold Rush payout record, as hashed into a SyntheticPayoutCheckpoint. */
 struct SyntheticPayoutRef {
     uint256 txid;
@@ -935,6 +940,14 @@ private:
     // by both legacy staking and claim selection are omitted. Dynamic wallet
     // policy and ownership are deliberately evaluated by the warm scan.
     std::set<COutPoint> m_live_unspent_legacy_claim_outpoints GUARDED_BY(cs_wallet);
+    // Ordered subset of the broad live index whose output script is of a kind
+    // the staker can ever use (a quantum migration or cold-stake program, or a
+    // PUBKEY, PUBKEYHASH, witness v0 keyhash or taproot script). The script is
+    // immutable for an outpoint, so membership only follows the live index.
+    // Ownership, maturity, lock, lineage and every other dynamic policy still
+    // run in AvailableCoinsForStaking; this only keeps outputs that could
+    // never pass the script test out of the per-slot walk.
+    std::set<COutPoint> m_live_unspent_stake_candidate_outpoints GUARDED_BY(cs_wallet);
     std::optional<ShadowPowClaimStakeReserveInfo>
         m_cached_shadow_pow_claim_stake_reserve GUARDED_BY(cs_wallet);
     /** Every observable live-index membership change advances this value.
@@ -1935,6 +1948,12 @@ public:
         return m_live_unspent_stake_outpoints;
     }
 
+    /** Live outpoints whose script is of a stakable kind; see the member. */
+    const std::set<COutPoint>& GetLiveUnspentStakeCandidateOutpoints() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_live_unspent_stake_candidate_outpoints;
+    }
+
     const std::set<COutPoint>& GetLiveUnspentLegacyClaimOutpoints() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         return m_live_unspent_legacy_claim_outpoints;
@@ -2024,6 +2043,17 @@ public:
     {
         LOCK(cs_wallet);
         return m_live_unspent_stake_outpoints.size();
+    }
+
+    /** Log the live legacy claim-source count against its capacity: always when `force`, else
+     *  at most once an hour. From 75% of the capacity the line is a warning. */
+    void ReportLegacyClaimSourceCapacity(bool force) EXCLUSIVE_LOCKS_REQUIRED(!cs_wallet);
+
+    /** O(1) count of live outputs whose script could stake (the per-slot scan size). */
+    size_t GetLiveUnspentStakeCandidateCount() const
+    {
+        LOCK(cs_wallet);
+        return m_live_unspent_stake_candidate_outpoints.size();
     }
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */

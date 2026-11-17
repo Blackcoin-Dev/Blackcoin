@@ -1164,8 +1164,9 @@ void PoSMiner(CWallet *pwallet)
             }
         }
 
-        pwallet->WalletLogPrintf("Set proof-of-stake timeout: %ums; %u live wallet outputs indexed for staking\n",
-                                 pos_timio, pwallet->GetLiveUnspentStakeOutputCount());
+        pwallet->WalletLogPrintf("Set proof-of-stake timeout: %ums; %u live wallet outputs indexed for staking (%u with a stakable script scanned per slot)\n",
+                                 pos_timio, pwallet->GetLiveUnspentStakeOutputCount(),
+                                 pwallet->GetLiveUnspentStakeCandidateCount());
     }
 
     unsigned int assembly_failures{0};

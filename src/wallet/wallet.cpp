@@ -141,6 +141,15 @@ bool IsShadowPowMiningTarget(const CScript& script)
 }
 } // namespace
 
+bool IsStakeCandidateScript(const CScript& script)
+{
+    if (IsQuantumMigrationScript(script) || IsQuantumColdStakeScript(script)) return true;
+    std::vector<std::vector<unsigned char>> solutions;
+    const TxoutType type = Solver(script, solutions);
+    return type == TxoutType::PUBKEY || type == TxoutType::PUBKEYHASH ||
+           type == TxoutType::WITNESS_V0_KEYHASH || type == TxoutType::WITNESS_V1_TAPROOT;
+}
+
 void SetPowMinerWorkerCreationFailureAfterForTesting(int created_workers)
 {
     g_pow_miner_worker_creation_failure_after_for_testing.store(
@@ -2029,6 +2038,13 @@ void CWallet::RefreshLiveUnspentStakeOutpoint(const COutPoint& outpoint)
                           wallet_tx->second.tx->vout[outpoint.n].scriptPubKey)
         ? m_live_unspent_legacy_claim_outpoints.insert(outpoint).second
         : m_live_unspent_legacy_claim_outpoints.erase(outpoint) != 0;
+    // The candidate subset follows live membership; it never changes the
+    // generation because it adds no observable state beyond the live index.
+    if (live && IsStakeCandidateScript(wallet_tx->second.tx->vout[outpoint.n].scriptPubKey)) {
+        m_live_unspent_stake_candidate_outpoints.insert(outpoint);
+    } else {
+        m_live_unspent_stake_candidate_outpoints.erase(outpoint);
+    }
     if (changed && ++m_live_unspent_stake_generation == 0) {
         ++m_live_unspent_stake_generation;
     }
@@ -2040,6 +2056,7 @@ bool CWallet::EraseLiveUnspentStakeOutpointForDrift(
     AssertLockHeld(cs_wallet);
     bool changed = m_live_unspent_stake_outpoints.erase(outpoint) != 0;
     changed |= m_live_unspent_legacy_claim_outpoints.erase(outpoint) != 0;
+    m_live_unspent_stake_candidate_outpoints.erase(outpoint);
     if (!changed) return false;
     if (++m_live_unspent_stake_generation == 0) {
         ++m_live_unspent_stake_generation;
@@ -2095,18 +2112,23 @@ void CWallet::RecomputeLiveUnspentStakeOutpoints()
     AssertLockHeld(cs_wallet);
     std::set<COutPoint> rebuilt;
     std::set<COutPoint> legacy_rebuilt;
+    std::set<COutPoint> candidate_rebuilt;
     for (const auto& [txid, wtx] : mapWallet) {
         if (!wtx.tx) continue;
         for (uint32_t output = 0; output < wtx.tx->vout.size(); ++output) {
             const COutPoint outpoint{txid, output};
             if (!IsSpentForStakeIndex(outpoint)) {
                 rebuilt.insert(outpoint);
+                if (IsStakeCandidateScript(wtx.tx->vout[output].scriptPubKey)) {
+                    candidate_rebuilt.insert(outpoint);
+                }
                 if (IsShadowPowMiningTarget(wtx.tx->vout[output].scriptPubKey)) {
                     legacy_rebuilt.insert(outpoint);
                 }
             }
         }
     }
+    m_live_unspent_stake_candidate_outpoints = std::move(candidate_rebuilt);
     if (rebuilt != m_live_unspent_stake_outpoints ||
         legacy_rebuilt != m_live_unspent_legacy_claim_outpoints) {
         m_live_unspent_stake_outpoints = std::move(rebuilt);
@@ -6646,6 +6668,8 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
             live_index_changed |=
                 m_live_unspent_legacy_claim_outpoints.erase(
                     COutPoint{hash, output}) != 0;
+            m_live_unspent_stake_candidate_outpoints.erase(
+                COutPoint{hash, output});
         }
         if (live_index_changed && ++m_live_unspent_stake_generation == 0) {
             ++m_live_unspent_stake_generation;

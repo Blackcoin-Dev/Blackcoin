@@ -2004,19 +2004,19 @@ struct StakeCandidateScanContext
     bool lineage_active;
     bool final_quantum_lockout;
     bool spend_state_prevalidated{false};
+    // True when the caller walks only outputs that already passed IsStakeCandidateScript.
+    bool script_class_prevalidated{false};
     std::set<uint256> trusted_parents;
     std::map<uint256, StakeTransactionEligibility> transaction_eligibility;
 };
 
 /**
- * Authoritative producer-side staking eligibility check. The wallet index is
- * intentionally only a live-unspent prefilter; every mutable policy and phase
- * rule is evaluated here for both stake weight and kernel selection.
- *
- * Gold Rush synthetic payout maturity remains output-specific, so that
- * exception is evaluated below rather than cached as transaction eligibility.
+ * The staking eligibility predicate exactly as it stood before the per-slot
+ * scan was narrowed (same conjuncts, same order, eager solvability). It is only
+ * used by AvailableCoinsForStakingReference so tests can prove the narrowed
+ * scan selects the identical set.
  */
-static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpoint,
+static bool EvaluateStakeCandidateReference(const CWallet& wallet, const COutPoint& outpoint,
                                    const CWalletTx& wtx, StakeCandidateScanContext& context,
                                    bool& spendable)
 {
@@ -2108,6 +2108,113 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
     return true;
 }
 
+/**
+ * Authoritative producer-side staking eligibility check. The wallet index is
+ * intentionally only a live-unspent, stakable-script prefilter; every mutable
+ * policy and phase rule is evaluated here for both stake weight and kernel
+ * selection.
+ *
+ * Gold Rush synthetic payout maturity remains output-specific, so that
+ * exception is evaluated below rather than cached as transaction eligibility.
+ *
+ * The result is the conjunction of independent side-effect-free tests. They
+ * run cheapest first (amount, lock, ownership) so an output that cannot stake
+ * never reaches the chain-view lookups, and solvability, which builds a
+ * signing provider, is only computed when it can change the answer.
+ */
+static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpoint,
+                                   const CWalletTx& wtx, StakeCandidateScanContext& context,
+                                   bool& spendable)
+{
+    spendable = false;
+    if (!wtx.tx || outpoint.n >= wtx.tx->vout.size()) return false;
+
+    const CTxOut& output = wtx.tx->vout[outpoint.n];
+    if (output.nValue < wallet.m_min_staking_amount ||
+        output.nValue < context.params.min_amount ||
+        output.nValue > context.params.max_amount) {
+        return false;
+    }
+    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked) return false;
+
+    const bool quantum_output = IsQuantumMigrationScript(output.scriptPubKey) ||
+                                IsQuantumColdStakeScript(output.scriptPubKey);
+    if ((quantum_output && !context.lineage_active) ||
+        (context.final_quantum_lockout && !quantum_output)) {
+        return false;
+    }
+
+    // CreateCoinStake can only construct kernels for these legacy types. Keep
+    // status weight and actual kernel selection on the same candidate set.
+    if (!quantum_output && !context.script_class_prevalidated &&
+        !IsStakeCandidateScript(output.scriptPubKey)) {
+        return false;
+    }
+
+    const isminetype mine = wallet.IsMine(output);
+    if (mine == ISMINE_NO) return false;
+    if (!context.allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) return false;
+
+    // Without watch-only access the result cannot depend on solvability.
+    const bool watch_only_allowed = (mine & ISMINE_WATCH_ONLY) != ISMINE_NO &&
+        context.coin_control && context.coin_control->fAllowWatchOnly;
+    const bool mine_spendable = (mine & ISMINE_SPENDABLE) != ISMINE_NO;
+    if (!mine_spendable && !watch_only_allowed && context.params.only_spendable) return false;
+
+    auto [eligibility, inserted] = context.transaction_eligibility.emplace(
+        wtx.GetHash(), StakeTransactionEligibility{});
+    if (inserted) {
+        const int depth = wallet.GetTxDepthInMainChain(wtx);
+        const bool active = depth >= 0 &&
+            !(depth == 0 && !wtx.InMempool()) &&
+            depth >= context.min_depth && depth <= context.max_depth &&
+            CachedTxIsTrusted(wallet, wtx, context.trusted_parents);
+        eligibility->second = {active, wallet.IsTxImmature(wtx)};
+    }
+    if (!eligibility->second.active) return false;
+    if (eligibility->second.immature &&
+        !IsNextBlockMatureGoldRushPayout(wallet, outpoint, context.spend_height, context.spend_time)) {
+        return false;
+    }
+
+    // The exact live-unspent index should make this redundant. Keep the check
+    // as a fail-closed invariant guard if a future wallet mutation path is
+    // introduced without an index hook.
+    if (!context.spend_state_prevalidated && wallet.IsSpent(outpoint)) {
+        return false;
+    }
+
+    if (context.lineage_active) {
+        const Coin& coin = wallet.chain().getCoinsTip().AccessCoin(outpoint);
+        if (coin.IsSpent() || !IsWalletProtectedLineageInput(
+                wallet, outpoint, coin, context.consensus,
+                context.spend_time, context.spend_height)) {
+            return false;
+        }
+    }
+
+    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey) ||
+        IsDemurrageLockedStakeCandidate(wallet, outpoint, output.scriptPubKey,
+                                        context.spend_height, context.spend_time) ||
+        context.protected_rgb_seals.count(outpoint)) {
+        return false;
+    }
+
+    bool solvable = quantum_output;
+    if (!mine_spendable && watch_only_allowed && !solvable) {
+        std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
+        if (provider) {
+            if (auto desc = InferDescriptor(output.scriptPubKey, *provider)) {
+                solvable = desc->IsSolvable();
+            }
+        }
+    }
+    spendable = mine_spendable || (watch_only_allowed && solvable);
+    if (!spendable && context.params.only_spendable) return false;
+
+    return true;
+}
+
 BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
     const CWallet& wallet,
     const std::vector<BoundedLegacyStakeSource>& sources,
@@ -2142,6 +2249,7 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
         /*lineage_active=*/false,
         /*final_quantum_lockout=*/false,
         /*spend_state_prevalidated=*/true,
+        /*script_class_prevalidated=*/false,
         {},
         {},
     };
@@ -2178,7 +2286,8 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
     return result;
 }
 
-void AvailableCoinsForStaking(const CWallet& wallet,
+template <bool REFERENCE>
+static void AvailableCoinsForStakingImpl(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl,
                            const CoinFilterParams& params)
@@ -2215,16 +2324,25 @@ void AvailableCoinsForStaking(const CWallet& wallet,
         lineage_active,
         consensus.IsQuantumFinalLockout(spend_time, spend_height),
         /*spend_state_prevalidated=*/false,
+        /*script_class_prevalidated=*/!REFERENCE,
         {},
         {},
     };
 
-    for (const COutPoint& outpoint : wallet.GetLiveUnspentStakeOutpoints()) {
+    // The candidate subset holds exactly the live outpoints whose script can
+    // stake, in the same order, so the selected set equals a walk of the full
+    // live index; the reference path walks the full index to prove that.
+    const std::set<COutPoint>& scan_set = REFERENCE ? wallet.GetLiveUnspentStakeOutpoints()
+                                                    : wallet.GetLiveUnspentStakeCandidateOutpoints();
+    for (const COutPoint& outpoint : scan_set) {
         const auto wallet_tx = wallet.mapWallet.find(outpoint.hash);
         if (wallet_tx == wallet.mapWallet.end()) continue;
 
         bool spendable{false};
-        if (!EvaluateStakeCandidate(wallet, outpoint, wallet_tx->second, context, spendable)) continue;
+        const bool evaluated = REFERENCE
+            ? EvaluateStakeCandidateReference(wallet, outpoint, wallet_tx->second, context, spendable)
+            : EvaluateStakeCandidate(wallet, outpoint, wallet_tx->second, context, spendable);
+        if (!evaluated) continue;
 
         const CTxOut& output = wallet_tx->second.tx->vout[outpoint.n];
         if (spendable) vCoins.emplace_back(&wallet_tx->second, outpoint.n);
@@ -2233,6 +2351,22 @@ void AvailableCoinsForStaking(const CWallet& wallet,
         if (params.min_sum_amount != MAX_MONEY && nTotal >= params.min_sum_amount) return;
         if (params.max_count > 0 && vCoins.size() >= params.max_count) return;
     }
+}
+
+void AvailableCoinsForStaking(const CWallet& wallet,
+                           std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
+                           const CCoinControl* coinControl,
+                           const CoinFilterParams& params)
+{
+    AvailableCoinsForStakingImpl</*REFERENCE=*/false>(wallet, vCoins, coinControl, params);
+}
+
+void AvailableCoinsForStakingReference(const CWallet& wallet,
+                           std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
+                           const CCoinControl* coinControl,
+                           const CoinFilterParams& params)
+{
+    AvailableCoinsForStakingImpl</*REFERENCE=*/true>(wallet, vCoins, coinControl, params);
 }
 
 // Select some coins without random shuffle or best subset approximation

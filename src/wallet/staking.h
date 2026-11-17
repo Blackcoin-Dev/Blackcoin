@@ -41,6 +41,12 @@ void AvailableCoinsForStaking(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl = nullptr,
                            const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+/** The pre-index-narrowing scan (full live index, original predicate order).
+ * Only for tests and benchmarks proving AvailableCoinsForStaking selects the same set. */
+void AvailableCoinsForStakingReference(const CWallet& wallet,
+                           std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
+                           const CCoinControl* coinControl = nullptr,
+                           const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 /** Evaluate the same authoritative per-output staking predicate for legacy
  * candidates at an already captured Gold Rush chain tuple. The phase
  * precondition is checked by the implementation before walking the bounded

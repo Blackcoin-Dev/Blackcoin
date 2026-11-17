@@ -1985,11 +1985,34 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         }
 #endif
 
+        // Every phase is timed and reported in one line at the end, so a slow
+        // wallet load can be attributed to a phase from the default log.
+        const auto elapsed_ms = [](SteadyClock::time_point since) {
+            return Ticks<std::chrono::milliseconds>(SteadyClock::now() - since);
+        };
+        auto phase_start = SteadyClock::now();
+        const auto lap = [&]() {
+            const int64_t ms = elapsed_ms(phase_start);
+            phase_start = SteadyClock::now();
+            return ms;
+        };
+        struct PhaseReport {
+            int64_t legacy{0}, descriptors{0}, quantum{0}, address_book{0}, transactions{0}, active_spkms{0}, decryption{0};
+            size_t tx_count{0};
+        } phases;
+        const auto report_phases = [&]() {
+            pwallet->WalletLogPrintf("Wallet load phases (ms): legacy keys %d, descriptors %d, quantum and RGB records %d, address book %d, %u transactions %d, active script managers %d, decryption keys %d\n",
+                                     phases.legacy, phases.descriptors, phases.quantum, phases.address_book,
+                                     phases.tx_count, phases.transactions, phases.active_spkms, phases.decryption);
+        };
+
         // Load legacy wallet keys
         result = std::max(LoadLegacyWalletRecords(pwallet, *m_batch, last_client), result);
+        phases.legacy = lap();
 
         // Load descriptors
         result = std::max(LoadDescriptorWalletRecords(pwallet, *m_batch, last_client), result);
+        phases.descriptors = lap();
         // Early return if there are unknown descriptors. Later loading of ACTIVEINTERNALSPK and ACTIVEEXTERNALEXPK
         // may reference the unknown descriptor's ID which can result in a misleading corruption error
         // when in reality the wallet is simply too new.
@@ -1998,18 +2021,25 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         // Load Quantum Quasar wallet-managed ML-DSA migration keys. These are wallet-wide
         // private keys, not legacy ScriptPubKeyMan records.
         result = std::max(LoadQuantumWalletRecords(pwallet, *m_batch), result);
+        phases.quantum = lap();
 
         // Load address book
         result = std::max(LoadAddressBookRecords(pwallet, *m_batch), result);
+        phases.address_book = lap();
 
         // Load tx records
         result = std::max(LoadTxRecords(pwallet, *m_batch, upgraded_txs, any_unordered), result);
+        phases.transactions = lap();
+        phases.tx_count = pwallet->mapWallet.size();
 
         // Load SPKMs
         result = std::max(LoadActiveSPKMs(pwallet, *m_batch), result);
+        phases.active_spkms = lap();
 
         // Load decryption keys
         result = std::max(LoadDecryptionKeys(pwallet, *m_batch), result);
+        phases.decryption = lap();
+        report_phases();
         if (result <= DBErrors::NONCRITICAL_ERROR) {
             if (!pwallet->mapMasterKeys.empty() && pwallet->HasPlaintextQuantumKeys()) {
                 pwallet->WalletLogPrintf("Error reading wallet database: encrypted wallet contains plaintext Quantum Quasar private keys\n");

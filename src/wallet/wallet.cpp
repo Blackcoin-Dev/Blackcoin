@@ -90,6 +90,7 @@
 #include <wallet/db.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/fees.h>
+#include <wallet/scheduler_stats.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/spend.h>
@@ -2544,6 +2545,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     RefreshShadowPowClaimIndexEntryLocked(wtx);
 
     // Mark inactive coinbase and coinstake transactions and their descendants as abandoned
+    bool descendants_rewritten{false};
     if ((wtx.IsCoinBase() || wtx.IsCoinStake()) && wtx.isInactive()) {
         std::vector<std::pair<CWalletTx*, bool>> txs{{&wtx, false}};
 
@@ -2581,6 +2583,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
             // Break caches since we have changed the state
             desc_tx->MarkDirty();
             batch.WriteTx(*desc_tx);
+            descendants_rewritten = true;
             MarkInputsDirty(desc_tx->tx);
             for (unsigned int i = 0; i < desc_tx->tx->vout.size(); ++i) {
                 COutPoint outpoint(desc_tx->GetHash(), i);
@@ -2605,8 +2608,12 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     UpdateConfirmedSyntheticPayoutIndex(wtx);
     RefreshLiveUnspentStakeOutpoints(wtx);
 
-    //// debug print
-    WalletLogPrintf("AddToWallet %s  %s%s %s\n", hash.ToString(), (fInsertedNew ? "new" : ""), (fUpdated ? "update" : ""), TxStateString(state));
+    // A re-add that changes nothing (a rescan or a repeated callback for a
+    // record the wallet already holds in this state) is not logged.
+    const bool record_changed = fInsertedNew || fUpdated || descendants_rewritten;
+    if (record_changed) {
+        WalletLogPrintf("AddToWallet %s  %s%s %s\n", hash.ToString(), (fInsertedNew ? "new" : ""), (fUpdated ? "update" : ""), TxStateString(state));
+    }
 
     // Write to disk
     if (fInsertedNew || fUpdated) {
@@ -2628,6 +2635,8 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     }
 
     // Notify UI of new or updated transaction
+    // Announced even when nothing changed: the GUI refresh, -walletnotify
+    // after a rescan and the wallet unit and functional tests rely on it.
     NotifyTransactionChanged(hash, fInsertedNew ? CT_NEW : CT_UPDATED);
 
 #if HAVE_SYSTEM
@@ -3034,7 +3043,9 @@ void CWallet::SyncTransaction(const CTransactionRef& ptx, const SyncTxState& sta
 }
 
 void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
+    WalletCallbackTimer lock_timer{WalletCallbackKind::MEMPOOL_ADDED};
     LOCK(cs_wallet);
+    lock_timer.LockAcquired();
     // Every mempool transaction of the network arrives here, for every loaded
     // wallet. The balance scan marker moves only when this wallet's state can
     // change: SyncTransaction bumps (AddToWallet, MarkInputsDirty) when the
@@ -3127,7 +3138,9 @@ void CWallet::transactionSubmittedByRpc(const CTransactionRef& tx)
 }
 
 void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason) {
+    WalletCallbackTimer lock_timer{WalletCallbackKind::MEMPOOL_REMOVED};
     LOCK(cs_wallet);
+    lock_timer.LockAcquired();
     // As above: only a wallet transaction changes wallet state here (the
     // CONFLICT path below goes through SyncTransaction, which bumps when the
     // transaction is, or turns out to be, ours).
@@ -3203,6 +3216,28 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
     }
 }
 
+void CWallet::PersistBlockProgress(WalletBatch& batch, const CBlockLocator& locator, bool atomic_with_block,
+                                   const uint256& block_hash, int block_height)
+{
+    AssertLockHeld(cs_wallet);
+    // Only inside the block's single commit scope: the best block then moves
+    // in the same commit as the block's records, so a crash leaves either both
+    // or neither and the wallet never claims a block whose records it lost.
+    // Without a scope (a database that cannot group writes) the old rule holds
+    // and the best block advances only on a chainstate flush.
+    if (!atomic_with_block || m_attaching_chain || locator.IsNull()) return;
+    if (!batch.WriteBestBlock(locator)) {
+        WalletLogPrintf("Failed to persist the best block %s (height %d); the next flush will record it\n",
+                        block_hash.ToString(), block_height);
+        return;
+    }
+    // The block's payouts were authenticated against the chainstate when they
+    // were recorded above, so the payout checkpoint may move with the block.
+    if (m_synthetic_payout_checkpoint_trusted) {
+        WriteSyntheticPayoutCheckpoint(batch, block_hash, block_height);
+    }
+}
+
 void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& block)
 {
     if (role == ChainstateRole::BACKGROUND) {
@@ -3213,6 +3248,11 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     const BlockConnectActivityScope block_connect_activity;
     const WalletBlockTime block_time{block.data->GetBlockTime(), block.chain_time_max};
     const std::vector<ShadowSyntheticPayoutTransaction> shadow_payout_txs = GetWalletShadowPayoutTransactions(*this, block);
+    // The locator that records this block as the wallet's best block. It is
+    // built from the block itself (not the current tip, which may already be
+    // ahead of this callback) and before cs_wallet is taken, because it needs
+    // cs_main.
+    const CBlockLocator best_block_locator = HaveChain() ? chain().getDenseChainLocator(block.hash) : CBlockLocator{};
     std::set<COutPoint> authenticated_shadow_payouts;
     for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
         if (payout.tx && !payout.tx->vout.empty()) {
@@ -3220,7 +3260,9 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         }
     }
     {
+    WalletCallbackTimer lock_timer{WalletCallbackKind::BLOCK_CONNECTED};
     LOCK(cs_wallet);
+    lock_timer.LockAcquired();
     BumpBalanceScanMarker();
 
     m_last_block_processed_height = block.height;
@@ -3256,6 +3298,7 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     // No need to scan block if it was created before the wallet birthday.
     // Uses chain max time and twice the grace period to adjust time for block time variability.
     if (block.chain_time_max < m_birth_time.load() - (TIMESTAMP_WINDOW * 2)) {
+        PersistBlockProgress(batch, best_block_locator, block_writes != nullptr, block.hash, block.height);
         commit_block_writes();
         return;
     }
@@ -3334,6 +3377,7 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
             },
             "mark connected-block claim quarantine");
     }
+    PersistBlockProgress(batch, best_block_locator, block_writes != nullptr, block.hash, block.height);
     commit_block_writes();
     }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a block connects.
@@ -3344,7 +3388,9 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     assert(block.data);
     const BlockConnectActivityScope block_connect_activity;
     {
+    WalletCallbackTimer lock_timer{WalletCallbackKind::BLOCK_DISCONNECTED};
     LOCK(cs_wallet);
+    lock_timer.LockAcquired();
     BumpBalanceScanMarker();
 
     // At block disconnection, this will change an abandoned transaction to
@@ -4205,14 +4251,20 @@ int64_t CWallet::RescanFromTime(int64_t startTime, const WalletRescanReserver& r
  * the main chain after to the addition of any new keys you want to detect
  * transactions for.
  */
-CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate, const bool save_progress)
+CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate, const bool save_progress, const bool wallet_lock_held)
 {
     constexpr auto INTERVAL_TIME{60s};
     auto current_time{reserver.now()};
     auto start_time{reserver.now()};
 
     assert(reserver.isReserved());
-    WITH_LOCK(cs_wallet, ClearOutputLifecycleMemo());
+    // The lifecycle memo is keyed by outpoint and checked against the
+    // confirming block's hash and height on every lookup. A scan from
+    // start_height only revisits transactions confirmed at or above it, so
+    // only those entries can be stale; a catch-up scan of the last few
+    // blocks leaves the deep entries (the ones worth keeping) alone. A scan
+    // from height 0 still drops everything.
+    WITH_LOCK(cs_wallet, EraseOutputLifecycleMemoFromHeight(start_height));
 
     uint256 block_hash = start_block;
     ScanResult result;
@@ -4232,6 +4284,12 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
     double progress_end = chain().guessVerificationProgress(end_hash);
     double progress_current = progress_begin;
     int block_height = start_height;
+    // With cs_wallet held for the whole scan the database writes of a batch of
+    // blocks share one commit (and the progress locator is written in it);
+    // otherwise each block commits on its own inside its own lock scope.
+    constexpr size_t RESCAN_BATCH_BLOCKS{64};
+    std::unique_ptr<DatabaseBulkScope> batch_scope;
+    size_t batch_blocks{0};
     while (!fAbortRescan && !chain().shutdownRequested()) {
         if (progress_end - progress_begin > 0.0) {
             m_scanning_progress = (progress_current - progress_begin) / (progress_end - progress_begin);
@@ -4294,9 +4352,10 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                         authenticated_shadow_payouts.emplace(payout.tx->GetHash(), 0);
                     }
                 }
+                const bool batch_boundary = wallet_lock_held && batch_blocks + 1 >= RESCAN_BATCH_BLOCKS;
                 std::optional<CBlockLocator> progress_locator;
-                if (save_progress && next_interval) {
-                    CBlockLocator locator = m_chain->getActiveChainLocator(block_hash);
+                if (save_progress && (next_interval || batch_boundary)) {
+                    CBlockLocator locator = m_chain->getDenseChainLocator(block_hash);
                     if (!locator.IsNull()) progress_locator = std::move(locator);
                 }
                 LOCK(cs_wallet);
@@ -4306,6 +4365,12 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                     result.last_failed_block = block_hash;
                     result.status = ScanResult::FAILURE;
                     break;
+                }
+                std::unique_ptr<DatabaseBulkScope> block_scope;
+                if (wallet_lock_held) {
+                    if (!batch_scope) batch_scope = GetDatabase().MakeBulkScope();
+                } else {
+                    block_scope = GetDatabase().MakeBulkScope();
                 }
                 WalletBatch batch(GetDatabase());
                 if (!ReconcileWalletShadowPayoutsForBlock(
@@ -4343,6 +4408,15 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                     WalletBatch batch(GetDatabase());
                     batch.WriteBestBlock(*progress_locator);
                 }
+                ++batch_blocks;
+                if (batch_scope && batch_boundary) {
+                    // The batch's records and its progress locator become durable together.
+                    if (!batch_scope->Commit()) {
+                        WalletLogPrintf("Failed to persist the wallet writes of the rescan batch ending at block %d\n", block_height);
+                    }
+                    batch_scope.reset();
+                    batch_blocks = 0;
+                }
             } else {
                 // could not scan block, keep scanning but record this block as the most recent failure
                 result.last_failed_block = block_hash;
@@ -4373,6 +4447,8 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
             }
         }
     }
+    // Commit the last, partial batch before anything else reads the wallet.
+    batch_scope.reset();
     if (!max_height) {
         WalletLogPrintf("Scanning current mempool transactions.\n");
         chain().requestMempoolTransactions(*this);
@@ -6347,6 +6423,7 @@ DBErrors CWallet::LoadWallet()
     std::set<uint256> synthetic_payout_blocks;
     std::vector<SyntheticPayoutRef> synthetic_payout_refs;
     std::optional<SyntheticPayoutCheckpoint> payout_checkpoint;
+    const auto load_start{SteadyClock::now()};
     {
         LOCK(cs_wallet);
         WalletBatch load_batch(GetDatabase());
@@ -6368,6 +6445,7 @@ DBErrors CWallet::LoadWallet()
             if (payout_checkpoint) synthetic_payout_refs = CollectSyntheticPayoutRefs();
         }
     }
+    const auto db_done{SteadyClock::now()};
 
     // Snapshot every referenced block against one active-chain view without
     // holding cs_wallet. Keeping database loading, chain lookup, and wallet
@@ -6451,12 +6529,13 @@ DBErrors CWallet::LoadWallet()
             }
             authenticated_shadow_payouts.emplace(block_hash, std::move(block_payouts));
         }
-        if (!synthetic_payout_blocks.empty()) {
-            WalletLogPrintf("Gold Rush payout check: %u payout blocks authenticated, %u already verified through height %d, took %d ms\n",
-                            blocks_to_authenticate, blocks_verified, verified_through_height,
-                            Ticks<std::chrono::milliseconds>(SteadyClock::now() - authentication_start));
-        }
+        // Always logged, also when there was nothing to authenticate, so the
+        // cost of this step (it runs under cs_main) is visible on every load.
+        WalletLogPrintf("Gold Rush payout check: %u payout blocks authenticated, %u already verified through height %d, took %d ms\n",
+                        blocks_to_authenticate, blocks_verified, verified_through_height,
+                        Ticks<std::chrono::milliseconds>(SteadyClock::now() - authentication_start));
     }
+    const auto chain_snapshot_done{SteadyClock::now()};
 
     LOCK(cs_wallet);
     bool reconciliation_write_ok{true};
@@ -6490,6 +6569,10 @@ DBErrors CWallet::LoadWallet()
                 reconciliation_write_ok;
         }
     }
+    WalletLogPrintf("Wallet load: %d ms reading the database, %d ms chain snapshot and payout check, %d ms reconciling wallet records\n",
+                    Ticks<std::chrono::milliseconds>(db_done - load_start),
+                    Ticks<std::chrono::milliseconds>(chain_snapshot_done - db_done),
+                    Ticks<std::chrono::milliseconds>(SteadyClock::now() - chain_snapshot_done));
     if (!reconciliation_write_ok) {
         WalletLogPrintf("Failed to persist one or more synthetic Gold Rush payout reconciliation updates while loading the wallet\n");
         if (static_cast<int>(nLoadWalletRet) < static_cast<int>(DBErrors::NONCRITICAL_ERROR)) {
@@ -9275,7 +9358,7 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
 
         {
             WalletRescanReserver reserver(*walletInstance);
-            if (!reserver.reserve() || (ScanResult::SUCCESS != walletInstance->ScanForWalletTransactions(chain.getBlockHash(rescan_height), rescan_height, /*max_height=*/{}, reserver, /*fUpdate=*/true, /*save_progress=*/true).status)) {
+            if (!reserver.reserve() || (ScanResult::SUCCESS != walletInstance->ScanForWalletTransactions(chain.getBlockHash(rescan_height), rescan_height, /*max_height=*/{}, reserver, /*fUpdate=*/true, /*save_progress=*/true, /*wallet_lock_held=*/true).status)) {
                 error = _("Failed to rescan the wallet during initialization");
                 return false;
             }

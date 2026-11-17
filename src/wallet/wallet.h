@@ -989,6 +989,10 @@ private:
     bool m_synthetic_payout_checkpoint_trusted GUARDED_BY(cs_wallet){false};
     /** Persist a checkpoint for block_hash/height if the wallet holds synthetic payouts and it changed. */
     void WriteSyntheticPayoutCheckpoint(WalletBatch& batch, const uint256& block_hash, int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Record block_hash as the wallet's best block (and move the payout checkpoint with it)
+     * inside the commit scope of the connected block; no-op unless atomic_with_block. */
+    void PersistBlockProgress(WalletBatch& batch, const CBlockLocator& locator, bool atomic_with_block,
+                              const uint256& block_hash, int block_height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool ReconcileWalletShadowPayoutsForBlock(const uint256& block_hash, int block_height,
                                               const std::set<COutPoint>& authenticated_outpoints,
                                               WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1697,7 +1701,12 @@ public:
         //! USER_ABORT.
         uint256 last_failed_block;
     };
-    ScanResult ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate, const bool save_progress);
+    /** `wallet_lock_held` is true only for a caller that holds cs_wallet across the whole scan
+     * (wallet attachment); the scan then groups its database writes into one commit per batch of
+     * blocks, with the progress locator in the same commit. Any other caller releases cs_wallet
+     * between blocks and gets one commit per block, because a commit scope that outlived a lock
+     * release could deadlock against a thread that holds cs_wallet and waits for the database. */
+    ScanResult ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate, const bool save_progress, const bool wallet_lock_held = false);
     void transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason) override;
     /** Set the next time this wallet should resend transactions to 12-36 hours from now, ~1 day on average. */
     void SetNextResend() { m_next_resend = GetDefaultNextResend(); }

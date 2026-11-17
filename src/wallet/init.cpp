@@ -22,10 +22,12 @@
 #include <util/check.h>
 #include <util/moneystr.h>
 #include <util/translation.h>
+#include <validationinterface.h>
 #ifdef USE_BDB
 #include <wallet/bdb.h>
 #endif
 #include <wallet/coincontrol.h>
+#include <wallet/scheduler_stats.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/wallet.h>
 #include <walletinitinterface.h>
@@ -262,6 +264,9 @@ void WalletInit::Construct(NodeContext& node) const
         LogPrintf("Wallet disabled!\n");
         return;
     }
+    // The wallet library has no scheduler of its own; the node supplies the
+    // number of validation callbacks still queued for the scheduler summary.
+    SetValidationQueueDepthProvider([] { return GetMainSignals().CallbacksPending(); });
     auto wallet_loader = node.init->makeWalletLoader(*node.chain);
     node.wallet_loader = wallet_loader.get();
     node.chain_clients.emplace_back(std::move(wallet_loader));

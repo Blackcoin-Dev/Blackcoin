@@ -375,6 +375,7 @@ BITCOIN_CORE_H = \
   wallet/rpc/util.h \
   wallet/rpc/wallet.h \
   wallet/salvage.h \
+  wallet/scheduler_stats.h \
   wallet/scriptpubkeyman.h \
   wallet/shadow_pow_claim_pagination.h \
   wallet/shadow_pow_claim_recovery.h \
@@ -559,6 +560,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/rpc/transactions.cpp \
   wallet/rpc/util.cpp \
   wallet/rpc/wallet.cpp \
+  wallet/scheduler_stats.cpp \
   wallet/scriptpubkeyman.cpp \
   wallet/shadow_pow_claim_recovery.cpp \
   wallet/display_balance.cpp \

@@ -9780,8 +9780,9 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     // Loading will also ask for current mempool transactions
     wallet = TestLoadWallet(context);
     BOOST_CHECK(rescan_completed);
-    // AddToWallet events for block_tx and mempool_tx (x2)
-    BOOST_CHECK_EQUAL(addtx_count, 3);
+    // AddToWallet logs only a new or changed record: block_tx and mempool_tx
+    // once each (the duplicate mempool_tx add changes nothing and is not logged)
+    BOOST_CHECK_EQUAL(addtx_count, 2);
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK_EQUAL(wallet->mapWallet.count(block_tx.GetHash()), 1U);
@@ -9793,9 +9794,9 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     // transactionAddedToMempool events are processed
     promise.set_value();
     SyncWithValidationInterfaceQueue();
-    // AddToWallet events for block_tx and mempool_tx events are counted a
-    // second time as the notification queue is processed
-    BOOST_CHECK_EQUAL(addtx_count, 5);
+    // The stale block_tx and mempool_tx events re-add records the wallet
+    // already holds in the same state, so nothing more is logged
+    BOOST_CHECK_EQUAL(addtx_count, 2);
 
 
     TestUnloadWallet(std::move(wallet));
@@ -9818,9 +9819,9 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
             SyncWithValidationInterfaceQueue();
         });
     wallet = TestLoadWallet(context);
-    // Since mempool transactions are requested at the end of loading, there will
-    // be 2 additional AddToWallet calls, one from the previous test, and a duplicate for mempool_tx
-    BOOST_CHECK_EQUAL(addtx_count, 2 + 2);
+    // block_tx and mempool_tx are logged once each; the repeated adds
+    // (mempool request at the end of loading, the earlier queue) are no-ops
+    BOOST_CHECK_EQUAL(addtx_count, 2);
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK_EQUAL(wallet->mapWallet.count(block_tx.GetHash()), 1U);
@@ -9918,7 +9919,7 @@ BOOST_FIXTURE_TEST_CASE(runtime_loadwallet_attachchain_lifecycle, TestChain100Se
     auto load_handler = HandleLoadWallet(
         context, [&](std::unique_ptr<interfaces::Wallet>) {
             notified_after_validation.store(validation_caught_up.load());
-            notified_after_duplicate.store(block_add_count.load() >= 2);
+            notified_after_duplicate.store(block_add_count.load() >= 1);
             notified_before_worker.store(!worker_started_signaled.load());
             load_notified.store(true);
         });
@@ -10053,7 +10054,8 @@ BOOST_FIXTURE_TEST_CASE(runtime_loadwallet_attachchain_lifecycle, TestChain100Se
     BOOST_CHECK(notified_after_validation.load());
     BOOST_CHECK(notified_after_duplicate.load());
     BOOST_CHECK(notified_before_worker.load());
-    BOOST_CHECK_GE(block_add_count.load(), 2);
+    // A repeated add of the same record is not logged any more, so only the first shows.
+    BOOST_CHECK_GE(block_add_count.load(), 1);
     BOOST_CHECK(GetWallet(context, wallet_name) == wallet);
     const std::optional<int> height = context.chain->getHeight();
     BOOST_REQUIRE(height);

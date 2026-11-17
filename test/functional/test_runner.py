@@ -187,6 +187,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_coinstatsindex.py',
     'wallet_goldrush_payout_checkpoint.py',
     'wallet_goldrush_block_connect_writes.py',
+    'wallet_best_block_durability.py',
     'feature_shadowindex_claim_boundary.py',
     'feature_witness_inventory_performance.py',
     'feature_goldrush_reorg.py',

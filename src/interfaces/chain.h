@@ -160,6 +160,11 @@ public:
     //! If specified block is not in the active chain, return locator for the latest ancestor that is in the chain.
     virtual CBlockLocator getActiveChainLocator(const uint256& block_hash) = 0;
 
+    //! Like getActiveChainLocator, but with entries every 1, 4 or 16 blocks for
+    //! the first 2048 blocks (see GetDenseLocator), for persisting a position
+    //! that must be found again within a few blocks after the chain rolled back.
+    virtual CBlockLocator getDenseChainLocator(const uint256& block_hash) = 0;
+
     //! Return height of the highest block on chain in common with the locator,
     //! which will either be the original block used to create the locator,
     //! or one of its ancestors.

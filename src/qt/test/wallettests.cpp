@@ -4094,6 +4094,12 @@ void TestBalanceStateLabels()
     QVERIFY(WalletModel::ClassifyBalance(true, false, true, 99, 100) == State::Behind);
     // The last attempt failed at the block of the node: not labelled "updating".
     QVERIFY(WalletModel::ClassifyBalance(true, false, true, 100, 100) == State::Failed);
+    // A reorg to another block of the same height: the snapshot is of a block the node left.
+    QVERIFY(WalletModel::ClassifyBalance(true, false, false, 100, 100, /*other_block_at_tip_height=*/true) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, 100, true) == State::Behind);
+    // The node's tip is not known, or the snapshot is ahead of what the model was told: not behind.
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, -1, true) == State::Exact);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 101, 100, true) == State::Exact);
 }
 
 void TestWalletPollCoalescing(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)

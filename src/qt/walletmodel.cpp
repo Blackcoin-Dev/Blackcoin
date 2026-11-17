@@ -329,10 +329,14 @@ void WalletModel::setClientModel(ClientModel* client_model)
         return;
     }
     m_node_tip_height = -1;
+    m_node_tip_hash.SetNull();
     m_balance_tip_connection = connect(m_client_model, &ClientModel::numBlocksChanged, this,
         [this](int count, const QDateTime&, double, SyncType type, SynchronizationState) {
             if (type != SyncType::BLOCK_SYNC) return;
             m_node_tip_height = count;
+            // The client model's cached tip (a leaf mutex, no chain lock); it
+            // is never older than the count this signal carries.
+            m_node_tip_hash = m_client_model ? m_client_model->getBestBlockHash() : uint256{};
             invalidateBalanceSnapshot();
         });
     if (m_balance_poll_started) startPollBalance();
@@ -387,10 +391,14 @@ void WalletModel::displayBalancesChanged()
     if (m_balance_poll_requested) pollBalanceChanged();
 }
 
-WalletModel::BalanceState WalletModel::ClassifyBalance(bool available, bool exact, bool failed, int snapshot_height, int node_tip_height)
+WalletModel::BalanceState WalletModel::ClassifyBalance(bool available, bool exact, bool failed, int snapshot_height, int node_tip_height,
+                                                       bool other_block_at_tip_height)
 {
     if (!available) return BalanceState::None;
     if (node_tip_height >= 0 && snapshot_height < node_tip_height) return BalanceState::Behind;
+    // A reorg that ends at the height it started from: the snapshot is of a
+    // block the node has left, which is behind too.
+    if (node_tip_height >= 0 && snapshot_height == node_tip_height && other_block_at_tip_height) return BalanceState::Behind;
     if (failed) return BalanceState::Failed;
     return exact ? BalanceState::Exact : BalanceState::CurrentUnverified;
 }
@@ -412,7 +420,8 @@ void WalletModel::applyDisplaySnapshot(const interfaces::WalletDisplayBalances& 
     // when the wallet has changed since, or the node is past that block; the
     // user is told only in the second case (Behind).
     const BalanceState state = ClassifyBalance(snapshot.available, snapshot.exact, snapshot.failed,
-                                               snapshot.block_height, m_node_tip_height);
+                                               snapshot.block_height, m_node_tip_height,
+                                               !m_node_tip_hash.IsNull() && snapshot.block_hash != m_node_tip_hash);
     const bool stale = snapshot.available && state != BalanceState::Exact;
     const bool behind = state == BalanceState::Behind;
     const bool was_behind = m_balance_state == BalanceState::Behind;

@@ -411,6 +411,11 @@ public:
     //! Get wallet enabled for staking
     virtual bool getEnabledStaking() = 0;
 
+    //! True when staking or in-process PoW mining is requested for this wallet.
+    //! Reads two atomic flags only: it takes no lock, so a GUI timer can call it
+    //! on the UI thread for every open wallet.
+    virtual bool isStakingOrPowMiningRequested() = 0;
+
     //! Read one coherent wallet-scoped PoS worker snapshot. This does not
     //! infer liveness from the timing-dependent last search interval.
     virtual WalletStakingInfo getStakingInfo() = 0;

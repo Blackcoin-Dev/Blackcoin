@@ -1297,6 +1297,31 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(info.enabled);
     QCOMPARE(info.threads, requested_threads);
     QCOMPARE(info.cpu_percent, 25);
+
+    {
+        // The App Nap poll runs on the UI thread every few seconds for every open
+        // wallet. It must read flags only: with cs_main and cs_wallet held by
+        // another thread it still answers at once, and it never goes through the
+        // chainstate-reading getPowMiningInfo()/getStakingInfo() snapshots.
+        QVERIFY(walletModel.wallet().isStakingOrPowMiningRequested());
+        std::promise<void> locks_held;
+        std::promise<void> release;
+        std::shared_future<void> release_future{release.get_future()};
+        std::thread holder([&] {
+            LOCK2(cs_main, core_wallet->cs_wallet);
+            locks_held.set_value();
+            release_future.wait();
+        });
+        locks_held.get_future().wait();
+        auto poll = std::async(std::launch::async, [&] {
+            return walletModel.wallet().isStakingOrPowMiningRequested();
+        });
+        const bool answered = poll.wait_for(std::chrono::seconds{2}) == std::future_status::ready;
+        release.set_value();
+        holder.join();
+        QVERIFY2(answered, "isStakingOrPowMiningRequested() blocked on a wallet or chainstate lock");
+        QVERIFY(poll.get());
+    }
     QVERIFY(info.payout_address_available);
     QVERIFY(!info.payout_address.empty());
 

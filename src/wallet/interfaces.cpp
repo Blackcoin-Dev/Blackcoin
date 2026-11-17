@@ -3200,6 +3200,11 @@ public:
     {
         return m_wallet->m_enabled_staking;
     }
+    bool isStakingOrPowMiningRequested() override
+    {
+        return m_wallet->m_enabled_staking.load(std::memory_order_relaxed) ||
+               m_wallet->m_pow_mining_enabled.load(std::memory_order_relaxed);
+    }
     interfaces::WalletStakingInfo getStakingInfo() override
     {
         const StakingTelemetrySnapshot snapshot =

@@ -1846,8 +1846,8 @@ bool BitcoinGUI::anyWalletStakingOrMining() const
 #ifdef ENABLE_WALLET
     if (!m_wallet_controller) return false;
     for (WalletModel* wallet_model : m_wallet_controller->getOpenWallets()) {
-        interfaces::Wallet& wallet = wallet_model->wallet();
-        if (wallet.getStakingInfo().enabled || wallet.getPowMiningInfo().enabled) return true;
+        // Two atomic flag reads per wallet: no lock, no chainstate access, safe on the UI thread.
+        if (wallet_model->wallet().isStakingOrPowMiningRequested()) return true;
     }
 #endif
     return false;

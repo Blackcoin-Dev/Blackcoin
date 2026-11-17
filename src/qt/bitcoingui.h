@@ -199,7 +199,7 @@ private:
     QTimer* m_app_nap_timer = nullptr;
     /** Begin or end the App Nap activity from the two flags above. */
     void applyAppNapPolicy();
-    /** Any open wallet with staking enabled or in-process PoW mining requested. Cheap: telemetry reads only. */
+    /** Any open wallet with staking enabled or in-process PoW mining requested. Cheap: two atomic flag reads per wallet, no locks. */
     bool anyWalletStakingOrMining() const;
 #endif
 

@@ -3203,6 +3203,34 @@ void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
     // transaction pays or spends the wallet and so becomes a wallet
     // transaction, and the block below bumps when it was one already.
     // An unrelated transaction leaves the marker alone.
+
+    // A transaction of the wallet writes up to three things here: the next
+    // order position and the record (a new transaction), and the cleared
+    // quarantine marks (a claim that returns). Each was a commit of its own,
+    // and a commit is a full flush of the disk, which can take hundreds of
+    // milliseconds on a busy machine while cs_wallet is held. Group them in
+    // one commit, as the block callbacks do; the scope also commits on
+    // unwinding. A transaction that is not the wallet's (almost all of them,
+    // in every loaded wallet) writes nothing and opens no scope.
+    std::unique_ptr<DatabaseBulkScope> writes;
+    if (mapWallet.count(tx->GetHash()) != 0 || IsMine(*tx) || IsFromMe(*tx)) {
+        writes = GetDatabase().MakeBulkScope();
+    }
+    struct CommitWrites {
+        CWallet& wallet;
+        std::unique_ptr<DatabaseBulkScope>& scope;
+        const uint256 txid;
+        ~CommitWrites() NO_THREAD_SAFETY_ANALYSIS
+        {
+            if (scope && !scope->Commit()) {
+                // As in blockConnected: memory may now differ from disk.
+                wallet.m_shadow_pow_claim_recovery_db_ambiguous = true;
+                wallet.WalletLogPrintf("Failed to persist the wallet writes of mempool transaction %s\n", txid.ToString());
+            }
+            scope.reset();
+        }
+    } commit_writes{*this, writes, tx->GetHash()};
+
     SyncTransaction(tx, TxStateInMempool{});
 
     auto it = mapWallet.find(tx->GetHash());

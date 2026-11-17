@@ -299,6 +299,9 @@ struct ReorgOutcome {
     int connect_rows{0};
     double connect_ms{0};
     uint64_t coinstakes_visited_with_win{0};
+    int readd_commits{0}, readd_rows{0}, new_commits{0}, new_rows{0};
+    double readd_ms{0}, new_ms{0}, foreign_ms{0};
+    size_t dirtied_by_mempool{0};
 };
 
 ReorgOutcome DisconnectAndReconnectTip(interfaces::Chain& chain, const std::string& name, int blocks, int stake_every)
@@ -404,6 +407,37 @@ ReorgOutcome DisconnectAndReconnectTip(interfaces::Chain& chain, const std::stri
         BOOST_CHECK_GE(outcome.coinstakes_visited_with_win, WalletReorgTestAccess::Coinstakes(wallet).size());
     }
     fixture.CheckAgainstRebuild("after the second disconnect");
+
+    // The node returns the disconnected block's transactions to its mempool
+    // and every wallet hears of each of them; then new ones arrive. Neither
+    // callback walks the history: the claim that returns, a claim the wallet
+    // has not seen, and a transaction that is not the wallet's.
+    const auto mempool_add = [&](const CTransactionRef& tx, int& commits, int& rows, double& ms) {
+        CommitCounter counter{fixture.RawDb()};
+        const int rows_before = sqlite3_total_changes(fixture.RawDb());
+        const auto start = std::chrono::steady_clock::now();
+        wallet.transactionAddedToMempool(tx);
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        commits = counter.commits;
+        rows = sqlite3_total_changes(fixture.RawDb()) - rows_before;
+    };
+    mempool_add(claim, outcome.readd_commits, outcome.readd_rows, outcome.readd_ms);
+    const CTransactionRef next_claim = ReorgWallet::MakeClaim(COutPoint{claim->GetHash(), 0}, fixture.script, blocks + 1);
+    mempool_add(next_claim, outcome.new_commits, outcome.new_rows, outcome.new_ms);
+    CMutableTransaction foreign;
+    foreign.vin.emplace_back(COutPoint{uint256{77}, 0});
+    foreign.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    int foreign_commits{0}, foreign_rows{0};
+    mempool_add(MakeTransactionRef(std::move(foreign)), foreign_commits, foreign_rows, outcome.foreign_ms);
+    BOOST_CHECK_EQUAL(foreign_commits, 0);
+    BOOST_CHECK_EQUAL(foreign_rows, 0);
+    outcome.dirtied_by_mempool = fixture.DirtyRecords();
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.mapWallet.count(next_claim->GetHash()) == 1);
+        std::string failure;
+        BOOST_CHECK_MESSAGE(wallet.CheckShadowPowClaimIndexConsistencyLocked(&failure), failure);
+    }
     return outcome;
 }
 
@@ -433,7 +467,11 @@ BOOST_AUTO_TEST_CASE(tip_reorg_work_follows_the_block_not_the_history)
                            << " dirtied=" << outcome->dirtied_by_disconnect << " commits=" << outcome->disconnect_commits
                            << " rows=" << outcome->disconnect_rows << "; reconnect: ms=" << outcome->connect_ms
                            << " dirtied=" << outcome->dirtied_by_connect << " commits=" << outcome->connect_commits
-                           << " rows=" << outcome->connect_rows);
+                           << " rows=" << outcome->connect_rows
+                           << "; mempool: returning claim ms=" << outcome->readd_ms << " commits=" << outcome->readd_commits
+                           << " rows=" << outcome->readd_rows << ", new claim ms=" << outcome->new_ms
+                           << " commits=" << outcome->new_commits << " rows=" << outcome->new_rows
+                           << ", foreign ms=" << outcome->foreign_ms << ", dirty records after=" << outcome->dirtied_by_mempool);
     }
     BOOST_CHECK_GT(large.records, 100000U);
 
@@ -456,6 +494,13 @@ BOOST_AUTO_TEST_CASE(tip_reorg_work_follows_the_block_not_the_history)
     BOOST_CHECK_EQUAL(large.disconnect_commits, 1);
     BOOST_CHECK_LE(large.disconnect_rows, 12);
     BOOST_CHECK_LE(large.connect_rows, 12);
+    // One commit per wallet transaction that enters the mempool, none otherwise.
+    BOOST_CHECK_EQUAL(large.readd_commits, 1);
+    BOOST_CHECK_EQUAL(large.new_commits, 1);
+    BOOST_CHECK_EQUAL(large.readd_rows, small.readd_rows);
+    BOOST_CHECK_EQUAL(large.new_rows, small.new_rows);
+    BOOST_CHECK_EQUAL(large.dirtied_by_mempool, small.dirtied_by_mempool);
+    BOOST_CHECK_LE(large.dirtied_by_mempool, 12U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

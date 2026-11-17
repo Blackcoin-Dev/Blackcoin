@@ -122,6 +122,12 @@ size_t CMainSignals::CallbacksPending()
     return m_internals->m_schedulerClient.CallbacksPending();
 }
 
+bool CMainSignals::CallbacksBusy()
+{
+    if (!m_internals) return false;
+    return m_internals->m_schedulerClient.CallbacksBusy();
+}
+
 CMainSignals& GetMainSignals()
 {
     return g_signals;

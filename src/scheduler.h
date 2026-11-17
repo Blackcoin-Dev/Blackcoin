@@ -153,6 +153,14 @@ public:
     void EmptyQueue() EXCLUSIVE_LOCKS_REQUIRED(!m_callbacks_mutex);
 
     size_t CallbacksPending() EXCLUSIVE_LOCKS_REQUIRED(!m_callbacks_mutex);
+
+    /**
+     * True while a callback is queued or one is executing. Unlike
+     * CallbacksPending() this stays true for as long as the callback that was
+     * taken off the queue has not returned, for example while it waits for a
+     * lock.
+     */
+    bool CallbacksBusy() EXCLUSIVE_LOCKS_REQUIRED(!m_callbacks_mutex);
 };
 
 #endif // BITCOIN_SCHEDULER_H

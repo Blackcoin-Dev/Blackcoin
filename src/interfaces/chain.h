@@ -291,6 +291,11 @@ public:
     //! Check if shutdown requested.
     virtual bool shutdownRequested() = 0;
 
+    //! True while the validation interface has a notification queued or one
+    //! executing (it stays true while the executing one waits for a lock).
+    //! Background work that takes a wallet lock yields to it.
+    virtual bool validationCallbacksBusy() = 0;
+
     //! Send init message.
     virtual void initMessage(const std::string& message) = 0;
 

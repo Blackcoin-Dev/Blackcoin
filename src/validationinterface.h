@@ -199,6 +199,9 @@ public:
     void FlushBackgroundCallbacks();
 
     size_t CallbacksPending();
+    /** True while a background callback is queued or one is executing (also
+     * while the executing one is blocked, for example on a wallet lock). */
+    bool CallbacksBusy();
 
 
     void UpdatedBlockTip(const CBlockIndex *, const CBlockIndex *, bool fInitialDownload);

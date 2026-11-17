@@ -3376,6 +3376,13 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         return;
     }
     assert(block.data);
+    // The PoW miner measures its reaction time from this instant.
+    PowMinerTipInfo pow_miner_tip;
+    pow_miner_tip.hash = block.hash;
+    pow_miner_tip.height = block.height;
+    pow_miner_tip.block_time = block.data->GetBlockTime();
+    pow_miner_tip.seen = std::chrono::steady_clock::now();
+    pow_miner_tip.seen_unix_ms = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
     // Tell the GUI balance poll that block dispatch is in progress (L15).
     const BlockConnectActivityScope block_connect_activity;
     const WalletBlockTime block_time{block.data->GetBlockTime(), block.chain_time_max};
@@ -3399,6 +3406,9 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
 
     m_last_block_processed_height = block.height;
     m_last_block_processed = block.hash;
+    // Wake the PoW miner now, in the critical section that moves the wallet's
+    // tip. Its next wallet sample waits for this callback to finish.
+    m_pow_tip_signal.NotifyTip(pow_miner_tip);
 
     // Every database write this callback makes for the block (payout
     // reconciliation, block transactions, claim quarantine clears, payout
@@ -3531,6 +3541,16 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     // future with a stickier abandoned state or even removing abandontransaction call.
     m_last_block_processed_height = block.height - 1;
     m_last_block_processed = *Assert(block.prev_hash);
+    {
+        // A disconnect is a tip change for the PoW miner too: work for the
+        // disconnected block is dead. The parent's timestamp is not at hand.
+        PowMinerTipInfo pow_miner_tip;
+        pow_miner_tip.hash = m_last_block_processed;
+        pow_miner_tip.height = m_last_block_processed_height;
+        pow_miner_tip.seen = std::chrono::steady_clock::now();
+        pow_miner_tip.seen_unix_ms = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
+        m_pow_tip_signal.NotifyTip(pow_miner_tip);
+    }
 
     // As for a connected block, group every database write this callback makes
     // (state changes of the block's transactions and payout records, orphaned
@@ -11613,7 +11633,19 @@ static constexpr uint64_t POW_MINER_BATCH_TRIES = 128;
 // callers (including pure-batch tests) retain wallet-scoped publication.
 thread_local int g_pow_miner_worker_id{-1};
 thread_local std::chrono::nanoseconds* g_pow_miner_explicit_wait{nullptr};
+thread_local std::chrono::nanoseconds* g_pow_miner_search_time{nullptr};
 thread_local uint64_t* g_pow_miner_period_hashes{nullptr};
+
+/** What one loop iteration has seen of the tip signal. The baseline is taken
+ * before the iteration reads any chain or wallet state. */
+struct PowMinerTipWatch {
+    PowMinerTipSignal::Baseline baseline;
+    /** Workers other than zero also wake when worker zero publishes a gate. */
+    bool watch_gate{false};
+    /** A wait or a search of this iteration was cut short by the signal. */
+    bool woken{false};
+};
+thread_local PowMinerTipWatch* g_pow_miner_tip_watch{nullptr};
 
 class PowMinerWorkerIdentity {
     const int m_previous{g_pow_miner_worker_id};
@@ -11632,10 +11664,20 @@ public:
     }
 };
 
+enum class PowMinerSleep {
+    FINISHED,  //!< The whole duration passed.
+    WOKEN,     //!< A new tip (or, for a sibling worker, a new gate) arrived.
+    CANCELLED, //!< Stop, unload, shutdown, or a wallet authority change.
+};
 
-bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
-                   bool allow_locked_wait = false,
-                   std::optional<uint64_t> expected_generation = std::nullopt)
+/** Every wait of the miner goes through here. It ends early on a stop
+ * request or an authority change (checked at least every 100 ms, and at once
+ * when the signal is poked) and, unless wake_on_tip is false, the moment the
+ * wallet's tip moves past what this iteration has seen. */
+PowMinerSleep SleepPowMinerDetailed(
+    CWallet& wallet, std::chrono::milliseconds duration,
+    bool allow_locked_wait, std::optional<uint64_t> expected_generation,
+    bool wake_on_tip)
 {
     PowMinerWaitAccounting wait_accounting;
     const uint64_t authority_generation = expected_generation.value_or(
@@ -11643,36 +11685,107 @@ bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
     if (!allow_locked_wait &&
         wallet.m_pow_state.load(std::memory_order_acquire) ==
             WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
-        return false;
+        return PowMinerSleep::CANCELLED;
     }
+    PowMinerTipWatch* const watch = wake_on_tip ? g_pow_miner_tip_watch : nullptr;
+    PowMinerTipSignal::Baseline baseline =
+        watch ? watch->baseline : wallet.m_pow_tip_signal.Sample();
+    const bool watch_gate = watch && watch->watch_gate;
     const auto step = std::chrono::milliseconds{100};
-    auto slept = std::chrono::milliseconds{0};
-    while (slept < duration) {
-        if (wallet.IsPowMiningClosing() || !wallet.m_pow_mining_enabled.load()) return false;
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return PowMinerSleep::FINISHED;
+        if (wallet.IsPowMiningClosing() || !wallet.m_pow_mining_enabled.load()) {
+            return PowMinerSleep::CANCELLED;
+        }
         if (wallet.m_pow_wallet_authority_generation.load(
                 std::memory_order_acquire) != authority_generation) {
-            return false;
+            return PowMinerSleep::CANCELLED;
         }
-        const auto pause = std::min(step, duration - slept);
-        std::this_thread::sleep_for(pause);
-        slept += pause;
+        const auto pause = std::min<std::chrono::nanoseconds>(step, deadline - now);
+        const PowMinerTipSignal::Wake wake =
+            wallet.m_pow_tip_signal.WaitFor(pause, baseline, watch_gate);
+        if (wake == PowMinerTipSignal::Wake::TIMEOUT) continue;
+        if (wake == PowMinerTipSignal::Wake::POKE) {
+            // Only a request to re-check the stop conditions above.
+            baseline.poke = wallet.m_pow_tip_signal.Sample().poke;
+            continue;
+        }
+        if (watch) {
+            watch->baseline = wallet.m_pow_tip_signal.Sample();
+            watch->woken = true;
+            return PowMinerSleep::WOKEN;
+        }
+        // Not watching the tip: take the new baseline and keep waiting.
+        baseline = wallet.m_pow_tip_signal.Sample();
     }
-    return true;
 }
 
-/** One owner per dedicated miner thread. Destruction runs for every continue,
- * break and normal batch completion after all iteration locks are released. */
+bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
+                   bool allow_locked_wait = false,
+                   std::optional<uint64_t> expected_generation = std::nullopt,
+                   bool wake_on_tip = true)
+{
+    return SleepPowMinerDetailed(wallet, duration, allow_locked_wait,
+                                 expected_generation, wake_on_tip) !=
+           PowMinerSleep::CANCELLED;
+}
+
+/** Duty state of one worker thread, kept across loop iterations. A telemetry
+ * period stays open until the carried debt is back to zero, so a completed
+ * period still never exceeds the configured duty. */
+struct PowMinerDutyState {
+    PowMiningDutyLedger ledger;
+    bool open{false};
+    uint64_t session_id{0};
+    uint64_t generation{0};
+    std::chrono::nanoseconds elapsed{0};
+    std::chrono::nanoseconds wait{0};
+    std::chrono::nanoseconds duty_wait{0};
+    uint64_t hashes{0};
+
+    explicit PowMinerDutyState(PowMiningDutyLedger ledger_in) : ledger{ledger_in} {}
+
+    void Publish(CWallet& wallet, bool finished)
+    {
+        if (!open) return;
+        wallet.RecordPowMiningDutyPeriod(
+            g_pow_miner_worker_id, session_id, generation, elapsed, wait,
+            duty_wait, finished, hashes);
+        open = false;
+        elapsed = wait = duty_wait = std::chrono::nanoseconds{0};
+        hashes = 0;
+    }
+};
+
+/** One owner per loop iteration of a dedicated miner thread. Destruction runs
+ * for every continue, break and normal batch completion after all iteration
+ * locks are released, and is the only place a duty sleep is taken.
+ *
+ * Work first: while claim work for the current tip is pending (the search is
+ * still running, the gate is still settling, or a new tip arrived during this
+ * iteration) no duty sleep is taken as long as the ledger's ceilings allow
+ * the debt to be carried. Otherwise the whole debt is slept off here, and a
+ * new tip ends that sleep at once. */
 class PowMinerIterationBudget {
     CWallet& m_wallet;
+    PowMinerDutyState& m_state;
     uint64_t m_session_id;
     uint64_t m_generation;
     const std::chrono::steady_clock::time_point m_start{std::chrono::steady_clock::now()};
     std::chrono::nanoseconds m_wait{0};
+    std::chrono::nanoseconds m_search{0};
     uint64_t m_hashes{0};
+    PowMinerTipWatch m_watch;
+    bool m_work_pending{false};
+    uint256 m_attempt_tip;
 public:
-    explicit PowMinerIterationBudget(CWallet& wallet)
-        : m_wallet(wallet)
+    PowMinerIterationBudget(CWallet& wallet, PowMinerDutyState& state, int worker_id)
+        : m_wallet(wallet), m_state(state)
     {
+        m_watch.baseline = m_wallet.m_pow_tip_signal.Sample();
+        m_watch.watch_gate = worker_id != 0;
         {
             LOCK(m_wallet.cs_wallet);
             m_session_id = m_wallet.m_pow_duty_cycle.session_id;
@@ -11681,33 +11794,79 @@ public:
         assert(!g_pow_miner_explicit_wait);
         assert(!g_pow_miner_period_hashes);
         g_pow_miner_explicit_wait = &m_wait;
+        g_pow_miner_search_time = &m_search;
         g_pow_miner_period_hashes = &m_hashes;
+        g_pow_miner_tip_watch = &m_watch;
     }
+    /** Claim work for the current tip continues in the next iteration. */
+    void SetWorkPending() { m_work_pending = true; }
+    /** This iteration searched for a claim on this tip. */
+    void SetAttemptTip(const uint256& tip) { m_attempt_tip = tip; }
+    /** Called with cs_wallet held, where the wallet's tip is sampled: the
+     * signal is raised under the same lock, so the tip this iteration sees
+     * and its baseline agree exactly. */
+    void ObserveTipUnderWalletLock()
+    {
+        if (!m_watch.woken) m_watch.baseline.tip = m_wallet.m_pow_tip_signal.TipSequence();
+    }
+    uint64_t TipSequence() const { return m_watch.baseline.tip; }
     ~PowMinerIterationBudget()
     {
         g_pow_miner_explicit_wait = nullptr;
+        g_pow_miner_search_time = nullptr;
         g_pow_miner_period_hashes = nullptr;
+        g_pow_miner_tip_watch = nullptr;
         const auto elapsed = std::chrono::steady_clock::now() - m_start;
-        const auto delay = PowMiningAdditionalDelay(
-            elapsed, m_wait,
-            m_wallet.m_pow_cpu_percent.load());
-        bool wait_finished{true};
-        std::chrono::nanoseconds duty_wait{0};
-        if (delay.count() > 0) {
-            const auto wait_start = std::chrono::steady_clock::now();
-            wait_finished = SleepPowMiner(m_wallet, delay, false, m_generation);
-            duty_wait = std::chrono::steady_clock::now() - wait_start;
+        const auto active = std::max(std::chrono::nanoseconds{0}, elapsed - m_wait);
+        const auto search = std::clamp(m_search, std::chrono::nanoseconds{0}, active);
+        if (m_state.open && (m_state.session_id != m_session_id ||
+                             m_state.generation != m_generation)) {
+            // A restart or a lock/unlock pulse ended the open period.
+            m_state.Publish(m_wallet, /*finished=*/false);
         }
-        m_wallet.RecordPowMiningDutyPeriod(
-            g_pow_miner_worker_id, m_session_id, m_generation, elapsed, m_wait, duty_wait,
-            wait_finished, m_hashes);
+        m_state.open = true;
+        m_state.session_id = m_session_id;
+        m_state.generation = m_generation;
+        m_state.elapsed += elapsed;
+        m_state.wait += m_wait;
+        m_state.hashes += m_hashes;
+        // Lock waits and gate evaluation are charged as other work, never as
+        // search, so they cannot use up the search allowance.
+        m_state.ledger.Charge(search, active - search);
+        m_state.ledger.Credit(m_wait);
+
+        const bool tip_arrived = m_watch.woken ||
+            m_wallet.m_pow_tip_signal.TipSequence() != m_watch.baseline.tip;
+        const auto delay = m_state.ledger.SleepNeeded(m_work_pending || tip_arrived);
+        PowMinerSleep outcome{PowMinerSleep::FINISHED};
+        if (delay.count() > 0) {
+            // A duty sleep is not an explicit wait, but it is tip-wakeable.
+            g_pow_miner_tip_watch = &m_watch;
+            const auto wait_start = std::chrono::steady_clock::now();
+            outcome = SleepPowMinerDetailed(
+                m_wallet, delay, /*allow_locked_wait=*/false, m_generation,
+                /*wake_on_tip=*/true);
+            const auto duty_wait = std::chrono::steady_clock::now() - wait_start;
+            g_pow_miner_tip_watch = nullptr;
+            m_state.ledger.Credit(duty_wait);
+            m_state.duty_wait += duty_wait;
+            if (!m_attempt_tip.IsNull()) {
+                m_wallet.NotePowClaimAttemptDutySleep(m_attempt_tip, duty_wait);
+            }
+        }
+        if (outcome == PowMinerSleep::CANCELLED) {
+            m_state.Publish(m_wallet, /*finished=*/false);
+        } else if (m_state.ledger.Debt().count() == 0) {
+            m_state.Publish(m_wallet, /*finished=*/true);
+        }
     }
 };
 
 WalletPowMiningGrindResult GrindShadowPowWorkInterruptibly(
     CWallet& wallet, const ShadowPowWork& work, uint64_t start_nonce,
     uint64_t nonce_step, uint64_t max_tries, uint64_t authority_generation,
-    std::vector<unsigned char>& data_out)
+    std::vector<unsigned char>& data_out,
+    std::optional<uint64_t> tip_sequence = std::nullopt)
 {
     WalletPowMiningGrindResult batch;
     data_out.clear();
@@ -11724,6 +11883,14 @@ WalletPowMiningGrindResult GrindShadowPowWorkInterruptibly(
                 std::memory_order_acquire) != authority_generation ||
             wallet.m_pow_state.load(std::memory_order_acquire) ==
                 WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
+            return batch;
+        }
+        if (tip_sequence &&
+            wallet.m_pow_tip_signal.TipSequence() != *tip_sequence) {
+            // The wallet moved to another tip: this work is dead. End the
+            // batch here, with the hashes done so far, so the caller goes
+            // straight back to the gate for the new tip.
+            batch.status = WalletPowMiningGrindStatus::EXHAUSTED;
             return batch;
         }
 
@@ -13369,6 +13536,8 @@ void CWallet::StopPowMiningLocked()
         m_pow_mining_enabled = false;
         m_stop_pow_mining_thread = true;
     }
+    // Workers re-check the stop flag at once instead of at their next slice.
+    m_pow_tip_signal.Poke();
     std::unique_ptr<std::vector<std::thread>> group;
     {
         LOCK(m_pow_miner_mutex);
@@ -14610,7 +14779,8 @@ WalletPowMiningGrindResult CWallet::RunShadowPowMiningBatch(
     const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step,
     uint64_t max_tries, uint64_t authority_generation,
     std::vector<unsigned char>& proof, int worker_id,
-    std::chrono::steady_clock::time_point& next_error_log)
+    std::chrono::steady_clock::time_point& next_error_log,
+    std::optional<uint64_t> tip_sequence)
 {
     PowMinerWorkerIdentity identity{worker_id};
     proof.clear();
@@ -14621,9 +14791,12 @@ WalletPowMiningGrindResult CWallet::RunShadowPowMiningBatch(
     const auto batch_start = std::chrono::steady_clock::now();
     auto result = GrindShadowPowWorkInterruptibly(
         *this, work, start_nonce, nonce_step, max_tries,
-        authority_generation, proof);
+        authority_generation, proof, tip_sequence);
+    const auto batch_elapsed = std::chrono::steady_clock::now() - batch_start;
+    // Only the search itself is charged to the search allowance.
+    if (g_pow_miner_search_time) *g_pow_miner_search_time += batch_elapsed;
     result.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - batch_start);
+        batch_elapsed);
     if (result.status == WalletPowMiningGrindStatus::CANCELLED ||
         !HasNormalPowMiningWalletAuthority(authority_generation)) {
         proof.clear();
@@ -14671,9 +14844,11 @@ WalletPowMiningGrindResult CWallet::RunShadowPowMiningBatch(
         }
         // Independent of CPU target and measured batch duration: a fast local
         // failure must not immediately repeat selection and Argon2 evaluation.
+        // A new tip does not shorten it either.
         if (!SleepPowMiner(*this, std::chrono::seconds{1},
                            /*allow_locked_wait=*/false,
-                           authority_generation)) {
+                           authority_generation,
+                           /*wake_on_tip=*/false)) {
             result.status = WalletPowMiningGrindStatus::CANCELLED;
         }
         return result;
@@ -14683,13 +14858,136 @@ WalletPowMiningGrindResult CWallet::RunShadowPowMiningBatch(
     return result;
 }
 
+WalletPowClaimTiming CWallet::GetPowClaimTiming() const
+{
+    LOCK(m_pow_miner_mutex);
+    return m_pow_last_claim_timing;
+}
+
+std::string CWallet::BeginPowClaimAttemptLocked(
+    const uint256& tip, int height, int64_t block_time)
+{
+    AssertLockHeld(m_pow_miner_mutex);
+    std::string replaced;
+    if (m_pow_claim_attempt.open) {
+        if (m_pow_claim_attempt.timing.tip == tip) return replaced;
+        replaced = FinishPowClaimAttemptLocked("tip_changed", /*tip_changed=*/true);
+    }
+    if (m_pow_last_claim_timing.valid && m_pow_last_claim_timing.tip == tip &&
+        m_pow_last_claim_timing.result == "submitted") {
+        // The claim for this tip is already in the mempool. A sibling worker
+        // finishing its last batch must not open a second record for it.
+        return replaced;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    PowClaimAttempt attempt;
+    attempt.open = true;
+    attempt.timing.valid = true;
+    attempt.timing.tip = tip;
+    attempt.timing.height = height;
+    attempt.timing.block_time = block_time;
+    if (const auto seen = m_pow_tip_signal.TipInfo(tip)) {
+        attempt.timing.tip_seen_known = true;
+        attempt.timing.tip_seen_unix_ms = seen->seen_unix_ms;
+        attempt.origin = seen->seen;
+    } else {
+        attempt.timing.tip_seen_unix_ms =
+            TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
+        attempt.origin = now;
+    }
+    const auto gate_ready = m_pow_gate_ready_tip == tip ? m_pow_gate_ready_at : now;
+    attempt.timing.gate_ready_ms = std::max<int64_t>(
+        0, std::chrono::duration_cast<std::chrono::milliseconds>(
+               gate_ready - attempt.origin).count());
+    m_pow_claim_attempt = attempt;
+    return replaced;
+}
+
+std::string CWallet::FinishPowClaimAttemptLocked(
+    const std::string& result, bool tip_changed)
+{
+    AssertLockHeld(m_pow_miner_mutex);
+    if (!m_pow_claim_attempt.open) return {};
+    WalletPowClaimTiming& timing = m_pow_claim_attempt.timing;
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - m_pow_claim_attempt.origin).count();
+    if (result == "submitted") timing.mempool_accept_ms = now_ms;
+    timing.duty_sleep_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        m_pow_claim_attempt.duty_sleep).count();
+    timing.tip_changed = tip_changed;
+    timing.result = result;
+    m_pow_last_claim_timing = timing;
+    m_pow_claim_attempt = {};
+    const WalletPowClaimTiming& done = m_pow_last_claim_timing;
+    // One line, stable key=value order. Fleet tooling parses this.
+    return strprintf(
+        "Gold Rush PoW claim timing: tip=%s height=%d block_time=%d "
+        "tip_seen_unix_ms=%d tip_seen_known=%d result=%s tip_changed=%d "
+        "gate_ready_ms=%d first_hash_ms=%d proof_found_ms=%d "
+        "mempool_accept_ms=%d hashes=%u batches=%u duty_sleep_ms=%d",
+        done.tip.ToString().substr(0, 16), done.height, done.block_time,
+        done.tip_seen_unix_ms, done.tip_seen_known ? 1 : 0, done.result,
+        done.tip_changed ? 1 : 0, done.gate_ready_ms, done.first_hash_ms,
+        done.proof_found_ms, done.mempool_accept_ms, done.hashes,
+        done.batches, done.duty_sleep_ms);
+}
+
+void CWallet::FinishPowClaimAttempt(
+    const uint256& tip, const std::string& result, bool tip_changed)
+{
+    std::string line;
+    {
+        LOCK(m_pow_miner_mutex);
+        if (!m_pow_claim_attempt.open ||
+            m_pow_claim_attempt.timing.tip != tip) return;
+        line = FinishPowClaimAttemptLocked(result, tip_changed);
+    }
+    if (!line.empty()) WalletLogPrintf("%s\n", line);
+}
+
+void CWallet::NotePowClaimAttemptFirstHash(const uint256& tip)
+{
+    LOCK(m_pow_miner_mutex);
+    if (!m_pow_claim_attempt.open || m_pow_claim_attempt.timing.tip != tip ||
+        m_pow_claim_attempt.timing.first_hash_ms >= 0) return;
+    m_pow_claim_attempt.timing.first_hash_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - m_pow_claim_attempt.origin).count();
+}
+
+void CWallet::NotePowClaimAttemptBatch(
+    const uint256& tip, uint64_t hashes, bool found)
+{
+    LOCK(m_pow_miner_mutex);
+    if (!m_pow_claim_attempt.open || m_pow_claim_attempt.timing.tip != tip) return;
+    m_pow_claim_attempt.timing.hashes += hashes;
+    ++m_pow_claim_attempt.timing.batches;
+    if (found && m_pow_claim_attempt.timing.proof_found_ms < 0) {
+        m_pow_claim_attempt.timing.proof_found_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - m_pow_claim_attempt.origin).count();
+    }
+}
+
+void CWallet::NotePowClaimAttemptDutySleep(
+    const uint256& tip, std::chrono::nanoseconds slept)
+{
+    LOCK(m_pow_miner_mutex);
+    if (!m_pow_claim_attempt.open || m_pow_claim_attempt.timing.tip != tip) return;
+    m_pow_claim_attempt.duty_sleep += slept;
+}
+
 void CWallet::ThreadShadowPoWMiner(int worker_id)
 {
     PowMinerWorkerIdentity identity{worker_id};
     WalletLogPrintf("Gold Rush PoW worker %d started\n", worker_id);
     std::chrono::steady_clock::time_point next_grind_error_log{};
+    PowMinerDutyState duty_state{PowMiningDutyLedger{
+        m_pow_cpu_percent.load(),
+        std::chrono::seconds{Params().GetConsensus().nTargetSpacing}}};
     while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
-        PowMinerIterationBudget iteration_budget{*this};
+        PowMinerIterationBudget iteration_budget{*this, duty_state, worker_id};
+        m_pow_miner_iterations.fetch_add(1, std::memory_order_relaxed);
         bilingual_str error;
         const uint64_t loop_authority_generation =
             m_pow_wallet_authority_generation.load(std::memory_order_acquire);
@@ -14755,6 +15053,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             }
             {
                 LOCK(cs_wallet);
+                iteration_budget.ObserveTipUnderWalletLock();
                 current_wallet_generation =
                     GetDatabase().nUpdateCounter.load();
                 current_candidate_state =
@@ -14783,8 +15082,14 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             }
             bool refresh_gate{false};
             bool wallet_wide_tip_wait{false};
+            std::string stale_attempt_line;
             {
                 LOCK(m_pow_miner_mutex);
+                if (m_pow_claim_attempt.open &&
+                    m_pow_claim_attempt.timing.tip != current_tip) {
+                    stale_attempt_line =
+                        FinishPowClaimAttemptLocked("tip_changed", /*tip_changed=*/true);
+                }
                 mining_gate = m_pow_mining_gate;
                 if (m_pow_wallet_wide_tip_wait &&
                     mining_gate.active_tip != current_tip) {
@@ -14830,6 +15135,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                       current_relay_clock_effective_time >=
                           mining_gate.relay_expiry_time));
             }
+            if (!stale_attempt_line.empty()) WalletLogPrintf("%s\n", stale_attempt_line);
             if (refresh_gate) {
                 if (mining_gate.ProofEvaluationPending()) {
                     // Publish the typed non-authorizing state before worker
@@ -14867,8 +15173,25 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                     mining_gate.relay_txid.SetNull();
                     mining_gate.relay_expiry_time = 0;
                 }
-                LOCK(m_pow_miner_mutex);
-                m_pow_mining_gate = mining_gate;
+                bool gate_changed{false};
+                {
+                    LOCK(m_pow_miner_mutex);
+                    gate_changed =
+                        m_pow_mining_gate.action != mining_gate.action ||
+                        m_pow_mining_gate.active_tip != mining_gate.active_tip;
+                    m_pow_mining_gate = mining_gate;
+                    if (have_tip && mining_gate.active_tip == current_tip &&
+                        mining_gate.coherent &&
+                        !mining_gate.RelayClockPending() &&
+                        !mining_gate.ProofEvaluationPending() &&
+                        !mining_gate.ClaimOwnershipPending() &&
+                        m_pow_gate_ready_tip != current_tip) {
+                        m_pow_gate_ready_tip = current_tip;
+                        m_pow_gate_ready_at = std::chrono::steady_clock::now();
+                    }
+                }
+                // Sibling workers wait on the published gate, not on a poll.
+                if (gate_changed) m_pow_tip_signal.NotifyGate();
             }
         } else {
             LOCK(m_pow_miner_mutex);
@@ -14897,6 +15220,11 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 ? std::chrono::milliseconds{1000}
                 : (worker_id == 0 ? std::chrono::milliseconds{100}
                                   : std::chrono::milliseconds{1000});
+            // Worker zero is still settling the gate for this tip.
+            if (worker_id == 0 &&
+                retry_delay == std::chrono::milliseconds{100}) {
+                iteration_budget.SetWorkPending();
+            }
             SleepPowMiner(*this, retry_delay);
             continue;
         }
@@ -14904,6 +15232,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             PublishPowMiningHashrate(0.0);
             PublishPowMiningWorkerState(
                 WalletPowMiningState::CLAIM_EVALUATION_PENDING);
+            if (worker_id == 0) iteration_budget.SetWorkPending();
             SleepPowMiner(
                 *this,
                 worker_id == 0 ? std::chrono::milliseconds{100}
@@ -14968,6 +15297,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 // concurrent stop holds while joining this worker.
                 ShadowPowClaimSubmissionGuard relay_guard(*this);
                 if (!relay_guard) {
+                    iteration_budget.SetWorkPending();
                     SleepPowMiner(*this, std::chrono::milliseconds{100});
                     continue;
                 }
@@ -15248,6 +15578,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 // insufficient-funds result nor a family quarantine.
                 PublishPowMiningWorkerState(
                     WalletPowMiningState::READY);
+                iteration_budget.SetWorkPending();
                 SleepPowMiner(
                     *this, std::chrono::milliseconds{100});
                 continue;
@@ -15299,6 +15630,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         ShadowPowWork work;
         uint64_t nonce_start{0};
         bool should_grind{false};
+        std::string replaced_attempt_line;
         {
             ChainstateManager& chainman = chain().chainman();
             LOCK(cs_main);
@@ -15355,6 +15687,11 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                             selected_input.outpoint, tip,
                             chainman.ActiveChainstate().CoinsTip());
                         should_grind = work.valid;
+                        if (should_grind) {
+                            LOCK(m_pow_miner_mutex);
+                            replaced_attempt_line = BeginPowClaimAttemptLocked(
+                                tip_hash, tip->nHeight, tip->GetBlockTime());
+                        }
                         if (!should_grind) {
                             PublishPowMiningHashrate(0.0);
                             PublishPowMiningWorkerState(
@@ -15366,15 +15703,28 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 }
             }
         }
+        if (!replaced_attempt_line.empty()) {
+            WalletLogPrintf("%s\n", replaced_attempt_line);
+        }
         if (loop_sleep.count() > 0) {
             SleepPowMiner(*this, loop_sleep);
             continue;
         }
         if (should_grind) {
+            iteration_budget.SetAttemptTip(tip_hash);
+            NotePowClaimAttemptFirstHash(tip_hash);
             const auto result = RunShadowPowMiningBatch(
                 work, nonce_start, 1, POW_MINER_BATCH_TRIES,
                 loop_authority_generation, proof, worker_id,
-                next_grind_error_log);
+                next_grind_error_log, iteration_budget.TipSequence());
+            NotePowClaimAttemptBatch(
+                tip_hash, result.successful_hashes,
+                result.status == WalletPowMiningGrindStatus::FOUND);
+            // The search goes on: carry the duty debt instead of sleeping
+            // between batches (bounded by the ledger's ceilings).
+            if (result.status == WalletPowMiningGrindStatus::EXHAUSTED) {
+                iteration_budget.SetWorkPending();
+            }
             if (result.status == WalletPowMiningGrindStatus::CANCELLED ||
                 result.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR ||
                 result.status == WalletPowMiningGrindStatus::INVALID_WORK) {
@@ -15398,7 +15748,11 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
                 tip_still_current = tip && tip->GetBlockHash() == tip_hash;
             }
-            if (!tip_still_current) continue;
+            if (!tip_still_current) {
+                iteration_budget.SetWorkPending();
+                FinishPowClaimAttempt(tip_hash, "tip_changed", /*tip_changed=*/true);
+                continue;
+            }
             {
                 LOCK(m_pow_miner_mutex);
                 if (m_pow_claim_inflight) continue;
@@ -15413,9 +15767,12 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             if (IsPowMiningClosing() ||
                 !HasNormalPowMiningWalletAuthority(
                     loop_authority_generation)) {
-                LOCK(m_pow_miner_mutex);
-                m_pow_claim_inflight = false;
-                m_pow_wallet_wide_tip_wait = false;
+                {
+                    LOCK(m_pow_miner_mutex);
+                    m_pow_claim_inflight = false;
+                    m_pow_wallet_wide_tip_wait = false;
+                }
+                FinishPowClaimAttempt(tip_hash, "cancelled", /*tip_changed=*/false);
                 continue;
             }
             std::optional<ShadowPowClaimMiningGate>
@@ -15425,6 +15782,24 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                     selected_input, work, proof,
                     loop_authority_generation, error,
                     &submit_failure_reselection);
+            {
+                // One timing line per attempt, whatever its outcome.
+                const bool tip_moved = !m_pow_tip_signal.TipInfo(tip_hash) &&
+                    WITH_LOCK(m_pow_miner_mutex,
+                              return m_pow_claim_attempt.timing.tip_seen_known);
+                FinishPowClaimAttempt(
+                    tip_hash,
+                    submit_result == ShadowPowClaimSubmitResult::SUBMITTED
+                        ? "submitted"
+                    : submit_result == ShadowPowClaimSubmitResult::PERSISTED_PENDING
+                        ? "persisted_pending"
+                    : IsShadowPowClaimConflict(error) ? "conflict"
+                    : submit_result == ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE
+                        ? "input_unavailable"
+                        : "failed",
+                    submit_result != ShadowPowClaimSubmitResult::SUBMITTED &&
+                        tip_moved);
+            }
             if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED ||
                 submit_result ==
                     ShadowPowClaimSubmitResult::PERSISTED_PENDING) {
@@ -15554,6 +15929,19 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             }
         }
 
+    }
+    // An open duty period ends with the thread; it is never a completed one.
+    duty_state.Publish(*this, /*finished=*/false);
+    {
+        std::string stopped_attempt_line;
+        if (IsPowMiningClosing() || !m_pow_mining_enabled.load()) {
+            LOCK(m_pow_miner_mutex);
+            stopped_attempt_line =
+                FinishPowClaimAttemptLocked("stopped", /*tip_changed=*/false);
+        }
+        if (!stopped_attempt_line.empty()) {
+            WalletLogPrintf("%s\n", stopped_attempt_line);
+        }
     }
     {
         LOCK(cs_wallet);

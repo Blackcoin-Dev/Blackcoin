@@ -35,6 +35,7 @@
 #include <util/ui_change_type.h>
 #include <wallet/crypter.h>
 #include <wallet/db.h>
+#include <wallet/pow_miner_tip_signal.h>
 #include <wallet/qq_development_donation.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/shadow_pow_claim_recovery_types.h>
@@ -121,6 +122,35 @@ struct WalletPowMiningDutySnapshot {
     uint64_t session_id{0};
     int cpu_percent{0};
     std::vector<WalletPowMiningDutyWorker> workers;
+};
+
+/** Timing of one claim attempt of the built-in miner: the work done for one
+ * tip from the moment the wallet's block callback saw that tip. Offsets are
+ * milliseconds from that moment; -1 means the step was not reached. */
+struct WalletPowClaimTiming {
+    bool valid{false};
+    uint256 tip;
+    int height{-1};
+    /** The tip block's own timestamp. */
+    int64_t block_time{0};
+    /** False when the block callback for this tip was not observed (the
+     * miner started on a tip the wallet already had); offsets then count
+     * from the miner's first sight of the tip. */
+    bool tip_seen_known{false};
+    int64_t tip_seen_unix_ms{0};
+    int64_t gate_ready_ms{-1};
+    int64_t first_hash_ms{-1};
+    int64_t proof_found_ms{-1};
+    int64_t mempool_accept_ms{-1};
+    uint64_t hashes{0};
+    uint64_t batches{0};
+    /** Duty sleep taken between the first hash and the end of the attempt. */
+    int64_t duty_sleep_ms{0};
+    /** Whether the tip changed before the claim was submitted. */
+    bool tip_changed{false};
+    /** submitted, persisted_pending, conflict, input_unavailable, failed,
+     * tip_changed, cancelled or stopped. */
+    std::string result;
 };
 
 enum class WalletCommitStatus {
@@ -2046,7 +2076,7 @@ public:
     // Runtime cache used to emit the configured QQSIGNAL binding once per
     // wallet process instead of once per retry attempt.
     std::string m_shadow_signal_payout_quantum GUARDED_BY(cs_wallet);
-    Mutex m_pow_miner_mutex;
+    mutable Mutex m_pow_miner_mutex;
     // Worker 0 refreshes the typed, component-aware mining gate and publishes
     // one coherent snapshot for the remaining hashing workers. This avoids N
     // identical proof classifications per second; final submission still
@@ -2058,6 +2088,22 @@ public:
     // reserves this wallet through the current tip. Family-local waits and
     // ordinary in-flight submissions must never acquire this provenance.
     bool m_pow_wallet_wide_tip_wait GUARDED_BY(m_pow_miner_mutex){false};
+    /** Signalled by the block callbacks under cs_wallet; wakes the miner
+     * workers out of every wait and out of a search for the old tip. */
+    PowMinerTipSignal m_pow_tip_signal;
+    /** Miner loop iterations started since the wallet was created. */
+    std::atomic<uint64_t> m_pow_miner_iterations{0};
+    struct PowClaimAttempt {
+        bool open{false};
+        WalletPowClaimTiming timing;
+        std::chrono::steady_clock::time_point origin{};
+        std::chrono::nanoseconds duty_sleep{0};
+    };
+    PowClaimAttempt m_pow_claim_attempt GUARDED_BY(m_pow_miner_mutex);
+    WalletPowClaimTiming m_pow_last_claim_timing GUARDED_BY(m_pow_miner_mutex);
+    // When worker zero first held a settled gate for a tip.
+    uint256 m_pow_gate_ready_tip GUARDED_BY(m_pow_miner_mutex);
+    std::chrono::steady_clock::time_point m_pow_gate_ready_at GUARDED_BY(m_pow_miner_mutex){};
     std::set<uint256> m_inflight_wallet_broadcasts GUARDED_BY(cs_wallet);
 
     uint64_t GetStakeWeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
@@ -2670,7 +2716,22 @@ public:
         const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step,
         uint64_t max_tries, uint64_t authority_generation,
         std::vector<unsigned char>& proof, int worker_id,
-        std::chrono::steady_clock::time_point& next_error_log);
+        std::chrono::steady_clock::time_point& next_error_log,
+        std::optional<uint64_t> tip_sequence = std::nullopt);
+    /** Timing of the most recently finished claim attempt. */
+    WalletPowClaimTiming GetPowClaimTiming() const;
+    /** Start timing an attempt for this tip unless one is already open for
+     * it. Returns the timing line of an attempt it had to close first. */
+    std::string BeginPowClaimAttemptLocked(const uint256& tip, int height, int64_t block_time)
+        EXCLUSIVE_LOCKS_REQUIRED(m_pow_miner_mutex);
+    /** Close the open attempt and return its one-line log record, or an
+     * empty string when no attempt is open. */
+    std::string FinishPowClaimAttemptLocked(const std::string& result, bool tip_changed)
+        EXCLUSIVE_LOCKS_REQUIRED(m_pow_miner_mutex);
+    void FinishPowClaimAttempt(const uint256& tip, const std::string& result, bool tip_changed);
+    void NotePowClaimAttemptFirstHash(const uint256& tip);
+    void NotePowClaimAttemptBatch(const uint256& tip, uint64_t hashes, bool found);
+    void NotePowClaimAttemptDutySleep(const uint256& tip, std::chrono::nanoseconds slept);
     void ThreadShadowPoWMiner(int worker_id);
     QuantumAddressBindingResult ResolveConfiguredQuantumAddress(
         const std::string& option,

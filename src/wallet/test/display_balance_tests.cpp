@@ -15,6 +15,7 @@
 #include <validationinterface.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/load.h>
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
@@ -24,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -390,6 +392,71 @@ BOOST_FIXTURE_TEST_CASE(worker_defers_to_a_blocked_validation_callback, DisplayW
     BOOST_CHECK(request.get());
     BOOST_CHECK(iface->getDisplaySnapshot().available);
     SyncWithValidationInterfaceQueue();
+}
+
+BOOST_FIXTURE_TEST_CASE(worker_starts_nothing_while_startup_wallets_are_loading, DisplayWalletSetup)
+{
+    BOOST_REQUIRE(!StartupWalletLoadInProgress());
+    std::future<bool> request;
+    {
+        const StartupWalletLoadGuard loading;
+        BOOST_CHECK(StartupWalletLoadInProgress());
+        {
+            // Guards nest: the worker waits for the last one.
+            const StartupWalletLoadGuard nested;
+            BOOST_CHECK(StartupWalletLoadInProgress());
+        }
+        BOOST_CHECK(StartupWalletLoadInProgress());
+        // A wallet that is shown and a caller that waits: both jobs stay
+        // queued, nothing is computed and nothing is logged.
+        iface->requestDisplayBalances(/*foreground=*/true, std::nullopt, /*retry_send=*/false);
+        request = std::async(std::launch::async, [&] {
+            interfaces::WalletDisplayBalances display;
+            return iface->tryGetDisplayBalances(display, std::nullopt, std::nullopt);
+        });
+        BOOST_CHECK(request.wait_for(500ms) == std::future_status::timeout);
+        BOOST_CHECK(!iface->getDisplaySnapshot().available);
+        BOOST_CHECK(!WITH_LOCK(wallet->cs_wallet, return wallet->m_output_lifecycle_memo.size()));
+    }
+    // The last guard is gone: the queued job runs at once.
+    BOOST_CHECK(!StartupWalletLoadInProgress());
+    BOOST_REQUIRE(request.wait_for(20s) == std::future_status::ready);
+    BOOST_CHECK(request.get());
+    const interfaces::WalletDisplayBalances shown = iface->getDisplaySnapshot();
+    BOOST_REQUIRE(shown.available);
+    BOOST_CHECK_EQUAL(shown.balances.balance, PlainBalance());
+
+    // A wallet put on the worker with no guard (loaded later through RPC or
+    // the GUI) is served immediately; see the other cases of this suite.
+}
+
+BOOST_FIXTURE_TEST_CASE(startup_load_guard_clears_on_every_way_out, TestChain100Setup)
+{
+    BOOST_REQUIRE(!StartupWalletLoadInProgress());
+    // An exception.
+    try {
+        const StartupWalletLoadGuard loading;
+        BOOST_CHECK(StartupWalletLoadInProgress());
+        throw std::runtime_error("wallet failed to load");
+    } catch (const std::runtime_error&) {
+    }
+    BOOST_CHECK(!StartupWalletLoadInProgress());
+    // An early return.
+    const auto early = [](bool fail) {
+        const StartupWalletLoadGuard loading;
+        if (fail) return false;
+        return StartupWalletLoadInProgress();
+    };
+    BOOST_CHECK(!early(true));
+    BOOST_CHECK(!StartupWalletLoadInProgress());
+    BOOST_CHECK(early(false));
+    BOOST_CHECK(!StartupWalletLoadInProgress());
+    // LoadWallets itself, with no wallet configured.
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    BOOST_CHECK(LoadWallets(context));
+    BOOST_CHECK(!StartupWalletLoadInProgress());
 }
 
 BOOST_FIXTURE_TEST_CASE(send_family_balance_and_sliced_worker_passes, DisplayWalletSetup)

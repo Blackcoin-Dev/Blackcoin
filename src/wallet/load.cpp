@@ -19,6 +19,7 @@
 #include <util/translation.h>
 #include <wallet/claim_maintenance.h>
 #include <wallet/context.h>
+#include <wallet/display_balance.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
@@ -316,6 +317,8 @@ bool VerifyWallets(WalletContext& context)
 
 bool LoadWallets(WalletContext& context)
 {
+    // No balance pass or warm-up of a loaded wallet while the others load.
+    const StartupWalletLoadGuard startup_load_guard;
     interfaces::Chain& chain = *context.chain;
     try {
         std::set<fs::path> wallet_paths;

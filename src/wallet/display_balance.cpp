@@ -755,6 +755,18 @@ void WalletDisplayBalance::RunSendFamilyOnly()
     if (copy->send_family_balance) Publish(std::move(copy));
 }
 
+namespace {
+std::atomic<int> g_startup_wallet_loads{0};
+} // namespace
+
+StartupWalletLoadGuard::StartupWalletLoadGuard() { ++g_startup_wallet_loads; }
+StartupWalletLoadGuard::~StartupWalletLoadGuard()
+{
+    // The jobs that were held back start now, not at the next recheck.
+    if (--g_startup_wallet_loads == 0) DisplayBalanceWorker::Global().Wake();
+}
+bool StartupWalletLoadInProgress() { return g_startup_wallet_loads.load() > 0; }
+
 void AttachPolledBalance(CWallet& wallet) { DisplayBalanceWorker::Global().AcquirePolled(wallet); }
 void DetachPolledBalance(CWallet& wallet) { DisplayBalanceWorker::Global().ReleasePolled(wallet); }
 
@@ -1089,6 +1101,14 @@ void DisplayBalanceWorker::Run()
         if (shutdown) {
             // No pass will run again: a caller blocked on one must not wait out its timeout.
             for (auto& [wallet, entry] : m_entries) entry.state->AbortWaiters();
+        }
+        // While the start-up wallets are loading nothing is started: the jobs
+        // stay queued, like under a busy validation interface.
+        const bool loading = !shutdown && StartupWalletLoadInProgress();
+        if (loading) {
+            m_wake = false;
+            m_cv.wait_for(lock, STARTUP_LOAD_RECHECK, [&] { return m_stop || m_wake; });
+            continue;
         }
         const int pick = shutdown ? -1 : PickDisplayWallet(candidates, now_ms);
         if (pick < 0) {

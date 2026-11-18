@@ -201,6 +201,32 @@ class PolledBalanceTest(BitcoinTestFramework):
         if info["balance_exact"]:
             assert_equal(info["balance"], final["mine"]["trusted"])
 
+        self.log.info("No balance work starts while the start-up wallets are still loading")
+        names = ["startup_a", "startup_b", "startup_c"]
+        for name in names:
+            node.createwallet(wallet_name=name, load_on_startup=True)
+            self.generatetoaddress(node, 3, node.get_wallet_rpc(name).getnewaddress())
+        self.generate(node, COINBASE_MATURITY)
+        self.stop_node(0)
+        log_start = node.debug_log_path.stat().st_size
+        self.start_node(0, ["-walletrpcexactbalance=0"])
+        for name in names:
+            wallet = node.get_wallet_rpc(name)
+            self.wait_until(lambda: wallet.getwalletinfo()["balance_exact"])
+            assert wallet.getbalance() > 0
+        with open(node.debug_log_path, encoding="utf-8", errors="replace") as log:
+            log.seek(log_start)
+            lines = log.read().splitlines()
+        loaded = [i for i, line in enumerate(lines) if "Wallet completed loading" in line]
+        balance = [i for i, line in enumerate(lines)
+                   if "GUI balance warm-up" in line or "first balance ready" in line]
+        assert len(loaded) >= len(names), loaded
+        # The worker did its work, and all of it after the last wallet loaded.
+        assert len(balance) >= len(names), balance
+        assert min(balance) > max(loaded), (min(balance), max(loaded))
+        for name in names:
+            node.unloadwallet(name, load_on_startup=False)
+
         self.log.info("-walletrpcexactbalance=1 makes exact the default")
         self.restart_node(0, ["-walletrpcexactbalance=1"])
         for _ in range(5):

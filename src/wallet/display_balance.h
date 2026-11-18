@@ -426,6 +426,8 @@ private:
     bool WaitTurn(Entry& entry);
     std::shared_ptr<WalletDisplayBalance> AcquireLocked(CWallet& wallet);
     void ReleaseLocked(CWallet& wallet);
+    //! How often the worker looks again while start-up wallet loading holds it back.
+    static constexpr std::chrono::milliseconds STARTUP_LOAD_RECHECK{50};
     //! Pause between two slices.
     static constexpr std::chrono::milliseconds SLICE_GAP{1};
 
@@ -439,6 +441,26 @@ private:
     DisplayBusyGate m_gate;              // worker thread only
     bool m_deferring{false};             // worker thread only
 };
+
+/**
+ * Held while the wallets configured for start-up are being loaded. For as
+ * long as one exists the display balance worker starts no pass and no
+ * warm-up: a wallet that has finished loading would otherwise be warmed up
+ * while the next ones load, and the two compete for cs_main, the processor
+ * and memory. Jobs stay queued; the worker starts them when the last guard is
+ * gone. A wallet loaded later (RPC, GUI) is not held back. Scoped, so that an
+ * early return or an exception cannot leave the worker waiting for ever.
+ */
+class StartupWalletLoadGuard
+{
+public:
+    StartupWalletLoadGuard();
+    ~StartupWalletLoadGuard();
+    StartupWalletLoadGuard(const StartupWalletLoadGuard&) = delete;
+    StartupWalletLoadGuard& operator=(const StartupWalletLoadGuard&) = delete;
+};
+/** Whether a StartupWalletLoadGuard exists. */
+bool StartupWalletLoadInProgress();
 
 /**
  * Balances for callers that poll (the wallet RPCs).

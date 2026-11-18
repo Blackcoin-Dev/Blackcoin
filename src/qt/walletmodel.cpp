@@ -330,9 +330,11 @@ void WalletModel::setClientModel(ClientModel* client_model)
     }
     m_node_tip_height = -1;
     m_node_tip_hash.SetNull();
+    m_node_tip_regressed = false;
     m_balance_tip_connection = connect(m_client_model, &ClientModel::numBlocksChanged, this,
         [this](int count, const QDateTime&, double, SyncType type, SynchronizationState) {
             if (type != SyncType::BLOCK_SYNC) return;
+            m_node_tip_regressed = m_node_tip_height >= 0 && count < m_node_tip_height;
             m_node_tip_height = count;
             // The client model's cached tip (a leaf mutex, no chain lock); it
             // is never older than the count this signal carries.
@@ -392,10 +394,15 @@ void WalletModel::displayBalancesChanged()
 }
 
 WalletModel::BalanceState WalletModel::ClassifyBalance(bool available, bool exact, bool failed, int snapshot_height, int node_tip_height,
-                                                       bool other_block_at_tip_height)
+                                                       bool other_block_at_tip_height, bool node_tip_regressed)
 {
     if (!available) return BalanceState::None;
     if (node_tip_height >= 0 && snapshot_height < node_tip_height) return BalanceState::Behind;
+    // The node's tip went down (invalidateblock, or a reorg to a heavier but
+    // shorter chain) and the snapshot is above it: of a block the node left.
+    // Without the regression a snapshot above the tip the model was told is
+    // only the tip announcement lagging the wallet, which is not behind.
+    if (node_tip_regressed && node_tip_height >= 0 && snapshot_height > node_tip_height) return BalanceState::Behind;
     // A reorg that ends at the height it started from: the snapshot is of a
     // block the node has left, which is behind too.
     if (node_tip_height >= 0 && snapshot_height == node_tip_height && other_block_at_tip_height) return BalanceState::Behind;
@@ -421,7 +428,13 @@ void WalletModel::applyDisplaySnapshot(const interfaces::WalletDisplayBalances& 
     // user is told only in the second case (Behind).
     const BalanceState state = ClassifyBalance(snapshot.available, snapshot.exact, snapshot.failed,
                                                snapshot.block_height, m_node_tip_height,
-                                               !m_node_tip_hash.IsNull() && snapshot.block_hash != m_node_tip_hash);
+                                               !m_node_tip_hash.IsNull() && snapshot.block_hash != m_node_tip_hash,
+                                               m_node_tip_regressed);
+    // A snapshot of the node's tip, or of a block no higher than it, is the
+    // worker having caught up with the regression.
+    if (snapshot.available && (snapshot.block_hash == m_node_tip_hash || snapshot.block_height <= m_node_tip_height)) {
+        m_node_tip_regressed = false;
+    }
     const bool stale = snapshot.available && state != BalanceState::Exact;
     const bool behind = state == BalanceState::Behind;
     const bool was_behind = m_balance_state == BalanceState::Behind;

@@ -387,7 +387,7 @@ public:
     //! The balance shown is of an older block than the node tip.
     bool balanceIsBehind() const { return m_balance_state == BalanceState::Behind; }
     static BalanceState ClassifyBalance(bool available, bool exact, bool failed, int snapshot_height, int node_tip_height,
-                                        bool other_block_at_tip_height = false);
+                                        bool other_block_at_tip_height = false, bool node_tip_regressed = false);
     bool haveWatchOnly() const { return fHaveWatchOnly; }
 
     void setSendBalanceFamily(std::optional<interfaces::WalletDisplayCoinFamily> family);
@@ -490,6 +490,9 @@ private:
     int m_node_tip_height{-1};
     //! The node's tip block when m_node_tip_height was taken (null: unknown).
     uint256 m_node_tip_hash;
+    //! The node's tip went down (invalidateblock, or a reorg to a shorter
+    //! chain) and no snapshot of the new tip has been applied since.
+    bool m_node_tip_regressed{false};
     //! Whether the balance shown is older than the wallet or the node tip,
     //! and the block it is the balance of.
     bool m_balance_stale{false};

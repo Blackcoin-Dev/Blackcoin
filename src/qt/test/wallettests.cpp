@@ -4097,9 +4097,21 @@ void TestBalanceStateLabels()
     // A reorg to another block of the same height: the snapshot is of a block the node left.
     QVERIFY(WalletModel::ClassifyBalance(true, false, false, 100, 100, /*other_block_at_tip_height=*/true) == State::Behind);
     QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, 100, true) == State::Behind);
-    // The node's tip is not known, or the snapshot is ahead of what the model was told: not behind.
+    // The node's tip is not known: not behind.
     QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, -1, true) == State::Exact);
+    // The tip announcement lagging the wallet is not behind: a snapshot above
+    // the tip the model was told, with no regression of the tip.
     QVERIFY(WalletModel::ClassifyBalance(true, true, false, 101, 100, true) == State::Exact);
+    // The node went to a lower tip (invalidateblock, or a reorg to a heavier
+    // but shorter chain): a snapshot above it is of a block the node left.
+    constexpr bool regressed{true};
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 101, 100, false, regressed) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 101, 100, true, regressed) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, false, false, 105, 100, true, regressed) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, false, true, 101, 100, false, regressed) == State::Behind);
+    // Caught up after the regression: the snapshot is of the new tip.
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, 100, false, regressed) == State::Exact);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 101, -1, false, regressed) == State::Exact);
 }
 
 void TestWalletPollCoalescing(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)

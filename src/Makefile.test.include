@@ -87,6 +87,7 @@ BITCOIN_TESTS =\
   test/blockmanager_tests.cpp \
   test/bloom_tests.cpp \
   test/bswap_tests.cpp \
+  test/caches_tests.cpp \
   test/checkqueue_tests.cpp \
   test/clientversion_tests.cpp \
   test/coins_tests.cpp \

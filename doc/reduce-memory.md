@@ -6,7 +6,7 @@ There are a few parameters that can be dialed down to reduce the memory usage of
 
 The size of some in-memory caches can be reduced. As caches trade off memory usage for performance, reducing these will usually have a negative effect on performance.
 
-- `-dbcache=<n>` - the UTXO database cache size, this defaults to `450`. The unit is MiB (1024).
+- `-dbcache=<n>` - the UTXO database cache size. When it is not set, the node uses one sixteenth of the system memory, no less than `100` and no more than `1024`, and half of that when less than four times that much memory is available. It falls back to `450` when the system memory cannot be detected. The unit is MiB (1024).
   - The minimum value for `-dbcache` is 4.
   - A lower `-dbcache` makes initial sync time much longer. After the initial sync, the effect is less pronounced for most use-cases, unless fast validation of blocks is important, such as for mining.
 

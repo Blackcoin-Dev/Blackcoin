@@ -31,6 +31,10 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <chrono>
 #include <optional>
 #include <system_error>
@@ -411,40 +415,199 @@ bool SQLiteDatabase::CheckWaitStopped(std::chrono::milliseconds delay)
     return m_check_stop;
 }
 
+static std::atomic<int> g_checks_active{0};
+static std::atomic<int> g_checks_max{0};
+
+/** The one worker that runs every database's background check, one at a time. */
+class IntegrityCheckQueue
+{
+public:
+    static IntegrityCheckQueue& Get()
+    {
+        static IntegrityCheckQueue queue;
+        return queue;
+    }
+
+    ~IntegrityCheckQueue()
+    {
+        std::thread t;
+        {
+            LOCK(m_mutex);
+            t = std::move(m_worker);
+        }
+        if (t.joinable()) t.join();
+    }
+
+    void Configure(std::chrono::milliseconds delay, std::chrono::milliseconds pause, std::function<bool()> ready)
+    {
+        LOCK(m_mutex);
+        m_deadline = std::chrono::steady_clock::now() + delay;
+        m_pause = pause;
+        m_ready = std::move(ready);
+    }
+
+    void Enqueue(SQLiteDatabase* db)
+    {
+        std::thread old;
+        {
+            LOCK(m_mutex);
+            db->m_check_state = static_cast<int>(SQLiteDatabase::BackgroundCheckState::QUEUED);
+            m_queue.push_back(db);
+            if (!m_worker_alive) {
+                old = std::move(m_worker);
+                m_worker_alive = true;
+                m_started = false;
+                m_checked = 0;
+                m_worker = std::thread([this] { Work(); });
+            }
+        }
+        if (old.joinable()) old.join();
+        m_cv.notify_all();
+    }
+
+    /** Take a database out of the queue, or stop its running check, and wait until it is out. */
+    void Remove(SQLiteDatabase* db) noexcept
+    {
+        std::thread to_join;
+        {
+            WAIT_LOCK(m_mutex, lock);
+            auto it = std::find(m_queue.begin(), m_queue.end(), db);
+            if (it != m_queue.end()) {
+                m_queue.erase(it);
+                db->m_check_state = static_cast<int>(SQLiteDatabase::BackgroundCheckState::CANCELLED);
+            }
+            if (m_running == db) {
+                {
+                    LOCK(db->m_check_mutex);
+                    db->m_check_stop = true;
+                    // Interrupts the full check on the copy; the pointer is cleared under this mutex before the copy closes.
+                    if (db->m_check_copy) sqlite3_interrupt(db->m_check_copy);
+                }
+                db->m_check_cv.notify_all();
+                m_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_running != db; });
+            }
+            // With nothing left, end the worker now: it may be inside the
+            // readiness callback, which must not outlive the node.
+            if (m_queue.empty() && m_running == nullptr && m_worker.joinable()) to_join = std::move(m_worker);
+        }
+        m_cv.notify_all();
+        if (to_join.joinable()) to_join.join();
+    }
+
+    void WaitDone(SQLiteDatabase* db)
+    {
+        WAIT_LOCK(m_mutex, lock);
+        m_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
+            const auto state = db->GetBackgroundCheckState();
+            return state != SQLiteDatabase::BackgroundCheckState::QUEUED && state != SQLiteDatabase::BackgroundCheckState::RUNNING;
+        });
+    }
+
+private:
+    Mutex m_mutex;
+    std::condition_variable m_cv;
+    std::deque<SQLiteDatabase*> m_queue GUARDED_BY(m_mutex);
+    SQLiteDatabase* m_running GUARDED_BY(m_mutex){nullptr};
+    std::thread m_worker GUARDED_BY(m_mutex);
+    bool m_worker_alive GUARDED_BY(m_mutex){false};
+    bool m_started GUARDED_BY(m_mutex){false};
+    unsigned m_checked GUARDED_BY(m_mutex){0};
+    std::chrono::steady_clock::time_point m_deadline GUARDED_BY(m_mutex){};
+    std::chrono::steady_clock::time_point m_t0 GUARDED_BY(m_mutex){};
+    std::chrono::milliseconds m_pause GUARDED_BY(m_mutex){0};
+    std::function<bool()> m_ready GUARDED_BY(m_mutex);
+
+    void Work() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        LowerCurrentThreadPriority();
+        WAIT_LOCK(m_mutex, lock);
+        while (true) {
+            if (m_queue.empty()) {
+                if (m_started) {
+                    LogPrintf("Background wallet integrity checks finished: %u wallets checked in %d ms\n", m_checked,
+                              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_t0).count());
+                }
+                m_worker_alive = false;
+                return;
+            }
+            // Wait for the quiet delay, then for the node to be past start-up.
+            if (std::chrono::steady_clock::now() < m_deadline) {
+                m_cv.wait_until(lock, m_deadline);
+                continue;
+            }
+            if (m_ready) {
+                const std::function<bool()> ready{m_ready};
+                lock.unlock();
+                const bool ok{ready()};
+                lock.lock();
+                if (!ok) {
+                    m_cv.wait_for(lock, std::chrono::seconds{5});
+                    continue;
+                }
+            }
+            if (m_queue.empty()) continue;
+            SQLiteDatabase* db = m_queue.front();
+            m_queue.pop_front();
+            if (!m_started) {
+                m_started = true;
+                m_t0 = std::chrono::steady_clock::now();
+                LogPrintf("Background wallet integrity checks started: %u wallets queued\n", m_queue.size() + 1);
+            }
+            m_running = db;
+            db->m_check_state = static_cast<int>(SQLiteDatabase::BackgroundCheckState::RUNNING);
+            lock.unlock();
+            const int now_active = ++g_checks_active;
+            int seen = g_checks_max.load();
+            while (now_active > seen && !g_checks_max.compare_exchange_weak(seen, now_active)) {}
+            db->RunBackgroundIntegrityCheck();
+            --g_checks_active;
+            lock.lock();
+            m_running = nullptr;
+            ++m_checked;
+            m_cv.notify_all();
+            if (!m_queue.empty()) {
+                const auto resume = std::chrono::steady_clock::now() + m_pause;
+                m_cv.wait_until(lock, resume, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_queue.empty(); });
+            }
+        }
+    }
+};
+
+void SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds delay, std::chrono::milliseconds pause, std::function<bool()> ready)
+{
+    IntegrityCheckQueue::Get().Configure(delay, pause, std::move(ready));
+}
+
+int SQLiteDatabase::BackgroundChecksMaxConcurrent(bool reset)
+{
+    return reset ? g_checks_max.exchange(0) : g_checks_max.load();
+}
+
 void SQLiteDatabase::StartBackgroundIntegrityCheck()
 {
-    if (m_mock || !m_db || m_check_thread.joinable()) return;
+    if (m_mock || !m_db) return;
+    const auto state = GetBackgroundCheckState();
+    if (state == BackgroundCheckState::QUEUED || state == BackgroundCheckState::RUNNING) return;
     {
         LOCK(m_check_mutex);
         m_check_stop = false;
     }
-    m_check_state = static_cast<int>(BackgroundCheckState::RUNNING);
-    m_check_thread = std::thread([this] { RunBackgroundIntegrityCheck(); });
+    IntegrityCheckQueue::Get().Enqueue(this);
 }
 
 void SQLiteDatabase::StopBackgroundIntegrityCheck() noexcept
 {
-    if (!m_check_thread.joinable()) return;
-    {
-        LOCK(m_check_mutex);
-        m_check_stop = true;
-        // Interrupts the full check on the copy; the connection stays valid
-        // while m_check_mutex is held because the thread clears the pointer
-        // under it before closing.
-        if (m_check_copy) sqlite3_interrupt(m_check_copy);
-    }
-    m_check_cv.notify_all();
-    m_check_thread.join();
+    // Also reaps a worker that has finished, so no thread outlives the databases.
+    IntegrityCheckQueue::Get().Remove(this);
 }
 
 void SQLiteDatabase::JoinBackgroundIntegrityCheck()
 {
-    if (m_check_thread.joinable()) m_check_thread.join();
+    IntegrityCheckQueue::Get().WaitDone(this);
 }
 
 void SQLiteDatabase::RunBackgroundIntegrityCheck()
 {
-    LowerCurrentThreadPriority();
     const auto start = std::chrono::steady_clock::now();
     const std::string copy_file = m_file_path + ".fullcheck";
     const fs::path copy_path = fs::PathFromString(copy_file);

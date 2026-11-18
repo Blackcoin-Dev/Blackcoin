@@ -92,7 +92,7 @@ class WalletBackgroundIntegrityCheckTest(BitcoinTestFramework):
         shutil.copyfile(clean, self.wallet_file())
         self.corrupt_index_only(self.wallet_file())
         with node.assert_debug_log(expected_msgs=["Background wallet integrity check of", "found damage", "missing from index"], timeout=60):
-            self.start_node(0)
+            self.start_node(0, extra_args=["-testwalletfullcheckdelay=0"])
         self.wait_until(lambda: "integrity check" in node.getblockchaininfo()["warnings"], timeout=60)
         # The wallet stays usable and the node keeps running.
         assert_equal(node.getwalletinfo()["walletname"], "w")
@@ -106,7 +106,7 @@ class WalletBackgroundIntegrityCheckTest(BitcoinTestFramework):
         self.log.info("A clean wallet passes the background check and raises no warning")
         shutil.copyfile(clean, self.wallet_file())
         with node.assert_debug_log(expected_msgs=["Background wallet integrity check of", "passed in"], timeout=60):
-            self.start_node(0)
+            self.start_node(0, extra_args=["-testwalletfullcheckdelay=0"])
         assert "integrity check" not in node.getblockchaininfo()["warnings"]
 
 

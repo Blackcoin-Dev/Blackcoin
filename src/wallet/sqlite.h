@@ -15,6 +15,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <thread>
 
@@ -26,6 +27,14 @@ struct sqlite3_mutex;
 
 namespace wallet {
 class SQLiteDatabase;
+class IntegrityCheckQueue;
+
+//! Pause between backup steps of the background check, so a slow disk is not saturated.
+static constexpr int DEFAULT_CHECK_STEP_DELAY_MS{4};
+//! Quiet time after start-up before the first background check starts.
+static constexpr std::chrono::seconds BACKGROUND_CHECK_START_DELAY{60};
+//! Pause between two wallets' background checks.
+static constexpr std::chrono::seconds BACKGROUND_CHECK_WALLET_PAUSE{5};
 
 /** Page cache of a wallet database connection in KiB: 16 MiB, or 4 MiB on a
  *  system with 4 GiB of memory or less. */
@@ -105,6 +114,7 @@ public:
 class SQLiteDatabase : public WalletDatabase
 {
 private:
+    friend class IntegrityCheckQueue;
     const bool m_mock{false};
 
     /** Run the full integrity check in Verify() (otherwise the quick check). */
@@ -130,7 +140,6 @@ private:
     std::condition_variable m_check_cv;
     bool m_check_stop GUARDED_BY(m_check_mutex){false};
     sqlite3* m_check_copy GUARDED_BY(m_check_mutex){nullptr};
-    std::thread m_check_thread;
     std::atomic<int> m_check_state{0};
     void RunBackgroundIntegrityCheck();
     /** Wait up to the given time; returns true when a stop was requested. */
@@ -148,6 +157,7 @@ public:
 
     enum class BackgroundCheckState : int {
         NOT_STARTED = 0,
+        QUEUED,
         RUNNING,
         PASSED,
         FAILED,    //!< damage found, warning raised
@@ -165,13 +175,22 @@ public:
      * error and sets the wallet integrity warning; it never stops the node.
      */
     void StartBackgroundIntegrityCheck() override EXCLUSIVE_LOCKS_REQUIRED(!m_check_mutex);
-    /** Cancel a running background check and wait for its thread to end. */
+    /**
+     * Background checks of all databases share one worker and run one at a
+     * time, in the order they were queued. The first starts after `delay`,
+     * once `ready` (if set) returns true, and the checks are `pause` apart.
+     * Call before StartBackgroundIntegrityCheck; the defaults start at once.
+     */
+    static void ConfigureBackgroundChecks(std::chrono::milliseconds delay, std::chrono::milliseconds pause, std::function<bool()> ready);
+    /** Most checks that ever ran at the same time since the last reset (tests). */
+    static int BackgroundChecksMaxConcurrent(bool reset = false);
+    /** Cancel a queued or running background check and wait for its thread to end. */
     void StopBackgroundIntegrityCheck() noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_check_mutex);
     BackgroundCheckState GetBackgroundCheckState() const { return static_cast<BackgroundCheckState>(m_check_state.load()); }
-    /** Wait for the thread to end without cancelling it (tests). */
+    /** Wait until this database's check is neither queued nor running, without cancelling it (tests). */
     void JoinBackgroundIntegrityCheck();
     /** Pause between backup steps (tests lengthen it to hold the check open). */
-    std::atomic<int> m_check_step_delay_ms{2};
+    std::atomic<int> m_check_step_delay_ms{DEFAULT_CHECK_STEP_DELAY_MS};
     /** Pages copied per backup step. */
     std::atomic<int> m_check_step_pages{256};
 

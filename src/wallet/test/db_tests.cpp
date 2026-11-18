@@ -24,6 +24,7 @@
 #include <warnings.h>
 
 #include <fstream>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -676,6 +677,74 @@ BOOST_AUTO_TEST_CASE(sqlite_background_check_is_cancelled_by_close)
     BOOST_CHECK(!fs::exists(copy));
     database->Open();
     BOOST_CHECK(database->MakeBatch()->Exists(std::string{"row-1"}));
+}
+
+static std::unique_ptr<SQLiteDatabase> MakeQueuedWallet(const fs::path& dir, int rows)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(dir, options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    auto batch = database->MakeBatch();
+    for (int i = 0; i < rows; ++i) BOOST_REQUIRE(batch->Write(strprintf("row-%d", i), std::string(100, 'x')));
+    return database;
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_checks_run_one_at_a_time_in_order)
+{
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds{0}, std::chrono::milliseconds{0}, nullptr);
+    (void)SQLiteDatabase::BackgroundChecksMaxConcurrent(/*reset=*/true);
+    std::vector<std::unique_ptr<SQLiteDatabase>> dbs;
+    for (int i = 0; i < 3; ++i) {
+        dbs.push_back(MakeQueuedWallet(m_path_root / fs::PathFromString(strprintf("queue%d", i)), 1500));
+        dbs.back()->m_check_step_pages = 8;
+        dbs.back()->m_check_step_delay_ms = 1;
+    }
+    for (auto& db : dbs) db->StartBackgroundIntegrityCheck();
+    // The shared worker never has two checks running at once.
+    for (int i = 0; i < 3; ++i) {
+        dbs[i]->JoinBackgroundIntegrityCheck();
+        BOOST_CHECK(dbs[i]->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::PASSED);
+    }
+    BOOST_CHECK_EQUAL(SQLiteDatabase::BackgroundChecksMaxConcurrent(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_queued_database_leaves_the_queue_when_closed)
+{
+    // The gate stays shut, so nothing runs while the databases wait.
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::hours{1}, std::chrono::milliseconds{0}, nullptr);
+    auto a = MakeQueuedWallet(m_path_root / "qa", 10);
+    auto b = MakeQueuedWallet(m_path_root / "qb", 10);
+    a->StartBackgroundIntegrityCheck();
+    b->StartBackgroundIntegrityCheck();
+    BOOST_CHECK(a->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::QUEUED);
+    const auto t0 = std::chrono::steady_clock::now();
+    a->Close();
+    BOOST_CHECK(a->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::CANCELLED);
+    BOOST_CHECK(b->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::QUEUED);
+    // Shutdown with a database still queued returns promptly.
+    b.reset();
+    BOOST_CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds{5});
+    a.reset();
+    // Later tests run with the gate open.
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds{0}, std::chrono::milliseconds{0}, nullptr);
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_check_waits_for_readiness)
+{
+    std::atomic<bool> ready{false};
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds{0}, std::chrono::milliseconds{0}, [&ready] { return ready.load(); });
+    auto a = MakeQueuedWallet(m_path_root / "ready", 10);
+    a->StartBackgroundIntegrityCheck();
+    UninterruptibleSleep(std::chrono::milliseconds{200});
+    BOOST_CHECK(a->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::QUEUED);
+    // Closing returns at once even though the worker is inside its wait for readiness.
+    const auto t0 = std::chrono::steady_clock::now();
+    a->Close();
+    BOOST_CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds{3});
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds{0}, std::chrono::milliseconds{0}, nullptr);
 }
 
 #endif // USE_SQLITE

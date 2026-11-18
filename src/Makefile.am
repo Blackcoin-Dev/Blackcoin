@@ -243,6 +243,7 @@ BITCOIN_CORE_H = \
   node/peerman_args.h \
   node/psbt.h \
   node/quantum_pool.h \
+  node/readahead.h \
   node/shadow_resource_monitor.h \
   node/transaction.h \
   node/txreconciliation.h \
@@ -473,6 +474,7 @@ libbitcoin_node_a_SOURCES = \
   node/peerman_args.cpp \
   node/psbt.cpp \
   node/quantum_pool.cpp \
+  node/readahead.cpp \
   node/shadow_resource_monitor.cpp \
   node/transaction.cpp \
   node/txreconciliation.cpp \
@@ -1043,6 +1045,7 @@ libbitcoinkernel_la_SOURCES = \
   logging.cpp \
   node/blockstorage.cpp \
   node/chainstate.cpp \
+  node/readahead.cpp \
   node/utxo_snapshot.cpp \
   policy/feerate.cpp \
   policy/fees.cpp \

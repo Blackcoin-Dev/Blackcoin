@@ -57,6 +57,7 @@
 #include <node/mempool_persist_args.h>
 #include <node/miner.h>
 #include <node/peerman_args.h>
+#include <node/readahead.h>
 #include <node/shadow_resource_monitor.h>
 #include <node/validation_cache_args.h>
 #include <policy/feerate.h>
@@ -482,6 +483,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-alertnotify=<cmd>", "Execute command when an alert is raised (%s in cmd is replaced by message)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
     argsman.AddArg("-assumevalid=<hex>", strprintf("If this block is in the chain assume that it and its ancestors are valid and potentially skip their script verification (0 to verify all, default: %s, testnet: %s, signet: %s)", defaultChainParams->GetConsensus().defaultAssumeValid.GetHex(), testnetChainParams->GetConsensus().defaultAssumeValid.GetHex(), signetChainParams->GetConsensus().defaultAssumeValid.GetHex()), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockindexreadahead", strprintf("Read the block index files once, in order, before loading them, so a hard disk is not read in small pieces (default: %u). Skipped when the index is larger than a quarter of the memory.", node::DEFAULT_BLOCKINDEX_READAHEAD), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksdir=<dir>", "Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #if HAVE_SYSTEM
     argsman.AddArg("-blocknotify=<cmd>", "Execute command when the best block changes (%s in cmd is replaced by block hash)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -1772,6 +1774,7 @@ static bool AppInitMainImpl(NodeContext& node,
         options.mempool = Assert(node.mempool.get());
         options.reindex = node::fReindex;
         options.reindex_chainstate = fReindexChainState;
+        options.block_index_readahead = args.GetBoolArg("-blockindexreadahead", node::DEFAULT_BLOCKINDEX_READAHEAD);
         options.check_blocks = args.GetIntArg("-checkblocks", DEFAULT_CHECKBLOCKS);
         options.check_level = args.GetIntArg("-checklevel", DEFAULT_CHECKLEVEL);
         options.require_full_verification = args.IsArgSet("-checkblocks") || args.IsArgSet("-checklevel");

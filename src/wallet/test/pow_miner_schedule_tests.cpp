@@ -7,10 +7,12 @@
 #include <wallet/wallet.h>
 
 #include <addresstype.h>
+#include <claim_relay_tracker.h>
 #include <interfaces/wallet.h>
 #include <script/script.h>
 #include <shadow.h>
 #include <test/util/setup_common.h>
+#include <tinyformat.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
 
@@ -734,7 +736,8 @@ BOOST_AUTO_TEST_CASE(claim_attempt_timing_record)
                             "block_time=", " tip_seen_unix_ms=", " tip_seen_known=1 ",
                             "result=submitted ", "tip_changed=0 ", "gate_ready_ms=",
                             " first_hash_ms=", " proof_found_ms=", " mempool_accept_ms=",
-                            " hashes=145 ", "batches=2 ", "duty_sleep_ms=5"}) {
+                            " hashes=145 ", "batches=2 ", "duty_sleep_ms=5 ",
+                            "first_inv_ms=-1 ", "inv_peers_1s=0"}) {
         const size_t found = line.find(key, at);
         BOOST_CHECK_MESSAGE(found != std::string::npos, key);
         if (found != std::string::npos) at = found;
@@ -765,6 +768,90 @@ BOOST_AUTO_TEST_CASE(claim_attempt_timing_record)
     BOOST_CHECK_EQUAL(second.result, "conflict");
     BOOST_CHECK_EQUAL(second.mempool_accept_ms, -1);
     BOOST_CHECK_EQUAL(second.first_hash_ms, -1);
+    BOOST_CHECK_EQUAL(second.first_inv_ms, -1);
+    BOOST_CHECK_EQUAL(second.inv_peers_1s, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(claim_relay_timing_is_appended_when_known)
+{
+    CWallet wallet{nullptr, "claim-relay-timing", CreateMockableWalletDatabase()};
+    const PowMinerTipInfo tip = TipInfo(21, 2000);
+    wallet.m_pow_tip_signal.NotifyTip(tip);
+    const COutPoint claim_input{uint256{77}, 3};
+    const COutPoint earlier_input{uint256{78}, 0};
+    // An announcement from before the attempt belongs to an earlier claim on
+    // the same input and is never reported for this one.
+    GetClaimRelayTracker().NoteAnnounced(
+        earlier_input, uint256{1}, std::chrono::steady_clock::now() - 1h);
+    std::this_thread::sleep_for(5ms);
+    {
+        LOCK(wallet.m_pow_miner_mutex);
+        BOOST_CHECK(wallet.BeginPowClaimAttemptLocked(tip.hash, tip.height, tip.block_time).empty());
+    }
+    wallet.NotePowClaimAttemptFirstHash(tip.hash);
+    wallet.NotePowClaimAttemptBatch(tip.hash, 9, true);
+    {
+        LOCK(wallet.m_pow_miner_mutex);
+        // The line of a submitted claim is held for its relay figures.
+        BOOST_CHECK(wallet.FinishPowClaimAttemptLocked("submitted", false, &claim_input).empty());
+        BOOST_CHECK(wallet.FlushPowClaimRelayTimingLocked(/*force=*/false).empty());
+    }
+    WalletPowClaimTiming timing = wallet.GetPowClaimTiming();
+    BOOST_CHECK(timing.valid);
+    BOOST_CHECK_EQUAL(timing.result, "submitted");
+    BOOST_CHECK_EQUAL(timing.first_inv_ms, -1);
+    BOOST_CHECK_EQUAL(timing.inv_peers_1s, 0U);
+
+    // The message handler announces the claim to two peers, then to a third
+    // more than a second later.
+    const auto announced = std::chrono::steady_clock::now();
+    GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{5}, announced);
+    GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{5}, announced + 10ms);
+    GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{5}, announced + 1500ms);
+    timing = wallet.GetPowClaimTiming();
+    BOOST_CHECK_GE(timing.first_inv_ms, timing.proof_found_ms);
+    BOOST_CHECK_EQUAL(timing.inv_peers_1s, 2U);
+    std::string line;
+    {
+        LOCK(wallet.m_pow_miner_mutex);
+        // Less than a second after the first announcement: still held.
+        BOOST_CHECK(wallet.FlushPowClaimRelayTimingLocked(/*force=*/false).empty());
+        line = wallet.FlushPowClaimRelayTimingLocked(/*force=*/true);
+        BOOST_CHECK(wallet.FlushPowClaimRelayTimingLocked(/*force=*/true).empty());
+    }
+    BOOST_CHECK_EQUAL(std::count(line.begin(), line.end(), '\n'), 0);
+    BOOST_CHECK(line.find("result=submitted ") != std::string::npos);
+    BOOST_CHECK(line.find(strprintf(" duty_sleep_ms=0 first_inv_ms=%d inv_peers_1s=2", timing.first_inv_ms)) != std::string::npos);
+    BOOST_CHECK_EQUAL(line.substr(line.size() - 14), "inv_peers_1s=2");
+    // The published record keeps the figures after the line went out.
+    timing = wallet.GetPowClaimTiming();
+    BOOST_CHECK_GE(timing.first_inv_ms, 0);
+    BOOST_CHECK_EQUAL(timing.inv_peers_1s, 2U);
+
+    // A held line goes out with the next attempt's line, never after it.
+    const PowMinerTipInfo next_tip = TipInfo(22, 2001);
+    wallet.m_pow_tip_signal.NotifyTip(next_tip);
+    {
+        LOCK(wallet.m_pow_miner_mutex);
+        BOOST_CHECK(wallet.BeginPowClaimAttemptLocked(next_tip.hash, next_tip.height, next_tip.block_time).empty());
+        BOOST_CHECK(wallet.FinishPowClaimAttemptLocked("submitted", false, &earlier_input).empty());
+        BOOST_CHECK(wallet.BeginPowClaimAttemptLocked(uint256{23}, 2002, next_tip.block_time + 16).empty());
+        const std::string both = wallet.FinishPowClaimAttemptLocked("failed", false);
+        BOOST_CHECK_EQUAL(std::count(both.begin(), both.end(), '\n'), 1);
+        const size_t held_at = both.find("result=submitted ");
+        const size_t failed_at = both.find("result=failed ");
+        BOOST_CHECK(held_at != std::string::npos && failed_at != std::string::npos && held_at < failed_at);
+        // The stale announcement of the earlier input was not attributed.
+        BOOST_CHECK(both.find("first_inv_ms=-1 inv_peers_1s=0\n") != std::string::npos);
+    }
+
+    // Another claim transaction on the same input starts its record over.
+    GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{6}, announced + 2s);
+    const auto restarted = GetClaimRelayTracker().Get(claim_input);
+    BOOST_REQUIRE(restarted.has_value());
+    BOOST_CHECK(restarted->txid == uint256{6});
+    BOOST_CHECK_EQUAL(restarted->peers_total, 1U);
+    BOOST_CHECK_EQUAL(restarted->peers_1s, 1U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

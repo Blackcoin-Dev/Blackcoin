@@ -17,6 +17,7 @@
 #include <blockfilter.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <claim_relay_tracker.h>
 #include <coins.h>
 #include <common/args.h>
 #include <common/settings.h>
@@ -15188,10 +15189,83 @@ WalletPowMiningGrindResult CWallet::RunShadowPowMiningBatch(
     return result;
 }
 
+namespace {
+/** One line, stable key=value order. Fleet tooling parses this; new keys are
+ * only ever appended. */
+std::string FormatPowClaimTimingLine(const WalletPowClaimTiming& done)
+{
+    return strprintf(
+        "Gold Rush PoW claim timing: tip=%s height=%d block_time=%d "
+        "tip_seen_unix_ms=%d tip_seen_known=%d result=%s tip_changed=%d "
+        "gate_ready_ms=%d first_hash_ms=%d proof_found_ms=%d "
+        "mempool_accept_ms=%d hashes=%u batches=%u duty_sleep_ms=%d "
+        "first_inv_ms=%d inv_peers_1s=%u",
+        done.tip.ToString().substr(0, 16), done.height, done.block_time,
+        done.tip_seen_unix_ms, done.tip_seen_known ? 1 : 0, done.result,
+        done.tip_changed ? 1 : 0, done.gate_ready_ms, done.first_hash_ms,
+        done.proof_found_ms, done.mempool_accept_ms, done.hashes,
+        done.batches, done.duty_sleep_ms, done.first_inv_ms,
+        done.inv_peers_1s);
+}
+
+/** Copy the relay figures of a submitted claim into its timing record.
+ * Returns the time of the first announcement when there is one. An
+ * announcement from before this attempt's proof belongs to an earlier claim
+ * on the same input and is ignored. */
+std::optional<std::chrono::steady_clock::time_point> FillPowClaimRelayTiming(
+    WalletPowClaimTiming& timing, const COutPoint& claim_input,
+    std::chrono::steady_clock::time_point origin)
+{
+    const std::optional<ClaimRelayStats> stats =
+        GetClaimRelayTracker().Get(claim_input);
+    if (!stats || stats->peers_total == 0) return std::nullopt;
+    const int64_t first_inv_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            stats->first_announced - origin).count();
+    if (first_inv_ms < std::max<int64_t>(0, timing.proof_found_ms)) {
+        return std::nullopt;
+    }
+    timing.first_inv_ms = first_inv_ms;
+    timing.inv_peers_1s = stats->peers_1s;
+    return stats->first_announced;
+}
+} // namespace
+
 WalletPowClaimTiming CWallet::GetPowClaimTiming() const
 {
     LOCK(m_pow_miner_mutex);
-    return m_pow_last_claim_timing;
+    WalletPowClaimTiming timing = m_pow_last_claim_timing;
+    if (m_pow_claim_relay_pending.open && timing.valid &&
+        timing.result == "submitted" &&
+        timing.tip == m_pow_claim_relay_pending.timing.tip) {
+        // The line is still held: show the relay figures as they stand.
+        FillPowClaimRelayTiming(timing, m_pow_claim_relay_pending.claim_input,
+                                m_pow_claim_relay_pending.origin);
+    }
+    return timing;
+}
+
+std::string CWallet::FlushPowClaimRelayTimingLocked(bool force)
+{
+    AssertLockHeld(m_pow_miner_mutex);
+    PowClaimRelayPending& pending = m_pow_claim_relay_pending;
+    if (!pending.open) return {};
+    const auto now = std::chrono::steady_clock::now();
+    const auto first_announced = FillPowClaimRelayTiming(
+        pending.timing, pending.claim_input, pending.origin);
+    const bool settled = first_announced
+        ? now - *first_announced >= std::chrono::seconds{1}
+        : now - pending.accepted >= std::chrono::seconds{3};
+    if (!force && !settled) return {};
+    if (m_pow_last_claim_timing.valid &&
+        m_pow_last_claim_timing.result == "submitted" &&
+        m_pow_last_claim_timing.tip == pending.timing.tip) {
+        m_pow_last_claim_timing.first_inv_ms = pending.timing.first_inv_ms;
+        m_pow_last_claim_timing.inv_peers_1s = pending.timing.inv_peers_1s;
+    }
+    const std::string line = FormatPowClaimTimingLine(pending.timing);
+    pending = {};
+    return line;
 }
 
 std::string CWallet::BeginPowClaimAttemptLocked(
@@ -15234,10 +15308,13 @@ std::string CWallet::BeginPowClaimAttemptLocked(
 }
 
 std::string CWallet::FinishPowClaimAttemptLocked(
-    const std::string& result, bool tip_changed)
+    const std::string& result, bool tip_changed, const COutPoint* relay_key)
 {
     AssertLockHeld(m_pow_miner_mutex);
     if (!m_pow_claim_attempt.open) return {};
+    // A line still held for an earlier claim goes out first, with this one.
+    std::string held = FlushPowClaimRelayTimingLocked(/*force=*/true);
+    if (!held.empty()) held += "\n";
     WalletPowClaimTiming& timing = m_pow_claim_attempt.timing;
     const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - m_pow_claim_attempt.origin).count();
@@ -15247,30 +15324,32 @@ std::string CWallet::FinishPowClaimAttemptLocked(
     timing.tip_changed = tip_changed;
     timing.result = result;
     m_pow_last_claim_timing = timing;
+    if (result == "submitted" && relay_key) {
+        PowClaimRelayPending pending;
+        pending.open = true;
+        pending.timing = timing;
+        pending.claim_input = *relay_key;
+        pending.origin = m_pow_claim_attempt.origin;
+        pending.accepted = std::chrono::steady_clock::now();
+        m_pow_claim_relay_pending = pending;
+        m_pow_claim_attempt = {};
+        if (!held.empty()) held.pop_back();
+        return held;
+    }
     m_pow_claim_attempt = {};
-    const WalletPowClaimTiming& done = m_pow_last_claim_timing;
-    // One line, stable key=value order. Fleet tooling parses this.
-    return strprintf(
-        "Gold Rush PoW claim timing: tip=%s height=%d block_time=%d "
-        "tip_seen_unix_ms=%d tip_seen_known=%d result=%s tip_changed=%d "
-        "gate_ready_ms=%d first_hash_ms=%d proof_found_ms=%d "
-        "mempool_accept_ms=%d hashes=%u batches=%u duty_sleep_ms=%d",
-        done.tip.ToString().substr(0, 16), done.height, done.block_time,
-        done.tip_seen_unix_ms, done.tip_seen_known ? 1 : 0, done.result,
-        done.tip_changed ? 1 : 0, done.gate_ready_ms, done.first_hash_ms,
-        done.proof_found_ms, done.mempool_accept_ms, done.hashes,
-        done.batches, done.duty_sleep_ms);
+    return held + FormatPowClaimTimingLine(m_pow_last_claim_timing);
 }
 
 void CWallet::FinishPowClaimAttempt(
-    const uint256& tip, const std::string& result, bool tip_changed)
+    const uint256& tip, const std::string& result, bool tip_changed,
+    const COutPoint* relay_key)
 {
     std::string line;
     {
         LOCK(m_pow_miner_mutex);
         if (!m_pow_claim_attempt.open ||
             m_pow_claim_attempt.timing.tip != tip) return;
-        line = FinishPowClaimAttemptLocked(result, tip_changed);
+        line = FinishPowClaimAttemptLocked(result, tip_changed, relay_key);
     }
     if (!line.empty()) WalletLogPrintf("%s\n", line);
 }
@@ -15417,8 +15496,12 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             bool refresh_gate{false};
             bool wallet_wide_tip_wait{false};
             std::string stale_attempt_line;
+            std::string relay_timing_line;
             {
                 LOCK(m_pow_miner_mutex);
+                relay_timing_line = FlushPowClaimRelayTimingLocked(
+                    /*force=*/m_pow_claim_relay_pending.open &&
+                        m_pow_claim_relay_pending.timing.tip != current_tip);
                 if (m_pow_claim_attempt.open &&
                     m_pow_claim_attempt.timing.tip != current_tip) {
                     stale_attempt_line =
@@ -15469,6 +15552,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                       current_relay_clock_effective_time >=
                           mining_gate.relay_expiry_time));
             }
+            if (!relay_timing_line.empty()) WalletLogPrintf("%s\n", relay_timing_line);
             if (!stale_attempt_line.empty()) WalletLogPrintf("%s\n", stale_attempt_line);
             if (refresh_gate) {
                 if (mining_gate.ProofEvaluationPending()) {
@@ -16138,7 +16222,10 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                         ? "input_unavailable"
                         : "failed",
                     submit_result != ShadowPowClaimSubmitResult::SUBMITTED &&
-                        tip_moved);
+                        tip_moved,
+                    // The relay tracker knows an input-bound claim by its
+                    // fee input; the line then waits for the relay figures.
+                    work.input_bound ? &selected_input.outpoint : nullptr);
             }
             if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED ||
                 submit_result ==
@@ -16278,10 +16365,15 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
     duty_state.Publish(*this, /*finished=*/false);
     {
         std::string stopped_attempt_line;
+        std::string held_relay_line;
         if (IsPowMiningClosing() || !m_pow_mining_enabled.load()) {
             LOCK(m_pow_miner_mutex);
+            held_relay_line = FlushPowClaimRelayTimingLocked(/*force=*/true);
             stopped_attempt_line =
                 FinishPowClaimAttemptLocked("stopped", /*tip_changed=*/false);
+        }
+        if (!held_relay_line.empty()) {
+            WalletLogPrintf("%s\n", held_relay_line);
         }
         if (!stopped_attempt_line.empty()) {
             WalletLogPrintf("%s\n", stopped_attempt_line);

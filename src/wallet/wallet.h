@@ -142,6 +142,13 @@ struct WalletPowClaimTiming {
     int64_t first_hash_ms{-1};
     int64_t proof_found_ms{-1};
     int64_t mempool_accept_ms{-1};
+    /** Offset at which the claim was first announced to a peer; -1 when it
+     * was not announced within the observation window (or has no peer). It is
+     * taken by the message handler, so it can be a few milliseconds smaller
+     * than mempool_accept_ms, which is taken when the submission returns. */
+    int64_t first_inv_ms{-1};
+    /** Peers the claim was announced to within one second of the first. */
+    uint32_t inv_peers_1s{0};
     uint64_t hashes{0};
     uint64_t batches{0};
     /** Duty sleep taken between the first hash and the end of the attempt. */
@@ -2242,6 +2249,20 @@ public:
         std::chrono::nanoseconds duty_sleep{0};
     };
     PowClaimAttempt m_pow_claim_attempt GUARDED_BY(m_pow_miner_mutex);
+    /** A submitted claim whose timing line waits for its relay figures. */
+    struct PowClaimRelayPending {
+        bool open{false};
+        WalletPowClaimTiming timing;
+        /** The fee input the proof is bound to: the relay tracker's key. */
+        COutPoint claim_input;
+        std::chrono::steady_clock::time_point origin{};
+        std::chrono::steady_clock::time_point accepted{};
+    };
+    PowClaimRelayPending m_pow_claim_relay_pending GUARDED_BY(m_pow_miner_mutex);
+    /** Tip sequence, plus one, for which a worker holds a found proof that it
+     * is submitting; zero when none. A lock-free mirror of the single-flight
+     * marker, read once per hash so sibling workers stop searching at once. */
+    std::atomic<uint64_t> m_pow_proof_found_tip_seq{0};
     WalletPowClaimTiming m_pow_last_claim_timing GUARDED_BY(m_pow_miner_mutex);
     // When worker zero first held a settled gate for a tip.
     uint256 m_pow_gate_ready_tip GUARDED_BY(m_pow_miner_mutex);
@@ -2901,9 +2922,18 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(m_pow_miner_mutex);
     /** Close the open attempt and return its one-line log record, or an
      * empty string when no attempt is open. */
-    std::string FinishPowClaimAttemptLocked(const std::string& result, bool tip_changed)
+    /** With relay_key, a submitted attempt returns no line yet: the line is
+     * held until its relay figures are known (FlushPowClaimRelayTimingLocked). */
+    std::string FinishPowClaimAttemptLocked(const std::string& result, bool tip_changed,
+                                            const COutPoint* relay_key = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(m_pow_miner_mutex);
-    void FinishPowClaimAttempt(const uint256& tip, const std::string& result, bool tip_changed);
+    void FinishPowClaimAttempt(const uint256& tip, const std::string& result, bool tip_changed,
+                               const COutPoint* relay_key = nullptr);
+    /** Return the held timing line of a submitted claim once its relay
+     * figures are settled (one second after the first announcement, or three
+     * seconds after acceptance without one), or at once when forced. */
+    std::string FlushPowClaimRelayTimingLocked(bool force)
+        EXCLUSIVE_LOCKS_REQUIRED(m_pow_miner_mutex);
     void NotePowClaimAttemptFirstHash(const uint256& tip);
     void NotePowClaimAttemptBatch(const uint256& tip, uint64_t hashes, bool found);
     void NotePowClaimAttemptDutySleep(const uint256& tip, std::chrono::nanoseconds slept);

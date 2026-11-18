@@ -866,6 +866,8 @@ LifecycleSliceResult PassWalletSliceLocked(const CWallet& wallet, LifecyclePass&
         if (meter.Expired()) return LifecycleSliceResult::MORE;
         // A bucket is always finished within the slice that started it, so
         // the cursor is a bucket number and no iterator outlives a lock hold.
+        // The bound on one slice is therefore the budget plus one mapWallet
+        // bucket (a handful of records), not the budget plus one record.
         for (auto it = wallet.mapWallet.begin(pass.bucket); it != wallet.mapWallet.end(pass.bucket); ++it) {
             meter.Tick();
             AddTxToBalance(wallet, it->second, pass.min_depth, pass.avoid_reuse, pass.trusted_parents, pass.balance);

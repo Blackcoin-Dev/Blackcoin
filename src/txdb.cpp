@@ -15,6 +15,7 @@
 #include <random.h>
 #include <serialize.h>
 #include <uint256.h>
+#include <util/io_counters.h>
 #include <util/vector.h>
 
 #include <cassert>
@@ -73,10 +74,12 @@ bool CCoinsViewDB::ResizeCache(size_t new_cache_size)
 }
 
 bool CCoinsViewDB::GetCoin(const COutPoint &outpoint, Coin &coin) const {
+    iocounters::OnGetCoin();
     return m_db->Read(CoinEntry(&outpoint), coin);
 }
 
 bool CCoinsViewDB::HaveCoin(const COutPoint &outpoint) const {
+    iocounters::OnHaveCoin();
     return m_db->Exists(CoinEntry(&outpoint));
 }
 

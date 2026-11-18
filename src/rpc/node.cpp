@@ -26,6 +26,7 @@
 #include <univalue.h>
 #include <util/any.h>
 #include <util/check.h>
+#include <util/io_counters.h>
 #include <util/time.h>
 
 #include <stdint.h>
@@ -404,6 +405,49 @@ static RPCHelpMan getindexinfo()
     };
 }
 
+static RPCHelpMan getiocounters()
+{
+    return RPCHelpMan{"getiocounters",
+        "\nReturn the process-wide counters of chainstate reads and wallet database commits (for tests).\n"
+        "Read-only: takes no wallet or chain lock. Counters only grow; a test compares two readings.\n",
+        {
+            {"recorder_start", RPCArg::Type::NUM, RPCArg::Default{0}, "Report the order of the coin keys recorded at positions from this one (needs -testrecordreadkeys)."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "chainstate_get_coin", "CCoinsViewDB::GetCoin calls"},
+                {RPCResult::Type::NUM, "chainstate_have_coin", "CCoinsViewDB::HaveCoin calls"},
+                {RPCResult::Type::NUM, "db_reads", "LevelDB reads of any database"},
+                {RPCResult::Type::NUM, "db_exists", "LevelDB existence checks of any database"},
+                {RPCResult::Type::NUM, "wallet_commits", "wallet SQLite commits"},
+                {RPCResult::Type::NUM, "wallet_commits_in_handler", "wallet commits made inside a wallet block or mempool handler (holding cs_wallet)"},
+                {RPCResult::Type::NUM, "recorded_keys", "database keys recorded so far"},
+                {RPCResult::Type::NUM, "recorded_coin_keys", "coin keys recorded from recorder_start on"},
+                {RPCResult::Type::NUM, "recorded_coin_key_inversions", "adjacent recorded coin keys from recorder_start on that are out of order"},
+            }},
+        RPCExamples{HelpExampleCli("getiocounters", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const int64_t start = request.params[0].isNull() ? 0 : request.params[0].getInt<int64_t>();
+    if (start < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "recorder_start must not be negative");
+    const iocounters::Snapshot s = iocounters::Read();
+    const iocounters::KeyOrderReport order = iocounters::RecordedKeyOrder('C', static_cast<size_t>(start));
+    UniValue result{UniValue::VOBJ};
+    result.pushKV("chainstate_get_coin", s.chainstate_get_coin);
+    result.pushKV("chainstate_have_coin", s.chainstate_have_coin);
+    result.pushKV("db_reads", s.db_reads);
+    result.pushKV("db_exists", s.db_exists);
+    result.pushKV("wallet_commits", s.wallet_commits);
+    result.pushKV("wallet_commits_in_handler", s.wallet_commits_in_handler);
+    result.pushKV("recorded_keys", static_cast<uint64_t>(iocounters::RecordedKeyCount()));
+    result.pushKV("recorded_coin_keys", static_cast<uint64_t>(order.keys));
+    result.pushKV("recorded_coin_key_inversions", static_cast<uint64_t>(order.inversions));
+    return result;
+},
+    };
+}
+
 void RegisterNodeRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -412,6 +456,7 @@ void RegisterNodeRPCCommands(CRPCTable& t)
         {"util", &getindexinfo},
         {"hidden", &setmocktime},
         {"hidden", &mockscheduler},
+        {"hidden", &getiocounters},
         {"hidden", &echo},
         {"hidden", &echojson},
         {"hidden", &echoipc},

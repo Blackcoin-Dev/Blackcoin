@@ -326,6 +326,7 @@ BITCOIN_CORE_H = \
   util/golombrice.h \
   util/hash_type.h \
   util/hasher.h \
+  util/io_counters.h \
   util/insert.h \
   util/macros.h \
   util/message.h \
@@ -824,6 +825,7 @@ libbitcoin_util_a_SOURCES = \
   util/fs_helpers.cpp \
   util/getuniquepath.cpp \
   util/hasher.cpp \
+  util/io_counters.cpp \
   util/sock.cpp \
   util/syserror.cpp \
   util/message.cpp \
@@ -1081,6 +1083,7 @@ libbitcoinkernel_la_SOURCES = \
   util/fs_helpers.cpp \
   util/getuniquepath.cpp \
   util/hasher.cpp \
+  util/io_counters.cpp \
   util/moneystr.cpp \
   util/serfloat.cpp \
   util/signalinterrupt.cpp \

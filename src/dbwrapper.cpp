@@ -14,6 +14,7 @@
 #include <streams.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
+#include <util/io_counters.h>
 #include <util/strencodings.h>
 
 #include <algorithm>
@@ -344,6 +345,7 @@ std::vector<unsigned char> CDBWrapper::CreateObfuscateKey() const
 
 std::optional<std::string> CDBWrapper::ReadImpl(Span<const std::byte> key) const
 {
+    iocounters::OnDbRead(key);
     leveldb::Slice slKey(CharCast(key.data()), key.size());
     std::string strValue;
     leveldb::Status status = DBContext().pdb->Get(DBContext().readoptions, slKey, &strValue);
@@ -358,6 +360,7 @@ std::optional<std::string> CDBWrapper::ReadImpl(Span<const std::byte> key) const
 
 bool CDBWrapper::ExistsImpl(Span<const std::byte> key) const
 {
+    iocounters::OnDbExists(key);
     leveldb::Slice slKey(CharCast(key.data()), key.size());
 
     std::string strValue;

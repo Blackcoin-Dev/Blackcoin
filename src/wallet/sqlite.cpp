@@ -13,10 +13,12 @@
 #include <sync.h>
 #include <util/fs_helpers.h>
 #include <util/check.h>
+#include <util/io_counters.h>
 #include <util/strencodings.h>
 #include <util/time.h>
 #include <util/translation.h>
 #include <wallet/db.h>
+#include <wallet/scheduler_stats.h>
 #include <warnings.h>
 
 #include <sqlite3.h>
@@ -601,6 +603,7 @@ bool SQLiteDatabase::Backup(const std::string& dest) const
 
 void SQLiteDatabase::RecordCommit(SqliteCommitKind kind, std::chrono::microseconds duration)
 {
+    iocounters::OnWalletCommit(InWalletCallback());
     m_commit_counters.Record(kind, duration);
     ProcessSqliteCommits().Record(kind, duration);
 }

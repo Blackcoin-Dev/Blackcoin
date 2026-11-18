@@ -157,6 +157,13 @@ private:
     bool m_have_acquired{false};
 };
 
+/**
+ * True on a thread that is inside a wallet validation-interface handler (a
+ * WalletCallbackTimer is alive). The handler holds cs_wallet for most of that
+ * span, so a wallet database commit made now is a commit under cs_wallet.
+ */
+bool InWalletCallback();
+
 /** Where the number of queued validation callbacks comes from; unset in tools that have no scheduler. */
 void SetValidationQueueDepthProvider(std::function<size_t()> provider);
 std::optional<size_t> GetValidationQueueDepth();

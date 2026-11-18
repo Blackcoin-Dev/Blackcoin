@@ -203,6 +203,11 @@ std::string FormatSqliteCommits(const SqliteCommitSnapshot& snapshot)
     return out;
 }
 
+bool InWalletCallback()
+{
+    return t_callback_depth > 0;
+}
+
 WalletCallbackTimer::WalletCallbackTimer(WalletCallbackKind kind)
     : m_kind{kind}, m_counted{t_callback_depth == 0}, m_start{std::chrono::steady_clock::now()}
 {

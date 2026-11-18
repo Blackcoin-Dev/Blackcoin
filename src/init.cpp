@@ -82,6 +82,7 @@
 #include <util/asmap.h>
 #include <util/chaintype.h>
 #include <util/check.h>
+#include <util/io_counters.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/moneystr.h>
@@ -630,6 +631,9 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-checkpoints", strprintf("Enable rejection of any forks from the known historical chain until block %s (default: %u)", defaultChainParams->Checkpoints().GetHeight(), DEFAULT_CHECKPOINTS_ENABLED), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-deprecatedrpc=<method>", "Allows deprecated RPC method(s) to be used", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-fastprune", "Use smaller block files and lower minimum prune height for functional tests", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testdbreaddelayus=<n>", "Sleep <n> microseconds on every database read, to reproduce a slow disk (regtest only, 0-1000000, default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testwalletsyncdelayus=<n>", "Sleep <n> microseconds on every wallet database commit, to reproduce a slow disk (regtest only, 0-1000000, default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testrecordreadkeys", "Record the key of every database read so the getiocounters RPC can report their order (regtest only, default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-stopafterblockimport", strprintf("Stop running after importing blocks from disk (default: %u)", DEFAULT_STOPAFTERBLOCKIMPORT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-stopatheight", strprintf("Stop running after reaching the given height in the main chain (default: %u)", DEFAULT_STOPATHEIGHT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-limitancestorcount=<n>", strprintf("Do not accept transactions if number of in-mempool ancestors is <n> or more (default: %u)", DEFAULT_ANCESTOR_LIMIT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -1010,6 +1014,18 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         if (chain != ChainType::REGTEST) return InitError(Untranslated("-publicendpointpollinterval is only supported on regtest."));
         if (poll < 1 || poll > 60) return InitError(Untranslated("-publicendpointpollinterval must be between 1 and 60 seconds"));
     }
+    for (const char* name : {"-testdbreaddelayus", "-testwalletsyncdelayus"}) {
+        if (!args.IsArgSet(name)) continue;
+        if (const auto err = iocounters::CheckTestDelayOption(name, args.GetIntArg(name, 0), chain == ChainType::REGTEST)) {
+            return InitError(Untranslated(*err));
+        }
+    }
+    if (args.GetBoolArg("-testrecordreadkeys", false) && chain != ChainType::REGTEST) {
+        return InitError(Untranslated("-testrecordreadkeys is only supported on regtest."));
+    }
+    iocounters::SetDbReadDelayUs(args.GetIntArg("-testdbreaddelayus", 0));
+    iocounters::SetWalletCommitDelayUs(args.GetIntArg("-testwalletsyncdelayus", 0));
+    iocounters::SetKeyRecorder(args.GetBoolArg("-testrecordreadkeys", false));
     if (args.IsArgSet("-shadowcompetingclaimsheight") && chain != ChainType::REGTEST) {
         return InitError(_("-shadowcompetingclaimsheight is only supported on regtest."));
     }

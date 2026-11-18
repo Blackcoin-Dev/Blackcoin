@@ -4799,7 +4799,8 @@ static RPCHelpMan getpowmininginfo()
                 {RPCResult::Type::NUM, "batches", "Search batches run in the attempt, all workers."},
                 {RPCResult::Type::NUM, "duty_sleep_ms", "CPU duty sleep taken inside the attempt, summed over workers. Zero unless the work-first allowance was used up."},
                 {RPCResult::Type::NUM, "first_inv_ms", "Offset at which the claim was first announced to a peer. -1 until that happens, and when it did not happen within three seconds of acceptance. It is taken by the network thread and can be a few milliseconds smaller than mempool_accept_ms."},
-                {RPCResult::Type::NUM, "inv_peers_1s", "Peers the claim was announced to within one second of the first announcement."},
+                {RPCResult::Type::NUM, "inv_peers_1s", "Peers the claim was announced to within one second of the first announcement, by inv or by sending the whole transaction."},
+                {RPCResult::Type::NUM, "push_peers_1s", "Of those, the peers that were sent the whole transaction at once, which this node does for a claim its own miner created."},
             }},
             {RPCResult::Type::NUM, "unresolved_claims", "Unconfirmed wallet QQSPROOF transactions, whether live or quarantined."},
             {RPCResult::Type::NUM, "live_claims", "Unconfirmed wallet QQSPROOF transactions currently in the local mempool."},
@@ -5008,6 +5009,7 @@ static RPCHelpMan getpowmininginfo()
         last_timing.pushKV("duty_sleep_ms", timing.duty_sleep_ms);
         last_timing.pushKV("first_inv_ms", timing.first_inv_ms);
         last_timing.pushKV("inv_peers_1s", timing.inv_peers_1s);
+        last_timing.pushKV("push_peers_1s", timing.push_peers_1s);
         obj.pushKV("last_claim_timing", std::move(last_timing));
     }
     obj.pushKV("unresolved_claims",

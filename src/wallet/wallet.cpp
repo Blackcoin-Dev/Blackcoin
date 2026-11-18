@@ -15221,13 +15221,13 @@ std::string FormatPowClaimTimingLine(const WalletPowClaimTiming& done)
         "tip_seen_unix_ms=%d tip_seen_known=%d result=%s tip_changed=%d "
         "gate_ready_ms=%d first_hash_ms=%d proof_found_ms=%d "
         "mempool_accept_ms=%d hashes=%u batches=%u duty_sleep_ms=%d "
-        "first_inv_ms=%d inv_peers_1s=%u",
+        "first_inv_ms=%d inv_peers_1s=%u push_peers_1s=%u",
         done.tip.ToString().substr(0, 16), done.height, done.block_time,
         done.tip_seen_unix_ms, done.tip_seen_known ? 1 : 0, done.result,
         done.tip_changed ? 1 : 0, done.gate_ready_ms, done.first_hash_ms,
         done.proof_found_ms, done.mempool_accept_ms, done.hashes,
         done.batches, done.duty_sleep_ms, done.first_inv_ms,
-        done.inv_peers_1s);
+        done.inv_peers_1s, done.push_peers_1s);
 }
 
 /** Copy the relay figures of a submitted claim into its timing record.
@@ -15249,6 +15249,7 @@ std::optional<std::chrono::steady_clock::time_point> FillPowClaimRelayTiming(
     }
     timing.first_inv_ms = first_inv_ms;
     timing.inv_peers_1s = stats->peers_1s;
+    timing.push_peers_1s = stats->pushed_1s;
     return stats->first_announced;
 }
 } // namespace
@@ -15284,6 +15285,7 @@ std::string CWallet::FlushPowClaimRelayTimingLocked(bool force)
         m_pow_last_claim_timing.tip == pending.timing.tip) {
         m_pow_last_claim_timing.first_inv_ms = pending.timing.first_inv_ms;
         m_pow_last_claim_timing.inv_peers_1s = pending.timing.inv_peers_1s;
+        m_pow_last_claim_timing.push_peers_1s = pending.timing.push_peers_1s;
     }
     const std::string line = FormatPowClaimTimingLine(pending.timing);
     pending = {};
@@ -16226,11 +16228,20 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             }
             std::optional<ShadowPowClaimMiningGate>
                 submit_failure_reselection;
+            // This node created the claim: its first relay sends peers the
+            // whole transaction. The mark is used at most once and does not
+            // outlive the submission.
+            if (work.input_bound) {
+                GetClaimRelayTracker().MarkLocalClaim(selected_input.outpoint);
+            }
             const ShadowPowClaimSubmitResult submit_result =
                 SubmitShadowPowClaim(
                     selected_input, work, proof,
                     loop_authority_generation, error,
                     &submit_failure_reselection);
+            if (work.input_bound) {
+                GetClaimRelayTracker().UnmarkLocalClaim(selected_input.outpoint);
+            }
             // Count the claim before anything else, as rc12 did: the wallet
             // transaction is already visible, and a reader that sees it must
             // not find the counter lagging behind the timing line below.

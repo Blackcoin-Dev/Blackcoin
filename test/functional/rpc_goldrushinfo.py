@@ -651,12 +651,13 @@ class GoldRushInfoTest(BitcoinTestFramework):
             "valid", "tip", "height", "block_time", "tip_seen_unix_ms",
             "tip_seen_known", "result", "tip_changed", "gate_ready_ms",
             "first_hash_ms", "proof_found_ms", "mempool_accept_ms", "hashes",
-            "batches", "duty_sleep_ms", "first_inv_ms", "inv_peers_1s"]))
+            "batches", "duty_sleep_ms", "first_inv_ms", "inv_peers_1s", "push_peers_1s"]))
         assert_equal(timing["valid"], False)
         assert_equal(timing["result"], "")
         assert_equal(timing["mempool_accept_ms"], -1)
         assert_equal(timing["first_inv_ms"], -1)
         assert_equal(timing["inv_peers_1s"], 0)
+        assert_equal(timing["push_peers_1s"], 0)
         assert "last_claim_timing" in wallet.help("getpowmininginfo")
         pow_help = wallet.help("setpowmining")
         assert "allow_new_payout_key" in pow_help

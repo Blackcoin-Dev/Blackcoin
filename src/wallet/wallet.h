@@ -149,6 +149,8 @@ struct WalletPowClaimTiming {
     int64_t first_inv_ms{-1};
     /** Peers the claim was announced to within one second of the first. */
     uint32_t inv_peers_1s{0};
+    /** Of those, the peers that were sent the whole transaction at once. */
+    uint32_t push_peers_1s{0};
     uint64_t hashes{0};
     uint64_t batches{0};
     /** Duty sleep taken between the first hash and the end of the attempt. */

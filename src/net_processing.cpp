@@ -432,6 +432,11 @@ struct Peer {
          *  queued for announcement at the next send, ahead of the trickle
          *  timer. Never larger than MAX_URGENT_CLAIM_INVS_PER_TRICKLE. */
         std::set<uint256> m_tx_inventory_urgent GUARDED_BY(m_tx_inventory_mutex);
+        /** The members of m_tx_inventory_urgent that this node's own miner
+         *  just created: they are sent as a whole transaction, with no inv
+         *  and getdata round trip. Filled only from the miner's one-shot
+         *  mark, never by anything a peer sends. */
+        std::set<uint256> m_tx_inventory_push GUARDED_BY(m_tx_inventory_mutex);
         /** Claims announced ahead of the timer since the last trickle. They
          *  were announced after m_last_inv_sequence was taken, so a getdata
          *  for one of them is served from this set. Bounded by
@@ -2520,10 +2525,10 @@ void PeerManagerImpl::SendPings()
 
 namespace {
 /** Record, for the miner's timing line only, that a claim was announced. */
-void NoteClaimAnnounced(const CTransaction& tx)
+void NoteClaimAnnounced(const CTransaction& tx, bool pushed = false)
 {
     if (const std::optional<COutPoint> claim_input{GetShadowPowProofBoundOutpoint(tx)}) {
-        GetClaimRelayTracker().NoteAnnounced(*claim_input, tx.GetHash(), std::chrono::steady_clock::now());
+        GetClaimRelayTracker().NoteAnnounced(*claim_input, tx.GetHash(), std::chrono::steady_clock::now(), pushed);
     }
 }
 } // namespace
@@ -2546,6 +2551,17 @@ void PeerManagerImpl::RelayTransaction(const uint256& txid, const uint256& wtxid
             }
         }
     }
+    // A claim this node's own miner has just submitted is sent whole, once,
+    // so its first hop does not wait for a getdata (which a peer delays by
+    // two seconds when we are its inbound peer). The mark is one-shot: a
+    // later relay of the same claim, and every claim from a peer, is
+    // announced by inv.
+    bool push{false};
+    if (urgent) {
+        if (const std::optional<COutPoint> claim_input{GetShadowPowProofBoundOutpoint(*mempool_tx)}) {
+            push = GetClaimRelayTracker().ConsumeLocalClaim(*claim_input);
+        }
+    }
     LOCK(m_peer_mutex);
     for(auto& it : m_peer_map) {
         Peer& peer = *it.second;
@@ -2565,6 +2581,7 @@ void PeerManagerImpl::RelayTransaction(const uint256& txid, const uint256& wtxid
             queued_inventory |= tx_relay->m_tx_inventory_to_send.insert(hash).second;
             if (urgent && tx_relay->m_tx_inventory_urgent.size() < MAX_URGENT_CLAIM_INVS_PER_TRICKLE) {
                 queued_inventory |= tx_relay->m_tx_inventory_urgent.insert(hash).second;
+                if (push) tx_relay->m_tx_inventory_push.insert(hash);
             }
         }
     };
@@ -6354,16 +6371,27 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                         if (txinfo.fee < urgent_filterrate.GetFee(txinfo.vsize)) continue;
                         if (tx_relay->m_bloom_filter && !tx_relay->m_bloom_filter->IsRelevantAndUpdate(*txinfo.tx)) continue;
                         tx_relay->m_tx_inventory_to_send.erase(hash);
-                        vInv.push_back(inv);
-                        if (vInv.size() == MAX_INV_SZ) {
-                            m_connman.PushMessage(pto, msgMaker.Make(NetMsgType::INV, vInv));
-                            vInv.clear();
+                        // Every released version processes a transaction it
+                        // did not request and disconnects only a sender it
+                        // told not to relay, which m_relay_txs excludes. A
+                        // peer whose send buffer is full gets the inv.
+                        const bool push_tx{!pto->fPauseSend && tx_relay->m_tx_inventory_push.count(hash) > 0};
+                        if (push_tx) {
+                            m_connman.PushMessage(pto, msgMaker.Make(NetMsgType::TX, TX_WITH_WITNESS(*txinfo.tx)));
+                        } else {
+                            vInv.push_back(inv);
+                            if (vInv.size() == MAX_INV_SZ) {
+                                m_connman.PushMessage(pto, msgMaker.Make(NetMsgType::INV, vInv));
+                                vInv.clear();
+                            }
                         }
                         tx_relay->m_tx_inventory_known_filter.insert(hash);
+                        // Counted against the same per-peer bound either way.
                         tx_relay->m_urgent_announced.insert(hash);
-                        NoteClaimAnnounced(*txinfo.tx);
+                        NoteClaimAnnounced(*txinfo.tx, push_tx);
                     }
                     tx_relay->m_tx_inventory_urgent.clear();
+                    tx_relay->m_tx_inventory_push.clear();
                 }
                 // Check whether periodic sends should happen
                 bool fSendTrickle = pto->HasPermission(NetPermissionFlags::NoBan);

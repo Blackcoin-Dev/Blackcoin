@@ -807,7 +807,7 @@ BOOST_AUTO_TEST_CASE(claim_attempt_timing_record)
                             "result=submitted ", "tip_changed=0 ", "gate_ready_ms=",
                             " first_hash_ms=", " proof_found_ms=", " mempool_accept_ms=",
                             " hashes=145 ", "batches=2 ", "duty_sleep_ms=5 ",
-                            "first_inv_ms=-1 ", "inv_peers_1s=0"}) {
+                            "first_inv_ms=-1 ", "inv_peers_1s=0 ", "push_peers_1s=0"}) {
         const size_t found = line.find(key, at);
         BOOST_CHECK_MESSAGE(found != std::string::npos, key);
         if (found != std::string::npos) at = found;
@@ -876,7 +876,7 @@ BOOST_AUTO_TEST_CASE(claim_relay_timing_is_appended_when_known)
     // more than a second later.
     const auto announced = std::chrono::steady_clock::now();
     GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{5}, announced);
-    GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{5}, announced + 10ms);
+    GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{5}, announced + 10ms, /*pushed=*/true);
     GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{5}, announced + 1500ms);
     timing = wallet.GetPowClaimTiming();
     BOOST_CHECK_GE(timing.first_inv_ms, timing.proof_found_ms);
@@ -891,8 +891,9 @@ BOOST_AUTO_TEST_CASE(claim_relay_timing_is_appended_when_known)
     }
     BOOST_CHECK_EQUAL(std::count(line.begin(), line.end(), '\n'), 0);
     BOOST_CHECK(line.find("result=submitted ") != std::string::npos);
-    BOOST_CHECK(line.find(strprintf(" duty_sleep_ms=0 first_inv_ms=%d inv_peers_1s=2", timing.first_inv_ms)) != std::string::npos);
-    BOOST_CHECK_EQUAL(line.substr(line.size() - 14), "inv_peers_1s=2");
+    BOOST_CHECK(line.find(strprintf(" duty_sleep_ms=0 first_inv_ms=%d inv_peers_1s=2 push_peers_1s=1", timing.first_inv_ms)) != std::string::npos);
+    BOOST_CHECK_EQUAL(line.substr(line.size() - 15), "push_peers_1s=1");
+    BOOST_CHECK_EQUAL(timing.push_peers_1s, 1U);
     // The published record keeps the figures after the line went out.
     timing = wallet.GetPowClaimTiming();
     BOOST_CHECK_GE(timing.first_inv_ms, 0);
@@ -912,8 +913,18 @@ BOOST_AUTO_TEST_CASE(claim_relay_timing_is_appended_when_known)
         const size_t failed_at = both.find("result=failed ");
         BOOST_CHECK(held_at != std::string::npos && failed_at != std::string::npos && held_at < failed_at);
         // The stale announcement of the earlier input was not attributed.
-        BOOST_CHECK(both.find("first_inv_ms=-1 inv_peers_1s=0\n") != std::string::npos);
+        BOOST_CHECK(both.find("first_inv_ms=-1 inv_peers_1s=0 push_peers_1s=0\n") != std::string::npos);
     }
+
+    // The miner's mark is used exactly once and can be withdrawn.
+    BOOST_CHECK(!GetClaimRelayTracker().ConsumeLocalClaim(claim_input));
+    GetClaimRelayTracker().MarkLocalClaim(claim_input);
+    BOOST_CHECK(!GetClaimRelayTracker().ConsumeLocalClaim(earlier_input));
+    BOOST_CHECK(GetClaimRelayTracker().ConsumeLocalClaim(claim_input));
+    BOOST_CHECK(!GetClaimRelayTracker().ConsumeLocalClaim(claim_input));
+    GetClaimRelayTracker().MarkLocalClaim(claim_input);
+    GetClaimRelayTracker().UnmarkLocalClaim(claim_input);
+    BOOST_CHECK(!GetClaimRelayTracker().ConsumeLocalClaim(claim_input));
 
     // Another claim transaction on the same input starts its record over.
     GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{6}, announced + 2s);

@@ -249,6 +249,54 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             if entry.get("comment") == "PoW Claim"
         }
 
+    def _mine_until_no_retained_claim_is_valid(self, funding_address):
+        """Leave a tip at which no retained claim of any loaded wallet is valid.
+
+        A historical QQP2 proof is not bound to its origin block: its hash is
+        taken over the current tip, so a claim that went stale is valid again
+        at a later tip with probability 2^-bits (about one tip in a thousand
+        on this chain). The wallet that owns it then puts it back into the
+        mempool on its own, by design, within milliseconds of the block. Below
+        the competing-claims height the mempool holds one proof, so such a
+        claim of an earlier section would make the next claim of the wallet
+        under test fail with shadow-proof-mempool-limit.
+
+        Validity at a tip is a pure function of the claim and the tip, so it is
+        checked directly: when a retained claim is valid here (or already back
+        in the mempool), one more empty block makes it stale again.
+        """
+        node = self.nodes[0]
+        occupied = {
+            "txn-already-in-mempool",
+            "shadow-proof-mempool-limit",
+            "shadow-proof-mempool-duplicate",
+        }
+        for _ in range(16):
+            node.syncwithvalidationinterfacequeue()
+            mempool = set(node.getrawmempool())
+            revalidated = []
+            for name in node.listwallets():
+                wallet = node.get_wallet_rpc(name)
+                for txid in self._claim_txids(wallet):
+                    claim = wallet.gettransaction(txid)
+                    if claim["confirmations"] != 0:
+                        continue
+                    result = node.testmempoolaccept([claim["hex"]])[0]
+                    if (
+                        txid in mempool
+                        or result["allowed"]
+                        or result.get("reject-reason") in occupied
+                    ):
+                        revalidated.append((name, txid))
+            if not revalidated:
+                return
+            self.log.info(
+                "Retained claim(s) valid again at tip %s by chance, mining past them: %s",
+                node.getbestblockhash(), revalidated,
+            )
+            self.generateblock(node, output=funding_address, transactions=[])
+        raise AssertionError("retained claims stayed valid across 16 consecutive tips")
+
     def _quarantined_claim_txids(self, wallet):
         mempool = set(self.nodes[0].getrawmempool())
         return {
@@ -1942,6 +1990,10 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
 
         self.log.info("Two concurrent RPC callers create at most one clean claim")
+        # The first caller needs the single QQP2 mempool slot: no claim of an
+        # earlier section may be valid at this tip.
+        self._mine_until_no_retained_claim_is_valid(funding_address)
+        assert_equal(node.getrawmempool(), [])
         manual_payout = manual.getnewquantumaddress("single-flight-payout")["address"]
         first_results = []
         first_errors = []
@@ -2886,6 +2938,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 timeout=180,
             )
             refreshed_claim_txid = next(iter(self._claim_txids(boundary) - before_refresh))
+            # The wallet record is published before the claim is handed to the
+            # mempool, and the worker counts it only after that returns.
+            self.wait_until(
+                lambda: get_pow_mining_info(boundary)["claims_submitted"] == 1,
+                timeout=60,
+            )
             info = get_pow_mining_info(boundary)
             assert_equal(info["claims_submitted"], 1)
             assert_equal(info["mining_gate_action"], "wait_for_live")
@@ -3812,6 +3870,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             )
             cross_head_txid = next(
                 iter(self._claim_txids(cross_boundary) - cross_before_refresh)
+            )
+            # As above: wait for the worker to finish the submission it has
+            # already recorded in the wallet.
+            self.wait_until(
+                lambda: get_pow_mining_info(cross_boundary)["claims_submitted"] == 1,
+                timeout=60,
             )
             cross_gate = get_pow_mining_info(cross_boundary)
             assert_equal(cross_gate["mining_gate_coherent"], True)

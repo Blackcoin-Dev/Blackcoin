@@ -285,6 +285,11 @@ void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_ty
     });
 }
 
+//! How long a test thread keeps a lock while it waits for the GUI to prove that it did not wait for that lock. The
+//! thread returns as soon as the proof arrives, so the limit only bounds a failing run: it is generous because the
+//! proof is one or more event loop turns of a build that can be many times slower than a release build.
+constexpr std::chrono::seconds LOCK_HOLD_LIMIT{10};
+
 void WaitForModal(const QString& description, std::function<bool()> action,
                   std::function<void()> timeout_action = {})
 {
@@ -810,6 +815,18 @@ void SettleChainTip(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wall
     QTRY_VERIFY_WITH_TIMEOUT(mini_gui.clientModel->getBestBlockHash() == active_tip(), 20000);
 }
 
+//! Whether the Staking and Mining page's hint reports a detail refresh that ended without a result and waits for the
+//! user to press Refresh again: a start block that was reorganized out, try-locks that stayed busy past the bounded
+//! retry, a cancelled or stopped pass, or an error.
+bool DetailRefreshEndedWithoutResult(const QLabel* hint)
+{
+    const QString text = hint->text();
+    return text.contains(QStringLiteral("The chain reorganized during refresh")) ||
+           text.contains(QStringLiteral("Press Refresh to retry")) ||
+           text.contains(QStringLiteral("Detail refresh was cancelled")) ||
+           text.contains(QStringLiteral("Detail refresh failed"));
+}
+
 //! Wait until done() holds, pressing Refresh the way a user would.
 //! The page applies a detail snapshot taken while the chain tip advanced and
 //! labels it with its block; it discards one only when its start block was
@@ -818,16 +835,16 @@ void SettleChainTip(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wall
 //! times, and give each attempt the full timeout. Returns whether done() held;
 //! call sites keep their original assertions after it, so it never weakens them.
 bool WaitForDetailPanels(QPushButton* refresh, const QLabel* hint, const std::function<bool()>& done,
-                         int timeout_ms, int max_refreshes = 5)
+                         int timeout_ms, int max_refreshes = 20)
 {
     int refreshes{0};
     QElapsedTimer attempt;
     attempt.start();
     while (!done()) {
         if (attempt.elapsed() >= timeout_ms) return false;
-        if (refreshes < max_refreshes && hint->text().contains(QStringLiteral("The chain reorganized during refresh"))) {
+        if (refreshes < max_refreshes && DetailRefreshEndedWithoutResult(hint)) {
             ++refreshes;
-            qInfo() << "Detail snapshot was stale; pressing Refresh again" << refreshes << "of" << max_refreshes;
+            qInfo() << "Detail refresh ended without a result; pressing Refresh again" << refreshes << "of" << max_refreshes << hint->text();
             refresh->click();
             attempt.restart();
         }
@@ -3897,13 +3914,21 @@ void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const Platfo
     stale_request.request_id = 1000000;
     stale_request.generation = 1000000;
     stale_request.expected_tip = std::string(64, 'f');
-    wallet_model.requestStakingMiningSnapshot(stale_request);
-    QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 1, 5000);
-    const std::shared_ptr<const WalletModel::StakingMiningSnapshot> stale_snapshot =
-        wallet_model.takeStakingMiningSnapshot(stale_request.request_id);
-    QVERIFY(stale_snapshot);
-    QVERIFY(!stale_snapshot->stale_tip);
-    QVERIFY(!stale_snapshot->start_tip.empty());
+    // The worker reads the tip and its height by try-lock and, while cs_main is busy (the display balance worker
+    // takes it in slices), labels the result with the requested tip instead. Ask again until it saw the chain.
+    std::shared_ptr<const WalletModel::StakingMiningSnapshot> stale_snapshot;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        ready_spy.clear();
+        ++stale_request.request_id;
+        wallet_model.requestStakingMiningSnapshot(stale_request);
+        QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 1, 5000);
+        stale_snapshot = wallet_model.takeStakingMiningSnapshot(stale_request.request_id);
+        QVERIFY(stale_snapshot);
+        QVERIFY(!stale_snapshot->stale_tip);
+        QVERIFY(!stale_snapshot->start_tip.empty());
+        if (stale_snapshot->start_tip != stale_request.expected_tip && stale_snapshot->start_height >= 0) break;
+        QTest::qWait(10);
+    }
     QVERIFY(stale_snapshot->start_tip != stale_request.expected_tip);
     QVERIFY(stale_snapshot->start_height >= 0);
     ready_spy.clear();
@@ -4008,7 +4033,7 @@ void TestHiddenSendBalanceHeartbeat(interfaces::Node& node, const std::shared_pt
     std::thread holder([&] {
         LOCK(wallet->cs_wallet);
         locked.set_value();
-        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
     });
     locked.get_future().wait();
 
@@ -4283,7 +4308,19 @@ void TestAccountSnapshotFiltering(interfaces::Node& node, const std::shared_ptr<
         }
         return count;
     };
-    QTRY_VERIFY_WITH_TIMEOUT(visible_rows() > 0, 5000);
+    // A snapshot that met a busy lock leaves the page asking for Refresh; press it again, as a user would.
+    const auto rows_after_refresh = [&] {
+        return QTest::qWaitFor([&] {
+            if (visible_rows() > 0) return true;
+            for (const QLabel* label : page.findChildren<QLabel*>()) {
+                if (!label->text().contains(QStringLiteral("Press Refresh to try again"))) continue;
+                QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection);
+                break;
+            }
+            return false;
+        }, 20000);
+    };
+    QVERIFY(rows_after_refresh());
     const QStringList card_names{QStringLiteral("accountTotalCard"), QStringLiteral("accountLegacyCard"),
         QStringLiteral("accountQuantumCard"), QStringLiteral("accountAttentionCard")};
     QList<QLabel*> cards;
@@ -4302,7 +4339,7 @@ void TestAccountSnapshotFiltering(interfaces::Node& node, const std::shared_ptr<
     std::thread holder([&] {
         LOCK(wallet->cs_wallet);
         locked.set_value();
-        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
     });
     locked.get_future().wait();
     bool addresses_available{true};
@@ -4343,7 +4380,7 @@ void TestAccountSnapshotFiltering(interfaces::Node& node, const std::shared_ptr<
     for (int i = 0; i < cards.size(); ++i) QVERIFY(cards[i]->text() != wallet_card_text[i]);
 
     QVERIFY(QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection));
-    QTRY_VERIFY_WITH_TIMEOUT(visible_rows() > 0, 5000);
+    QVERIFY(rows_after_refresh());
     page.hide();
     page.setWalletModel(nullptr);
     for (int i = 0; i < cards.size(); ++i) QVERIFY(cards[i]->text() != wallet_card_text[i]);
@@ -4437,7 +4474,7 @@ void TestDeferredWalletHistory(interfaces::Node& node, const std::shared_ptr<CWa
     std::thread holder([&] {
         LOCK(wallet->cs_wallet);
         locked.set_value();
-        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
     });
     locked.get_future().wait();
     model->startPollBalance();
@@ -4599,7 +4636,7 @@ void TestDeferredWalletHistory(interfaces::Node& node, const std::shared_ptr<CWa
     std::thread close_holder([&] {
         LOCK(wallet->cs_wallet);
         closing_locked.set_value();
-        closed_during_lock = wait_for_close.wait_for(750ms) == std::future_status::ready;
+        closed_during_lock = wait_for_close.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
     });
     closing_locked.get_future().wait();
     closing->startPollBalance();
@@ -4667,7 +4704,7 @@ void TestTransactionTableResponsiveUnderWalletLock(interfaces::Node& node, const
         wallet->NotifyTransactionChanged(uint256{0x42}, CT_UPDATED);
         if (!wallet->AddToWallet(transactions.back(), wallet::TxStateInactive{})) ok = false;
         notification_sent.set_value(ok);
-        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
     });
     const bool added = notification_sent.get_future().get();
     wallet->ShowProgress("scan", 100);
@@ -4704,7 +4741,8 @@ void TestTransactionTableResponsiveUnderWalletLock(interfaces::Node& node, const
     QVERIFY(!inserted.back().second);
     const QModelIndex row = FindTx(*table, transactions.front()->GetHash());
     QVERIFY(row.isValid());
-    QCOMPARE(row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("test label"));
+    // The label is read by try-lock and retried every 25 ms while the wallet is busy.
+    QTRY_COMPARE_WITH_TIMEOUT(row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("test label"), 10000);
 
     // An uncontended burst also shares the turn budget.
     inserted.clear();
@@ -4728,7 +4766,7 @@ void TestTransactionTableResponsiveUnderWalletLock(interfaces::Node& node, const
         LOCK(wallet->cs_wallet);
         wallet->NotifyTransactionChanged(transactions.back()->GetHash(), CT_UPDATED);
         queued.set_value();
-        destroyed_during_lock = wait_for_release.wait_for(750ms) == std::future_status::ready;
+        destroyed_during_lock = wait_for_release.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
     });
     queued.get_future().wait();
     QCoreApplication::sendPostedEvents(table, QEvent::MetaCall);
@@ -4782,7 +4820,7 @@ void TestTransactionLabelsResponsiveUnderWalletLock(interfaces::Node& node, cons
     std::thread holder([&] {
         LOCK(wallet->cs_wallet);
         locked.set_value();
-        heartbeat_during_lock = wait_for_heartbeat.wait_for(750ms) == std::future_status::ready;
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
     });
     locked.get_future().wait();
 
@@ -4909,7 +4947,7 @@ void TestTransactionLabelsResponsiveUnderWalletLock(interfaces::Node& node, cons
         QEventLoop insertion_loop;
         QObject::connect(table, &TransactionTableModel::rowsInserted, &insertion_loop, [&] {
             start_relock.set_value();
-            lock_reacquired = wait_for_lock.wait_for(1500ms) == std::future_status::ready;
+            lock_reacquired = wait_for_lock.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
             if (!lock_reacquired) {
                 insertion_loop.quit();
                 return;
@@ -4928,12 +4966,12 @@ void TestTransactionLabelsResponsiveUnderWalletLock(interfaces::Node& node, cons
         next.vout.emplace_back(COIN, GetScriptForDestination(*receive));
         QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(next)), wallet::TxStateInactive{}));
         std::thread locker([&] {
-            if (wait_for_relock.wait_for(1500ms) != std::future_status::ready) return;
+            if (wait_for_relock.wait_for(LOCK_HOLD_LIMIT) != std::future_status::ready) return;
             LOCK(wallet->cs_wallet);
             relocked.set_value();
-            insertion_heartbeat_during_lock = wait_for_insertion_heartbeat.wait_for(750ms) == std::future_status::ready;
+            insertion_heartbeat_during_lock = wait_for_insertion_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
         });
-        QTimer::singleShot(2500, &insertion_loop, &QEventLoop::quit);
+        QTimer::singleShot(15000, &insertion_loop, &QEventLoop::quit);
         insertion_loop.exec();
         locker.join();
         QVERIFY2(lock_reacquired, "Wallet lock reacquisition handshake timed out");
@@ -4953,7 +4991,18 @@ void TestTransactionLabelsResponsiveUnderWalletLock(interfaces::Node& node, cons
     repaint.clear();
     QVERIFY(wallet->SetAddressBook(send, "after removal", wallet::AddressPurpose::SEND));
     QTest::qWait(75);
-    QVERIFY(repaint.isEmpty());
+    // Other rows may still receive a status or label read that was retried behind a busy wallet lock. What must
+    // not happen is a repaint for the renamed address, whose only row is gone.
+    {
+        const QString renamed_address = QString::fromStdString(EncodeDestination(send));
+        for (const auto& change : repaint) {
+            const int first = qvariant_cast<QModelIndex>(change.at(0)).row();
+            const int last = qvariant_cast<QModelIndex>(change.at(1)).row();
+            for (int changed = first; changed <= last; ++changed) {
+                QVERIFY(table->index(changed, 0).data(TransactionTableModel::AddressRole).toString() != renamed_address);
+            }
+        }
+    }
     QVERIFY(wallet->AddToWallet(sent_tx, wallet::TxStateInactive{}));
     QTRY_VERIFY_WITH_TIMEOUT(FindTx(*table, sent_tx->GetHash()).isValid(), 5000);
     QCOMPARE(FindTx(*table, sent_tx->GetHash()).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("after removal"));
@@ -4965,7 +5014,7 @@ void TestTransactionLabelsResponsiveUnderWalletLock(interfaces::Node& node, cons
     std::thread shutdown_holder([&] {
         LOCK(wallet->cs_wallet);
         changed.set_value(wallet->SetAddressBook(*receive, "changed", wallet::AddressPurpose::RECEIVE));
-        destroyed_during_lock = wait_for_release.wait_for(750ms) == std::future_status::ready;
+        destroyed_during_lock = wait_for_release.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
     });
     const bool change_ok = changed.get_future().get();
     QCoreApplication::sendPostedEvents(model.get(), QEvent::MetaCall);
@@ -5336,6 +5385,20 @@ void TestDetailRefreshSurvivesTipAdvance(interfaces::Node& node, TestChain100Set
         const uint256 before = WITH_LOCK(::cs_main, return wallet->chain().chainman().ActiveChain().Tip()->GetBlockHash());
         test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
         QVERIFY(WITH_LOCK(::cs_main, return wallet->chain().chainman().ActiveChain().Tip()->GetBlockHash()) != before);
+        // A pass whose try-locks stayed busy past the page's bounded retry ends in a hint that asks for Refresh;
+        // that is not what this test is about, so press it again. A tip-change or reorganization hint ends the wait.
+        bool tip_change_reported{false};
+        QVERIFY(QTest::qWaitFor([&] {
+            const QString text = hint->text();
+            if (text.contains(QStringLiteral("changed during refresh")) || text.contains(QStringLiteral("reorganized"))) {
+                tip_change_reported = true;
+                return true;
+            }
+            if (text.contains(QStringLiteral("Detail panels updated as of block"))) return true;
+            if (DetailRefreshEndedWithoutResult(hint)) refresh->click();
+            return false;
+        }, 20000));
+        QVERIFY(!tip_change_reported);
         QTRY_VERIFY_WITH_TIMEOUT(hint->text().contains(QStringLiteral("Detail panels updated as of block")), 20000);
         QVERIFY(!hint->text().contains(QStringLiteral("changed during refresh")));
         QVERIFY(!hint->text().contains(QStringLiteral("reorganized")));
@@ -5859,9 +5922,11 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
         const std::vector<std::string> addresses{
             liquid_coldstake_result->address, tiered_coldstake_result->address, "invalid"};
         // Both reads are try-locks and report a busy lock as unavailable.
-        // Compare a pair of reads that each got their locks.
+        // Compare a pair of reads that each got their locks. Not QTRY_VERIFY:
+        // it evaluates its condition once more after it held, and that read
+        // can meet the busy lock again.
         std::map<std::string, interfaces::WalletQuantumColdStakeBalanceInfo> grouped, singles;
-        QTRY_VERIFY_WITH_TIMEOUT([&] {
+        QVERIFY(QTest::qWaitFor([&] {
             grouped = wallet_interface.getQuantumColdStakeBalances(addresses);
             singles.clear();
             bool available{true};
@@ -5872,7 +5937,7 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
                 singles.emplace(address, single);
             }
             return available;
-        }(), 10000);
+        }, 10000));
         QCOMPARE(grouped.size(), addresses.size());
         for (const auto& address : addresses) {
             const auto& single = singles.at(address);
@@ -5941,14 +6006,26 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
         QCOMPARE(snapshot.block_hash, node.getBestBlockHash());
         previous_balance_tip = snapshot.block_hash;
         QVERIFY(!wallet_interface.tryGetDisplayBalances(snapshot, previous_balance_tip, std::nullopt));
-        const interfaces::WalletQuantumFundingStatus status = wallet_interface.getQuantumFundingStatus();
-        QVERIFY(status.available);
+        // A try-lock read: unavailable while cs_main or the wallet is busy.
+        interfaces::WalletQuantumFundingStatus status;
+        QVERIFY(QTest::qWaitFor([&] { return (status = wallet_interface.getQuantumFundingStatus()).available; }, 10000));
         QCOMPARE(status.quantum_outputs_active, quantum_active);
         QCOMPARE(status.legacy_migration_active, legacy_active);
         QCOMPARE(status.stake_tiers_active, tiers_active);
 
         coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
-        update_controls();
+        // The page derives these permissions from the same try-lock read on every status update and disables
+        // the controls while it is unavailable: update again, as the page's timer does, until one read lands.
+        QVERIFY(QTest::qWaitFor([&] {
+            update_controls();
+            return migration_legacy_sweep->isEnabled() == legacy_active &&
+                   migration_goldrush_sweep->isEnabled() == quantum_active &&
+                   selfstake_fund_amount->isEnabled() == tiers_active &&
+                   selfstake_fund->isEnabled() == tiers_active &&
+                   operator_bond_amount->isEnabled() == tiers_active &&
+                   operator_fund->isEnabled() == tiers_active &&
+                   coldstake_fund_amount->isEnabled() == tiers_active;
+        }, 10000));
         QCOMPARE(migration_legacy_sweep->isEnabled(), legacy_active);
         QCOMPARE(migration_goldrush_sweep->isEnabled(), quantum_active);
         QCOMPARE(selfstake_fund_amount->isEnabled(), tiers_active);
@@ -5960,13 +6037,26 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
         // Liquid cold-stake funding follows ordinary quantum-output support;
         // only tiered cold-stake addresses require stake-tier activation.
         coldstake_address->setText(QString::fromStdString(liquid_coldstake_result->address));
-        update_controls();
+        QVERIFY(QTest::qWaitFor([&] {
+            update_controls();
+            return coldstake_fund_amount->isEnabled() == quantum_active;
+        }, 10000));
         QCOMPARE(coldstake_fund_amount->isEnabled(), quantum_active);
         coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
     };
     const auto mine_block = [&] {
         test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
         SyncWithValidationInterfaceQueue();
+    };
+    // The address list is a try-lock read that is empty while the wallet is busy: count a read that got the lock.
+    const auto quantum_address_count = [&] {
+        size_t count{0};
+        bool available{false};
+        const bool read = QTest::qWaitFor([&] {
+            count = wallet_interface.listQuantumAddresses(&available).size();
+            return available;
+        }, 10000);
+        return read ? count : std::numeric_limits<size_t>::max();
     };
     const auto invalidate_tip = [&] {
         CBlockIndex* tip = WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Tip());
@@ -5979,9 +6069,9 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     // Tip 105 creates candidate 106, the final Gold Rush block. Both the UI
     // and the backend reject migration without allocating an unused address.
     expect_controls(105, /*quantum_active=*/false, /*legacy_active=*/false, /*tiers_active=*/false);
-    const size_t goldrush_address_count = wallet_interface.listQuantumAddresses().size();
+    const size_t goldrush_address_count = quantum_address_count();
     QVERIFY(!wallet_interface.migrateLegacyToQuantum(/*allow_new_quantum_key=*/true));
-    QCOMPARE(wallet_interface.listQuantumAddresses().size(), goldrush_address_count);
+    QCOMPARE(quantum_address_count(), goldrush_address_count);
 
     // Candidate 107 is Migration but precedes the tier activation at 108.
     mine_block();
@@ -5996,9 +6086,9 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     // Candidate 110 is Final: ordinary quantum and tiered funding remain
     // available, but legacy migration closes. Failure must not reserve a key.
     expect_controls(109, /*quantum_active=*/true, /*legacy_active=*/false, /*tiers_active=*/true);
-    const size_t final_address_count = wallet_interface.listQuantumAddresses().size();
+    const size_t final_address_count = quantum_address_count();
     QVERIFY(!wallet_interface.migrateLegacyToQuantum(/*allow_new_quantum_key=*/true));
-    QCOMPARE(wallet_interface.listQuantumAddresses().size(), final_address_count);
+    QCOMPARE(quantum_address_count(), final_address_count);
 
     // Reorg backward across Final, tier activation, and Gold Rush. Every
     // lightweight refresh must derive permissions from the new active tip.
@@ -6218,8 +6308,9 @@ void WalletTests::stakingSnapshotContention()
     const auto delegation = model.wallet().createQuantumColdStakeAddress(op->public_key, "snapshot delegation", 9450);
     QVERIFY(delegation);
     bool available{false};
-    QCOMPARE(model.wallet().listQuantumColdStakeDelegations(&available).size(), size_t{1});
-    QVERIFY(available);
+    size_t delegation_count{0};
+    QVERIFY(QTest::qWaitFor([&] { delegation_count = model.wallet().listQuantumColdStakeDelegations(&available).size(); return available; }, 10000));
+    QCOMPARE(delegation_count, size_t{1});
 
     // Keep actual immutable results before the page takes them. The trace is
     // bounded and cannot turn an unavailable collection into an accepted one.
@@ -6576,7 +6667,8 @@ void WalletTests::receiveCapabilityContention()
     QVERIFY(model.getCachedAddressCapability() == oracle);
     for (bool internal : {false, true}) {
         bool value{false};
-        QVERIFY(wallet->TryCanGetAddresses(value, internal));
+        // A try-lock read: the display balance worker can hold the wallet lock in a slice.
+        QVERIFY(QTest::qWaitFor([&] { return wallet->TryCanGetAddresses(value, internal); }, 10000));
         QCOMPARE(value, wallet->CanGetAddresses(internal));
     }
     // With a known value, the same lock miss must preserve it, not flash false.

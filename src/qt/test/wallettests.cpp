@@ -5322,7 +5322,7 @@ void TestSlimTransactionRow()
 //! Only some of them carry the notes the list reads; every one also carries notes it does not.
 void AddMixedHistory(const std::shared_ptr<CWallet>& wallet, int count, uint32_t salt, std::vector<uint256>& hashes)
 {
-    const auto dest = wallet->GetNewDestination(OutputType::BECH32, "mixed history " + std::to_string(salt));
+    const auto dest = wallet->GetNewDestination(OutputType::BECH32, "mixed history " + ToString(salt));
     const auto script = GetScriptForDestination(*dest);
     const CScript external = GetScriptForDestination(WitnessV0KeyHash(uint160(std::vector<unsigned char>(20, static_cast<unsigned char>(salt + 1)))));
     const std::array<std::string, 3> claim_addresses{"bc1qclaimaddressone", "bc1qclaimaddresstwo", "bc1qclaimaddressthree"};
@@ -5334,12 +5334,12 @@ void AddMixedHistory(const std::shared_ptr<CWallet>& wallet, int count, uint32_t
         const auto ref = MakeTransactionRef(tx);
         const int kind = i % 6;
         std::function<bool(wallet::CWalletTx&, bool)> update = [&](wallet::CWalletTx& wtx, bool) {
-            wtx.mapValue["message"] = "note the list never reads " + std::to_string(i);
+            wtx.mapValue["message"] = "note the list never reads " + ToString(i);
             wtx.mapValue["n"] = "1";
             if (kind == 1) { wtx.mapValue["comment"] = "PoW - Quantum Claim"; wtx.mapValue["to"] = claim_addresses[i % 3]; }
             if (kind == 2) { wtx.mapValue["comment"] = "PoS - Quantum Stake"; wtx.mapValue["to"] = claim_addresses[(i + 1) % 3]; }
             if (kind == 3) { wtx.mapValue["comment"] = "PoW Claim"; }
-            if (kind == 5) { wtx.mapValue["from"] = "someone " + std::to_string(i % 4); }
+            if (kind == 5) { wtx.mapValue["from"] = "someone " + ToString(i % 4); }
             return true;
         };
         QVERIFY2(wallet->AddToWallet(ref, wallet::TxStateInactive{}, update), "add history transaction");

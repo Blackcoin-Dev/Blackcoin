@@ -7,9 +7,15 @@
 #include <logging.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <util/strencodings.h>
+#include <util/string.h>
 
 #include <algorithm>
 #include <mutex>
+#include <vector>
+#include <string_view>
+#include <string>
+#include <optional>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -260,10 +266,16 @@ std::optional<ProcessMemory> GetProcessMemory()
 #elif defined(__linux__)
     std::FILE* file = std::fopen("/proc/self/statm", "r");
     if (!file) return std::nullopt;
-    unsigned long long size_pages{0}, resident_pages{0};
-    const int parsed = std::fscanf(file, "%llu %llu", &size_pages, &resident_pages);
+    // "size resident shared ...", in pages. Parsed without the C locale.
+    char line[128]{};
+    const bool got_line = std::fgets(line, sizeof(line), file) != nullptr;
     std::fclose(file);
-    if (parsed != 2) return std::nullopt;
+    if (!got_line) return std::nullopt;
+    const std::vector<std::string> fields = SplitString(std::string_view{line}, " \n");
+    if (fields.size() < 2) return std::nullopt;
+    const std::optional<uint64_t> resident = ToIntegral<uint64_t>(fields[1]);
+    if (!ToIntegral<uint64_t>(fields[0]) || !resident) return std::nullopt;
+    const uint64_t resident_pages = *resident;
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) return std::nullopt;
     ProcessMemory memory;

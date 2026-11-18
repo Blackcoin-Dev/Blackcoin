@@ -400,22 +400,27 @@ TransactionSortKey& TransactionSortKey::operator=(const std::string& text)
     // "%010d-%01d-%010u-%03d-%d": the height may carry a sign, every later field is read after its separator.
     *this = TransactionSortKey{};
     if (text.empty()) return *this;
+    // Each field is an optionally signed run of decimal digits, read without the C locale.
     const char* p = text.c_str();
-    char* end{nullptr};
-    const long height = std::strtol(p, &end, 10);
-    if (end == p || *end != '-') return *this;
-    p = end + 1;
-    const long generated = std::strtol(p, &end, 10);
-    if (end == p || *end != '-') return *this;
-    p = end + 1;
-    const unsigned long received = std::strtoul(p, &end, 10);
-    if (end == p || *end != '-') return *this;
-    p = end + 1;
-    const long idx = std::strtol(p, &end, 10);
-    if (end == p || *end != '-') return *this;
-    p = end + 1;
-    const long type_order = std::strtol(p, &end, 10);
-    if (end == p || *end != '\0') return *this;
+    const auto read_field = [&p](int64_t& out, char terminator) {
+        const bool negative = *p == '-';
+        if (negative) ++p;
+        if (*p < '0' || *p > '9') return false;
+        int64_t value{0};
+        for (; *p >= '0' && *p <= '9'; ++p) {
+            if (value > 100'000'000'000LL) return false;
+            value = value * 10 + (*p - '0');
+        }
+        if (*p != terminator) return false;
+        if (terminator != '\0') ++p;
+        out = negative ? -value : value;
+        return true;
+    };
+    int64_t height{0}, generated{0}, received{0}, idx{0}, type_order{0};
+    if (!read_field(height, '-') || !read_field(generated, '-') || !read_field(received, '-') ||
+        !read_field(idx, '-') || !read_field(type_order, '\0')) {
+        return *this;
+    }
     *this = TransactionSortKey(static_cast<int>(height), generated != 0, static_cast<unsigned>(received), static_cast<int>(idx), static_cast<int>(type_order));
     return *this;
 }

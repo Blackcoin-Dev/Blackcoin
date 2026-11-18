@@ -12,6 +12,7 @@
 #include <script/solver.h>
 #include <shadow.h>
 #include <test/util/setup_common.h>
+#include <util/strencodings.h>
 #include <util/string.h>
 #include <util/time.h>
 #include <validation.h>
@@ -491,7 +492,7 @@ ReorgOutcome DisconnectAndReconnectTip(interfaces::Chain& chain, const std::stri
 int EnvInt(const char* name, int fallback)
 {
     const char* value = std::getenv(name);
-    return value && *value ? std::atoi(value) : fallback;
+    return value && *value ? LocaleIndependentAtoi<int>(value) : fallback;
 }
 
 } // namespace

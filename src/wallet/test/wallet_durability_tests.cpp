@@ -459,6 +459,126 @@ BOOST_FIXTURE_TEST_CASE(disconnected_block_drops_its_deferred_best_block, TestCh
     wallet->Flush();
     BOOST_CHECK(StoredBestBlock(*wallet) == first.hash);
 }
+
+BOOST_FIXTURE_TEST_CASE(commit_transaction_is_one_commit, TestChain100Setup)
+{
+    auto wallet = LoadSqliteWallet("commit-transaction-once", m_node.chain.get());
+    const CBlockIndex* funding_block = WITH_LOCK(::cs_main, return Assert(m_node.chainman)->ActiveChain()[1]);
+    const CTransactionRef funding{m_coinbase_txns[0]};
+    BOOST_REQUIRE(wallet->AddToWallet(funding, TxStateConfirmed{funding_block->GetBlockHash(), funding_block->nHeight, /*index=*/0}));
+
+    CMutableTransaction spend;
+    spend.vin.emplace_back(COutPoint{funding->GetHash(), 0});
+    spend.vout.emplace_back(funding->vout[0].nValue - 10000, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    const CTransactionRef tx{MakeTransactionRef(spend)};
+
+    const auto& counters = static_cast<SQLiteDatabase&>(wallet->GetDatabase()).CommitCounters();
+    const SqliteCommitSnapshot before{counters.Snapshot()};
+    BOOST_REQUIRE(!wallet->GetBroadcastTransactions());
+    {
+        // The order position and the transaction record are separate rows.
+        CommitCounter counter{RawDb(*wallet)};
+        BOOST_CHECK(wallet->CommitTransaction(tx, {}, {}));
+        BOOST_CHECK_EQUAL(counter.commits, 1);
+    }
+    const SqliteCommitSnapshot after{counters.Snapshot()};
+    const auto delta = [&](SqliteCommitKind kind) {
+        return after[static_cast<size_t>(kind)].count - before[static_cast<size_t>(kind)].count;
+    };
+    BOOST_CHECK_EQUAL(delta(SqliteCommitKind::BULK_SCOPE), 1U);
+    BOOST_CHECK_EQUAL(delta(SqliteCommitKind::AUTOCOMMIT), 0U);
+    BOOST_CHECK_EQUAL(delta(SqliteCommitKind::DURABLE), 0U);
+    BOOST_CHECK_EQUAL(delta(SqliteCommitKind::NON_DURABLE), 0U);
+
+    // Both rows are on disk: the record and the order position survive a reload.
+    const int64_t order_pos{WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.at(tx->GetHash()).nOrderPos)};
+    wallet.reset();
+    wallet = LoadSqliteWallet("commit-transaction-once", m_node.chain.get());
+    LOCK(wallet->cs_wallet);
+    const auto reloaded = wallet->mapWallet.find(tx->GetHash());
+    BOOST_REQUIRE(reloaded != wallet->mapWallet.end());
+    BOOST_CHECK_EQUAL(reloaded->second.nOrderPos, order_pos);
+    BOOST_CHECK(reloaded->second.fFromMe);
+    BOOST_CHECK_GT(wallet->nOrderPosNext, order_pos);
+}
+
+BOOST_FIXTURE_TEST_CASE(entering_the_mempool_rewrites_no_record, TestChain100Setup)
+{
+    auto wallet = LoadSqliteWallet("mempool-entry-no-write", m_node.chain.get());
+    CMutableTransaction mtx;
+    mtx.vin.emplace_back(COutPoint{Txid::FromUint256(GetRandHash()), 0});
+    mtx.vout.emplace_back(50000, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    const CTransactionRef tx{MakeTransactionRef(mtx)};
+    const uint256 hash{tx->GetHash()};
+    BOOST_REQUIRE(wallet->AddToWallet(tx, TxStateInactive{}));
+
+    int notifications{0};
+    ChangeType last_change{CT_NEW};
+    auto connection = wallet->NotifyTransactionChanged.connect([&](const uint256& changed, ChangeType change) {
+        if (changed == hash) {
+            ++notifications;
+            last_change = change;
+        }
+    });
+
+    // Inactive to InMempool: the stored record is byte for byte the same, so
+    // no row is written, and the wallet still announces the change.
+    {
+        const unsigned int updates_before{wallet->GetDatabase().nUpdateCounter.load()};
+        CommitCounter counter{RawDb(*wallet)};
+        const CWalletTx* wtx{wallet->AddToWallet(tx, TxStateInMempool{})};
+        BOOST_REQUIRE(wtx);
+        BOOST_CHECK(wtx->InMempool());
+        BOOST_CHECK_EQUAL(counter.commits, 0);
+        BOOST_CHECK_EQUAL(wallet->GetDatabase().nUpdateCounter.load(), updates_before);
+        BOOST_CHECK_EQUAL(notifications, 1);
+        BOOST_CHECK(last_change == CT_UPDATED);
+    }
+    const auto [order_pos, time_received] = WITH_LOCK(wallet->cs_wallet, return std::make_pair(wallet->mapWallet.at(hash).nOrderPos, wallet->mapWallet.at(hash).nTimeReceived));
+
+    // A reload gives the state that record always had on disk.
+    connection.disconnect();
+    wallet.reset();
+    wallet = LoadSqliteWallet("mempool-entry-no-write", m_node.chain.get());
+    {
+        LOCK(wallet->cs_wallet);
+        const auto reloaded = wallet->mapWallet.find(hash);
+        BOOST_REQUIRE(reloaded != wallet->mapWallet.end());
+        const auto* inactive = reloaded->second.state<TxStateInactive>();
+        BOOST_REQUIRE(inactive);
+        BOOST_CHECK(!inactive->abandoned);
+        BOOST_CHECK_EQUAL(reloaded->second.nOrderPos, order_pos);
+        BOOST_CHECK_EQUAL(reloaded->second.nTimeReceived, time_received);
+        BOOST_CHECK(reloaded->second.mapValue.count("note") == 0);
+    }
+
+    // An update function that changes the record makes the same transition write it.
+    {
+        CommitCounter counter{RawDb(*wallet)};
+        BOOST_REQUIRE(wallet->AddToWallet(tx, TxStateInMempool{}, [](CWalletTx& wtx, bool) {
+            wtx.mapValue["note"] = "kept";
+            return true;
+        }));
+        BOOST_CHECK_EQUAL(counter.commits, 1);
+    }
+    // Leaving the mempool, and an abandoned record entering it, are written as before.
+    {
+        CommitCounter counter{RawDb(*wallet)};
+        BOOST_REQUIRE(wallet->AddToWallet(tx, TxStateInactive{/*abandoned=*/true}));
+        BOOST_CHECK_EQUAL(counter.commits, 1);
+        BOOST_REQUIRE(wallet->AddToWallet(tx, TxStateInMempool{}));
+        BOOST_CHECK_EQUAL(counter.commits, 2);
+    }
+    wallet.reset();
+    wallet = LoadSqliteWallet("mempool-entry-no-write", m_node.chain.get());
+    LOCK(wallet->cs_wallet);
+    const auto reloaded = wallet->mapWallet.find(hash);
+    BOOST_REQUIRE(reloaded != wallet->mapWallet.end());
+    const auto* inactive = reloaded->second.state<TxStateInactive>();
+    BOOST_REQUIRE(inactive);
+    BOOST_CHECK(!inactive->abandoned);
+    BOOST_CHECK_EQUAL(reloaded->second.mapValue.at("note"), "kept");
+}
 #endif
 
 BOOST_FIXTURE_TEST_CASE(dense_locator_resumes_within_a_few_blocks, TestChain100Setup)

@@ -2688,11 +2688,26 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
         MaybeUpdateBirthTime(wtx.GetTxTime());
     }
 
+    // True when the state moved in memory only (see below).
+    bool state_changed_without_write{false};
     if (!fInsertedNew)
     {
         if (state.index() != wtx.m_state.index()) {
+            // A record that is not in a block and not abandoned is stored the
+            // same way whether or not the mempool holds it, so entering the
+            // mempool changes no byte of the stored record. Unless an update
+            // function changed something else, there is nothing to write.
+            const bool same_stored_record{!fUpdated &&
+                std::holds_alternative<TxStateInactive>(wtx.m_state) &&
+                std::holds_alternative<TxStateInMempool>(state) &&
+                TxStateSerializedIndex(wtx.m_state) == TxStateSerializedIndex(state) &&
+                TxStateSerializedBlockHash(wtx.m_state) == TxStateSerializedBlockHash(state)};
             wtx.m_state = state;
-            fUpdated = true;
+            if (same_stored_record) {
+                state_changed_without_write = true;
+            } else {
+                fUpdated = true;
+            }
             MarkShadowPowClaimCandidateStateChangedLocked();
         } else {
             assert(TxStateSerializedIndex(wtx.m_state) == TxStateSerializedIndex(state));
@@ -2778,9 +2793,9 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
 
     // A re-add that changes nothing (a rescan or a repeated callback for a
     // record the wallet already holds in this state) is not logged.
-    const bool record_changed = fInsertedNew || fUpdated || descendants_rewritten;
+    const bool record_changed = fInsertedNew || fUpdated || descendants_rewritten || state_changed_without_write;
     if (record_changed) {
-        WalletLogPrintf("AddToWallet %s  %s%s %s\n", hash.ToString(), (fInsertedNew ? "new" : ""), (fUpdated ? "update" : ""), TxStateString(state));
+        WalletLogPrintf("AddToWallet %s  %s%s %s\n", hash.ToString(), (fInsertedNew ? "new" : ""), (fUpdated || state_changed_without_write ? "update" : ""), TxStateString(state));
     }
 
     // Write to disk
@@ -6436,7 +6451,12 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
             "::cs_main", __FILE__, __LINE__);
         LOCK(cs_wallet);
         BumpBalanceScanMarker();
-        WalletLogPrintf("CommitTransaction:\n%s", tx->ToString()); // NOLINT(bitcoin-unterminated-logprintf)
+        // Formatting the whole transaction is not worth doing under both
+        // locks; the txid finds it. The dump stays available for debugging.
+        WalletLogPrintf("CommitTransaction: %s (%u bytes)\n", tx->GetHash().ToString(), tx->GetTotalSize());
+        if (LogAcceptCategory(BCLog::WALLETDB, BCLog::Level::Debug)) {
+            WalletLogPrintf("CommitTransaction:\n%s", tx->ToString()); // NOLINT(bitcoin-unterminated-logprintf)
+        }
 
         bool reopen_automatic_shadow_signal{false};
         if (automatic_shadow_signal_commit) {
@@ -6647,7 +6667,19 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
             });
         };
 
+        // The order position and the transaction record (and any address
+        // book or key pool row the add touches) reach the disk in one synced
+        // commit instead of one each. The commit completes here, before the
+        // wallet lock is released and before anything is relayed, so a
+        // transaction is never broadcast ahead of its durable record.
+        std::unique_ptr<DatabaseBulkScope> commit_writes = GetDatabase().MakeBulkScope();
         CWalletTx* wtx = add_wallet_record();
+        if (commit_writes && !commit_writes->Commit()) {
+            // The grouped writes were rolled back: memory holds a record the
+            // disk does not. Treat it exactly like a failed record write.
+            wtx = nullptr;
+        }
+        commit_writes.reset();
 
         // wtx can only be null if the db write failed.
         if (!wtx) {

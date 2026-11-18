@@ -5552,8 +5552,9 @@ void TestBatchedStatusRefresh(interfaces::Node& node, TestChain100Setup& test, c
     // One batch reads every row that can still change (and a bounded number of never-read rows) under one lock.
     const auto start = table->statusStats();
     table->updateConfirmations();
+    // The batch takes the wallet lock by try-lock and retries shortly when another thread holds it.
+    QTRY_COMPARE_WITH_TIMEOUT(table->statusStats().batches, start.batches + 1, 10000);
     auto stats = table->statusStats();
-    QCOMPARE(stats.batches, start.batches + 1);
     QVERIFY(stats.rows >= start.rows + table->activeRows());
     QCOMPARE(stats.single_reads, start.single_reads);
     const auto first_view = tooltips();
@@ -5564,8 +5565,8 @@ void TestBatchedStatusRefresh(interfaces::Node& node, TestChain100Setup& test, c
     SyncRecoveryReviewWalletTip(wallet, node); // a standalone test wallet does not follow the chain by itself
     const auto before_block = table->statusStats();
     table->updateConfirmations();
+    QTRY_COMPARE_WITH_TIMEOUT(table->statusStats().batches, before_block.batches + 1, 10000); // one call for the block
     stats = table->statusStats();
-    QCOMPARE(stats.batches, before_block.batches + 1); // one call for the block
     QVERIFY(stats.rows > before_block.rows);
     const auto second_view = tooltips();
     QCOMPARE(table->statusStats().single_reads, before_block.single_reads); // no per-row reads were needed to show them

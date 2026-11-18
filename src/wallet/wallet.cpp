@@ -16001,6 +16001,12 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                     selected_input, work, proof,
                     loop_authority_generation, error,
                     &submit_failure_reselection);
+            // Count the claim before anything else, as rc12 did: the wallet
+            // transaction is already visible, and a reader that sees it must
+            // not find the counter lagging behind the timing line below.
+            if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED) {
+                ++m_pow_claims_submitted;
+            }
             {
                 // One timing line per attempt, whatever its outcome.
                 const bool tip_moved = !m_pow_tip_signal.TipInfo(tip_hash) &&
@@ -16022,9 +16028,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED ||
                 submit_result ==
                     ShadowPowClaimSubmitResult::PERSISTED_PENDING) {
-                if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED) {
-                    ++m_pow_claims_submitted;
-                } else {
+                if (submit_result != ShadowPowClaimSubmitResult::SUBMITTED) {
                     // The retained claim is retried through the gate on this
                     // tip: carry the debt (within the ceilings) rather than
                     // sleeping it all before worker zero can relay again.

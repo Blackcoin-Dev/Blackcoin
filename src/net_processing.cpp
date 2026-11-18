@@ -5996,7 +5996,14 @@ void PeerManagerImpl::MaybeSendFeefilter(CNode& pto, Peer& peer, std::chrono::mi
         }
     }
     if (current_time > peer.m_next_send_feefilter) {
-        CAmount filterToSend = m_fee_filter_rounder.round(currentFilter);
+        // Outside initial block download the filter is the fixed minimum
+        // fee rate, not a private mempool figure, so there is nothing for
+        // rounding to hide. Rounding it picks the bucket above the minimum
+        // one time in three, which told the peer not to announce
+        // transactions paying exactly the minimum: every Gold Rush claim.
+        CAmount filterToSend = currentFilter == MAX_MONEY
+            ? m_fee_filter_rounder.round(currentFilter)
+            : currentFilter;
         // We always have a fee filter of at least the min relay fee
         filterToSend = std::max(filterToSend, m_mempool.m_min_relay_feerate.GetFeePerK());
         if (filterToSend != peer.m_fee_filter_sent) {

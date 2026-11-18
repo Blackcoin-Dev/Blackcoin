@@ -80,6 +80,25 @@ struct PowMiningSleepPlan {
     std::chrono::milliseconds remainder{0};
 };
 
+/** Whether an iteration must leave the carried debt below the ceilings for a
+ * later iteration to sleep off.
+ *
+ * Claim work that is still pending and a tip that arrived during the
+ * iteration are the work-first cases. The third case is an iteration that ran
+ * a proof search and has no more work, typically the one that found the proof
+ * and submitted the claim. What the miner reports (the hashrate, which reads
+ * zero whenever the worker is not searching, the worker state, and the gate
+ * worker zero publishes for its siblings) is brought up to date by the next
+ * iteration, when it finds nothing to do. Sleeping the whole debt first left
+ * the rate of the finished search on display for up to both ceilings (about
+ * two minutes at 1%) while the worker was only waiting for the next block.
+ * The next iteration takes its normal wait and then sleeps the debt, so
+ * nothing is forgiven; it only costs one more gate evaluation. */
+inline bool PowMiningCarryRemainder(bool work_pending, bool tip_arrived, bool searched)
+{
+    return work_pending || tip_arrived || searched;
+}
+
 /** Per-worker duty ledger for the work-first schedule.
  *
  * The long-run rule is the documented one: every span of active work owes

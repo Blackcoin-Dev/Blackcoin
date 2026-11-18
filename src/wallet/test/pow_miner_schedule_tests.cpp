@@ -492,6 +492,49 @@ BOOST_AUTO_TEST_CASE(pending_claim_work_is_not_delayed_by_the_carried_debt)
     BOOST_CHECK_EQUAL(ledger.Plan(/*work_pending=*/true).remainder.count(), 0);
 }
 
+BOOST_AUTO_TEST_CASE(debt_is_not_slept_before_the_idle_state_is_published)
+{
+    BOOST_CHECK(!PowMiningCarryRemainder(false, false, false));
+    BOOST_CHECK(PowMiningCarryRemainder(true, false, false));
+    BOOST_CHECK(PowMiningCarryRemainder(false, true, false));
+    BOOST_CHECK(PowMiningCarryRemainder(false, false, true));
+
+    // 1%: a search of 0.5 s finds its proof and the claim is submitted. That
+    // iteration has no pending work, but it searched, so it sleeps nothing:
+    // the worker goes straight to the iteration that publishes the idle
+    // state (hashrate zero, waiting for the next tip).
+    PowMiningDutyLedger ledger{1, 64s};
+    ledger.Charge(/*search=*/500ms, /*other=*/5ms);
+    BOOST_CHECK(ledger.MayDefer());
+    const auto owed = ledger.Debt();
+    BOOST_CHECK_EQUAL(owed.count(), nanoseconds{49'995ms}.count());
+    const PowMiningSleepPlan submitted = ledger.Plan(
+        PowMiningCarryRemainder(/*work_pending=*/false, /*tip_arrived=*/false, /*searched=*/true));
+    BOOST_CHECK_EQUAL(submitted.excess.count(), 0);
+    BOOST_CHECK_EQUAL(submitted.remainder.count(), 0);
+    // Without the rule the stale state would have stayed up this long.
+    BOOST_CHECK_EQUAL(ledger.Plan(/*work_pending=*/false).remainder.count(), 49'995);
+
+    // The idle iteration: a gate evaluation, the one-second wait for the next
+    // tip, then the rest of the debt. Nothing is forgiven.
+    ledger.Charge(/*search=*/0ns, /*other=*/1ms);
+    ledger.Credit(1s);
+    const PowMiningSleepPlan idle = ledger.Plan(
+        PowMiningCarryRemainder(/*work_pending=*/false, /*tip_arrived=*/false, /*searched=*/false));
+    BOOST_CHECK_EQUAL(idle.excess.count(), 0);
+    BOOST_CHECK_EQUAL(idle.remainder.count(), 49'995 + 99 - 1'000);
+    ledger.Credit(idle.remainder);
+    BOOST_CHECK_EQUAL(ledger.Debt().count(), 0);
+
+    // Above a ceiling the excess is still slept by the searching iteration.
+    PowMiningDutyLedger over{1, 64s};
+    over.Charge(/*search=*/700ms, /*other=*/0ns);
+    const PowMiningSleepPlan capped = over.Plan(
+        PowMiningCarryRemainder(false, false, /*searched=*/true));
+    BOOST_CHECK_EQUAL(capped.excess.count(), 69'300 - 63'360);
+    BOOST_CHECK_EQUAL(capped.remainder.count(), 0);
+}
+
 BOOST_AUTO_TEST_CASE(tip_signal_wakes_waiters)
 {
     PowMinerTipSignal signal;

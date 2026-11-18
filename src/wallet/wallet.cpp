@@ -12029,8 +12029,12 @@ public:
 
         const bool tip_arrived = m_watch.woken ||
             m_wallet.m_pow_tip_signal.TipSequence() != m_watch.baseline.tip;
-        const PowMiningSleepPlan plan =
-            m_state.ledger.Plan(m_work_pending || tip_arrived, iteration_debt);
+        // An iteration that searched never sleeps the carried debt itself:
+        // the next one first publishes what the worker is doing now.
+        const PowMiningSleepPlan plan = m_state.ledger.Plan(
+            PowMiningCarryRemainder(m_work_pending, tip_arrived,
+                                    /*searched=*/!m_attempt_tip.IsNull()),
+            iteration_debt);
         PowMinerSleep outcome{PowMinerSleep::FINISHED};
         const auto take_sleep = [&](std::chrono::milliseconds delay, bool wake_on_tip) {
             if (delay.count() <= 0 || outcome == PowMinerSleep::CANCELLED) return;

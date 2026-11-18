@@ -3435,6 +3435,14 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
         // new recovery authority. The executor rechecks exact relay guards.
         RequestWalletClaimMaintenance(m_claim_maintenance,
                                       /*resolve=*/false, /*relay=*/true);
+        if (m_pow_mining_enabled.load(std::memory_order_acquire)) {
+            // The miner's worker zero relays or replaces the claim. Wake it
+            // now instead of leaving that to its one-second poll.
+            WalletLogPrintf("Waking the Gold Rush PoW miner after %s mempool removal of claim %s\n",
+                            RemovalReasonToString(reason),
+                            tx->GetHash().ToString());
+            m_pow_tip_signal.NotifyClaimRemoved();
+        }
     }
 }
 
@@ -12007,6 +12015,9 @@ PowMinerSleep SleepPowMinerDetailed(
             baseline.poke = wallet.m_pow_tip_signal.Sample().poke;
             continue;
         }
+        // A removed claim ends a wait exactly as a new tip does: the gate is
+        // evaluated again now, so the claim is relayed or replaced without
+        // waiting out the poll.
         if (watch) {
             // While the node is syncing, reindexing or loading blocks, each
             // connected block would start an iteration that can only find the

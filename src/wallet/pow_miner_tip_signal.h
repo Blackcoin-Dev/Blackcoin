@@ -44,8 +44,9 @@ public:
         uint64_t tip{0};
         uint64_t gate{0};
         uint64_t poke{0};
+        uint64_t claim{0};
     };
-    enum class Wake { TIMEOUT, TIP, GATE, POKE };
+    enum class Wake { TIMEOUT, TIP, GATE, POKE, CLAIM };
 
     /** The wallet moved to a new tip (connect or disconnect). */
     void NotifyTip(const PowMinerTipInfo& tip)
@@ -78,13 +79,24 @@ public:
         m_cv.notify_all();
     }
 
+    /** The mempool dropped a live claim of this wallet for a reason other
+     * than a block: it may be relayed again or replaced now. */
+    void NotifyClaimRemoved()
+    {
+        {
+            std::lock_guard<std::mutex> lock{m_mutex};
+            ++m_claim_seq;
+        }
+        m_cv.notify_all();
+    }
+
     /** Lock-free; read once per hash by the proof search. */
     uint64_t TipSequence() const { return m_tip_seq.load(std::memory_order_acquire); }
 
     Baseline Sample() const
     {
         std::lock_guard<std::mutex> lock{m_mutex};
-        return {m_tip_seq.load(std::memory_order_relaxed), m_gate_seq, m_poke_seq};
+        return {m_tip_seq.load(std::memory_order_relaxed), m_gate_seq, m_poke_seq, m_claim_seq};
     }
 
     /** The recorded arrival of this exact tip, if it is the latest one. */
@@ -96,7 +108,8 @@ public:
     }
 
     /** Wait until something changed relative to baseline, or the duration
-     * passed. A tip change wins over a gate change, which wins over a poke. */
+     * passed. A tip change wins over a gate change, which wins over a removed
+     * claim, which wins over a poke. */
     Wake WaitFor(std::chrono::nanoseconds duration, const Baseline& baseline,
                  bool watch_gate) const
     {
@@ -104,11 +117,13 @@ public:
         const auto changed = [&] {
             return m_tip_seq.load(std::memory_order_relaxed) != baseline.tip ||
                    (watch_gate && m_gate_seq != baseline.gate) ||
+                   m_claim_seq != baseline.claim ||
                    m_poke_seq != baseline.poke;
         };
         if (duration.count() > 0) m_cv.wait_for(lock, duration, changed);
         if (m_tip_seq.load(std::memory_order_relaxed) != baseline.tip) return Wake::TIP;
         if (watch_gate && m_gate_seq != baseline.gate) return Wake::GATE;
+        if (m_claim_seq != baseline.claim) return Wake::CLAIM;
         if (m_poke_seq != baseline.poke) return Wake::POKE;
         return Wake::TIMEOUT;
     }
@@ -119,6 +134,7 @@ private:
     std::atomic<uint64_t> m_tip_seq{0};
     uint64_t m_gate_seq{0};
     uint64_t m_poke_seq{0};
+    uint64_t m_claim_seq{0};
     PowMinerTipInfo m_tip;
 };
 

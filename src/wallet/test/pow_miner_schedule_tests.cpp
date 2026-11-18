@@ -581,6 +581,76 @@ BOOST_AUTO_TEST_CASE(tip_signal_wakes_waiters)
     const auto poke_base = signal.Sample();
     signal.Poke();
     BOOST_CHECK(signal.WaitFor(10s, poke_base, false) == PowMinerTipSignal::Wake::POKE);
+
+    // A removed claim wakes every waiter, also one that does not watch the
+    // gate, and is not lost when it arrives between the baseline and the wait.
+    const auto claim_base = signal.Sample();
+    signal.NotifyClaimRemoved();
+    start = std::chrono::steady_clock::now();
+    BOOST_CHECK(signal.WaitFor(10s, claim_base, false) == PowMinerTipSignal::Wake::CLAIM);
+    BOOST_CHECK((std::chrono::steady_clock::now() - start) < 200ms);
+    BOOST_CHECK(signal.WaitFor(20ms, signal.Sample(), false) == PowMinerTipSignal::Wake::TIMEOUT);
+    {
+        const auto base = signal.Sample();
+        std::promise<void> waiting;
+        auto waiter = std::async(std::launch::async, [&] {
+            waiting.set_value();
+            return signal.WaitFor(10s, base, false);
+        });
+        waiting.get_future().wait();
+        std::this_thread::sleep_for(20ms);
+        signal.NotifyClaimRemoved();
+        BOOST_REQUIRE(waiter.wait_for(5s) == std::future_status::ready);
+        BOOST_CHECK(waiter.get() == PowMinerTipSignal::Wake::CLAIM);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(found_proof_stops_sibling_search)
+{
+    const ShadowPowWork work = NeverSolvedWork();
+    CWallet wallet{nullptr, "found-stops-siblings", CreateMockableWalletDatabase()};
+    wallet.m_pow_mining_enabled = true;
+    wallet.m_pow_state = interfaces::WalletPowMiningState::READY;
+    const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+    const uint64_t tip_sequence = wallet.m_pow_tip_signal.TipSequence();
+    std::chrono::steady_clock::time_point next_error_log{};
+    std::vector<unsigned char> proof;
+    auto batch = std::async(std::launch::async, [&] {
+        return wallet.RunShadowPowMiningBatch(
+            work, 0, 1, uint64_t{1} << 40, generation, proof, 1, next_error_log,
+            tip_sequence);
+    });
+    BOOST_CHECK(batch.wait_for(300ms) == std::future_status::timeout);
+    // Another worker found the proof for this tip.
+    const auto marked = std::chrono::steady_clock::now();
+    wallet.m_pow_proof_found_tip_seq = tip_sequence + 1;
+    BOOST_REQUIRE(batch.wait_for(5s) == std::future_status::ready);
+    const auto reaction = std::chrono::steady_clock::now() - marked;
+    const auto result = batch.get();
+    BOOST_CHECK(result.status == WalletPowMiningGrindStatus::EXHAUSTED);
+    BOOST_CHECK_GT(result.successful_hashes, 0U);
+    BOOST_CHECK(reaction < 200ms);
+    BOOST_CHECK(proof.empty());
+    // While the mark stands, a batch for that tip ends before its first hash.
+    auto marked_batch = wallet.RunShadowPowMiningBatch(
+        work, 0, 1, 4, generation, proof, 1, next_error_log, tip_sequence);
+    BOOST_CHECK(marked_batch.status == WalletPowMiningGrindStatus::EXHAUSTED);
+    BOOST_CHECK_EQUAL(marked_batch.successful_hashes, 0U);
+    // A mark for another tip, or none, does not stop the search; neither
+    // does any mark for a caller that passes no tip sequence.
+    wallet.m_pow_proof_found_tip_seq = tip_sequence + 2;
+    auto other_tip = wallet.RunShadowPowMiningBatch(
+        work, 0, 1, 4, generation, proof, 1, next_error_log, tip_sequence);
+    BOOST_CHECK_EQUAL(other_tip.successful_hashes, 4U);
+    wallet.m_pow_proof_found_tip_seq = tip_sequence + 1;
+    auto plain = wallet.RunShadowPowMiningBatch(
+        work, 0, 1, 4, generation, proof, 1, next_error_log);
+    BOOST_CHECK_EQUAL(plain.successful_hashes, 4U);
+    wallet.m_pow_proof_found_tip_seq = 0;
+    auto cleared = wallet.RunShadowPowMiningBatch(
+        work, 0, 1, 4, generation, proof, 1, next_error_log, tip_sequence);
+    BOOST_CHECK_EQUAL(cleared.successful_hashes, 4U);
+    wallet.m_pow_mining_enabled = false;
 }
 
 BOOST_AUTO_TEST_CASE(tip_change_interrupts_a_search)

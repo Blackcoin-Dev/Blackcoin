@@ -5781,10 +5781,24 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     const auto compare_coldstake_batch = [&](CAmount funded_liquid_amount = 0) {
         const std::vector<std::string> addresses{
             liquid_coldstake_result->address, tiered_coldstake_result->address, "invalid"};
-        const auto grouped = wallet_interface.getQuantumColdStakeBalances(addresses);
+        // Both reads are try-locks and report a busy lock as unavailable.
+        // Compare a pair of reads that each got their locks.
+        std::map<std::string, interfaces::WalletQuantumColdStakeBalanceInfo> grouped, singles;
+        QTRY_VERIFY_WITH_TIMEOUT([&] {
+            grouped = wallet_interface.getQuantumColdStakeBalances(addresses);
+            singles.clear();
+            bool available{true};
+            for (const auto& entry : grouped) available = available && entry.second.available;
+            for (const auto& address : addresses) {
+                const auto single = wallet_interface.getQuantumColdStakeBalanceInfo(address);
+                available = available && single.available;
+                singles.emplace(address, single);
+            }
+            return available;
+        }(), 10000);
         QCOMPARE(grouped.size(), addresses.size());
         for (const auto& address : addresses) {
-            const auto single = wallet_interface.getQuantumColdStakeBalanceInfo(address);
+            const auto& single = singles.at(address);
             const auto& bulk = grouped.at(address);
             QCOMPARE(bulk.available, single.available);
             QCOMPARE(bulk.valid_delegation_address, single.valid_delegation_address);

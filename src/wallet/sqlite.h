@@ -12,6 +12,8 @@
 #include <wallet/scheduler_stats.h>
 
 #include <chrono>
+#include <cstdint>
+#include <optional>
 
 struct bilingual_str;
 
@@ -21,6 +23,10 @@ struct sqlite3_mutex;
 
 namespace wallet {
 class SQLiteDatabase;
+
+/** Page cache of a wallet database connection in KiB: 16 MiB, or 4 MiB on a
+ *  system with 4 GiB of memory or less. */
+int SQLitePageCacheKiB(const std::optional<uint64_t>& total_ram);
 
 /** RAII class that provides a database cursor */
 class SQLiteCursor : public DatabaseCursor

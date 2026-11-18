@@ -7,6 +7,7 @@
 #include <wallet/sqlite.h>
 
 #include <chainparams.h>
+#include <common/system.h>
 #include <crypto/common.h>
 #include <logging.h>
 #include <sync.h>
@@ -126,6 +127,11 @@ static void SetPragma(sqlite3* db, const std::string& key, const std::string& va
     if (ret != SQLITE_OK) {
         throw std::runtime_error(strprintf("SQLiteDatabase: %s: %s\n", err_msg, sqlite3_errstr(ret)));
     }
+}
+
+int SQLitePageCacheKiB(const std::optional<uint64_t>& total_ram)
+{
+    return total_ram && *total_ram <= (uint64_t{4} << 30) ? 4 * 1024 : 16 * 1024;
 }
 
 Mutex SQLiteDatabase::g_sqlite_mutex;
@@ -313,6 +319,12 @@ void SQLiteDatabase::Open()
 
     // Enable fullfsync for the platforms that use it
     SetPragma(m_db, "fullfsync", "true", "Failed to enable fullfsync");
+
+    // SQLite keeps about 2 MiB of pages by default, far less than the b-tree
+    // of a wallet with a long history, so lookups went to the disk. A negative
+    // cache_size is a size in KiB. The journal mode and the synchronous level
+    // are left alone.
+    SetPragma(m_db, "cache_size", strprintf("-%d", SQLitePageCacheKiB(GetTotalRAM())), "Failed to set the page cache size");
 
     if (m_use_unsafe_sync) {
         LogPrintf("WARNING SQLite is configured to not wait for data to be flushed to disk. Data loss and corruption may occur.\n");

@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chain.h>
+#include <common/system.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
 #include <random.h>
@@ -11,6 +12,7 @@
 #include <test/util/logging.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <tinyformat.h>
 #include <util/check.h>
 #include <validation.h>
 #include <wallet/scheduler_stats.h>
@@ -579,6 +581,32 @@ BOOST_FIXTURE_TEST_CASE(entering_the_mempool_rewrites_no_record, TestChain100Set
     BOOST_CHECK(!inactive->abandoned);
     BOOST_CHECK_EQUAL(reloaded->second.mapValue.at("note"), "kept");
 }
+BOOST_FIXTURE_TEST_CASE(sqlite_page_cache_follows_system_memory, BasicTestingSetup)
+{
+    BOOST_CHECK_EQUAL(SQLitePageCacheKiB(std::nullopt), 16 * 1024);
+    BOOST_CHECK_EQUAL(SQLitePageCacheKiB(uint64_t{2} << 30), 4 * 1024);
+    BOOST_CHECK_EQUAL(SQLitePageCacheKiB(uint64_t{4} << 30), 4 * 1024);
+    BOOST_CHECK_EQUAL(SQLitePageCacheKiB((uint64_t{4} << 30) + 1), 16 * 1024);
+    BOOST_CHECK_EQUAL(SQLitePageCacheKiB(uint64_t{64} << 30), 16 * 1024);
+
+    auto wallet = LoadSqliteWallet("page-cache", nullptr);
+    const auto pragma = [&](const char* name) {
+        std::string value;
+        const std::string sql{strprintf("PRAGMA %s", name)};
+        const auto callback = [](void* out, int columns, char** values, char**) -> int {
+            if (columns > 0 && values[0]) *static_cast<std::string*>(out) = values[0];
+            return 0;
+        };
+        BOOST_REQUIRE_EQUAL(sqlite3_exec(RawDb(*wallet), sql.c_str(), callback, &value, nullptr), SQLITE_OK);
+        return value;
+    };
+    BOOST_CHECK_EQUAL(pragma("cache_size"), strprintf("-%d", SQLitePageCacheKiB(GetTotalRAM())));
+    // The durability settings are untouched: rollback journal, full sync, no memory map.
+    BOOST_CHECK_EQUAL(pragma("journal_mode"), "delete");
+    BOOST_CHECK_EQUAL(pragma("synchronous"), "2");
+    BOOST_CHECK_EQUAL(pragma("locking_mode"), "exclusive");
+}
+
 #endif
 
 BOOST_FIXTURE_TEST_CASE(dense_locator_resumes_within_a_few_blocks, TestChain100Setup)

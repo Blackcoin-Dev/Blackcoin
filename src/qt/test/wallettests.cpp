@@ -2263,6 +2263,42 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isEnabled(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!pow_unlock->isChecked(), 5000);
         QCOMPARE(model.getCachedEncryptionStatus(), WalletModel::Locked);
+        {
+            // The unlock helper reads the wallet's state by try-lock. With the
+            // wallet lock held for longer than its bounded retry the click must
+            // end in a visible notice, not in nothing, and must change nothing.
+            std::promise<void> locked, release;
+            const auto release_future = release.get_future().share();
+            std::atomic<bool> expired{false};
+            std::thread holder([&] {
+                LOCK(wallet->cs_wallet);
+                locked.set_value();
+                expired = release_future.wait_for(std::chrono::seconds{20}) == std::future_status::timeout;
+            });
+            auto release_holder = interfaces::MakeCleanupHandler([&] { release.set_value(); holder.join(); });
+            locked.get_future().wait();
+            bool busy_notice{false}, passphrase_asked{false};
+            WaitForModal(QStringLiteral("wallet busy notice"), [&] {
+                QWidget* modal = QApplication::activeModalWidget();
+                if (!modal) return false;
+                if (modal->inherits("AskPassphraseDialog")) passphrase_asked = true;
+                auto* box = qobject_cast<QMessageBox*>(modal);
+                busy_notice = box && box->text().contains(QStringLiteral("wallet is busy"));
+                qobject_cast<QDialog*>(modal)->reject();
+                return true;
+            });
+            pow_unlock->click();
+            QVERIFY(busy_notice);
+            QVERIFY(!passphrase_asked);
+            QVERIFY(!expired.load());
+            release_holder.reset();
+            QCOMPARE(model.getEncryptionStatus(), WalletModel::Locked);
+            QVERIFY(model.getWalletUnlockStakingOnly());
+            QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isEnabled() && !pow_unlock->isChecked(), 5000);
+            // The status read that met the held lock is retried on a 50 ms timer: let it land first.
+            QTest::qWait(150);
+            QCOMPARE(model.getCachedEncryptionStatus(), WalletModel::Locked);
+        }
         QVERIFY(model.setWalletLocked(false, passphrase,
                                       /*staking_only=*/true));
         // No event processing between this Core unlock and the click: force

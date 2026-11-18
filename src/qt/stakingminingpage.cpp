@@ -51,6 +51,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QThread>
 #include <QPalette>
 #include <QPushButton>
 #include <QScopedValueRollback>
@@ -5380,8 +5381,20 @@ bool StakingMiningPage::requestNormalUnlock()
     // cache can still say Locked immediately after a staking-only unlock.
     // Refuse a busy snapshot instead of blocking the GUI or trusting that cache.
     interfaces::WalletEncryptionStatus authority;
-    if (!expected_wallet->wallet().tryGetEncryptionStatus(authority)) {
+    // The wallet lock is also taken in short slices by background readers (the display balance worker, a detail
+    // refresh). One of them holding it at the instant of the click must not turn the click into nothing: try again
+    // within a bound the user does not notice, and say so when the wallet stays busy.
+    constexpr int ATTEMPTS{40};
+    constexpr int ATTEMPT_INTERVAL_MS{5};
+    bool have_authority{false};
+    for (int attempt = 0; attempt < ATTEMPTS && !have_authority; ++attempt) {
+        if (attempt > 0) QThread::msleep(ATTEMPT_INTERVAL_MS);
+        have_authority = expected_wallet->wallet().tryGetEncryptionStatus(authority);
+    }
+    if (!have_authority) {
         expected_wallet->updateStatus();
+        QMessageBox::warning(this, tr("Wallet busy"),
+            tr("The wallet is busy, so the unlock request was not started and nothing was changed. Try again in a moment."));
         return false;
     }
     const WalletModel::EncryptionStatus encryption_status = !authority.encrypted

@@ -27,6 +27,7 @@
 #include <wallet/bdb.h>
 #endif
 #include <wallet/coincontrol.h>
+#include <wallet/display_balance.h>
 #include <wallet/scheduler_stats.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/wallet.h>
@@ -81,6 +82,7 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-spendzeroconfchange", strprintf("Spend unconfirmed change when sending transactions (default: %u)", DEFAULT_SPEND_ZEROCONF_CHANGE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-wallet=<path>", "Specify wallet path to load at startup. Can be used multiple times to load multiple wallets. Path is to a directory containing wallet data and log files. If the path is not absolute, it is interpreted relative to <walletdir>. This only loads existing wallets and does not create new ones. For backwards compatibility this also accepts names of existing top-level data files in <walletdir>.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::WALLET);
     argsman.AddArg("-walletfullcheck", strprintf("Run the full SQLite wallet integrity check before the wallet loads, as in earlier versions. By default start-up runs the quick check and the full check follows in the background, raising a warning if it finds damage (default: %u)", DEFAULT_WALLETFULLCHECK), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-walletrpcexactbalance", strprintf("Make getwalletinfo, getbalances and getbalance wait for an exact balance when the caller does not pass exact (default: %u). By default they return the last calculated balance at once and say whether it is exact, so that polling never waits on a busy node.", DEFAULT_WALLET_RPC_EXACT_BALANCE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-walletbroadcast",  strprintf("Make the wallet broadcast transactions (default: %u)", DEFAULT_WALLETBROADCAST), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-walletdir=<dir>", "Specify directory to hold wallets (default: <datadir>/wallets if it exists, otherwise <datadir>)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::WALLET);
 #if HAVE_SYSTEM

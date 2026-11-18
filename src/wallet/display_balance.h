@@ -232,6 +232,16 @@ public:
     bool IsCurrent(const DisplayBalanceSnapshot& snapshot) const;
     /** Whether the last attempt ended in an error (not a routine retry). */
     bool Failed() const;
+    /** Whether the wallet was taken off the worker: no pass will run again. */
+    bool Aborted() const;
+    /** A balance poll (RPC) read the snapshot: for a while the wallet is
+     * recomputed as soon as it changes, like the wallet shown, instead of at
+     * most once per BACKGROUND_MIN_INTERVAL_MS. */
+    void NotePolled() { m_polled_ms.store(NowMs(), std::memory_order_relaxed); }
+    /** The cached balance of all outputs, reused addresses included, when it
+     * was computed for exactly this (tip, marker). */
+    std::optional<Balance> FullBalanceFor(const uint256& tip_hash, uint64_t marker) const;
+    void StoreFullBalance(const uint256& tip_hash, uint64_t marker, const Balance& balance);
 
     /** What the GUI wants: whether this wallet is the one shown, and which
      * send-family balance, if any. `retry_send` asks again for a send-family
@@ -345,6 +355,10 @@ private:
     //! For the log line: what the warm-up has left (-1 = not running).
     int64_t m_warmup_waiting{-1};
     int m_warmup_walked_percent{100};
+    //! (tip, marker) and the balance without the reuse filter, for `mine.used`.
+    std::optional<std::tuple<uint256, uint64_t, Balance>> m_full_balance;
+    //! NowMs() of the latest balance poll, 0 = never. Not guarded by m_mutex.
+    std::atomic<int64_t> m_polled_ms{0};
 
     LifecycleSliceLimits m_next_limits; // taken over at the start of a job
 
@@ -386,6 +400,16 @@ public:
     void Release(CWallet& wallet);
     void Wake();
 
+    /** The reference a loaded wallet holds for as long as it is loaded, so
+     * that balance polls (RPC) have a snapshot whether or not a window shows
+     * the wallet. Both are idempotent; ReleasePolled returns only once no
+     * slice of the wallet is running when it gives up the last reference. */
+    void AcquirePolled(CWallet& wallet);
+    void ReleasePolled(CWallet& wallet);
+    /** The display state of a wallet that is on the worker, or null. Takes
+     * no reference: the caller keeps the wallet alive. */
+    std::shared_ptr<WalletDisplayBalance> Find(const CWallet& wallet);
+
     /** Number of wallets served, for tests. */
     size_t WalletCount();
 
@@ -395,10 +419,13 @@ private:
         int refs{0};
         bool running{false};
         bool removing{false};
+        bool polled{false}; //!< holds the reference of AcquirePolled
         int64_t last_served_ms{0};
     };
     void Run();
     bool WaitTurn(Entry& entry);
+    std::shared_ptr<WalletDisplayBalance> AcquireLocked(CWallet& wallet);
+    void ReleaseLocked(CWallet& wallet);
     //! Pause between two slices.
     static constexpr std::chrono::milliseconds SLICE_GAP{1};
 
@@ -412,6 +439,80 @@ private:
     DisplayBusyGate m_gate;              // worker thread only
     bool m_deferring{false};             // worker thread only
 };
+
+/**
+ * Balances for callers that poll (the wallet RPCs).
+ *
+ * A poll returns the published snapshot. It takes neither cs_main nor
+ * cs_wallet, so it answers while a block is being connected, while the
+ * wallet is staking or mining and on a machine whose disk is slow. What it
+ * returns says for which block it was computed and whether the wallet has
+ * changed since.
+ *
+ * A caller that needs the balance of this moment asks for `exact`: the call
+ * waits, without a lock, for a pass of the display worker that started after
+ * the request, and after `exact_timeout` returns what is published with
+ * `exact` false. Nothing here ever falls back to a walk of the wallet under
+ * cs_main and cs_wallet together.
+ */
+//! -walletrpcexactbalance: whether the balance RPCs wait for an exact balance
+//! when the caller does not say.
+static constexpr bool DEFAULT_WALLET_RPC_EXACT_BALANCE{false};
+
+struct PolledBalanceOptions {
+    bool exact{false};
+    //! Also compute the balance without the reuse filter (getbalances
+    //! `mine.used`) for the snapshot returned.
+    bool want_full{false};
+    std::chrono::milliseconds exact_timeout{std::chrono::seconds{30}};
+    //! A poll that finds the snapshot out of date waits this long for the
+    //! worker; on a node that is not busy the new snapshot is there in time.
+    std::chrono::milliseconds fresh_wait{std::chrono::milliseconds{250}};
+    //! A poll that finds no snapshot at all (just loaded) waits this long.
+    std::chrono::milliseconds first_wait{std::chrono::seconds{2}};
+    //! Bound of the reuse-free balance in a poll that is not exact.
+    std::chrono::milliseconds full_wait{std::chrono::seconds{2}};
+};
+
+struct PolledBalance {
+    //! Null when nothing has been published yet (or the wallet is unloading).
+    std::shared_ptr<const DisplayBalanceSnapshot> snapshot;
+    //! The snapshot is the balance of the wallet as it is now, or as it was
+    //! at a moment after the call started.
+    bool exact{false};
+    //! The worker's last attempt ended in an error.
+    bool failed{false};
+    //! The balance without the reuse filter, of the same (tip, marker).
+    std::optional<Balance> full;
+};
+
+PolledBalance GetPolledBalance(const CWallet& wallet, const PolledBalanceOptions& options = {});
+
+/** How the polled balance stands against the wallet's last processed block:
+ * the ClassifyDisplayBalance() strings. */
+std::string PolledBalanceStateString(const CWallet& wallet, const PolledBalance& polled)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** A lifecycle-adjusted balance for arguments the snapshot does not cover. */
+struct BalanceVariant {
+    uint256 tip_hash;
+    int tip_height{-1};
+    uint64_t marker{0};
+    Balance balance;
+    WalletLifecycleSummary lifecycle;
+    bool have_watch_only{false};
+};
+
+/**
+ * Compute a balance on the calling thread with the sliced engine: slice after
+ * slice, each under one try-lock of cs_main or cs_wallet for a bounded time,
+ * never both. Exact for the tip and wallet state it reports. Returns nullopt,
+ * with `error` set, when it did not finish within `timeout` (the node is busy
+ * or the wallet is not synchronized) or the accounting failed.
+ */
+std::optional<BalanceVariant> ComputeBalanceVariant(const CWallet& wallet, int min_depth, bool avoid_reuse,
+                                                    std::chrono::milliseconds timeout, std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(!::cs_main, !wallet.cs_wallet);
 
 } // namespace wallet
 

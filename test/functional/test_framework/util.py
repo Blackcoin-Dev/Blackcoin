@@ -415,6 +415,10 @@ def write_config(config_path, *, n, chain, extra_config="", disable_autoconnect=
         f.write("deprecatedrpc=create_bdb\n")  # Required to run the tests
         # To improve SQLite wallet performance so that the tests don't timeout, use -unsafesqlitesync
         f.write("unsafesqlitesync=1\n")
+        # The balance RPCs return the last calculated balance by default and say
+        # whether it is exact. The tests read a balance right after changing it,
+        # so they ask for the exact one unless a test overrides this.
+        f.write("walletrpcexactbalance=1\n")
         if disable_autoconnect:
             f.write("connect=0\n")
         f.write(extra_config)

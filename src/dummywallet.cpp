@@ -46,6 +46,7 @@ void DummyWalletInit::AddWalletOptions(ArgsManager& argsman) const
         "-txconfirmtarget=<n>",
         "-wallet=<path>",
         "-walletbroadcast",
+        "-walletrpcexactbalance",
         "-walletdir=<dir>",
         "-walletnotify=<cmd>",
         "-dblogsize=<n>",

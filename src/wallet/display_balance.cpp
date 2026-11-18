@@ -125,6 +125,27 @@ bool WalletDisplayBalance::Failed() const
     return m_failed;
 }
 
+bool WalletDisplayBalance::Aborted() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_aborted;
+}
+
+std::optional<Balance> WalletDisplayBalance::FullBalanceFor(const uint256& tip_hash, uint64_t marker) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_full_balance && std::get<0>(*m_full_balance) == tip_hash && std::get<1>(*m_full_balance) == marker) {
+        return std::get<2>(*m_full_balance);
+    }
+    return std::nullopt;
+}
+
+void WalletDisplayBalance::StoreFullBalance(const uint256& tip_hash, uint64_t marker, const Balance& balance)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_full_balance = std::make_tuple(tip_hash, marker, balance);
+}
+
 bool WalletDisplayBalance::SetInterest(bool foreground, std::optional<bool> send_family_quantum, bool retry_send)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -208,8 +229,11 @@ DisplayCandidate WalletDisplayBalance::Candidate(int64_t now_ms)
     // After an error the next attempt waits, unless the wallet has changed.
     const bool ready = now_ms >= m_not_before_ms || (m_failed && marker != m_failed_marker);
     const bool dirty = !m_snapshot || m_snapshot->marker != marker;
-    // A wallet that is not shown keeps its snapshot for a while.
-    const bool throttled = m_snapshot && !c.foreground &&
+    // A wallet that is not shown keeps its snapshot for a while, unless
+    // somebody polls its balance.
+    const int64_t polled_ms = m_polled_ms.load(std::memory_order_relaxed);
+    const bool polled = polled_ms != 0 && now_ms - polled_ms < BACKGROUND_MIN_INTERVAL_MS;
+    const bool throttled = m_snapshot && !c.foreground && !polled &&
         now_ms - m_snapshot->published_ms < BACKGROUND_MIN_INTERVAL_MS;
     const bool want_pass = dirty && ready && !throttled;
     const bool want_send = m_snapshot && !dirty && ready && SendFamilyDue(*m_snapshot, now_ms);
@@ -502,8 +526,8 @@ void WalletDisplayBalance::RunWarmup(const std::function<bool()>& turn)
             // the next pass, for ever. Let that pass resolve the outputs
             // itself; it reports what is wrong with them.
             m_warmup_was_useless = stored == 0;
-            m_wallet.WalletLogPrintf("GUI balance warm-up: wallet=%s done outputs=%d stored=%d skipped=%d rewinds=%d slices=%d\n",
-                                     m_wallet.GetName(), m_warmup->collected, stored, m_warmup->skipped,
+            m_wallet.WalletLogPrintf("GUI balance warm-up: wallet=%s done outputs=%d stored=%d derived=%d skipped=%d rewinds=%d slices=%d\n",
+                                     m_wallet.GetName(), m_warmup->collected, stored, m_warmup->derived, m_warmup->skipped,
                                      m_warmup->rewinds, m_warmup->slices);
             m_warmup.reset();
             m_warmup_armed.store(false);
@@ -589,8 +613,8 @@ void WalletDisplayBalance::RunPass(const std::function<bool()>& turn)
                 wallet_us = m_pass_wallet_us;
                 main_us = m_pass_main_us;
             }
-            LogPrint(BCLog::WALLETDB, "[%s] GUI balance pass: height=%d outputs=%d memo_hits=%d database_reads=%d pending=%d memo_mismatches=%d slices=%d wallet_ms=%.1f main_ms=%.1f took_ms=%d\n",
-                     m_wallet.GetName(), m_pass.tip.height, m_pass.stats.outputs, m_pass.stats.memo_hits,
+            LogPrint(BCLog::WALLETDB, "[%s] GUI balance pass: height=%d outputs=%d memo_hits=%d derived=%d database_reads=%d pending=%d memo_mismatches=%d slices=%d wallet_ms=%.1f main_ms=%.1f took_ms=%d\n",
+                     m_wallet.GetName(), m_pass.tip.height, m_pass.stats.outputs, m_pass.stats.memo_hits, m_pass.stats.derived,
                      m_pass.stats.database_reads, m_pass.stats.pending, m_pass.stats.memo_mismatches,
                      m_pass.slices, wallet_us / 1000.0, main_us / 1000.0, NowMs() - m_pass_start_ms);
             m_pass.Reset();
@@ -731,6 +755,157 @@ void WalletDisplayBalance::RunSendFamilyOnly()
     if (copy->send_family_balance) Publish(std::move(copy));
 }
 
+std::optional<BalanceVariant> ComputeBalanceVariant(const CWallet& wallet, int min_depth, bool avoid_reuse,
+                                                    std::chrono::milliseconds timeout, std::string& error)
+{
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(wallet.cs_wallet);
+    error.clear();
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    LifecyclePass pass;
+    pass.min_depth = min_depth;
+    pass.avoid_reuse = avoid_reuse;
+    // What this pass reads for the memo is applied by its own wallet slices;
+    // it resolves every output itself, so it never asks for a warm-up.
+    LifecycleMemoJournal journal;
+    LifecycleAttestationCache attestations;
+    const LifecycleSliceLimits limits;
+    DisplayBusyGate gate;
+    std::string last_reason{"the node is busy"};
+    for (;;) {
+        if (std::chrono::steady_clock::now() >= deadline ||
+            (wallet.HaveChain() && wallet.chain().shutdownRequested())) {
+            error = strprintf("The balance could not be calculated within %d ms (%s)", timeout.count(), last_reason);
+            return std::nullopt;
+        }
+        // The same deference to the validation interface as the worker's.
+        if (!gate.MayRun(WalletDisplayBalance::NowMs(), wallet.HaveChain() && wallet.chain().validationCallbacksBusy())) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            continue;
+        }
+        LifecycleSliceReport report;
+        try {
+            report = RunLifecyclePassSlice(wallet, pass, journal, attestations, limits);
+        } catch (const std::exception& e) {
+            error = e.what();
+            return std::nullopt;
+        }
+        switch (report.result) {
+        case LifecycleSliceResult::MORE:
+            // Whoever waits for the lock that was just released gets it.
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            break;
+        case LifecycleSliceResult::LOCK_BUSY:
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            break;
+        case LifecycleSliceResult::TIP_MOVED:
+            last_reason = "the chain tip keeps moving";
+            break;
+        case LifecycleSliceResult::WALLET_MOVED:
+            last_reason = "the wallet keeps changing";
+            break;
+        case LifecycleSliceResult::NOT_SYNCED:
+            last_reason = "the wallet has not processed the chain tip";
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+            break;
+        case LifecycleSliceResult::DONE: {
+            BalanceVariant result;
+            result.tip_hash = pass.tip.hash;
+            result.tip_height = pass.tip.height;
+            result.marker = pass.marker;
+            result.balance = pass.balance;
+            result.lifecycle = pass.summary;
+            result.have_watch_only = pass.have_watch_only;
+            return result;
+        }
+        case LifecycleSliceResult::UP_TO_DATE:
+        case LifecycleSliceResult::NEED_WARMUP:
+        case LifecycleSliceResult::FAILED:
+            error = report.error.empty() ? "Unable to calculate the wallet balance" : report.error;
+            return std::nullopt;
+        }
+    }
+}
+
+PolledBalance GetPolledBalance(const CWallet& wallet, const PolledBalanceOptions& options)
+{
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(wallet.cs_wallet);
+    PolledBalance result;
+    const std::shared_ptr<WalletDisplayBalance> state = DisplayBalanceWorker::Global().Find(wallet);
+    if (!state) return result;
+    state->NotePolled();
+    const auto wake = [] { DisplayBalanceWorker::Global().Wake(); };
+    const auto start = std::chrono::steady_clock::now();
+    const auto remaining = [&](std::chrono::milliseconds bound) {
+        return std::max(std::chrono::milliseconds{0},
+                        bound - std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start));
+    };
+
+    result.snapshot = state->Snapshot();
+    result.exact = result.snapshot && state->IsCurrent(*result.snapshot);
+    if (!result.exact) {
+        // Not up to date (or nothing yet): wait for a pass that starts now.
+        // A poll waits briefly, an exact request up to its timeout. An
+        // attempt can end without a balance (the wallet has not processed
+        // the tip yet, an error); then the next one is waited for.
+        const std::chrono::milliseconds bound = options.exact ? options.exact_timeout
+            : result.snapshot ? options.fresh_wait : options.first_wait;
+        for (;;) {
+            const std::chrono::milliseconds left = remaining(bound);
+            if (left.count() <= 0 || state->Aborted()) break;
+            const DisplayBalanceOutcome outcome = state->RequestAndWait(std::nullopt, left, wake);
+            if (outcome.ok && outcome.snapshot) {
+                // Computed by a pass that started after this call.
+                result.snapshot = outcome.snapshot;
+                result.exact = true;
+                break;
+            }
+            if (!options.exact && !outcome.ok && state->Snapshot()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        if (!result.exact) {
+            result.snapshot = state->Snapshot();
+            result.exact = result.snapshot && state->IsCurrent(*result.snapshot);
+        }
+    }
+    result.failed = state->Failed();
+
+    if (options.want_full && result.snapshot) {
+        const DisplayBalanceSnapshot& snapshot = *result.snapshot;
+        result.full = state->FullBalanceFor(snapshot.tip_hash, snapshot.marker);
+        const std::chrono::milliseconds bound = options.exact ? options.exact_timeout : options.full_wait;
+        // The variant is of whatever the wallet is when it runs. It belongs
+        // to this snapshot only if tip and marker are the snapshot's.
+        while (!result.full && state->IsCurrent(snapshot)) {
+            const std::chrono::milliseconds left = remaining(bound);
+            if (left.count() <= 0) break;
+            std::string error;
+            const std::optional<BalanceVariant> full = ComputeBalanceVariant(wallet, /*min_depth=*/0, /*avoid_reuse=*/false, left, error);
+            if (!full) break;
+            state->StoreFullBalance(full->tip_hash, full->marker, full->balance);
+            if (full->tip_hash == snapshot.tip_hash && full->marker == snapshot.marker) result.full = full->balance;
+        }
+    }
+    return result;
+}
+
+std::string PolledBalanceStateString(const CWallet& wallet, const PolledBalance& polled)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    int reference_height{-1};
+    std::optional<uint256> reference_hash;
+    if (const std::optional<int> height = wallet.GetLastBlockHeightIfSet()) {
+        reference_height = *height;
+        reference_hash = wallet.GetLastBlockHash();
+    }
+    const bool marker_current = polled.exact ||
+        (polled.snapshot && polled.snapshot->marker == wallet.GetBalanceScanMarker());
+    // A failure is reported as such only while there is nothing newer to say.
+    return ClassifyDisplayBalance(polled.snapshot.get(), polled.failed && !polled.exact, marker_current,
+                                  polled.exact ? -1 : reference_height, reference_hash).ToString();
+}
+
 DisplayBalanceWorker& DisplayBalanceWorker::Global()
 {
     static DisplayBalanceWorker instance;
@@ -751,6 +926,44 @@ DisplayBalanceWorker::~DisplayBalanceWorker()
 std::shared_ptr<WalletDisplayBalance> DisplayBalanceWorker::Acquire(CWallet& wallet)
 {
     std::lock_guard<std::mutex> lifecycle(m_lifecycle_mutex);
+    return AcquireLocked(wallet);
+}
+
+void DisplayBalanceWorker::AcquirePolled(CWallet& wallet)
+{
+    std::lock_guard<std::mutex> lifecycle(m_lifecycle_mutex);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto it = m_entries.find(&wallet);
+        if (it != m_entries.end() && it->second.polled) return;
+    }
+    AcquireLocked(wallet);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_entries.at(&wallet).polled = true;
+}
+
+void DisplayBalanceWorker::ReleasePolled(CWallet& wallet)
+{
+    std::lock_guard<std::mutex> lifecycle(m_lifecycle_mutex);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto it = m_entries.find(&wallet);
+        if (it == m_entries.end() || !it->second.polled) return;
+        it->second.polled = false;
+    }
+    ReleaseLocked(wallet);
+}
+
+std::shared_ptr<WalletDisplayBalance> DisplayBalanceWorker::Find(const CWallet& wallet)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto it = m_entries.find(const_cast<CWallet*>(&wallet));
+    if (it == m_entries.end() || it->second.removing) return nullptr;
+    return it->second.state;
+}
+
+std::shared_ptr<WalletDisplayBalance> DisplayBalanceWorker::AcquireLocked(CWallet& wallet)
+{
     std::shared_ptr<WalletDisplayBalance> state;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -769,6 +982,11 @@ std::shared_ptr<WalletDisplayBalance> DisplayBalanceWorker::Acquire(CWallet& wal
 void DisplayBalanceWorker::Release(CWallet& wallet)
 {
     std::lock_guard<std::mutex> lifecycle(m_lifecycle_mutex);
+    ReleaseLocked(wallet);
+}
+
+void DisplayBalanceWorker::ReleaseLocked(CWallet& wallet)
+{
     bool last{false};
     {
         std::unique_lock<std::mutex> lock(m_mutex);

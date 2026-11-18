@@ -89,6 +89,7 @@
 #include <wallet/context.h>
 #include <wallet/crypter.h>
 #include <wallet/db.h>
+#include <wallet/display_balance.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/fees.h>
 #include <wallet/scheduler_stats.h>
@@ -1345,6 +1346,9 @@ bool AddWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
     context.wallets.push_back(wallet);
     wallet->ConnectScriptPubKeyManNotifiers();
     wallet->NotifyCanGetAddressesChanged();
+    // A loaded wallet keeps a published balance snapshot for the RPCs that
+    // poll it, whether or not a window shows the wallet.
+    if (wallet->HaveChain()) DisplayBalanceWorker::Global().AcquirePolled(*wallet);
     return true;
 }
 
@@ -1358,6 +1362,9 @@ bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet
     // Unregister with the validation interface which also drops shared pointers.
     wallet->m_chain_notifications_handler.reset();
     context.claim_maintenance->Unregister(*wallet);
+    // Take the wallet off the display balance worker (a no-op when AddWallet
+    // did not put it there). Returns once no slice of the wallet is running.
+    DisplayBalanceWorker::Global().ReleasePolled(*wallet);
     LOCK(context.wallets_mutex);
     std::vector<std::shared_ptr<CWallet>>::iterator i = std::find(context.wallets.begin(), context.wallets.end(), wallet);
     if (i == context.wallets.end()) return false;
@@ -1423,6 +1430,9 @@ static void ReleaseWallet(CWallet* wallet)
 {
     const std::string name = wallet->GetName();
     wallet->WalletLogPrintf("Releasing wallet\n");
+    // Normally done by RemoveWallet; a wallet destroyed without it must not
+    // stay on the display balance worker.
+    DisplayBalanceWorker::Global().ReleasePolled(*wallet);
     wallet->Flush();
     delete wallet;
     // Wallet is now released, notify UnloadWallet, if any.

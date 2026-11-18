@@ -7,11 +7,13 @@
 
 #include <wallet/rpc/util.h>
 
+#include <common/args.h>
 #include <common/url.h>
 #include <rpc/util.h>
 #include <util/any.h>
 #include <util/translation.h>
 #include <wallet/context.h>
+#include <wallet/display_balance.h>
 #include <wallet/wallet.h>
 
 #include <univalue.h>
@@ -182,6 +184,26 @@ void HandleWalletError(const std::shared_ptr<CWallet> wallet, DatabaseStatus& st
         }
         throw JSONRPCError(code, error.original);
     }
+}
+
+const std::string HELP_BALANCE_EXACT_ARG{
+    "Wait until the balance of the wallet as it is now has been calculated, instead of returning the last calculated balance at once. "
+    "The balance is calculated in the background without holding the node's locks, so the call never stalls the node; "
+    "if it is not ready within 30 seconds the last calculated balance is returned (see balance_exact)."};
+
+bool WantExactBalance(const UniValue& param)
+{
+    if (!param.isNull()) return param.get_bool();
+    return gArgs.GetBoolArg("-walletrpcexactbalance", DEFAULT_WALLET_RPC_EXACT_BALANCE);
+}
+
+void AppendPolledBalanceState(UniValue& entry, const CWallet& wallet, const PolledBalance& polled)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    entry.pushKV("balance_exact", polled.exact);
+    entry.pushKV("balance_height", polled.snapshot ? polled.snapshot->tip_height : -1);
+    if (polled.snapshot) entry.pushKV("balance_blockhash", polled.snapshot->tip_hash.GetHex());
+    entry.pushKV("balance_state", PolledBalanceStateString(wallet, polled));
 }
 
 void AppendLastProcessedBlock(UniValue& entry, const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)

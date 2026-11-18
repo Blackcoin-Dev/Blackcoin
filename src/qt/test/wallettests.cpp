@@ -5568,7 +5568,10 @@ void TestBatchedStatusRefresh(interfaces::Node& node, TestChain100Setup& test, c
     const auto second_view = tooltips();
     QCOMPARE(table->statusStats().single_reads, before_block.single_reads); // no per-row reads were needed to show them
     int advanced{0};
-    for (const auto& [hash, shown_before] : first_view) {
+    for (const auto& entry : first_view) {
+        // Named, not a structured binding: the lambda below captures the hash.
+        const auto& hash = entry.first;
+        const auto& shown_before = entry.second;
         const auto& shown_after = second_view.at(hash);
         if (shown_before.second < 0 || shown_after.second < 0) continue;
         QVERIFY2(shown_after.second == shown_before.second + 1,

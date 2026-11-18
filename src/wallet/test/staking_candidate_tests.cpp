@@ -116,7 +116,7 @@ BOOST_AUTO_TEST_CASE(candidate_scan_selects_the_same_set_as_the_full_scan)
     auto wallet = CreateSyncedWallet(*m_node.chain,
         WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
     {
-        LOCK(wallet->cs_wallet);
+        LOCK2(::cs_main, wallet->cs_wallet); // Populate reads the chain
         Populate(*wallet, coinbaseKey, *m_node.chainman, 900);
     }
 
@@ -163,7 +163,7 @@ BOOST_AUTO_TEST_CASE(candidate_scan_cost_on_a_large_wallet)
         WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
     const size_t count = 50000;
     {
-        LOCK(wallet->cs_wallet);
+        LOCK2(::cs_main, wallet->cs_wallet); // Populate reads the chain
         Populate(*wallet, coinbaseKey, *m_node.chainman, count);
     }
     LOCK2(::cs_main, wallet->cs_wallet);
@@ -475,7 +475,7 @@ BOOST_AUTO_TEST_CASE(stake_slot_cost_on_a_large_wallet)
     auto wallet = CreateSyncedWallet(*m_node.chain,
         WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
     {
-        LOCK(wallet->cs_wallet);
+        LOCK2(::cs_main, wallet->cs_wallet); // Populate reads the chain
         Populate(*wallet, coinbaseKey, *m_node.chainman, 50000);
     }
     LOCK2(::cs_main, wallet->cs_wallet);

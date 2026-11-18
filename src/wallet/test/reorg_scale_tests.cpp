@@ -56,6 +56,14 @@ struct WalletReorgTestAccess {
     {
         return wallet.m_redelegation_last_win_height;
     }
+    //! The last step of attaching to the chain, as the attach runs it.
+    static void ReconcileAfterAttach(CWallet& wallet) { wallet.ReconcileCoinstakesAfterAttach(); }
+    //! What a connected block does for the history.
+    static void RecordWin(CWallet& wallet, const CTransaction& tx, int height) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+    {
+        WalletBatch batch(wallet.GetDatabase());
+        wallet.RecordQuantumRedelegationWins(tx, height, batch);
+    }
 };
 
 namespace {
@@ -684,6 +692,98 @@ BOOST_AUTO_TEST_CASE(sweep_index_after_load_has_only_what_a_full_walk_finds)
     LOCK(wallet.cs_wallet);
     for (const uint256& txid : inactive) BOOST_CHECK(wallet.mapWallet.at(txid).isAbandoned());
     BOOST_CHECK(WalletReorgTestAccess::UnconfirmedCoinstakes(wallet).empty());
+}
+
+// The redelegation win history is repaired by one recomputation at attach and
+// after a coinstake is removed, not by the disconnect (which recomputes it
+// only when an entry names the disconnected height).
+BOOST_AUTO_TEST_CASE(redelegation_history_is_repaired_at_attach_and_after_a_zap)
+{
+    const auto real_hash = [&](int height) { return WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain()[height]->GetBlockHash()); };
+    const int tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Height());
+    BOOST_REQUIRE_GE(tip, 95);
+    const uint256 tip_hash = real_hash(tip);
+
+    // The wallet as the last run left it: a delegation, a win at 50 on a block
+    // of the chain, and the newest win at 90 on a block the node no longer has.
+    CWallet seed(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    CScript script;
+    std::vector<unsigned char> program;
+    CTransactionRef older, newer;
+    {
+        LOCK(seed.cs_wallet);
+        seed.SetLastBlockProcessed(tip, tip_hash);
+        const auto key_destination = seed.GetNewQuantumChangeDestination();
+        BOOST_REQUIRE(key_destination);
+        const auto key_info = seed.GetQuantumKeyInfo(*key_destination);
+        BOOST_REQUIRE(key_info);
+        const auto delegation = seed.AddQuantumColdStakeDelegation(key_info->public_key, key_info->public_key, "delegation", GetTime());
+        BOOST_REQUIRE(delegation);
+        script = GetScriptForDestination(*delegation);
+        const auto info = seed.GetQuantumColdStakeDelegationInfo(*delegation);
+        BOOST_REQUIRE(info && info->has_owner_key);
+        program = info->witness_program;
+        older = ReorgWallet::MakeStake(COutPoint{uint256{1}, 0}, script);
+        newer = ReorgWallet::MakeStake(COutPoint{uint256{2}, 0}, script);
+        BOOST_REQUIRE(seed.AddToWallet(older, TxStateConfirmed{real_hash(50), 50, 1}));
+        BOOST_REQUIRE(seed.AddToWallet(newer, TxStateConfirmed{FakeBlockHash(90), 90, 1}));
+        WalletReorgTestAccess::RecordWin(seed, *older, 50);
+        WalletReorgTestAccess::RecordWin(seed, *newer, 90);
+    }
+
+    CWallet wallet(m_node.chain.get(), "", DuplicateMockDatabase(seed.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    LOCK(wallet.cs_wallet);
+    wallet.SetLastBlockProcessed(tip, tip_hash);
+    auto& history = WalletReorgTestAccess::RedelegationHistory(wallet);
+    const auto expect = [&](int height, const std::string& when) {
+        const auto it = history.find(program);
+        if (height < 0) {
+            BOOST_CHECK_MESSAGE(it == history.end(), when + ": no entry");
+        } else {
+            BOOST_REQUIRE_MESSAGE(it != history.end(), when + ": entry");
+            BOOST_CHECK_MESSAGE(it->second == height, when + ": height " + ToString(it->second));
+        }
+    };
+
+    // A win orphaned while the node was offline: the load made the coinstake
+    // inactive, the stored history still says 90.
+    BOOST_CHECK(wallet.mapWallet.at(older->GetHash()).isConfirmed());
+    BOOST_CHECK(wallet.mapWallet.at(newer->GetHash()).isInactive());
+    BOOST_CHECK(!wallet.mapWallet.at(newer->GetHash()).isAbandoned());
+    expect(90, "after the load");
+    WalletReorgTestAccess::ReconcileAfterAttach(wallet);
+    BOOST_CHECK(wallet.mapWallet.at(newer->GetHash()).isAbandoned());
+    expect(50, "after the attach");
+
+    // A history never backfilled: the attach builds it from the coinstakes.
+    history.clear();
+    WalletReorgTestAccess::ReconcileAfterAttach(wallet);
+    expect(50, "backfilled at attach");
+
+    // An entry that no coinstake backs is dropped at attach (a disconnect
+    // leaves it, as the test above shows).
+    const std::vector<unsigned char> stray(32, 0x61);
+    history[stray] = 60;
+    WalletReorgTestAccess::ReconcileAfterAttach(wallet);
+    BOOST_CHECK_EQUAL(history.count(stray), 0U);
+    expect(50, "after a stray entry");
+
+    // The newest win is confirmed on a block of the chain and then removed from the wallet.
+    BOOST_REQUIRE(wallet.AddToWallet(newer, TxStateConfirmed{real_hash(91), 91, 1}));
+    WalletReorgTestAccess::RecordWin(wallet, *newer, 91);
+    expect(91, "recorded");
+    std::vector<uint256> zap_in{newer->GetHash()}, zap_out;
+    BOOST_REQUIRE_EQUAL(wallet.ZapSelectTx(zap_in, zap_out), DBErrors::LOAD_OK);
+    BOOST_CHECK_EQUAL(zap_out.size(), 1U);
+    expect(50, "after the zap of the newest win");
+
+    // Removing the last backing coinstake empties the entry.
+    zap_in = {older->GetHash()};
+    zap_out.clear();
+    BOOST_REQUIRE_EQUAL(wallet.ZapSelectTx(zap_in, zap_out), DBErrors::LOAD_OK);
+    expect(-1, "after the zap of the last win");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

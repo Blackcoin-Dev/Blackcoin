@@ -1141,6 +1141,10 @@ private:
      *  (UpdateUnconfirmedCoinstakeIndex). */
     std::set<uint256> m_unconfirmed_coinstake_txids GUARDED_BY(cs_wallet);
     void UpdateUnconfirmedCoinstakeIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** The last step of attaching to the chain: abandon the coinstakes whose block
+     *  the node no longer has and rebuild the redelegation win history from the
+     *  confirmed coinstakes, in one bulk write scope. */
+    void ReconcileCoinstakesAfterAttach();
     /** When the legacy claim-source capacity was last logged (steady clock). */
     std::optional<std::chrono::steady_clock::time_point> m_legacy_source_capacity_reported GUARDED_BY(cs_wallet);
     /** Incremental payout digest, kept in step with the two indexes above. */

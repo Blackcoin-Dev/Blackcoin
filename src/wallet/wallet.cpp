@@ -4732,6 +4732,29 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
     return result;
 }
 
+void CWallet::ReconcileCoinstakesAfterAttach()
+{
+    std::unique_ptr<DatabaseBulkScope> writes = GetDatabase().MakeBulkScope();
+    AbandonOrphanedCoinstakes();
+    // The stored redelegation win history is only read at load, and a
+    // disconnect repairs it only when an entry names the disconnected height.
+    // A win orphaned while the node was offline, or between load and now, was
+    // marked inactive above but is still in the history, as is an entry no
+    // coinstake backs. Rebuild it once from the confirmed coinstakes. Not
+    // while the chain height is unknown (a reindex): the confirmed states are
+    // not trustworthy then, as for the sweep.
+    {
+        LOCK(cs_wallet);
+        if (m_last_block_processed_height >= 0) {
+            WalletBatch history_batch(GetDatabase());
+            RecomputeQuantumRedelegationWinHistory(history_batch);
+        }
+    }
+    if (writes && !writes->Commit()) {
+        WalletLogPrintf("Failed to persist the abandoned orphaned coinstakes; they are abandoned again at the next load\n");
+    }
+}
+
 size_t CWallet::AbandonOrphanedCoinstakes()
 {
 	LOCK(cs_wallet);
@@ -7083,6 +7106,7 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
     AssertLockHeld(cs_wallet);
     BumpBalanceScanMarker();
     DBErrors nZapSelectTxRet = WalletBatch(GetDatabase()).ZapSelectTx(vHashIn, vHashOut);
+    bool removed_coinstake{false};
     for (const uint256& hash : vHashOut) {
         const auto& it = mapWallet.find(hash);
         std::vector<uint256> direct_spenders;
@@ -7095,6 +7119,7 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
                 direct_spenders.push_back(spender->second);
             }
         }
+        removed_coinstake |= it->second.IsCoinStake();
         wtxOrdered.erase(it->second.m_it_wtxOrdered);
         std::vector<COutPoint> spent_inputs;
         spent_inputs.reserve(it->second.tx->vin.size());
@@ -7185,6 +7210,14 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
             RefreshLiveUnspentStakeOutpoint(input);
         }
         NotifyTransactionChanged(hash, CT_DELETED);
+    }
+
+    // A removed coinstake may have been the only record behind a delegation's
+    // newest win; the history is otherwise repaired only by a disconnect of
+    // that height, so rebuild it from the coinstakes that remain.
+    if (removed_coinstake) {
+        WalletBatch history_batch(GetDatabase());
+        RecomputeQuantumRedelegationWinHistory(history_batch);
     }
 
     if (nZapSelectTxRet == DBErrors::NEED_REWRITE)
@@ -9877,13 +9910,7 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
     // reconnected delivers its coinstake through a notification already queued
     // behind this lock: AddToWallet takes the state over to Confirmed whenever
     // the kind of state changes, abandoned or not, which reactivates it.
-    {
-        std::unique_ptr<DatabaseBulkScope> abandon_writes = walletInstance->GetDatabase().MakeBulkScope();
-        walletInstance->AbandonOrphanedCoinstakes();
-        if (abandon_writes && !abandon_writes->Commit()) {
-            walletInstance->WalletLogPrintf("Failed to persist the abandoned orphaned coinstakes; they are abandoned again at the next load\n");
-        }
-    }
+    walletInstance->ReconcileCoinstakesAfterAttach();
     walletInstance->m_attaching_chain = false;
 
     // AttachChainUnpublished inherits Bitcoin Core's wallet -> chain lock order

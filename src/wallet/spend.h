@@ -12,6 +12,7 @@
 #include <policy/fees.h> // for FeeCalculation
 #include <shadow.h>
 #include <util/result.h>
+#include <wallet/coin_facts.h>
 #include <wallet/coinselection.h>
 #include <wallet/receive.h>
 #include <wallet/transaction.h>
@@ -58,6 +59,7 @@ struct WalletLifecycleScanStats {
     bool budget_exhausted{false}; //!< the scan stopped because its budget ran out
     uint64_t memo_mismatches{0}; //!< verified memo entries that disagreed with the chainstate (each one was dropped)
     uint64_t pending{0};        //!< sliced passes: outputs handed to the chainstate slices
+    uint64_t derived{0};        //!< outputs whose chainstate facts were derived from the wallet transaction and the active chain, without a database read
 };
 
 /** Latest demurrage attestation per scriptPubKey, resolved at most once per
@@ -337,9 +339,15 @@ struct LifecyclePassOutput {
     bool in_mempool{false};
     int64_t tx_time{0};
     WalletOutputLifecycleMemo memo;
+    //! The confirming block the wallet names (memo-eligible or derivable outputs).
     uint256 confirmed_block_hash;
     int confirmed_block_height{0};
     uint64_t txout_digest{0};
+    //! A confirmed transaction that is not coinbase shaped: the chainstate
+    //! slice derives the coin (DeriveConfirmedCoin) instead of reading it.
+    bool derivable{false};
+    int32_t tx_version{0};
+    uint32_t tx_ntime{0};
 };
 
 struct LifecyclePass {
@@ -369,6 +377,10 @@ struct LifecyclePass {
     Balance balance;
     WalletLifecycleSummary summary;
     std::vector<LifecyclePassOutput> pending;
+    //! `pending` in the order of the coins database keys; built without a
+    //! lock when the walk has finished.
+    OrderedChainCursor chain_order;
+    bool chain_order_built{false};
     size_t chain_cursor{0};
     WalletLifecycleScanStats stats;
     uint64_t memo_misses{0};     //!< memo-eligible outputs without a usable entry
@@ -420,6 +432,11 @@ struct LifecycleWarmupItem {
     uint256 confirmed_block_hash;
     int confirmed_block_height{0};
     uint64_t txout_digest{0};
+    //! See LifecyclePassOutput::derivable.
+    bool derivable{false};
+    bool tx_coinstake{false};
+    int32_t tx_version{0};
+    uint32_t tx_ntime{0};
 };
 
 /** Resumable memo warm-up: COLLECT (cs_wallet) lists a batch of deep outputs
@@ -437,11 +454,19 @@ struct LifecycleWarmup {
     //! Costliest chainstate item of the latest slice; half of it seeds the next slice's meter.
     std::chrono::microseconds max_chain_item{0};
     std::vector<LifecycleWarmupItem> items;
+    //! `items` in the order of the coins database keys; built without a lock.
+    OrderedChainCursor fetch_order;
+    bool fetch_order_built{false};
     size_t fetch_cursor{0};
     uint64_t collected{0}; //!< outputs listed so far
-    uint64_t fetched{0};   //!< outputs whose facts were read
+    uint64_t fetched{0};   //!< outputs whose facts were read or derived
+    uint64_t derived{0};   //!< of those, outputs whose facts needed no database read
+    uint64_t fetched_in_batch{0}; //!< counted into `fetched` by the batch in progress
+    uint64_t derived_in_batch{0};
+    uint64_t skipped_in_batch{0};
     uint64_t skipped{0};   //!< outputs the chainstate could not describe (left to the pass)
     uint64_t rewinds{0};   //!< times the cursor went back to the start (mapWallet was rehashed)
+    uint64_t tip_restarts{0}; //!< batches read again because the tip moved in the middle
     uint32_t slices{0};
 
     //! Outputs listed and not yet stored, plus the share of mapWallet walked.

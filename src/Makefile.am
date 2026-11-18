@@ -396,6 +396,7 @@ BITCOIN_CORE_H = \
   wallet/wallettool.h \
   wallet/walletutil.h \
   wallet/block_connect_activity.h \
+  wallet/coin_facts.h \
   wallet/display_balance.h \
   walletinitinterface.h \
   warnings.h \
@@ -569,6 +570,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/scheduler_stats.cpp \
   wallet/scriptpubkeyman.cpp \
   wallet/shadow_pow_claim_recovery.cpp \
+  wallet/coin_facts.cpp \
   wallet/display_balance.cpp \
   wallet/spend.cpp \
   wallet/transaction.cpp \

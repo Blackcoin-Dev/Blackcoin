@@ -198,6 +198,7 @@ BITCOIN_TESTS += \
   wallet/test/payout_digest_tests.cpp \
   wallet/test/staking_candidate_tests.cpp \
   wallet/test/block_connect_activity_tests.cpp \
+  wallet/test/coin_facts_tests.cpp \
   wallet/test/display_balance_tests.cpp \
   wallet/test/io_gate_tests.cpp \
   wallet/test/available_coins_memo_tests.cpp \

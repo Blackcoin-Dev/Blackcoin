@@ -30,6 +30,7 @@
 #include <util/time.h>
 
 #include <stdint.h>
+#include <map>
 #include <set>
 #include <string>
 #ifdef HAVE_MALLOC_INFO
@@ -425,11 +426,14 @@ static RPCHelpMan getiocounters()
                 {RPCResult::Type::NUM, "db_exists", "LevelDB existence checks of any database"},
                 {RPCResult::Type::NUM, "wallet_commits", "wallet SQLite commits"},
                 {RPCResult::Type::NUM, "wallet_commits_in_handler", "wallet commits made inside a wallet block or mempool handler (holding cs_wallet)"},
+                {RPCResult::Type::NUM, "wallet_autocommits", "wallet commits that were single statements outside any transaction"},
                 {RPCResult::Type::NUM, "recorded_keys", "database keys recorded so far"},
                 {RPCResult::Type::NUM, "recorded_coin_keys", "coin keys recorded from recorder_start on"},
                 {RPCResult::Type::NUM, "recorded_coin_key_inversions", "adjacent recorded coin keys from recorder_start on that are out of order"},
                 {RPCResult::Type::ARR, "recorded_coin_txids", /*optional=*/true, "distinct transaction ids of the recorded coin keys (only with include_coin_txids)",
                     {{RPCResult::Type::STR_HEX, "", "transaction id"}}},
+                {RPCResult::Type::OBJ_DYN, "recorded_coin_reads_by_txid", /*optional=*/true, "number of recorded coin reads per transaction id (only with include_coin_txids)",
+                    {{RPCResult::Type::NUM, "txid", "reads"}}},
             }},
         RPCExamples{HelpExampleCli("getiocounters", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -445,19 +449,26 @@ static RPCHelpMan getiocounters()
     result.pushKV("db_exists", s.db_exists);
     result.pushKV("wallet_commits", s.wallet_commits);
     result.pushKV("wallet_commits_in_handler", s.wallet_commits_in_handler);
+    result.pushKV("wallet_autocommits", s.wallet_autocommits);
     result.pushKV("recorded_keys", static_cast<uint64_t>(iocounters::RecordedKeyCount()));
     result.pushKV("recorded_coin_keys", static_cast<uint64_t>(order.keys));
     result.pushKV("recorded_coin_key_inversions", static_cast<uint64_t>(order.inversions));
     if (!request.params[1].isNull() && request.params[1].get_bool()) {
         std::set<uint256> txids;
+        std::map<uint256, uint64_t> reads;
         for (const std::string& key : iocounters::RecordedKeys(static_cast<size_t>(start))) {
             // DB_COIN ('C'), then the 32 txid bytes, then the output index.
             if (key.size() < 33 || key[0] != 'C') continue;
-            txids.insert(uint256{Span<const unsigned char>{reinterpret_cast<const unsigned char*>(key.data()) + 1, 32}});
+            const uint256 txid{Span<const unsigned char>{reinterpret_cast<const unsigned char*>(key.data()) + 1, 32}};
+            txids.insert(txid);
+            ++reads[txid];
         }
         UniValue list{UniValue::VARR};
         for (const uint256& txid : txids) list.push_back(txid.GetHex());
         result.pushKV("recorded_coin_txids", std::move(list));
+        UniValue per_txid{UniValue::VOBJ};
+        for (const auto& [txid, count] : reads) per_txid.pushKV(txid.GetHex(), count);
+        result.pushKV("recorded_coin_reads_by_txid", std::move(per_txid));
     }
     return result;
 },

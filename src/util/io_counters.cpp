@@ -52,6 +52,7 @@ Snapshot Read()
     s.db_exists = g_db_exists.load(std::memory_order_relaxed);
     s.wallet_commits = g_wallet_commits.load(std::memory_order_relaxed);
     s.wallet_commits_in_handler = g_wallet_commits_in_handler.load(std::memory_order_relaxed);
+    s.wallet_autocommits = g_wallet_autocommits.load(std::memory_order_relaxed);
     return s;
 }
 

@@ -603,7 +603,7 @@ bool SQLiteDatabase::Backup(const std::string& dest) const
 
 void SQLiteDatabase::RecordCommit(SqliteCommitKind kind, std::chrono::microseconds duration)
 {
-    iocounters::OnWalletCommit(InWalletCallback());
+    iocounters::OnWalletCommit(InWalletCallback(), kind == SqliteCommitKind::AUTOCOMMIT);
     m_commit_counters.Record(kind, duration);
     ProcessSqliteCommits().Record(kind, duration);
 }

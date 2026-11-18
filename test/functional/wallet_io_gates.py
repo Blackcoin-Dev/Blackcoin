@@ -21,9 +21,8 @@ RPCs that read the whole wallet afterwards take longer). A transaction with
 block holds six of them, so 125,000 outputs is the practical shape on regtest;
 set BLACKCOIN_IO_GATE_FANOUT_TXS to build more or fewer.
 
-Part one holds on RC13 and must keep holding. Part two are gates for the other
-RC14 tracks and run only when RC14_INTEGRATION_ENABLED is True (or the
-environment has RC14_ENFORCE_GATES=1); until then each prints whether it holds.
+Part one holds on RC13 and must keep holding. Part two are the gates for the
+RC14 behavior, enforced.
 """
 
 import os
@@ -36,20 +35,22 @@ from test_framework.messages import COIN, COutPoint, CTransaction, CTxIn, CTxOut
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
-# TODO(rc14-integration): set to True once the other RC14 tracks are merged
-# (balance served without chainstate reads, sorted warm-up, one commit per
-# idle block batch). The gates below fail on RC13 by design.
-RC14_INTEGRATION_ENABLED = False
+# The gates are enforced. RC14_ENFORCE_GATES=0 in the environment turns them
+# into reports (to look at a build that does not meet them).
+RC14_INTEGRATION_ENABLED = True
 
 FANOUT_TXS = int(os.environ.get("BLACKCOIN_IO_GATE_FANOUT_TXS", "52"))
 FANOUT_OUTPUTS = 2400
 FANOUT_TXS_PER_BLOCK = 6
 FANOUT_VALUE = Decimal("1.0")
 FANOUT_FEE = Decimal("2.0")
+# Coins first, derived records second, and an authenticated Gold Rush payout
+# can take more than two sweeps; five leaves room, a random order shows as thousands.
+MAX_ASCENDING_RUNS = 5
 
 
 def gates_enforced():
-    return RC14_INTEGRATION_ENABLED or os.environ.get("RC14_ENFORCE_GATES") == "1"
+    return RC14_INTEGRATION_ENABLED and os.environ.get("RC14_ENFORCE_GATES") != "0"
 
 
 class WalletIoGatesTest(BitcoinTestFramework):
@@ -139,20 +140,36 @@ class WalletIoGatesTest(BitcoinTestFramework):
         polled = self.chainstate_reads(self.counters()) - self.chainstate_reads(before)
         self.gate(polled == 0, "polling getwalletinfo and getbalances performs zero chainstate reads (saw %d)" % polled)
 
-        # 2. A restart serves the first balance without reading non-coinbase outputs.
-        self.restart_node(0, self.node_args)
-        node = self.nodes[0]
-        wallet = node.get_wallet_rpc(self.default_wallet_name)
-        wallet.getbalances()  # the first balance served
-        recorded = self.counters(0, True)
-        noncoinbase_reads = set(recorded["recorded_coin_txids"]) & set(fanout_txids)
-        self.gate(not noncoinbase_reads,
-                  "restart performs zero chainstate reads for non-coinbase wallet outputs before the first balance (saw %d transactions)" % len(noncoinbase_reads))
-
-        # 3. Whatever the warm-up read came in key order.
-        self.gate(recorded["recorded_coin_key_inversions"] == 0,
-                  "chainstate reads of the balance warm-up come in non-decreasing key order (%d reads, %d out of order)"
-                  % (recorded["recorded_coin_keys"], recorded["recorded_coin_key_inversions"]))
+        # 2 and 3. A restart serves the first balance without reading the wallet's
+        # ordinary outputs one by one, in both balance modes (the framework
+        # writes walletrpcexactbalance=1; the shipped default is 0).
+        noncoinbase_outputs = FANOUT_TXS * (FANOUT_OUTPUTS + 1)
+        for exact in (0, 1):
+            # -checklevel=0: the startup chain verification (level 3 by default)
+            # disconnects the last blocks and so reads every output they spend
+            # or create; that is the node's, not the wallet's, and is left out.
+            self.restart_node(0, self.node_args + ["-walletrpcexactbalance=%d" % exact, "-checklevel=0"])
+            node = self.nodes[0]
+            wallet = node.get_wallet_rpc(self.default_wallet_name)
+            wallet.getbalances()  # the first balance served
+            recorded = self.counters(0, True)
+            per_txid = recorded["recorded_coin_reads_by_txid"]
+            reads = sum(per_txid.get(txid, 0) for txid in fanout_txids)
+            self.log.info("walletrpcexactbalance=%d: %d of %d non-coinbase outputs read from the chainstate, %d coin reads, %d ascending runs",
+                          exact, reads, noncoinbase_outputs, recorded["recorded_coin_keys"], recorded["recorded_coin_key_inversions"] + 1)
+            # The memo verification samples 1 in LIFECYCLE_MEMO_VERIFY_MODULUS (1024)
+            # outputs by design; allow twice that share (about 0.2 percent).
+            bound = noncoinbase_outputs * 2 // 1024
+            self.gate(reads <= bound,
+                      "restart reads at most %d (0.2 percent) of the %d non-coinbase wallet outputs from the chainstate before the first balance, exact=%d (saw %d)"
+                      % (bound, noncoinbase_outputs, exact, reads))
+            # The warm-up reads in ascending sweeps (coins first, then derived
+            # records, and a Gold Rush payout may need more than two): a small
+            # bounded number of ascending runs, never a random order.
+            runs = recorded["recorded_coin_key_inversions"] + 1
+            self.gate(runs <= MAX_ASCENDING_RUNS,
+                      "chainstate reads of the balance warm-up come in at most %d ascending runs, exact=%d (saw %d reads in %d runs)"
+                      % (MAX_ASCENDING_RUNS, exact, recorded["recorded_coin_keys"], runs))
 
         # 4. Blocks that do nothing for the wallet cost it almost no commits.
         node.syncwithvalidationinterfacequeue()

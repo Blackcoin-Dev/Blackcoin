@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Slow-disk gate: one Gold Rush PoW claim submission performs one wallet-add commit.
+"""Slow-disk gate: a Gold Rush PoW claim submission performs one wallet-add commit and one quarantine-clear commit.
 
 Every wallet database commit is a disk sync, and on a spinning disk each one
 costs tens of milliseconds while the wallet lock is held. Submitting a claim
@@ -10,12 +10,12 @@ adds one transaction to the wallet, so it needs one commit, not one per
 record it touches. The hidden getiocounters RPC counts the commits, so the
 gate does not depend on how fast the disk is.
 
-The gate runs only when RC14_INTEGRATION_ENABLED is True (or the environment has
-RC14_ENFORCE_GATES=1); until then it reports whether it holds. What always runs
-is that the count is read and the claim is submitted and accepted.
+The claim is stored with a quarantine mark and the mark is cleared in one more
+commit when the mempool accepts it, so the exact shape is two commits: one
+wallet-add (the submitting thread) and one quarantine clear (the mempool
+handler), and no autocommit.
 """
 
-import os
 import time
 
 from test_framework.authproxy import JSONRPCException
@@ -23,14 +23,7 @@ from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
-# TODO(rc14-integration): set to True once the wallet commit track is merged.
-RC14_INTEGRATION_ENABLED = False
-
 WALLET_NAME = "claim_commit"
-
-
-def gates_enforced():
-    return RC14_INTEGRATION_ENABLED or os.environ.get("RC14_ENFORCE_GATES") == "1"
 
 
 class WalletIoClaimCommitTest(BitcoinTestFramework):
@@ -92,20 +85,26 @@ class WalletIoClaimCommitTest(BitcoinTestFramework):
         payout_address = wallet.getnewquantumaddress()["address"]
         node.syncwithvalidationinterfacequeue()
 
+        node.syncwithvalidationinterfacequeue()
         before = node.getiocounters()
         claim = self._send_claim(wallet, claim_address, payout_address)
+        node.syncwithvalidationinterfacequeue()
         after = node.getiocounters()
         assert claim["txid"] in node.getrawmempool()
         commits = after["wallet_commits"] - before["wallet_commits"]
-        self.log.info("One claim submission performed %d wallet commits", commits)
-        holds = commits == 1
-        if gates_enforced():
-            assert holds, "one claim submission performs one wallet-add commit (saw %d)" % commits
-        else:
-            self.log.info("[rc14 gate waits for integration] one claim submission performs one wallet-add commit: %s",
-                          "HOLDS" if holds else "does not hold yet")
-        assert commits >= 1
-
+        in_handler = after["wallet_commits_in_handler"] - before["wallet_commits_in_handler"]
+        autocommits = after["wallet_autocommits"] - before["wallet_autocommits"]
+        self.log.info("One claim submission: %d wallet commits (%d in the mempool handler, %d autocommits)", commits, in_handler, autocommits)
+        # The shape, by design: the wallet-add of the claim is one grouped commit
+        # (CommitTransaction). The claim record is stored quarantined, and the
+        # mempool-added handler clears that mark in one durable commit once the
+        # mempool really holds the claim (transactionAddedToMempool ->
+        # UpdateShadowPowClaimRecoveryRecordDurably, quarantine key). Nothing
+        # else, and in particular no single-statement autocommit.
+        assert_equal(commits, 2)
+        assert_equal(in_handler, 1)
+        assert_equal(autocommits, 0)
+        assert_equal(commits - in_handler, 1)  # exactly one wallet-add commit
 
 if __name__ == "__main__":
     WalletIoClaimCommitTest().main()

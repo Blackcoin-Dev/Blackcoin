@@ -46,6 +46,8 @@ struct Snapshot {
      * whether the caller holds cs_wallet.
      */
     uint64_t wallet_commits_in_handler{0};
+    //! Of the wallet commits, single statements outside any transaction that SQLite committed by itself.
+    uint64_t wallet_autocommits{0};
 };
 
 // Hot-path state. Only the functions below touch it.
@@ -55,6 +57,7 @@ inline std::atomic<uint64_t> g_db_reads{0};
 inline std::atomic<uint64_t> g_db_exists{0};
 inline std::atomic<uint64_t> g_wallet_commits{0};
 inline std::atomic<uint64_t> g_wallet_commits_in_handler{0};
+inline std::atomic<uint64_t> g_wallet_autocommits{0};
 //! Nonzero while a delay is set or the recorder is on: the only branch of the read path.
 inline std::atomic<bool> g_read_hook{false};
 inline std::atomic<bool> g_commit_hook{false};
@@ -76,8 +79,9 @@ inline void OnDbExists(Span<const std::byte> key)
     g_db_exists.fetch_add(1, std::memory_order_relaxed);
     if (g_read_hook.load(std::memory_order_relaxed)) ReadHook(key);
 }
-inline void OnWalletCommit(bool in_wallet_handler)
+inline void OnWalletCommit(bool in_wallet_handler, bool autocommit = false)
 {
+    if (autocommit) g_wallet_autocommits.fetch_add(1, std::memory_order_relaxed);
     g_wallet_commits.fetch_add(1, std::memory_order_relaxed);
     if (in_wallet_handler) g_wallet_commits_in_handler.fetch_add(1, std::memory_order_relaxed);
     if (g_commit_hook.load(std::memory_order_relaxed)) CommitHook();

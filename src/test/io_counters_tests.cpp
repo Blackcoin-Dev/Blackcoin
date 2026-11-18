@@ -24,9 +24,8 @@
 #include <string>
 #include <vector>
 
-//! TODO(rc14-integration): set to true once the LevelDB options track is merged
-//! (seek compaction off). The checks it guards fail on RC13.
-static constexpr bool RC14_GATES_ENFORCED{false};
+//! The gate it guards (seek compaction off) is enforced; it failed on RC13.
+static constexpr bool RC14_GATES_ENFORCED{true};
 
 namespace {
 

@@ -124,7 +124,11 @@ bool GatherLifecycleChainFactsFromView(const COutPoint& outpoint, const CTxOut& 
                     /*coinstake=*/false, tx_time);
     }
 
-    if (facts.confirmed_coin) {
+    // A Gold Rush payout is authenticated only as a coinbase coin, and only a
+    // coinbase coin can be a payout candidate whose record is missing: for
+    // every other coin the status is NOT_CANDIDATE whatever the chainstate
+    // holds, so the provenance records (several reads that miss) are not read.
+    if (facts.confirmed_coin && coin.IsCoinBase()) {
         const GoldRushPayoutStatus status = GetGoldRushPayoutStatus(
             view, outpoint, consensus, nullptr, tip);
         if (status == GoldRushPayoutStatus::CORRUPT) {

@@ -6250,6 +6250,40 @@ void WalletTests::stakingSnapshotContention()
         QCOMPARE(page.m_detail_retries, 1U);
         QVERIFY(!page.m_detail_refresh_pending && !page.m_detail_refresh_in_flight);
     }
+    {
+        // Both reads of the mining details in one pass miss their try-locks,
+        // as when the chain lock is taken again and again while a block is
+        // built and connected. The collection probes had passed. This is the
+        // same busy lock the probes report: the page must retry it within its
+        // budget and show the result, not end in "Detail refresh failed" until
+        // Refresh is pressed again. The misses are reported through the test
+        // seam exactly as a failed try-lock reports them; the retry reads the
+        // wallet unhindered.
+        std::atomic<int> reads{0};
+        model.m_staking_snapshot_mining_details_read = [&reads](interfaces::WalletPowMiningInfo& info) {
+            if (reads.fetch_add(1) >= 2) return;
+            info.payout_address_available = false;
+            info.wallet_goldrush_status_available = false;
+        };
+        auto remove_seam = interfaces::MakeCleanupHandler([&] { model.m_staking_snapshot_mining_details_read = nullptr; });
+        const size_t before = results.size();
+        page.queueFullDetailRefresh();
+        QVERIFY(wait_result([&] { return results.size() == before + 1; }));
+        QCOMPARE(reads.load(), 2);
+        QVERIFY(results.back()->transient_unavailable);
+        QCOMPARE(QString::fromStdString(results.back()->unavailable_stage), QStringLiteral("pow_mining_info"));
+        QVERIFY(!results.back()->cancelled && !results.back()->stale_tip && results.back()->error.empty());
+        QVERIFY(!hint->text().contains(QStringLiteral("Detail refresh failed")));
+        QVERIFY(hint->text().contains(QStringLiteral("retrying (1/2)")));
+        QVERIFY(page.m_detail_refresh_pending && page.m_detail_retry_timer->isActive());
+        QVERIFY(wait_result([&] { return results.size() == before + 2 && !page.m_detail_refresh_in_flight; }));
+        QCOMPARE(reads.load(), 3);
+        QVERIFY(!results.back()->transient_unavailable && !results.back()->cancelled &&
+                !results.back()->stale_tip && results.back()->error.empty());
+        QVERIFY(results.back()->pow.payout_address_available && results.back()->pow.wallet_goldrush_status_available);
+        QCOMPARE(page.m_detail_retries, 1U);
+        QVERIFY(hint->text().contains(QStringLiteral("Detail panels updated")));
+    }
     const size_t warm = results.size();
     {
         std::promise<void> locked, release;

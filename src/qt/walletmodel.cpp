@@ -660,7 +660,7 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
     const auto cancel = std::make_shared<std::atomic<bool>>(false);
     m_staking_snapshot_cancel = cancel;
 
-    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel] {
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel, mining_details_read = m_staking_snapshot_mining_details_read] {
         assert(QThread::currentThread() == worker->thread());
         auto snapshot = std::make_shared<StakingMiningSnapshot>();
         snapshot->request = request;
@@ -752,7 +752,12 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
 
             m_wallet->refreshPowMiningStakeReserve();
             if (checkpoint()) { publish(); return; }
-            snapshot->pow = m_wallet->getPowMiningInfo();
+            const auto read_mining_details = [&] {
+                interfaces::WalletPowMiningInfo info = m_wallet->getPowMiningInfo();
+                if (mining_details_read) mining_details_read(info);
+                return info;
+            };
+            snapshot->pow = read_mining_details();
             if (checkpoint()) { publish(); return; }
             snapshot->migration = m_wallet->getMigrationStatus();
             if (checkpoint()) { publish(); return; }
@@ -793,17 +798,21 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
             if (checkpoint()) { publish(); return; }
             // getPowMiningInfo() deliberately uses try-locks so callers never
             // stall a GUI thread. A transient miss is not an authoritative
-            // empty payout or eligibility state. The intervening detail reads
-            // have crossed the same wallet/chain locks, so resample once and
-            // reject the whole snapshot if it is still incomplete.
+            // empty payout or eligibility state, so resample once. The
+            // intervening detail reads have crossed the same wallet/chain
+            // locks, but a thread that takes cs_main or cs_wallet repeatedly
+            // (a block being built and then connected, blocks connecting
+            // one after another) can hold it again at the resample. That is
+            // the busy lock the collection probes report, not a failure:
+            // hand it to the page's bounded retry like them.
             if (!snapshot->pow.payout_address_available ||
                 !snapshot->pow.wallet_goldrush_status_available) {
-                snapshot->pow = m_wallet->getPowMiningInfo();
+                snapshot->pow = read_mining_details();
                 if (checkpoint()) { publish(); return; }
                 if (!snapshot->pow.payout_address_available ||
                     !snapshot->pow.wallet_goldrush_status_available) {
-                    snapshot->error =
-                        "Wallet mining details are temporarily unavailable; retry the refresh";
+                    snapshot->transient_unavailable = true;
+                    snapshot->unavailable_stage = "pow_mining_info";
                     publish();
                     return;
                 }

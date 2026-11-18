@@ -533,6 +533,9 @@ private:
     std::shared_ptr<std::atomic<bool>> m_staking_snapshot_cancel;
     uint64_t m_staking_snapshot_request_id{0};
     std::shared_ptr<const StakingMiningSnapshot> m_completed_staking_snapshot;
+    //! Test only: sees every read of the mining details a staking snapshot
+    //! makes, on the wallet worker, and may turn it into a missed try-lock.
+    std::function<void(interfaces::WalletPowMiningInfo&)> m_staking_snapshot_mining_details_read;
     void publishPendingPowPayoutWarnings();
     std::mutex m_pow_payout_warning_mutex;
     std::map<uint64_t, std::string> m_pending_pow_payout_warnings;

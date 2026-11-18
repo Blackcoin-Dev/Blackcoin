@@ -199,6 +199,11 @@ public:
 
     virtual std::string Format() = 0;
 
+    /** Start the full integrity check in the background, when the backend has
+     *  one and the cheaper start-up check was used. The default does nothing.
+     *  The check is cancelled by Close() and by destruction. */
+    virtual void StartBackgroundIntegrityCheck() {}
+
     std::atomic<unsigned int> nUpdateCounter;
     unsigned int nLastSeen{0};
     unsigned int nLastFlushed{0};
@@ -229,6 +234,7 @@ struct DatabaseOptions {
 
     // Specialized options. Not every option is supported by every backend.
     bool verify = true;             //!< Check data integrity on load.
+    bool full_integrity_check = true; //!< Run the full integrity check on load, not the quick one (SQLite).
     bool use_unsafe_sync = false;   //!< Disable file sync for faster performance.
     bool use_shared_memory = false; //!< Let other processes access the database.
     int64_t max_log_mb = 100;       //!< Max log size to allow before consolidating.

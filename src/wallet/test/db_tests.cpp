@@ -10,6 +10,7 @@
 #include <util/check.h>
 #include <util/fs.h>
 #include <util/string.h>
+#include <util/time.h>
 #include <util/translation.h>
 #ifdef USE_BDB
 #include <wallet/bdb.h>
@@ -20,11 +21,13 @@
 #endif
 #include <wallet/test/util.h>
 #include <wallet/walletutil.h> // for WALLET_FLAG_DESCRIPTORS
+#include <warnings.h>
 
 #include <fstream>
 #include <chrono>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -518,6 +521,163 @@ BOOST_AUTO_TEST_CASE(sqlite_bulk_scope_groups_writes_into_one_commit)
     BOOST_CHECK(reopened->Exists(std::string{"unit-kept"}));
     BOOST_CHECK(reopened->Exists(std::string{"before-throw"}));
 }
+
+static std::vector<char> ReadWholeFile(const std::string& path)
+{
+    std::ifstream in{path, std::ios::binary};
+    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
+static void WriteWholeFile(const std::string& path, const std::vector<char>& data)
+{
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    out.write(data.data(), data.size());
+}
+
+static std::vector<size_t> FindAll(const std::vector<char>& data, std::string_view needle)
+{
+    std::vector<size_t> hits;
+    for (size_t i = 0; i + needle.size() <= data.size(); ++i) {
+        if (std::string_view{data.data() + i, needle.size()} == needle) hits.push_back(i);
+    }
+    return hits;
+}
+
+/** Make a closed wallet file holding three rows. */
+static std::string MakeSmallSQLiteWallet(const fs::path& dir)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(dir, options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    auto batch = database->MakeBatch();
+    for (int i : {1, 2, 3}) {
+        const std::string key = i == 1 ? "k-aaaa" : (i == 2 ? "k-bbbb" : "k-cccc");
+        BOOST_REQUIRE(batch->Write(key, i));
+    }
+    batch.reset();
+    const std::string file = database->Filename();
+    database->Close();
+    return file;
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_quick_check_still_fails_start_on_page_damage)
+{
+    const std::string file = MakeSmallSQLiteWallet(m_path_root / "quickdamage");
+    std::vector<char> data = ReadWholeFile(file);
+    BOOST_REQUIRE_GE(data.size(), 3U * 4096U);
+    // Page 2 is the table's root: an invalid b-tree page type.
+    data[4096] = 0x7f;
+    WriteWholeFile(file, data);
+
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    options.verify = true;
+    options.full_integrity_check = false; // the start-up setting
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "quickdamage", options, status, error);
+    BOOST_CHECK(!database);
+    BOOST_CHECK(status == DatabaseStatus::FAILED_VERIFY || status == DatabaseStatus::FAILED_LOAD);
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_check_reports_what_quick_check_misses)
+{
+    const std::string file = MakeSmallSQLiteWallet(m_path_root / "indexmismatch");
+    std::vector<char> data = ReadWholeFile(file);
+    // The key is stored in the table row and in the index row. Change the
+    // index copy to a key that sorts the same: only the full check sees it.
+    const auto hits = FindAll(data, "k-bbbb");
+    BOOST_REQUIRE_EQUAL(hits.size(), 2U);
+    data[hits.back() + 5] = 'c';
+    WriteWholeFile(file, data);
+
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    options.verify = true;
+
+    // The synchronous full check, as -walletfullcheck=1, rejects it.
+    options.full_integrity_check = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    BOOST_CHECK(!MakeSQLiteDatabase(m_path_root / "indexmismatch", options, status, error));
+    BOOST_CHECK(status == DatabaseStatus::FAILED_VERIFY);
+
+    // The quick check passes (this is why the full check must still run).
+    options.full_integrity_check = false;
+    bilingual_str quick_error;
+    auto database = MakeSQLiteDatabase(m_path_root / "indexmismatch", options, status, quick_error);
+    BOOST_REQUIRE_MESSAGE(database, quick_error.original);
+
+    // The background check on the quick-checked database reports it and
+    // raises the warning, without closing or failing the database.
+    SetWalletIntegrityWarning({});
+    database->StartBackgroundIntegrityCheck();
+    database->JoinBackgroundIntegrityCheck();
+    BOOST_CHECK(database->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::FAILED);
+    BOOST_CHECK(GetWarnings(false).original.find("integrity check") != std::string::npos);
+    BOOST_CHECK(database->MakeBatch()->Exists(std::string{"k-aaaa"}));
+    BOOST_CHECK(!fs::exists(fs::PathFromString(file + ".fullcheck")));
+    SetWalletIntegrityWarning({});
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_check_passes_on_clean_wallet_with_concurrent_writes)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "cleanbg", options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    {
+        auto batch = database->MakeBatch();
+        for (int i = 0; i < 2000; ++i) BOOST_REQUIRE(batch->Write(strprintf("row-%d", i), std::string(100, 'x')));
+    }
+    SetWalletIntegrityWarning({});
+    database->m_check_step_pages = 4;
+    database->m_check_step_delay_ms = 1;
+    database->StartBackgroundIntegrityCheck();
+    // The wallet stays usable, and writes made during the copy are mirrored.
+    for (int i = 0; i < 200; ++i) {
+        auto batch = database->MakeBatch();
+        BOOST_CHECK(batch->Write(strprintf("late-%d", i), std::string(100, 'y')));
+    }
+    database->JoinBackgroundIntegrityCheck();
+    BOOST_CHECK(database->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::PASSED);
+    BOOST_CHECK(GetWarnings(false).original.find("integrity check") == std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_check_is_cancelled_by_close)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "cancelbg", options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    {
+        auto batch = database->MakeBatch();
+        for (int i = 0; i < 4000; ++i) BOOST_REQUIRE(batch->Write(strprintf("row-%d", i), std::string(100, 'x')));
+    }
+    const fs::path copy = fs::PathFromString(database->Filename() + ".fullcheck");
+    // One page per step and a long pause: the check cannot finish by itself
+    // within the test, so only cancellation can end it.
+    database->m_check_step_pages = 1;
+    database->m_check_step_delay_ms = 5000;
+    database->StartBackgroundIntegrityCheck();
+    for (int i = 0; i < 500 && !fs::exists(copy); ++i) UninterruptibleSleep(std::chrono::milliseconds{10});
+    const auto t0 = std::chrono::steady_clock::now();
+    database->Close();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    BOOST_CHECK(elapsed < std::chrono::seconds{4});
+    BOOST_CHECK(database->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::CANCELLED);
+    BOOST_CHECK(!fs::exists(copy));
+    database->Open();
+    BOOST_CHECK(database->MakeBatch()->Exists(std::string{"row-1"}));
+}
+
 #endif // USE_SQLITE
 
 BOOST_AUTO_TEST_CASE(sqlite_commit_counters_split_by_kind)

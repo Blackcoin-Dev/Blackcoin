@@ -17,6 +17,7 @@
 static GlobalMutex g_warnings_mutex;
 static bilingual_str g_misc_warnings GUARDED_BY(g_warnings_mutex);
 static bilingual_str g_shadow_resource_warning GUARDED_BY(g_warnings_mutex);
+static bilingual_str g_wallet_integrity_warning GUARDED_BY(g_warnings_mutex);
 static bool fLargeWorkInvalidChainFound GUARDED_BY(g_warnings_mutex) = false;
 
 void SetMiscWarning(const bilingual_str& warning)
@@ -34,6 +35,12 @@ bool SetShadowResourceWarning(const bilingual_str& warning)
     }
     g_shadow_resource_warning = warning;
     return true;
+}
+
+void SetWalletIntegrityWarning(const bilingual_str& warning)
+{
+    LOCK(g_warnings_mutex);
+    g_wallet_integrity_warning = warning;
 }
 
 void SetfLargeWorkInvalidChainFound(bool flag)
@@ -68,6 +75,12 @@ bilingual_str GetWarnings(bool verbose)
             warnings_concise = g_shadow_resource_warning;
         }
         warnings_verbose.emplace_back(g_shadow_resource_warning);
+    }
+
+    // Damage found by the background wallet check must stay visible.
+    if (!g_wallet_integrity_warning.empty()) {
+        warnings_concise = g_wallet_integrity_warning;
+        warnings_verbose.emplace_back(g_wallet_integrity_warning);
     }
 
     if (fLargeWorkInvalidChainFound) {

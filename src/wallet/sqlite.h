@@ -11,9 +11,12 @@
 #include <wallet/db.h>
 #include <wallet/scheduler_stats.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <optional>
+#include <thread>
 
 struct bilingual_str;
 
@@ -104,6 +107,9 @@ class SQLiteDatabase : public WalletDatabase
 private:
     const bool m_mock{false};
 
+    /** Run the full integrity check in Verify() (otherwise the quick check). */
+    const bool m_full_check{true};
+
     const std::string m_dir_path;
 
     const std::string m_file_path;
@@ -119,6 +125,17 @@ private:
 
     void Cleanup() noexcept EXCLUSIVE_LOCKS_REQUIRED(!g_sqlite_mutex);
 
+    // Background full integrity check (see StartBackgroundIntegrityCheck).
+    Mutex m_check_mutex;
+    std::condition_variable m_check_cv;
+    bool m_check_stop GUARDED_BY(m_check_mutex){false};
+    sqlite3* m_check_copy GUARDED_BY(m_check_mutex){nullptr};
+    std::thread m_check_thread;
+    std::atomic<int> m_check_state{0};
+    void RunBackgroundIntegrityCheck();
+    /** Wait up to the given time; returns true when a stop was requested. */
+    bool CheckWaitStopped(std::chrono::milliseconds delay) EXCLUSIVE_LOCKS_REQUIRED(!m_check_mutex);
+
 public:
     SQLiteDatabase() = delete;
 
@@ -128,6 +145,35 @@ public:
     ~SQLiteDatabase();
 
     bool Verify(bilingual_str& error);
+
+    enum class BackgroundCheckState : int {
+        NOT_STARTED = 0,
+        RUNNING,
+        PASSED,
+        FAILED,    //!< damage found, warning raised
+        CANCELLED, //!< stopped by Close() or Rewrite()
+        SKIPPED,   //!< could not run (for example no space for the copy); not a finding
+    };
+
+    /**
+     * Run the full integrity check in a low-priority thread. The wallet keeps
+     * the file in exclusive locking mode, so a second connection cannot read
+     * it. The thread therefore copies the file with SQLite's online backup in
+     * small steps through the wallet's own connection (the connection lock is
+     * held for one step at a time, then released), and runs the full check on
+     * that private copy. The copy is deleted afterwards. On damage it logs an
+     * error and sets the wallet integrity warning; it never stops the node.
+     */
+    void StartBackgroundIntegrityCheck() override EXCLUSIVE_LOCKS_REQUIRED(!m_check_mutex);
+    /** Cancel a running background check and wait for its thread to end. */
+    void StopBackgroundIntegrityCheck() noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_check_mutex);
+    BackgroundCheckState GetBackgroundCheckState() const { return static_cast<BackgroundCheckState>(m_check_state.load()); }
+    /** Wait for the thread to end without cancelling it (tests). */
+    void JoinBackgroundIntegrityCheck();
+    /** Pause between backup steps (tests lengthen it to hold the check open). */
+    std::atomic<int> m_check_step_delay_ms{2};
+    /** Pages copied per backup step. */
+    std::atomic<int> m_check_step_pages{256};
 
     /** Open the database if it is not already opened */
     void Open() override;

@@ -54,6 +54,8 @@ struct WalletContext;
  */
 
 static const bool DEFAULT_FLUSHWALLET = true;
+//! Run the full SQLite integrity check synchronously at start (otherwise a quick check at start and the full check in the background).
+static const bool DEFAULT_WALLETFULLCHECK = false;
 
 /** Error statuses for the wallet database.
  * Values are in order of severity. When multiple errors occur, the most severe (highest value) will be returned.

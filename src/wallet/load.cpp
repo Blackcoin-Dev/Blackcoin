@@ -297,6 +297,9 @@ bool VerifyWallets(WalletContext& context)
         ReadDatabaseArgs(args, options);
         options.require_existing = true;
         options.verify = true;
+        // Start-up runs the quick check; the full one follows in the
+        // background once the wallet is loaded (see StartWallets).
+        options.full_integrity_check = args.GetBoolArg("-walletfullcheck", DEFAULT_WALLETFULLCHECK);
         bilingual_str error_string;
         if (!MakeWalletDatabase(wallet_file, options, status, error_string)) {
             if (status == DatabaseStatus::FAILED_NOT_FOUND) {
@@ -361,6 +364,9 @@ void StartWallets(WalletContext& context, CScheduler& scheduler)
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets(context)) {
         pwallet->postInitProcess();
+        if (!context.args->GetBoolArg("-walletfullcheck", DEFAULT_WALLETFULLCHECK)) {
+            pwallet->GetDatabase().StartBackgroundIntegrityCheck();
+        }
         context.claim_maintenance->Register(pwallet);
     }
     context.claim_maintenance->Start();

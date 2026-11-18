@@ -15,6 +15,7 @@
 #include <blockencodings.h>
 #include <blockfilter.h>
 #include <chainparams.h>
+#include <claim_relay_tracker.h>
 #include <common/args.h> // for GetBoolArg
 #include <consensus/amount.h>
 #include <consensus/validation.h>
@@ -170,6 +171,12 @@ static constexpr unsigned int INVENTORY_BROADCAST_PER_SECOND = 7;
 static constexpr unsigned int INVENTORY_BROADCAST_TARGET = INVENTORY_BROADCAST_PER_SECOND * count_seconds(INBOUND_INVENTORY_BROADCAST_INTERVAL);
 /** Maximum number of inventory items to send per transmission. */
 static constexpr unsigned int INVENTORY_BROADCAST_MAX = 1000;
+/** Gold Rush claim transactions are announced without waiting for the trickle
+ *  timer, because a claim that misses the next block is lost. This is the
+ *  most such announcements one peer gets between two of its trickles; a claim
+ *  past it waits for the timer like any other transaction. A block evaluates
+ *  at most this many proofs, so honest traffic stays below it. */
+static constexpr size_t MAX_URGENT_CLAIM_INVS_PER_TRICKLE{MAX_SHADOW_POW_EVALS_PER_BLOCK};
 static_assert(INVENTORY_BROADCAST_MAX >= INVENTORY_BROADCAST_TARGET, "INVENTORY_BROADCAST_MAX too low");
 static_assert(INVENTORY_BROADCAST_MAX <= MAX_PEER_TX_ANNOUNCEMENTS, "INVENTORY_BROADCAST_MAX too high");
 /** Average delay between feefilter broadcasts in seconds. */
@@ -421,6 +428,15 @@ struct Peer {
          *  mempool to sort transactions in dependency order before relay, so
          *  this does not have to be sorted. */
         std::set<uint256> m_tx_inventory_to_send GUARDED_BY(m_tx_inventory_mutex);
+        /** The members of m_tx_inventory_to_send that are Gold Rush claims
+         *  queued for announcement at the next send, ahead of the trickle
+         *  timer. Never larger than MAX_URGENT_CLAIM_INVS_PER_TRICKLE. */
+        std::set<uint256> m_tx_inventory_urgent GUARDED_BY(m_tx_inventory_mutex);
+        /** Claims announced ahead of the timer since the last trickle. They
+         *  were announced after m_last_inv_sequence was taken, so a getdata
+         *  for one of them is served from this set. Bounded by
+         *  MAX_URGENT_CLAIM_INVS_PER_TRICKLE and cleared at every trickle. */
+        std::set<uint256> m_urgent_announced GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
         /** Whether the peer has requested us to send our complete mempool. Only
          *  permitted if the peer has NetPermissionFlags::Mempool or we advertise
          *  NODE_BLOOM. See BIP35. */
@@ -2502,9 +2518,34 @@ void PeerManagerImpl::SendPings()
     for(auto& it : m_peer_map) it.second->m_ping_queued = true;
 }
 
+namespace {
+/** Record, for the miner's timing line only, that a claim was announced. */
+void NoteClaimAnnounced(const CTransaction& tx)
+{
+    if (const std::optional<COutPoint> claim_input{GetShadowPowProofBoundOutpoint(tx)}) {
+        GetClaimRelayTracker().NoteAnnounced(*claim_input, tx.GetHash(), std::chrono::steady_clock::now());
+    }
+}
+} // namespace
+
 void PeerManagerImpl::RelayTransaction(const uint256& txid, const uint256& wtxid)
 {
     bool queued_inventory{false};
+    // A Gold Rush claim must reach the producer of the next block or it is
+    // lost, so it does not wait for the trickle timer. Only a transaction the
+    // mempool holds qualifies: it has passed claim policy, proof included. A
+    // claim with a parent in the mempool keeps the timer, which announces in
+    // dependency order; announced early it would reach peers as an orphan.
+    const CTransactionRef mempool_tx{m_mempool.get(txid)};
+    bool urgent{mempool_tx && TransactionHasShadowProof(*mempool_tx)};
+    if (urgent) {
+        for (const CTxIn& txin : mempool_tx->vin) {
+            if (m_mempool.exists(GenTxid::Txid(txin.prevout.hash))) {
+                urgent = false;
+                break;
+            }
+        }
+    }
     LOCK(m_peer_mutex);
     for(auto& it : m_peer_map) {
         Peer& peer = *it.second;
@@ -2522,6 +2563,9 @@ void PeerManagerImpl::RelayTransaction(const uint256& txid, const uint256& wtxid
         const uint256& hash{peer.m_wtxid_relay ? wtxid : txid};
         if (!tx_relay->m_tx_inventory_known_filter.contains(hash)) {
             queued_inventory |= tx_relay->m_tx_inventory_to_send.insert(hash).second;
+            if (urgent && tx_relay->m_tx_inventory_urgent.size() < MAX_URGENT_CLAIM_INVS_PER_TRICKLE) {
+                queued_inventory |= tx_relay->m_tx_inventory_urgent.insert(hash).second;
+            }
         }
     };
     if (queued_inventory) m_connman.WakeMessageHandler();
@@ -2732,6 +2776,13 @@ CTransactionRef PeerManagerImpl::FindTxForGetData(const Peer::TxRelay& tx_relay,
     auto txinfo = m_mempool.info_for_relay(gtxid, tx_relay.m_last_inv_sequence);
     if (txinfo.tx) {
         return std::move(txinfo.tx);
+    }
+
+    // Or it is a claim this peer was told about ahead of its trickle timer.
+    if (tx_relay.m_urgent_announced.count(gtxid.GetHash()) > 0) {
+        if (CTransactionRef tx = gtxid.IsWtxid() ? m_mempool.info(gtxid).tx : m_mempool.get(gtxid.GetHash())) {
+            return tx;
+        }
     }
 
     // Or it might be from the most recent block
@@ -6278,6 +6329,35 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
 
         if (auto tx_relay = peer->GetTxRelay(); tx_relay != nullptr) {
                 LOCK(tx_relay->m_tx_inventory_mutex);
+                // Gold Rush claims first, whatever the trickle timer says.
+                // Everything else that governs an announcement still applies:
+                // the peer's relay flag, its fee filter and bloom filter, the
+                // known-inventory filter, and mempool membership. A claim that
+                // does not go out here stays queued for the trickle.
+                if (!tx_relay->m_tx_inventory_urgent.empty()) {
+                    LOCK(tx_relay->m_bloom_filter_mutex);
+                    const CFeeRate urgent_filterrate{tx_relay->m_fee_filter_received.load()};
+                    for (const uint256& hash : tx_relay->m_tx_inventory_urgent) {
+                        if (!tx_relay->m_relay_txs) break;
+                        if (tx_relay->m_urgent_announced.size() >= MAX_URGENT_CLAIM_INVS_PER_TRICKLE) break;
+                        if (tx_relay->m_tx_inventory_known_filter.contains(hash)) continue;
+                        const CInv inv(peer->m_wtxid_relay ? MSG_WTX : MSG_TX, hash);
+                        const auto txinfo = m_mempool.info(ToGenTxid(inv));
+                        if (!txinfo.tx) continue;
+                        if (txinfo.fee < urgent_filterrate.GetFee(txinfo.vsize)) continue;
+                        if (tx_relay->m_bloom_filter && !tx_relay->m_bloom_filter->IsRelevantAndUpdate(*txinfo.tx)) continue;
+                        tx_relay->m_tx_inventory_to_send.erase(hash);
+                        vInv.push_back(inv);
+                        if (vInv.size() == MAX_INV_SZ) {
+                            m_connman.PushMessage(pto, msgMaker.Make(NetMsgType::INV, vInv));
+                            vInv.clear();
+                        }
+                        tx_relay->m_tx_inventory_known_filter.insert(hash);
+                        tx_relay->m_urgent_announced.insert(hash);
+                        NoteClaimAnnounced(*txinfo.tx);
+                    }
+                    tx_relay->m_tx_inventory_urgent.clear();
+                }
                 // Check whether periodic sends should happen
                 bool fSendTrickle = pto->HasPermission(NetPermissionFlags::NoBan);
                 if (tx_relay->m_next_inv_send_time < current_time) {
@@ -6378,11 +6458,14 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                             vInv.clear();
                         }
                         tx_relay->m_tx_inventory_known_filter.insert(hash);
+                        NoteClaimAnnounced(*txinfo.tx);
                     }
 
                     // Ensure we'll respond to GETDATA requests for anything we've just announced
                     LOCK(m_mempool.cs);
                     tx_relay->m_last_inv_sequence = m_mempool.GetSequence();
+                    // The new sequence covers every claim announced early.
+                    tx_relay->m_urgent_announced.clear();
                 }
         }
         if (!vInv.empty())

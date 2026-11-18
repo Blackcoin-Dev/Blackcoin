@@ -132,6 +132,7 @@ BITCOIN_CORE_H = \
   chainparamsbase.h \
   chainparamsseeds.h \
   checkqueue.h \
+  claim_relay_tracker.h \
   clientversion.h \
   coins.h \
   common/args.h \

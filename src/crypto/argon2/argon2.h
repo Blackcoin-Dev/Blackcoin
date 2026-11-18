@@ -91,11 +91,6 @@ extern "C" {
 #define ARGON2_DEFAULT_FLAGS UINT32_C(0)
 #define ARGON2_FLAG_CLEAR_PASSWORD (UINT32_C(1) << 0)
 #define ARGON2_FLAG_CLEAR_SECRET (UINT32_C(1) << 1)
-/* Blackcoin addition: the caller declares that every input of this context is
- * public data, so the working memory block is not wiped before it is handed
- * back to the deallocator. Never set this for a context that carries a
- * password or a secret. The output is unaffected. */
-#define ARGON2_FLAG_PUBLIC_DATA_NO_WIPE (UINT32_C(1) << 2)
 
 /* Global flag to determine if we are wiping internal memory buffers. This flag
  * is defined in core.c and defaults to 1 (wipe internal memory). */

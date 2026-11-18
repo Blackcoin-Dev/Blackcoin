@@ -8,7 +8,6 @@
 #include <consensus/demurrage.h>
 #include <consensus/params.h>
 #include <crypto/argon2/argon2.h>
-#include <crypto/argon2_pow.h>
 #include <crypto/common.h>
 #include <crypto/muhash.h>
 #include <hash.h>
@@ -2438,8 +2437,7 @@ bool ComputeShadowProofHash(const CScript& target, const CScript& payout_script,
         return false;
     }
 
-    // Every input of this hash is public proof data.
-    const int rc = Argon2idPowHashRaw(
+    const int rc = argon2id_hash_raw(
         SHADOW_ARGON2_TIME_COST,
         SHADOW_ARGON2_MEMORY_KIB,
         SHADOW_ARGON2_LANES,

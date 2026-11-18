@@ -329,7 +329,7 @@ mapValue_t ClaimShapedValues(uint32_t i)
     // pairs, CommitTransaction's relay clock and the first-quarantine pair.
     const auto hash = [&](uint8_t domain) {
         uint256 value;
-        for (size_t b{0}; b < 32; ++b) *(value.begin() + b) = static_cast<unsigned char>((i * 2654435761U + domain * 97U + b * 131U) >> (b % 4 * 8));
+        for (size_t b{0}; b < 32; ++b) *(value.begin() + b) = static_cast<unsigned char>(static_cast<uint32_t>(uint64_t{i} * 2654435761ULL + domain * 97ULL + b * 131ULL) >> (b % 4 * 8));
         return value.GetHex();
     };
     mapValue_t values;

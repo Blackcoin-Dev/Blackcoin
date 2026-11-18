@@ -198,6 +198,8 @@ class SliceMeter
 public:
     static constexpr uint64_t MIN_ITEMS_BEFORE_EARLY_END{4};
 
+    //! The meter keeps its own copy of the limits: it may be built from a
+    //! temporary and outlive it.
     SliceMeter(const LifecycleSliceLimits& limits, std::chrono::milliseconds budget)
         : m_limits(limits), m_timed(budget.count() > 0), m_start(Now()), m_deadline(m_start + budget), m_last_read(m_start) {}
 
@@ -250,7 +252,7 @@ public:
     }
 
 private:
-    const LifecycleSliceLimits& m_limits;
+    const LifecycleSliceLimits m_limits;
     const bool m_timed;
     const std::chrono::steady_clock::time_point m_start;
     const std::chrono::steady_clock::time_point m_deadline;

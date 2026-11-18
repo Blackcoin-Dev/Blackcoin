@@ -736,16 +736,19 @@ BOOST_AUTO_TEST_CASE(read_plan_reads_the_database_in_ascending_sweeps)
             BOOST_CHECK_EQUAL(moved.Unresolved(), items.size());
             database.reads.clear();
             count = 0;
+            const LifecycleSliceLimits unlimited = LifecycleSliceLimits::Unlimited();
             do {
                 moved.PrepareUnlocked();
                 LOCK(::cs_main);
-                SliceMeter meter{LifecycleSliceLimits::Unlimited(), std::chrono::milliseconds{0}};
+                SliceMeter meter{unlimited, unlimited.main_budget};
                 result = moved.RunSlice(coins_tip, other_tip, true, meter, compute, count_commit);
             } while (result == OrderedSliceResult::MORE);
             BOOST_CHECK(result == OrderedSliceResult::DONE);
             BOOST_CHECK_EQUAL(count, items.size());
             BOOST_CHECK_EQUAL(AscendingRuns(database.reads), 3U);
         }
+        // The clock of this round goes out of scope.
+        database.on_read = nullptr;
     }
 }
 

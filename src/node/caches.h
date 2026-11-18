@@ -15,6 +15,11 @@
 class ArgsManager;
 
 namespace node {
+//! Smallest and largest -dbcache default chosen from the system memory (MiB).
+//! nDefaultDbCache (txdb.h) is the default when the memory cannot be detected.
+static constexpr int64_t MIN_DYNAMIC_DB_CACHE{100};
+static constexpr int64_t MAX_DYNAMIC_DB_CACHE{1024};
+
 struct CacheSizes {
     int64_t block_tree_db;
     int64_t coins_db;
@@ -29,13 +34,10 @@ struct SystemRAM {
     std::optional<uint64_t> available;
 };
 
-//! The total database cache and the ceiling of the chain state database's
-//! own cache, before the total is split between the databases.
+//! The total database cache, before it is split between the databases.
 struct DbCacheChoice {
     //! Total database cache (MiB), within nMinDbCache and nMaxDbCache.
     int64_t total_mib;
-    //! Most the chain state database cache may take of the total (MiB).
-    int64_t coins_db_max_mib;
     //! True when -dbcache was not set and the total follows the system memory.
     bool from_system_ram;
     //! True when little available memory halved the choice.
@@ -47,7 +49,8 @@ struct DbCacheChoice {
  * file or settings file) is used as given. Otherwise the total is one
  * sixteenth of the system memory, between 100 MiB and 1024 MiB, halved when
  * less than four times that much memory is available; when the system memory
- * is unknown it is nDefaultDbCache.
+ * is unknown it is nDefaultDbCache. The chain state database's own cache stays
+ * capped at nMaxCoinsDBCache; a larger total goes to the in-memory coins cache.
  */
 DbCacheChoice ChooseDbCache(const ArgsManager& args, const SystemRAM& ram);
 

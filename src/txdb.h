@@ -24,12 +24,8 @@
 class COutPoint;
 class uint256;
 
-//! -dbcache default (MiB) when the system memory cannot be detected.
-//! Otherwise the default follows the system memory, see node::ChooseDbCache().
+//! -dbcache default (MiB)
 static const int64_t nDefaultDbCache = 450;
-//! Smallest and largest -dbcache default chosen from the system memory (MiB)
-static const int64_t nMinDynamicDbCache = 100;
-static const int64_t nMaxDynamicDbCache = 1024;
 //! -dbbatchsize default (bytes)
 static const int64_t nDefaultDbBatchSize = 16 << 20;
 //! max. -dbcache (MiB)
@@ -44,12 +40,8 @@ static const int64_t nMaxBlockDBCache = 2;
 static const int64_t nMaxTxIndexCache = 1024;
 //! Max memory allocated to all block filter index caches combined in MiB.
 static const int64_t max_filter_index_cache = 1024;
-//! Coin DB specific cache (MiB): the ceiling is 1/256 of the system memory
-//! kept between these two values, so 8 MiB is the smallest ceiling there is.
-static const int64_t nMinCoinsDBCache = 8;
-static const int64_t nMaxCoinsDBCache = 64;
-//! Ceiling of the coin DB specific cache when the system memory is unknown (MiB)
-static const int64_t nUnknownRamCoinsDBCache = 16;
+//! Max memory allocated to coin DB specific cache (MiB)
+static const int64_t nMaxCoinsDBCache = 8;
 
 //! User-controlled performance and debug options.
 struct CoinsViewOptions {

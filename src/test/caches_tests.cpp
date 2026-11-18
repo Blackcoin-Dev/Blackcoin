@@ -43,19 +43,19 @@ BOOST_AUTO_TEST_CASE(dbcache_follows_system_memory)
     struct Row {
         uint64_t ram;
         int64_t total_mib;
-        int64_t coins_db_mib;
     };
-    // One sixteenth of the memory between 100 and 1024 MiB, and one 256th of
-    // it between 8 and 64 MiB for the chain state database.
+    // One sixteenth of the memory between 100 and 1024 MiB. The chain state
+    // database cache is 8 MiB on every machine, as it was with the old default.
     const Row rows[]{
-        {512 * MIB, 100, 8},
-        {1 * GIB, 100, 8},
-        {2 * GIB, 128, 8},
-        {4 * GIB, 256, 16},
-        {8 * GIB, 512, 32},
-        {16 * GIB, 1024, 64},
-        {24 * GIB, 1024, 64},
-        {256 * GIB, 1024, 64},
+        {512 * MIB, 100},
+        {1 * GIB, 100},
+        {2 * GIB, 128},
+        {4 * GIB, 256},
+        {8 * GIB, 512},
+        {16 * GIB, 1024},
+        {24 * GIB, 1024},
+        {256 * GIB, 1024},
+        {504 * GIB, 1024},
     };
     for (const Row& row : rows) {
         BOOST_TEST_CONTEXT("ram_mib=" << (row.ram >> 20)) {
@@ -63,10 +63,9 @@ BOOST_AUTO_TEST_CASE(dbcache_follows_system_memory)
             BOOST_CHECK(choice.from_system_ram);
             BOOST_CHECK(!choice.halved);
             BOOST_CHECK_EQUAL(choice.total_mib, row.total_mib);
-            BOOST_CHECK_EQUAL(choice.coins_db_max_mib, row.coins_db_mib);
 
             const CacheSizes sizes{CalculateCacheSizes(args, 0, Ram(row.ram))};
-            BOOST_CHECK_EQUAL(sizes.coins_db, row.coins_db_mib << 20);
+            BOOST_CHECK_EQUAL(sizes.coins_db, nMaxCoinsDBCache << 20);
             BOOST_CHECK_EQUAL(Sum(sizes), row.total_mib << 20);
             BOOST_CHECK_GT(sizes.coins, 0);
         }
@@ -81,7 +80,6 @@ BOOST_AUTO_TEST_CASE(dbcache_halved_when_little_memory_is_available)
         const DbCacheChoice choice{ChooseDbCache(args, SystemRAM{.total = 8 * GIB, .available = 2048 * MIB})};
         BOOST_CHECK(!choice.halved);
         BOOST_CHECK_EQUAL(choice.total_mib, 512);
-        BOOST_CHECK_EQUAL(choice.coins_db_max_mib, 32);
     }
     {
         const SystemRAM ram{.total = 8 * GIB, .available = 2047 * MIB};
@@ -89,17 +87,17 @@ BOOST_AUTO_TEST_CASE(dbcache_halved_when_little_memory_is_available)
         BOOST_CHECK(choice.from_system_ram);
         BOOST_CHECK(choice.halved);
         BOOST_CHECK_EQUAL(choice.total_mib, 256);
-        BOOST_CHECK_EQUAL(choice.coins_db_max_mib, 16);
         const CacheSizes sizes{CalculateCacheSizes(args, 0, ram)};
-        BOOST_CHECK_EQUAL(sizes.coins_db, 16 << 20);
+        BOOST_CHECK_EQUAL(sizes.coins_db, nMaxCoinsDBCache << 20);
         BOOST_CHECK_EQUAL(Sum(sizes), 256 << 20);
     }
-    // The chain state database cache is never chosen below 8 MiB.
+    // The chain state database cache is still 8 MiB after the smallest choice is halved.
     {
-        const DbCacheChoice choice{ChooseDbCache(args, SystemRAM{.total = 2 * GIB, .available = 100 * MIB})};
+        const SystemRAM ram{.total = 1 * GIB, .available = 100 * MIB};
+        const DbCacheChoice choice{ChooseDbCache(args, ram)};
         BOOST_CHECK(choice.halved);
-        BOOST_CHECK_EQUAL(choice.total_mib, 64);
-        BOOST_CHECK_EQUAL(choice.coins_db_max_mib, 8);
+        BOOST_CHECK_EQUAL(choice.total_mib, 50);
+        BOOST_CHECK_EQUAL(CalculateCacheSizes(args, 0, ram).coins_db, nMaxCoinsDBCache << 20);
     }
     // Unknown available memory leaves the choice alone.
     {
@@ -117,10 +115,8 @@ BOOST_AUTO_TEST_CASE(dbcache_default_when_memory_is_unknown)
     BOOST_CHECK(!choice.from_system_ram);
     BOOST_CHECK(!choice.halved);
     BOOST_CHECK_EQUAL(choice.total_mib, nDefaultDbCache);
-    // 8 MiB used to be the ceiling of the chain state database cache.
     const CacheSizes sizes{CalculateCacheSizes(args, 0, unknown)};
-    BOOST_CHECK_GT(sizes.coins_db, 8 << 20);
-    BOOST_CHECK_EQUAL(sizes.coins_db, nUnknownRamCoinsDBCache << 20);
+    BOOST_CHECK_EQUAL(sizes.coins_db, nMaxCoinsDBCache << 20);
     BOOST_CHECK_EQUAL(Sum(sizes), nDefaultDbCache << 20);
 }
 
@@ -140,10 +136,11 @@ BOOST_AUTO_TEST_CASE(explicit_dbcache_is_kept)
                 const CacheSizes sizes{CalculateCacheSizes(args, 0, ram)};
                 BOOST_CHECK_EQUAL(Sum(sizes), choice.total_mib << 20);
                 BOOST_CHECK_GT(sizes.coins, 0);
-                BOOST_CHECK_LE(sizes.coins_db, choice.coins_db_max_mib << 20);
-                // 8 MiB is a floor once the cache is large enough to hold it
-                // beside an in-memory cache of the same size.
-                if (dbcache >= 50) BOOST_CHECK_GE(sizes.coins_db, 8 << 20);
+                // Exactly what the fixed rule always gave: half of what is
+                // left after the block index cache, capped at 8 MiB.
+                const int64_t total{choice.total_mib << 20};
+                const int64_t rest{total - std::min(total / 8, nMaxBlockDBCache << 20)};
+                BOOST_CHECK_EQUAL(sizes.coins_db, std::min(rest / 2, nMaxCoinsDBCache << 20));
             }
         }
     }

@@ -13,11 +13,19 @@
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
+#include <tinyformat.h>
+#include <util/fs.h>
 #include <util/string.h>
 
+#include <leveldb/db.h>
+#include <leveldb/env.h>
+#include <leveldb/options.h>
+
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #include <boost/test/unit_test.hpp>
 
@@ -437,5 +445,119 @@ BOOST_AUTO_TEST_CASE(unicodepath)
     BOOST_CHECK(fs::exists(lockPath));
 }
 
+
+namespace {
+//! Counts the background jobs LevelDB schedules. LevelDB only calls
+//! Env::Schedule() when there is a flush or a compaction to do.
+class CountingEnv final : public leveldb::EnvWrapper
+{
+public:
+    CountingEnv() : leveldb::EnvWrapper(leveldb::Env::Default()) {}
+    void Schedule(void (*function)(void*), void* arg) override
+    {
+        ++m_scheduled;
+        target()->Schedule(function, arg);
+    }
+    std::atomic<int> m_scheduled{0};
+};
+
+struct SeekCompactionResult {
+    int scheduled_at_open;
+    int scheduled_after_reads;
+    bool tables_unchanged;
+    int hits;
+    int misses;
+};
+
+std::string SeekTestKey(int i) { return strprintf("key%08d", i); }
+
+//! Build a database whose lookups consult two table files (a small file at
+//! level 0 over larger files further down), then do random-like point reads
+//! of present and missing keys and report what LevelDB scheduled.
+SeekCompactionResult RunSeekCompactionReads(const fs::path& path, bool disable_seek_autocompaction, int reads)
+{
+    static constexpr int KEYS{20000};
+    const std::string value(100, 'v');
+    const std::string name{fs::PathToString(path)};
+
+    leveldb::Options options;
+    options.create_if_missing = true;
+    options.compression = leveldb::kNoCompression;
+    options.disable_seek_autocompaction = disable_seek_autocompaction;
+
+    {
+        leveldb::DB* raw{nullptr};
+        BOOST_REQUIRE(leveldb::DB::Open(options, name, &raw).ok());
+        std::unique_ptr<leveldb::DB> db{raw};
+        for (int i = 0; i < KEYS; ++i) {
+            BOOST_REQUIRE(db->Put(leveldb::WriteOptions(), SeekTestKey(i), value).ok());
+        }
+        // Push everything down, then write a thin layer across the whole key
+        // range. Reopening turns that layer into one level 0 table file.
+        db->CompactRange(nullptr, nullptr);
+        for (int i = 0; i < KEYS; i += 10) {
+            BOOST_REQUIRE(db->Put(leveldb::WriteOptions(), SeekTestKey(i), value).ok());
+        }
+    }
+
+    CountingEnv env;
+    options.env = &env;
+    leveldb::DB* raw{nullptr};
+    BOOST_REQUIRE(leveldb::DB::Open(options, name, &raw).ok());
+    std::unique_ptr<leveldb::DB> db{raw};
+
+    SeekCompactionResult result{};
+    result.scheduled_at_open = env.m_scheduled.load();
+    std::string tables_before;
+    BOOST_REQUIRE(db->GetProperty("leveldb.sstables", &tables_before));
+    // More than one level must hold files, or no lookup would charge a seek.
+    std::string level0_files;
+    BOOST_REQUIRE(db->GetProperty("leveldb.num-files-at-level0", &level0_files));
+    BOOST_REQUIRE_EQUAL(level0_files, "1");
+
+    std::string read_value;
+    for (int n = 0; n < reads; ++n) {
+        const int i{static_cast<int>((static_cast<int64_t>(n) * 7919) % KEYS)};
+        // Every other read asks for a key that is absent but inside the key range.
+        const std::string key{(n % 2 == 0) ? SeekTestKey(i) : SeekTestKey(i) + "x"};
+        const leveldb::Status status{db->Get(leveldb::ReadOptions(), key, &read_value)};
+        if (status.ok()) {
+            ++result.hits;
+        } else {
+            BOOST_REQUIRE(status.IsNotFound());
+            ++result.misses;
+        }
+        if (!disable_seek_autocompaction && env.m_scheduled.load() > result.scheduled_at_open) break;
+    }
+    result.scheduled_after_reads = env.m_scheduled.load();
+    std::string tables_after;
+    if (disable_seek_autocompaction) {
+        BOOST_REQUIRE(db->GetProperty("leveldb.sstables", &tables_after));
+    }
+    result.tables_unchanged = tables_before == tables_after;
+    return result;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(seek_autocompaction_disabled_reads_schedule_nothing)
+{
+    const fs::path ph = m_args.GetDataDirBase() / "seek_autocompaction_disabled";
+    const SeekCompactionResult result{RunSeekCompactionReads(ph, /*disable_seek_autocompaction=*/true, /*reads=*/200000)};
+    BOOST_CHECK_EQUAL(result.scheduled_at_open, 0);
+    BOOST_CHECK_EQUAL(result.scheduled_after_reads, 0);
+    BOOST_CHECK(result.tables_unchanged);
+    BOOST_CHECK_EQUAL(result.hits, 100000);
+    BOOST_CHECK_EQUAL(result.misses, 100000);
+}
+
+BOOST_AUTO_TEST_CASE(seek_autocompaction_stock_reads_schedule_compaction)
+{
+    // Control: the same reads against stock LevelDB behavior use up the seek
+    // allowance of the level 0 file and schedule a compaction.
+    const fs::path ph = m_args.GetDataDirBase() / "seek_autocompaction_stock";
+    const SeekCompactionResult result{RunSeekCompactionReads(ph, /*disable_seek_autocompaction=*/false, /*reads=*/200000)};
+    BOOST_CHECK_EQUAL(result.scheduled_at_open, 0);
+    BOOST_CHECK_GT(result.scheduled_after_reads, 0);
+}
 
 BOOST_AUTO_TEST_SUITE_END()

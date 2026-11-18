@@ -401,6 +401,10 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
 }
 
 bool Version::UpdateStats(const GetStats& stats) {
+  // Blackcoin: with Options::disable_seek_autocompaction no read charges a
+  // seek to a file, so file_to_compact_ is never set and reads never schedule
+  // a compaction. RecordReadSample() (iterators) also ends up here.
+  if (vset_->options_->disable_seek_autocompaction) return false;
   FileMetaData* f = stats.seek_file;
   if (f != nullptr) {
     f->allowed_seeks--;

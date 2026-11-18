@@ -140,6 +140,17 @@ struct LEVELDB_EXPORT Options {
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.
   const FilterPolicy* filter_policy = nullptr;
+
+  // Blackcoin: if true, reads never trigger a compaction. Stock LevelDB
+  // charges a "seek" to the first table file consulted whenever a lookup
+  // has to look in more than one file, and compacts a file once its seek
+  // allowance (file size / 16 KiB, at least 100) is used up. A burst of
+  // random lookups after a cold start can use up the allowance of nearly
+  // every file and make the database rewrite itself, which is very slow
+  // on a spinning disk. Size-triggered compaction is not affected.
+  //
+  // Default: false (stock behavior)
+  bool disable_seek_autocompaction = false;
 };
 
 // Options that control read operations

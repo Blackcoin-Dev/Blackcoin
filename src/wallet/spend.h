@@ -377,10 +377,10 @@ struct LifecyclePass {
     Balance balance;
     WalletLifecycleSummary summary;
     std::vector<LifecyclePassOutput> pending;
-    //! `pending` in the order of the coins database keys; built without a
-    //! lock when the walk has finished.
-    OrderedChainCursor chain_order;
-    bool chain_order_built{false};
+    //! Resolves `pending` against the chainstate: every coin in one ascending
+    //! sweep of the coins database, then every derived record in another.
+    ChainReadPlan chain_plan;
+    //! Outputs of `pending` resolved so far.
     size_t chain_cursor{0};
     WalletLifecycleScanStats stats;
     uint64_t memo_misses{0};     //!< memo-eligible outputs without a usable entry
@@ -439,38 +439,38 @@ struct LifecycleWarmupItem {
     uint32_t tx_ntime{0};
 };
 
-/** Resumable memo warm-up: COLLECT (cs_wallet) lists a batch of deep outputs
- * without a memo entry, FETCH (cs_main) reads their facts into the journal,
- * STORE (cs_wallet) applies the journal; then the next batch, until the
- * cursor has been through mapWallet once. */
+/** Resumable memo warm-up: COLLECT (cs_wallet) lists every deep output
+ * without a memo entry, in as many slices as the walk of mapWallet takes;
+ * FETCH (cs_main) resolves all of them through one ChainReadPlan, so that the
+ * coins database is read in ascending key order across the whole wallet and
+ * not once per batch; STORE (cs_wallet) applies the journal. A tip move does
+ * not discard what was read: the facts of an output this deep do not depend
+ * on the tip, and every journal entry is checked against the wallet when it
+ * is applied. (A warm-up that started over at every block would never end
+ * on a disk that needs longer than a block interval for it.) */
 struct LifecycleWarmup {
     enum class Stage { COLLECT, FETCH, STORE, DONE };
     Stage stage{Stage::COLLECT};
-    //! Outputs listed per batch.
-    size_t batch_size{4096};
     size_t bucket{0};
     size_t bucket_count{0};
     bool walk_finished{false};
     //! Costliest chainstate item of the latest slice; half of it seeds the next slice's meter.
     std::chrono::microseconds max_chain_item{0};
     std::vector<LifecycleWarmupItem> items;
-    //! `items` in the order of the coins database keys; built without a lock.
-    OrderedChainCursor fetch_order;
-    bool fetch_order_built{false};
-    size_t fetch_cursor{0};
+    ChainReadPlan fetch_plan;
     uint64_t collected{0}; //!< outputs listed so far
     uint64_t fetched{0};   //!< outputs whose facts were read or derived
     uint64_t derived{0};   //!< of those, outputs whose facts needed no database read
-    uint64_t fetched_in_batch{0}; //!< counted into `fetched` by the batch in progress
-    uint64_t derived_in_batch{0};
-    uint64_t skipped_in_batch{0};
     uint64_t skipped{0};   //!< outputs the chainstate could not describe (left to the pass)
     uint64_t rewinds{0};   //!< times the cursor went back to the start (mapWallet was rehashed)
-    uint64_t tip_restarts{0}; //!< batches read again because the tip moved in the middle
     uint32_t slices{0};
 
     //! Outputs listed and not yet stored, plus the share of mapWallet walked.
-    size_t Waiting(const LifecycleMemoJournal& journal) const { return (items.size() - fetch_cursor) + journal.Waiting(); }
+    size_t Waiting(const LifecycleMemoJournal& journal) const
+    {
+        const size_t resolved = fetch_plan.Active() ? fetch_plan.Count() - fetch_plan.Unresolved() : 0;
+        return (items.size() - std::min(items.size(), resolved)) + journal.Waiting();
+    }
     int WalkedPercent() const
     {
         if (walk_finished || stage == Stage::DONE) return 100;

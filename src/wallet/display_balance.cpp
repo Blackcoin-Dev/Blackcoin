@@ -500,9 +500,11 @@ void WalletDisplayBalance::RunWarmup(const std::function<bool()>& turn)
         m_warmup.emplace();
         m_warmup_stored_base = m_journal.stored;
     }
-    for (;;) {
-        if (!turn()) return;
-        const LifecycleWarmup::Stage before = m_warmup->stage;
+    // The warm-up of a wallet is one sweep over all of it; other wallets get
+    // their turn after this many slices of it.
+    constexpr int SLICES_PER_TURN{256};
+    for (int slices = 0;; ++slices) {
+        if (slices >= SLICES_PER_TURN || !turn()) return;
         const LifecycleSliceReport report = RunLifecycleWarmupSlice(m_wallet, *m_warmup, m_journal, m_limits);
         Account(report);
         {
@@ -539,8 +541,6 @@ void WalletDisplayBalance::RunWarmup(const std::function<bool()>& turn)
             ClearBackOff();
             return;
         }
-        // One batch (collect, fetch, store) is one turn of this wallet.
-        if (before == LifecycleWarmup::Stage::STORE && m_warmup->stage == LifecycleWarmup::Stage::COLLECT) return;
     }
 }
 

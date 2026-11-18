@@ -15,7 +15,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 class CBlockIndex;
@@ -238,6 +240,221 @@ private:
     std::vector<std::optional<Coin>> m_coins;
     OrderedChainCursor m_cursor;
     uint256 m_tip_hash;
+    std::function<void(const COutPoint&)> m_on_read;
+};
+
+/**
+ * A coins view that holds only what was read for it. A coin it knows (or
+ * knows to be absent) is answered from memory. A coin it does not know is
+ * answered as absent and noted as missing: whoever asked got a provisional
+ * answer and must ask again once the missing coins have been read.
+ */
+class PlannedCoinsView final : public CCoinsView
+{
+public:
+    bool GetCoin(const COutPoint& outpoint, Coin& coin) const override
+    {
+        const auto it = m_known.find(outpoint);
+        if (it == m_known.end()) {
+            ++m_unknown_requests;
+            m_missing.insert(outpoint);
+            return false;
+        }
+        if (!it->second) return false;
+        coin = *it->second;
+        return true;
+    }
+    bool HaveCoin(const COutPoint& outpoint) const override
+    {
+        Coin coin;
+        return GetCoin(outpoint, coin);
+    }
+    uint256 GetBestBlock() const override { return m_best_block; }
+    void SetBestBlock(const uint256& hash) { m_best_block = hash; }
+
+    /** Grows with every request for a coin that is not known. */
+    uint64_t UnknownRequests() const { return m_unknown_requests; }
+    /** The coins asked for and not known, each once; forgets the list. */
+    std::vector<COutPoint> TakeMissing()
+    {
+        std::vector<COutPoint> missing{m_missing.begin(), m_missing.end()};
+        m_missing.clear();
+        return missing;
+    }
+    void Learn(const COutPoint& outpoint, std::optional<Coin> coin) { m_known[outpoint] = std::move(coin); }
+    size_t Known() const { return m_known.size(); }
+    void Clear()
+    {
+        m_known.clear();
+        m_missing.clear();
+    }
+
+private:
+    std::map<COutPoint, std::optional<Coin>> m_known;
+    mutable std::set<COutPoint> m_missing;
+    mutable uint64_t m_unknown_requests{0};
+    uint256 m_best_block;
+};
+
+/**
+ * Resolves a set of items against the chainstate so that the coins database
+ * is read in ascending key order, whatever the items need from it.
+ *
+ * What an item needs is not known in advance: the coin of an output, then,
+ * if that coin is coinbase, the records of a Gold Rush payout under derived
+ * keys, the demurrage attestation of its script. So the work goes in rounds.
+ * A round computes every unresolved item against a PlannedCoinsView, which
+ * holds what has been read so far and notes what it was asked for and does
+ * not have; an item whose computation asked for nothing unknown is resolved
+ * and committed. Then everything that was missing is sorted by database key
+ * and read in one ascending sweep through the peek path, and the next round
+ * computes the items that are left. The first sweep is the coins of all
+ * outputs, the second every record derived from them, and only an item whose
+ * records name further records (an authenticated payout) takes more sweeps.
+ *
+ * Both the rounds and the sweeps run in slices of cs_main under a SliceMeter
+ * and resume where the previous slice stopped. The sort happens without a
+ * lock (PrepareUnlocked). With `restart_on_tip_move` a slice that finds
+ * another tip than the plan started at forgets everything and says so.
+ */
+class ChainReadPlan
+{
+public:
+    /** Start over with items 0..count-1 unresolved and nothing read. */
+    void Reset(size_t count)
+    {
+        m_unresolved.resize(count);
+        for (size_t i = 0; i < count; ++i) m_unresolved[i] = static_cast<uint32_t>(i);
+        m_next_unresolved.clear();
+        m_view.Clear();
+        m_wave.clear();
+        m_eval_cursor = 0;
+        m_read_cursor = 0;
+        m_reading = false;
+        m_wave_sorted = false;
+        m_started = false;
+        m_count = count;
+        m_committed = 0;
+        m_active = true;
+    }
+    bool Active() const { return m_active; }
+    size_t Count() const { return m_count; }
+    /** Items not resolved yet. */
+    size_t Unresolved() const { return m_count - m_committed; }
+    /** Keys of the sweep in progress that are still to be read. */
+    size_t ReadsWaiting() const { return m_reading ? m_wave.size() - m_read_cursor : 0; }
+    uint64_t Restarts() const { return m_restarts; }
+    /** Sweeps started so far. */
+    uint32_t Sweeps() const { return m_sweeps; }
+    uint64_t KeysRead() const { return m_keys_read; }
+    //! Test only: called with every key as it is read from the chainstate.
+    void SetOnReadForTest(std::function<void(const COutPoint&)> on_read) { m_on_read = std::move(on_read); }
+
+    /** What can be done without a lock: sort the keys of the next sweep. */
+    void PrepareUnlocked()
+    {
+        if (m_reading && !m_wave_sorted) {
+            std::sort(m_wave.begin(), m_wave.end(), ChainstateKeyLess);
+            m_wave_sorted = true;
+        }
+    }
+
+    /**
+     * One slice. `compute(item, view)` computes an item against the planned
+     * view and has no effect outside its return value; `commit(item, value)`
+     * is called with that value when the computation asked for no coin the
+     * view does not know, and returns false to stop (STOPPED).
+     */
+    template <typename Meter, typename Compute, typename Commit>
+    OrderedSliceResult RunSlice(const CCoinsViewCache& coins_tip, const uint256& tip_hash, bool restart_on_tip_move,
+                                Meter& meter, Compute&& compute, Commit&& commit)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        AssertLockHeld(::cs_main);
+        if (m_started && restart_on_tip_move && tip_hash != m_tip_hash) {
+            Reset(m_count);
+            ++m_restarts;
+            return OrderedSliceResult::RESTARTED;
+        }
+        m_tip_hash = tip_hash;
+        m_started = true;
+        m_view.SetBestBlock(tip_hash);
+        for (;;) {
+            if (m_reading) {
+                // Sorted by the caller between two slices, without the lock.
+                if (!m_wave_sorted) return OrderedSliceResult::MORE;
+                const CoinsViewPeek peek{coins_tip};
+                while (m_read_cursor < m_wave.size()) {
+                    if (meter.Expired()) return OrderedSliceResult::MORE;
+                    const COutPoint& key = m_wave[m_read_cursor];
+                    Coin coin;
+                    if (peek.GetCoin(key, coin) && !coin.IsSpent()) {
+                        m_view.Learn(key, std::move(coin));
+                    } else {
+                        m_view.Learn(key, std::nullopt);
+                    }
+                    ++m_keys_read;
+                    if (m_on_read) m_on_read(key);
+                    ++m_read_cursor;
+                    meter.TickChainItem();
+                }
+                m_wave.clear();
+                m_read_cursor = 0;
+                m_reading = false;
+            }
+            {
+                // Hits are copied into this scratch cache for the slice only.
+                CCoinsViewCache scratch{&m_view};
+                const CCoinsViewCache& view{scratch};
+                while (m_eval_cursor < m_unresolved.size()) {
+                    if (meter.Expired()) return OrderedSliceResult::MORE;
+                    const uint32_t item = m_unresolved[m_eval_cursor];
+                    const uint64_t unknown_before = m_view.UnknownRequests();
+                    auto value = compute(item, view);
+                    if (m_view.UnknownRequests() == unknown_before) {
+                        if (!commit(item, std::move(value))) return OrderedSliceResult::STOPPED;
+                        ++m_committed;
+                    } else {
+                        m_next_unresolved.push_back(item);
+                    }
+                    ++m_eval_cursor;
+                    meter.Tick();
+                }
+            }
+            m_unresolved.swap(m_next_unresolved);
+            m_next_unresolved.clear();
+            m_eval_cursor = 0;
+            m_wave = m_view.TakeMissing();
+            if (m_wave.empty()) {
+                // Nothing was missing, so nothing is unresolved.
+                m_unresolved.clear();
+                return OrderedSliceResult::DONE;
+            }
+            m_reading = true;
+            m_wave_sorted = false;
+            ++m_sweeps;
+            // The sweep starts with the next slice, after the sort.
+            return OrderedSliceResult::MORE;
+        }
+    }
+
+private:
+    PlannedCoinsView m_view;
+    std::vector<uint32_t> m_unresolved;
+    std::vector<uint32_t> m_next_unresolved;
+    std::vector<COutPoint> m_wave;
+    size_t m_eval_cursor{0};
+    size_t m_read_cursor{0};
+    size_t m_count{0};
+    size_t m_committed{0};
+    bool m_reading{false};
+    bool m_wave_sorted{false};
+    bool m_started{false};
+    bool m_active{false};
+    uint256 m_tip_hash;
+    uint64_t m_restarts{0};
+    uint64_t m_keys_read{0};
+    uint32_t m_sweeps{0};
     std::function<void(const COutPoint&)> m_on_read;
 };
 

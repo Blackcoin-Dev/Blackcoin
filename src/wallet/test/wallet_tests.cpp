@@ -6583,7 +6583,6 @@ BOOST_FIXTURE_TEST_CASE(sliced_display_balance_matches_single_lock_and_fails_clo
         LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
         limits.max_items = 3;
         LifecycleWarmup warmup;
-        warmup.batch_size = 16;
         size_t previous_memo{0};
         uint64_t previous_progress{0};
         int slices{0};

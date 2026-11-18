@@ -7,10 +7,14 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <coins.h>
+#include <hash.h>
 #include <interfaces/chain.h>
 #include <key.h>
 #include <random.h>
+#include <script/interpreter.h>
 #include <script/script.h>
+#include <script/sign.h>
+#include <script/signingprovider.h>
 #include <script/solver.h>
 #include <serialize.h>
 #include <shadow.h>
@@ -24,7 +28,11 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <functional>
+#include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace wallet {
@@ -538,6 +546,349 @@ BOOST_FIXTURE_TEST_CASE(sliced_pass_derives_confirmed_outputs_that_are_not_coinb
         BOOST_CHECK_EQUAL(warmed.synthetic, memo.synthetic);
     }
     check_equal(deep_reference, sliced(0));
+}
+
+namespace {
+/** A coins database stand-in that records every key it is asked for and
+ * charges an injected clock for each read. */
+class RecordingCoinsView final : public CCoinsView
+{
+public:
+    std::map<COutPoint, Coin> coins;
+    mutable std::vector<COutPoint> reads;
+    std::function<void()> on_read;
+
+    bool GetCoin(const COutPoint& outpoint, Coin& coin) const override
+    {
+        reads.push_back(outpoint);
+        if (on_read) on_read();
+        const auto it = coins.find(outpoint);
+        if (it == coins.end()) return false;
+        coin = it->second;
+        return true;
+    }
+    bool HaveCoin(const COutPoint& outpoint) const override
+    {
+        Coin coin;
+        return GetCoin(outpoint, coin);
+    }
+};
+
+/** Number of maximal ascending runs of the keys, in database key order. */
+size_t AscendingRuns(const std::vector<COutPoint>& keys)
+{
+    size_t runs{keys.empty() ? 0U : 1U};
+    for (size_t i = 1; i < keys.size(); ++i) {
+        if (ChainstateKeyBytes(keys[i]) < ChainstateKeyBytes(keys[i - 1])) ++runs;
+    }
+    return runs;
+}
+
+COutPoint DerivedKey(const COutPoint& outpoint, uint8_t tag)
+{
+    HashWriter hasher{};
+    hasher << tag << outpoint;
+    return COutPoint{hasher.GetSHA256(), 0};
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(read_plan_reads_the_database_in_ascending_sweeps)
+{
+    // A few thousand outputs. An ordinary one needs its coin. A coinbase one
+    // also needs a record under a key derived from its outpoint (present for
+    // some), and a record that is present names one more.
+    FastRandomContext rng{/*fDeterministic=*/true};
+    RecordingCoinsView database;
+    struct Item {
+        COutPoint outpoint;
+        bool exists;
+        bool coinbase;
+        bool marked;
+    };
+    std::vector<Item> items;
+    for (int i = 0; i < 4000; ++i) {
+        Item item{COutPoint{rng.rand256(), static_cast<uint32_t>(i % 5)}, i % 11 != 0, i % 3 == 0, false};
+        if (item.exists) {
+            database.coins.emplace(item.outpoint, Coin{CTxOut{COIN + i, PayScript(0x44)}, 100 + i, item.coinbase, false, 7});
+        }
+        items.push_back(item);
+    }
+    const auto compute = [&](uint32_t index, const CCoinsViewCache& view) {
+        // 0: no coin; 1: ordinary; 2: coinbase without a record; 3: record
+        // without the one it names; 4: both records.
+        const Item& item = items[index];
+        Coin coin;
+        if (!view.GetCoin(item.outpoint, coin) || coin.IsSpent()) return 0;
+        if (!coin.IsCoinBase()) return 1;
+        Coin record;
+        if (!view.GetCoin(DerivedKey(item.outpoint, 1), record)) return 2;
+        Coin named;
+        return view.GetCoin(DerivedKey(item.outpoint, 2), named) ? 4 : 3;
+    };
+    const auto expected = [&](const Item& item, bool second_level) {
+        if (!item.exists) return 0;
+        if (!item.coinbase) return 1;
+        if (!item.marked) return 2;
+        return second_level ? 4 : 3;
+    };
+
+    for (const bool second_level : {false, true}) {
+        // Records of the second sweep; with `second_level` some name a third.
+        size_t marked{0};
+        for (size_t i = 0; i < items.size(); ++i) {
+            Item& item = items[i];
+            item.marked = second_level && item.exists && item.coinbase && i % 2 == 0;
+            if (item.marked) {
+                ++marked;
+                database.coins.emplace(DerivedKey(item.outpoint, 1), Coin{CTxOut{0, PayScript(0x55)}, 1, true, false, 0});
+                database.coins.emplace(DerivedKey(item.outpoint, 2), Coin{CTxOut{0, PayScript(0x66)}, 1, true, false, 0});
+            }
+        }
+        BOOST_REQUIRE_EQUAL(marked > 0, second_level);
+        database.reads.clear();
+        CCoinsViewCache coins_tip{&database};
+
+        // An injected clock: a read costs 4 ms, nothing else costs anything.
+        auto now = std::chrono::steady_clock::time_point{} + std::chrono::hours{1};
+        database.on_read = [&] { now += std::chrono::milliseconds{4}; };
+        LifecycleSliceLimits limits;
+        limits.now = [&] { return now; };
+
+        ChainReadPlan plan;
+        plan.Reset(items.size());
+        std::vector<int> results(items.size(), -1);
+        std::vector<COutPoint> announced;
+        plan.SetOnReadForTest([&](const COutPoint& key) { announced.push_back(key); });
+        uint256 tip_hash;
+        *tip_hash.begin() = 1;
+        int slices{0};
+        size_t committed{0};
+        OrderedSliceResult result;
+        do {
+            plan.PrepareUnlocked();
+            const size_t reads_before = database.reads.size();
+            const size_t committed_before = committed;
+            const auto slice_start = now;
+            {
+                LOCK(::cs_main);
+                SliceMeter meter{limits, limits.main_budget};
+                result = plan.RunSlice(coins_tip, tip_hash, /*restart_on_tip_move=*/true, meter, compute,
+                    [&](uint32_t index, int value) {
+                        BOOST_CHECK_EQUAL(results[index], -1); // committed once
+                        results[index] = value;
+                        ++committed;
+                        return true;
+                    });
+            }
+            ++slices;
+            BOOST_REQUIRE(result == OrderedSliceResult::MORE || result == OrderedSliceResult::DONE);
+            // The slice stays within its budget plus the reads the meter
+            // lets it finish, and a slice that reads makes progress.
+            const auto held = std::chrono::duration_cast<std::chrono::milliseconds>(now - slice_start);
+            BOOST_CHECK_LE(held.count(), limits.main_budget.count() + 4 * static_cast<int64_t>(SliceMeter::MIN_ITEMS_BEFORE_EARLY_END));
+            BOOST_CHECK(result == OrderedSliceResult::DONE || database.reads.size() > reads_before ||
+                        committed > committed_before || plan.ReadsWaiting() > 0);
+            BOOST_REQUIRE_LT(slices, 100000);
+        } while (result != OrderedSliceResult::DONE);
+
+        // Many slices, each a few reads long.
+        BOOST_CHECK_GT(slices, 500);
+        // Every item has the answer direct reads give.
+        for (size_t i = 0; i < items.size(); ++i) BOOST_CHECK_EQUAL(results[i], expected(items[i], second_level));
+        BOOST_CHECK_EQUAL(plan.Unresolved(), 0U);
+        // The database saw exactly the reads the plan announced, each key
+        // once: the coin of every item, a record key for every coinbase coin
+        // and the key every present record names.
+        BOOST_CHECK(database.reads == announced);
+        const std::set<COutPoint> distinct{database.reads.begin(), database.reads.end()};
+        BOOST_CHECK_EQUAL(distinct.size(), database.reads.size());
+        size_t coinbase_coins{0};
+        for (const Item& item : items) coinbase_coins += item.exists && item.coinbase ? 1 : 0;
+        BOOST_CHECK_EQUAL(database.reads.size(), items.size() + coinbase_coins + marked);
+        // And in ascending sweeps: all coins, then all records; a third
+        // sweep only for what a record names.
+        BOOST_CHECK_EQUAL(AscendingRuns(database.reads), second_level ? 3U : 2U);
+        BOOST_CHECK_EQUAL(plan.Sweeps(), second_level ? 3U : 2U);
+        for (size_t i = 0; i < items.size(); ++i) BOOST_CHECK(database.reads[i] != DerivedKey(items[i].outpoint, 1));
+
+        if (second_level) {
+            // A tip move forgets everything and the plan starts again.
+            ChainReadPlan moved;
+            moved.Reset(items.size());
+            database.reads.clear();
+            size_t count{0};
+            const auto count_commit = [&](uint32_t, int) { ++count; return true; };
+            uint256 other_tip;
+            *other_tip.begin() = 2;
+            for (int i = 0; i < 20; ++i) {
+                moved.PrepareUnlocked();
+                LOCK(::cs_main);
+                SliceMeter meter{limits, limits.main_budget};
+                BOOST_REQUIRE(moved.RunSlice(coins_tip, tip_hash, true, meter, compute, count_commit) == OrderedSliceResult::MORE);
+            }
+            BOOST_CHECK_GT(database.reads.size(), 0U);
+            {
+                LOCK(::cs_main);
+                SliceMeter meter{limits, limits.main_budget};
+                BOOST_CHECK(moved.RunSlice(coins_tip, other_tip, true, meter, compute, count_commit) == OrderedSliceResult::RESTARTED);
+            }
+            BOOST_CHECK_EQUAL(moved.Restarts(), 1U);
+            BOOST_CHECK_EQUAL(moved.Unresolved(), items.size());
+            database.reads.clear();
+            count = 0;
+            do {
+                moved.PrepareUnlocked();
+                LOCK(::cs_main);
+                SliceMeter meter{LifecycleSliceLimits::Unlimited(), std::chrono::milliseconds{0}};
+                result = moved.RunSlice(coins_tip, other_tip, true, meter, compute, count_commit);
+            } while (result == OrderedSliceResult::MORE);
+            BOOST_CHECK(result == OrderedSliceResult::DONE);
+            BOOST_CHECK_EQUAL(count, items.size());
+            BOOST_CHECK_EQUAL(AscendingRuns(database.reads), 3U);
+        }
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(wallet_pass_and_warmup_read_the_chainstate_in_two_ascending_sweeps, CoinFactsChainSetup)
+{
+    std::unique_ptr<CWallet> wallet{CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()),
+        coinbaseKey)};
+    const CScript wallet_script = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
+
+    // A few thousand wallet outputs: ordinary ones from one large
+    // transaction, and the coinbase of every block.
+    CMutableTransaction fan = CreateValidMempoolTransaction(
+        m_coinbase_txns[0], /*input_vout=*/0, /*input_height=*/1, coinbaseKey, wallet_script,
+        m_coinbase_txns[0]->vout[0].nValue - COIN, /*submit=*/false);
+    {
+        const int ordinary{3000};
+        const CAmount each = fan.vout[0].nValue / ordinary;
+        fan.vout.assign(ordinary, CTxOut{each, wallet_script});
+        // Signed again, as the fixture signs: the outputs changed.
+        fan.vin[0].scriptSig.clear();
+        FillableSigningProvider keystore;
+        keystore.AddKey(coinbaseKey);
+        const CTxOut& spent = m_coinbase_txns[0]->vout[0];
+        int hash_type = SIGHASH_ALL;
+        {
+            LOCK(::cs_main);
+            const CBlockIndex* tip{m_node.chainman->ActiveChain().Tip()};
+            if (IsQuantumWitnessSpendActive(Params().GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1)) {
+                hash_type |= SIGHASH_FORKID;
+            }
+        }
+        const CTransaction fan_const{fan};
+        PrecomputedTransactionData txdata;
+        txdata.Init(fan_const, std::vector<CTxOut>{spent}, true);
+        SignatureData sigdata = DataFromTransaction(fan, 0, spent);
+        BOOST_REQUIRE(ProduceSignature(keystore, MutableTransactionSignatureCreator{fan, 0, spent.nValue, &txdata, hash_type},
+                                       spent.scriptPubKey, sigdata));
+        UpdateInput(fan.vin[0], sigdata);
+    }
+    Notify(*wallet, Mine({fan}));
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return wallet->GetWalletTx(fan.GetHash()) != nullptr));
+    for (int i = 0; i < 260; ++i) Notify(*wallet, Mine());
+
+    Balance reference_balance;
+    WalletLifecycleSummary reference_summary;
+    WalletLifecycleScanStats reference_stats;
+    {
+        WalletLifecycleOptions options;
+        options.stats = &reference_stats;
+        std::string error;
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_REQUIRE_MESSAGE(GetLifecycleAdjustedBalance(*wallet, 0, true, reference_balance, reference_summary, error, options), error);
+    }
+    BOOST_REQUIRE_GT(reference_stats.outputs, 3300U);
+
+    // An injected clock: a chainstate read costs 5 ms.
+    auto now = std::chrono::steady_clock::time_point{} + std::chrono::hours{1};
+    LifecycleSliceLimits limits;
+    limits.now = [&] { return now; };
+    const int64_t main_bound = limits.main_budget.count() + 5 * static_cast<int64_t>(SliceMeter::MIN_ITEMS_BEFORE_EARLY_END);
+
+    // The display pass on a wallet whose memo is empty.
+    {
+        LifecycleMemoJournal journal;
+        LifecycleAttestationCache attestations;
+        LifecyclePass pass;
+        std::vector<COutPoint> reads;
+        pass.chain_plan.SetOnReadForTest([&](const COutPoint& key) {
+            reads.push_back(key);
+            now += std::chrono::milliseconds{5};
+        });
+        int main_slices{0};
+        for (;;) {
+            const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+            BOOST_REQUIRE(report.result != LifecycleSliceResult::LOCK_BUSY);
+            if (report.held_main) {
+                ++main_slices;
+                BOOST_CHECK_LE(report.held.count() / 1000, main_bound);
+            }
+            if (report.result == LifecycleSliceResult::MORE) continue;
+            BOOST_REQUIRE_MESSAGE(report.result == LifecycleSliceResult::DONE, report.error);
+            break;
+        }
+        BOOST_CHECK_EQUAL(pass.balance.m_mine_trusted, reference_balance.m_mine_trusted);
+        BOOST_CHECK_EQUAL(pass.balance.m_mine_immature, reference_balance.m_mine_immature);
+        BOOST_CHECK(pass.summary.mine.outputs == reference_summary.mine.outputs);
+        BOOST_CHECK(pass.summary.mine.nominal == reference_summary.mine.nominal);
+        BOOST_CHECK(pass.summary.mine.effective == reference_summary.mine.effective);
+        BOOST_CHECK_EQUAL(pass.stats.outputs, reference_stats.outputs);
+        // The ordinary outputs cost no read; every coinbase output costs its
+        // coin and the key of its payout record, which is not there.
+        BOOST_CHECK_EQUAL(pass.stats.derived, 3000U);
+        BOOST_CHECK_EQUAL(pass.stats.database_reads, pass.stats.outputs - 3000U);
+        BOOST_CHECK_EQUAL(reads.size(), 2 * pass.stats.database_reads);
+        const std::set<COutPoint> distinct{reads.begin(), reads.end()};
+        BOOST_CHECK_EQUAL(distinct.size(), reads.size());
+        // First every coin, then every record: two ascending sweeps.
+        BOOST_CHECK_EQUAL(AscendingRuns(reads), 2U);
+        const std::vector<COutPoint> coin_sweep{reads.begin(), reads.begin() + static_cast<std::ptrdiff_t>(pass.stats.database_reads)};
+        BOOST_CHECK_EQUAL(AscendingRuns(coin_sweep), 1U);
+        for (const COutPoint& key : coin_sweep) {
+            BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->GetWalletTx(key.hash) != nullptr));
+        }
+        BOOST_CHECK_GT(main_slices, 20);
+    }
+
+    // The memo warm-up of the whole wallet: the same two sweeps, not two per
+    // batch of outputs.
+    {
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        LifecycleWarmup warmup;
+        LifecycleMemoJournal journal;
+        std::vector<COutPoint> reads;
+        warmup.fetch_plan.SetOnReadForTest([&](const COutPoint& key) {
+            reads.push_back(key);
+            now += std::chrono::milliseconds{5};
+        });
+        for (int i = 0; i < 1000000; ++i) {
+            const LifecycleSliceReport report = RunLifecycleWarmupSlice(*wallet, warmup, journal, limits);
+            BOOST_REQUIRE(report.result != LifecycleSliceResult::LOCK_BUSY);
+            if (report.held_main) BOOST_CHECK_LE(report.held.count() / 1000, main_bound);
+            if (report.result == LifecycleSliceResult::DONE) break;
+        }
+        BOOST_REQUIRE(warmup.stage == LifecycleWarmup::Stage::DONE);
+        BOOST_CHECK_EQUAL(warmup.derived, 3000U);
+        BOOST_CHECK_GT(warmup.fetched, warmup.derived + 150);
+        BOOST_CHECK_EQUAL(warmup.skipped, 0U);
+        BOOST_CHECK_EQUAL(reads.size(), 2 * (warmup.fetched - warmup.derived));
+        BOOST_CHECK_EQUAL(AscendingRuns(reads), 2U);
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->m_output_lifecycle_memo.size()), warmup.fetched);
+
+        // What the warm-up stored is what a pass computes the balance from.
+        LifecycleAttestationCache attestations;
+        LifecyclePass pass;
+        const LifecycleSliceReport report = RunLifecyclePassToEnd(*wallet, pass, journal, attestations);
+        BOOST_REQUIRE_MESSAGE(report.result == LifecycleSliceResult::DONE, report.error);
+        BOOST_CHECK_EQUAL(pass.balance.m_mine_trusted, reference_balance.m_mine_trusted);
+        BOOST_CHECK_EQUAL(pass.balance.m_mine_immature, reference_balance.m_mine_immature);
+        BOOST_CHECK(pass.summary.mine.nominal == reference_summary.mine.nominal);
+        BOOST_CHECK_GE(pass.stats.memo_hits, warmup.fetched - 16);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

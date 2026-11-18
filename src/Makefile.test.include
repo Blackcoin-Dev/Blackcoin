@@ -99,6 +99,7 @@ BITCOIN_TESTS =\
   test/crypto_tests.cpp \
   test/cuckoocache_tests.cpp \
   test/dbwrapper_tests.cpp \
+  test/io_counters_tests.cpp \
   test/denialofservice_tests.cpp \
   test/demurrage_tests.cpp \
   test/descriptor_tests.cpp \
@@ -198,6 +199,8 @@ BITCOIN_TESTS += \
   wallet/test/staking_candidate_tests.cpp \
   wallet/test/block_connect_activity_tests.cpp \
   wallet/test/display_balance_tests.cpp \
+  wallet/test/io_gate_tests.cpp \
+  wallet/test/available_coins_memo_tests.cpp \
   wallet/test/wallet_tests.cpp \
   wallet/test/pow_miner_schedule_tests.cpp \
   wallet/test/reorg_scale_tests.cpp \

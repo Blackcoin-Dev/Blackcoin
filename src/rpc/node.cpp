@@ -30,6 +30,8 @@
 #include <util/time.h>
 
 #include <stdint.h>
+#include <set>
+#include <string>
 #ifdef HAVE_MALLOC_INFO
 #include <malloc.h>
 #endif
@@ -412,6 +414,7 @@ static RPCHelpMan getiocounters()
         "Read-only: takes no wallet or chain lock. Counters only grow; a test compares two readings.\n",
         {
             {"recorder_start", RPCArg::Type::NUM, RPCArg::Default{0}, "Report the order of the coin keys recorded at positions from this one (needs -testrecordreadkeys)."},
+            {"include_coin_txids", RPCArg::Type::BOOL, RPCArg::Default{false}, "Also list the transaction ids of the coin keys recorded from recorder_start on."},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
@@ -425,6 +428,8 @@ static RPCHelpMan getiocounters()
                 {RPCResult::Type::NUM, "recorded_keys", "database keys recorded so far"},
                 {RPCResult::Type::NUM, "recorded_coin_keys", "coin keys recorded from recorder_start on"},
                 {RPCResult::Type::NUM, "recorded_coin_key_inversions", "adjacent recorded coin keys from recorder_start on that are out of order"},
+                {RPCResult::Type::ARR, "recorded_coin_txids", /*optional=*/true, "distinct transaction ids of the recorded coin keys (only with include_coin_txids)",
+                    {{RPCResult::Type::STR_HEX, "", "transaction id"}}},
             }},
         RPCExamples{HelpExampleCli("getiocounters", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -443,6 +448,17 @@ static RPCHelpMan getiocounters()
     result.pushKV("recorded_keys", static_cast<uint64_t>(iocounters::RecordedKeyCount()));
     result.pushKV("recorded_coin_keys", static_cast<uint64_t>(order.keys));
     result.pushKV("recorded_coin_key_inversions", static_cast<uint64_t>(order.inversions));
+    if (!request.params[1].isNull() && request.params[1].get_bool()) {
+        std::set<uint256> txids;
+        for (const std::string& key : iocounters::RecordedKeys(static_cast<size_t>(start))) {
+            // DB_COIN ('C'), then the 32 txid bytes, then the output index.
+            if (key.size() < 33 || key[0] != 'C') continue;
+            txids.insert(uint256{Span<const unsigned char>{reinterpret_cast<const unsigned char*>(key.data()) + 1, 32}});
+        }
+        UniValue list{UniValue::VARR};
+        for (const uint256& txid : txids) list.push_back(txid.GetHex());
+        result.pushKV("recorded_coin_txids", std::move(list));
+    }
     return result;
 },
     };

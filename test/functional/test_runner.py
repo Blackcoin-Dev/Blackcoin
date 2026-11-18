@@ -348,6 +348,7 @@ BASE_SCRIPTS = [
     'feature_versionbits_warning.py',
     'rpc_preciousblock.py',
     'p2p_leak_tx.py',
+    'p2p_goldrush_claim_fast_relay.py',
     'p2p_leak_tx.py --v2transport',
     'p2p_eviction.py',
     'p2p_net_deadlock.py',

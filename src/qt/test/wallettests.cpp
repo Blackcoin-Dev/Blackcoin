@@ -4479,6 +4479,47 @@ void TestDeferredWalletHistory(interfaces::Node& node, const std::shared_ptr<CWa
     }));
 
     {
+        // A recent transaction clicked while the History table applies a new row without a scan. The projection is
+        // not ready from the row's arrival until its batch (10 ms), so the view keeps the transaction to focus, and
+        // the batch ends without projectionReady: the view must pick the transaction up when the batch is applied.
+        // The same holds for the table's enabled state when it is refreshed in that window, as it is when the
+        // history finishes loading there (the failure of this test under a thread sanitizer build).
+        auto* projection = qobject_cast<TransactionPresentationProxy*>(history_view->model());
+        auto* status = view.findChild<QLabel*>(QStringLiteral("transactionHistoryState"));
+        QVERIFY(projection && status);
+        QTRY_VERIFY_WITH_TIMEOUT(projection->isReady() && history_view->isEnabled(), 5000);
+        const QString late_hash = QString::fromStdString(late->GetHash().ToString());
+        QVERIFY(history_view->currentIndex().data(TransactionTableModel::TxHashRole).toString() != late_hash);
+        CMutableTransaction incoming;
+        incoming.vin.emplace_back(COutPoint{uint256{19}, 0});
+        incoming.vout.emplace_back(COIN, GetScriptForDestination(*dest));
+        bool clicked{false}, ready_at_click{true}, enabled_at_click{true}, selected_at_click{true};
+        const auto batches_before = projection->stats().incremental_batches;
+        const auto rebuilds_before = projection->stats().rebuilds;
+        // Connected after the projection's own handler, so the new row is already waiting for its batch.
+        const auto click = QObject::connect(table, &TransactionTableModel::rowsInserted, &view, [&] {
+            if (clicked) return;
+            clicked = true;
+            ready_at_click = projection->isReady();
+            view.focusTransaction(FindTx(*table, late->GetHash()));
+            // What the end of the history load does to the view when it falls in this window.
+            Q_EMIT table->historyLoaded();
+            enabled_at_click = history_view->isEnabled();
+            selected_at_click = history_view->currentIndex().data(TransactionTableModel::TxHashRole).toString() == late_hash;
+        });
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(incoming)), wallet::TxStateInactive{}));
+        QTRY_VERIFY_WITH_TIMEOUT(clicked, 10000);
+        QObject::disconnect(click);
+        QVERIFY(!ready_at_click);
+        QVERIFY(!enabled_at_click);
+        QVERIFY(!selected_at_click);
+        QTRY_COMPARE_WITH_TIMEOUT(history_view->currentIndex().data(TransactionTableModel::TxHashRole).toString(), late_hash, 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(projection->isReady() && history_view->isEnabled() && status->isHidden(), 10000);
+        // The row was applied as a batch, not by the complete scan that ends in projectionReady.
+        QCOMPARE(projection->stats().rebuilds, rebuilds_before);
+        QVERIFY(projection->stats().incremental_batches > batches_before);
+    }
+    {
         WalletModel identity_model(interfaces::MakeWallet(*node.walletLoader().context(), wallet), client, style.get(), nullptr, /*defer_history=*/true);
         auto* identity_table = identity_model.getTransactionTableModel();
         std::deque<TransactionRecord> paired(2);

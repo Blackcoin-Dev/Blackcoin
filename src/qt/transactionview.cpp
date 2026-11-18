@@ -261,7 +261,7 @@ void TransactionView::setModel(WalletModel *_model)
         connect(transactionProxyModel, &TransactionPresentationProxy::projectionStarted, this, [this] {
             updateHistoryState();
         });
-        connect(transactionProxyModel, &TransactionPresentationProxy::projectionReady, this, [this] {
+        const auto projection_ready = [this] {
             updateHistoryState();
             const auto pending = std::exchange(m_pending_focus, std::monostate{});
             if (const auto* index = std::get_if<QPersistentModelIndex>(&pending); index && index->isValid()) {
@@ -269,7 +269,12 @@ void TransactionView::setModel(WalletModel *_model)
             } else if (const auto* txid = std::get_if<uint256>(&pending)) {
                 focusTransaction(*txid);
             }
-        });
+        };
+        connect(transactionProxyModel, &TransactionPresentationProxy::projectionReady, this, projection_ready);
+        // The projection is also not ready between a row change and the batch that applies it without a scan, and
+        // that batch ends without projectionReady. A transaction to focus, or the disabled table of a history that
+        // finished loading in that window, would otherwise wait for the next complete scan.
+        connect(transactionProxyModel, &TransactionPresentationProxy::incrementalApplied, this, projection_ready);
         transactionProxyModel->setSourceModel(history);
         if (m_visibility->active()) ensureHistorySource();
         updateHistoryState();

@@ -205,6 +205,9 @@ Q_SIGNALS:
     void structureAboutToChange();
     void projectionReady();
     void projectionStarted();
+    /** A batch of row changes was applied without a scan. isReady() is false from the change until this batch,
+     *  with neither of the two signals above: whoever deferred work on isReady() resumes here. */
+    void incrementalApplied();
     /** Observer-only invalidation. Internal RETIRE continuation keeps this epoch. */
     void diagnosticInvalidated(DiagnosticChange reason, bool ready = false);
     /** Work count is useful to deterministic scheduling tests, not a timing claim. */

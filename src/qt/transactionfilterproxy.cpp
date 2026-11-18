@@ -987,8 +987,13 @@ void TransactionPresentationProxy::flushInserts()
         else forwardDataChanged(updated, m_pending_first_column, m_pending_last_column, m_pending_roles);
     }
     if (done && !identities.empty()) done = incrementalReady() && flushNewRows(identities);
-    if (done) { ++m_stats.incremental_batches; m_stats.incremental_ns += applying.nsecsElapsed(); }
-    else continueRebuild();
+    if (done) {
+        ++m_stats.incremental_batches;
+        m_stats.incremental_ns += applying.nsecsElapsed();
+        if (isReady()) Q_EMIT incrementalApplied();
+    } else {
+        continueRebuild();
+    }
 }
 
 bool TransactionPresentationProxy::flushNewRows(const std::vector<TransactionRowIdentity>& identities)

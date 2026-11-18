@@ -154,6 +154,7 @@ BITCOIN_CORE_H = \
   eutxo/transition.h \
   core_io.h \
   core_memusage.h \
+  crypto/argon2_pow.h \
   crypto/argon2_selftest.h \
   crypto/mldsa.h \
   hash.h \
@@ -623,6 +624,7 @@ crypto_libbitcoin_crypto_base_la_SOURCES = \
   crypto/argon2/blake2/blake2b.c \
   crypto/argon2/blake2/blamka-round-opt.h \
   crypto/argon2/blake2/blamka-round-ref.h \
+  crypto/argon2_pow.cpp \
   crypto/argon2_selftest.cpp \
   crypto/aes.cpp \
   crypto/aes.h \

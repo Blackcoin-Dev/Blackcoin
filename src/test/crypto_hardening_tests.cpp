@@ -6,6 +6,8 @@
 #include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
+#include <crypto/argon2/argon2.h>
+#include <crypto/argon2_pow.h>
 #include <crypto/argon2_selftest.h>
 #include <crypto/mldsa.h>
 #include <crypto/mldsa_kat.h>
@@ -17,6 +19,7 @@
 #include <shadow.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
+#include <tinyformat.h>
 #include <uint256.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
@@ -390,6 +393,119 @@ BOOST_AUTO_TEST_SUITE(crypto_hardening_tests)
 BOOST_AUTO_TEST_CASE(argon2id_rfc9106_startup_vector)
 {
     BOOST_CHECK(Argon2idSelfTest());
+}
+
+BOOST_AUTO_TEST_CASE(argon2_pow_hash_matches_general_entry_point)
+{
+    // The proof-of-work entry point reuses a per-thread block and skips the
+    // wipe. Its output must equal the general entry point for every input,
+    // including when the block still holds another hash's working state.
+    struct Params {
+        uint32_t t_cost;
+        uint32_t m_cost;
+        uint32_t lanes;
+        size_t input_len;
+    };
+    const std::array<Params, 7> cases{{
+        {1, 1024, 1, 80},
+        {1, 1024, 1, 116},
+        {1, 8, 1, 80},
+        {1, 1024, 1, 80},
+        {2, 64, 1, 33},
+        {1, 2048, 2, 116},
+        {1, 1024, 1, 1},
+    }};
+    const auto check_all = [&cases](unsigned char seed) {
+        bool all_equal{true};
+        for (size_t round = 0; round < 3; ++round) {
+            for (const Params& params : cases) {
+                std::array<unsigned char, 116> input{};
+                for (size_t i = 0; i < input.size(); ++i) {
+                    input[i] = static_cast<unsigned char>((i * 7 + seed + round * 31) & 0xff);
+                }
+                std::array<unsigned char, 16> salt{};
+                salt.fill(static_cast<unsigned char>((seed ^ (round + 1)) & 0xff));
+                std::array<unsigned char, 32> expected{};
+                std::array<unsigned char, 32> actual{};
+                const int expected_rc = argon2id_hash_raw(
+                    params.t_cost, params.m_cost, params.lanes, input.data(),
+                    params.input_len, salt.data(), salt.size(),
+                    expected.data(), expected.size());
+                const int actual_rc = Argon2idPowHashRaw(
+                    params.t_cost, params.m_cost, params.lanes, input.data(),
+                    params.input_len, salt.data(), salt.size(), actual.data(),
+                    actual.size());
+                all_equal = all_equal && expected_rc == ARGON2_OK &&
+                            actual_rc == ARGON2_OK && expected == actual;
+            }
+        }
+        return all_equal;
+    };
+    BOOST_CHECK(check_all(0x11));
+    std::array<bool, 3> thread_results{};
+    {
+        std::vector<std::thread> threads;
+        for (size_t i = 0; i < thread_results.size(); ++i) {
+            threads.emplace_back([&thread_results, &check_all, i] {
+                thread_results[i] = check_all(static_cast<unsigned char>(0x40 + i));
+            });
+        }
+        for (std::thread& thread : threads) thread.join();
+    }
+    for (const bool result : thread_results) BOOST_CHECK(result);
+
+    // Bad lengths are refused exactly as the general entry point refuses them.
+    std::array<unsigned char, 32> out{};
+    const std::array<unsigned char, 16> salt{};
+    const std::array<unsigned char, 8> input{};
+    BOOST_CHECK_EQUAL(
+        Argon2idPowHashRaw(1, 1024, 1, input.data(), input.size(),
+                           salt.data(), salt.size(), out.data(), 3),
+        argon2id_hash_raw(1, 1024, 1, input.data(), input.size(), salt.data(),
+                          salt.size(), out.data(), 3));
+    BOOST_CHECK_EQUAL(
+        Argon2idPowHashRaw(1, 1024, 1, input.data(), input.size(),
+                           salt.data(), 4, out.data(), out.size()),
+        argon2id_hash_raw(1, 1024, 1, input.data(), input.size(), salt.data(),
+                          4, out.data(), out.size()));
+}
+
+BOOST_AUTO_TEST_CASE(argon2_pow_hash_rate_report)
+{
+    // Reported, never asserted: one thread, the Gold Rush proof parameters.
+    static constexpr int HASHES{300};
+    std::array<unsigned char, 116> input{};
+    const std::array<unsigned char, 16> salt{};
+    std::array<unsigned char, 32> general_out{};
+    std::array<unsigned char, 32> pow_out{};
+    const auto general_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < HASHES; ++i) {
+        input[0] = static_cast<unsigned char>(i & 0xff);
+        BOOST_REQUIRE_EQUAL(
+            argon2id_hash_raw(1, 1024, 1, input.data(), input.size(),
+                              salt.data(), salt.size(), general_out.data(),
+                              general_out.size()),
+            ARGON2_OK);
+    }
+    const auto pow_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < HASHES; ++i) {
+        input[0] = static_cast<unsigned char>(i & 0xff);
+        BOOST_REQUIRE_EQUAL(
+            Argon2idPowHashRaw(1, 1024, 1, input.data(), input.size(),
+                               salt.data(), salt.size(), pow_out.data(),
+                               pow_out.size()),
+            ARGON2_OK);
+    }
+    const auto pow_end = std::chrono::steady_clock::now();
+    BOOST_CHECK(general_out == pow_out);
+    const double general_seconds =
+        std::chrono::duration<double>(pow_start - general_start).count();
+    const double pow_seconds =
+        std::chrono::duration<double>(pow_end - pow_start).count();
+    BOOST_TEST_MESSAGE(strprintf(
+        "argon2id t=1 m=1024 KiB lanes=1, one thread: general %.1f hashes/s, proof-of-work entry %.1f hashes/s",
+        general_seconds > 0 ? HASHES / general_seconds : 0.0,
+        pow_seconds > 0 ? HASHES / pow_seconds : 0.0));
 }
 
 BOOST_AUTO_TEST_CASE(shadow_argon2_faults_are_typed_retryable_and_canonical)

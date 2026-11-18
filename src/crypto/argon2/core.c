@@ -115,7 +115,9 @@ int allocate_memory(const argon2_context *context, uint8_t **memory,
 void free_memory(const argon2_context *context, uint8_t *memory,
                  size_t num, size_t size) {
     size_t memory_size = num*size;
-    clear_internal_memory(memory, memory_size);
+    if (!(context->flags & ARGON2_FLAG_PUBLIC_DATA_NO_WIPE)) {
+        clear_internal_memory(memory, memory_size);
+    }
     if (context->free_cbk) {
         (context->free_cbk)(memory, memory_size);
     } else {

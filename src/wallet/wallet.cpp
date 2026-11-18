@@ -12227,6 +12227,14 @@ WalletPowMiningGrindResult GrindShadowPowWorkInterruptibly(
             batch.status = WalletPowMiningGrindStatus::EXHAUSTED;
             return batch;
         }
+        if (tip_sequence &&
+            wallet.m_pow_proof_found_tip_seq.load(
+                std::memory_order_acquire) == *tip_sequence + 1) {
+            // A sibling worker found the proof for this tip and is submitting
+            // it. Stop here; the loop then waits on the single-flight marker.
+            batch.status = WalletPowMiningGrindStatus::EXHAUSTED;
+            return batch;
+        }
 
         std::vector<unsigned char> candidate;
         uint64_t candidate_tries{0};
@@ -16093,6 +16101,12 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                             m_pow_wallet_wide_tip_wait = false;
                         }
                         claim_inflight = m_pow_claim_inflight;
+                        // No proof is being submitted: a mirror left by a
+                        // submission that failed must not stop this search.
+                        if (!claim_inflight) {
+                            m_pow_proof_found_tip_seq.store(
+                                0, std::memory_order_release);
+                        }
                     }
                     if (claim_inflight) {
                         PublishPowMiningWorkerState(
@@ -16179,6 +16193,9 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 if (m_pow_claim_inflight) continue;
                 m_pow_wallet_wide_tip_wait = false;
                 m_pow_claim_inflight = true;
+                m_pow_proof_found_tip_seq.store(
+                    iteration_budget.TipSequence() + 1,
+                    std::memory_order_release);
             }
             MaybeDelayShadowPowClaimSubmissionForTest(selected_input.outpoint);
             // A stop request that arrives after the proof is found but before

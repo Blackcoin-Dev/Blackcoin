@@ -32,7 +32,7 @@ MAX_RESTART_RESCAN_BLOCKS = 20
 
 class WalletIdleBlockCommitsTest(BitcoinTestFramework):
     def add_options(self, parser):
-        self.add_wallet_options(parser)
+        self.add_wallet_options(parser, legacy=False)
 
     def set_test_params(self):
         self.num_nodes = 2
@@ -115,13 +115,10 @@ class WalletIdleBlockCommitsTest(BitcoinTestFramework):
         idle_commits, idle_grouped = self._grouped_commits_at_unload(node, IDLE_WALLET)
         self.log.info(f"idle wallet: {idle_grouped} grouped commits, {idle_commits} commits of any kind")
         assert idle_grouped <= MAX_IDLE_COMMITS, f"idle wallet made {idle_grouped} grouped commits for {IDLE_BLOCKS} blocks"
-        if self.options.descriptors:
-            # Control: a wallet that every block pays still commits once per block.
-            _, paid_grouped = self._grouped_commits_at_unload(node, self.default_wallet_name)
-            self.log.info(f"paid wallet: {paid_grouped} grouped commits")
-            assert paid_grouped >= IDLE_BLOCKS, f"paid wallet made only {paid_grouped} grouped commits for {IDLE_BLOCKS} blocks"
-        else:
-            default.unloadwallet()
+        # Control: a wallet that every block pays still commits once per block.
+        _, paid_grouped = self._grouped_commits_at_unload(node, self.default_wallet_name)
+        self.log.info(f"paid wallet: {paid_grouped} grouped commits")
+        assert paid_grouped >= IDLE_BLOCKS, f"paid wallet made only {paid_grouped} grouped commits for {IDLE_BLOCKS} blocks"
 
         self.log.info("An unload wrote the deferred best block: loading again rescans nothing")
         with node.assert_debug_log([], unexpected_msgs=["Rescanning last"]):

@@ -524,6 +524,12 @@ struct StakeSlotCacheState;
 void UnloadWallet(std::shared_ptr<CWallet>&& wallet);
 
 bool AddWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+/** Put a loaded wallet on, and take it off, the display balance worker, which
+ * keeps the balance snapshot the polling RPCs return. Called by AddWallet and
+ * RemoveWallet; both are idempotent. Defined in wallet/display_balance.cpp so
+ * that the wallet does not depend on the worker. */
+void AttachPolledBalance(CWallet& wallet);
+void DetachPolledBalance(CWallet& wallet);
 bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet, std::optional<bool> load_on_start, std::vector<bilingual_str>& warnings);
 bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet, std::optional<bool> load_on_start);
 std::vector<std::shared_ptr<CWallet>> GetWallets(WalletContext& context);

@@ -755,6 +755,9 @@ void WalletDisplayBalance::RunSendFamilyOnly()
     if (copy->send_family_balance) Publish(std::move(copy));
 }
 
+void AttachPolledBalance(CWallet& wallet) { DisplayBalanceWorker::Global().AcquirePolled(wallet); }
+void DetachPolledBalance(CWallet& wallet) { DisplayBalanceWorker::Global().ReleasePolled(wallet); }
+
 std::optional<BalanceVariant> ComputeBalanceVariant(const CWallet& wallet, int min_depth, bool avoid_reuse,
                                                     std::chrono::milliseconds timeout, std::string& error)
 {
@@ -862,6 +865,9 @@ PolledBalance GetPolledBalance(const CWallet& wallet, const PolledBalanceOptions
                 break;
             }
             if (!options.exact && !outcome.ok && state->Snapshot()) break;
+            // An error is not asked for again and again: the worker retries
+            // it at its own pace and the caller is told that it failed.
+            if (outcome.exception || state->Failed()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds{10});
         }
         if (!result.exact) {

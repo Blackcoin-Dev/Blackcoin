@@ -286,7 +286,8 @@ BOOST_FIXTURE_TEST_CASE(connected_block_persists_best_block_in_its_commit, TestC
     const CBlock block = CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
     const int height = WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return Assert(m_node.chainman)->ActiveChain().Height());
     const uint256 prev_hash = block.hashPrevBlock;
-    interfaces::BlockInfo info{block.GetHash()};
+    const uint256 block_hash = block.GetHash();
+    interfaces::BlockInfo info{block_hash};
     info.prev_hash = &prev_hash;
     info.height = height;
     info.data = &block;

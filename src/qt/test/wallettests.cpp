@@ -5030,9 +5030,10 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     // Blackcoin
     uint256 txid1 = SendCoins(*wallet.get(), sendCoinsDialog, PKHash(), 5 * COIN);
     uint256 txid2 = SendCoins(*wallet.get(), sendCoinsDialog, PKHash(), 10 * COIN);
-    // Transaction table model updates on a QueuedConnection, so process events to ensure it's updated.
-    qApp->processEvents();
-    QCOMPARE(transactionTableModel->rowCount({}), 107);
+    // The table applies a notification on a later turn of the event loop, and reads the transaction under a
+    // try-lock: while another thread (a wallet worker job, for one) holds the wallet lock, the notification stays at
+    // the head of the queue and is read again 25 ms later. One pass over the event loop is therefore not enough.
+    QTRY_COMPARE_WITH_TIMEOUT(transactionTableModel->rowCount({}), 107, 10000);
     QVERIFY(FindTx(*transactionTableModel, txid1).isValid());
     QVERIFY(FindTx(*transactionTableModel, txid2).isValid());
 
@@ -5451,9 +5452,10 @@ void TestLazyWalletHistory(interfaces::Node& node, const std::shared_ptr<CWallet
     QVERIFY(eager_table->isHistoryLoaded());
     QCOMPARE(table->rowCount({}), eager_table->rowCount({}));
     QVERIFY(table->rowCount({}) > MIXED);
+    // A label is read under a try-lock: while another thread holds the wallet lock a row shows its bare address, and
+    // the label follows (with dataChanged) once the lock is free. Compare the tables once both have settled.
+    QTRY_VERIFY_WITH_TIMEOUT(ReadRows(*table) == ReadRows(*eager_table), 10000);
     const auto lazy_rows = ReadRows(*table);
-    const auto eager_rows = ReadRows(*eager_table);
-    QVERIFY(lazy_rows == eager_rows);
     std::set<int> types;
     for (const auto& row : lazy_rows) types.insert(row.type);
     QString type_list;

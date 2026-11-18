@@ -222,7 +222,7 @@ BOOST_AUTO_TEST_CASE(random_gets_on_a_multi_level_db_do_not_compact)
     const std::string value(100, 'v');
     for (uint32_t base = 0; base < KEYS; base += 1000) {
         CDBBatch batch{db};
-        for (uint32_t n = base; n < base + 1000; ++n) batch.Write(std::make_pair(uint8_t{'k'}, uint64_t{n} * 2654435761ULL), value);
+        for (uint32_t n = base; n < base + 1000; ++n) batch.Write(std::make_pair(uint8_t{'k'}, uint64_t{n} * uint64_t{2654435761}), value);
         BOOST_REQUIRE(db.WriteBatch(batch));
     }
     const std::set<std::string> built = SettledTableFiles(path, /*quiet=*/10, /*max_polls=*/300);
@@ -232,7 +232,7 @@ BOOST_AUTO_TEST_CASE(random_gets_on_a_multi_level_db_do_not_compact)
     std::string out;
     for (int n = 0; n < 200'000; ++n) {
         // Half present, half absent: both walk several files.
-        const uint64_t key = uint64_t{rng.randrange(KEYS)} * 2654435761ULL + static_cast<uint64_t>(n % 2);
+        const uint64_t key = uint64_t{rng.randrange(KEYS)} * uint64_t{2654435761} + static_cast<uint64_t>(n % 2);
         (void)db.Read(std::make_pair(uint8_t{'k'}, key), out);
     }
     // Seek compaction runs in the background after the reads; give it ample time to show.

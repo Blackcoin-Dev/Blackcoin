@@ -547,8 +547,11 @@ BOOST_AUTO_TEST_CASE(tip_reorg_work_follows_the_block_not_the_history)
     BOOST_CHECK_EQUAL(large.disconnect_commits, 1);
     BOOST_CHECK_LE(large.disconnect_rows, 12);
     BOOST_CHECK_LE(large.connect_rows, 12);
-    // One commit per wallet transaction that enters the mempool, none otherwise.
-    BOOST_CHECK_EQUAL(large.readd_commits, 1);
+    // One commit for a wallet transaction that is new when it enters the
+    // mempool. One the wallet already holds is stored the same way in and out
+    // of the mempool, so its return writes nothing; nor does a foreign one.
+    BOOST_CHECK_EQUAL(large.readd_commits, 0);
+    BOOST_CHECK_EQUAL(large.readd_rows, 0);
     BOOST_CHECK_EQUAL(large.new_commits, 1);
     BOOST_CHECK_EQUAL(large.readd_rows, small.readd_rows);
     BOOST_CHECK_EQUAL(large.new_rows, small.new_rows);

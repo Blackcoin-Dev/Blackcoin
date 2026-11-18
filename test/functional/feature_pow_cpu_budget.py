@@ -5,7 +5,7 @@
 """Bounded process-CPU observations for natural wallet PoW jobs.
 
 This diagnostic deliberately has no precise OS CPU pass threshold. A natural
-proof can end available work, and 128-try batches can exceed a short sample's
+proof can end available work, and 512-try batches can exceed a short sample's
 duty budget before their compensating sleep completes. Every matrix cell is
 therefore reported as an observation, never as a duty-cycle validation pass.
 Only disposable framework regtest wallets and public RPCs are used.

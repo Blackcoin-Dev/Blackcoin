@@ -11920,7 +11920,10 @@ StakingTelemetrySnapshot CWallet::GetStakingTelemetrySnapshot() const
 }
 
 namespace {
-static constexpr uint64_t POW_MINER_BATCH_TRIES = 128;
+// Hashes per loop iteration. The search checks stop, authority, the tip and a
+// sibling's found proof before every hash, so the batch size only sets how
+// often the gate, input selection and work preparation are repeated.
+static constexpr uint64_t POW_MINER_BATCH_TRIES = 512;
 // Dedicated miner threads publish their own bounded telemetry slot. Other
 // callers (including pure-batch tests) retain wallet-scoped publication.
 thread_local int g_pow_miner_worker_id{-1};

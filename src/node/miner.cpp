@@ -298,12 +298,17 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         pblock->nTime = static_cast<uint32_t>(*pos_time);
 #ifdef ENABLE_WALLET
         // A background retry can reach the same slot many times before the
-        // clock or tip advances. Leave the late check authoritative for a
-        // search, including when this preliminary try-lock misses.
+        // clock or tip advances. The late check stays authoritative for a
+        // search that proceeds.
         if (stake_search == StakeSearch::BACKGROUND && !forced_kernel) {
             TRY_LOCK(pwallet->cs_wallet, wallet_lock);
-            if (wallet_lock && !CanSearchStakeSlot(pblock->nTime, pwallet->m_last_coin_stake_search_time,
-                                                   pindexPrev->GetBlockHash(), pwallet->m_last_coin_stake_search_tip)) {
+            // A busy wallet gets the answer the late try-lock below would
+            // give (no template, cancel), without first assembling a block
+            // template that is then thrown away. Nothing is consumed: the
+            // slot is recorded only by a search that took the lock, so the
+            // next retry sees the same slot.
+            if (!wallet_lock || !CanSearchStakeSlot(pblock->nTime, pwallet->m_last_coin_stake_search_time,
+                                                    pindexPrev->GetBlockHash(), pwallet->m_last_coin_stake_search_tip)) {
                 if (pfPoSCancel) *pfPoSCancel = true;
                 return nullptr;
             }

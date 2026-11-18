@@ -1332,8 +1332,9 @@ BOOST_AUTO_TEST_CASE(background_pos_retries_skip_repeated_package_selection)
     BOOST_CHECK(run(background, Search::BACKGROUND).empty());
     BOOST_CHECK_EQUAL(background.GetStakingTelemetrySnapshot().sequence, reorg_telemetry.sequence);
 
-    // If the preliminary wallet lock misses, package assembly still runs.
-    // The authoritative late try-lock also misses in this fixture.
+    // If the preliminary wallet lock misses, the search ends there: no
+    // package assembly, the same cancel the late try-lock would give, and
+    // nothing consumed, so the next retry at this slot searches normally.
     std::promise<void> wallet_locked;
     std::promise<void> release;
     const auto release_signal = release.get_future();
@@ -1348,8 +1349,16 @@ BOOST_AUTO_TEST_CASE(background_pos_retries_skip_repeated_package_selection)
     release.set_value();
     lock_holder.join();
     BOOST_REQUIRE(ready);
-    BOOST_CHECK(fallback_ids == reorg_ids);
+    BOOST_CHECK(fallback_ids.empty());
     BOOST_CHECK_EQUAL(background.GetStakingTelemetrySnapshot().sequence, reorg_telemetry.sequence);
+    // The slot was not consumed: with the lock free again the retry assembles and searches.
+    {
+        LOCK(background.cs_wallet);
+        BOOST_CHECK_EQUAL(background.m_last_coin_stake_search_time, slot + 16);
+        background.m_last_coin_stake_search_time = 0;
+        background.m_last_coin_stake_search_tip = {};
+    }
+    BOOST_CHECK(run(background, Search::BACKGROUND) == reorg_ids);
 }
 #endif // ENABLE_WALLET
 

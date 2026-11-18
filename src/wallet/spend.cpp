@@ -1619,6 +1619,48 @@ util::Result<PreSelectedInputs> FetchSelectedInputs(const CWallet& wallet, const
     return result;
 }
 
+namespace {
+//! What AvailableCoins learns about an output from its script alone.
+struct ScriptFacts {
+    isminetype mine{ISMINE_NO};
+    int input_bytes{-1};
+    TxoutType type{TxoutType::NONSTANDARD};
+    bool is_from_p2sh{false};
+    //! A solvable P2SH output whose redeem script the provider cannot return.
+    bool missing_redeem_script{false};
+};
+
+ScriptFacts ComputeScriptFacts(const CWallet& wallet, const CTxOut& output, bool can_grind_r, const CCoinControl* coinControl)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    ScriptFacts facts;
+    facts.mine = wallet.IsMine(output);
+    if (facts.mine == ISMINE_NO) return facts;
+
+    std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
+    facts.input_bytes = CalculateMaximumSignedInputSize(output, COutPoint(), provider.get(), can_grind_r, coinControl);
+
+    // Obtain script type
+    std::vector<std::vector<uint8_t>> script_solutions;
+    facts.type = Solver(output.scriptPubKey, script_solutions);
+
+    // If the output is P2SH and solvable, we want to know if it is
+    // a P2SH (legacy) or one of P2SH-P2WPKH, P2SH-P2WSH (P2SH-Segwit). We can determine
+    // this from the redeemScript. If the output is not solvable, it will be classified
+    // as a P2SH (legacy), since we have no way of knowing otherwise without the redeemScript
+    if (facts.type == TxoutType::SCRIPTHASH && facts.input_bytes > -1) {
+        CScript script;
+        if (!provider->GetCScript(CScriptID(uint160(script_solutions[0])), script)) {
+            facts.missing_redeem_script = true;
+            return facts;
+        }
+        facts.type = Solver(script, script_solutions);
+        facts.is_from_p2sh = true;
+    }
+    return facts;
+}
+} // namespace
+
 CoinsResult AvailableCoins(const CWallet& wallet,
                            const CCoinControl* coinControl,
                            std::optional<CFeeRate> feerate,
@@ -1645,6 +1687,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
     std::set<uint256> trusted_parents;
     size_t walked{0};
+    std::map<CScript, ScriptFacts> script_memo;
     for (const auto& entry : wallet.mapWallet)
     {
         if (params.interrupt && walked++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && params.interrupt()) {
@@ -1714,7 +1757,26 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             if (protected_rgb_seals.count(outpoint))
                 continue;
 
-            isminetype mine = wallet.IsMine(output);
+            // Everything below up to the script type depends only on the
+            // output script (and on coin control, which is fixed for this
+            // call), and a mining wallet pays to a handful of scripts. Look
+            // each script up once. Coin control that can change the answer for
+            // one output (a watch-only allowance, a weight or an external
+            // signer for this very outpoint) bypasses the memo.
+            const bool use_memo = !coinControl || !(coinControl->fAllowWatchOnly ||
+                                                    coinControl->HasInputWeight(outpoint) ||
+                                                    coinControl->IsExternalSelected(outpoint));
+            ScriptFacts local_facts;
+            const ScriptFacts* facts{nullptr};
+            if (use_memo) {
+                auto [memo_it, inserted] = script_memo.try_emplace(output.scriptPubKey);
+                if (inserted) memo_it->second = ComputeScriptFacts(wallet, output, can_grind_r, coinControl);
+                facts = &memo_it->second;
+            } else {
+                local_facts = ComputeScriptFacts(wallet, output, can_grind_r, coinControl);
+                facts = &local_facts;
+            }
+            const isminetype mine = facts->mine;
 
             if (mine == ISMINE_NO) {
                 continue;
@@ -1724,9 +1786,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
                 continue;
             }
 
-            std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
-
-            int input_bytes = CalculateMaximumSignedInputSize(output, COutPoint(), provider.get(), can_grind_r, coinControl);
+            const int input_bytes = facts->input_bytes;
             // Because CalculateMaximumSignedInputSize infers a solvable descriptor to get the satisfaction size,
             // it is safe to assume that this input is solvable if input_bytes is greater than -1.
             bool solvable = input_bytes > -1;
@@ -1735,21 +1795,9 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             // Filter by spendable outputs only
             if (!spendable && params.only_spendable) continue;
 
-            // Obtain script type
-            std::vector<std::vector<uint8_t>> script_solutions;
-            TxoutType type = Solver(output.scriptPubKey, script_solutions);
-
-            // If the output is P2SH and solvable, we want to know if it is
-            // a P2SH (legacy) or one of P2SH-P2WPKH, P2SH-P2WSH (P2SH-Segwit). We can determine
-            // this from the redeemScript. If the output is not solvable, it will be classified
-            // as a P2SH (legacy), since we have no way of knowing otherwise without the redeemScript
-            bool is_from_p2sh{false};
-            if (type == TxoutType::SCRIPTHASH && solvable) {
-                CScript script;
-                if (!provider->GetCScript(CScriptID(uint160(script_solutions[0])), script)) continue;
-                type = Solver(script, script_solutions);
-                is_from_p2sh = true;
-            }
+            if (facts->missing_redeem_script) continue;
+            const TxoutType type = facts->type;
+            const bool is_from_p2sh = facts->is_from_p2sh;
 
             COutput candidate(outpoint, output, nDepth, input_bytes, spendable, solvable, safeTx, wtx.GetTxTime(), tx_from_me, feerate);
             if (const auto demurrage = GetDemurrageEvaluationForOutput(wallet, outpoint, output.scriptPubKey, spend_height, spend_time);

@@ -1908,11 +1908,17 @@ void CWallet::chainStateFlushed(ChainstateRole role, const CBlockLocator& loc)
         return;
     }
     WalletBatch batch(GetDatabase());
-    batch.WriteBestBlock(loc);
+    // The best block is two rows and the payout checkpoint a third: one commit.
+    const bool grouped{batch.TxnBegin()};
+    // This also covers any best block that blockConnected deferred.
+    if (batch.WriteBestBlock(loc)) BestBlockPersisted();
     // Every synthetic payout up to the last processed block was authenticated
     // when it was recorded; remember that so the next start can skip it.
     if (m_synthetic_payout_checkpoint_trusted) {
         WriteSyntheticPayoutCheckpoint(batch, m_last_block_processed, m_last_block_processed_height);
+    }
+    if (grouped && !batch.TxnCommit()) {
+        WalletLogPrintf("Failed to persist the best block on a chainstate flush; the next flush will record it\n");
     }
 }
 
@@ -1970,11 +1976,19 @@ bool CWallet::HasWalletSpend(const CTransactionRef& tx) const
 
 void CWallet::Flush()
 {
+    {
+        LOCK(cs_wallet);
+        PersistDeferredBestBlock();
+    }
     GetDatabase().Flush();
 }
 
 void CWallet::Close()
 {
+    {
+        LOCK(cs_wallet);
+        PersistDeferredBestBlock();
+    }
     GetDatabase().Close();
 }
 
@@ -3400,7 +3414,7 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
 }
 
 void CWallet::PersistBlockProgress(WalletBatch& batch, const CBlockLocator& locator, bool atomic_with_block,
-                                   const uint256& block_hash, int block_height)
+                                   const uint256& block_hash, int block_height, bool block_wrote_records)
 {
     AssertLockHeld(cs_wallet);
     // Only inside the block's single commit scope: the best block then moves
@@ -3409,15 +3423,66 @@ void CWallet::PersistBlockProgress(WalletBatch& batch, const CBlockLocator& loca
     // Without a scope (a database that cannot group writes) the old rule holds
     // and the best block advances only on a chainstate flush.
     if (!atomic_with_block || m_attaching_chain || locator.IsNull()) return;
+    if (!block_wrote_records) {
+        // The block changed nothing in this wallet, so the best block would be
+        // the only write and would cost a synced commit by itself. Leave the
+        // stored best block where it is: after a crash the wallet scans the
+        // deferred blocks again and finds, again, nothing in them. The stored
+        // best block never names a block whose records are missing, because a
+        // block that writes a record still moves it in the same commit.
+        const bool within_blocks{m_best_block_deferred_blocks < MAX_DEFERRED_BEST_BLOCKS};
+        const bool within_time{NodeClock::now() - m_best_block_persisted_at < MAX_BEST_BLOCK_DEFERRAL};
+        if (within_blocks && within_time) {
+            ++m_best_block_deferred_blocks;
+            m_deferred_best_block = DeferredBestBlock{locator, block_hash, block_height};
+            return;
+        }
+    }
+    if (!WriteBlockProgress(batch, locator, block_hash, block_height)) {
+        // Still owed; the next block, flush or close writes it.
+        m_deferred_best_block = DeferredBestBlock{locator, block_hash, block_height};
+    }
+}
+
+bool CWallet::WriteBlockProgress(WalletBatch& batch, const CBlockLocator& locator,
+                                 const uint256& block_hash, int block_height)
+{
+    AssertLockHeld(cs_wallet);
     if (!batch.WriteBestBlock(locator)) {
         WalletLogPrintf("Failed to persist the best block %s (height %d); the next flush will record it\n",
                         block_hash.ToString(), block_height);
-        return;
+        return false;
     }
+    BestBlockPersisted();
     // The block's payouts were authenticated against the chainstate when they
     // were recorded above, so the payout checkpoint may move with the block.
     if (m_synthetic_payout_checkpoint_trusted) {
         WriteSyntheticPayoutCheckpoint(batch, block_hash, block_height);
+    }
+    return true;
+}
+
+void CWallet::BestBlockPersisted()
+{
+    AssertLockHeld(cs_wallet);
+    m_deferred_best_block.reset();
+    m_best_block_deferred_blocks = 0;
+    m_best_block_persisted_at = NodeClock::now();
+}
+
+void CWallet::PersistDeferredBestBlock()
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_deferred_best_block || m_attaching_chain) return;
+    // The deferred block is the last block this wallet processed: a later
+    // connected block replaces or writes it and a disconnect drops it.
+    const DeferredBestBlock deferred{*m_deferred_best_block};
+    WalletBatch batch(GetDatabase());
+    // The best block is two rows and the payout checkpoint a third: one commit.
+    const bool grouped{batch.TxnBegin()};
+    WriteBlockProgress(batch, deferred.locator, deferred.hash, deferred.height);
+    if (grouped && !batch.TxnCommit()) {
+        WalletLogPrintf("Failed to persist the deferred best block %s; the next flush will record a best block\n", deferred.hash.ToString());
     }
 }
 
@@ -3469,6 +3534,11 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     // the block's writes and resynchronizes from its persisted best block.
     // The scope also commits on unwinding, as one commit per write did.
     std::unique_ptr<DatabaseBulkScope> block_writes = GetDatabase().MakeBulkScope();
+    // Every successful record write or erase advances this counter, and no
+    // other thread can write while the scope is open, so it tells whether the
+    // block changed anything in this wallet's database.
+    const unsigned int updates_before_block{GetDatabase().nUpdateCounter.load()};
+    const auto block_wrote_records = [&] { return GetDatabase().nUpdateCounter.load() != updates_before_block; };
     const auto commit_block_writes = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
         if (block_writes && !block_writes->Commit()) {
             // Same stance as a failed record write in AddToWallet: memory may
@@ -3491,7 +3561,7 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     // No need to scan block if it was created before the wallet birthday.
     // Uses chain max time and twice the grace period to adjust time for block time variability.
     if (block.chain_time_max < m_birth_time.load() - (TIMESTAMP_WINDOW * 2)) {
-        PersistBlockProgress(batch, best_block_locator, block_writes != nullptr, block.hash, block.height);
+        PersistBlockProgress(batch, best_block_locator, block_writes != nullptr, block.hash, block.height, block_wrote_records());
         commit_block_writes();
         return;
     }
@@ -3570,7 +3640,7 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
             },
             "mark connected-block claim quarantine");
     }
-    PersistBlockProgress(batch, best_block_locator, block_writes != nullptr, block.hash, block.height);
+    PersistBlockProgress(batch, best_block_locator, block_writes != nullptr, block.hash, block.height, block_wrote_records());
     commit_block_writes();
     }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a block connects.
@@ -3592,6 +3662,10 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     // future with a stickier abandoned state or even removing abandontransaction call.
     m_last_block_processed_height = block.height - 1;
     m_last_block_processed = *Assert(block.prev_hash);
+    // A best block deferred by blockConnected names the last processed block.
+    // Once that block is disconnected it is not written at all; the stored
+    // best block stays at the older block it already names.
+    if (m_deferred_best_block && m_deferred_best_block->height >= block.height) m_deferred_best_block.reset();
     {
         // A disconnect is a tip change for the PoW miner too: work for the
         // disconnected block is dead. The parent's timestamp is not at hand.

@@ -1176,9 +1176,37 @@ private:
     /** Persist a checkpoint for block_hash/height if the wallet holds synthetic payouts and it changed. */
     void WriteSyntheticPayoutCheckpoint(WalletBatch& batch, const uint256& block_hash, int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Record block_hash as the wallet's best block (and move the payout checkpoint with it)
-     * inside the commit scope of the connected block; no-op unless atomic_with_block. */
+     * inside the commit scope of the connected block; no-op unless atomic_with_block.
+     * A block that wrote no other wallet record does not get a commit of its own: its
+     * best block is remembered in m_deferred_best_block and written with the next block
+     * that writes a record, after MAX_DEFERRED_BEST_BLOCKS blocks or MAX_BEST_BLOCK_DEFERRAL
+     * (whichever comes first), on a chainstate flush, and when the wallet is flushed or closed. */
     void PersistBlockProgress(WalletBatch& batch, const CBlockLocator& locator, bool atomic_with_block,
-                              const uint256& block_hash, int block_height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+                              const uint256& block_hash, int block_height, bool block_wrote_records) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Write the best block and the payout checkpoint for it; clears the deferral on success. */
+    bool WriteBlockProgress(WalletBatch& batch, const CBlockLocator& locator,
+                            const uint256& block_hash, int block_height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Forget any deferred best block: the stored best block is current as of now. */
+    void BestBlockPersisted() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    struct DeferredBestBlock {
+        CBlockLocator locator;
+        uint256 hash;
+        int height{-1};
+    };
+    /** The last connected block, when its best-block record is not on disk yet. */
+    std::optional<DeferredBestBlock> m_deferred_best_block GUARDED_BY(cs_wallet);
+    /** Blocks connected since the stored best block was last written. */
+    int m_best_block_deferred_blocks GUARDED_BY(cs_wallet){0};
+    /** When the stored best block was last written (or the wallet was created). */
+    NodeClock::time_point m_best_block_persisted_at GUARDED_BY(cs_wallet){NodeClock::now()};
+public:
+    /** Most blocks a crash can make the wallet scan again because their best block was deferred. */
+    static constexpr int MAX_DEFERRED_BEST_BLOCKS{20};
+    /** Longest time the stored best block may trail a connected block while blocks keep arriving. */
+    static constexpr std::chrono::minutes MAX_BEST_BLOCK_DEFERRAL{10};
+    /** Write the best block that blockConnected deferred, if there is one. */
+    void PersistDeferredBestBlock() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+private:
     bool ReconcileWalletShadowPayoutsForBlock(const uint256& block_hash, int block_height,
                                               const std::set<COutPoint>& authenticated_outpoints,
                                               WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

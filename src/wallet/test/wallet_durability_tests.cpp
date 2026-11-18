@@ -4,7 +4,9 @@
 
 #include <chain.h>
 #include <interfaces/chain.h>
+#include <key_io.h>
 #include <random.h>
+#include <script/descriptor.h>
 #include <script/script.h>
 #include <test/util/logging.h>
 #include <test/util/random.h>
@@ -21,6 +23,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <future>
+#include <optional>
 #include <thread>
 
 #include <sqlite3.h>
@@ -278,31 +281,183 @@ BOOST_FIXTURE_TEST_CASE(topup_without_change_writes_and_announces_nothing, Basic
     }
 }
 
+//! A block of the test chain with the BlockInfo the wallet callbacks take.
+struct ConnectedBlock {
+    CBlock block;
+    uint256 hash;
+    uint256 prev_hash;
+    int height;
+    interfaces::BlockInfo Info() const
+    {
+        interfaces::BlockInfo info{hash};
+        info.prev_hash = &prev_hash;
+        info.height = height;
+        info.data = &block;
+        info.chain_time_max = block.GetBlockTime();
+        return info;
+    }
+};
+
+ConnectedBlock MineBlock(TestChain100Setup& setup)
+{
+    ConnectedBlock out;
+    out.block = setup.CreateAndProcessBlock({}, GetScriptForRawPubKey(setup.coinbaseKey.GetPubKey()));
+    out.hash = out.block.GetHash();
+    out.prev_hash = out.block.hashPrevBlock;
+    out.height = WITH_LOCK(Assert(setup.m_node.chainman)->GetMutex(), return Assert(setup.m_node.chainman)->ActiveChain().Height());
+    return out;
+}
+
+std::optional<uint256> StoredBestBlock(CWallet& wallet)
+{
+    CBlockLocator stored;
+    if (!WalletBatch{wallet.GetDatabase()}.ReadBestBlock(stored) || stored.vHave.empty()) return std::nullopt;
+    return stored.vHave.front();
+}
+
 BOOST_FIXTURE_TEST_CASE(connected_block_persists_best_block_in_its_commit, TestChain100Setup)
 {
-    // The best block moves with the block's own writes: one commit, and the
-    // stored locator leads with the block just connected.
+    // A block that writes a wallet record moves the best block with the
+    // block's own writes: one commit, and the stored locator leads with the
+    // block just connected.
     auto wallet = LoadSqliteWallet("best-block-per-block", m_node.chain.get());
-    const CBlock block = CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
-    const int height = WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return Assert(m_node.chainman)->ActiveChain().Height());
-    const uint256 prev_hash = block.hashPrevBlock;
-    const uint256 block_hash = block.GetHash();
-    interfaces::BlockInfo info{block_hash};
-    info.prev_hash = &prev_hash;
-    info.height = height;
-    info.data = &block;
-    info.chain_time_max = block.GetBlockTime();
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        FlatSigningProvider provider;
+        std::string error;
+        std::unique_ptr<Descriptor> desc = Parse("combo(" + EncodeSecret(coinbaseKey) + ")", provider, error, /*require_checksum=*/false);
+        BOOST_REQUIRE(desc);
+        WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
+        BOOST_REQUIRE(wallet->AddWalletDescriptor(w_desc, provider, "", false));
+    }
+    for (int i = 0; i < 3; ++i) {
+        const ConnectedBlock connected{MineBlock(*this)};
+        const size_t txs_before{WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.size())};
+        {
+            CommitCounter counter{RawDb(*wallet)};
+            wallet->blockConnected(ChainstateRole::NORMAL, connected.Info());
+            BOOST_CHECK_EQUAL(counter.commits, 1);
+        }
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.size()), txs_before + 1);
+        CBlockLocator stored;
+        BOOST_REQUIRE(WalletBatch{wallet->GetDatabase()}.ReadBestBlock(stored));
+        BOOST_REQUIRE(!stored.vHave.empty());
+        BOOST_CHECK(stored.vHave.front() == connected.hash);
+        BOOST_CHECK(m_node.chain->findLocatorFork(stored) == connected.height);
+    }
+    // Nothing is left to write when the wallet is flushed.
+    CommitCounter counter{RawDb(*wallet)};
+    wallet->Flush();
+    BOOST_CHECK_EQUAL(counter.commits, 0);
+}
 
+BOOST_FIXTURE_TEST_CASE(block_without_wallet_records_defers_the_best_block, TestChain100Setup)
+{
+    // The wallet holds no key, so no block writes a record.
+    auto wallet = LoadSqliteWallet("best-block-deferred", m_node.chain.get());
+    const auto bulk_commits = [&] {
+        return static_cast<SQLiteDatabase&>(wallet->GetDatabase()).CommitCounters().Snapshot()[static_cast<size_t>(SqliteCommitKind::BULK_SCOPE)].count;
+    };
+    const uint64_t bulk_before{bulk_commits()};
+
+    // Blocks are deferred up to the bound: no commit, and nothing stored.
+    ConnectedBlock last;
+    for (int i = 0; i < CWallet::MAX_DEFERRED_BEST_BLOCKS; ++i) {
+        last = MineBlock(*this);
+        CommitCounter counter{RawDb(*wallet)};
+        wallet->blockConnected(ChainstateRole::NORMAL, last.Info());
+        BOOST_CHECK_EQUAL(counter.commits, 0);
+    }
+    BOOST_CHECK(!StoredBestBlock(*wallet));
+    BOOST_CHECK_EQUAL(bulk_commits(), bulk_before);
+
+    // The next block is past the bound and writes its own best block.
+    last = MineBlock(*this);
     {
         CommitCounter counter{RawDb(*wallet)};
-        wallet->blockConnected(ChainstateRole::NORMAL, info);
+        wallet->blockConnected(ChainstateRole::NORMAL, last.Info());
         BOOST_CHECK_EQUAL(counter.commits, 1);
     }
+    BOOST_CHECK(StoredBestBlock(*wallet) == last.hash);
+    BOOST_CHECK_EQUAL(bulk_commits(), bulk_before + 1);
+    const ConnectedBlock persisted{last};
+
+    // Deferral starts over, and a flush writes the deferred best block.
+    for (int i = 0; i < 3; ++i) {
+        last = MineBlock(*this);
+        CommitCounter counter{RawDb(*wallet)};
+        wallet->blockConnected(ChainstateRole::NORMAL, last.Info());
+        BOOST_CHECK_EQUAL(counter.commits, 0);
+    }
+    BOOST_CHECK(StoredBestBlock(*wallet) == persisted.hash);
+    {
+        CommitCounter counter{RawDb(*wallet)};
+        wallet->Flush();
+        BOOST_CHECK_EQUAL(counter.commits, 1);
+        BOOST_CHECK(StoredBestBlock(*wallet) == last.hash);
+        wallet->Flush();
+        BOOST_CHECK_EQUAL(counter.commits, 1);
+    }
+
+    // Ten minutes after the last write the next block is written at once.
+    last = MineBlock(*this);
+    wallet->blockConnected(ChainstateRole::NORMAL, last.Info());
+    BOOST_CHECK(StoredBestBlock(*wallet) != last.hash);
+    SetMockTime(GetTime<std::chrono::seconds>() + CWallet::MAX_BEST_BLOCK_DEFERRAL + std::chrono::seconds{1});
+    last = MineBlock(*this);
+    {
+        CommitCounter counter{RawDb(*wallet)};
+        wallet->blockConnected(ChainstateRole::NORMAL, last.Info());
+        BOOST_CHECK_EQUAL(counter.commits, 1);
+    }
+    BOOST_CHECK(StoredBestBlock(*wallet) == last.hash);
+
+    // A chainstate flush writes the best block, so nothing stays deferred.
+    last = MineBlock(*this);
+    wallet->blockConnected(ChainstateRole::NORMAL, last.Info());
+    BOOST_CHECK(StoredBestBlock(*wallet) != last.hash);
+    wallet->chainStateFlushed(ChainstateRole::NORMAL, m_node.chain->getTipLocator());
+    BOOST_CHECK(StoredBestBlock(*wallet) == last.hash);
+    {
+        CommitCounter counter{RawDb(*wallet)};
+        wallet->Flush();
+        BOOST_CHECK_EQUAL(counter.commits, 0);
+    }
+
+    // A wallet that goes away without a flush (a crash) keeps the older
+    // stored best block and resumes at most the deferred blocks behind.
+    const ConnectedBlock flushed{last};
+    for (int i = 0; i < 5; ++i) {
+        last = MineBlock(*this);
+        wallet->blockConnected(ChainstateRole::NORMAL, last.Info());
+    }
+    wallet.reset();
+    wallet = LoadSqliteWallet("best-block-deferred", m_node.chain.get());
     CBlockLocator stored;
     BOOST_REQUIRE(WalletBatch{wallet->GetDatabase()}.ReadBestBlock(stored));
     BOOST_REQUIRE(!stored.vHave.empty());
-    BOOST_CHECK(stored.vHave.front() == block.GetHash());
-    BOOST_CHECK(m_node.chain->findLocatorFork(stored) == height);
+    BOOST_CHECK(stored.vHave.front() == flushed.hash);
+    const std::optional<int> fork{m_node.chain->findLocatorFork(stored)};
+    BOOST_REQUIRE(fork);
+    BOOST_CHECK_EQUAL(*fork, flushed.height);
+    BOOST_CHECK_LE(last.height - *fork, CWallet::MAX_DEFERRED_BEST_BLOCKS);
+}
+
+BOOST_FIXTURE_TEST_CASE(disconnected_block_drops_its_deferred_best_block, TestChain100Setup)
+{
+    auto wallet = LoadSqliteWallet("best-block-disconnect", m_node.chain.get());
+    const ConnectedBlock first{MineBlock(*this)};
+    wallet->blockConnected(ChainstateRole::NORMAL, first.Info());
+    wallet->Flush();
+    BOOST_CHECK(StoredBestBlock(*wallet) == first.hash);
+
+    const ConnectedBlock second{MineBlock(*this)};
+    wallet->blockConnected(ChainstateRole::NORMAL, second.Info());
+    wallet->blockDisconnected(second.Info());
+    // The disconnected block is never recorded as the best block.
+    wallet->Flush();
+    BOOST_CHECK(StoredBestBlock(*wallet) == first.hash);
 }
 #endif
 

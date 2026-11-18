@@ -410,7 +410,8 @@ void SQLiteDatabase::Close()
             max_us = std::max(max_us, c.max_us);
         }
         if (n > 0) {
-            LogPrintf("SQLite commits for %s over its lifetime: n=%u total=%u ms max=%u ms\n", m_file_path, n, total_us / 1000, max_us / 1000);
+            LogPrintf("SQLite commits for %s over its lifetime: n=%u total=%u ms max=%u ms (grouped write scopes: %u)\n", m_file_path, n, total_us / 1000, max_us / 1000,
+                      commits[static_cast<size_t>(SqliteCommitKind::BULK_SCOPE)].count);
         }
     }
     int res = sqlite3_close(m_db);
@@ -832,10 +833,13 @@ class SQLiteBulkScope : public DatabaseBulkScope
 {
     SQLiteDatabase& m_database;
     sqlite3_mutex* m_mutex;
+    //! Row changes of the connection when the scope began.
+    const int m_changes_at_begin;
     bool m_done{false};
 
 public:
-    SQLiteBulkScope(SQLiteDatabase& database, sqlite3_mutex* mutex) : m_database(database), m_mutex(mutex) {}
+    SQLiteBulkScope(SQLiteDatabase& database, sqlite3_mutex* mutex)
+        : m_database(database), m_mutex(mutex), m_changes_at_begin(sqlite3_total_changes(database.m_db)) {}
     ~SQLiteBulkScope() override { Commit(); }
 
     bool Commit() override
@@ -847,9 +851,14 @@ public:
         bool committed{false};
         if (sqlite3_get_autocommit(m_database.m_db) == 0) {
             const auto commit_start = SteadyClock::now();
+            // A scope in which no row was written ends without touching the
+            // disk, so it is not counted as a commit.
+            const bool wrote_rows{sqlite3_total_changes(m_database.m_db) != m_changes_at_begin};
             committed = sqlite3_exec(m_database.m_db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr) == SQLITE_OK;
-            m_database.RecordCommit(SqliteCommitKind::BULK_SCOPE,
-                                    std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - commit_start));
+            if (wrote_rows) {
+                m_database.RecordCommit(SqliteCommitKind::BULK_SCOPE,
+                                        std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - commit_start));
+            }
             if (!committed) {
                 LogPrintf("SQLiteDatabase: Failed to commit the grouped wallet writes\n");
                 if (sqlite3_get_autocommit(m_database.m_db) == 0 &&

@@ -573,6 +573,17 @@ BOOST_AUTO_TEST_CASE(sqlite_commit_counters_split_by_kind)
     BOOST_CHECK_EQUAL(count(SqliteCommitKind::BULK_SCOPE), 1U);
     BOOST_CHECK_EQUAL(count(SqliteCommitKind::DURABLE), 1U);
     BOOST_CHECK_EQUAL(count(SqliteCommitKind::AUTOCOMMIT), 2U);
+    // A bulk scope in which nothing was written (reads only) touches no disk
+    // and is not a commit.
+    {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        int value{0};
+        BOOST_CHECK(database->MakeBatch()->Read(std::string{"d"}, value));
+        BOOST_CHECK_EQUAL(value, 4);
+        BOOST_CHECK(scope->Commit());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::BULK_SCOPE), 1U);
     {
         auto batch = database->MakeBatch();
         BOOST_REQUIRE(batch->TxnBegin());

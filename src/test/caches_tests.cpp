@@ -137,9 +137,8 @@ BOOST_AUTO_TEST_CASE(explicit_dbcache_is_kept)
                 BOOST_CHECK_EQUAL(Sum(sizes), choice.total_mib << 20);
                 BOOST_CHECK_GT(sizes.coins, 0);
                 // Exactly what the fixed rule always gave: half of what is
-                // left after the block index cache, capped at 8 MiB.
-                const int64_t total{choice.total_mib << 20};
-                const int64_t rest{total - std::min(total / 8, nMaxBlockDBCache << 20)};
+                // left after the index caches, capped at 8 MiB.
+                const int64_t rest{(choice.total_mib << 20) - sizes.block_tree_db - sizes.tx_index - sizes.filter_index};
                 BOOST_CHECK_EQUAL(sizes.coins_db, std::min(rest / 2, nMaxCoinsDBCache << 20));
             }
         }

@@ -2,21 +2,23 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Gold Rush claims are announced to peers without the trickle delay.
+"""Gold Rush claims reach peers without the trickle or the request delay.
 
-A claim made on one tip must be in the next block, so the node that creates
-or relays it announces it at once instead of waiting for the per-peer
-inventory timer. Ordinary transactions keep the timer.
+A claim made on one tip must be in the next block. A node announces a claim
+it relays at once instead of waiting for the per-peer inventory timer, and a
+claim its own miner created is sent to peers as a whole transaction, so the
+first hop has no inv and getdata round trip. Ordinary transactions keep the
+timer and the inv.
 
 Mock time is frozen on every node, so a trickle timer never fires and a
 delayed transaction request never becomes due until the test moves the clock.
-Three nodes:
 
-  node1 dials node0: node1 treats node0 as a preferred peer and requests the
-      claim the moment it is announced.
+  node1 dials node0 and prefers it as a transaction source.
   node0 dials node2: node2 treats node0 as an inbound, non-preferred peer and
-      holds its request for two seconds of its own clock. That delay is on the
-      receiving side and is unchanged here; the test pins it down.
+      would hold a getdata for two seconds of its own clock. The direct send
+      removes that wait.
+  Three test peers on node0: one that never requests anything, one that asked
+      for no transaction relay, and one with a high fee filter.
 
 The test also covers the relay figures of the miner's timing record and the
 miner being woken when the mempool drops its live claim.
@@ -27,6 +29,8 @@ import re
 import time
 
 from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.messages import MSG_TX, MSG_WTX, msg_feefilter
+from test_framework.p2p import P2PInterface
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
@@ -34,6 +38,29 @@ from test_framework.util import assert_equal
 GOLD_RUSH_END_TIME = 2_000_000_000
 MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 40_000
 QQSPROOF_HEX = "51515350524f4f46"
+
+
+class SilentPeer(P2PInterface):
+    """Records transaction invs and transactions; never sends a getdata."""
+
+    def __init__(self, relay=1):
+        super().__init__()
+        self.version_relay = relay
+        self.tx_invs = []
+        self.txs = []
+
+    def peer_connect_send_version(self, services):
+        super().peer_connect_send_version(services)
+        self.on_connection_send_msg.relay = self.version_relay
+
+    def on_inv(self, message):
+        for inv in message.inv:
+            if inv.type in (MSG_TX, MSG_WTX):
+                self.tx_invs.append(f"{inv.hash:064x}")
+
+    def on_tx(self, message):
+        message.tx.rehash()
+        self.txs.append(message.tx.hash)
 
 
 class GoldRushClaimFastRelayTest(BitcoinTestFramework):
@@ -88,7 +115,6 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
         of the setup. A pong proves the pass that carried the ping ran."""
         node = self.nodes[0]
         before = {peer["id"]: peer["bytesrecv_per_msg"].get("pong", 0) for peer in node.getpeerinfo()}
-        assert_equal(len(before), 2)
         for _ in range(2):
             node.ping()
             self.wait_until(lambda: all(
@@ -130,13 +156,20 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
         self.sync_all()
         for node in self.nodes:
             assert_equal(node.getrawmempool(), [])
+
+        self.log.info("Connecting test peers: silent, no transaction relay, high fee filter")
+        silent = node0.add_p2p_connection(SilentPeer())
+        no_relay = node0.add_p2p_connection(SilentPeer(relay=0))
+        high_fee = node0.add_p2p_connection(SilentPeer())
+        high_fee.send_and_ping(msg_feefilter(100_000_000))
         self._settle_inventory_timers()
 
         self.log.info("An ordinary transaction waits for the trickle timer, which the frozen clock never fires")
         ordinary_txid = staker.sendtoaddress(staker.getnewaddress("", "legacy"), Decimal("0.5"))
         assert ordinary_txid in node0.getrawmempool()
 
-        self.log.info("The miner's claim reaches the peer that prefers node0 with no clock movement at all")
+        self.log.info("The miner's claim is sent whole: it arrives with no getdata and no clock movement")
+        getdata_before = {peer["id"]: peer["bytesrecv_per_msg"].get("getdata", 0) for peer in node0.getpeerinfo()}
         started = miner.setpowmining(True, 1, 100, True)
         assert_equal(started["enabled"], True)
         self.wait_until(
@@ -144,22 +177,43 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
             timeout=180,
         )
         claim_txid = self._claim_txids(node0)[0]
+        claim_wtxid = node0.getmempoolentry(claim_txid)["wtxid"]
+        self.wait_until(lambda: claim_txid in silent.txs, timeout=60)
+        # node2 would have held its request for two seconds of a clock that
+        # does not move; it has the claim because no request was needed.
         self.wait_until(lambda: claim_txid in node1.getrawmempool(), timeout=60)
+        self.wait_until(lambda: claim_txid in node2.getrawmempool(), timeout=60)
+        for peer in node0.getpeerinfo():
+            assert_equal(peer["bytesrecv_per_msg"].get("getdata", 0), getdata_before[peer["id"]])
+        for peer in (silent, no_relay, high_fee):
+            peer.sync_with_ping()
+        assert claim_txid not in silent.tx_invs and claim_wtxid not in silent.tx_invs
+
+        self.log.info("A peer that asked for no transactions and a peer with a higher fee filter get nothing")
+        for peer in (no_relay, high_fee):
+            assert peer.is_connected
+            assert_equal(peer.txs, [])
+            assert_equal(peer.tx_invs, [])
+
+        self.log.info("The ordinary transaction was neither sent nor, with the clock frozen, announced")
+        assert_equal(silent.txs, [claim_txid])
+        assert_equal(silent.tx_invs, [])
         assert ordinary_txid not in node1.getrawmempool()
         assert ordinary_txid not in node2.getrawmempool()
         assert ordinary_txid in node0.getrawmempool()
 
-        self.log.info("The timing record reports the announcement to both peers")
+        self.log.info("The timing record reports the three peers the claim was sent to")
         self.wait_until(
             lambda: miner.getpowmininginfo()["last_claim_timing"]["first_inv_ms"] >= 0,
             timeout=30,
         )
         timing = miner.getpowmininginfo()["last_claim_timing"]
         assert_equal(timing["result"], "submitted")
-        assert_equal(timing["inv_peers_1s"], 2)
+        assert_equal(timing["inv_peers_1s"], 3)
+        assert_equal(timing["push_peers_1s"], 3)
         assert timing["first_inv_ms"] >= timing["proof_found_ms"]
         # The log line is held until the relay figures are settled, then
-        # written once with the two new keys appended.
+        # written once with the new keys appended.
         self.wait_until(
             lambda: any("result=submitted" in line for line in self._timing_lines()),
             timeout=30,
@@ -168,15 +222,12 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
         assert_equal(len(submitted_lines), 1)
         assert re.search(
             rf" mempool_accept_ms={timing['mempool_accept_ms']} hashes=\d+ batches=\d+ "
-            rf"duty_sleep_ms=\d+ first_inv_ms={timing['first_inv_ms']} inv_peers_1s=2$",
+            rf"duty_sleep_ms=\d+ first_inv_ms={timing['first_inv_ms']} inv_peers_1s=3 push_peers_1s=3$",
             submitted_lines[0],
         ), submitted_lines[0]
 
-        self.log.info("A peer that does not prefer node0 was told at once but requests only after its own two-second delay")
-        assert claim_txid not in node2.getrawmempool()
         old_entry_time = node0.getmempoolentry(claim_txid)["time"]
         self._set_mocktime(max(self.mock_time, old_entry_time) + 3)
-        self.wait_until(lambda: claim_txid in node2.getrawmempool(), timeout=60)
 
         self.log.info("Dropping the live claim from node0's mempool wakes the miner, which relays it again on the same tip")
         tip = node0.getbestblockhash()
@@ -184,7 +235,7 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
             f"Waking the Gold Rush PoW miner after expiry mempool removal of claim {claim_txid}".encode(),
         ], timeout=30):
             # Accepting any transaction runs the expiry pass.
-            staker.sendtoaddress(staker.getnewaddress("", "legacy"), Decimal("0.25"))
+            late_txid = staker.sendtoaddress(staker.getnewaddress("", "legacy"), Decimal("0.25"))
         node0.syncwithvalidationinterfacequeue()
         self.wait_until(
             lambda: claim_txid in node0.getrawmempool()
@@ -196,6 +247,20 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
 
         miner.setpowmining(False)
         assert_equal(miner.getpowmininginfo()["state"], "disabled")
+
+        self.log.info("The relay after the removal sent nothing whole, and an ordinary transaction is only ever announced by inv")
+        late_wtxid = node0.getmempoolentry(late_txid)["wtxid"]
+        for _ in range(40):
+            if late_txid in silent.tx_invs or late_wtxid in silent.tx_invs:
+                break
+            self._set_mocktime(self.mock_time + 30)
+            self._settle_inventory_timers()
+        assert late_txid in silent.tx_invs or late_wtxid in silent.tx_invs
+        silent.sync_with_ping()
+        assert_equal(silent.txs, [claim_txid])
+        assert_equal(no_relay.txs, [])
+        assert_equal(high_fee.txs, [])
+        assert no_relay.is_connected and high_fee.is_connected
 
 
 if __name__ == "__main__":

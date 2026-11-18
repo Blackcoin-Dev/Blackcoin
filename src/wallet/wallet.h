@@ -1131,13 +1131,14 @@ private:
     /** Every coinstake in the wallet. Whether a transaction is a coinstake never changes,
      *  so this only follows insertion and removal. */
     std::set<uint256> m_coinstake_txids GUARDED_BY(cs_wallet);
-    /** The coinstakes that are not confirmed in the wallet's view of the chain
-     *  (inactive, abandoned or not, in the mempool, or conflicted). Only these
-     *  can be orphans that still hold their inputs, so the sweep after a block
-     *  disconnect walks this set and not every coinstake the wallet ever made:
-     *  a staking wallet has one entry per stake it lost. Follows the record's
-     *  state wherever the coinstake index is kept and wherever a state is
-     *  written (UpdateUnconfirmedCoinstakeIndex). */
+    /** The coinstakes the orphan sweep can act on: neither confirmed, nor
+     *  conflicted, nor abandoned (inactive, or in the mempool). Only these can
+     *  be orphans that still hold their inputs, so the sweep after a block
+     *  disconnect walks this set and not every coinstake the wallet ever made.
+     *  A lost stake ends conflicted or abandoned and leaves the set, so it does
+     *  not grow with the stakes a wallet has lost. Follows the record's state
+     *  wherever the coinstake index is kept and wherever a state is written
+     *  (UpdateUnconfirmedCoinstakeIndex). */
     std::set<uint256> m_unconfirmed_coinstake_txids GUARDED_BY(cs_wallet);
     void UpdateUnconfirmedCoinstakeIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** When the legacy claim-source capacity was last logged (steady clock). */

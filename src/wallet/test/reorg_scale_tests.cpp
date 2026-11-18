@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <hash.h>
+#include <chain.h>
 #include <interfaces/chain.h>
 #include <key.h>
 #include <primitives/block.h>
@@ -13,6 +14,7 @@
 #include <test/util/setup_common.h>
 #include <util/string.h>
 #include <util/time.h>
+#include <validation.h>
 #include <wallet/receive.h>
 #include <wallet/shadow_pow_claim_recovery_types.h>
 #include <wallet/sqlite.h>
@@ -70,6 +72,40 @@ bool BalancesEqual(const Balance& a, const Balance& b)
            a.m_watchonly_trusted == b.m_watchonly_trusted &&
            a.m_watchonly_untrusted_pending == b.m_watchonly_untrusted_pending &&
            a.m_watchonly_immature == b.m_watchonly_immature && a.m_watchonly_stake == b.m_watchonly_stake;
+}
+
+//! The walk the index replaced: every coinstake of the wallet whose depth is
+//! zero and that is not abandoned, the ones the sweep may abandon.
+std::set<uint256> ReferenceOrphanWalk(CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    std::set<uint256> found;
+    for (const uint256& txid : WalletReorgTestAccess::Coinstakes(wallet)) {
+        const CWalletTx& wtx = wallet.mapWallet.at(txid);
+        if (wallet.GetTxDepthInMainChain(wtx) == 0 && !wtx.isAbandoned()) found.insert(txid);
+    }
+    return found;
+}
+
+//! The indexed sweep abandons exactly what the full walk finds (a record in
+//! the mempool cannot be abandoned by either) and touches nothing else.
+void CheckIndexedSweepEqualsFullWalk(CWallet& wallet, const std::string& when)
+{
+    LOCK(wallet.cs_wallet);
+    const std::set<uint256> reference = ReferenceOrphanWalk(wallet);
+    BOOST_CHECK_MESSAGE(reference == WalletReorgTestAccess::UnconfirmedCoinstakes(wallet), when + ": index before the sweep");
+    std::map<uint256, bool> abandoned_before;
+    for (const uint256& txid : WalletReorgTestAccess::Coinstakes(wallet)) abandoned_before[txid] = wallet.mapWallet.at(txid).isAbandoned();
+    wallet.AbandonOrphanedCoinstakes();
+    for (const uint256& txid : WalletReorgTestAccess::Coinstakes(wallet)) {
+        const CWalletTx& wtx = wallet.mapWallet.at(txid);
+        const bool expected = abandoned_before[txid] || (reference.count(txid) && !wtx.InMempool());
+        BOOST_CHECK_MESSAGE(wtx.isAbandoned() == expected, when + ": sweep result for " + txid.ToString());
+    }
+    // What is left in the index is only what neither walk could abandon.
+    for (const uint256& txid : WalletReorgTestAccess::UnconfirmedCoinstakes(wallet)) {
+        BOOST_CHECK_MESSAGE(wallet.mapWallet.at(txid).InMempool(), when + ": index entry left after the sweep " + txid.ToString());
+    }
+    BOOST_CHECK_MESSAGE(ReferenceOrphanWalk(wallet).size() == WalletReorgTestAccess::UnconfirmedCoinstakes(wallet).size(), when + ": index after the sweep");
 }
 
 /**
@@ -264,14 +300,17 @@ struct ReorgWallet {
         BOOST_CHECK_MESSAGE(legacy == WalletReorgTestAccess::LegacyClaimOutpoints(*wallet), when + ": legacy claim outpoints");
         // The index of unconfirmed coinstakes is exact, and the sweep that
         // walked it left nothing a sweep over every coinstake would abandon.
+        // The index holds what the sweep can act on: no confirmed, conflicted
+        // or abandoned coinstake.
         std::set<uint256> unconfirmed;
         for (const uint256& txid : WalletReorgTestAccess::Coinstakes(*wallet)) {
             const CWalletTx& wtx = wallet->mapWallet.at(txid);
-            if (!wtx.isConfirmed()) unconfirmed.insert(txid);
-            BOOST_CHECK_MESSAGE(!(wallet->GetTxDepthInMainChain(wtx) == 0 && !wtx.isAbandoned()),
+            if (wtx.isUnconfirmed()) unconfirmed.insert(txid);
+            BOOST_CHECK_MESSAGE(!(wallet->GetTxDepthInMainChain(wtx) == 0 && !wtx.isAbandoned() && !wtx.InMempool()),
                                 when + ": orphaned coinstake left unabandoned " + txid.ToString());
         }
         BOOST_CHECK_MESSAGE(unconfirmed == WalletReorgTestAccess::UnconfirmedCoinstakes(*wallet), when + ": unconfirmed coinstake index");
+        BOOST_CHECK_MESSAGE(unconfirmed == ReferenceOrphanWalk(*wallet), when + ": index equals a walk of every coinstake");
         // The cached amounts that were kept are still right.
         wallet->MarkDirty();
         BOOST_CHECK_MESSAGE(BalancesEqual(incremental, GetBalance(*wallet)), when + ": balance");
@@ -506,6 +545,145 @@ BOOST_AUTO_TEST_CASE(tip_reorg_work_follows_the_block_not_the_history)
     BOOST_CHECK_EQUAL(large.new_rows, small.new_rows);
     BOOST_CHECK_EQUAL(large.dirtied_by_mempool, small.dirtied_by_mempool);
     BOOST_CHECK_LE(large.dirtied_by_mempool, 12U);
+}
+
+// A lost stake (conflicted by a block of the chain, or abandoned) can never
+// be swept again, so it leaves the index of unconfirmed coinstakes: a
+// staking node that has lost a thousand stakes disconnects a block as fast as
+// one that has lost none, and the indexed sweep abandons what a walk over
+// every coinstake would.
+BOOST_AUTO_TEST_CASE(lost_stakes_leave_the_sweep_index_and_the_sweep_equals_a_full_walk)
+{
+    const int blocks = 400;
+    ReorgWallet fixture{*m_node.chain, "reorg-scale-lost-stakes", blocks, /*stake_every=*/10};
+    CWallet& wallet = *fixture.wallet;
+    (void)GetBalance(wallet);
+    CheckIndexedSweepEqualsFullWalk(wallet, "at the start");
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(WalletReorgTestAccess::UnconfirmedCoinstakes(wallet).empty()); // the rival is conflicted
+    }
+
+    // A thousand historical lost stakes, half conflicted by a block and half abandoned.
+    constexpr int LOST = 1000;
+    {
+        LOCK(wallet.cs_wallet);
+        std::unique_ptr<DatabaseBulkScope> writes = wallet.GetDatabase().MakeBulkScope();
+        for (int i = 0; i < LOST; ++i) {
+            const COutPoint input{(HashWriter{} << std::string{"lost-stake"} << i).GetHash(), 0};
+            const CTransactionRef lost = ReorgWallet::MakeStake(input, fixture.script);
+            const int height = 1 + (i % blocks);
+            const TxState state = i % 2 == 0 ? TxState{TxStateConflicted{FakeBlockHash(height), height}} : TxState{TxStateInactive{/*abandoned=*/true}};
+            BOOST_REQUIRE(wallet.AddToWallet(lost, state));
+        }
+        if (writes) BOOST_REQUIRE(writes->Commit());
+        BOOST_CHECK_GT(WalletReorgTestAccess::Coinstakes(wallet).size(), static_cast<size_t>(LOST));
+        BOOST_CHECK(WalletReorgTestAccess::UnconfirmedCoinstakes(wallet).empty());
+    }
+    CheckIndexedSweepEqualsFullWalk(wallet, "with the lost stakes");
+
+    const uint256 tip_hash = FakeBlockHash(blocks);
+    const uint256 prev_hash = FakeBlockHash(blocks - 1);
+    interfaces::BlockInfo info{tip_hash};
+    info.prev_hash = &prev_hash;
+    info.height = blocks;
+    info.data = &fixture.tip_block;
+    info.chain_time_max = fixture.tip_block.GetBlockTime();
+    const CTransactionRef stake = fixture.stakes.back().second;
+
+    // Own stake orphaned by a reorg, and a competing conflicted stake that the
+    // reorg frees: both are swept; none of the thousand is visited.
+    wallet.blockDisconnected(info);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK_LE(wallet.m_last_block_disconnect_work.coinstakes_visited, 4U);
+        BOOST_CHECK(wallet.mapWallet.at(stake->GetHash()).isAbandoned());
+        BOOST_CHECK(wallet.mapWallet.at(fixture.rival_stake->GetHash()).isAbandoned());
+        BOOST_CHECK(WalletReorgTestAccess::UnconfirmedCoinstakes(wallet).empty());
+    }
+    CheckIndexedSweepEqualsFullWalk(wallet, "after the disconnect");
+    fixture.CheckAgainstRebuild("lost stakes: after the disconnect");
+
+    // The abandoned stake's block returns.
+    wallet.blockConnected(ChainstateRole::NORMAL, info);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.mapWallet.at(stake->GetHash()).isConfirmed());
+        BOOST_CHECK(wallet.mapWallet.at(fixture.rival_stake->GetHash()).isConflicted());
+        BOOST_CHECK(WalletReorgTestAccess::UnconfirmedCoinstakes(wallet).empty());
+    }
+    CheckIndexedSweepEqualsFullWalk(wallet, "after the reconnect");
+
+    // Disconnected again, the stake returns in a later block (another hash and height).
+    wallet.blockDisconnected(info);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.mapWallet.at(stake->GetHash()).isAbandoned());
+        BOOST_REQUIRE(wallet.AddToWallet(stake, TxStateConfirmed{FakeBlockHash(blocks + 1000), blocks + 1, 1}));
+        BOOST_CHECK(wallet.mapWallet.at(stake->GetHash()).isConfirmed());
+        BOOST_CHECK(WalletReorgTestAccess::UnconfirmedCoinstakes(wallet).empty());
+    }
+    CheckIndexedSweepEqualsFullWalk(wallet, "stake reconnected in a later block");
+
+    // A coinstake in the mempool is in the index and neither sweep abandons it.
+    {
+        LOCK(wallet.cs_wallet);
+        const CTransactionRef pooled = ReorgWallet::MakeStake(COutPoint{uint256{91}, 0}, fixture.script);
+        BOOST_REQUIRE(wallet.AddToWallet(pooled, TxStateInMempool{}));
+        BOOST_CHECK_EQUAL(WalletReorgTestAccess::UnconfirmedCoinstakes(wallet).count(pooled->GetHash()), 1U);
+    }
+    CheckIndexedSweepEqualsFullWalk(wallet, "with a coinstake in the mempool");
+    fixture.CheckAgainstRebuild("lost stakes: at the end");
+}
+
+// The index after a load: a coinstake of each state read from the database.
+BOOST_AUTO_TEST_CASE(sweep_index_after_load_has_only_what_a_full_walk_finds)
+{
+    CWallet seed(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+    const CScript script = GetScriptForRawPubKey(key.GetPubKey());
+    std::vector<uint256> inactive, abandoned, conflicted, confirmed;
+    {
+        LOCK(seed.cs_wallet);
+        // Real blocks of the chain: a load turns a record whose block the
+        // node does not have into an inactive one.
+        const auto real_hash = [&](int height) { return WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain()[height]->GetBlockHash()); };
+        const int tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Height());
+        seed.SetLastBlockProcessed(tip, real_hash(tip));
+        for (int i = 0; i < 3; ++i) {
+            const auto stake = [&](const std::string& kind) { return ReorgWallet::MakeStake(COutPoint{(HashWriter{} << kind << i).GetHash(), 0}, script); };
+            const CTransactionRef a = stake("inactive"), b = stake("abandoned"), c = stake("conflicted"), d = stake("confirmed");
+            // A confirmed record whose block the node does not have is
+            // inactive, and not abandoned, after the load.
+            BOOST_REQUIRE(seed.AddToWallet(a, TxStateConfirmed{FakeBlockHash(30 + i), 30 + i, 1}));
+            BOOST_REQUIRE(seed.AddToWallet(b, TxStateInactive{/*abandoned=*/true}));
+            BOOST_REQUIRE(seed.AddToWallet(c, TxStateConflicted{real_hash(10 + i), 10 + i}));
+            BOOST_REQUIRE(seed.AddToWallet(d, TxStateConfirmed{real_hash(20 + i), 20 + i, 1}));
+            inactive.push_back(a->GetHash());
+            abandoned.push_back(b->GetHash());
+            conflicted.push_back(c->GetHash());
+            confirmed.push_back(d->GetHash());
+        }
+    }
+    CWallet wallet(m_node.chain.get(), "", DuplicateMockDatabase(seed.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(wallet.cs_wallet);
+        const int tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Height());
+        wallet.SetLastBlockProcessed(tip, WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip()->GetBlockHash()));
+        BOOST_CHECK_EQUAL(WalletReorgTestAccess::Coinstakes(wallet).size(), 12U);
+        for (const uint256& txid : abandoned) BOOST_CHECK(wallet.mapWallet.at(txid).isAbandoned());
+        for (const uint256& txid : conflicted) BOOST_CHECK(wallet.mapWallet.at(txid).isConflicted());
+        for (const uint256& txid : confirmed) BOOST_CHECK(wallet.mapWallet.at(txid).isConfirmed());
+        const std::set<uint256> expected{inactive.begin(), inactive.end()};
+        BOOST_CHECK(WalletReorgTestAccess::UnconfirmedCoinstakes(wallet) == expected);
+    }
+    CheckIndexedSweepEqualsFullWalk(wallet, "after the load");
+    LOCK(wallet.cs_wallet);
+    for (const uint256& txid : inactive) BOOST_CHECK(wallet.mapWallet.at(txid).isAbandoned());
+    BOOST_CHECK(WalletReorgTestAccess::UnconfirmedCoinstakes(wallet).empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

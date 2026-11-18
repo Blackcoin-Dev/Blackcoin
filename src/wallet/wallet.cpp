@@ -918,10 +918,14 @@ void CWallet::UpdateUnconfirmedCoinstakeIndex(const CWalletTx& wtx)
 {
     AssertLockHeld(cs_wallet);
     if (!wtx.tx || !wtx.IsCoinStake()) return;
-    if (wtx.isConfirmed()) {
-        m_unconfirmed_coinstake_txids.erase(wtx.GetHash());
-    } else {
+    // Only what the orphan sweep can act on is kept: a coinstake that is
+    // neither confirmed, nor conflicted, nor abandoned. A lost stake ends
+    // conflicted or abandoned and leaves the index for good, so the index
+    // does not grow with the number of stakes the wallet has lost.
+    if (wtx.isUnconfirmed()) {
         m_unconfirmed_coinstake_txids.insert(wtx.GetHash());
+    } else {
+        m_unconfirmed_coinstake_txids.erase(wtx.GetHash());
     }
 }
 
@@ -4740,10 +4744,10 @@ size_t CWallet::AbandonOrphanedCoinstakes()
     }
     size_t visited{0};
 
-    // Walk only the wallet's coinstakes that are not confirmed, not every
-    // coinstake it ever made and not its whole history: a confirmed coinstake
-    // has a depth above zero and is never abandoned here. Abandoning keeps a
-    // record unconfirmed but can add descendants to the index, so walk a copy.
+    // Walk only the wallet's coinstakes that are neither confirmed, conflicted
+    // nor abandoned, not every coinstake it ever made and not its whole
+    // history: only such a coinstake has depth zero and can be abandoned here.
+    // Abandoning removes the record from the index, so walk a copy.
     const std::vector<uint256> unconfirmed{m_unconfirmed_coinstake_txids.begin(), m_unconfirmed_coinstake_txids.end()};
     for (const uint256& wtxid : unconfirmed) {
         ++visited;

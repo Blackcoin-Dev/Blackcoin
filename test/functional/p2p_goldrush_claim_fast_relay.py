@@ -66,6 +66,12 @@ class SilentPeer(P2PInterface):
 class GoldRushClaimFastRelayTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser)
+        parser.add_argument(
+            "--qqp4-inactive",
+            action="store_true",
+            help="Leave the QQP4 input-bound proof format inactive, as it is on mainnet: "
+                 "the claim's proof then names no fee input",
+        )
 
     def set_test_params(self):
         self.num_nodes = 3
@@ -76,7 +82,6 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
             "-txindex=1",
             "-shadowwhitelistheight=1",
             "-shadowcompetingclaimsheight=2",
-            "-shadowqqp4height=2",
             "-shadowgoldrushblocks=500",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
             f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
@@ -89,6 +94,10 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
         self.skip_if_no_wallet()
 
     def setup_network(self):
+        # Options are parsed after set_test_params. Regtest leaves QQP4
+        # disabled unless a height is given, which is the mainnet shape.
+        if not self.options.qqp4_inactive:
+            self.extra_args = [[*args, "-shadowqqp4height=2"] for args in self.extra_args]
         self.setup_nodes()
         self.connect_nodes(1, 0)
         self.connect_nodes(0, 2)
@@ -137,6 +146,7 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
 
     def run_test(self):
         node0, node1, node2 = self.nodes
+        assert_equal(node0.getgoldrushinfo()["qqp4_activation_disabled"], self.options.qqp4_inactive)
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
 
         self.log.info("Funding a staker and a miner wallet on node0 and entering the Gold Rush phase")
@@ -211,6 +221,7 @@ class GoldRushClaimFastRelayTest(BitcoinTestFramework):
         assert_equal(timing["result"], "submitted")
         assert_equal(timing["inv_peers_1s"], 3)
         assert_equal(timing["push_peers_1s"], 3)
+        assert_equal(miner.getgoldrushinfo()["qqp4_active"], not self.options.qqp4_inactive)
         assert timing["first_inv_ms"] >= timing["proof_found_ms"]
         # The log line is held until the relay figures are settled, then
         # written once with the new keys appended.

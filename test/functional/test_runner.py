@@ -349,6 +349,7 @@ BASE_SCRIPTS = [
     'rpc_preciousblock.py',
     'p2p_leak_tx.py',
     'p2p_goldrush_claim_fast_relay.py',
+    'p2p_goldrush_claim_fast_relay.py --qqp4-inactive',
     'p2p_leak_tx.py --v2transport',
     'p2p_eviction.py',
     'p2p_net_deadlock.py',

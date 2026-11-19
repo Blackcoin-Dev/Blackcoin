@@ -9,6 +9,7 @@
 #include <addresstype.h>
 #include <claim_relay_tracker.h>
 #include <interfaces/wallet.h>
+#include <primitives/transaction.h>
 #include <script/script.h>
 #include <shadow.h>
 #include <test/util/setup_common.h>
@@ -925,6 +926,43 @@ BOOST_AUTO_TEST_CASE(claim_relay_timing_is_appended_when_known)
     GetClaimRelayTracker().MarkLocalClaim(claim_input);
     GetClaimRelayTracker().UnmarkLocalClaim(claim_input);
     BOOST_CHECK(!GetClaimRelayTracker().ConsumeLocalClaim(claim_input));
+
+    // A claim is found by the fee input it spends, whether or not its proof
+    // binds that input (QQP4 does; the formats before it do not).
+    {
+        const COutPoint fee_input{uint256{90}, 1};
+        const COutPoint other_input{uint256{91}, 0};
+        CMutableTransaction unbound;
+        unbound.vin.emplace_back(fee_input);
+        const CTransaction unbound_tx{unbound};
+        BOOST_CHECK(ClaimRelayKey(unbound_tx, std::nullopt) == std::optional<COutPoint>{fee_input});
+        BOOST_CHECK(ClaimRelayKey(unbound_tx, other_input) == std::optional<COutPoint>{other_input});
+        BOOST_CHECK(!ClaimRelayKey(CTransaction{CMutableTransaction{}}, std::nullopt).has_value());
+        // No mark, no push; one mark, exactly one push.
+        BOOST_CHECK(!GetClaimRelayTracker().ConsumeLocalClaim(unbound_tx));
+        GetClaimRelayTracker().MarkLocalClaim(fee_input);
+        CMutableTransaction stranger;
+        stranger.vin.emplace_back(other_input);
+        BOOST_CHECK(!GetClaimRelayTracker().ConsumeLocalClaim(CTransaction{stranger}));
+        BOOST_CHECK(GetClaimRelayTracker().ConsumeLocalClaim(unbound_tx));
+        BOOST_CHECK(!GetClaimRelayTracker().ConsumeLocalClaim(unbound_tx));
+        // The marked input need not be the first one.
+        CMutableTransaction two_inputs;
+        two_inputs.vin.emplace_back(other_input);
+        two_inputs.vin.emplace_back(fee_input);
+        GetClaimRelayTracker().MarkLocalClaim(fee_input);
+        BOOST_CHECK(GetClaimRelayTracker().ConsumeLocalClaim(CTransaction{two_inputs}));
+        BOOST_CHECK(!GetClaimRelayTracker().ConsumeLocalClaim(CTransaction{two_inputs}));
+        // The statistics of the unbound claim are read back under the key
+        // the wallet holds: the fee input it selected.
+        const auto sent = std::chrono::steady_clock::now();
+        GetClaimRelayTracker().NoteAnnounced(
+            *ClaimRelayKey(unbound_tx, std::nullopt), unbound_tx.GetHash(), sent, /*pushed=*/true);
+        const auto unbound_stats = GetClaimRelayTracker().Get(fee_input);
+        BOOST_REQUIRE(unbound_stats.has_value());
+        BOOST_CHECK_EQUAL(unbound_stats->peers_1s, 1U);
+        BOOST_CHECK_EQUAL(unbound_stats->pushed_1s, 1U);
+    }
 
     // Another claim transaction on the same input starts its record over.
     GetClaimRelayTracker().NoteAnnounced(claim_input, uint256{6}, announced + 2s);

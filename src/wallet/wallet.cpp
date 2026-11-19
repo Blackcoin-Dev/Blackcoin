@@ -16230,18 +16230,15 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 submit_failure_reselection;
             // This node created the claim: its first relay sends peers the
             // whole transaction. The mark is used at most once and does not
-            // outlive the submission.
-            if (work.input_bound) {
-                GetClaimRelayTracker().MarkLocalClaim(selected_input.outpoint);
-            }
+            // outlive the submission. It names the fee input, which every
+            // proof format spends, bound to it or not.
+            GetClaimRelayTracker().MarkLocalClaim(selected_input.outpoint);
             const ShadowPowClaimSubmitResult submit_result =
                 SubmitShadowPowClaim(
                     selected_input, work, proof,
                     loop_authority_generation, error,
                     &submit_failure_reselection);
-            if (work.input_bound) {
-                GetClaimRelayTracker().UnmarkLocalClaim(selected_input.outpoint);
-            }
+            GetClaimRelayTracker().UnmarkLocalClaim(selected_input.outpoint);
             // Count the claim before anything else, as rc12 did: the wallet
             // transaction is already visible, and a reader that sees it must
             // not find the counter lagging behind the timing line below.
@@ -16265,9 +16262,9 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                         : "failed",
                     submit_result != ShadowPowClaimSubmitResult::SUBMITTED &&
                         tip_moved,
-                    // The relay tracker knows an input-bound claim by its
-                    // fee input; the line then waits for the relay figures.
-                    work.input_bound ? &selected_input.outpoint : nullptr);
+                    // The relay tracker knows the claim by its fee input;
+                    // the line then waits for the relay figures.
+                    &selected_input.outpoint);
             }
             if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED ||
                 submit_result ==

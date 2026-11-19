@@ -28,8 +28,8 @@ struct ClaimRelayStats {
 
 /** Process-wide, bounded record of claim announcements, written by the
  * message handler when it sends an inv for a claim and read by the wallet's
- * miner for its timing line. Claims are keyed by the fee input their proof is
- * bound to, which the miner knows before the transaction exists. The
+ * miner for its timing line. A claim is keyed by its fee input, which the
+ * miner knows before the transaction exists (see ClaimRelayKey). The
  * statistics are measurements only and feed no decision.
  *
  * It also carries the miner's one-shot marks for claims it is about to
@@ -45,7 +45,7 @@ public:
 
     static constexpr size_t MAX_LOCAL_MARKS{16};
 
-    /** The miner is about to submit a claim bound to this fee input. */
+    /** The miner is about to submit a claim that spends this fee input. */
     void MarkLocalClaim(const COutPoint& claim_input)
     {
         std::lock_guard<std::mutex> lock{m_mutex};
@@ -65,6 +65,20 @@ public:
     {
         std::lock_guard<std::mutex> lock{m_mutex};
         return m_local_marks.erase(claim_input) > 0;
+    }
+
+    /** True once per mark: the first relay of a claim that spends a marked
+     * fee input. The proof format plays no part: a claim whose proof binds
+     * no input is recognized the same way. Every mark the transaction
+     * carries is used up. */
+    bool ConsumeLocalClaim(const CTransaction& tx)
+    {
+        std::lock_guard<std::mutex> lock{m_mutex};
+        bool marked{false};
+        for (const CTxIn& txin : tx.vin) {
+            if (m_local_marks.erase(txin.prevout) > 0) marked = true;
+        }
+        return marked;
     }
 
     void NoteAnnounced(const COutPoint& claim_input, const uint256& txid,
@@ -110,6 +124,19 @@ private:
     std::deque<COutPoint> m_order;
     std::map<COutPoint, bool> m_local_marks;
 };
+
+/** The key of a claim transaction in the tracker: the fee input its proof is
+ * bound to when the proof format binds one (pass it as bound_input), and
+ * otherwise the transaction's first input. A claim the wallet's miner builds
+ * spends exactly one input, its fee input, so both forms name the outpoint
+ * the miner selected. */
+inline std::optional<COutPoint> ClaimRelayKey(
+    const CTransaction& tx, const std::optional<COutPoint>& bound_input)
+{
+    if (bound_input) return bound_input;
+    if (tx.vin.empty()) return std::nullopt;
+    return tx.vin.front().prevout;
+}
 
 inline ClaimRelayTracker& GetClaimRelayTracker()
 {

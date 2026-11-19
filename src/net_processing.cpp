@@ -2527,7 +2527,8 @@ namespace {
 /** Record, for the miner's timing line only, that a claim was announced. */
 void NoteClaimAnnounced(const CTransaction& tx, bool pushed = false)
 {
-    if (const std::optional<COutPoint> claim_input{GetShadowPowProofBoundOutpoint(tx)}) {
+    if (!TransactionHasShadowProof(tx)) return;
+    if (const std::optional<COutPoint> claim_input{ClaimRelayKey(tx, GetShadowPowProofBoundOutpoint(tx))}) {
         GetClaimRelayTracker().NoteAnnounced(*claim_input, tx.GetHash(), std::chrono::steady_clock::now(), pushed);
     }
 }
@@ -2556,12 +2557,9 @@ void PeerManagerImpl::RelayTransaction(const uint256& txid, const uint256& wtxid
     // two seconds when we are its inbound peer). The mark is one-shot: a
     // later relay of the same claim, and every claim from a peer, is
     // announced by inv.
-    bool push{false};
-    if (urgent) {
-        if (const std::optional<COutPoint> claim_input{GetShadowPowProofBoundOutpoint(*mempool_tx)}) {
-            push = GetClaimRelayTracker().ConsumeLocalClaim(*claim_input);
-        }
-    }
+    // The mark names the fee input the miner selected, so it is found on the
+    // transaction's inputs whatever the proof format binds.
+    const bool push{urgent && GetClaimRelayTracker().ConsumeLocalClaim(*mempool_tx)};
     LOCK(m_peer_mutex);
     for(auto& it : m_peer_map) {
         Peer& peer = *it.second;

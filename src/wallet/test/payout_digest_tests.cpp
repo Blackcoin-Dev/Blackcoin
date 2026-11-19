@@ -257,7 +257,7 @@ BOOST_AUTO_TEST_CASE(highest_usable_checkpoint_is_selected)
         changed.push_back(SyntheticPayoutRef{uint256{77}, uint256{105}, 5, false});
         BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({own, flushed}, changed, all_active));
     }
-    // Another client version, an unknown schema or a negative height is never usable,
+    // A newer client version, an unknown schema or a negative height is never usable,
     // and never asks about the chain.
     {
         const auto must_not_ask = [](const SyntheticPayoutCheckpoint&) {
@@ -301,8 +301,22 @@ BOOST_AUTO_TEST_CASE(every_checkpoint_gets_a_verdict_with_its_reason)
     changed.schema = 3;
     BOOST_CHECK(verdict(changed, refs).verdict == Verdict::UNKNOWN_SCHEMA);
     changed = own;
-    changed.client_version = CLIENT_VERSION - 1;
+    // A record written by a newer client, or by one older than the oldest trusted
+    // version, is not used. One written by any version in between (an upgrade) is.
+    changed.client_version = CLIENT_VERSION + 1;
     BOOST_CHECK(verdict(changed, refs).verdict == Verdict::OTHER_CLIENT_VERSION);
+    changed.client_version = SyntheticPayoutCheckpoint::OLDEST_TRUSTED_CLIENT_VERSION - 1;
+    BOOST_CHECK(verdict(changed, refs).verdict == Verdict::OTHER_CLIENT_VERSION);
+    BOOST_REQUIRE(SyntheticPayoutCheckpoint::OLDEST_TRUSTED_CLIENT_VERSION <= CLIENT_VERSION);
+    for (int32_t version{SyntheticPayoutCheckpoint::OLDEST_TRUSTED_CLIENT_VERSION}; version <= CLIENT_VERSION; ++version) {
+        changed.client_version = version;
+        BOOST_CHECK(verdict(changed, refs).verdict == Verdict::ACCEPTED);
+        // The other checks still apply to it.
+        SyntheticPayoutCheckpoint tampered{changed};
+        tampered.digest = uint256{9};
+        BOOST_CHECK(verdict(tampered, refs).verdict == Verdict::DIGEST_MISMATCH);
+        BOOST_CHECK(verdict(changed, refs, Verdict::BLOCK_NOT_ACTIVE).verdict == Verdict::BLOCK_NOT_ACTIVE);
+    }
     changed = own;
     changed.height = -1;
     BOOST_CHECK(verdict(changed, refs).verdict == Verdict::NO_HEIGHT);

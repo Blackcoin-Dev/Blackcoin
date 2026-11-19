@@ -248,6 +248,12 @@ struct SyntheticPayoutCheckpoint {
     static constexpr uint32_t LEGACY_SCHEMA{1};
     /** Digest = finalised order-independent sum of per-record terms, maintained incrementally. */
     static constexpr uint32_t CURRENT_SCHEMA{2};
+    /** Oldest client version whose records are honored. Every release from this one on
+     *  authenticates a payout by the same rule, so a record written before an upgrade is
+     *  still checked against the chain, the count and the digest and then used. A release
+     *  that changes what makes a payout authentic must raise this to its own version. A
+     *  record written by a newer client than the one loading it is never used. */
+    static constexpr int32_t OLDEST_TRUSTED_CLIENT_VERSION{300105};
     uint32_t schema{0};
     int32_t client_version{0};
     int32_t height{-1};

@@ -1090,7 +1090,8 @@ SyntheticPayoutCheckpointResult CheckSyntheticPayoutCheckpoint(
         result.verdict = Verdict::UNKNOWN_SCHEMA;
         return result;
     }
-    if (checkpoint.client_version != CLIENT_VERSION) {
+    if (checkpoint.client_version < SyntheticPayoutCheckpoint::OLDEST_TRUSTED_CLIENT_VERSION ||
+        checkpoint.client_version > CLIENT_VERSION) {
         result.verdict = Verdict::OTHER_CLIENT_VERSION;
         return result;
     }
@@ -1119,7 +1120,7 @@ std::string DescribeSyntheticPayoutCheckpointResult(const SyntheticPayoutCheckpo
     switch (result.verdict) {
     case Verdict::ACCEPTED: return what + ": accepted";
     case Verdict::UNKNOWN_SCHEMA: return what + strprintf(": rejected, unknown schema %u", checkpoint.schema);
-    case Verdict::OTHER_CLIENT_VERSION: return what + strprintf(": rejected, written by client version %d, this is %d", checkpoint.client_version, CLIENT_VERSION);
+    case Verdict::OTHER_CLIENT_VERSION: return what + strprintf(": rejected, written by client version %d, this is %d and honors %d and later", checkpoint.client_version, CLIENT_VERSION, SyntheticPayoutCheckpoint::OLDEST_TRUSTED_CLIENT_VERSION);
     case Verdict::NO_HEIGHT: return what + ": rejected, no height";
     case Verdict::BLOCK_NOT_IN_INDEX: return what + strprintf(": rejected, block %s is not in the block index", checkpoint.block_hash.ToString());
     case Verdict::BLOCK_NOT_ACTIVE: return what + strprintf(": rejected, block %s is not on the active chain at that height", checkpoint.block_hash.ToString());

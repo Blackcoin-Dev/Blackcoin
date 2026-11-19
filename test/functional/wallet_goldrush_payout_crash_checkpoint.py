@@ -53,7 +53,11 @@ CHECKPOINT_KEY = b"\x19syntheticpayoutcheckpoint"
 FLUSH_CHECKPOINT_KEY = b"\x1esyntheticpayoutflushcheckpoint"
 CHECK_LINE = re.compile(
     r"Gold Rush payout check: (\d+) payout blocks authenticated, (\d+) already verified through height (-?\d+)")
-FLUSH_CHECKPOINT_USED = "Gold Rush payout check uses the checkpoint of the last chainstate flush"
+# One line per stored checkpoint record at load: accepted, rejected with the reason, or none stored.
+VERDICT_LINE = re.compile(
+    r"Gold Rush payout checkpoint \((wallet tip|chainstate flush)\): (none stored|height -?\d+, \d+ payout records: (accepted|rejected, .*)) \(chain height -?\d+\)")
+VERDICTS = ["none stored", "accepted", "not in the block index", "not on the active chain", "count mismatch", "digest mismatch",
+            "unknown schema", "client version", "no height"]
 PAYOUT_COMMENT = "PoS - Quantum Stake"
 
 
@@ -90,23 +94,31 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
 
     def _mine_pos_block(self, wallet):
         node = self.nodes[0]
-        inputs = [{"txid": utxo["txid"], "vout": utxo["vout"]} for utxo in wallet.listunspent(1, 9999999)]
         start_height = node.getblockcount()
-        for _ in range(3000):
-            self._set_mocktime(self.mock_time + 16, peer=False)
-            kernel = wallet.checkkernel(inputs)
-            if kernel["found"]:
-                kernel_time = kernel["kernel"]["time"]
+        # The staker can miss the kernel the search found (it samples the clock on its own
+        # schedule), so search again from where the clock stands instead of failing.
+        for attempt in range(4):
+            inputs = [{"txid": utxo["txid"], "vout": utxo["vout"]} for utxo in wallet.listunspent(1, 9999999)]
+            for _ in range(3000):
+                self._set_mocktime(self.mock_time + 16, peer=False)
+                kernel = wallet.checkkernel(inputs)
+                if kernel["found"]:
+                    kernel_time = kernel["kernel"]["time"]
+                    break
+            else:
+                raise AssertionError("timed out searching for a deterministic PoS kernel")
+            self._set_mocktime(kernel_time - 16, peer=False)
+            wallet.staking(True)
+            try:
+                self._set_mocktime(kernel_time)
+                self.wait_until(lambda: node.getblockcount() > start_height, timeout=20)
                 break
-        else:
-            raise AssertionError("timed out searching for a deterministic PoS kernel")
-        self._set_mocktime(kernel_time - 16, peer=False)
-        wallet.staking(True)
-        try:
-            self._set_mocktime(kernel_time)
-            self.wait_until(lambda: node.getblockcount() > start_height, timeout=30)
-        finally:
-            wallet.staking(False)
+            except AssertionError:
+                if attempt == 3:
+                    raise
+                self.log.info("the staker did not use the kernel found; searching again")
+            finally:
+                wallet.staking(False)
         node.syncwithvalidationinterfacequeue()
 
     def _mine_payout_blocks(self, wallet, count):
@@ -154,10 +166,28 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
     def _chainstate_reads(counters):
         return counters["chainstate_get_coin"] + counters["chainstate_have_coin"]
 
+    @staticmethod
+    def _parse_payout_check(text):
+        """From the log of one load of the wallet: (authenticated, already verified, verified through height)
+        and what the load said of each checkpoint record, as {"wallet tip": ..., "chainstate flush": ...}."""
+        lines = [line for line in text.splitlines() if f"[{WALLET_NAME}]" in line]
+        found = [match for match in (CHECK_LINE.search(line) for line in lines) if match]
+        assert_equal(len(found), 1)
+        verdicts = {}
+        for match in (VERDICT_LINE.search(line) for line in lines):
+            if match:
+                assert match.group(1) not in verdicts
+                codes = [code for code in VERDICTS if code in match.group(2)]
+                assert_equal(len(codes), 1)
+                verdicts[match.group(1)] = codes[0]
+        assert_equal(sorted(verdicts), ["chainstate flush", "wallet tip"])
+        return tuple(int(group) for group in found[0].groups()), verdicts
+
     def _load_wallet(self, flush_checkpoint_used):
         """Load the wallet. Returns (authenticated, already verified, verified through height) and the chainstate reads it took.
 
-        flush_checkpoint_used: whether the load must say that it fell back to the flush-anchored checkpoint."""
+        flush_checkpoint_used: whether the load must report that the wallet's own checkpoint
+        was not accepted and the flush-anchored one was."""
         node = self.nodes[0]
         with open(node.debug_log_path, "rb") as log:
             log.seek(0, 2)
@@ -168,10 +198,12 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
         with open(node.debug_log_path, "rb") as log:
             log.seek(offset)
             text = log.read().decode("utf-8", "replace")
-        found = [match for match in (CHECK_LINE.search(line) for line in text.splitlines()) if match]
-        assert_equal(len(found), 1)
-        assert_equal(FLUSH_CHECKPOINT_USED in text, flush_checkpoint_used)
-        return tuple(int(group) for group in found[0].groups()), reads
+        result, verdicts = self._parse_payout_check(text)
+        self.last_verdicts = verdicts
+        assert_equal(verdicts["wallet tip"] != "accepted" and verdicts["chainstate flush"] == "accepted", flush_checkpoint_used)
+        # A record is used exactly when the load says it accepted one.
+        assert_equal("accepted" in verdicts.values(), result[2] >= 0)
+        return result, reads
 
     def _kill_node(self):
         """End the node as a power cut would: no shutdown, so no chainstate flush."""
@@ -266,6 +298,8 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
                       f"{crash_reads} chainstate reads while loading")
         # Every payout block on the restarted chain is at or below the flushed block and is vouched for.
         assert_equal(result, (0, flushed_payouts, flushed_height))
+        # The restarted node does not know the block the wallet stands on.
+        assert_equal(self.last_verdicts["wallet tip"], "not in the block index")
         wallet = node.get_wallet_rpc(WALLET_NAME)
         # The payouts of the lost blocks are not confirmed (and so not spendable) until their blocks are back.
         assert_equal(len(self._payout_heights(self._snapshot(wallet))), flushed_payouts)
@@ -293,6 +327,7 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
         self._start()
         result, full_reads = self._load_wallet(flush_checkpoint_used=False)
         assert_equal(result, (total_payouts, 0, -1))
+        assert_equal(self.last_verdicts, {"wallet tip": "none stored", "chainstate flush": "none stored"})
         self.log.info(f"chainstate reads while loading: {crash_reads} after the kill, {clean_reads} after a clean stop, "
                       f"{full_reads} for a full authentication of {total_payouts} payout blocks")
         # A full authentication reads the chainstate at least once per payout block. The
@@ -310,6 +345,7 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
         self._start()
         result, _ = self._load_wallet(flush_checkpoint_used=False)
         assert_equal(result, (0, total_payouts, height_before_kill))
+        assert_equal(self.last_verdicts, {"wallet tip": "accepted", "chainstate flush": "digest mismatch"})
 
         self.log.info("No chainstate flush since the wallet was loaded: the checkpoint written at load covers the kill")
         # The clean stop flushed the chainstate; remove the record the wallet wrote then, so
@@ -372,6 +408,8 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
         assert remaining_payouts > 0
         result, _ = self._load_wallet(flush_checkpoint_used=False)
         assert_equal(result, (remaining_payouts, 0, -1))
+        # The wallet's block is unknown to the restarted node; the flushed block is known and was reorged out.
+        assert_equal(self.last_verdicts, {"wallet tip": "not in the block index", "chainstate flush": "not on the active chain"})
         wallet = node.get_wallet_rpc(WALLET_NAME)
         assert_equal(len(self._payout_heights(self._snapshot(wallet))), remaining_payouts)
 

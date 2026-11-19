@@ -56,7 +56,7 @@ BETA2_RELEASE_CANDIDATE = 2
 FINAL_RELEASE_IDENTITY = (30, 1, 5, 1, 0, True)
 CANDIDATE_RELEASE_IDENTITY = (30, 1, 5, 2, 1, False)
 CURRENT_FINAL_RELEASE_IDENTITY = (30, 1, 5, 2, 0, True)
-DEVELOPMENT_RELEASE_BASE = (30, 1, 5, 3)
+DEVELOPMENT_RELEASE_BASE = (30, 1, 6, 0)
 BETA2_RELEASE_IDENTITY = (30, 1, 1, 0, BETA2_RELEASE_CANDIDATE, False)
 
 
@@ -942,20 +942,21 @@ def check_development_release_identity(root, failures):
     # Preserve historical source identities and notes; qualify this source separately.
     identity = configured_release_identity(read_text(root, "configure.ac"))
     if not is_development_release_identity(identity):
-        failures.append("configure.ac development identity requires 30.1.5.3 positive RC/false")
+        failures.append("configure.ac development identity requires 30.1.6 positive RC/false")
         return
-    version = ".".join(map(str, identity[:4])) + f"rc{identity[4]}"
+    # A zero maintenance revision is not part of the version string.
+    version = ".".join(map(str, identity[:3])) + f"rc{identity[4]}"
     check_final_release_identity(root, failures, identity)
     workflow_relative = ".github/workflows/build.yml"
     workflow = read_text(root, workflow_relative)
     for fragment in (
-        "name: v30.1.5.3 signed maintenance release build",
-        "default: 30.1.5.3-beta15",
-        "- 'v30.1.5.3'",
-        "group: v30.1.5.3-release-",
-        'test "$BASE_VERSION" = "30.1.5.3"',
-        "expected='V30.1.5.3'",
-        "expected_ack='V30.1.5.3'",
+        "name: v30.1.6 signed maintenance release build",
+        "default: 30.1.6-beta1",
+        "- 'v30.1.6'",
+        "group: v30.1.6-release-",
+        'test "$BASE_VERSION" = "30.1.6"',
+        "expected='V30.1.6'",
+        "expected_ack='V30.1.6'",
         'test "$RC" = "0"',
         'test "$IS_RELEASE" = "true"',
         'test "$IS_RELEASE" = "false"',
@@ -963,12 +964,14 @@ def check_development_release_identity(root, failures):
         "IMMUTABLE_RELEASE_RECEIPT_B64",
         "verify_reproducible.py",
         "RELEASE_NOTES_NOT_FINAL",
-        "unreleased[[:space:]]+candidate|30[.]1[.]5[.]3rc[0-9]+",
+        "unreleased[[:space:]]+candidate|30[.]1[.]6rc[0-9]+",
     ):
         require_fragment(failures, workflow_relative, workflow, fragment,
                          "development workflow lock or production publication gate")
     if "30.1.5.2" in workflow or "V30.1.5.2" in workflow:
         failures.append(f"{workflow_relative}: stale v30.1.5.2 release lock")
+    if "30.1.5.3" in workflow or "V30.1.5.3" in workflow:
+        failures.append(f"{workflow_relative}: stale 30.1.5.3 development lock")
 
     overview = read_text(root, "doc/release-notes.md")
     if not overview.startswith(f"{version} DEVELOPMENT Candidate Notes\n"):
@@ -976,23 +979,23 @@ def check_development_release_identity(root, failures):
     for relative, fragments in (
         ("doc/release-notes.md", (
             "`CLIENT_VERSION_IS_RELEASE=false`",
-            "`doc/release-notes/release-notes-30.1.5.3.md`",
+            "`doc/release-notes/release-notes-30.1.6.md`",
             "30.1.5.2 Maintenance Release Notes",
         )),
-        ("doc/release-notes/release-notes-30.1.5.3.md", (
+        ("doc/release-notes/release-notes-30.1.6.md", (
             f"# Blackcoin Core {version} (DEVELOPMENT, unreleased candidate)",
             "RELEASE_NOTES_NOT_FINAL",
             "`CLIENT_VERSION_IS_RELEASE=false`",
             "Release qualification is pending.",
-            "numeric `CLIENT_VERSION` remains\n`300105`",
-            "bundle version `30.1.503`",
+            "numeric `CLIENT_VERSION` is\n`300106`",
+            "bundle version `30.1.600`",
             "template assembly only",
             "Berkeley DB",
             "[release process](../release-process.md)",
         )),
         ("doc/release-process.md", (
             f"## Current v{version} DEVELOPMENT candidate",
-            "`V30.1.5.3` acknowledgement",
+            "`V30.1.6` acknowledgement",
             "two isolated builders with byte comparison",
             "## v30.1.5.2 signed maintenance release (historical)",
         )),
@@ -1091,7 +1094,7 @@ def check_release_identity(root, failures):
         failures.append(
             "configure.ac release identity must be historical final 30.1.5.1 RC0/true, "
             "candidate 30.1.5.2 RC1/false, final 30.1.5.2 RC0/true, "
-            "development 30.1.5.3 positive RC/false, or "
+            "development 30.1.6 positive RC/false, or "
             f"replacement Beta 2 30.1.1 RC{BETA2_RELEASE_CANDIDATE}/false; found "
             f"{major}.{minor}.{build}.{revision} RC{rc}/{'true' if is_release else 'false'}"
         )

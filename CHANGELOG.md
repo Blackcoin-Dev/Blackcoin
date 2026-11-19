@@ -1,5 +1,11 @@
 # Changelog
 
+## v30.1.6rc1 (DEVELOPMENT, unreleased candidate)
+
+- Identify the source as 30.1.6. It continues the development candidates
+  numbered 30.1.5.3rc1 through 30.1.5.3rc15, which were never published.
+  The numeric client version becomes 300106.
+
 ## v30.1.5.3rc15 (DEVELOPMENT, unreleased candidate)
 
 - Bound GUI-thread work for wallet history, Account, Staking and Peers with

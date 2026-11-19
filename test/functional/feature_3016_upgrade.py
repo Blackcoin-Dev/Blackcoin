@@ -2,11 +2,11 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://www.opensource.org/licenses/mit-license.php.
-"""Exercise 30.1.5.2 -> 30.1.5.3 -> 30.1.5.2 on synthetic regtest wallets.
+"""Exercise 30.1.5.2 -> 30.1.6 -> 30.1.5.2 on synthetic regtest wallets.
 
 Requires --baseline-bitcoind or BLACKCOIN_30152_BITCOIND pointing to an
-independently built 30.1.5.2 daemon. Both revisions share numeric RPC version
-300105, so the public subversion is checked as well. No historical wallet,
+independently built 30.1.5.2 daemon. The baseline reports numeric RPC version
+300105 and the candidate 300106; the public subversion is checked as well. No historical wallet,
 production datadir, RPC endpoint or secret is accepted as input. This is a
 bounded compatibility fixture, not a guarantee of arbitrary downgrade safety.
 """
@@ -23,8 +23,12 @@ from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework, SkipTest
 from test_framework.util import assert_equal
 
+BASELINE = "30.1.5.2"
+CANDIDATE = "30.1.6"
+RPC_VERSIONS = {BASELINE: 300105, CANDIDATE: 300106}
 
-class Upgrade30153Test(BitcoinTestFramework):
+
+class Upgrade3016Test(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser, descriptors=True, legacy=False)
         parser.add_argument("--baseline-bitcoind", default=os.getenv("BLACKCOIN_30152_BITCOIND"),
@@ -57,20 +61,20 @@ class Upgrade30153Test(BitcoinTestFramework):
         self.add_nodes(1, extra_args=self.extra_args, binary=[self.baseline_binary])
         self.start_nodes()
 
-    def _assert_version(self, revision):
+    def _assert_version(self, release):
         info = self.nodes[0].getnetworkinfo()
-        assert_equal(info["version"], 300105)
-        assert re.fullmatch(rf"/Blackcoin:30\.1\.5\.{revision}(?:\([^/]*\))?/", info["subversion"]), info
+        assert_equal(info["version"], RPC_VERSIONS[release])
+        assert re.fullmatch(rf"/Blackcoin:{re.escape(release)}(?:\([^/]*\))?/", info["subversion"]), info
         assert_equal(self.nodes[0].getblockchaininfo()["chain"], "regtest")
         return {key: info[key] for key in ("version", "subversion")}
 
-    def _switch(self, binary, revision):
+    def _switch(self, binary, release):
         node = self.nodes[0]
         self.stop_node(0)
         node.binary = binary
         node.args[0] = binary
         self.start_node(0)
-        self._assert_version(revision)
+        self._assert_version(release)
         # Every tested wallet explicitly requested loading on startup. Check
         # persistence across revisions before any wallet-specific operation.
         assert set(self.wallets).issubset(node.listwallets())
@@ -89,7 +93,7 @@ class Upgrade30153Test(BitcoinTestFramework):
                               if key in address_info}
             # A fresh signature proves retained private key ownership without
             # exporting key material. Addresses here are ordinary legacy P2PKH.
-            message = "isolated 30.1.5.3 compatibility fixture"
+            message = "isolated 30.1.6 compatibility fixture"
             assert node.verifymessage(address, wallet.signmessage(address, message), message)
         quantum = wallet.getquantumkeyinventory()
         assert_equal(quantum["total"], 1)
@@ -116,7 +120,7 @@ class Upgrade30153Test(BitcoinTestFramework):
 
     def run_test(self):
         node = self.nodes[0]
-        baseline_info = self._assert_version(2)
+        baseline_info = self._assert_version(BASELINE)
         self.wallets = {}
         skipped = []
         node.createwallet(wallet_name="funding", descriptors=True)
@@ -152,11 +156,11 @@ class Upgrade30153Test(BitcoinTestFramework):
         expected = {name: self._snapshot(name) for name in self.wallets}
         for snapshot in expected.values():
             assert_equal(snapshot["balances"]["mine"]["trusted"], Decimal("10"))
-        self._switch(self.candidate_binary, 3)
+        self._switch(self.candidate_binary, CANDIDATE)
         for name in self.wallets:
             self._assert_wallet(name, expected[name])
         self.restart_node(0)
-        self._assert_version(3)
+        self._assert_version(CANDIDATE)
         for name in self.wallets:
             self._assert_wallet(name, expected[name])
 
@@ -181,14 +185,14 @@ class Upgrade30153Test(BitcoinTestFramework):
             expected[restored] = expected[name]
             backups[name] = hashlib.sha256(backup.read_bytes()).hexdigest()
         self.restart_node(0)
-        self._assert_version(3)
+        self._assert_version(CANDIDATE)
         for name in self.wallets:
             self._assert_wallet(name, expected[name])
-        self._switch(self.baseline_binary, 2)
+        self._switch(self.baseline_binary, BASELINE)
         for name in self.wallets:
             self._assert_wallet(name, expected[name])
         self.restart_node(0)
-        self._assert_version(2)
+        self._assert_version(BASELINE)
         for name in self.wallets:
             self._assert_wallet(name, expected[name])
             # backupwallet reopens the written database and challenges its
@@ -200,7 +204,7 @@ class Upgrade30153Test(BitcoinTestFramework):
             assert node.get_wallet_rpc(name).getquantumkeyinventory()["all_backed_up"]
         report = {
             "baseline": baseline_info,
-            "candidate": {"version": 300105, "revision": "30.1.5.3"},
+            "candidate": {"version": RPC_VERSIONS[CANDIDATE], "revision": CANDIDATE},
             "binary_sha256": {label: hashlib.sha256(Path(binary).read_bytes()).hexdigest()
                               for label, binary in (("baseline", self.baseline_binary), ("candidate", self.candidate_binary))},
             "wallets": list(self.wallets), "skipped": skipped,
@@ -214,4 +218,4 @@ class Upgrade30153Test(BitcoinTestFramework):
 
 
 if __name__ == '__main__':
-    Upgrade30153Test().main()
+    Upgrade3016Test().main()

@@ -1,8 +1,8 @@
-# Blackcoin Core 30.1.5.3rc15 (DEVELOPMENT, unreleased candidate)
+# Blackcoin Core 30.1.6rc1 (DEVELOPMENT, unreleased candidate)
 
 RELEASE_NOTES_NOT_FINAL
 
-Blackcoin Core 30.1.5.3rc15 improves peer discovery, bounds header replay tracking,
+Blackcoin Core 30.1.6rc1 improves peer discovery, bounds header replay tracking,
 and reduces work in mining controls, block-template assembly, and UTXO scans.
 This candidate has `CLIENT_VERSION_IS_RELEASE=false`.
 Release qualification is pending.
@@ -168,11 +168,12 @@ changes. History scans also check RPC cancellation for each record.
 
 ## Compatibility and release qualification
 
-The source version is `30.1.5.3rc15`; numeric `CLIENT_VERSION` remains
-`300105`.
-macOS uses short version `30.1.5`, bundle version `30.1.503`, and
-`BlackcoinFullVersion=30.1.5.3` (the base revision). The runtime and configured
-package version remain `30.1.5.3rc15`.
+The source version is `30.1.6rc1`; numeric `CLIENT_VERSION` is
+`300106`.
+macOS uses short version `30.1.6`, bundle version `30.1.600`, and
+`BlackcoinFullVersion=30.1.6`. The runtime and configured package version are
+`30.1.6rc1`. Earlier development candidates of this source line were numbered
+30.1.5.3rc1 through 30.1.5.3rc15 and reported numeric version `300105`.
 
 This release preserves consensus and reward rules, activation
 heights, wire protocol, wallet storage, and chainstate formats. No reindex or

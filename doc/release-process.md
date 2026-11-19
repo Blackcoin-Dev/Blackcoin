@@ -1,21 +1,25 @@
 # Blackcoin Core release process
 
-## Current v30.1.5.3rc15 DEVELOPMENT candidate
+## Current v30.1.6rc1 DEVELOPMENT candidate
 
 This is an unpublished development candidate. `configure.ac` records major 30,
-minor 1, build 5, revision 3, RC15, and `CLIENT_VERSION_IS_RELEASE=false`.
-The numeric `CLIENT_VERSION` remains `300105`; macOS short version remains
-`30.1.5`, bundle version is `30.1.503`, and `BlackcoinFullVersion` is
-`30.1.5.3` (the base revision). The runtime and configured package version
-remain `30.1.5.3rc15`. The canonical development notes are
-`doc/release-notes/release-notes-30.1.5.3.md`.
+minor 1, build 6, revision 0, RC1, and `CLIENT_VERSION_IS_RELEASE=false`.
+The numeric `CLIENT_VERSION` is `300106`; macOS short version is `30.1.6`,
+bundle version is `30.1.600`, and `BlackcoinFullVersion` is `30.1.6`. The
+runtime and configured package version are `30.1.6rc1`. The canonical
+development notes are `doc/release-notes/release-notes-30.1.6.md`.
 
-Manual candidate packages use an explicit `30.1.5.3-alpha13` or
-`30.1.5.3-beta15` label bound to the exact source SHA. Such builds do not publish
-a release. The future `v30.1.5.3` production path remains blocked until RC0,
+This source line continues the development candidates that were numbered
+30.1.5.3rc1 through 30.1.5.3rc15. None of them was published as a release, and
+no `v30.1.5.3` tag exists or will be created. The last published release is
+v30.1.5.2.
+
+Manual candidate packages use an explicit `30.1.6-alpha1` or
+`30.1.6-beta1` label bound to the exact source SHA. Such builds do not publish
+a release. The future `v30.1.6` production path remains blocked until RC0,
 release=true, final canonical notes, the complete exact-source safety gate,
 a Blackcoin-Dev SSH-signed source commit and annotated tag, and protected
-`V30.1.5.3` acknowledgement are present. Retain the signed immutable-configuration
+`V30.1.6` acknowledgement are present. Retain the signed immutable-configuration
 receipt, authenticated release inventory and numeric release-ID checks,
 two isolated builders with byte comparison, attestations, and immutable
 publication verification. A version transition is not evidence of those results.

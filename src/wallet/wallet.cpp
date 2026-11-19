@@ -1078,28 +1078,73 @@ std::pair<uint32_t, uint256> CWallet::RecomputeSyntheticPayoutDigestLocked(int h
     return HashSyntheticPayoutRefs(CollectSyntheticPayoutRefs(), height, schema);
 }
 
+SyntheticPayoutCheckpointResult CheckSyntheticPayoutCheckpoint(
+    const SyntheticPayoutCheckpoint& checkpoint,
+    const std::vector<SyntheticPayoutRef>& refs,
+    const SyntheticPayoutCheckpointBlockStatus& block_status)
+{
+    using Verdict = SyntheticPayoutCheckpointVerdict;
+    SyntheticPayoutCheckpointResult result;
+    if (checkpoint.schema != SyntheticPayoutCheckpoint::CURRENT_SCHEMA &&
+        checkpoint.schema != SyntheticPayoutCheckpoint::LEGACY_SCHEMA) {
+        result.verdict = Verdict::UNKNOWN_SCHEMA;
+        return result;
+    }
+    if (checkpoint.client_version != CLIENT_VERSION) {
+        result.verdict = Verdict::OTHER_CLIENT_VERSION;
+        return result;
+    }
+    if (checkpoint.height < 0) {
+        result.verdict = Verdict::NO_HEIGHT;
+        return result;
+    }
+    result.verdict = block_status(checkpoint);
+    if (result.verdict != Verdict::ACCEPTED) return result;
+    // A checkpoint written by an earlier release (schema 1) is checked once with
+    // the algorithm that wrote it; see SyntheticPayoutCheckpointMatches.
+    const auto [count, digest] = HashSyntheticPayoutRefs(refs, checkpoint.height, checkpoint.schema);
+    result.records_found = count;
+    if (count != checkpoint.count) {
+        result.verdict = Verdict::COUNT_MISMATCH;
+    } else if (digest != checkpoint.digest) {
+        result.verdict = Verdict::DIGEST_MISMATCH;
+    }
+    return result;
+}
+
+std::string DescribeSyntheticPayoutCheckpointResult(const SyntheticPayoutCheckpoint& checkpoint, const SyntheticPayoutCheckpointResult& result)
+{
+    using Verdict = SyntheticPayoutCheckpointVerdict;
+    const std::string what{strprintf("height %d, %u payout records", checkpoint.height, checkpoint.count)};
+    switch (result.verdict) {
+    case Verdict::ACCEPTED: return what + ": accepted";
+    case Verdict::UNKNOWN_SCHEMA: return what + strprintf(": rejected, unknown schema %u", checkpoint.schema);
+    case Verdict::OTHER_CLIENT_VERSION: return what + strprintf(": rejected, written by client version %d, this is %d", checkpoint.client_version, CLIENT_VERSION);
+    case Verdict::NO_HEIGHT: return what + ": rejected, no height";
+    case Verdict::BLOCK_NOT_IN_INDEX: return what + strprintf(": rejected, block %s is not in the block index", checkpoint.block_hash.ToString());
+    case Verdict::BLOCK_NOT_ACTIVE: return what + strprintf(": rejected, block %s is not on the active chain at that height", checkpoint.block_hash.ToString());
+    case Verdict::COUNT_MISMATCH: return what + strprintf(": rejected, count mismatch, the wallet holds %u payout records at or below that height", result.records_found);
+    case Verdict::DIGEST_MISMATCH: return what + ": rejected, digest mismatch, a payout record at or below that height changed";
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
 std::optional<size_t> SelectSyntheticPayoutCheckpoint(
     const std::vector<SyntheticPayoutCheckpoint>& checkpoints,
     const std::vector<SyntheticPayoutRef>& refs,
-    const std::function<bool(const SyntheticPayoutCheckpoint&)>& on_active_chain)
+    const SyntheticPayoutCheckpointBlockStatus& block_status,
+    std::vector<SyntheticPayoutCheckpointResult>* results)
 {
-    std::vector<size_t> order(checkpoints.size());
-    std::iota(order.begin(), order.end(), size_t{0});
-    // Highest first, so the first usable one is the answer and a lower one is never hashed in vain.
-    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return checkpoints[a].height > checkpoints[b].height;
-    });
-    for (const size_t index : order) {
-        const SyntheticPayoutCheckpoint& checkpoint{checkpoints[index]};
-        if (checkpoint.schema != SyntheticPayoutCheckpoint::CURRENT_SCHEMA &&
-            checkpoint.schema != SyntheticPayoutCheckpoint::LEGACY_SCHEMA) {
-            continue;
-        }
-        if (checkpoint.client_version != CLIENT_VERSION || checkpoint.height < 0) continue;
-        if (!on_active_chain(checkpoint)) continue;
-        if (SyntheticPayoutCheckpointMatches(checkpoint, refs)) return index;
+    // Every checkpoint is checked, also one below an accepted one: the load reports each.
+    std::optional<size_t> best;
+    if (results) results->clear();
+    for (size_t index{0}; index < checkpoints.size(); ++index) {
+        const SyntheticPayoutCheckpointResult result{CheckSyntheticPayoutCheckpoint(checkpoints[index], refs, block_status)};
+        if (results) results->push_back(result);
+        if (result.verdict != SyntheticPayoutCheckpointVerdict::ACCEPTED) continue;
+        if (!best || checkpoints[index].height > checkpoints[*best].height) best = index;
     }
-    return std::nullopt;
+    return best;
 }
 
 std::optional<SyntheticPayoutCheckpoint> CWallet::MakeSyntheticPayoutCheckpoint(const uint256& block_hash, int height) const
@@ -1954,10 +1999,16 @@ bool CWallet::ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase,
 
 void CWallet::chainStateFlushed(ChainstateRole role, const CBlockLocator& loc)
 {
+    if (role == ChainstateRole::BACKGROUND) return;
+    PersistBestBlockLocator(loc, /*chainstate_flushed=*/true);
+}
+
+void CWallet::PersistBestBlockLocator(const CBlockLocator& loc, bool chainstate_flushed)
+{
     LOCK(cs_wallet);
     // Don't update the best block until the chain is attached so that in case of a shutdown,
     // the rescan will be restarted at next startup.
-    if (m_attaching_chain || role == ChainstateRole::BACKGROUND) {
+    if (m_attaching_chain) {
         return;
     }
     WalletBatch batch(GetDatabase());
@@ -1978,7 +2029,11 @@ void CWallet::chainStateFlushed(ChainstateRole role, const CBlockLocator& loc)
         // that block is, and the wallet is then off by that block; the record of the
         // previous flush is kept. Written here and at load only, in a commit that
         // happens anyway.
-        if (!loc.IsNull() && loc.vHave.front() == m_last_block_processed) {
+        //
+        // The wallet also comes here with the chain tip after a rescan at attach and when
+        // it is created. That tip need not be on disk, so the record is left alone then:
+        // one for an unflushed block would replace a good one and be useless after a crash.
+        if (chainstate_flushed && !loc.IsNull() && loc.vHave.front() == m_last_block_processed) {
             WriteSyntheticPayoutFlushCheckpoint(batch, m_last_block_processed, m_last_block_processed_height);
         }
     }
@@ -7090,6 +7145,8 @@ DBErrors CWallet::LoadWallet()
     std::vector<SyntheticPayoutRef> synthetic_payout_refs;
     // The stored payout checkpoints: the wallet's own first, then the flush-anchored one.
     std::vector<SyntheticPayoutCheckpoint> payout_checkpoints;
+    bool have_tip_checkpoint{false};
+    bool have_flush_checkpoint{false};
     const auto load_start{SteadyClock::now()};
     const std::optional<int64_t> load_cpu_start{util::CurrentThreadCpuMicros()};
     {
@@ -7103,10 +7160,12 @@ DBErrors CWallet::LoadWallet()
             if (load_batch.ReadSyntheticPayoutCheckpoint(stored)) {
                 m_synthetic_payout_checkpoint = stored;
                 payout_checkpoints.push_back(stored);
+                have_tip_checkpoint = true;
             }
             if (load_batch.ReadSyntheticPayoutFlushCheckpoint(stored)) {
                 m_synthetic_payout_flush_checkpoint = stored;
                 payout_checkpoints.push_back(stored);
+                have_flush_checkpoint = true;
             }
             for (const auto& [_, wtx] : mapWallet) {
                 if (const auto* conf = wtx.state<TxStateConfirmed>()) {
@@ -7118,7 +7177,7 @@ DBErrors CWallet::LoadWallet()
                     referenced_blocks.insert(conf->conflicting_block_hash);
                 }
             }
-            if (!payout_checkpoints.empty()) synthetic_payout_refs = CollectSyntheticPayoutRefs();
+            synthetic_payout_refs = CollectSyntheticPayoutRefs();
         }
     }
     const auto db_done{SteadyClock::now()};
@@ -7163,25 +7222,32 @@ DBErrors CWallet::LoadWallet()
         // anchored at a flushed block and still is. The highest one that
         // passes every check is used.
         int verified_through_height{-1};
-        if (!payout_checkpoints.empty() && !synthetic_payout_blocks.empty()) {
+        if (!synthetic_payout_blocks.empty()) {
             for (SyntheticPayoutRef& ref : synthetic_payout_refs) {
                 const auto snapshot = active_block_heights.find(ref.block_hash);
                 ref.height = (snapshot != active_block_heights.end() && snapshot->second) ? *snapshot->second : -1;
             }
+            std::vector<SyntheticPayoutCheckpointResult> results;
             const std::optional<size_t> usable{SelectSyntheticPayoutCheckpoint(
                 payout_checkpoints, synthetic_payout_refs, [&](const SyntheticPayoutCheckpoint& checkpoint) {
                     const CBlockIndex* checkpoint_index = chainman.m_blockman.LookupBlockIndex(checkpoint.block_hash);
-                    return checkpoint_index && checkpoint_index->nHeight == checkpoint.height &&
-                           chainman.ActiveChain().Contains(checkpoint_index);
-                })};
-            if (usable) {
-                verified_through_height = payout_checkpoints[*usable].height;
-                if (m_synthetic_payout_flush_checkpoint && payout_checkpoints[*usable] == *m_synthetic_payout_flush_checkpoint &&
-                    !(m_synthetic_payout_checkpoint && payout_checkpoints[*usable] == *m_synthetic_payout_checkpoint)) {
-                    WalletLogPrintf("Gold Rush payout check uses the checkpoint of the last chainstate flush (height %d): the wallet's own checkpoint%s cannot be used, as after a crash\n",
-                                    verified_through_height,
-                                    m_synthetic_payout_checkpoint ? strprintf(" at height %d", m_synthetic_payout_checkpoint->height) : "");
+                    if (!checkpoint_index) return SyntheticPayoutCheckpointVerdict::BLOCK_NOT_IN_INDEX;
+                    if (checkpoint_index->nHeight != checkpoint.height || !chainman.ActiveChain().Contains(checkpoint_index)) {
+                        return SyntheticPayoutCheckpointVerdict::BLOCK_NOT_ACTIVE;
+                    }
+                    return SyntheticPayoutCheckpointVerdict::ACCEPTED;
+                }, &results)};
+            if (usable) verified_through_height = payout_checkpoints[*usable].height;
+            // One line per record, also for a missing one: what a slow start needs to be explained.
+            size_t stored{0};
+            for (const auto& [name, present] : {std::pair{"wallet tip", have_tip_checkpoint}, std::pair{"chainstate flush", have_flush_checkpoint}}) {
+                if (!present) {
+                    WalletLogPrintf("Gold Rush payout checkpoint (%s): none stored (chain height %d)\n", name, payout_tip_height);
+                    continue;
                 }
+                WalletLogPrintf("Gold Rush payout checkpoint (%s): %s (chain height %d)\n", name,
+                                DescribeSyntheticPayoutCheckpointResult(payout_checkpoints[stored], results[stored]), payout_tip_height);
+                ++stored;
             }
         }
         // Where the chainstate is on disk (one read). Every payout record at
@@ -7298,6 +7364,18 @@ DBErrors CWallet::LoadWallet()
         // And at or below the block the chainstate holds on disk, so that a crash before
         // the next chainstate flush does not cost a full authentication either.
         WriteSyntheticPayoutFlushCheckpoint(checkpoint_batch, payout_flushed_hash, payout_flushed_height);
+    }
+    if (HaveChain() && !m_confirmed_synthetic_payouts_by_block.empty()) {
+        // What the next start will find, in one line, or why nothing was stored.
+        if (m_synthetic_payout_checkpoint_trusted) {
+            WalletLogPrintf("Gold Rush payout checkpoints stored: wallet tip %s, chainstate flush %s (chainstate on disk at height %d)\n",
+                            m_synthetic_payout_checkpoint ? strprintf("height %d, %u payout records", m_synthetic_payout_checkpoint->height, m_synthetic_payout_checkpoint->count) : "none",
+                            m_synthetic_payout_flush_checkpoint ? strprintf("height %d, %u payout records", m_synthetic_payout_flush_checkpoint->height, m_synthetic_payout_flush_checkpoint->count) : "none",
+                            payout_flushed_height);
+        } else {
+            WalletLogPrintf("Gold Rush payout checkpoints are not written until the wallet is loaded again: %s\n",
+                            reconciliation_write_ok ? strprintf("the wallet database loaded with result %d", static_cast<int>(nLoadWalletRet)) : "a payout record could not be written");
+        }
     }
     if (nLoadWalletRet == DBErrors::NEED_REWRITE)
     {
@@ -9770,7 +9848,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
         }
 
         if (chain) {
-            walletInstance->chainStateFlushed(ChainstateRole::NORMAL, chain->getTipLocator());
+            walletInstance->PersistBestBlockLocator(chain->getTipLocator(), /*chainstate_flushed=*/false);
         }
     } else if (wallet_creation_flags & WALLET_FLAG_DISABLE_PRIVATE_KEYS) {
         // Make it impossible to disable private keys after creation
@@ -10114,7 +10192,7 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
             }
         }
         walletInstance->m_attaching_chain = false;
-        walletInstance->chainStateFlushed(ChainstateRole::NORMAL, chain.getTipLocator());
+        walletInstance->PersistBestBlockLocator(chain.getTipLocator(), /*chainstate_flushed=*/false);
         walletInstance->GetDatabase().IncrementUpdateCounter();
     }
 

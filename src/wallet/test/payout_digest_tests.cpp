@@ -12,6 +12,7 @@
 #include <shadow.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <tinyformat.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
 #include <wallet/staking.h>
@@ -24,6 +25,7 @@
 #include <random.h>
 #include <wallet/walletdb.h>
 #include <set>
+#include <string>
 
 #include <boost/test/unit_test.hpp>
 
@@ -186,8 +188,9 @@ BOOST_AUTO_TEST_CASE(highest_usable_checkpoint_is_selected)
     // Fifty payout records, one per block, at heights 1 to 50.
     std::vector<SyntheticPayoutRef> refs;
     for (uint8_t i = 1; i <= 50; ++i) refs.push_back(SyntheticPayoutRef{uint256{i}, uint256{static_cast<uint8_t>(100 + i)}, i, i % 7 == 0});
-    const auto all_active = [](const SyntheticPayoutCheckpoint&) { return true; };
-    const auto none_active = [](const SyntheticPayoutCheckpoint&) { return false; };
+    using Verdict = SyntheticPayoutCheckpointVerdict;
+    const auto all_active = [](const SyntheticPayoutCheckpoint&) { return Verdict::ACCEPTED; };
+    const auto none_active = [](const SyntheticPayoutCheckpoint&) { return Verdict::BLOCK_NOT_ACTIVE; };
 
     // The wallet's own checkpoint (first) and the flush-anchored one, as LoadWallet passes them.
     const SyntheticPayoutCheckpoint own{CheckpointAt(refs, 50, 150)};
@@ -211,7 +214,9 @@ BOOST_AUTO_TEST_CASE(highest_usable_checkpoint_is_selected)
     for (SyntheticPayoutRef& ref : restarted) {
         if (ref.height > 40) ref.height = -1;
     }
-    const auto active_through_40 = [](const SyntheticPayoutCheckpoint& checkpoint) { return checkpoint.height <= 40; };
+    const auto active_through_40 = [](const SyntheticPayoutCheckpoint& checkpoint) {
+        return checkpoint.height <= 40 ? Verdict::ACCEPTED : Verdict::BLOCK_NOT_IN_INDEX;
+    };
     BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own, flushed}, restarted, active_through_40) == std::optional<size_t>{1});
     // Accepting the wallet's own checkpoint there merely because of its hash would not help:
     // it does not describe the records that are on the restarted chain.
@@ -224,7 +229,7 @@ BOOST_AUTO_TEST_CASE(highest_usable_checkpoint_is_selected)
     size_t asked{0};
     BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own, flushed}, refs, [&](const SyntheticPayoutCheckpoint& checkpoint) {
         ++asked;
-        return checkpoint.block_hash == flushed.block_hash;
+        return checkpoint.block_hash == flushed.block_hash ? Verdict::ACCEPTED : Verdict::BLOCK_NOT_ACTIVE;
     }) == std::optional<size_t>{1});
     BOOST_CHECK_EQUAL(asked, 2U);
 
@@ -255,9 +260,9 @@ BOOST_AUTO_TEST_CASE(highest_usable_checkpoint_is_selected)
     // Another client version, an unknown schema or a negative height is never usable,
     // and never asks about the chain.
     {
-        const auto must_not_ask = [](const SyntheticPayoutCheckpoint&) -> bool {
+        const auto must_not_ask = [](const SyntheticPayoutCheckpoint&) {
             BOOST_ERROR("an unusable checkpoint must not reach the chain lookup");
-            return true;
+            return Verdict::ACCEPTED;
         };
         SyntheticPayoutCheckpoint other_version{own};
         other_version.client_version = CLIENT_VERSION + 1;
@@ -268,6 +273,60 @@ BOOST_AUTO_TEST_CASE(highest_usable_checkpoint_is_selected)
         BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({other_version, other_schema, no_height}, refs, must_not_ask));
         BOOST_CHECK(SelectSyntheticPayoutCheckpoint({other_version, flushed}, refs, all_active) == std::optional<size_t>{1});
     }
+}
+
+BOOST_AUTO_TEST_CASE(every_checkpoint_gets_a_verdict_with_its_reason)
+{
+    using Verdict = SyntheticPayoutCheckpointVerdict;
+    std::vector<SyntheticPayoutRef> refs;
+    for (uint8_t i = 1; i <= 50; ++i) refs.push_back(SyntheticPayoutRef{uint256{i}, uint256{static_cast<uint8_t>(100 + i)}, i, false});
+    const auto all_active = [](const SyntheticPayoutCheckpoint&) { return Verdict::ACCEPTED; };
+    const SyntheticPayoutCheckpoint own{CheckpointAt(refs, 50, 150)};
+    const SyntheticPayoutCheckpoint flushed{CheckpointAt(refs, 40, 140)};
+
+    const auto verdict = [&](const SyntheticPayoutCheckpoint& checkpoint, const std::vector<SyntheticPayoutRef>& records, Verdict block = Verdict::ACCEPTED) {
+        const SyntheticPayoutCheckpointResult result{CheckSyntheticPayoutCheckpoint(checkpoint, records, [block](const SyntheticPayoutCheckpoint&) { return block; })};
+        // Every verdict has a description that names the checkpoint height and its count.
+        const std::string text{DescribeSyntheticPayoutCheckpointResult(checkpoint, result)};
+        BOOST_CHECK_MESSAGE(text.find(strprintf("height %d, %u payout records: ", checkpoint.height, checkpoint.count)) == 0, text);
+        BOOST_CHECK_MESSAGE((text.find(": accepted") != std::string::npos) == (result.verdict == Verdict::ACCEPTED), text);
+        BOOST_CHECK_MESSAGE((text.find(": rejected, ") != std::string::npos) == (result.verdict != Verdict::ACCEPTED), text);
+        return result;
+    };
+    BOOST_CHECK(verdict(own, refs).verdict == Verdict::ACCEPTED);
+    BOOST_CHECK_EQUAL(verdict(own, refs).records_found, 50U);
+    BOOST_CHECK(verdict(own, refs, Verdict::BLOCK_NOT_IN_INDEX).verdict == Verdict::BLOCK_NOT_IN_INDEX);
+    BOOST_CHECK(verdict(own, refs, Verdict::BLOCK_NOT_ACTIVE).verdict == Verdict::BLOCK_NOT_ACTIVE);
+    SyntheticPayoutCheckpoint changed{own};
+    changed.schema = 3;
+    BOOST_CHECK(verdict(changed, refs).verdict == Verdict::UNKNOWN_SCHEMA);
+    changed = own;
+    changed.client_version = CLIENT_VERSION - 1;
+    BOOST_CHECK(verdict(changed, refs).verdict == Verdict::OTHER_CLIENT_VERSION);
+    changed = own;
+    changed.height = -1;
+    BOOST_CHECK(verdict(changed, refs).verdict == Verdict::NO_HEIGHT);
+    changed = own;
+    changed.digest = uint256{9};
+    BOOST_CHECK(verdict(changed, refs).verdict == Verdict::DIGEST_MISMATCH);
+    // A record that left the active chain is a count mismatch, and the count found is reported.
+    auto fewer = refs;
+    fewer[4].height = -1;
+    BOOST_CHECK(verdict(own, fewer).verdict == Verdict::COUNT_MISMATCH);
+    BOOST_CHECK_EQUAL(verdict(own, fewer).records_found, 49U);
+    BOOST_CHECK(DescribeSyntheticPayoutCheckpointResult(own, verdict(own, fewer)).find("the wallet holds 49 payout records") != std::string::npos);
+
+    // The selection reports every checkpoint, in the order given, also one below the accepted one.
+    std::vector<SyntheticPayoutCheckpointResult> results;
+    BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own, flushed}, refs, all_active, &results) == std::optional<size_t>{0});
+    BOOST_REQUIRE_EQUAL(results.size(), 2U);
+    BOOST_CHECK(results[0].verdict == Verdict::ACCEPTED && results[1].verdict == Verdict::ACCEPTED);
+    BOOST_CHECK_EQUAL(results[1].records_found, 40U);
+    BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({own, flushed}, fewer, all_active, &results));
+    BOOST_REQUIRE_EQUAL(results.size(), 2U);
+    BOOST_CHECK(results[0].verdict == Verdict::COUNT_MISMATCH && results[1].verdict == Verdict::COUNT_MISMATCH);
+    BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({}, refs, all_active, &results));
+    BOOST_CHECK(results.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

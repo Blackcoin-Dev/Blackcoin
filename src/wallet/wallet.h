@@ -462,18 +462,49 @@ struct SyntheticPayoutCheckpoint;
 /** Whether a stored checkpoint (either schema) describes exactly these records. The records carry
  *  the heights to hash against (at load, the active-chain heights of their blocks). */
 bool SyntheticPayoutCheckpointMatches(const SyntheticPayoutCheckpoint& checkpoint, const std::vector<SyntheticPayoutRef>& refs);
+/** What the load made of one stored payout checkpoint. */
+enum class SyntheticPayoutCheckpointVerdict {
+    ACCEPTED,
+    UNKNOWN_SCHEMA,
+    OTHER_CLIENT_VERSION,
+    NO_HEIGHT,
+    BLOCK_NOT_IN_INDEX,
+    //! The block is known but is not the active-chain block at the checkpoint height.
+    BLOCK_NOT_ACTIVE,
+    COUNT_MISMATCH,
+    DIGEST_MISMATCH,
+};
+struct SyntheticPayoutCheckpointResult {
+    SyntheticPayoutCheckpointVerdict verdict{SyntheticPayoutCheckpointVerdict::NO_HEIGHT};
+    //! Records the wallet holds at or below the checkpoint height (set once the block was found active).
+    uint32_t records_found{0};
+};
+/** Where the chain has a checkpoint's block: ACCEPTED (active at the checkpoint height),
+ *  BLOCK_NOT_IN_INDEX or BLOCK_NOT_ACTIVE. */
+using SyntheticPayoutCheckpointBlockStatus = std::function<SyntheticPayoutCheckpointVerdict(const SyntheticPayoutCheckpoint&)>;
 /**
- * Choose among the stored payout checkpoints at load. A checkpoint is usable only when its
- * schema is known, it was written by this client version, on_active_chain says its block is
- * the active-chain block at its height, and it matches the records (whose heights are the
- * active-chain heights of their blocks, negative for a block that is not on the active chain).
- * Returns the index of the usable checkpoint with the greatest height (the first of equals),
- * or nullopt when none is usable and every payout block has to be authenticated.
+ * Check one stored payout checkpoint at load. It is accepted only when its schema is known,
+ * it was written by this client version, block_status says its block is the active-chain
+ * block at its height, and it matches the records (whose heights are the active-chain heights
+ * of their blocks, negative for a block that is not on the active chain).
+ */
+SyntheticPayoutCheckpointResult CheckSyntheticPayoutCheckpoint(
+    const SyntheticPayoutCheckpoint& checkpoint,
+    const std::vector<SyntheticPayoutRef>& refs,
+    const SyntheticPayoutCheckpointBlockStatus& block_status);
+/** One log line's worth of text for a checked checkpoint: its height and count, and the verdict with its reason. */
+std::string DescribeSyntheticPayoutCheckpointResult(const SyntheticPayoutCheckpoint& checkpoint, const SyntheticPayoutCheckpointResult& result);
+/**
+ * Choose among the stored payout checkpoints at load: the index of the accepted checkpoint
+ * with the greatest height (the first of equals), or nullopt when none is accepted and every
+ * payout block has to be authenticated. results, when given, receives the result of every
+ * checkpoint in the order passed.
  */
 std::optional<size_t> SelectSyntheticPayoutCheckpoint(
     const std::vector<SyntheticPayoutCheckpoint>& checkpoints,
     const std::vector<SyntheticPayoutRef>& refs,
-    const std::function<bool(const SyntheticPayoutCheckpoint&)>& on_active_chain);
+    const SyntheticPayoutCheckpointBlockStatus& block_status,
+    std::vector<SyntheticPayoutCheckpointResult>* results = nullptr);
 
 /** Block timing captured before taking cs_wallet. */
 struct WalletBlockTime {
@@ -2571,6 +2602,10 @@ public:
     bool IsFromMe(const CTransaction& tx) const;
     CAmount GetDebit(const CTransaction& tx, const isminefilter& filter) const;
     void chainStateFlushed(ChainstateRole role, const CBlockLocator& loc) override;
+    /** Store loc as the wallet's best block, with the payout checkpoint of the last processed
+     * block. chainstate_flushed says that the chainstate is on disk at the front of loc (a
+     * chainstate flush notification); only then may the flush-anchored payout checkpoint move. */
+    void PersistBestBlockLocator(const CBlockLocator& loc, bool chainstate_flushed);
 
     DBErrors LoadWallet();
     DBErrors ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256>& vHashOut) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

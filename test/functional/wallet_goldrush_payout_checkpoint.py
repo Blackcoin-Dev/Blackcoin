@@ -30,6 +30,8 @@ MIGRATION_END_HEIGHT = GOLD_RUSH_END_HEIGHT + 10
 WALLET_NAME = "payout_checkpoint"
 PAYOUT_BLOCKS = 8
 CHECKPOINT_KEY = b"\x19syntheticpayoutcheckpoint"
+# The same hint anchored at the last chainstate flush; see wallet_goldrush_payout_crash_checkpoint.py.
+FLUSH_CHECKPOINT_KEY = b"\x1esyntheticpayoutflushcheckpoint"
 CHECK_LINE = re.compile(
     r"Gold Rush payout check: (\d+) payout blocks authenticated, (\d+) already verified through height (-?\d+)")
 
@@ -126,8 +128,12 @@ class WalletGoldRushPayoutCheckpointTest(BitcoinTestFramework):
         self.restart_node(0, [*self.node_args, *extra])
         return self._load_wallet()
 
-    def _edit_checkpoint(self, edit):
-        """Stop the node and apply `edit(value) -> value or None (delete)` to the stored checkpoint."""
+    def _edit_checkpoint(self, edit, keep_flush_checkpoint=False):
+        """Stop the node and apply `edit(value) -> value or None (delete)` to the stored checkpoint.
+
+        The flush-anchored checkpoint, which a clean stop leaves at the same block, is
+        removed unless keep_flush_checkpoint is set, so that the wallet's own checkpoint
+        alone decides what the next load authenticates."""
         self.stop_node(0)
         db_path = self.nodes[0].wallets_path / WALLET_NAME / self.wallet_data_filename
         conn = sqlite3.connect(db_path)
@@ -139,6 +145,10 @@ class WalletGoldRushPayoutCheckpointTest(BitcoinTestFramework):
                 conn.execute("DELETE FROM main WHERE key = ?", (CHECKPOINT_KEY,))
             else:
                 conn.execute("UPDATE main SET value = ? WHERE key = ?", (new_value, CHECKPOINT_KEY))
+            flush_row = conn.execute("SELECT value FROM main WHERE key = ?", (FLUSH_CHECKPOINT_KEY,)).fetchone()
+            assert flush_row is not None, "wallet did not store a flush-anchored payout checkpoint"
+            if not keep_flush_checkpoint:
+                conn.execute("DELETE FROM main WHERE key = ?", (FLUSH_CHECKPOINT_KEY,))
         conn.close()
 
     def run_test(self):
@@ -171,6 +181,14 @@ class WalletGoldRushPayoutCheckpointTest(BitcoinTestFramework):
         self._edit_checkpoint(lambda value: value[:-1] + bytes([value[-1] ^ 0xff]))
         self.start_node(0, self.node_args)
         assert_equal(self._load_wallet(), (payouts, 0, -1))
+        assert_equal(self._snapshot(node.get_wallet_rpc(WALLET_NAME)), before)
+
+        self.log.info("With the wallet's own checkpoint corrupted, the flush-anchored one of the clean stop still serves")
+        self._edit_checkpoint(lambda value: value[:-1] + bytes([value[-1] ^ 0xff]), keep_flush_checkpoint=True)
+        self.start_node(0, self.node_args)
+        authenticated, verified, through = self._load_wallet()
+        assert_equal((authenticated, verified), (0, payouts))
+        assert through > 0
         assert_equal(self._snapshot(node.get_wallet_rpc(WALLET_NAME)), before)
 
         self.log.info("A checkpoint whose count does not match the wallet's records is ignored")

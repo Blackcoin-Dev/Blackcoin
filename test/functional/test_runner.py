@@ -191,6 +191,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_coldstake_auto_migration.py',
     'feature_goldrush_coinstatsindex.py',
     'wallet_goldrush_payout_checkpoint.py',
+    'wallet_goldrush_payout_crash_checkpoint.py',
     'wallet_goldrush_block_connect_writes.py',
     'wallet_best_block_durability.py',
     'wallet_idle_block_commits.py --descriptors',

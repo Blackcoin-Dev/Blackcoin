@@ -339,6 +339,14 @@ BOOST_FIXTURE_TEST_CASE(worker_publishes_for_the_wallet_shown_and_announces_it, 
 {
     std::atomic<int> announced{0};
     const std::unique_ptr<interfaces::Handler> handler = iface->handleDisplayBalancesChanged([&] { ++announced; });
+    // The worker publishes a snapshot and then announces it, so a reader can see the
+    // snapshot before the announcement has been made: wait for it, within a bound.
+    const auto wait_for_announcements = [&](int count) {
+        for (int i = 0; i < 2000 && announced.load() < count; ++i) {
+            std::this_thread::sleep_for(5ms);
+        }
+        return announced.load();
+    };
     // No synchronous request: the wallet is the one shown, and the worker
     // gives it a snapshot by itself.
     iface->requestDisplayBalances(/*foreground=*/true, std::nullopt, /*retry_send=*/false);
@@ -350,7 +358,7 @@ BOOST_FIXTURE_TEST_CASE(worker_publishes_for_the_wallet_shown_and_announces_it, 
     }
     BOOST_REQUIRE(shown.available);
     BOOST_CHECK(shown.exact);
-    BOOST_CHECK_GE(announced.load(), 1);
+    BOOST_CHECK_GE(wait_for_announcements(1), 1);
     BOOST_CHECK_EQUAL(shown.balances.balance, PlainBalance());
 
     // A wallet change is picked up without anybody asking again.
@@ -365,7 +373,7 @@ BOOST_FIXTURE_TEST_CASE(worker_publishes_for_the_wallet_shown_and_announces_it, 
     BOOST_CHECK(shown.exact);
     BOOST_CHECK(shown.block_hash == Tip()->GetBlockHash());
     BOOST_CHECK_EQUAL(shown.balances.balance, PlainBalance());
-    BOOST_CHECK_GE(announced.load(), 2);
+    BOOST_CHECK_GE(wait_for_announcements(2), 2);
     handler->disconnect();
 }
 

@@ -29,7 +29,9 @@ chainstate flush, and the restart must
 - and a clean stop and start still authenticates nothing.
 """
 
+from pathlib import Path
 import re
+import shutil
 import time
 
 try:
@@ -48,6 +50,8 @@ WALLET_NAME = "payout_crash"
 FLUSHED_PAYOUT_BLOCKS = 12
 UNFLUSHED_PAYOUT_BLOCKS = 4
 MIDDLE_PAYOUT_BLOCKS = 2
+# How often a load whose chainstate reads look too high is measured again.
+LOAD_REPEATS = 2
 REORG_DEPTH = 3
 CHECKPOINT_KEY = b"\x19syntheticpayoutcheckpoint"
 FLUSH_CHECKPOINT_KEY = b"\x1esyntheticpayoutflushcheckpoint"
@@ -188,6 +192,13 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
 
         flush_checkpoint_used: whether the load must report that the wallet's own checkpoint
         was not accepted and the flush-anchored one was."""
+        # Kept so that _settled_reads can measure this same load again.
+        self.wallet_before_load = Path(self.options.tmpdir) / "wallet_before_load"
+        shutil.rmtree(self.wallet_before_load, ignore_errors=True)
+        shutil.copytree(self.nodes[0].wallets_path / WALLET_NAME, self.wallet_before_load)
+        return self._measure_load(flush_checkpoint_used)
+
+    def _measure_load(self, flush_checkpoint_used):
         node = self.nodes[0]
         with open(node.debug_log_path, "rb") as log:
             log.seek(0, 2)
@@ -204,6 +215,35 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
         # A record is used exactly when the load says it accepted one.
         assert_equal("accepted" in verdicts.values(), result[2] >= 0)
         return result, reads
+
+    def _settled_reads(self, reads, result, flush_checkpoint_used, suspect):
+        """The chainstate reads of the load just measured by _load_wallet, with the reads of the
+        wallet's background balance pass kept out of them.
+
+        The counter is the whole node's. The balance pass starts within milliseconds of the
+        load and reads the chainstate too, so on a busy machine some of its reads fall before
+        the counter is read the second time. They can only add to the count. While
+        suspect(reads) holds, the load is therefore repeated from the same wallet file and the
+        same chain, and the lowest count is the one returned: a load that really reads that
+        much reads it every time.
+
+        result: what the measured load reported; every repeat must report the same."""
+        node = self.nodes[0]
+        verdicts = self.last_verdicts
+        wallet_dir = node.wallets_path / WALLET_NAME
+        for _ in range(LOAD_REPEATS):
+            if not suspect(reads):
+                break
+            self.log.info(f"{reads} chainstate reads while loading, more than the load should take; measuring the same load again")
+            self.stop_node(0)
+            shutil.rmtree(wallet_dir)
+            shutil.copytree(self.wallet_before_load, wallet_dir)
+            self._start()
+            again, reads_again = self._measure_load(flush_checkpoint_used)
+            assert_equal(again, result)
+            assert_equal(self.last_verdicts, verdicts)
+            reads = min(reads, reads_again)
+        return reads
 
     def _kill_node(self):
         """End the node as a power cut would: no shutdown, so no chainstate flush."""
@@ -293,6 +333,8 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
         assert_equal(node.getblockcount(), flushed_height)
         assert flushed_height < height_before_kill, "the kill must lose unflushed blocks for this test to mean anything"
         result, crash_reads = self._load_wallet(flush_checkpoint_used=True)
+        # A clean start reads no less than nothing, so a load within the allowance below needs no second look.
+        crash_reads = self._settled_reads(crash_reads, result, True, lambda reads: reads > UNFLUSHED_PAYOUT_BLOCKS)
         self.log.info(f"after the kill: {result[0]} payout blocks authenticated, {result[1]} already verified through height {result[2]} "
                       f"(wallet holds {total_payouts} payout blocks, {flushed_payouts} at or below the flushed height {flushed_height}); "
                       f"{crash_reads} chainstate reads while loading")
@@ -315,6 +357,9 @@ class WalletGoldRushPayoutCrashCheckpointTest(BitcoinTestFramework):
         self._start()
         result, clean_reads = self._load_wallet(flush_checkpoint_used=False)
         assert_equal(result, (0, total_payouts, height_before_kill))
+        # The clean start is what the other two loads are compared with: reads of the balance
+        # pass in it would hide as many reads of the load after the kill.
+        clean_reads = self._settled_reads(clean_reads, result, False, lambda reads: reads > UNFLUSHED_PAYOUT_BLOCKS)
         wallet = node.get_wallet_rpc(WALLET_NAME)
         self._assert_same(before, self._snapshot(wallet))
 

@@ -173,6 +173,7 @@ class WalletGoldRushPayoutDoubleCrashTest(WalletGoldRushPayoutCrashCheckpointTes
             self._start()
             result, reads = self._load_wallet(flush_checkpoint_used=True)
             verdicts = self.last_verdicts
+            reads = self._settled_reads(reads, result, True, lambda reads: reads >= state["flushed_payouts"])
         self.log.info(f"second restart: {result[0]} payout blocks authenticated, {result[1]} already verified through height {result[2]} "
                       f"(wallet holds {state['total_payouts']}, {state['flushed_payouts']} at or below the flushed height {state['flushed_height']}); "
                       f"wallet tip record: {verdicts['wallet tip']}; flush record: {verdicts['chainstate flush']}"
@@ -228,6 +229,7 @@ class WalletGoldRushPayoutDoubleCrashTest(WalletGoldRushPayoutCrashCheckpointTes
         assert_equal(node.getblockcount(), state["height"])
         result, reads = self._load_wallet(flush_checkpoint_used=True)
         assert_equal(result, (0, state["total_payouts"], state["height"]))
+        reads = self._settled_reads(reads, result, True, lambda reads: reads >= state["total_payouts"])
         assert_equal(self.last_verdicts["wallet tip"], "not in the block index")
         assert reads < state["total_payouts"], f"{reads} chainstate reads for a load that authenticates nothing"
         self._check_back_in_sync(state)

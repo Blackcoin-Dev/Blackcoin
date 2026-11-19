@@ -109,6 +109,14 @@ class WalletBackgroundIntegrityCheckTest(BitcoinTestFramework):
             self.start_node(0, extra_args=["-testwalletfullcheckdelay=0"])
         assert "integrity check" not in node.getblockchaininfo()["warnings"]
 
+        self.log.info("The wallet file is read once, in order, before the start-up check; -walletreadahead=0 turns that off")
+        self.stop_node(0)
+        with node.assert_debug_log(expected_msgs=["Wallet read-ahead of", "wallet.dat: read "], timeout=60):
+            self.start_node(0, extra_args=["-testwalletfullcheckdelay=0"])
+        self.stop_node(0)
+        with node.assert_debug_log(expected_msgs=[], unexpected_msgs=["Wallet read-ahead of"], timeout=10):
+            self.start_node(0, extra_args=["-testwalletfullcheckdelay=0", "-walletreadahead=0"])
+
 
 if __name__ == '__main__':
     WalletBackgroundIntegrityCheckTest().main()

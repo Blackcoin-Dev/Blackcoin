@@ -21,6 +21,7 @@
 #include <univalue.h>
 #include <util/check.h>
 #include <util/moneystr.h>
+#include <util/readahead.h>
 #include <util/translation.h>
 #include <validationinterface.h>
 #ifdef USE_BDB
@@ -82,6 +83,7 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-spendzeroconfchange", strprintf("Spend unconfirmed change when sending transactions (default: %u)", DEFAULT_SPEND_ZEROCONF_CHANGE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-wallet=<path>", "Specify wallet path to load at startup. Can be used multiple times to load multiple wallets. Path is to a directory containing wallet data and log files. If the path is not absolute, it is interpreted relative to <walletdir>. This only loads existing wallets and does not create new ones. For backwards compatibility this also accepts names of existing top-level data files in <walletdir>.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::WALLET);
     argsman.AddArg("-testwalletfullcheckdelay=<seconds>", "Regtest-only: seconds before the background wallet integrity check starts, without waiting for initial block download (default: 60 seconds and out of initial block download)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-walletreadahead", strprintf("Read the wallet file once, in order, before checking it, so a hard disk is not read in small pieces (default: %u). Skipped when the file is larger than a quarter of the memory.", util::DEFAULT_WALLET_READAHEAD), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-walletfullcheck", strprintf("Run the full SQLite wallet integrity check before the wallet loads, as in earlier versions. By default start-up runs the quick check and the full check follows in the background, raising a warning if it finds damage (default: %u)", DEFAULT_WALLETFULLCHECK), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-walletrpcexactbalance", strprintf("Make getwalletinfo, getbalances and getbalance wait for an exact balance when the caller does not pass exact (default: %u). By default they return the last calculated balance at once and say whether it is exact, so that polling never waits on a busy node.", DEFAULT_WALLET_RPC_EXACT_BALANCE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-walletbroadcast",  strprintf("Make the wallet broadcast transactions (default: %u)", DEFAULT_WALLETBROADCAST), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);

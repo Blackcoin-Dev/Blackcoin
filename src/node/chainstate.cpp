@@ -16,7 +16,6 @@
 #include <logging.h>
 #include <node/blockstorage.h>
 #include <node/caches.h>
-#include <node/readahead.h>
 #include <node/utxo_snapshot.h>
 #include <sync.h>
 #include <threadsafety.h>
@@ -25,6 +24,7 @@
 #include <uint256.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
+#include <util/readahead.h>
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/time.h>
@@ -960,7 +960,7 @@ static ChainstateLoadResult CompleteChainstateInitialization(
     if (options.block_index_readahead && !options.reindex && !options.block_tree_db_in_memory) {
         const fs::path index_dir{chainman.m_options.datadir / "blocks" / "index"};
         const auto readahead_start{std::chrono::steady_clock::now()};
-        const node::ReadAheadStats ra{node::ReadAheadDirectory(index_dir, node::ReadAheadMaxBytes(), node::READAHEAD_CHUNK_BYTES, options.check_interrupt)};
+        const util::ReadAheadStats ra{util::ReadAheadDirectory(index_dir, options.block_index_readahead_max_bytes, util::READAHEAD_CHUNK_BYTES, options.check_interrupt)};
         const auto readahead_ms{std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - readahead_start).count()};
         if (ra.skipped_too_large) {
             LogPrintf("Block index read-ahead skipped: %u MiB of index files is more than a quarter of the memory\n", ra.dir_bytes >> 20);

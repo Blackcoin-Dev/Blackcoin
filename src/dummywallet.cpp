@@ -52,6 +52,7 @@ void DummyWalletInit::AddWalletOptions(ArgsManager& argsman) const
         "-walletnotify=<cmd>",
         "-dblogsize=<n>",
         "-flushwallet",
+        "-walletreadahead",
         "-privdb",
         "-walletrejectlongchains",
         "-walletcrosschain",

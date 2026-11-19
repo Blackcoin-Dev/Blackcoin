@@ -9,6 +9,7 @@
 #include <common/args.h>
 #include <logging.h>
 #include <util/fs.h>
+#include <util/readahead.h>
 #include <wallet/db.h>
 
 #include <exception>
@@ -149,6 +150,7 @@ void ReadDatabaseArgs(const ArgsManager& args, DatabaseOptions& options)
     options.use_unsafe_sync = args.GetBoolArg("-unsafesqlitesync", options.use_unsafe_sync);
     options.use_shared_memory = !args.GetBoolArg("-privdb", !options.use_shared_memory);
     options.max_log_mb = args.GetIntArg("-dblogsize", options.max_log_mb);
+    options.read_ahead = args.GetBoolArg("-walletreadahead", util::DEFAULT_WALLET_READAHEAD);
 }
 
 } // namespace wallet

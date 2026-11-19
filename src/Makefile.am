@@ -244,7 +244,6 @@ BITCOIN_CORE_H = \
   node/peerman_args.h \
   node/psbt.h \
   node/quantum_pool.h \
-  node/readahead.h \
   node/shadow_resource_monitor.h \
   node/transaction.h \
   node/txreconciliation.h \
@@ -334,6 +333,7 @@ BITCOIN_CORE_H = \
   util/moneystr.h \
   util/overflow.h \
   util/overloaded.h \
+  util/readahead.h \
   util/readwritefile.h \
   util/result.h \
   util/serfloat.h \
@@ -477,7 +477,6 @@ libbitcoin_node_a_SOURCES = \
   node/peerman_args.cpp \
   node/psbt.cpp \
   node/quantum_pool.cpp \
-  node/readahead.cpp \
   node/shadow_resource_monitor.cpp \
   node/transaction.cpp \
   node/txreconciliation.cpp \
@@ -826,6 +825,7 @@ libbitcoin_util_a_SOURCES = \
   util/exception.cpp \
   util/fs.cpp \
   util/fs_helpers.cpp \
+  util/readahead.cpp \
   util/getuniquepath.cpp \
   util/hasher.cpp \
   util/io_counters.cpp \
@@ -1050,7 +1050,6 @@ libbitcoinkernel_la_SOURCES = \
   logging.cpp \
   node/blockstorage.cpp \
   node/chainstate.cpp \
-  node/readahead.cpp \
   node/utxo_snapshot.cpp \
   policy/feerate.cpp \
   policy/fees.cpp \
@@ -1084,6 +1083,7 @@ libbitcoinkernel_la_SOURCES = \
   util/exception.cpp \
   util/fs.cpp \
   util/fs_helpers.cpp \
+  util/readahead.cpp \
   util/getuniquepath.cpp \
   util/hasher.cpp \
   util/io_counters.cpp \

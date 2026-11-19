@@ -2,22 +2,23 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <node/readahead.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
+#include <util/readahead.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #ifndef WIN32
 #include <unistd.h>
 #endif
 
-using node::ReadAheadDirectory;
-using node::ReadAheadStats;
+using util::ReadAheadDirectory;
+using util::ReadAheadStats;
 
 namespace {
 void MakeFile(const fs::path& path, size_t size)
@@ -118,11 +119,31 @@ BOOST_AUTO_TEST_CASE(interrupt_stops_early)
     BOOST_CHECK_EQUAL(stats.bytes_read, 0U);
 }
 
+BOOST_AUTO_TEST_CASE(single_file_and_journal_list)
+{
+    const fs::path dir{m_path_root / "ra_file"};
+    fs::create_directories(dir);
+    MakeFile(dir / "wallet.dat", 70000);
+    MakeFile(dir / "wallet.dat-journal", 3000);
+    const std::vector<fs::path> files{dir / "wallet.dat", dir / "wallet.dat-journal"};
+    const ReadAheadStats stats{util::ReadAheadFiles(files, uint64_t{1} << 30, 4096)};
+    BOOST_CHECK_EQUAL(stats.bytes_read, 73000U);
+    BOOST_CHECK_EQUAL(stats.files_read, 2U);
+
+    // A missing journal is ignored.
+    const ReadAheadStats no_journal{util::ReadAheadFiles({dir / "wallet.dat", dir / "absent-journal"}, uint64_t{1} << 30)};
+    BOOST_CHECK_EQUAL(no_journal.bytes_read, 70000U);
+    BOOST_CHECK(!no_journal.skipped_missing);
+
+    // Over the cap nothing is read; a file that is not there is skipped.
+    BOOST_CHECK(util::ReadAheadFiles(files, 72999).skipped_too_large);
+    BOOST_CHECK(util::ReadAheadFiles({dir / "absent"}, 1000).skipped_missing);
+}
+
 BOOST_AUTO_TEST_CASE(max_bytes_is_a_quarter_of_ram_or_zero)
 {
-    const uint64_t max{node::ReadAheadMaxBytes()};
-    // Any machine that runs the tests has more than 64 MiB of RAM.
-    BOOST_CHECK_GT(max, uint64_t{16} << 20);
+    BOOST_CHECK_EQUAL(util::ReadAheadMaxBytesFromRam(uint64_t{8} << 30), uint64_t{2} << 30);
+    BOOST_CHECK_EQUAL(util::ReadAheadMaxBytesFromRam(0), 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

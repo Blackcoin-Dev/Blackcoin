@@ -2,21 +2,24 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NODE_READAHEAD_H
-#define BITCOIN_NODE_READAHEAD_H
+#ifndef BITCOIN_UTIL_READAHEAD_H
+#define BITCOIN_UTIL_READAHEAD_H
 
 #include <util/fs.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
-namespace node {
+namespace util {
 
 //! Default read size when warming a directory.
 static constexpr size_t READAHEAD_CHUNK_BYTES{size_t{8} << 20};
 //! Default for -blockindexreadahead.
 static constexpr bool DEFAULT_BLOCKINDEX_READAHEAD{true};
+//! Default for -walletreadahead.
+static constexpr bool DEFAULT_WALLET_READAHEAD{true};
 
 struct ReadAheadStats {
     uint64_t dir_bytes{0};   //!< total size of the regular files found
@@ -38,9 +41,15 @@ struct ReadAheadStats {
  */
 ReadAheadStats ReadAheadDirectory(const fs::path& dir, uint64_t max_bytes, size_t chunk_bytes = READAHEAD_CHUNK_BYTES, const std::function<bool()>& interrupted = {});
 
-/** A quarter of the machine's RAM, or 0 when it cannot be read. */
-uint64_t ReadAheadMaxBytes();
+/**
+ * The same for a list of files (a wallet database and its journal). Files that
+ * do not exist are ignored. They are read in the order given.
+ */
+ReadAheadStats ReadAheadFiles(const std::vector<fs::path>& files, uint64_t max_bytes, size_t chunk_bytes = READAHEAD_CHUNK_BYTES, const std::function<bool()>& interrupted = {});
 
-} // namespace node
+/** The size cap for read-ahead: a quarter of the given total RAM, or 0 (read nothing) when it is unknown. */
+constexpr uint64_t ReadAheadMaxBytesFromRam(uint64_t total_ram_bytes) { return total_ram_bytes / 4; }
 
-#endif // BITCOIN_NODE_READAHEAD_H
+} // namespace util
+
+#endif // BITCOIN_UTIL_READAHEAD_H

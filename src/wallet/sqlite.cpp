@@ -12,6 +12,7 @@
 #include <logging.h>
 #include <sync.h>
 #include <util/fs_helpers.h>
+#include <util/readahead.h>
 #include <util/check.h>
 #include <util/io_counters.h>
 #include <util/strencodings.h>
@@ -1269,6 +1270,20 @@ std::unique_ptr<SQLiteDatabase> MakeSQLiteDatabase(const fs::path& path, const D
 {
     try {
         fs::path data_file = SQLiteDataFile(path);
+        if (options.verify && options.read_ahead) {
+            // SQLite reads the file page by page in b-tree order, which is
+            // random access on a hard disk. One sequential pass first puts it
+            // in the OS cache.
+            const auto start{std::chrono::steady_clock::now()};
+            const uint64_t max_bytes{util::ReadAheadMaxBytesFromRam(GetTotalRAM().value_or(0))};
+            const util::ReadAheadStats ra{util::ReadAheadFiles({data_file, fs::PathFromString(fs::PathToString(data_file) + "-journal")}, max_bytes)};
+            const auto ms{std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()};
+            if (ra.skipped_too_large) {
+                LogPrintf("Wallet read-ahead of %s skipped: %u MiB is more than a quarter of the memory\n", fs::PathToString(data_file), ra.dir_bytes >> 20);
+            } else if (!ra.skipped_missing) {
+                LogPrintf("Wallet read-ahead of %s: read %u bytes (%u MiB) in %d ms\n", fs::PathToString(data_file), ra.bytes_read, ra.bytes_read >> 20, ms);
+            }
+        }
         auto db = std::make_unique<SQLiteDatabase>(data_file.parent_path(), data_file, options);
         if (options.verify && !db->Verify(error)) {
             status = DatabaseStatus::FAILED_VERIFY;

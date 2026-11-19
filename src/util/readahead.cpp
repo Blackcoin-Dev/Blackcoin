@@ -2,7 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <node/readahead.h>
+#include <util/readahead.h>
 
 #include <logging.h>
 #include <tinyformat.h>
@@ -14,44 +14,12 @@
 
 #ifdef WIN32
 #include <fstream>
-#include <windows.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#include <sys/types.h>
-#endif
 #endif
 
-namespace node {
-
-// TODO(rc14-integration): switch to GetTotalRAM() from common/system.h once it
-// is merged, and delete this probe.
-static uint64_t ProbeTotalRam()
-{
-#ifdef WIN32
-    MEMORYSTATUSEX status;
-    status.dwLength = sizeof(status);
-    if (GlobalMemoryStatusEx(&status)) return status.ullTotalPhys;
-    return 0;
-#elif defined(__APPLE__)
-    uint64_t mem{0};
-    size_t len{sizeof(mem)};
-    if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) return mem;
-    return 0;
-#else
-    const long pages{sysconf(_SC_PHYS_PAGES)};
-    const long page_size{sysconf(_SC_PAGE_SIZE)};
-    if (pages > 0 && page_size > 0) return uint64_t(pages) * uint64_t(page_size);
-    return 0;
-#endif
-}
-
-uint64_t ReadAheadMaxBytes()
-{
-    return ProbeTotalRam() / 4;
-}
+namespace util {
 
 #ifndef WIN32
 /** Ask the system to start reading [offset, offset + len) ahead of the reader. */
@@ -114,6 +82,25 @@ static bool ReadWholeFileAndDiscard(const fs::path& path, uint64_t file_size, st
 #endif
 }
 
+static ReadAheadStats ReadAheadList(std::vector<std::pair<fs::path, uint64_t>>& files, ReadAheadStats stats, uint64_t max_bytes, size_t chunk_bytes, const std::function<bool()>& interrupted)
+{
+    if (stats.dir_bytes > max_bytes) {
+        stats.skipped_too_large = true;
+        return stats;
+    }
+    std::vector<char> buf(std::max<size_t>(chunk_bytes, 1));
+    for (const auto& [path, size] : files) {
+        if (interrupted && interrupted()) { stats.interrupted = true; break; }
+        if (ReadWholeFileAndDiscard(path, size, buf, stats, interrupted)) {
+            if (!stats.interrupted) ++stats.files_read;
+        } else {
+            ++stats.files_failed;
+        }
+        if (stats.interrupted) break;
+    }
+    return stats;
+}
+
 ReadAheadStats ReadAheadDirectory(const fs::path& dir, uint64_t max_bytes, size_t chunk_bytes, const std::function<bool()>& interrupted)
 {
     ReadAheadStats stats;
@@ -132,23 +119,28 @@ ReadAheadStats ReadAheadDirectory(const fs::path& dir, uint64_t max_bytes, size_
         stats.skipped_missing = true;
         return stats;
     }
-    if (stats.dir_bytes > max_bytes) {
-        stats.skipped_too_large = true;
-        return stats;
-    }
     // LevelDB's table files are numbered; read them in that order.
     std::sort(files.begin(), files.end());
-    std::vector<char> buf(std::max<size_t>(chunk_bytes, 1));
-    for (const auto& [path, size] : files) {
-        if (interrupted && interrupted()) { stats.interrupted = true; break; }
-        if (ReadWholeFileAndDiscard(path, size, buf, stats, interrupted)) {
-            if (!stats.interrupted) ++stats.files_read;
-        } else {
-            ++stats.files_failed;
-        }
-        if (stats.interrupted) break;
-    }
-    return stats;
+    return ReadAheadList(files, stats, max_bytes, chunk_bytes, interrupted);
 }
 
-} // namespace node
+ReadAheadStats ReadAheadFiles(const std::vector<fs::path>& paths, uint64_t max_bytes, size_t chunk_bytes, const std::function<bool()>& interrupted)
+{
+    ReadAheadStats stats;
+    std::vector<std::pair<fs::path, uint64_t>> files;
+    for (const fs::path& path : paths) {
+        std::error_code ec;
+        if (!fs::is_regular_file(path, ec) || ec) continue;
+        const uint64_t size{fs::file_size(path, ec)};
+        if (ec) { ++stats.files_failed; continue; }
+        files.emplace_back(path, size);
+        stats.dir_bytes += size;
+    }
+    if (files.empty() && stats.files_failed == 0) {
+        stats.skipped_missing = true;
+        return stats;
+    }
+    return ReadAheadList(files, stats, max_bytes, chunk_bytes, interrupted);
+}
+
+} // namespace util

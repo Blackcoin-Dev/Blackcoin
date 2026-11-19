@@ -234,6 +234,7 @@ struct DatabaseOptions {
 
     // Specialized options. Not every option is supported by every backend.
     bool verify = true;             //!< Check data integrity on load.
+    bool read_ahead = false;        //!< Read the file once, in order, before the first check (SQLite; set by -walletreadahead).
     bool full_integrity_check = true; //!< Run the full integrity check on load, not the quick one (SQLite).
     bool use_unsafe_sync = false;   //!< Disable file sync for faster performance.
     bool use_shared_memory = false; //!< Let other processes access the database.

@@ -60,7 +60,7 @@ class GoldRushPosUnrestrictedTest(BitcoinTestFramework):
             non_whitelist_kernel = wallet.checkkernel(non_whitelist_inputs)
             whitelist_kernel = wallet.checkkernel(whitelist_inputs)
             if non_whitelist_kernel["found"] and not whitelist_kernel["found"]:
-                return non_whitelist_kernel["kernel"]["time"]
+                return non_whitelist_kernel["kernel"]["time"], self.mock_time
         raise AssertionError("timed out searching for a non-whitelisted-only PoS kernel")
 
     def _find_kernel_time(self, wallet, inputs):
@@ -68,20 +68,32 @@ class GoldRushPosUnrestrictedTest(BitcoinTestFramework):
             self._bump_mocktime(16)
             kernel = wallet.checkkernel(inputs)
             if kernel["found"]:
-                return kernel["kernel"]["time"]
+                return kernel["kernel"]["time"], self.mock_time
         raise AssertionError("timed out searching for a PoS kernel")
 
-    def _mine_at_kernel(self, wallet, kernel_time):
+    def _mine_at_kernel(self, wallet, kernel_time, mock_time):
+        """Stake exactly the slot the kernel search found.
+
+        The staker searches one slot per retry, the slot of the node's current
+        time, and takes the first kernel it finds in that slot. The search
+        moved mocktime in steps of 16 seconds, so every earlier step is a slot
+        in which the search did not prove the kernel unique (the other output
+        may have had one too). The staker must therefore never see any time
+        but the found one: mocktime is set to it before staking starts, and
+        nothing moves it until the block is in.
+        """
         node = self.nodes[0]
         start_height = node.getblockcount()
-        self._set_mocktime(kernel_time - 16)
+        self._set_mocktime(mock_time)
         wallet.staking(True)
         try:
-            self._set_mocktime(kernel_time)
             self.wait_until(lambda: node.getblockcount() > start_height, timeout=30)
         finally:
             wallet.staking(False)
-        return node.getblock(node.getbestblockhash(), 2)
+        block = node.getblock(node.getbestblockhash(), 2)
+        assert_equal(block["height"], start_height + 1)
+        assert_equal(block["time"], kernel_time)
+        return block
 
     def run_test(self):
         node = self.nodes[0]
@@ -136,14 +148,14 @@ class GoldRushPosUnrestrictedTest(BitcoinTestFramework):
         assert_equal(len(pure_utxos), 1)
 
         self.log.info("Selecting a timestamp where only the non-whitelisted output has a valid kernel")
-        kernel_time = self._find_non_whitelisted_only_kernel_time(
+        kernel_time, mock_time = self._find_non_whitelisted_only_kernel_time(
             wallet,
             self._kernel_inputs(whitelist_utxos),
             self._kernel_inputs(non_whitelist_utxos),
         )
 
         self.log.info("The mixed wallet must produce the ordinary PoS block with that kernel")
-        block = self._mine_at_kernel(wallet, kernel_time)
+        block = self._mine_at_kernel(wallet, kernel_time, mock_time)
         assert "proof-of-stake" in block["flags"]
         kernel_input = block["tx"][1]["vin"][0]
         assert_equal(kernel_input["txid"], non_whitelist_utxos[0]["txid"])
@@ -152,8 +164,8 @@ class GoldRushPosUnrestrictedTest(BitcoinTestFramework):
 
         self.log.info("A pure non-whitelisted wallet also stakes, without a shadow reward")
         shadow_before = node.getgoldrushstate()
-        pure_kernel_time = self._find_kernel_time(pure_wallet, self._kernel_inputs(pure_utxos))
-        pure_block = self._mine_at_kernel(pure_wallet, pure_kernel_time)
+        pure_kernel_time, pure_mock_time = self._find_kernel_time(pure_wallet, self._kernel_inputs(pure_utxos))
+        pure_block = self._mine_at_kernel(pure_wallet, pure_kernel_time, pure_mock_time)
         pure_kernel = pure_block["tx"][1]["vin"][0]
         assert_equal(pure_kernel["txid"], pure_utxos[0]["txid"])
         assert_equal(pure_kernel["vout"], pure_utxos[0]["vout"])

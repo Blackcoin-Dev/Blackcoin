@@ -462,6 +462,18 @@ struct SyntheticPayoutCheckpoint;
 /** Whether a stored checkpoint (either schema) describes exactly these records. The records carry
  *  the heights to hash against (at load, the active-chain heights of their blocks). */
 bool SyntheticPayoutCheckpointMatches(const SyntheticPayoutCheckpoint& checkpoint, const std::vector<SyntheticPayoutRef>& refs);
+/**
+ * Choose among the stored payout checkpoints at load. A checkpoint is usable only when its
+ * schema is known, it was written by this client version, on_active_chain says its block is
+ * the active-chain block at its height, and it matches the records (whose heights are the
+ * active-chain heights of their blocks, negative for a block that is not on the active chain).
+ * Returns the index of the usable checkpoint with the greatest height (the first of equals),
+ * or nullopt when none is usable and every payout block has to be authenticated.
+ */
+std::optional<size_t> SelectSyntheticPayoutCheckpoint(
+    const std::vector<SyntheticPayoutCheckpoint>& checkpoints,
+    const std::vector<SyntheticPayoutRef>& refs,
+    const std::function<bool(const SyntheticPayoutCheckpoint&)>& on_active_chain);
 
 /** Block timing captured before taking cs_wallet. */
 struct WalletBlockTime {
@@ -1188,8 +1200,16 @@ private:
     std::optional<SyntheticPayoutCheckpoint> m_synthetic_payout_checkpoint GUARDED_BY(cs_wallet);
     /** True once LoadWallet authenticated every payout without error; checkpoints are never written before. */
     bool m_synthetic_payout_checkpoint_trusted GUARDED_BY(cs_wallet){false};
+    /** Cached copy of the persisted flush-anchored checkpoint (nullopt when none is stored). */
+    std::optional<SyntheticPayoutCheckpoint> m_synthetic_payout_flush_checkpoint GUARDED_BY(cs_wallet);
+    /** The checkpoint that describes the payout records at heights [0, height]; nullopt when there are none. */
+    std::optional<SyntheticPayoutCheckpoint> MakeSyntheticPayoutCheckpoint(const uint256& block_hash, int height) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Persist a checkpoint for block_hash/height if the wallet holds synthetic payouts and it changed. */
     void WriteSyntheticPayoutCheckpoint(WalletBatch& batch, const uint256& block_hash, int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** The same for the flush-anchored record. The caller knows that block_hash is the block the
+     * chainstate holds on disk and that every payout record at or below it is authenticated.
+     * Never written per block: only on a chainstate flush and at load. */
+    void WriteSyntheticPayoutFlushCheckpoint(WalletBatch& batch, const uint256& block_hash, int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Record block_hash as the wallet's best block (and move the payout checkpoint with it)
      * inside the commit scope of the connected block; no-op unless atomic_with_block.
      * A block that wrote no other wallet record does not get a commit of its own: its

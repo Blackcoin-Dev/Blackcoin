@@ -685,6 +685,51 @@ BOOST_AUTO_TEST_CASE(synthetic_payout_checkpoint_roundtrip_and_malformed_is_igno
     BOOST_CHECK(!batch.ReadSyntheticPayoutCheckpoint(output));
 }
 
+BOOST_AUTO_TEST_CASE(synthetic_payout_flush_checkpoint_is_a_separate_record)
+{
+    std::unique_ptr<WalletDatabase> database = CreateMockableWalletDatabase();
+    WalletBatch batch(*database, /*flush_on_close=*/false);
+
+    SyntheticPayoutCheckpoint own;
+    own.schema = SyntheticPayoutCheckpoint::CURRENT_SCHEMA;
+    own.client_version = CLIENT_VERSION;
+    own.height = 1234;
+    own.block_hash = Hash(std::string{"block"});
+    own.count = 77;
+    own.digest = Hash(std::string{"digest"});
+    SyntheticPayoutCheckpoint flushed{own};
+    flushed.height = 1000;
+    flushed.block_hash = Hash(std::string{"flushed block"});
+    flushed.count = 60;
+
+    SyntheticPayoutCheckpoint output;
+    BOOST_CHECK(!batch.ReadSyntheticPayoutFlushCheckpoint(output));
+    BOOST_REQUIRE(batch.WriteSyntheticPayoutCheckpoint(own));
+    // Neither record is read as the other.
+    BOOST_CHECK(!batch.ReadSyntheticPayoutFlushCheckpoint(output));
+    BOOST_REQUIRE(batch.WriteSyntheticPayoutFlushCheckpoint(flushed));
+    BOOST_REQUIRE(batch.ReadSyntheticPayoutFlushCheckpoint(output));
+    BOOST_CHECK(output == flushed);
+    BOOST_REQUIRE(batch.ReadSyntheticPayoutCheckpoint(output));
+    BOOST_CHECK(output == own);
+
+    // A record of another type cannot be decoded and reads as absent.
+    {
+        std::unique_ptr<DatabaseBatch> raw_batch = database->MakeBatch(/*flush_on_close=*/false);
+        BOOST_REQUIRE(raw_batch->Write(DBKeys::SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT, std::string{"truncated"}));
+    }
+    BOOST_CHECK(!batch.ReadSyntheticPayoutFlushCheckpoint(output));
+    BOOST_CHECK(output == SyntheticPayoutCheckpoint{});
+    BOOST_REQUIRE(batch.ReadSyntheticPayoutCheckpoint(output));
+    BOOST_CHECK(output == own);
+
+    BOOST_REQUIRE(batch.WriteSyntheticPayoutFlushCheckpoint(flushed));
+    BOOST_REQUIRE(batch.EraseSyntheticPayoutFlushCheckpoint());
+    BOOST_CHECK(!batch.ReadSyntheticPayoutFlushCheckpoint(output));
+    BOOST_REQUIRE(batch.ReadSyntheticPayoutCheckpoint(output));
+    BOOST_CHECK(output == own);
+}
+
 BOOST_AUTO_TEST_CASE(synthetic_payout_checkpoint_never_prevents_wallet_loading)
 {
     for (const bool malformed : {false, true}) {
@@ -693,12 +738,15 @@ BOOST_AUTO_TEST_CASE(synthetic_payout_checkpoint_never_prevents_wallet_loading)
             std::unique_ptr<DatabaseBatch> raw_batch = database->MakeBatch(/*flush_on_close=*/false);
             if (malformed) {
                 BOOST_REQUIRE(raw_batch->Write(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, std::string{"truncated"}));
+                BOOST_REQUIRE(raw_batch->Write(DBKeys::SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT, std::string{"truncated"}));
             } else {
                 SyntheticPayoutCheckpoint checkpoint;
                 checkpoint.schema = SyntheticPayoutCheckpoint::CURRENT_SCHEMA;
                 checkpoint.client_version = CLIENT_VERSION;
                 checkpoint.height = 5;
                 BOOST_REQUIRE(raw_batch->Write(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, checkpoint));
+                checkpoint.height = 3;
+                BOOST_REQUIRE(raw_batch->Write(DBKeys::SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT, checkpoint));
             }
         }
         const std::shared_ptr<CWallet> wallet(

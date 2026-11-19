@@ -114,6 +114,7 @@ extern const std::string SETTINGS;
 extern const std::string QQ_DEVELOPMENT_DONATION_CONSENT;
 extern const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY;
 extern const std::string SYNTHETIC_PAYOUT_CHECKPOINT;
+extern const std::string SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT;
 extern const std::string SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER;
 extern const std::string SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER;
 extern const std::string TX;
@@ -230,6 +231,16 @@ public:
  * unreadable or rejected record only means the full authentication runs.
  * Older releases ignore the unknown key and keep it when they rewrite the
  * wallet.
+ *
+ * Two records of this form are stored. SYNTHETIC_PAYOUT_CHECKPOINT moves with
+ * the wallet's last processed block, so a clean stop leaves it at the tip.
+ * After a crash the chain restarts at the last chainstate flush, which can be
+ * far behind the wallet; that record then names a block that is not on the
+ * active chain and cannot be honored. SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT is
+ * the same hint for a block the chainstate held on disk when it was written
+ * (on a chainstate flush and when the wallet is loaded), so it stays on the
+ * active chain across a crash. At load the highest record that passes every
+ * check above is used. Releases that do not know the second key ignore it.
  */
 struct SyntheticPayoutCheckpoint {
     /** Digest = SHA256d of the records sorted by txid (written by releases up to rc11). A
@@ -384,6 +395,10 @@ public:
     /** Returns false when the record is absent or unreadable (the caller then authenticates everything). */
     bool ReadSyntheticPayoutCheckpoint(SyntheticPayoutCheckpoint& checkpoint);
     bool EraseSyntheticPayoutCheckpoint();
+    /** The same hint, anchored at a block the chainstate holds on disk (see SyntheticPayoutCheckpoint). */
+    bool WriteSyntheticPayoutFlushCheckpoint(const SyntheticPayoutCheckpoint& checkpoint);
+    bool ReadSyntheticPayoutFlushCheckpoint(SyntheticPayoutCheckpoint& checkpoint);
+    bool EraseSyntheticPayoutFlushCheckpoint();
 
     /** Optional wallet-scoped Quantum Quasar development-donation consent. */
     bool WriteQQDevelopmentDonationConsent(const QQDevelopmentDonationConsent& consent);

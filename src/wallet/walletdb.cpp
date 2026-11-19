@@ -74,6 +74,7 @@ const std::string SETTINGS{"settings"};
 const std::string QQ_DEVELOPMENT_DONATION_CONSENT{"qqdevelopmentdonationconsent"};
 const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY{"shadowpowclaimrecoverypolicy"};
 const std::string SYNTHETIC_PAYOUT_CHECKPOINT{"syntheticpayoutcheckpoint"};
+const std::string SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT{"syntheticpayoutflushcheckpoint"};
 const std::string SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER{
     "shadowpowclaimrelayclockhighwater"};
 const std::string SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER{
@@ -469,18 +470,38 @@ bool WalletBatch::WriteSyntheticPayoutCheckpoint(const SyntheticPayoutCheckpoint
     return WriteIC(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, checkpoint);
 }
 
-bool WalletBatch::ReadSyntheticPayoutCheckpoint(SyntheticPayoutCheckpoint& checkpoint)
+static bool ReadPayoutCheckpointRecord(DatabaseBatch& batch, const std::string& key, SyntheticPayoutCheckpoint& checkpoint)
 {
     checkpoint = SyntheticPayoutCheckpoint{};
-    if (m_batch->Read(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, checkpoint)) return true;
+    if (batch.Read(key, checkpoint)) return true;
     // A failed read can leave a partially decoded record behind.
     checkpoint = SyntheticPayoutCheckpoint{};
     return false;
 }
 
+bool WalletBatch::ReadSyntheticPayoutCheckpoint(SyntheticPayoutCheckpoint& checkpoint)
+{
+    return ReadPayoutCheckpointRecord(*m_batch, DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, checkpoint);
+}
+
 bool WalletBatch::EraseSyntheticPayoutCheckpoint()
 {
     return EraseIC(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT);
+}
+
+bool WalletBatch::WriteSyntheticPayoutFlushCheckpoint(const SyntheticPayoutCheckpoint& checkpoint)
+{
+    return WriteIC(DBKeys::SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT, checkpoint);
+}
+
+bool WalletBatch::ReadSyntheticPayoutFlushCheckpoint(SyntheticPayoutCheckpoint& checkpoint)
+{
+    return ReadPayoutCheckpointRecord(*m_batch, DBKeys::SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT, checkpoint);
+}
+
+bool WalletBatch::EraseSyntheticPayoutFlushCheckpoint()
+{
+    return EraseIC(DBKeys::SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT);
 }
 
 bool WalletBatch::WriteShadowPowClaimRelayClockHighWater(int64_t high_water)

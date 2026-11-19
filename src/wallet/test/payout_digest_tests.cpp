@@ -166,5 +166,109 @@ BOOST_AUTO_TEST_CASE(checkpoint_written_by_the_previous_release_is_recognised)
     }
 }
 
+namespace {
+SyntheticPayoutCheckpoint CheckpointAt(const std::vector<SyntheticPayoutRef>& refs, int height, uint8_t block)
+{
+    SyntheticPayoutCheckpoint checkpoint;
+    checkpoint.schema = SyntheticPayoutCheckpoint::CURRENT_SCHEMA;
+    checkpoint.client_version = CLIENT_VERSION;
+    checkpoint.height = height;
+    checkpoint.block_hash = uint256{block};
+    const auto [count, digest] = SyntheticPayoutDigest::Compute(refs, height);
+    checkpoint.count = count;
+    checkpoint.digest = digest;
+    return checkpoint;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(highest_usable_checkpoint_is_selected)
+{
+    // Fifty payout records, one per block, at heights 1 to 50.
+    std::vector<SyntheticPayoutRef> refs;
+    for (uint8_t i = 1; i <= 50; ++i) refs.push_back(SyntheticPayoutRef{uint256{i}, uint256{static_cast<uint8_t>(100 + i)}, i, i % 7 == 0});
+    const auto all_active = [](const SyntheticPayoutCheckpoint&) { return true; };
+    const auto none_active = [](const SyntheticPayoutCheckpoint&) { return false; };
+
+    // The wallet's own checkpoint (first) and the flush-anchored one, as LoadWallet passes them.
+    const SyntheticPayoutCheckpoint own{CheckpointAt(refs, 50, 150)};
+    const SyntheticPayoutCheckpoint flushed{CheckpointAt(refs, 40, 140)};
+
+    BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({}, refs, all_active));
+
+    // A clean stop: both are usable and the higher one wins, in either order.
+    BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own, flushed}, refs, all_active) == std::optional<size_t>{0});
+    BOOST_CHECK(SelectSyntheticPayoutCheckpoint({flushed, own}, refs, all_active) == std::optional<size_t>{1});
+    // Equal heights: the first.
+    BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own, own}, refs, all_active) == std::optional<size_t>{0});
+    // One record alone, as a wallet of an earlier release has it.
+    BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own}, refs, all_active) == std::optional<size_t>{0});
+    BOOST_CHECK(SelectSyntheticPayoutCheckpoint({flushed}, refs, all_active) == std::optional<size_t>{0});
+
+    // After a crash the chain restarted at height 40: the blocks above it are not on the
+    // active chain, so their records carry no height and the wallet's own checkpoint block
+    // is not active. The flush-anchored checkpoint is skipped to, and matches.
+    auto restarted = refs;
+    for (SyntheticPayoutRef& ref : restarted) {
+        if (ref.height > 40) ref.height = -1;
+    }
+    const auto active_through_40 = [](const SyntheticPayoutCheckpoint& checkpoint) { return checkpoint.height <= 40; };
+    BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own, flushed}, restarted, active_through_40) == std::optional<size_t>{1});
+    // Accepting the wallet's own checkpoint there merely because of its hash would not help:
+    // it does not describe the records that are on the restarted chain.
+    BOOST_CHECK(!SyntheticPayoutCheckpointMatches(own, restarted));
+    BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({own}, restarted, active_through_40));
+
+    // A reorg across both: no block is active, nothing is usable.
+    BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({own, flushed}, refs, none_active));
+    // The callback decides for each checkpoint separately.
+    size_t asked{0};
+    BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own, flushed}, refs, [&](const SyntheticPayoutCheckpoint& checkpoint) {
+        ++asked;
+        return checkpoint.block_hash == flushed.block_hash;
+    }) == std::optional<size_t>{1});
+    BOOST_CHECK_EQUAL(asked, 2U);
+
+    // A digest or count that does not match rejects that checkpoint only.
+    {
+        SyntheticPayoutCheckpoint bad_digest{own};
+        bad_digest.digest = uint256{9};
+        BOOST_CHECK(SelectSyntheticPayoutCheckpoint({bad_digest, flushed}, refs, all_active) == std::optional<size_t>{1});
+        SyntheticPayoutCheckpoint bad_count{flushed};
+        ++bad_count.count;
+        BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own, bad_count}, refs, all_active) == std::optional<size_t>{0});
+        BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({bad_digest, bad_count}, refs, all_active));
+    }
+    // A record changed at or below the flush-anchored checkpoint rejects both; one changed
+    // between the two rejects only the higher.
+    {
+        auto changed = refs;
+        changed[9].stale = !changed[9].stale; // height 10
+        BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({own, flushed}, changed, all_active));
+        changed = refs;
+        changed[44].stale = !changed[44].stale; // height 45
+        BOOST_CHECK(SelectSyntheticPayoutCheckpoint({own, flushed}, changed, all_active) == std::optional<size_t>{1});
+        // A record added below the checkpoint (a rescan found an older payout).
+        changed = refs;
+        changed.push_back(SyntheticPayoutRef{uint256{77}, uint256{105}, 5, false});
+        BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({own, flushed}, changed, all_active));
+    }
+    // Another client version, an unknown schema or a negative height is never usable,
+    // and never asks about the chain.
+    {
+        const auto must_not_ask = [](const SyntheticPayoutCheckpoint&) -> bool {
+            BOOST_ERROR("an unusable checkpoint must not reach the chain lookup");
+            return true;
+        };
+        SyntheticPayoutCheckpoint other_version{own};
+        other_version.client_version = CLIENT_VERSION + 1;
+        SyntheticPayoutCheckpoint other_schema{own};
+        other_schema.schema = 3;
+        SyntheticPayoutCheckpoint no_height{own};
+        no_height.height = -1;
+        BOOST_CHECK(!SelectSyntheticPayoutCheckpoint({other_version, other_schema, no_height}, refs, must_not_ask));
+        BOOST_CHECK(SelectSyntheticPayoutCheckpoint({other_version, flushed}, refs, all_active) == std::optional<size_t>{1});
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

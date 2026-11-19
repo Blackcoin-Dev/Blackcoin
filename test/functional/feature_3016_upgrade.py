@@ -79,6 +79,17 @@ class Upgrade3016Test(BitcoinTestFramework):
         # persistence across revisions before any wallet-specific operation.
         assert set(self.wallets).issubset(node.listwallets())
 
+    def _amounts(self, wallet):
+        # 30.1.6 also reports which snapshot the amounts come from. 30.1.5.2
+        # does not, so wait for an exact snapshot at the tip and compare the
+        # amounts alone.
+        def exact_at_tip():
+            balances = wallet.getbalances()
+            return "balance_exact" not in balances or (
+                balances["balance_exact"] and balances["balance_blockhash"] == self.nodes[0].getbestblockhash())
+        self.wait_until(exact_at_tip)
+        return {key: value for key, value in wallet.getbalances().items() if not key.startswith("balance_")}
+
     def _snapshot(self, name):
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(name)
@@ -105,7 +116,7 @@ class Upgrade3016Test(BitcoinTestFramework):
         return {
             "format": info["format"], "descriptors": info["descriptors"],
             "private_keys_enabled": info["private_keys_enabled"],
-            "balances": wallet.getbalances(), "addresses": owned,
+            "balances": self._amounts(wallet), "addresses": owned,
             "transactions": wallet.listtransactions("*", 1000, 0, True),
             "utxos": sorted(wallet.listunspent(), key=lambda item: (item["txid"], item["vout"])),
             "quantum_keys": quantum_keys,

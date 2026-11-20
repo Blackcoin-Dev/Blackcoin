@@ -1,36 +1,35 @@
 # Blackcoin Core release process
 
-## Current v30.1.6rc1 DEVELOPMENT candidate
+## Current v30.1.6 signed release
 
-This is an unpublished development candidate. `configure.ac` records major 30,
-minor 1, build 6, revision 0, RC1, and `CLIENT_VERSION_IS_RELEASE=false`.
-The numeric `CLIENT_VERSION` is `300106`; macOS short version is `30.1.6`,
-bundle version is `30.1.600`, and `BlackcoinFullVersion` is `30.1.6`. The
-runtime and configured package version are `30.1.6rc1`. The canonical
-development notes are `doc/release-notes/release-notes-30.1.6.md`.
+This runbook's current source line is `30.1.6`.
+`configure.ac` records major 30, minor 1, build 6, revision 0, RC0, and
+`CLIENT_VERSION_IS_RELEASE=true`. The numeric `CLIENT_VERSION` is `300106`;
+macOS short version is `30.1.6`, bundle version is `30.1.600`, and
+`BlackcoinFullVersion` is `30.1.6`. The canonical final notes are
+`doc/release-notes/release-notes-30.1.6.md`.
 
-This source line continues the development candidates that were numbered
-30.1.5.3rc1 through 30.1.5.3rc15. None of them was published as a release, and
-no `v30.1.5.3` tag exists or will be created. The last published release is
+This source line was developed as the candidates 30.1.5.3rc1 through
+30.1.5.3rc15 and one 30.1.6 release candidate. None of them was published, and
+no `v30.1.5.3` tag exists or will be created. The previous published release is
 v30.1.5.2.
 
-Manual candidate packages use an explicit `30.1.6-alpha1` or
-`30.1.6-beta1` label bound to the exact source SHA. Such builds do not publish
-a release. The future `v30.1.6` production path remains blocked until RC0,
-release=true, final canonical notes, the complete exact-source safety gate,
-a Blackcoin-Dev SSH-signed source commit and annotated tag, and protected
-`V30.1.6` acknowledgement are present. Retain the signed immutable-configuration
-receipt, authenticated release inventory and numeric release-ID checks,
-two isolated builders with byte comparison, attestations, and immutable
-publication verification. A version transition is not evidence of those results.
+The `v30.1.6` tag path requires RC0 and release=true, canonical final notes,
+the complete current-SHA safety gate, a Blackcoin-Dev SSH-signed exact source
+commit and annotated tag, and the protected `V30.1.6` acknowledgement. Retain the
+fresh signed immutable-configuration receipt, authenticated inventory and
+numeric release-ID checks, two isolated builders with byte comparison,
+attestations, and one immutable publication. Record actual qualification and
+publication evidence before stating that those controls have passed.
 
-Qualify the final exact source and artifacts across the native platform matrix,
-pinned Berkeley DB legacy-wallet support, sanitizers and fuzzing, mixed-version
-compatibility, restart and long-running resource behavior. Record actual test
-results and the selected artifact digests. Source changes, focused fixtures, and
-template-only measurements do not replace those checks. MacBook Air live-wallet
-resource observations and any seed or fleet operations require their own actual
-evidence; this runbook records no deployment or operational completion.
+Manual candidate packages use an explicit `30.1.6-alpha1` or `30.1.6-beta1`
+label bound to the exact source SHA of a candidate source, with a nonzero
+release-candidate number and release=false. Such builds do not publish a
+release, and the final RC0 source is packaged only by the tag path.
+
+The release notes record what was measured for this release and every known
+limitation. This release does not change consensus or the wallet and
+chainstate formats.
 
 The sections below preserve historical release controls and evidence boundaries.
 

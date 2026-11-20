@@ -1,15 +1,17 @@
-30.1.6rc1 DEVELOPMENT Candidate Notes
-===================================
+30.1.6 Release Notes
+====================
 
-This development candidate adds macOS window restoration, incremental history
-and Account rendering, cancellable wallet preparation and asynchronous UI worker
-shutdown. It retains the earlier QQ peer discovery, header replay tracking,
+This release makes Gold Rush claims reach the network faster, cuts the wallet
+work done for every block, shortens start-up and crash recovery on large
+wallets and hard disks, and keeps the window responsive with many wallets
+loaded. It also carries the QQ peer discovery, header replay tracking,
 mining-control, block-template and UTXO scan changes. Consensus and storage
-formats are unchanged. RC5 UI and local soak qualification remain pending.
-The source is RC1 with `CLIENT_VERSION_IS_RELEASE=false`; final release
-qualification is pending. See
-`doc/release-notes/release-notes-30.1.6.md` for configuration changes,
-compatibility, and the measured synthetic template-assembly benchmark.
+formats are unchanged.
+
+The final source is RC0 with `CLIENT_VERSION_IS_RELEASE=true`. See
+`doc/release-notes/release-notes-30.1.6.md` for the changes, the measured
+results, the new options and RPC fields, the minimum memory and the known
+limitations.
 
 The following sections preserve prior release history.
 

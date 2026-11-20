@@ -1,10 +1,28 @@
 # Changelog
 
-## v30.1.6rc1 (DEVELOPMENT, unreleased candidate)
+## v30.1.6
 
-- Identify the source as 30.1.6. It continues the development candidates
-  numbered 30.1.5.3rc1 through 30.1.5.3rc15, which were never published.
-  The numeric client version becomes 300106.
+- Final release of the source line developed as 30.1.5.3rc1 through
+  30.1.5.3rc15, which were never published. The numeric client version is
+  300106.
+- Announce Gold Rush claims without the trickle delay, send a claim this
+  node's miner created to peers as a whole transaction, and do not round the
+  fee filter above the minimum. The claim fee is unchanged.
+- Cut the wallet work per block: no commit for a block that writes no wallet
+  record, one commit per submitted transaction, packed transaction metadata.
+- Shorten start-up and restart: sequential read-ahead of the block index and
+  the wallet file, a quick integrity check with the full check in the
+  background, and payout checkpoints at the wallet tip and at the last
+  chainstate flush so that a crash does not re-authenticate every payout.
+- Honor a payout checkpoint written by an earlier trusted client version, so
+  the upgrade does not force a full payout re-check.
+- Calculate display balances on one sliced background worker; the balance RPCs
+  return the last calculated balance at once and say whether it is exact.
+- Size the database cache from the system memory, with the chainstate
+  database's own cache capped at 8 MiB.
+- No consensus rules or storage formats change. See
+  `doc/release-notes/release-notes-30.1.6.md` for measured results and known
+  limitations.
 
 ## v30.1.5.3rc15 (DEVELOPMENT, unreleased candidate)
 

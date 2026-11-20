@@ -6,8 +6,6 @@
 
 #include <boost/test/unit_test.hpp>
 
-#include <regex>
-
 BOOST_AUTO_TEST_SUITE(clientversion_tests)
 
 BOOST_AUTO_TEST_CASE(release_identity_and_numeric_version)
@@ -18,8 +16,8 @@ BOOST_AUTO_TEST_CASE(release_identity_and_numeric_version)
     BOOST_CHECK_EQUAL(CLIENT_VERSION_BUILD, 6);
     BOOST_CHECK_EQUAL(CLIENT_VERSION_REVISION, 0);
     BOOST_CHECK_EQUAL(CLIENT_VERSION_STRING, "30.1.6");
-    BOOST_CHECK(std::regex_match(PACKAGE_VERSION, std::regex{R"(30\.1\.6rc[1-9][0-9]*)"}));
-    BOOST_CHECK(!CLIENT_VERSION_IS_RELEASE);
+    BOOST_CHECK_EQUAL(PACKAGE_VERSION, "30.1.6");
+    BOOST_CHECK(CLIENT_VERSION_IS_RELEASE);
 }
 
 BOOST_AUTO_TEST_CASE(peer_revision_is_explicit_and_historical_format_is_unchanged)
